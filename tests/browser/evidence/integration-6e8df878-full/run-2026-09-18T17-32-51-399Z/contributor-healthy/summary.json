@@ -1,0 +1,50 @@
+{
+  "tree_label": "integration-6e8df878-full",
+  "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+  "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+  "role": "contributor",
+  "scenario": "healthy",
+  "started_at": "2026-09-18T17:35:50.452Z",
+  "journeys": {
+    "home": {
+      "crashed": false,
+      "console_errors": 0,
+      "api_non_2xx": [],
+      "allow_crash": false,
+      "ready": "ok",
+      "ready_wait_ms": 1,
+      "evidence": "complete"
+    },
+    "ticker-lookup": {
+      "crashed": false,
+      "console_errors": 3,
+      "api_non_2xx": [
+        "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.contributor"
+      ],
+      "allow_crash": false,
+      "ready": "ok",
+      "ready_wait_ms": 1,
+      "evidence": "complete"
+    },
+    "ten-year": {
+      "crashed": false,
+      "console_errors": 1,
+      "api_non_2xx": [],
+      "allow_crash": false,
+      "ready": "ok",
+      "ready_wait_ms": 2,
+      "evidence": "complete"
+    },
+    "catalyst-timeline-ACME": {
+      "crashed": false,
+      "console_errors": 1,
+      "api_non_2xx": [],
+      "allow_crash": true,
+      "ready": "ok",
+      "ready_wait_ms": 1,
+      "evidence": "complete"
+    }
+  },
+  "finished_at": "2026-09-18T17:36:09.800Z"
+}

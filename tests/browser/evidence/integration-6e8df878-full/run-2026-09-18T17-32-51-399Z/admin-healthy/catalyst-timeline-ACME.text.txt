@@ -1,0 +1,66 @@
+CATALYST TIMELINE
+GO
+milestone
+catalyst
+prediction
+hypothesis
+ACME
+6 events
+$100.00
+MOS: 5%
+TODAY
+Fair Value: $95.00 – $105.00 – $118.00
+MOS: 5% | Live: $100.00
+Jul 26
+Aug 26
+Sep 26
+Oct 26
+Nov 26
+Dec 26
+Jan 27
+Feb 27
+Mar 27
+P
+BEARISH → $90.00
+P
+BULLISH → $110.00
+$
+FY26 EPS guidance $2
+↩
+Buyback tranche, zer
+Rx
+Readout: NCT00000000
+P
+BULLISH → $120.00
+milestone
+catalyst
+prediction
+hypothesis
+|
+invalidation gate
+today
+above center = positive value impact | below = negative
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

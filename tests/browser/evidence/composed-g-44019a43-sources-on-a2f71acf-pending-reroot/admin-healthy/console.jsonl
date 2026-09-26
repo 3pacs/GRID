@@ -1,0 +1,23 @@
+{"ts":"2026-09-18T09:36:39.014Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.082Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.115Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.461Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.594Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.712Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.872Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:39.951Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.072Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.186Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.274Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.343Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.514Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.627Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.707Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:40.779Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:44.273Z","role":"admin","scenario":"healthy","type":"error","text":"Each child in a list should have a unique \"key\" prop.%s%s See https://react.dev/link/warning-keys for more information. \n\nCheck the render method of `FinvizPanel`. "}
+{"ts":"2026-09-18T09:36:44.381Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:46.416Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:48.063Z","role":"admin","scenario":"healthy","type":"error","text":"%s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Updating padding paddingTop"}
+{"ts":"2026-09-18T09:36:48.325Z","role":"admin","scenario":"healthy","type":"error","text":"%s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Updating padding paddingTop"}
+{"ts":"2026-09-18T09:36:48.441Z","role":"admin","scenario":"healthy","type":"error","text":"Failed to load resource: the server responded with a status of 404 (Not Found)"}
+{"ts":"2026-09-18T09:36:48.762Z","role":"admin","scenario":"healthy","type":"error","text":"%s a style property during rerender (%s) when a conflicting property is set (%s) can lead to styling bugs. To avoid this, don't mix shorthand and non-shorthand properties for the same value; instead, replace the shorthand with separate values. Removing paddingTop padding"}

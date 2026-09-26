@@ -1,0 +1,52 @@
+Portfolio
+Watchlist as portfolio -- estimated from equal-weight allocation
+Portfolio Value
+--
+estimated
+1D P&L
+--
+--
+1M P&L (est)
+--
+Positions
+0
+SECTOR ALLOCATION
+No sector data available.
+RISK METRICS
+Top-3 Concentration
+0.0%
+diversified
+Beta (Weighted)
+--
+moderate
+Sector Diversification
+0%
+concentrated
+POSITIONS
+No positions in watchlist.
+OPTIONS P&L
+No options recommendations tracked yet.
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

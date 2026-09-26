@@ -1,0 +1,7 @@
+{"ts":"2026-09-18T10:20:28.968Z","role":"contributor","scenario":"empty","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:20:29.315Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/alerts","status":502}
+{"ts":"2026-09-18T10:20:29.316Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":502}
+{"ts":"2026-09-18T10:20:29.513Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":502}
+{"ts":"2026-09-18T10:24:41.097Z","role":"contributor","scenario":"empty","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:24:41.477Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/alerts","status":200}
+{"ts":"2026-09-18T10:24:41.565Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":200}

@@ -1,0 +1,86 @@
+God View — Institutional Pillars
+as of 
+CFTC Positioning
+as of 2026-09-18
+25%
+1/4 contractsstale: stale
+SP500 (ES)
+Noncommercial net
+142,450contracts
+measured
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+Total open interest
+2,504,900contracts
+measured
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+Spec net % OI
+5.69pct
+measured
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+Z-score (1y)
+1.43zscore
+derived
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+Z-score (3y)
+1.43zscore
+derived
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+Percentile (3y)
+93.75pct
+derived
+pub 2023-02-24
+avail 2026-09-18 17:55:52
+ingest —
+NOTE10Y (ZN)
+no data for this contract as of this date
+GOLD (GC)
+no data for this contract as of this date
+CRUDE_OIL (CL)
+no data for this contract as of this date
+generation 77b18669-b534-4b94-83de-e06450bddb46 published 2026-09-18 17:55:53
+FINRA Short Volume
+not built yet — no data
+SEC Reg SHO — FTD
+not built yet — no data
+Commodity Warehouses
+not built yet — no data
+Fed Net Liquidity
+not built yet — no data
+Corporate Buyback Blackouts
+not built yet — no data
+Dealer Gamma Exposure
+not built yet — no data
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

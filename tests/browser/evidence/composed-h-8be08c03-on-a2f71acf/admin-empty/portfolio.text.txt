@@ -1,0 +1,50 @@
+Portfolio
+Watchlist as a weighted basket. No share counts or cost basis are stored, so returns are shown as percentages and no dollar value is reported.
+Portfolio Value
+—
+no position sizes stored
+1D Return (weighted)
+—
+no priced position with a 1D return
+Positions Priced
+0
+all holdings priced
+Missing Price
+0
+SECTOR ALLOCATION
+No sector data available.
+RISK METRICS
+Top-3 Concentration
+—
+no priced positions
+Beta Proxy (by asset class)
+—
+no per-position beta measured; proxy by asset class only
+Sector Diversification
+—
+no priced positions
+POSITIONS
+No positions in watchlist.
+OPTIONS P&L
+No options recommendations tracked yet.
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+
