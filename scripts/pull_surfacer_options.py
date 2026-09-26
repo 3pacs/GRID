@@ -3,15 +3,17 @@
 
 This script is a deterministic worker for ``surfacer_data_requirements``.
 It claims pending ``options_expectation`` rows by volume rank, writes
-``options_snapshots`` and ``options_daily_signals``, then marks the
+``options_daily_signals``, then marks the
 requirement done/no_data/error or defers transiently slow tickers.
+Its capped yfinance pass is not a complete GEX chain and must never write
+``options_snapshots``; that table is owned by ``ingestion.options.OptionsPuller``.
 """
 
 from __future__ import annotations
 
 import argparse
-import math
 import json
+import math
 import multiprocessing as mp
 import sys
 import time
@@ -150,15 +152,6 @@ def _safe_int(value: Any) -> int:
         return 0
 
 
-def _safe_float(value: Any) -> float | None:
-    try:
-        if value is None or (isinstance(value, float) and np.isnan(value)):
-            return None
-        return float(value)
-    except Exception:
-        return None
-
-
 def _spot_price(stock: Any) -> float | None:
     try:
         fast_info = stock.fast_info
@@ -226,7 +219,6 @@ def _pull_one(
         return {"status": "no_data", "reason": "no options expirations", "spot_price": spot}
 
     total_call_oi = total_put_oi = total_call_vol = total_put_vol = 0
-    snap_count = 0
     iv_by_expiry: list[float] = []
     near_expiry = expirations[0]
     nearest_chain = None
@@ -239,39 +231,17 @@ def _pull_one(
         exp_iv = _atm_iv(chain.calls, chain.puts, float(spot))
         if exp_iv is not None:
             iv_by_expiry.append(exp_iv)
-        for opt_type, df in (("call", chain.calls), ("put", chain.puts)):
+        for is_call, df in ((True, chain.calls), (False, chain.puts)):
             if df.empty:
                 continue
             oi_sum = _safe_int(df["openInterest"].fillna(0).sum()) if "openInterest" in df else 0
             vol_sum = _safe_int(df["volume"].fillna(0).sum()) if "volume" in df else 0
-            if opt_type == "call":
+            if is_call:
                 total_call_oi += oi_sum
                 total_call_vol += vol_sum
             else:
                 total_put_oi += oi_sum
                 total_put_vol += vol_sum
-            for _, row in df.iterrows():
-                cur.execute(
-                    """
-                    INSERT INTO options_snapshots (
-                        ticker, snap_date, expiry, opt_type, strike, last_price,
-                        bid, ask, volume, open_interest, implied_vol, in_the_money
-                    )
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT DO NOTHING
-                    """,
-                    (
-                        ticker, today, exp, opt_type, row.get("strike"),
-                        _safe_float(row.get("lastPrice")),
-                        _safe_float(row.get("bid")),
-                        _safe_float(row.get("ask")),
-                        _safe_int(row.get("volume")),
-                        _safe_int(row.get("openInterest")),
-                        _safe_float(row.get("impliedVolatility")),
-                        bool(row.get("inTheMoney")) if row.get("inTheMoney") is not None else None,
-                    ),
-                )
-                snap_count += 1
 
     if nearest_chain is None:
         return {"status": "no_data", "reason": "empty option chains", "spot_price": spot}
@@ -312,7 +282,8 @@ def _pull_one(
 
     return {
         "status": "done",
-        "snapshots": snap_count,
+        "snapshots": 0,
+        "snapshot_status": "not_written_by_surfacer",
         "spot_price": spot,
         "iv_atm": iv_atm,
         "total_oi": total_oi,

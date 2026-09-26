@@ -6,7 +6,8 @@
 # Database
 psycopg2-binary>=2.9.12
 asyncpg>=0.29.0  # LISTEN only: cross-process contract events → SSE (events/bus.py); the sync engine stays psycopg2
-sqlalchemy>=2.0.0
+# 2.1 changes postgresql:// to psycopg v3; GRID uses psycopg2 throughout.
+sqlalchemy>=2.0.0,<2.1
 alembic>=1.20.0
 
 # Data
@@ -42,6 +43,7 @@ seaborn>=0.13.2
 # Utilities
 python-dotenv>=1.0.0
 schedule>=1.2.0
+pytz>=2024.1  # schedule.at(..., "UTC") timezone support
 pydantic>=2.13.4
 pydantic-settings>=2.1.0
 eval_type_backport>=0.2.0

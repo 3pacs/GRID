@@ -23,6 +23,7 @@ from intelligence.actors.db import (
     _seed_known_actors,
 )
 from intelligence.actors.models import Actor
+from intelligence.actors.provenance import stamp_actor_node
 
 # ── Sector inference ───────────────────────────────────────────────────────
 # Maps actor categories and keywords to user-facing sector labels.
@@ -214,7 +215,7 @@ def build_actor_graph(
     nodes: list[dict] = []
     for actor_id, actor in actors.items():
         effective_influence = propagated.get(actor_id, actor.influence_score)
-        nodes.append({
+        node = {
             "id": actor_id,
             "label": actor.name,
             "tier": actor.tier,
@@ -229,7 +230,9 @@ def build_actor_graph(
             "credibility": actor.credibility,
             # D3 sizing: scale radius by influence
             "size": max(4, int(effective_influence * 30)),
-        })
+        }
+        stamp_actor_node(node, actor_id, stored=actor.provenance, vintage=actor.provenance_as_of)
+        nodes.append(node)
 
     # Build links from actor_connections table (5M+ rows)
     # Only include links between actors in our current set

@@ -165,7 +165,9 @@ function SectorHealthGauge({ health }) {
     const ringRef = useRef(null);
     const [showTip, setShowTip] = useState(false);
     const score = health?.score ?? null;
-    const trend = health?.trend_30d || 'stable';
+    // null when the health payload is unavailable; never default to a
+    // 'stable' reading the backend did not report.
+    const trend = health?.trend_30d ?? null;
     const components = health?.components || {};
     const color = HEALTH_COLOR(score);
 
@@ -269,7 +271,7 @@ function SectorHealthGauge({ health }) {
                             {TREND_ARROW[trend] || '\u2192'}
                         </span>
                         <span style={{ fontFamily: mono, fontSize: '11px', color: colors.text }}>
-                            {trend}
+                            {trend ?? 'unavailable'}
                         </span>
                     </div>
                 </div>
@@ -734,13 +736,15 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
                     value={fmtUSD(metrics.etf_flow_5d)}
                     color={metrics.etf_flow_5d == null ? colors.textMuted : (metrics.etf_flow_5d >= 0 ? colors.green : colors.red)}
                 />
-                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || 'neutral'} color={
+                {/* A missing signal or activity list renders '--', never a
+                    'neutral' reading or a count of 0 the backend did not send. */}
+                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || '--'} color={
                     metrics.dark_pool_signal === 'accumulation' ? colors.green
                     : metrics.dark_pool_signal === 'distribution' ? colors.red
-                    : colors.textDim
+                    : metrics.dark_pool_signal ? colors.textDim : colors.textMuted
                 } />
-                <MetricCard label="Insider Trades (30d)" value={String((metrics.insider_activity || []).length)} color={colors.text} />
-                <MetricCard label="Congressional (60d)" value={String((metrics.congressional_activity || []).length)} color={colors.text} />
+                <MetricCard label="Insider Trades (30d)" value={Array.isArray(metrics.insider_activity) ? String(metrics.insider_activity.length) : '--'} color={Array.isArray(metrics.insider_activity) ? colors.text : colors.textMuted} />
+                <MetricCard label="Congressional (60d)" value={Array.isArray(metrics.congressional_activity) ? String(metrics.congressional_activity.length) : '--'} color={Array.isArray(metrics.congressional_activity) ? colors.text : colors.textMuted} />
             </div>
 
             {/* ═══ SUBSECTOR TREEMAP ═══ */}
