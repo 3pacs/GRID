@@ -157,7 +157,13 @@ def replay(csv_path, sampling, perms=10000, seed=20260924, run_id=None):
         "blocks": sorted(set(payload["blocks"].values())),
         "raw_p_lt_0.05": sum(t["p"] < 0.05 for t in tested),
         "min_p": min((t["p"] for t in tested), default=None),
-        "bh10_survivors": sum(t["selected"] for t in ledger),
+        # BH rejections at 10% over the whole run. Fixed-step runs never select
+        # (diagnostic only, #658 review), so count rejections, not selections.
+        "bh10_survivors": sum(
+            t["status"] == "tested" and t["adjusted_p"] <= 0.10 for t in ledger
+        ),
+        "selected": sum(t["selected"] for t in ledger),
+        "candidate_eligible": payload["candidate_eligible"],
         "bh05_survivors": sum(
             t["status"] == "tested" and t["adjusted_p"] <= 0.05 for t in ledger
         ),

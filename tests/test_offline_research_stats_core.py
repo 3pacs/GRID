@@ -8,12 +8,14 @@
 Synthetic data only; no DB.
 """
 
+import copy
 from dataclasses import replace
 from itertools import pairwise
 
 import numpy as np
 import pandas as pd
 import pytest
+from scipy.signal import lfilter
 from scipy.stats import pearsonr
 
 from analysis.offline_research_proof import (
@@ -22,7 +24,9 @@ from analysis.offline_research_proof import (
     block_permutation_pvalue,
     block_permutations,
     build_family_rows,
+    digest,
     discover,
+    evaluate_holdout,
     permutation_block,
     validate_rows,
 )
@@ -305,3 +309,67 @@ def test_discover_applies_one_bh_family_across_every_trial():
     assert payload["min_attainable_p"] == 1 / 300
     with pytest.raises(ValueError, match="family universe"):
         discover(protocol, {k: v for k, v in rows.items() if k != "SPY|fwd1"})
+
+
+# --- S09: fixes carried from the #658 review ---------------------------------------
+
+
+@pytest.mark.parametrize("n", [60, 240])
+def test_horizon_spaced_block_one_null_is_calibrated(n):
+    """Horizon-spaced outcomes do not overlap, so block 1 is the right null: an
+    independent persistent feature must be rejected at about the nominal 5%
+    (the #658 reviewer's simulation gave 4.25%). With 499 permutations the exact
+    size of ``p < 0.05`` is 24/500 = 4.8%; this seed measures 4.0% / 3.9%."""
+    rng = np.random.default_rng(20260926 + n)
+    sims, hits = 800, 0
+    for s in range(sims):
+        x = lfilter([1.0], [1.0, -0.95], rng.normal(size=n + 200))[200:]
+        y = rng.normal(size=n)
+        hits += block_permutation_pvalue(x, y, 1, 499, s)[1] < 0.05
+    assert 0.03 <= hits / sims <= 0.07
+
+
+def test_fixed_step_runs_are_diagnostic_only_and_say_so():
+    from scripts.demo_offline_research_proof import fixture
+
+    protocol, discovery, holdout = fixture()
+    spaced = discover(protocol, discovery)["payload"]
+    assert spaced["candidate_eligible"] and not spaced["caveats"]
+    assert any(t["selected"] for t in spaced["ledger"])
+    assert "CAVEAT" not in spaced["method"]
+
+    fixed = replace(protocol, sampling="fixed_step_block_null")
+    frozen = discover(fixed, discovery)
+    payload = frozen["payload"]
+    signal = payload["ledger"][0]
+    assert signal["status"] == "tested" and signal["adjusted_p"] <= fixed.fdr_q
+    assert not any(t["selected"] for t in payload["ledger"])
+    assert not payload["candidate_eligible"]
+    assert payload["caveats"] and "anti-conservative" in payload["caveats"][0]
+    assert "CAVEAT" in payload["method"] and "anti-conservative" in payload["method"]
+    result = evaluate_holdout(frozen, holdout)
+    assert result["holdout_checks"] == result["candidates"] == []
+
+    # A fixed-step manifest re-signed with a selection is still refused.
+    forged = copy.deepcopy(frozen)
+    forged["payload"]["ledger"][0]["selected"] = True
+    forged["sha256"] = digest(forged["payload"])
+    with pytest.raises(ValueError, match="diagnostic only"):
+        evaluate_holdout(forged, holdout)
+
+
+def test_change_labels_are_differences_and_part_of_the_horizon_identity():
+    features, prices = synthetic_panel()
+    protocol = protocol_for(features)
+    level = prices["SPY"] - 100  # a level that crosses zero
+    rows = build_family_rows(protocol, features, level, 5, "discovery", "change")
+    first = rows[0]
+    i = features.index.get_loc(pd.Timestamp(first["decision_at"]))
+    assert first["target"] == pytest.approx(level.iloc[i + 5] - level.iloc[i])
+    assert first["label"] == "change"
+    returns = build_family_rows(protocol, features, prices["SPY"], 5, "discovery")
+    assert "label" not in returns[0]
+    with pytest.raises(ValueError, match="mixed outcome horizons"):
+        validate_rows(returns[:3] + rows[3:6], protocol, "discovery")
+    with pytest.raises(ValueError, match="label"):
+        build_family_rows(protocol, features, level, 5, "discovery", "log")
