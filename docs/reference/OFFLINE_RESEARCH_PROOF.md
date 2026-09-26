@@ -666,7 +666,10 @@ machinery, not the null.
 ### Windows: the single-use holdout registry
 
 The registry is keyed on a trial's **scientific identity**: feature ×
-target × horizon (`feature=>TARGET|label|fwdH`). Class labels play no part
+target × horizon: the target series, label, horizon, feature series and
+transform. The key is the sha256 of that, which is S10's `identity_sha256`,
+so the ledger and the forward log agree on it. Class labels and direction
+play no part
 in the key.
 
 A run declares one label window `[start, end)`, which is discovery
@@ -692,9 +695,51 @@ Identities that share a target share its labels. Their validity given each
 other's outcomes rests on the permutation null being valid given the target
 sequence. That caveat is stated, not proved.
 
-### Forward-log input (S10 interface)
+### Forward-log input (S10)
 
-`ingest_forward_outcomes(ledger, path)` reads a JSONL file whose lines
+There are two ways to feed forward verdicts to the ledger. The S10 log
+adapter is the one to use; the generic file is for other sources.
+
+**The S10 log adapter.** `ingest_forward_log(ledger, log_dir,
+external_anchors=None)` reads `hypothesis_forward_v1.jsonl` directly.
+Before it reads anything as evidence, it checks:
+
+- the log's hash chain;
+- its chained `hypothesis_forward_v1.anchors.jsonl`, and the off-host anchor
+  copy when one is given (a missing copy is refused);
+- the pre-registration file, which must hash to the pinned `PREREG_SHA256`,
+  and the header and every verdict, which must name that hash;
+- every verdict's `log_head_sha256`, which must equal its `prev_sha256`;
+- every verdict's identity, which must be the scientific identity of its
+  family and feature, with the stated sha256;
+- a matching admission for every verdict, with the same identity and plan
+  hash.
+
+Only anchored verdicts are taken. A crash between the log append and the
+anchor append can leave an unanchored tail, and that tail waits for the
+next run. Re-ingesting the same log is idempotent.
+
+Verdict states map as follows:
+
+| S10 state | Ledger outcome | Score |
+|---|---|---|
+| `FORWARD_SUPPORTED_REVIEW_REQUIRED` | `pass` | success |
+| `FORWARD_FAILED` | `fail` | failure |
+| `FORWARD_INCONCLUSIVE_STOPPED` | `inconclusive` | none |
+
+Every ingested verdict touches its identity's forward window. The window
+runs from the first decision to the label end of the last resolved decision
+(or the pairs' last label end, if that is later). For a ledger survivor it
+starts at the ledger run's end if that is earlier.
+
+Two kinds of verdict are recorded with `scored: false` but still touch the
+window:
+
+- a verdict for a candidate that is not a ledger holdout survivor, because
+  its data was still used;
+- a verdict whose window a later ledger run already used.
+
+**The generic file.** `ingest_forward_outcomes(ledger, path)` reads a JSONL file whose lines
 carry exactly these fields: `trial_id`, `candidate_sha256`, `outcome`,
 `n`, `evaluated_through` (a tz-aware ISO timestamp, not before the run's
 end) and `prereg_sha256` (a sha256).

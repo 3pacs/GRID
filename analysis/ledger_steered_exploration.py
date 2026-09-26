@@ -28,9 +28,10 @@ Flow (one run)
 
 Identity, catalog and anchor (review of #663)
 ---------------------------------------------
-* A trial's *scientific identity* is feature x target x horizon
-  (``feature=>TARGET|label|fwdH``), independent of class labels. The window
-  registry is keyed on it.
+* A trial's *scientific identity* is feature x target x horizon (target
+  series, label, horizon, feature series and transform), independent of class
+  labels and direction. The window registry is keyed on its sha256, which is
+  S10's ``identity_sha256``.
 * The catalog (families, features, classes, self_lag pairs) is frozen at
   genesis by hash; an allocation with any other catalog is refused, so
   classes cannot be relabelled to re-open a window.
@@ -159,7 +160,8 @@ WINDOW_RULE = (
     "runs' [start, end) and forward verdicts' [run end, evaluated_through]"
 )
 CANONICAL_LEDGER_ID = "grid-hypothesis-loop"
-IDENTITY_SEPARATOR = "=>"
+FORWARD_LOG_SOURCE = "hypothesis_forward_v1"
+REPO = Path(__file__).resolve().parent.parent
 MAX_Q = 0.10
 PERMS_CAP = 20000
 STATUSES = ("tested", "untestable", SELF_LAG)
@@ -214,9 +216,32 @@ def trial_id(run_id: str, family: str, feature: str) -> str:
     return digest([run_id, family, feature])
 
 
+def scientific_identity(family: str, feature: str) -> dict:
+    """Feature x target x horizon, independent of class labels, scan and direction.
+
+    The same shape as ``research_forward_log.scientific_identity`` (S10): target
+    series, label kind, horizon in sessions, feature series and transform
+    suffix, so ledger and forward-log keys agree.
+    """
+    parts = family.rsplit("|", 2)
+    if len(parts) != 3 or not parts[2].startswith("fwd") or not parts[2][3:].isdigit():
+        raise ValueError(f"unknown family shape {family!r} (TARGET|label|fwdH)")
+    target, label, fwd = parts
+    # a feature without a transform suffix is its own series (S10 names always carry one)
+    series, suffix = feature.rsplit("|", 1) if "|" in feature else (feature, "")
+    return {
+        "target": target,
+        "label": label,
+        "horizon_sessions": int(fwd[3:]),
+        "feature_series": series,
+        "feature_suffix": suffix,
+    }
+
+
+@lru_cache(maxsize=65536)
 def identity(family: str, feature: str) -> str:
-    """Scientific identity: feature x target x horizon, independent of class labels."""
-    return f"{feature}{IDENTITY_SEPARATOR}{family}"
+    """The registry key: sha256 of :func:`scientific_identity` (S10's identity_sha256)."""
+    return digest(scientific_identity(family, feature))
 
 
 # --- catalog ------------------------------------------------------------------------
@@ -258,6 +283,8 @@ class Catalog:
             for pair in self.self_lag
         ) or len(set(self.self_lag)) != len(self.self_lag):
             raise ValueError("self_lag pairs must name catalog families and features")
+        for family in self.families:
+            scientific_identity(family, self.features[0])  # refuses a bad family shape
 
     def sha256(self) -> str:
         return digest(asdict(self))
@@ -576,7 +603,7 @@ class Ledger:
             for t in allocation["trials"]:
                 out.setdefault(identity(t["family"], t["feature"]), []).append(window)
         for verdict in self.of_kind("forward_outcome"):
-            out.setdefault(verdict["identity"], []).append(
+            out.setdefault(verdict["identity_sha256"], []).append(
                 {**verdict["forward_window"], "closed": True, "source": "forward"}
             )
         return out
@@ -825,7 +852,7 @@ def allocate(
                     "family": family,
                     "feature": feature,
                     "family_key": key,
-                    "identity": identity(family, feature),
+                    "identity_sha256": identity(family, feature),
                 }
             )
     m = len(trials)
@@ -1060,7 +1087,9 @@ def ingest_forward_outcomes(
     run_of = {
         t["trial_id"]: a["run_id"] for a in ledger.allocations() for t in a["trials"]
     }
-    seen = {v["trial_id"] for v in ledger.of_kind("forward_outcome")}
+    seen = {v["trial_id"] for v in ledger.of_kind("forward_outcome")} | {
+        v["candidate_id"] for v in ledger.of_kind("forward_outcome")
+    }
     touched = ledger.touched_windows()
     verdicts = []
     for number, line in enumerate(lines, 1):
@@ -1083,9 +1112,9 @@ def ingest_forward_outcomes(
             raise ValueError(f"line {number}: evaluated_through precedes the run's end")
         if not isinstance(entry["prereg_sha256"], str) or len(entry["prereg_sha256"]) != 64:
             raise ValueError(f"line {number}: prereg_sha256 must be a sha256")
-        if entry["trial_id"] in seen:
+        if entry["trial_id"] in seen or entry["candidate_sha256"] in seen:
             raise ValueError(f"line {number}: trial already has a forward verdict")
-        seen.add(entry["trial_id"])
+        seen.update((entry["trial_id"], entry["candidate_sha256"]))
         forward_window = {"start": start, "end": entry["evaluated_through"]}
         key = identity(trial["family"], trial["feature"])
         reused = [
@@ -1099,9 +1128,13 @@ def ingest_forward_outcomes(
         ledger._append(
             {
                 "kind": "forward_outcome",
+                "source": "file",
                 **entry,
+                "candidate_id": entry["candidate_sha256"],
+                "family": trials[entry["trial_id"]]["family"],
+                "feature": trials[entry["trial_id"]]["feature"],
                 "family_key": trials[entry["trial_id"]]["family_key"],
-                "identity": key,
+                "identity_sha256": key,
                 "forward_window": forward_window,
                 "scored": entry["outcome"] in SCORED_FORWARD and not reused,
                 **(
@@ -1114,6 +1147,167 @@ def ingest_forward_outcomes(
             }
         )
     return len(verdicts)
+
+
+def ingest_forward_log(
+    ledger: Ledger,
+    log_dir: str | Path,
+    *,
+    external_anchors: str | Path | None = None,
+    repo_root: str | Path | None = None,
+    recorded_at: str | None = None,
+) -> dict:
+    """Ingest S10 verdicts straight from the ``hypothesis_forward_v1`` log.
+
+    Before anything is read as evidence: the log's hash chain and its chained
+    anchor file (and ``external_anchors``, an off-host copy, when given) must
+    verify; the pre-registration file must hash to the pinned
+    ``PREREG_SHA256``, as must the log header and every verdict; each verdict's
+    ``log_head_sha256`` must equal its ``prev_sha256``; its identity must be the
+    scientific identity of its family/feature with the stated sha256; and its
+    admission record must carry the same identity and plan hash. Only anchored
+    verdicts are taken (a crash between the log and anchor appends leaves an
+    unanchored tail, which waits for the next run).
+
+    Mapping: ``FORWARD_SUPPORTED_REVIEW_REQUIRED`` -> ``pass`` (a success),
+    ``FORWARD_FAILED`` -> ``fail`` (a failure), ``FORWARD_INCONCLUSIVE_STOPPED``
+    -> ``inconclusive`` (no score update). Every ingested verdict touches its
+    identity's forward window ``[first decision (or the ledger run's end, if
+    earlier), last label end]``, where the last label end is that of the last
+    resolved decision. A verdict for a candidate that is not a ledger holdout
+    survivor still touches the window (the data was used) but scores nothing,
+    and so does one whose window a later ledger run already used. Re-ingesting
+    the same log is idempotent. Returns counts and the verified log head.
+    """
+    from analysis import research_forward_log as rfl
+
+    log = rfl.ForwardLog(Path(log_dir))
+    if external_anchors is not None and not Path(external_anchors).is_file():
+        raise ValueError("forward log refused: the external anchor copy is missing")
+    check = log.verify_chain(Path(external_anchors) if external_anchors else None)
+    if not check["ok"]:
+        raise ValueError(f"forward log refused: {check['detail']}")
+    if rfl.prereg_file_sha256(Path(repo_root) if repo_root else REPO) != rfl.PREREG_SHA256:
+        raise ValueError("the pre-registration file does not hash to the pinned sha256")
+    lines = [line for line in log.path.read_bytes().split(b"\n") if line]
+    records = [json.loads(line) for line in lines]
+    if records and records[0].get("prereg_sha256") != rfl.PREREG_SHA256:
+        raise ValueError("forward log header names another pre-registration")
+    states = {rfl.SUPPORTED: "pass", rfl.FAILED: "fail", rfl.INCONCLUSIVE: "inconclusive"}
+    admissions = {r["candidate_id"]: r for r in records if r.get("kind") == "admission"}
+    previous = ledger.of_kind("forward_outcome")
+    ingested = {v.get("verdict_sha256") for v in previous}
+    seen = {v["candidate_id"] for v in previous}
+    survivors = {
+        t["candidate_sha256"]: t
+        for t in ledger.trial_results()
+        if t["holdout_outcome"] == "survived"
+    }
+    run_end = {t["trial_id"]: a["windows"]["end"] for a in ledger.allocations() for t in a["trials"]}
+    run_of = {t["trial_id"]: a["run_id"] for a in ledger.allocations() for t in a["trials"]}
+    touched = ledger.touched_windows()
+    new, unanchored = [], 0
+    for index, (line, record) in enumerate(zip(lines, records)):
+        if record.get("kind") != "verdict":
+            continue
+        verdict_sha = sha256_bytes(line)
+        if verdict_sha in ingested:
+            continue
+        if index >= check["anchored_records"]:
+            unanchored += 1
+            continue
+        cid = record["candidate_id"]
+        where = f"verdict for candidate {cid[:12]}"
+        if record.get("log_head_sha256") != record.get("prev_sha256"):
+            raise ValueError(f"{where}: log_head_sha256 is not its prev_sha256")
+        if record.get("prereg_sha256") != rfl.PREREG_SHA256:
+            raise ValueError(f"{where}: names another pre-registration")
+        family, feature = record["family"], record["feature"]
+        expected = scientific_identity(family, feature)
+        if (
+            record.get("identity") != expected
+            or rfl.scientific_identity(family, feature) != expected
+            or record.get("identity_sha256") != identity(family, feature)
+        ):
+            raise ValueError(f"{where}: identity differs from its family/feature")
+        admission = admissions.get(cid)
+        if (
+            admission is None
+            or admission.get("identity_sha256") != record["identity_sha256"]
+            or admission.get("plan_sha256") != record.get("plan_sha256")
+            or digest(admission["plan"]) != record.get("plan_sha256")
+        ):
+            raise ValueError(f"{where}: no matching admission")
+        if record.get("state") not in states:
+            raise ValueError(f"{where}: unknown verdict state {record.get('state')!r}")
+        if cid in seen:
+            raise ValueError(f"{where}: already has a forward verdict in the ledger")
+        seen.add(cid)
+        plan, windows = admission["plan"], record["windows"]
+        resolved = int(record["decisions_resolved"])
+        ends = [windows["first_decision_at"]]
+        if windows.get("pairs_last_label_end"):
+            ends.append(windows["pairs_last_label_end"])
+        if resolved:
+            ends.append(rfl.label_end(plan, resolved - 1).isoformat())
+        start = windows["first_decision_at"]
+        trial = survivors.get(cid)
+        if trial is not None:
+            if trial["identity_sha256"] != record["identity_sha256"]:
+                raise ValueError(f"{where}: identity differs from the ledger trial")
+            start = min(start, run_end[trial["trial_id"]], key=stamp)
+        forward_window = {"start": start, "end": max(ends, key=stamp)}
+        own_run = run_of.get(trial["trial_id"]) if trial else None
+        reused = sorted(
+            w["source"]
+            for w in touched.get(record["identity_sha256"], [])
+            if w["source"] != own_run
+            and overlaps((w["start"], w["end"]), {**forward_window, "closed": True})
+        )
+        outcome = states[record["state"]]
+        reason = (
+            "candidate is not a ledger holdout survivor"
+            if trial is None
+            else f"forward window re-used by {reused}" if reused else None
+        )
+        entry = {
+            "kind": "forward_outcome",
+            "source": FORWARD_LOG_SOURCE,
+            "candidate_id": cid,
+            "trial_id": None if trial is None else trial["trial_id"],
+            "family": family,
+            "feature": feature,
+            "family_key": None if trial is None else trial["family_key"],
+            "identity_sha256": record["identity_sha256"],
+            "direction": record.get("direction"),
+            "state": record["state"],
+            "outcome": outcome,
+            "n": record.get("n"),
+            "alpha": record.get("alpha"),
+            "family_size": record.get("family_size"),
+            "forward_window": forward_window,
+            "prereg_sha256": record["prereg_sha256"],
+            "plan_sha256": record["plan_sha256"],
+            "log_head_sha256": record["log_head_sha256"],
+            "verdict_sha256": verdict_sha,
+            "source_log_head_sha256": check["head_sha256"],
+            "scored": reason is None and outcome in SCORED_FORWARD,
+            **({"unscored_reason": reason} if reason else {}),
+            "recorded_at": recorded_at or now_iso(),
+        }
+        new.append(entry)
+        touched.setdefault(record["identity_sha256"], []).append(
+            {**forward_window, "closed": True, "source": "forward"}
+        )
+    for entry in new:
+        ledger._append(entry)
+    return {
+        "ingested": len(new),
+        "scored": sum(e["scored"] for e in new),
+        "by_outcome": {o: sum(e["outcome"] == o for e in new) for o in FORWARD_OUTCOMES},
+        "unanchored_skipped": unanchored,
+        "log_head_sha256": check["head_sha256"],
+    }
 
 
 def summarize(ledger: Ledger) -> dict:

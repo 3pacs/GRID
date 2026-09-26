@@ -15,6 +15,7 @@ Synthetic data and in-memory/tmp ledgers only; no DB.
 import json
 import math
 import re
+from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
@@ -201,7 +202,7 @@ def test_relabelled_classes_cannot_re_test_the_same_trials_on_a_window():
                      recorded_at=FIXED)
     # and the registry itself is keyed on feature x target x horizon, not on labels
     touched = ledger.touched_windows()
-    assert set(touched) == {t["identity"] for t in first["record"]["trials"]}
+    assert set(touched) == {t["identity_sha256"] for t in first["record"]["trials"]}
     assert all("::" not in key for key in touched)
     with pytest.raises(ValueError, match="no eligible family"):
         lse.allocate(ledger, catalog, policy, run_id="r2", windows=window(1),
@@ -386,7 +387,7 @@ def test_holdout_windows_are_single_use_per_identity():
     policy = lse.Policy(budget=8)  # floor only: about one trial per arm
     first = lse.allocate(ledger, catalog, policy, run_id="r1", windows=window(1),
                          recorded_at=FIXED)
-    touched = {t["identity"] for t in first["record"]["trials"]}
+    touched = {t["identity_sha256"] for t in first["record"]["trials"]}
     lse.abandon(ledger, "abandoned runs still consume their windows", recorded_at=FIXED)
     overlapping = {
         "start": window(1)["split"],
@@ -395,7 +396,7 @@ def test_holdout_windows_are_single_use_per_identity():
     }
     second = lse.allocate(ledger, catalog, policy, run_id="r2", windows=overlapping,
                           recorded_at=FIXED)
-    declared = {t["identity"] for t in second["record"]["trials"]}
+    declared = {t["identity_sha256"] for t in second["record"]["trials"]}
     assert declared and not declared & touched  # untouched identities only
     arms = second["record"]["arms"]
     assert arms[PLANTED]["stale"] >= 1
@@ -727,7 +728,7 @@ def test_forward_data_is_never_re_used_by_a_later_run(tmp_path):
     policy = lse.Policy(budget=100)
     later = lse.allocate(ledger, catalog, policy, run_id="covering", windows=covering,
                          recorded_at=FIXED)
-    declared = {t["identity"] for t in later["record"]["trials"]}
+    declared = {t["identity_sha256"] for t in later["record"]["trials"]}
     assert passed_identity not in declared
     others = {lse.identity(t["family"], t["feature"]) for t in survivors[1:]}
     assert others <= declared  # survivors without a forward verdict stay testable
@@ -740,7 +741,7 @@ def test_forward_data_is_never_re_used_by_a_later_run(tmp_path):
     }
     fresh = lse.allocate(ledger, catalog, policy, run_id="after", windows=after,
                          recorded_at=FIXED)
-    assert passed_identity in {t["identity"] for t in fresh["record"]["trials"]}
+    assert passed_identity in {t["identity_sha256"] for t in fresh["record"]["trials"]}
 
 
 def test_a_verdict_on_data_a_later_run_already_used_does_not_score(tmp_path):
@@ -767,6 +768,188 @@ def test_a_verdict_on_data_a_later_run_already_used_does_not_score(tmp_path):
     assert "covering" in verdict["unscored_reason"]
     assert ledger.outcomes()["families"][PLANTED] == before
     assert lse.summarize(ledger)["forward_unscored"] == 1
+
+
+def s10_log(tmp_path, ledger, run_end, verdicts):
+    """A real S10 ``ForwardLog`` (chain + anchors) holding admissions and verdicts.
+
+    ``verdicts``: (candidate_id, family, feature, state, n) tuples.
+    """
+    from analysis import research_forward_log as rfl
+
+    log = rfl.ForwardLog(tmp_path / "forward")
+    now = datetime(2027, 1, 4, tzinfo=timezone.utc)
+    first = (run_end + pd.Timedelta(days=14)).normalize()
+    records = [rfl.header_record(now, "c" * 40)]
+    closing = []
+    for cid, family, feature, state, n in verdicts:
+        ident = rfl.scientific_identity(family, feature)
+        plan = {
+            "family": family,
+            "feature": {"name": feature},
+            "direction": 1,
+            "horizon_sessions": 1,
+            "spacing_sessions": 1,
+            "first_decision_at": first.isoformat(),
+            "alpha": 0.05 / len(verdicts),
+            "family_size": len(verdicts),
+            "min_n": 30,
+            "max_decisions": 60,
+        }
+        admission = {
+            "kind": "admission",
+            "run_at": now.isoformat(),
+            "candidate_id": cid,
+            "identity": ident,
+            "identity_sha256": digest(ident),
+            "plan": plan,
+            "plan_sha256": digest(plan),
+            "promotion_allowed": False,
+        }
+        records.append(admission)
+        resolved = 60 if state == rfl.INCONCLUSIVE else 30
+        closing.append(
+            {
+                "kind": "verdict",
+                "candidate_id": cid,
+                "identity": ident,
+                "identity_sha256": digest(ident),
+                "family": family,
+                "feature": feature,
+                "direction": 1,
+                "prereg_sha256": rfl.PREREG_SHA256,
+                "plan_sha256": digest(plan),
+                "admitted_at": now.isoformat(),
+                "windows": {
+                    "first_decision_at": first.isoformat(),
+                    "pairs_first_decision_at": first.isoformat() if n else None,
+                    "pairs_last_decision_at": rfl.decision_at(plan, n - 1).isoformat()
+                    if n else None,
+                    "pairs_last_label_end": rfl.label_end(plan, n - 1).isoformat()
+                    if n else None,
+                    "last_resolved_decision_at": rfl.decision_at(plan, resolved - 1)
+                    .isoformat(),
+                },
+                "decisions_resolved": resolved,
+                "n": n,
+                "family_size": len(verdicts),
+                "alpha": plan["alpha"],
+                "state": state,
+                "promotion_allowed": False,
+            }
+        )
+    log.append(records)
+    log.append(closing)
+    return log
+
+
+def test_s10_adapter_verifies_the_log_and_maps_every_verdict(tmp_path):
+    from analysis import research_forward_log as rfl
+
+    ledger, survivors, _, run_end = dry_ledger(tmp_path)
+    outsider = ("f" * 64, "T2|change|fwd1", "beta3|x", rfl.SUPPORTED, 30)
+    log = s10_log(tmp_path, ledger, run_end, [
+        (survivors[0]["candidate_sha256"], survivors[0]["family"], survivors[0]["feature"],
+         rfl.SUPPORTED, 30),
+        (survivors[1]["candidate_sha256"], survivors[1]["family"], survivors[1]["feature"],
+         rfl.FAILED, 30),
+        (survivors[2]["candidate_sha256"], survivors[2]["family"], survivors[2]["feature"],
+         rfl.INCONCLUSIVE, 12),
+        outsider,
+    ])
+    before = ledger.outcomes()["families"][PLANTED]
+    report = lse.ingest_forward_log(ledger, log.log_dir, recorded_at=FIXED)
+    assert report["ingested"] == 4 and report["scored"] == 2
+    assert report["by_outcome"] == {"pass": 2, "fail": 1, "inconclusive": 1}
+    assert report["log_head_sha256"] == log.verify_chain()["head_sha256"]
+    after = ledger.outcomes()["families"][PLANTED]
+    assert after["successes"] == before["successes"] + 1  # SUPPORTED
+    assert after["failures"] == before["failures"] + 1  # FAILED; INCONCLUSIVE: none
+    recorded = {r["candidate_id"]: r for r in ledger.of_kind("forward_outcome")}
+    assert recorded["f" * 64]["scored"] is False  # not a ledger survivor: data still used
+    assert "not a ledger holdout survivor" in recorded["f" * 64]["unscored_reason"]
+    touched = ledger.touched_windows()
+    for cid, family, feature, *_ in [
+        (s["candidate_sha256"], s["family"], s["feature"]) for s in survivors
+    ] + [outsider[:3]]:
+        forward = [w for w in touched[lse.identity(family, feature)] if w["source"] == "forward"]
+        assert len(forward) == 1  # INCONCLUSIVE and the outsider count as touched
+        assert forward[0]["end"] >= forward[0]["start"]
+    # the forward windows are never re-used by a later run (B1)
+    last_end = max(pd.Timestamp(r["forward_window"]["end"]) for r in recorded.values())
+    covering = {
+        "start": run_end.isoformat(),
+        "split": (last_end - pd.Timedelta(days=5)).isoformat(),
+        "end": (last_end + pd.Timedelta(days=30)).isoformat(),
+    }
+    later = lse.allocate(ledger, lse.synthetic_catalog(), lse.Policy(budget=100),
+                         run_id="covering", windows=covering, recorded_at=FIXED)
+    declared = {t["identity_sha256"] for t in later["record"]["trials"]}
+    for family, feature in [(s["family"], s["feature"]) for s in survivors] + [outsider[1:3]]:
+        assert lse.identity(family, feature) not in declared
+    lse.abandon(ledger, "x", recorded_at=FIXED)
+    # idempotent: the same verified log adds nothing
+    assert lse.ingest_forward_log(ledger, log.log_dir, recorded_at=FIXED)["ingested"] == 0
+
+
+def test_s10_adapter_refuses_an_unverifiable_log(tmp_path):
+    from analysis import research_forward_log as rfl
+
+    ledger, survivors, _, run_end = dry_ledger(tmp_path)
+    good = [(survivors[0]["candidate_sha256"], survivors[0]["family"],
+             survivors[0]["feature"], rfl.SUPPORTED, 30)]
+    log = s10_log(tmp_path, ledger, run_end, good)
+    original = log.path.read_bytes()
+    log.path.write_bytes(original.replace(b"FORWARD_SUPPORTED_REVIEW_REQUIRED",
+                                          b"FORWARD_FAILED"))
+    with pytest.raises(ValueError, match="forward log refused"):
+        lse.ingest_forward_log(ledger, log.log_dir)
+    lines = original.split(b"\n")[:-1]
+    log.path.write_bytes(b"\n".join(lines[:-1]) + b"\n")  # trailing verdict dropped
+    with pytest.raises(ValueError, match="forward log refused"):
+        lse.ingest_forward_log(ledger, log.log_dir)
+    log.path.write_bytes(original)
+    with pytest.raises(ValueError, match="external anchor copy is missing"):
+        lse.ingest_forward_log(ledger, log.log_dir, external_anchors=tmp_path / "missing")
+    external = tmp_path / "offhost.anchors.jsonl"
+    anchors = log.anchor_path.read_bytes()
+    external.write_bytes(anchors.replace(b'"records":', b'"records":1', 1))
+    with pytest.raises(ValueError, match="forward log refused"):
+        lse.ingest_forward_log(ledger, log.log_dir, external_anchors=external)
+    prereg = tmp_path / "repo" / rfl.PREREG_PATH
+    prereg.parent.mkdir(parents=True)
+    prereg.write_text("not the pre-registration\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="pinned sha256"):
+        lse.ingest_forward_log(ledger, log.log_dir, repo_root=tmp_path / "repo")
+    assert ledger.of_kind("forward_outcome") == []
+
+    # a chained, anchored verdict whose identity does not match its family/feature
+    bad = tmp_path / "bad"
+    bad.mkdir()
+    forged = s10_log(bad, ledger, run_end, good)
+    records = forged.read_all()
+    verdict = {k: v for k, v in records[-1].items()
+               if k not in ("prev_sha256", "log_head_sha256")}
+    verdict["candidate_id"] = survivors[1]["candidate_sha256"]
+    verdict["identity_sha256"] = "0" * 64
+    forged.append([verdict])
+    with pytest.raises(ValueError, match="identity differs"):
+        lse.ingest_forward_log(ledger, forged.log_dir)
+    assert ledger.of_kind("forward_outcome") == []
+
+
+def test_ledger_identity_is_the_s10_identity():
+    from analysis import research_forward_log as rfl
+
+    catalog = lse.synthetic_catalog()
+    for family in catalog.families:
+        for feature in catalog.features:
+            assert lse.scientific_identity(family, feature) == rfl.scientific_identity(
+                family, feature
+            )
+            assert lse.identity(family, feature) == digest(
+                rfl.scientific_identity(family, feature)
+            )
 
 
 # --- hard limits --------------------------------------------------------------------
