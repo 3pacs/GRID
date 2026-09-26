@@ -10,6 +10,8 @@ import pytest
 
 from ingestion import options
 
+SESSION_NOW = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
+
 
 class _Result:
     def __init__(self, row: tuple) -> None:
@@ -46,13 +48,13 @@ class _DB:
         self.calls.append((sql, values))
         if "txid_current()" in sql:
             self.next_xid += 1
-            started = datetime.now(timezone.utc) + self.clock_offsets.get(
+            started = SESSION_NOW + self.clock_offsets.get(
                 current_thread().name, timedelta(),
             )
             self.allocations.append((current_thread().name, self.next_xid, started))
             return _Result((self.next_xid, started))
         if "SELECT clock_timestamp()" in sql:
-            return _Result((datetime.now(timezone.utc) + self.clock_offsets.get(
+            return _Result((SESSION_NOW + timedelta(minutes=1) + self.clock_offsets.get(
                 current_thread().name, timedelta(),
             ),))
         if "MAX(capture_ordinal)" in sql:
@@ -107,7 +109,7 @@ class _Yahoo:
 
     def get_options(self, _ticker: str, _expiry: int | None = None) -> dict | None:
         self.calls += 1
-        self.final_response_at = datetime.now(timezone.utc)
+        self.final_response_at = SESSION_NOW
         if self.calls == 2 and self.fail_second:
             return None
         opts = [{
@@ -116,7 +118,8 @@ class _Yahoo:
             "bid": 1.0, "ask": 3.0, "inTheMoney": False,
         } for strike in self.strikes]
         return {
-            "quote": {"regularMarketPrice": 100.0},
+            "quote": {"regularMarketPrice": 100.0,
+                      "regularMarketTime": int((SESSION_NOW - timedelta(hours=2)).timestamp())},
             "expirations": self.expirations,
             "calls": opts, "puts": opts,
         }
@@ -128,6 +131,7 @@ def puller(monkeypatch: pytest.MonkeyPatch) -> options.OptionsPuller:
     obj.engine = _DB()
     monkeypatch.setattr(obj, "_push_to_resolved", lambda *_args: None)
     monkeypatch.setattr(options.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(options, "_utc_now", lambda: SESSION_NOW)
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
     monkeypatch.setattr(options, "compute_iv_skew", lambda *_args: 0.0)
     monkeypatch.setattr(options, "_compute_atm_iv", lambda *_args: 0.2)
@@ -137,7 +141,7 @@ def puller(monkeypatch: pytest.MonkeyPatch) -> options.OptionsPuller:
 
 
 def _run(puller: options.OptionsPuller, strikes: list[float], *, fail_second: bool = False):
-    now = datetime.now(timezone.utc)
+    now = SESSION_NOW
     expirations = [int((now + timedelta(days=days)).timestamp()) for days in (10, 20)]
     yahoo = _Yahoo(expirations, strikes, fail_second=fail_second)
     puller._yahoo = yahoo
@@ -157,6 +161,8 @@ def test_completed_batch_time_follows_final_provider_response(
     assert len({row["ordinal"] for row in db.rows}) == 1
     assert len({row["started_at"] for row in db.rows}) == 1
     assert len({row["completed_at"] for row in db.rows}) == 1
+    assert all(row["provider_regular_market_at"].date() == SESSION_NOW.date()
+               for row in db.rows)
     assert yahoo.final_response_at is not None
     assert db.rows[0]["completed_at"] >= yahoo.final_response_at
     sql = [statement for statement, _ in db.calls]
@@ -170,7 +176,7 @@ def test_completed_batch_time_follows_final_provider_response(
 def test_explicit_six_expiry_cap_preserves_legacy_gem_scope(
     puller: options.OptionsPuller,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = SESSION_NOW
     expirations = [int((now + timedelta(days=10 * n)).timestamp()) for n in range(1, 8)]
     yahoo = _Yahoo(expirations, [100.0])
     puller._yahoo = yahoo
@@ -183,10 +189,77 @@ def test_explicit_six_expiry_cap_preserves_legacy_gem_scope(
     assert len({row["batch_id"] for row in puller.engine.rows}) == 1
 
 
+@pytest.mark.parametrize("now", [
+    datetime(2026, 9, 26, 15, tzinfo=timezone.utc),  # Saturday
+    datetime(2026, 9, 7, 19, tzinfo=timezone.utc),   # Labor Day
+    datetime(2026, 9, 26, 0, 15, tzinfo=timezone.utc),  # Friday ET, Saturday UTC
+    datetime(2026, 9, 25, 0, 15, tzinfo=timezone.utc),  # Friday UTC, Thursday ET
+])
+def test_non_session_never_initializes_provider_or_publishes(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    monkeypatch.setattr(options, "_utc_now", lambda: now)
+    monkeypatch.setattr(options, "YahooOptionsClient",
+                        lambda: pytest.fail("closed day must not contact provider"))
+    result = puller.pull_all(tickers=["SPY"], max_expirations=6)
+    assert result == [{"ticker": "SPY", "status": "SKIPPED",
+                       "reason": "non-equity-session"}]
+    assert puller.engine.rows == []
+
+
+@pytest.mark.parametrize("reported", [
+    None,
+    int((SESSION_NOW - timedelta(days=1)).timestamp()),
+    int((SESSION_NOW + timedelta(minutes=5)).timestamp()),
+])
+def test_missing_stale_or_future_quote_time_cannot_publish(
+    puller: options.OptionsPuller, reported: int | None,
+) -> None:
+    expirations = [int((SESSION_NOW + timedelta(days=n)).timestamp()) for n in (10, 20)]
+    yahoo = _Yahoo(expirations, [100.0])
+    original = yahoo.get_options
+
+    def dated(ticker: str, expiry: int | None = None) -> dict | None:
+        page = original(ticker, expiry)
+        assert page is not None
+        if reported is None:
+            page["quote"].pop("regularMarketTime")
+        else:
+            page["quote"]["regularMarketTime"] = reported
+        return page
+
+    yahoo.get_options = dated
+    puller._yahoo = yahoo
+    assert puller._pull_ticker("SPY", SESSION_NOW.date().isoformat())["status"] == "FAILED"
+    assert puller.engine.rows == []
+
+
+def test_second_page_with_stale_quote_time_cannot_publish(
+    puller: options.OptionsPuller,
+) -> None:
+    expirations = [int((SESSION_NOW + timedelta(days=n)).timestamp()) for n in (10, 20)]
+    yahoo = _Yahoo(expirations, [100.0])
+    original = yahoo.get_options
+
+    def mixed(ticker: str, expiry: int | None = None) -> dict | None:
+        page = original(ticker, expiry)
+        assert page is not None
+        if expiry is not None:
+            page["quote"]["regularMarketTime"] = int(
+                (SESSION_NOW - timedelta(days=1)).timestamp()
+            )
+        return page
+
+    yahoo.get_options = mixed
+    puller._yahoo = yahoo
+    assert puller._pull_ticker("SPY", SESSION_NOW.date().isoformat())["status"] == "FAILED"
+    assert puller.engine.rows == []
+
+
 def test_near_expiry_signal_stays_within_captured_six(
     puller: options.OptionsPuller,
 ) -> None:
-    now = datetime.now(timezone.utc)
+    now = SESSION_NOW
     expirations = [int((now + timedelta(days=1, hours=n)).timestamp()) for n in range(6)]
     expirations.append(int((now + timedelta(days=10)).timestamp()))
     yahoo = _Yahoo(expirations, [100.0])
@@ -262,7 +335,7 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
     newer = options.OptionsPuller.__new__(options.OptionsPuller)
     newer.engine = db
     newer._push_to_resolved = lambda *_args: None
-    now = datetime.now(timezone.utc)
+    now = SESSION_NOW
     expirations = [int((now + timedelta(days=days)).timestamp()) for days in (10, 20)]
     old_yahoo = _Yahoo(expirations, [100.0])
     newer._yahoo = _Yahoo(expirations, [120.0])
@@ -310,7 +383,7 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
 
 def test_complete_pull_replaces_preexisting_legacy_rows(puller: options.OptionsPuller) -> None:
     puller.engine.rows = [{
-        "ticker": "SPY", "snap_date": datetime.now(timezone.utc).date().isoformat(),
+        "ticker": "SPY", "snap_date": SESSION_NOW.date().isoformat(),
         "strike": 999.0, "batch_id": None, "ordinal": None,
         "started_at": None, "completed_at": None,
     }]

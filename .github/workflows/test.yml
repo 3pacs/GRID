@@ -291,7 +291,9 @@ jobs:
           cache: pip
 
       - name: Install linters
-        run: pip install ruff bandit
+        # The backlink check imports loguru; Alien has it installed persistently,
+        # but the supported ubuntu-latest fallback starts from a clean image.
+        run: pip install ruff bandit 'loguru>=0.7.2'
 
       # Style and unused-import noise across a 700+ module tree: too much to
       # gate on today, so this stays advisory and reports without failing.

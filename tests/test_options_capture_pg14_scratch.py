@@ -20,10 +20,13 @@ from sqlalchemy.engine import URL, make_url
 
 from ingestion import options
 from migrations.versions import options_capture_batch_20260924 as migration
+from migrations.versions import options_quote_time_20260925 as source_migration
 from physics.dealer_gamma import DealerGammaEngine
 
+_SYNTHETIC_SESSION_AT = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
 
-def _yahoo(expirations: list[int], strikes: list[float]):
+
+def _yahoo(expirations: list[int], strikes: list[float], *, quote_at: datetime | None = None):
     class Yahoo:
         def get_options(self, _ticker, _expiry=None):
             rows = [{
@@ -32,7 +35,8 @@ def _yahoo(expirations: list[int], strikes: list[float]):
                 "bid": 1.0, "ask": 3.0, "inTheMoney": False,
             } for strike in strikes]
             return {
-                "quote": {"regularMarketPrice": 100.0},
+                "quote": {"regularMarketPrice": 100.0,
+                          "regularMarketTime": int((quote_at or datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp())},
                 "expirations": expirations, "calls": rows, "puts": rows,
             }
 
@@ -45,6 +49,42 @@ def _puller(engine, yahoo):
     puller._yahoo = yahoo
     puller._push_to_resolved = lambda *_args: None
     return puller
+
+
+@pytest.fixture
+def synthetic_session_pg14(scratch_pg14, monkeypatch):
+    """Freeze only test clocks; PostgreSQL transactions and locks remain real.
+
+    This proves writer mechanics on weekends without representing a live quote,
+    options-chain revision, or production freshness. The transaction ordinal is
+    still assigned by real PostgreSQL txid_current().
+    """
+    engine = scratch_pg14
+    started = _SYNTHETIC_SESSION_AT.isoformat()
+    completed = (_SYNTHETIC_SESSION_AT + timedelta(minutes=2)).isoformat()
+    monkeypatch.setattr(options, "_utc_now", lambda: _SYNTHETIC_SESSION_AT)
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "ALTER TABLE options_snapshots ALTER COLUMN created_at "
+            f"SET DEFAULT TIMESTAMPTZ '{completed}'"
+        )
+    substituted = {"start": 0, "complete": 0}
+
+    def fixed_capture_clock(_conn, _cursor, statement, parameters, _context, _many):
+        if statement == "SELECT txid_current(), clock_timestamp()":
+            substituted["start"] += 1
+            return f"SELECT txid_current(), TIMESTAMPTZ '{started}'", parameters
+        if statement == "SELECT clock_timestamp()":
+            substituted["complete"] += 1
+            return f"SELECT TIMESTAMPTZ '{completed}'", parameters
+        return statement, parameters
+
+    event.listen(engine, "before_cursor_execute", fixed_capture_clock, retval=True)
+    try:
+        yield engine, _SYNTHETIC_SESSION_AT
+    finally:
+        event.remove(engine, "before_cursor_execute", fixed_capture_clock)
+        assert substituted["start"] > 0 and substituted["complete"] > 0
 
 
 def _scratch_url(dsn: str) -> URL:
@@ -188,6 +228,8 @@ def scratch_pg14(monkeypatch):
         with engine.begin() as conn:
             monkeypatch.setattr(migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
             migration.upgrade()
+            monkeypatch.setattr(source_migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
+            source_migration.upgrade()
         yield engine
     finally:
         engine.dispose()
@@ -196,9 +238,54 @@ def scratch_pg14(monkeypatch):
         admin.dispose()
 
 
-def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypatch):
+def test_pg14_nullable_provider_quote_migration_rejects_legacy(scratch_pg14) -> None:
     engine = scratch_pg14
+    day = datetime(2026, 9, 23, 19, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        columns = {row[0] for row in conn.execute(text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'options_snapshots'
+        """))}
+        assert "provider_regular_market_at" in columns
+        conn.execute(text("""
+            INSERT INTO options_snapshots
+              (ticker, snap_date, expiry, opt_type, strike, open_interest,
+               implied_vol, created_at, capture_batch_id, capture_ordinal,
+               capture_started_at, capture_completed_at)
+            VALUES ('SPY', :day, :expiry, 'call', 100, 10, 0.2, :started,
+                    '11111111-1111-4111-8111-111111111111', 1, :started, :completed)
+        """), {"day": day.date(), "expiry": day.date() + timedelta(days=10),
+               "started": day, "completed": day + timedelta(minutes=1)})
+    assert DealerGammaEngine(engine)._load_chain("SPY", day.date()).empty
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE options_snapshots SET provider_regular_market_at = :provider_at
+            WHERE ticker = 'SPY' AND snap_date = :day
+        """), {"provider_at": day - timedelta(hours=2), "day": day.date()})
+    assert not DealerGammaEngine(engine)._load_chain("SPY", day.date()).empty
+
+
+def test_pg14_real_clock_non_session_refuses_before_provider(scratch_pg14) -> None:
+    """The unmodified current clock must refuse a non-session capture."""
     now = datetime.now(timezone.utc)
+    if (options.is_market_open(now.date())
+            and now.astimezone(options._EQUITY_TZ).date() == now.date()):
+        pytest.skip("real clock is currently a same-day equity session")
+
+    class NoProvider:
+        def get_options(self, *_args, **_kwargs):
+            pytest.fail("non-session capture reached the provider")
+
+    result = _puller(scratch_pg14, NoProvider())._pull_ticker(
+        "SPY", now.date().isoformat(),
+    )
+    assert result["status"] == "SKIPPED"
+    with scratch_pg14.connect() as conn:
+        assert conn.execute(text("SELECT COUNT(*) FROM options_snapshots")).scalar_one() == 0
+
+
+def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14, monkeypatch):
+    engine, now = synthetic_session_pg14
     day = now.date()
     expirations = [int((now + timedelta(days=n)).timestamp()) for n in (10, 20)]
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
@@ -213,7 +300,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
             WHERE table_schema = current_schema() AND table_name = 'options_snapshots'
         """))}
         assert {"capture_batch_id", "capture_ordinal", "capture_started_at",
-                "capture_completed_at"} <= columns
+                "capture_completed_at", "provider_regular_market_at"} <= columns
         assert conn.exec_driver_sql(
             "SELECT to_regclass('options_capture_ordinal_seq')"
         ).scalar_one() is None
@@ -224,10 +311,11 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
         """), {"day": day, "expiry": day + timedelta(days=10)})
     assert DealerGammaEngine(engine)._load_chain("SPY", day).empty
 
-    assert _puller(engine, _yahoo(expirations, [100.0, 110.0]))._pull_ticker(
+    quote_at = now - timedelta(minutes=1)
+    assert _puller(engine, _yahoo(expirations, [100.0, 110.0], quote_at=quote_at))._pull_ticker(
         "SPY", day.isoformat(),
     )["status"] == "SUCCESS"
-    assert _puller(engine, _yahoo(expirations, [100.0, 120.0]))._pull_ticker(
+    assert _puller(engine, _yahoo(expirations, [100.0, 120.0], quote_at=quote_at))._pull_ticker(
         "SPY", day.isoformat(),
     )["status"] == "SUCCESS"
     with engine.connect() as conn:
@@ -255,7 +343,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
             CREATE TRIGGER reject_130 BEFORE INSERT ON options_snapshots
             FOR EACH ROW EXECUTE FUNCTION reject_130()
         """)
-    assert _puller(engine, _yahoo(expirations, [100.0, 130.0]))._pull_ticker(
+    assert _puller(engine, _yahoo(expirations, [100.0, 130.0], quote_at=quote_at))._pull_ticker(
         "SPY", day.isoformat(),
     )["status"] == "FAILED"
     with engine.connect() as conn:
@@ -267,7 +355,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
         conn.exec_driver_sql("DROP TRIGGER reject_130 ON options_snapshots")
         conn.exec_driver_sql("DROP FUNCTION reject_130()")
 
-    old = _yahoo(expirations, [90.0])
+    old = _yahoo(expirations, [90.0], quote_at=quote_at)
     old_get = old.get_options
     entered, release, newer_done = Event(), Event(), Event()
     results = {}
@@ -286,7 +374,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
             newer_done.set()
 
     a = Thread(target=run, args=("older", old), daemon=True)
-    b = Thread(target=run, args=("newer", _yahoo(expirations, [140.0])), daemon=True)
+    b = Thread(target=run, args=("newer", _yahoo(expirations, [140.0], quote_at=quote_at)), daemon=True)
     a.start()
     try:
         assert entered.wait(5)

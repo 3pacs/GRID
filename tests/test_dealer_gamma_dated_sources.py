@@ -13,6 +13,7 @@ from store.astrogrid import AstroGridStore
 AS_OF = date(2026, 9, 23)
 CHAIN_TIME = datetime(2026, 9, 23, 19, tzinfo=timezone.utc)
 COMPLETE = CHAIN_TIME + timedelta(minutes=10)
+SOURCE_TIME = CHAIN_TIME - timedelta(hours=2)
 BATCH = "11111111-1111-4111-8111-111111111111"
 
 
@@ -47,9 +48,11 @@ def _option_row(created_at: datetime = CHAIN_TIME, *,
                 batch: str | None = BATCH,
                 ordinal: int | None = 1,
                 started: datetime | None = CHAIN_TIME,
-                completed: datetime | None = COMPLETE) -> tuple:
+                completed: datetime | None = COMPLETE,
+                provider_regular_market_at: datetime | None = SOURCE_TIME) -> tuple:
     return (765.0, "call", 100, 0.2, AS_OF + timedelta(days=7),
-            timedelta(days=7), created_at, batch, ordinal, started, completed)
+            timedelta(days=7), created_at, batch, ordinal, started, completed,
+            provider_regular_market_at)
 
 
 def _receipt() -> dict:
@@ -108,6 +111,7 @@ def test_chain_preserves_actual_capture_and_requested_date() -> None:
     assert chain.attrs["capture_ordinal"] == 1
     assert chain.attrs["capture_started_at"] == CHAIN_TIME
     assert chain.attrs["capture_completed_at"] == COMPLETE
+    assert chain.attrs["provider_regular_market_at_min"] == SOURCE_TIME
 
 
 def test_publication_created_at_after_provider_completion_is_valid() -> None:
@@ -118,10 +122,32 @@ def test_publication_created_at_after_provider_completion_is_valid() -> None:
     assert chain.attrs["capture_completed_at"] == COMPLETE
 
 
+@pytest.mark.parametrize("reported", [
+    None,
+    SOURCE_TIME - timedelta(days=1),
+    COMPLETE + timedelta(minutes=1),
+    datetime(2026, 9, 23, 0, 30, tzinfo=timezone.utc),  # UTC Wed, NY Tue
+])
+def test_reader_rejects_missing_stale_future_or_wrong_market_day_source(
+    reported: datetime | None,
+) -> None:
+    assert DealerGammaEngine(_DB([_option_row(provider_regular_market_at=reported)]))._load_chain(
+        "SPY", AS_OF,
+    ).empty
+
+
+def test_reader_rejects_saturday_chain_before_spot_lookup() -> None:
+    saturday = date(2026, 9, 26)
+    db = _DB([_option_row()])
+    assert DealerGammaEngine(db)._load_chain("SPY", saturday).empty
+    assert db.queries == []
+
+
 def test_invalid_option_row_from_second_pull_still_invalidates_chain() -> None:
     late_invalid = (765.0, "put", 0, 0.0, AS_OF + timedelta(days=7),
                     timedelta(days=7), CHAIN_TIME + timedelta(minutes=5),
-                    "22222222-2222-4222-8222-222222222222", 2, CHAIN_TIME, COMPLETE)
+                    "22222222-2222-4222-8222-222222222222", 2, CHAIN_TIME,
+                    COMPLETE, SOURCE_TIME)
     db = _DB([_option_row(), late_invalid])
     assert DealerGammaEngine(db)._load_chain("SPY", AS_OF).empty
 
@@ -188,3 +214,4 @@ def test_profile_pairs_receipt_with_completed_batch_time(
     assert seen == [COMPLETE]
     assert profile["chain_batch_id"] == BATCH
     assert profile["chain_capture_completed_at"] == COMPLETE.isoformat()
+    assert profile["chain_provider_regular_market_at_min"] == SOURCE_TIME.isoformat()

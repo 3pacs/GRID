@@ -58,12 +58,16 @@ from datetime import date, datetime, timedelta, timezone
 from itertools import pairwise
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
+
+from ingestion.market_calendar import is_market_open
 
 # GEX-6: route Black-Scholes Greeks through the canonical primitives in
 # `physics/greeks/black_scholes.py` (landed in GEX-3, #79). The local _d1/_d2/
@@ -72,6 +76,8 @@ from sqlalchemy.engine import Engine
 # with any external caller still importing them by name.
 from physics.greeks import black_scholes as _bs
 from store.availability import unavailable
+
+_EQUITY_TZ = ZoneInfo("America/New_York")
 
 # Assumed dealer-side positioning used for every modeled Greek below.
 DEALER_CALL_SIGN: float = 1.0
@@ -185,7 +191,7 @@ class DealerGammaEngine:
             profile, per_strike — set to ``None``. Never a guessed number.
         """
         if snap_date is None:
-            snap_date = date.today()
+            snap_date = datetime.now(timezone.utc).date()
 
         chain = self._load_chain(ticker, snap_date)
         if chain.empty:
@@ -263,6 +269,8 @@ class DealerGammaEngine:
             "chain_capture_ordinal": chain.attrs["capture_ordinal"],
             "chain_capture_started_at": chain.attrs["capture_started_at"].isoformat(),
             "chain_capture_completed_at": chain_completed_at.isoformat(),
+            "chain_provider_regular_market_at_min": chain.attrs["provider_regular_market_at_min"].isoformat(),
+            "chain_provider_regular_market_at_max": chain.attrs["provider_regular_market_at_max"].isoformat(),
             "chain_created_at": chain.attrs["created_at_min"].isoformat(),
             "chain_created_at_max": chain.attrs["created_at_max"].isoformat(),
             "spot": round(spot, 2),
@@ -542,16 +550,23 @@ class DealerGammaEngine:
         published chain without ordinal, start, batch, and completion provenance fails
         closed, as do rows mixed with an older writer.
         """
-        with self.engine.connect() as conn:
-            rows = conn.execute(text("""
+        if not is_market_open(snap_date):
+            return pd.DataFrame()
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
                        capture_batch_id, capture_ordinal,
-                       capture_started_at, capture_completed_at
+                       capture_started_at, capture_completed_at, provider_regular_market_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
-            """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
+                """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
+        except SQLAlchemyError:
+            # Until the additive migration exists, no old batch earns a
+            # guessed source market date.
+            return pd.DataFrame()
 
         if not rows:
             return pd.DataFrame()
@@ -561,6 +576,7 @@ class DealerGammaEngine:
         ordinals = {row[8] for row in rows}
         starts = {row[9] for row in rows}
         completions = {row[10] for row in rows}
+        quote_times = [row[11] for row in rows]
         now = datetime.now(timezone.utc)
         if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
                 or len(batches) != 1 or not next(iter(batches))
@@ -588,11 +604,20 @@ class DealerGammaEngine:
                 or completed_at.astimezone(timezone.utc).date() != snap_date
                 or started_at > completed_at or completed_at > now):
             return pd.DataFrame()
+        if any(
+            not isinstance(ts, datetime) or ts.tzinfo is None
+            or ts.astimezone(timezone.utc).date() != snap_date
+            or ts.astimezone(_EQUITY_TZ).date() != snap_date
+            or ts > completed_at
+            for ts in quote_times
+        ):
+            return pd.DataFrame()
 
         df = pd.DataFrame(rows, columns=["strike", "opt_type", "open_interest",
                                           "implied_volatility", "expiry", "dte",
                                           "created_at", "capture_batch_id", "capture_ordinal",
-                                          "capture_started_at", "capture_completed_at"])
+                                          "capture_started_at", "capture_completed_at",
+                                          "provider_regular_market_at"])
         df["dte"] = df["dte"].apply(lambda x: x.days if hasattr(x, 'days') else int(x))
         df = df[(df["dte"] > 0)
                 & (df["open_interest"] > 0)
@@ -601,6 +626,8 @@ class DealerGammaEngine:
                         capture_ordinal=ordinal,
                         capture_started_at=started_at,
                         capture_completed_at=completed_at,
+                        provider_regular_market_at_min=min(quote_times),
+                        provider_regular_market_at_max=max(quote_times),
                         created_at_min=first, created_at_max=last)
         return df
 
@@ -686,7 +713,7 @@ class DealerGammaEngine:
         short_gamma = [r for r in results if r["regime"] == "SHORT_GAMMA"]
 
         return {
-            "snap_date": str(snap_date or date.today()),
+            "snap_date": str(snap_date or datetime.now(timezone.utc).date()),
             "total_tickers": len(results),
             "aggregate_gex": round(total_gex, 0),
             "aggregate_vanna": round(total_vanna, 0),

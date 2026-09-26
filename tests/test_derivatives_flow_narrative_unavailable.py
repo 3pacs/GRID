@@ -12,10 +12,18 @@ import pytest
 from api.routers import derivatives
 from ollama import dealer_flow_briefing as flow
 
+SESSION_DAY = date(2026, 9, 25)
+
+
+@pytest.fixture(autouse=True)
+def _session_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(derivatives, "_utc_day", lambda: SESSION_DAY)
+    monkeypatch.setattr(flow, "_utc_day", lambda: SESSION_DAY)
+
 
 def _dated_spy() -> dict:
-    today = date.today()
-    captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
+    today = SESSION_DAY
+    captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=19)
     return {
         "estimated": True,
         "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
@@ -30,6 +38,8 @@ def _dated_spy() -> dict:
         "chain_capture_ordinal": 1,
         "chain_capture_started_at": captured.isoformat(),
         "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
+        "chain_provider_regular_market_at_min": (captured - timedelta(hours=2)).isoformat(),
+        "chain_provider_regular_market_at_max": (captured - timedelta(hours=2)).isoformat(),
         "chain_created_at": (captured + timedelta(minutes=2)).isoformat(),
         "chain_created_at_max": (captured + timedelta(minutes=2)).isoformat(),
     }
@@ -109,7 +119,7 @@ def test_measured_spot_still_builds_inline_narrative(
     assert "SPY prior verified close was $767.12" in result["content"]
     assert "LONG GAMMA" in result["content"]
     assert result["positioning_data"]["gex"]["SPY"]["spot"] == 767.12
-    assert result["briefing_date"] == date.today().isoformat()
+    assert result["briefing_date"] == SESSION_DAY.isoformat()
 
 
 def test_legacy_error_profile_without_availability_fields_stays_unavailable(
@@ -169,7 +179,7 @@ def test_source_guarded_saved_briefing_is_retained(
             "spot_contract": flow.SPOT_CONTRACT,
             "gex": {"SPY": _dated_spy()},
         },
-        "briefing_date": date.today().isoformat(),
+        "briefing_date": SESSION_DAY.isoformat(),
         "stale": False,
     }
     briefing.get_latest_flow_briefing = lambda _db: saved
