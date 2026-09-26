@@ -111,6 +111,19 @@ CAPPED_BLOCK_CALIBRATION = (
 SELF_LAG = "self_lag"
 
 
+FORWARD_PENDING = "FORWARD_EVIDENCE_PENDING"
+
+
+def candidate_state(origin: str) -> str:
+    """A frozen candidate's state, tagged by origin (S10, from the #658 review).
+
+    Only a ``latest_vintage_read`` candidate may wait for forward evidence. A
+    synthetic-fixture or exploratory-replay "candidate" is a proof artifact:
+    it carries its origin's state, so no forward log can mistake it for one.
+    """
+    return FORWARD_PENDING if origin == LATEST_VINTAGE_ORIGIN else ORIGINS[origin]
+
+
 def digest(value):
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, allow_nan=False).encode()
@@ -738,7 +751,7 @@ def evaluate_holdout(frozen, holdout_rows, panel=None):
                 {
                     "specification": specification,
                     "sha256": digest(specification),
-                    "state": "FORWARD_EVIDENCE_PENDING",
+                    "state": candidate_state(protocol.origin),
                     "promotion_allowed": False,
                 }
             )

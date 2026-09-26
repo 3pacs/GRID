@@ -102,10 +102,12 @@ def file_sha256(relative: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def read_only_engine(statement_timeout_s: int):
+def read_only_engine(statement_timeout_s: int, application_name: str = "s09_real_panel_scan"):
     """NullPool engine: read-only sessions, bounded statements, autocommit."""
     if not 0 < statement_timeout_s <= MAX_STATEMENT_TIMEOUT_S:
         raise ValueError(f"statement timeout must be 1..{MAX_STATEMENT_TIMEOUT_S} s")
+    if not application_name.replace("_", "").isalnum():
+        raise ValueError("application_name must be alphanumeric/underscore")
     from sqlalchemy import create_engine
     from sqlalchemy.pool import NullPool
 
@@ -115,7 +117,7 @@ def read_only_engine(statement_timeout_s: int):
         f"-c statement_timeout={statement_timeout_s * 1000} "
         "-c default_transaction_read_only=on "
         "-c idle_in_transaction_session_timeout=30000 "
-        "-c application_name=s09_real_panel_scan"
+        f"-c application_name={application_name}"
     )
     return create_engine(
         settings.DB_URL,
