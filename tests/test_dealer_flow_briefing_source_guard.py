@@ -10,10 +10,17 @@ import pytest
 
 from ollama import dealer_flow_briefing as flow
 
+SESSION_DAY = date(2026, 9, 25)
+
+
+@pytest.fixture(autouse=True)
+def _session_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(flow, "_utc_day", lambda: SESSION_DAY)
+
 
 def _dated_spy() -> dict:
-    today = date.today()
-    captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
+    today = SESSION_DAY
+    captured = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=19)
     return {
         "estimated": True,
         "basis": "options_open_interest_with_assumed_dealer_sign_and_black_scholes",
@@ -28,6 +35,8 @@ def _dated_spy() -> dict:
         "chain_capture_ordinal": 1,
         "chain_capture_started_at": captured.isoformat(),
         "chain_capture_completed_at": (captured + timedelta(minutes=1)).isoformat(),
+        "chain_provider_regular_market_at_min": (captured - timedelta(hours=2)).isoformat(),
+        "chain_provider_regular_market_at_max": (captured - timedelta(hours=2)).isoformat(),
         "chain_created_at": (captured + timedelta(minutes=2)).isoformat(),
         "chain_created_at_max": (captured + timedelta(minutes=2)).isoformat(),
     }
@@ -101,7 +110,26 @@ def test_generation_stamps_only_a_verified_dated_spot(
     {"chain_capture_completed_at": "2099-01-01T00:00:00+00:00"},
 ])
 def test_v4_guard_rejects_stale_future_or_revised_saved_spot(change: dict) -> None:
-    assert not flow.valid_spy_gex_profile({**_dated_spy(), **change}, date.today())
+    assert not flow.valid_spy_gex_profile({**_dated_spy(), **change}, SESSION_DAY)
+
+
+def test_saved_profile_requires_new_source_quote_contract() -> None:
+    old = _dated_spy()
+    old.pop("chain_provider_regular_market_at_min")
+    old.pop("chain_provider_regular_market_at_max")
+    assert not flow.valid_spy_gex_profile(old, SESSION_DAY)
+    assert flow.SPOT_CONTRACT.endswith("_v6")
+
+
+def test_saturday_profile_cannot_be_served_as_current(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    saturday = date(2026, 9, 26)
+    monkeypatch.setattr(flow, "_utc_day", lambda: saturday)
+    profile = _dated_spy()
+    profile.update({"snap_date": saturday.isoformat(),
+                    "chain_snap_date": saturday.isoformat()})
+    assert not flow.valid_spy_gex_profile(profile, saturday)
 
 
 class _ReadOnlyConnection:
@@ -145,15 +173,26 @@ def test_reading_missing_briefing_never_creates_table(
     "resolved_series_only_v1", "spy_receipt_chain_pit_v2",
     "spy_receipt_chain_batch_pit_v3",
     "spy_receipt_chain_batch_pit_v4",
+    "spy_receipt_chain_batch_pit_v5",
 ])
 def test_legacy_saved_row_is_withheld_even_if_dated_today(contract: str) -> None:
-    saved = (date.today(), "Legacy dealer narrative", {
+    saved = (SESSION_DAY, "Legacy dealer narrative", {
         "spot_contract": contract,
         "gex": {"SPY": {"spot": 767.12, "spot_source": "resolved_series"}},
     }, datetime.now(timezone.utc))
     result = flow.get_latest_flow_briefing(_ReadOnlyEngine(saved))
     assert result["content"] is None
     assert result["positioning_data"] is None
+    assert result["stale"] is True
+
+
+def test_saved_v5_with_otherwise_valid_spy_profile_is_withheld() -> None:
+    saved = (SESSION_DAY, "Old contract narrative", {
+        "spot_contract": "spy_receipt_chain_batch_pit_v5",
+        "gex": {"SPY": _dated_spy()},
+    }, datetime.now(timezone.utc))
+    result = flow.get_latest_flow_briefing(_ReadOnlyEngine(saved))
+    assert result["content"] is None
     assert result["stale"] is True
 
 

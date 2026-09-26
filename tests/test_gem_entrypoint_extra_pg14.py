@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import sys
 from collections import defaultdict
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -12,7 +12,10 @@ from sqlalchemy import text
 from ingestion import options
 from physics.dealer_gamma import DealerGammaEngine
 from scripts import pull_options_gem_tickers as gem
-from tests.test_options_capture_pg14_scratch import _puller, _yahoo
+from tests.test_options_capture_pg14_scratch import (
+    _puller,
+    _yahoo,
+)
 
 pytest_plugins = ("tests.test_options_capture_pg14_scratch",)
 
@@ -26,9 +29,11 @@ def _fast_calculations(monkeypatch):
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
 
 
-def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, monkeypatch):
+def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
+    synthetic_session_pg14, monkeypatch,
+):
     """Use the real wrapper and writer, but a local deterministic provider."""
-    engine = scratch_pg14
+    engine, start = synthetic_session_pg14
     _fast_calculations(monkeypatch)
     monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=lambda: engine))
 
@@ -40,7 +45,6 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
 
     monkeypatch.setattr(options, "OptionsPuller", BoundPuller)
     calls = defaultdict(list)
-    start = datetime.now(timezone.utc)
     expirations = [int((start + timedelta(days=10 + n)).timestamp()) for n in range(8)]
 
     class FakeYahoo:
@@ -51,7 +55,8 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
             chain = [{"strike": 100.0, "volume": 3, "openInterest": 10,
                       "impliedVolatility": 0.2, "lastPrice": 2.0,
                       "bid": 1.0, "ask": 3.0, "inTheMoney": False}]
-            return {"quote": {"regularMarketPrice": 100.0},
+            return {"quote": {"regularMarketPrice": 100.0,
+                              "regularMarketTime": int((start - timedelta(minutes=1)).timestamp())},
                     "expirations": expirations, "calls": chain, "puts": chain}
 
     monkeypatch.setattr(options, "YahooOptionsClient", FakeYahoo)
@@ -68,7 +73,9 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
             SELECT ticker, COUNT(*), COUNT(DISTINCT expiry),
                    COUNT(DISTINCT capture_batch_id), COUNT(DISTINCT capture_ordinal),
                    BOOL_AND(capture_batch_id IS NOT NULL AND capture_ordinal IS NOT NULL
-                            AND capture_started_at IS NOT NULL AND capture_completed_at IS NOT NULL)
+                            AND capture_started_at IS NOT NULL AND capture_completed_at IS NOT NULL
+                            AND provider_regular_market_at IS NOT NULL
+                            AND provider_regular_market_at <= capture_completed_at)
               FROM options_snapshots GROUP BY ticker ORDER BY ticker
         """)).fetchall()
         signals = conn.execute(text("SELECT COUNT(*) FROM options_daily_signals")).scalar_one()
@@ -84,15 +91,17 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
     ).empty
 
 
-def test_legacy_style_upsert_retains_provenance_until_canonical_replacement(scratch_pg14, monkeypatch):
+def test_legacy_style_upsert_retains_provenance_until_canonical_replacement(
+    synthetic_session_pg14, monkeypatch,
+):
     """Demonstrate the SQL failure mode without importing the installed legacy artifact."""
-    engine = scratch_pg14
+    engine, now = synthetic_session_pg14
     _fast_calculations(monkeypatch)
-    now = datetime.now(timezone.utc)
     day = now.date()
     expirations = [int((now + timedelta(days=n)).timestamp()) for n in (10, 20)]
 
-    assert _puller(engine, _yahoo(expirations, [100.0]))._pull_ticker(
+    quote_at = now - timedelta(minutes=1)
+    assert _puller(engine, _yahoo(expirations, [100.0], quote_at=quote_at))._pull_ticker(
         "SPY", day.isoformat(),
     )["status"] == "SUCCESS"
     with engine.connect() as conn:
@@ -128,7 +137,7 @@ def test_legacy_style_upsert_retains_provenance_until_canonical_replacement(scra
     assert (changed[5], changed[6]) == (99, 777)
     assert not DealerGammaEngine(engine)._load_chain("SPY", day).empty
 
-    assert _puller(engine, _yahoo(expirations, [120.0]))._pull_ticker(
+    assert _puller(engine, _yahoo(expirations, [120.0], quote_at=quote_at))._pull_ticker(
         "SPY", day.isoformat(),
     )["status"] == "SUCCESS"
     with engine.connect() as conn:

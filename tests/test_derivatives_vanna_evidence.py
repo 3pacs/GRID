@@ -3,17 +3,26 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from api.routers import derivatives
+from ollama import dealer_flow_briefing as flow
+
+SESSION_DAY = date(2026, 9, 25)
+
+
+@pytest.fixture(autouse=True)
+def _session_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(derivatives, "_utc_day", lambda: SESSION_DAY)
+    monkeypatch.setattr(flow, "_utc_day", lambda: SESSION_DAY)
 
 
 def _profile() -> dict:
-    today = datetime.now(timezone.utc).astimezone().date()
-    first = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=1)
+    today = SESSION_DAY
+    first = datetime.combine(today, datetime.min.time(), timezone.utc) + timedelta(hours=19)
     completed = first + timedelta(minutes=2)
     return {
         "ticker": "SPY", "snap_date": today.isoformat(),
@@ -24,6 +33,8 @@ def _profile() -> dict:
         "chain_capture_ordinal": 1,
         "chain_capture_started_at": first.isoformat(),
         "chain_capture_completed_at": completed.isoformat(),
+        "chain_provider_regular_market_at_min": (first - timedelta(hours=2)).isoformat(),
+        "chain_provider_regular_market_at_max": (first - timedelta(hours=2)).isoformat(),
         "spot": 100.0, "spot_source": "spy_close_receipt",
         "spot_basis": "prior_completed_unadjusted_close",
         "spot_obs_date": (today - timedelta(days=1)).isoformat(),

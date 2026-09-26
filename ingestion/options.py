@@ -10,10 +10,12 @@ Falls back to yfinance if the direct API fails.
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, timezone
 from typing import Any
 from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -23,6 +25,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
+from ingestion.market_calendar import is_market_open
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -39,6 +42,29 @@ EQUITY_TICKERS: list[str] = [
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 12
 MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
+_EQUITY_TZ = ZoneInfo("America/New_York")
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _regular_market_time(quote: Any, session_day: date) -> datetime | None:
+    """Read Yahoo's *reported quote time*, not an options-chain revision time."""
+    if not isinstance(quote, dict):
+        return None
+    raw = quote.get("regularMarketTime")
+    if (not isinstance(raw, (int, float)) or isinstance(raw, bool)
+            or not math.isfinite(raw)):
+        return None
+    try:
+        reported = datetime.fromtimestamp(raw, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if (reported.date() != session_day
+            or reported.astimezone(_EQUITY_TZ).date() != session_day):
+        return None
+    return reported
 
 # Catalyst-universe coverage (2026-09-10).
 #
@@ -205,6 +231,7 @@ class OptionsPuller(BasePuller):
                     capture_ordinal BIGINT,
                     capture_started_at TIMESTAMPTZ,
                     capture_completed_at TIMESTAMPTZ,
+                    provider_regular_market_at TIMESTAMPTZ,
                     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
                 )
             """))
@@ -266,11 +293,6 @@ class OptionsPuller(BasePuller):
                 or not 1 <= max_expirations <= MAX_EXPIRATIONS):
             raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
-        self._yahoo = YahooOptionsClient()
-        if not self._yahoo.is_available:
-            log.error("Yahoo options client unavailable — cannot pull options")
-            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
-
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
@@ -281,7 +303,18 @@ class OptionsPuller(BasePuller):
                         n=len(extra), b=len(tickers),
                     )
                     tickers = tickers + extra
-        today_str = date.today().isoformat()
+        now = _utc_now()
+        today = now.date()
+        today_str = today.isoformat()
+        if not is_market_open(today) or now.astimezone(_EQUITY_TZ).date() != today:
+            log.info("Options pull skipped: {day} is not a scheduled equity session", day=today_str)
+            return [{"ticker": ticker, "status": "SKIPPED",
+                     "reason": "non-equity-session"} for ticker in tickers]
+
+        self._yahoo = YahooOptionsClient()
+        if not self._yahoo.is_available:
+            log.error("Yahoo options client unavailable — cannot pull options")
+            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
         results: list[dict[str, Any]] = []
 
         for ticker in tickers:
@@ -302,6 +335,12 @@ class OptionsPuller(BasePuller):
     ) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
+            session_day = date.fromisoformat(today_str)
+            now = _utc_now()
+            if (session_day != now.date() or not is_market_open(session_day)
+                    or now.astimezone(_EQUITY_TZ).date() != session_day):
+                return {"ticker": ticker, "status": "SKIPPED",
+                        "reason": "non-equity-session or UTC date mismatch"}
             capture_clock = time.monotonic()
             # Force a 64-bit PostgreSQL transaction ID for each capture. It is
             # allocated in database order, survives rollback, and needs no
@@ -316,10 +355,11 @@ class OptionsPuller(BasePuller):
                 return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
 
             quote = first.get("quote", {})
-            spot_price = quote.get("regularMarketPrice") or quote.get("regularMarketPreviousClose")
-            if not spot_price:
-                log.warning("{t}: no spot price available", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "reason": "no spot price"}
+            spot_price = quote.get("regularMarketPrice")
+            if (not isinstance(spot_price, (int, float)) or isinstance(spot_price, bool)
+                    or not math.isfinite(spot_price) or spot_price <= 0):
+                return {"ticker": ticker, "status": "SKIPPED",
+                        "reason": "no dated regular-market price"}
 
             expirations = first.get("expirations", [])
             if not expirations:
@@ -358,6 +398,10 @@ class OptionsPuller(BasePuller):
                 if not chain_data:
                     complete = False
                     continue
+                provider_regular_market_at = _regular_market_time(chain_data.get("quote"), session_day)
+                if provider_regular_market_at is None:
+                    complete = False
+                    break
                 if not chain_data.get("calls") or not chain_data.get("puts"):
                     complete = False
 
@@ -388,6 +432,7 @@ class OptionsPuller(BasePuller):
                             "bid": bid, "ask": ask, "volume": vol,
                             "oi": oi, "iv": iv, "itm": itm,
                             "batch_id": batch_id,
+                            "provider_regular_market_at": provider_regular_market_at,
                         })
                         snap_count += 1
                         rows_for_df.append({
@@ -431,6 +476,12 @@ class OptionsPuller(BasePuller):
                 conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                 conn.execute(text("SET LOCAL statement_timeout = '30s'"))
                 completed_at = conn.execute(text("SELECT clock_timestamp()")).fetchone()[0]
+                if (completed_at.astimezone(timezone.utc).date() != session_day
+                        or completed_at.astimezone(_EQUITY_TZ).date() != session_day
+                        or capture_started_at.astimezone(timezone.utc).date() != session_day
+                        or capture_started_at.astimezone(_EQUITY_TZ).date() != session_day
+                        or any(row["provider_regular_market_at"] > completed_at for row in snapshot_rows)):
+                    raise ValueError("options capture crossed session date or quote time is future")
                 conn.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
                     {"ticker": ticker, "snap_date": today_str},
@@ -460,10 +511,12 @@ class OptionsPuller(BasePuller):
                             "(ticker, snap_date, expiry, opt_type, strike, "
                             "last_price, bid, ask, volume, open_interest, "
                             "implied_vol, in_the_money, capture_batch_id, "
-                            "capture_ordinal, capture_started_at, capture_completed_at) "
+                            "capture_ordinal, capture_started_at, capture_completed_at, "
+                            "provider_regular_market_at) "
                             "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
                             ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
-                            ":batch_id, :ordinal, :started_at, :completed_at) "
+                            ":batch_id, :ordinal, :started_at, :completed_at, "
+                            ":provider_regular_market_at) "
                             "ON CONFLICT DO NOTHING"
                         ),
                         {**row, "ordinal": capture_ordinal,
