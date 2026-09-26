@@ -9,7 +9,7 @@ DealerGammaEngine and options_snapshots tables.
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -33,11 +33,15 @@ def _get_gex_engine():
     return DealerGammaEngine(get_db_engine())
 
 
+def _utc_day() -> date:
+    return datetime.now(timezone.utc).date()
+
+
 def _verified_gex_profile(profile: dict[str, Any]) -> bool:
     """Require the current completed SPY chain/close contract at API edges."""
     from ollama.dealer_flow_briefing import valid_spy_gex_profile
 
-    return valid_spy_gex_profile(profile, date.today())
+    return valid_spy_gex_profile(profile, _utc_day())
 
 
 def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
@@ -45,7 +49,8 @@ def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
         "estimated", "basis", "spot_source", "spot_basis", "spot_obs_date",
         "spot_available_at", "spot_receipt_id", "chain_snap_date",
         "chain_batch_id", "chain_capture_ordinal", "chain_capture_started_at",
-        "chain_capture_completed_at",
+        "chain_capture_completed_at", "chain_provider_regular_market_at_min",
+        "chain_provider_regular_market_at_max",
     )}
 
 
@@ -596,10 +601,10 @@ async def get_flow_narrative() -> dict[str, Any]:
         if (
             result.get("content")
             and result.get("stale") is False
-            and result.get("briefing_date") == date.today().isoformat()
+            and result.get("briefing_date") == _utc_day().isoformat()
             and isinstance(positioning, dict)
             and positioning.get("spot_contract") == SPOT_CONTRACT
-            and valid_spy_gex_profile(spy_saved, date.today())
+            and valid_spy_gex_profile(spy_saved, _utc_day())
         ):
             return result
     except Exception as exc:
@@ -612,7 +617,7 @@ async def get_flow_narrative() -> dict[str, Any]:
 
         spot = spy.get("spot")
         if (
-            not valid_spy_gex_profile(spy, date.today())
+            not valid_spy_gex_profile(spy, _utc_day())
             or spy.get("available") is False
             or spy.get("error")
             or not isinstance(spot, (int, float))

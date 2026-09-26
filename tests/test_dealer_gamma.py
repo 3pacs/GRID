@@ -86,7 +86,9 @@ def _compute_profile(
                        batch_id="11111111-1111-4111-8111-111111111111",
                        capture_ordinal=1,
                        capture_started_at=chain_time,
-                       capture_completed_at=chain_time + timedelta(minutes=1))
+                       capture_completed_at=chain_time + timedelta(minutes=1),
+                       provider_regular_market_at_min=chain_time - timedelta(hours=2),
+                       provider_regular_market_at_max=chain_time - timedelta(hours=2))
     engine = DealerGammaEngine(MagicMock(), risk_free_rate=risk_free_rate)
     monkeypatch.setattr(engine, "_load_chain", lambda _ticker, _snap_date: chain)
     monkeypatch.setattr(engine, "_get_spot_receipt", lambda _ticker, _time: {

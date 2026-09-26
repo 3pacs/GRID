@@ -15,14 +15,21 @@ import math
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.market_calendar import is_market_open
 from store.availability import unavailable
 
-SPOT_CONTRACT = "spy_receipt_chain_batch_pit_v5"
+SPOT_CONTRACT = "spy_receipt_chain_batch_quote_day_pit_v6"
+_EQUITY_TZ = ZoneInfo("America/New_York")
+
+
+def _utc_day() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
@@ -53,16 +60,19 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
         chain_last = datetime.fromisoformat(profile["chain_created_at_max"])
         chain_started = datetime.fromisoformat(profile["chain_capture_started_at"])
         chain_completed = datetime.fromisoformat(profile["chain_capture_completed_at"])
+        source_first = datetime.fromisoformat(profile["chain_provider_regular_market_at_min"])
+        source_last = datetime.fromisoformat(profile["chain_provider_regular_market_at_max"])
         UUID(profile["chain_batch_id"])
     except (KeyError, TypeError, ValueError, AttributeError):
         return False
     if any(ts.tzinfo is None for ts in (
         available_at, receipt_created_at, chain_first, chain_last,
-        chain_started, chain_completed,
+        chain_started, chain_completed, source_first, source_last,
     )):
         return False
     return (
-        chain_date == briefing_date == date.today()
+        chain_date == briefing_date == _utc_day()
+        and is_market_open(chain_date)
         and profile.get("snap_date") == chain_date.isoformat()
         and 1 <= (chain_date - spot_date).days <= 4
         and available_at >= datetime.combine(
@@ -71,6 +81,11 @@ def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
         and release_date <= chain_date and vintage_date <= chain_date
         and available_at <= receipt_created_at <= chain_completed
         and chain_started <= chain_completed <= datetime.now(timezone.utc)
+        and source_first <= source_last <= chain_completed
+        and source_first.astimezone(timezone.utc).date() == chain_date
+        and source_last.astimezone(timezone.utc).date() == chain_date
+        and source_first.astimezone(_EQUITY_TZ).date() == chain_date
+        and source_last.astimezone(_EQUITY_TZ).date() == chain_date
         and chain_first <= chain_last <= datetime.now(timezone.utc)
         and chain_started.astimezone(timezone.utc).date() == chain_date
         and chain_first.astimezone(timezone.utc).date() == chain_date
@@ -116,7 +131,7 @@ def _next_monthly_opex(from_date: date | None = None) -> date:
     If today IS the 3rd Friday, returns today (it hasn't expired yet
     if we're computing pre-close).
     """
-    d = from_date or date.today()
+    d = from_date or _utc_day()
     year, month = d.year, d.month
 
     # 3rd Friday = first Friday + 14 days
@@ -141,7 +156,7 @@ def _next_monthly_opex(from_date: date | None = None) -> date:
 
 
 def _days_to_opex(from_date: date | None = None) -> int:
-    d = from_date or date.today()
+    d = from_date or _utc_day()
     return (_next_monthly_opex(d) - d).days
 
 
@@ -158,7 +173,7 @@ def _gather_positioning_data(engine: Engine) -> dict[str, Any]:
     - top_signals: top tickers from options_daily_signals
     """
     data: dict[str, Any] = {
-        "date": date.today().isoformat(),
+        "date": _utc_day().isoformat(),
         "gex": {},
         "vix": None,
         "returns": {"1d": None, "5d": None},
@@ -410,7 +425,7 @@ def _build_prompt(data: dict[str, Any]) -> tuple[str, str]:
     data_block = "\n".join(context_lines)
 
     user_prompt = (
-        f"Generate a Dealer Flow Briefing for {date.today().isoformat()}.\n\n"
+        f"Generate a Dealer Flow Briefing for {_utc_day().isoformat()}.\n\n"
         f"{data_block}\n\n"
 
         "## Generate a Dealer Flow Briefing with these sections:\n\n"
@@ -460,7 +475,7 @@ def generate_dealer_flow_briefing(engine: Engine) -> dict[str, Any]:
     positioning = _gather_positioning_data(engine)
 
     spy = positioning.get("gex", {}).get("SPY", {})
-    if not valid_spy_gex_profile(spy, date.today()):
+    if not valid_spy_gex_profile(spy, _utc_day()):
         return unavailable(
             "SPY GEX profile lacks a dated verified close and chain pair",
             source="spy_close_receipt",
@@ -496,7 +511,7 @@ def generate_dealer_flow_briefing(engine: Engine) -> dict[str, Any]:
         log.warning("LLM unavailable -- using fallback dealer flow briefing")
 
     # Store in DB (strip heavy profile/per_strike from JSONB to keep it lean)
-    today = date.today()
+    today = _utc_day()
     lean_positioning = _strip_heavy_fields(positioning)
     positioning_json = json.dumps(lean_positioning, default=str)
 
@@ -561,14 +576,14 @@ def get_latest_flow_briefing(engine: Engine) -> dict[str, Any]:
             }
 
         briefing_date = row[0]
-        is_stale = briefing_date < date.today()
+        is_stale = briefing_date < _utc_day()
         positioning = row[2]
         saved_spy = (
             positioning.get("gex", {}).get("SPY")
             if isinstance(positioning, dict) and isinstance(positioning.get("gex"), dict)
             else None
         )
-        if (briefing_date != date.today()
+        if (briefing_date != _utc_day()
                 or not isinstance(positioning, dict)
                 or positioning.get("spot_contract") != SPOT_CONTRACT
                 or not valid_spy_gex_profile(saved_spy, briefing_date)):
@@ -624,7 +639,7 @@ def _strip_heavy_fields(positioning: dict[str, Any]) -> dict[str, Any]:
 def _generate_fallback(positioning: dict[str, Any]) -> str:
     """Generate a data-only briefing when LLM is unavailable."""
     lines = [
-        f"# Dealer Flow Briefing -- {positioning.get('date', date.today().isoformat())}",
+        f"# Dealer Flow Briefing -- {positioning.get('date', _utc_day().isoformat())}",
         "",
         "**Note: AI analysis unavailable. Data summary only.**",
         "",

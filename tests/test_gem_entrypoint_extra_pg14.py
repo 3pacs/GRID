@@ -12,7 +12,11 @@ from sqlalchemy import text
 from ingestion import options
 from physics.dealer_gamma import DealerGammaEngine
 from scripts import pull_options_gem_tickers as gem
-from tests.test_options_capture_pg14_scratch import _puller, _yahoo
+from tests.test_options_capture_pg14_scratch import (
+    _puller,
+    _require_same_day_equity_session,
+    _yahoo,
+)
 
 pytest_plugins = ("tests.test_options_capture_pg14_scratch",)
 
@@ -28,6 +32,7 @@ def _fast_calculations(monkeypatch):
 
 def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, monkeypatch):
     """Use the real wrapper and writer, but a local deterministic provider."""
+    _require_same_day_equity_session()
     engine = scratch_pg14
     _fast_calculations(monkeypatch)
     monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=lambda: engine))
@@ -51,7 +56,8 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
             chain = [{"strike": 100.0, "volume": 3, "openInterest": 10,
                       "impliedVolatility": 0.2, "lastPrice": 2.0,
                       "bid": 1.0, "ask": 3.0, "inTheMoney": False}]
-            return {"quote": {"regularMarketPrice": 100.0},
+            return {"quote": {"regularMarketPrice": 100.0,
+                              "regularMarketTime": int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp())},
                     "expirations": expirations, "calls": chain, "puts": chain}
 
     monkeypatch.setattr(options, "YahooOptionsClient", FakeYahoo)
@@ -86,6 +92,7 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(scratch_pg14, m
 
 def test_legacy_style_upsert_retains_provenance_until_canonical_replacement(scratch_pg14, monkeypatch):
     """Demonstrate the SQL failure mode without importing the installed legacy artifact."""
+    _require_same_day_equity_session()
     engine = scratch_pg14
     _fast_calculations(monkeypatch)
     now = datetime.now(timezone.utc)

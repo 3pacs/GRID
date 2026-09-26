@@ -20,6 +20,7 @@ from sqlalchemy.engine import URL, make_url
 
 from ingestion import options
 from migrations.versions import options_capture_batch_20260924 as migration
+from migrations.versions import options_source_quote_time_20260925 as source_migration
 from physics.dealer_gamma import DealerGammaEngine
 
 
@@ -32,7 +33,8 @@ def _yahoo(expirations: list[int], strikes: list[float]):
                 "bid": 1.0, "ask": 3.0, "inTheMoney": False,
             } for strike in strikes]
             return {
-                "quote": {"regularMarketPrice": 100.0},
+                "quote": {"regularMarketPrice": 100.0,
+                          "regularMarketTime": int((datetime.now(timezone.utc) - timedelta(minutes=1)).timestamp())},
                 "expirations": expirations, "calls": rows, "puts": rows,
             }
 
@@ -45,6 +47,13 @@ def _puller(engine, yahoo):
     puller._yahoo = yahoo
     puller._push_to_resolved = lambda *_args: None
     return puller
+
+
+def _require_same_day_equity_session() -> None:
+    now = datetime.now(timezone.utc)
+    if (not options.is_market_open(now.date())
+            or now.astimezone(options._EQUITY_TZ).date() != now.date()):
+        pytest.skip("writer transaction proof needs a same-UTC/New-York equity session")
 
 
 def _scratch_url(dsn: str) -> URL:
@@ -188,6 +197,8 @@ def scratch_pg14(monkeypatch):
         with engine.begin() as conn:
             monkeypatch.setattr(migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
             migration.upgrade()
+            monkeypatch.setattr(source_migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
+            source_migration.upgrade()
         yield engine
     finally:
         engine.dispose()
@@ -196,7 +207,35 @@ def scratch_pg14(monkeypatch):
         admin.dispose()
 
 
+def test_pg14_nullable_provider_quote_migration_rejects_legacy(scratch_pg14) -> None:
+    engine = scratch_pg14
+    day = datetime(2026, 9, 23, 19, tzinfo=timezone.utc)
+    with engine.begin() as conn:
+        columns = {row[0] for row in conn.execute(text("""
+            SELECT column_name FROM information_schema.columns
+            WHERE table_schema = current_schema() AND table_name = 'options_snapshots'
+        """))}
+        assert "provider_regular_market_at" in columns
+        conn.execute(text("""
+            INSERT INTO options_snapshots
+              (ticker, snap_date, expiry, opt_type, strike, open_interest,
+               implied_vol, created_at, capture_batch_id, capture_ordinal,
+               capture_started_at, capture_completed_at)
+            VALUES ('SPY', :day, :expiry, 'call', 100, 10, 0.2, :started,
+                    '11111111-1111-4111-8111-111111111111', 1, :started, :completed)
+        """), {"day": day.date(), "expiry": day.date() + timedelta(days=10),
+               "started": day, "completed": day + timedelta(minutes=1)})
+    assert DealerGammaEngine(engine)._load_chain("SPY", day.date()).empty
+    with engine.begin() as conn:
+        conn.execute(text("""
+            UPDATE options_snapshots SET provider_regular_market_at = :provider_at
+            WHERE ticker = 'SPY' AND snap_date = :day
+        """), {"provider_at": day - timedelta(hours=2), "day": day.date()})
+    assert not DealerGammaEngine(engine)._load_chain("SPY", day.date()).empty
+
+
 def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypatch):
+    _require_same_day_equity_session()
     engine = scratch_pg14
     now = datetime.now(timezone.utc)
     day = now.date()
@@ -213,7 +252,7 @@ def test_pg14_migration_replacement_rollback_and_overlap(scratch_pg14, monkeypat
             WHERE table_schema = current_schema() AND table_name = 'options_snapshots'
         """))}
         assert {"capture_batch_id", "capture_ordinal", "capture_started_at",
-                "capture_completed_at"} <= columns
+                "capture_completed_at", "provider_regular_market_at"} <= columns
         assert conn.exec_driver_sql(
             "SELECT to_regclass('options_capture_ordinal_seq')"
         ).scalar_one() is None
