@@ -16,6 +16,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # FLOW KNOWLEDGE BASE
@@ -456,7 +458,8 @@ def _get_fed_liquidity_state(engine: Engine) -> dict[str, Any]:
             if bs is None:
                 return {"direction": NEUTRAL, "value": None, "detail": "No data"}
 
-            net_liq = bs - (rr or 0) - (tga or 0)
+            # RRPONTSYD is billions; WALCL/WTREGEN are millions
+            net_liq = bs - (rr or 0) * RRPONTSYD_TO_MILLIONS - (tga or 0)
 
             # Compare to 30 days ago
             bs_30 = conn.execute(text("""
@@ -479,7 +482,8 @@ def _get_fed_liquidity_state(engine: Engine) -> dict[str, Any]:
                     AND obs_date <= CURRENT_DATE - 30
                     ORDER BY obs_date DESC LIMIT 1
                 """)).fetchone()
-                net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
+                # RRPONTSYD is billions; WALCL/WTREGEN are millions
+                net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) * RRPONTSYD_TO_MILLIONS if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
                 change = net_liq - net_liq_30
 
                 if change > 50:
