@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -13,6 +13,27 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/options", tags=["options"])
+SAVED_RECOMMENDATION_MAX_AGE = timedelta(hours=24)
+
+
+def _saved_age_status(when: Any, now: datetime) -> tuple[str, int | None]:
+    """Classify saved-row age, never treating an absent or future stamp as fresh."""
+    if not isinstance(when, datetime) or when.tzinfo is None:
+        return "unknown_age", None
+    age_seconds = (now - when.astimezone(timezone.utc)).total_seconds()
+    if age_seconds < 0:
+        return "unknown_age", None
+    return (
+        "stale" if age_seconds > SAVED_RECOMMENDATION_MAX_AGE.total_seconds() else "recent_saved",
+        int(age_seconds),
+    )
+
+
+def _utc_timestamp(when: Any) -> str | None:
+    """Only label an aware saved timestamp as UTC after converting it."""
+    if not isinstance(when, datetime) or when.tzinfo is None:
+        return None
+    return when.astimezone(timezone.utc).isoformat()
 
 
 # ── Recommendation helpers ───────────────────────────────────
@@ -86,7 +107,6 @@ def _format_recommendation_response(
     generated_at: str | None = None,
 ) -> dict:
     """Build the standard response envelope for recommendations."""
-    now = generated_at or datetime.now(timezone.utc).isoformat()
     summary = scan_summary or {
         "total_scanned": len(recommendations),
         "passed_sanity": len(recommendations),
@@ -94,7 +114,7 @@ def _format_recommendation_response(
     }
     return {
         "recommendations": recommendations,
-        "generated_at": now,
+        "generated_at": generated_at,
         "scan_summary": summary,
     }
 
@@ -130,7 +150,7 @@ def _serialize_saved_recommendation(row: Any) -> dict[str, Any]:
         "thesis": row[10],
         "sanity_status": sanity_status,
         "dealer_context": row[12],
-        "generated_at": row[13].isoformat() if row[13] else None,
+        "generated_at": _utc_timestamp(row[13]),
         "outcome": row[14],
     }
 
@@ -140,7 +160,7 @@ def _load_saved_recommendations(
     *,
     ticker: str | None = None,
     limit: int = 50,
-) -> tuple[list[dict[str, Any]], dict[str, Any], str]:
+) -> tuple[list[dict[str, Any]], dict[str, Any], str | None]:
     """Read persisted open recommendations without running a scan or writer."""
     from sqlalchemy import text
 
@@ -162,24 +182,37 @@ def _load_saved_recommendations(
             rows = conn.execute(text(query), params).fetchall()
 
         recommendations = [_serialize_saved_recommendation(row) for row in rows]
-        generated_at = recommendations[0]["generated_at"] if recommendations else datetime.now(
-            timezone.utc
-        ).isoformat()
+        now = datetime.now(timezone.utc)
+        for recommendation, row in zip(recommendations, rows):
+            recommendation["data_status"], recommendation["age_seconds"] = _saved_age_status(row[13], now)
+        # The envelope describes the displayed, confidence-ranked page. A newer
+        # recommendation beyond LIMIT must not make an all-stale page look fresh.
+        latest_saved = max(
+            (row[13] for row in rows if isinstance(row[13], datetime) and row[13].tzinfo),
+            default=None,
+        )
+        data_status, age_seconds = _saved_age_status(latest_saved, now)
+        generated_at = _utc_timestamp(latest_saved)
+        if not recommendations:
+            data_status = "missing"
         return (
             recommendations,
             {
                 "total_scanned": len(recommendations),
                 "passed_sanity": len(recommendations),
                 "rejected": 0,
-                "source": "persisted",
+                "source": "persisted" if recommendations else "missing",
                 "fresh_scan": False,
-                "reason": "saved_recommendations",
+                "data_status": data_status,
+                "status_scope": "returned_recommendations",
+                "age_seconds": age_seconds,
+                "stale_after_seconds": int(SAVED_RECOMMENDATION_MAX_AGE.total_seconds()),
+                "reason": "saved_recommendations" if recommendations else "no_saved_recommendations",
             },
             generated_at,
         )
     except Exception as exc:
         log.warning("Saved recommendations fallback failed: {e}", e=str(exc))
-        now = datetime.now(timezone.utc).isoformat()
         return (
             [],
             {
@@ -188,9 +221,10 @@ def _load_saved_recommendations(
                 "rejected": 0,
                 "source": "unavailable",
                 "fresh_scan": False,
+                "data_status": "unavailable",
                 "reason": "saved_recommendations_read_failed",
             },
-            now,
+            None,
         )
 
 
@@ -213,6 +247,7 @@ async def get_recommendations(
             "rejected": 0,
             "source": "unavailable",
             "fresh_scan": False,
+            "data_status": "unavailable",
             "reason": "saved_recommendations_read_failed",
         })
     recommendations, scan_summary, generated_at = _load_saved_recommendations(
