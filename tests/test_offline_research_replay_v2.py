@@ -45,5 +45,7 @@ def test_replay_reproduces_v2_zero_survivors(
     assert result["discovery_first_decision"] == "2025-03-03"
     assert result["bh10_survivors"] == result["bh05_survivors"] == 0
     assert result["bh10_survivors_testable_only_denominator"] == 0
+    assert result["selected"] == 0
+    assert result["candidate_eligible"] == (sampling == "horizon_spaced")
     assert result["holdout_checks"] == result["candidates"] == 0
     assert result["state"] == "EXPLORATORY_REPLAY_ONLY"

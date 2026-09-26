@@ -22,10 +22,26 @@ vein-scan prototype v2 (obsidian-vault 532883a68) into this contract:
     target family, including excluded, insufficient, constant and NaN trials,
     is in the denominator (they carry p = 1.0).
 
-Origins: ``synthetic_fixture`` (deterministic proof data) and
+Origins: ``synthetic_fixture`` (deterministic proof data),
 ``exploratory_replay`` (a hindsight replay of an offline CSV that has no
-per-source known-at/vintage contract). Any other origin, including real
-point-in-time market data, is refused until those contracts exist.
+per-source known-at/vintage contract) and ``pit_vintage_read`` (S09). The PIT
+origin is not a self-declared label: its protocol must carry the receipt hash
+of a panel that ``analysis.research_real_panel`` read through the vintage-safe
+``store.observations.read_window`` path, and ``discover``/``evaluate_holdout``
+re-derive every row from that verified panel and refuse anything else. Any
+other origin is refused.
+
+S09 fixes carried from the #658 review:
+
+* ``fixed_step_block_null`` is anti-conservative at its default block (overlap
+  depth + 1): the reviewer measured 8.5% at n=60 and 10.75% at n=240 for a
+  nominal 5%. Fixed-step runs are therefore diagnostic only: they still report
+  every p-value and BH-adjusted p, but no trial is ever ``selected``, so no
+  holdout check and no candidate can come from them. Candidates come only from
+  ``horizon_spaced`` runs. The caveat is written into the manifest
+  (``caveats``, ``candidate_eligible``) and the payload ``method`` string.
+* Targets may be labelled as a ``return`` (end/start - 1, prices) or a
+  ``change`` (end - start, for rates, spreads and indexes that can cross 0).
 """
 
 from __future__ import annotations
@@ -48,8 +64,17 @@ from analysis.hypothesis_tester import compute_lagged_correlation
 ORIGINS = {
     "synthetic_fixture": "SYNTHETIC_PROOF_ONLY",
     "exploratory_replay": "EXPLORATORY_REPLAY_ONLY",
+    "pit_vintage_read": "PIT_VINTAGE_READ_EXPLORATORY",
 }
+PIT_ORIGIN = "pit_vintage_read"
 SAMPLING = ("horizon_spaced", "fixed_step_block_null")
+CANDIDATE_SAMPLING = ("horizon_spaced",)
+LABELS = ("return", "change")
+FIXED_STEP_CAVEAT = (
+    "fixed_step_block_null is anti-conservative at block = overlap depth + 1 "
+    "(#658 review: 8.5% at n=60, 10.75% at n=240 for nominal 5%); diagnostic "
+    "only, never selects, no candidates"
+)
 STATISTICS = ("pearson", "spearman")
 
 
@@ -84,10 +109,21 @@ class Protocol:
     seed: int = 20260926
     statistic: str = "pearson"
     start: str = ""  # optional discovery start (earlier rows are warm-up only)
+    pit_receipt: str = ""  # sha256 of the vintage-safe read receipt (PIT origin only)
 
     def validate(self):
         if self.origin not in ORIGINS:
             raise ValueError("real PIT/source/session contracts are not implemented")
+        if (self.origin == PIT_ORIGIN) != bool(self.pit_receipt) or (
+            self.pit_receipt
+            and (
+                len(self.pit_receipt) != 64
+                or set(self.pit_receipt) - set("0123456789abcdef")
+            )
+        ):
+            raise ValueError(
+                "pit_vintage_read needs, and only it may carry, a vintage-safe read receipt"
+            )
         if (
             not self.run_id
             or not self.features
@@ -132,9 +168,14 @@ def excluded(feature):
 
 
 def outcome_horizon(row):
-    """Declared horizon label (e.g. "5 sessions") or the wall-clock seconds."""
+    """Declared horizon label (e.g. "5 sessions") or the wall-clock seconds.
+
+    A ``change`` label is part of the horizon identity, so a family can never
+    mix return and change labels, and the holdout must use discovery's label.
+    """
     if "horizon" in row:
-        return row["horizon"]
+        kind = row.get("label", "return")
+        return row["horizon"] if kind == "return" else f"{row['horizon']} {kind}"
     return (stamp(row["label_end"]) - stamp(row["decision_at"])).total_seconds()
 
 
@@ -210,12 +251,14 @@ def permutation_block(protocol, depth):
 # --- (a) split first, then label -------------------------------------------------
 
 
-def build_family_rows(protocol, features, price, horizon, window):
+def build_family_rows(protocol, features, price, horizon, window, label="return"):
     """Build one target family's rows for one window, labelling only after the split.
 
     ``features``: DataFrame on a sorted, unique, tz-aware session index; the
-    value at t must be computable from data up to t. ``price``: the tradeable
+    value at t must be computable from data up to t. ``price``: the target
     level on the same index. ``horizon``: forward label length in sessions.
+    ``label``: ``return`` (end/start - 1, for prices) or ``change`` (end -
+    start, for rates/spreads/indexes whose level can be 0 or negative).
 
     Every price outside the window ([start or first row, split) for discovery,
     [split, end) for holdout) is blanked before any label is computed, so a
@@ -225,8 +268,8 @@ def build_family_rows(protocol, features, price, horizon, window):
     NaN feature values become explicit ``None`` abstentions.
     """
     protocol.validate()
-    if window not in ("discovery", "holdout") or horizon < 1:
-        raise ValueError("unknown window or horizon")
+    if window not in ("discovery", "holdout") or horizon < 1 or label not in LABELS:
+        raise ValueError("unknown window, horizon or label")
     index = features.index
     if (
         not isinstance(index, pd.DatetimeIndex)
@@ -258,9 +301,14 @@ def build_family_rows(protocol, features, price, horizon, window):
         if j >= len(index):
             continue
         start_price, end_price = visible[i], visible[j]
-        if not (np.isfinite(start_price) and np.isfinite(end_price)) or not start_price:
+        if not (np.isfinite(start_price) and np.isfinite(end_price)) or (
+            label == "return" and not start_price
+        ):
             continue  # label needs a price outside the window (or missing): purged
         decided, labelled = index[i].isoformat(), index[j].isoformat()
+        target = (
+            end_price / start_price - 1 if label == "return" else end_price - start_price
+        )
         rows.append(
             {
                 "origin": protocol.origin,
@@ -268,7 +316,8 @@ def build_family_rows(protocol, features, price, horizon, window):
                 "label_end": labelled,
                 "target_known_at": labelled,
                 "horizon": f"{horizon} sessions",
-                "target": float(end_price / start_price - 1),
+                **({} if label == "return" else {"label": label}),
+                "target": float(target),
                 "features": {
                     name: {
                         "value": float(v) if np.isfinite(v) else None,
@@ -382,9 +431,27 @@ def as_families(protocol, rows):
     return {protocol.families[0]: rows}
 
 
-def discover(protocol, discovery_rows):
-    """This API never receives holdout rows. Freeze its result before evaluation."""
+def check_pit_rows(protocol, families, pit_panel, window):
+    """The PIT origin is proven by re-deriving rows from a verified panel, not by its label."""
+    if protocol.origin != PIT_ORIGIN:
+        if pit_panel is not None:
+            raise ValueError(
+                "a vintage-safe panel is only accepted with origin pit_vintage_read"
+            )
+        return
+    # Lazy import: the adapter imports this module.
+    from analysis.research_real_panel import verify_pit_rows
+
+    verify_pit_rows(pit_panel, protocol, families, window)
+
+
+def discover(protocol, discovery_rows, pit_panel=None):
+    """This API never receives holdout rows. Freeze its result before evaluation.
+
+    ``pit_panel`` is required for (and only accepted with) ``pit_vintage_read``.
+    """
     families = as_families(protocol, discovery_rows)
+    check_pit_rows(protocol, families, pit_panel, "discovery")
     ledger, horizons, blocks = [], {}, {}
     for family, rows in families.items():
         blocks[family] = permutation_block(
@@ -407,10 +474,15 @@ def discover(protocol, discovery_rows):
                 }
             )
     # (d) one BH family: the whole run, untestable trials included at p = 1.0.
+    # Only horizon-spaced runs may select (the fixed-step null is anti-conservative).
+    eligible = protocol.sampling in CANDIDATE_SAMPLING
     for trial, adjusted in zip(ledger, bh_adjusted([t["p"] for t in ledger])):
         trial["adjusted_p"] = adjusted
-        trial["selected"] = trial["status"] == "tested" and adjusted <= protocol.fdr_q
+        trial["selected"] = (
+            eligible and trial["status"] == "tested" and adjusted <= protocol.fdr_q
+        )
     tested = sum(t["status"] == "tested" for t in ledger)
+    caveats = [] if eligible else [FIXED_STEP_CAVEAT]
     payload = {
         "protocol": asdict(protocol),
         "discovery_sha256": digest(families),
@@ -421,11 +493,14 @@ def discover(protocol, discovery_rows):
         "untestable_count": len(ledger) - tested,
         "min_attainable_p": 1 / (protocol.perms + 1),
         "ledger": ledger,
+        "candidate_eligible": eligible,
+        "caveats": caveats,
         "method": (
             f"fixed lag0 {protocol.statistic}; {protocol.sampling} sampling; "
             f"block-permutation null ({protocol.perms} perms, seed {protocol.seed}); "
             f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
             "untestable; holdout Bonferroni over frozen selections"
+            + ("" if eligible else f"; CAVEAT: {FIXED_STEP_CAVEAT}")
         ),
         "state": "DISCOVERY_FROZEN",
         "promotion_allowed": False,
@@ -433,12 +508,13 @@ def discover(protocol, discovery_rows):
     return {"payload": payload, "sha256": digest(payload)}
 
 
-def evaluate_holdout(frozen, holdout_rows):
+def evaluate_holdout(frozen, holdout_rows, pit_panel=None):
     payload = frozen["payload"]
     if digest(payload) != frozen["sha256"]:
         raise ValueError("frozen discovery manifest changed")
     protocol = protocol_from_payload(payload["protocol"])
     families = as_families(protocol, holdout_rows)
+    check_pit_rows(protocol, families, pit_panel, "holdout")
     blocks = {}
     for family, rows in families.items():
         blocks[family] = permutation_block(
@@ -447,6 +523,8 @@ def evaluate_holdout(frozen, holdout_rows):
         if rows and payload["horizons"][family] != outcome_horizon(rows[0]):
             raise ValueError("holdout horizon differs from frozen discovery")
     selected = [trial for trial in payload["ledger"] if trial["selected"]]
+    if selected and protocol.sampling not in CANDIDATE_SAMPLING:
+        raise ValueError("fixed-step manifests are diagnostic only")
     checks, candidates = [], []
     for trial in selected:
         family = trial["family"]
@@ -500,15 +578,17 @@ def write_once(path, value):
         json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
 
 
-def run_proof(protocol, discovery_rows, holdout_rows, output):
+def run_proof(protocol, discovery_rows, holdout_rows, output, pit_panel=None):
     """Local receipt directory must be new: reruns cannot overwrite consumed evidence."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    frozen = discover(protocol, discovery_rows)
+    frozen = discover(protocol, discovery_rows, pit_panel)
     write_once(output / "discovery-frozen.json", frozen)
     # Read back the persisted freeze; holdout cannot alter search or trial universe.
     result = evaluate_holdout(
-        json.loads((output / "discovery-frozen.json").read_text()), holdout_rows
+        json.loads((output / "discovery-frozen.json").read_text()),
+        holdout_rows,
+        pit_panel,
     )
     write_once(output / "holdout-result.json", result)
     return result
