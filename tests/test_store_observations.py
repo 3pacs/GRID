@@ -11,6 +11,12 @@ puller writes ``(value=0, pull_status='FAILED', obs_date=date.today())`` on
 any failure, successful re-pulls append a second vintage for the same
 ``obs_date``, and a weekly series' newest real observation can be a day
 older than its newest FAILED marker.
+
+``source_catalog`` and a real ``source_id`` FK are included (unlike the
+pre-#561 fixture) because the reader now joins it for every read: to detect
+a mixed-source series_id (``YF:{ticker}:close`` written by both ``yfinance``
+and ``tiingo`` in production — see ``store/observations.py``'s module
+docstring) and to stamp provenance on every returned ``Observation``.
 """
 
 from __future__ import annotations
@@ -24,6 +30,8 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
+    Integer,
     MetaData,
     String,
     Table,
@@ -40,15 +48,23 @@ sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
 TODAY = date(2026, 9, 17)
 T0 = datetime(2026, 9, 10, 6, 0, 0)
 
+FRED_SRC = 1
+TIINGO_SRC = 2
+
 
 @pytest.fixture()
 def conn():
     engine = create_engine("sqlite://")
     md = MetaData()
+    source_catalog = Table(
+        "source_catalog", md,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, nullable=False),
+    )
     raw = Table(
         "raw_series", md,
         Column("series_id", String, nullable=False),
-        Column("source_id", String, nullable=False),
+        Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
         Column("obs_date", Date, nullable=False),
         Column("pull_timestamp", DateTime, nullable=False),
         Column("value", Float, nullable=False),
@@ -57,9 +73,9 @@ def conn():
     )
     md.create_all(engine)
 
-    def row(sid, d, v, status="SUCCESS", ts_offset_h=0):
+    def row(sid, d, v, status="SUCCESS", ts_offset_h=0, source_id=FRED_SRC):
         return {
-            "series_id": sid, "source_id": "fred", "obs_date": d,
+            "series_id": sid, "source_id": source_id, "obs_date": d,
             "pull_timestamp": T0 + timedelta(hours=ts_offset_h),
             "value": v, "raw_payload": "{}", "pull_status": status,
         }
@@ -79,8 +95,17 @@ def conn():
         row("RRPONTSYD", date(2026, 9, 16), 0.0, status="FAILED", ts_offset_h=21),
         # PARTIAL is not an accepted observation either.
         row("RRPONTSYD", TODAY, 0.5, status="PARTIAL", ts_offset_h=30),
+        # Mixed-source series_id: yfinance (FRED_SRC standing in for it here;
+        # only the id differs from TIINGO_SRC) and tiingo both write
+        # "YF:AAPL:close" — the #561 contamination scenario.
+        row("YF:AAPL:close", date(2026, 9, 15), 227.5, ts_offset_h=0, source_id=FRED_SRC),
+        row("YF:AAPL:close", date(2026, 9, 16), 229.0, ts_offset_h=10, source_id=TIINGO_SRC),
     ]
     with engine.begin() as c:
+        c.execute(source_catalog.insert(), [
+            {"id": FRED_SRC, "name": "fred"},
+            {"id": TIINGO_SRC, "name": "tiingo"},
+        ])
         c.execute(raw.insert(), rows)
     with engine.connect() as c:
         yield c
@@ -158,3 +183,57 @@ def test_observation_carries_provenance():
     o = obs.Observation("X", date(2026, 9, 1), 1.0, datetime(2026, 9, 1, 12))
     assert o.series_id == "X" and o.pull_timestamp is not None
     assert o.age_days >= 0
+    assert o.source is None  # positional/legacy construction still works
+
+
+def test_single_source_read_is_unaffected_and_carries_its_source(conn):
+    """A series with exactly one contributing source behaves exactly as before."""
+    o = obs.read_latest(conn, "WALCL")
+    assert o is not None and o.value == 6_746_548.0 and o.source == "fred"
+    window = obs.read_window(conn, "RRPONTSYD")
+    assert all(o.source == "fred" for o in window)
+    n = obs.read_latest_n(conn, "WALCL", 2)
+    assert all(o.source == "fred" for o in n)
+
+
+def test_mixed_source_read_fails_closed_without_explicit_source(conn):
+    """YF:AAPL:close has rows from both fred (standing in for yfinance) and
+    tiingo in the fixture — the #561 contamination scenario. Without an
+    explicit ``source=``, every reader must refuse rather than silently pick
+    whichever source's pull sorts first."""
+    with pytest.raises(obs.MixedSourceError):
+        obs.read_latest(conn, "YF:AAPL:close")
+    with pytest.raises(obs.MixedSourceError):
+        obs.read_window(conn, "YF:AAPL:close")
+    with pytest.raises(obs.MixedSourceError):
+        obs.read_latest_n(conn, "YF:AAPL:close", 5)
+
+
+def test_explicit_source_disambiguates_a_mixed_series_id(conn):
+    """Passing ``source=`` picks exactly that puller's rows, deterministically."""
+    fred_latest = obs.read_latest(conn, "YF:AAPL:close", source="fred")
+    assert fred_latest is not None
+    assert (fred_latest.obs_date, fred_latest.value, fred_latest.source) == (
+        date(2026, 9, 15), 227.5, "fred",
+    )
+
+    tiingo_latest = obs.read_latest(conn, "YF:AAPL:close", source="tiingo")
+    assert tiingo_latest is not None
+    assert (tiingo_latest.obs_date, tiingo_latest.value, tiingo_latest.source) == (
+        date(2026, 9, 16), 229.0, "tiingo",
+    )
+
+    # Case-insensitive, matching the convention in evaluation/prices.py.
+    assert obs.read_latest(conn, "YF:AAPL:close", source="TIINGO").value == 229.0
+
+    fred_window = obs.read_window(conn, "YF:AAPL:close", source="fred")
+    assert [(o.obs_date, o.value) for o in fred_window] == [(date(2026, 9, 15), 227.5)]
+
+    tiingo_n = obs.read_latest_n(conn, "YF:AAPL:close", 5, source="tiingo")
+    assert [(o.obs_date, o.value) for o in tiingo_n] == [(date(2026, 9, 16), 229.0)]
+
+
+def test_unknown_source_filter_returns_empty_not_mixed_error(conn):
+    """An explicit source that matches nothing is a normal empty result, not a mixing error."""
+    assert obs.read_latest(conn, "YF:AAPL:close", source="kaggle_bulk") is None
+    assert obs.read_window(conn, "YF:AAPL:close", source="kaggle_bulk") == []
