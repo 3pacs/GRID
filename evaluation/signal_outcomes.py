@@ -53,6 +53,7 @@ REASON_PRICE_OUT_OF_BOUNDS = "price_outside_sanity_bounds"
 REASON_STALE_ENTRY = "stale_entry_bar"
 REASON_STALE_EXIT = "stale_exit_bar"
 REASON_UNVERIFIED_KNOWN_AT = "known_at_unverified"
+REASON_AMBIGUOUS_PRICE = "ambiguous_raw_close_multiple_values"
 
 
 def validate_scoring_parameters(dead_band_pct: float, cost_bps: float) -> None:
@@ -70,6 +71,22 @@ class UnsupportedInstrumentError(Exception):
     supported at all" (-> INELIGIBLE(unsupported_instrument_history)) from a
     plain "no price for this specific date yet" (return ``None``, which this
     module treats as UNRESOLVED-or-missing depending on horizon elapsed).
+    """
+
+
+class AmbiguousPriceError(UnsupportedInstrumentError):
+    """Raise when the raw-close series has more than one distinct value for a date.
+
+    ``raw_series``'s uniqueness constraint is on ``(series_id, source_id,
+    obs_date, pull_timestamp)`` — a second writer under the *same* series_id
+    and source_id (for example an adjusted-close puller sharing the
+    ``yfinance`` source row) can insert a second, differently-valued row for
+    the same ``obs_date`` at a later ``pull_timestamp``. Historical
+    contamination of this kind is confirmed for ``YF:{ticker}:close`` (see
+    ``docs/reference/PRICE_SERIES_CONTRACT.md``). An accessor must refuse the
+    date outright rather than silently pick "the latest pull wins" -> a
+    dedicated subclass of ``UnsupportedInstrumentError`` so callers can label
+    the refusal distinctly from a generic unsupported-instrument refusal.
     """
 
 
@@ -295,6 +312,8 @@ def evaluate_signal(
 
     try:
         entry = price_accessor(record.instrument, entry_as_of)
+    except AmbiguousPriceError:
+        return _ineligible(record, REASON_AMBIGUOUS_PRICE, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
     except UnsupportedInstrumentError:
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
 
@@ -336,6 +355,8 @@ def evaluate_signal(
 
     try:
         exit_ = price_accessor(record.instrument, exit_as_of)
+    except AmbiguousPriceError:
+        return _ineligible(record, REASON_AMBIGUOUS_PRICE, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
     except UnsupportedInstrumentError:
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 

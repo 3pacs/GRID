@@ -54,3 +54,46 @@ without a verified raw-basis cutover, the cohort cannot have priced outcomes.
 Real exchange sessions, disclosures,
 corporate actions, splits, timezone/session alignment, and source lineage
 still require validation before any production interpretation.
+
+## Multi-valued dates are refused, not resolved
+
+`raw_series`'s only uniqueness constraint is on `(series_id, source_id,
+obs_date, pull_timestamp)`. A second writer under the same `series_id` and
+`source_id` — for example an adjusted-close puller sharing the `yfinance`
+source row — can insert a second, differently-valued row for the same
+`obs_date` at a later `pull_timestamp`. Historical `YF:{ticker}:close` rows
+are confirmed contaminated this way (a pre-`#656` `fill_missing_features.py`
+run wrote adjusted closes under the same series/source identity; the vast
+majority of `YF:SPY:close` dates hold more than one distinct value). The
+accessor computes the distinct-value count for the selected date in the same
+query that selects the price and refuses the date outright
+(`ambiguous_raw_close_multiple_values`) whenever more than one distinct value
+exists, rather than accepting "the latest pull wins." A single
+`verified_raw_close_since` cutover cannot close this gap by itself — it only
+proves the canonical puller was live by that date, not that nothing else
+wrote to the same series afterward.
+
+## Instrument-class gate
+
+The accessor refuses any ticker matching a 24/7 crypto pattern
+(`^[A-Z0-9]{2,10}-USD$`, e.g. `BTC-USD`, `ETH-USD`, `SOL-USD`, `TAO-USD` —
+exactly the tickers `fill_missing_features.py` pulls into this same
+`YF:{ticker}:close` shape) before any query. This evaluator's exact-date bar
+matching and after-16:00-America/New_York rollover are an equity/ETF
+NYSE-session policy; a continuously-traded instrument does not have that
+session structure, so it is refused rather than silently mispriced.
+
+## `known_at` for congressional disclosures
+
+`scripts/evaluate_signals.py::to_signal_record` now reads the congressional
+`disclosure_date` out of `signal_value` JSONB (captured by
+`ingestion/altdata/congressional.py`) and uses it as `known_at`, anchored to
+the end of that calendar day (`time.max` in `America/New_York`) so the
+existing after-16:00 rollover applies conservatively rather than assuming an
+earlier intraday disclosure time. Every other `source_type`, and any
+congressional row missing or with an unparseable `disclosure_date`, has no
+verified publication field wired here yet: `known_at` stays `None` and
+`evaluate_signal()` falls back to `created_at`, with the specific reason
+recorded on `SignalRecord.metadata["known_at_source"]` — the fallback is
+explicit and labelled, not a silent assumption that ingestion time is always
+a safe proxy for publication time.

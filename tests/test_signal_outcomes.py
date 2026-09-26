@@ -143,7 +143,12 @@ class _RawEngine:
         self.requests.append((str(query), params))
         candidates = [bar for bar in self.bars if bar[0] <= params["as_of"] and
                       params["verified_since"] <= bar[3] <= params["cutoff"]]
-        return _RawResult(max(candidates, key=lambda bar: (bar[0], bar[3])) if candidates else None)
+        if not candidates:
+            return _RawResult(None)
+        winner = max(candidates, key=lambda bar: (bar[0], bar[3]))
+        same_date = [bar for bar in candidates if bar[0] == winner[0]]
+        distinct_value_count = len({bar[1] for bar in same_date})
+        return _RawResult((*winner, distinct_value_count))
 
 
 def _raw_bar(day, value):
@@ -184,3 +189,29 @@ def test_invalid_scoring_parameters_refused_before_price_lookup(band, cost):
     with pytest.raises(ValueError):
         evaluate_signal(rec(), accessor({}, calls), dead_band_pct=band, cost_bps=cost)
     assert calls == []
+
+
+def test_real_accessor_multi_valued_date_refused_not_averaged_or_latest_wins():
+    """A second writer (fill_missing_features.py, pre-#656) inserted a second,
+    differently-valued row for the same obs_date under the same series/source
+    identity. evaluate_signal must come back INELIGIBLE(ambiguous_raw_close_
+    multiple_values), never CORRECT/WRONG/NO_MOVE from a silently-picked value."""
+    contaminated_entry_day = date(2026, 9, 1)
+    prices, engine = _real_accessor([
+        _raw_bar(contaminated_entry_day, 100),
+        (contaminated_entry_day, 130, "YF:AAA:close",
+         datetime(contaminated_entry_day.year, contaminated_entry_day.month, contaminated_entry_day.day, 23, tzinfo=timezone.utc)),
+        _raw_bar(date(2026, 9, 6), 110),
+    ])
+    result = evaluate_signal(rec(), prices, today=date(2026, 9, 7))
+    assert result.outcome == "INELIGIBLE"
+    assert result.eligibility_reason == "ambiguous_raw_close_multiple_values"
+
+
+def test_real_accessor_refuses_crypto_instrument_before_any_price_lookup():
+    prices, engine = _real_accessor([_raw_bar(date(2026, 9, 1), 100)])
+    signal = rec(instrument="BTC-USD")
+    result = evaluate_signal(signal, prices, today=date(2026, 9, 8))
+    assert result.outcome == "INELIGIBLE"
+    assert result.eligibility_reason == "unsupported_instrument_history"
+    assert engine.requests == []

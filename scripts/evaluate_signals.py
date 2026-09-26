@@ -9,7 +9,7 @@ import json
 import sys
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
 from zoneinfo import ZoneInfo
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -89,6 +89,24 @@ class SelectedRow:
     signal_date: date
     signal_type: str
     created_at: datetime
+    signal_value: Optional[dict] = None
+
+
+def _parse_signal_value(value) -> Optional[dict]:
+    """Normalize the JSONB signal_value column. Some drivers return a dict
+    already; others return the raw JSON text. Anything else (including
+    malformed JSON) is treated as absent rather than guessed at."""
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def select_signal_sources(engine, *, source_type: str, date_from: date, date_to: date, limit: int) -> list[SelectedRow]:
@@ -123,22 +141,67 @@ def select_signal_sources(engine, *, source_type: str, date_from: date, date_to:
         else:
             raise RefusalError(f"unverified signal_date database type: {data_type!r}")
         rows = conn.execute(text(f"""
-            SELECT id, source_type, ticker, signal_date, signal_type, created_at
+            SELECT id, source_type, ticker, signal_date, signal_type, created_at, signal_value
               FROM signal_sources
              WHERE source_type = :source_type AND {predicate}
              ORDER BY signal_date DESC, id DESC LIMIT :limit
         """), {"source_type": source_type, "limit": limit, **bounds}).fetchall()
-    selected = [SelectedRow(r[0], r[1], r[2], _market_date(r[3]), r[4], _aware_timestamp(r[5], "created_at")) for r in rows]
+    selected = [SelectedRow(r[0], r[1], r[2], _market_date(r[3]), r[4], _aware_timestamp(r[5], "created_at"),
+                            _parse_signal_value(r[6])) for r in rows]
     if any(not date_from <= r.signal_date <= date_to for r in selected):
         raise RefusalError("database date predicate returned a row outside market-date bounds")
     return selected
 
 
+# known_at resolution is source_type-specific and explicit: only congressional
+# rows have a proven publication field wired here (disclosure_date, captured
+# in signal_value JSONB by ingestion/altdata/congressional.py). Every other
+# source_type falls back to created_at inside evaluate_signal() itself -- that
+# fallback is the existing, already-tested behaviour; this function's job is
+# only to populate known_at where a real publication timestamp is provably
+# available, and to label why it did not for everything else, rather than
+# leaving the reason implicit.
+KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE = "congressional_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE = "created_at_fallback_missing_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE = "created_at_fallback_unparseable_disclosure_date"
+KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE = "created_at_fallback_unverified_source_type"
+
+
+def _resolve_known_at(row: SelectedRow) -> Tuple[Optional[datetime], str]:
+    """Return (known_at, known_at_source) for one selected row.
+
+    Congressional trade disclosures publish a `disclosure_date` (the date the
+    STOCK Act filing became public), captured verbatim in `signal_value`
+    (`ingestion/altdata/congressional.py`). That date has no time component,
+    so the conservative, PIT-safe reading is "known no earlier than the end
+    of that trading day" -- using `time.max` here reuses evaluate_signal()'s
+    own after-16:00-ET rollover rule to push entry to the next session,
+    rather than assuming (and possibly leaking) an earlier intraday time.
+
+    Every other source_type has no verified publication field wired here
+    yet, so known_at stays None and evaluate_signal() falls back to
+    created_at -- explicitly labelled below, not silently assumed safe.
+    """
+    if "congress" not in row.source_type.lower():
+        return None, KNOWN_AT_SOURCE_FALLBACK_UNVERIFIED_SOURCE_TYPE
+    raw = (row.signal_value or {}).get("disclosure_date")
+    if not isinstance(raw, str):
+        return None, KNOWN_AT_SOURCE_FALLBACK_MISSING_DISCLOSURE
+    try:
+        disclosure_date = date.fromisoformat(raw)
+    except ValueError:
+        return None, KNOWN_AT_SOURCE_FALLBACK_UNPARSEABLE_DISCLOSURE
+    known_at = datetime.combine(disclosure_date, time.max, MARKET_TZ)
+    return known_at, KNOWN_AT_SOURCE_CONGRESSIONAL_DISCLOSURE
+
+
 def to_signal_record(row: SelectedRow, *, horizon_days: int) -> SignalRecord:
+    known_at, known_at_source = _resolve_known_at(row)
     return SignalRecord(
         source_type=row.source_type, instrument=row.ticker or "", signal_date=row.signal_date,
         direction=_DIRECTION.get(row.signal_type, "UNKNOWN"), horizon_days=horizon_days,
-        signal_source_id=row.id, created_at=row.created_at,
+        signal_source_id=row.id, created_at=row.created_at, known_at=known_at,
+        metadata={"known_at_source": known_at_source},
     )
 
 
@@ -155,7 +218,12 @@ def run(engine, args: argparse.Namespace, *, out=None, today: Optional[date] = N
     result = {
         "evaluation_version": EVALUATION_VERSION,
         "dry_run": True,
-        "assumptions": "provisional: calendar-day horizon; exact-date entry and exit bars; after-16:00 America/New_York next calendar date; created_at ingestion proxy; origin unknown",
+        "assumptions": "provisional: calendar-day horizon; exact-date entry and exit bars; "
+                       "after-16:00 America/New_York next calendar date; created_at ingestion "
+                       "proxy fallback (labelled per-row as known_at_source, congressional "
+                       "disclosure_date used when present); origin unknown; multi-valued raw-close "
+                       "dates refused rather than picked (ambiguous_raw_close_multiple_values); "
+                       "crypto/24-7 instruments refused (not run through NYSE-session logic)",
         "n_selected": len(rows), "n_skipped_null_ticker": sum(not r.ticker for r in rows),
         "cohort_summary": dataclasses.asdict(summarize_outcomes(outcomes)),
     }
