@@ -30,12 +30,18 @@ if _REPO_ROOT not in sys.path:
 os.chdir(_REPO_ROOT)
 
 from loguru import logger as log  # noqa: E402
+from sqlalchemy import text  # noqa: E402
+from sqlalchemy.engine import Engine  # noqa: E402
 
 from db import get_engine  # noqa: E402
 from intelligence.company_financial_rollups import (  # noqa: E402
+    TTM_CONFIDENCE,
+    TTM_SOURCE_FILING,
+    TTM_WINDOW_QUARTERS,
     compute_ttm,
     fold_announcements,
     run_all,
+    ttm_statement_sql,
 )
 
 
@@ -58,7 +64,61 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging.",
     )
+    parser.add_argument(
+        "--explain-ttm",
+        action="store_true",
+        help=(
+            "Read-only pre-deployment plan check, intended for the "
+            "operator/coordinator to run against PRODUCTION before a "
+            "release: print EXPLAIN (plain — no ANALYZE) of the exact "
+            "SQL statement compute_ttm executes, using the same bind "
+            "parameters, then exit 0 without running any task. EXPLAIN "
+            "without ANALYZE only plans the statement; it never executes "
+            "or writes, even though the statement's CTEs contain a "
+            "DELETE and an INSERT.",
+        ),
+    )
+    parser.add_argument(
+        "--watermark",
+        default=None,
+        help=(
+            "Vestigial (fable-daily-intel-sql-tasks, 2026-09-20 SECOND "
+            "follow-up): compute_ttm's dirty-actor recompute set is now "
+            "decided entirely by a durable per-actor content fingerprint "
+            "in capital_flows_ttm_state, not by any as_of cursor. This "
+            "flag is accepted and passed through for backward-compatible "
+            "call signatures only and has NO effect on which actors are "
+            "recomputed — see intelligence/company_financial_rollups.py's "
+            "module docstring."
+        ),
+    )
     return parser.parse_args()
+
+
+def _run_explain_ttm(engine: Engine) -> int:
+    """Print EXPLAIN (no ANALYZE) of the exact compute_ttm statement.
+
+    Takes the SQL text from ``ttm_statement_sql()`` — the same string
+    ``compute_ttm`` itself executes — wraps it in ``EXPLAIN`` (plain,
+    not ``EXPLAIN ANALYZE``), and runs it with the same bind parameters
+    ``compute_ttm`` uses. Plain ``EXPLAIN`` only plans a statement; it
+    never executes it, so this issues exactly one read-only statement
+    and performs no task run — safe to point at production ahead of a
+    release to check the plan does not regress to a nested-loop scan.
+    """
+    stmt = text(f"EXPLAIN {ttm_statement_sql()}")
+    with engine.connect() as conn:
+        result = conn.execute(
+            stmt,
+            {
+                "window": TTM_WINDOW_QUARTERS,
+                "source_filing": TTM_SOURCE_FILING,
+                "confidence": TTM_CONFIDENCE,
+            },
+        )
+        for row in result:
+            print(row[0])
+    return 0
 
 
 def main() -> int:
@@ -69,13 +129,19 @@ def main() -> int:
 
     engine = get_engine()
 
+    if args.explain_ttm:
+        return _run_explain_ttm(engine)
+
     if args.ttm_only and args.rollup_only:
         log.error("--ttm-only and --rollup-only are mutually exclusive")
         return 2
 
     if args.ttm_only:
-        n = compute_ttm(engine)
-        print(f"capital_flow_rollups: ttm rows={n}")
+        result = compute_ttm(engine, args.watermark)
+        print(
+            f"capital_flow_rollups: ttm rows={result.rows_written} "
+            f"watermark={args.watermark!r} -> {result.watermark!r}"
+        )
         return 0
 
     if args.rollup_only:
@@ -83,11 +149,11 @@ def main() -> int:
         print(f"capital_flow_rollups: rolled rows={n}")
         return 0
 
-    stats = run_all(engine)
+    stats = run_all(engine, ttm_watermark=args.watermark)
     print("capital_flow_rollups summary:")
     for k, v in stats.items():
         print(f"  {k}: {v}")
-    if stats.get("ttm_error") or stats.get("rolled_error"):
+    if not stats.get("ok", False):
         return 1
     return 0
 

@@ -23,19 +23,32 @@ from scripts import hermes_operator as ho
 
 
 def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> None:
-    """Scorer budget + observed daily batch must fit inside the step budget.
+    """Scorer budget + the daily-intel per-cycle budget (+ headroom) must
+    fit inside the step budget.
 
-    The scorer runs first and the daily block runs last inside the same
-    step; if their combined worst case exceeds the step cap, the daily
-    block (and hypothesis discovery) is unreachable on the days it matters.
+    The scorer runs first and the daily-intel block (DAILY_INTEL_TASKS,
+    executed by _run_daily_intel_block) runs last inside the same step; if
+    their combined worst case exceeds the step cap, the daily block is
+    starved of any turn at all on the cycles that matter.
+
+    fable-daily-intel-resumable (2026-09-20) replaced the single
+    DAILY_INTEL_BATCH_OBSERVED_S measurement with a hard per-cycle cap,
+    DAILY_INTEL_CYCLE_BUDGET_SECONDS, that _run_daily_intel_block enforces
+    itself (checked before starting each task) — so this pin now compares
+    against the cap the code actually enforces, not an observed value from
+    the monolithic block that preceded it. The +60 covers the
+    earnings-calendar-sync SQL call and active-hypo-scoring bookkeeping
+    that run ahead of both inside the same step.
     """
     assert (
-        ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + ho.DAILY_INTEL_BATCH_OBSERVED_S
+        ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + ho.DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60
         <= ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
     ), (
-        "ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S must not "
-        "exceed INTELLIGENCE_TASKS_TIMEOUT_SECONDS — otherwise the intelligence "
-        "step times out before auto_discover() runs (regression of 2026-05-15)."
+        "ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60 "
+        "must not exceed INTELLIGENCE_TASKS_TIMEOUT_SECONDS — otherwise the "
+        "intelligence step times out before the daily-intel block ever gets a "
+        "turn (regression of 2026-05-15, re-created one level down before this "
+        "fix)."
     )
 
 
@@ -56,3 +69,27 @@ def test_scorer_budget_leaves_headroom_for_batch_at_observed_throughput() -> Non
     measured_rows_per_sec = 15.0
     expected_batch_seconds = ho.ACTIVE_HYPO_SCORING_BATCH_SIZE / measured_rows_per_sec
     assert expected_batch_seconds * 4 < ho.ACTIVE_HYPO_SCORING_MAX_RUNTIME_S
+
+
+def test_sector_health_timeout_is_a_positive_int_independent_of_intelligence_budget() -> None:
+    """SECTOR_HEALTH_TIMEOUT_SECONDS (2026-09-19 split — sector-health is
+    now its own run_cycle step, dispatched ahead of intelligence_tasks; see
+    _run_sector_and_intelligence_steps) must be a sane, positive timeout
+    used by that step's dispatch, and must NOT be derived from or tied to
+    INTELLIGENCE_TASKS_TIMEOUT_SECONDS — the whole point of the split is
+    that the two budgets are independent, so sector-health is reachable
+    and bounded regardless of whether intelligence_tasks times out."""
+    assert isinstance(ho.SECTOR_HEALTH_TIMEOUT_SECONDS, int)
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS > 0
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS != ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS < ho.INTELLIGENCE_TASKS_TIMEOUT_SECONDS, (
+        "sector-health is observed at 3-8s in production; it should stay a "
+        "short step, not scale with the much larger intelligence_tasks budget"
+    )
+    assert ho.SECTOR_HEALTH_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+
+    import inspect
+    src = inspect.getsource(ho._run_sector_and_intelligence_steps)
+    assert "SECTOR_HEALTH_TIMEOUT_SECONDS" in src, (
+        "the sector-health dispatch must actually use the constant"
+    )

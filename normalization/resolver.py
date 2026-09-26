@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -18,7 +19,13 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from binance_close_contract import CANONICAL_CLOSE_SERIES, is_completed_canonical_close
 from normalization.entity_map import EntityMap
+from price_close_contract import (
+    SPY_CLOSE_CONTRACT,
+    SPY_CLOSE_SERIES,
+    is_policy_capture,
+)
 
 # Default window for manual/CLI runs. The Hermes cycle passes a much smaller
 # window (see scripts/hermes_operator.py::RESOLUTION_CYCLE_LOOKBACK_DAYS) plus
@@ -185,6 +192,54 @@ def _flush_batch(engine: Engine, batch: list[dict]) -> int:
     except Exception as exc:
         log.error("Batch insert failed ({n} rows): {e}", n=len(batch), e=str(exc))
         return 0
+
+
+def _resolve_spy_close_receipt(
+    engine: Engine, feature_id: int, obs_date: date, sources: list[dict]
+) -> int:
+    """Atomically write one new resolved close and its exact raw-row receipt.
+
+    A collision with an existing vintage is intentionally not promoted: its
+    original raw winner is unknown, even if the numeric value happens to match.
+    """
+    eligible = [
+        source for source in sources
+        if source["source_name"].lower() == "yfinance"
+        and isinstance(source["value"], (int, float))
+        and math.isfinite(float(source["value"]))
+        and source["value"] > 0
+        and is_policy_capture(source["raw_payload"], obs_date, source["pull_timestamp"])
+    ]
+    if not eligible:
+        return 0
+    winner = min(eligible, key=lambda source: (source["pull_timestamp"], source["raw_id"]))
+    vintage = winner["pull_timestamp"].astimezone(timezone.utc).date()
+    with engine.begin() as conn:
+        resolved = conn.execute(text("""
+            INSERT INTO resolved_series
+                (feature_id, obs_date, release_date, vintage_date, value,
+                 source_priority_used, conflict_flag)
+            VALUES (:fid, :od, :vd, :vd, :val, :src, FALSE)
+            ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING
+            RETURNING id
+        """), {"fid": feature_id, "od": obs_date, "vd": vintage,
+                "val": winner["value"], "src": winner["source_id"]}).fetchone()
+        if not resolved:
+            return 0
+        receipt = conn.execute(text("""
+            INSERT INTO astrogrid.price_close_receipt
+                (contract_version, raw_series_id, resolved_series_id, feature_id,
+                 obs_date, price_basis, available_at, value)
+            VALUES (:contract, :raw_id, :resolved_id, :fid, :od, :basis,
+                    :available_at, :val)
+            RETURNING id
+        """), {"contract": SPY_CLOSE_CONTRACT, "raw_id": winner["raw_id"],
+                "resolved_id": resolved[0], "fid": feature_id, "od": obs_date,
+                "basis": SPY_CLOSE_SERIES,
+                "available_at": winner["pull_timestamp"], "val": winner["value"]}).fetchone()
+        if not receipt:
+            raise RuntimeError("SPY close resolved without receipt")
+    return 1
 
 
 class Resolver:
@@ -628,13 +683,19 @@ class Resolver:
                     feature_ids[series_id] = entity_map.get_feature_id(series_id)
                 return feature_ids[series_id]
 
+            spy_feature_id = (
+                _feature_id(SPY_CLOSE_SERIES)
+                if any(":SPY:" in sid for sid in partition) else None
+            )
+
             try:
                 with self.engine.begin() as conn:
                     self._set_statement_timeout(conn)
                     rows = conn.execute(text("""
                         SELECT rs.series_id, rs.obs_date, rs.value,
                                rs.source_id, rs.pull_timestamp,
-                               sc.priority_rank, sc.name AS source_name
+                               sc.priority_rank, sc.name AS source_name,
+                               rs.id, rs.raw_payload
                         FROM raw_series rs
                         JOIN source_catalog sc ON rs.source_id = sc.id
                         WHERE rs.series_id = ANY(:sids)
@@ -655,6 +716,8 @@ class Resolver:
                         "value": row[2], "source_id": row[3],
                         "pull_timestamp": row[4], "priority_rank": row[5],
                         "source_name": row[6],
+                        "raw_id": row[7] if len(row) > 7 else None,
+                        "raw_payload": row[8] if len(row) > 8 else None,
                     })
 
                 # Resolve and batch insert
@@ -664,6 +727,33 @@ class Resolver:
                     feature_id = _feature_id(series_id)
                     if feature_id is None:
                         continue
+
+                    if spy_feature_id is not None and feature_id == spy_feature_id:
+                        # Only the exact unadjusted SPY close can earn a
+                        # receipt. Adjusted-close/other mapped series must not
+                        # occupy its vintage before the verified writer does.
+                        if series_id == SPY_CLOSE_SERIES:
+                            eligible = any(is_policy_capture(
+                                s["raw_payload"], obs_date_val, s["pull_timestamp"]
+                            ) for s in sources)
+                            if eligible:
+                                if dry_run:
+                                    local["resolved"] += 1
+                                else:
+                                    local["resolved"] += _resolve_spy_close_receipt(
+                                        self.engine, feature_id, obs_date_val, sources
+                                    )
+                        continue
+
+                    if series_id in CANONICAL_CLOSE_SERIES:
+                        # A provisional or legacy unmarked Binance row must
+                        # never become a canonical BTC/ETH daily close merely
+                        # because its observation date is current.
+                        sources = [s for s in sources if is_completed_canonical_close(
+                            s["raw_payload"], obs_date_val, s["pull_timestamp"]
+                        )]
+                        if not sources:
+                            continue
 
                     sources.sort(key=lambda s: s["priority_rank"])
                     winner = sources[0]
