@@ -390,6 +390,46 @@ def test_autocorrelation_block_rule():
     assert autocorrelation_block([], depth=2)[0] == 3
 
 
+def test_block_caveat_when_the_cap_binds_or_acf1_is_undetectable():
+    rng = np.random.default_rng(20260926)
+    capped = autocorrelation_block(ar1(rng, 0.6, 60))[1]
+    assert "capped" in capped["caveat"] and "7.0%" in capped["caveat"]
+    # The n=60 calibration case is always caveated: an acf1 outside the band
+    # (0.258) wants a block > 7 and is capped; one inside it is undetectable.
+    kinds = set()
+    for _ in range(50):
+        basis = autocorrelation_block(ar1(rng, 0.35, 60))[1]
+        kinds.add("capped" if "capped" in basis["caveat"] else "undetectable")
+    assert kinds == {"capped", "undetectable"}
+    small = autocorrelation_block(rng.normal(size=40))[1]  # band 0.316 > 0.2
+    assert abs(small["acf1"]) <= small["band_2se"]
+    assert "undetectable" in small["caveat"]
+    for y in (rng.normal(size=240), ar1(rng, 0.35, 690)):  # neither binds
+        assert "caveat" not in autocorrelation_block(y)[1]
+
+
+def test_block_caveats_reach_the_manifest_and_the_method_string():
+    features, prices = synthetic_panel()
+    protocol = protocol_for(features)
+    discovery = family_rows(protocol, features, prices, "discovery")
+    family = "SPY|fwd5"
+    rng = np.random.default_rng(3)
+    for row, value in zip(discovery[family], ar1(rng, 0.6, len(discovery[family]))):
+        row["target"] = float(value)
+    payload = discover(protocol, discovery)["payload"]
+    assert payload["candidate_eligible"]  # a caveat, not a refusal
+    block_caveats = [c for c in payload["caveats"] if c.startswith(f"{family}:")]
+    assert len(block_caveats) == 1 and "capped" in block_caveats[0]
+    assert "CAVEAT: data-driven block may be anti-conservative" in payload["method"]
+    # families too short to test (n < min_n) carry no caveat
+    short = [f for f, b in payload["block_basis"].items() if b["n"] < protocol.min_n]
+    assert short and not any(c.startswith(tuple(f"{f}:" for f in short))
+                             for c in payload["caveats"])
+    # a declared block carries no data-driven caveat
+    declared = discover(replace(protocol, block=2), discovery)["payload"]
+    assert declared["caveats"] == [] and "CAVEAT" not in declared["method"]
+
+
 def test_default_block_comes_from_discovery_labels_and_is_frozen_for_holdout():
     features, prices = synthetic_panel()
     protocol = protocol_for(features)

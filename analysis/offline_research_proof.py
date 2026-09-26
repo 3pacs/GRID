@@ -56,7 +56,10 @@ S09b fixes carried from the #660 review:
   phi=0.35 against a persistent feature: 15.9% / 14.6% rejections at n=60 / 240
   for a nominal 5%). :func:`autocorrelation_block` sizes the block from the
   lag-1 autocorrelation of the sampled target on discovery rows only, and the
-  holdout reuses the frozen discovery block.
+  holdout reuses the frozen discovery block. Where the block may still be
+  anti-conservative (the MIN_BLOCKS cap binds, or |acf1| is inside a noise band
+  wider than 0.2 at small n) the family is named in the manifest ``caveats``
+  and the ``method`` string carries a CAVEAT.
 * Feature ``known_at`` may be supplied per value (the adapter stamps declared
   publication times). ``validate_rows`` refuses any feature known after its
   decision.
@@ -99,6 +102,12 @@ STATISTICS = ("pearson", "spearman")
 # the fewest blocks a permutation may have.
 BLOCK_TOLERANCE = 0.05
 MIN_BLOCKS = 8
+# Below n = 100 the 2/sqrt(n) band exceeds 0.2: dependence that size goes unseen.
+UNDETECTABLE_ACF = 0.2
+CAPPED_BLOCK_CALIBRATION = (
+    "target AR(1) 0.35 vs persistent feature at n=60, block capped at 7: "
+    "7.0% rejections at nominal 5%"
+)
 SELF_LAG = "self_lag"
 
 
@@ -298,7 +307,11 @@ def autocorrelation_block(target, depth: int = 0) -> tuple[int, dict]:
     1 is then conservative against a persistent feature, and the longer block
     is the accurate null (see the S09b calibration tests).
 
-    Returns ``(block, basis)``; ``basis`` is written into the manifest.
+    Returns ``(block, basis)``; ``basis`` is written into the manifest. It
+    carries a ``caveat`` when the block is known to be possibly
+    anti-conservative: the ``MIN_BLOCKS`` cap binds, or |phi| is inside a noise
+    band wider than ``UNDETECTABLE_ACF`` (small n), where real dependence of
+    that size would go undetected and the floor block would be used.
     """
     floor = depth + 1
     n = len(target)
@@ -306,6 +319,12 @@ def autocorrelation_block(target, depth: int = 0) -> tuple[int, dict]:
     band = 2 / math.sqrt(n) if n else None
     basis = {"n": n, "acf1": phi, "band_2se": band, "rule": "overlap floor"}
     if phi is None or abs(phi) <= band:
+        if phi is not None and band > UNDETECTABLE_ACF:
+            basis["caveat"] = (
+                f"|acf1|={abs(phi):.3f} inside the 2/sqrt(n) band {band:.3f} at n={n}: "
+                f"serial dependence up to that size is undetectable, so block {floor} "
+                "may be anti-conservative"
+            )
         return floor, basis
     a = min(abs(phi), 0.95)
     wanted = math.ceil(a / ((1 - a) ** 2 * BLOCK_TOLERANCE))
@@ -314,6 +333,11 @@ def autocorrelation_block(target, depth: int = 0) -> tuple[int, dict]:
         f"ceil(|acf1|/((1-|acf1|)^2*{BLOCK_TOLERANCE}))={wanted}, "
         f"capped at n//{MIN_BLOCKS}={n // MIN_BLOCKS}, floor {floor}"
     )
+    if block < wanted:
+        basis["caveat"] = (
+            f"block capped at {block} < {wanted} (n={n}, >= {MIN_BLOCKS} blocks): "
+            f"residual anti-conservatism (calibration: {CAPPED_BLOCK_CALIBRATION})"
+        )
     return block, basis
 
 
@@ -615,7 +639,13 @@ def discover(protocol, discovery_rows, panel=None):
             eligible and trial["status"] == "tested" and adjusted <= protocol.fdr_q
         )
     tested = sum(t["status"] == "tested" for t in ledger)
-    caveats = [] if eligible else [FIXED_STEP_CAVEAT]
+    # Block caveats only where trials could be tested (n >= min_n).
+    block_caveats = [
+        f"{family}: {basis['caveat']}"
+        for family, basis in block_basis.items()
+        if "caveat" in basis and basis["n"] >= protocol.min_n
+    ]
+    caveats = ([] if eligible else [FIXED_STEP_CAVEAT]) + block_caveats
     payload = {
         "protocol": asdict(protocol),
         "discovery_sha256": digest(families),
@@ -638,6 +668,13 @@ def discover(protocol, discovery_rows, panel=None):
             f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
             "untestable; holdout Bonferroni over frozen selections"
             + ("" if eligible else f"; CAVEAT: {FIXED_STEP_CAVEAT}")
+            + (
+                f"; CAVEAT: data-driven block may be anti-conservative in "
+                f"{len(block_caveats)} of {len(block_basis)} families (block capped "
+                "or acf1 undetectable at small n; see caveats)"
+                if block_caveats
+                else ""
+            )
         ),
         "state": "DISCOVERY_FROZEN",
         "promotion_allowed": False,

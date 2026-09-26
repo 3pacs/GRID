@@ -246,32 +246,43 @@ In S09 all 4 targets were also features, and nothing flagged own-series or
 near-copy features. `analysis/research_real_panel.py::PROXY_GROUPS` now
 declares, per target series, the series that are its own value or a
 near-copy of it. The groups are keyed by target, not found by matching series
-ids, and they follow one rule:
+ids, and they follow one rule. Rules (a) to (d) are computed from a declared
+leg map (`SPREAD_LEGS`, e.g. `T10YIE = DGS10 - DFII10`) and tenor ladder
+(`TREASURY_TENORS`) by `required_proxies`:
 
-- the target's own series;
-- the legs of a spread target, plus the next shorter and next longer quoted
-  tenor of each Treasury leg;
-- other spreads that share a leg;
-- the rating sub-indices and the yield or total-return versions of the same
-  credit index;
-- other indices in the same implied-volatility family.
+- **(a)** the target's own series and its legs (a level is its own leg);
+- **(b)** every series that shares a leg with the target;
+- **(c)** for a spread target, the other leg of every spread that shares a
+  leg with it (T10YIE and DFII10 together rebuild the 10-year leg of T10Y2Y);
+- **(d)** for each Treasury leg, the next shorter and next longer quoted
+  tenor. Where that tenor is absent from the universe, the nearest tenor that
+  is present on that side is added too (the universe has no DGS3 or DGS7, so
+  DGS5 counts for both the 2-year and the 10-year leg, and DGS30 for the
+  10-year leg);
+- **(e)** by declaration: the rating sub-indices and the yield or total-return
+  versions of the same credit index, and the other indices in the same
+  implied-volatility family.
 
 | Target | Proxy group |
 |---|---|
 | `VIXCLS` | VIXCLS, VXVCLS, VXOCLS, VIX3M, VIX9D |
-| `DGS2` | DGS2, DGS1, DGS3, T10Y2Y |
-| `T10Y2Y` | T10Y2Y, DGS10, DGS7, DGS20, DGS2, DGS1, DGS3, T10Y3M, T10Y1Y |
+| `DGS2` | DGS2, DGS1, DGS3, DGS5, T10Y2Y |
+| `T10Y2Y` | T10Y2Y; legs DGS10, DGS2; tenors DGS7, DGS20, DGS1, DGS3, DGS5, DGS30; shared-leg spreads T10Y3M, T10Y1Y, T10YIE; their other legs DGS3MO, DFII10 |
 | `BAMLH0A0HYM2` | the HY master, its BB/B/CCC sub-indices, and their effective-yield and total-return series |
 
-The adapter refuses a target that has no declared group. It derives the
+The adapter refuses a target that has no declared group. It also refuses a
+group that lacks a member rules (a) to (d) require for the declared universe,
+so the groups cannot silently drift from the leg map. A test also checks the
+leg-sharing condition directly from `SPREAD_LEGS`. The adapter derives the
 `(family, feature)` pairs whose feature series is in the family target's
 group, and the protocol must carry exactly those pairs as `self_lag`. The
 contract refuses a protocol that drops or changes them. `discover` still
 measures each such trial and records `self_lag_r`/`self_lag_p`. It gives the
 trial status `self_lag` and p = 1.0 in the BH denominator, so the trial can
 never be selected. `evaluate_holdout` refuses a manifest that selects one,
-even if the manifest is re-signed. Over the declared scan universe, 108 of
-the 1,044 trials are `self_lag`.
+even if the manifest is re-signed. Over the declared scan universe, 153 of
+the 1,044 trials are `self_lag` (17 target-series pairs × 3 transforms × 3
+horizons).
 
 Relabelled candidates from the ef0d564b scan (written to
 `scan-ef0d564b/frozen-candidates.relabelled.json`; the original receipts are
@@ -402,6 +413,22 @@ under the same cap, and never re-estimates it from holdout labels. A declared
 `block` is used as is. At n=60 the cap (7) leaves a residual 7.0%. Short
 families therefore stay somewhat anti-conservative, and their p-value
 resolution is coarse.
+
+That residual is recorded in the manifest, not only here. A family's
+`block_basis` carries a `caveat`, and the manifest's `caveats` list carries
+`"<family>: ..."`, in either of two cases:
+
+- the 8-block cap binds, so the block is shorter than the rule wants (the
+  caveat cites the 7.0% calibration);
+- |acf1| is inside a 2/sqrt(n) band wider than 0.2, i.e. n < 100, where
+  dependence of that size cannot be detected and the floor block is used.
+
+A family whose n is below `min_n` has no testable trials and gets no caveat.
+When any family is caveated, the payload `method` string ends with `CAVEAT:
+data-driven block may be anti-conservative in K of F families ...`. A caveat
+is a warning, not a refusal: `candidate_eligible` is unchanged. At n=60 with
+AR(1) 0.35, a family is always caveated. Either its acf1 is outside the band
+(0.258) and the block it wants exceeds 7, or its acf1 is inside the band.
 
 **Why longer blocks selected more in the post-hoc diagnostic.** The permutation
 null variance of a correlation is roughly

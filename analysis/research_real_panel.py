@@ -291,28 +291,71 @@ def publication_times(dates, publication: Publication) -> pd.DatetimeIndex:
 
 
 # --- proxy groups (S09b) ---------------------------------------------------------
-# Rule: the target's own series; the legs of a spread target; the adjacent
-# quoted tenors (next shorter and next longer) of a Treasury leg on the same
-# curve; other spreads sharing a leg; the rating sub-indices and
-# yield/total-return variants of the same credit index; and other indices of
-# the same implied-volatility family. Keyed by target series id, not by series
-# equality: a target without a declared group is refused.
+# Rule (checked by required_proxies against the declared universe at load):
+#   (a) the target's own series and its legs (SPREAD_LEGS; a level is its own leg);
+#   (b) every series sharing a leg with the target;
+#   (c) for a spread target, the other leg of every spread that shares a leg
+#       with it (T10YIE + DFII10 rebuild the 10-year leg of T10Y2Y);
+#   (d) for each Treasury leg, the adjacent quoted tenors on TREASURY_TENORS
+#       and, where an adjacent tenor is absent from the universe, the nearest
+#       tenor present on that side;
+#   (e) by declaration: rating sub-indices and yield/total-return variants of the
+#       same credit index, and other indices of the same implied-vol family.
+# Keyed by target series id, not by series equality: a target without a
+# declared group is refused, and so is a group missing a required member.
+SPREAD_LEGS: dict[str, tuple[str, str]] = {
+    "T10Y2Y": ("DGS10", "DGS2"),
+    "T10Y3M": ("DGS10", "DGS3MO"),
+    "T10Y1Y": ("DGS10", "DGS1"),
+    "T10YIE": ("DGS10", "DFII10"),  # 10-year breakeven = nominal - real
+    "T5YIE": ("DGS5", "DFII5"),
+}
+TREASURY_TENORS = (
+    "DGS1MO",
+    "DGS3MO",
+    "DGS6MO",
+    "DGS1",
+    "DGS2",
+    "DGS3",
+    "DGS5",
+    "DGS7",
+    "DGS10",
+    "DGS20",
+    "DGS30",
+)
 PROXY_GROUPS: dict[str, frozenset[str]] = {
     "VIXCLS": frozenset({"VIXCLS", "VXVCLS", "VXOCLS", "VIX3M", "VIX9D"}),
-    "DGS2": frozenset({"DGS2", "DGS1", "DGS3", "T10Y2Y"}),
+    "DGS2": frozenset(
+        {
+            "DGS2",
+            # adjacent tenors; DGS5 is the nearest longer tenor in the universe
+            "DGS1",
+            "DGS3",
+            "DGS5",
+            # spreads with a 2-year leg
+            "T10Y2Y",
+        }
+    ),
     "T10Y2Y": frozenset(
         {
             "T10Y2Y",
-            # legs and their adjacent tenors
+            # legs
             "DGS10",
+            "DGS2",
+            # adjacent tenors of the legs, and the nearest ones in the universe
             "DGS7",
             "DGS20",
-            "DGS2",
             "DGS1",
             "DGS3",
-            # other slopes sharing the 10-year leg
+            "DGS5",
+            "DGS30",
+            # spreads sharing the 10-year leg
             "T10Y3M",
             "T10Y1Y",
+            "T10YIE",
+            # their other legs
+            "DGS3MO",
+            "DFII10",
         }
     ),
     "BAMLH0A0HYM2": frozenset(
@@ -370,11 +413,50 @@ def refusal(series_id: str) -> str | None:
     return None
 
 
-def proxy_group(target_id: str) -> frozenset[str]:
+def proxy_group(target_id: str, universe=None) -> frozenset[str]:
+    """The declared group; with ``universe``, also refuse one missing a rule member."""
     group = PROXY_GROUPS.get(target_id)
     if group is None or target_id not in group:
         raise ValueError(f"{target_id}: refused: no declared proxy group for this target")
+    if universe is not None:
+        missing = required_proxies(target_id, universe) - group
+        if missing:
+            raise ValueError(
+                f"{target_id}: refused: proxy group lacks rule members {sorted(missing)}"
+            )
     return group
+
+
+def legs(series_id: str) -> tuple[str, ...]:
+    return SPREAD_LEGS.get(series_id, (series_id,))
+
+
+def _neighbour_tenors(leg: str, universe: frozenset[str]) -> set[str]:
+    """Adjacent quoted tenors of ``leg`` and, per side, the nearest in the universe."""
+    if leg not in TREASURY_TENORS:
+        return set()
+    i = TREASURY_TENORS.index(leg)
+    out = set()
+    for side in (TREASURY_TENORS[:i][::-1], TREASURY_TENORS[i + 1 :]):
+        if side:
+            out.add(side[0])
+            out.update(next(([t] for t in side if t in universe), []))
+    return out
+
+
+def required_proxies(target_id: str, universe) -> frozenset[str]:
+    """Members rules (a)-(d) require in ``target_id``'s group, given ``universe``."""
+    universe = frozenset(universe)
+    own = set(legs(target_id))
+    required = {target_id, *own}
+    for sid in universe | set(SPREAD_LEGS):
+        if own & set(legs(sid)):
+            required.add(sid)  # (b) shares a leg
+            if target_id in SPREAD_LEGS:
+                required.update(legs(sid))  # (c) the other leg of that spread
+    for leg in own:
+        required |= _neighbour_tenors(leg, universe)  # (d)
+    return frozenset(required)
 
 
 def self_lag_pairs(
@@ -438,8 +520,9 @@ class LatestVintagePanel:
                 raise ValueError(f"{spec.series_id}: {refusal(spec.series_id)}")
             if spec.source not in PUBLICATIONS:
                 raise ValueError(f"{spec.series_id}: undeclared publication source")
+        universe = {s.series_id for s in (*self.features, *self.targets)}
         for target in self.targets:
-            proxy_group(target.series_id)
+            proxy_group(target.series_id, universe)
         for sid, obs in self._data.items():
             previous = None
             for o in obs:
@@ -668,7 +751,7 @@ def load_latest_vintage_panel(
         if spec.source not in PUBLICATIONS:
             raise ValueError(f"{spec.series_id}: undeclared publication source")
     for target in targets:
-        proxy_group(target.series_id)
+        proxy_group(target.series_id, ids + [t.series_id for t in targets])
     data = {}
     for sid in dict.fromkeys(ids + [t.series_id for t in targets]):
         data[sid] = tuple(

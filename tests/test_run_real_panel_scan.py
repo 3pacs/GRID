@@ -11,9 +11,11 @@ import pytest
 from analysis.research_real_panel import (
     PROXY_GROUPS,
     PUBLICATIONS,
+    SPREAD_LEGS,
     proxy_group,
     refusal,
     relabel_frozen_candidates,
+    required_proxies,
     self_lag_pairs,
 )
 from scripts import relabel_frozen_candidates as relabel_script
@@ -69,17 +71,53 @@ def test_reviewer_verified_publication_lags_are_declared():
     )
 
 
+def universe() -> set[str]:
+    return {s.series_id for s in (*scan_script.FEATURES, *scan_script.TARGETS)}
+
+
 def test_proxy_groups_cover_every_target_and_known_near_copies():
     for target in scan_script.TARGETS:
-        assert target.series_id in proxy_group(target.series_id)
-    assert {"DGS1", "DGS3", "T10Y2Y"} <= PROXY_GROUPS["DGS2"]
-    assert {"DGS10", "DGS2", "DGS1", "T10Y3M"} <= PROXY_GROUPS["T10Y2Y"]
+        assert target.series_id in proxy_group(target.series_id, universe())
+    assert {"DGS1", "DGS3", "DGS5", "T10Y2Y"} <= PROXY_GROUPS["DGS2"]
+    assert {"DGS10", "DGS2", "DGS1", "T10Y3M", "T10YIE", "DFII10"} <= PROXY_GROUPS["T10Y2Y"]
     assert {"BAMLH0A1HYBB", "BAMLH0A2HYB", "BAMLH0A3HYC"} <= PROXY_GROUPS["BAMLH0A0HYM2"]
     assert "VXVCLS" in PROXY_GROUPS["VIXCLS"]
     # cross-series links stay testable: they are not near-copies of the target
     assert "BAMLH0A0HYM2" not in PROXY_GROUPS["VIXCLS"]
-    assert "DGS5" not in PROXY_GROUPS["DGS2"]
     assert "BAMLC0A0CM" not in PROXY_GROUPS["BAMLH0A0HYM2"]
+    assert "DFF" not in PROXY_GROUPS["DGS2"]
+
+
+def test_every_universe_series_sharing_a_leg_with_a_target_is_in_its_group():
+    """Derived from the declared leg map, independently of required_proxies."""
+    def leg_set(sid):
+        return set(SPREAD_LEGS.get(sid, (sid,)))
+
+    checked = 0
+    for target in scan_script.TARGETS:
+        group = PROXY_GROUPS[target.series_id]
+        for sid in universe():
+            if leg_set(sid) & leg_set(target.series_id):
+                assert sid in group, (target.series_id, sid)
+                checked += 1
+                if target.series_id in SPREAD_LEGS:  # the other leg rebuilds ours
+                    assert leg_set(sid) <= group, (target.series_id, sid)
+        assert required_proxies(target.series_id, universe()) <= group
+    assert checked >= 6
+    # T10YIE = DGS10 - DFII10 shares the 10-year leg with T10Y2Y
+    assert SPREAD_LEGS["T10YIE"] == ("DGS10", "DFII10")
+    assert {"T10YIE", "DFII10"} <= required_proxies("T10Y2Y", universe())
+    # DGS3 is absent from the universe, so DGS5 is the nearest longer tenor
+    assert "DGS3" not in universe() and "DGS5" in required_proxies("DGS2", universe())
+
+
+def test_a_group_that_drifts_from_the_rule_is_refused(monkeypatch):
+    monkeypatch.setitem(PROXY_GROUPS, "T10Y2Y", PROXY_GROUPS["T10Y2Y"] - {"T10YIE"})
+    with pytest.raises(ValueError, match=r"lacks rule members \['T10YIE'\]"):
+        proxy_group("T10Y2Y", universe())
+    monkeypatch.setitem(PROXY_GROUPS, "DGS2", PROXY_GROUPS["DGS2"] - {"DGS5"})
+    with pytest.raises(ValueError, match="DGS5"):
+        proxy_group("DGS2", universe())
 
 
 def test_self_lag_pairs_over_the_declared_universe():
@@ -99,11 +137,13 @@ def test_self_lag_pairs_over_the_declared_universe():
         series.setdefault(family.split("|")[0], set()).add(feature.split("|")[0])
     assert series == {
         "VIXCLS": {"VIXCLS"},
-        "DGS2": {"DGS1", "DGS2", "T10Y2Y"},
-        "T10Y2Y": {"DGS1", "DGS2", "T10Y2Y", "T10Y3M"},
+        "DGS2": {"DGS1", "DGS2", "DGS5", "T10Y2Y"},
+        "T10Y2Y": {
+            "DGS1", "DGS2", "DGS5", "DGS30", "DFII10", "T10Y2Y", "T10Y3M", "T10YIE",
+        },
         "BAMLH0A0HYM2": {"BAMLH0A0HYM2", "BAMLH0A1HYBB", "BAMLH0A2HYB", "BAMLH0A3HYC"},
     }
-    assert len(pairs) == 3 * 3 * (1 + 3 + 4 + 4)  # suffixes x horizons x series
+    assert len(pairs) == 3 * 3 * (1 + 4 + 8 + 4)  # suffixes x horizons x series
 
 
 def test_relabelling_marks_the_five_self_lag_candidates(tmp_path):
