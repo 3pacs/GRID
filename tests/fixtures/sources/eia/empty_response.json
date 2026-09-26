@@ -1,0 +1,19 @@
+{
+  "response": {
+    "warnings": [],
+    "total": "0",
+    "dateFormat": "YYYY-MM-DD",
+    "frequency": "daily",
+    "data": []
+  },
+  "request": {
+    "command": "/v2/petroleum/pri/spt/data/",
+    "params": {
+      "frequency": "daily",
+      "data": ["value"],
+      "facets": {"series": ["RWTC"]},
+      "start": "2026-06-18",
+      "end": "2026-09-16"
+    }
+  }
+}

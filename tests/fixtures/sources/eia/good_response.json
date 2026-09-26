@@ -1,0 +1,53 @@
+{
+  "response": {
+    "warnings": [],
+    "total": "3",
+    "dateFormat": "YYYY-MM-DD",
+    "frequency": "daily",
+    "data": [
+      {
+        "period": "2026-09-14",
+        "duoarea": "NUS",
+        "area-name": "NUS",
+        "product": "EPCBRENT",
+        "product-name": "Crude Oil, Brent",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "68.4200",
+        "units": "$/BBL"
+      },
+      {
+        "period": "2026-09-15",
+        "duoarea": "NUS",
+        "area-name": "NUS",
+        "product": "EPCBRENT",
+        "product-name": "Crude Oil, Brent",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "69.1000",
+        "units": "$/BBL"
+      },
+      {
+        "period": "2026-09-16",
+        "duoarea": "NUS",
+        "area-name": "NUS",
+        "product": "EPCBRENT",
+        "product-name": "Crude Oil, Brent",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "68.9500",
+        "units": "$/BBL"
+      }
+    ]
+  },
+  "request": {
+    "command": "/v2/petroleum/pri/spt/data/",
+    "params": {
+      "frequency": "daily",
+      "data": ["value"],
+      "facets": {"series": ["RBRTE"]},
+      "start": "2026-06-18",
+      "end": "2026-09-16"
+    }
+  }
+}

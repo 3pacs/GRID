@@ -14,6 +14,7 @@ Series stored:
 from __future__ import annotations
 
 import os
+import re
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -28,6 +29,17 @@ _EIA_BASE = "https://api.eia.gov/v2/petroleum/pri/spt/data/"
 _REQUEST_TIMEOUT: int = 30
 _SERIES_MAP: dict[str, str] = {"RBRTE": "brent_spot", "RWTC": "wti_spot"}
 _SERIES_PREFIX = "eia"
+
+# EIA requests carry ``api_key=<value>`` in the query string, so any
+# exception raised by ``requests`` (e.g. ``HTTPError.__str__``, which embeds
+# ``response.url``) can echo the live key straight into the log. Redact it
+# before anything derived from a request exception is logged.
+_API_KEY_QS_PATTERN = re.compile(r"(api_key=)[^&\s]+", re.IGNORECASE)
+
+
+def _redact_api_key(text: str) -> str:
+    """Strip an ``api_key=...`` query value out of an error message."""
+    return _API_KEY_QS_PATTERN.sub(r"\1***", text)
 
 
 class EIAPuller(BasePuller):
@@ -79,7 +91,16 @@ class EIAPuller(BasePuller):
             try:
                 records = self._fetch_series(facet, start_str, end_str)
             except Exception as exc:
-                log.error("EIA fetch failed for {f}: {e}", f=facet, e=str(exc))
+                # Upstream/network fault (bad JSON, HTTP error, timeout) --
+                # not a code bug, so this is a WARNING per the project's
+                # log-level convention (see ingestion/base.py::log_pull_failure).
+                # The exception text from `requests` can embed the request
+                # URL -- including our api_key query param -- so redact it.
+                log.warning(
+                    "EIA fetch failed for {f}: {e}",
+                    f=facet,
+                    e=_redact_api_key(str(exc)),
+                )
                 continue
 
             with self.engine.begin() as conn:
@@ -98,6 +119,13 @@ class EIAPuller(BasePuller):
                     self._insert_raw(conn=conn, series_id=sid, obs_date=obs,
                                      value=fv, raw_payload={"facet": facet})
                     total += 1
+                    # A single response can (rarely) repeat a period -- e.g. a
+                    # duplicated row from an upstream retry-within-response.
+                    # Record it as seen immediately so a repeat later in this
+                    # same `records` list is skipped too, not just repeats
+                    # across separate pull() calls (which `existing` already
+                    # covered before this fix).
+                    existing.add(obs)
             time.sleep(1.0)
 
         log.info("EIA: {n} rows inserted", n=total)
