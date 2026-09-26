@@ -40,6 +40,11 @@ T0 = datetime(2026, 1, 1, 6, 0, 0)
 def _engine(rows):
     engine = create_engine("sqlite://")
     md = MetaData()
+    source_catalog = Table(
+        "source_catalog", md,
+        Column("id", String, primary_key=True),
+        Column("name", String, nullable=False),
+    )
     raw = Table(
         "raw_series", md,
         Column("series_id", String, nullable=False),
@@ -51,14 +56,22 @@ def _engine(rows):
         Column("pull_status", String, nullable=False),
     )
     md.create_all(engine)
+    # Every row in this file's fixtures uses source_id="t" (a single stand-in
+    # source) unless a test overrides it — store/observations.py now joins
+    # source_catalog for provenance and mixed-source detection.
+    source_ids = sorted({r["source_id"] for r in rows}) or ["yfinance"]
     with engine.begin() as c:
+        c.execute(source_catalog.insert(), [{"id": s, "name": s} for s in source_ids])
         c.execute(raw.insert(), rows)
     return engine
 
 
-def _row(sid, d, v, status="SUCCESS", h=0):
+def _row(sid, d, v, status="SUCCESS", h=0, source_id="yfinance"):
+    # Every fixture in this file is single-source; "yfinance" also satisfies
+    # the callers that now pass source="yfinance" explicitly for YF:* ids
+    # (intelligence/sentiment_scorer.py, intelligence/market_diary.py).
     return {
-        "series_id": sid, "source_id": "t", "obs_date": d,
+        "series_id": sid, "source_id": source_id, "obs_date": d,
         "pull_timestamp": T0 + timedelta(hours=h), "value": v,
         "raw_payload": "{}", "pull_status": status,
     }

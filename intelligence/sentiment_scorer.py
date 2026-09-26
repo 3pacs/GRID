@@ -325,7 +325,7 @@ def _score_momentum(engine: Engine) -> SentimentComponent:
 
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 25)
+            rows = read_latest_n(conn, "YF:^GSPC:close", 25, source="yfinance")
 
             if len(rows) >= 6:
                 latest = rows[0].value
@@ -361,7 +361,7 @@ def _score_volatility(engine: Engine) -> SentimentComponent:
     """Score from VIX level — high VIX = bearish, low VIX = bullish."""
     try:
         with engine.connect() as conn:
-            row = read_latest(conn, "YF:^VIX:close")
+            row = read_latest(conn, "YF:^VIX:close", source="yfinance")
 
             if row:
                 vix = row.value
@@ -395,8 +395,8 @@ def _score_vol_term_structure(engine: Engine) -> SentimentComponent:
     """VIX vs VIX3M: contango = complacent (bullish), backwardation = fear (bearish)."""
     try:
         with engine.connect() as conn:
-            vix_obs = read_latest(conn, "YF:^VIX:close")
-            vix3m_obs = read_latest(conn, "YF:^VIX3M:close")
+            vix_obs = read_latest(conn, "YF:^VIX:close", source="yfinance")
+            vix3m_obs = read_latest(conn, "YF:^VIX3M:close", source="yfinance")
             vix = vix_obs.value if vix_obs else None
             vix3m = vix3m_obs.value if vix3m_obs else None
             if vix and vix3m and vix3m > 0:
@@ -421,7 +421,7 @@ def _score_breadth(engine: Engine) -> SentimentComponent:
             positive = 0
             total = 0
             for etf in etfs:
-                rows = read_latest_n(conn, f"YF:{etf}:close", 6)
+                rows = read_latest_n(conn, f"YF:{etf}:close", 6, source="yfinance")
                 if len(rows) >= 2:
                     total += 1
                     if rows[0].value > rows[1].value:
@@ -442,7 +442,7 @@ def _score_trend(engine: Engine) -> SentimentComponent:
     """SPY position relative to 50d and 200d moving averages."""
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 200)
+            rows = read_latest_n(conn, "YF:^GSPC:close", 200, source="yfinance")
             if len(rows) >= 50:
                 latest = rows[0].value
                 ma50 = sum(r.value for r in rows[:50]) / 50
@@ -628,8 +628,8 @@ def _score_credit_spread(engine: Engine) -> SentimentComponent:
     """HYG vs LQD ratio — rising = risk appetite (bullish), falling = flight to quality."""
     try:
         with engine.connect() as conn:
-            hyg_rows = read_latest_n(conn, "YF:HYG:close", 21)
-            lqd_rows = read_latest_n(conn, "YF:LQD:close", 21)
+            hyg_rows = read_latest_n(conn, "YF:HYG:close", 21, source="yfinance")
+            lqd_rows = read_latest_n(conn, "YF:LQD:close", 21, source="yfinance")
             if len(hyg_rows) >= 2 and len(lqd_rows) >= 2:
                 hyg_now = hyg_rows[0].value
                 lqd_now = lqd_rows[0].value
@@ -682,7 +682,7 @@ def _score_fear_greed(engine: Engine) -> SentimentComponent:
     # We compute it from existing data rather than external API
     try:
         with engine.connect() as conn:
-            vix_obs = read_latest(conn, "YF:^VIX:close")
+            vix_obs = read_latest(conn, "YF:^VIX:close", source="yfinance")
             if vix_obs:
                 vix_val = vix_obs.value
                 # Simple fear/greed: VIX < 15 = extreme greed, > 30 = extreme fear
@@ -881,6 +881,7 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
                 # Get realized SPY return over the evaluation window
                 spy_rows = read_window(
                     conn, "YF:^GSPC:close",
+                    source="yfinance",
                     start=pred_date,
                     as_of=pred_date + timedelta(days=EVALUATION_WINDOW_DAYS + 3),  # Buffer for weekends
                 )
