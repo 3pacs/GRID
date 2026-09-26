@@ -33,7 +33,7 @@
     "react-dom": "^19.2.7",
     "sigma": "^3.0.2",
     "three": "^0.186.0",
-    "zustand": "^5.0.14"
+    "zustand": "^5.0.15"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^6.4.0",
