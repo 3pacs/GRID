@@ -21,6 +21,7 @@ from typing import Literal
 
 import numpy as np
 import pandas as pd
+from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.panel_builder import build_price_panel, get_vix_series
@@ -65,12 +66,24 @@ COOLDOWN_DAYS = 20
 
 @dataclass(frozen=True)
 class RegimeState:
-    label: Literal["risk-on", "neutral", "risk-off"]
-    spy_trend: float  # 26-week return
-    vix_zscore: float
+    """The strategy's current regime read.
+
+    ``available=False`` (label "unavailable") means the inputs required to
+    compute a genuine regime were missing or too short — NOT that risk-off
+    or neutral was detected. ``spy_trend``/``vix_zscore`` are ``None`` in
+    that case; a caller must never treat that ``None`` as ``0.0`` (see
+    VERIFIED FACT 4 — the old code fabricated exactly that zero, which
+    detect_regime's own thresholds then read as a calm/neutral market).
+    """
+
+    label: Literal["risk-on", "neutral", "risk-off", "unavailable"]
+    spy_trend: float | None  # 26-week return
+    vix_zscore: float | None
     fast_risk_off: bool
     max_groups: int
     cash_floor: float
+    available: bool = True
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -114,21 +127,42 @@ def detect_regime(
     """
     26-week SPY trend + VIX z-score → regime label.
     Fast risk-off: 3-day drawdown < -3% OR VIX z-score > 3.0.
+
+    Returns an unavailable RegimeState (label="unavailable", available=False)
+    when there isn't enough SPY history (need >=130 obs for the 26-week
+    trend) or VIX history (need >=20 obs for the z-score) to compute a
+    genuine reading. The old behaviour of defaulting spy_trend/vix_zscore to
+    0.0 silently manufactured a calm/neutral-looking regime out of missing
+    data (VERIFIED FACT 4) — an absent input must say so, not read as zero.
     """
-    # 26-week (~130 trading days) SPY trend
+    reasons = []
     if len(spy_prices) < 130:
-        spy_trend = 0.0
-    else:
-        spy_trend = float(spy_prices.iloc[-1] / spy_prices.iloc[-130] - 1)
+        reasons.append(f"SPY history has {len(spy_prices)} obs, need >= 130 for the 26-week trend")
+    if len(vix_series) < 20:
+        reasons.append(f"VIX history has {len(vix_series)} obs, need >= 20 for the z-score")
+
+    if reasons:
+        reason = "; ".join(reasons)
+        log.warning("Regime unavailable: {r}", r=reason)
+        return RegimeState(
+            label="unavailable",
+            spy_trend=None,
+            vix_zscore=None,
+            fast_risk_off=False,
+            max_groups=0,
+            cash_floor=1.0,
+            available=False,
+            reason=reason,
+        )
+
+    # 26-week (~130 trading days) SPY trend
+    spy_trend = float(spy_prices.iloc[-1] / spy_prices.iloc[-130] - 1)
 
     # VIX z-score (20-day)
-    if len(vix_series) < 20:
-        vix_zscore = 0.0
-    else:
-        vix_20d = vix_series.iloc[-20:]
-        vix_zscore = float(
-            (vix_series.iloc[-1] - vix_20d.mean()) / (vix_20d.std() + 1e-8)
-        )
+    vix_20d = vix_series.iloc[-20:]
+    vix_zscore = float(
+        (vix_series.iloc[-1] - vix_20d.mean()) / (vix_20d.std() + 1e-8)
+    )
 
     # Fast risk-off check
     fast_risk_off = False
@@ -296,9 +330,24 @@ def run_rotation(
     )
 
     if prices.empty or "SPY" not in prices.columns:
+        reason = (
+            "build_price_panel returned no rows"
+            if prices.empty
+            else "SPY missing from the price panel"
+        )
+        log.warning("Rotation inputs unavailable: {r} — returning no target weights", r=reason)
         return RotationResult(
-            weights={t: 1.0 / len(FALLBACK_TICKERS) for t in FALLBACK_TICKERS},
-            regime=RegimeState("neutral", 0.0, 0.0, False, 2, 0.2),
+            weights={},
+            regime=RegimeState(
+                label="unavailable",
+                spy_trend=None,
+                vix_zscore=None,
+                fast_risk_off=False,
+                max_groups=0,
+                cash_floor=1.0,
+                available=False,
+                reason=reason,
+            ),
             active_groups=[],
             group_scores=[],
             stopped_tickers=[],
@@ -307,23 +356,37 @@ def run_rotation(
 
     prices = prices.ffill(limit=5)
 
-    # Pull the real VIX series PIT-correctly. detect_regime() needs >=20 obs to
-    # compute a non-zero z-score; with fewer obs it deterministically returns 0.
+    # Pull the real VIX series PIT-correctly and hand it to detect_regime as
+    # found — including empty. detect_regime() needs >=20 obs to compute a
+    # genuine z-score and returns an explicit unavailable regime otherwise
+    # (see its docstring). VERIFIED FACT 2: a previous revision of this
+    # function propped up an empty read with a fabricated single-value
+    # series instead — that fallback path is gone; see
+    # tests/test_adaptive_rotation.py's
+    # test_run_rotation_returns_unavailable_regime_when_vix_missing.
     vix_series = get_vix_series(
         engine,
         start_date=as_of_date - timedelta(days=60),
         end_date=as_of_date,
         as_of_date=as_of_date,
     )
-    if vix_series.empty:
-        # Fall back to a single-element series — yields vix_zscore=0 downstream.
-        from alpha_research.signals.exposure_scaler import compute_vix_exposure_scalar
-        vix_result = compute_vix_exposure_scalar(engine, as_of_date)
-        vix_value = vix_result.get("vix") or 20.0
-        vix_series = pd.Series([vix_value], index=[pd.Timestamp(as_of_date)])
 
     # 1. Detect regime
     regime = detect_regime(prices["SPY"], vix_series, as_of_date)
+
+    if not regime.available:
+        log.warning(
+            "Rotation regime unavailable ({r}) — returning no target weights",
+            r=regime.reason,
+        )
+        return RotationResult(
+            weights={},
+            regime=regime,
+            active_groups=[],
+            group_scores=[],
+            stopped_tickers=[],
+            as_of_date=as_of_date,
+        )
 
     # 2. Check stops on existing positions
     current_prices_dict = {}

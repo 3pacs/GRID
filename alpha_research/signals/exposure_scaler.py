@@ -15,10 +15,10 @@ from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-VIX_FEATURE_ID = 105
+from alpha_research.data.panel_builder import get_vix_series
+
 MA_WINDOW = 20
 
 
@@ -29,6 +29,15 @@ def compute_vix_exposure_scalar(
 ) -> dict:
     """
     Compute the VIX/MA exposure scalar.
+
+    Reads the same PIT-correct source as ``alpha_research.strategies.
+    adaptive_rotation`` — ``panel_builder.get_vix_series`` (feature
+    ``VIX_FEATURE_NAME`` = "vix_spot", one value per obs_date, latest
+    vintage as of ``as_of_date``). Previously this queried a hardcoded,
+    dead ``feature_id = 105`` directly and callers papered over the
+    resulting empty read with a fabricated ``vix_value or 20.0`` — removed;
+    insufficient data now returns the same honest "unknown" payload it
+    already did for a too-short series.
 
     Returns dict with:
       - scalar: float in [0.0, 1.0] (1.0 = full exposure, 0.0 = flat)
@@ -42,34 +51,19 @@ def compute_vix_exposure_scalar(
 
     lookback = as_of_date - timedelta(days=ma_window * 3)
 
-    query = text("""
-        SELECT obs_date, value
-        FROM resolved_series
-        WHERE feature_id = :fid
-          AND obs_date BETWEEN :start AND :end
-          AND release_date <= :as_of
-        ORDER BY obs_date
-    """)
+    vix_series = get_vix_series(
+        engine, start_date=lookback, end_date=as_of_date, as_of_date=as_of_date,
+    )
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            query,
-            {"fid": VIX_FEATURE_ID, "start": lookback, "end": as_of_date, "as_of": as_of_date},
-        ).fetchall()
-
-    if len(rows) < ma_window:
+    if len(vix_series) < ma_window:
         return {
             "scalar": 1.0,
             "vix": None,
             "vix_ma": None,
             "ratio": None,
             "regime_hint": "unknown",
-            "error": f"insufficient data ({len(rows)} rows, need {ma_window})",
+            "error": f"insufficient data ({len(vix_series)} rows, need {ma_window})",
         }
-
-    vix_series = pd.Series(
-        [r[1] for r in rows], index=[r[0] for r in rows]
-    ).sort_index()
 
     current_vix = float(vix_series.iloc[-1])
     vix_ma = float(vix_series.rolling(ma_window).mean().iloc[-1])
@@ -107,6 +101,10 @@ def compute_vix_exposure_series(
     """
     Compute VIX exposure scalar as a time series for backtesting.
 
+    Same PIT-correct source as ``compute_vix_exposure_scalar`` —
+    ``panel_builder.get_vix_series`` — instead of a hardcoded dead
+    ``feature_id``.
+
     Returns DataFrame with columns: vix, vix_ma, ratio, scalar
     """
     if end_date is None:
@@ -116,25 +114,11 @@ def compute_vix_exposure_series(
 
     lookback = start_date - timedelta(days=ma_window * 3)
 
-    query = text("""
-        SELECT obs_date, value
-        FROM resolved_series
-        WHERE feature_id = :fid
-          AND obs_date BETWEEN :start AND :end
-          AND release_date <= :as_of
-        ORDER BY obs_date
-    """)
+    vix = get_vix_series(engine, start_date=lookback, end_date=end_date, as_of_date=end_date)
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            query,
-            {"fid": VIX_FEATURE_ID, "start": lookback, "end": end_date, "as_of": end_date},
-        ).fetchall()
-
-    if not rows:
+    if vix.empty:
         return pd.DataFrame()
 
-    vix = pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows])).sort_index()
     vix_ma = vix.rolling(ma_window, min_periods=ma_window).mean()
     ratio = vix / vix_ma
     scalar = (1.0 - (ratio - 1.0)).clip(0.0, 1.0)

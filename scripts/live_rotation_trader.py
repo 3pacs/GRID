@@ -2,10 +2,15 @@
 """
 Live Rotation Trader — bridges GRID rotation signals to a crypto venue.
 
-Maps the Adaptive Rotation regime to crypto allocations:
-  - risk-on:  80% BTC, 20% ETH (aggressive)
+Maps the Adaptive Rotation regime to crypto allocations (REGIME_ALLOCATIONS
+below is the source of truth — keep this docstring in sync with it):
+  - risk-on:  60% BTC, 25% ETH, 15% SOL (aggressive)
   - neutral:  50% BTC, 50% cash (defensive)
   - risk-off: 100% cash (flat)
+  - unavailable (regime could not be computed — missing/short inputs):
+    trading skipped entirely, existing positions left untouched. Never
+    treated as risk-off — that would liquidate positions on a data outage
+    rather than a genuine risk-off signal.
 
 Two venues share the same target-weight logic:
   - ``hyperliquid`` (default) — perps, testnet unless ``--mainnet``.
@@ -56,7 +61,6 @@ REGIME_ALLOCATIONS: dict[str, dict[str, float]] = {
 }
 
 MAX_POSITION_USD = 100.0  # Per-coin max
-TOTAL_CAPITAL = 100.0     # Total wallet capital
 
 #: Venues the rotation trader can target. Hyperliquid stays the default.
 VENUES: tuple[str, ...] = ("hyperliquid", "robinhood")
@@ -67,6 +71,20 @@ SPOT_VENUES: frozenset[str] = frozenset({"robinhood"})
 
 #: Skip a rebalance whose delta is under this notional — not worth the spread.
 _MIN_REBALANCE_USD = 1.0
+
+
+def _total_capital() -> float:
+    """Total wallet capital used to size rotation weights into notional USD.
+
+    Configurable via ROBINHOOD_ROTATION_CAPITAL_USD (default 100.0, matching
+    the previous hardcoded TOTAL_CAPITAL constant so behavior is unchanged
+    unless an operator opts in). Imported lazily — like _get_trader's
+    ``from config import settings`` — so importing this module never
+    requires a fully configured .env.
+    """
+    from config import settings
+
+    return float(settings.ROBINHOOD_ROTATION_CAPITAL_USD)
 
 
 def _get_trader(mainnet: bool = False, venue: str = "hyperliquid"):
@@ -187,6 +205,7 @@ def _rebalance_spot(trader: Any, engine, target: dict[str, float], regime: str,
     results: list[dict] = []
     cap = float(getattr(trader, "max_position_usd", MAX_POSITION_USD))
     today = _date.today()
+    total_capital = _total_capital()
 
     # Sell anything the regime no longer wants — risk-off empties the book.
     for coin, pos in current.items():
@@ -199,7 +218,7 @@ def _rebalance_spot(trader: Any, engine, target: dict[str, float], regime: str,
 
     # Buy up / trim down to the target notional.
     for coin, weight in target.items():
-        target_usd = min(TOTAL_CAPITAL * weight, cap)
+        target_usd = min(total_capital * weight, cap)
         held_usd = current.get(coin, {}).get("size_usd", 0.0)
         delta = target_usd - held_usd
 
@@ -230,6 +249,7 @@ def _rebalance_perps(trader: Any, engine, target: dict[str, float], regime: str,
     """Perp rebalance: close what fell out of target, re-open at the new size."""
     results: list[dict] = []
     current_coins = {p["coin"]: p for p in current_positions}
+    total_capital = _total_capital()
 
     for pos in current_positions:
         if pos["coin"] not in target:
@@ -241,7 +261,7 @@ def _rebalance_perps(trader: Any, engine, target: dict[str, float], regime: str,
                                   close_result, venue)
 
     for coin, weight in target.items():
-        target_usd = min(TOTAL_CAPITAL * weight, MAX_POSITION_USD)
+        target_usd = min(total_capital * weight, MAX_POSITION_USD)
 
         if coin in current_coins:
             current_usd = current_coins[coin]["size_usd"]
@@ -287,13 +307,34 @@ def execute_rotation_live(mainnet: bool = False, venue: str = "hyperliquid") -> 
     # 1. Get current regime from rotation strategy
     try:
         rotation = run_rotation(engine, as_of_date=date.today())
-        regime = rotation.regime.label
     except Exception as e:
         log.error("Rotation strategy failed: {e}", e=str(e))
         return {"status": "ERROR", "error": str(e)}
 
+    regime_state = rotation.regime
+    regime = regime_state.label
+
+    if not regime_state.available:
+        # Missing/short inputs, NOT a risk-off signal — REGIME_ALLOCATIONS.get(regime, {})
+        # would otherwise silently read "unavailable" as the same empty-dict
+        # target as "risk-off" and liquidate every position on a data outage.
+        # Skip the cycle loudly instead and leave positions untouched.
+        log.error(
+            "Rotation regime unavailable ({r}) — skipping live trading cycle "
+            "on {v} {m}, positions left untouched",
+            r=regime_state.reason, v=venue, m=mode,
+        )
+        return {
+            "status": "BLOCKED",
+            "venue": venue,
+            "mode": mode,
+            "regime": regime,
+            "reason": regime_state.reason,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
     log.info("Regime: {r} (SPY trend={t:.4f}, VIX z={v:.2f})",
-             r=regime, t=rotation.regime.spy_trend, v=rotation.regime.vix_zscore)
+             r=regime, t=regime_state.spy_trend, v=regime_state.vix_zscore)
 
     # 2. Get target crypto allocation (venue may not list every coin)
     target = _tradable_targets(trader, REGIME_ALLOCATIONS.get(regime, {}), venue)

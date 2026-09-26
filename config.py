@@ -550,6 +550,11 @@ class Settings(BaseSettings):
     ROBINHOOD_PRIVATE_KEY_B64: str = ""      # base64 Ed25519 seed; server .env only
     ROBINHOOD_LIVE_TRADING: bool = False     # Must be True to send orders
     ROBINHOOD_MAX_POSITION_USD: float = 100.0
+    # Total wallet capital scripts/live_rotation_trader.py sizes rotation
+    # weights against (both venues — Hyperliquid and Robinhood). Default
+    # 100.0 matches the previous hardcoded TOTAL_CAPITAL constant, so this
+    # is a no-op until an operator raises it.
+    ROBINHOOD_ROTATION_CAPITAL_USD: float = 100.0
     ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
     ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
 
