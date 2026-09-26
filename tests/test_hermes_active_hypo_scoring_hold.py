@@ -30,7 +30,6 @@ def _run_and_record(monkeypatch) -> list[str]:
 
     def fake_run_intel_task(name, fn, state, engine, **kwargs):
         called.append(name)
-        return None
 
     fake_engine_mod = types.ModuleType("intelligence.hypothesis_engine")
     fake_engine_mod.score_due_active_hypotheses = lambda *a, **k: None
