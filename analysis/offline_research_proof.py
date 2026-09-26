@@ -63,6 +63,19 @@ S09b fixes carried from the #660 review:
 * Feature ``known_at`` may be supplied per value (the adapter stamps declared
   publication times). ``validate_rows`` refuses any feature known after its
   decision.
+
+S11 (ledger-steered exploration, ``analysis.ledger_steered_exploration``):
+
+* ``trials``: a run may declare a subset of the families x features product as
+  its trial universe (the ledger's allocation). Only declared trials are
+  measured and counted; an empty tuple keeps the full product.
+* ``selection="ledger_holm"``: instead of BH-FDR over the run, discovery
+  selects by Holm's step-down at ``selection_alpha``, the run's share of the
+  global cross-run alpha issued by the ledger allocation named in
+  ``allocation_sha256``. Holm is valid under arbitrary dependence, and the
+  per-run shares sum to at most the ledger's global level, so the family-wise
+  error (and hence the FDR) is bounded across every run the ledger records.
+  A ledger run may not declare a ``self_lag`` trial.
 """
 
 from __future__ import annotations
@@ -109,6 +122,9 @@ CAPPED_BLOCK_CALIBRATION = (
     "7.0% rejections at nominal 5%"
 )
 SELF_LAG = "self_lag"
+# S11: per-run BH (default) or Holm at the ledger-issued run alpha.
+SELECTIONS = ("bh_run", "ledger_holm")
+LEDGER_SELECTION = "ledger_holm"
 
 
 def digest(value):
@@ -145,6 +161,11 @@ class Protocol:
     read_receipt: str = ""  # sha256 of the latest-vintage read receipt (read origin only)
     # (family, feature) trials whose feature proxies the family's own target
     self_lag: tuple[tuple[str, str], ...] = ()
+    # S11: declared (family, feature) trial subset; () = the full product
+    trials: tuple[tuple[str, str], ...] = ()
+    selection: str = "bh_run"
+    selection_alpha: float = 0.0  # ledger-issued run alpha (ledger_holm only)
+    allocation_sha256: str = ""  # the ledger allocation record (ledger_holm only)
 
     def validate(self):
         if self.origin not in ORIGINS:
@@ -190,6 +211,35 @@ class Protocol:
             or self.perms < 99
         ):
             raise ValueError("invalid frozen statistical protocol")
+        self.validate_selection()
+
+    def validate_selection(self):
+        if len(set(self.trials)) != len(self.trials) or any(
+            len(pair) != 2
+            or pair[0] not in self.families
+            or pair[1] not in self.features
+            for pair in self.trials
+        ):
+            raise ValueError("declared trials must name declared families and features")
+        if self.selection not in SELECTIONS:
+            raise ValueError("unknown selection rule")
+        if self.selection != LEDGER_SELECTION:
+            if self.selection_alpha or self.allocation_sha256:
+                raise ValueError("only ledger_holm runs carry a ledger alpha/allocation")
+            return
+        if (
+            not 0 < self.selection_alpha <= 0.10
+            or len(self.allocation_sha256) != 64
+            or set(self.allocation_sha256) - set("0123456789abcdef")
+            or not self.trials
+            or not self.start
+        ):
+            raise ValueError(
+                "ledger_holm needs a ledger alpha, allocation hash, declared trials "
+                "and a declared discovery start"
+            )
+        if set(self.trials) & set(self.self_lag):
+            raise ValueError("a ledger run may not declare a self_lag trial")
 
 
 def protocol_from_payload(value):
@@ -199,6 +249,7 @@ def protocol_from_payload(value):
             "features": tuple(value["features"]),
             "families": tuple(value["families"]),
             "self_lag": tuple(tuple(pair) for pair in value.get("self_lag", ())),
+            "trials": tuple(tuple(pair) for pair in value.get("trials", ())),
         }
     )
 
@@ -525,6 +576,25 @@ def bh_adjusted(pvalues):
     return adjusted.tolist()
 
 
+def holm_adjusted(pvalues):
+    """Holm step-down adjusted p-values over ALL given trials (S11).
+
+    ``adjusted <= alpha`` is exactly Holm's rejection set at family-wise level
+    alpha, valid under arbitrary dependence. As with BH, the caller passes every
+    declared trial (untestable ones as 1.0): the length is the denominator.
+    """
+    p = np.asarray(pvalues, dtype=float)
+    if not len(p):
+        return []
+    if not np.all((p >= 0) & (p <= 1)):
+        raise ValueError("p-values must lie in [0, 1]")
+    order = np.argsort(p, kind="stable")
+    scaled = np.maximum.accumulate(p[order] * (len(p) - np.arange(len(p))))
+    adjusted = np.empty(len(p))
+    adjusted[order] = np.minimum(scaled, 1.0)
+    return adjusted.tolist()
+
+
 def corrected_p(p, total):
     """Bonferroni over a whole family; used for the holdout confirmation family."""
     return min(1.0, p * total)
@@ -603,6 +673,7 @@ def discover(protocol, discovery_rows, panel=None):
     families = as_families(protocol, discovery_rows)
     check_read_rows(protocol, families, panel, "discovery")
     self_lag = set(protocol.self_lag)
+    declared = set(protocol.trials) if protocol.trials else None
     ledger, horizons, blocks, block_basis = [], {}, {}, {}
     for family, rows in families.items():
         depth = validate_rows(rows, protocol, "discovery")
@@ -615,6 +686,8 @@ def discover(protocol, discovery_rows, panel=None):
             block_basis[family] = {**basis, "block": blocks[family]}
         horizons[family] = outcome_horizon(rows[0]) if rows else None
         for feature in protocol.features:
+            if declared is not None and (family, feature) not in declared:
+                continue  # not in this run's declared trial universe (S11)
             if excluded(feature):
                 result = {"n": 0, "r": None, "p": 1.0, "status": "excluded_telemetry"}
             elif (family, feature) in self_lag:
@@ -631,12 +704,19 @@ def discover(protocol, discovery_rows, panel=None):
                 }
             )
     # (d) one BH family: the whole run, untestable trials included at p = 1.0.
+    # S11 ledger runs use Holm at the ledger-issued run alpha instead.
     # Only horizon-spaced runs may select (the fixed-step null is anti-conservative).
     eligible = protocol.sampling in CANDIDATE_SAMPLING
-    for trial, adjusted in zip(ledger, bh_adjusted([t["p"] for t in ledger])):
+    ledger_run = protocol.selection == LEDGER_SELECTION
+    adjust, level = (
+        (holm_adjusted, protocol.selection_alpha)
+        if ledger_run
+        else (bh_adjusted, protocol.fdr_q)
+    )
+    for trial, adjusted in zip(ledger, adjust([t["p"] for t in ledger])):
         trial["adjusted_p"] = adjusted
         trial["selected"] = (
-            eligible and trial["status"] == "tested" and adjusted <= protocol.fdr_q
+            eligible and trial["status"] == "tested" and adjusted <= level
         )
     tested = sum(t["status"] == "tested" for t in ledger)
     # Block caveats only where trials could be tested (n >= min_n).
@@ -665,8 +745,15 @@ def discover(protocol, discovery_rows, panel=None):
             f"block-permutation null ({protocol.perms} perms, seed {protocol.seed}, "
             f"block {'declared' if protocol.block else 'from discovery target acf1'}); "
             "self_lag proxy trials never select; "
-            f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
-            "untestable; holdout Bonferroni over frozen selections"
+            + (
+                f"Holm at ledger run alpha {protocol.selection_alpha:.6g} (allocation "
+                f"{protocol.allocation_sha256[:12]}) over the declared trials incl. "
+                "untestable"
+                if ledger_run
+                else f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
+                "untestable"
+            )
+            + "; holdout Bonferroni over frozen selections"
             + ("" if eligible else f"; CAVEAT: {FIXED_STEP_CAVEAT}")
             + (
                 f"; CAVEAT: data-driven block may be anti-conservative in "

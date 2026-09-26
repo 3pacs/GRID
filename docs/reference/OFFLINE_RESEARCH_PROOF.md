@@ -451,6 +451,185 @@ not move. "Longer blocks selected more" therefore shows that block 1 was
 mis-calibrated in both directions. It is not evidence that the selections are
 robust.
 
+## S11: ledger-steered exploration (2026-09-26)
+
+Code: `analysis/ledger_steered_exploration.py`. Tests:
+`python -m pytest tests/test_ledger_steered_exploration.py -q` (about 80 s,
+mostly Monte Carlo). Synthetic dry runs:
+`python -m scripts.demo_ledger_steered_exploration NEW_OUTPUT_DIRECTORY`.
+
+"Self-improving" here means one thing: the ledger decides which hypothesis
+**families** (feature class × target × horizon) get the next run's trial
+budget. Nothing changes weights, promotes or rescores. The module has no DB,
+route, timer or registry code and never touches `hypothesis_registry`,
+`discovered_hypotheses` or `scanner_weights`. Its outputs are files and ledger
+records, and every record carries `promotion_allowed: false`.
+
+### The global ledger
+
+One append-only JSONL file per research program. Each line is canonical
+JSON with `seq` and `prev_sha256`, the sha256 of the previous line (the GEX
+paper-log pattern). The chain is verified on load, and the file is
+byte-compared before every append, so an edited, reordered, truncated or
+concurrently extended file is refused. The chain cannot detect an edit of
+the last record on its own. `Ledger(path, expected_head=...)` anchors it to
+a head recorded elsewhere, and each run's `summary.json` records the head.
+
+| Record | Written | Holds |
+|---|---|---|
+| `genesis` | once | global level `q` (≤ 0.10), spending rule, within-run rule, window rule |
+| `allocation` | before any data is read | run id and index, issued alpha, windows, policy, catalog and its hash, per-family posterior / P(best) / count / eligibility, the declared trial list |
+| `run_result` | after the contract run | every declared trial: family key, p, adjusted p, status (`tested`/`untestable`), selected, holdout outcome (`survived`/`failed`/`not_selected`), candidate hash; manifest and holdout hashes |
+| `abandoned` | instead of a result | the alpha stays spent and the windows stay touched |
+| `forward_outcome` | from S10's file | final forward verdict for a holdout survivor, plus the source file hash |
+
+Only one allocation may be open at a time, and run ids are unique.
+`record_run` accepts only the frozen manifest of the open allocation. The
+digest must match, and so must the run id, `allocation_sha256`, alpha,
+windows and the exact declared trial set, and the holdout result must name
+that manifest. A re-signed manifest with a different alpha or trial subset
+is refused.
+
+### Frozen before data
+
+`allocate()` reads only the ledger and appends the allocation.
+`protocol_for_allocation()` turns it into the run's `Protocol`, and the
+caller cannot override the run id, trials, alpha, windows or allocation
+hash. The contract gained four fields: `trials` (the declared subset of
+families × features; empty keeps the full product), `selection`
+(`bh_run`, the default and unchanged, or `ledger_holm`), `selection_alpha`
+and `allocation_sha256`. A `ledger_holm` protocol must carry all of them and
+a discovery start, and it may not declare a `self_lag` trial. `discover`
+measures only declared trials and selects by Holm at `selection_alpha`.
+Holdout, candidates and the latest-vintage panel checks are unchanged.
+Features stay the whole universe, so the panel's self_lag check still holds.
+
+### Allocation policy
+
+Each family is a Beta-Bernoulli arm with a Beta(1, 1) prior. A trial counts
+as a success when it was selected and survived its holdout, or later passed
+its forward log. Any other declared trial counts as a failure: not
+selected, failed holdout, untestable, or failed forward.
+
+1. Every eligible arm gets `floor` trials (default 1). This is the
+   exploration floor.
+2. The rest of the budget goes by Thompson sampling's allocation
+   probability, the posterior P(arm has the highest yield). It is computed
+   by quadrature, not sampling, so identical arms get identical shares.
+   Each arm's allocation is capped at its feature pool. Budget that a
+   capped arm cannot use is not pushed onto arms the posterior does not
+   favour, so a run can spend fewer trials than its budget, and fewer
+   trials means a larger Holm level for each one.
+3. Inside an arm, features that succeeded before are re-tested first, then
+   the least-tested ones, with ties broken by a seeded hash.
+
+Some arms are never eligible:
+
+- `SELF_LAG::` families, whose pairs are the contract's `self_lag` pairs
+  (the target or a declared near-copy of it);
+- families whose only features are excluded telemetry;
+- families without a fresh window (see below).
+
+On the S09b real-panel universe (`catalog_from_specs`, with class = the
+publication source), 153 of the 1,044 trials fall in SELF_LAG arms, and a
+full-budget allocation declares the other 891.
+
+### Cross-run error control
+
+Run `k` counts every allocation, abandoned ones included. It is issued
+`alpha_k = q / (k (k + 1))`, and those sum to `q k / (k + 1) < q` for all
+time. Inside a run, discovery selects by Holm at `alpha_k` over every
+declared trial, with untestable trials at p = 1. Holm bounds the
+family-wise error at `alpha_k` under **arbitrary dependence**. The union
+bound over runs then gives P(any false discovery, ever) ≤ Σ alpha_k < q,
+and FWER ≤ q implies FDR ≤ q. Holdout confirmation only removes
+selections.
+
+**Why not the alternatives?**
+
+- **LORD, SAFFRON and alpha-investing.** Their FDR guarantees need
+  independence or PRDS/local-dependence conditions. Here the p-values
+  depend on each other within a run (every feature of a family shares its
+  target labels, and features within a class share a factor) and across
+  runs (shared targets and features).
+- **A global BH over the cumulative ledger.** It needs PRDS, and it
+  re-decides old trials whenever the denominator grows: a trial acted on
+  in run 3, after its holdout was consumed, can be revoked by run 9. Its
+  repeated looks are also not covered by a single-look guarantee.
+- **Cost of the choice.** Alpha spending with Holm is valid whatever the
+  dependence, and its cost is power. The allocator partly pays that back
+  by concentrating trials. Late runs need many permutations:
+  `min_perms_for_first_step` is recorded per allocation, and a run whose
+  permutation resolution cannot reach Holm's first step is recorded as
+  `resolution_limited`.
+
+### Windows: the single-use holdout registry
+
+A run declares one label window `[start, end)`, which is discovery
+`[start, split)` plus holdout `[split, end)`. The allocator refuses a
+family whose earlier runs touched any part of that window. Abandoned
+allocations count as touching it. So a holdout is never re-tested, and a
+family is never re-tested on outcomes it has already seen, which is what
+keeps adaptively steered p-values valid.
+
+Once a family has spent the history, it can be re-tested only on new data,
+for example S10's forward log. Other families can still use the same
+history.
+
+The registry is per family. Families that share a target share its
+labels, so their validity given each other's outcomes rests on the
+permutation null being valid given the target sequence. That caveat is
+stated, not proved.
+
+### Forward-log input (S10 interface)
+
+`ingest_forward_outcomes(ledger, path)` reads a JSONL file whose lines
+carry exactly these fields: `trial_id`, `candidate_sha256`, `outcome`
+(`pass` or `fail`, the final verdict after the pre-registered stop rule),
+`n`, `evaluated_through` (a tz-aware ISO timestamp) and `prereg_sha256`.
+
+Each line must name a ledger holdout survivor with a matching candidate
+hash, and a trial can have only one verdict. The whole file is validated
+before anything is appended. Pending outcomes are not ingested.
+
+### Results (synthetic, seed 20260926)
+
+**Done-when: two consecutive dry runs.** The catalog has 3 feature classes
+× 2 targets at fwd1, 6 features per class, plus T1's own change (SELF_LAG
+for T1, and an `own` arm for T2). Budget 21, floor 1. Each run reads a
+fresh, disjoint epoch of 300 sessions (200 discovery and 100 holdout), and
+only `alpha::T1` carries a planted signal.
+
+| Family | Run 1 | Run 2 |
+|---|---|---|
+| `alpha::T1` (planted) | 3 (P(best) 0.143) | **6** (0.894) |
+| `alpha::T2`, `beta::T1`, `beta::T2`, `gamma::T2` | 3 each | 1 each (0.009) |
+| `gamma::T1` | 3 | 2 (0.009) |
+| `own::T2` | 1 | 1 (0.060) |
+| `SELF_LAG::T1` | 0 | 0 |
+| trials / issued alpha | 19 / 0.05 | 13 / 0.0167 |
+
+All 3 run-1 discoveries and all 6 run-2 discoveries are in the planted
+family, and all of them survive the holdout.
+
+**Pure noise, 20 runs, end to end** (allocate → contract → record, with a
+permutation cap of 2,999). There were 0 discoveries and alpha spent was
+0.0952. Per-run BH at q = 0.10 on the same recorded p-values would have
+made 4 false discoveries.
+
+**Monte Carlo** (300 sequences × 20 runs through the real allocator and
+ledger, with Gaussian p-values):
+
+| p-values | P(any false discovery) | Mean false discoveries | Per-run BH: P(any) | Per-run BH: mean |
+|---|---|---|---|---|
+| independent | 0.063 | 0.063 | 0.84 | 2.3 |
+| equicorrelated, ρ = 0.5 | 0.073 | 0.083 | 0.78 | 4.9 |
+
+The bound is Σ alpha_k = 0.0952. With a planted family (shift 5, ρ = 0.3,
+150 sequences), the mean FDP is 0.0009, there are about 102 true
+discoveries per sequence, and the planted family keeps its full pool of 6
+from run 2 on.
+
 ## Lineage and boundaries
 
 Claude's corrected vault #101 retracts its original leaking 12/3 survivors and
@@ -480,8 +659,9 @@ reads `hypothesis_registry`, `discovered_hypotheses` or `scanner_weights`.
   autocorrelation. It is not an exact test for every dependence structure: in
   the calibration test it cuts a 29% IID false-positive rate to about 9%, not
   to 5%. Since S09, fixed-step runs are diagnostic only for this reason.
-- A durable cross-run trial budget and single-use holdout registry; authenticated
-  code/protocol/input hashes; no repeated tuning against the same holdout.
+- Authenticated code/protocol/input hashes. (A durable cross-run trial budget and
+  a single-use holdout registry now exist as S11's file ledger; it is not yet
+  wired to any scheduled run.)
 - Prospective prediction logging before outcomes, frozen sample-size and stopping
   rules, forward scoring and an independently reviewed promotion policy.
 
