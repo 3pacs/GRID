@@ -24,12 +24,14 @@ vein-scan prototype v2 (obsidian-vault 532883a68) into this contract:
 
 Origins: ``synthetic_fixture`` (deterministic proof data),
 ``exploratory_replay`` (a hindsight replay of an offline CSV that has no
-per-source known-at/vintage contract) and ``pit_vintage_read`` (S09). The PIT
-origin is not a self-declared label: its protocol must carry the receipt hash
-of a panel that ``analysis.research_real_panel`` read through the vintage-safe
-``store.observations.read_window`` path, and ``discover``/``evaluate_holdout``
-re-derive every row from that verified panel and refuse anything else. Any
-other origin is refused.
+per-source known-at/vintage contract) and ``latest_vintage_read`` (S09, renamed
+from ``pit_vintage_read`` in S09b). The read origin is not a self-declared
+label: its protocol must carry the receipt hash of a panel that
+``analysis.research_real_panel`` read through ``store.observations.read_window``,
+and ``discover``/``evaluate_holdout`` re-derive every row from that verified
+panel and refuse anything else. Any other origin is refused. It is **not**
+point-in-time: every value is the latest vintage (hindsight), so its state is
+``LATEST_VINTAGE_READ_EXPLORATORY``.
 
 S09 fixes carried from the #658 review:
 
@@ -42,6 +44,25 @@ S09 fixes carried from the #658 review:
   (``caveats``, ``candidate_eligible``) and the payload ``method`` string.
 * Targets may be labelled as a ``return`` (end/start - 1, prices) or a
   ``change`` (end - start, for rates, spreads and indexes that can cross 0).
+
+S09b fixes carried from the #660 review:
+
+* ``self_lag``: declared (family, feature) pairs whose feature is the target's
+  own series or a declared near-copy (``research_real_panel.PROXY_GROUPS``).
+  They are measured for the record but carry status ``self_lag`` and p = 1.0
+  in the BH denominator, so they can never be selected or become candidates.
+* The default permutation block (``block=0``) is data-driven. The block-1 null
+  is anti-conservative when the sampled target is autocorrelated (target AR(1)
+  phi=0.35 against a persistent feature: 15.9% / 14.6% rejections at n=60 / 240
+  for a nominal 5%). :func:`autocorrelation_block` sizes the block from the
+  lag-1 autocorrelation of the sampled target on discovery rows only, and the
+  holdout reuses the frozen discovery block. Where the block may still be
+  anti-conservative (the MIN_BLOCKS cap binds, or |acf1| is inside a noise band
+  wider than 0.2 at small n) the family is named in the manifest ``caveats``
+  and the ``method`` string carries a CAVEAT.
+* Feature ``known_at`` may be supplied per value (the adapter stamps declared
+  publication times). ``validate_rows`` refuses any feature known after its
+  decision.
 """
 
 from __future__ import annotations
@@ -64,9 +85,9 @@ from analysis.hypothesis_tester import compute_lagged_correlation
 ORIGINS = {
     "synthetic_fixture": "SYNTHETIC_PROOF_ONLY",
     "exploratory_replay": "EXPLORATORY_REPLAY_ONLY",
-    "pit_vintage_read": "PIT_VINTAGE_READ_EXPLORATORY",
+    "latest_vintage_read": "LATEST_VINTAGE_READ_EXPLORATORY",
 }
-PIT_ORIGIN = "pit_vintage_read"
+LATEST_VINTAGE_ORIGIN = "latest_vintage_read"
 SAMPLING = ("horizon_spaced", "fixed_step_block_null")
 CANDIDATE_SAMPLING = ("horizon_spaced",)
 LABELS = ("return", "change")
@@ -76,6 +97,18 @@ FIXED_STEP_CAVEAT = (
     "only, never selects, no candidates"
 )
 STATISTICS = ("pearson", "spearman")
+# Data-driven block (S09b): the tolerated Bartlett-weight bias of the block null,
+# sum_k min(k/L, 1) |phi|^k ~ |phi| / ((1 - |phi|)^2 L) <= BLOCK_TOLERANCE, and
+# the fewest blocks a permutation may have.
+BLOCK_TOLERANCE = 0.05
+MIN_BLOCKS = 8
+# Below n = 100 the 2/sqrt(n) band exceeds 0.2: dependence that size goes unseen.
+UNDETECTABLE_ACF = 0.2
+CAPPED_BLOCK_CALIBRATION = (
+    "target AR(1) 0.35 vs persistent feature at n=60, block capped at 7: "
+    "7.0% rejections at nominal 5%"
+)
+SELF_LAG = "self_lag"
 
 
 def digest(value):
@@ -104,26 +137,35 @@ class Protocol:
     fdr_q: float = 0.10  # discovery BH-FDR level over the whole run
     sampling: str = "horizon_spaced"
     step: int = 1  # base decision spacing, in panel sessions
-    block: int = 0  # permutation block length in samples; 0 = overlap depth + 1
+    block: int = 0  # permutation block length in samples; 0 = data-driven (acf1)
     perms: int = 10000
     seed: int = 20260926
     statistic: str = "pearson"
     start: str = ""  # optional discovery start (earlier rows are warm-up only)
-    pit_receipt: str = ""  # sha256 of the vintage-safe read receipt (PIT origin only)
+    read_receipt: str = ""  # sha256 of the latest-vintage read receipt (read origin only)
+    # (family, feature) trials whose feature proxies the family's own target
+    self_lag: tuple[tuple[str, str], ...] = ()
 
     def validate(self):
         if self.origin not in ORIGINS:
             raise ValueError("real PIT/source/session contracts are not implemented")
-        if (self.origin == PIT_ORIGIN) != bool(self.pit_receipt) or (
-            self.pit_receipt
+        if (self.origin == LATEST_VINTAGE_ORIGIN) != bool(self.read_receipt) or (
+            self.read_receipt
             and (
-                len(self.pit_receipt) != 64
-                or set(self.pit_receipt) - set("0123456789abcdef")
+                len(self.read_receipt) != 64
+                or set(self.read_receipt) - set("0123456789abcdef")
             )
         ):
             raise ValueError(
-                "pit_vintage_read needs, and only it may carry, a vintage-safe read receipt"
+                "latest_vintage_read needs, and only it may carry, a read receipt"
             )
+        if len(set(self.self_lag)) != len(self.self_lag) or any(
+            len(pair) != 2
+            or pair[0] not in self.families
+            or pair[1] not in self.features
+            for pair in self.self_lag
+        ):
+            raise ValueError("self_lag pairs must name declared families and features")
         if (
             not self.run_id
             or not self.features
@@ -156,6 +198,7 @@ def protocol_from_payload(value):
             **value,
             "features": tuple(value["features"]),
             "families": tuple(value["families"]),
+            "self_lag": tuple(tuple(pair) for pair in value.get("self_lag", ())),
         }
     )
 
@@ -240,18 +283,98 @@ def validate_rows(rows, protocol, window):
     return depth
 
 
-def permutation_block(protocol, depth):
-    """Block length covering the outcome overlap; a shorter declared block is refused."""
+def lag1_autocorrelation(values) -> float | None:
+    """Sample lag-1 autocorrelation (``None`` when undefined)."""
+    y = np.asarray(values, dtype=float)
+    if len(y) < 3:
+        return None
+    y = y - y.mean()
+    denominator = float(y @ y)
+    return float(y[1:] @ y[:-1]) / denominator if denominator > 0 else None
+
+
+def autocorrelation_block(target, depth: int = 0) -> tuple[int, dict]:
+    """Data-driven permutation block for a sampled target sequence (S09b).
+
+    ``target`` must be the sampled *discovery* labels only. If the lag-1
+    autocorrelation phi lies inside the 2/sqrt(n) band, the block is the overlap
+    floor (``depth + 1``). Otherwise it is sized so the block null's
+    Bartlett-weight bias for an AR(1) of that |phi| stays below
+    ``BLOCK_TOLERANCE``, i.e. ``ceil(|phi| / ((1 - |phi|)^2 * tol))``, capped so
+    at least ``MIN_BLOCKS`` blocks remain and never below the overlap floor.
+
+    Negative phi (mean-reverting change labels) lengthens the block too: block
+    1 is then conservative against a persistent feature, and the longer block
+    is the accurate null (see the S09b calibration tests).
+
+    Returns ``(block, basis)``; ``basis`` is written into the manifest. It
+    carries a ``caveat`` when the block is known to be possibly
+    anti-conservative: the ``MIN_BLOCKS`` cap binds, or |phi| is inside a noise
+    band wider than ``UNDETECTABLE_ACF`` (small n), where real dependence of
+    that size would go undetected and the floor block would be used.
+    """
+    floor = depth + 1
+    n = len(target)
+    phi = lag1_autocorrelation(target)
+    band = 2 / math.sqrt(n) if n else None
+    basis = {"n": n, "acf1": phi, "band_2se": band, "rule": "overlap floor"}
+    if phi is None or abs(phi) <= band:
+        if phi is not None and band > UNDETECTABLE_ACF:
+            basis["caveat"] = (
+                f"|acf1|={abs(phi):.3f} inside the 2/sqrt(n) band {band:.3f} at n={n}: "
+                f"serial dependence up to that size is undetectable, so block {floor} "
+                "may be anti-conservative"
+            )
+        return floor, basis
+    a = min(abs(phi), 0.95)
+    wanted = math.ceil(a / ((1 - a) ** 2 * BLOCK_TOLERANCE))
+    block = max(floor, min(wanted, n // MIN_BLOCKS))
+    basis["rule"] = (
+        f"ceil(|acf1|/((1-|acf1|)^2*{BLOCK_TOLERANCE}))={wanted}, "
+        f"capped at n//{MIN_BLOCKS}={n // MIN_BLOCKS}, floor {floor}"
+    )
+    if block < wanted:
+        basis["caveat"] = (
+            f"block capped at {block} < {wanted} (n={n}, >= {MIN_BLOCKS} blocks): "
+            f"residual anti-conservatism (calibration: {CAPPED_BLOCK_CALIBRATION})"
+        )
+    return block, basis
+
+
+def permutation_block(protocol, depth, target=None) -> int:
+    """Block length covering the outcome overlap; a shorter declared block is refused.
+
+    A declared ``protocol.block`` is used as is. The default (``block=0``) is
+    data-driven from ``target`` (the sampled discovery labels) when given, and
+    the overlap floor ``depth + 1`` otherwise.
+    """
     needed = depth + 1
     if protocol.block and protocol.block < needed:
         raise ValueError("permutation block shorter than outcome overlap")
-    return protocol.block or needed
+    if protocol.block:
+        return protocol.block
+    if target is None:
+        return needed
+    return autocorrelation_block(target, depth)[0]
+
+
+def holdout_block(protocol, frozen_block: int, depth: int, n: int) -> int:
+    """The frozen discovery block: holdout labels never re-estimate it.
+
+    Capped so at least ``MIN_BLOCKS`` blocks remain, never below the holdout
+    overlap floor. A declared block is used as is.
+    """
+    if protocol.block:
+        return permutation_block(protocol, depth)
+    return max(depth + 1, min(frozen_block, max(1, n // MIN_BLOCKS)))
 
 
 # --- (a) split first, then label -------------------------------------------------
 
 
-def build_family_rows(protocol, features, price, horizon, window, label="return"):
+def build_family_rows(
+    protocol, features, price, horizon, window, label="return", known_at=None
+):
     """Build one target family's rows for one window, labelling only after the split.
 
     ``features``: DataFrame on a sorted, unique, tz-aware session index; the
@@ -266,6 +389,9 @@ def build_family_rows(protocol, features, price, horizon, window, label="return"
     from the window's first session every ``max(step, horizon)`` sessions
     (``horizon_spaced``) or every ``step`` sessions (``fixed_step_block_null``).
     NaN feature values become explicit ``None`` abstentions.
+    ``known_at``: optional DataFrame shaped like ``features`` holding when each
+    value became known (tz-aware timestamps). Without it a value is stamped as
+    known at its decision, which is only honest for synthetic fixtures.
     """
     protocol.validate()
     if window not in ("discovery", "holdout") or horizon < 1 or label not in LABELS:
@@ -280,6 +406,10 @@ def build_family_rows(protocol, features, price, horizon, window, label="return"
         or list(features.columns) != list(protocol.features)
     ):
         raise ValueError("features/price must share a unique tz-aware session index")
+    if known_at is not None and (
+        not known_at.index.equals(index) or list(known_at.columns) != list(features.columns)
+    ):
+        raise ValueError("known_at must be shaped like the features")
     split, end = stamp(protocol.split), stamp(protocol.end)
     if window == "discovery":
         lo = stamp(protocol.start) if protocol.start else index[0]
@@ -290,6 +420,7 @@ def build_family_rows(protocol, features, price, horizon, window, label="return"
     visible = price.to_numpy(dtype=float, copy=True)
     visible[~in_window] = np.nan
     values = features.to_numpy(dtype=float)
+    stamps = known_at
     step = (
         max(protocol.step, horizon)
         if protocol.sampling == "horizon_spaced"
@@ -321,9 +452,15 @@ def build_family_rows(protocol, features, price, horizon, window, label="return"
                 "features": {
                     name: {
                         "value": float(v) if np.isfinite(v) else None,
-                        "known_at": decided,
+                        "known_at": (
+                            stamps.iat[i, k].isoformat()
+                            if stamps is not None
+                            and np.isfinite(v)
+                            and not pd.isna(stamps.iat[i, k])
+                            else decided
+                        ),
                     }
-                    for name, v in zip(protocol.features, values[i])
+                    for k, (name, v) in enumerate(zip(protocol.features, values[i]))
                 },
             }
         )
@@ -431,39 +568,59 @@ def as_families(protocol, rows):
     return {protocol.families[0]: rows}
 
 
-def check_pit_rows(protocol, families, pit_panel, window):
-    """The PIT origin is proven by re-deriving rows from a verified panel, not by its label."""
-    if protocol.origin != PIT_ORIGIN:
-        if pit_panel is not None:
+def check_read_rows(protocol, families, panel, window):
+    """The read origin is proven by re-deriving rows from a verified panel, not by its label."""
+    if protocol.origin != LATEST_VINTAGE_ORIGIN:
+        if panel is not None:
             raise ValueError(
-                "a vintage-safe panel is only accepted with origin pit_vintage_read"
+                "a latest-vintage panel is only accepted with origin latest_vintage_read"
             )
         return
     # Lazy import: the adapter imports this module.
-    from analysis.research_real_panel import verify_pit_rows
+    from analysis.research_real_panel import verify_latest_vintage_rows
 
-    verify_pit_rows(pit_panel, protocol, families, window)
+    verify_latest_vintage_rows(panel, protocol, families, window)
 
 
-def discover(protocol, discovery_rows, pit_panel=None):
+def self_lag_result(rows, feature, protocol, block):
+    """A proxy trial: measured for the record, never testable, p = 1.0 in BH."""
+    measured = measure(rows, feature, protocol, block)
+    return {
+        "n": measured["n"],
+        "r": None,
+        "p": 1.0,
+        "status": SELF_LAG,
+        "self_lag_r": measured["r"],
+        "self_lag_p": measured["p"] if measured["status"] == "tested" else None,
+    }
+
+
+def discover(protocol, discovery_rows, panel=None):
     """This API never receives holdout rows. Freeze its result before evaluation.
 
-    ``pit_panel`` is required for (and only accepted with) ``pit_vintage_read``.
+    ``panel`` is required for (and only accepted with) ``latest_vintage_read``.
     """
     families = as_families(protocol, discovery_rows)
-    check_pit_rows(protocol, families, pit_panel, "discovery")
-    ledger, horizons, blocks = [], {}, {}
+    check_read_rows(protocol, families, panel, "discovery")
+    self_lag = set(protocol.self_lag)
+    ledger, horizons, blocks, block_basis = [], {}, {}, {}
     for family, rows in families.items():
-        blocks[family] = permutation_block(
-            protocol, validate_rows(rows, protocol, "discovery")
-        )
+        depth = validate_rows(rows, protocol, "discovery")
+        targets = [row["target"] for row in rows]  # discovery labels only
+        if protocol.block:
+            blocks[family] = permutation_block(protocol, depth)
+            block_basis[family] = {"rule": "declared", "block": protocol.block}
+        else:
+            blocks[family], basis = autocorrelation_block(targets, depth)
+            block_basis[family] = {**basis, "block": blocks[family]}
         horizons[family] = outcome_horizon(rows[0]) if rows else None
         for feature in protocol.features:
-            result = (
-                {"n": 0, "r": None, "p": 1.0, "status": "excluded_telemetry"}
-                if excluded(feature)
-                else measure(rows, feature, protocol, blocks[family])
-            )
+            if excluded(feature):
+                result = {"n": 0, "r": None, "p": 1.0, "status": "excluded_telemetry"}
+            elif (family, feature) in self_lag:
+                result = self_lag_result(rows, feature, protocol, blocks[family])
+            else:
+                result = measure(rows, feature, protocol, blocks[family])
             ledger.append(
                 {
                     "trial_id": digest([protocol.run_id, family, feature]),
@@ -482,13 +639,21 @@ def discover(protocol, discovery_rows, pit_panel=None):
             eligible and trial["status"] == "tested" and adjusted <= protocol.fdr_q
         )
     tested = sum(t["status"] == "tested" for t in ledger)
-    caveats = [] if eligible else [FIXED_STEP_CAVEAT]
+    # Block caveats only where trials could be tested (n >= min_n).
+    block_caveats = [
+        f"{family}: {basis['caveat']}"
+        for family, basis in block_basis.items()
+        if "caveat" in basis and basis["n"] >= protocol.min_n
+    ]
+    caveats = ([] if eligible else [FIXED_STEP_CAVEAT]) + block_caveats
     payload = {
         "protocol": asdict(protocol),
         "discovery_sha256": digest(families),
         "horizons": horizons,
         "blocks": blocks,
+        "block_basis": block_basis,
         "trial_count": len(ledger),
+        "self_lag_count": sum(t["status"] == SELF_LAG for t in ledger),
         "tested_count": tested,
         "untestable_count": len(ledger) - tested,
         "min_attainable_p": 1 / (protocol.perms + 1),
@@ -497,10 +662,19 @@ def discover(protocol, discovery_rows, pit_panel=None):
         "caveats": caveats,
         "method": (
             f"fixed lag0 {protocol.statistic}; {protocol.sampling} sampling; "
-            f"block-permutation null ({protocol.perms} perms, seed {protocol.seed}); "
+            f"block-permutation null ({protocol.perms} perms, seed {protocol.seed}, "
+            f"block {'declared' if protocol.block else 'from discovery target acf1'}); "
+            "self_lag proxy trials never select; "
             f"BH-FDR q={protocol.fdr_q} over the full declared universe incl. "
             "untestable; holdout Bonferroni over frozen selections"
             + ("" if eligible else f"; CAVEAT: {FIXED_STEP_CAVEAT}")
+            + (
+                f"; CAVEAT: data-driven block may be anti-conservative in "
+                f"{len(block_caveats)} of {len(block_basis)} families (block capped "
+                "or acf1 undetectable at small n; see caveats)"
+                if block_caveats
+                else ""
+            )
         ),
         "state": "DISCOVERY_FROZEN",
         "promotion_allowed": False,
@@ -508,23 +682,29 @@ def discover(protocol, discovery_rows, pit_panel=None):
     return {"payload": payload, "sha256": digest(payload)}
 
 
-def evaluate_holdout(frozen, holdout_rows, pit_panel=None):
+def evaluate_holdout(frozen, holdout_rows, panel=None):
     payload = frozen["payload"]
     if digest(payload) != frozen["sha256"]:
         raise ValueError("frozen discovery manifest changed")
     protocol = protocol_from_payload(payload["protocol"])
     families = as_families(protocol, holdout_rows)
-    check_pit_rows(protocol, families, pit_panel, "holdout")
+    check_read_rows(protocol, families, panel, "holdout")
     blocks = {}
     for family, rows in families.items():
-        blocks[family] = permutation_block(
-            protocol, validate_rows(rows, protocol, "holdout")
+        blocks[family] = holdout_block(
+            protocol,
+            payload["blocks"][family],
+            validate_rows(rows, protocol, "holdout"),
+            len(rows),
         )
         if rows and payload["horizons"][family] != outcome_horizon(rows[0]):
             raise ValueError("holdout horizon differs from frozen discovery")
     selected = [trial for trial in payload["ledger"] if trial["selected"]]
     if selected and protocol.sampling not in CANDIDATE_SAMPLING:
         raise ValueError("fixed-step manifests are diagnostic only")
+    self_lag = set(protocol.self_lag)
+    if any((t["family"], t["feature"]) in self_lag for t in selected):
+        raise ValueError("self_lag proxy trials can never become candidates")
     checks, candidates = [], []
     for trial in selected:
         family = trial["family"]
@@ -565,6 +745,7 @@ def evaluate_holdout(frozen, holdout_rows, pit_panel=None):
     return {
         "discovery_manifest": frozen["sha256"],
         "holdout_sha256": digest(families),
+        "holdout_blocks": blocks,
         "holdout_checks": checks,
         "candidates": candidates,
         "state": ORIGINS[protocol.origin],
@@ -578,17 +759,17 @@ def write_once(path, value):
         json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
 
 
-def run_proof(protocol, discovery_rows, holdout_rows, output, pit_panel=None):
+def run_proof(protocol, discovery_rows, holdout_rows, output, panel=None):
     """Local receipt directory must be new: reruns cannot overwrite consumed evidence."""
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
-    frozen = discover(protocol, discovery_rows, pit_panel)
+    frozen = discover(protocol, discovery_rows, panel)
     write_once(output / "discovery-frozen.json", frozen)
     # Read back the persisted freeze; holdout cannot alter search or trial universe.
     result = evaluate_holdout(
         json.loads((output / "discovery-frozen.json").read_text()),
         holdout_rows,
-        pit_panel,
+        panel,
     )
     write_once(output / "holdout-result.json", result)
     return result

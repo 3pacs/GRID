@@ -7,6 +7,8 @@ survivors (fwd10/fwd20 untestable); weekly + block-permutation null: 2,280
 testable, 0 BH survivors. This replay uses 10,000 permutations like v2 and a
 whole-run BH denominator (2,640), which can only be stricter than v2's
 testable-only denominator. Exploratory replay: nothing here is evidence.
+Since S09b the default block is data-driven from each family's discovery
+target acf1, so some families use blocks 5-6; the zero survivors are unchanged.
 """
 
 from pathlib import Path
@@ -28,8 +30,8 @@ def test_fixture_is_the_v2_panel():
 @pytest.mark.parametrize(
     "sampling, testable, untestable_by_horizon, blocks",
     [
-        ("horizon_spaced", 1140, {1: 90, 5: 90, 10: 660, 20: 660}, [1]),
-        ("fixed_step_block_null", 2280, {1: 90, 5: 90, 10: 90, 20: 90}, [1, 2, 4]),
+        ("horizon_spaced", 1140, {1: 90, 5: 90, 10: 660, 20: 660}, [1, 6]),
+        ("fixed_step_block_null", 2280, {1: 90, 5: 90, 10: 90, 20: 90}, [1, 2, 4, 5, 6]),
     ],
 )
 @pytest.mark.slow

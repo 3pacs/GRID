@@ -9,6 +9,7 @@ Synthetic data only; no DB.
 """
 
 import copy
+import math
 from dataclasses import replace
 from itertools import pairwise
 
@@ -19,7 +20,10 @@ from scipy.signal import lfilter
 from scipy.stats import pearsonr
 
 from analysis.offline_research_proof import (
+    BLOCK_TOLERANCE,
+    MIN_BLOCKS,
     Protocol,
+    autocorrelation_block,
     bh_adjusted,
     block_permutation_pvalue,
     block_permutations,
@@ -316,8 +320,9 @@ def test_discover_applies_one_bh_family_across_every_trial():
 
 @pytest.mark.parametrize("n", [60, 240])
 def test_horizon_spaced_block_one_null_is_calibrated(n):
-    """Horizon-spaced outcomes do not overlap, so block 1 is the right null: an
-    independent persistent feature must be rejected at about the nominal 5%
+    """Horizon-spaced outcomes do not overlap, so with a serially independent
+    target block 1 is the right null (S09b: not with an autocorrelated target,
+    see below): an independent persistent feature must be rejected at about the nominal 5%
     (the #658 reviewer's simulation gave 4.25%). With 499 permutations the exact
     size of ``p < 0.05`` is 24/500 = 4.8%; this seed measures 4.0% / 3.9%."""
     rng = np.random.default_rng(20260926 + n)
@@ -327,6 +332,139 @@ def test_horizon_spaced_block_one_null_is_calibrated(n):
         y = rng.normal(size=n)
         hits += block_permutation_pvalue(x, y, 1, 499, s)[1] < 0.05
     assert 0.03 <= hits / sims <= 0.07
+
+
+# --- S09b: calibration under an autocorrelated target (#660 review) ---------------
+
+
+def ar1(rng, phi, n):
+    return lfilter([1.0], [1.0, -phi], rng.normal(size=n + 200))[200:]
+
+
+def null_rejection_rates(phi_y, n, sims, seed=20260926):
+    """Independent persistent feature (AR(1) 0.95, like a z60 sampled every 5
+    sessions) vs an AR(1) target *at the sampling spacing*: rejection rates at
+    nominal 5% for block 1 and for the data-driven block."""
+    rng = np.random.default_rng(seed + n)
+    one = auto = 0
+    for s in range(sims):
+        x, y = ar1(rng, 0.95, n), ar1(rng, phi_y, n)
+        block = autocorrelation_block(y)[0]
+        one += block_permutation_pvalue(x, y, 1, 499, s)[1] < 0.05
+        auto += block_permutation_pvalue(x, y, block, 499, s)[1] < 0.05
+    return one / sims, auto / sims
+
+
+@pytest.mark.parametrize("n, auto_bound", [(60, 0.085), (240, 0.07)])
+def test_block_one_is_anti_conservative_for_an_autocorrelated_target(n, auto_bound):
+    """Target AR(1) phi=0.35 (the HY OAS fwd5 label has acf1 = +0.335). This seed
+    measures block 1 at 15.9% (n=60) / 14.6% (n=240) for a nominal 5%, and the
+    data-driven block at 7.0% / 5.0% (median block 7 / 16). At n=60 the block
+    is capped at n // MIN_BLOCKS = 7, which leaves the residual excess."""
+    one, auto = null_rejection_rates(0.35, n, sims=800)
+    assert one > 0.12
+    assert auto <= auto_bound and auto < one / 2
+
+
+def test_negative_target_autocorrelation_makes_block_one_conservative():
+    """Target AR(1) phi=-0.18 (the VIX fwd5 label has acf1 = -0.176): block 1
+    rejects 2.0% for a nominal 5% (too few), the data-driven block 4.25%. This
+    is why the post-hoc longer blocks selected MORE, not fewer."""
+    one, auto = null_rejection_rates(-0.18, 240, sims=800)
+    assert one < 0.035
+    assert 0.03 <= auto <= 0.07 and auto > one
+
+
+def test_autocorrelation_block_rule():
+    rng = np.random.default_rng(5)
+    iid = rng.normal(size=690)
+    assert autocorrelation_block(iid)[0] == 1
+    assert autocorrelation_block(iid, depth=3)[0] == 4  # overlap floor
+    y = ar1(rng, 0.35, 690)
+    block, basis = autocorrelation_block(y)
+    a = abs(basis["acf1"])
+    assert basis["n"] == 690 and a > basis["band_2se"]
+    assert block == math.ceil(a / ((1 - a) ** 2 * BLOCK_TOLERANCE))
+    assert autocorrelation_block(y[:80])[0] <= 80 // MIN_BLOCKS  # at least 8 blocks
+    assert autocorrelation_block([1.0, 2.0])[0] == 1  # undefined acf -> floor
+    assert autocorrelation_block([], depth=2)[0] == 3
+
+
+def test_block_caveat_when_the_cap_binds_or_acf1_is_undetectable():
+    rng = np.random.default_rng(20260926)
+    capped = autocorrelation_block(ar1(rng, 0.6, 60))[1]
+    assert "capped" in capped["caveat"] and "7.0%" in capped["caveat"]
+    # The n=60 calibration case is always caveated: an acf1 outside the band
+    # (0.258) wants a block > 7 and is capped; one inside it is undetectable.
+    kinds = set()
+    for _ in range(50):
+        basis = autocorrelation_block(ar1(rng, 0.35, 60))[1]
+        kinds.add("capped" if "capped" in basis["caveat"] else "undetectable")
+    assert kinds == {"capped", "undetectable"}
+    small = autocorrelation_block(rng.normal(size=40))[1]  # band 0.316 > 0.2
+    assert abs(small["acf1"]) <= small["band_2se"]
+    assert "undetectable" in small["caveat"]
+    for y in (rng.normal(size=240), ar1(rng, 0.35, 690)):  # neither binds
+        assert "caveat" not in autocorrelation_block(y)[1]
+
+
+def test_block_caveats_reach_the_manifest_and_the_method_string():
+    features, prices = synthetic_panel()
+    protocol = protocol_for(features)
+    discovery = family_rows(protocol, features, prices, "discovery")
+    family = "SPY|fwd5"
+    rng = np.random.default_rng(3)
+    for row, value in zip(discovery[family], ar1(rng, 0.6, len(discovery[family]))):
+        row["target"] = float(value)
+    payload = discover(protocol, discovery)["payload"]
+    assert payload["candidate_eligible"]  # a caveat, not a refusal
+    block_caveats = [c for c in payload["caveats"] if c.startswith(f"{family}:")]
+    assert len(block_caveats) == 1 and "capped" in block_caveats[0]
+    assert "CAVEAT: data-driven block may be anti-conservative" in payload["method"]
+    # families too short to test (n < min_n) carry no caveat
+    short = [f for f, b in payload["block_basis"].items() if b["n"] < protocol.min_n]
+    assert short and not any(c.startswith(tuple(f"{f}:" for f in short))
+                             for c in payload["caveats"])
+    # a declared block carries no data-driven caveat
+    declared = discover(replace(protocol, block=2), discovery)["payload"]
+    assert declared["caveats"] == [] and "CAVEAT" not in declared["method"]
+
+
+def test_default_block_comes_from_discovery_labels_and_is_frozen_for_holdout():
+    features, prices = synthetic_panel()
+    protocol = protocol_for(features)
+    discovery = family_rows(protocol, features, prices, "discovery")
+    # make one family's discovery labels strongly autocorrelated
+    rng = np.random.default_rng(1)
+    family = "SPY|fwd5"
+    walk = ar1(rng, 0.6, len(discovery[family]))
+    for row, value in zip(discovery[family], walk):
+        row["target"] = float(value)
+    frozen = discover(protocol, discovery)
+    payload = frozen["payload"]
+    basis = payload["block_basis"][family]
+    assert basis["n"] == len(discovery[family])  # discovery rows only
+    assert payload["blocks"][family] == basis["block"] > 1
+    assert payload["blocks"]["SPY|fwd1"] >= 1
+    holdout = family_rows(protocol, features, prices, "holdout")
+    result = evaluate_holdout(frozen, holdout)
+    for name, block in result["holdout_blocks"].items():
+        n = len(holdout[name])
+        assert block == max(1, min(payload["blocks"][name], max(1, n // MIN_BLOCKS)))
+    # a declared block is used as is, in discovery and holdout
+    declared = discover(replace(protocol, block=3), discovery)["payload"]
+    assert set(declared["blocks"].values()) == {3}
+    assert declared["block_basis"][family] == {"rule": "declared", "block": 3}
+
+
+def test_self_lag_pairs_must_name_declared_trials():
+    features, _ = synthetic_panel()
+    protocol = protocol_for(features)
+    replace(protocol, self_lag=(("SPY|fwd5", "VIX|chg5"),)).validate()
+    with pytest.raises(ValueError, match="self_lag"):
+        replace(protocol, self_lag=(("SPY|fwd7", "VIX|chg5"),)).validate()
+    with pytest.raises(ValueError, match="self_lag"):
+        replace(protocol, self_lag=(("SPY|fwd5", "NOPE"),)).validate()
 
 
 def test_fixed_step_runs_are_diagnostic_only_and_say_so():
