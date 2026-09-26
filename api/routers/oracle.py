@@ -15,6 +15,12 @@ from loguru import logger as log
 from api.auth import require_auth
 from api.dependencies import get_db_engine
 from oracle.engine import EnsemblePredictor, OracleEngine
+from oracle.entry_price_policy import (
+    PNL_BASIS_MEASURED,
+    PNL_BASIS_NO_SPOT,
+    PNL_BASIS_SPOT_LOOKUP_FAILED,
+    entry_price_pnl_basis,
+)
 from oracle.publish import publish_astrogrid_prediction
 from oracle.scoreboard import build_oracle_scoreboard
 
@@ -46,7 +52,10 @@ class OraclePublishRequest(BaseModel):
     call: str
     timing: str
     invalidation: str
-    confidence: float = 0.5
+    # No default: a publisher that does not state a confidence publishes
+    # without one (docs/reference/CONFIDENCE_POLICY.md). The old 0.5 default
+    # made every silent caller look like a stated 50% forecast.
+    confidence: float | None = None
     weight_version: str = "astrogrid-v1"
     model_version: str = "astrogrid-oracle-v1"
     grid_summary: str | None = None
@@ -105,7 +114,7 @@ def get_predictions(
                 "expected_move_pct, signal_strength, coherence, "
                 "model_name, model_version, signals, anti_signals, "
                 "flow_context, verdict, actual_price, actual_move_pct, "
-                "pnl_pct, scored_at, score_notes "
+                "pnl_pct, scored_at, score_notes, null_write_policy "
                 "FROM oracle_predictions WHERE " + where_sql + " "
                 "ORDER BY created_at DESC LIMIT :lim OFFSET :off"
             ),
@@ -119,23 +128,39 @@ def get_predictions(
             expiry_date = date.fromisoformat(expiry_date)
         days_left = (expiry_date - today).days if expiry_date else 0
 
-        # Compute tracking P&L for active predictions
+        # Compute tracking P&L for active predictions.
+        #
+        # A NULL entry price (D-M32: no spot observed at publish time) is not
+        # a zero entry price, and neither is divisible. Both are excluded, but
+        # explicitly and *before* the division: `and r[6]` only escaped a
+        # divide-by-zero because 0.0 happens to be falsy. Whenever the return
+        # cannot be computed the client is told so by name in
+        # `tracking_pnl_basis` rather than being handed a null it has to guess
+        # about — and never a stand-in entry price or a 0% return.
         tracking_pnl = None
-        if r[17] == "pending" and r[6]:
-            try:
-                with engine.connect() as conn2:
-                    spot = conn2.execute(text("""
-                        SELECT spot_price FROM options_daily_signals
-                        WHERE ticker = :t AND spot_price > 0
-                        ORDER BY signal_date DESC LIMIT 1
-                    """), {"t": r[2]}).fetchone()
-                    if spot:
-                        current = float(spot[0])
-                        entry = float(r[6])
-                        move_pct = (current - entry) / entry * 100
-                        tracking_pnl = move_pct if r[4] == "CALL" else -move_pct
-            except Exception as e:
-                log.warning("Oracle: spot price lookup failed for {t}: {e}", t=r[2], e=str(e))
+        tracking_pnl_basis = None
+        if r[17] == "pending":
+            entry_raw = r[6]
+            tracking_pnl_basis = entry_price_pnl_basis(entry_raw)
+            if tracking_pnl_basis is None:
+                try:
+                    with engine.connect() as conn2:
+                        spot = conn2.execute(text("""
+                            SELECT spot_price FROM options_daily_signals
+                            WHERE ticker = :t AND spot_price > 0
+                            ORDER BY signal_date DESC LIMIT 1
+                        """), {"t": r[2]}).fetchone()
+                        if spot:
+                            current = float(spot[0])
+                            entry = float(entry_raw)
+                            move_pct = (current - entry) / entry * 100
+                            tracking_pnl = move_pct if r[4] == "CALL" else -move_pct
+                            tracking_pnl_basis = PNL_BASIS_MEASURED
+                        else:
+                            tracking_pnl_basis = PNL_BASIS_NO_SPOT
+                except Exception as e:
+                    log.warning("Oracle: spot price lookup failed for {t}: {e}", t=r[2], e=str(e))
+                    tracking_pnl_basis = PNL_BASIS_SPOT_LOOKUP_FAILED
 
         predictions.append({
             "id": r[0],
@@ -161,8 +186,15 @@ def get_predictions(
             "pnl_pct": r[20],
             "scored_at": r[21].isoformat() if r[21] else None,
             "score_notes": r[22],
+            # Historical-NULL provenance boundary (oracle_pred_nullable_0918):
+            # non-null here proves this row's entry_price/confidence NULL,
+            # if either is NULL, is the honest-measurement policy's NULL,
+            # without a reader having to re-derive that from migration
+            # history. NULL means "predates the policy, or unknown."
+            "null_write_policy": r[23],
             "days_left": days_left,
             "tracking_pnl": round(tracking_pnl, 2) if tracking_pnl is not None else None,
+            "tracking_pnl_basis": tracking_pnl_basis,
         })
 
     return {
@@ -216,7 +248,11 @@ def get_latest(
             FROM oracle_predictions
             WHERE created_at >= :ct - INTERVAL '5 minutes'
               AND dedup_keep = TRUE
-            ORDER BY confidence DESC
+            -- A prediction with no stated confidence is unknown, not the
+            -- most confident: NULLS LAST, never first. Postgres sorts NULLs
+            -- FIRST under DESC, so without this an unscored row heads the
+            -- headline list.
+            ORDER BY confidence DESC NULLS LAST
             LIMIT 20
         """), {"ct": cycle_time}).fetchall()
 

@@ -248,6 +248,20 @@ def compute_regime_stats(
     return stats
 
 
+def _pit_safe_fill(matrix: pd.DataFrame) -> pd.DataFrame:
+    """Forward-fill gaps from already-known history only.
+
+    Never back-fills: a gap must be carried forward from the most recent
+    prior observation, never patched from an observation that has not
+    happened yet (``bfill`` would pull a *future* value backwards into an
+    earlier row). Columns that never had any data are dropped; a row that
+    still has a gap after forward-filling (i.e. before that column's very
+    first observation) is dropped too rather than guessed at.
+    """
+    filled = matrix.ffill().dropna(axis=1, how="all")
+    return filled.dropna()
+
+
 def compute_transition_returns(
     daily_returns: pd.Series,
     regime_series: pd.Series,
@@ -311,6 +325,42 @@ class PitchBacktester:
             from store.pit import PITStore
             self.pit_store = PITStore(self.engine)
 
+    def _fetch_pit_correct_matrix(
+        self,
+        feature_ids: list[int],
+        start_date: date,
+        end_date: date,
+        vintage_policy: str = "FIRST_RELEASE",
+    ) -> pd.DataFrame:
+        """Fetch one calendar day at a time so no row's value can reflect
+        anything released after that row's own date.
+
+        Twin of ``validation.backtest.WalkForwardBacktest._fetch_pit_correct_matrix``
+        — see that docstring for the full rationale. ``PITStore.get_feature_matrix``
+        only takes one ``as_of_date`` per call, so per-decision-point PIT
+        correctness requires pinning it to each row's own date.
+        """
+        frames: list[pd.DataFrame] = []
+        current = start_date
+        while current <= end_date:
+            daily = self.pit_store.get_feature_matrix(
+                feature_ids=feature_ids,
+                start_date=current,
+                end_date=current,
+                as_of_date=current,
+                vintage_policy=vintage_policy,
+            )
+            if not daily.empty:
+                frames.append(daily)
+            current += timedelta(days=1)
+
+        if not frames:
+            return pd.DataFrame(index=pd.DatetimeIndex([], name="obs_date"))
+
+        combined = pd.concat(frames)
+        combined = combined[~combined.index.duplicated(keep="first")]
+        return combined.sort_index()
+
     def run_historical_regime(
         self,
         start_date: date = date(2015, 1, 1),
@@ -351,13 +401,16 @@ class PitchBacktester:
             log.error("No model-eligible features found")
             return pd.DataFrame()
 
-        # Get full feature matrix
+        # Get full feature matrix. Fetched one calendar day at a time (see
+        # _fetch_pit_correct_matrix) instead of a single as_of_date=end_date
+        # call for the whole window: a single end_date cutoff let a value
+        # released partway through the window (but before end_date) be
+        # visible for training on an earlier day than it actually existed.
         lookback_start = start_date - timedelta(days=504)
-        matrix = self.pit_store.get_feature_matrix(
+        matrix = self._fetch_pit_correct_matrix(
             feature_ids=fids,
             start_date=lookback_start,
             end_date=end_date,
-            as_of_date=end_date,
             vintage_policy="FIRST_RELEASE",
         )
 
@@ -365,7 +418,7 @@ class PitchBacktester:
             log.error("Empty feature matrix")
             return pd.DataFrame()
 
-        matrix = matrix.ffill().bfill().dropna(axis=1, how="all").dropna()
+        matrix = _pit_safe_fill(matrix)
         log.info("Feature matrix: {r} rows × {c} cols", r=matrix.shape[0], c=matrix.shape[1])
 
         # Day-by-day regime classification with periodic retraining

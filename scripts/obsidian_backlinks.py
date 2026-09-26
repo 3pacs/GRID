@@ -13,10 +13,13 @@ Usage:
     python scripts/obsidian_backlinks.py --check       # Fail on malformed links
 """
 
+import os
 import re
 import sys
 from pathlib import Path
 from collections import defaultdict
+
+from loguru import logger as log
 
 GRID_ROOT = Path(__file__).resolve().parent.parent
 
@@ -61,6 +64,104 @@ def collect_markdown_files() -> list[Path]:
                 if f.name not in SKIP_FILES:
                     files.append(f)
     return sorted(set(files))
+
+
+# ─── Automated (Hermes) write target — never the repo checkout ───────────
+#
+# Hermes' automated backlink step (scripts/hermes_operator.py::
+# _run_obsidian_cycle) used to call add_wikilinks() on every file from
+# collect_markdown_files() above and write the annotated result straight
+# back onto that SAME tracked file — silently rewriting README.md,
+# CLAUDE.md, ATTENTION.md, and everything under docs/ in the release tree
+# on (nearly) every Hermes cycle that had any concept-stub backlink to add,
+# which in a real docs corpus is nearly every cycle. See
+# docs/handoffs/2026-09-18/fable-w4d-hermes-docs-rewrite.md for exactly
+# what that touched.
+#
+# The manual CLI below (`python scripts/obsidian_backlinks.py --apply`) is
+# UNCHANGED by this: a human runs it, reviews the diff, and commits (or
+# doesn't) through the normal PR flow — that in-place write is a
+# deliberate, reviewed action, not an unattended daemon's side effect.
+# Only scripts/hermes_operator.py's automated path is redirected, via the
+# two functions below.
+BACKLINKS_OUTPUT_DIR_ENV = "GRID_OBSIDIAN_BACKLINKS_DIR"
+
+
+def resolve_backlinks_output_dir() -> Path | None:
+    """Resolve where the AUTOMATED (Hermes) backlink step may write
+    annotated copies, or None if it must skip entirely this cycle.
+
+    Never returns a path inside this repository checkout (GRID_ROOT) —
+    that is precisely the bug being removed. Resolution order:
+
+      1. ``GRID_OBSIDIAN_BACKLINKS_DIR`` env var, if set to a non-empty
+         value. Set it to an empty string to explicitly disable the step.
+      2. Otherwise, ``<config.settings.OBSIDIAN_VAULT_PATH>/grid-backlinks``
+         — a subdirectory of the same Obsidian vault path
+         ingestion/altdata/obsidian_sync.py already reads/writes, so
+         operators who already have that vault configured don't need a
+         second "where does this go" answer.
+
+    Returns None (the caller must log why and skip that cycle) when:
+      - the env var is present but set to an empty/whitespace string,
+      - the resolved directory sits inside GRID_ROOT (refused
+        defensively — today's two resolution paths above never produce
+        this, but a future config change must not silently reintroduce
+        the bug),
+      - the resolved directory cannot be created (permissions, a
+        read-only mount, vault not mounted, etc.).
+    """
+    raw = os.environ.get(BACKLINKS_OUTPUT_DIR_ENV)
+    if raw is not None:
+        if not raw.strip():
+            log.debug(
+                "{env} explicitly set empty — automated Obsidian backlinks "
+                "step disabled", env=BACKLINKS_OUTPUT_DIR_ENV,
+            )
+            return None
+        candidate = Path(raw).expanduser()
+    else:
+        from config import settings
+
+        candidate = Path(os.path.expanduser(settings.OBSIDIAN_VAULT_PATH)) / "grid-backlinks"
+
+    try:
+        resolved = candidate.resolve()
+    except OSError:
+        resolved = candidate.absolute()
+
+    grid_root_resolved = GRID_ROOT.resolve()
+    if resolved == grid_root_resolved or grid_root_resolved in resolved.parents:
+        log.warning(
+            "Refusing to write automated Obsidian backlinks inside the "
+            "repository checkout ({p}) — check {env}",
+            p=resolved, env=BACKLINKS_OUTPUT_DIR_ENV,
+        )
+        return None
+
+    try:
+        candidate.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log.warning(
+            "Could not create Obsidian backlinks output dir {p}: {e} — "
+            "skipping automated backlinks this cycle",
+            p=candidate, e=str(exc),
+        )
+        return None
+
+    return candidate
+
+
+def write_annotated_copy(output_dir: Path, source_file: Path, new_content: str) -> Path:
+    """Write *new_content* under *output_dir*, mirroring *source_file*'s
+    path relative to GRID_ROOT. Never writes to *source_file* itself —
+    that file is only ever read by the automated step.
+    """
+    rel = source_file.relative_to(GRID_ROOT)
+    out_path = output_dir / rel
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(new_content, encoding="utf-8")
+    return out_path
 
 
 # ─── Entity Registry ───

@@ -181,7 +181,7 @@ def test_yahoo_realtime_feed_passes_auto_adjust_false():
     from ingestion.realtime.feeds.yahoo import SYMBOLS, _fetch_prices
 
     symbols = list(SYMBOLS.keys())
-    idx = pd.to_datetime(["2026-03-11 14:30", "2026-03-11 14:31"])
+    idx = pd.to_datetime(["2026-03-11 14:30", "2026-03-11 14:31"], utc=True)
     frame = pd.DataFrame(
         {
             ("Close", symbols[0]): [100.0, 101.0],
@@ -197,6 +197,8 @@ def test_yahoo_realtime_feed_passes_auto_adjust_false():
     assert mock_dl.call_count == 1
     assert mock_dl.call_args.kwargs["auto_adjust"] is False
     assert prices[symbols[0]][0] == pytest.approx(101.0)
+    assert prices[symbols[0]][2].isoformat() == "2026-03-11T14:31:00+00:00"
+    assert SYMBOLS["SPY"] == "equity"
 
 
 # ── 5. api/routers/watchlist_helpers.py — displayed + DB-cached prices ─────
