@@ -299,15 +299,23 @@ function ScannerCard({ item }) {
    ═══════════════════════════════════════════════════════════════════ */
 
 const sanityLayerNames = ['Volatility', 'Liquidity', 'Greeks', 'Regime', 'Risk'];
+const persistedSanityLayers = [
+    ['DATA_QUALITY', 'Data quality'],
+    ['DEALER_FLOW', 'Dealer flow'],
+    ['CROSS_ASSET', 'Cross asset'],
+    ['LLM_REVIEW', 'LLM review'],
+    ['HISTORICAL_ANALOG', 'Historical analog'],
+];
 
 function SanityDots({ checks }) {
-    // checks: array of { layer, status } or null
-    const layers = checks || sanityLayerNames.map(() => null);
+    // The persisted producer stores a keyed sanity_status object; live cards
+    // may still supply the legacy positional sanity_checks array.
+    const layers = Array.isArray(checks)
+        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i] }))
+        : persistedSanityLayers.map(([key, name]) => ({ name, status: checks?.[key]?.status }));
     return (
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }} title="Sanity checks">
-            {sanityLayerNames.map((name, i) => {
-                const check = Array.isArray(layers) ? layers[i] : null;
-                const status = check?.status || check;
+            {layers.map(({ name, status }) => {
                 const bg = status === 'PASS' ? colors.green
                     : status === 'FAIL' ? colors.red
                     : '#3A4A5A';
@@ -424,6 +432,9 @@ const outcomeColors = {
 function TradeRecommendationCard({ rec }) {
     const dir = rec.direction || 'CALL';
     const dirColor = dir === 'CALL' ? colors.green : colors.red;
+    const entry = rec.entry_price ?? rec.entry;
+    const target = rec.target_price ?? rec.target;
+    const stop = rec.stop_loss ?? rec.stop;
     const expReturn = rec.expected_return != null ? (rec.expected_return * 100).toFixed(1) : null;
     const kelly = rec.kelly_fraction != null ? (rec.kelly_fraction * 100).toFixed(1) : null;
 
@@ -454,9 +465,9 @@ function TradeRecommendationCard({ rec }) {
                 {[
                     { label: 'Strike', value: rec.strike != null ? `$${rec.strike.toFixed(0)}` : '--' },
                     { label: 'Expiry', value: rec.expiry || '--' },
-                    { label: 'Entry', value: rec.entry != null ? `$${rec.entry.toFixed(2)}` : '--' },
-                    { label: 'Target', value: rec.target != null ? `$${rec.target.toFixed(2)}` : '--' },
-                    { label: 'Stop', value: rec.stop != null ? `$${rec.stop.toFixed(2)}` : '--' },
+                    { label: 'Entry', value: entry != null ? `$${entry.toFixed(2)}` : '--' },
+                    { label: 'Target', value: target != null ? `$${target.toFixed(2)}` : '--' },
+                    { label: 'Stop', value: stop != null ? `$${stop.toFixed(2)}` : '--' },
                 ].map(m => (
                     <div key={m.label} style={styles.metricBox}>
                         <div style={{ ...styles.metricLabel, fontSize: '9px' }}>{m.label}</div>
@@ -466,7 +477,7 @@ function TradeRecommendationCard({ rec }) {
             </div>
 
             {/* Risk/Reward bar */}
-            <RiskRewardBar stop={rec.stop} entry={rec.entry} target={rec.target} />
+            <RiskRewardBar stop={stop} entry={entry} target={target} />
 
             {/* Expected return + Kelly + Sanity */}
             <div style={{
@@ -493,7 +504,7 @@ function TradeRecommendationCard({ rec }) {
                         </span>
                     )}
                 </div>
-                <SanityDots checks={rec.sanity_checks} />
+                <SanityDots checks={rec.sanity_status ?? rec.sanity_checks} />
             </div>
 
             {/* Thesis */}
@@ -708,18 +719,46 @@ function TradesTab() {
 export function TickerRecommendations({ ticker }) {
     const [recs, setRecs] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [availability, setAvailability] = useState('loading');
 
     useEffect(() => {
-        if (!ticker) return;
+        if (!ticker) {
+            setRecs([]);
+            setAvailability('empty');
+            setLoading(false);
+            return;
+        }
+        let active = true;
         setLoading(true);
+        setRecs([]);
+        setAvailability('loading');
         api.getOptionsRecommendations(ticker)
-            .then(data => setRecs(data?.error ? [] : (data.recommendations || [])))
-            .catch(() => setRecs([]))
-            .finally(() => setLoading(false));
+            .then(data => {
+                if (!active) return;
+                if (data?.error || data?.scan_summary?.source === 'unavailable'
+                    || !Array.isArray(data?.recommendations)) {
+                    setAvailability('unavailable');
+                    return;
+                }
+                const tickerRecs = data.recommendations.filter(
+                    rec => rec?.ticker?.toUpperCase() === ticker.toUpperCase(),
+                );
+                setRecs(tickerRecs);
+                setAvailability(tickerRecs.length > 0 ? 'available' : 'empty');
+            })
+            .catch(() => { if (active) setAvailability('unavailable'); })
+            .finally(() => { if (active) setLoading(false); });
+        return () => { active = false; };
     }, [ticker]);
 
     if (loading) return null;
-    if (recs.length === 0) return null;
+    if (availability !== 'available') {
+        return <div role="status" style={styles.emptyState}>
+            {availability === 'empty'
+                ? `No active trade recommendations for ${ticker}.`
+                : 'Trade recommendations unavailable.'}
+        </div>;
+    }
 
     return (
         <div>

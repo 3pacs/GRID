@@ -77,6 +77,8 @@ jobs:
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Explicit opt-in for the isolated briefing route PostgreSQL test.
+          GRID_BRIEFING_ROUTE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
@@ -126,6 +128,99 @@ jobs:
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
           exit "$pytest_status"
+
+      - name: Pipeline health PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_PIPELINE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
+
+      - name: Watchlist edge PostgreSQL identity contract
+        env:
+          GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+        run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
+
+      - name: Watchlist overview read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_overview_readonly_pg.py -q -rA
+
+      - name: Watchlist analysis and flow PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_analysis_derivatives_readonly_pg.py -q -rA
+
+      - name: Watchlist options recommendations PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_options_readonly_pg.py -q -rA
+
+      # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
+      # and resolver contracts against the isolated disposable PG schemas.
+      # test_spy_binance_composition_pg.py proves the two policies resolve
+      # correctly TOGETHER in one Resolver.resolve_pending() call -- the
+      # actual composition question this branch exists to answer -- and was
+      # added after this step was first written; it was never in this list
+      # and so never actually ran in CI despite CI reporting green.
+      - name: SPY and Binance close PostgreSQL contracts
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
+
+      - name: Binance forward cadence and scheduler pull logging
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_binance_forward_cadence.py tests/test_spy_completed_close_schedule.py tests/test_scheduler_pull_logging.py -q -rA
+
+      - name: Portfolio GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_portfolio_pg.py -q -rA
+
+      - name: Snapshot GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_snapshots_readonly_pg.py -q -rA
+
+      - name: Dad gold read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
+
+      - name: Dad ticker detail read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
 
       - name: Check for SQL injection patterns
         run: |
@@ -196,7 +291,9 @@ jobs:
           cache: pip
 
       - name: Install linters
-        run: pip install ruff bandit
+        # The backlink check imports loguru; Alien has it installed persistently,
+        # but the supported ubuntu-latest fallback starts from a clean image.
+        run: pip install ruff bandit 'loguru>=0.7.2'
 
       # Style and unused-import noise across a 700+ module tree: too much to
       # gate on today, so this stays advisory and reports without failing.
@@ -227,3 +324,36 @@ jobs:
 
       - name: Security scan (medium audit)
         run: bandit -r api/ store/ intelligence/ -ll --exit-zero
+
+      # Failure-injection proof for scripts/deploy_release_swap.sh: a failed
+      # build/migration must never leave the live release directory
+      # half-updated. Runs entirely inside its own temp sandbox -- no
+      # database, no grid-svr, no production path is touched. See
+      # tests/deploy/test_deploy_release_swap.sh's own header for what each
+      # case proves.
+      - name: Deploy pipeline — atomic release swap (failure injection)
+        run: bash tests/deploy/test_deploy_release_swap.sh
+
+      - name: Deploy pipeline — immutable runtime preservation
+        run: bash tests/deploy/test_runtime_preservation.sh
+
+      # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
+      # the resolved-cwd + independent-SHA check every "verify running the
+      # deployed tree" step in deploy.yml now shares. Added after the
+      # 2026-09-22 incident where the grid-api verify step's literal
+      # `$cwd = $DEPLOY_PATH` comparison could never pass again once
+      # deploy_release_swap.sh made $DEPLOY_PATH a symlink -- it failed a
+      # genuinely healthy deploy. See
+      # tests/deploy/test_deploy_verify_release_tree.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — release-tree verification (failure injection)
+        run: bash tests/deploy/test_deploy_verify_release_tree.sh
+
+      # Failure-injection proof for scripts/deploy_pin_candidate_sha.sh:
+      # `main` advancing during a build must not change the commit a
+      # candidate is built from, or -- via the real
+      # scripts/deploy_release_swap.sh -- the commit that ends up live. See
+      # tests/deploy/test_deploy_pin_candidate_sha.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — build-time exact-SHA pinning (failure injection)
+        run: bash tests/deploy/test_deploy_pin_candidate_sha.sh

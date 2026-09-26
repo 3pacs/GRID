@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import socket
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import schedule
@@ -280,7 +280,7 @@ def run_pull_group(
     """Run all pullers in a named schedule group.
 
     Parameters:
-        group_name: One of 'daily', 'weekly', 'monthly', 'annual'.
+        group_name: One of 'crypto', 'daily', 'weekly', 'monthly', 'annual'.
         db_engine: SQLAlchemy engine for database access.
         config: Optional config dict with API keys, etc.
         skip_sources: Source names to skip (e.g. blacklisted after timeout).
@@ -311,7 +311,30 @@ def run_pull_group(
         "skipped_count": 0,
     }
 
-    pullers = _get_pullers_for_group(group_name, db_engine, config)
+    try:
+        pullers = _get_pullers_for_group(group_name, db_engine, config)
+    except Exception as exc:
+        if group_name != "crypto":
+            raise
+        # Binance is a required source for this dedicated group.  Record an
+        # import/constructor failure as a real FAILED pull, not an omitted
+        # source or a synthetic SUCCESS.  A DB outage must not be reported as
+        # a persisted failure when the pull_log insert itself did not commit.
+        error_kind = type(exc).__name__
+        pull_log_id = _record_binance_init_failure(db_engine, error_kind)
+        log.error(
+            "Binance_Crypto initialization failed ({kind}); pull_log_id={log_id}",
+            kind=error_kind, log_id=pull_log_id,
+        )
+        summary["results"].append({
+            "puller": "Binance_Crypto", "status": "FAILED",
+            "error": f"initialization_failed:{error_kind}",
+            "pull_log_id": pull_log_id,
+        })
+        summary["failure_count"] = 1
+        return summary
+
+    from ingestion.pull_context import PullContext, PullLogPersistenceError
 
     node_name = socket.gethostname()
 
@@ -324,11 +347,17 @@ def run_pull_group(
             continue
 
         try:
-            source_id, source_name = _resolve_source_catalog_entry(
-                db_engine,
-                puller_name,
-                puller_instance,
-            )
+            if group_name == "crypto":
+                # The required Binance constructor already resolved its
+                # canonical source id. Avoid a second catalog round trip
+                # before the strict pull_log start can be persisted.
+                source_id, source_name = puller_instance.source_id, "binance"
+            else:
+                source_id, source_name = _resolve_source_catalog_entry(
+                    db_engine,
+                    puller_name,
+                    puller_instance,
+                )
             if step_callback:
                 step_callback(puller_name)
             log.info("Running {p}.{m}()", p=puller_name, m=method_name)
@@ -343,13 +372,12 @@ def run_pull_group(
                     )
 
             method = getattr(puller_instance, method_name)
-            from ingestion.pull_context import PullContext
-
             with PullContext(
                 db_engine,
                 puller_name,
                 source_id=source_id,
                 node_name=node_name,
+                require_persisted_log=(group_name == "crypto"),
             ) as ctx:
                 result = method(**resolved_kwargs)
                 ctx.record_rows(_extract_rows_inserted(result))
@@ -365,6 +393,10 @@ def run_pull_group(
             log.info("{p} complete", p=puller_name)
 
         except Exception as exc:
+            if isinstance(exc, PullLogPersistenceError):
+                # PullContext is best-effort for legacy sources, but Binance
+                # must never claim a complete cycle with no durable log.
+                raise
             log.error("{p} failed: {err}", p=puller_name, err=str(exc))
             summary["results"].append({"puller": puller_name, "status": "FAILED", "error": str(exc)})
             summary["failure_count"] += 1
@@ -379,6 +411,39 @@ def run_pull_group(
     return summary
 
 
+def _record_binance_init_failure(db_engine: Engine, error_kind: str) -> int:
+    """Persist one FAILED required-source attempt, or raise if it cannot be logged."""
+    observed_at = datetime.now(timezone.utc)
+    try:
+        with db_engine.begin() as conn:
+            row = conn.execute(text("""
+                INSERT INTO pull_log
+                    (puller_name, source_id, started_at, completed_at,
+                     status, rows_inserted, error_message, node_name)
+                VALUES
+                    (:name, NULL, :observed, :observed,
+                     'FAILED', 0, :error, :node)
+                RETURNING id
+            """), {
+                "name": "Binance_Crypto",
+                "observed": observed_at,
+                "error": f"initialization_failed:{error_kind}",
+                "node": socket.gethostname(),
+            }).fetchone()
+            if row is None:
+                raise RuntimeError("pull_log insert returned no id")
+            return int(row[0])
+    except Exception as exc:
+        log.error(
+            "Binance_Crypto initialization failure could not be persisted "
+            "to pull_log ({kind})",
+            kind=type(exc).__name__,
+        )
+        raise RuntimeError(
+            "Binance_Crypto initialization failure could not be persisted"
+        ) from exc
+
+
 def _get_pullers_for_group(
     group_name: str,
     db_engine: Engine,
@@ -391,7 +456,15 @@ def _get_pullers_for_group(
     """
     pullers: list[tuple[str, Any, str, dict]] = []
 
-    if group_name == "daily":
+    if group_name == "crypto":
+        # One owner of Binance daily UTC closes, on all seven days.  Let an
+        # import or constructor failure reach run_pull_group's required-source
+        # failure path so it is counted and durably logged when DB is healthy.
+        from ingestion.altdata.binance_puller import BinancePuller
+
+        pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
+
+    elif group_name == "daily":
         try:
             from ingestion.international.ecb import ECBPuller
             pullers.append(("ECB_SDW", ECBPuller(db_engine), "pull_all", {"start_date": "incremental"}))
@@ -733,12 +806,6 @@ def _get_pullers_for_group(
             pullers.append(("Wikidata_Relations", WikidataPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Wikidata init failed: {err}", err=str(exc))
-        # Binance — crypto OHLCV + 24hr ticker (daily, no key)
-        try:
-            from ingestion.altdata.binance_puller import BinancePuller
-            pullers.append(("Binance_Crypto", BinancePuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Binance init failed: {err}", err=str(exc))
         # Fed Speeches — canonical puller registered below (fed_speeches.FedSpeechPuller).
         # Wave 3 dedupe 2026-04-13: deleted fed_speeches_puller.py (orphaned output).
         # Wikipedia pageviews — anomaly detection on financial topics (daily)
@@ -1017,6 +1084,42 @@ def _get_pullers_for_group(
     return pullers
 
 
+def run_daily_binance_close() -> dict[str, Any]:
+    """Run only Binance's current completed UTC day; never catch up old days."""
+    try:
+        from db import get_engine
+
+        engine = get_engine()
+    except Exception as exc:
+        return _unverified_binance_failure("engine_unavailable", exc)
+    try:
+        return run_pull_group("crypto", engine)
+    except Exception as exc:
+        # Preserve the scheduler loop and its other jobs. This is one failed
+        # attempted cycle, not a request to retry or ingest a previous day.
+        return _unverified_binance_failure("cycle_unverified", exc)
+
+
+def _unverified_binance_failure(phase: str, exc: Exception) -> dict[str, Any]:
+    """Report a failed scheduled attempt without claiming a completed receipt."""
+    error = f"{phase}:{type(exc).__name__}"
+    provider_write_state = "not_started" if phase == "engine_unavailable" else "unknown"
+    log.error(
+        "Binance_Crypto scheduled cycle FAILED; pull_log completion unverified "
+        "({error}); provider_write_state={write_state}",
+        error=error, write_state=provider_write_state,
+    )
+    return {
+        "group": "crypto",
+        "results": [{
+            "puller": "Binance_Crypto", "status": "FAILED", "error": error,
+            "pull_log_id": None, "completed_log_persisted": False,
+            "provider_write_state": provider_write_state,
+        }],
+        "success_count": 0, "failure_count": 1, "skipped_count": 0,
+    }
+
+
 def backfill_all(start_date: str = "1970-01-01") -> None:
     """Run all pull groups with historical start dates.
 
@@ -1211,6 +1314,50 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     log.info("Daily pulls finished")
 
 
+def _completed_spy_close_window(
+    start_date: str | date, *, now_utc: datetime | None = None,
+) -> tuple[date, date] | None:
+    """One completed trading session omitted by this scheduler's start date.
+
+    This is a forward daily check, bounded by the close contract's existing
+    four-calendar-day capture policy. It never selects a historical range.
+    """
+    from ingestion.market_calendar import last_trading_day
+    from price_close_contract import SPY_CAPTURE_MAX_LOOKBACK_DAYS
+
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        raise ValueError("SPY close window requires an aware UTC clock")
+    utc_today = now.astimezone(timezone.utc).date()
+    completed_session = last_trading_day(utc_today - timedelta(days=1))
+    requested_start = (
+        start_date if isinstance(start_date, date)
+        else date.fromisoformat(start_date)
+    )
+    if (requested_start <= completed_session or
+            (utc_today - completed_session).days > SPY_CAPTURE_MAX_LOOKBACK_DAYS):
+        return None
+    return completed_session, completed_session + timedelta(days=1)
+
+
+def _pull_completed_spy_close(
+    puller: Any, start_date: str | date, *, now_utc: datetime | None = None,
+) -> tuple[date, dict[str, Any]] | None:
+    """Fetch only the omitted completed SPY close through the marked writer.
+
+    Yahoo's end is exclusive. The puller retains the post-UTC-day marker and
+    exact raw-row dedupe; this request writes no other OHLCV field.
+    """
+    window = _completed_spy_close_window(start_date, now_utc=now_utc)
+    if window is None:
+        return None
+    result = puller.pull_ticker(
+        "SPY", start_date=window[0], end_date=window[1],
+        interval="1d", only_fields=frozenset({"close"}),
+    )
+    return window[0], result
+
+
 def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
     """Equity-hours pullers — only called when market is open."""
     from db import get_engine
@@ -1252,15 +1399,71 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         yf_puller = YFinancePuller(db_engine=engine)
+        # results is the plain list[dict] shape (should_continue not passed
+        # here) — each item now also carries an "outcome" key (Check 1a,
+        # fable-hermes-repair-bound follow-up review, 2026-09-19):
+        # "inserted" | "duplicate_only" | "no_data" | "error".
         results = yf_puller.pull_all(start_date=start_date)
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
-            "yfinance daily pull complete — {ok}/{total} tickers, {rows} rows",
+            "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
             ok=succeeded,
             total=len(results),
             rows=total_rows,
         )
+        completed_spy = _pull_completed_spy_close(yf_puller, start_date)
+        if completed_spy is not None:
+            completed_day, spy_result = completed_spy
+            log.info(
+                "SPY completed-close check for {d}: outcome={o}, rows={n}",
+                d=completed_day, o=spy_result["outcome"],
+                n=spy_result["rows_inserted"],
+            )
+        # Surface per-ticker failures here too instead of only in
+        # pull_ticker's own log lines — this is the function actually
+        # wired to the 4x/day cron, so this is where an operator/Hermes
+        # would look first for "which tickers didn't check cleanly today".
+        failing = [
+            (r.get("ticker"), r.get("outcome"))
+            for r in results
+            if r.get("outcome") in ("no_data", "error")
+        ]
+        if failing:
+            log.warning(
+                "yfinance daily pull — {n} ticker(s) did not check cleanly: {f}",
+                n=len(failing), f=failing[:20],
+            )
+        # Freshness-signal fix (fable-hermes-repair-bound, 2026-09-19):
+        # run_daily_pulls is the function actually wired to the 4x/day
+        # cron in start_scheduler() below, and unlike run_pull_group's
+        # _touch_source_catalog_last_pull (used by the newer group-based
+        # path), it never updated source_catalog.last_pull_at. Traced in
+        # production: yfinance pulled fresh data here every day, but
+        # last_pull_at stayed stuck at a stale timestamp, so Hermes's
+        # staleness check (DATA_FRESHNESS_THRESHOLD_HOURS in
+        # scripts/hermes_operator.py) kept flagging yfinance as stale and
+        # triggering unnecessary REPULL repairs against data that was
+        # already current. Best-effort, same swallow-on-error pattern as
+        # the existing update in scripts/hermes_fixers.py::_retry_source.
+        #
+        # Semantics (Check 1c, review follow-up): this update means "the
+        # source was successfully CHECKED at this time" — it runs only
+        # after pull_all has returned (never on exception — the whole
+        # block above is inside this try, so an exception skips straight
+        # to the except below and this line is never reached), and it is
+        # NOT a claim that every ticker's data is current through today.
+        # Currency through 2026-09-18 was traced and verified only for
+        # YF:SPY:close, YF:XLI:close, and YF:EMB:close (see the handoff
+        # doc) — do not generalise that to "equities are current".
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    "UPDATE source_catalog SET last_pull_at = NOW() "
+                    "WHERE LOWER(name) = LOWER(:name)"
+                ), {"name": "yfinance"})
+        except Exception:
+            pass
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))
         try:
@@ -1499,7 +1702,8 @@ def start_scheduler() -> None:
 
     Domestic:
     - 4x daily: open (9:30 AM ET), midday (12 PM ET), close (4 PM ET), post-close (6 PM ET)
-    - Equity pullers gated by market calendar; 24/7 pullers (crypto, OSINT, sentiment) run every day
+    - Equity pullers gated by market calendar; domestic 24/7 pullers run every day
+    - Binance completed UTC daily closes: one independent seven-day UTC slot
     - Monthly pulls on the 5th at 9:00 AM (BLS, EDGAR 13F)
     - Weekly SEC velocity on Sundays at 10:00 AM
 
@@ -1515,6 +1719,12 @@ def start_scheduler() -> None:
 
     # For ongoing pulls, use recent date
     ongoing_start = date.today().isoformat()
+
+    # Register the required crypto close before the 20:00 domestic and extended
+    # jobs. schedule.at(..., "UTC") converts from UTC even on a non-UTC host.
+    # The scheduler is still single-threaded: an earlier hung job can delay
+    # this slot, and a missed UTC day is not repaired automatically.
+    schedule.every().day.at("20:00", "UTC").do(run_daily_binance_close)
 
     # --- Domestic schedules ---
 

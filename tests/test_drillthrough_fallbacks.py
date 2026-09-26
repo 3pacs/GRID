@@ -54,7 +54,6 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(watchlist_analysis, "_get_analysis_cached", lambda *_args: None)
-    monkeypatch.setattr(watchlist_analysis, "_init_table", lambda: None)
     monkeypatch.setattr(watchlist_analysis, "get_db_engine", lambda: engine)
     monkeypatch.setattr(
         watchlist_analysis,
@@ -66,7 +65,6 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
         "_fetch_live_price",
         lambda _ticker: {"price": 200.0, "prev_close": 198.0, "pct_1d": 0.01, "source": "live"},
     )
-    monkeypatch.setattr(watchlist_analysis, "_cache_price_to_db", lambda *_args, **_kwargs: None)
 
     response = client.get("/api/v1/watchlist/GD/analysis")
 
@@ -79,7 +77,7 @@ def test_watchlist_analysis_allows_unsaved_ticker(monkeypatch) -> None:
     assert body["price_source"] in {"live", "yfinance"}
 
 
-def test_options_recommendations_fall_back_to_saved_rows(monkeypatch) -> None:
+def test_options_recommendations_read_saved_rows(monkeypatch) -> None:
     client = _build_client(options_router)
     engine = _engine_with_results(
         _result(
@@ -106,11 +104,6 @@ def test_options_recommendations_fall_back_to_saved_rows(monkeypatch) -> None:
     )
 
     monkeypatch.setattr(options_module, "get_db_engine", lambda: engine)
-
-    def _missing_engine(_engine, *, force_refresh: bool = False) -> dict:
-        raise ImportError("missing recommender")
-
-    monkeypatch.setattr(options_module, "_generate_recommendations", _missing_engine)
 
     response = client.get("/api/v1/options/recommendations?ticker=NVDA")
 
