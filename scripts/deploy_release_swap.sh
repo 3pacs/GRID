@@ -562,7 +562,14 @@ echo "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RELEASES_DIR}
 # Prune old releases, keeping the one just replaced (for manual rollback)
 # plus the new one -- never the candidate we just failed to promote, since a
 # failed run exits above before reaching this point.
+# Cleanup is best-effort AFTER the pointer/activation marker are committed.
+# A pruning failure must not turn a successful swap into a failed build step,
+# which would prevent deploy.yml from restarting API/Hermes onto the new tree.
+# An asynchronous subshell preserves errexit (unlike `if function ...`) and the
+# inherited protected-path union, while containing helper `exit` and rm errors.
 if [ -n "$previous_target" ]; then
+  (
+  set -euo pipefail
   # Process substitution hides find/sort errors from mapfile and set -e. Never
   # act on a partial directory inventory even if it contains plausible paths.
   if ! release_inventory="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)" ||
@@ -588,6 +595,14 @@ if [ -n "$previous_target" ]; then
       kept=$((kept + 1))
     fi
   done
+  ) &
+  prune_pid=$!
+  if wait "$prune_pid"; then
+    :
+  else
+    prune_status=$?
+    echo "::warning::Release swap succeeded; pruning stopped (status $prune_status). Remaining old releases are retained; continue activation of $CANDIDATE_DIR." >&2
+  fi
 fi
 
 exit 0

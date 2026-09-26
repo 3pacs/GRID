@@ -42,6 +42,10 @@ case "$*" in
     printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=active\nControlGroup=/scheduler\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" "$TEST_SCHEDULER_PID" ;;
   'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-realtime.service')
     [ "${TEST_SHOW_FAIL:-0}" != 1 ] || exit 1
+    if [ -n "${TEST_POST_SWAP_SHOW_FAIL_LABEL:-}" ] &&
+       [ "$(readlink -f "${TEST_RELEASE_ROOT%.releases}")" = "$TEST_RELEASE_ROOT/$TEST_POST_SWAP_SHOW_FAIL_LABEL" ]; then
+      exit 42
+    fi
     printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=%s\nControlGroup=%s\nSubState=running\nType=simple\nRemainAfterExit=no\nExecMainPID=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" "$TEST_REALTIME_STATE" "$TEST_REALTIME_CGROUP" "${TEST_REALTIME_EXEC_PID:-$TEST_REALTIME_PID}" ;;
   'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup,SubState,Type,RemainAfterExit,ExecMainPID -- grid-db.service')
     printf 'LoadState=loaded\nMainPID=0\nWorkingDirectory=\nActiveState=active\nControlGroup=\nSubState=%s\nType=%s\nRemainAfterExit=%s\nExecMainPID=0\n' "${TEST_DB_SUBSTATE-exited}" "${TEST_DB_TYPE-oneshot}" "${TEST_DB_REMAIN-yes}" ;;
@@ -51,7 +55,7 @@ case "$*" in
 esac
 SH
 chmod +x "$box/bin/systemctl"
-export TEST_REAL_FIND="$(command -v find)" TEST_RELEASE_ROOT="$root"
+export TEST_REAL_FIND="$(command -v find)" TEST_REAL_RM="$(command -v rm)" TEST_RELEASE_ROOT="$root"
 cat > "$box/bin/find" <<'SH'
 #!/usr/bin/env bash
 if [ "${TEST_FIND_PARTIAL_FAIL:-0}" = 1 ] && [ "$1" = "$TEST_RELEASE_ROOT" ]; then
@@ -61,6 +65,13 @@ fi
 exec "$TEST_REAL_FIND" "$@"
 SH
 chmod +x "$box/bin/find"
+cat > "$box/bin/rm" <<'SH'
+#!/usr/bin/env bash
+if [ -n "${TEST_RM_LOG:-}" ]; then printf '%s\n' "$*" >> "$TEST_RM_LOG"; fi
+if [ "$1" = -rf ] && [ "${2:-}" = "${TEST_RM_FAIL_PATH:-}" ]; then exit 42; fi
+exec "$TEST_REAL_RM" "$@"
+SH
+chmod +x "$box/bin/rm"
 cat > "$box/build" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -154,6 +165,17 @@ set -e
 test "$collision_rc" -eq 5
 test -L "$root/realtime-alias"
 
+# A deletion failure before the swap is still fatal and cannot activate new code.
+mkdir "$root/stale-candidate"
+set +e
+TEST_RM_FAIL_PATH="$root/stale-candidate" bash "$swap" "$live" stale-candidate "$box/build" bad > "$box/pre-rm.log" 2>&1
+pre_rm_rc=$?
+set -e
+test "$pre_rm_rc" -eq 42
+test -d "$root/stale-candidate"
+test "$(readlink -f "$live")" = "$root/current"
+rm -rf "$root/stale-candidate"
+
 # Deleted cwd fails before any build, even if the configured restart path exists.
 mkdir "$box/deleted-cwd"
 ( cd "$box/deleted-cwd" && exec sleep 300 ) &
@@ -223,15 +245,37 @@ activated_pid=$!
 TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-4" \
   fail_without_swap "$root/next-4" stale-after-activation
 
-# A failed find must not yield a partially usable prune list after the swap.
+# Post-swap churn cannot turn success into a failed workflow build step. No
+# deletion occurs, the new pointer/marker remain, and activation may continue.
 mkdir "$root/unused-sentinel"
 touch -d '2018-01-01 UTC' "$root/unused-sentinel"
+TEST_POST_SWAP_SHOW_FAIL_LABEL=post-swap-churn TEST_RM_LOG="$box/churn-rm.log" \
+  bash "$swap" "$live" post-swap-churn "$box/build" churn > "$box/churn.log" 2>&1
+test -d "$root/unused-sentinel"
+test ! -s "$box/churn-rm.log"
+test "$(readlink -f "$live")" = "$root/post-swap-churn"
+grep -q 'label=post-swap-churn ' "$root/.activation-in-progress"
+grep -q '::warning::Release swap succeeded; pruning stopped' "$box/churn.log"
+
+# A failed find must not yield a partially usable prune list after the swap.
+# It likewise leaves the activation path successful and all old trees intact.
 set +e
 TEST_FIND_PARTIAL_FAIL=1 bash "$swap" "$live" partial-inventory "$box/build" partial > "$box/partial.log" 2>&1
 partial_rc=$?
 set -e
-test "$partial_rc" -eq 5
+test "$partial_rc" -eq 0
 test -d "$root/unused-sentinel"
 test "$(readlink -f "$live")" = "$root/partial-inventory"
 grep -q 'cannot completely inventory releases' "$box/partial.log"
-echo 'PASS: runtime preservation, realtime descendants/multi-swap/collision/inactive/symlink/deleted-cwd, failed inventory, invalid identities and stale activation record'
+grep -q '::warning::Release swap succeeded; pruning stopped' "$box/partial.log"
+grep -q 'label=partial-inventory ' "$root/.activation-in-progress"
+
+# Even a deletion error stops only cleanup, preserving later prune candidates.
+mkdir "$root/failing-prune"
+touch -d '2025-01-01 UTC' "$root/failing-prune"
+TEST_RM_FAIL_PATH="$root/failing-prune" bash "$swap" "$live" rm-failure "$box/build" rm-failure > "$box/rm-failure.log" 2>&1
+test -d "$root/failing-prune" && test -d "$root/unused-sentinel"
+test "$(readlink -f "$live")" = "$root/rm-failure"
+grep -q 'pruning stopped (status 42)' "$box/rm-failure.log"
+grep -q 'label=rm-failure ' "$root/.activation-in-progress"
+echo 'PASS: retained runtimes/descendants/oneshots, pre-swap refusal, post-swap churn/find/rm failure containment, invalid identities and stale activation record'
