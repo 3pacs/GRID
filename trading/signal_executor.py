@@ -135,8 +135,17 @@ class VenueTag:
         raw = self.capital * float(position_size)
         return round(min(raw, float(self.trader.max_position_usd)), 2)
 
-    def submit(self, ticker: str, direction: str, position_size: float) -> dict | None:
-        """Send the signal to the venue. ``None`` when nothing was routed."""
+    def submit(self, ticker: str, direction: str, position_size: float,
+              decision_id: str | None = None) -> dict | None:
+        """Send the signal to the venue. ``None`` when nothing was routed.
+
+        *decision_id* (e.g. ``f"{strategy_id}-{trade_id}"``), when given,
+        derives a deterministic idempotency key (see
+        ``trading.robinhood.deterministic_client_order_id``) so re-running
+        the same signal cycle for a decision that already went through is
+        recognized as a duplicate rather than resubmitted. Omitted, the
+        connector generates a fresh key each call and does not deduplicate.
+        """
         if direction != "LONG":
             log.debug("Venue {v}: {t} {d} skipped — spot venue is long only",
                       v=self.venue, t=ticker, d=direction)
@@ -151,7 +160,7 @@ class VenueTag:
             log.debug("Venue {v}: {t} is not a tradable pair", v=self.venue, t=ticker)
             return None
 
-        from trading.robinhood import crypto_asset_code
+        from trading.robinhood import crypto_asset_code, deterministic_client_order_id
 
         size_usd = self.order_size_usd(position_size)
         if size_usd < self.min_order_usd:
@@ -160,8 +169,13 @@ class VenueTag:
             return None
 
         asset = crypto_asset_code(ticker) or ticker
+        client_order_id = (
+            deterministic_client_order_id(self.venue, decision_id, asset, "buy", date.today())
+            if decision_id is not None else None
+        )
         try:
-            result = self.trader.open_position(ticker=asset, direction="LONG", size_usd=size_usd)
+            result = self.trader.open_position(ticker=asset, direction="LONG", size_usd=size_usd,
+                                               client_order_id=client_order_id)
         except Exception as exc:  # noqa: BLE001 — the paper book must not care
             log.warning("Venue {v}: {a} order failed: {e}", v=self.venue, a=asset, e=str(exc))
             result = {"error": str(exc)}
@@ -212,9 +226,24 @@ def build_venue_tag(
             log.warning("Venue {v}: wallet {w} is {s} — paper only",
                         v=venue, w=wallet_id, s=wallet.get("status"))
             return None
+    else:
+        # No wallet_id given used to mean "no wallet gate at all" here —
+        # VenueTag.capital then fell back to the connector's bare per-order
+        # cap instead of a real balance, and nothing blocked a KILLED/absent
+        # wallet. RobinhoodCryptoTrader's own wallet_lookup (wired by
+        # get_robinhood_trader()) is the authoritative gate either way, but
+        # resolving the ACTIVE wallet here too fixes sizing and makes the
+        # gate visible at this layer as well.
+        from trading.wallet_manager import WalletManager
+
+        wallets = WalletManager(engine).get_all_wallets(exchange=venue, status="ACTIVE")
+        if not wallets:
+            log.warning("Venue {v}: no ACTIVE wallet for this exchange — paper only", v=venue)
+            return None
+        wallet = wallets[0]
 
     log.info("Venue tag active: {v} mode={m} wallet={w}",
-             v=venue, m=trader.mode, w=wallet_id or "none")
+             v=venue, m=trader.mode, w=wallet.get("id"))
     return VenueTag(venue, trader, wallet)
 
 
@@ -388,7 +417,8 @@ def execute_signals(
                                     "leader_return": round(leader_return, 4),
                                 }
                                 if venue_tag is not None:
-                                    order = venue_tag.submit(follower, direction, position_size)
+                                    order = venue_tag.submit(follower, direction, position_size,
+                                                             decision_id=f"{strategy_id}-{trade_id}")
                                     if order:
                                         detail["venue_order"] = order
                                         venue_orders.append(

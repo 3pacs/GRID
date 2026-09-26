@@ -346,3 +346,29 @@ class WalletManager:
             if isinstance(v, (date, datetime)):
                 d[k] = str(v)
         return d
+
+
+# ---------------------------------------------------------------------------
+# Venue wallet gate — shared by every order-placing path for one exchange
+# ---------------------------------------------------------------------------
+
+
+def resolve_active_wallet(engine: Engine, exchange: str, wallet_id: str | None = None) -> dict | None:
+    """Return the ACTIVE wallet an order on *exchange* should be gated by.
+
+    ``wallet_id`` (when given) must itself resolve to an ACTIVE wallet.
+    Without one, the newest ACTIVE wallet for *exchange* is used (
+    ``get_all_wallets`` already orders by ``created_at DESC``). Returns
+    ``None`` when there is no such wallet — a KILLED/PAUSED wallet, an
+    unknown id, or no wallet at all for the exchange — and callers must
+    treat that as "block the order", never as "no wallet configured, so
+    let it through".
+    """
+    wm = WalletManager(engine)
+    if wallet_id:
+        wallet = wm.get_wallet(wallet_id)
+        if "error" in wallet or wallet.get("status") != "ACTIVE":
+            return None
+        return wallet
+    wallets = wm.get_all_wallets(exchange=exchange, status="ACTIVE")
+    return wallets[0] if wallets else None

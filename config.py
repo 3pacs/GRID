@@ -553,6 +553,59 @@ class Settings(BaseSettings):
     ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
     ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
 
+    # Robinhood brakes (fix/robinhood-live-guards-20260924): every limit here
+    # reads/writes the persisted state in trading_risk_state / trading_order_log
+    # (trading/robinhood_risk_store.py) so it survives restarts, unlike the old
+    # in-memory drawdown high-water mark.
+    #   * Daily loss cap blocks new BUYS once today's loss from start-of-day
+    #     equity reaches this fraction; sells/closes stay allowed so a position
+    #     can still be de-risked.
+    ROBINHOOD_MAX_DAILY_LOSS_PCT: float = 0.05
+    #   * Order-rate cap: max new positions opened per UTC day.
+    ROBINHOOD_MAX_ORDERS_PER_DAY: int = 6
+    #   * Reject a quote older than this many seconds, measured from
+    #     Robinhood's own `timestamp` field. A quote WITHOUT a venue timestamp
+    #     is rejected (fail closed) -- GRID's local fetch time is never used
+    #     as a stand-in. A one-sided quote (bid or ask missing/0) is rejected
+    #     by the spread guard rather than scored as a 0bps spread.
+    ROBINHOOD_MAX_QUOTE_AGE_S: float = 30.0
+    #   * Reject an order whose (ask-bid)/mid spread exceeds this many basis
+    #     points. MEASURED, not assumed: a read-only quote pull through the
+    #     deployed connector (DRY_RUN) on 2026-09-24 14:23Z found Robinhood's
+    #     own spread-inclusive executable gap ((ask-bid)/mid, i.e.
+    #     ask_inclusive_of_buy_spread vs bid_inclusive_of_sell_spread) running
+    #     ~188-190bps as NORMAL pricing: BTC 188.7bps, ETH 189.7bps,
+    #     SOL 187.8bps. That matches Robinhood's own published crypto fee of
+    #     ~95bps per side (2 x 95 = 190). A round trip (buy then immediately
+    #     sell) costs ~1.9% before any other fee. An earlier default of 50bps
+    #     was an unverified assumption ("BTC/ETH typically trade inside
+    #     5-10bps") that does not hold for Robinhood's retail crypto product
+    #     and would have blocked every single order. 250bps leaves headroom
+    #     above the ~190bps normal range so the guard still catches genuinely
+    #     abnormal widening (a flash move, an illiquid pair) rather than
+    #     normal Robinhood pricing.
+    ROBINHOOD_MAX_SPREAD_BPS: float = 250.0
+    #   * Marketable limit orders instead of market orders when True (see
+    #     trading/robinhood.py — Robinhood's Crypto Trading API supports
+    #     type=limit with time_in_force="gtc", its only documented value).
+    #     False keeps market orders behind the same stale-quote/spread guards.
+    ROBINHOOD_USE_LIMIT_ORDERS: bool = True
+    #   * Slippage added past the touch price so a marketable limit still
+    #     crosses the spread and fills like a market order: buy at
+    #     ask*(1+slip), sell at bid*(1-slip).
+    ROBINHOOD_LIMIT_SLIPPAGE_BPS: float = 25.0
+    #   * Robinhood crypto limit orders only support time_in_force="gtc" (no
+    #     IOC/FOK), so a marketable limit that doesn't fill immediately would
+    #     otherwise rest indefinitely. RobinhoodCryptoTrader.reconcile_stale_orders()
+    #     cancels our own open orders older than this many seconds — wire it
+    #     into a periodic job before ROBINHOOD_LIVE_TRADING is ever set True.
+    ROBINHOOD_LIMIT_CANCEL_AFTER_S: float = 15.0
+    #   * Email (alerts/email.py, gated by ALERT_EMAIL_ENABLED) fires on every
+    #     LIVE order and every guard trip unconditionally. A dry-run order that
+    #     passed every guard only alerts when this is also True — off by
+    #     default so a normal dry-run cycle doesn't spam the inbox.
+    ROBINHOOD_ALERT_ON_DRY_RUN: bool = False
+
     # Solana trading (AutoHedge-derived 4-agent pipeline)
     JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits
     SOLANA_PRIVATE_KEY: str = ""           # Base58 wallet key; required for live
