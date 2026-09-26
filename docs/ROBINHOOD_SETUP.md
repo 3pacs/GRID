@@ -72,8 +72,8 @@ call:
 | Daily loss cap (blocks new buys; sells/closes stay allowed) | `ROBINHOOD_MAX_DAILY_LOSS_PCT` | 5% from start-of-day equity | yes |
 | Order-rate cap (blocks new buys) | `ROBINHOOD_MAX_ORDERS_PER_DAY` | 6/day | yes |
 | Idempotent submission | `client_order_id` / API `idempotency_key` | n/a | yes — repeat comes back `status="duplicate"` |
-| Stale-quote guard | `ROBINHOOD_MAX_QUOTE_AGE_S` | 30s | n/a (checked fresh every call) |
-| Spread guard | `ROBINHOOD_MAX_SPREAD_BPS` | 250bps | n/a |
+| Stale-quote guard (a quote with no venue `timestamp` is rejected, never aged from local fetch time) | `ROBINHOOD_MAX_QUOTE_AGE_S` | 30s | n/a (checked fresh every call) |
+| Spread guard (a one-sided quote — bid or ask missing/0 — is rejected, never scored as 0bps) | `ROBINHOOD_MAX_SPREAD_BPS` | 250bps | n/a |
 | Marketable limit orders | `ROBINHOOD_USE_LIMIT_ORDERS` / `ROBINHOOD_LIMIT_SLIPPAGE_BPS` | on / 25bps | n/a |
 | Wallet gate (KILLED/PAUSED/no wallet blocks orders) | n/a — an ACTIVE `trading_wallets` row for `exchange='robinhood'` | n/a | reads `trading_wallets` |
 | Shorts | n/a | spot only — SHORT sells held quantity, never goes net short | n/a |
@@ -246,6 +246,13 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 `trading/wallet_manager.py` then tracks P&L, high-water mark and drawdown for
 that pool and auto-kills it at 20 %. It shows up in
 `GET /api/v1/trading/wallets/dashboard` under `per_exchange.robinhood`.
+
+Only REAL (`status="submitted"`) sells book realized P&L to the wallet, and
+their cost basis counts only real (`submitted`) buys. A DRY-RUN sell never
+calls `WalletManager.update_pnl` (which could otherwise move capital, record
+losses and auto-kill the wallet on simulated trades); its estimate is stored
+only in that sell's own `trading_order_log.raw_response`, labelled
+`SIMULATED dry-run P&L estimate - not booked to any wallet`.
 
 ### 2. Rotation trader
 

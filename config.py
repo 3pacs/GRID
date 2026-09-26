@@ -545,8 +545,11 @@ class Settings(BaseSettings):
     ROBINHOOD_MAX_DAILY_LOSS_PCT: float = 0.05
     #   * Order-rate cap: max new positions opened per UTC day.
     ROBINHOOD_MAX_ORDERS_PER_DAY: int = 6
-    #   * Reject a quote older than this many seconds (Robinhood's own
-    #     `timestamp` field when present, else GRID's local fetch time).
+    #   * Reject a quote older than this many seconds, measured from
+    #     Robinhood's own `timestamp` field. A quote WITHOUT a venue timestamp
+    #     is rejected (fail closed) -- GRID's local fetch time is never used
+    #     as a stand-in. A one-sided quote (bid or ask missing/0) is rejected
+    #     by the spread guard rather than scored as a 0bps spread.
     ROBINHOOD_MAX_QUOTE_AGE_S: float = 30.0
     #   * Reject an order whose (ask-bid)/mid spread exceeds this many basis
     #     points. MEASURED, not assumed: a read-only quote pull through the

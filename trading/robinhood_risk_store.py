@@ -46,6 +46,16 @@ from sqlalchemy.engine import Engine
 #: the same automated decision can retry once whatever guard tripped clears.
 _CONSUMED_STATUSES = ("dry_run", "submitted")
 
+#: Order-log statuses that count toward a REAL cost basis. Only orders that
+#: actually reached Robinhood — a dry-run "fill" never bought anything, so a
+#: simulated buy must never become the basis that real (post-live) sells are
+#: measured against, and a simulated sell must never reset that basis.
+_REAL_FILL_STATUSES = ("submitted",)
+
+
+def _cost_basis_statuses(include_simulated: bool) -> tuple[str, ...]:
+    return _CONSUMED_STATUSES if include_simulated else _REAL_FILL_STATUSES
+
 
 def _safe_float(value: Any) -> float:
     try:
@@ -80,7 +90,7 @@ class RiskStore(Protocol):
 
     def get_state(self, venue: str) -> RiskState | None: ...
 
-    def average_cost(self, venue: str, ticker: str) -> float | None: ...
+    def average_cost(self, venue: str, ticker: str, include_simulated: bool = False) -> float | None: ...
 
 
 # ---------------------------------------------------------------------------
@@ -144,13 +154,19 @@ class InMemoryRiskStore:
         return RiskState(state.venue, state.peak_equity, state.day_start_equity,
                           state.day_start_date, state.orders_today)
 
-    def average_cost(self, venue: str, ticker: str) -> float | None:
+    def average_cost(self, venue: str, ticker: str, include_simulated: bool = False) -> float | None:
         """Volume-weighted average BUY fill price for *ticker* since the
         most recent SELL, from this store's own order log — a best-effort
         cost basis (Robinhood's API exposes none; see
-        ``RobinhoodCryptoTrader._settle_wallet_pnl``)."""
+        ``RobinhoodCryptoTrader._settle_wallet_pnl``).
+
+        By default only REAL (``submitted``) orders count, both as buys and
+        as the resetting sell. ``include_simulated=True`` also counts
+        dry-run rows — used only for the labelled simulated-P&L estimate a
+        dry-run sell records in its own order-log row, never for a wallet."""
+        statuses = _cost_basis_statuses(include_simulated)
         relevant = [r for r in self._log if r.get("venue") == venue and r.get("ticker") == ticker
-                    and r.get("status") in _CONSUMED_STATUSES]
+                    and r.get("status") in statuses]
         total_qty = 0.0
         total_cost = 0.0
         for row in reversed(relevant):
@@ -312,14 +328,17 @@ class PostgresRiskStore:
             return None
         return RiskState(venue, row[0], row[1], row[2], row[3])
 
-    def average_cost(self, venue: str, ticker: str) -> float | None:
+    def average_cost(self, venue: str, ticker: str, include_simulated: bool = False) -> float | None:
         """Volume-weighted average BUY fill price for *ticker* since the
         most recent SELL — a best-effort cost basis from GRID's own order
         log (Robinhood's API exposes none; see
-        ``RobinhoodCryptoTrader._settle_wallet_pnl``)."""
+        ``RobinhoodCryptoTrader._settle_wallet_pnl``). Real (``submitted``)
+        orders only unless *include_simulated* — see
+        :meth:`InMemoryRiskStore.average_cost`."""
         with self.engine.connect() as conn:
             row = conn.execute(text(_AVERAGE_COST_SQL), {
-                "venue": venue, "ticker": ticker, "statuses": list(_CONSUMED_STATUSES),
+                "venue": venue, "ticker": ticker,
+                "statuses": list(_cost_basis_statuses(include_simulated)),
             }).fetchone()
         return float(row[0]) if row and row[0] is not None else None
 

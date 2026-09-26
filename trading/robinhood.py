@@ -263,11 +263,14 @@ def _parse_iso(value: Any) -> datetime | None:
     return None
 
 
-def _parse_quote_timestamp(value: Any, fallback: datetime) -> datetime:
-    """Robinhood's ``best_bid_ask`` rows carry a ``timestamp`` field; fall
-    back to the local fetch time when it is absent or unparseable — see
-    ``ROBINHOOD_MAX_QUOTE_AGE_S``."""
-    return _parse_iso(value) or fallback
+def _parse_quote_timestamp(value: Any) -> datetime | None:
+    """Robinhood's own ``timestamp`` on a ``best_bid_ask`` row, or ``None``
+    when it is absent, null or unparseable. There is deliberately NO
+    fallback to the local fetch time: that would measure how recently GRID
+    asked, not how old the venue's price is, and would let an arbitrarily
+    old quote pass the stale-quote guard. :meth:`RobinhoodCryptoTrader._quote_for`
+    rejects a quote without a venue timestamp — see ``ROBINHOOD_MAX_QUOTE_AGE_S``."""
+    return _parse_iso(value)
 
 
 #: Fixed namespace (derived once from a readable name, itself a uuid5 of
@@ -470,14 +473,13 @@ class RobinhoodCryptoTrader:
     def get_best_bid_ask(self, symbols: list[str]) -> dict[str, dict[str, Any]]:
         """``{symbol: {bid, ask, mid, timestamp}}`` for the requested pairs.
 
-        ``timestamp`` is Robinhood's own quote timestamp when the response
-        carries one, else the local time this call completed — see
+        ``timestamp`` is Robinhood's own quote timestamp, or ``None`` when
+        the response carries none — never the local fetch time; see
         :meth:`_quote_for` / ``ROBINHOOD_MAX_QUOTE_AGE_S``.
         """
         if not symbols:
             return {}
         data = self._request("GET", PATH_BEST_BID_ASK, params=[("symbol", s) for s in symbols])
-        fetched_at = datetime.now(timezone.utc)
         quotes: dict[str, dict[str, Any]] = {}
         for row in self._results(data):
             sym = row.get("symbol")
@@ -488,7 +490,7 @@ class RobinhoodCryptoTrader:
             mid = _to_float(row.get("price")) or ((bid + ask) / 2 if bid and ask else 0.0)
             quotes[sym] = {
                 "bid": bid, "ask": ask, "mid": mid,
-                "timestamp": _parse_quote_timestamp(row.get("timestamp"), fetched_at),
+                "timestamp": _parse_quote_timestamp(row.get("timestamp")),
             }
         return quotes
 
@@ -689,9 +691,17 @@ class RobinhoodCryptoTrader:
         self._send_alert(f"[GRID] Robinhood guard tripped: {guard}", message, severity="warning")
 
     def _settle_wallet_pnl(self, wallet: dict[str, Any] | None, symbol: str,
-                           qty: Decimal, fill_price: float, simulated: bool) -> None:
-        """Best-effort realized P&L on a SELL fill, fed to
-        ``WalletManager.update_pnl`` via ``self.wallet_pnl_fn``.
+                           qty: Decimal, fill_price: float) -> None:
+        """Best-effort realized P&L on a REAL (``submitted``) SELL fill, fed
+        to ``WalletManager.update_pnl`` via ``self.wallet_pnl_fn``.
+
+        NEVER called for a dry-run: ``update_pnl`` mutates the wallet's
+        current_capital / total_pnl / win-loss / max_drawdown and runs its
+        risk check, which can mark the wallet KILLED — and a KILLED wallet
+        blocks every later open AND close, live included. A simulated sell
+        records its estimate in its own order-log row instead (see
+        :meth:`_simulated_pnl_estimate`). The cost basis here likewise
+        counts only real (``submitted``) buys.
 
         Robinhood's API exposes no cost basis for a spot holding (see
         :func:`status` — positions carry no ``unrealized_pnl`` field), so this
@@ -707,7 +717,7 @@ class RobinhoodCryptoTrader:
         if wallet is None or self.wallet_pnl_fn is None or fill_price <= 0:
             return
         try:
-            avg_cost = self.risk_store.average_cost(self.venue, symbol)
+            avg_cost = self.risk_store.average_cost(self.venue, symbol, include_simulated=False)
         except Exception as exc:  # noqa: BLE001 — a P&L estimate must never block a settled order
             log.warning("Robinhood avg-cost lookup failed for {s}: {e}", s=symbol, e=str(exc))
             return
@@ -716,10 +726,30 @@ class RobinhoodCryptoTrader:
         pnl = (float(fill_price) - avg_cost) * float(qty)
         try:
             self.wallet_pnl_fn(wallet["id"], pnl, pnl > 0)
-            log.info("Robinhood wallet {w} P&L settled: {p:+.2f}{sim}",
-                     w=wallet["id"], p=pnl, sim=" (simulated)" if simulated else "")
+            log.info("Robinhood wallet {w} P&L settled: {p:+.2f}", w=wallet["id"], p=pnl)
         except Exception as exc:  # noqa: BLE001 — a P&L write failure must not fail the order
             log.warning("Robinhood update_pnl failed for wallet {w}: {e}", w=wallet.get("id"), e=str(exc))
+
+    def _simulated_pnl_estimate(self, symbol: str, qty: Decimal, fill_price: float) -> dict[str, Any] | None:
+        """Labelled P&L estimate for a DRY-RUN sell, stored only in that
+        sell's own order-log row (``raw_response``) — never passed to
+        ``wallet_pnl_fn``. Basis counts simulated and real buys since the
+        last sell of either kind. ``None`` when there is no basis."""
+        if fill_price <= 0:
+            return None
+        try:
+            avg_cost = self.risk_store.average_cost(self.venue, symbol, include_simulated=True)
+        except Exception as exc:  # noqa: BLE001 — an estimate must never block a dry run
+            log.warning("Robinhood simulated avg-cost lookup failed for {s}: {e}", s=symbol, e=str(exc))
+            return None
+        if not avg_cost or avg_cost <= 0:
+            return None
+        return {
+            "simulated_pnl_estimate_usd": round((float(fill_price) - avg_cost) * float(qty), 6),
+            "simulated_cost_basis": avg_cost,
+            "simulated_fill_price": float(fill_price),
+            "label": "SIMULATED dry-run P&L estimate - not booked to any wallet",
+        }
 
     # ------------------------------------------------------------------
     # Quoting
@@ -742,19 +772,32 @@ class RobinhoodCryptoTrader:
         if not quote:
             return {"error": f"No quote for {symbol} on Robinhood."}
         bid, ask, mid = quote["bid"], quote["ask"], quote["mid"]
+        if bid <= 0 or ask <= 0:
+            # One-sided (or empty) book: the spread cannot be measured, so it
+            # must be rejected — never scored as a 0bps spread, and never
+            # priced off `mid` in place of the missing side.
+            msg = (f"{symbol} quote is one-sided (bid {bid} / ask {ask}) — refusing an "
+                   "unmeasurable spread.")
+            self._alert_guard_trip("one_sided_quote", msg)
+            return {"error": msg, "status": "blocked", "guard": "spread"}
+        if mid <= 0:
+            mid = (bid + ask) / 2
         price = ask if side == "buy" else bid
-        price = price or mid
-        if price <= 0:
-            return {"error": f"Invalid price for {symbol}: {price}"}
 
-        age_s = max(0.0, (datetime.now(timezone.utc) - quote["timestamp"]).total_seconds())
+        quote_ts = quote.get("timestamp")
+        if quote_ts is None:
+            msg = (f"Quote for {symbol} carries no venue timestamp — its age cannot be "
+                   "verified, refusing it (fail closed).")
+            self._alert_guard_trip("stale_quote", msg)
+            return {"error": msg, "status": "blocked", "guard": "stale_quote"}
+        age_s = max(0.0, (datetime.now(timezone.utc) - quote_ts).total_seconds())
         if age_s > self.max_quote_age_s:
             msg = (f"Quote for {symbol} is {age_s:.0f}s old (max {self.max_quote_age_s:.0f}s) — "
                    "refusing a stale price.")
             self._alert_guard_trip("stale_quote", msg)
             return {"error": msg, "status": "blocked", "guard": "stale_quote"}
 
-        spread_bps = ((ask - bid) / mid * 10000.0) if (mid and ask and bid) else 0.0
+        spread_bps = (ask - bid) / mid * 10000.0
         if spread_bps > self.max_spread_bps:
             msg = (f"{symbol} spread {spread_bps:.1f}bps exceeds the {self.max_spread_bps:.1f}bps cap "
                    f"(bid {bid} / ask {ask}) — refusing a dislocated quote.")
@@ -841,8 +884,18 @@ class RobinhoodCryptoTrader:
         # order log for PRIOR fills of this ticker, and this fill (a SELL,
         # when we get here) would otherwise be its own most-recent row and
         # short-circuit the scan to "no prior BUY history" every time.
-        if side == "sell" and status in ("dry_run", "submitted"):
-            self._settle_wallet_pnl(wallet, symbol, qty, fill_price, simulated=(status == "dry_run"))
+        # Only a REAL sell touches the wallet; a dry-run sell's estimate goes
+        # into its own order-log row, labelled, and nowhere else.
+        raw_response = result.get("raw_response")
+        if side == "sell" and status == "submitted":
+            self._settle_wallet_pnl(wallet, symbol, qty, fill_price)
+        elif side == "sell" and status == "dry_run":
+            estimate = self._simulated_pnl_estimate(symbol, qty, fill_price)
+            if estimate is not None:
+                raw_response = estimate
+                log.info("Robinhood dry-run sell {s}: simulated P&L estimate {p:+.2f} "
+                         "(order log only, no wallet change)", s=symbol,
+                         p=estimate["simulated_pnl_estimate_usd"])
 
         self.risk_store.log_order(
             self.venue, order.get("client_order_id", ""),
@@ -854,7 +907,7 @@ class RobinhoodCryptoTrader:
             fill_price=fill_price,
             guard_results={"wallet": "ok", "drawdown": "ok", "daily_loss": "ok",
                           "order_rate": "ok", "stale_quote": "ok", "spread": "ok"},
-            error=result.get("error"), raw_response=result.get("raw_response"),
+            error=result.get("error"), raw_response=raw_response,
             simulated=(status == "dry_run"),
         )
         # LIVE orders already alert unconditionally from _submit(). A dry-run

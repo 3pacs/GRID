@@ -110,26 +110,26 @@ class TestAverageCost:
 
     def test_single_buy_is_its_own_average(self):
         store = InMemoryRiskStore()
-        store.log_order("robinhood", "buy-1", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="0.1", fill_price=60000.0)
         assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(60000.0)
 
     def test_volume_weighted_across_two_buys(self):
         store = InMemoryRiskStore()
-        store.log_order("robinhood", "buy-1", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="1.0", fill_price=100.0)
-        store.log_order("robinhood", "buy-2", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-2", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="3.0", fill_price=200.0)
         # (1*100 + 3*200) / 4 = 175
         assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(175.0)
 
     def test_only_history_since_the_last_sell_counts(self):
         store = InMemoryRiskStore()
-        store.log_order("robinhood", "buy-1", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="1.0", fill_price=100.0)
-        store.log_order("robinhood", "sell-1", status="dry_run", ticker="BTC-USD", side="sell",
+        store.log_order("robinhood", "sell-1", status="submitted", ticker="BTC-USD", side="sell",
                         quantity="1.0", fill_price=150.0)
-        store.log_order("robinhood", "buy-2", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-2", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="1.0", fill_price=300.0)
         assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(300.0)
 
@@ -141,6 +141,29 @@ class TestAverageCost:
 
     def test_tickers_are_independent(self):
         store = InMemoryRiskStore()
-        store.log_order("robinhood", "buy-1", status="dry_run", ticker="BTC-USD", side="buy",
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
                         quantity="1.0", fill_price=100.0)
         assert store.average_cost("robinhood", "ETH-USD") is None
+
+    def test_simulated_buys_are_excluded_from_the_real_basis(self):
+        store = InMemoryRiskStore()
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
+                        quantity="1.0", fill_price=100.0)
+        store.log_order("robinhood", "buy-2", status="dry_run", ticker="BTC-USD", side="buy",
+                        quantity="3.0", fill_price=200.0, simulated=True)
+        assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(100.0)
+        assert store.average_cost("robinhood", "BTC-USD", include_simulated=True) == pytest.approx(175.0)
+
+    def test_only_simulated_history_gives_no_real_basis(self):
+        store = InMemoryRiskStore()
+        store.log_order("robinhood", "buy-1", status="dry_run", ticker="BTC-USD", side="buy",
+                        quantity="1.0", fill_price=100.0, simulated=True)
+        assert store.average_cost("robinhood", "BTC-USD") is None
+
+    def test_a_simulated_sell_does_not_reset_the_real_basis(self):
+        store = InMemoryRiskStore()
+        store.log_order("robinhood", "buy-1", status="submitted", ticker="BTC-USD", side="buy",
+                        quantity="1.0", fill_price=100.0)
+        store.log_order("robinhood", "sell-1", status="dry_run", ticker="BTC-USD", side="sell",
+                        quantity="1.0", fill_price=150.0, simulated=True)
+        assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(100.0)

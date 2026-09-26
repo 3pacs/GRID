@@ -57,15 +57,24 @@ class FakeSession:
 PRIVATE_B64, PUBLIC_B64 = rh.generate_keypair()
 
 
-def _routes(buying_power="1000", btc_qty="0.5", price="60000", spread_pct=0.001, quote_timestamp=None):
-    """*quote_timestamp*, when given, is an ISO string echoed back as the
-    best_bid_ask row's own ``timestamp`` field (Robinhood's real schema) —
-    tests use it to simulate a stale quote. Omitted, the connector falls
-    back to its local fetch time, so the quote is always "fresh"."""
-    quote_row = {"price": price, "bid_inclusive_of_sell_spread": str(float(price) * (1 - spread_pct)),
-                 "ask_inclusive_of_buy_spread": str(float(price) * (1 + spread_pct))}
-    if quote_timestamp is not None:
-        quote_row["timestamp"] = quote_timestamp
+_FRESH = object()
+
+
+def _routes(buying_power="1000", btc_qty="0.5", price="60000", spread_pct=0.001, quote_timestamp=_FRESH):
+    """*quote_timestamp* is echoed back as the best_bid_ask row's own
+    ``timestamp`` field (Robinhood's real schema). Default: a fresh venue
+    timestamp stamped at request time. An ISO string simulates a stale (or
+    fresh) quote; ``None`` omits the field entirely — which the connector
+    must reject (no fallback to its local fetch time)."""
+
+    def _quote_row():
+        row = {"price": price, "bid_inclusive_of_sell_spread": str(float(price) * (1 - spread_pct)),
+               "ask_inclusive_of_buy_spread": str(float(price) * (1 + spread_pct))}
+        if quote_timestamp is _FRESH:
+            row["timestamp"] = datetime.now(timezone.utc).isoformat()
+        elif quote_timestamp is not None:
+            row["timestamp"] = quote_timestamp
+        return row
     return {
         ("GET", rh.PATH_ACCOUNT): {"account_number": "RH123456789", "status": "active",
                                    "buying_power": buying_power, "buying_power_currency": "USD"},
@@ -74,7 +83,7 @@ def _routes(buying_power="1000", btc_qty="0.5", price="60000", spread_pct=0.001,
             {"asset_code": "ETH", "total_quantity": "0", "quantity_available_for_trading": "0"},
         ]},
         ("GET", rh.PATH_BEST_BID_ASK): lambda q, _b: {"results": [
-            {"symbol": s, **quote_row} for s in q.get("symbol", [])
+            {"symbol": s, **_quote_row()} for s in q.get("symbol", [])
         ]},
         ("GET", rh.PATH_TRADING_PAIRS): {"results": [
             {"symbol": "BTC-USD", "status": "tradable", "min_order_size": "0.000001",
@@ -449,21 +458,20 @@ class TestQuoteGuards:
         trader = _trader(session=FakeSession(_routes(quote_timestamp=fresh_ts)), max_quote_age_s=30.0)
         assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
 
-    def test_missing_timestamp_falls_back_to_local_fetch_time(self):
-        """_routes() with no quote_timestamp omits Robinhood's `timestamp`
-        field entirely -- the connector must fall back to its own fetch
-        time rather than treat that as infinitely stale."""
-        trader = _trader(session=FakeSession(_routes()), max_quote_age_s=5.0)
-        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+    def test_missing_timestamp_is_rejected_not_backfilled(self):
+        """No venue `timestamp` field at all: the quote's age cannot be
+        verified, so the stale-quote guard must fail closed. Falling back to
+        GRID's local fetch time would measure how recently GRID asked, not
+        how old Robinhood's price is."""
+        trader = _trader(session=FakeSession(_routes(quote_timestamp=None)), max_quote_age_s=5.0)
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "stale_quote"
+        assert "timestamp" in out["error"]
 
-    def test_explicit_null_timestamp_falls_back_to_local_fetch_time(self):
-        """Matches the real Robinhood response observed 2026-09-24 14:23Z via
-        a read-only quote pull through the deployed connector: the
-        best_bid_ask row's `timestamp` field was present but null (not
-        merely absent from the payload, which test_missing_timestamp_...
-        above already covers) -- row.get("timestamp") returns None either
-        way, but this proves the exact observed shape explicitly rather
-        than relying on that equivalence."""
+    def test_explicit_null_timestamp_is_rejected(self):
+        """The shape observed 2026-09-24 14:23Z via a read-only quote pull
+        through the deployed connector: the best_bid_ask row's `timestamp`
+        field present but null. Same fail-closed rule as a missing field."""
         routes = _routes()
         routes[("GET", rh.PATH_BEST_BID_ASK)] = lambda q, _b: {"results": [
             {"symbol": s, "price": "60000", "bid_inclusive_of_sell_spread": "59940",
@@ -471,7 +479,25 @@ class TestQuoteGuards:
             for s in q.get("symbol", [])
         ]}
         trader = _trader(session=FakeSession(routes), max_quote_age_s=5.0)
-        assert trader.open_position("BTC", "LONG", 10)["status"] == "dry_run"
+        out = trader.open_position("BTC", "LONG", 10)
+        assert out["status"] == "blocked" and out["guard"] == "stale_quote"
+
+    @pytest.mark.parametrize("bid,ask", [("0", "60060"), ("59940", "0"), ("", "60060"), ("59940", None)])
+    def test_one_sided_quote_is_rejected_not_scored_as_zero_spread(self, bid, ask):
+        """A missing/zero side makes the spread unmeasurable. It used to
+        score as spread_bps=0 (passing the spread guard) and price off
+        `mid`; it must be blocked instead — for opens and closes alike."""
+        routes = _routes()
+        fresh = datetime.now(timezone.utc).isoformat()
+        routes[("GET", rh.PATH_BEST_BID_ASK)] = lambda q, _b: {"results": [
+            {"symbol": s, "price": "60000", "bid_inclusive_of_sell_spread": bid,
+             "ask_inclusive_of_buy_spread": ask, "timestamp": fresh}
+            for s in q.get("symbol", [])
+        ]}
+        trader = _trader(session=FakeSession(routes))
+        for out in (trader.open_position("BTC", "LONG", 10), trader.close_position("BTC-USD")):
+            assert out["status"] == "blocked" and out["guard"] == "spread"
+            assert "one-sided" in out["error"]
 
     def test_wide_spread_is_rejected(self):
         trader = _trader(session=FakeSession(_routes(spread_pct=0.05)), max_spread_bps=250.0)
@@ -599,7 +625,11 @@ class TestAlerts:
 
 
 class TestWalletPnl:
-    def test_update_pnl_called_on_sell_fill_with_estimated_cost_basis(self):
+    def test_dry_run_sell_never_touches_the_wallet(self):
+        """A DRY-RUN round trip must leave the wallet untouched: update_pnl
+        mutates current_capital/total_pnl/win-loss/max_drawdown and can mark
+        the wallet KILLED, which would then block every later live order.
+        The estimate is recorded, labelled, in the sell's own order-log row."""
         store = InMemoryRiskStore()
         pnl_fn = MagicMock()
         wallet = {"id": "w1", "status": "ACTIVE"}
@@ -607,17 +637,56 @@ class TestWalletPnl:
         buyer = _trader(session=FakeSession(_routes(price="60000")),
                         risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
         assert buyer.open_position("BTC", "LONG", 100, client_order_id="buy-1")["status"] == "dry_run"
-        assert not pnl_fn.called  # a BUY never realizes P&L
-
-        # Sell at a higher price than the recorded buy -> a profit, estimated
-        # from GRID's own order log (Robinhood's API exposes no cost basis).
         seller = _trader(session=FakeSession(_routes(price="66000", btc_qty="0.5")),
                          risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
         assert seller.close_position("BTC-USD", client_order_id="sell-1")["status"] == "dry_run"
+
+        assert not pnl_fn.called
+        sell_row = next(r for r in store._log if r["client_order_id"] == "sell-1")
+        assert sell_row["simulated"] is True
+        estimate = sell_row["raw_response"]
+        assert estimate["label"].startswith("SIMULATED")
+        assert estimate["simulated_pnl_estimate_usd"] > 0
+
+    def test_simulated_buys_do_not_enter_the_real_cost_basis(self):
+        """A LIVE sell after only dry-run buys has no real basis -> no
+        wallet P&L is booked at all (rather than one measured against a
+        price that was never paid)."""
+        store = InMemoryRiskStore()
+        pnl_fn = MagicMock()
+        wallet = {"id": "w1", "status": "ACTIVE"}
+        buyer = _trader(session=FakeSession(_routes(price="60000")),
+                        risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
+        assert buyer.open_position("BTC", "LONG", 100, client_order_id="buy-1")["status"] == "dry_run"
+        assert store.average_cost("robinhood", "BTC-USD") is None
+        assert store.average_cost("robinhood", "BTC-USD", include_simulated=True) is not None
+
+        seller = _trader(live=True, session=FakeSession(_routes(price="66000", btc_qty="0.5")),
+                         risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
+        assert seller.close_position("BTC-USD", client_order_id="sell-1")["status"] == "submitted"
+        assert not pnl_fn.called
+
+    def test_live_sell_settles_against_real_buys_only(self):
+        store = InMemoryRiskStore()
+        pnl_fn = MagicMock()
+        wallet = {"id": "w1", "status": "ACTIVE"}
+        # A real (submitted) buy at 60000, then a simulated buy far below it
+        # that must NOT drag the basis down.
+        store.log_order("robinhood", "real-buy", status="submitted", ticker="BTC-USD", side="buy",
+                        quantity="0.001", fill_price=60000.0)
+        store.log_order("robinhood", "sim-buy", status="dry_run", ticker="BTC-USD", side="buy",
+                        quantity="1.0", fill_price=1000.0, simulated=True)
+        assert store.average_cost("robinhood", "BTC-USD") == pytest.approx(60000.0)
+
+        seller = _trader(live=True, session=FakeSession(_routes(price="66000", btc_qty="0.5")),
+                         risk_store=store, wallet_lookup=lambda: wallet, wallet_pnl_fn=pnl_fn)
+        assert seller.close_position("BTC-USD", client_order_id="sell-1")["status"] == "submitted"
         assert pnl_fn.called
         wallet_id, pnl, is_win = pnl_fn.call_args.args
         assert wallet_id == "w1"
-        assert is_win is True and pnl > 0
+        # POST route echoes average_price=66000 -> (66000 - 60000) * 0.5 held.
+        assert pnl == pytest.approx(3000.0)
+        assert is_win is True
 
     def test_no_update_pnl_without_prior_cost_history(self):
         pnl_fn = MagicMock()

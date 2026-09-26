@@ -200,14 +200,25 @@ class TestAverageCost:
         venue = _venue("avg-cost")
         store.log_order(venue, "buy-1", ticker="BTC-USD", side="buy", direction="LONG",
                         size_usd=100.0, quantity="1.0", fill_price=100.0, order_type="limit",
-                        status="dry_run", simulated=True)
+                        status="submitted", simulated=False)
         store.log_order(venue, "buy-2", ticker="BTC-USD", side="buy", direction="LONG",
                         size_usd=300.0, quantity="3.0", fill_price=200.0, order_type="limit",
-                        status="dry_run", simulated=True)
+                        status="submitted", simulated=False)
         assert store.average_cost(venue, "BTC-USD") == pytest.approx(175.0)
 
     def test_none_without_history(self, store):
         assert store.average_cost(_venue("no-history"), "BTC-USD") is None
+
+    def test_simulated_buys_are_excluded_from_the_real_basis(self, store):
+        venue = _venue("avg-cost-sim")
+        store.log_order(venue, "buy-1", ticker="BTC-USD", side="buy", direction="LONG",
+                        size_usd=100.0, quantity="1.0", fill_price=100.0, order_type="limit",
+                        status="submitted", simulated=False)
+        store.log_order(venue, "buy-2", ticker="BTC-USD", side="buy", direction="LONG",
+                        size_usd=600.0, quantity="3.0", fill_price=200.0, order_type="limit",
+                        status="dry_run", simulated=True)
+        assert store.average_cost(venue, "BTC-USD") == pytest.approx(100.0)
+        assert store.average_cost(venue, "BTC-USD", include_simulated=True) == pytest.approx(175.0)
 
 
 class TestFailsClosedWithoutMigration:
