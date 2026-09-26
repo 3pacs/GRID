@@ -1,4 +1,4 @@
-"""S09: one read-only real-panel scan through the PIT research contract.
+"""S09: one read-only real-panel scan through the latest-vintage research contract.
 
 Run (on a host that can reach griddb, env loaded, never printing it):
 
@@ -11,12 +11,16 @@ autocommit (one short transaction per statement). The only SQL executed is
 read per declared series. No writes, no registry, no route, no timer; the
 output directory must be new.
 
-Universe (declared here, frozen in the manifest): 30 FRED/AAII series that are
+Universe (declared here, frozen in the manifest): 29 FRED/AAII series that are
 single-source and single-valued per date on griddb (bounded read-only probe,
-2026-09-26), none with material revisions, none yfinance-sourced (historical
-``YF:*:close`` rows carry more than one close per date, S07/#642), no
-``snap:*``/LLM/astro series. Targets are non-price: forward *changes* of VIX,
-the 2-year yield, the 10y-2y slope and the HY OAS.
+2026-09-26), none on the adapter's revised-series denylist (DTWEXBGS was
+dropped in S09b: the broad dollar index history is revised with trade
+weights), none yfinance-sourced (historical ``YF:*:close`` rows carry more than
+one close per date, S07/#642), no ``snap:*``/LLM/astro series. Every series
+declares its publication source (``research_real_panel.PUBLICATIONS``).
+Targets are non-price: forward *changes* of VIX, the 2-year yield, the 10y-2y
+slope and the HY OAS. Trials whose feature is in the target's declared proxy
+group are ``self_lag``: measured, never selectable (S09b).
 """
 
 from __future__ import annotations
@@ -29,59 +33,66 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from analysis.offline_research_proof import PIT_ORIGIN, Protocol, run_proof, write_once
-from analysis.research_real_panel import SeriesSpec, TargetSpec, load_pit_panel
+from analysis.offline_research_proof import (
+    LATEST_VINTAGE_ORIGIN,
+    Protocol,
+    run_proof,
+    write_once,
+)
+from analysis.research_real_panel import (
+    SeriesSpec,
+    TargetSpec,
+    load_latest_vintage_panel,
+)
 
 REPO = Path(__file__).resolve().parent.parent
 MAX_STATEMENT_TIMEOUT_S = 60
 
-DAILY = {"lag_days": 1, "stale_sessions": 5}
-H10_FX = {"lag_days": 8, "stale_sessions": 5}  # H.10 posts daily rates weekly
 WEEKLY = {"stale_sessions": 10}
 
 FEATURES: tuple[SeriesSpec, ...] = (
-    # Treasury curve / inflation / policy (H.15, daily, not revised)
-    SeriesSpec("DGS1", "diff", **DAILY),
-    SeriesSpec("DGS2", "diff", **DAILY),
-    SeriesSpec("DGS5", "diff", **DAILY),
-    SeriesSpec("DGS30", "diff", **DAILY),
-    SeriesSpec("T10Y2Y", "diff", **DAILY),
-    SeriesSpec("T10Y3M", "diff", **DAILY),
-    SeriesSpec("T10YIE", "diff", **DAILY),
-    SeriesSpec("T5YIE", "diff", **DAILY),
-    SeriesSpec("DFII10", "diff", **DAILY),
-    SeriesSpec("DFF", "diff", **DAILY),
+    # Treasury curve / real yields / policy (H.15, daily, not revised)
+    SeriesSpec("DGS1", "diff", "FRB_H15"),
+    SeriesSpec("DGS2", "diff", "FRB_H15"),
+    SeriesSpec("DGS5", "diff", "FRB_H15"),
+    SeriesSpec("DGS30", "diff", "FRB_H15"),
+    SeriesSpec("DFII10", "diff", "FRB_H15"),
+    SeriesSpec("DFF", "diff", "FRB_H15"),
+    # FRED-computed spreads / breakevens from H.15 legs
+    SeriesSpec("T10Y2Y", "diff", "FRED_H15_SPREAD"),
+    SeriesSpec("T10Y3M", "diff", "FRED_H15_SPREAD"),
+    SeriesSpec("T10YIE", "diff", "FRED_H15_SPREAD"),
+    SeriesSpec("T5YIE", "diff", "FRED_H15_SPREAD"),
     # Credit (ICE BofA OAS, daily)
-    SeriesSpec("BAMLH0A0HYM2", "diff", **DAILY),
-    SeriesSpec("BAMLC0A0CM", "diff", **DAILY),
-    SeriesSpec("BAMLH0A1HYBB", "diff", **DAILY),
-    SeriesSpec("BAMLH0A2HYB", "diff", **DAILY),
-    SeriesSpec("BAMLH0A3HYC", "diff", **DAILY),
-    SeriesSpec("BAMLC0A4CBBB", "diff", **DAILY),
-    SeriesSpec("BAMLHE00EHYIOAS", "diff", **DAILY),
-    SeriesSpec("BAMLEMHBHYCRPIOAS", "diff", **DAILY),
+    SeriesSpec("BAMLH0A0HYM2", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLC0A0CM", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLH0A1HYBB", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLH0A2HYB", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLH0A3HYC", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLC0A4CBBB", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLHE00EHYIOAS", "diff", "ICE_BOFA"),
+    SeriesSpec("BAMLEMHBHYCRPIOAS", "diff", "ICE_BOFA"),
     # Volatility
-    SeriesSpec("VIXCLS", "diff", **DAILY),
-    # Dollar / FX (H.10)
-    SeriesSpec("DTWEXBGS", "pct", **H10_FX),
-    SeriesSpec("DEXJPUS", "pct", **H10_FX),
-    SeriesSpec("DEXUSEU", "pct", **H10_FX),
-    SeriesSpec("DEXCAUS", "pct", **H10_FX),
-    SeriesSpec("DEXSZUS", "pct", **H10_FX),
-    SeriesSpec("DEXUSUK", "pct", **H10_FX),
+    SeriesSpec("VIXCLS", "diff", "CBOE_VIX"),
+    # FX (H.10 bilateral rates; the broad index DTWEXBGS is revised: refused)
+    SeriesSpec("DEXJPUS", "pct", "FRB_H10"),
+    SeriesSpec("DEXUSEU", "pct", "FRB_H10"),
+    SeriesSpec("DEXCAUS", "pct", "FRB_H10"),
+    SeriesSpec("DEXSZUS", "pct", "FRB_H10"),
+    SeriesSpec("DEXUSUK", "pct", "FRB_H10"),
     # Liquidity / balance sheet (H.4.1 Wednesday levels, Thursday release)
-    SeriesSpec("WALCL", "pct", lag_days=2, **WEEKLY),
-    SeriesSpec("WTREGEN", "pct", lag_days=2, **WEEKLY),
-    SeriesSpec("RRPONTSYD", "diff", **DAILY),
-    # Housing finance / sentiment (weekly, Thursday release)
-    SeriesSpec("MORTGAGE30US", "diff", lag_days=1, **WEEKLY),
-    SeriesSpec("aaii.bull_bear_spread", "diff", lag_days=1, **WEEKLY),
+    SeriesSpec("WALCL", "pct", "FRB_H41", **WEEKLY),
+    SeriesSpec("WTREGEN", "pct", "FRB_H41", **WEEKLY),
+    SeriesSpec("RRPONTSYD", "diff", "NYFED_RRP"),
+    # Housing finance / sentiment (weekly, Thursday-dated)
+    SeriesSpec("MORTGAGE30US", "diff", "FREDDIE_PMMS", **WEEKLY),
+    SeriesSpec("aaii.bull_bear_spread", "diff", "AAII", **WEEKLY),
 )
 TARGETS: tuple[TargetSpec, ...] = (
-    TargetSpec("VIXCLS", "change", lag_days=1),
-    TargetSpec("DGS2", "change", lag_days=1),
-    TargetSpec("T10Y2Y", "change", lag_days=1),
-    TargetSpec("BAMLH0A0HYM2", "change", lag_days=1),
+    TargetSpec("VIXCLS", "change", "CBOE_VIX"),
+    TargetSpec("DGS2", "change", "FRB_H15"),
+    TargetSpec("T10Y2Y", "change", "FRED_H15_SPREAD"),
+    TargetSpec("BAMLH0A0HYM2", "change", "ICE_BOFA"),
 )
 HORIZONS = (1, 5, 20)
 
@@ -131,7 +142,7 @@ def bh_threshold(ledger: list[dict], q: float) -> dict:
 
 def scan(conn, output: Path, args) -> dict:
     started = time.time()
-    panel = load_pit_panel(
+    panel = load_latest_vintage_panel(
         conn,
         FEATURES,
         TARGETS,
@@ -149,7 +160,7 @@ def scan(conn, output: Path, args) -> dict:
         features=panel.feature_names(),
         split=f"{args.split}T00:00:00+00:00",
         end=end.isoformat(),
-        origin=PIT_ORIGIN,
+        origin=LATEST_VINTAGE_ORIGIN,
         families=panel.family_names(HORIZONS),
         fdr_q=0.10,
         alpha=0.05,
@@ -159,26 +170,27 @@ def scan(conn, output: Path, args) -> dict:
         seed=args.seed,
         statistic="spearman",
         start=f"{args.discovery_start}T00:00:00+00:00",
-        pit_receipt=panel.receipt_sha,
+        read_receipt=panel.receipt_sha,
+        self_lag=panel.self_lag(panel.family_names(HORIZONS)),
     )
     discovery = panel.family_rows(protocol, "discovery")
     holdout = panel.family_rows(protocol, "holdout")
-    result = run_proof(protocol, discovery, holdout, output / "run", pit_panel=panel)
+    result = run_proof(protocol, discovery, holdout, output / "run", panel=panel)
     frozen = json.loads((output / "run" / "discovery-frozen.json").read_text())
     payload = frozen["payload"]
     ledger = payload["ledger"]
     with (output / "trial-ledger.csv").open("x", newline="", encoding="utf-8") as f:
         fields = ["trial_id", "family", "feature", "n", "r", "p", "adjusted_p",
-                  "status", "block", "selected"]
+                  "status", "block", "selected", "self_lag_r", "self_lag_p"]
         writer = csv.DictWriter(f, fields)
         writer.writeheader()
         for t in ledger:
-            writer.writerow({k: t[k] for k in fields})
+            writer.writerow({k: t.get(k) for k in fields})
     survivors = [t for t in ledger if t["selected"]]
     summary = {
         "state": result["state"],
         "promotion_allowed": False,
-        "origin": PIT_ORIGIN,
+        "origin": LATEST_VINTAGE_ORIGIN,
         "code_sha": args.code_sha,
         "file_sha256": {
             f: file_sha256(f)
@@ -196,7 +208,11 @@ def scan(conn, output: Path, args) -> dict:
         "holdout_start": args.split,
         "holdout_end_exclusive": protocol.end,
         "reader": panel.receipt["reader"],
-        "pit_receipt_sha256": panel.receipt_sha,
+        "read_receipt_sha256": panel.receipt_sha,
+        "vintage": panel.receipt["vintage"],
+        "publications": panel.receipt["publications"],
+        "proxy_groups": panel.receipt["proxy_groups"],
+        "self_lag_trials": payload["self_lag_count"],
         "series_read": panel.receipt["series"],
         "universe": [s.series_id for s in FEATURES],
         "feature_specs": panel.receipt["features"],
@@ -216,6 +232,8 @@ def scan(conn, output: Path, args) -> dict:
             "holdout": {k: len(v) for k, v in holdout.items()},
         },
         "blocks": payload["blocks"],
+        "block_basis": payload["block_basis"],
+        "holdout_blocks": result["holdout_blocks"],
         "min_attainable_p": payload["min_attainable_p"],
         "raw_p_lt_0.05": sum(t["status"] == "tested" and t["p"] < 0.05 for t in ledger),
         "bh": bh_threshold(ledger, protocol.fdr_q),

@@ -1,4 +1,5 @@
-"""S09 real-panel adapter: vintage-safe reads and the distinct PIT origin.
+"""S09/S09b real-panel adapter: latest-vintage reads, publication-time known_at,
+the revised-series denylist, proxy groups and the latest_vintage_read origin.
 
 Runs the real ``store.observations.read_window`` SQL against an in-memory
 SQLite ``raw_series`` shaped like production (FAILED zero markers, several
@@ -10,7 +11,7 @@ from __future__ import annotations
 
 import copy
 import sqlite3
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,11 +33,13 @@ from sqlalchemy import (
 
 from analysis import research_real_panel as rp
 from analysis.offline_research_proof import (
-    PIT_ORIGIN,
+    LATEST_VINTAGE_ORIGIN,
     Protocol,
+    digest,
     discover,
     evaluate_holdout,
     run_proof,
+    validate_rows,
 )
 
 sqlite3.register_adapter(date, lambda d: d.isoformat())
@@ -48,11 +51,17 @@ AS_OF_TS = datetime(2022, 2, 1, tzinfo=timezone.utc)
 SPLIT = "2021-01-04T00:00:00+00:00"
 END = "2022-01-01T00:00:00+00:00"
 FEATURES = (
-    rp.SeriesSpec("FEAT_D", "diff", lag_days=1),
-    rp.SeriesSpec("FEAT_W", "pct", lag_days=6, stale_sessions=10),
+    rp.SeriesSpec("FEAT_D", "diff", "FRB_H15"),
+    rp.SeriesSpec("FEAT_W", "pct", "FRB_H10", stale_sessions=10),
 )
-TARGETS = (rp.TargetSpec("TGT", "change", lag_days=1),)
+TARGETS = (rp.TargetSpec("TGT", "change", "FRB_H15"),)
 HORIZONS = (1, 5)
+
+
+@pytest.fixture(autouse=True)
+def tgt_proxy_group(monkeypatch):
+    """The synthetic target declares itself and FEAT_D as its proxy group."""
+    monkeypatch.setitem(rp.PROXY_GROUPS, "TGT", frozenset({"TGT", "FEAT_D"}))
 
 
 @pytest.fixture()
@@ -95,7 +104,7 @@ def engine():
         row("FEAT_D", d.date(), feat[i])
     for d in pd.date_range(START, AS_OF, freq="W-SAT"):  # weekly, Saturday-dated
         row("FEAT_W", d.date(), 100 + rng.normal())
-    # pull-log defects the vintage-safe path must ignore
+    # pull-log defects the latest-vintage path must ignore
     row("FEAT_D", date(2021, 6, 1), 0.0, status="FAILED", pulled=PULLED + timedelta(1))
     row("FEAT_D", date(2021, 6, 2), -999.0, pulled=PULLED - timedelta(days=3))  # older vintage
     row("TGT", date(2021, 3, 3), 99.0, pulled=PULLED + timedelta(days=55))  # after as_of_ts
@@ -107,7 +116,7 @@ def engine():
 
 
 def load(conn, features=FEATURES, targets=TARGETS):
-    return rp.load_pit_panel(
+    return rp.load_latest_vintage_panel(
         conn, features, targets, start=START, as_of=AS_OF, as_of_ts=AS_OF_TS
     )
 
@@ -118,20 +127,25 @@ def protocol_for(panel, **overrides):
         features=panel.feature_names(),
         split=SPLIT,
         end=END,
-        origin=PIT_ORIGIN,
+        origin=LATEST_VINTAGE_ORIGIN,
         families=panel.family_names(HORIZONS),
         step=5,
         perms=199,
         start="2020-05-01T00:00:00+00:00",
-        pit_receipt=panel.receipt_sha,
+        read_receipt=panel.receipt_sha,
+        self_lag=panel.self_lag(panel.family_names(HORIZONS)),
         **overrides,
     )
+
+
+def utc(text):
+    return pd.Timestamp(text, tz="UTC")
 
 
 # --- reads -------------------------------------------------------------------------
 
 
-def test_panel_reads_only_through_the_vintage_safe_path(engine):
+def test_panel_reads_only_through_read_window(engine):
     statements = []
     event.listen(
         engine,
@@ -175,9 +189,33 @@ def test_excluded_or_unverified_series_are_refused(engine, sid):
             load(conn, targets=(rp.TargetSpec(sid),))
 
 
-def test_revised_series_without_vintage_history_are_refused(engine):
-    with engine.connect() as conn, pytest.raises(ValueError, match="vintage history"):
-        load(conn, features=(*FEATURES, rp.SeriesSpec("NFCI", revised=True)))
+@pytest.mark.parametrize(
+    "sid", ["NFCI", "NFCICREDIT", "ANFCI", "STLFSI4", "ICSA", "PAYEMS", "DTWEXBGS"]
+)
+def test_revised_series_are_refused_by_the_adapter_not_the_caller(engine, sid):
+    # no caller-declared flag exists any more: the denylist lives in the adapter
+    assert "revised" not in {f.name for f in fields(rp.SeriesSpec)}
+    assert "revised" in rp.refusal(sid)
+    with engine.connect() as conn:
+        with pytest.raises(ValueError, match="vintage history"):
+            load(conn, features=(*FEATURES, rp.SeriesSpec(sid)))
+        with pytest.raises(ValueError, match="vintage history"):
+            load(conn, targets=(rp.TargetSpec(sid),))
+
+
+def test_revised_denylist_documents_its_sources():
+    assert "NFCI" in rp.REVISED_PREFIXES and "STLFSI" in rp.REVISED_PREFIXES
+    assert any("ALFRED" in source for source in rp.REVISED_SOURCES)
+    for sid in ("DGS2", "T10Y2Y", "BAMLH0A0HYM2", "VIXCLS", "WALCL", "MORTGAGE30US"):
+        assert rp.refusal(sid) is None
+
+
+def test_undeclared_source_or_proxy_group_is_refused(engine):
+    with engine.connect() as conn:
+        with pytest.raises(ValueError, match="publication source"):
+            load(conn, features=(*FEATURES, rp.SeriesSpec("FEAT_X", source="guess")))
+        with pytest.raises(ValueError, match="proxy group"):
+            load(conn, targets=(rp.TargetSpec("FEAT_D"),))
 
 
 def test_adapter_never_names_hypothesis_tables_or_writes():
@@ -190,19 +228,72 @@ def test_adapter_never_names_hypothesis_tables_or_writes():
 # --- availability ------------------------------------------------------------------
 
 
+def test_publication_times_follow_the_declared_schedules():
+    h15 = rp.PUBLICATIONS["FRB_H15"]
+    # Friday -> Monday 21:17Z; the Friday before Presidents' Day -> Tuesday
+    assert rp.publication_times([date(2021, 3, 5)], h15)[0] == utc("2021-03-08 21:17")
+    assert rp.publication_times([date(2021, 2, 12)], h15)[0] == utc("2021-02-16 21:17")
+    # a Saturday-dated observation is published the next business day
+    assert rp.publication_times([date(2021, 3, 6)], h15)[0] == utc("2021-03-08 21:17")
+    h10 = rp.PUBLICATIONS["FRB_H10"]
+    assert rp.publication_times([date(2021, 3, 1)], h10)[0] == utc("2021-03-09 21:15")
+    h41 = rp.PUBLICATIONS["FRB_H41"]  # Wednesday level
+    assert rp.publication_times([date(2021, 3, 3)], h41)[0] == utc("2021-03-05 21:30")
+    # every declared source is known strictly after the next day's 00:00Z decision
+    for publication in rp.PUBLICATIONS.values():
+        for d in (date(2021, 3, 1), date(2021, 3, 5), date(2021, 3, 6)):
+            known = rp.publication_times([d], publication)[0]
+            assert known > utc(d.isoformat()) + pd.Timedelta(days=1)
+    assert h15.time_utc >= "20:17"  # reviewer-verified ~20:17Z, never earlier
+
+
 def test_features_use_only_published_observations(engine):
     with engine.connect() as conn:
         panel = load(conn)
     index = panel.session_index()
     daily = panel._available_level(FEATURES[0], index)
     obs = {o.obs_date: o.value for o in panel.series_observations("FEAT_D")}
-    monday = pd.Timestamp("2021-03-08", tz="UTC")
-    assert daily[monday] == obs[date(2021, 3, 5)]  # Friday's value, published Saturday
+    # Friday 2021-03-05 is published Monday 21:17Z: usable Tuesday, not Monday
+    assert daily[utc("2021-03-08")] == obs[date(2021, 3, 4)]
+    assert daily[utc("2021-03-09")] == obs[date(2021, 3, 5)]
+    # Presidents' Day 2021-02-15: Friday's value is published Tuesday 21:17Z
+    assert daily[utc("2021-02-16")] == obs[date(2021, 2, 11)]
+    assert daily[utc("2021-02-17")] == obs[date(2021, 2, 15)]  # newest published wins
     weekly = panel._available_level(FEATURES[1], index)
     wobs = {o.obs_date: o.value for o in panel.series_observations("FEAT_W")}
-    # Saturday 2021-03-06 + 6 days = Friday 2021-03-12: invisible before, visible on it
-    assert weekly[pd.Timestamp("2021-03-11", tz="UTC")] == wobs[date(2021, 2, 27)]
-    assert weekly[pd.Timestamp("2021-03-12", tz="UTC")] == wobs[date(2021, 3, 6)]
+    # Saturday 2021-03-06 + 8 days = Sunday 03-14 21:15Z: first usable Monday 03-15
+    assert weekly[utc("2021-03-12")] == wobs[date(2021, 2, 27)]
+    assert weekly[utc("2021-03-15")] == wobs[date(2021, 3, 6)]
+
+
+def test_no_feature_is_known_after_its_decision(engine):
+    with engine.connect() as conn:
+        panel = load(conn)
+    protocol = protocol_for(panel)
+    stamped = 0
+    for window in ("discovery", "holdout"):
+        for rows in panel.family_rows(protocol, window).values():
+            validate_rows(rows, protocol, window)
+            for row in rows:
+                decision = pd.Timestamp(row["decision_at"])
+                for feature in row["features"].values():
+                    known = pd.Timestamp(feature["known_at"])
+                    assert known <= decision
+                    if feature["value"] is not None:
+                        # the declared publication stamp, not the decision time
+                        assert known < decision
+                        assert known.strftime("%H:%M") in ("21:17", "21:15")
+                        stamped += 1
+    assert stamped > 1000
+    # A value stamped as known at its 00:00Z session (the pre-S09b stamping)
+    # while H.15 publishes at 21:17Z is refused.
+    rows = copy.deepcopy(panel.family_rows(protocol, "discovery")[protocol.families[0]])
+    decision = pd.Timestamp(rows[0]["decision_at"])
+    rows[0]["features"]["FEAT_D|chg5"]["known_at"] = (
+        decision + pd.Timedelta(hours=21, minutes=17)
+    ).isoformat()
+    with pytest.raises(ValueError, match="future"):
+        validate_rows(rows, protocol, "discovery")
 
 
 def test_target_known_at_respects_publication_lag_and_window(engine):
@@ -215,13 +306,15 @@ def test_target_known_at_respects_publication_lag_and_window(engine):
         for row in rows:
             end, known = pd.Timestamp(row["label_end"]), pd.Timestamp(row["target_known_at"])
             assert known > end and known < pd.Timestamp(SPLIT)
+            published = rp.publication_times([end.date()], rp.PUBLICATIONS["FRB_H15"])
+            assert known == published[0]
             assert row["label"] == "change"
 
 
-# --- the distinct PIT origin -------------------------------------------------------
+# --- the distinct latest_vintage_read origin ---------------------------------------
 
 
-def test_pit_run_end_to_end_is_exploratory_and_never_promotes(engine, tmp_path):
+def test_latest_vintage_run_end_to_end_is_exploratory_and_never_promotes(engine, tmp_path):
     with engine.connect() as conn:
         panel = load(conn)
     protocol = protocol_for(panel)
@@ -230,29 +323,34 @@ def test_pit_run_end_to_end_is_exploratory_and_never_promotes(engine, tmp_path):
         panel.family_rows(protocol, "discovery"),
         panel.family_rows(protocol, "holdout"),
         tmp_path / "run",
-        pit_panel=panel,
+        panel=panel,
     )
-    assert result["state"] == "PIT_VINTAGE_READ_EXPLORATORY"
+    assert result["state"] == "LATEST_VINTAGE_READ_EXPLORATORY"
     assert not result["promotion_allowed"] and result["forward_evidence_count"] == 0
+    assert panel.receipt["origin"] == "latest_vintage_read"
+    assert "hindsight" in panel.receipt["vintage"]
+    assert panel.receipt["proxy_groups"] == {"TGT": ["FEAT_D", "TGT"]}
 
 
-def test_pit_label_without_a_verified_panel_is_refused(engine):
+def test_origin_label_without_a_verified_panel_is_refused(engine):
     with engine.connect() as conn:
         panel = load(conn)
     protocol = protocol_for(panel)
     rows = panel.family_rows(protocol, "discovery")
-    with pytest.raises(ValueError, match="vintage-safe read path"):
+    with pytest.raises(ValueError, match="read_window"):
         discover(protocol, rows)
-    with pytest.raises(ValueError, match="vintage-safe read path"):
-        discover(protocol, rows, pit_panel=object())
+    with pytest.raises(ValueError, match="read_window"):
+        discover(protocol, rows, panel=object())
     with pytest.raises(ValueError, match="receipt"):
-        discover(replace(protocol, pit_receipt="0" * 64), rows, pit_panel=panel)
+        discover(replace(protocol, read_receipt="0" * 64), rows, panel=panel)
     with pytest.raises(ValueError, match="receipt"):
-        replace(protocol, pit_receipt="").validate()
+        replace(protocol, read_receipt="").validate()
     with pytest.raises(ValueError, match="receipt"):
         replace(protocol, origin="exploratory_replay").validate()
+    with pytest.raises(ValueError, match="not implemented"):
+        replace(protocol, origin="pit_vintage_read").validate()  # the old label is gone
     with pytest.raises(TypeError):
-        rp.PitPanel(
+        rp.LatestVintagePanel(
             token=object(),
             features=FEATURES,
             targets=TARGETS,
@@ -271,12 +369,12 @@ def test_rows_not_derived_from_the_panel_are_refused(engine):
     tampered = copy.deepcopy(rows)
     tampered[protocol.families[0]][3]["target"] += 0.5
     with pytest.raises(ValueError, match="re-derived"):
-        discover(protocol, tampered, pit_panel=panel)
-    frozen = discover(protocol, rows, pit_panel=panel)
+        discover(protocol, tampered, panel=panel)
+    frozen = discover(protocol, rows, panel=panel)
     holdout = panel.family_rows(protocol, "holdout")
-    with pytest.raises(ValueError, match="vintage-safe read path"):
+    with pytest.raises(ValueError, match="read_window"):
         evaluate_holdout(frozen, holdout)
-    evaluate_holdout(frozen, holdout, pit_panel=panel)
+    evaluate_holdout(frozen, holdout, panel=panel)
 
 
 def test_a_panel_changed_after_its_read_is_refused(engine):
@@ -288,16 +386,18 @@ def test_a_panel_changed_after_its_read_is_refused(engine):
     obs[10] = replace(obs[10], value=obs[10].value + 1)
     panel._data["TGT"] = tuple(obs)
     with pytest.raises(ValueError, match="changed after"):
-        discover(protocol, rows, pit_panel=panel)
+        discover(protocol, rows, panel=panel)
 
 
-def test_panel_is_refused_for_non_pit_origins(engine):
+def test_panel_is_refused_for_other_origins(engine):
     with engine.connect() as conn:
         panel = load(conn)
-    protocol = replace(protocol_for(panel), origin="exploratory_replay", pit_receipt="")
+    protocol = replace(
+        protocol_for(panel), origin="exploratory_replay", read_receipt=""
+    )
     rows = panel.family_rows(protocol, "discovery")
     with pytest.raises(ValueError, match="only accepted with origin"):
-        discover(protocol, rows, pit_panel=panel)
+        discover(protocol, rows, panel=panel)
 
 
 def test_window_past_as_of_is_refused(engine):
@@ -306,4 +406,51 @@ def test_window_past_as_of_is_refused(engine):
     protocol = protocol_for(panel)
     late = replace(protocol, end="2022-03-01T00:00:00+00:00")
     with pytest.raises(ValueError, match="past the panel"):
-        discover(late, panel.family_rows(late, "discovery"), pit_panel=panel)
+        discover(late, panel.family_rows(late, "discovery"), panel=panel)
+
+
+# --- proxy groups / SELF_LAG ---------------------------------------------------------
+
+
+def test_proxy_trials_are_measured_but_never_selectable(engine):
+    with engine.connect() as conn:
+        panel = load(conn)
+    protocol = protocol_for(panel)
+    assert set(protocol.self_lag) == {
+        (family, f"FEAT_D|{suffix}")
+        for family in protocol.families
+        for suffix in ("chg5", "chg20", "z60")
+    }
+    payload = discover(
+        protocol, panel.family_rows(protocol, "discovery"), panel=panel
+    )["payload"]
+    proxies = [t for t in payload["ledger"] if t["status"] == "self_lag"]
+    assert len(proxies) == payload["self_lag_count"] == 6
+    for trial in proxies:
+        assert trial["p"] == 1.0 and not trial["selected"] and trial["r"] is None
+        assert trial["self_lag_p"] is not None and trial["self_lag_r"] is not None
+    assert all(
+        t["status"] != "self_lag" for t in payload["ledger"] if "FEAT_W" in t["feature"]
+    )
+
+
+def test_a_protocol_that_drops_the_proxy_groups_is_refused(engine):
+    with engine.connect() as conn:
+        panel = load(conn)
+    protocol = replace(protocol_for(panel), self_lag=())
+    with pytest.raises(ValueError, match="proxy groups"):
+        discover(protocol, panel.family_rows(protocol, "discovery"), panel=panel)
+
+
+def test_a_forged_self_lag_selection_never_becomes_a_candidate(engine):
+    with engine.connect() as conn:
+        panel = load(conn)
+    protocol = protocol_for(panel)
+    frozen = discover(protocol, panel.family_rows(protocol, "discovery"), panel=panel)
+    forged = copy.deepcopy(frozen)
+    next(t for t in forged["payload"]["ledger"] if t["status"] == "self_lag")[
+        "selected"
+    ] = True
+    forged["sha256"] = digest(forged["payload"])
+    with pytest.raises(ValueError, match="never become candidates"):
+        evaluate_holdout(forged, panel.family_rows(protocol, "holdout"), panel=panel)
