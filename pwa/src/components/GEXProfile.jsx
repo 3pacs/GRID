@@ -12,6 +12,7 @@
  *   onStrikeClick - (strike: number) => void (optional)
  */
 import React, { useEffect, useRef, useState, useCallback } from 'react';
+import GEXProvenance from './GEXProvenance.jsx';
 import * as d3 from 'd3';
 import { colors, tokens } from '../styles/shared.js';
 
@@ -50,7 +51,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
 
     // Main D3 render
     useEffect(() => {
-        if (!svgRef.current || !gexData) return;
+        if (!svgRef.current || !gexData || gexData.error || gexData.stale) return;
 
         const perStrike = gexData.per_strike || [];
         const profile = gexData.profile || [];
@@ -60,7 +61,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
         const callWall = gexData.call_wall;
         const putWall = gexData.put_wall;
         const regime = gexData.regime;
-        const netGEX = gexData.gex_aggregate || 0;
+        const netGEX = Number.isFinite(gexData.gex_aggregate) ? gexData.gex_aggregate : null;
         const vannaExp = gexData.vanna_exposure || 0;
         const charmExp = gexData.charm_exposure || 0;
 
@@ -123,7 +124,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
             .attr('font-family', "'JetBrains Mono', monospace")
             .attr('fill', colors.yellow)
             .attr('opacity', 0.9)
-            .text('Gamma Flip');
+            .text('Zero modeled GEX');
 
         // ── Gradient definitions ──
         const defs = svg.append('defs');
@@ -236,7 +237,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.accent)
                     .attr('font-weight', 700)
-                    .text(`Spot $${spot.toFixed(0)}`);
+                    .text(`Reference $${spot.toFixed(0)}`);
             }
         }
 
@@ -258,7 +259,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.yellow)
-                    .text(`Flip $${gammaFlip.toFixed(0)}`);
+                    .text(`Modeled flip $${gammaFlip.toFixed(0)}`);
             }
         }
 
@@ -285,7 +286,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.green)
-                    .text(`Resistance $${callWall.toFixed(0)}`);
+                    .text(`Modeled call wall $${callWall.toFixed(0)}`);
             }
         }
 
@@ -312,16 +313,14 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.red)
-                    .text(`Support $${putWall.toFixed(0)}`);
+                    .text(`Modeled put wall $${putWall.toFixed(0)}`);
             }
         }
 
         // ── Regime annotation (top-left) ──
         const isShortGamma = regime === 'SHORT_GAMMA' || netGEX < 0;
         const regimeColor = isShortGamma ? colors.red : colors.green;
-        const regimeText = isShortGamma
-            ? 'Dealers SHORT gamma -- moves amplified'
-            : 'Dealers LONG gamma -- moves dampened';
+        const regimeText = `Modeled ${regime?.replaceAll('_', ' ') || 'unknown regime'}`;
 
         const annotG = g.append('g')
             .attr('transform', `translate(8, 8)`);
@@ -370,7 +369,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
             .attr('font-size', '9px')
             .attr('font-family', "'JetBrains Mono', monospace")
             .attr('fill', colors.textMuted)
-            .text('Net GEX ($)');
+            .text('Modeled GEX ($)');
 
         // ── X axis (bottom) ──
         const xAxis = d3.axisBottom(xScale)
@@ -470,7 +469,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
             .attr('font-size', '7px')
             .attr('font-family', "'JetBrains Mono', monospace")
             .attr('fill', colors.textMuted)
-            .text('Dealer flow direction');
+            .text('Modeled sensitivities');
 
         // ── Crosshair overlay ──
         const crosshairG = g.append('g').style('display', 'none');
@@ -529,8 +528,8 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     tooltip.style.display = 'flex';
                     const gexColor = d.gex >= 0 ? colors.green : colors.red;
                     const interp = d.gex >= 0
-                        ? 'Dealers long gamma here (stabilizing)'
-                        : 'Dealers short gamma here (amplifying)';
+                        ? 'Modeled positive gamma'
+                        : 'Modeled negative gamma';
                     tooltip.innerHTML =
                         `<span style="color:${colors.text};font-weight:600">$${d.strike.toFixed(0)}</span>` +
                         `<span style="color:${gexColor};margin-left:10px;font-weight:600">${formatGEX(d.gex)}</span>` +
@@ -551,7 +550,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
 
     }, [gexData, width, ticker, spot, onStrikeClick]);
 
-    if (!gexData || gexData.error) {
+    if (!gexData || gexData.error || gexData.stale) {
         return (
             <div style={{
                 background: colors.bg,
@@ -562,13 +561,13 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                 color: colors.textMuted,
                 fontSize: '11px',
             }}>
-                {gexData?.error || 'No GEX data available'}
+                {gexData?.stale ? 'Stale GEX profile unavailable' : 'GEX profile unavailable.'}
             </div>
         );
     }
 
     const regime = gexData.regime;
-    const netGEX = gexData.gex_aggregate || 0;
+    const netGEX = Number.isFinite(gexData.gex_aggregate) ? gexData.gex_aggregate : null;
 
     return (
         <div ref={containerRef} style={{
@@ -586,7 +585,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     <span style={{
                         fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
                         color: colors.accent, fontFamily: "'JetBrains Mono', monospace",
-                    }}>DEALER GEX PROFILE</span>
+                    }}>MODELED GEX PROFILE</span>
                     <span style={{
                         fontSize: '10px',
                         padding: '1px 6px',
@@ -596,20 +595,21 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                         background: regime === 'SHORT_GAMMA' ? `${colors.red}18` : regime === 'LONG_GAMMA' ? `${colors.green}18` : `${colors.yellow}18`,
                         color: regime === 'SHORT_GAMMA' ? colors.red : regime === 'LONG_GAMMA' ? colors.green : colors.yellow,
                     }}>
-                        {regime || 'UNKNOWN'}
+                        Estimated {regime?.replaceAll('_', ' ') || 'unknown regime'}
                     </span>
                 </div>
                 <div style={{
                     fontSize: '10px', color: colors.textMuted,
                     fontFamily: "'JetBrains Mono', monospace",
                 }}>
-                    Net: <span style={{
-                        color: netGEX >= 0 ? colors.green : colors.red,
+                    Modeled net: <span style={{
+                        color: netGEX == null || netGEX === 0 ? colors.textMuted : netGEX > 0 ? colors.green : colors.red,
                         fontWeight: 600,
-                    }}>{formatGEX(netGEX)}</span>
+                    }}>{netGEX == null ? 'Unavailable' : formatGEX(netGEX)}</span>
                 </div>
             </div>
 
+            <GEXProvenance data={gexData} />
             {/* Tooltip bar */}
             <div
                 ref={tooltipRef}

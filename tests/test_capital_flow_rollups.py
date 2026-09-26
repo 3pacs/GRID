@@ -70,6 +70,11 @@ def cleanup_test_rows(pg_engine: Engine, test_actor_id: str):
                 a=test_actor_id,
             ),
         )
+        conn.execute(
+            text("DELETE FROM capital_flows_ttm_state WHERE actor_id = :a").bindparams(
+                a=test_actor_id,
+            ),
+        )
 
 
 def _insert_quarter(
@@ -104,6 +109,52 @@ def _insert_quarter(
             ).bindparams(
                 a=actor_id, fp=fp, ft=flow_type, d=direction,
                 amt=amount, cp=counterparty, sf=source_filing,
+            ),
+        )
+
+
+def _insert_quarter_stale(
+    engine: Engine,
+    actor_id: str,
+    fp: date,
+    flow_type: str,
+    amount: float,
+    *,
+    as_of_days_ago: int,
+    direction: str = "in",
+    counterparty: str | None = None,
+    source_filing: str = "10-Q test",
+) -> None:
+    """Like ``_insert_quarter`` but with an explicit, backdated ``as_of``
+    (fable-daily-intel-sql-tasks, 2026-09-20) — used to prove
+    ``compute_ttm``'s dirty-actor gating (content-fingerprint based since
+    the 2026-09-20 SECOND follow-up; see
+    ``intelligence/company_financial_rollups.py``'s module docstring)
+    does not care how "recent" a row's ``as_of`` looks, only whether its
+    content differs from what was last durably recorded."""
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO capital_flows (
+                    actor_id, fiscal_period, period_type, flow_type,
+                    direction, amount_usd, counterparty_id, source_filing,
+                    confidence, currency, as_of
+                ) VALUES (
+                    :a, :fp, 'quarter', :ft, :d, :amt, :cp, :sf,
+                    'confirmed', 'USD', NOW() - make_interval(days => :ago)
+                )
+                ON CONFLICT (
+                    actor_id, fiscal_period, period_type, flow_type,
+                    (COALESCE(NULLIF(counterparty_id,''), '__none__')),
+                    source_filing
+                ) DO UPDATE SET
+                    amount_usd = EXCLUDED.amount_usd,
+                    as_of = EXCLUDED.as_of
+                """,
+            ).bindparams(
+                a=actor_id, fp=fp, ft=flow_type, d=direction,
+                amt=amount, cp=counterparty, sf=source_filing, ago=as_of_days_ago,
             ),
         )
 
@@ -273,6 +324,75 @@ def test_compute_ttm_skips_when_under_four_quarters(
 
     rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
     assert rows == [], f"expected no TTM rows, got {rows}"
+
+
+def test_compute_ttm_watermark_param_does_not_gate_recompute(
+    pg_engine: Engine, test_actor_id: str,
+):
+    """fable-daily-intel-sql-tasks (2026-09-20, SECOND follow-up):
+    superseded test. The original version of this test pinned a scalar
+    ``as_of`` watermark excluding an actor whose rows were all older than
+    it — the controller established that mechanism is NOT commit-order
+    safe (see intelligence/company_financial_rollups.py's module
+    docstring and tests/test_capital_flow_rollups_pg.py's case-1/case-2
+    tests for the concurrent-connection proofs) and it was replaced with
+    a durable per-actor content fingerprint. Under the new design, an
+    EXPLICIT watermark — even one that would have excluded this actor
+    under the retired design — has NO effect: the actor is first-time-
+    seen (no capital_flows_ttm_state row yet), so it is recomputed
+    regardless.
+    """
+    quarters = [
+        (date(2024, 3, 31), 100.0),
+        (date(2024, 6, 30), 110.0),
+        (date(2024, 9, 30), 120.0),
+        (date(2024, 12, 31), 130.0),
+    ]
+    for fp, amt in quarters:
+        _insert_quarter_stale(
+            pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
+        )
+
+    with pg_engine.connect() as conn:
+        watermark = conn.execute(
+            text("SELECT NOW() - make_interval(days => 3)"),
+        ).fetchone()[0].isoformat()
+    compute_ttm(pg_engine, watermark)  # would have excluded a 30-day-old actor under the retired design
+
+    rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
+    latest = [r for r in rows if r["fiscal_period"] == date(2024, 12, 31)]
+    assert len(latest) == 1, (
+        f"a first-time actor must be recomputed regardless of the (now "
+        f"vestigial) watermark parameter, got {rows}"
+    )
+    assert latest[0]["amount_usd"] == pytest.approx(460.0)
+
+
+def test_compute_ttm_none_watermark_picks_up_stale_actor(
+    pg_engine: Engine, test_actor_id: str,
+):
+    """``watermark=None`` (the default, and what
+    scripts/run_capital_flow_rollups.py passes with no --watermark flag)
+    still finds a stale actor — trivially true now since the parameter
+    is vestigial and dirty-actor gating is decided entirely by comparing
+    content against ``capital_flows_ttm_state``, never by ``as_of``."""
+    quarters = [
+        (date(2024, 3, 31), 100.0),
+        (date(2024, 6, 30), 110.0),
+        (date(2024, 9, 30), 120.0),
+        (date(2024, 12, 31), 130.0),
+    ]
+    for fp, amt in quarters:
+        _insert_quarter_stale(
+            pg_engine, test_actor_id, fp, "revenue", amt, as_of_days_ago=30,
+        )
+
+    compute_ttm(pg_engine, None)
+
+    rows = _fetch_ttm_rows(pg_engine, test_actor_id, "revenue")
+    latest = [r for r in rows if r["fiscal_period"] == date(2024, 12, 31)]
+    assert len(latest) == 1, f"expected 1 TTM row at 2024-Q4, got {rows}"
+    assert latest[0]["amount_usd"] == pytest.approx(460.0)
 
 
 def test_fold_announcements_creates_rolled_annual(

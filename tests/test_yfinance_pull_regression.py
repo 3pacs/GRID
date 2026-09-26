@@ -11,6 +11,7 @@ puller happily fed it to PostgreSQL as obs_date:
 
 from __future__ import annotations
 
+import json
 import sys
 import types
 
@@ -24,7 +25,7 @@ if "multitasking" not in sys.modules:
     _shim.wait_for_tasks = lambda *a, **k: None
     sys.modules["multitasking"] = _shim
 
-from datetime import date
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pandas as pd
@@ -97,6 +98,91 @@ def test_string_index_entries_never_reach_obs_date(engine_recording_inserts):
         f"obs_date received string values — regression of the TLT bug: {offending}"
     )
     assert result["status"] in ("SUCCESS", "PARTIAL")
+
+
+def test_spy_daily_close_repull_is_not_frozen_by_earlier_value(engine_recording_inserts):
+    """A provisional daily value cannot block a later post-period capture."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    obs_date = date(2026, 9, 22)
+    early = pd.DataFrame({"Close": [680.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+    completed = pd.DataFrame({"Close": [685.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        result.fetchone.return_value = None
+        result.fetchall.return_value = []
+        return result
+
+    conn.execute.side_effect = execute
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", side_effect=[set(), {obs_date}]), \
+         patch.object(yfinance_pull, "_utc_now", side_effect=[
+             datetime(2026, 9, 22, 13, 33, tzinfo=timezone.utc),
+             datetime(2026, 9, 23, 0, 30, tzinfo=timezone.utc),
+         ]), \
+         patch.object(yfinance_pull.yf, "download", side_effect=[early, completed]):
+        puller = yfinance_pull.YFinancePuller(engine)
+        first = puller.pull_ticker("SPY", start_date=obs_date)
+        second = puller.pull_ticker("SPY", start_date=obs_date)
+
+    assert first["rows_inserted"] == 0
+    assert second["rows_inserted"] == 1
+    assert second["outcome"] == "inserted"
+    marked = [c.args[1] for c in conn.execute.call_args_list
+              if "INSERT INTO raw_series" in str(c.args[0])]
+    assert len(marked) == 1
+    assert marked[0]["sid"] == "YF:SPY:close"
+    assert marked[0]["val"] == 685.0
+
+
+def test_bounded_completed_spy_close_writes_only_marked_requested_day(engine_recording_inserts):
+    """Today's scheduler start can fetch yesterday without other OHLCV writes."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [680.0, 684.0, 687.0],
+         "Close": [681.0, 685.0, 688.0],
+         "Adj Close": [681.0, 685.0, 688.0]},
+        index=pd.DatetimeIndex([
+            pd.Timestamp("2026-09-21"),
+            pd.Timestamp("2026-09-22"),
+            pd.Timestamp("2026-09-23"),
+        ]),
+    )
+    conn.execute.return_value.fetchone.return_value = None
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull, "_utc_now", return_value=datetime(
+             2026, 9, 23, 13, 30, tzinfo=timezone.utc)), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame) as download:
+        result = yfinance_pull.YFinancePuller(engine).pull_ticker(
+            "SPY", start_date=date(2026, 9, 22), end_date=date(2026, 9, 23),
+            interval="1d", only_fields=frozenset({"close"}),
+        )
+
+    assert result["rows_inserted"] == 1
+    assert result["outcome"] == "inserted"
+    download.assert_called_once()
+    assert download.call_args.kwargs["start"] == "2026-09-22"
+    assert download.call_args.kwargs["end"] == "2026-09-23"
+    assert download.call_args.kwargs["auto_adjust"] is False
+    inserted = [call.args[1] for call in conn.execute.call_args_list
+                if "INSERT INTO raw_series" in str(call.args[0])]
+    assert len(inserted) == 1
+    assert inserted[0]["sid"] == "YF:SPY:close"
+    assert inserted[0]["od"] == date(2026, 9, 22)
+    assert inserted[0]["val"] == 685.0
+    assert json.loads(inserted[0]["payload"]) == {
+        "price_contract_version": "spy_close_v1",
+        "capture_policy": "post_utc_day_end_v1",
+        "price_basis": "YF:SPY:close",
+        "interval": "1d",
+        "obs_date": "2026-09-22",
+        "provider_certified_final": False,
+    }
 
 
 def test_duplicate_columns_dont_iterate_column_names(engine_recording_inserts):
@@ -256,3 +342,161 @@ def test_pull_all_backfill_still_passes_a_wide_open_ended_bound(engine_recording
     _, kwargs = mock_get_existing.call_args
     assert kwargs.get("start_date") == date(2020, 1, 1)
     assert kwargs.get("end_date") is None
+
+
+# ─── Freshness-semantics review (fable-hermes-repair-bound follow-up,
+# 2026-09-19): per-ticker outcome classification and the bounded timeout
+# passed to yf.download when the installed yfinance version supports it.
+
+
+def test_outcome_is_duplicate_only_when_all_dates_already_exist(engine_recording_inserts):
+    """A non-empty download whose every date is already present is a
+    successful CHECK (0 rows inserted, status SUCCESS) — not a "no_data"
+    or error outcome."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value={date(2026, 9, 11)}), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("SPY", start_date="2026-09-11")
+
+    assert result["rows_inserted"] == 0
+    assert result["status"] == "SUCCESS"
+    assert result["outcome"] == "duplicate_only"
+
+
+def test_outcome_is_no_data_when_provider_returns_empty_frame(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.yf, "download", return_value=pd.DataFrame()):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("ZZZZ", start_date="2026-09-11")
+
+    assert result["status"] == "PARTIAL"
+    assert result["outcome"] == "no_data"
+
+
+def test_outcome_is_inserted_when_new_rows_land(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("SPY", start_date="2026-09-11")
+
+    assert result["rows_inserted"] > 0
+    assert result["outcome"] == "inserted"
+
+
+def test_outcome_is_error_for_invalid_ticker(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("N/A", start_date="2026-09-11")
+
+    assert result["status"] == "SKIPPED"
+    assert result["outcome"] == "error"
+
+
+def test_download_receives_bounded_timeout_when_supported(engine_recording_inserts):
+    """Check 2a: pull_ticker passes a bounded `timeout` to yf.download when
+    the installed yfinance version's signature accepts one."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    captured: dict = {}
+
+    def _fake_download(ticker, **kwargs):
+        captured.update(kwargs)
+        return frame
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull, "_YF_DOWNLOAD_ACCEPTS_TIMEOUT", True), \
+         patch.object(yfinance_pull.yf, "download", side_effect=_fake_download):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_ticker("SPY", start_date="2026-09-11")
+
+    assert captured.get("timeout") == yfinance_pull._YF_DOWNLOAD_TIMEOUT_SECONDS
+
+
+def test_download_omits_timeout_when_unsupported(engine_recording_inserts):
+    """If the installed yfinance version's yf.download() doesn't accept a
+    `timeout` kwarg, pull_ticker must not pass one (would raise TypeError)."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    captured: dict = {}
+
+    def _fake_download(ticker, **kwargs):
+        captured.update(kwargs)
+        return frame
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull, "_YF_DOWNLOAD_ACCEPTS_TIMEOUT", False), \
+         patch.object(yfinance_pull.yf, "download", side_effect=_fake_download):
+        puller = yfinance_pull.YFinancePuller(engine)
+        puller.pull_ticker("SPY", start_date="2026-09-11")
+
+    assert "timeout" not in captured
+
+
+def test_pull_all_with_should_continue_reports_per_outcome_counts(engine_recording_inserts):
+    """Check 1a: pull_all's dict-shaped (should_continue given) return
+    carries top-level counts per outcome, including "unattempted" for
+    tickers never reached because the budget ran out."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", side_effect=lambda *a, **kw: set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        calls = {"n": 0}
+
+        def _should_continue():
+            calls["n"] += 1
+            return calls["n"] <= 2  # allow tickers 0 and 1, stop before 2
+
+        result = puller.pull_all(
+            ticker_list=["AAA", "BBB", "CCC"],
+            start_date="2026-09-11",
+            should_continue=_should_continue,
+        )
+
+    assert isinstance(result, dict)
+    assert result["stopped_by_budget"] is True
+    assert result["tickers_not_attempted"] == ["CCC"]
+    assert result["counts"]["inserted"] == 2
+    assert result["counts"]["unattempted"] == 1
+    assert sum(result["counts"].values()) == 3

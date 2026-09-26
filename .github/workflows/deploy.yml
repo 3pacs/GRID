@@ -55,6 +55,22 @@ on:
         required: false
         default: false
 
+# Fixed group, deliberately NOT scoped by github.ref: $DEPLOY_PATH is one
+# single, fixed resource regardless of which ref triggers a run (a push to
+# main and a workflow_dispatch against some other ref would otherwise land
+# in different groups and queue separately -- while still eventually
+# serialized by scripts/deploy_release_swap.sh's own flock during the
+# build+swap phase, their unlocked marker-write/clear steps could still
+# clash; not worth the exposure when the fix is a fixed string). Two runs
+# must never build/migrate/swap concurrently against the same $DEPLOY_PATH
+# -- the flock is a backstop, but queuing here is cheaper (no runner
+# occupied waiting) and is the primary defense. cancel-in-progress stays
+# false: a deploy already mid-restart or mid-migration must run to
+# completion, never be killed partway.
+concurrency:
+  group: deploy-grid-release
+  cancel-in-progress: false
+
 env:
   DEPLOY_PATH: /data/grid_v4/grid_release
 
@@ -134,21 +150,24 @@ jobs:
     if: always() && (needs.verify.result == 'success' || needs.verify.result == 'skipped')
 
     steps:
+      # Fetches ONLY this job's own orchestration scripts
+      # (scripts/deploy_release_swap.sh, scripts/deploy_build_hook.sh) into
+      # the ephemeral $GITHUB_WORKSPACE at the exact commit being deployed --
+      # it does not touch $DEPLOY_PATH, which remains the persistent,
+      # separately-managed checkout that grid-api/grid-hermes actually run
+      # from. Needed because "Build release tree" below no longer builds
+      # in-place on $DEPLOY_PATH (see that step's own comment for why); the
+      # scripts that now do that work have to come from somewhere that is
+      # guaranteed to already be at the pushed commit, and $DEPLOY_PATH -- by
+      # design -- is not that, until the swap this step's script performs.
+      - uses: actions/checkout@v7
+
       # Scoped to this job only, via actions/setup-node's own tool-cache --
       # does NOT touch grid-svr's global Node install (still whatever
       # `node -v` shows in an interactive shell there). Must be its own
       # step: setup-node adds its installed version to $GITHUB_PATH, which
       # only takes effect for steps that run *after* this one in the same
       # job -- the "Build release tree" step's npm commands rely on that.
-      #
-      # No `cache: npm` here, unlike test.yml's equivalent step: this job
-      # has no actions/checkout step at all (it manages $DEPLOY_PATH as a
-      # persistent git checkout via its own `git fetch`/`reset --hard`
-      # below, not a fresh clone into GITHUB_WORKSPACE), so there is no
-      # lockfile at a path relative to the default workspace for the cache
-      # action to key off. Caching is a speed optimization, not required
-      # for the version pin itself -- left out rather than pointed at a
-      # path that may not resolve the way it does in test.yml.
       - name: Set up Node (this job only)
         uses: actions/setup-node@v7
         with:
@@ -158,75 +177,36 @@ jobs:
           # for this today.
           node-version: "22.23.2"
 
+      # Builds and migrates in an ISOLATED CANDIDATE directory, never on
+      # $DEPLOY_PATH itself, and only repoints $DEPLOY_PATH at that candidate
+      # if every step -- fetch, pip install, npm build, alembic upgrade --
+      # succeeds. Introduced 2026-09-22 after #596's deploy fetched, built,
+      # and reset directly on top of the LIVE release directory, then failed
+      # during `alembic upgrade head`: the new source and freshly-built PWA
+      # bundle were already sitting in the live path when the migration
+      # failed, so grid-api/grid-hermes's on-disk tree no longer matched the
+      # database schema even though neither process had been restarted yet --
+      # any restart (planned, or an unplanned crash; both units are
+      # Restart=always) would have run new code against the old schema.
+      # Recovering required a coordinated pause of every writer touching the
+      # affected tables and an isolated revert PR before either service
+      # could safely restart. See scripts/deploy_release_swap.sh's own
+      # comment for the swap mechanism and
+      # tests/deploy/test_deploy_release_swap.sh for failure-injection proof
+      # that a failed build leaves the previous release fully usable.
       - name: Build release tree
         env:
           SRC_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
         run: |
           set -euo pipefail
-          cd "$DEPLOY_PATH"
-          echo "before: $(git log --oneline -1)"
-          # Fetch from GitHub itself with the job token, not from whatever `origin`
-          # points at: the clone's origin went stale in 2026 and every deploy after
-          # #364 reset to the same old commit while reporting success.
-          git fetch "$SRC_URL" main
-          git reset --hard FETCH_HEAD
-          echo "after:  $(git log --oneline -1)"
-          # A merge burst (several PRs landing within a minute) means an older run's
-          # `main` fetch can already be a strict ancestor of a newer commit that merged
-          # in the meantime — the release tree still contains the pushed commit, it's
-          # just not HEAD anymore. Accept "pushed commit is an ancestor of HEAD" instead
-          # of requiring exact equality, so only the newest run (which is what should
-          # deploy anyway) needs to pass.
-          git merge-base --is-ancestor "${{ github.sha }}" HEAD || { echo "::error::release tree is not at the pushed commit ${{ github.sha }}"; exit 1; }
-          pip install -r requirements.txt
-          # Node itself is now pinned by the "Set up Node (this job only)"
-          # step above, via actions/setup-node's own tool-cache -- it
-          # prepended that version to $GITHUB_PATH before this step ran, so
-          # `npm` here resolves to 22.23.2, not grid-svr's global install.
-          # pwa/.npmrc still sets engine-strict=true, so `npm ci` fails
-          # loudly (not the non-fatal EBADENGINE warning npm prints by
-          # default) on any installed package's real `engines.node` range
-          # this pinned version doesn't satisfy -- no hand-rolled version
-          # check to keep in sync here.
-          cd pwa && npm ci && npm run build && cd ..
-          if [ "${{ inputs.skip_migrations }}" = "true" ]; then
-            echo "::warning::alembic upgrade head skipped via workflow_dispatch input skip_migrations=true"
-          else
-            # Source the same GRID .env candidates ops-exec.yml uses so alembic gets DB
-            # credentials — the release tree carries no .env of its own, which is why
-            # every deploy before this one failed on "no password supplied" (or, before
-            # PR #443, on the divergent alembic heads) and had the failure swallowed by
-            # `|| echo "no migrations"`. No migration has ever actually been applied by
-            # a deploy; echo only which file was sourced, never its contents.
-            for f in /data/grid_v4/grid_release/.env /home/grid/grid_v4/grid_repo/.env /home/grid/grid_v4/grid_repo/grid/.env; do
-              if [ -f "$f" ]; then set -a; . "$f"; set +a; echo "(env sourced from $f)"; break; fi
-            done
-            {
-              echo "## Alembic"
-              echo '### current (before upgrade)'
-              echo '```'
-              python3 -m alembic current
-              echo '```'
-              echo '### heads'
-              echo '```'
-              python3 -m alembic heads
-              echo '```'
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-            python3 -m alembic upgrade head
-            # ...and again afterwards. Without this the summary records only
-            # where the database *was*: `alembic current` before the upgrade,
-            # and then silence. Run 641 is the case -- the upgrade ran, a
-            # revision took its deferral branch, and the log showed neither
-            # which revisions were applied nor where head ended up. A deploy
-            # that migrates the production database should say so in its own
-            # record.
-            {
-              echo '### current (after upgrade)'
-              echo '```'
-              python3 -m alembic current
-              echo '```'
-            } | tee -a "$GITHUB_STEP_SUMMARY"
-          fi
+          chmod +x scripts/deploy_release_swap.sh scripts/deploy_build_hook.sh
+          ./scripts/deploy_release_swap.sh \
+            "$DEPLOY_PATH" \
+            "${{ github.sha }}" \
+            "$(pwd)/scripts/deploy_build_hook.sh" \
+            "$SRC_URL" \
+            "${{ github.sha }}" \
+            "${{ inputs.skip_migrations }}"
 
       - name: Restart grid-api
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
@@ -258,9 +238,14 @@ jobs:
           echo
           fail() { echo "::error::verify failed: $*"; exit 1; }
           api_pid="$(systemctl show -p MainPID --value grid-api)"
-          cwd="$(sudo -n readlink "/proc/${api_pid}/cwd" 2>/dev/null || readlink "/proc/${api_pid}/cwd" 2>/dev/null || true)"
-          echo "grid-api pid=$api_pid cwd=$cwd"
-          [ "$cwd" = "$DEPLOY_PATH" ] || fail "grid-api cwd '$cwd' != $DEPLOY_PATH"
+          # Compares grid-api's resolved cwd against the resolved live-release
+          # target (not the literal $DEPLOY_PATH string, which can never match
+          # once it's a symlink -- see scripts/deploy_verify_release_tree.sh's
+          # own header) and independently verifies the deployed SHA by reading
+          # the target's own git history directly.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$api_pid" "${{ github.sha }}" \
+            || fail "release-tree verification failed for grid-api (pid=$api_pid) -- see the deploy_verify_release_tree output above"
           curl -fsS http://localhost:8000/ > /tmp/grid-index.html || fail "GET / failed"
           index_js="$(grep -o '/assets/index-[^"]*\.js' /tmp/grid-index.html | head -1 || true)"
           echo "index asset: ${index_js:-<none>}"
@@ -321,16 +306,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-hermes)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-hermes pid=$pid cwd=$cwd"
-          # DEPLOY_PATH is reached through a symlink on this host, so compare
-          # resolved paths rather than the literal strings.
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-hermes cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
-          echo "verify: grid-hermes is running the deployed tree"
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
       # grid-realtime has the exact same class of bug already fixed for
       # grid-hermes (#487/#490): its unit runs `ExecStart=/usr/bin/python3 -m
@@ -464,13 +443,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-realtime)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-realtime pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-realtime cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
           restart_ts="$(cat "$RUNNER_TEMP/grid-realtime-restart-ts")"
           for attempt in {1..30}; do
             if journalctl -u grid-realtime --since "@${restart_ts}" --no-pager -q 2>/dev/null \
@@ -657,13 +633,22 @@ jobs:
             BACKUP="${DROPIN}.bak-$(date -u +%Y%m%dT%H%M%SZ)"
             sudo cp -a "$DROPIN" "$BACKUP"
             echo "Existing drop-in backed up to $BACKUP"
-            echo "Exact rollback: sudo cp -a $BACKUP $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-scheduler" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "Prior scheduler drop-in backup: $BACKUP. Restoration requires a separate code/schema/writer decision; this file may contain a mutable path." | tee -a "$GITHUB_STEP_SUMMARY"
           else
             echo "No pre-existing drop-in at $DROPIN (first activation)."
-            echo "Exact rollback: sudo rm $DROPIN && sudo systemctl daemon-reload && sudo systemctl restart grid-scheduler" | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "No prior scheduler drop-in. Restoration requires a separate code/schema/writer decision; removing this drop-in may expose a different base-unit path." | tee -a "$GITHUB_STEP_SUMMARY"
           fi
-          printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee "$DROPIN" >/dev/null
+          # A mutable release link would select new code on any later
+          # Restart=always recovery, even without activate_scheduler=true.
+          # Keep future restarts on this exact reviewed release directory.
+          SCHEDULER_RELEASE="$(readlink -f -- "$DEPLOY_PATH")"
+          RELEASES_ROOT="$(readlink -f -- "${DEPLOY_PATH}.releases")"
+          test -d "$SCHEDULER_RELEASE"
+          test "$(dirname -- "$SCHEDULER_RELEASE")" = "$RELEASES_ROOT"
+          test "$(git -C "$SCHEDULER_RELEASE" rev-parse HEAD)" = "${{ github.sha }}"
+          printf '%s\n' '[Service]' "WorkingDirectory=$SCHEDULER_RELEASE" | sudo tee "$DROPIN" >/dev/null
           sudo systemctl daemon-reload
+          test "$(systemctl show -p WorkingDirectory --value grid-scheduler)" = "$SCHEDULER_RELEASE"
           sudo systemctl restart grid-scheduler
 
       # Same proof-of-tree pattern as the grid-hermes verify above -- a bare
@@ -685,14 +670,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-scheduler)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-scheduler pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-scheduler cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
-          echo "verify: grid-scheduler is running the deployed tree"
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
       # Beyond PID/cwd: prove the pool override actually reached the new
       # process and that it initialized cleanly under that config (not just
@@ -890,13 +871,10 @@ jobs:
             sleep 2
           done
           pid="$(systemctl show -p MainPID --value grid-intelligence)"
-          cwd="$(sudo -n readlink "/proc/${pid}/cwd" 2>/dev/null || readlink "/proc/${pid}/cwd" 2>/dev/null || true)"
-          echo "grid-intelligence pid=$pid cwd=$cwd"
-          want="$(readlink -f "$DEPLOY_PATH")"
-          [ -n "$cwd" ] && [ "$(readlink -f "$cwd")" = "$want" ] || {
-            echo "::error::grid-intelligence cwd '$cwd' does not resolve to $want -- it is running a different tree"
-            exit 1
-          }
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
           # Persisted for the telemetry-verify step below: filtering
           # journalctl by --since alone is not enough. If this were a
           # *re*-activation (not the first one), the OLD process --
@@ -952,6 +930,36 @@ jobs:
           fi
           echo "**grid-intelligence activated successfully** (pid=${new_pid} logged the deployed pool telemetry and is still the current active process)." | tee -a "$GITHUB_STEP_SUMMARY"
 
+      # scripts/deploy_release_swap.sh's own lock only covers ITS run (build
+      # + swap) -- it's released the instant that script exits, before any
+      # of the restart/verify steps above ever run. Those steps hold no lock
+      # of their own, so a manual scripts/deploy_release_rollback.sh
+      # invoked mid-job would otherwise be free to swap the live path out
+      # from under a restart or health check still in flight against it.
+      # deploy_release_swap.sh writes .activation-in-progress on every
+      # successful swap specifically so the rollback script refuses that
+      # race outright (no auto-proceed on age -- an operator must pass
+      # --override-stuck-activation, a deliberate acknowledgment, never
+      # inferred from elapsed time). Clearing it here, as the LAST step of
+      # this job, `if: always()` so it runs regardless of which optional
+      # activation gates fired or failed above, is the ONLY thing that
+      # normally clears it -- this IS the "positively established
+      # deployment completion" signal the rollback script waits for.
+      # Label-scoped (via ${{ github.sha }}) so this only ever clears a
+      # marker THIS job's own swap wrote, never a later deploy's, even
+      # though the fixed concurrency group above should make that
+      # impossible in practice. If the job is killed outright (not just a
+      # failed step), this step never runs and the marker is left behind
+      # indefinitely -- deploy_release_rollback.sh does not time it out; an
+      # operator who has confirmed no deploy is actually running must pass
+      # --override-stuck-activation to proceed past it.
+      - name: Clear activation-in-progress marker
+        if: always()
+        run: |
+          set -euo pipefail
+          chmod +x scripts/deploy_clear_activation_marker.sh
+          ./scripts/deploy_clear_activation_marker.sh "$DEPLOY_PATH" "${{ github.sha }}"
+
       - name: Notify success
         if: success()
         run: echo "Deployment successful"
@@ -967,6 +975,10 @@ jobs:
     # real deploys — a failure here does not fail this workflow. Same gating as the
     # restart step: only meaningful right after a deploy that actually restarted
     # grid-api, and only if that deploy succeeded.
+    # Always non-mutating: dad-smoke.yml hardcodes --mode non-mutating on the
+    # script invocation (scripts/smoke_dad_path.py) and exposes no input to
+    # change it. --mode=mutating is not wired into any workflow in this
+    # repository; it is a manually-gated CLI escape hatch only.
     if: needs.deploy.result == 'success' && (github.event_name == 'push' || inputs.do_restart == true)
     uses: ./.github/workflows/dad-smoke.yml
     with:

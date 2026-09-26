@@ -43,14 +43,14 @@ the FCI reports a partial score rather than crashing.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 from typing import Any, Sequence
 
 import numpy as np
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import read_window
 
 # ── FCI component configuration ───────────────────────────────────────────
 
@@ -241,24 +241,18 @@ def _read_series_history(
     Empty list when the series is missing. Caller handles the empty case
     via the FCI composer's missing_components path.
     """
+    # SUCCESS-only, one value per obs_date (latest vintage). FRED's puller
+    # writes ``value 0 / FAILED`` on every failed pull; a zero inside the
+    # z-score window shifts the composite for the whole rolling period.
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    """
-                    SELECT value
-                    FROM raw_series
-                    WHERE series_id = :s
-                      AND obs_date >= (CURRENT_DATE - :days * INTERVAL '1 day')
-                      AND value IS NOT NULL
-                    ORDER BY obs_date ASC
-                    """
-                ).bindparams(s=series_id, days=lookback_days),
-            ).fetchall()
+            obs_rows = read_window(
+                conn, series_id, start=date.today() - timedelta(days=lookback_days),
+            )
     except Exception as exc:  # noqa: BLE001
         log.debug("FCI: read failed for {s}: {e}", s=series_id, e=str(exc))
         return []
-    return [float(r[0]) for r in rows]
+    return [o.value for o in obs_rows]
 
 
 def compute_fci(engine: Engine) -> FCIResult:
