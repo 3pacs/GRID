@@ -174,7 +174,7 @@ __all__ = [
     "_momentum_score",
     "_momentum_bias",
     "_momentum_trend",
-    "_scorecard_confidence",
+    "_coverage_score",
     "_resolve_scorecard_feature",
     "_load_scorecard_history",
     "_build_scorecard_item",
@@ -654,12 +654,24 @@ def _build_postmortem_stub(req: AstrogridPredictionRequest) -> dict[str, Any]:
     }
 
 
-def _prediction_confidence(req: AstrogridPredictionRequest) -> float:
+def _prediction_confidence(req: AstrogridPredictionRequest) -> float | None:
+    """The caller's stated confidence, or None.
+
+    A request with no seer block used to become a 50%-confidence prediction
+    of record, published to the oracle as if the caller had stated it
+    (D-M2). It is now null: an unstated confidence is not a stated 0.5, and
+    calibration excludes null-confidence rows rather than scoring them.
+    """
+    value = (req.seer or {}).get("confidence")
+    if value is None:
+        return None
     try:
-        value = float((req.seer or {}).get("confidence"))
+        number = float(value)
     except (TypeError, ValueError):
-        return 0.5
-    return min(max(value, 0.0), 1.0)
+        return None
+    if math.isnan(number) or math.isinf(number):
+        return None
+    return min(max(number, 0.0), 1.0)
 
 
 def _signed_longitude_delta(current: float, future: float) -> float:
@@ -1036,15 +1048,15 @@ def _build_snapshot_seer(
     if pressure >= 6 and pressure > release:
         reading = "Hard aspects, retrogrades, and timing friction dominate."
         prediction = "Expect failed breaks, sharper reversals, and narrower acceptable risk."
-        confidence = 0.72
+        bucket = "pressure_dominant"
     elif release >= pressure + 2:
         reading = "Soft aspects and lunar timing currently outweigh pressure."
         prediction = "Continuation has the cleaner edge while the current geometry holds."
-        confidence = 0.69
+        bucket = "release_dominant"
     else:
         reading = "The active lenses are mixed; no side has clear control."
         prediction = "Favor selective timing over broad conviction until the next cleaner cut."
-        confidence = 0.6
+        bucket = "mixed"
 
     if market_bias is not None:
         if market_bias > 0.3 and pressure >= 6:
@@ -1075,18 +1087,28 @@ def _build_snapshot_seer(
     if signals.get("dominantElement") in {"air", "water"}:
         supporting_lenses.append("taoist")
 
-    if confidence >= 0.7:
-        confidence_band = "high"
-    elif confidence >= 0.62:
-        confidence_band = "medium"
-    else:
-        confidence_band = "low"
+    # The three literals that used to live here (0.72 / 0.69 / 0.6) and the
+    # bands tuned to map exactly onto them (>= 0.7 high, >= 0.62 medium) were
+    # not measurements of anything — nothing in this path is ever scored
+    # against an outcome (D-H4). A real number here would be the backtested
+    # hit rate for this pressure/release bucket; the bucket is computed here
+    # and never persisted, so no such history exists and there is nothing to
+    # read. Both fields are therefore null, and the two integer counts the
+    # reading was actually built from ship instead.
+    confidence = None
+    confidence_band = None
 
     return {
         "reading": reading,
         "prediction": prediction,
-        "confidence": round(confidence, 3),
+        "confidence": confidence,
         "confidence_band": confidence_band,
+        "confidence_basis": (
+            "no scored history for the pressure/release bucket"
+        ),
+        "bucket": bucket,
+        "pressure_score": pressure,
+        "release_score": release,
         "key_factors": key_factors,
         "supporting_lenses": list(dict.fromkeys(supporting_lenses)),
         "conflicts": conflicts,
@@ -1749,11 +1771,19 @@ def _momentum_trend(
     return "mixed"
 
 
-def _scorecard_confidence(
+def _coverage_score(
     history_points: int,
     latest_date: date | None,
     has_live_price: bool,
 ) -> float:
+    """How much data we hold for this item — NOT a forecast confidence.
+
+    Every constant below is hand-tuned and nothing in this path is scored
+    against an outcome, so it was renamed out of `confidence` (D-H5). It is
+    published beside the three inputs it is computed from — `history_points`,
+    `latest_date` and `coverage.has_live_price` — which the scorecard item
+    already carries, so a reader can reproduce it.
+    """
     stale_penalty = 0.0
     if latest_date and (date.today() - latest_date).days > 3:
         stale_penalty = 0.18
@@ -1893,7 +1923,13 @@ def _build_scorecard_item(
         "momentum_score": momentum,
         "bias": _momentum_bias(momentum) if latest_value is not None else "wait",
         "trend": trend,
-        "confidence": _scorecard_confidence(len(history), latest_date, bool(live_quote)),
+        "coverage_score": _coverage_score(
+            len(history), latest_date, bool(live_quote)
+        ),
+        "coverage_score_basis": (
+            "0.28 + min(history_points/60, 0.35) + 0.08*has_live_price "
+            "- 0.18*(latest_date older than 3d), clamped to [0.15, 0.92]"
+        ),
         "coverage": {
             "has_feature": bool(feature_name),
             "has_history": bool(history),

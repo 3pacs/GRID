@@ -489,7 +489,15 @@ def test_hermes_daily_postmortem_batch_is_bounded():
     import inspect
     import scripts.hermes_operator as hermes_operator
 
-    source = inspect.getsource(hermes_operator.run_intelligence_tasks)
+    # The postmortem call moved out of run_intelligence_tasks into the
+    # per-task function the DAILY_INTEL_TASKS table dispatches
+    # (fable/daily-intel-resumable-20260920); the bound must live wherever
+    # batch_postmortem is actually invoked.
+    fn = getattr(hermes_operator, "_daily_intel_postmortem_batch", None) or hermes_operator.run_intelligence_tasks
+    source = inspect.getsource(fn)
 
     assert "POSTMORTEM_BATCH_LIMIT" in source
     assert "limit=POSTMORTEM_BATCH_LIMIT" in source
+    # ...and the table must actually dispatch that function.
+    assert any(t.name == "postmortem_batch" and t.fn is hermes_operator._daily_intel_postmortem_batch
+               for t in hermes_operator.DAILY_INTEL_TASKS)

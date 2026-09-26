@@ -47,11 +47,13 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, NamedTuple
 
 # Ensure grid/ is on sys.path
 _GRID_DIR = str(Path(__file__).resolve().parent.parent)
@@ -69,10 +71,30 @@ CYCLE_INTERVAL_SECONDS = 300          # 5 minutes between cycles
 CYCLE_TIMEOUT_SECONDS = 4500          # 75 min max per cycle (oracle dominates one in N cycles)
                                        # (per-step timeouts kick in earlier; this
                                        # is a safety net for unforeseen hangs)
+# The per-cycle pool_stats log (below, in run_cycle) only fires when a cycle
+# completes -- a stuck or long-running cycle (up to CYCLE_TIMEOUT_SECONDS)
+# would otherwise produce zero visibility into connections it opened and
+# never returned. This poll runs on its own thread, independent of cycle
+# completion, so an outstanding checkout is visible well before -- or even
+# without -- a cycle ever finishing.
+OUTSTANDING_CHECKOUT_POLL_SECONDS = 60
 PIPELINE_INTERVAL_HOURS = 6           # run full pipeline every 6 hours
 DATA_FRESHNESS_THRESHOLD_HOURS = 26   # flag stale sources after 26h
 MAX_PULL_RETRIES = 3                  # retry failed pulls up to 3 times
 AUTORESEARCH_MAX_ITER = 5             # hypothesis iterations per cycle
+# Autoresearch had NO per-step timeout at all before this task (see
+# docs/handoffs/2026-09-18/fable-w4-research-states.md's "Activation
+# condition" section) — the cycle-6 gate called maybe_run_autoresearch()
+# directly inside a plain try/except, never through _run_with_timeout.
+# Duplicated from scripts/autoresearch.py's own AUTORESEARCH_TIMEOUT_SECONDS
+# (same env var, same default) for the same reason AUTORESEARCH_MAX_ITER is
+# duplicated in scripts/hermes_fixers.py: avoiding a circular import, since
+# scripts/autoresearch.py is only ever imported lazily, inside the function
+# that calls it. Conservative default: one iteration can chain an LLM
+# generate call, a walk-forward backtest, and an LLM critique call, so this
+# is sized like the other multi-call LLM steps below (ORACLE_CYCLE_TIMEOUT_
+# SECONDS=4000 for 41 tickers), not the single-call steps (120-240s).
+AUTORESEARCH_TIMEOUT_SECONDS = int(os.getenv("GRID_AUTORESEARCH_TIMEOUT_SECONDS", "1800"))
 HERMES_TEMPERATURE = 0.3              # LLM temperature for diagnostics
 # git-sync committed analytical outputs into the repo (data-exhaust pollution) and the pushes were failing; disabled by default. Set GRID_HERMES_GIT_SYNC=true only with a proper external sync target.
 GIT_SYNC_ENABLED = os.getenv("GRID_HERMES_GIT_SYNC", "false").lower() in ("1", "true", "yes")  # pull/push on each cycle
@@ -92,12 +114,30 @@ SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
 DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step — bumped 2026-05-08 because diagnose runs per-source retry which can chain HTTP calls
+# Self-diagnostics step (cycle step 5, every 6th cycle). Added
+# fable-hermes-repair-bound (2026-09-19): this step used to call
+# run_self_diagnostics() inside a plain try/except with NO _run_with_timeout
+# at all (see docs/handoffs/2026-09-19/fable-hermes-repair-bound.md). A
+# REPULL action inside diagnostics ran _retry_source synchronously, and
+# because that call defaulted to a full-history pull, cycle 6300 stayed on
+# this one step for 71 minutes, starving every step scheduled after it —
+# including the new sector_health step (SECTOR_HEALTH_TIMEOUT_SECONDS
+# above) and intelligence_tasks. Repair pulls are now bounded to a
+# REPAIR_LOOKBACK_DAYS window with their own REPAIR_BUDGET_SECONDS
+# cooperative budget (scripts/hermes_fixers.py) — this timeout is the
+# step-level backstop: LLM call (~60s observed) + REPAIR_BUDGET_SECONDS
+# (180) + headroom for the rest of run_self_diagnostics's own work.
+# REPAIR_BUDGET_SECONDS must stay under this AND under
+# DIAGNOSE_PULLS_TIMEOUT_SECONDS above — pinned by
+# tests/test_hermes_repair_bounded.py.
+DIAGNOSTICS_TIMEOUT_SECONDS = 300
 RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.resolve_pending. Outer guard only — RESOLUTION_SCAN_BUDGET_SECONDS is what bounds the step. Must hold that budget (180) + one slice of overshoot capped at MIN_SCAN_SLICE_TIMEOUT_S (60) + the worst resolve phase observed live on 2026-09-14 (77.5s, cycle 6014) = 317.5s. Was 240, which the 371-411s cold scan of ops-exec run 292 did not fit inside. tests/test_hermes_resolution_watermark.py pins the invariant.
 SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 ASTROGRID_CELESTIAL_TIMEOUT_SECONDS = 240      # oracle.astrogrid_cycle.run_celestial_cycle: deterministic sky build is sub-second; the budget is almost entirely the one local-LLM interpretation call (num_predict=1200). Degrades to a deterministic fallback if the model is offline, so a timeout here means the model was slow, not absent.
-DAILY_INTEL_BATCH_OBSERVED_S = 360            # observed run length of the 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08
-INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_BATCH_OBSERVED_S: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget alone exceeds this cap the step times out before the daily block — and auto_discover() — is ever reached. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward. Was 360 (2026-05-08); raised 2026-09-10. tests/test_hermes_timeout_budgets.py pins the invariant.
+DAILY_INTEL_BATCH_OBSERVED_S = 360            # HISTORICAL — observed run length of the OLD monolithic 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08. Superseded by DAILY_INTEL_CYCLE_BUDGET_SECONDS below for the timeout-budget pin (fable-daily-intel-resumable, 2026-09-20) — kept only because it is a documented historical measurement other notes reference; nothing computes with it anymore.
+INTELLIGENCE_TASKS_TIMEOUT_SECONDS = 900      # whole run_intelligence_tasks() step. MUST exceed ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60: the 30-min active-hypothesis scorer runs FIRST inside this step, so if its budget plus the daily-intel block's own per-cycle budget (plus headroom for the earnings-sync bookkeeping ahead of both) exceeds this cap, the step times out before the daily block ever gets a turn. That inversion (360s cap vs 600s scorer) is how hypothesis discovery starved from 2026-05-15 onward, and — after the 2026-09-10 raise — the still-unbounded daily block re-created the same starvation one level down (fable-daily-intel-resumable, 2026-09-20: the block itself, not just the scorer, could run unbounded and get orphaned mid-list every cycle after 02:00Z). The per-task/per-cycle budgets on DAILY_INTEL_TASKS + DAILY_INTEL_CYCLE_BUDGET_SECONDS below fix that. tests/test_hermes_timeout_budgets.py pins the invariant.
+SECTOR_HEALTH_TIMEOUT_SECONDS = 120           # whole sector-health snapshot step (scripts/hermes_operator.py::_run_sector_health_step), split out of run_intelligence_tasks on 2026-09-19 into its own dispatch with its own timeout. Observed run time for ~20 sectors is 3-8s; 120s is generous headroom, not a sized budget like INTELLIGENCE_TASKS_TIMEOUT_SECONDS above. Deliberately independent of that 900s budget: production traces show intelligence_tasks times out on essentially every cycle (the daily block runs with catch_up=True every cycle, so it never reaches state.last_daily_intel = now, and the sector-health call used to run AFTER that point — i.e. never). Giving this step its own short timeout, dispatched before intelligence_tasks, makes it reachable regardless of whether intelligence_tasks times out. See docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md ("Parent-timeout blocker and own-step fix").
 POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in bounded chunks instead of orphaning long LLM loops.
 
 # Active-hypothesis scoring — periodic batch that closes the loop on the
@@ -114,6 +154,93 @@ POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in boun
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
 ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
+
+# Daily intelligence batch (fable-daily-intel-resumable, 2026-09-20) — see
+# DAILY_INTEL_TASKS and _run_daily_intel_block below.
+#
+# Traced defect: the old daily block (formerly inline in
+# run_intelligence_tasks under "Daily at 2:00 AM") ran ~20 sequential tasks
+# in one undifferentiated try/except chain with NO timeout of its own,
+# inside the 900s INTELLIGENCE_TASKS_TIMEOUT_SECONDS step. Production was
+# abandoned at 900s on every post-02:00Z cycle before reaching
+# `state.last_daily_intel = now`, so the whole block restarted from the
+# top as catch-up every cycle and nothing past the first ~10 minutes of it
+# (hypothesis_discovery, rag_index, actor_research, ... onward) ever ran —
+# hypothesis discovery starved since 2026-09-17.
+#
+# Fix: each task now runs under its OWN _run_with_timeout budget
+# (DailyIntelTask.budget_s) and a persisted per-period ledger
+# (OperatorState.daily_intel_done/daily_intel_attempts) tracks which tasks
+# are already done for the current due period, so a restart or a new cycle
+# resumes from the first undone task instead of re-running everything.
+DAILY_INTEL_BOUNDARY_HOUR = 2                 # UTC hour the daily-intel due-period opens — matches the block's pre-existing "Daily at 2:00 AM" schedule (daily_task_due's boundary-hour convention, same helper the sector-health scheduler uses with boundary_hour=3).
+DAILY_INTEL_MAX_ATTEMPTS = 3                  # a task that fails (timeout or exception) this many times within one due period is marked skipped_for_period so it cannot block the tasks behind it forever.
+DAILY_INTEL_CYCLE_BUDGET_SECONDS = 480        # cumulative wall-time budget for the daily-intel block PER CYCLE, checked before starting each task (not mid-task). When exhausted, the block stops for this cycle and _run_daily_intel_block resumes from the first undone task on the next due call. Pin: ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60 <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS (240 + 480 + 60 = 780 <= 900) — the +60 covers the earnings-calendar-sync SQL call and active-hypo-scoring bookkeeping that run ahead of both in the same step. tests/test_hermes_timeout_budgets.py pins this.
+DAILY_INTEL_LLM_TASK_BUDGET_S = 180           # documented default per-task budget for LLM-backed daily-intel tasks (source_audit, backtest_scan, options_improvement, hypothesis_review, hypothesis_discovery, rag_index, actor_research, edgar_transcripts) — sized like the other single-to-few-call LLM steps above (e.g. TIMESFM_TIMEOUT_SECONDS, KNOWLEDGE_MAP_TIMEOUT_SECONDS), not the many-ticker ORACLE_CYCLE_TIMEOUT_SECONDS.
+DAILY_INTEL_SQL_TASK_BUDGET_S = 60            # documented default per-task budget for SQL/CPU-only daily-intel tasks (flow_materialize, icij_linking, milestone_scoring, attention_anomaly, corporate_actions, capital_flow_rollups, fundamental_divergence, holder_deal_overlap) — matches SMART_INGESTION/RESOLUTION-class steps, generous headroom over the sub-10s runtimes those steps observe.
+DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budget for the three daily-intel file/log cleanup tasks (insight_cleanup, briefing_cleanup, errors_jsonl_cleanup) — cheap filesystem work, not DB or LLM bound.
+DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = DAILY_INTEL_LLM_TASK_BUDGET_S  # postmortem_batch is LLM-backed but bounded on the WORK axis by POSTMORTEM_BATCH_LIMIT (20 rows/cycle, see above) rather than its own time constant; the time budget still uses the LLM default.
+DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
+
+# capital_flow_rollups / fundamental_divergence per-task budgets
+# (fable-daily-intel-sql-tasks, 2026-09-20) — deliberately SEPARATE
+# constants from DAILY_INTEL_SQL_TASK_BUDGET_S (not a shared-constant
+# bump, which would also loosen the other 6 SQL-class tasks with no
+# evidence behind it). See docs/handoffs/2026-09-20/
+# fable-daily-intel-sql-tasks.md for the full diagnosis; both tasks were
+# timing out at the shared 60s default because compute_ttm ran an
+# unbounded ROW_NUMBER/window recompute over ALL ~310k
+# capital_flows(period_type='quarter') rows every cycle (cancelled by
+# db.py's 120s statement_timeout every attempt — company_financial_
+# rollups.py::compute_ttm, originally bounded by a fixed
+# TTM_LOOKBACK_DAYS=3 window and now by a durable persisted watermark,
+# OperatorState.capital_flow_ttm_watermark — see that module's docstring)
+# and fundamental_divergence
+# issued 1-4 queries PER TICKER (~1,500 tickers, an N+1 pattern summing
+# to ~120-124s of round-trip overhead — fundamental_divergence.py's
+# "Batched metric extraction" comment). The controller's instruction was
+# explicit: do not just raise these budgets to paper over the timeout —
+# the numbers below are set AFTER the query-side fixes, sized off what
+# the fix leaves each task to do, not a guess at "give it more time":
+#
+#   capital_flow_rollups (90s, up from the 60s shared default): the
+#   ONE production number this task has ever actually measured
+#   completing is fold_announcements alone — 16s (see
+#   docs/handoffs/2026-09-20/fable-daily-intel-sql-tasks.md's evidence
+#   quote, 07:51:13->07:51:29). compute_ttm's expensive ROW_NUMBER/
+#   window recompute is still bounded to DIRTY actors only — but as of
+#   the 2026-09-20 SECOND follow-up, dirtiness is decided by a per-actor
+#   content-fingerprint comparison (capital_flows_ttm_state), not by
+#   OperatorState.capital_flow_ttm_watermark (now vestigial — see
+#   intelligence/company_financial_rollups.py's module docstring for
+#   why the scalar watermark was replaced). That comparison itself DOES
+#   read every quarter row every cycle (a single GROUP BY aggregate
+#   scan, not a window function) — cheap on a normal day at the ~310k-
+#   row scale measured here, but evidence-uncertain on a catch-up day
+#   after downtime (more actors dirty at once, more window work). 90s
+#   keeps ~5.6x headroom over the one measured baseline (16s) for that
+#   uncertainty while staying a small fraction of the 480s cycle budget.
+#
+#   fundamental_divergence (60s, UNCHANGED from the shared default):
+#   batching collapses the ~4,500-6,000 sequential per-ticker round
+#   trips the evidence attributes the ~120-124s DB-checkout holds to
+#   (no QueryCanceled was ever logged for this task — see the same
+#   evidence doc) into 4 queries total for the whole universe. There is
+#   no evidence this needs MORE time than the existing SQL-class
+#   default; raising it without evidence is exactly what the controller
+#   said not to do, so it stays at 60s.
+DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S = 90
+DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S
+
+# Sector health snapshot — daily due-period scheduling (2026-09-19). Was
+# "now.hour == 3 and now.minute < 10", which only fired on the rare cycle
+# evaluated inside that 10-minute slice; production ran it successfully
+# twice in the last 400 snapshots (2026-07-13, 2026-09-13). See
+# docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+SECTOR_HEALTH_BOUNDARY_HOUR = 3               # UTC hour the daily due-period opens
+SECTOR_HEALTH_RETRY_BACKOFF_MINUTES = 60      # min minutes between failed-attempt retries
+SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY = 5        # cap on attempts per due period so a
+                                               # persistent failure doesn't retry every cycle forever
 
 # Earnings events → earnings_calendar back-compat sync. The DB-side
 # function ``sync_earnings_events_to_calendar()`` (installed
@@ -255,6 +382,59 @@ def _run_with_timeout(name: str, fn, timeout_s: int, state):
         state.cooldowns.record_attempt(name, success=False, error=str(exc))
         ex.shutdown(wait=False, cancel_futures=True)
         return None, False
+
+
+class _AutoresearchGenerationTracker:
+    """In-process generation counter, used to fence autoresearch writes.
+
+    ``_run_with_timeout`` above abandons a timed-out worker rather than
+    cancelling it (its own docstring explains why: ``ThreadPoolExecutor``/
+    ``concurrent.futures`` has no API to kill a running thread). Without
+    something else stopping it, that orphaned worker keeps running
+    scripts/autoresearch.py::run_autoresearch() to completion and can still
+    insert into hypothesis_registry / model_registry / the research_run
+    snapshot trail, arbitrarily long after the operator moved on to the
+    next cycle.
+
+    This tracker is the compensating control. Every autoresearch
+    invocation is assigned a generation (``next()``) before it is handed to
+    the worker thread. run_autoresearch() (scripts/autoresearch.py) checks
+    ``is_current(generation)`` — via the closure captured in
+    ``is_current_generation`` below — before every write it makes; once
+    this tracker's ``current`` has moved past that generation, the check
+    fails and the write is skipped with a recorded "fenced" reason instead
+    of being made.
+
+    SCOPE: this fences a stale worker THREAD within this SAME PROCESS only.
+    ``current`` is a plain int behind the GIL, which is enough for an
+    orphan thread in the same interpreter to observe a bump made by the
+    main operator thread — it is NOT enough to fence a second Hermes
+    process, or a worker that survives past a process restart. Cross-
+    process fencing needs a DB-backed lease (a row with an owner/epoch
+    that every writer re-checks transactionally, e.g. ``SELECT ... FOR
+    UPDATE`` or an optimistic version column) — not implemented here. That
+    gap is why autoresearch remains explicitly not-yet-safe-to-activate on
+    a schedule; this task only makes it observable and safe to restart
+    within one process.
+    """
+
+    def __init__(self) -> None:
+        self.current = 0
+
+    def next(self) -> int:
+        """Advance to a new generation and return it."""
+        self.current += 1
+        return self.current
+
+    def is_current(self, generation: int) -> bool:
+        """Return whether *generation* is still the latest one assigned."""
+        return generation == self.current
+
+
+# Module-level: one tracker per Hermes operator process, shared by every
+# autoresearch invocation across cycles (see class docstring for scope).
+_autoresearch_generation = _AutoresearchGenerationTracker()
+
 
 # ─── Source registry (DERIVED from PULLER_REGISTRY — task #179) ────────────
 #
@@ -592,6 +772,1899 @@ def _dispatch_daily_storage_maintenance(engine: Any, state: OperatorState) -> di
     )
 
 
+def _period_boundary(now: datetime, boundary_hour: int) -> datetime:
+    """Return the most recent UTC boundary crossing (``boundary_hour:00``)
+    at or before *now*.
+
+    Internal to :func:`daily_task_due`; also reused by the sector-health
+    retry-attempt bookkeeping in :func:`run_intelligence_tasks` so both
+    share one definition of "due period". *now* must already be
+    timezone-aware (callers normalise before calling this).
+    """
+    today_boundary = now.replace(hour=boundary_hour, minute=0, second=0, microsecond=0)
+    if now >= today_boundary:
+        return today_boundary
+    return today_boundary - timedelta(days=1)
+
+
+def daily_task_due(
+    last_success: datetime | None,
+    now: datetime,
+    boundary_hour: int,
+) -> bool:
+    """Return True if a once-per-due-period daily task is due.
+
+    Replaces the old ``now.hour == H and now.minute < 10`` window pattern,
+    which only executes the task on the rare cycle that happens to be
+    evaluated inside that 10-minute slice. Traced live on the sector-health
+    step (2026-09-19): production went from 2026-07-13 to 2026-09-13
+    between successful runs — 62 days — because cycles routinely take long
+    enough, or start late enough, to miss the window (a cycle starting
+    02:55Z had not reached the check by 03:13Z). See
+    docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md.
+
+    A due *period* is the UTC day starting at ``boundary_hour:00``. The
+    task is due at any evaluation at or after the most recent boundary
+    crossing, as long as no successful run (``last_success``) has landed
+    since that boundary. There is no upper bound on the window: if the
+    process is idle, mid-cycle, or was just restarted, the first
+    evaluation after the boundary still runs the task instead of skipping
+    the period entirely.
+
+    Timezone handling: both arguments are expected to be timezone-aware
+    UTC datetimes — every call site in this module uses
+    ``datetime.now(timezone.utc)``. A naive value is NOT rejected; it is
+    normalised by assuming it is already UTC, the same convention
+    ``OperatorState.hydrate_from_snapshot`` uses when restoring timestamps
+    from a JSON snapshot that predates tzinfo-aware storage.
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    if last_success is None:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    return last_success < _period_boundary(now, boundary_hour)
+
+
+# Guards the in-process sector-health state marker (state.last_sector_health*,
+# state.sector_health_attempt*) against the check-to-write race described in
+# _maybe_run_sector_health_snapshot's docstring below: without it, Python can
+# switch threads between _commit's token check and its subsequent writes, so
+# an abandoned worker's belated _commit can pass the check, a newer attempt
+# can then start and commit, and the old worker's writes land last anyway.
+# Deliberately module-level, NOT an attribute on OperatorState — OperatorState
+# is serialised via to_dict() (analytical-snapshot persistence), and a
+# threading.Lock is not picklable/JSON-able. The DB row race for the
+# sector_health_snapshots table itself is closed separately, by the upsert's
+# `WHERE ... as_of < EXCLUDED.as_of` guard in
+# intelligence/sector_health.py::snapshot_all_sectors (evaluated atomically
+# on the locked conflicting row in PostgreSQL); this lock only closes the
+# in-process marker race, which the DB guard does not touch.
+_SECTOR_HEALTH_STATE_LOCK = threading.Lock()
+
+# Test-only seam: called inside _commit, between the token check and the
+# state/results writes, so a test can force a specific thread interleaving
+# at that exact point (see tests/test_sector_health_upsert_ordering_pg.py,
+# scenario d). Default no-op; production code never sets this.
+_SECTOR_HEALTH_COMMIT_TEST_HOOK: Callable[[], None] | None = None
+
+
+def _maybe_run_sector_health_snapshot(
+    engine: Any,
+    state: OperatorState,
+    now: datetime,
+    results: dict[str, Any],
+) -> None:
+    """Run the daily sector-health snapshot if its due period has arrived.
+
+    Computes the composite health score for every sector in ``SECTOR_MAP``
+    and upserts one row per (sector, today) into ``sector_health_snapshots``
+    (``intelligence/sector_health.py::snapshot_all_sectors`` — the INSERT is
+    ``ON CONFLICT (sector_name, snapshot_date) DO UPDATE``, so a re-run
+    inside the same UTC day is idempotent by construction; the state marker
+    below exists to skip redundant compute/DB work, not to guard against
+    duplicate rows). The row ~30 days back is read by the API to label
+    ``trend_30d``.
+
+    Scheduling uses :func:`daily_task_due` (see its docstring) instead of
+    the old ``now.hour == 3 and now.minute < 10`` window — see
+    ``docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md`` for the
+    production trace that motivated this (successful runs 62 days apart
+    despite ~5-minute cycles, because most cycles land outside the
+    10-minute slice).
+
+    Snapshot date identity: every attempt (and retry) within one due
+    period passes the SAME ``snapshot_date`` — the date of
+    ``_period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR)`` — to
+    :func:`intelligence.sector_health.snapshot_all_sectors`, not "today"
+    at the moment of the call. Without this, a 23:30 UTC attempt that
+    fails and a 00:30 UTC retry that succeeds would target two different
+    calendar dates even though they are one due period to this
+    scheduler, defeating the (sector_name, snapshot_date) upsert's
+    idempotency.
+
+    Outcome semantics: a call either (a) ``success`` — at least one row
+    written and no upsert failures, (b) ``no_eligible_sectors`` — zero
+    rows written, every sector reported unavailable, no upsert failures;
+    this is a legitimate empty day, so the due period IS marked done,
+    (c) ``superseded`` — zero rows written, no upsert failures, but at
+    least one sector was ``snapshots_stale_skipped`` (every row this
+    attempt tried already had an as-new-or-newer row from a different
+    attempt — see the ``as_of`` tie rule on
+    ``intelligence.sector_health.snapshot_all_sectors``: "first committed
+    wins on equal as_of"); this attempt did no useful work but is not a
+    failure either, so the due period IS marked done, PROVIDED the token
+    is still current — if a newer attempt is already in-process, that
+    newer attempt owns marking its own due period done, and this stale
+    attempt's ``_commit`` call is a no-op regardless (see the token guard
+    below), or (d) ``failure`` — any upsert failure or an exception; the
+    due period is NOT marked done. Failure handling: a failed execution
+    does NOT advance ``state.last_sector_health`` (so the due period is
+    not marked done and a later evaluation can retry), but retries are
+    throttled to once every ``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` (60)
+    and capped at ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` (5) per due
+    period so a persistent failure doesn't re-attempt on every ~5-minute
+    cycle indefinitely. The outcome is recorded on
+    ``state.last_sector_health_outcome`` regardless of which branch runs.
+
+    Cross-cycle race guard: this step runs inside ``run_intelligence_tasks``,
+    which the caller wraps in ``_run_with_timeout`` — a timeout abandons
+    the worker thread rather than killing it, so an orphaned attempt can
+    still be running when a later cycle starts a fresh attempt. To keep
+    an abandoned worker from clobbering a newer attempt's result, this
+    function captures ``state.sector_health_attempt_token`` (incremented
+    at attempt start) locally and only commits ``last_sector_health`` /
+    ``last_sector_health_outcome`` if the token is still current when the
+    call completes; otherwise the result is discarded and logged as
+    stale.
+
+    Check-to-write race on the state marker: the token check above and the
+    subsequent writes to ``state.last_sector_health*`` are NOT atomic on
+    their own — Python can switch threads between ``_commit``'s check and
+    its assignments, so an abandoned worker's ``_commit`` can pass the
+    check, a newer attempt can then start AND commit, and the old worker's
+    assignments can still land last, overwriting the newer attempt's
+    marker. ``_SECTOR_HEALTH_STATE_LOCK`` (module-level, not stored on
+    ``OperatorState`` — see its own docstring) is held around (a) the
+    attempt-start block (token bump + attempt fields) below, (b) the whole
+    of ``_commit`` (check + writes), and (c) the timeout-path token bump in
+    ``_run_sector_and_intelligence_steps``, so the check and the writes for
+    any one attempt happen atomically with respect to every other
+    attempt's check-and-write. This is purely an in-process guard for the
+    Python-level marker; the DB row race for the actual
+    ``sector_health_snapshots`` table is independently closed by the
+    upsert's ``WHERE`` guard (see ``snapshot_all_sectors``).
+    """
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    sector_health_period_due = daily_task_due(
+        state.last_sector_health, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+    )
+
+    sector_health_due = False
+    if sector_health_period_due:
+        attempt_in_this_period = (
+            state.last_sector_health_attempt is not None
+            and not daily_task_due(
+                state.last_sector_health_attempt, now, SECTOR_HEALTH_BOUNDARY_HOUR,
+            )
+        )
+        if not attempt_in_this_period:
+            # Fresh due period (or a restart with no attempt recorded yet
+            # for it) — always allowed, and the attempt counter resets.
+            state.sector_health_attempt_count = 0
+            sector_health_due = True
+        else:
+            # Computed from the *passed-in* now, not a fresh wall-clock
+            # read (unlike _minutes_since) — this function is evaluated
+            # with the caller's `now`, and callers (including tests) may
+            # legitimately pass a `now` that differs from the real clock.
+            last_attempt = state.last_sector_health_attempt
+            if last_attempt.tzinfo is None:
+                last_attempt = last_attempt.replace(tzinfo=timezone.utc)
+            minutes_since_attempt = (now - last_attempt).total_seconds() / 60.0
+            backoff_elapsed = minutes_since_attempt >= SECTOR_HEALTH_RETRY_BACKOFF_MINUTES
+            under_attempt_cap = (
+                state.sector_health_attempt_count < SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY
+            )
+            sector_health_due = backoff_elapsed and under_attempt_cap
+
+    if not sector_health_due:
+        return
+
+    log.info(
+        "Running daily sector health snapshot (due since {h}:00 UTC, attempt {a})",
+        h=SECTOR_HEALTH_BOUNDARY_HOUR, a=state.sector_health_attempt_count + 1,
+    )
+    with _SECTOR_HEALTH_STATE_LOCK:
+        state.last_sector_health_attempt = now
+        state.sector_health_attempt_count += 1
+        state.sector_health_attempt_token += 1
+        attempt_token = state.sector_health_attempt_token
+    due_period_date = _period_boundary(now, SECTOR_HEALTH_BOUNDARY_HOUR).date()
+
+    def _commit(outcome: str, extra: dict[str, Any]) -> None:
+        """Write the attempt's result to `state`/`results`, but only if no
+        later attempt has started since this one (see docstring). The
+        check and the writes happen under _SECTOR_HEALTH_STATE_LOCK so an
+        abandoned worker cannot pass the check and then lose a race to
+        write after a newer attempt has already committed (the
+        check-to-write race described in this function's docstring)."""
+        with _SECTOR_HEALTH_STATE_LOCK:
+            if state.sector_health_attempt_token != attempt_token:
+                log.warning(
+                    "stale sector-health worker result ignored (token {t}, current {c})",
+                    t=attempt_token, c=state.sector_health_attempt_token,
+                )
+                return
+            if _SECTOR_HEALTH_COMMIT_TEST_HOOK is not None:
+                _SECTOR_HEALTH_COMMIT_TEST_HOOK()
+            results["sector_health_snapshot"] = {**extra, "outcome": outcome}
+            state.last_sector_health_outcome = outcome
+            if outcome in ("success", "no_eligible_sectors", "superseded"):
+                state.last_sector_health = now
+
+    try:
+        from intelligence.sector_health import snapshot_all_sectors
+        sh_result = snapshot_all_sectors(
+            engine,
+            snapshot_date=due_period_date,
+            computed_at=now,
+            # Cheap in-process staleness guard for an abandoned
+            # _run_with_timeout worker (see this function's "Cross-cycle
+            # race guard" docstring section above): checked by
+            # snapshot_all_sectors before each sector's compute and again
+            # immediately before each upsert. If a LATER attempt has
+            # already bumped state.sector_health_attempt_token past this
+            # attempt's captured value, this closure starts returning
+            # False and the loop stops mid-run instead of racing a newer
+            # attempt's writes. This is in-process only (same caveat as
+            # the token guard below and _AutoresearchGenerationTracker):
+            # it does not fence a second Hermes process.
+            should_continue=lambda: state.sector_health_attempt_token == attempt_token,
+        )
+
+        if sh_result.get("aborted_stale"):
+            # A later attempt already started (token moved past ours)
+            # while snapshot_all_sectors was still running — the _commit
+            # token guard below would discard this result anyway, so
+            # return without touching `results` or state.last_sector_health*
+            # at all, rather than committing a partial/stale outcome.
+            log.info(
+                "sector_health: attempt {a} aborted mid-run (stale token; a "
+                "later attempt already started) — result discarded",
+                a=state.sector_health_attempt_count,
+            )
+            return
+
+        written = sh_result.get("snapshots_written", 0)
+        skipped = sh_result.get("snapshots_skipped_unavailable", 0)
+        upsert_failed = sh_result.get("upsert_failed", 0)
+        stale_skipped = sh_result.get("snapshots_stale_skipped", 0)
+
+        if upsert_failed > 0:
+            outcome = "failure"
+            log.warning(
+                "sector_health: {n} upsert failure(s), due period not marked done",
+                n=upsert_failed,
+            )
+        elif written == 0 and stale_skipped > 0:
+            # Every row this attempt tried already had an as-new-or-newer
+            # row from a different attempt (the snapshot_all_sectors
+            # `as_of` WHERE guard rejected every write this attempt made).
+            # Not a failure — a different attempt already did the work —
+            # so the due period is marked done via _commit's outcome set,
+            # but only if this attempt's token is still current (a newer
+            # in-process attempt already handles its own marker).
+            outcome = "superseded"
+            log.info(
+                "sector_health: superseded — {n} row(s) already had an "
+                "as-new-or-newer as_of from a different attempt, nothing "
+                "written this attempt",
+                n=stale_skipped,
+            )
+        elif written == 0 and skipped > 0:
+            outcome = "no_eligible_sectors"
+            log.info(
+                "sector_health: executed, no eligible sectors, nothing to write "
+                "({k} unavailable)", k=skipped,
+            )
+        else:
+            outcome = "success"
+            log.info("sector_health: {n} snapshots written", n=written)
+
+        _commit(outcome, sh_result)
+    except Exception as exc:
+        log.warning("sector_health snapshot failed: {e}", e=str(exc))
+        _commit("failure", {"status": "failed", "error": str(exc)})
+
+
+def _run_diagnostics_step(
+    engine: Any,
+    hermes_ok: bool,
+    health: dict,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run self-diagnostics (cycle step 5, every 6th cycle) under its own
+    ``_run_with_timeout(..., DIAGNOSTICS_TIMEOUT_SECONDS)`` budget.
+
+    Extracted 2026-09-19 (fable-hermes-repair-bound; see
+    docs/handoffs/2026-09-19/fable-hermes-repair-bound.md). Before this the
+    call site was::
+
+        if state.cycle_count % 6 == 0:
+            try:
+                diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
+                cycle_result["diagnostics"] = diag
+            except Exception as exc:
+                log.warning(...)
+
+    — a plain try/except with NO per-step timeout. run_self_diagnostics can
+    execute a Hermes-emitted ``REPULL:<source>`` command via
+    ``_execute_hermes_repair_command`` -> ``_retry_source``, which (before
+    this task) called a full-history pull for any puller with a
+    ``start_date`` parameter. Traced: cycle 6300 spent 71 minutes on this
+    one step (``yfinance`` was diagnosed "stale" from a freshness-signal
+    bug — see the E finding in the handoff doc — even though its data was
+    current), and every step scheduled after diagnostics that cycle
+    (including sector_health and intelligence_tasks) never ran.
+
+    Repair pulls are now bounded on two independent axes (both in
+    scripts/hermes_fixers.py): a ``REPAIR_LOOKBACK_DAYS`` window per
+    attempt, and a shared ``REPAIR_BUDGET_SECONDS`` cooperative deadline
+    that ``run_self_diagnostics`` computes once and threads through to the
+    puller. This wrapper is the remaining backstop — it bounds the WHOLE
+    step (including the LLM call itself, and any command that doesn't
+    participate in the cooperative budget) so a hang anywhere inside
+    diagnostics cannot starve due maintenance placed after it in
+    ``run_cycle``.
+
+    Deliberately no ``can_retry("diagnostics")`` check on timeout — same
+    reasoning as ``_run_sector_and_intelligence_steps`` above: the
+    blacklist entry ``_run_with_timeout`` writes on a timeout is only
+    honoured by call sites that explicitly check
+    ``state.cooldowns.can_retry(<name>)`` before running (traced to exactly
+    four: ``oracle_cycle``, ``signal_classification``, ``anomaly_narration``,
+    ``knowledge_mapping``). ``diagnostics`` is not one of them and adding
+    that check now would make a single timeout block every diagnostics
+    cycle for ``TIMEOUT_BLACKLIST_HOURS`` (24h) — this step already has its
+    own per-call budget (``REPAIR_BUDGET_SECONDS``) and its natural
+    cadence (every 6th cycle) as throttling.
+    """
+    if state.cycle_count % 6 != 0:
+        return
+    try:
+        state.current_step = "diagnostics"
+        diag, ok = _run_with_timeout(
+            "diagnostics",
+            lambda: run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run),
+            DIAGNOSTICS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok:
+            cycle_result["diagnostics"] = diag
+        else:
+            cycle_result["diagnostics"] = {"timeout": True}
+    except Exception as exc:
+        log.warning("Self-diagnostics failed: {e}", e=str(exc))
+
+
+def _run_sector_health_step(engine: Any, state: OperatorState, dry_run: bool) -> dict[str, Any]:
+    """Entry point for the sector-health snapshot as its own ``run_cycle``
+    step (dispatched by :func:`_run_sector_and_intelligence_steps` under
+    ``_run_with_timeout(..., SECTOR_HEALTH_TIMEOUT_SECONDS)``).
+
+    Split out of ``run_intelligence_tasks`` on 2026-09-19 — see that
+    function's NOTE for why the old placement (inside, and after the daily
+    block of, ``run_intelligence_tasks``) made this step effectively
+    unreachable in production. This wrapper owns only what changed by the
+    split: building ``now`` and a fresh per-call ``results`` dict, and the
+    dry-run short-circuit. All due-period, retry/backoff, idempotency and
+    cross-cycle-race handling is unchanged and still lives in
+    :func:`_maybe_run_sector_health_snapshot`.
+    """
+    if dry_run:
+        log.info("[DRY RUN] Would evaluate sector health")
+        return {"skipped": "dry_run"}
+
+    now = datetime.now(timezone.utc)
+    results: dict[str, Any] = {}
+    _maybe_run_sector_health_snapshot(engine, state, now, results)
+    return results
+
+
+def _run_sector_and_intelligence_steps(
+    engine: Any,
+    state: OperatorState,
+    dry_run: bool,
+    cycle_result: dict[str, Any],
+) -> None:
+    """Run the sector-health snapshot and the intelligence-tasks batch as
+    two INDEPENDENT ``run_cycle`` steps, each under its own
+    ``_run_with_timeout`` budget, sector-health dispatched first.
+
+    Why split (2026-09-19; see
+    docs/handoffs/2026-09-19/fable-hermes-sector-schedule.md, "Parent-
+    timeout blocker and own-step fix"): the sector-health snapshot used to
+    run INSIDE ``run_intelligence_tasks``, after its ``daily_due`` block
+    (source_audit -> backtest_scan -> postmortem -> options_improvement ->
+    hypothesis_review -> auto_discover -> ``state.last_daily_intel = now``).
+    Production journal evidence (2026-09-19 03:48, 04:35, 05:02, 06:05 UTC,
+    and the May-2026 log) shows the whole ``intelligence_tasks`` step times
+    out at ``INTELLIGENCE_TASKS_TIMEOUT_SECONDS`` (900s) on EVERY observed
+    cycle: the daily batch runs with ``catch_up=True`` every cycle because
+    the step is abandoned before ``state.last_daily_intel = now`` is ever
+    reached, so nothing placed after that point in the function — including
+    the old sector-health call — ever ran. This is a separate, confirmed-
+    current blocker from the due-period scheduling fix in
+    ``daily_task_due``/``_maybe_run_sector_health_snapshot`` (which fixed a
+    different, already-merged defect: a 10-minute evaluation window that
+    made execution rare even when reached). Neither defect alone is claimed
+    to explain the full historical gap; both are real and independent.
+    Dispatching sector-health as its own step, ahead of intelligence_tasks
+    and with its own short timeout (``SECTOR_HEALTH_TIMEOUT_SECONDS``,
+    observed 3-8s in production), makes it reachable every cycle regardless
+    of whether intelligence_tasks times out — which it still does; that
+    900s budget is unchanged by this split and is explicitly NOT fixed
+    here (see the handoff doc's "NOT fixed here" note).
+
+    Blacklist trace (do not "fix" this by adding a can_retry check):
+    ``_run_with_timeout`` calls
+    ``state.cooldowns.blacklist_for_timeout("sector_health")`` on a
+    timeout, same as it does for every named step. But that blacklist
+    entry is only ever honoured by a call site that explicitly checks
+    ``state.cooldowns.can_retry(<name>)`` before running — traced here to
+    exactly four such call sites: ``oracle_cycle``, ``signal_classification``,
+    ``anomaly_narration`` and ``knowledge_mapping``. ``intelligence_tasks``
+    and ``resolution`` do not consult it either (see
+    ``_run_resolution_step``'s docstring for the same trace on
+    ``resolution``), so for those steps a timeout's blacklist entry is
+    written but never read — it changes nothing about whether the step
+    runs again. This new ``sector_health`` step deliberately joins that
+    second group: it does NOT check ``can_retry("sector_health")``. Adding
+    that check would make a single timeout block every retry for
+    ``TIMEOUT_BLACKLIST_HOURS`` (24h), reintroducing a multi-day stall on
+    top of a step that already has its own bounded retry/backoff
+    (``SECTOR_HEALTH_RETRY_BACKOFF_MINUTES`` = 60, capped at
+    ``SECTOR_HEALTH_MAX_ATTEMPTS_PER_DAY`` = 5 per due period, both enforced
+    inside ``_maybe_run_sector_health_snapshot``). Retry throttling for
+    this step comes entirely from that backoff, not from the cooldown
+    blacklist.
+
+    Abandoned-worker handling: ``_run_with_timeout`` abandons (does not
+    kill) the worker thread on timeout, so a timed-out sector-health
+    attempt can still be running — and can still call
+    ``snapshot_all_sectors`` / ``_commit`` — after this function has moved
+    on. ``_maybe_run_sector_health_snapshot`` already guards against a
+    LATER attempt starting while an earlier one is still in flight (its
+    ``state.sector_health_attempt_token`` check). This function closes the
+    other half of that gap — an abandoned attempt with no later attempt
+    ever starting — by bumping the token itself right here on timeout, so
+    the orphan's eventual ``_commit``/upsert-guard sees a stale token
+    either way. This bump is taken under ``_SECTOR_HEALTH_STATE_LOCK`` —
+    the same lock ``_commit`` holds — so it can never land between an
+    in-flight ``_commit``'s token check and its writes.
+    """
+    # ── Sector health snapshot — own step, own (short) timeout ─────────
+    try:
+        state.current_step = "sector_health"
+        sector_result, ok = _run_with_timeout(
+            "sector_health",
+            lambda: _run_sector_health_step(engine, state, dry_run),
+            SECTOR_HEALTH_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and sector_result:
+            cycle_result["sector_health"] = sector_result
+        elif not ok:
+            cycle_result["sector_health"] = {"timeout": True}
+            # See docstring: bump the token so an abandoned worker's
+            # belated _commit()/upsert is discarded as stale even if no
+            # later attempt ever starts. Under the same lock _commit uses,
+            # so this bump can never interleave with an in-flight
+            # _commit's check-then-write.
+            with _SECTOR_HEALTH_STATE_LOCK:
+                state.sector_health_attempt_token += 1
+    except Exception as exc:
+        log.warning("Sector health step failed: {e}", e=str(exc))
+
+    # ── Intelligence tasks — unchanged from before the split; still 900s,
+    #    still the step production shows timing out on effectively every
+    #    cycle (see docstring above). Dispatched second so a slow/timed-out
+    #    intelligence_tasks step can never again prevent sector-health from
+    #    running.
+    try:
+        state.current_step = "intelligence_tasks"
+        intel_result, ok = _run_with_timeout(
+            "intelligence_tasks",
+            lambda: run_intelligence_tasks(engine, state, dry_run=dry_run),
+            INTELLIGENCE_TASKS_TIMEOUT_SECONDS,
+            state,
+        )
+        if ok and intel_result:
+            cycle_result["intelligence"] = intel_result
+        elif not ok:
+            cycle_result["intelligence"] = {"timeout": True}
+    except Exception as exc:
+        log.warning("Intelligence tasks failed: {e}", e=str(exc))
+
+
+# ─── Daily intelligence batch — task table (fable-daily-intel-resumable) ──
+#
+# Each function below is one step of the old monolithic 02:00 UTC daily
+# block, moved verbatim (same imports, same log lines, same results[...]
+# keys) into its own callable. The ONE behavioral change versus the
+# pre-existing body: the bare `try/except Exception: log.warning(...)`
+# that used to wrap each step (swallowing the failure so the sequential
+# block could keep going) is gone — that job now belongs to
+# _run_with_timeout, called once per task by _run_daily_intel_block below,
+# which is what makes each task's success/failure visible to the per-period
+# ledger (state.daily_intel_done/daily_intel_attempts). A task that used to
+# silently log "X import failed" and move on now silently logs
+# "Step 'daily_intel:X' raised: ..." (via _run_with_timeout) and moves on
+# — same effect, but now the ledger also counts the attempt.
+#
+# `_run_intel_task` (scripts/hermes_fixers.py) already swallows exceptions
+# from the call it wraps (returns None, records state.task_status, logs a
+# warning) — for the six tasks that use it, _daily_intel_raise_if_task_
+# status_failed re-raises when task_status shows failure, so
+# _run_with_timeout still sees it.
+
+
+def _daily_intel_raise_if_task_status_failed(state: OperatorState, name: str) -> None:
+    """Make a `_run_intel_task`-swallowed failure visible to `_run_with_timeout`.
+
+    `_run_intel_task` records the outcome on `state.task_status[name]` and
+    returns None instead of raising. Without this check, every daily-intel
+    task that goes through `_run_intel_task` would report ok=True to
+    `_run_with_timeout` (and therefore "done" to the per-period ledger)
+    even when the wrapped call actually raised — only a genuine timeout
+    would ever be visible. This is the only behavioral addition versus the
+    pre-existing task body.
+    """
+    status = state.task_status.get(name)
+    if status is not None and status.get("success") is False:
+        raise RuntimeError(status.get("error") or f"{name} failed")
+
+
+def _daily_intel_storage_maintenance(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Queue the bounded storage-maintenance subagent. Dispatch only — no
+    LLM call in this step itself (see DAILY_INTEL_DISPATCH_TASK_BUDGET_S).
+
+    Done-vs-done_queued (fable-hermes-daily-intel-resumable review, part C,
+    2026-09-20): this step's own work is fully synchronous and finished the
+    moment ``_dispatch_daily_storage_maintenance`` returns — it INSERTs one
+    ``goal_queue`` row (``enqueue_goal``, dedup-checked, goal_type
+    ``hermes_storage_maintenance``; see ``_dispatch_subagent`` in
+    scripts/hermes_fixers.py) and nothing else. That is why
+    ``_run_daily_intel_block`` marks this task's own outcome
+    "done_queued" rather than "done" on success (see
+    ``DailyIntelTask.reports_done_queued`` below) — this step is DONE the
+    instant the goal is queued; the queued goal's own execution is a
+    SEPARATE, asynchronous unit of work tracked by ``goal_queue``/
+    ``goal_results`` (intelligence/goal_queue.py), not by this ledger.
+    Neither this ledger nor ``_run_daily_intel_block`` ever learns whether
+    the queued ``hermes_storage_maintenance`` goal later succeeds, fails,
+    or sits unclaimed.
+
+    Held-category reachability (same review, part C): the queued goal is
+    claimed by whichever ``scripts/goal_worker.py`` node next polls for a
+    ``cpu``-tier goal and executes
+    ``handle_hermes_storage_maintenance`` -> ``_inspect_storage_maintenance``
+    (scripts/hermes_fixers.py) -> ``storage_curator.run_storage_maintenance``
+    (scripts/storage_curator.py). Read end to end: that call chain only
+    builds a read-only filesystem/DB inventory report
+    (``build_storage_maintenance_report``, a plain ``engine.connect()``
+    SELECT — no INSERT/UPDATE/DELETE), writes it to
+    ``outputs/storage_maintenance/*.json``/``*.md`` on disk, and — only
+    when the report's status is not "ok" — INSERTs one row into
+    ``operator_issues`` via ``log_issue`` (scripts/hermes_health.py). No
+    call anywhere in that chain reaches ``hypothesis_registry``,
+    ``discovered_hypotheses``, ``scanner_weights``, ``trade_postmortems``,
+    or any other scoring/learning/backfill/model-registry table — i.e. the
+    HELD categories this allow-list withholds. The dispatched child work
+    cannot be used to bypass a hold.
+    """
+    results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
+
+
+def _daily_intel_source_audit(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from intelligence.source_audit import run_full_audit
+    results["source_audit"] = _run_intel_task(
+        "source_audit", run_full_audit, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "source_audit")
+
+
+def _daily_intel_flow_materialize(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Projects signal_sources into the relational flow tables
+    (dark_pool_weekly, etf_flows, insider_trades, congressional_trades,
+    junction_point_readings)."""
+    from ingestion.flow_materializer import sync_all as _flow_sync_all
+    results["flow_materialize"] = _run_intel_task(
+        "flow_materialize", _flow_sync_all, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "flow_materialize")
+
+
+def _daily_intel_backtest_scan(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from analysis.backtest_scanner import run_full_scan
+    results["backtest_scan"] = _run_intel_task(
+        "backtest_scan", run_full_scan, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "backtest_scan")
+
+
+def _daily_intel_postmortem_batch(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from intelligence.postmortem import batch_postmortem
+    results["postmortem_batch"] = _run_intel_task(
+        "postmortem_batch", batch_postmortem, state, engine,
+        limit=POSTMORTEM_BATCH_LIMIT,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "postmortem_batch")
+
+
+def _daily_intel_options_improvement(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from trading.options_tracker import run_improvement_cycle
+    results["options_improvement"] = _run_intel_task(
+        "options_improvement", run_improvement_cycle, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "options_improvement")
+
+
+def _daily_intel_hypothesis_review(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    from analysis.backtest_scanner import review_existing_hypotheses
+    results["hypothesis_review"] = _run_intel_task(
+        "hypothesis_review", review_existing_hypotheses, state, engine,
+    )
+    _daily_intel_raise_if_task_status_failed(state, "hypothesis_review")
+
+
+def _daily_intel_hypothesis_discovery(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Auto-discover new hypotheses from data patterns. Kept its own
+    ``_hours_since(last_hypothesis_discovery) >= 20`` guard from the
+    pre-existing body — redundant with the per-period ledger now (a task
+    only runs once per period regardless), but harmless, and
+    ``state.last_hypothesis_discovery`` is still read elsewhere for
+    diagnostics (see the log line near the bottom of this module)."""
+    if _hours_since(state.last_hypothesis_discovery) >= 20:
+        from intelligence.hypothesis_engine import HypothesisGenerator
+        hyp_engine = HypothesisGenerator(engine)
+        discovered = hyp_engine.auto_discover()
+        results["hypothesis_discovery"] = {
+            "new_hypotheses": len(discovered),
+        }
+        log.info(
+            "Hypothesis discovery: {n} new hypotheses generated",
+            n=len(discovered),
+        )
+        state.last_hypothesis_discovery = now
+
+
+def _daily_intel_rag_index(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Re-embed latest intelligence data. Kept its own
+    ``_hours_since(last_rag_index) >= 20`` guard — see
+    _daily_intel_hypothesis_discovery's docstring for why that's harmless."""
+    if _hours_since(state.last_rag_index) >= 20:
+        from intelligence.rag import RAGIndexer
+        indexer = RAGIndexer(engine)
+        indexer.ensure_tables()
+        snap_count = indexer.index_snapshots()
+        actor_count = indexer.index_actors()
+        results["rag_index"] = {
+            "snapshots_indexed": snap_count,
+            "actors_indexed": actor_count,
+        }
+        log.info(
+            "RAG index refreshed: {s} snapshot chunks, {a} actor chunks",
+            s=snap_count, a=actor_count,
+        )
+        state.last_rag_index = now
+
+
+def _daily_intel_actor_research(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """LLM enriches sparse actors, follows rabbit holes."""
+    from intelligence.actor_researcher import research_batch
+    actor_result = research_batch(engine, batch_size=20)
+    results["actor_research"] = actor_result
+    log.info(
+        "Actor research: {u} enriched, {n} new actors, {r} rabbit holes",
+        u=actor_result.get("updated", 0),
+        n=actor_result.get("new_actors", 0),
+        r=actor_result.get("rabbit_holes", 0),
+    )
+
+
+def _daily_intel_icij_linking(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Fuzzy match actors against offshore entities."""
+    from intelligence.icij_linker import link_actors
+    icij_result = link_actors(engine, min_similarity=0.6, limit=500)
+    results["icij_linking"] = {"matches": len(icij_result)}
+    log.info("ICIJ linking: {n} matches found", n=len(icij_result))
+
+
+def _daily_intel_milestone_scoring(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Execution scorecards for all companies."""
+    from intelligence.milestone_tracker import scan_all_tickers
+    milestones = scan_all_tickers(engine)
+    results["milestone_scoring"] = {"companies_scored": len(milestones)}
+    log.info("Milestone scoring: {n} companies scored", n=len(milestones))
+
+
+def _daily_intel_attention_anomaly(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Wikipedia + Trends spike detection."""
+    from intelligence.attention_anomaly import get_alerts
+    alerts = get_alerts(engine, threshold=60.0)
+    results["attention_alerts"] = {"high_alerts": len(alerts)}
+    if alerts:
+        log.info("ATTENTION: {n} entities with unusual attention", n=len(alerts))
+
+
+def _daily_intel_edgar_transcripts(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """8-K filings with LLM milestone extraction."""
+    from ingestion.altdata.edgar_transcripts import EdgarTranscriptPuller
+    edgar = EdgarTranscriptPuller(engine)
+    edgar_result = edgar.pull(days_back=30)
+    results["edgar_transcripts"] = edgar_result
+    log.info("EDGAR: {f} filings, {g} guidance phrases",
+             f=edgar_result.get("filings_processed", 0),
+             g=edgar_result.get("guidance_extracted", 0))
+
+
+def _daily_intel_corporate_actions(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Regex-mine 8-Ks for M&A, buybacks, dividends, debt, equity issuance.
+    Writes capital_flows rows with period_type='announcement'. Daily: last
+    30 days of 8-Ks."""
+    from ingestion.altdata.corporate_actions_parser import (
+        CorporateActionsParser,
+    )
+    corp = CorporateActionsParser(engine)
+    try:
+        corp_result = corp.pull(days_back=30)
+    finally:
+        corp.close()
+    results["corporate_actions"] = corp_result
+    log.info(
+        "corporate_actions: {r} rows from {f} filings "
+        "({h} tickers with hits)",
+        r=corp_result.get("rows_inserted", 0),
+        f=corp_result.get("filings_scanned", 0),
+        h=corp_result.get("tickers_with_hits", 0),
+    )
+
+
+def _daily_intel_capital_flow_rollups(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Derives ttm rows from quarterly XBRL data and folds announcement rows
+    into annual_rolled rows. Runs after the XBRL ingestor + corporate_actions
+    so it always sees the freshest base rows (corporate_actions dispatched
+    just before this in DAILY_INTEL_TASKS, same as before this task).
+
+    compute_ttm's recompute is bounded to DIRTY actors, decided by a
+    durable per-actor content fingerprint (``capital_flows_ttm_state``) —
+    fable-daily-intel-sql-tasks, 2026-09-20 SECOND follow-up. This
+    replaced the first follow-up's scalar ``as_of`` watermark
+    (``state.capital_flow_ttm_watermark``), which the controller
+    established is NOT commit-order safe (see
+    ``intelligence/company_financial_rollups.py``'s module docstring for
+    the full design and why). ``state.capital_flow_ttm_watermark`` is
+    still set here, unconditionally, as soon as ``run_all`` reports
+    ``ttm_ok`` — but it is now purely informational telemetry (the wall-
+    clock time the run completed), not a gating cursor; the state that
+    actually governs recomputation already committed, atomically with
+    the ttm rows themselves, inside ``compute_ttm``'s own transaction,
+    regardless of whether this ledger later credits the attempt as
+    done/done_late/abandoned (see the "abandonment truth" doc on
+    ``_run_daily_intel_block``: an abandoned run still performs its DB
+    writes).
+
+    ``run_all`` never raises on its own — a partial failure (e.g.
+    ``compute_ttm`` cancelled but ``fold_announcements`` fine) is
+    reported honestly by re-raising HERE when ``cf_stats["ok"]`` is
+    False, so ``_run_with_timeout`` sees this task as ``ok=False`` and
+    the daily-intel ledger records a genuine FAILURE (attempt counted,
+    eventually skipped_for_period) rather than silently letting
+    done_late — or a same-cycle "done" from _run_with_timeout's
+    synchronous ok=True path — hide a compute_ttm that never wrote
+    anything this cycle.
+    """
+    from intelligence.company_financial_rollups import run_all as cf_rollup_run
+    cf_stats = cf_rollup_run(engine, ttm_watermark=state.capital_flow_ttm_watermark)
+    results["capital_flow_rollups"] = cf_stats
+    log.info(
+        "capital_flow_rollups: ttm={t} rolled={r} ttm_ok={to} fold_ok={fo}",
+        t=cf_stats.get("ttm_rows", 0),
+        r=cf_stats.get("rolled_rows", 0),
+        to=cf_stats.get("ttm_ok"),
+        fo=cf_stats.get("fold_ok"),
+    )
+    if cf_stats.get("ttm_ok"):
+        state.capital_flow_ttm_watermark = cf_stats.get("ttm_watermark")
+    if not cf_stats.get("ok"):
+        raise RuntimeError(
+            "capital_flow_rollups partial failure: "
+            f"ttm_ok={cf_stats.get('ttm_ok')} fold_ok={cf_stats.get('fold_ok')} "
+            f"ttm_error={cf_stats.get('ttm_error')} "
+            f"fold_error={cf_stats.get('fold_error')}"
+        )
+
+
+def _daily_intel_fundamental_divergence(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Snapshot fundamental-vs-price divergence daily. Runs after
+    capital_flow_rollups (same ordering as before this task) so it sees the
+    freshest revenue/margin rows."""
+    from intelligence.fundamental_divergence import (
+        snapshot_all as fd_snapshot_all,
+    )
+    fd_stats = fd_snapshot_all(engine)
+    results["fundamental_divergence"] = fd_stats
+    log.info(
+        "fundamental_divergence: wrote={w} long={l} short={s}",
+        w=fd_stats.get("written", 0),
+        l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
+        s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
+    )
+
+
+def _daily_intel_holder_deal_overlap(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Pre-positioning detector: cross-references institutional_holdings 13F
+    snapshots against capital_flows acquisition announcements. Must run
+    after corporate_actions and after the 13F ingestor (same ordering as
+    before this task)."""
+    from intelligence.holder_deal_overlap import run as hdo_run
+    hdo_stats = hdo_run(engine)
+    results["holder_deal_overlap"] = hdo_stats
+    log.info(
+        "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
+        d=hdo_stats.get("deals_scanned", 0),
+        o=hdo_stats.get("overlaps_written", 0),
+        p=hdo_stats.get("pre_positioned", 0),
+    )
+
+
+def _daily_intel_insight_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """outputs/llm_insights/ 30-day retention (audit #49, #61)."""
+    from outputs.llm_logger import cleanup_old_insights
+    n_cleaned = cleanup_old_insights(max_age_days=30)
+    if n_cleaned:
+        log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
+
+
+def _daily_intel_briefing_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """Market briefings — 90-day retention (higher-value artifacts)."""
+    from ollama.market_briefing import MarketBriefingEngine
+    n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
+    if n_briefings:
+        log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
+
+
+def _daily_intel_errors_jsonl_cleanup(
+    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
+) -> None:
+    """errors.jsonl — append-only log, truncate to last 5000 lines (~3-4
+    days of errors at current rate). Cheap, atomic."""
+    from pathlib import Path
+    errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
+    if errfile.exists() and errfile.stat().st_size > 1_000_000:
+        lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) > 5000:
+            keep = lines[-5000:]
+            tmp = errfile.with_suffix(".jsonl.tmp")
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            tmp.replace(errfile)
+            log.info("errors.jsonl rotated: {n} → 5000 lines",
+                     n=len(lines))
+
+
+class DailyIntelTask(NamedTuple):
+    """One step of the daily intelligence batch (see DAILY_INTEL_TASKS).
+
+    ``fn(engine, state, now, results)`` runs the step's existing body —
+    same imports, same log lines, same ``results[...]`` keys as the
+    pre-existing inline block. ``budget_s`` is this step's own
+    ``_run_with_timeout`` budget, independent of every other step's (see
+    DAILY_INTEL_LLM_TASK_BUDGET_S / _SQL_ / _CLEANUP_ above for the
+    documented defaults each task below draws from).
+    """
+    name: str
+    fn: Callable[[Any, OperatorState, datetime, dict[str, Any]], Any]
+    budget_s: int
+    # True only for a task whose own step is DONE once it enqueues a
+    # goal_queue row, before the enqueued work executes (currently only
+    # storage_maintenance_subagent — see its docstring above). Makes
+    # _run_daily_intel_block record daily_intel_task_outcome[name] =
+    # "done_queued" instead of "done" on success, so the ledger cannot be
+    # misread as "the dispatched subagent finished" — see part C of
+    # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+    reports_done_queued: bool = False
+
+
+# Ordered exactly as the pre-existing inline block ran them. Do not
+# reorder without checking the ordering-dependency notes on
+# capital_flow_rollups, fundamental_divergence and holder_deal_overlap
+# above — they assume the tasks before them in this tuple already ran
+# this period.
+DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
+    DailyIntelTask("storage_maintenance_subagent", _daily_intel_storage_maintenance, DAILY_INTEL_DISPATCH_TASK_BUDGET_S, reports_done_queued=True),
+    DailyIntelTask("source_audit", _daily_intel_source_audit, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("flow_materialize", _daily_intel_flow_materialize, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("backtest_scan", _daily_intel_backtest_scan, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("postmortem_batch", _daily_intel_postmortem_batch, DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S),
+    DailyIntelTask("options_improvement", _daily_intel_options_improvement, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("hypothesis_review", _daily_intel_hypothesis_review, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("hypothesis_discovery", _daily_intel_hypothesis_discovery, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("rag_index", _daily_intel_rag_index, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("actor_research", _daily_intel_actor_research, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("icij_linking", _daily_intel_icij_linking, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("milestone_scoring", _daily_intel_milestone_scoring, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
+    DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("capital_flow_rollups", _daily_intel_capital_flow_rollups, DAILY_INTEL_CAPITAL_FLOW_ROLLUPS_BUDGET_S),
+    DailyIntelTask("fundamental_divergence", _daily_intel_fundamental_divergence, DAILY_INTEL_FUNDAMENTAL_DIVERGENCE_BUDGET_S),
+    DailyIntelTask("holder_deal_overlap", _daily_intel_holder_deal_overlap, DAILY_INTEL_SQL_TASK_BUDGET_S),
+    DailyIntelTask("insight_cleanup", _daily_intel_insight_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("briefing_cleanup", _daily_intel_briefing_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+    DailyIntelTask("errors_jsonl_cleanup", _daily_intel_errors_jsonl_cleanup, DAILY_INTEL_CLEANUP_TASK_BUDGET_S),
+)
+
+
+# ─── Safe initial task allow-list (fable-daily-intel-resumable review ────
+#     amendment, 2026-09-20) ─────────────────────────────────────────────
+#
+# Standing holds (controller instruction, not re-litigated here): scorer
+# execution / signal scoring, historical repair or backfill, and
+# learning/research writes (hypothesis registry, backtests, model
+# registry, postmortems that feed learning) are NOT authorised to run on
+# a schedule yet. DAILY_INTEL_TASKS above is the full ~21-task table this
+# task's resumability work made independently retryable; that table is
+# NOT itself an authorisation to run every task — DAILY_INTEL_INITIAL_
+# ALLOWLIST is the actual gate _run_daily_intel_block enforces. A task
+# absent from this frozenset is "held": _run_daily_intel_block skips its
+# `fn` entirely (never dispatched, never attempted, never timed), and it
+# can never appear in daily_intel_done/daily_intel_skipped_for_period —
+# see DAILY_INTEL_HOLD_REASONS below and the per-task table in
+# docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md for the
+# full writes/classification evidence. Enabling a held task later means
+# editing this frozenset in its own reviewed change — not a runtime flag,
+# not something this scheduler decides on its own.
+#
+# Classification method: read each task's wrapped function body (not just
+# its docstring) for (a) what table(s)/file(s) it writes, (b) whether it
+# calls llm.router (an LLM/Tier reference) anywhere in its own file, and
+# (c) whether what it writes is deterministic-derived (safe) versus
+# learning/scoring/backfill (held). Two tasks whose PRE-EXISTING per-task
+# budget constant name implied "LLM-backed" (DAILY_INTEL_LLM_TASK_BUDGET_S)
+# turned out, on reading the code, to have NO llm.router call anywhere in
+# their module and to write only derived audit tables — reclassified to
+# `allow` below with the file:line evidence in DAILY_INTEL_HOLD_REASONS'
+# sibling comments and the handoff doc; every other task keeps the
+# controller's default hold.
+DAILY_INTEL_INITIAL_ALLOWLIST: frozenset[str] = frozenset({
+    # Dispatch only — enqueues a goal_queue row for a bounded subagent;
+    # no LLM call and no learning-table write in this step itself
+    # (scripts/hermes_fixers.py::_execute_hermes_repair_command,
+    # DISPATCH_SUBAGENT branch -> intelligence.goal_queue.enqueue_goal).
+    "storage_maintenance_subagent",
+    # intelligence/icij_linker.py::link_actors — deterministic fuzzy
+    # string matching against ICIJ offshore-entity records. No LLM.
+    "icij_linking",
+    # intelligence/attention_anomaly.py::get_alerts — deterministic
+    # Wikipedia/Trends spike detection; read-only for this step (logs
+    # only, no DB write of its own beyond what get_alerts's own upstream
+    # ingestion already persists).
+    "attention_anomaly",
+    # ingestion/altdata/corporate_actions_parser.py — deterministic regex
+    # mining of 8-Ks into capital_flows rows (period_type='announcement').
+    # No LLM.
+    "corporate_actions",
+    # intelligence/company_financial_rollups.py::run_all — deterministic
+    # TTM/annual-rolled capital_flows derivation from XBRL + the
+    # announcement rows corporate_actions just wrote. No LLM.
+    "capital_flow_rollups",
+    # intelligence/fundamental_divergence.py::snapshot_all — deterministic
+    # fundamental-vs-price divergence snapshot. No LLM.
+    "fundamental_divergence",
+    # intelligence/holder_deal_overlap.py::run — deterministic
+    # cross-reference of 13F institutional holdings against capital_flows
+    # acquisition announcements. No LLM.
+    "holder_deal_overlap",
+    # NOTE: the three filesystem cleanups (insight_cleanup,
+    # briefing_cleanup, errors_jsonl_cleanup) are NOT in this initial
+    # subset — see DAILY_INTEL_HOLD_REASONS below. Controller decision
+    # (2026-09-20): file deletion/truncation policy (directories,
+    # retention windows, exclusions) has not yet been separately
+    # accepted, even though each cleanup's own deletion/truncation logic
+    # is deterministic and idempotent.
+})
+
+# Every DAILY_INTEL_TASKS name NOT in DAILY_INTEL_INITIAL_ALLOWLIST above,
+# with the standing-hold category it falls under and the file:line
+# evidence for the write that earns it that category. Exists so the
+# classification is machine-checkable (see
+# TestDailyIntelAllowlistClassification in
+# tests/test_hermes_daily_intel_resumable.py: every DAILY_INTEL_TASKS name
+# must appear in EXACTLY ONE of DAILY_INTEL_INITIAL_ALLOWLIST /
+# DAILY_INTEL_HOLD_REASONS) rather than only documented in prose.
+DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
+    "flow_materialize": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "a LIVE systemd timer on grid-svr, grid-flow-materializer.timer "
+        "(enabled, every 30 min, Persistent), runs the same "
+        "ingestion.flow_materializer.sync_all from the OLD checkout "
+        "/home/grid/grid_v4/grid_repo as a separate oneshot process; the "
+        "unit lives in /etc/systemd/system (not in server_setup/), so a "
+        "repository invocation search could not see it. Two automated "
+        "writers of the same incremental (row-count-window) keys in "
+        "different processes, which _DAILY_INTEL_IN_FLIGHT cannot "
+        "coordinate → unresolved overlapping-writer risk. The timer already "
+        "materialises every 30 min, so the Hermes daily task adds nothing; "
+        "keep it held unless cross-process coordination is implemented"
+    ),
+    "source_audit": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "no LLM, but its writes are not idempotent — run_full_audit "
+        "(intelligence/source_audit.py) appends plain-INSERT rows to "
+        "source_accuracy and source_discrepancies on every run (no ON "
+        "CONFLICT), so a retry after an abandoned run duplicates audit rows; "
+        "it also rewrites source_catalog.priority_rank, which steers "
+        "ingestion priority. Re-run semantics must be settled before it "
+        "graduates"
+    ),
+    "rag_index": (
+        "held for the INITIAL subset by the release coordinator (2026-09-20): "
+        "no LLM, local embeddings only, but RAGIndexer rebuilds "
+        "intelligence_embeddings by DELETE-then-bulk-INSERT per source_type; "
+        "an abandoned run keeps executing in its orphan thread and readers "
+        "see a partially emptied index until it finishes, and a later retry "
+        "repeats the full delete/rebuild. Needs a swap-in rebuild (or an "
+        "accepted window) before it graduates"
+    ),
+    "hypothesis_discovery": (
+        "learning write — HypothesisGenerator.auto_discover() "
+        "(intelligence/hypothesis_engine.py) inserts/updates "
+        "discovered_hypotheses, hypothesis_postmortems and "
+        "hypothesis_boost_log directly"
+    ),
+    "hypothesis_review": (
+        "learning write — review_existing_hypotheses "
+        "(analysis/backtest_scanner.py) is LLM-driven (llm.router "
+        "Tier.ORACLE) and mutates hypothesis_registry state/kill_reason"
+    ),
+    "backtest_scan": (
+        "learning write + backtest — run_full_scan "
+        "(analysis/backtest_scanner.py) is LLM-gated (llm.router "
+        "Tier.ORACLE sanity-checks winners) and inserts into "
+        "hypothesis_registry via generate_hypotheses_from_winners"
+    ),
+    "postmortem_batch": (
+        "postmortem write that feeds learning — batch_postmortem "
+        "(intelligence/postmortem.py) is LLM-narrated (llm.router "
+        "Tier.REASON) and inserts trade_postmortems rows"
+    ),
+    "options_improvement": (
+        "model/weight registry write + scorer — run_improvement_cycle "
+        "(trading/options_tracker.py) writes scanner_weights (a de-facto "
+        "model registry) and updates options_recommendations scoring; "
+        "its report step also calls llm.router Tier.REASON"
+    ),
+    "milestone_scoring": (
+        "scorer execution (standing hold) — scan_all_tickers "
+        "(intelligence/milestone_tracker.py) is execution/milestone "
+        "scoring by category even though the current function body is "
+        "read-only (no INSERT/UPDATE found); held on category, not on "
+        "current write footprint, since a future change to persist "
+        "scorecards must not silently graduate this task"
+    ),
+    "actor_research": (
+        "LLM-driven write, not shown to be derived-only — research_batch "
+        "(intelligence/actor_researcher.py) uses llm.router Tier.REASON "
+        "to synthesize actor profile JSON, updates the actors entity "
+        "registry, and can create new actor rows ('rabbit holes') that "
+        "feed further LLM research"
+    ),
+    "edgar_transcripts": (
+        "LLM-driven write, not shown to be derived-only — "
+        "EdgarTranscriptPuller.pull (ingestion/altdata/edgar_transcripts.py) "
+        "uses llm.router Tier.REASON (and a local Gemma extractor) to "
+        "extract guidance/milestone figures and inserts them as raw_series "
+        "data points, not just audit metadata"
+    ),
+    "insight_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
+    ),
+    "briefing_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
+    ),
+    "errors_jsonl_cleanup": (
+        "held for the initial subset by the controller (2026-09-20): file "
+        "deletion/truncation policy (directories, retention, exclusions) "
+        "to be accepted separately"
+    ),
+}
+
+
+# ─── Overlapping-writer analysis, redone from code (2026-09-20 amendment 2 ──
+#     — release-controller rejection response) ───────────────────────────────
+#
+# The release controller rejected the first version of this analysis for
+# asserting "sole writer" per TABLE without checking whether the same
+# underlying FUNCTIONS could be invoked from paths other than this Hermes
+# task — in particular a hypothesised flow-materializer timer running in a
+# separate process that _DAILY_INTEL_IN_FLIGHT (below) cannot see, and for
+# leaning on "deterministic computation" as a conclusion instead of a
+# derivation. Redone by grepping every caller of each of the 8 allow-listed
+# tasks' underlying function across ingestion/, intelligence/, api/,
+# scripts/, and every server_setup/*.service + *.timer file (the actual
+# process/cadence registrations) plus .github/*.yml — not assumed. Full
+# per-task invocation-path/write-key/bound evidence lives in
+# docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md
+# ("Release-controller rejection response" section, reconciled table).
+# Condensed per task (function -> invocation paths -> verdict):
+#
+#  storage_maintenance_subagent — _dispatch_daily_storage_maintenance ->
+#    enqueue_goal(goal_type="hermes_storage_maintenance"). Only ONE
+#    enqueue call site in the whole repo (scripts/hermes_fixers.py, called
+#    only from this Hermes task); enqueue_goal's partial unique index makes
+#    a duplicate-while-open enqueue a DO NOTHING (returns None), so even
+#    two grid-hermes processes racing cannot double-queue. The queued goal
+#    is claimed by whichever scripts/goal_worker.py process next polls a
+#    cpu-tier goal (no server_setup/*.service found for goal_worker.py in
+#    this repo snapshot — documented as unverified rather than guessed) and
+#    runs a read-only inventory report + conditional operator_issues
+#    insert — no write to any DAILY_INTEL-owned table. ALLOW.
+#
+#  flow_materialize — ingestion/flow_materializer.py::sync_all. Confirmed
+#    by grep: NOT called from ingestion/scheduler.py (grid-scheduler.service)
+#    or ingestion/smart_scheduler.py — smart_scheduler.py's "etf_flows"
+#    registry entry is ingestion.altdata.institutional_flows.
+#    InstitutionalFlowsPuller.pull_all, a DIFFERENT function writing only
+#    signal_sources, never the 5 tables sync_all's sub-materializers write.
+#    No other caller found outside tests/. Sole automated writer:
+#    grid-hermes, daily. Each sub-materializer reads the most recent
+#    5,000-50,000 signal_sources rows (ORDER BY ... DESC LIMIT N — a
+#    row-count window, not a calendar one) and upserts on a key derived
+#    from the source event's own date, so a late/abandoned run's write is
+#    corrected by the next successful grid-hermes run for as long as that
+#    event stays inside the LIMIT-N slice (true across many consecutive
+#    daily runs at observed volumes; not a proven full-history guarantee).
+#    ALLOW.
+#
+#  icij_linking — intelligence/icij_linker.py::link_actors, sole caller
+#    found. INSERT INTO icij_actor_matches ... ON CONFLICT DO NOTHING — the
+#    first successful write for a key wins; later runs never overwrite it.
+#    Safe specifically because the computed value (a fuzzy-match score
+#    between an actor name and a largely-static ICIJ offshore-entity name)
+#    is a pure function of two static text columns, not of when it ran —
+#    there is no "fresher" value a later run could be blocked from
+#    writing. Residual: each run only scans a 1,000-actor/500-match subset,
+#    so full-universe coverage is gradual — a coverage gap, not a
+#    staleness/overwrite risk. ALLOW.
+#
+#  attention_anomaly — intelligence/attention_anomaly.py::get_alerts. Two
+#    invocation paths found: this Hermes task (daily) AND
+#    api/routers/intelligence_actors.py (grid-api, on-demand per HTTP
+#    request) — a genuine second PROCESS, but both paths are read-only
+#    (get_alerts -> score_attention is a SELECT; no INSERT/UPDATE/DELETE
+#    anywhere in the call chain), so there is nothing to race. ALLOW.
+#
+#  corporate_actions — ingestion/altdata/corporate_actions_parser.py::
+#    CorporateActionsParser.pull(days_back=30). Writes capital_flows keyed
+#    on (actor_id, fiscal_period, period_type='announcement', flow_type,
+#    counterparty_id, source_filing) where source_filing embeds the
+#    immutable 8-K accession number — the key is fixed by the filing's own
+#    identity, not by when it's parsed. Incremental: only the trailing 30
+#    days of 8-Ks are in this Hermes task's scope each run, so a filing
+#    drops out of ITS reprocessing window ~30 days after filing. Other
+#    invocation paths: scripts/run_corporate_actions.py (manual CLI,
+#    default days_back=1500) and scripts/backfill_announcement_
+#    counterparties.py (manual, NULL-counterparty-only backfill) — neither
+#    has a server_setup/*.service, *.timer, or .github/*.yml trigger
+#    anywhere in the repo; both are human-run only. Because source_filing
+#    is keyed off the immutable accession and the regex extraction is a
+#    pure function of that filing's static text, ANY writer that
+#    reprocesses the SAME filing computes the SAME value, so the rare
+#    manual-script overlap is convergent, not a staleness risk. Bound:
+#    <= next successful grid-hermes run while the filing is <30 days old.
+#    Residual (same-writer, not cross-process): a filing whose ONLY
+#    successful write happened during an abandoned run near that 30-day
+#    boundary, with no manual script reprocessing it in time, keeps that
+#    value indefinitely once >30 days old. Recorded here rather than
+#    smoothed over; does not change the ALLOW verdict since it requires a
+#    same-writer near-boundary failure, not an uncoordinated race.
+#
+#  capital_flow_rollups — intelligence/company_financial_rollups.py::
+#    run_all (compute_ttm + fold_announcements). Both are FULL RECOMPUTES:
+#    compute_ttm scans ALL period_type='quarter' capital_flows rows (no
+#    date filter) and fold_announcements scans ALL period_type=
+#    'announcement' rows (no date filter) every run, upserting the
+#    complete ttm/announcement_rolled key sets from current state. Sole
+#    automated writer: grid-hermes, daily; scripts/run_capital_flow_
+#    rollups.py is a manual CLI wrapper around the same run_all, not
+#    scheduled anywhere. Full recompute means the next successful run of
+#    run_all (by any writer) rewrites every key it owns, so a stale value
+#    cannot outlive that next run. ALLOW.
+#
+#  fundamental_divergence — intelligence/fundamental_divergence.py::
+#    snapshot_all. FULL RECOMPUTE: _load_universe() has no date/limit
+#    filter — every eligible ticker is rescored and upserted on
+#    (ticker, as_of=today) every run. Sole automated writer: grid-hermes,
+#    daily; scripts/run_fundamental_divergence.py is a manual CLI wrapper,
+#    not scheduled. Bound: <= next successful run today (same as_of key).
+#    ALLOW.
+#
+#  holder_deal_overlap — intelligence/holder_deal_overlap.py::run.
+#    FULL RECOMPUTE — find_deals() returns "every acquisition announcement
+#    with a non-null target" (no date filter); run()'s own docstring calls
+#    itself a "Full detection pass". Sole automated writer: grid-hermes,
+#    daily; scripts/run_holder_deal_overlap.py is a manual CLI wrapper, not
+#    scheduled. ALLOW.
+#
+# Process/cadence registry checked directly, not inferred: every
+# server_setup/*.service and *.timer file in this repo; ingestion/
+# scheduler.py (grid-scheduler.service) and ingestion/smart_scheduler.py;
+# intelligence/scheduler.py (grid-intelligence.service — a genuine
+# 15min/1h/4h/daily/weekly `schedule` loop confirmed running in its OWN
+# always-on process, but its capital-flow task
+# (analysis/capital_flows.py::CapitalFlowResearchEngine.run_research)
+# writes capital_flow_snapshots keyed on snapshot_date, a table disjoint
+# from capital_flows — no key overlap with corporate_actions/
+# capital_flow_rollups); api/main.py's deferred-startup warmers
+# (oracle_models migration, spider graph cache, dashboard cache,
+# sector-flow cache — none touch a DAILY_INTEL-owned table); and
+# scripts/goal_worker.py's HANDLERS dict (only hermes_storage_maintenance
+# overlaps, covered above). No task in this allow-list has an undiscovered
+# SCHEDULED second writer; the manual-script paths found for
+# corporate_actions/capital_flow_rollups/fundamental_divergence/
+# holder_deal_overlap are ad hoc (no cron/systemd/CI trigger anywhere in
+# the repo) and, per the per-task notes above, converge to the same value
+# as grid-hermes regardless of run order — so they do not change any
+# verdict above.
+
+
+# ─── No-overlap guard + late-publish fencing for daily-intel tasks ───────
+#     (fable-daily-intel-resumable review amendment, 2026-09-20)
+#
+# Reuses the two patterns already established elsewhere in this module
+# rather than inventing a third: the no-overlap in-flight registry from
+# scripts/hermes_fixers.py::_REPAIRS_IN_FLIGHT (#582), and the
+# capture-a-token-at-start / commit-only-if-still-current pattern from
+# _maybe_run_sector_health_snapshot's _SECTOR_HEALTH_STATE_LOCK /
+# sector_health_attempt_token (#580).
+#
+# _DAILY_INTEL_IN_FLIGHT: task name -> {"token": int, "thread": int | None,
+# "started": float | None}. One entry per task, created just before that
+# task's _run_with_timeout call and never deleted afterwards (bounded to
+# len(DAILY_INTEL_TASKS) entries — harmless to keep). "thread" is filled
+# in BY THE WORKER ITSELF (see _run_task closure below) the moment it
+# starts running — unlike _retry_source, which runs directly inside an
+# already-existing worker thread and can capture threading.get_ident()
+# at its own top, _run_daily_intel_block's per-task call is dispatched
+# via _run_with_timeout's ThreadPoolExecutor, so the new worker's ident
+# does not exist yet at registration time in the driver (main) thread.
+#
+# RLock, not Lock: mirrors _REPAIRS_LOCK's own reasoning — the driver
+# thread and a task's worker thread both take this lock, and a future
+# amendment that has one call another under the same lock (as
+# _retry_source already does with _next_repair_token) would self-deadlock
+# on a plain Lock.
+_DAILY_INTEL_LOCK = threading.RLock()
+_DAILY_INTEL_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_daily_intel_token_seq = 0
+
+# SCOPE, stated precisely (release-controller rejection response,
+# 2026-09-20 amendment 2 — do not soften this): _DAILY_INTEL_IN_FLIGHT
+# coordinates ONLY tasks of the SAME name, within THIS grid-hermes
+# process, while the worker thread is alive per threading.enumerate().
+# It does NOT coordinate, and has no visibility into:
+#   - grid-scheduler (ingestion/scheduler.py) or ingestion/smart_scheduler.py
+#   - grid-api (deferred-startup warmers in api/main.py, or any request
+#     handler in api/routers/*)
+#   - grid-intelligence (intelligence/scheduler.py::run_intelligence_loop,
+#     a separate always-on systemd process with its own 15min/1h/4h/daily/
+#     weekly `schedule` timers)
+#   - scripts/goal_worker.py (the process that claims a queued
+#     hermes_storage_maintenance goal — a completely separate execution,
+#     tracked by goal_queue/goal_results, not this dict)
+#   - any manual script run by a human (e.g. scripts/run_corporate_actions.py,
+#     scripts/run_capital_flow_rollups.py, scripts/run_fundamental_divergence.py,
+#     scripts/run_holder_deal_overlap.py)
+#   - a PREVIOUS grid-hermes process — this is a plain in-memory dict, so
+#     it (and every in-flight entry in it) is gone the instant this
+#     process restarts, along with the orphan thread it was tracking.
+# Every one of the 8 allow-listed tasks' underlying functions was grepped
+# against all of the above (server_setup/*.service, *.timer,
+# ingestion/scheduler.py, ingestion/smart_scheduler.py, api/, scripts/,
+# .github/*.yml) to confirm what, if anything, actually calls it from
+# outside this registry's scope — see the "Overlapping-writer analysis"
+# comment block above DAILY_INTEL_INITIAL_ALLOWLIST and the reconciled
+# table in docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+# A held task graduating into the allow-list later must redo this same
+# check for whatever tables IT writes — this registry will not catch a
+# second writer for it either.
+
+
+def _next_daily_intel_token() -> int:
+    global _daily_intel_token_seq
+    with _DAILY_INTEL_LOCK:
+        _daily_intel_token_seq += 1
+        return _daily_intel_token_seq
+
+
+def _daily_intel_thread_alive(ident: int | None) -> bool:
+    """True if a live thread with this identity still exists.
+
+    Same safety-net reasoning as scripts/hermes_fixers.py::
+    _thread_is_alive: an in-flight entry is not trusted indefinitely on
+    its own — if the process somehow lost track of the thread, a stale
+    entry must not permanently block retries for that task.
+    """
+    if ident is None:
+        return False
+    return any(t.ident == ident and t.is_alive() for t in threading.enumerate())
+
+
+def _run_daily_intel_block(
+    engine: Any,
+    state: OperatorState,
+    now: datetime,
+    results: dict[str, Any],
+) -> None:
+    """Execute the ALLOW-LISTED subset of DAILY_INTEL_TASKS in order,
+    resumable across cycles, with no-overlap and late-publish guards.
+
+    Called from run_intelligence_tasks when ``daily_due`` (see that
+    function's "Daily at 2:00 AM (with catch-up)" scheduling block) — same
+    trigger conditions as before this task; only what happens once
+    triggered has changed.
+
+    Allow-list gate (review amendment): a task whose name is NOT in
+    ``DAILY_INTEL_INITIAL_ALLOWLIST`` is "held" — its ``fn`` is never
+    called, it is never attempted, it is recorded on
+    ``state.daily_intel_task_outcome[name] = "held"`` every time the loop
+    reaches it, and it is invisible to the period-completion check below
+    (held tasks are excluded from both ``total`` and ``done_count``, so a
+    held task can never block — or fake — period completion). Enabling a
+    held task means editing ``DAILY_INTEL_INITIAL_ALLOWLIST`` in its own
+    reviewed change, not a runtime decision this function makes.
+
+    Per-period ledger: ``state.daily_intel_done`` /
+    ``daily_intel_skipped_for_period`` / ``daily_intel_attempts`` /
+    ``daily_intel_task_outcome``, keyed to ``state.daily_intel_period``
+    (the due period's ISO date, boundary_hour=DAILY_INTEL_BOUNDARY_HOUR).
+    A due period that differs from the ledger's recorded period means the
+    ledger has rolled over: all four dicts (plus
+    ``daily_intel_period_outcome``) are cleared/reset and
+    ``state.daily_intel_period`` is updated before anything runs.
+
+    Idempotent-redo note: state is only persisted at the END of a cycle
+    (the analytical_snapshots write in save_cycle_snapshot), not after
+    each task inside this function. A mid-cycle process restart therefore
+    can re-run a task this call already finished but hadn't yet had a
+    chance to persist — safe, because every task's own DB writes are
+    idempotent upserts/inserts-with-dedupe (a property this task
+    explicitly did NOT change), so a redo just repeats the same write.
+
+    Per-cycle budget: ``DAILY_INTEL_CYCLE_BUDGET_SECONDS`` is checked
+    BEFORE starting each task (not mid-task) against cumulative wall time
+    already spent in this call. Once exhausted, the loop stops for this
+    cycle; the next ``daily_due`` call (state.last_daily_intel is not set
+    until every ALLOW-LISTED task is done-or-skipped — see below) resumes
+    at the first undone task. A held task costs no budget (skipped before
+    the budget check) and an in_flight skip costs no budget either
+    (skipped before the per-task clock starts).
+
+    No-overlap guard (review amendment): before starting a task, this
+    loop checks ``_DAILY_INTEL_IN_FLIGHT[task.name]`` — if an entry exists
+    AND its recorded thread is still alive (``_daily_intel_thread_alive``),
+    a previous attempt's worker (orphaned by ``_run_with_timeout``'s
+    timeout-abandons-rather-than-kills behaviour — see its own docstring)
+    is still running. This retry is skipped: logged as ``in_flight``,
+    ``state.daily_intel_task_outcome[name] = "in_flight"``, and it counts
+    as NEITHER an attempt NOR a completion — ``daily_intel_attempts`` is
+    not incremented and the loop proceeds to the next task. Otherwise a
+    fresh attempt token is minted (``_next_daily_intel_token``) and
+    registered before the task's ``_run_with_timeout`` call, so a
+    concurrent registration race is impossible (both the check and the
+    register happen under ``_DAILY_INTEL_LOCK``).
+
+    Late-publish guard, with done_late (fable-daily-intel-sql-tasks,
+    2026-09-20 amendment — supersedes the original review amendment's
+    "always reject a late return" behavior): each attempt's task ``fn``
+    runs against a LOCAL ``results`` dict, not the shared one, via a
+    small ``_run_task`` closure that (a) records its own thread ident
+    into the in-flight entry the moment it starts (under the lock — this
+    is the only place ``"thread"`` is ever set), (b) calls
+    ``task.fn(...)``, recording whether it returned normally or raised,
+    then (c) checks — again under the lock — whether its token is still
+    the entry's current token AND whether the driver already reported a
+    timeout for THIS attempt (``entry["timed_out"]``, set by the driver
+    below). Three outcomes:
+
+      * token no longer current (a genuine NEW attempt has since started
+        for this task+period — the fresh-attempt registration above
+        fully replaces the entry dict, token included) — this is the
+        real overlap case: log ``"...abandoned — exiting without
+        publishing (superseded by a new attempt)"`` and discard the
+        local results, exactly as before this amendment.
+      * token still current, ``timed_out`` is set, and ``task.fn``
+        returned successfully (no exception), within the SAME due
+        period, and the task is not already recorded done: mark
+        ``state.daily_intel_done[name] = period_iso`` and
+        ``state.daily_intel_task_outcome[name] = "done_late"``. This is
+        a late-but-successful return with no retry ever having started —
+        the ledger stops re-attempting the task (no more 3x-repeated
+        late writes for the identical period), but the local ``results``
+        are still NEVER merged into the shared ``results`` dict — there
+        is no driver call left waiting to consume them.
+      * token still current, ``timed_out`` is set, and ``task.fn``
+        raised (or the period rolled over, or it's already done): log
+        ``"...abandoned — exiting without publishing"`` and discard —
+        a late FAILURE never marks done.
+      * token still current and ``timed_out`` is NOT set: this is the
+        ordinary on-time path — do nothing here; the driver's own
+        post-``_run_with_timeout`` handling (below) records the outcome
+        synchronously right after this call returns.
+
+    The driver's own post-``_run_with_timeout`` handling, under the same
+    lock: on ``ok=True`` it merges the local results into the shared
+    ``results`` and marks the task done (the token cannot have moved in
+    this branch — nothing invalidates it before this point on the
+    success path); on ``ok=False`` it sets ``entry["timed_out"] = True``
+    — deliberately NOT a token bump — BEFORE recording the attempt/skip
+    outcome. Before this amendment the timeout path bumped the token
+    itself (mirroring ``_run_sector_and_intelligence_steps``'s
+    ``sector_health_attempt_token`` bump), which made every late return
+    look identical to "a retry already started" and made done_late
+    undecidable; ``timed_out`` now carries that "this attempt's wrapper
+    already gave up" signal instead, leaving the token free to serve
+    ONLY as the overlap/supersession signal described above. The
+    in-flight entry itself (with its thread ident intact) is deliberately
+    NOT deleted on a timeout — the NEXT attempt's no-overlap check still
+    needs that thread ident to detect the orphan is still running, and a
+    genuine new attempt only ever starts once that check reports the
+    orphan is no longer alive (which, in a single continuously-running
+    process, can only be true after the orphan's own ``_run_task``
+    epilogue has already run and already decided done_late vs abandoned
+    for its attempt — see
+    ``tests/test_hermes_daily_intel_resumable.py``'s done_late tests for
+    how the "retry already started" case is exercised by direct
+    entry/token manipulation rather than a real thread race, since the
+    no-overlap guard makes that ordering effectively unreachable via real
+    threading alone).
+
+    Per-task attempts: ``ok=False`` (timeout or exception — see
+    ``_daily_intel_raise_if_task_status_failed`` for the six tasks that go
+    through ``_run_intel_task``) increments its attempt count; at
+    ``DAILY_INTEL_MAX_ATTEMPTS`` the task is marked ``skipped_for_period``
+    (also recorded in ``daily_intel_done``, so the loop treats it as done
+    — it cannot block the tasks behind it;
+    ``daily_intel_task_outcome[name] = "skipped_for_period"``) and the
+    block continues to the NEXT task rather than aborting.
+
+    ``cooldowns.can_retry`` is deliberately NOT consulted here — same
+    reasoning ``_run_sector_and_intelligence_steps`` documents for the
+    sector-health/intelligence-tasks split: the blacklist entry
+    ``_run_with_timeout`` writes on a timeout is only honoured by call
+    sites that explicitly check ``state.cooldowns.can_retry(<name>)``
+    before running (exactly four elsewhere in this module — oracle_cycle,
+    signal_classification, anomaly_narration, knowledge_mapping), and
+    daily-intel task names are not among them. This ledger's own
+    ``DAILY_INTEL_MAX_ATTEMPTS`` is the throttle for a
+    persistently-failing daily-intel task; adding the 24h can_retry
+    blacklist on top would mean a single timeout blocks that task for a
+    full day regardless of the per-period ledger's own, much shorter,
+    per-period skip.
+
+    ``state.last_daily_intel = now`` is set ONLY when every ALLOW-LISTED
+    task is done, done_queued, or skipped_for_period — i.e.
+    ``state.daily_intel_done`` has an entry, dated to the current period,
+    for every name in ``DAILY_INTEL_INITIAL_ALLOWLIST``. Held tasks are
+    excluded from this check entirely. ``state.daily_intel_period_outcome``
+    is set in the same branch to one of four values — see
+    ``OperatorState.daily_intel_period_outcome``'s docstring
+    (scripts/hermes_health.py) for the full matrix; in short, it is always
+    one of the two ``"..._for_enabled_tasks[_with_skips]"`` values while
+    any task is held (true today), and only the bare
+    ``"complete"``/``"complete_with_skips"`` once none are. This is what
+    ``daily_due`` (in ``run_intelligence_tasks``) reads to decide whether
+    the whole block is due again.
+
+    Abandonment truth (fable-hermes-daily-intel-resumable review, part B,
+    2026-09-20) — read this before assuming a timeout means a task's work
+    did not happen. The attempt-token check above runs AFTER
+    ``task.fn(...)`` has already returned (or, for an abandoned worker,
+    whenever it eventually does) — it decides only whether THIS ledger
+    publishes that return, not whether the call happened. Concretely: on a
+    timeout, ``_run_with_timeout`` abandons the worker thread rather than
+    killing it (Python's ``concurrent.futures`` has no API to kill a
+    running thread — see ``_run_with_timeout``'s own docstring), so
+    ``task.fn`` keeps executing to completion in that orphaned thread and
+    performs EVERY ONE of its underlying effects exactly as if it had
+    finished on time: its DB writes (INSERT/UPDATE/UPSERT), its file
+    writes/deletions, its enqueued goal_queue row (storage_maintenance_
+    subagent only), all happen. What is prevented is narrower: (1) this
+    ledger's ``daily_intel_done``/``daily_intel_task_outcome`` update for
+    that attempt (the token check discards the orphan's local ``results``
+    and skips the ledger write — see the late-publish guard above), and
+    (2) a concurrent retry of the SAME task colliding with the still-
+    running orphan (the in-flight registry above). Neither of those is the
+    task's own work being prevented — none of the 8 allow-listed tasks'
+    ``fn`` accepts a ``should_continue``/cooperative-cancellation
+    parameter (checked: every ``DailyIntelTask.fn`` signature is
+    ``fn(engine, state, now, results)``), so there is no cooperative exit
+    point an abandoned run could even observe. See the per-task "effects
+    an abandoned run can still perform" column in
+    docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md (answer,
+    for every one of the 8: all of its DB writes / dispatched child work
+    / external calls / file writes — the same effects it would have
+    performed on a timely return) and
+    ``tests/test_hermes_daily_intel_resumable.py::
+    TestAbandonmentDoesNotPreventTaskEffects``.
+
+    fable-daily-intel-sql-tasks (2026-09-20) amendment: (1) above is now
+    NARROWER than the paragraph above suggests — "the ledger write" is
+    only unconditionally skipped when there's a genuine reason to (a
+    superseding retry, a late failure, or a period rollover). A late
+    SUCCESS with no superseding retry now DOES get a ledger write — just
+    the narrower ``"done_late"`` one described in the late-publish guard
+    above, never the ``results`` payload merge. This does not change the
+    "effects an abandoned run can still perform" analysis above at all —
+    it only changes what THIS ledger does with the fact that those
+    effects already happened.
+    """
+    period_iso = _period_boundary(now, DAILY_INTEL_BOUNDARY_HOUR).date().isoformat()
+
+    if state.daily_intel_period != period_iso:
+        state.daily_intel_period = period_iso
+        state.daily_intel_done = {}
+        state.daily_intel_skipped_for_period = {}
+        state.daily_intel_attempts = {}
+        state.daily_intel_task_outcome = {}
+        state.daily_intel_period_outcome = None
+
+    ran: list[str] = []
+    skipped_for_period: list[str] = []
+    held: list[str] = []
+    in_flight_skipped: list[str] = []
+    budget_used = 0.0
+
+    for task in DAILY_INTEL_TASKS:
+        if task.name not in DAILY_INTEL_INITIAL_ALLOWLIST:
+            state.daily_intel_task_outcome[task.name] = "held"
+            held.append(task.name)
+            continue
+        if state.daily_intel_done.get(task.name) == period_iso:
+            continue
+        if budget_used >= DAILY_INTEL_CYCLE_BUDGET_SECONDS:
+            break
+
+        with _DAILY_INTEL_LOCK:
+            existing = _DAILY_INTEL_IN_FLIGHT.get(task.name)
+            if existing is not None and _daily_intel_thread_alive(existing.get("thread")):
+                age_s = (
+                    time.monotonic() - existing["started"]
+                    if existing.get("started") is not None else 0.0
+                )
+                log.warning(
+                    "daily_intel task '{n}' in_flight (previous worker "
+                    "still running, age {a:.0f}s) — skipping this cycle",
+                    n=task.name, a=age_s,
+                )
+                state.daily_intel_task_outcome[task.name] = "in_flight"
+                in_flight_skipped.append(task.name)
+                continue
+            token = _next_daily_intel_token()
+            _DAILY_INTEL_IN_FLIGHT[task.name] = {
+                "token": token, "thread": None, "started": None,
+            }
+
+        t0 = time.monotonic()
+        with _DAILY_INTEL_LOCK:
+            _DAILY_INTEL_IN_FLIGHT[task.name]["started"] = t0
+
+        local_results: dict[str, Any] = {}
+
+        def _run_task(t=task, tok=token, lr=local_results) -> None:
+            with _DAILY_INTEL_LOCK:
+                entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
+                if entry is not None and entry.get("token") == tok:
+                    entry["thread"] = threading.get_ident()
+            fn_ok = False
+            try:
+                t.fn(engine, state, now, lr)
+                fn_ok = True
+            finally:
+                # Runs whether t.fn returned normally or raised — a
+                # worker finishing (on time OR late/abandoned) must clear
+                # its own "thread" marker itself, from inside the worker
+                # thread, the instant it is actually done. Relying on the
+                # NEXT call's _daily_intel_thread_alive(ident) check alone
+                # would race the OS thread's own teardown timing: a
+                # thread that just returned from t.fn can still show
+                # is_alive()==True for a brief window while Python tears
+                # it down, which made a fast synchronous failure look
+                # "in_flight" to an immediately-following retry in
+                # testing. Same fix shape as
+                # scripts/hermes_fixers.py::_retry_source's `finally`
+                # block deleting its own _REPAIRS_IN_FLIGHT entry before
+                # returning, rather than trusting is_alive() for the
+                # normal-completion case.
+                with _DAILY_INTEL_LOCK:
+                    entry = _DAILY_INTEL_IN_FLIGHT.get(t.name)
+                    # "current" here means: no NEW attempt has been
+                    # registered for this task since THIS attempt's token
+                    # was minted — i.e. nothing has superseded it. A
+                    # superseding new attempt fully replaces the entry
+                    # dict (see the fresh-attempt registration above),
+                    # token included, so entry.get("token") != tok is the
+                    # signal a genuine retry has started. This is
+                    # DIFFERENT from "timed_out" below: a driver-side
+                    # wrapper timeout no longer bumps the token by
+                    # itself (fable-daily-intel-sql-tasks, 2026-09-20) —
+                    # only a real new attempt does.
+                    current = entry is not None and entry.get("token") == tok
+                    timed_out = bool(entry is not None and entry.get("timed_out"))
+                    if entry is not None and entry.get("thread") == threading.get_ident():
+                        entry["thread"] = None
+                    if not current:
+                        # A genuine retry already started for this task —
+                        # this is the real overlap case. Reject: exiting
+                        # without publishing, exactly as before.
+                        log.warning(
+                            "daily_intel task {n} abandoned — exiting "
+                            "without publishing (superseded by a new "
+                            "attempt)",
+                            n=t.name,
+                        )
+                    elif timed_out:
+                        # This attempt's wrapper already gave up on it
+                        # (ok=False was reported to the driver) and no
+                        # retry has started since — this is the late-
+                        # return case (fable-daily-intel-sql-tasks,
+                        # 2026-09-20, deliverable 3). A successful late
+                        # return, still within the same due period,
+                        # marks the task done via a NEW outcome —
+                        # "done_late" — so the ledger stops re-attempting
+                        # it (no more 3x repeats of the same late write)
+                        # WITHOUT publishing local_results into the
+                        # shared results dict: nothing downstream of this
+                        # driver call is still around to consume it, and
+                        # publishing a stale/partial payload out of band
+                        # would be worse than not publishing at all. A
+                        # late FAILURE must never mark done — the task
+                        # stays exactly as the driver already left it
+                        # (an attempt was counted; skipped_for_period
+                        # applies normally at DAILY_INTEL_MAX_ATTEMPTS).
+                        same_period = state.daily_intel_period == period_iso
+                        already_done = (
+                            state.daily_intel_done.get(t.name) == period_iso
+                        )
+                        if fn_ok and same_period and not already_done:
+                            state.daily_intel_done[t.name] = period_iso
+                            state.daily_intel_task_outcome[t.name] = "done_late"
+                            log.info(
+                                "daily_intel task {n} done_late — worker "
+                                "finished successfully after its wrapper "
+                                "timed out; period marked done, results "
+                                "payload not published",
+                                n=t.name,
+                            )
+                        else:
+                            log.warning(
+                                "daily_intel task {n} abandoned — exiting "
+                                "without publishing ({why})",
+                                n=t.name,
+                                why=(
+                                    "late failure" if not fn_ok
+                                    else "period rolled over" if not same_period
+                                    else "already done"
+                                ),
+                            )
+                    # else: current and not timed_out -> this is the
+                    # normal on-time path; the driver handles the
+                    # outcome synchronously right after _run_with_timeout
+                    # returns below. Nothing to do here.
+
+        _, ok = _run_with_timeout(
+            f"daily_intel:{task.name}",
+            _run_task,
+            task.budget_s,
+            state,
+        )
+        budget_used += time.monotonic() - t0
+        ran.append(task.name)
+
+        with _DAILY_INTEL_LOCK:
+            entry = _DAILY_INTEL_IN_FLIGHT.get(task.name)
+            current = entry is not None and entry.get("token") == token
+            if not ok and current:
+                # Mark this attempt's entry timed_out NOW so a late-
+                # returning orphan's own _run_task epilogue can recognize
+                # "my wrapper already gave up" the instant it finishes,
+                # however long that takes — see _run_task's finally block
+                # for the done_late / abandoned decision this flag
+                # drives. Unlike before fable-daily-intel-sql-tasks
+                # (2026-09-20), the TOKEN itself is deliberately left
+                # alone here: bumping it eagerly would make every late
+                # return look identical to "a retry already started",
+                # which is exactly the distinction done_late depends on.
+                # The token is only ever bumped by a genuine NEW attempt
+                # (the fresh-attempt registration above, which replaces
+                # this whole entry dict) — that is the real overlap case,
+                # still rejected exactly as before.
+                entry["timed_out"] = True
+
+            if ok and current:
+                results.update(local_results)
+                state.daily_intel_done[task.name] = period_iso
+                state.daily_intel_task_outcome[task.name] = (
+                    "done_queued" if task.reports_done_queued else "done"
+                )
+            elif not ok:
+                attempts = state.daily_intel_attempts.get(task.name, 0) + 1
+                state.daily_intel_attempts[task.name] = attempts
+                if attempts >= DAILY_INTEL_MAX_ATTEMPTS:
+                    state.daily_intel_done[task.name] = period_iso
+                    state.daily_intel_skipped_for_period[task.name] = period_iso
+                    state.daily_intel_task_outcome[task.name] = "skipped_for_period"
+                    skipped_for_period.append(task.name)
+                    log.warning(
+                        "daily_intel: task '{n}' skipped_for_period after "
+                        "{a} failed attempts (period={p})",
+                        n=task.name, a=attempts, p=period_iso,
+                    )
+
+    enabled_tasks = [t for t in DAILY_INTEL_TASKS if t.name in DAILY_INTEL_INITIAL_ALLOWLIST]
+    total = len(enabled_tasks)
+    done_count = sum(
+        1 for t in enabled_tasks if state.daily_intel_done.get(t.name) == period_iso
+    )
+    remaining = [
+        t.name for t in enabled_tasks
+        if state.daily_intel_done.get(t.name) != period_iso
+    ]
+    # done_late tasks are a SUBSET of done_count (done_late sets
+    # daily_intel_done same as any other done outcome — see _run_task's
+    # finally block) — reported separately (deliverable 3d) so a reader
+    # can tell "finished on time" apart from "its wrapper had already
+    # given up and reported a timeout/attempt before the worker's late
+    # success was discovered" without re-deriving it from raw state. Most
+    # of the time this reflects a done_late written by a PREVIOUS call's
+    # orphaned worker (the async completion generally lands well after
+    # this synchronous log line for the SAME call — see
+    # tests/test_hermes_daily_intel_resumable.py's done_late tests).
+    done_late_names = [
+        t.name for t in enabled_tasks
+        if state.daily_intel_task_outcome.get(t.name) == "done_late"
+        and state.daily_intel_done.get(t.name) == period_iso
+    ]
+
+    if total and done_count == total:
+        state.last_daily_intel = now
+        any_skipped_this_period = any(
+            v == period_iso for v in state.daily_intel_skipped_for_period.values()
+        )
+        # "_for_enabled_tasks" wording (fable-hermes-daily-intel-resumable
+        # review, part E, 2026-09-20): the bare "complete"/"complete_with_
+        # skips" values are reserved for the case where every
+        # DAILY_INTEL_TASKS entry is allow-listed (no held tasks at all).
+        # As long as any task is held — true today (8 of 21 allow-listed)
+        # — "complete" must never be reported on its own, since that could
+        # be misread as "the whole daily-intel batch ran." See
+        # OperatorState.daily_intel_period_outcome's docstring
+        # (scripts/hermes_health.py) for the full four-value matrix.
+        all_tasks_enabled = len(DAILY_INTEL_INITIAL_ALLOWLIST) == len(DAILY_INTEL_TASKS)
+        if all_tasks_enabled:
+            state.daily_intel_period_outcome = (
+                "complete_with_skips" if any_skipped_this_period else "complete"
+            )
+        else:
+            state.daily_intel_period_outcome = (
+                "complete_for_enabled_tasks_with_skips" if any_skipped_this_period
+                else "complete_for_enabled_tasks"
+            )
+
+    log.info(
+        "daily_intel: period={p} done={d}/{t} ran={r} skipped_for_period={s} "
+        "held={h} in_flight={f} remaining={rem} budget_used={b:.1f}s "
+        "done_late={dl}",
+        p=period_iso, d=done_count, t=total, r=ran, s=skipped_for_period,
+        h=held, f=in_flight_skipped, rem=remaining, b=budget_used,
+        dl=len(done_late_names),
+    )
+
+    if total and done_count == total:
+        # Completion-only summary, in the exact wording the release
+        # controller asked for (part E): done vs done_queued vs
+        # skipped_for_period are kept as SEPARATE counts (not folded
+        # together) so a reader can tell "ran to completion in this step"
+        # (done) apart from "only enqueued a subagent whose own completion
+        # this ledger does not track" (done_queued) — see
+        # DailyIntelTask.reports_done_queued and part C of
+        # docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md.
+        # held is reported separately from skipped_for_period too: a held
+        # task was never attempted at all (standing controller hold),
+        # while skipped_for_period means it WAS attempted DAILY_INTEL_MAX_
+        # ATTEMPTS times and gave up — very different operational meanings
+        # that must not be merged into one count. Emitted AFTER the
+        # per-cycle progress line above (not instead of it) so existing
+        # per-cycle log consumers/tests are unaffected.
+        done_only = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "done"
+        )
+        done_queued = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "done_queued"
+        )
+        skipped_count = sum(
+            1 for t in enabled_tasks
+            if state.daily_intel_task_outcome.get(t.name) == "skipped_for_period"
+        )
+        # done_late is a subset of "done" by ledger state (daily_intel_done
+        # is set either way) but deliberately NOT folded into done_only
+        # here — done_only is specifically outcome=="done" (on-time
+        # publish), and a reader needs to be able to tell a late-but-
+        # successful completion apart from that (deliverable 3d).
+        done_late_count = len(done_late_names)
+        log.info(
+            "daily_intel: period={p} {outcome} enabled={n} done={d} "
+            "done_queued={dq} skipped_for_period={s} held={h} "
+            "done_late={dl}",
+            p=period_iso, outcome=state.daily_intel_period_outcome, n=total,
+            d=done_only, dq=done_queued, s=skipped_count, h=len(held),
+            dl=done_late_count,
+        )
+
+
 def run_intelligence_tasks(
     engine: Any,
     state: OperatorState,
@@ -848,313 +2921,27 @@ def run_intelligence_tasks(
             "Running daily intelligence batch (window={w} catch_up={c})",
             w=is_daily_window, c=(is_catch_up and not is_daily_window),
         )
+        _run_daily_intel_block(engine, state, now, results)
 
-        try:
-            results["storage_maintenance_subagent"] = _dispatch_daily_storage_maintenance(engine, state)
-        except Exception as exc:
-            log.warning("Storage maintenance subagent dispatch failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.source_audit import run_full_audit
-            results["source_audit"] = _run_intel_task(
-                "source_audit", run_full_audit, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Source audit import failed: {e}", e=str(exc))
-
-        # Flow materialization — projects signal_sources into the relational
-        # flow tables (dark_pool_weekly, etf_flows, insider_trades,
-        # congressional_trades, junction_point_readings). The module existed
-        # with zero callers, which is why those tables were documented empty
-        # (docs/planning/FILL-EMPTY-TABLES.md; LEVER-PACKAGE.md §7 T1.4).
-        try:
-            from ingestion.flow_materializer import sync_all as _flow_sync_all
-            results["flow_materialize"] = _run_intel_task(
-                "flow_materialize", _flow_sync_all, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Flow materializer import failed: {e}", e=str(exc))
-
-        try:
-            from analysis.backtest_scanner import run_full_scan
-            results["backtest_scan"] = _run_intel_task(
-                "backtest_scan", run_full_scan, state, engine,
-            )
-        except Exception as exc:
-            log.warning("Backtest scanner import failed: {e}", e=str(exc))
-
-        try:
-            from intelligence.postmortem import batch_postmortem
-            results["postmortem_batch"] = _run_intel_task(
-                "postmortem_batch", batch_postmortem, state, engine,
-                limit=POSTMORTEM_BATCH_LIMIT,
-            )
-        except Exception as exc:
-            log.warning("Postmortem import failed: {e}", e=str(exc))
-
-        try:
-            from trading.options_tracker import run_improvement_cycle
-            results["options_improvement"] = _run_intel_task(
-                "options_improvement",
-                run_improvement_cycle,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Options improvement import failed: {e}", e=str(exc))
-
-        try:
-            from analysis.backtest_scanner import review_existing_hypotheses
-            results["hypothesis_review"] = _run_intel_task(
-                "hypothesis_review",
-                review_existing_hypotheses,
-                state,
-                engine,
-            )
-        except Exception as exc:
-            log.warning("Hypothesis review import failed: {e}", e=str(exc))
-
-        # Hypothesis discovery — auto-discover new hypotheses from data patterns
-        if _hours_since(state.last_hypothesis_discovery) >= 20:
-            try:
-                from intelligence.hypothesis_engine import HypothesisGenerator
-                hyp_engine = HypothesisGenerator(engine)
-                discovered = hyp_engine.auto_discover()
-                results["hypothesis_discovery"] = {
-                    "new_hypotheses": len(discovered),
-                }
-                log.info(
-                    "Hypothesis discovery: {n} new hypotheses generated",
-                    n=len(discovered),
-                )
-            except Exception as exc:
-                log.warning("Hypothesis discovery failed: {e}", e=str(exc))
-            state.last_hypothesis_discovery = now
-
-        # RAG index refresh — re-embed latest intelligence data
-        if _hours_since(state.last_rag_index) >= 20:
-            try:
-                from intelligence.rag import RAGIndexer
-                indexer = RAGIndexer(engine)
-                indexer.ensure_tables()
-                snap_count = indexer.index_snapshots()
-                actor_count = indexer.index_actors()
-                results["rag_index"] = {
-                    "snapshots_indexed": snap_count,
-                    "actors_indexed": actor_count,
-                }
-                log.info(
-                    "RAG index refreshed: {s} snapshot chunks, {a} actor chunks",
-                    s=snap_count, a=actor_count,
-                )
-            except Exception as exc:
-                log.warning("RAG indexing failed: {e}", e=str(exc))
-            state.last_rag_index = now
-
-        # ── 13F mining + actor enrichment + milestone scoring ────────
-
-        # Actor research — LLM enriches sparse actors, follows rabbit holes
-        try:
-            from intelligence.actor_researcher import research_batch
-            actor_result = research_batch(engine, batch_size=20)
-            results["actor_research"] = actor_result
-            log.info(
-                "Actor research: {u} enriched, {n} new actors, {r} rabbit holes",
-                u=actor_result.get("updated", 0),
-                n=actor_result.get("new_actors", 0),
-                r=actor_result.get("rabbit_holes", 0),
-            )
-        except Exception as exc:
-            log.warning("Actor research failed: {e}", e=str(exc))
-
-        # ICIJ cross-reference — fuzzy match actors against offshore entities
-        try:
-            from intelligence.icij_linker import link_actors
-            icij_result = link_actors(engine, min_similarity=0.6, limit=500)
-            results["icij_linking"] = {"matches": len(icij_result)}
-            log.info("ICIJ linking: {n} matches found", n=len(icij_result))
-        except Exception as exc:
-            log.warning("ICIJ linking failed: {e}", e=str(exc))
-
-        # Milestone scoring — execution scorecards for all companies
-        try:
-            from intelligence.milestone_tracker import scan_all_tickers
-            milestones = scan_all_tickers(engine)
-            results["milestone_scoring"] = {"companies_scored": len(milestones)}
-            log.info("Milestone scoring: {n} companies scored", n=len(milestones))
-        except Exception as exc:
-            log.warning("Milestone scoring failed: {e}", e=str(exc))
-
-        # Attention anomaly — Wikipedia + Trends spike detection
-        try:
-            from intelligence.attention_anomaly import get_alerts
-            alerts = get_alerts(engine, threshold=60.0)
-            results["attention_alerts"] = {"high_alerts": len(alerts)}
-            if alerts:
-                log.info("ATTENTION: {n} entities with unusual attention", n=len(alerts))
-        except Exception as exc:
-            log.warning("Attention anomaly failed: {e}", e=str(exc))
-
-        # EDGAR transcripts — 8-K filings with LLM milestone extraction
-        try:
-            from ingestion.altdata.edgar_transcripts import EdgarTranscriptPuller
-            edgar = EdgarTranscriptPuller(engine)
-            edgar_result = edgar.pull(days_back=30)
-            results["edgar_transcripts"] = edgar_result
-            log.info("EDGAR: {f} filings, {g} guidance phrases",
-                     f=edgar_result.get("filings_processed", 0),
-                     g=edgar_result.get("guidance_extracted", 0))
-        except Exception as exc:
-            log.warning("EDGAR transcripts failed: {e}", e=str(exc))
-
-        # Corporate actions — regex-mine 8-Ks for M&A, buybacks,
-        # dividends, debt, equity issuance. Writes capital_flows rows
-        # with period_type='announcement'. Daily: last 30 days of 8-Ks.
-        try:
-            from ingestion.altdata.corporate_actions_parser import (
-                CorporateActionsParser,
-            )
-            corp = CorporateActionsParser(engine)
-            try:
-                corp_result = corp.pull(days_back=30)
-            finally:
-                corp.close()
-            results["corporate_actions"] = corp_result
-            log.info(
-                "corporate_actions: {r} rows from {f} filings "
-                "({h} tickers with hits)",
-                r=corp_result.get("rows_inserted", 0),
-                f=corp_result.get("filings_scanned", 0),
-                h=corp_result.get("tickers_with_hits", 0),
-            )
-        except Exception as exc:
-            log.warning("corporate_actions failed: {e}", e=str(exc))
-
-        # Capital-flow rollups — derives ttm rows from quarterly XBRL
-        # data and folds announcement rows into annual_rolled rows so
-        # the API layer can show M&A / buyback events inside annual
-        # totals without losing the original event records.
-        # Runs daily AFTER the XBRL ingestor + corporate_actions so it
-        # always sees the freshest base rows.
-        try:
-            from intelligence.company_financial_rollups import run_all as cf_rollup_run
-            cf_stats = cf_rollup_run(engine)
-            results["capital_flow_rollups"] = cf_stats
-            log.info(
-                "capital_flow_rollups: ttm={t} rolled={r}",
-                t=cf_stats.get("ttm_rows", 0),
-                r=cf_stats.get("rolled_rows", 0),
-            )
-        except Exception as exc:
-            log.warning("capital_flow_rollups failed: {e}", e=str(exc))
-
-        # Fundamental-vs-price divergence — snapshot daily so the
-        # `fundamental_divergence` table always has a fresh row per
-        # ticker in the latest snapshot. Runs AFTER capital_flow_rollups
-        # so it sees the freshest revenue / margin rows.
-        try:
-            from intelligence.fundamental_divergence import (
-                snapshot_all as fd_snapshot_all,
-            )
-            fd_stats = fd_snapshot_all(engine)
-            results["fundamental_divergence"] = fd_stats
-            log.info(
-                "fundamental_divergence: wrote={w} long={l} short={s}",
-                w=fd_stats.get("written", 0),
-                l=(fd_stats.get("counts") or {}).get("long_candidate", 0),
-                s=(fd_stats.get("counts") or {}).get("short_candidate", 0),
-            )
-        except Exception as exc:
-            log.warning("fundamental_divergence failed: {e}", e=str(exc))
-
-        # Holder / deal overlap — pre-positioning detector. Cross-
-        # references institutional_holdings 13F snapshots against
-        # capital_flows acquisition announcements to find filers that
-        # held BOTH the acquirer and the target before the deal was
-        # announced. Must run AFTER corporate_actions (announcement
-        # rows) and AFTER the 13F ingestor. Writes holder_deal_overlap.
-        try:
-            from intelligence.holder_deal_overlap import run as hdo_run
-            hdo_stats = hdo_run(engine)
-            results["holder_deal_overlap"] = hdo_stats
-            log.info(
-                "holder_deal_overlap: deals={d} overlaps={o} pre={p}",
-                d=hdo_stats.get("deals_scanned", 0),
-                o=hdo_stats.get("overlaps_written", 0),
-                p=hdo_stats.get("pre_positioned", 0),
-            )
-        except Exception as exc:
-            log.warning("holder_deal_overlap failed: {e}", e=str(exc))
-
-        # ── Daily file rotation (audit #49, #61) ────────────────────
-        # Insight files in outputs/llm_insights/ accumulate forever
-        # without cleanup; the dir hit 100k+ files (45 days, ~22k/day
-        # peaks) before this hook was wired in. 30-day retention caps
-        # steady-state at ~660k worst case, manageable.
-        try:
-            from outputs.llm_logger import cleanup_old_insights
-            n_cleaned = cleanup_old_insights(max_age_days=30)
-            if n_cleaned:
-                log.info("Insight cleanup: deleted {n} files (>30d)", n=n_cleaned)
-        except Exception as exc:
-            log.warning("Insight cleanup failed: {e}", e=str(exc))
-
-        # Market briefings — same pattern, 90-day retention since these
-        # are higher-value artifacts (full market write-ups).
-        try:
-            from ollama.market_briefing import MarketBriefingEngine
-            n_briefings = MarketBriefingEngine.cleanup_old_briefings(max_age_days=90)
-            if n_briefings:
-                log.info("Briefing cleanup: deleted {n} files (>90d)", n=n_briefings)
-        except Exception as exc:
-            log.warning("Briefing cleanup failed: {e}", e=str(exc))
-
-        # errors.jsonl — append-only log, just truncate to last 5000 lines
-        # (~3-4 days of errors at current rate). Cheap, atomic.
-        try:
-            from pathlib import Path
-            errfile = Path(_GRID_DIR) / ".server-logs" / "errors.jsonl"
-            if errfile.exists() and errfile.stat().st_size > 1_000_000:
-                lines = errfile.read_text(encoding="utf-8", errors="replace").splitlines()
-                if len(lines) > 5000:
-                    keep = lines[-5000:]
-                    tmp = errfile.with_suffix(".jsonl.tmp")
-                    tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
-                    tmp.replace(errfile)
-                    log.info("errors.jsonl rotated: {n} → 5000 lines",
-                             n=len(lines))
-        except Exception as exc:
-            log.warning("errors.jsonl rotation failed: {e}", e=str(exc))
-
-        state.last_daily_intel = now
-
-    # ── Daily at 3:00 AM UTC — sector health snapshot ───────────────
-    # Computes the composite health score for every sector in SECTOR_MAP
-    # and upserts one row per (sector, today) into sector_health_snapshots.
-    # The row ~30 days back is read by the API to label trend_30d.
-
-    is_sector_health_window = (now.hour == 3 and now.minute < 10)
-    sector_health_due = (
-        is_sector_health_window
-        and _hours_since(state.last_sector_health) >= 20
-    )
-
-    if sector_health_due:
-        log.info("Running daily sector health snapshot (3:00 AM UTC)")
-        try:
-            from intelligence.sector_health import snapshot_all_sectors
-            sh_result = snapshot_all_sectors(engine)
-            results["sector_health_snapshot"] = sh_result
-            log.info(
-                "sector_health: {n} snapshots written",
-                n=sh_result.get("snapshots_written", 0),
-            )
-        except Exception as exc:
-            log.warning("sector_health snapshot failed: {e}", e=str(exc))
-            results["sector_health_snapshot"] = {
-                "status": "failed", "error": str(exc),
-            }
-        state.last_sector_health = now
+    # NOTE (2026-09-19): the daily sector-health snapshot used to run here,
+    # AFTER the daily-due block above. It now has its own dispatch and its
+    # own timeout (SECTOR_HEALTH_TIMEOUT_SECONDS), run BEFORE this whole
+    # step in run_cycle — see the sector/intelligence orchestration helper
+    # near the run_cycle dispatch for the design and the traced reason:
+    # production showed this step timing out at INTELLIGENCE_TASKS_TIMEOUT_
+    # SECONDS on essentially every cycle, and the daily-due block above ran
+    # with catch_up=True every time (state.last_daily_intel never advanced
+    # far enough to reach code after it), so anything placed after this
+    # block was never actually reached in production. Do not re-add a
+    # sector-health call in this function.
+    #
+    # UPDATE (fable-daily-intel-resumable, 2026-09-20): the daily-due block
+    # above is no longer monolithic or all-or-nothing (see
+    # _run_daily_intel_block/DAILY_INTEL_TASKS) — it now makes bounded
+    # per-cycle progress and can reach `state.last_daily_intel = now` over
+    # several cycles instead of needing one uninterrupted ~360s+ run. This
+    # does not change the sector-health placement/reasoning above; still
+    # do not re-add a sector-health call in this function.
 
     # ── Daily at 6:30 UTC — forced-flow waterfall briefing ──────────
     # Implements docs/playbooks/opex_waterfall.md. Runs once per day,
@@ -1362,31 +3149,56 @@ def _run_obsidian_cycle(engine: Any) -> dict[str, Any]:
             log.debug("Concept stubs skipped: {e}", e=str(exc))
 
         # 5. Add wikilinks to docs (only if concept stubs changed)
+        #
+        # IMPORTANT (2026-09-18 fix, see
+        # docs/handoffs/2026-09-18/fable-w4d-hermes-docs-rewrite.md): this
+        # used to write add_wikilinks()'s result straight back onto the
+        # SAME tracked file it read via collect_markdown_files() — silently
+        # rewriting README.md/CLAUDE.md/ATTENTION.md/docs/**/*.md in the
+        # release tree on nearly every Hermes cycle. Source docs are now
+        # read-only here; annotated copies go to
+        # resolve_backlinks_output_dir() (env-configurable, defaults under
+        # the Obsidian vault path this module already uses elsewhere), or
+        # this step is skipped entirely (logged) when that directory is
+        # unavailable. Never falls back to writing inside this checkout.
         backlinks_added = 0
         if stubs_created > 0:
             try:
                 from scripts.obsidian_backlinks import (
                     collect_markdown_files, build_doc_registry,
                     add_wikilinks, CONCEPT_LINKS,
+                    resolve_backlinks_output_dir, write_annotated_copy,
                 )
 
-                files = collect_markdown_files()
-                doc_registry = build_doc_registry(files)
-                all_entities = {**CONCEPT_LINKS}
-                skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
-                for stem, target in doc_registry.items():
-                    if stem not in skip_stems and len(stem) > 3:
-                        all_entities[stem] = target
+                output_dir = resolve_backlinks_output_dir()
+                if output_dir is None:
+                    log.debug(
+                        "Obsidian backlinks skipped this cycle: no output "
+                        "directory configured/available (see "
+                        "resolve_backlinks_output_dir)",
+                    )
+                else:
+                    files = collect_markdown_files()
+                    doc_registry = build_doc_registry(files)
+                    all_entities = {**CONCEPT_LINKS}
+                    skip_stems = {"README", "CLAUDE", "index", "plan", "config"}
+                    for stem, target in doc_registry.items():
+                        if stem not in skip_stems and len(stem) > 3:
+                            all_entities[stem] = target
 
-                for f in files:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                    new_content, changes = add_wikilinks(content, f, all_entities)
-                    if changes:
-                        f.write_text(new_content, encoding="utf-8")
-                        backlinks_added += len(changes)
+                    for f in files:
+                        content = f.read_text(encoding="utf-8", errors="replace")
+                        new_content, changes = add_wikilinks(content, f, all_entities)
+                        if changes:
+                            write_annotated_copy(output_dir, f, new_content)
+                            backlinks_added += len(changes)
 
-                if backlinks_added:
-                    log.info("Obsidian backlinks: {n} links added", n=backlinks_added)
+                    if backlinks_added:
+                        log.info(
+                            "Obsidian backlinks: {n} links added (written "
+                            "to {d}; source docs untouched)",
+                            n=backlinks_added, d=output_dir,
+                        )
             except Exception as exc:
                 log.debug("Backlinks skipped: {e}", e=str(exc))
 
@@ -1762,7 +3574,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
                 try:
-                    _retry_source(src, engine, attempt=1)
+                    _retry_source(src, engine, attempt=1, state=state)
                     state.cooldowns.record_attempt(src, success=True)
                     stale_repulled += 1
                     log.info("Proactively refreshed stale source: {s}", s=src)
@@ -1817,24 +3629,76 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     # SmartScheduler's frequency tracking replaces this.
     cycle_result["data_gaps"] = {"skipped": "handled_by_smart_scheduler"}
 
-    # 5. Self-diagnostics — only every 6th cycle (30 min)
-    if state.cycle_count % 6 == 0:
-        try:
-            state.current_step = "diagnostics"
-            diag = run_self_diagnostics(engine, hermes_ok, health, state, dry_run=dry_run)
-            cycle_result["diagnostics"] = diag
-        except Exception as exc:
-            log.warning("Self-diagnostics failed: {e}", e=str(exc))
+    # 5. Self-diagnostics — only every 6th cycle (30 min), bounded by its
+    # own timeout (see _run_diagnostics_step's docstring for the traced
+    # 71-minute-stall defect this replaces).
+    _run_diagnostics_step(engine, hermes_ok, health, state, dry_run, cycle_result)
 
     # 6. Autoresearch — only every 12th cycle (1 hour)
+    #
+    # Bounded + fenced (this task): previously called maybe_run_autoresearch
+    # directly inside a plain try/except, with NO per-step timeout at all
+    # (see docs/handoffs/2026-09-18/fable-w4-research-states.md's
+    # "Activation condition" — this was the exact gap that made activating
+    # autoresearch on a schedule unsafe). Now wrapped in _run_with_timeout
+    # like resolution/oracle_cycle, AND every invocation gets a generation
+    # id from _autoresearch_generation: if the timeout fires, the worker
+    # thread is abandoned (not killed — see _run_with_timeout's docstring)
+    # but the generation is bumped immediately below, so any write that
+    # orphan later attempts is fenced by scripts/autoresearch.py's
+    # generation checks (recorded there with a "fenced" reason).
     if state.cycle_count % 12 == 0 and health.get("overall_healthy") and hermes_ok:
-        try:
-            state.current_step = "autoresearch"
-            ar_result = maybe_run_autoresearch(state, dry_run=dry_run)
-            if ar_result is not None:
-                cycle_result["autoresearch"] = ar_result
-        except Exception as exc:
-            log.warning("Autoresearch failed: {e}", e=str(exc))
+        from config import settings as _ar_settings
+
+        if not _ar_settings.AUTORESEARCH_ENABLED:
+            # Same off-by-default gate as maybe_run_autoresearch, checked
+            # here too so the disabled state shows up in this cycle's log
+            # (and cycle_result) even though the cycle-modulo/health gate
+            # above was otherwise satisfied — without this, "Running
+            # autoresearch cycle" would never be reached anyway
+            # (maybe_run_autoresearch's own check returns first), but the
+            # operator's cycle log would stay silent about why.
+            log.info("autoresearch disabled (AUTORESEARCH_ENABLED=false) — skipping")
+            cycle_result["autoresearch"] = {"status": "skipped", "reason": "disabled"}
+        else:
+            try:
+                state.current_step = "autoresearch"
+                ar_run_id = str(uuid.uuid4())
+                ar_generation = _autoresearch_generation.next()
+
+                def _autoresearch_call():
+                    return maybe_run_autoresearch(
+                        state, dry_run=dry_run,
+                        run_id=ar_run_id, generation=ar_generation,
+                        is_current_generation=_autoresearch_generation.is_current,
+                    )
+
+                ar_result, ar_ok = _run_with_timeout(
+                    "autoresearch", _autoresearch_call,
+                    AUTORESEARCH_TIMEOUT_SECONDS, state,
+                )
+                if ar_ok:
+                    if ar_result is not None:
+                        cycle_result["autoresearch"] = ar_result
+                else:
+                    # Bump NOW, not on the next cycle-6 gate an hour from now —
+                    # the abandoned worker thread is still running and could
+                    # write at any point between now and then.
+                    _autoresearch_generation.next()
+                    cycle_result["autoresearch"] = {"status": "timeout", "run_id": ar_run_id}
+                    try:
+                        from scripts.autoresearch import _record_research_run
+                        _record_research_run(
+                            engine, ar_run_id, "timeout",
+                            phase="operator_timeout",
+                            error=f"exceeded {AUTORESEARCH_TIMEOUT_SECONDS}s",
+                            error_category="timeout",
+                            generation=ar_generation,
+                        )
+                    except Exception as exc:
+                        log.warning("Failed to record autoresearch timeout: {e}", e=str(exc))
+            except Exception as exc:
+                log.warning("Autoresearch failed: {e}", e=str(exc))
 
     # 7. UX Audit — only every 72nd cycle (~6 hours)
     if state.cycle_count % 72 == 0 and health.get("overall_healthy") and hermes_ok:
@@ -2380,22 +4244,17 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     except Exception as exc:
         log.warning("Alpha research heartbeat failed: {e}", e=str(exc))
 
-    # 7f. Intelligence modules — trust scoring, cross-reference, lever pullers,
-    #     actor network, source audit, postmortem, options tracking, backtests
-    try:
-        state.current_step = "intelligence_tasks"
-        intel_result, ok = _run_with_timeout(
-            "intelligence_tasks",
-            lambda: run_intelligence_tasks(engine, state, dry_run=dry_run),
-            INTELLIGENCE_TASKS_TIMEOUT_SECONDS,
-            state,
-        )
-        if ok and intel_result:
-            cycle_result["intelligence"] = intel_result
-        elif not ok:
-            cycle_result["intelligence"] = {"timeout": True}
-    except Exception as exc:
-        log.warning("Intelligence tasks failed: {e}", e=str(exc))
+    # 7f. Sector health snapshot, then intelligence modules — trust scoring,
+    #     cross-reference, lever pullers, actor network, source audit,
+    #     postmortem, options tracking, backtests. Split into two
+    #     independent steps (own dispatch, own _run_with_timeout budget)
+    #     on 2026-09-19: intelligence_tasks (900s) was starving the
+    #     sector-health snapshot, which used to run at the very end of it.
+    #     See _run_sector_and_intelligence_steps's docstring for the traced
+    #     production evidence and the blacklist-trace rationale for why the
+    #     new sector-health step deliberately does not consult the cooldown
+    #     retry-eligibility check that a few other steps use.
+    _run_sector_and_intelligence_steps(engine, state, dry_run, cycle_result)
 
     # 7g. Rotation paper trading — daily after 17:00 UTC (market close)
     try:
@@ -2622,6 +4481,52 @@ def _emit_obsidian_cycle_report(state: Any, cycle_result: dict[str, Any]) -> Non
         log.warning("obsidian-report fan-out failed: {e}", e=str(exc))
 
 
+def _log_outstanding_checkouts_once() -> list[dict[str, Any]] | None:
+    """Poll and log this process's currently-open DB checkouts.
+
+    This must run inside the same process as the engine it inspects --
+    db.py's checkout tracking is a process-local module dict, so a
+    separate Python invocation (e.g. a one-off diagnostic script) gets its
+    own empty tracking state and can never see what this Hermes process
+    has open. Wrapped in its own try/except, matching the isolation used
+    for the per-cycle pool_stats log, so a telemetry bug can never affect
+    real cycle work. Returns the outstanding-checkout list for tests;
+    callers running the poll loop don't need the return value.
+    """
+    try:
+        from db import get_outstanding_checkouts
+        outstanding = get_outstanding_checkouts()
+        if outstanding:
+            log.info(
+                "DB pool (this process) — {n} outstanding checkout(s): {rows}",
+                n=len(outstanding), rows=outstanding,
+            )
+        return outstanding
+    except Exception as exc:
+        log.warning("Outstanding-checkout telemetry failed: {e}", e=str(exc))
+        return None
+
+
+def _outstanding_checkout_telemetry_loop(
+    interval_seconds: float, *, sleep_fn: Callable[[float], None] = time.sleep,
+) -> None:
+    """Background loop: poll outstanding DB checkouts on a fixed interval.
+
+    Runs independently of cycle completion or cycle length -- a cycle can
+    run for up to CYCLE_TIMEOUT_SECONDS (75 min) or hang past it, during
+    which the per-cycle pool_stats log in run_cycle never fires. This loop
+    is the only source of outstanding-checkout visibility during that
+    window. Intended to run as a daemon thread for the life of the process.
+
+    ``sleep_fn`` is injectable (defaults to time.sleep) so tests can drive
+    a bounded number of iterations without monkeypatching the global time
+    module or actually sleeping.
+    """
+    while True:
+        sleep_fn(interval_seconds)
+        _log_outstanding_checkouts_once()
+
+
 def main(args: list[str] | None = None) -> None:
     """Entry point for the Hermes operator daemon."""
     parser = argparse.ArgumentParser(description="GRID Hermes Operator — 24/7 self-healing daemon")
@@ -2679,6 +4584,29 @@ def main(args: list[str] | None = None) -> None:
         except Exception as exc:
             log.warning("Failed to start LLM task queue: {e}", e=str(exc))
 
+    # Start outstanding-checkout telemetry as its own background daemon
+    # thread, independent of cycle completion (see
+    # _outstanding_checkout_telemetry_loop). Must run in-process: it reads
+    # db.py's process-local checkout tracking, which a separate script
+    # invocation cannot see.
+    _outstanding_checkout_thread = None
+    if not opts.dry_run:
+        try:
+            import threading as _threading
+            _outstanding_checkout_thread = _threading.Thread(
+                target=_outstanding_checkout_telemetry_loop,
+                args=(OUTSTANDING_CHECKOUT_POLL_SECONDS,),
+                daemon=True,
+                name="hermes-outstanding-checkout-telemetry",
+            )
+            _outstanding_checkout_thread.start()
+            log.info(
+                "Outstanding-checkout telemetry thread launched (interval={s}s)",
+                s=OUTSTANDING_CHECKOUT_POLL_SECONDS,
+            )
+        except Exception as exc:
+            log.warning("Failed to start outstanding-checkout telemetry: {e}", e=str(exc))
+
     # Run DB model migrations once on startup (idempotent)
     try:
         from db import get_engine as _get_engine_for_migrate
@@ -2704,7 +4632,15 @@ def main(args: list[str] | None = None) -> None:
                 result[0] = run_cycle(state, dry_run=dry_run)
             except Exception as exc:
                 error[0] = exc
-        t = threading.Thread(target=_target, daemon=True)
+        # Named explicitly (default would be "Thread-N") so db.py's
+        # per-thread checkout attribution (get_checkout_attribution) can
+        # actually distinguish this cycle's connections from the
+        # long-running llm-taskqueue background thread's, instead of both
+        # showing up as anonymous thread names in a burst.
+        t = threading.Thread(
+            target=_target, daemon=True,
+            name=f"hermes-cycle-{state.cycle_count + 1}",
+        )
         t.start()
         t.join(timeout=timeout)
         if t.is_alive():

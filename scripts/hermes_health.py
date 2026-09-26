@@ -340,10 +340,166 @@ class OperatorState:
         self.last_forced_flow_brief: datetime | None = None  # Daily forced-flow waterfall briefing ~06:30 UTC
         self.last_contagion_backtest: datetime | None = None  # Daily contagion backtest at 5 AM
         self.last_contagion_feedback: datetime | None = None  # Daily contagion feedback loop right after backtest
-        self.last_sector_health: datetime | None = None  # Daily sector health snapshot at 3 AM UTC
+        self.last_sector_health: datetime | None = None  # Daily sector health snapshot, due-period opens 3 AM UTC (marks the due period done — success, no_eligible_sectors, or superseded)
+        self.last_sector_health_attempt: datetime | None = None  # Last sector-health attempt (success or failure) — drives retry backoff
+        self.sector_health_attempt_count: int = 0  # Attempts made in the current sector-health due period — capped, reset each new period
+        self.last_sector_health_outcome: str | None = None  # "success" | "no_eligible_sectors" | "superseded" | "failure" — see _maybe_run_sector_health_snapshot
+        self.sector_health_attempt_token: int = 0  # Incremented at each attempt start; a worker's result is only committed if this still matches at completion (guards against an abandoned _run_with_timeout worker writing stale state after a later cycle's attempt has already started)
         self.last_active_hypo_scoring: datetime | None = None  # Periodic batch scoring of overdue active hypos (30 min)
         self.last_earnings_calendar_sync: datetime | None = None  # earnings_events → earnings_calendar back-compat sync (30 min)
         self.last_resolution: datetime | None = None  # raw_series → resolved_series watermark (start time of the last clean resolver run)
+
+        # Daily-intel per-task ledger (fable-daily-intel-resumable,
+        # 2026-09-20). See scripts/hermes_operator.py::DAILY_INTEL_TASKS and
+        # _run_daily_intel_block for the executor. Replaces the old
+        # all-or-nothing `state.last_daily_intel = now` (set only at the very
+        # end of the block, after every task ran) with a per-task record so a
+        # cycle-budget cutoff or a restart resumes from the first undone task
+        # instead of re-running the whole ~20-task block from the top.
+        #
+        # daily_intel_period: ISO date of the due period (boundary_hour=
+        # DAILY_INTEL_BOUNDARY_HOUR=2) the three dicts below belong to. When
+        # a new evaluation's due-period date differs from this, the ledger
+        # has rolled over: _run_daily_intel_block clears daily_intel_done,
+        # daily_intel_skipped_for_period and daily_intel_attempts and sets
+        # this to the new period before doing anything else.
+        self.daily_intel_period: str | None = None
+        # daily_intel_done: task name -> ISO date of the due period it
+        # completed (or was skipped_for_period) for. A task present here
+        # with the CURRENT period's date is not re-run this period —
+        # checked regardless of whether it got there via success or via
+        # DAILY_INTEL_MAX_ATTEMPTS-exhaustion (see daily_intel_skipped_for_
+        # period below), so a permanently-broken task cannot block the
+        # tasks scheduled after it.
+        self.daily_intel_done: dict[str, str] = {}
+        # daily_intel_skipped_for_period: task name -> ISO date of the due
+        # period it was marked skipped_for_period for (attempts reached
+        # DAILY_INTEL_MAX_ATTEMPTS without a success). Every entry here also
+        # has a matching entry in daily_intel_done (same date) — this dict
+        # exists only to distinguish "skipped" from "succeeded" for the
+        # per-cycle summary log line and for tests; it is never consulted on
+        # its own to decide whether to (re)run a task.
+        self.daily_intel_skipped_for_period: dict[str, str] = {}
+        # daily_intel_attempts: task name -> attempts made in the CURRENT
+        # period (timeouts and exceptions both count; see
+        # _run_daily_intel_block). Reset to {} on period rollover along with
+        # daily_intel_done/daily_intel_skipped_for_period above.
+        self.daily_intel_attempts: dict[str, int] = {}
+        # daily_intel_task_outcome: task name -> "done" | "done_queued" |
+        # "skipped_for_period" | "held" | "in_flight", for the CURRENT
+        # period only (reset to {} on the same rollover as
+        # daily_intel_done/skipped_for_period/attempts above). This is a
+        # strictly additive, human/test-facing view over the same facts
+        # daily_intel_done/daily_intel_skipped_for_period already encode —
+        # "done"/"done_queued" and "skipped_for_period" are written at the
+        # exact same points those two dicts are (see _run_daily_intel_block)
+        # — plus two states neither of those dicts can represent: "held"
+        # (task is not in DAILY_INTEL_INITIAL_ALLOWLIST this period — never
+        # attempted, never counted toward daily_intel_done, and therefore
+        # invisible to the "period complete" check) and "in_flight" (a
+        # retry this cycle was skipped because the previous attempt's
+        # worker thread was still alive — see _DAILY_INTEL_IN_FLIGHT in
+        # scripts/hermes_operator.py). A held task can never carry "done"/
+        # "done_queued" or "skipped_for_period" here, by construction —
+        # _run_daily_intel_block never runs a held task's fn, so there is
+        # no code path that could write either value for it.
+        #
+        # "done_queued" (fable-hermes-daily-intel-resumable review, part C,
+        # 2026-09-20): a task whose own step only ENQUEUES a goal_queue row
+        # for a separate subagent process (currently just
+        # storage_maintenance_subagent — see DailyIntelTask.
+        # reports_done_queued in scripts/hermes_operator.py) reports
+        # "done_queued" instead of "done" the moment the enqueue call
+        # returns, deliberately distinct from "done" so this ledger cannot
+        # be misread as "the subagent's work finished." The subagent's own
+        # completion (or failure) is tracked separately, by goal_queue's
+        # state column and the goal_results table
+        # (intelligence/goal_queue.py) — NOT by this ledger. "done_queued"
+        # still counts toward daily_intel_done/period completion exactly
+        # like "done" does; it only changes what the outcome label claims
+        # happened.
+        self.daily_intel_task_outcome: dict[str, str] = {}
+        # daily_intel_period_outcome: "complete" | "complete_with_skips" |
+        # "complete_for_enabled_tasks" | "complete_for_enabled_tasks_with_
+        # skips" | None. Set (alongside state.last_daily_intel = now) the
+        # moment every ALLOW-LISTED task for the current period has a
+        # daily_intel_done entry.
+        #
+        # The "_for_enabled_tasks" suffix (fable-hermes-daily-intel-
+        # resumable review, part E, 2026-09-20) reports honestly that a
+        # held subset of DAILY_INTEL_TASKS did NOT run this period — the
+        # bare "complete"/"complete_with_skips" values are reserved for the
+        # (currently hypothetical) case where DAILY_INTEL_INITIAL_ALLOWLIST
+        # covers every DAILY_INTEL_TASKS entry (no held tasks at all). As
+        # long as any task is held — true today, 8 of 21 allow-listed —
+        # the period outcome is always one of the "_for_enabled_tasks"
+        # values, never the bare ones, so "complete" can never be read as
+        # "the whole daily-intel batch ran."
+        #   - "complete_for_enabled_tasks": all allow-listed tasks done/
+        #     done_queued, none needed skipped_for_period, at least one
+        #     task is held.
+        #   - "complete_for_enabled_tasks_with_skips": same, but at least
+        #     one allow-listed task got there via skipped_for_period.
+        #   - "complete" / "complete_with_skips": same two conditions, but
+        #     with zero held tasks.
+        # None while the period is still in progress, and reset to None on
+        # period rollover (same trigger as the four ledger dicts above) so
+        # a stale prior period's outcome can never be read as the current
+        # period's.
+        self.daily_intel_period_outcome: str | None = None
+
+        # capital_flow_ttm_watermark (fable-daily-intel-sql-tasks,
+        # 2026-09-20 follow-up; made VESTIGIAL by the SAME-DAY SECOND
+        # follow-up): originally a durable, restart-safe scalar ``as_of``
+        # cursor gating intelligence/company_financial_rollups.py::
+        # compute_ttm's recompute set. The controller established that
+        # design is NOT commit-order safe — PostgreSQL's NOW() is
+        # transaction-START time, so a late-committing writer can carry
+        # an as_of this cursor already passed, permanently skipping it
+        # (see that module's docstring for the full writeup and
+        # tests/test_capital_flow_rollups_pg.py for the concurrent-
+        # connection proofs). Replaced with a durable PER-ACTOR content
+        # fingerprint stored in ``capital_flows_ttm_state`` (migration
+        # ``capital_flow_ttm_state_20260920``), committed atomically with
+        # the ttm rows it governs — no caller-owned cursor is load-
+        # bearing for correctness any more. This field is KEPT, still set
+        # by scripts/hermes_operator.py::_daily_intel_capital_flow_
+        # rollups as soon as ``run_all`` reports ``ttm_ok``, purely as
+        # telemetry (the ISO-8601 wall-clock time the run completed) —
+        # removing it would touch call signatures with no correctness
+        # benefit. Persisted/hydrated the same "only if currently unset"
+        # way as the daily-intel ledger fields above.
+        self.capital_flow_ttm_watermark: str | None = None
+
+        # Bounded-repair backlog (fable-hermes-repair-bound, 2026-09-19):
+        # source_key (lowercased source_catalog name) -> list of tickers/ids
+        # not yet attempted, left over when a repair pull in
+        # scripts/hermes_fixers.py::_retry_source stops early because
+        # REPAIR_BUDGET_SECONDS ran out. Persisted so the NEXT repair
+        # attempt for that source resumes from the remainder instead of
+        # restarting from the first ticker every cycle. Cleared once a
+        # repair for that source completes without being stopped by budget.
+        self.repair_backlog: dict[str, list[str]] = {}
+
+        # Freshness-semantics fix (fable-hermes-repair-bound follow-up,
+        # 2026-09-19 review): source_key -> the single most recent bounded-
+        # repair check summary for that source (see _retry_source in
+        # scripts/hermes_fixers.py). Bounded to the LAST summary only — this
+        # is a status snapshot, not a history log. Persisted so a checked-
+        # but-not-fully-current source's most recent check is visible after
+        # a restart, not just in that cycle's log line.
+        self.repair_last_check: dict[str, dict[str, Any]] = {}
+
+        # source_key -> the most recent record of repair coverage that did
+        # NOT reach every ticker (attempt cap hit, or per-ticker no_data/
+        # error outcomes). This is the compensating signal for Check 1b:
+        # source_catalog.last_pull_at (and repair_last_check above) can look
+        # "checked" while some tickers are still outside the repair window's
+        # reach — this field is what tells a human or the diagnostics LLM
+        # that a separately authorised backfill, not another REPULL, is
+        # what would actually close the gap. Bounded to the last record per
+        # source, persisted the same way as repair_backlog/repair_last_check.
+        self.repair_uncovered: dict[str, dict[str, Any]] = {}
 
         # Hermes status log: task_name -> {last_run, success, duration_s, error}
         self.task_status: dict[str, dict[str, Any]] = {}
@@ -408,11 +564,24 @@ class OperatorState:
             "last_contagion_backtest": self.last_contagion_backtest.isoformat() if self.last_contagion_backtest else None,
             "last_contagion_feedback": self.last_contagion_feedback.isoformat() if self.last_contagion_feedback else None,
             "last_sector_health": self.last_sector_health.isoformat() if self.last_sector_health else None,
+            "last_sector_health_attempt": self.last_sector_health_attempt.isoformat() if self.last_sector_health_attempt else None,
+            "sector_health_attempt_count": self.sector_health_attempt_count,
+            "last_sector_health_outcome": self.last_sector_health_outcome,
             "last_active_hypo_scoring": self.last_active_hypo_scoring.isoformat() if self.last_active_hypo_scoring else None,
             "last_earnings_calendar_sync": self.last_earnings_calendar_sync.isoformat() if self.last_earnings_calendar_sync else None,
             "last_resolution": self.last_resolution.isoformat() if self.last_resolution else None,
             "last_options_scoring": self.last_options_scoring.isoformat() if self.last_options_scoring else None,
             "task_status": self.task_status,
+            "repair_backlog": self.repair_backlog,
+            "repair_last_check": self.repair_last_check,
+            "repair_uncovered": self.repair_uncovered,
+            "daily_intel_period": self.daily_intel_period,
+            "daily_intel_done": self.daily_intel_done,
+            "daily_intel_skipped_for_period": self.daily_intel_skipped_for_period,
+            "daily_intel_attempts": self.daily_intel_attempts,
+            "daily_intel_task_outcome": self.daily_intel_task_outcome,
+            "daily_intel_period_outcome": self.daily_intel_period_outcome,
+            "capital_flow_ttm_watermark": self.capital_flow_ttm_watermark,
         }
 
     def hydrate_from_snapshot(self, engine: Any) -> bool:
@@ -450,7 +619,7 @@ class OperatorState:
             "last_lever_pullers", "last_actor_wealth", "last_signal_registry",
             "last_signal_forecasts", "last_enrich_connections",
             "last_contagion_backtest", "last_contagion_feedback",
-            "last_sector_health", "last_active_hypo_scoring",
+            "last_sector_health", "last_sector_health_attempt", "last_active_hypo_scoring",
             "last_earnings_calendar_sync", "last_resolution", "last_ux_audit",
             "last_daily_digest", "last_100x_digest", "last_oracle_cycle",
         ]
@@ -470,7 +639,8 @@ class OperatorState:
 
         # Counters and task_status are cumulative — carry them forward too.
         for int_field in ("cycle_count", "fixes_applied", "pulls_retried",
-                          "hypotheses_tested", "errors_diagnosed"):
+                          "hypotheses_tested", "errors_diagnosed",
+                          "sector_health_attempt_count"):
             val = op_state.get(int_field)
             if isinstance(val, int) and getattr(self, int_field, 0) == 0:
                 setattr(self, int_field, val)
@@ -478,6 +648,72 @@ class OperatorState:
         ts = op_state.get("task_status")
         if isinstance(ts, dict) and not self.task_status:
             self.task_status = ts
+
+        backlog = op_state.get("repair_backlog")
+        if isinstance(backlog, dict) and not self.repair_backlog:
+            self.repair_backlog = {
+                str(k): list(v) for k, v in backlog.items() if isinstance(v, list)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_backlog)
+
+        last_check = op_state.get("repair_last_check")
+        if isinstance(last_check, dict) and not self.repair_last_check:
+            self.repair_last_check = {
+                str(k): v for k, v in last_check.items() if isinstance(v, dict)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_last_check)
+
+        uncovered = op_state.get("repair_uncovered")
+        if isinstance(uncovered, dict) and not self.repair_uncovered:
+            self.repair_uncovered = {
+                str(k): v for k, v in uncovered.items() if isinstance(v, dict)
+            }
+            hydrated_any = hydrated_any or bool(self.repair_uncovered)
+
+        # Daily-intel ledger (fable-daily-intel-resumable, 2026-09-20) —
+        # same "only if currently unset" rule as repair_backlog above, so a
+        # restart mid-period resumes from the first undone task instead of
+        # re-running everything.
+        daily_intel_done = op_state.get("daily_intel_done")
+        if isinstance(daily_intel_done, dict) and not self.daily_intel_done:
+            self.daily_intel_done = {
+                str(k): str(v) for k, v in daily_intel_done.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_done)
+
+        daily_intel_skipped = op_state.get("daily_intel_skipped_for_period")
+        if isinstance(daily_intel_skipped, dict) and not self.daily_intel_skipped_for_period:
+            self.daily_intel_skipped_for_period = {
+                str(k): str(v) for k, v in daily_intel_skipped.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_skipped_for_period)
+
+        daily_intel_attempts = op_state.get("daily_intel_attempts")
+        if isinstance(daily_intel_attempts, dict) and not self.daily_intel_attempts:
+            self.daily_intel_attempts = {
+                str(k): int(v) for k, v in daily_intel_attempts.items()
+                if isinstance(v, int)
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_attempts)
+
+        daily_intel_task_outcome = op_state.get("daily_intel_task_outcome")
+        if isinstance(daily_intel_task_outcome, dict) and not self.daily_intel_task_outcome:
+            self.daily_intel_task_outcome = {
+                str(k): str(v) for k, v in daily_intel_task_outcome.items() if v is not None
+            }
+            hydrated_any = hydrated_any or bool(self.daily_intel_task_outcome)
+
+        # Plain string fields (not timestamps, not counters) — restore
+        # verbatim, same "only if currently unset" rule as the datetime
+        # fields above.
+        for str_field in (
+            "last_sector_health_outcome", "daily_intel_period",
+            "daily_intel_period_outcome", "capital_flow_ttm_watermark",
+        ):
+            val = op_state.get(str_field)
+            if isinstance(val, str) and getattr(self, str_field, None) is None:
+                setattr(self, str_field, val)
+                hydrated_any = True
 
         return hydrated_any
 

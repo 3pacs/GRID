@@ -21,6 +21,30 @@ const CATEGORY_OPTIONS = ['ALL', 'ingestion', 'normalization', 'discovery', 'inf
 
 const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 
+// Normalises a list-bearing API response into { list, error }.
+// api.js never throws on network/HTTP/parse failure — it resolves an
+// `{ error: true, status, message }` marker instead (see api.js's request
+// helper). That marker is truthy and not an array, so a naive
+// `res?.key || res || []` fallback lets it flow into state as-is and any
+// later `.map()` over it throws. Handle all three shapes explicitly:
+//   - already an array -> use it
+//   - object with `key` holding an array -> unwrap it
+//   - error marker (or anything else unexpected) -> empty list + message
+const normalizeListResponse = (res, key) => {
+    if (Array.isArray(res)) {
+        return { list: res, error: null };
+    }
+    if (res && typeof res === 'object') {
+        if (res.error === true) {
+            return { list: [], error: res.message || 'Request failed' };
+        }
+        if (Array.isArray(res[key])) {
+            return { list: res[key], error: null };
+        }
+    }
+    return { list: [], error: 'Unexpected response' };
+};
+
 export default function Operator() {
     const [status, setStatus] = useState(null);
     const [hermesStatus, setHermesStatus] = useState(null);
@@ -32,6 +56,8 @@ export default function Operator() {
     const [categoryFilter, setCategoryFilter] = useState('ALL');
     const [expandedIssue, setExpandedIssue] = useState(null);
     const [daysBack, setDaysBack] = useState(30);
+    const [issuesError, setIssuesError] = useState(null);
+    const [cyclesError, setCyclesError] = useState(null);
 
     const [health, setHealth] = useState(null);
     const [freshness, setFreshness] = useState(null);
@@ -58,8 +84,12 @@ export default function Operator() {
             ]);
             setStatus(statusRes);
             setHermesStatus(hermesRes);
-            setIssues(issuesRes?.issues || issuesRes || []);
-            setRecentCycles(cyclesRes?.snapshots || cyclesRes || []);
+            const issuesNorm = normalizeListResponse(issuesRes, 'issues');
+            setIssues(issuesNorm.list);
+            setIssuesError(issuesNorm.error);
+            const cyclesNorm = normalizeListResponse(cyclesRes, 'snapshots');
+            setRecentCycles(cyclesNorm.list);
+            setCyclesError(cyclesNorm.error);
             setHealth(healthRes);
             setFreshness(freshnessRes);
         } catch (e) {
@@ -75,7 +105,9 @@ export default function Operator() {
                 categoryFilter !== 'ALL' ? categoryFilter : null,
                 severityFilter !== 'ALL' ? severityFilter : null,
             );
-            setIssues(res?.issues || res || []);
+            const norm = normalizeListResponse(res, 'issues');
+            setIssues(norm.list);
+            setIssuesError(norm.error);
         } catch (e) {
             console.warn('[GRID] Operator:', e.message);
         }
@@ -292,7 +324,7 @@ export default function Operator() {
                     {status.database && (
                         <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '8px' }}>
                             DB: {status.database.connected ? 'Connected' : 'Disconnected'}
-                            {status.database.size_mb && ` · ${(status.database.size_mb / 1024).toFixed(1)}GB`}
+                            {status.database.connected && typeof status.database.size_mb === 'number' && ` · ${(status.database.size_mb / 1024).toFixed(1)}GB`}
                         </div>
                     )}
                 </div>
@@ -356,7 +388,18 @@ export default function Operator() {
                         </div>
                     </div>
 
-                    {issues.length === 0 && (
+                    {issuesError && (
+                        <div style={{
+                            marginBottom: '8px', padding: '10px 12px', borderRadius: '8px',
+                            background: colors.redBg || `${colors.red}10`,
+                            border: `1px solid ${colors.red}30`,
+                            fontSize: '12px', color: colors.red,
+                        }}>
+                            Issues unavailable: {issuesError}
+                        </div>
+                    )}
+
+                    {!issuesError && issues.length === 0 && (
                         <div style={{ color: colors.textMuted, fontSize: '13px', padding: '16px', textAlign: 'center' }}>
                             No issues found
                         </div>
@@ -430,7 +473,21 @@ export default function Operator() {
             )}
 
             {/* Recent Cycles */}
-            {!loading && recentCycles.length > 0 && (
+            {!loading && cyclesError && (
+                <div style={{ marginTop: '8px' }}>
+                    <div style={shared.sectionTitle}>RECENT CYCLES</div>
+                    <div style={{
+                        marginTop: '8px', padding: '10px 12px', borderRadius: '8px',
+                        background: colors.redBg || `${colors.red}10`,
+                        border: `1px solid ${colors.red}30`,
+                        fontSize: '12px', color: colors.red,
+                    }}>
+                        Cycle history unavailable: {cyclesError}
+                    </div>
+                </div>
+            )}
+
+            {!loading && !cyclesError && recentCycles.length > 0 && (
                 <div style={{ marginTop: '8px' }}>
                     <div style={shared.sectionTitle}>RECENT CYCLES</div>
                     {recentCycles.map((cycle, i) => {

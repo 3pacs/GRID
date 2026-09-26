@@ -5,7 +5,10 @@ computation lives in the domain module — this router just caches and
 serves the result.
 
     GET /api/v1/sectors/{sector_name}/health
-      → { sector, score, trend_30d, components, narrative, as_of }
+      → { sector, score, trend_30d, components, narrative, as_of,
+          status: "ok" | "unavailable", data_coverage, [reason] }
+    ``score`` is ``null`` (never a neutral 50) when the computation fails
+    or no component has underlying data.
 """
 
 from __future__ import annotations
@@ -54,6 +57,11 @@ async def get_sector_health(
         raise HTTPException(
             status_code=500, detail="Failed to compute sector health",
         ) from exc
+
+    if result.get("status") == "unavailable":
+        # Serve the honest unavailable payload but do not pin it in the
+        # 10-minute cache: the next request should retry the computation.
+        return result
 
     _CACHE.set(sector_name, result)
     return result
