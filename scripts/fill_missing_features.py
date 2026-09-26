@@ -234,14 +234,36 @@ YF_MISSING_TICKERS = {
 }
 
 
+YF_ADJUSTED_SOURCE = "yfinance_adjusted_extended"
+
+
+def _extended_yf_series(ticker: str, field: str) -> tuple[str, dict]:
+    """Keep adjusted closes outside the canonical raw YF close namespace.
+
+    Volume retains its existing feature mapping, but its payload records the
+    download settings. Neither field has a verified historical known-at time.
+    """
+    if field == "Close":
+        return f"YF_ADJ:{ticker}:close", {
+            "provider": "yfinance", "download_auto_adjust": True,
+            "price_basis": "adjusted_close", "known_at_verified": False,
+        }
+    if field == "Volume":
+        return f"YF:{ticker}:volume", {
+            "provider": "yfinance", "download_auto_adjust": True,
+            "measurement_basis": "provider_volume", "known_at_verified": False,
+        }
+    raise ValueError(f"Unsupported extended yfinance field: {field}")
+
+
 def pull_yfinance_extended(engine):
-    """Pull additional yfinance tickers — 5 year bulk history."""
+    """Pull adjusted closes and provider volume with explicit provenance."""
     import yfinance as yf
 
-    source_id = _ensure_source(engine, "yfinance", {
+    source_id = _ensure_source(engine, YF_ADJUSTED_SOURCE, {
         "base_url": "https://finance.yahoo.com",
         "cost_tier": "FREE", "latency_class": "EOD",
-        "pit_available": False, "revision_behavior": "RARE",
+        "pit_available": False, "revision_behavior": "FREQUENT",
         "trust_score": "MED", "priority_rank": 20,
     })
 
@@ -278,21 +300,25 @@ def pull_yfinance_extended(engine):
                     for field in ["Close", "Volume"]:
                         if field not in ticker_data.columns:
                             continue
-                        series_id = f"YF:{ticker}:{field.lower()}"
+                        series_id, provenance = _extended_yf_series(ticker, field)
                         existing = set()
                         rows = conn.execute(text(
                             "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
                         ), {"sid": series_id, "src": source_id}).fetchall()
-                        existing = {r[0] for r in rows}
+                        existing = {
+                            r[0] if isinstance(r[0], date) else date.fromisoformat(r[0])
+                            for r in rows
+                        }
 
                         for idx, val in ticker_data[field].items():
                             obs = idx.date() if hasattr(idx, 'date') else idx
                             if obs in existing or pd.isna(val):
                                 continue
                             conn.execute(text(
-                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                            ), {"sid": series_id, "src": source_id, "od": obs, "val": float(val)})
+                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                                "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                            ), {"sid": series_id, "src": source_id, "od": obs,
+                                "val": float(val), "payload": json.dumps(provenance)})
                             count += 1
 
                 results.append({"ticker": ticker, "rows": count, "status": "OK"})
