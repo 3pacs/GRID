@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import threading
 from datetime import date, timedelta
 
@@ -14,6 +15,7 @@ from api.routers.ten_year_portfolio import (
     _RESOLVED_TICKER_TO_FEATURE,
     _load_price_history,
 )
+from api.routers import ten_year_portfolio as ten_year_router
 
 
 class _FakeCursor:
@@ -199,3 +201,70 @@ def test_weekly_recommendation_includes_frontier_candidate_board():
     assert board["ranked"][0]["ticker"] == "NVDA"
     assert "AI compute" in FRONTIER_THEME_CANDIDATES["NVDA"]
     assert any(row["ticker"] == "CCJ" and "uranium" in row["themes"] for row in board["ranked"])
+
+
+def test_requested_horizon_reaches_seeded_projection_and_preserves_default_ten_years():
+    start = date(2015, 1, 2)
+    history = {
+        "QQQ": _weekly_growth(start, 530, 100, 0.0020),
+        "AAPL": _weekly_growth(start, 530, 80, 0.0036),
+    }
+    expected_median = {3: 1720691.59, 10: 6208585.30, 20: 38160272.38}
+    for years, expected in expected_median.items():
+        result = build_weekly_recommendation(
+            history, capital=1_000_000, years=years, profile_id="dad_chartist",
+        )
+        profile = result["profiles"][0]
+        projection = profile["monte_carlo"]
+        assert result["universe"]["requested_years"] == years
+        assert profile["allocations"][0]["ticker"] == "AAPL"
+        assert projection["years"] == years
+        assert projection["p50"] == expected
+        assert f"{years}-year chart" in profile["weekly_policy"]["exit_rule"]
+
+    default = build_weekly_recommendation(
+        history, capital=1_000_000, profile_id="dad_chartist",
+    )
+    assert default["profiles"][0]["monte_carlo"]["years"] == 10
+    assert default["profiles"][0]["monte_carlo"]["p50"] == expected_median[10]
+
+
+def test_weekly_route_describes_mixed_storage_basis_and_vintage_without_common_as_of(monkeypatch):
+    start = date(2015, 1, 2)
+    history = {
+        "QQQ": _weekly_growth(start, 530, 100, 0.0020),
+        "AAPL": _weekly_growth(start, 528, 80, 0.0036),
+        "CCJ": _weekly_growth(start, 525, 20, 0.0030),
+    }
+    requested_years = []
+
+    def fake_history(_engine, *, years):
+        requested_years.append(years)
+        return history
+
+    monkeypatch.setattr(ten_year_router, "_load_price_history", fake_history)
+    result = asyncio.run(ten_year_router.weekly_ten_year_portfolio(
+        capital=1_000_000, years=3, profile="dad_chartist", engine=object(),
+    ))
+
+    assert requested_years == [3]
+    assert result["status"] == "ok"
+    assert result["profiles"][0]["monte_carlo"]["years"] == 3
+    assert result["as_of"] == history["QQQ"][-1][0].isoformat()
+    assert result["as_of_basis"] == "latest_observation_on_any_loaded_ticker"
+    assert result["oldest_ticker_latest_date"] == history["CCJ"][-1][0].isoformat()
+    assert result["mixed_latest_dates"] is True
+    assert result["ticker_latest_dates"] == {
+        ticker: points[-1][0].isoformat() for ticker, points in history.items()
+    }
+    universe = result["universe"]
+    assert universe["source"] == "mixed:resolved_series+raw_series"
+    assert universe["frontier_source"] == "raw_series:YF:*:adj_close"
+    assert universe["price_basis"] == "unknown"
+    assert universe["source_by_ticker"]["AAPL"] == {
+        "storage": "resolved_series", "series": "aapl_full", "price_basis": "unknown",
+    }
+    assert universe["source_by_ticker"]["CCJ"] == {
+        "storage": "raw_series", "series": "YF:CCJ:adj_close",
+        "price_basis": "declared_adj_close_unverified",
+    }
