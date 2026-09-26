@@ -273,6 +273,82 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
   fi
 fi
 
+# Preserve every installed/loaded GRID service's current and restart directory,
+# not just the scheduler recorded above. Activation is intentionally independent
+# of a release swap (notably for realtime). Keep the union across the swap so a
+# mutable WorkingDirectory symlink cannot erase its former target from this set.
+# Service repoints must share release coordination; refresh before each deletion
+# as well, failing closed on an unreadable/deleted process cwd or systemd query.
+declare -A runtime_release_dirs=()
+protect_runtime_path() {
+  local path="$1" owner="$2" resolved relative release
+  if [[ "$path" != /* ]] || ! resolved="$(realpath -e -- "$path")" || [ ! -d "$resolved" ]; then
+    echo "cannot resolve $owner runtime directory: $path" >&2
+    exit 5
+  fi
+  # Also retain a configured alias inside the releases directory: deleting the
+  # alias would break a future restart even though its resolved target survives.
+  case "$path" in
+    "$RELEASES_DIR"/*)
+      relative="${path#"$RELEASES_DIR"/}"
+      runtime_release_dirs["${RELEASES_DIR}/${relative%%/*}"]=1
+      ;;
+  esac
+  case "$resolved" in
+    "$RELEASES_DIR"/*)
+      relative="${resolved#"$RELEASES_DIR"/}"
+      release="${RELEASES_DIR}/${relative%%/*}"
+      runtime_release_dirs["$release"]=1
+      ;;
+  esac
+}
+refresh_runtime_release_dirs() {
+  [ "${test_only_skip_preservation:-0}" != 1 ] || return 0
+  local installed loaded units unit details key value load pid workdir cwd workdir_seen
+  if ! installed="$(systemctl list-unit-files --no-legend --no-pager 'grid-*.service')" ||
+     ! loaded="$(systemctl list-units --all --plain --no-legend --no-pager 'grid-*.service')"; then
+    echo 'cannot inventory GRID service runtimes; refusing release deletion' >&2
+    exit 5
+  fi
+  units="$(printf '%s\n%s\n' "$installed" "$loaded" | awk 'NF {print $1}' | sort -u)"
+  if [ -z "$units" ]; then
+    echo 'empty GRID service inventory; refusing release deletion' >&2
+    exit 5
+  fi
+  while IFS= read -r unit; do
+    [[ "$unit" == grid-*.service ]] || { echo "invalid runtime unit: $unit" >&2; exit 5; }
+    # A template cannot run without an instance; loaded instances are included
+    # by list-units above and must still be inspected.
+    [[ "$unit" != *@.service ]] || continue
+    if ! details="$(systemctl show --property=LoadState,MainPID,WorkingDirectory -- "$unit")"; then
+      echo "cannot inspect runtime unit $unit" >&2
+      exit 5
+    fi
+    load= pid= workdir= workdir_seen=0
+    while IFS='=' read -r key value; do
+      case "$key" in
+        LoadState) load="$value" ;;
+        MainPID) pid="$value" ;;
+        WorkingDirectory) workdir="$value"; workdir_seen=1 ;;
+      esac
+    done <<< "$details"
+    if [ "$load" != loaded ] || [[ ! "$pid" =~ ^[0-9]+$ ]] || [ "$workdir_seen" != 1 ]; then
+      echo "ambiguous runtime identity for $unit" >&2
+      exit 5
+    fi
+    # Empty WorkingDirectory means systemd's default /, not an unknown value.
+    protect_runtime_path "${workdir:-/}" "$unit configured"
+    if [ "$pid" != 0 ]; then
+      if ! cwd="$(readlink -- "/proc/$pid/cwd")" || [[ "$cwd" == *' (deleted)' ]]; then
+        echo "missing/deleted runtime cwd for $unit PID $pid" >&2
+        exit 5
+      fi
+      protect_runtime_path "$cwd" "$unit PID $pid"
+    fi
+  done <<< "$units"
+}
+refresh_runtime_release_dirs
+
 # Crash recovery: see header. Only fires when <live_path> does not exist as
 # anything at all (a prior run was killed mid-conversion).
 if [ ! -e "$LIVE_PATH" ] && [ ! -L "$LIVE_PATH" ]; then
@@ -323,8 +399,10 @@ if [ -L "$LIVE_PATH" ]; then
 fi
 
 if [ -e "$CANDIDATE_DIR" ]; then
+  refresh_runtime_release_dirs
   if [ "${test_only_skip_preservation:-0}" != 1 ] &&
-     { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ]; }; then
+     { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ] ||
+       [ "${runtime_release_dirs[$CANDIDATE_DIR]:-0}" = 1 ]; }; then
     echo "candidate label names a protected runtime directory" >&2
     exit 5
   fi
@@ -389,9 +467,11 @@ if [ -n "$previous_target" ]; then
   mapfile -t all_releases < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
   kept=0
   for rel in "${all_releases[@]}"; do
+    refresh_runtime_release_dirs
     if [ "$rel" = "$CANDIDATE_DIR" ] || [ "$rel" = "$previous_target" ] ||
        { [ "${test_only_skip_preservation:-0}" != 1 ] &&
-         { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ]; }; }; then
+         { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ] ||
+           [ "${runtime_release_dirs[$rel]:-0}" = 1 ]; }; }; then
       kept=$((kept + 1))
       continue
     fi
