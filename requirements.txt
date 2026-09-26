@@ -6,7 +6,8 @@
 # Database
 psycopg2-binary>=2.9.12
 asyncpg>=0.29.0  # LISTEN only: cross-process contract events → SSE (events/bus.py); the sync engine stays psycopg2
-sqlalchemy>=2.0.0
+# 2.1 changes postgresql:// to psycopg v3; GRID uses psycopg2 throughout.
+sqlalchemy>=2.0.0,<2.1
 alembic>=1.20.0
 
 # Data

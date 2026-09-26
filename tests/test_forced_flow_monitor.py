@@ -19,6 +19,7 @@ from intelligence.forced_flow_monitor import (
     build_morning_briefing,
     build_posture,
     check_gamma_regime,
+    run_forced_flow_cycle,
     scan_thresholds,
     upcoming_calendar_events,
 )
@@ -357,6 +358,80 @@ def test_check_gamma_regime_uses_dealer_gamma_engine_contract(mock_engine):
     assert result.regime == "SHORT_GAMMA"
     assert result.spot == 500.0
     assert result.gamma_flip == 501.0
+
+
+@pytest.mark.unit
+def test_check_gamma_regime_unknown_when_spy_spot_unavailable(mock_engine):
+    """get_market_gex_summary reporting no usable SPY row (the shape
+    physics.dealer_gamma now returns when no measured spot exists) must map
+    to regime UNKNOWN — never a fabricated NEUTRAL/0 regime."""
+    summary = {
+        "snap_date": "2026-09-24",
+        "total_tickers": 0,
+        "aggregate_gex": 0,
+        "aggregate_vanna": 0,
+        "aggregate_charm": 0,
+        "long_gamma_count": 0,
+        "short_gamma_count": 0,
+        "market_regime": "UNKNOWN",
+        "spy_spot": None,
+        "spy_gamma_flip": None,
+        "spy_put_wall": None,
+        "spy_call_wall": None,
+        "spy_gex": None,
+        "tickers": [],
+    }
+    with patch("physics.dealer_gamma.DealerGammaEngine") as engine_cls:
+        engine_cls.return_value.get_market_gex_summary.return_value = summary
+        result = check_gamma_regime(mock_engine)
+
+    assert result.regime == "UNKNOWN"
+    assert result.gamma_flip is None
+    assert result.put_wall is None
+    assert result.call_wall is None
+
+
+@pytest.mark.unit
+def test_scan_thresholds_no_trip_when_regime_unknown_from_missing_data():
+    """UNKNOWN regime (missing spot) must not trip any threshold that is
+    driven by regime/flip/wall data — only a real calendar catalyst may."""
+    regime = GammaRegimeSnapshot(
+        regime="UNKNOWN", spot=0.0, gamma_flip=None,
+        put_wall=None, call_wall=None, aggregate_gex=0.0,
+        snapshot_date="2026-09-24",
+    )
+    thresholds = scan_thresholds(regime, events=[])
+    tripped = {t.name for t in thresholds if t.tripped}
+    assert tripped == set()
+
+
+@pytest.mark.unit
+def test_waterfall_cycle_no_alert_when_regime_unknown_from_missing_spot(mock_engine):
+    """End-to-end: missing spot -> UNKNOWN regime -> zero tripped thresholds
+    -> run_forced_flow_cycle never calls send_waterfall_alert."""
+    unknown_regime = GammaRegimeSnapshot(
+        regime="UNKNOWN", spot=0.0, gamma_flip=None,
+        put_wall=None, call_wall=None, aggregate_gex=0.0,
+        snapshot_date="2026-09-24",
+    )
+    with patch(
+        "intelligence.forced_flow_monitor.check_gamma_regime",
+        return_value=unknown_regime,
+    ), patch(
+        "intelligence.forced_flow_monitor.upcoming_calendar_events",
+        return_value=[],
+    ), patch(
+        "intelligence.forced_flow_monitor.persist_briefing", return_value=1,
+    ), patch(
+        "alerts.waterfall_watch.send_waterfall_alert"
+    ) as mock_alert:
+        result = run_forced_flow_cycle(mock_engine)
+
+    assert result["status"] == "ok"
+    assert result["regime"] == "UNKNOWN"
+    assert result["waterfall_risk_score"] == 0
+    assert result["tripped_conditions"] == []
+    mock_alert.assert_not_called()
 
 
 @pytest.mark.unit

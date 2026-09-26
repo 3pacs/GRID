@@ -22,9 +22,10 @@ from __future__ import annotations
 
 import inspect
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 from loguru import logger as loguru_logger
 
@@ -196,6 +197,63 @@ class TestQuoteLiveFallback:
         assert data["change_pct"] == 0.01
         assert data["as_of"] == str(date.today())
         assert data["stale"] is False
+
+
+class TestSpyIntradayQuote:
+    @staticmethod
+    def _wire_spy(mock_engine, candle):
+        mock_conn = MagicMock()
+        prices = MagicMock()
+        # Daily fixtures must follow the bar's date, even just after midnight
+        # when a recent delayed bar still belongs to the previous UTC day.
+        bar_date = (candle[1] + timedelta(minutes=5)).date()
+        prices.fetchall.return_value = [
+            (104.0, bar_date),
+            (100.0, bar_date - timedelta(days=1)),
+        ]
+        options = MagicMock()
+        options.fetchone.return_value = None
+        realtime = MagicMock()
+        realtime.fetchone.return_value = candle
+        mock_conn.execute.side_effect = [prices, options, realtime]
+        _wire_engine(mock_engine, mock_conn)
+        return mock_conn
+
+    @pytest.mark.parametrize("now", [
+        datetime(2026, 9, 24, 18, 0, tzinfo=timezone.utc),
+        datetime(2026, 9, 25, 0, 10, tzinfo=timezone.utc),
+    ], ids=["daytime", "utc-midnight"])
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_recent_delayed_bar_beats_daily_price_with_its_own_timestamp(self, mock_engine, now):
+        bucket = now - timedelta(minutes=20)
+        conn = self._wire_spy(mock_engine, (105.0, bucket))
+
+        with patch("api.routers.watchlist_overview.datetime", wraps=datetime) as clock:
+            clock.now.return_value = now
+            response = client.get("/api/v1/watchlist/SPY/quote", headers=_auth_header())
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["price"] == 105.0
+        assert data["change_pct"] == 0.05
+        assert data["source"] == "yahoo_intraday"
+        assert data["price_tier"] == "intraday_delayed"
+        assert data["price_bar_end_at"] == (bucket + timedelta(minutes=5)).isoformat()
+        assert "realtime_candles" in str(conn.execute.call_args_list[2].args[0])
+
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_old_bar_keeps_daily_price(self, mock_engine):
+        bucket = datetime.now(timezone.utc) - timedelta(minutes=50)
+        self._wire_spy(mock_engine, (105.0, bucket))
+
+        response = client.get("/api/v1/watchlist/SPY/quote", headers=_auth_header())
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["price"] == 104.0
+        assert data["source"] == "grid"
+        assert data["price_tier"] == "daily"
+        assert data["price_bar_end_at"] is None
 
 
 class TestQuoteQueryCollapsesVintages:

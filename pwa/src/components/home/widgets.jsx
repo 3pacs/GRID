@@ -157,6 +157,14 @@ function TickerPulseCard({ title, props }) {
                             </span>
                         )}
                     </div>
+                    {data?.price_tier === 'intraday_delayed' && data?.price_bar_end_at && (
+                        <div style={CS.body}>
+                            Delayed intraday price · bar ended {data.price_bar_end_at.slice(11, 16)} UTC
+                        </div>
+                    )}
+                    {data?.price_tier === 'daily' && data?.as_of && (
+                        <div style={CS.body}>Daily price · {data.as_of}</div>
+                    )}
                     {data?.sentiment && <MoodBadge raw={data.sentiment} />}
                     {line ? <div style={CS.body}>{line}</div>
                         : <Empty msg={`${tickerName(ticker)}'s price isn’t updating right now (the market may be closed).`} />}

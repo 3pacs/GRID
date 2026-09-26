@@ -105,7 +105,10 @@ describe('RiskMap truthfulness', () => {
         // Treemap subtitles must not print a default 0 for an unmeasured sub-system.
         expect(document.body.textContent).not.toMatch(/Top5: 0%/);
         expect(document.body.textContent).not.toMatch(/Fed: 0/);
-        expect(document.body.textContent).toMatch(/no data/);
+        // D3 updates the metric text in a 600 ms transition after the chips render.
+        await waitFor(() => {
+            expect(document.body.textContent).toMatch(/no data/);
+        }, { timeout: 2000 });
     });
 
     it('source contains no random walk and no synthetic timeline', () => {
