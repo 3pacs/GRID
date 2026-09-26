@@ -3,13 +3,13 @@
 Old batches remain NULL and reader-unavailable; no source timestamp is inferred
 from capture time or a legacy daily signal.
 
-Revision ID: options_source_quote_time_20260925
+Revision ID: options_quote_time_20260925
 Revises: options_capture_batch_20260924
 """
 
 from alembic import op
 
-revision = "options_source_quote_time_20260925"
+revision = "options_quote_time_20260925"
 down_revision = "options_capture_batch_20260924"
 branch_labels = None
 depends_on = None

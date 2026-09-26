@@ -20,7 +20,7 @@ from sqlalchemy.engine import URL, make_url
 
 from ingestion import options
 from migrations.versions import options_capture_batch_20260924 as migration
-from migrations.versions import options_source_quote_time_20260925 as source_migration
+from migrations.versions import options_quote_time_20260925 as source_migration
 from physics.dealer_gamma import DealerGammaEngine
 
 _SYNTHETIC_SESSION_AT = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
