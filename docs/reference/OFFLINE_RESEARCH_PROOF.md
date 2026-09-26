@@ -28,8 +28,10 @@ The discovery manifest is hashed and written before holdout evaluation. Holdout
 tests only frozen discovery survivors, with a Bonferroni correction over that
 frozen family and the same effect sign. Its horizon must match discovery. The
 local candidate spec records family, direction, horizon, manifest and earliest
-forward start. Its hash and status remain `FORWARD_EVIDENCE_PENDING`, never
-PASSED/confirmed/promoted. All results report zero forward evidence, and no
+forward start. Its status is never PASSED/confirmed/promoted. Since S10 it is
+tagged by origin: only a `latest_vintage_read` candidate is
+`FORWARD_EVIDENCE_PENDING`; a synthetic or replay "candidate" carries
+`SYNTHETIC_PROOF_ONLY` / `EXPLORATORY_REPLAY_ONLY`. All results report zero forward evidence, and no
 promotion API exists. The output directory must be new, so a consumed local
 holdout receipt cannot be overwritten by accident. This is not a global
 anti-rerun service: an operator can deliberately create another directory.
@@ -451,6 +453,53 @@ not move. "Longer blocks selected more" therefore shows that block 1 was
 mis-calibrated in both directions. It is not evidence that the selections are
 robust.
 
+## S10: prospective forward log (2026-09-26)
+
+Rules: `docs/paper_log/hypothesis-forward-v1-preregistration.md` (its LF
+sha256 is pinned as `research_forward_log.PREREG_SHA256` and written into the
+log's header record). Code: `analysis/research_forward_log.py`, CLI
+`scripts/research_forward_log.py`, cron wrapper
+`deploy/paper_log/hypothesis_forward_v1.sh`. Tests:
+`python -m pytest tests/test_research_forward_log.py -q`.
+
+- **Log.** Append-only JSONL, same pattern as the GEX paper log: every record
+  carries `prev_sha256` (sha256 of the previous canonical JSON line), the
+  code commit and its run time; the first record is a header with the
+  pre-registration hash. `verify` walks the chain; `run` and `admit` refuse to
+  append to a broken chain, and `STATUS.md` says BROKEN. The chain cannot
+  detect an edit to the last line on its own: the head hash in `STATUS.md`
+  (and any off-host mirror of it) is the anchor.
+- **Starts empty.** `run` on an empty log writes the header only. Candidates
+  enter only through `admit` from one scan directory, all or none. The scan
+  must be `latest_vintage_read` on code that descends from the #661 head
+  `4506ce48` (checked with `git merge-base --is-ancestor` in a named clone,
+  and the scan's recorded file sha256s must equal the files at its commit);
+  its summary must rebuild the signed read receipt; every candidate must be a
+  selected, holdout-surviving, non-`self_lag` trial in state
+  `FORWARD_EVIDENCE_PENDING`; and the candidate set must be exactly the
+  holdout survivors (it fixes the Bonferroni family). Synthetic, replay,
+  `pit_vintage_read`, `SELF_LAG*`, `RESCAN_REQUIRED` and relabelled scans are
+  refused, and the ef0d564b manifest is refused by name.
+- **Forward evaluation.** Decisions are business days at 00:00Z strictly after
+  the admission (freeze), every `max(step, h)` sessions. A prediction is the
+  feature value GRID held at the decision instant (`read_window` with
+  `as_of_ts` = the decision, plus the declared publication time), logged
+  before its label's publication time; otherwise it is excluded as
+  `late_prediction`. An outcome is read only after that publication time.
+  The evaluation re-checks all of this from the log for every pair.
+- **Stop rule.** One look on the first `min_n` valid pairs: one-sided
+  block-permutation test (9,999 perms, seed 20260926, frozen discovery block
+  capped at `min_n // 8`), alpha 0.05 / (candidates admitted from the scan).
+  `FORWARD_SUPPORTED_REVIEW_REQUIRED`, `FORWARD_FAILED`, or
+  `FORWARD_INCONCLUSIVE_STOPPED` after `2 * min_n` decisions. Every state keeps
+  `promotion_allowed: false`. `status` shows activity only until the verdict.
+- **Operator steps (not automated).** Install the code like the GEX log (an
+  immutable `git -c core.autocrlf=false archive` under
+  `/data/grid/paper_log/code/<sha>/` with a `VERSION` file), then add one
+  crontab line (see the wrapper's header; grid-svr cron runs in UTC). Admit a
+  post-#661 scan with `python -m scripts.research_forward_log admit --log-dir
+  /data/grid/paper_log/hypothesis_forward_v1 --scan-dir SCAN --repo CLONE`.
+
 ## Lineage and boundaries
 
 Claude's corrected vault #101 retracts its original leaking 12/3 survivors and
@@ -482,8 +531,9 @@ reads `hypothesis_registry`, `discovered_hypotheses` or `scanner_weights`.
   to 5%. Since S09, fixed-step runs are diagnostic only for this reason.
 - A durable cross-run trial budget and single-use holdout registry; authenticated
   code/protocol/input hashes; no repeated tuning against the same holdout.
-- Prospective prediction logging before outcomes, frozen sample-size and stopping
-  rules, forward scoring and an independently reviewed promotion policy.
+- An independently reviewed promotion policy. (Prospective prediction logging,
+  frozen sample-size and stopping rules and forward scoring exist since S10,
+  in code; the grid-svr cron is not installed until the owner approves it.)
 
 Those requirements are intentionally unresolved here. Synthetic mechanism
 success and a zero-survivor replay do not authorize live research, learning,

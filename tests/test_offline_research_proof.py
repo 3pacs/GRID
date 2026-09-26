@@ -28,8 +28,9 @@ def test_finished_vertical_slice_never_promotes(tmp_path):
     assert result["candidates"]
     assert result["forward_evidence_count"] == 0
     assert not result["promotion_allowed"]
+    # S10 (#658 review): a synthetic candidate never waits for forward evidence
     assert all(
-        c["state"] == "FORWARD_EVIDENCE_PENDING" and not c["promotion_allowed"]
+        c["state"] == "SYNTHETIC_PROOF_ONLY" and not c["promotion_allowed"]
         for c in result["candidates"]
     )
     assert (tmp_path / "proof/discovery-frozen.json").exists()
