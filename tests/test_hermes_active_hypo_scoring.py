@@ -26,7 +26,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from intelligence import hypothesis_engine
 from intelligence.hypothesis_engine import score_due_active_hypotheses
+
+
+@pytest.fixture(autouse=True)
+def _scoring_unheld(monkeypatch):
+    # These tests pin the scorer's behaviour when enabled; the production
+    # hold (ACTIVE_HYPOTHESIS_SCORING_HELD) is covered by
+    # tests/test_hypothesis_scoring_hold.py.
+    monkeypatch.setattr(hypothesis_engine, "ACTIVE_HYPOTHESIS_SCORING_HELD", False)
 
 
 def _stub_engine(due_ids: list[str]) -> MagicMock:
