@@ -517,7 +517,13 @@ class Settings(BaseSettings):
     HERMES_Z4_URL: str = "http://gridz4:8080"  # gridz4 llama.cpp node, GTX 1080/P1000
 
     # Autoresearch (self-improvement loop)
-    AUTORESEARCH_ENABLED: bool = True
+    # Dead flag until now — nothing in the codebase read it, so it never
+    # gated anything (verified 2026-09-19: grep found only this
+    # declaration). Default OFF so a deployment never activates research
+    # on its own; enable with env AUTORESEARCH_ENABLED=true under explicit
+    # operator authorisation. See scripts/hermes_fixers.py::
+    # maybe_run_autoresearch and scripts/hermes_operator.py's cycle-6 gate.
+    AUTORESEARCH_ENABLED: bool = False
     AUTORESEARCH_CRON: str = "0 2 * * 1-5"   # weekdays 2 AM
     AUTORESEARCH_MAX_ITER: int = 5
     AUTORESEARCH_LAYER: str = "REGIME"

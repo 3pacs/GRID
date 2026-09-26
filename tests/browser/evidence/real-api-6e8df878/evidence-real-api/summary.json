@@ -1,0 +1,29 @@
+{
+  "base": "http://localhost:5175",
+  "journeys": {
+    "home": {
+      "ready": "timeout",
+      "ready_wait_ms": 10220,
+      "crashed": false,
+      "text_len": 478
+    },
+    "ticker-lookup": {
+      "ready": "ok",
+      "ready_wait_ms": 2,
+      "crashed": false,
+      "text_len": 1194
+    },
+    "watchlist-analysis": {
+      "ready": "timeout",
+      "ready_wait_ms": 10194,
+      "crashed": false,
+      "text_len": 383
+    },
+    "godview": {
+      "ready": "ok",
+      "ready_wait_ms": 38,
+      "crashed": false,
+      "text_len": 1424
+    }
+  }
+}

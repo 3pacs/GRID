@@ -299,15 +299,23 @@ function ScannerCard({ item }) {
    ═══════════════════════════════════════════════════════════════════ */
 
 const sanityLayerNames = ['Volatility', 'Liquidity', 'Greeks', 'Regime', 'Risk'];
+const persistedSanityLayers = [
+    ['DATA_QUALITY', 'Data quality'],
+    ['DEALER_FLOW', 'Dealer flow'],
+    ['CROSS_ASSET', 'Cross asset'],
+    ['LLM_REVIEW', 'LLM review'],
+    ['HISTORICAL_ANALOG', 'Historical analog'],
+];
 
 function SanityDots({ checks }) {
-    // checks: array of { layer, status } or null
-    const layers = checks || sanityLayerNames.map(() => null);
+    // The persisted producer stores a keyed sanity_status object; live cards
+    // may still supply the legacy positional sanity_checks array.
+    const layers = Array.isArray(checks)
+        ? sanityLayerNames.map((name, i) => ({ name, status: checks[i]?.status || checks[i] }))
+        : persistedSanityLayers.map(([key, name]) => ({ name, status: checks?.[key]?.status }));
     return (
         <div style={{ display: 'flex', gap: '4px', alignItems: 'center' }} title="Sanity checks">
-            {sanityLayerNames.map((name, i) => {
-                const check = Array.isArray(layers) ? layers[i] : null;
-                const status = check?.status || check;
+            {layers.map(({ name, status }) => {
                 const bg = status === 'PASS' ? colors.green
                     : status === 'FAIL' ? colors.red
                     : '#3A4A5A';
@@ -424,6 +432,9 @@ const outcomeColors = {
 function TradeRecommendationCard({ rec }) {
     const dir = rec.direction || 'CALL';
     const dirColor = dir === 'CALL' ? colors.green : colors.red;
+    const entry = rec.entry_price ?? rec.entry;
+    const target = rec.target_price ?? rec.target;
+    const stop = rec.stop_loss ?? rec.stop;
     const expReturn = rec.expected_return != null ? (rec.expected_return * 100).toFixed(1) : null;
     const kelly = rec.kelly_fraction != null ? (rec.kelly_fraction * 100).toFixed(1) : null;
 
@@ -446,6 +457,15 @@ function TradeRecommendationCard({ rec }) {
                 <ConfidenceCircle value={rec.confidence} />
             </div>
 
+            {rec.data_status && (
+                <div style={{ marginTop: '6px', fontSize: '10px', color: rec.data_status === 'stale' ? colors.red : colors.textMuted }}>
+                    {rec.data_status === 'stale' ? 'STALE SAVED RECOMMENDATION'
+                        : rec.data_status === 'unknown_age' ? 'SAVED RECOMMENDATION · AGE UNKNOWN'
+                            : 'SAVED RECOMMENDATION'}
+                    {rec.generated_at ? ` · ${rec.generated_at.slice(0, 10)} UTC` : ''}
+                </div>
+            )}
+
             {/* Key numbers row */}
             <div style={{
                 display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)',
@@ -454,9 +474,9 @@ function TradeRecommendationCard({ rec }) {
                 {[
                     { label: 'Strike', value: rec.strike != null ? `$${rec.strike.toFixed(0)}` : '--' },
                     { label: 'Expiry', value: rec.expiry || '--' },
-                    { label: 'Entry', value: rec.entry != null ? `$${rec.entry.toFixed(2)}` : '--' },
-                    { label: 'Target', value: rec.target != null ? `$${rec.target.toFixed(2)}` : '--' },
-                    { label: 'Stop', value: rec.stop != null ? `$${rec.stop.toFixed(2)}` : '--' },
+                    { label: 'Entry', value: entry != null ? `$${entry.toFixed(2)}` : '--' },
+                    { label: 'Target', value: target != null ? `$${target.toFixed(2)}` : '--' },
+                    { label: 'Stop', value: stop != null ? `$${stop.toFixed(2)}` : '--' },
                 ].map(m => (
                     <div key={m.label} style={styles.metricBox}>
                         <div style={{ ...styles.metricLabel, fontSize: '9px' }}>{m.label}</div>
@@ -466,7 +486,7 @@ function TradeRecommendationCard({ rec }) {
             </div>
 
             {/* Risk/Reward bar */}
-            <RiskRewardBar stop={rec.stop} entry={rec.entry} target={rec.target} />
+            <RiskRewardBar stop={stop} entry={entry} target={target} />
 
             {/* Expected return + Kelly + Sanity */}
             <div style={{
@@ -493,7 +513,7 @@ function TradeRecommendationCard({ rec }) {
                         </span>
                     )}
                 </div>
-                <SanityDots checks={rec.sanity_checks} />
+                <SanityDots checks={rec.sanity_status ?? rec.sanity_checks} />
             </div>
 
             {/* Thesis */}
@@ -571,6 +591,8 @@ function TradeHistoryCard({ rec }) {
 
 function TradesTab() {
     const [recs, setRecs] = useState([]);
+    const [savedStatus, setSavedStatus] = useState(null);
+    const [savedAt, setSavedAt] = useState(null);
     const [history, setHistory] = useState([]);
     const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
@@ -590,6 +612,8 @@ function TradesTab() {
                 setError('Failed to load trade recommendations');
             }
             setRecs(active?.error ? [] : (active.recommendations || []));
+            setSavedStatus(active?.error ? 'unavailable' : active?.scan_summary?.data_status);
+            setSavedAt(active?.generated_at || null);
             setHistory(hist?.error ? [] : (hist.history || hist.recommendations || []));
         } catch (e) {
             setError('Failed to load trade recommendations');
@@ -660,8 +684,21 @@ function TradesTab() {
             </div>
 
             {/* Active Recommendations */}
-            {recs.length === 0 ? (
-                <div style={styles.emptyState}>No active trade recommendations</div>
+            {savedStatus === 'stale' && (
+                <div role="status" style={styles.emptyState}>
+                    Saved recommendations are stale{savedAt ? ` (last generated ${savedAt.slice(0, 10)} UTC)` : ''}. No fresh scan was run.
+                </div>
+            )}
+            {savedStatus === 'unknown_age' && (
+                <div role="status" style={styles.emptyState}>
+                    Saved recommendation age is unknown. No fresh scan was run.
+                </div>
+            )}
+            {savedStatus === 'unavailable' && (
+                <div role="status" style={styles.emptyState}>Saved trade recommendations are unavailable.</div>
+            )}
+            {recs.length === 0 && savedStatus !== 'unavailable' ? (
+                <div style={styles.emptyState}>No saved active trade recommendations</div>
             ) : (
                 recs.map((r, i) => (
                     <TradeRecommendationCard key={`${r.ticker}-${r.strike}-${i}`} rec={r} />
@@ -708,21 +745,65 @@ function TradesTab() {
 export function TickerRecommendations({ ticker }) {
     const [recs, setRecs] = useState([]);
     const [loading, setLoading] = useState(true);
+    const [availability, setAvailability] = useState('loading');
+    const [savedStatus, setSavedStatus] = useState(null);
+    const [savedAt, setSavedAt] = useState(null);
 
     useEffect(() => {
-        if (!ticker) return;
+        if (!ticker) {
+            setRecs([]);
+            setAvailability('empty');
+            setLoading(false);
+            return;
+        }
+        let active = true;
         setLoading(true);
+        setRecs([]);
+        setAvailability('loading');
+        setSavedStatus(null);
+        setSavedAt(null);
         api.getOptionsRecommendations(ticker)
-            .then(data => setRecs(data?.error ? [] : (data.recommendations || [])))
-            .catch(() => setRecs([]))
-            .finally(() => setLoading(false));
+            .then(data => {
+                if (!active) return;
+                if (data?.error || data?.scan_summary?.source === 'unavailable'
+                    || !Array.isArray(data?.recommendations)) {
+                    setAvailability('unavailable');
+                    return;
+                }
+                const tickerRecs = data.recommendations.filter(
+                    rec => rec?.ticker?.toUpperCase() === ticker.toUpperCase(),
+                );
+                setRecs(tickerRecs);
+                setSavedStatus(data?.scan_summary?.data_status);
+                setSavedAt(data?.generated_at || null);
+                setAvailability(tickerRecs.length > 0 ? 'available' : 'empty');
+            })
+            .catch(() => { if (active) setAvailability('unavailable'); })
+            .finally(() => { if (active) setLoading(false); });
+        return () => { active = false; };
     }, [ticker]);
 
     if (loading) return null;
-    if (recs.length === 0) return null;
+    if (availability !== 'available') {
+        return <div role="status" style={styles.emptyState}>
+            {availability === 'empty'
+                ? `No saved trade recommendations for ${ticker}. No fresh scan was run.`
+                : 'Trade recommendations unavailable.'}
+        </div>;
+    }
 
     return (
         <div>
+            {savedStatus === 'stale' && (
+                <div role="status" style={{ ...styles.emptyState, padding: '10px 0' }}>
+                    Saved recommendations are stale{savedAt ? ` (last generated ${savedAt.slice(0, 10)} UTC)` : ''}. No fresh scan was run.
+                </div>
+            )}
+            {savedStatus === 'unknown_age' && (
+                <div role="status" style={{ ...styles.emptyState, padding: '10px 0' }}>
+                    Saved recommendation age is unknown. No fresh scan was run.
+                </div>
+            )}
             <div style={{
                 fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
                 color: colors.accent, fontFamily: "'JetBrains Mono', monospace",

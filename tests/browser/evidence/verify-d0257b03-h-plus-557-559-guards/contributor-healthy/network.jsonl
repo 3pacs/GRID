@@ -1,0 +1,2 @@
+{"ts":"2026-09-18T10:10:18.477Z","role":"contributor","scenario":"healthy","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:10:18.979Z","role":"contributor","scenario":"healthy","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":200}

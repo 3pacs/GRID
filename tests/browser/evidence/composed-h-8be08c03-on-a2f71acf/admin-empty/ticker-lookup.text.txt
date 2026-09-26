@@ -1,0 +1,173 @@
+DAD TICKER LOOKUP
+RXT
+No match
+Get Gold
+RXT
+PURR
+EVIDENCE
+READY
+CHART
+READY
+FINVIZ
+READY
+OPTIONS
+READY
+GOLD VERDICT
+No workbook history yet
+
+This ticker is not showing up in Dad's copied workbook corpus yet.
+
+--
+No workbook rows, so no score.
+WORKBOOK FOOTPRINT
+Mentions
+0
+Files
+0
+Sheets
+0
+Evidence
+0
+DAD-METHOD FIT
+No fit signals yet
+Lookup needs workbook evidence before scoring fit.
+GRID DECISION STACK
+Do not surface hard yet
+0.0
+Hand-picked point awards over the workbook prior plus GRID price, fundamentals, options, signal, regime and freshness checks. Not a backtested or calibrated conviction score - every weight is in `weights`.
+Heuristic score from hand-picked weights (1 terms), not a backtested conviction.
+Dad workbooks
+0.0 pts
+This ticker is not showing up in Dad's copied workbook corpus yet.
+GRID price history
+0.0 pts
+No GRID chart history.
+Finviz fundamentals
+0.0 pts
+0 fields, missing
+GRID options
+0.0 pts
+No options_daily_signals row.
+GRID signals
+0.0 pts
+0 trusted signal rows, 0 TradingView alerts
+Reasons
+GRID does not have enough current evidence for this ticker yet.
+Blockers
+No major blockers in the current stack.
+FINVIZ IN POSTGRES
+unavailable
+0 fields
+missing
+no date
+
+No Finviz snapshot rows found for this ticker yet.
+
+GRID FRESHNESS
+Source age
+yfinance
+missing
+-
+Finviz
+missing
+-
+TradingView
+missing
+-
+Social_Smart_Money
+missing
+-
+SEC_INSIDER
+missing
+-
+Unusual_Whales
+missing
+-
+CHART LANE
+RXT vs Dad's chart question
+Price loading
+Needs market history
+Open TradingView
+Symbol search
+RXT chart lane ready
+PRICE
+1W
+1M
+3M
+6M
+1Y
+No price data for this period
+
+TradingView webhooks are supported when your alerts post into GRID. The button opens your TradingView chart/session for this symbol.
+
+DAD STATS
+What to show him first
+Chart Quality
+
+Dad checks whether the long-term chart is up-and-right and whether it recovered from prior highs.
+
+Show 1Y, 5Y, 10Y trend, drawdown, recovery from high, and QQQ/SPY relative strength.
+Benchmark Fit
+
+He thinks in S&P/QQQ context: what sector or theme am I overweight, missing, or duplicating?
+
+Compare against QQQ/SPY and show whether it adds a new role or just repeats existing exposure.
+Prudent Entry
+
+His buy decision wants zones: speculative, prudent, and back-up-the-truck levels.
+
+Show valuation context, current price versus target zones, and reason not to buy yet.
+Options / Yield
+
+He uses covered calls and spreads to define payoff, premium, stop, and take-profit.
+
+Show premium, days to expiry, return if exercised, max loss, take-profit, and stop-loss.
+Portfolio Role
+
+He wants to know what account, sleeve, and allocation role a name belongs in.
+
+Show sleeve, target size, current exposure, cost basis evidence, and rebalance impact.
+Risk Control
+
+The spreadsheet language repeatedly checks downside, distance from high, stop-loss, and drawdown.
+
+Show what can break the thesis, downside level, debt/liquidity risk, and exit trigger.
+EVIDENCE ROWS
+Workbook hits
+No workbook evidence rows found for this ticker.
+TOP FILES
+Where it appears
+
+No matching files yet.
+
+RISK CHECK
+Before acting
+Workbook footprint is historical evidence, not a live buy/sell recommendation.
+Current price, fundamentals, news, and liquidity still need a fresh market check.
+Regex extraction found no confident workbook footprint for this ticker.
+NEXT CHECKS
+Review queue
+Try the company name or related ticker if this was renamed, delisted, or crypto-like.
+Compare the workbook evidence against a current chart and fundamentals pass.
+Check whether Dad's workbook language is buy, watch, hold, or sell before acting.
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

@@ -1,0 +1,395 @@
+============================= test session starts =============================
+platform win32 -- Python 3.13.15, pytest-9.1.1, pluggy-1.6.0
+rootdir: C:\Users\owner\dev\GRID-fable-wt-integration
+configfile: pytest.ini
+plugins: anyio-4.15.1, timeout-2.4.0, xdist-3.8.0
+collected 82 items
+
+tests\godview\test_cftc_pillar_api_db.py .FF                             [  3%]
+tests\godview\test_cftc_pillar_db.py ...F.....                           [ 14%]
+tests\godview\test_cftc_pillar_pure.py ...........................       [ 47%]
+tests\godview\test_commodity_warehouse_pillar_db.py ....                 [ 52%]
+tests\godview\test_commodity_warehouse_pillar_pure.py ........           [ 62%]
+tests\godview\test_fed_liquidity_pillar_db.py .F.F                       [ 67%]
+tests\godview\test_fed_liquidity_pillar_pure.py .............            [ 82%]
+tests\godview\test_new_pillars_api_db.py F..                             [ 86%]
+tests\test_fed_liquidity_units.py ...........                            [100%]
+
+================================== FAILURES ===================================
+___________ test_api_router_returns_available_generation_end_to_end ___________
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000002093602E3F0>
+
+    def test_api_router_returns_available_generation_end_to_end(godview_pg_engine, monkeypatch):
+        engine = godview_pg_engine
+        contract_key = f"APITEST_{uuid.uuid4().hex[:8]}"
+        contract_code = f"A{uuid.uuid4().hex[:6]}"
+        contracts = {contract_key: {"contract_code": contract_code, "contract_name": "API Test", "asset_class": "test"}}
+        records = build_cot_records(n_weeks=10)
+    
+        with engine.begin() as conn:
+            sid = _ensure_source_catalog_row(conn, f"CFTC_COT_API_TEST_{uuid.uuid4().hex[:8]}")
+            _insert_raw_series_on_schedule(conn, contract_key, records, source_id=sid)
+    
+        last_report_date = date.fromisoformat(records[-1]["report_date_as_yyyy_mm_dd"][:10])
+        result = materialize_cftc_pillar(engine, as_of=last_report_date, contracts=contracts)
+        assert result.status == "SUCCESS"
+    
+        import api.routers.godview_pillars as router_module
+    
+        monkeypatch.setattr(router_module, "get_db_engine", lambda: engine)
+        monkeypatch.setattr(router_module, "CFTC_PILLAR_CONTRACTS", contracts)
+    
+        as_of = last_report_date + timedelta(days=3)  # the Friday release
+        response = router_module.get_cftc_pillar(as_of=as_of, _token="test")
+    
+        assert response["available"] is True
+        assert response["pillar"] == "cftc_positioning"
+>       assert response["include_inferred"] is False
+E       assert Query(False) is False
+
+tests\godview\test_cftc_pillar_api_db.py:124: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_ test_api_router_exposes_availability_basis_and_admits_inferred_rows_when_flagged _
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000209360FD250>
+
+    def test_api_router_exposes_availability_basis_and_admits_inferred_rows_when_flagged(
+        godview_pg_engine, monkeypatch
+    ):
+        """A backfilled (weeks-late) pull -> inferred_schedule: excluded by default,
+        admitted and labelled once ?include_inferred=true is passed through."""
+        engine = godview_pg_engine
+        contract_key = f"APIBACK_{uuid.uuid4().hex[:8]}"
+        contract_code = f"K{uuid.uuid4().hex[:6]}"
+        contracts = {contract_key: {"contract_code": contract_code, "contract_name": "API Backfill", "asset_class": "test"}}
+        report_date = date(2026, 1, 6)  # a Tuesday
+        records = build_cot_records(n_weeks=1, start_date=report_date)
+        release_date = report_date + timedelta(days=3)
+        backfill_pull = datetime.combine(release_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(weeks=10)
+    
+        with engine.begin() as conn:
+            sid = _ensure_source_catalog_row(conn, f"CFTC_COT_API_BACKFILL_{uuid.uuid4().hex[:8]}")
+            for record in records:
+                from godview.cftc_pillar import parse_cot_record
+    
+                parsed = parse_cot_record(record)
+                for metric, value in parsed.metrics.items():
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series (series_id, source_id, obs_date, value, "
+                            "pull_timestamp, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, :pts, 'SUCCESS')"
+                        ),
+                        {
+                            "sid": f"cftc.{contract_key}.{metric}",
+                            "src": sid,
+                            "od": parsed.report_date,
+                            "val": value,
+                            "pts": backfill_pull,
+                        },
+                    )
+    
+        result = materialize_cftc_pillar(engine, as_of=backfill_pull.date(), contracts=contracts)
+        assert result.status == "SUCCESS"
+    
+        import api.routers.godview_pillars as router_module
+    
+        monkeypatch.setattr(router_module, "get_db_engine", lambda: engine)
+        monkeypatch.setattr(router_module, "CFTC_PILLAR_CONTRACTS", contracts)
+    
+        as_of = backfill_pull.date() + timedelta(days=1)
+    
+        default_response = router_module.get_cftc_pillar(as_of=as_of, _token="test")
+>       assert contract_code not in default_response["fields"]
+E       AssertionError: assert 'K2913e4' not in {'K2913e4': {'total_open_interest': {'availability': 'available', 'provenance': 'measured', 'value': 2500000, 'unit': ...ercial_net': {'availability': 'available', 'provenance': 'measured', 'value': -250000, 'unit': 'contracts', ...}, ...}}
+
+tests\godview\test_cftc_pillar_api_db.py:179: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+______________ test_pit_read_excludes_rows_released_after_as_of _______________
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+source_id = 40
+
+    def test_pit_read_excludes_rows_released_after_as_of(godview_pg_engine, source_id):
+        engine = godview_pg_engine
+        contract_key = f"PIT_{uuid.uuid4().hex[:8]}"
+        contract_code = f"P{uuid.uuid4().hex[:6]}"
+        contracts = {contract_key: {"contract_code": contract_code, "contract_name": "PIT Test", "asset_class": "test"}}
+        records = build_cot_records(n_weeks=10)
+    
+        with engine.begin() as conn:
+            _insert_raw_series(conn, contract_key, records, source_id=source_id)
+    
+        last_report_date = date.fromisoformat(records[-1]["report_date_as_yyyy_mm_dd"][:10])
+        result = materialize_cftc_pillar(engine, as_of=last_report_date, contracts=contracts)
+        assert result.status == "SUCCESS"
+    
+        # The newest report's release_date is report_date + 3 days (Friday).
+        newest_release_date = last_report_date + timedelta(days=3)
+    
+        with engine.begin() as conn:
+            # As-of the day BEFORE release: must not see the newest row.
+            before = read_cftc_pillar(conn, newest_release_date - timedelta(days=1), contracts=contracts)
+            after = read_cftc_pillar(conn, newest_release_date, contracts=contracts)
+    
+        before_dates = {r["report_date"] for r in before.rows if r["contract_code"] == contract_code}
+        after_dates = {r["report_date"] for r in after.rows if r["contract_code"] == contract_code}
+    
+        assert last_report_date not in before_dates
+>       assert last_report_date in after_dates
+E       assert datetime.date(2023, 3, 7) in set()
+
+tests\godview\test_cftc_pillar_db.py:239: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_ test_materializer_writes_a_row_on_a_wednesday_when_all_three_components_present _
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+source_id = 48
+
+    def test_materializer_writes_a_row_on_a_wednesday_when_all_three_components_present(
+        godview_pg_engine, source_id
+    ):
+        engine = godview_pg_engine
+        obs_date = date(2026, 9, 16)  # a Wednesday
+        on_schedule = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
+    
+        with engine.begin() as conn:
+            _insert_component(conn, WALCL_SERIES_ID, obs_date, 7_500_000.0, source_id=source_id, pull_timestamp=on_schedule)
+            _insert_component(conn, WTREGEN_SERIES_ID, obs_date, 700_000.0, source_id=source_id, pull_timestamp=on_schedule)
+            _insert_component(conn, RRP_SERIES_ID, obs_date, 300.0, source_id=source_id, pull_timestamp=on_schedule)
+    
+        result = materialize_fed_liquidity_pillar(engine, as_of=obs_date)
+>       assert result.status == "SUCCESS"
+E       AssertionError: assert 'SUCCESS_NOOP' == 'SUCCESS'
+E         
+E         - SUCCESS
+E         + SUCCESS_NOOP
+
+tests\godview\test_fed_liquidity_pillar_db.py:91: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+______________ test_pit_read_excludes_a_row_released_after_as_of ______________
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+source_id = 50
+
+    def test_pit_read_excludes_a_row_released_after_as_of(godview_pg_engine, source_id):
+        engine = godview_pg_engine
+        obs_date = date(2026, 6, 3)  # a Wednesday
+        pts = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
+    
+        with engine.begin() as conn:
+            _insert_component(conn, WALCL_SERIES_ID, obs_date, 7_450_000.0, source_id=source_id, pull_timestamp=pts)
+            _insert_component(conn, WTREGEN_SERIES_ID, obs_date, 680_000.0, source_id=source_id, pull_timestamp=pts)
+            _insert_component(conn, RRP_SERIES_ID, obs_date, 250.0, source_id=source_id, pull_timestamp=pts)
+    
+        result = materialize_fed_liquidity_pillar(engine, as_of=obs_date)
+>       assert result.status == "SUCCESS"
+E       AssertionError: assert 'SUCCESS_NOOP' == 'SUCCESS'
+E         
+E         - SUCCESS
+E         + SUCCESS_NOOP
+
+tests\godview\test_fed_liquidity_pillar_db.py:144: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+___ test_fed_liquidity_route_exposes_per_component_basis_and_derived_fields ___
+
+godview_pg_engine = Engine(postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740)
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000209364696D0>
+
+    def test_fed_liquidity_route_exposes_per_component_basis_and_derived_fields(
+        godview_pg_engine, monkeypatch
+    ):
+        engine = godview_pg_engine
+        obs_date = date(2026, 8, 5)  # a Wednesday
+        pts = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(days=1, hours=20)
+    
+        with engine.begin() as conn:
+            sid = _ensure_source_catalog_row(conn, f"FRED_ROUTE_TEST_{uuid.uuid4().hex[:8]}")
+            for series_id, value in ((WALCL_SERIES_ID, 7_600_000.0), (WTREGEN_SERIES_ID, 720_000.0), (RRP_SERIES_ID, 280.0)):
+                conn.execute(
+                    text(
+                        "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_timestamp, pull_status) "
+                        "VALUES (:sid, :src, :od, :val, :pts, 'SUCCESS')"
+                    ),
+                    {"sid": series_id, "src": sid, "od": obs_date, "val": value, "pts": pts},
+                )
+    
+        result = materialize_fed_liquidity_pillar(engine, as_of=obs_date)
+>       assert result.status == "SUCCESS"
+E       AssertionError: assert 'SUCCESS_NOOP' == 'SUCCESS'
+E         
+E         - SUCCESS
+E         + SUCCESS_NOOP
+
+tests\godview\test_new_pillars_api_db.py:62: AssertionError
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+=================================== PASSES ====================================
+_____________ test_api_router_never_500s_when_the_table_is_absent _____________
+---------------------------- Captured stderr setup ----------------------------
+2026-09-18 11:32:58 | INFO     | config:<module>:767 — GitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)
+2026-09-18 11:32:58 | INFO     | config:<module>:777 — GRID config loaded — environment=development, db=127.0.0.1:55432/griddb_fable_20260918_1740
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+___________ test_migration_added_pit_columns_and_generations_table ____________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+__________ test_materializer_writes_one_generation_and_is_idempotent __________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_____________ test_empty_upstream_does_not_advance_the_generation _____________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+____________ test_partial_refresh_cannot_expose_a_mixed_generation ____________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+__ test_availability_basis_first_release_is_observed_and_included_by_default __
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+__ test_availability_basis_backfill_is_inferred_and_excluded_unless_flagged ___
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_ test_availability_basis_revised_report_date_labels_the_materialized_vintage_inferred _
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_________ test_api_contract_never_configured_for_unknown_pillar_state _________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+______________________ test_migration_added_pit_columns _______________________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+________ test_materializer_writes_a_row_reusing_the_pullers_own_ratio _________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+________ test_missing_total_leaves_the_day_unmaterialized_no_fallback _________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+____ test_read_bounds_by_report_date_since_there_is_no_schedule_based_gate ____
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+______________________ test_migration_added_pit_columns _______________________
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_____ test_missing_component_leaves_the_wednesday_unavailable_no_fallback _____
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+____ test_fed_liquidity_route_never_configured_before_any_materializer_run ____
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+_ test_commodity_warehouse_route_wraps_lme_and_permanently_unavailable_cushing _
+---------------------------- Captured stderr setup ----------------------------
+INFO  [alembic.runtime.migration] Context impl PostgresqlImpl.
+INFO  [alembic.runtime.migration] Will assume transactional DDL.
+=========================== short test summary info ===========================
+PASSED tests/godview/test_cftc_pillar_api_db.py::test_api_router_never_500s_when_the_table_is_absent
+PASSED tests/godview/test_cftc_pillar_db.py::test_migration_added_pit_columns_and_generations_table
+PASSED tests/godview/test_cftc_pillar_db.py::test_materializer_writes_one_generation_and_is_idempotent
+PASSED tests/godview/test_cftc_pillar_db.py::test_empty_upstream_does_not_advance_the_generation
+PASSED tests/godview/test_cftc_pillar_db.py::test_partial_refresh_cannot_expose_a_mixed_generation
+PASSED tests/godview/test_cftc_pillar_db.py::test_availability_basis_first_release_is_observed_and_included_by_default
+PASSED tests/godview/test_cftc_pillar_db.py::test_availability_basis_backfill_is_inferred_and_excluded_unless_flagged
+PASSED tests/godview/test_cftc_pillar_db.py::test_availability_basis_revised_report_date_labels_the_materialized_vintage_inferred
+PASSED tests/godview/test_cftc_pillar_db.py::test_api_contract_never_configured_for_unknown_pillar_state
+PASSED tests/godview/test_cftc_pillar_pure.py::test_parse_cot_record_extracts_all_required_metrics
+PASSED tests/godview/test_cftc_pillar_pure.py::test_parse_cot_record_returns_none_for_unparseable_date
+PASSED tests/godview/test_cftc_pillar_pure.py::test_validate_fixture_accepts_a_clean_constructed_set
+PASSED tests/godview/test_cftc_pillar_pure.py::test_validate_fixture_flags_each_constructed_defect[0-unparseable_report_date]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_validate_fixture_flags_each_constructed_defect[1-missing_metric]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_validate_fixture_flags_each_constructed_defect[2-negative_value]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_validate_fixture_flags_each_constructed_defect[3-commercial_exceeds_open_interest]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_release_date_sets_friday_for_a_tuesday_report
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_release_date_withholds_for_a_non_tuesday_report
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_zscore_none_below_min_history
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_zscore_none_for_a_flat_series
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_zscore_positive_for_an_upward_drifting_series
+PASSED tests/godview/test_cftc_pillar_pure.py::test_compute_percentile_is_100_for_the_series_maximum
+PASSED tests/godview/test_cftc_pillar_pure.py::test_coverage_fraction_for_window_caps_at_one
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[None-insufficient_history]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[97-extreme_long_crowding]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[90-elevated_long_crowding]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[50-neutral]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[10-elevated_short_crowding]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_classify_crowding_thresholds[2-extreme_short_crowding]
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_unknown_without_a_release_date
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_unknown_without_an_available_at
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_observed_for_a_first_release_pulled_on_schedule
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_observed_accepts_the_full_tolerance_window
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_inferred_for_a_backfilled_record_weeks_late
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_inferred_for_a_revised_report_regardless_of_timing
+PASSED tests/godview/test_cftc_pillar_pure.py::test_availability_basis_revised_vs_first_release_side_by_side
+PASSED tests/godview/test_commodity_warehouse_pillar_db.py::test_migration_added_pit_columns
+PASSED tests/godview/test_commodity_warehouse_pillar_db.py::test_materializer_writes_a_row_reusing_the_pullers_own_ratio
+PASSED tests/godview/test_commodity_warehouse_pillar_db.py::test_missing_total_leaves_the_day_unmaterialized_no_fallback
+PASSED tests/godview/test_commodity_warehouse_pillar_db.py::test_read_bounds_by_report_date_since_there_is_no_schedule_based_gate
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_cushing_series_id_is_deliberately_none
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_classify_physical_tightness[None-False]
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_classify_physical_tightness[0.0-False]
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_classify_physical_tightness[0.1-False]
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_classify_physical_tightness[0.3-True]
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_classify_physical_tightness[0.99-True]
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_compute_net_change_none_without_a_prior_observation
+PASSED tests/godview/test_commodity_warehouse_pillar_pure.py::test_compute_net_change_is_the_simple_difference
+PASSED tests/godview/test_fed_liquidity_pillar_db.py::test_migration_added_pit_columns
+PASSED tests/godview/test_fed_liquidity_pillar_db.py::test_missing_component_leaves_the_wednesday_unavailable_no_fallback
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_release_date_sets_thursday_for_a_wednesday_obs
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_release_date_withholds_for_a_non_wednesday_obs
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_net_liquidity_converts_rrp_billions_to_millions
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_net_liquidity_without_conversion_would_be_wrong
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_rrp_pct_of_peak_is_100_at_a_new_high
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_compute_rrp_pct_of_peak_none_below_min_history
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_coverage_fraction_for_window_caps_at_one
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_find_nearest_prior_within_tolerance
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_find_nearest_prior_none_when_nothing_within_tolerance
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_classify_liquidity_regime[None-insufficient_history]
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_classify_liquidity_regime[60000.0-expanding]
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_classify_liquidity_regime[-60000.0-contracting]
+PASSED tests/godview/test_fed_liquidity_pillar_pure.py::test_classify_liquidity_regime[0.0-neutral]
+PASSED tests/godview/test_new_pillars_api_db.py::test_fed_liquidity_route_never_configured_before_any_materializer_run
+PASSED tests/godview/test_new_pillars_api_db.py::test_commodity_warehouse_route_wraps_lme_and_permanently_unavailable_cushing
+PASSED tests/test_fed_liquidity_units.py::test_walcl_and_wtregen_are_millions_rrpontsyd_is_billions
+PASSED tests/test_fed_liquidity_units.py::test_unit_scale_table_is_explicit_never_a_bare_multiplier
+PASSED tests/test_fed_liquidity_units.py::test_normalize_walcl_millions_is_unchanged
+PASSED tests/test_fed_liquidity_units.py::test_normalize_wtregen_millions_is_unchanged
+PASSED tests/test_fed_liquidity_units.py::test_normalize_rrpontsyd_billions_scales_by_1000
+PASSED tests/test_fed_liquidity_units.py::test_normalize_returns_none_for_a_missing_value
+PASSED tests/test_fed_liquidity_units.py::test_normalize_returns_none_for_an_unknown_series_unit
+PASSED tests/test_fed_liquidity_units.py::test_build_net_liquidity_series_computes_the_normalised_value
+PASSED tests/test_fed_liquidity_units.py::test_build_net_liquidity_series_omits_dates_missing_any_component
+PASSED tests/test_fed_liquidity_units.py::test_build_net_liquidity_series_forward_fills_the_weekly_vs_daily_mismatch
+PASSED tests/test_fed_liquidity_units.py::test_regression_pre_fix_arithmetic_was_materially_wrong_on_a_fixture
+FAILED tests/godview/test_cftc_pillar_api_db.py::test_api_router_returns_available_generation_end_to_end
+FAILED tests/godview/test_cftc_pillar_api_db.py::test_api_router_exposes_availability_basis_and_admits_inferred_rows_when_flagged
+FAILED tests/godview/test_cftc_pillar_db.py::test_pit_read_excludes_rows_released_after_as_of
+FAILED tests/godview/test_fed_liquidity_pillar_db.py::test_materializer_writes_a_row_on_a_wednesday_when_all_three_components_present
+FAILED tests/godview/test_fed_liquidity_pillar_db.py::test_pit_read_excludes_a_row_released_after_as_of
+FAILED tests/godview/test_new_pillars_api_db.py::test_fed_liquidity_route_exposes_per_component_basis_and_derived_fields
+======================== 6 failed, 76 passed in 54.78s ========================

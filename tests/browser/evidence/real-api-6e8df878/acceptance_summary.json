@@ -1,0 +1,34 @@
+{
+  "mode": "acceptance",
+  "required_behaviours": {
+    "availability_vintage": {
+      "executed": true,
+      "passed": true
+    },
+    "cheating_predictor_rejected": {
+      "executed": true,
+      "passed": true
+    },
+    "chronological_holdout": {
+      "executed": true,
+      "passed": true
+    },
+    "feature_order_invariance": {
+      "executed": true,
+      "passed": true
+    },
+    "postgres_pit_vintage_proof": {
+      "executed": true,
+      "passed": true
+    },
+    "predictor_used": {
+      "executed": true,
+      "passed": true
+    },
+    "some_required_behaviour": {
+      "executed": true,
+      "passed": false
+    }
+  },
+  "tree_sha": "6e8df878a2f3893deb01ea6ec99a38edeb534440"
+}

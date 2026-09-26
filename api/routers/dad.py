@@ -7,9 +7,12 @@ usable while the ingestion model is still evolving.
 
 from __future__ import annotations
 
+import concurrent.futures
+import copy
 import json
 import os
 import re
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -35,6 +38,102 @@ MAX_FILE_ROWS = 12
 COMPACT_FILE_ROWS = 5
 MAX_SNIPPET_CHARS = 360
 SUMMARY_CACHE_TTL_SECONDS = 300
+
+# Stale-while-revalidate tier for /ticker/{ticker}/gold, in the spirit of
+# /api/v1/flows/sectors' two-tier cache (PR #441, api/routers/flows.py):
+# fresh hit -> return; fresh miss but a still-reasonably-recent row exists ->
+# return that with cache.stale=True; nothing usable at all -> an explicit
+# "unavailable" shape, never a block. flows.py can run a single background
+# warm loop because it has exactly one cache key ("sectors"); dad:gold is
+# keyed per ticker over an effectively unbounded symbol space, so there is
+# no fixed set to pre-warm. The adaptation here is request-bounded instead
+# of proactive: cap how long a request will wait for a fresh compute
+# (GOLD_COMPACT_BUDGET_SECONDS) and fall back to this wider stale window.
+GOLD_STALE_MAX_AGE_SECONDS = int(os.getenv("GRID_DAD_GOLD_STALE_MAX_AGE_SECONDS", str(6 * 3600)))
+
+# Wall-clock budget for computing a cold dad:gold payload. Chosen comfortably
+# under the dad-smoke script's request read timeout, which is
+# `max(args.budget_ms, 15_000) / 1000` seconds (scripts/smoke_dad_path.py
+# step_widget_data) -- i.e. never less than 15s. Measured cold-cache totals
+# from preserved smoke artifacts (00-Agent-Reports/2026-09-19 and -20,
+# releases packet1/batch3/#583/#585): 10.8s-13.0s "ok" and 21.1s-25.1s
+# "broken" (Read timed out 15.0s), all sampled during the ~2-minute
+# post-restart warm-up window where api.main:_sync_deferred_startup and
+# other startup warmers hold DB connections. GOLD_COMPACT_BUDGET_SECONDS
+# is the request's own bound, independent of and smaller than the smoke's
+# floor, so the API -- not the test's socket timeout -- decides when to
+# stop waiting and answer honestly.
+GOLD_COMPACT_BUDGET_SECONDS = float(os.getenv("GRID_DAD_GOLD_BUDGET_SECONDS", "8"))
+
+# Bounds concurrent cold-cache computes across all tickers. Deliberately
+# small and shared (not one ThreadPoolExecutor per request): the goal is to
+# keep a burst of gold requests from adding to exactly the DB-connection
+# pressure that makes them slow in the first place (see
+# api.main:_sync_deferred_startup and the sector-flow-warm/spider-graph-warmer
+# threads in the preserved smoke logs).
+#
+# PER-PROCESS, NOT DEPLOYMENT-WIDE: this executor (and GOLD_COMPACT_MAX_INFLIGHT
+# below) is module-level state inside one Python process. If grid-api ever
+# runs as more than one OS process (uvicorn/gunicorn `--workers N`, multiple
+# systemd instances, etc.), each process gets its own independent executor
+# and in-flight table -- the real ceiling on simultaneous cold computes
+# across the whole deployment is then (this cap) x (process count), not
+# this cap alone.
+#
+# The CHECKED-IN unit, server_setup/grid-api.service (`ExecStart=...
+# uvicorn api.main:app --host 0.0.0.0 --port 8000`, no `--workers` flag,
+# `Type=simple`), describes INTENDED single-process topology as of
+# 2026-09-21 -- that is a fact about the repo, not a live read of grid-svr.
+# This codebase has direct precedent for production drifting from what's
+# tracked in git (the 2026-09-18 god-view incident ran from untracked
+# files on the deployed host). Do not state "grid-api runs as N processes"
+# as settled without a live check at release time (e.g. `systemctl show
+# grid-api -p MainPID`, then confirm exactly one uvicorn worker process
+# under it, or `ss -ltnp` on :8000) -- the checked-in unit is a starting
+# assumption, not a substitute for that read. (Also: docs/deployment.md has
+# a stale example unit showing `--workers 2` that does not match
+# server_setup/grid-api.service; don't use that doc as the source of truth
+# either.) If the live process count is ever more than 1, these two
+# constants' deployment-wide effect is effective_cap = constant x
+# worker_count, not the constant alone.
+_GOLD_COMPACT_EXECUTOR_WORKERS = int(os.getenv("GRID_DAD_GOLD_EXECUTOR_WORKERS", "4"))
+_GOLD_COMPACT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=_GOLD_COMPACT_EXECUTOR_WORKERS,
+    thread_name_prefix="dad-gold-compact",
+)
+
+# Caps the number of *distinct* (ticker, refresh_finviz) computes allowed to
+# be queued-or-running at once, per process (see the per-process note
+# above). max_workers alone only bounds concurrency (threads actually
+# executing); ThreadPoolExecutor's internal work queue is unbounded, so
+# without this cap a burst of many different cold tickers (not repeats of
+# the same one -- single-flight above already covers that case) could queue
+# an ever-growing backlog of orphaned computes behind the fixed-size
+# executor, each still eventually opening a DuckDB handle and ~5 Postgres
+# connections once it gets a worker slot, long after its original caller
+# gave up. Once this cap is hit, a new ticker's cold request is refused a
+# background compute outright and goes straight to the
+# stale-cache-or-honest-unavailable fallback -- see
+# _get_or_start_gold_compact / _build_compact_dad_response.
+GOLD_COMPACT_MAX_INFLIGHT = int(
+    os.getenv("GRID_DAD_GOLD_MAX_INFLIGHT", str(_GOLD_COMPACT_EXECUTOR_WORKERS * 4))
+)
+
+# Single-flight: de-dupes concurrent cold-cache requests for the same ticker
+# onto one shared Future instead of each request independently re-running
+# _load_workbook_context + _load_grid_payload (each of which opens its own
+# DuckDB handle and several Postgres connections). Guarded by its own lock,
+# separate from the executor above. Also doubles as the live "how much
+# background work is outstanding right now" count for the cap above.
+_GOLD_INFLIGHT: dict[str, concurrent.futures.Future] = {}
+_GOLD_INFLIGHT_LOCK = threading.Lock()
+_GOLD_MEMORY_CACHE: dict[tuple[str, str, str, float | None], tuple[datetime, dict[str, Any]]] = {}
+_GOLD_MEMORY_CACHE_LOCK = threading.Lock()
+GOLD_MEMORY_CACHE_MAX_ENTRIES = 512
+_FINVIZ_MEMORY_CACHE: dict[str, tuple[datetime, dict[str, Any]]] = {}
+_FINVIZ_MEMORY_CACHE_LOCK = threading.Lock()
+FINVIZ_MEMORY_CACHE_MAX_ENTRIES = 512
+
 DAD_CACHE_VERSION = "dad-ticker-v2"
 DEFAULT_CHART_POINTS = 220
 MAX_CHART_POINTS = 800
@@ -433,32 +532,53 @@ def _research_db_fingerprint(db_path: Path) -> tuple[str, float | None]:
         return str(db_path), None
 
 
-def _ensure_summary_cache_table(engine: Any) -> None:
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS dad_ticker_summary_cache (
-                    ticker             TEXT PRIMARY KEY,
-                    payload_version    TEXT NOT NULL,
-                    generated_at       TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                    research_db_path   TEXT,
-                    research_db_mtime  DOUBLE PRECISION,
-                    payload            JSONB NOT NULL,
-                    timings            JSONB NOT NULL DEFAULT '{}'::jsonb
-                )
-            """))
-            conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_dad_summary_cache_generated
-                    ON dad_ticker_summary_cache (generated_at DESC)
-            """))
-    except Exception as exc:
-        log.debug("Dad summary cache table unavailable: {e}", e=str(exc))
-
-
-def _read_summary_cache(engine: Any, ticker: str, db_path: Path) -> dict[str, Any] | None:
+def _remember_summary_cache(ticker: str, db_path: Path, payload: dict[str, Any]) -> None:
+    """Bounded per-process cache; a GET never persists a computed payload."""
     path, mtime = _research_db_fingerprint(db_path)
+    key = (ticker, DAD_CACHE_VERSION, path, mtime)
+    now = datetime.now(timezone.utc)
+    with _GOLD_MEMORY_CACHE_LOCK:
+        expired = [item for item, (created, _) in _GOLD_MEMORY_CACHE.items()
+                   if (now - created).total_seconds() > GOLD_STALE_MAX_AGE_SECONDS]
+        for item in expired:
+            del _GOLD_MEMORY_CACHE[item]
+        if key not in _GOLD_MEMORY_CACHE and len(_GOLD_MEMORY_CACHE) >= GOLD_MEMORY_CACHE_MAX_ENTRIES:
+            del _GOLD_MEMORY_CACHE[min(_GOLD_MEMORY_CACHE, key=lambda item: _GOLD_MEMORY_CACHE[item][0])]
+        _GOLD_MEMORY_CACHE[key] = (now, copy.deepcopy(payload))
+
+
+def _read_summary_cache(
+    engine: Any,
+    ticker: str,
+    db_path: Path,
+    *,
+    max_age_seconds: int = SUMMARY_CACHE_TTL_SECONDS,
+) -> dict[str, Any] | None:
+    """Read a cached compact payload no older than `max_age_seconds`.
+
+    Callers pass SUMMARY_CACHE_TTL_SECONDS (the default) for a "fresh" read,
+    or GOLD_STALE_MAX_AGE_SECONDS for the stale-while-revalidate fallback
+    when a fresh compute can't finish inside its budget. `max_age_seconds`
+    is caller-supplied (not always the fixed module constant), so it's bound
+    as a parameter via make_interval rather than interpolated into the SQL
+    string -- see .claude/rules/security.md.
+    """
+    path, mtime = _research_db_fingerprint(db_path)
+    key = (ticker, DAD_CACHE_VERSION, path, mtime)
+    with _GOLD_MEMORY_CACHE_LOCK:
+        remembered = _GOLD_MEMORY_CACHE.get(key)
+    if remembered:
+        generated_at, memory_payload = remembered
+        age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
+        if age_seconds <= max_age_seconds:
+            payload = copy.deepcopy(memory_payload)
+            payload["cache"] = {
+                "hit": True, "stale": age_seconds > SUMMARY_CACHE_TTL_SECONDS,
+                "generated_at": generated_at.isoformat(), "age_seconds": age_seconds,
+                "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
+            }
+            return payload
     try:
-        _ensure_summary_cache_table(engine)
         with engine.connect() as conn:
             row = conn.execute(
                 text(
@@ -468,7 +588,7 @@ def _read_summary_cache(engine: Any, ticker: str, db_path: Path) -> dict[str, An
                     "AND payload_version = :version "
                     "AND research_db_path = :path "
                     "AND research_db_mtime IS NOT DISTINCT FROM :mtime "
-                    f"AND generated_at >= NOW() - INTERVAL '{SUMMARY_CACHE_TTL_SECONDS} seconds' "
+                    "AND generated_at >= NOW() - make_interval(secs => :max_age_seconds) "
                     "LIMIT 1"
                 ),
                 {
@@ -476,6 +596,7 @@ def _read_summary_cache(engine: Any, ticker: str, db_path: Path) -> dict[str, An
                     "version": DAD_CACHE_VERSION,
                     "path": path,
                     "mtime": mtime,
+                    "max_age_seconds": max_age_seconds,
                 },
             ).fetchone()
     except Exception as exc:
@@ -491,46 +612,23 @@ def _read_summary_cache(engine: Any, ticker: str, db_path: Path) -> dict[str, An
             return None
     if not isinstance(payload, dict):
         return None
+    generated_at = _as_utc(row[1])
+    age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds() if generated_at else None
+    # Staleness reflects the row's *actual* age, not the max_age_seconds
+    # window it was queried with -- a stale-tier query (max_age_seconds =
+    # GOLD_STALE_MAX_AGE_SECONDS) can still land on a row that happens to be
+    # brand new (e.g. another concurrent single-flight compute just finished
+    # and wrote it), and that must not be mislabeled stale.
+    is_fresh = age_seconds is not None and age_seconds <= SUMMARY_CACHE_TTL_SECONDS
     payload = dict(payload)
     payload["cache"] = {
         "hit": True,
-        "generated_at": _as_utc(row[1]).isoformat() if _as_utc(row[1]) else str(row[1]),
+        "stale": not is_fresh,
+        "generated_at": generated_at.isoformat() if generated_at else str(row[1]),
+        "age_seconds": age_seconds,
         "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
     }
     return payload
-
-
-def _write_summary_cache(engine: Any, ticker: str, db_path: Path, payload: dict[str, Any], timings: dict[str, float]) -> None:
-    path, mtime = _research_db_fingerprint(db_path)
-    to_store = dict(payload)
-    to_store["cache"] = {"hit": False, "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS}
-    try:
-        _ensure_summary_cache_table(engine)
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO dad_ticker_summary_cache "
-                    "(ticker, payload_version, generated_at, research_db_path, research_db_mtime, payload, timings) "
-                    "VALUES (:ticker, :version, NOW(), :path, :mtime, CAST(:payload AS JSONB), CAST(:timings AS JSONB)) "
-                    "ON CONFLICT (ticker) DO UPDATE SET "
-                    "payload_version = EXCLUDED.payload_version, "
-                    "generated_at = EXCLUDED.generated_at, "
-                    "research_db_path = EXCLUDED.research_db_path, "
-                    "research_db_mtime = EXCLUDED.research_db_mtime, "
-                    "payload = EXCLUDED.payload, "
-                    "timings = EXCLUDED.timings"
-                ),
-                {
-                    "ticker": ticker,
-                    "version": DAD_CACHE_VERSION,
-                    "path": path,
-                    "mtime": mtime,
-                    "payload": json.dumps(to_store, default=str),
-                    "timings": json.dumps(timings, default=str),
-                },
-            )
-    except Exception as exc:
-        log.debug("Dad summary cache write failed for {t}: {e}", t=ticker, e=str(exc))
 
 
 def _ensure_finviz_source_id(engine: Any) -> int:
@@ -745,8 +843,35 @@ def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]
     return cards
 
 
-def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> dict[str, Any]:
+def _remember_finviz_profile(ticker: str, stored: dict[str, Any]) -> None:
+    """Keep a live GET refresh useful to subsequent detail reads in this process."""
+    now = datetime.now(timezone.utc)
+    with _FINVIZ_MEMORY_CACHE_LOCK:
+        expired = [key for key, (created, _) in _FINVIZ_MEMORY_CACHE.items()
+                   if (now - created).total_seconds() > 24 * 3600]
+        for key in expired:
+            del _FINVIZ_MEMORY_CACHE[key]
+        if ticker not in _FINVIZ_MEMORY_CACHE and len(_FINVIZ_MEMORY_CACHE) >= FINVIZ_MEMORY_CACHE_MAX_ENTRIES:
+            del _FINVIZ_MEMORY_CACHE[min(_FINVIZ_MEMORY_CACHE, key=lambda key: _FINVIZ_MEMORY_CACHE[key][0])]
+        _FINVIZ_MEMORY_CACHE[ticker] = (now, copy.deepcopy(stored))
+
+
+def _get_finviz_profile(
+    engine: Any, ticker: str, *, refresh: bool = False, persist_refresh: bool = True
+) -> dict[str, Any]:
     stored = _read_finviz_rows(engine, ticker)
+    from_memory = False
+    if not persist_refresh:
+        with _FINVIZ_MEMORY_CACHE_LOCK:
+            remembered = _FINVIZ_MEMORY_CACHE.get(ticker)
+        if remembered:
+            created, memory_stored = remembered
+            stored_pull = _as_utc(stored.get("latest_pull"))
+            if (datetime.now(timezone.utc) - created).total_seconds() <= 24 * 3600 and (
+                stored_pull is None or created > stored_pull
+            ):
+                stored = copy.deepcopy(memory_stored)
+                from_memory = True
     freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
     scraped = False
     scrape_error: str | None = None
@@ -754,11 +879,32 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
     if refresh and freshness["state"] in {"missing", "aging", "stale"}:
         try:
             pairs = _fetch_finviz_snapshot(ticker)
-            inserted = _store_finviz_snapshot(engine, ticker, pairs)
+            if persist_refresh:
+                inserted = _store_finviz_snapshot(engine, ticker, pairs)
+                stored = _read_finviz_rows(engine, ticker)
+                freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
+                stored["rows_inserted"] = inserted
+            else:
+                now = datetime.now(timezone.utc)
+                live_fields = {}
+                for label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
+                    raw_value = pairs.get(label)
+                    parsed = _parse_finviz_value(raw_value)
+                    if raw_value is None or parsed is None:
+                        continue
+                    live_fields[field_id] = {
+                        "field": field_id, "label": display_label, "group": group,
+                        "raw_value": raw_value, "parsed": parsed,
+                        "numeric_value": float(parsed) if isinstance(parsed, (int, float)) else 0.0,
+                        "obs_date": date.today().isoformat(), "pull_timestamp": now.isoformat(),
+                    }
+                if not live_fields:
+                    raise RuntimeError("no recognized Finviz snapshot fields")
+                stored = {"fields": live_fields, "field_count": len(live_fields),
+                          "latest_pull": now, "latest_obs_date": date.today(), "rows_inserted": 0}
+                freshness = _freshness_state(now, stale_hours=24)
+                _remember_finviz_profile(ticker, stored)
             scraped = True
-            stored = _read_finviz_rows(engine, ticker)
-            freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-            stored["rows_inserted"] = inserted
         except Exception as exc:
             scrape_error = str(exc)
             log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
@@ -770,7 +916,8 @@ def _get_finviz_profile(engine: Any, ticker: str, *, refresh: bool = False) -> d
 
     return {
         "status": status,
-        "source": "postgres+live" if scraped else "postgres",
+        "source": (("postgres+live" if persist_refresh else "live-readonly") if scraped
+                   else "live-memory" if from_memory else "postgres"),
         "freshness": freshness,
         "latest_pull": stored.get("latest_pull").isoformat() if stored.get("latest_pull") else None,
         "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
@@ -1422,10 +1569,13 @@ def _load_grid_payload(
     include_price_history: bool = False,
     chart_points: int | None = None,
     feature_limit: int = 8,
+    persist_finviz_refresh: bool = True,
 ) -> dict[str, Any]:
     try:
         engine = engine or get_db_engine()
-        finviz = _get_finviz_profile(engine, ticker, refresh=refresh_finviz)
+        finviz = _get_finviz_profile(
+            engine, ticker, refresh=refresh_finviz, persist_refresh=persist_finviz_refresh
+        )
         grid = _grid_market_context(
             engine,
             ticker,
@@ -1716,16 +1866,21 @@ def _assemble_dad_response(
     }
 
 
-def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, use_cache: bool = True) -> dict[str, Any]:
-    timings: dict[str, float] = {}
-    engine = get_db_engine()
-    db_path = _research_db_path()
-    if use_cache and not refresh_finviz:
-        cached = _timed("cache_read", timings, lambda: _read_summary_cache(engine, ticker, db_path))
-        if cached:
-            cached.setdefault("performance", {})["cache_read_ms"] = timings["cache_read"]
-            return cached
+def _compute_compact_dad_payload(
+    ticker: str, *, refresh_finviz: bool, engine: Any, db_path: Path
+) -> dict[str, Any]:
+    """Cold-cache compute path: workbook + GRID context, assembled, cached in process.
 
+    Split out of _build_compact_dad_response so it can run inside
+    _GOLD_COMPACT_EXECUTOR, possibly as a single-flight task whose original
+    caller already gave up and returned a stale/degraded response (see
+    _build_compact_dad_response). It still runs to completion and still
+    remembers the result in process here -- bounded by the same DB statement/connection
+    timeouts the rest of the app already relies on, nothing unbounded added
+    by this function -- so the next request for this ticker gets a fresh or
+    stale cache hit instead of repeating the same cold compute.
+    """
+    timings: dict[str, float] = {}
     workbook = _timed(
         "workbook_compact",
         timings,
@@ -1745,13 +1900,287 @@ def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, us
             include_price_history=False,
             chart_points=None,
             feature_limit=8,
+            persist_finviz_refresh=False,
         ),
     )
     payload = _assemble_dad_response(ticker, workbook, grid_payload, timings=timings, compact=True)
-    _timed("cache_write", timings, lambda: _write_summary_cache(engine, ticker, db_path, payload, timings))
+    _timed("cache_write", timings, lambda: _remember_summary_cache(ticker, db_path, payload))
     payload["performance"] = {"timings_ms": timings, "total_ms": round(sum(timings.values()), 1)}
     _log_slow_ticker(ticker, timings, route="gold_compact")
     return payload
+
+
+def _get_or_start_gold_compact(
+    ticker: str, *, refresh_finviz: bool, engine: Any, db_path: Path
+) -> concurrent.futures.Future | None:
+    """Single-flight: share one compute across concurrent requests for the same ticker.
+
+    Without this, a burst of concurrent requests for the same cold ticker
+    (e.g. several PWA widgets/tabs open on the same name) would each
+    independently open a DuckDB handle and issue the same ~5 Postgres round
+    trips, multiplying exactly the DB-connection pressure that makes the
+    compute slow in the first place. Keyed on (ticker, refresh_finviz) since
+    a refresh request must not be satisfied by -- or satisfy -- a plain one.
+
+    Returns None, never submitting anything, when GOLD_COMPACT_MAX_INFLIGHT
+    distinct (ticker, refresh_finviz) computes are already queued or
+    running. Single-flight alone only bounds *repeats of the same ticker*;
+    it does nothing for a burst of many *different* cold tickers, which
+    would otherwise queue an unbounded backlog behind the fixed-size
+    executor (max_workers caps concurrency, not queue depth). At the cap, a
+    new ticker is refused a background compute outright rather than piling
+    onto that backlog -- the caller falls back to stale-cache-or-honest-
+    unavailable immediately, without waiting out the full budget.
+    """
+    key = f"{ticker}:{refresh_finviz}"
+    with _GOLD_INFLIGHT_LOCK:
+        existing = _GOLD_INFLIGHT.get(key)
+        if existing is not None and not existing.done():
+            return existing
+
+        if len(_GOLD_INFLIGHT) >= GOLD_COMPACT_MAX_INFLIGHT:
+            log.warning(
+                "Dad gold_compact inflight cap reached ({n}/{m}) -- refusing a new "
+                "background compute for {t}; falling back to stale/unavailable",
+                n=len(_GOLD_INFLIGHT),
+                m=GOLD_COMPACT_MAX_INFLIGHT,
+                t=ticker,
+            )
+            return None
+
+        holder: dict[str, concurrent.futures.Future] = {}
+
+        def _run() -> dict[str, Any]:
+            try:
+                return _compute_compact_dad_payload(
+                    ticker, refresh_finviz=refresh_finviz, engine=engine, db_path=db_path
+                )
+            finally:
+                with _GOLD_INFLIGHT_LOCK:
+                    if _GOLD_INFLIGHT.get(key) is holder.get("future"):
+                        _GOLD_INFLIGHT.pop(key, None)
+
+        new_future = _GOLD_COMPACT_EXECUTOR.submit(_run)
+        holder["future"] = new_future
+        _GOLD_INFLIGHT[key] = new_future
+        return new_future
+
+
+def _format_age_label(age_seconds: float | None) -> str:
+    if age_seconds is None or age_seconds < 0:
+        return "an unknown amount of time"
+    if age_seconds < 60:
+        return "under a minute"
+    if age_seconds < 3600:
+        return f"{round(age_seconds / 60)}m"
+    return f"{age_seconds / 3600:.1f}h"
+
+
+def _mark_stale_response(payload: dict[str, Any], *, ticker: str) -> dict[str, Any]:
+    """Make a stale-cache fallback visibly stale everywhere a viewer would look.
+
+    _read_summary_cache already sets payload["cache"]["stale"]/"age_seconds",
+    but that alone is easy to miss: the rest of the payload (status,
+    gold.one_liner, decision_stack.blockers) looks identical to a fresh
+    compute -- including the displayed prices and Dad's own buy/watch/sell
+    guidance. A stale response must not appear current. This mutates the
+    returned dict (never the cached row itself -- _read_summary_cache
+    already returns a fresh dict()) so the staleness reaches every surface:
+    a top-level flag, the message banner, the gold verdict text, and the
+    decision-stack blockers list (the same list this file already uses for
+    "Finviz fundamentals are stale" / "Stale or missing source rows").
+    """
+    cache_info = dict(payload.get("cache") or {})
+    age_seconds = cache_info.get("age_seconds")
+    age_label = _format_age_label(age_seconds)
+    notice = (
+        f"Showing a cached snapshot of {ticker} from {age_label} ago -- a live refresh "
+        "is taking longer than usual and did not finish in time. Prices, the gold "
+        "verdict, and the decision stack below may be out of date."
+    )
+
+    payload = dict(payload)
+    payload["stale"] = True
+    cache_info["stale"] = True
+    payload["cache"] = cache_info
+    existing_message = payload.get("message")
+    payload["message"] = f"{notice} {existing_message}" if existing_message else notice
+
+    gold = payload.get("gold")
+    if isinstance(gold, dict):
+        gold = dict(gold)
+        one_liner = gold.get("one_liner") or ""
+        gold["one_liner"] = f"[Cached snapshot, {age_label} old] {one_liner}".strip()
+        payload["gold"] = gold
+
+    decision_stack = payload.get("decision_stack")
+    if isinstance(decision_stack, dict):
+        decision_stack = dict(decision_stack)
+        blockers = list(decision_stack.get("blockers") or [])
+        blockers.insert(
+            0,
+            f"This is a cached snapshot from {age_label} ago, not a live read -- "
+            "treat prices and guidance as potentially out of date.",
+        )
+        decision_stack["blockers"] = blockers[:6]
+        payload["decision_stack"] = decision_stack
+
+    return payload
+
+
+def _unmeasured_gold(one_liner: str) -> dict[str, Any]:
+    """Gold card for 'we do not know', distinct from _gold_from_summary(None)'s 'we checked, there is nothing'.
+
+    _gold_from_summary(None) -- score 0, tone "neutral", verdict "No
+    workbook history yet" -- is a genuine, already-established result: it
+    means Dad's workbook corpus was actually queried and this ticker truly
+    has no footprint in it. A budget/capacity timeout means the opposite:
+    nothing was measured at all. Returning _gold_from_summary(None) verbatim
+    for a timeout would make an unmeasured ticker structurally identical to
+    a measured-and-empty one -- score, tone, and verdict text all the same
+    -- so a consumer reading only the gold card could not tell "verified
+    zero" from "unknown, ask again." score is None (not 0: 0 is a
+    measurement), tone is "unknown" (not any of _gold_from_summary's real
+    tones: strong/watch/light/neutral), and the verdict names the
+    distinction explicitly.
+    """
+    return {
+        "verdict": "Not checked yet",
+        "score": None,
+        "tone": "unknown",
+        "one_liner": one_liner,
+    }
+
+
+def _build_degraded_gold_response(ticker: str, *, elapsed_ms: float, reason: str = "budget_exceeded") -> dict[str, Any]:
+    """Honest 'still loading' shape: nothing usable is cached and no compute finished in time.
+
+    Reuses the same "no data yet" building blocks this module already uses
+    for a missing workbook (_empty_workbook_context) or a failed GRID
+    payload (_empty_grid_payload), assembled through the same
+    _assemble_dad_response the real path uses -- so the overall contract
+    (top-level keys, status="unavailable") is the existing honest-empty
+    shape, not a new divergent one, and carries no fabricated numeric
+    values. The one deliberate exception is the `gold` card itself (see
+    _unmeasured_gold): _assemble_dad_response would otherwise compute it as
+    _gold_from_summary(None), which is indistinguishable from a genuinely
+    measured "no workbook history" ticker -- overridden below, along with
+    the matching decision-stack card/blocker, so a timeout can never read
+    as a measured zero or a neutral verdict.
+
+    `reason` distinguishes "this ticker's own compute exceeded the budget"
+    (budget_exceeded) from "the shared background-compute capacity was
+    already full across other tickers" (capacity_exceeded, see
+    GOLD_COMPACT_MAX_INFLIGHT) -- both are honest-unavailable, but the
+    message and performance flag differ so the two are distinguishable in
+    logs/response for anyone diagnosing a burst.
+    """
+    if reason == "capacity_exceeded":
+        detail = f"too many other tickers are already loading (cap {GOLD_COMPACT_MAX_INFLIGHT})"
+    else:
+        detail = f"budget {GOLD_COMPACT_BUDGET_SECONDS:.0f}s exceeded after {elapsed_ms:.0f}ms"
+    not_measured_note = (
+        f"Dad's workbook and market checks for {ticker} did not complete in time ({detail}). "
+        "This is an unmeasured result, not a verified zero -- try again in a moment."
+    )
+    workbook = _empty_workbook_context(
+        ticker,
+        _research_db_path(),
+        attached=False,
+        status="unavailable",
+        message=f"Still loading {ticker}'s workbook research ({detail}). Try again in a moment.",
+    )
+    grid_payload = _empty_grid_payload(f"Still loading {ticker}'s market context ({detail}).")
+    payload = _assemble_dad_response(ticker, workbook, grid_payload, timings={}, compact=True)
+
+    unmeasured = _unmeasured_gold(not_measured_note)
+    payload["gold"] = unmeasured
+    decision_stack = payload.get("decision_stack")
+    if isinstance(decision_stack, dict):
+        decision_stack = dict(decision_stack)
+        cards = list(decision_stack.get("cards") or [])
+        if cards and cards[0].get("source") == "Dad workbooks":
+            cards[0] = {**cards[0], "state": "unknown", "points": None, "detail": unmeasured["one_liner"]}
+            decision_stack["cards"] = cards
+        blockers = list(decision_stack.get("blockers") or [])
+        blockers.insert(0, not_measured_note)
+        decision_stack["blockers"] = blockers[:6]
+        payload["decision_stack"] = decision_stack
+
+    payload["performance"] = {
+        "budget_exceeded": reason == "budget_exceeded",
+        "capacity_exceeded": reason == "capacity_exceeded",
+        "elapsed_ms": elapsed_ms,
+        "budget_s": GOLD_COMPACT_BUDGET_SECONDS,
+    }
+    payload["cache"] = {"hit": False, "stale": False, "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS}
+    return payload
+
+
+def _build_compact_dad_response(ticker: str, *, refresh_finviz: bool = False, use_cache: bool = True) -> dict[str, Any]:
+    """Return the compact dad:gold payload within a bounded request budget.
+
+    Never blocks past GOLD_COMPACT_BUDGET_SECONDS: a fresh cache hit returns
+    immediately; on a miss, a shared bounded compute (single-flighted per
+    ticker, capacity-capped across tickers) gets up to that budget; if it
+    doesn't finish in time -- or capacity was already full -- a stale cache
+    row (up to GOLD_STALE_MAX_AGE_SECONDS old) is returned, visibly marked
+    stale (see _mark_stale_response), otherwise an explicit "unavailable"
+    payload -- never a fabricated value and never an unbounded wait.
+
+    The budget only ends *this request's wait*, not the compute itself.
+    `future.result(timeout=...)` returning does not touch the worker: it
+    keeps running in _GOLD_COMPACT_EXECUTOR, still holding whatever DB
+    connection or DuckDB handle it currently has checked out (still
+    single-flight-owned until it actually exits -- see
+    _get_or_start_gold_compact's `finally`). There is no cancellation here:
+    nothing about our timeout firing releases, interrupts, or closes that
+    connection. Release happens only when the worker's own blocking call
+    returns or raises and its `with`/`finally` block runs -- which is
+    bounded by the DB/DuckDB's own statement/connection timeouts (already
+    present in production; not modified here), not by GOLD_COMPACT_BUDGET_SECONDS.
+    If that call never returns, the connection is held for as long as the
+    DB-side timeout allows, regardless of how many callers have already
+    given up. Once the worker does unwind, it still fills the local cache so the
+    next request gets a fresh or stale hit instead of repeating the same
+    cold work.
+    """
+    engine = get_db_engine()
+    db_path = _research_db_path()
+    if use_cache and not refresh_finviz:
+        cache_timings: dict[str, float] = {}
+        cached = _timed("cache_read", cache_timings, lambda: _read_summary_cache(engine, ticker, db_path))
+        if cached:
+            cached.setdefault("performance", {})["cache_read_ms"] = cache_timings["cache_read"]
+            return cached
+
+    start = time.perf_counter()
+    future = _get_or_start_gold_compact(ticker, refresh_finviz=refresh_finviz, engine=engine, db_path=db_path)
+    if future is None:
+        elapsed = _perf_ms(start)
+        stale = _read_summary_cache(engine, ticker, db_path, max_age_seconds=GOLD_STALE_MAX_AGE_SECONDS)
+        if stale:
+            return _mark_stale_response(stale, ticker=ticker)
+        return _build_degraded_gold_response(ticker, elapsed_ms=elapsed, reason="capacity_exceeded")
+
+    try:
+        return future.result(timeout=GOLD_COMPACT_BUDGET_SECONDS)
+    except concurrent.futures.TimeoutError:
+        elapsed = _perf_ms(start)
+        log.warning(
+            "Dad ticker gold_compact budget exceeded ticker={t} budget_s={b} elapsed_ms={e}",
+            t=ticker,
+            b=GOLD_COMPACT_BUDGET_SECONDS,
+            e=elapsed,
+        )
+    except Exception as exc:
+        elapsed = _perf_ms(start)
+        log.warning("Dad ticker gold_compact failed ticker={t}: {e}", t=ticker, e=str(exc))
+
+    stale = _read_summary_cache(engine, ticker, db_path, max_age_seconds=GOLD_STALE_MAX_AGE_SECONDS)
+    if stale:
+        return _mark_stale_response(stale, ticker=ticker)
+    return _build_degraded_gold_response(ticker, elapsed_ms=elapsed, reason="budget_exceeded")
 
 
 def _sse_event(event: str, payload: dict[str, Any]) -> str:
@@ -1860,7 +2289,9 @@ def _build_finviz_payload(
         "finviz",
         timings,
         lambda: _compact_finviz(
-            _get_finviz_profile(engine, ticker, refresh=refresh_finviz),
+            _get_finviz_profile(
+                engine, ticker, refresh=refresh_finviz, persist_refresh=False
+            ),
             include_fields=True,
         ),
     )
@@ -1903,7 +2334,7 @@ def get_dad_ticker_gold(
     ticker: str,
     refresh_finviz: bool = Query(
         default=False,
-        description="Explicitly refresh the ticker's Finviz snapshot before returning cached rows.",
+        description="Fetch current Finviz fields for this response without storing a snapshot.",
     ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -1952,7 +2383,7 @@ def get_dad_ticker_finviz(
     refresh_finviz: bool = Query(False),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return the full cached Finviz snapshot, optionally refreshing stale rows."""
+    """Return stored Finviz rows or live refreshed fields without persisting a GET."""
     ticker_upper = _normalize_ticker(ticker)
     if not ticker_upper:
         return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}

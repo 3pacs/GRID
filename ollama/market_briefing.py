@@ -150,6 +150,14 @@ class MarketBriefingEngine:
                     for row in feature_rows
                 }
 
+                # SPY put/call ratio — explicit lookup so the briefing writer
+                # has a real number to cite. On 2026-09-23 the LLM published
+                # "P/C ratio of 8.96" though this module had no put/call
+                # input anywhere; number_grounding.py now catches an invented
+                # figure like that, but the better fix is to also give the
+                # model the real one to cite instead. See _fetch_spy_put_call.
+                snapshot["options"] = {"spy_put_call": self._fetch_spy_put_call(conn)}
+
                 # Get latest regime inference if available
                 regime_row = conn.execute(
                     text(
@@ -215,6 +223,75 @@ class MarketBriefingEngine:
 
         return snapshot
 
+    def _fetch_spy_put_call(self, conn: Any) -> dict[str, Any] | None:
+        """Fetch the latest SPY put/call ratio (open interest, all expiries).
+
+        Tries the resolved feature ``spy_pcr`` first — the PIT-correct
+        resolved-series value that ``ingestion/options.py`` writes via the
+        ``OPT:SPY:pcr`` source (see ``normalization/entity_map.py``) — then
+        falls back to reading ``options_daily_signals.put_call_ratio``
+        directly, which is the same figure at its origin table. Returns
+        ``None`` rather than a fabricated number if neither has data, per
+        ``docs/reference/AVAILABILITY_CONTRACT.md``.
+
+        A stored value of exactly 0 is treated as unavailable, not as a
+        real reading: ``spy_pcr`` has repeated ``0`` rows (confirmed via a
+        read-only production query — 2026-09-17 and at least 14 other dates
+        in its history), which is put OI of 0 against real call OI, not a
+        plausible SPY put/call ratio. ``value <= 0`` can only be a bad
+        write for a ratio of two positive open-interest counts; treating it
+        as "no data" and falling back (or reporting unavailable) is the
+        same honesty rule this whole module exists to enforce, applied to
+        its own new input.
+
+        Parameters:
+            conn: Open SQLAlchemy connection, reused from the caller's
+                ``with self.engine.connect() as conn:`` block.
+
+        Returns:
+            dict with ``value``, ``date`` (as_of, as text), and ``source``,
+            or None if unavailable.
+        """
+        try:
+            from sqlalchemy import text
+
+            row = conn.execute(
+                text(
+                    "SELECT rs.value, rs.obs_date "
+                    "FROM resolved_series rs "
+                    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+                    "WHERE fr.name = :name "
+                    "ORDER BY rs.obs_date DESC LIMIT 1"
+                ),
+                {"name": "spy_pcr"},
+            ).fetchone()
+            if row and row[0] is not None and float(row[0]) > 0:
+                return {
+                    "value": round(float(row[0]), 4),
+                    "date": str(row[1]),
+                    "source": "spy_pcr",
+                }
+
+            row = conn.execute(
+                text(
+                    "SELECT put_call_ratio, signal_date "
+                    "FROM options_daily_signals "
+                    "WHERE ticker = :ticker AND put_call_ratio IS NOT NULL "
+                    "ORDER BY signal_date DESC LIMIT 1"
+                ),
+                {"ticker": "SPY"},
+            ).fetchone()
+            if row and row[0] is not None and float(row[0]) > 0:
+                return {
+                    "value": round(float(row[0]), 4),
+                    "date": str(row[1]),
+                    "source": "options_daily_signals",
+                }
+        except Exception as exc:
+            log.warning("Could not fetch SPY put/call ratio: {e}", e=str(exc))
+
+        return None
+
     def _build_data_context(self, snapshot: dict[str, Any]) -> str:
         """Convert market snapshot to a readable text block for the LLM.
 
@@ -262,6 +339,27 @@ class MarketBriefingEngine:
                     lines.append(f"- {name}: {info['value']} (as of {info['date']})")
                     shown += 1
                 lines.append("")
+
+        # SPY put/call ratio — explicit, clearly-labeled section so the
+        # model has a real number to cite instead of inventing one (see
+        # the 2026-09-23 "P/C ratio of 8.96" incident — this section did
+        # not exist and no put/call input reached the prompt at all).
+        pcr = snapshot.get("options", {}).get("spy_put_call")
+        lines.append("### OPTIONS — SPY PUT/CALL RATIO")
+        if pcr:
+            lines.append(
+                "Definition: SPY put/call ratio, open interest, all "
+                "expiries (put open interest / call open interest)."
+            )
+            lines.append(
+                f"- Value: {pcr['value']} (as of {pcr['date']}, "
+                f"source: {pcr['source']})"
+            )
+        else:
+            lines.append(
+                "- Value: unavailable (no spy_pcr / options_daily_signals data)"
+            )
+        lines.append("")
 
         # Latest regime
         regime = snapshot.get("latest_regime")
@@ -418,12 +516,27 @@ class MarketBriefingEngine:
             content = self._generate_fallback_briefing(snapshot)
             log.warning("LLM unavailable — using fallback briefing")
 
+        # ── Number-grounding gate ──
+        # Runs on every generated briefing before it is written: numeric
+        # claims (decimals, percents, $ amounts, ratios) must be backed by
+        # a number actually present in `data_context` — the same text
+        # handed to the LLM above. Catches invented figures with no basis
+        # at all (the 2026-09-23 "P/C ratio of 8.96" incident) that a
+        # prompt instruction alone did not stop. See ollama/number_grounding.py.
+        from ollama.number_grounding import check_numbers_grounded
+
+        grounding = check_numbers_grounded(content, data_context)
+        content = grounding.annotated_text
+        grounding_stats = grounding.to_dict()
+        snapshot["grounding"] = grounding_stats
+
         result = {
             "content": content,
             "snapshot": snapshot,
             "timestamp": datetime.now().isoformat(),
             "type": briefing_type,
             "sentiment": sentiment.to_dict() if sentiment else None,
+            "grounding": grounding_stats,
         }
 
         if save:
@@ -431,10 +544,13 @@ class MarketBriefingEngine:
             self._persist_to_db(result)
 
         log.info(
-            "{t} briefing generated — {n} chars, sentiment={s}",
+            "{t} briefing generated — {n} chars, sentiment={s}, "
+            "grounding={u}/{gt} unverified",
             t=briefing_type,
             n=len(content),
             s=sentiment.label if sentiment else "N/A",
+            u=len(grounding.ungrounded),
+            gt=grounding.total_numbers,
         )
         return result
 
@@ -639,6 +755,11 @@ class MarketBriefingEngine:
     def _save_briefing(self, result: dict[str, Any]) -> None:
         """Save a briefing to disk as a markdown file.
 
+        Also writes a ``<stem>.grounding.json`` sidecar with the
+        number-grounding stats for this briefing (see
+        ``ollama/number_grounding.py``), matching how the rest of this
+        engine's output is written — one file per generated briefing.
+
         Parameters:
             result: Briefing result dict.
         """
@@ -649,6 +770,18 @@ class MarketBriefingEngine:
         with filepath.open("w", encoding="utf-8") as f:
             f.write(result["content"])
             f.write(f"\n\n---\n*Generated: {result['timestamp']}*\n")
+
+        grounding = result.get("grounding")
+        if grounding is not None:
+            sidecar_path = filepath.with_name(f"{filepath.stem}.grounding.json")
+            try:
+                with sidecar_path.open("w", encoding="utf-8") as f:
+                    json.dump(grounding, f, indent=2, default=str)
+            except Exception as exc:
+                log.warning(
+                    "Could not write grounding sidecar {p}: {e}",
+                    p=sidecar_path, e=str(exc),
+                )
 
     @staticmethod
     def cleanup_old_briefings(max_age_days: int = 90) -> int:
@@ -670,6 +803,8 @@ class MarketBriefingEngine:
                     if file_ts < cutoff:
                         f.unlink()
                         deleted += 1
+                        sidecar = f.with_name(f"{f.stem}.grounding.json")
+                        sidecar.unlink(missing_ok=True)
                 except ValueError:
                     continue
         return deleted

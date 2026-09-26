@@ -1,0 +1,68 @@
+DISCOVERY
+?
+ORTHOGONALITY AUDIT
+CLUSTER DISCOVERY
+JOBS
+orthogonality14:30:00
+COMPLETE
+ORTHOGONALITY
+Features analyzed
+40
+True dimensionality
+6
+Correlated pairs
+0
+CLUSTERING
+Best k
+4
+PCA components
+6
+Variance explained
+82.0%
+TESTED HYPOTHESES
+ALL
+PASSED
+FAILED
+TESTING
+TEST1 momentum leads sector flow
+TESTING
+r=+0.420
+lag 3d
+R²=0.180
+REGIME
+Moderate relationship — may be conditionally useful
+HYPOTHESES
+ALL
+CANDIDATE
+TESTING
+PASSED
+FAILED
+KILLED
+PROMOTED
+TEST1 momentum leads sector flow
+TESTING
+2026-09-15
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

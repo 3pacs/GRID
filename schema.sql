@@ -685,6 +685,10 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     implied_vol     DOUBLE PRECISION,
     in_the_money    BOOLEAN,
     created_at      TIMESTAMPTZ DEFAULT NOW(),
+    capture_batch_id TEXT,
+    capture_ordinal BIGINT,
+    capture_started_at TIMESTAMPTZ,
+    capture_completed_at TIMESTAMPTZ,
     UNIQUE (ticker, snap_date, expiry, opt_type, strike)
 );
 
@@ -1112,6 +1116,24 @@ CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
 -- AstroGrid may read from shared GRID inputs, but it writes only here.
 -- ============================================================
 CREATE SCHEMA IF NOT EXISTS astrogrid;
+
+-- New SPY close evidence only. Legacy resolved rows have no receipt and are
+-- deliberately not promoted or backfilled.
+CREATE TABLE IF NOT EXISTS astrogrid.price_close_receipt (
+    id                  BIGSERIAL PRIMARY KEY,
+    contract_version    TEXT NOT NULL CHECK (contract_version = 'spy_close_v1'),
+    raw_series_id       BIGINT NOT NULL UNIQUE REFERENCES raw_series(id),
+    resolved_series_id  BIGINT NOT NULL UNIQUE REFERENCES resolved_series(id),
+    feature_id          INTEGER NOT NULL REFERENCES feature_registry(id),
+    obs_date            DATE NOT NULL,
+    price_basis         TEXT NOT NULL CHECK (price_basis = 'YF:SPY:close'),
+    available_at        TIMESTAMPTZ NOT NULL,
+    value               DOUBLE PRECISION NOT NULL CHECK (value > 0 AND value < 'Infinity'::float8),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (contract_version, feature_id, obs_date)
+);
+CREATE INDEX IF NOT EXISTS idx_price_close_receipt_available
+    ON astrogrid.price_close_receipt (feature_id, obs_date, available_at);
 
 CREATE TABLE IF NOT EXISTS astrogrid.grid_input_allowlist (
     id            BIGSERIAL PRIMARY KEY,
@@ -1762,3 +1784,59 @@ CREATE TABLE IF NOT EXISTS ref_verification_log (
 CREATE INDEX IF NOT EXISTS idx_ref_log_url ON ref_verification_log(url);
 CREATE INDEX IF NOT EXISTS idx_ref_log_classification ON ref_verification_log(classification);
 CREATE INDEX IF NOT EXISTS idx_ref_log_checked_at ON ref_verification_log(checked_at);
+
+-- ---------------------------------------------------------------------------
+-- market_briefings: written by ollama/market_briefing.py (which also creates it
+-- lazily at runtime). Declared here because the Alembic revision
+-- god_view_market_tables_20260918 builds the materialized view
+-- market_god_view_daily on top of it, so a fresh install that applies
+-- schema.sql and then runs `alembic upgrade head` must already have it.
+-- DDL identical to ollama/market_briefing.py; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_briefings (
+    id              SERIAL PRIMARY KEY,
+    briefing_type   TEXT NOT NULL,
+    briefing_date   DATE NOT NULL,
+    content         TEXT NOT NULL,
+    sentiment_score REAL,
+    sentiment_label TEXT,
+    sentiment_data  JSONB,
+    snapshot_data   JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_date
+    ON market_briefings (briefing_date DESC);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_type
+    ON market_briefings (briefing_type, briefing_date DESC);
+
+-- ---------------------------------------------------------------------------
+-- insider_trades: normally created by revision f1a2b3c4d5e6_capital_flow_tables
+-- (and lazily by ingestion/flow_materializer.py). Declared here too because a
+-- database built from schema.sql and stamped at a later revision skips that
+-- revision, and the god-view materialized view (revision
+-- god_view_market_tables_20260918) reads insider_trades. DDL identical to the
+-- revision; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS insider_trades (
+    id              BIGSERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    trade_date      DATE NOT NULL,
+    insider_name    TEXT NOT NULL,
+    insider_title   TEXT,
+    trade_type      TEXT NOT NULL,
+    shares          NUMERIC,
+    value           NUMERIC,
+    price_per_share NUMERIC,
+    filing_date     DATE,
+    is_cluster_buy  BOOLEAN DEFAULT FALSE,
+    signal_source_id INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, trade_date, insider_name, trade_type)
+);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_ticker_date
+    ON insider_trades (ticker, trade_date DESC);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_value
+    ON insider_trades (value DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_cluster_buy
+    ON insider_trades (is_cluster_buy)
+    WHERE is_cluster_buy = TRUE;

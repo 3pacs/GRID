@@ -50,6 +50,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+
 
 # ── Global Central Banks Registry ─────────────────────────────────────
 # Each entry carries the series IDs we try to resolve from raw_series /
@@ -645,7 +647,8 @@ def _build_central_banks_layer(engine: Engine, as_of: date) -> dict:
             if bs_val is not None:  # bs_val is in millions for Fed
                 net_liq = bs_val
                 if reverse_repo is not None:
-                    net_liq -= reverse_repo
+                    # RRPONTSYD is billions; WALCL/WTREGEN are millions
+                    net_liq -= reverse_repo * RRPONTSYD_TO_MILLIONS
                 if tga is not None:
                     net_liq -= tga
 
@@ -656,7 +659,8 @@ def _build_central_banks_layer(engine: Engine, as_of: date) -> dict:
                 rr_1m = _get_fred_value_at(engine, "RRPONTSYD", one_month_ago)
                 tga_1m = _get_fred_value_at(engine, "WTREGEN", one_month_ago)
                 if rr_1m is not None:
-                    net_liq_1m -= rr_1m
+                    # RRPONTSYD is billions; WALCL/WTREGEN are millions
+                    net_liq_1m -= rr_1m * RRPONTSYD_TO_MILLIONS
                 if tga_1m is not None:
                     net_liq_1m -= tga_1m
 
@@ -972,14 +976,21 @@ def _infer_flows(layers: list[dict], engine: Engine, as_of: date) -> list[dict]:
                 if nl_change is not None:
                     abs_vol = abs(nl_change)
                     direction = "inflow" if nl_change > 0 else "outflow"
+                    # The 50% / 30% split of the net-liquidity change into
+                    # equity and bond channels is an assumption, not an
+                    # observed flow, so these edges are "estimated" and
+                    # carry no period-over-period change (an earlier
+                    # version emitted a constant +11.1% "change" computed
+                    # as pct_change(v, 0.9 * v) on every request).
                     flows.append({
                         "from": "fed",
                         "to": "equities",
                         "volume": abs_vol * 0.5,
                         "direction": direction,
-                        "change": _safe_pct_change(abs_vol, abs_vol * 0.9),
+                        "change": None,
                         "label": f"Fed liquidity {'injection' if direction == 'inflow' else 'drain'}",
-                        "confidence": "confirmed",
+                        "confidence": "estimated",
+                        "basis": "net_liquidity_change_1m x 0.5 (assumed equity share)",
                     })
                     flows.append({
                         "from": "fed",
@@ -988,7 +999,8 @@ def _infer_flows(layers: list[dict], engine: Engine, as_of: date) -> list[dict]:
                         "direction": "inflow" if direction == "outflow" else "outflow",
                         "change": None,
                         "label": "Flight to/from safety",
-                        "confidence": "confirmed",
+                        "confidence": "estimated",
+                        "basis": "net_liquidity_change_1m x 0.3 (assumed bond share)",
                     })
                 continue
 
