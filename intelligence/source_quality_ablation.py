@@ -59,6 +59,8 @@ class SourcePredictionStats:
     partials: int = 0
     misses: int = 0
     brier_sum: float = 0.0
+    # Rows whose confidence was actually stated — the Brier denominator.
+    brier_scored_count: int = 0
 
     def record(self, verdict: str, confidence: Any) -> None:
         verdict_norm = str(verdict or "").strip().lower()
@@ -71,6 +73,14 @@ class SourcePredictionStats:
         else:
             return
         self.prediction_count += 1
+        if confidence is None:
+            # An unstated confidence has no probability to score. Counting it
+            # via `_brier_score(None, ...)`, which falls back to p=0.5, would
+            # invent a 50% forecast the model never made. The row still
+            # counts towards hits/misses/hit_rate — only the Brier term is
+            # skipped, so `brier` averages over the scored subset.
+            return
+        self.brier_scored_count += 1
         self.brier_sum += _brier_score(confidence, _outcome_value(verdict_norm))
 
     @property
@@ -85,9 +95,11 @@ class SourcePredictionStats:
 
     @property
     def brier(self) -> Optional[float]:
-        if self.prediction_count <= 0:
+        # Averaged over the rows that actually stated a confidence, not over
+        # every scored row: an unstated confidence is excluded, not imputed.
+        if self.brier_scored_count <= 0:
             return None
-        return self.brier_sum / float(self.prediction_count)
+        return self.brier_sum / float(self.brier_scored_count)
 
 
 @dataclass
