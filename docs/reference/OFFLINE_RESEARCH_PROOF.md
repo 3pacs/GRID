@@ -55,6 +55,8 @@ parallel module.
   fixed step. It allows overlap only when the permutation block is at least
   the measured overlap depth + 1. With v2's weekly step this gives blocks of
   1/1/2/4 for 1/5/10/20-day horizons, and a shorter declared block is refused.
+  Since S09b, overlap depth + 1 is only the floor: the default block is
+  data-driven from the discovery target's lag-1 autocorrelation (see S09b).
 - **(c) Block-permutation null.** The p-value is two-sided against permutations
   of contiguous target blocks. The feature is never permuted, so its
   autocorrelation is kept. Permutations are exact, and a short final block
@@ -86,6 +88,10 @@ trial universe matches. Labels, sampling, the null and BH come from the library.
 | weekly + block null: BH-10% / 5% survivors | 0 / 0 | 0 / 0 |
 | discovery / holdout start | 2025-03-03 / 2026-02-09 | 2025-03-03 / 2026-02-09 |
 
+Since S09b the default block is data-driven, so the replay now uses blocks
+1 and 6 (horizon-spaced) and 1, 2, 4, 5 and 6 (weekly). Both modes still give
+0 / 0 survivors.
+
 Checking per trial against v2's discovery ledger (`--v2-ledger`), every one of
 the 2,640 trials matches `n` and testable status in both modes. The largest
 |rho| gap is 5.0e-5, which is the 4-decimal rounding done by
@@ -108,7 +114,12 @@ measures only frozen selections in the holdout, by design. The test
 `tests/test_offline_research_replay_v2.py` asserts all of the above and takes
 about 35 s locally.
 
-## S09: fixes from the #658 review, PIT origin, real-panel adapter (2026-09-26)
+## S09: fixes from the #658 review, read origin, real-panel adapter (2026-09-26)
+
+S09 named its origin `pit_vintage_read`, its panel `PitPanel` and the protocol
+field `pit_receipt`. S09b renamed them to `latest_vintage_read`,
+`LatestVintagePanel` and `read_receipt`, because the data is not
+point-in-time (see S09b). The S09 text below uses the new names.
 
 Run the tests with `python -m pytest tests/test_offline_research_stats_core.py tests/test_research_real_panel.py tests/test_run_real_panel_scan.py -q`.
 
@@ -124,16 +135,18 @@ Run the tests with `python -m pytest tests/test_offline_research_stats_core.py t
   (phi 0.95) feature against serially independent outcomes gives 4.0% at
   n=60 and 3.9% at n=240, with 800 simulations and 499 permutations. The
   exact size of `p < 0.05` at that resolution is 4.8%. The reviewer measured
-  4.25%.
+  4.25%. This holds only for a serially independent target. S09b shows that
+  block 1 is anti-conservative when the target is autocorrelated.
 - **`change` labels.** `build_family_rows(..., label="change")` labels
   `end - start` for rates, spreads and indexes that can be 0 or negative. The
   label is part of the horizon identity, so a family cannot mix label kinds.
-- **Distinct PIT origin `pit_vintage_read`.** `exploratory_replay` is a
+- **Distinct read origin `latest_vintage_read`.** `exploratory_replay` is a
   self-declared label, so this origin is gated differently. A `Protocol` with
-  this origin must carry `pit_receipt`, the sha256 of a `PitPanel` receipt,
-  and no other origin may carry one. `analysis/research_real_panel.py` is the
-  only constructor of a `PitPanel` (`load_pit_panel`, guarded by a capability
-  token). It reads each declared series once through
+  this origin must carry `read_receipt`, the sha256 of a `LatestVintagePanel`
+  receipt, and no other origin may carry one. `analysis/research_real_panel.py`
+  is the only constructor of a `LatestVintagePanel`
+  (`load_latest_vintage_panel`, guarded by a capability token). It reads each
+  declared series once through
   `store.observations.read_window` with `as_of` and `as_of_ts`: `SUCCESS`
   rows only, the latest vintage per date, nothing pulled after `as_of_ts`.
   `discover` and `evaluate_holdout` re-derive every row from the verified
@@ -145,17 +158,19 @@ Run the tests with `python -m pytest tests/test_offline_research_stats_core.py t
   - a panel changed after its read;
   - a window past `as_of`;
   - a panel passed with any other origin.
-- **Adapter availability rules.** A feature observation dated `d` becomes
-  usable at the first business-day session on or after `d + lag_days`, where
-  `lag_days` is a conservative per-series publication lag: 1 for daily
-  H.15/ICE/VIX, 8 for H.10 FX, 2 for H.4.1. It is then carried forward at
-  most `stale_sessions` sessions. A target's label becomes known at the first
-  session on or after `label_end + lag_days`, and a label not known inside
-  its window is purged.
+- **Adapter availability rules (S09, superseded by S09b).** A feature
+  observation dated `d` became usable at the first session on or after
+  `d + lag_days` calendar days, with a per-series lag (1 for daily
+  H.15/ICE/VIX, 8 for H.10 FX, 2 for H.4.1). It was then carried forward at
+  most `stale_sessions` sessions. Every feature's `known_at` was stamped
+  00:00Z of its session, which is about 20 hours before H.15 publishes. A
+  target's label became known at the first session on or after
+  `label_end + lag_days`, and a label not known inside its window was purged.
 - **Adapter refusals.** The adapter refuses `snap:*`, LLM/telemetry counters,
-  astro/celestial ids, yfinance ids (`YF:`/`YF_ADJ:`, see S07/#642) and
-  `revised=True` series. It builds no SQL of its own and never names
-  `discovered_hypotheses` or `hypothesis_registry`.
+  astro/celestial ids and yfinance ids (`YF:`/`YF_ADJ:`, see S07/#642). In S09
+  revised series were refused only when the caller declared `revised=True`;
+  S09b replaced that flag with a denylist inside the adapter. It builds no SQL
+  of its own and never names `discovered_hypotheses` or `hypothesis_registry`.
 - **`scripts/run_real_panel_scan.py`.** The scan engine is read-only: a
   NullPool engine with `default_transaction_read_only=on`,
   `statement_timeout` of at most 60 s and autocommit. It writes
@@ -194,10 +209,20 @@ a few known effects counted many times:
 - short-rate policy drift.
 
 A post-hoc re-read of the identical panel (receipt hash matched; not a scan,
-nothing frozen) keeps 102, 102 and 108 selections with blocks 2, 4 and 8, so
-the result is not an artifact of the block-1 null. The machinery detects real
-dependence. Tradable targets still need the price-basis split, and those scans
-should exclude each target's own-family proxies.
+nothing frozen) kept 102, 102 and 108 selections with blocks 2, 4 and 8. S09
+read this as "not an artifact of the block-1 null". S09b corrects that
+reading (see "Why longer blocks selected more" below): more selections under
+longer blocks is expected when the target labels are negatively
+autocorrelated, so it is not a robustness check. Tradable targets still need
+the price-basis split.
+
+**Review of this ledger (#660).** An independent review found that at least 5
+of the 8 frozen candidates are a target predicting itself or a near-copy of
+itself: 3 are VIX → VIX, and 2 are DGS1 → DGS2 and DGS1 → T10Y2Y. The other 3
+(HY OAS z-scores → VIX) reflect shared volatility state. The data is
+latest-vintage hindsight, and feature `known_at` was stamped before
+publication. `frozen-candidates.json` must not be consumed. S09b writes a
+relabelled copy beside it.
 
 **Known limits.**
 
@@ -206,6 +231,198 @@ should exclude each target's own-family proxies.
   does not give first-release values.
 - **Sessions are business days**, not an exchange calendar.
 - **Publication lags are declared constants**, not per-release timestamps.
+  S09b declares a lag and a time of day per source, but these are still
+  schedules, not the timestamps of individual releases.
+
+## S09b: follow-ups from the #660 review (2026-09-26)
+
+Run the tests with `python -m pytest tests/test_offline_research_stats_core.py tests/test_research_real_panel.py tests/test_run_real_panel_scan.py -q`.
+Relabel a pre-S09b candidate file with
+`python -m scripts.relabel_frozen_candidates PATH/frozen-candidates.json`.
+
+### 1. Proxy groups and `self_lag` trials
+
+In S09 all 4 targets were also features, and nothing flagged own-series or
+near-copy features. `analysis/research_real_panel.py::PROXY_GROUPS` now
+declares, per target series, the series that are its own value or a
+near-copy of it. The groups are keyed by target, not found by matching series
+ids, and they follow one rule:
+
+- the target's own series;
+- the legs of a spread target, plus the next shorter and next longer quoted
+  tenor of each Treasury leg;
+- other spreads that share a leg;
+- the rating sub-indices and the yield or total-return versions of the same
+  credit index;
+- other indices in the same implied-volatility family.
+
+| Target | Proxy group |
+|---|---|
+| `VIXCLS` | VIXCLS, VXVCLS, VXOCLS, VIX3M, VIX9D |
+| `DGS2` | DGS2, DGS1, DGS3, T10Y2Y |
+| `T10Y2Y` | T10Y2Y, DGS10, DGS7, DGS20, DGS2, DGS1, DGS3, T10Y3M, T10Y1Y |
+| `BAMLH0A0HYM2` | the HY master, its BB/B/CCC sub-indices, and their effective-yield and total-return series |
+
+The adapter refuses a target that has no declared group. It derives the
+`(family, feature)` pairs whose feature series is in the family target's
+group, and the protocol must carry exactly those pairs as `self_lag`. The
+contract refuses a protocol that drops or changes them. `discover` still
+measures each such trial and records `self_lag_r`/`self_lag_p`. It gives the
+trial status `self_lag` and p = 1.0 in the BH denominator, so the trial can
+never be selected. `evaluate_holdout` refuses a manifest that selects one,
+even if the manifest is re-signed. Over the declared scan universe, 108 of
+the 1,044 trials are `self_lag`.
+
+Relabelled candidates from the ef0d564b scan (written to
+`scan-ef0d564b/frozen-candidates.relabelled.json`; the original receipts are
+unchanged):
+
+| Family | Feature | Label |
+|---|---|---|
+| VIXCLS fwd1 | VIXCLS chg5 | SELF_LAG |
+| VIXCLS fwd1 | VIXCLS z60 | SELF_LAG |
+| VIXCLS fwd5 | VIXCLS z60 | SELF_LAG |
+| DGS2 fwd5 | DGS1 chg20 | SELF_LAG |
+| T10Y2Y fwd5 | DGS1 z60 | SELF_LAG |
+| VIXCLS fwd5 | BAMLH0A0HYM2 z60 | cross-series |
+| VIXCLS fwd5 | BAMLH0A1HYBB z60 | cross-series |
+| VIXCLS fwd5 | BAMLH0A2HYB z60 | cross-series |
+
+The 3 cross-series candidates remain candidates only under the proxy rule.
+Their run predates the publication-time `known_at` and the data-driven block,
+so the copy marks them `RESCAN_REQUIRED`; they need a new scan under S09b
+before any forward logging. The SELF_LAG ones are marked
+`SELF_LAG_NEVER_A_CANDIDATE`.
+`promotion_allowed` stays false for all 8.
+
+### 2. `latest_vintage_read` and the revised-series denylist
+
+The origin `pit_vintage_read` overclaimed. Every row is the latest vintage, all
+backfilled on or after 2026-03-24. S09 also refused revised series only when
+the caller declared `revised=True`, and the default was False. S09b makes
+these changes:
+
+- **Rename.** The origin is now `latest_vintage_read` and its state is
+  `LATEST_VINTAGE_READ_EXPLORATORY`, in the code, the manifest, the docs and
+  the tests. The receipt records
+  `vintage: "latest vintage per obs_date (hindsight), not first release"`.
+  The old label is refused as an unknown origin.
+- **Denylist.** The adapter enforces it; the caller declares nothing, and
+  `SeriesSpec` no longer has a `revised` field. `REVISED_SERIES` lists single
+  ids and `REVISED_PREFIXES` lists whole families (`NFCI*`, `ANFCI*`,
+  `STLFSI*`). The list covers:
+  - Chicago Fed NFCI/ANFCI, CFNAI and KCFSI, whose history is re-estimated
+    each release;
+  - the Weekly Economic Index;
+  - DOL claims, which go from advance to revised and get annual seasonal
+    factors;
+  - BLS CES/CPS/CPI/JOLTS;
+  - BEA PCE/NIPA;
+  - Census activity series;
+  - Fed G.17, H.6, H.8 and G.19;
+  - the Michigan preliminary sentiment;
+  - the Fed broad dollar indices (`DTWEXBGS`/`AFEGS`/`EMEGS`), whose history
+    is revised when trade weights are updated.
+
+  The list is kept by hand from those publishers' revision policies
+  (`REVISED_SOURCES`). ALFRED vintage counts are the check before any id is
+  removed. `DTWEXBGS` was dropped from the scan universe, which now has 29
+  series.
+- **Limit.** Being absent from the list does not prove a series is never
+  revised. H.15, ICE BofA and CBOE closes are treated as unrevised because
+  that is their publishers' practice.
+
+### 3. Publication-time `known_at`
+
+In S09 every feature value carried `known_at` = 00:00Z of its decision
+session. A calendar lag of 1 day made H.15's Monday value usable at Tuesday
+00:00Z, about 20 hours before H.15 publishes it. Friday values became usable
+on Monday, before the Monday publication.
+
+S09b gives every series a publication `source` (`PUBLICATIONS`). An
+observation dated `d` is known at `d + lag` at a declared UTC time of day.
+Business-day lags use the US federal holiday calendar. The value is usable
+from the first 00:00Z session at or after that stamp. Each feature value now
+carries that stamp as its `known_at`, and the target label is known at the
+publication stamp of the observation dated `label_end`.
+
+| Source | Series | Lag | Time (UTC) | Basis |
+|---|---|---|---|---|
+| `FRB_H15` | DGS*, DFII10, DFF | 1 business day | 21:17 | Reviewer-verified ~20:17Z in EDT; +1 h covers EST |
+| `FRED_H15_SPREAD` | T10Y2Y, T10Y3M, T10YIE, T5YIE | 1 business day | 23:59 | FRED computes these from H.15 legs after H.15 posts; time not verified |
+| `ICE_BOFA` | BAML* | 1 business day | 23:59 | Time not verified |
+| `CBOE_VIX` | VIXCLS | 1 business day | 23:59 | Time not verified |
+| `FRB_H10` | DEX* | 8 calendar days | 21:15 | Weekly Monday post; reviewer-verified lag 8 |
+| `FRB_H41` | WALCL, WTREGEN | 2 calendar days | 21:30 | Wednesday level, Thursday 16:30 ET release; reviewer-verified lag 2 |
+| `NYFED_RRP` | RRPONTSYD | 1 business day | 23:59 | Time not verified |
+| `FREDDIE_PMMS` | MORTGAGE30US | 1 calendar day | 17:00 | Thursday same-day release; reviewer-verified lag 1 |
+| `AAII` | aaii.bull_bear_spread | 1 calendar day | 23:59 | Thursday-dated, pulled Friday; reviewer-verified lag 1 |
+
+In practice a daily H.15 value dated Monday is first used at Wednesday
+00:00Z. After a Monday holiday, a Friday value is first used on Wednesday.
+The tests check four things:
+
+- every feature `known_at` is at or before its decision, and every observed
+  value carries a real publication stamp;
+- every declared source is known strictly after the next day's 00:00Z
+  decision;
+- the holiday and weekend cases resolve as described;
+- a value stamped the S09 way is refused by `validate_rows`.
+
+### 4. Calibration under an autocorrelated target, and the data-driven block
+
+S09's block-1 calibration used a serially independent target. S09b adds a
+target that is AR(1) with phi = 0.35 at the sampling spacing (the HY OAS fwd5
+label has acf1 = +0.335), against an independent AR(1) 0.95 feature. The
+tests use 800 simulations, 499 permutations and a nominal 5%:
+
+| Target | n | Block 1 | Data-driven block (median) |
+|---|---|---|---|
+| AR(1) phi = 0.35 | 60 | 15.9% | 7.0% (7) |
+| AR(1) phi = 0.35 | 240 | 14.6% | 5.0% (16) |
+| AR(1) phi = -0.18 | 240 | 2.0% | 4.25% (6) |
+| independent | 240 | 4.4% | 4.4% (1) |
+
+Block 1 is badly anti-conservative for a positively autocorrelated target, so
+the default block (`block=0`) is now data-driven
+(`offline_research_proof.autocorrelation_block`):
+
+- It uses the lag-1 autocorrelation phi of the sampled target, computed on
+  discovery rows only.
+- If |phi| is inside the 2/sqrt(n) band, the block is the overlap floor
+  (depth + 1).
+- Otherwise the block is `ceil(|phi| / ((1 - |phi|)^2 * 0.05))`. This bounds
+  the block null's Bartlett-weight bias for an AR(1) of that |phi|.
+- The block is capped so that at least 8 blocks remain, and it is never below
+  the overlap floor.
+
+The per-family basis (n, acf1, band, rule, block) is written into the
+manifest as `block_basis`. The holdout reuses the frozen discovery block,
+under the same cap, and never re-estimates it from holdout labels. A declared
+`block` is used as is. At n=60 the cap (7) leaves a residual 7.0%. Short
+families therefore stay somewhat anti-conservative, and their p-value
+resolution is coarse.
+
+**Why longer blocks selected more in the post-hoc diagnostic.** The permutation
+null variance of a correlation is roughly
+(1 + 2 Σ_k w_k ρ_x(k) ρ_y(k)) / n, where w_k is the share of lag-k pairs the
+block keeps. Block 1 keeps none, so its null variance is 1/n. The true null
+variance keeps every lag. The features here (z60 and overlapping chg20) are
+persistent, so ρ_x > 0. The VIX change labels are mean-reverting: acf1 is
+-0.176 at fwd5 and -0.096 at fwd20. For those families the true null is
+*narrower* than block 1 assumes, so block 1 is conservative. That is the 2.0%
+against 4.25% in the table. Longer blocks keep the negative dependence,
+tighten the null and select more.
+
+The ledger bears this out. The total rose from 89 to 108, and the three VIX
+families account for more than all of the rise: they went from 37 selections
+at block 1 to 58 at block 8. VIX fwd5 went 16 → 25 → 28 and VIX fwd20 went
+15 → 19 → 22 at blocks 1, 2 and 8. The HY OAS fwd5 family has acf1 = +0.335,
+so block 1 was anti-conservative there, and it moved the other way, from 16
+to 12. Its strongest p-values were already at the permutation floor and did
+not move. "Longer blocks selected more" therefore shows that block 1 was
+mis-calibrated in both directions. It is not evidence that the selections are
+robust.
 
 ## Lineage and boundaries
 
