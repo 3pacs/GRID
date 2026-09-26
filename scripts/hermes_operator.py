@@ -154,6 +154,13 @@ POSTMORTEM_BATCH_LIMIT = 20                   # Drain postmortem backlog in boun
 ACTIVE_HYPO_SCORING_BATCH_SIZE = 200
 ACTIVE_HYPO_SCORING_MAX_RUNTIME_S = 240
 ACTIVE_HYPO_SCORING_INTERVAL_MINUTES = 30
+# Owner-approved hold (2026-09-26): the periodic scorer marks
+# discovered_hypotheses "confirmed" after 3 correct checks with no trial
+# ledger, FDR or holdout, and 86% of those rows correlate GRID's own snap:*
+# telemetry with the market. Held with the other learning writes
+# (DAILY_INTEL_INITIAL_ALLOWLIST below); re-enabling it is its own reviewed
+# change, not a runtime flag.
+ACTIVE_HYPO_SCORING_ENABLED = False
 
 # Daily intelligence batch (fable-daily-intel-resumable, 2026-09-20) — see
 # DAILY_INTEL_TASKS and _run_daily_intel_block below.
@@ -2748,7 +2755,12 @@ def run_intelligence_tasks(
     # 2026-05-15 handoff). Cadence kept short so the ~25k current overdue
     # backlog drains across the next ~2-3 days at ~15 scored/sec on grid-svr.
     # Dedented out of daily_due — was only firing 2:00-2:10 UTC, now every loop
-    if _minutes_since(state.last_active_hypo_scoring) >= ACTIVE_HYPO_SCORING_INTERVAL_MINUTES:
+    # HELD by ACTIVE_HYPO_SCORING_ENABLED (2026-09-26): this step is a
+    # learning write (flips discovered_hypotheses to confirmed/invalidated).
+    if (
+        ACTIVE_HYPO_SCORING_ENABLED
+        and _minutes_since(state.last_active_hypo_scoring) >= ACTIVE_HYPO_SCORING_INTERVAL_MINUTES
+    ):
         try:
             from intelligence.hypothesis_engine import score_due_active_hypotheses
             results["active_hypo_scoring"] = _run_intel_task(
