@@ -61,7 +61,7 @@ langfuse>=4.15.2
 akshare>=1.14.0
 imfdatapy>=0.1.1
 dbnomics>=0.2.6
-eurostat>=0.2.1
+eurostat>=1.1.1
 requests-cache>=1.1.0
 
 # Trade data
