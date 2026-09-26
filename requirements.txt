@@ -60,7 +60,7 @@ langfuse>=4.15.2
 # International data
 akshare>=1.14.0
 imfdatapy>=0.1.1
-dbnomics>=1.2.7
+dbnomics>=0.2.6
 eurostat>=1.1.1
 requests-cache>=1.1.0
 
