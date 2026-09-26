@@ -280,6 +280,16 @@ fi
 # Service repoints must share release coordination; refresh before each deletion
 # as well, failing closed on an unreadable/deleted process cwd or systemd query.
 declare -A runtime_release_dirs=()
+CGROUP_ROOT=/sys/fs/cgroup
+protect_runtime_pid() {
+  local pid="$1" owner="$2" cwd
+  if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] ||
+     ! cwd="$(readlink -- "/proc/$pid/cwd")" || [[ "$cwd" == *' (deleted)' ]]; then
+    echo "missing/deleted runtime cwd for $owner PID $pid" >&2
+    exit 5
+  fi
+  protect_runtime_path "$cwd" "$owner PID $pid"
+}
 protect_runtime_path() {
   local path="$1" owner="$2" resolved relative release
   if [[ "$path" != /* ]] || ! resolved="$(realpath -e -- "$path")" || [ ! -d "$resolved" ]; then
@@ -304,7 +314,8 @@ protect_runtime_path() {
 }
 refresh_runtime_release_dirs() {
   [ "${test_only_skip_preservation:-0}" != 1 ] || return 0
-  local installed loaded units unit details key value load pid workdir cwd workdir_seen
+  local installed loaded units unit details key value load pid workdir workdir_seen
+  local state cgroup cgroup_seen cgroup_dir files file members member member_count main_seen
   if ! installed="$(systemctl list-unit-files --no-legend --no-pager 'grid-*.service')" ||
      ! loaded="$(systemctl list-units --all --plain --no-legend --no-pager 'grid-*.service')"; then
     echo 'cannot inventory GRID service runtimes; refusing release deletion' >&2
@@ -320,30 +331,72 @@ refresh_runtime_release_dirs() {
     # A template cannot run without an instance; loaded instances are included
     # by list-units above and must still be inspected.
     [[ "$unit" != *@.service ]] || continue
-    if ! details="$(systemctl show --property=LoadState,MainPID,WorkingDirectory -- "$unit")"; then
+    if ! details="$(systemctl show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup -- "$unit")"; then
       echo "cannot inspect runtime unit $unit" >&2
       exit 5
     fi
-    load= pid= workdir= workdir_seen=0
+    load= pid= workdir= workdir_seen=0 state= cgroup= cgroup_seen=0
     while IFS='=' read -r key value; do
       case "$key" in
         LoadState) load="$value" ;;
         MainPID) pid="$value" ;;
         WorkingDirectory) workdir="$value"; workdir_seen=1 ;;
+        ActiveState) state="$value" ;;
+        ControlGroup) cgroup="$value"; cgroup_seen=1 ;;
       esac
     done <<< "$details"
-    if [ "$load" != loaded ] || [[ ! "$pid" =~ ^[0-9]+$ ]] || [ "$workdir_seen" != 1 ]; then
+    if [ "$load" != loaded ] || [[ ! "$pid" =~ ^[0-9]+$ ]] ||
+       [ "$workdir_seen" != 1 ] || [ "$cgroup_seen" != 1 ] || [ -z "$state" ]; then
       echo "ambiguous runtime identity for $unit" >&2
       exit 5
     fi
     # Empty WorkingDirectory means systemd's default /, not an unknown value.
     protect_runtime_path "${workdir:-/}" "$unit configured"
     if [ "$pid" != 0 ]; then
-      if ! cwd="$(readlink -- "/proc/$pid/cwd")" || [[ "$cwd" == *' (deleted)' ]]; then
-        echo "missing/deleted runtime cwd for $unit PID $pid" >&2
+      protect_runtime_pid "$pid" "$unit"
+    fi
+    # MainPID=0 does not prove an empty unit: forked workers can remain in its
+    # cgroup during failure/stopping. Inspect every descendant cgroup as well.
+    if [ -z "$cgroup" ]; then
+      if [ "$pid" != 0 ] || { [ "$state" != inactive ] && [ "$state" != failed ]; }; then
+        echo "nonquiescent unit $unit has no inspectable cgroup" >&2
         exit 5
       fi
-      protect_runtime_path "$cwd" "$unit PID $pid"
+      continue
+    fi
+    if [ ! -f "$CGROUP_ROOT/cgroup.controllers" ] || [[ "$cgroup" != /* ]] ||
+       [ "$cgroup" = / ] || ! cgroup_dir="$(realpath -e -- "$CGROUP_ROOT$cgroup")" ||
+       [ "$cgroup_dir" != "$CGROUP_ROOT$cgroup" ] ||
+       [ "$(realpath -e -- "$CGROUP_ROOT")" != "$CGROUP_ROOT" ] || [ ! -d "$cgroup_dir" ]; then
+      echo "unsupported or unresolved cgroup for $unit: $cgroup" >&2
+      exit 5
+    fi
+    if ! files="$(find "$cgroup_dir" -type f -name cgroup.procs -print)" ||
+       [ ! -f "$cgroup_dir/cgroup.procs" ] || [ -z "$files" ]; then
+      echo "cannot completely inventory cgroup for $unit" >&2
+      exit 5
+    fi
+    member_count=0 main_seen=0
+    while IFS= read -r file; do
+      if ! members="$(cat -- "$file")"; then
+        echo "cannot read cgroup membership for $unit" >&2
+        exit 5
+      fi
+      while IFS= read -r member; do
+        [ -n "$member" ] || continue
+        protect_runtime_pid "$member" "$unit cgroup"
+        member_count=$((member_count + 1))
+        [ "$member" != "$pid" ] || main_seen=1
+      done <<< "$members"
+    done <<< "$files"
+    if { [ "$pid" != 0 ] && [ "$main_seen" != 1 ]; } ||
+       { [ "$member_count" = 0 ] && [ "$state" != inactive ] && [ "$state" != failed ]; }; then
+      echo "ambiguous empty/inconsistent cgroup for $unit" >&2
+      exit 5
+    fi
+    if [ "$pid" != 0 ] && ! [ -e "/proc/$pid/cwd" ]; then
+      echo "runtime identity changed during inventory for $unit" >&2
+      exit 5
     fi
   done <<< "$units"
 }
@@ -464,7 +517,14 @@ echo "label=$LABEL swapped_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "${RELEASES_DIR}
 # plus the new one -- never the candidate we just failed to promote, since a
 # failed run exits above before reaching this point.
 if [ -n "$previous_target" ]; then
-  mapfile -t all_releases < <(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)
+  # Process substitution hides find/sort errors from mapfile and set -e. Never
+  # act on a partial directory inventory even if it contains plausible paths.
+  if ! release_inventory="$(find "$RELEASES_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | cut -d' ' -f2-)" ||
+     [ -z "$release_inventory" ]; then
+    echo 'cannot completely inventory releases; refusing prune' >&2
+    exit 5
+  fi
+  mapfile -t all_releases <<< "$release_inventory"
   kept=0
   for rel in "${all_releases[@]}"; do
     refresh_runtime_release_dirs

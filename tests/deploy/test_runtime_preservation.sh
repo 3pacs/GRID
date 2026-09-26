@@ -2,11 +2,17 @@
 # Linux-only integration test. Uses a real process cwd and a fake systemctl.
 set -euo pipefail
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
-swap="$repo/scripts/deploy_release_swap.sh"
+source_swap="$repo/scripts/deploy_release_swap.sh"
 box="$(mktemp -d)"
 trap 'kill "${scheduler_pid:-}" "${activated_pid:-}" "${realtime_pid:-}" "${deleted_pid:-}" 2>/dev/null || true; rm -rf "$box"' EXIT
 live="$box/grid_release"
 root="${live}.releases"
+mkdir -p "$box/cgroup/scheduler" "$box/cgroup/realtime/workers"
+touch "$box/cgroup/cgroup.controllers" "$box/cgroup/realtime/cgroup.procs"
+# Only the immutable sysfs root literal is substituted in this test copy.
+# Membership is fixture-backed; process cwd inspection still uses real /proc.
+swap="$box/swap.sh"
+sed "s|^CGROUP_ROOT=/sys/fs/cgroup$|CGROUP_ROOT=$box/cgroup|" "$source_swap" > "$swap"
 mkdir -p "$root/scheduler-old" "$root/recovery-old" "$root/current" "$box/bin" \
   "$root/realtime-old/subdir" "$root/realtime-restart"
 printf 'retained\n' > "$root/realtime-old/subdir/module.txt"
@@ -31,17 +37,27 @@ case "$*" in
   'list-unit-files --no-legend --no-pager grid-*.service'|'list-units --all --plain --no-legend --no-pager grid-*.service')
     [ "${TEST_INVENTORY_FAIL:-0}" != 1 ] || exit 1
     printf '%s\n' grid-scheduler.service grid-realtime.service grid-worker@.service ;;
-  'show --property=LoadState,MainPID,WorkingDirectory -- grid-scheduler.service')
-    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" ;;
-  'show --property=LoadState,MainPID,WorkingDirectory -- grid-realtime.service')
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup -- grid-scheduler.service')
+    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=active\nControlGroup=/scheduler\n' "$TEST_SCHEDULER_PID" "$TEST_SCHEDULER_WORKDIR" ;;
+  'show --property=LoadState,MainPID,WorkingDirectory,ActiveState,ControlGroup -- grid-realtime.service')
     [ "${TEST_SHOW_FAIL:-0}" != 1 ] || exit 1
-    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" ;;
+    printf 'LoadState=loaded\nMainPID=%s\nWorkingDirectory=%s\nActiveState=%s\nControlGroup=%s\n' "$TEST_REALTIME_PID" "$TEST_REALTIME_WORKDIR" "$TEST_REALTIME_STATE" "$TEST_REALTIME_CGROUP" ;;
   'show -p MainPID --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_PID" ;;
   'show -p WorkingDirectory --value grid-scheduler') printf '%s\n' "$TEST_SCHEDULER_WORKDIR" ;;
   *) exit 1 ;;
 esac
 SH
 chmod +x "$box/bin/systemctl"
+export TEST_REAL_FIND="$(command -v find)" TEST_RELEASE_ROOT="$root"
+cat > "$box/bin/find" <<'SH'
+#!/usr/bin/env bash
+if [ "${TEST_FIND_PARTIAL_FAIL:-0}" = 1 ] && [ "$1" = "$TEST_RELEASE_ROOT" ]; then
+  "$TEST_REAL_FIND" "$@"
+  exit 42
+fi
+exec "$TEST_REAL_FIND" "$@"
+SH
+chmod +x "$box/bin/find"
 cat > "$box/build" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -52,8 +68,11 @@ chmod +x "$box/build"
 scheduler_pid=$!
 ( cd "$root/realtime-old/subdir" && exec sleep 300 ) &
 realtime_pid=$!
+printf '%s\n' "$scheduler_pid" > "$box/cgroup/scheduler/cgroup.procs"
+printf '%s\n' "$realtime_pid" > "$box/cgroup/realtime/workers/cgroup.procs"
 export TEST_SCHEDULER_PID="$scheduler_pid" TEST_SCHEDULER_WORKDIR="$root/scheduler-old"
 export TEST_REALTIME_PID="$realtime_pid" TEST_REALTIME_WORKDIR="$box/realtime-config-link"
+export TEST_REALTIME_STATE=active TEST_REALTIME_CGROUP=/realtime
 export PATH="$box/bin:$PATH"
 record="$root/.runtime-preservation"
 printf 'scheduler=%s\nrecovery=%s\nscheduler_sha=%s\nscheduler_tree=%s\nrecovery_sha=%s\nrecovery_tree=%s\n' \
@@ -98,6 +117,13 @@ git -C "$root/recovery-old" restore marker.txt
 TEST_SCHEDULER_WORKDIR="$live" fail_without_swap "$root/current" mutable-unit
 TEST_INVENTORY_FAIL=1 fail_without_swap "$root/current" failed-inventory
 TEST_SHOW_FAIL=1 fail_without_swap "$root/current" failed-show
+TEST_REALTIME_CGROUP= fail_without_swap "$root/current" no-active-cgroup
+TEST_REALTIME_CGROUP=/realtime/../scheduler fail_without_swap "$root/current" traversed-cgroup
+ln -s "$box/cgroup/realtime" "$box/cgroup/linked"
+TEST_REALTIME_CGROUP=/linked fail_without_swap "$root/current" linked-cgroup
+mkdir "$box/cgroup/empty"
+touch "$box/cgroup/empty/cgroup.procs"
+TEST_REALTIME_PID=0 TEST_REALTIME_CGROUP=/empty fail_without_swap "$root/current" empty-active-cgroup
 
 # An existing candidate that is a retained runtime must never be erased.
 set +e
@@ -142,8 +168,9 @@ test ! -d "$root/current"
 test "$(cat "/proc/$realtime_pid/cwd/module.txt")" = retained
 test -d "$root/realtime-restart"
 
-# A third swap retains actual cwd even while configured restart points elsewhere.
-bash "$swap" "$live" next-3 "$box/build" next-3 > "$box/third.log" 2>&1
+# A third swap retains a living descendant even with MainPID=0 and a distinct
+# configured restart directory (the independent review's child-cwd regression).
+TEST_REALTIME_PID=0 bash "$swap" "$live" next-3 "$box/build" next-3 > "$box/third.log" 2>&1
 test "$(cat "/proc/$realtime_pid/cwd/module.txt")" = retained
 test -d "$root/realtime-restart"
 test ! -d "$root/next-1"
@@ -153,6 +180,8 @@ kill "$realtime_pid"
 wait "$realtime_pid" 2>/dev/null || true
 realtime_pid=
 export TEST_REALTIME_PID=0
+export TEST_REALTIME_STATE=inactive TEST_REALTIME_CGROUP=
+: > "$box/cgroup/realtime/workers/cgroup.procs"
 bash "$swap" "$live" next-4 "$box/build" next-4 > "$box/inactive.log" 2>&1
 test -d "$root/realtime-restart"
 
@@ -166,4 +195,16 @@ test "$(cat "$live/marker.txt")" = next-4
 activated_pid=$!
 TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-4" \
   fail_without_swap "$root/next-4" stale-after-activation
-echo 'PASS: runtime preservation, realtime multi-swap/collision/inactive/symlink/deleted-cwd, query failures, invalid identities and stale activation record'
+
+# A failed find must not yield a partially usable prune list after the swap.
+mkdir "$root/unused-sentinel"
+touch -d '2018-01-01 UTC' "$root/unused-sentinel"
+set +e
+TEST_FIND_PARTIAL_FAIL=1 bash "$swap" "$live" partial-inventory "$box/build" partial > "$box/partial.log" 2>&1
+partial_rc=$?
+set -e
+test "$partial_rc" -eq 5
+test -d "$root/unused-sentinel"
+test "$(readlink -f "$live")" = "$root/partial-inventory"
+grep -q 'cannot completely inventory releases' "$box/partial.log"
+echo 'PASS: runtime preservation, realtime descendants/multi-swap/collision/inactive/symlink/deleted-cwd, failed inventory, invalid identities and stale activation record'
