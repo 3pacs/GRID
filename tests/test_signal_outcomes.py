@@ -208,6 +208,29 @@ def test_real_accessor_multi_valued_date_refused_not_averaged_or_latest_wins():
     assert result.eligibility_reason == "ambiguous_raw_close_multiple_values"
 
 
+def test_real_accessor_multi_valued_exit_date_refused_not_just_entry():
+    """Entry date is clean (single value); only the EXIT date has a second,
+    differently-valued row under the same series/source identity. The exit
+    lookup must independently refuse via AmbiguousPriceError, not just the
+    entry lookup -- a signal must not be scored using whichever exit value
+    happened to sort last."""
+    entry_day = date(2026, 9, 1)
+    exit_day = date(2026, 9, 6)
+    prices, engine = _real_accessor([
+        _raw_bar(entry_day, 100),
+        _raw_bar(exit_day, 110),
+        (exit_day, 140, "YF:AAA:close",
+         datetime(exit_day.year, exit_day.month, exit_day.day, 23, tzinfo=timezone.utc)),
+    ])
+    result = evaluate_signal(rec(), prices, today=date(2026, 9, 7))
+    assert result.outcome == "INELIGIBLE"
+    assert result.eligibility_reason == "ambiguous_raw_close_multiple_values"
+    # Entry must have resolved cleanly (not itself refused) -- this proves
+    # the refusal came from the exit lookup, not the entry lookup.
+    assert result.entry_price == 100.0
+    assert len(engine.requests) == 2
+
+
 def test_real_accessor_refuses_crypto_instrument_before_any_price_lookup():
     prices, engine = _real_accessor([_raw_bar(date(2026, 9, 1), 100)])
     signal = rec(instrument="BTC-USD")

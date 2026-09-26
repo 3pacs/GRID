@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 
 from evaluation.signal_outcomes import AmbiguousPriceError as _EvaluationAmbiguous
 from evaluation.signal_outcomes import UnsupportedInstrumentError as _EvaluationUnsupported
+from evaluation.signal_outcomes import UnverifiedCutoverError as _EvaluationUnverifiedCutover
 
 class UnsupportedInstrumentError(_EvaluationUnsupported):
     """The raw-close source or instrument cannot be established."""
@@ -26,14 +27,19 @@ class AmbiguousPriceError(_EvaluationAmbiguous, UnsupportedInstrumentError):
     """More than one distinct raw-close value exists for the selected date."""
 
 
+class UnverifiedCutoverError(_EvaluationUnverifiedCutover, UnsupportedInstrumentError):
+    """No verified raw-close ingestion cutover was supplied to this accessor."""
+
+
 # fill_missing_features.py maps exactly these tickers to a 24/7 crypto series
 # (BTC-USD, ETH-USD, SOL-USD, TAO-USD) via the same YF:{ticker}:{field} shape
 # this accessor reads. Crypto trades continuously; this accessor's exact-date
 # bar matching and after-16:00-America/New_York rollover are an equity/ETF
 # NYSE-session policy, not the exchange-session policy a 24/7 instrument
 # actually has. Refuse the instrument class outright rather than silently
-# apply the wrong session policy to it.
-_CRYPTO_TICKER_PATTERN = re.compile(r"^[A-Z0-9]{2,10}-USD$")
+# apply the wrong session policy to it. Case-insensitive: a lowercase ticker
+# (e.g. "btc-usd") is the same instrument and must be refused identically.
+_CRYPTO_TICKER_PATTERN = re.compile(r"^[A-Z0-9]{2,10}-USD$", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -84,7 +90,7 @@ prove the close field after multiple raw fields merge into one feature.
         # supplies no cutover, so it refuses ambiguous legacy price history.
         verified_since = self._verified_raw_close_since
         if verified_since is None or verified_since.tzinfo is None or verified_since.utcoffset() is None:
-            raise UnsupportedInstrumentError("raw-close ingestion cutover is unverified")
+            raise UnverifiedCutoverError("raw-close ingestion cutover is unverified")
         if not instrument or not instrument.isascii() or not all(
             c.isalnum() or c in ".-^" for c in instrument
         ):

@@ -54,6 +54,7 @@ REASON_STALE_ENTRY = "stale_entry_bar"
 REASON_STALE_EXIT = "stale_exit_bar"
 REASON_UNVERIFIED_KNOWN_AT = "known_at_unverified"
 REASON_AMBIGUOUS_PRICE = "ambiguous_raw_close_multiple_values"
+REASON_UNVERIFIED_CUTOVER = "price_basis_cutover_unverified"
 
 
 def validate_scoring_parameters(dead_band_pct: float, cost_bps: float) -> None:
@@ -87,6 +88,21 @@ class AmbiguousPriceError(UnsupportedInstrumentError):
     date outright rather than silently pick "the latest pull wins" -> a
     dedicated subclass of ``UnsupportedInstrumentError`` so callers can label
     the refusal distinctly from a generic unsupported-instrument refusal.
+    """
+
+
+class UnverifiedCutoverError(UnsupportedInstrumentError):
+    """Raise when no verified raw-close ingestion cutover was supplied.
+
+    Without an externally verified ``verified_raw_close_since`` timestamp,
+    the accessor cannot tell a genuinely raw close from a later, differently
+    -basised value written under the same series/source identity -- so it
+    refuses every row before running any query at all, including the
+    ambiguous-date check (``AmbiguousPriceError``), which can only run once a
+    cutover narrows the visible pull window. This is a distinct, dedicated
+    reason from a generic "instrument unsupported" refusal: the instrument
+    may be perfectly fine, the cutover is simply absent (e.g. the manual CLI
+    never supplies one).
     """
 
 
@@ -314,6 +330,8 @@ def evaluate_signal(
         entry = price_accessor(record.instrument, entry_as_of)
     except AmbiguousPriceError:
         return _ineligible(record, REASON_AMBIGUOUS_PRICE, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
+    except UnverifiedCutoverError:
+        return _ineligible(record, REASON_UNVERIFIED_CUTOVER, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
     except UnsupportedInstrumentError:
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps)
 
@@ -357,6 +375,8 @@ def evaluate_signal(
         exit_ = price_accessor(record.instrument, exit_as_of)
     except AmbiguousPriceError:
         return _ineligible(record, REASON_AMBIGUOUS_PRICE, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
+    except UnverifiedCutoverError:
+        return _ineligible(record, REASON_UNVERIFIED_CUTOVER, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
     except UnsupportedInstrumentError:
         return _ineligible(record, REASON_UNSUPPORTED_INSTRUMENT, dead_band_pct=dead_band_pct, cost_bps=cost_bps, entry=entry)
 

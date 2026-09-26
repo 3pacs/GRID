@@ -123,8 +123,12 @@ def test_cli_refuses_unverified_raw_basis_without_price_query():
                                            "--date-from", "2026-09-01", "--date-to", "2026-09-02"])
     engine = Engine("date", [(1, "news", "AAA", date(2026, 9, 1), "BUY", datetime(2026, 9, 1, 18, tzinfo=timezone.utc), None)])
     result = run(engine, args, out=io.StringIO(), today=date(2026, 9, 8))
-    assert result["cohort_summary"]["n_ineligible_by_reason"] == {"unsupported_instrument_history": 1}
+    # The CLI never supplies a cutover, so the accessor refuses before any
+    # query -- the reason must say so distinctly (B1), not the generic
+    # "unsupported instrument" reason (that ticker/instrument is fine).
+    assert result["cohort_summary"]["n_ineligible_by_reason"] == {"price_basis_cutover_unverified": 1}
     assert result["cohort_summary"]["origin_tag_counts"] == {"unknown": 1}
+    assert result["known_at_source_counts"] == {"created_at_fallback_unverified_source_type": 1}
     assert len(engine.calls) == 2  # schema introspection and source SELECT only
 
 
@@ -170,6 +174,21 @@ def test_non_congressional_source_type_falls_back_explicitly_even_with_signal_va
     known_at, source = _resolve_known_at(row)
     assert known_at is None
     assert source == "created_at_fallback_unverified_source_type"
+
+
+def test_cli_output_known_at_source_counts_reflect_congressional_disclosure_date():
+    args = build_arg_parser().parse_args(["--db-url", "postgresql://test", "--source-type", "congressional",
+                                           "--date-from", "2026-09-01", "--date-to", "2026-09-02"])
+    engine = Engine("date", [(1, "congressional", "AAA", date(2026, 9, 1), "BUY",
+                              datetime(2026, 9, 1, 18, tzinfo=timezone.utc),
+                              {"disclosure_date": "2026-09-01"})])
+    result = run(engine, args, out=io.StringIO(), today=date(2026, 9, 8))
+    assert result["known_at_source_counts"] == {"congressional_disclosure_date": 1}
+    # Truthfulness check (B2): the assumptions string must not claim the
+    # ambiguity check ran unconditionally -- it must say the check is gated
+    # on a cutover this CLI never supplies.
+    assert "cutover" in result["assumptions"]
+    assert "price_basis_cutover_unverified" in result["assumptions"]
 
 
 def test_bounds_required_and_limited():

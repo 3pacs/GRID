@@ -212,19 +212,36 @@ def run(engine, args: argparse.Namespace, *, out=None, today: Optional[date] = N
     rows = select_signal_sources(engine, source_type=args.source_type, date_from=args.date_from,
                                  date_to=args.date_to, limit=args.limit)
     accessor = PITPriceAccessor(engine)
-    outcomes = [evaluate_signal(to_signal_record(r, horizon_days=args.horizon_days),
-                                accessor, dead_band_pct=args.dead_band_pct, cost_bps=args.cost_bps, today=today)
-                for r in rows if r.ticker]
+    records = [to_signal_record(r, horizon_days=args.horizon_days) for r in rows if r.ticker]
+    # known_at_source is on SignalRecord.metadata, which evaluate_signal()
+    # does not carry into its output record -- tally it separately here so
+    # the CLI's own claim about how known_at was resolved is actually
+    # reflected in what gets printed, not just asserted in prose.
+    known_at_source_counts: dict = {}
+    for record in records:
+        source = record.metadata.get("known_at_source", "unlabelled")
+        known_at_source_counts[source] = known_at_source_counts.get(source, 0) + 1
+    outcomes = [evaluate_signal(record, accessor, dead_band_pct=args.dead_band_pct,
+                                cost_bps=args.cost_bps, today=today)
+                for record in records]
     result = {
         "evaluation_version": EVALUATION_VERSION,
         "dry_run": True,
-        "assumptions": "provisional: calendar-day horizon; exact-date entry and exit bars; "
-                       "after-16:00 America/New_York next calendar date; created_at ingestion "
-                       "proxy fallback (labelled per-row as known_at_source, congressional "
-                       "disclosure_date used when present); origin unknown; multi-valued raw-close "
-                       "dates refused rather than picked (ambiguous_raw_close_multiple_values); "
-                       "crypto/24-7 instruments refused (not run through NYSE-session logic)",
+        "assumptions": (
+            "provisional: calendar-day horizon; exact-date entry and exit bars; "
+            "after-16:00 America/New_York next calendar date; created_at ingestion "
+            "proxy fallback, labelled per-row -- see known_at_source_counts below "
+            "for how many rows actually used the congressional disclosure_date vs. "
+            "fell back to created_at; origin unknown; multi-valued raw-close dates "
+            "are refused rather than picked (ambiguous_raw_close_multiple_values), "
+            "but that check only runs once a verified raw-close cutover is supplied "
+            "to the accessor -- this CLI supplies none, so every row is refused as "
+            "price_basis_cutover_unverified before any ambiguity check or price "
+            "query can run; crypto/24-7 instruments are refused regardless, before "
+            "any query, and are not run through NYSE-session logic"
+        ),
         "n_selected": len(rows), "n_skipped_null_ticker": sum(not r.ticker for r in rows),
+        "known_at_source_counts": known_at_source_counts,
         "cohort_summary": dataclasses.asdict(summarize_outcomes(outcomes)),
     }
     print(json.dumps(result, indent=2, default=str), file=out)

@@ -115,7 +115,10 @@ def test_null_distinct_count_refused_rather_than_treated_as_unambiguous():
         PITPriceAccessor(engine, verified_raw_close_since=VERIFIED_SINCE)("AAA", date(2026, 9, 1))
 
 
-@pytest.mark.parametrize("ticker", ["BTC-USD", "ETH-USD", "SOL-USD", "TAO-USD"])
+@pytest.mark.parametrize("ticker", [
+    "BTC-USD", "ETH-USD", "SOL-USD", "TAO-USD",
+    "btc-usd", "Btc-Usd", "eth-USD",  # case-insensitive: same instrument, same refusal
+])
 def test_crypto_instrument_refused_without_query(ticker):
     """fill_missing_features.py pulls exactly these tickers as YF:{ticker}:close
     rows via the same yfinance source_id this accessor reads (§3 of
