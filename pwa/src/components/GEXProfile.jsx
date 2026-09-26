@@ -124,7 +124,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
             .attr('font-family', "'JetBrains Mono', monospace")
             .attr('fill', colors.yellow)
             .attr('opacity', 0.9)
-            .text('Gamma Flip');
+            .text('Zero modeled GEX');
 
         // ── Gradient definitions ──
         const defs = svg.append('defs');
@@ -259,7 +259,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.yellow)
-                    .text(`Flip $${gammaFlip.toFixed(0)}`);
+                    .text(`Modeled flip $${gammaFlip.toFixed(0)}`);
             }
         }
 
@@ -286,7 +286,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.green)
-                    .text(`Resistance $${callWall.toFixed(0)}`);
+                    .text(`Modeled call wall $${callWall.toFixed(0)}`);
             }
         }
 
@@ -313,7 +313,7 @@ export default function GEXProfile({ ticker, gexData, spotPrice, onStrikeClick }
                     .attr('font-size', '8px')
                     .attr('font-family', "'JetBrains Mono', monospace")
                     .attr('fill', colors.red)
-                    .text(`Support $${putWall.toFixed(0)}`);
+                    .text(`Modeled put wall $${putWall.toFixed(0)}`);
             }
         }
 
