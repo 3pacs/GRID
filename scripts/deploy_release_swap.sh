@@ -298,11 +298,24 @@ runtime_pid_cgroup() {
   [[ "$raw" == 0::/* && "$raw" != *$'\n'* ]] || return 1
   printf '%s\n' "${raw#0::}"
 }
+runtime_pid_cwd() {
+  local pid="$1" result
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  if result="$(LC_ALL=C readlink -v -- "/proc/$pid/cwd" 2>&1)"; then
+    printf '%s\n' "$result"
+  elif [ "$result" = "readlink: /proc/$pid/cwd: Permission denied" ]; then
+    # Root-owned registered service processes can deny the deploy user's read.
+    # Escalate only this numeric PID's read-only link lookup, never a shell.
+    sudo -n -- readlink -- "/proc/$pid/cwd" 2>/dev/null
+  else
+    return 1
+  fi
+}
 protect_runtime_pid() {
   local pid="$1" owner="$2" cwd start end
   if [[ ! "$pid" =~ ^[1-9][0-9]*$ ]] ||
      ! start="$(runtime_pid_start "$pid")" ||
-     ! cwd="$(readlink -- "/proc/$pid/cwd")" || [[ "$cwd" == *' (deleted)' ]]; then
+     ! cwd="$(runtime_pid_cwd "$pid")" || [[ "$cwd" == *' (deleted)' ]]; then
     echo "missing/deleted runtime cwd for $owner PID $pid" >&2
     exit 5
   fi

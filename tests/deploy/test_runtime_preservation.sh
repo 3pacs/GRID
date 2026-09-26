@@ -56,6 +56,42 @@ esac
 SH
 chmod +x "$box/bin/systemctl"
 export TEST_REAL_FIND="$(command -v find)" TEST_REAL_RM="$(command -v rm)" TEST_RELEASE_ROOT="$root"
+export TEST_REAL_READLINK="$(command -v readlink)" TEST_SUDO_LOG="$box/sudo.log"
+export TEST_REAL_CAT="$(command -v cat)"
+cat > "$box/bin/cat" <<'SH'
+#!/usr/bin/env bash
+if [ "${TEST_CWD_READ_MODE:-}" = reused ] && [ "$*" = "-- /proc/$TEST_REALTIME_PID/stat" ] && [ -s "$TEST_SUDO_LOG" ]; then
+  # The fixture process is sleep (a single-word comm); change only starttime.
+  "$TEST_REAL_CAT" "$@" | awk '{$22=$22+1; print}'
+else
+  exec "$TEST_REAL_CAT" "$@"
+fi
+SH
+chmod +x "$box/bin/cat"
+cat > "$box/bin/readlink" <<'SH'
+#!/usr/bin/env bash
+if [ "${TEST_CWD_READ_MODE:-}" != '' ] && [ "$*" = "-v -- /proc/$TEST_REALTIME_PID/cwd" ]; then
+  if [ "$TEST_CWD_READ_MODE" = vanished ]; then
+    echo "readlink: /proc/$TEST_REALTIME_PID/cwd: No such file or directory" >&2
+  else
+    echo "readlink: /proc/$TEST_REALTIME_PID/cwd: Permission denied" >&2
+  fi
+  exit 1
+fi
+exec "$TEST_REAL_READLINK" "$@"
+SH
+cat > "$box/bin/sudo" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$TEST_SUDO_LOG"
+[ "$*" = "-n -- readlink -- /proc/$TEST_REALTIME_PID/cwd" ] || exit 99
+case "${TEST_CWD_READ_MODE:-}" in
+  denied) echo 'SENSITIVE_TEST_DIAGNOSTIC' >&2; exit 1 ;;
+  deleted) printf '/unavailable (deleted)\n' ;;
+  vanished-after-denial) exit 1 ;;
+  *) exec "$TEST_REAL_READLINK" -- "/proc/$TEST_REALTIME_PID/cwd" ;;
+esac
+SH
+chmod +x "$box/bin/readlink" "$box/bin/sudo"
 cat > "$box/bin/find" <<'SH'
 #!/usr/bin/env bash
 if [ "${TEST_FIND_PARTIAL_FAIL:-0}" = 1 ] && [ "$1" = "$TEST_RELEASE_ROOT" ]; then
@@ -192,11 +228,25 @@ kill "$deleted_pid"
 wait "$deleted_pid" 2>/dev/null || true
 deleted_pid=
 
+# Permission-only fallback is a numeric read-only lookup, never a sudo shell.
+for mode in denied deleted vanished-after-denial; do
+  TEST_CWD_READ_MODE="$mode" fail_without_swap "$root/current" "privileged-$mode"
+  ! grep -q SENSITIVE_TEST_DIAGNOSTIC "$box/log"
+done
+: > "$TEST_SUDO_LOG"
+TEST_CWD_READ_MODE=reused fail_without_swap "$root/current" privileged-pid-reused
+grep -q 'runtime PID identity changed' "$box/log"
+: > "$TEST_SUDO_LOG"
+TEST_CWD_READ_MODE=vanished fail_without_swap "$root/current" vanished-no-escalation
+test ! -s "$TEST_SUDO_LOG"
+
 # Old scheduler dir sorts last by mtime; both protected identities survive
 # two swaps and the ordinary retention budget still prunes stale current.
 touch -d '2020-01-01 UTC' "$root/scheduler-old" "$root/recovery-old"
 touch -d '2019-01-01 UTC' "$root/realtime-old" "$root/realtime-restart"
-bash "$swap" "$live" next-1 "$box/build" next-1 > "$box/first.log" 2>&1
+TEST_CWD_READ_MODE=allowed bash "$swap" "$live" next-1 "$box/build" next-1 > "$box/first.log" 2>&1
+test -s "$TEST_SUDO_LOG"
+test "$(sort -u "$TEST_SUDO_LOG")" = "-n -- readlink -- /proc/$TEST_REALTIME_PID/cwd"
 test -d "$root/scheduler-old" && test -d "$root/recovery-old"
 touch -d '2021-01-01 UTC' "$root/current"
 bash "$swap" "$live" next-2 "$box/build" next-2 > "$box/second.log" 2>&1
