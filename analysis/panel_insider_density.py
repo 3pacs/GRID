@@ -39,10 +39,13 @@ and ``analysis.ledger_steered_exploration``):
   reported;
 * holdout: Bonferroni over the frozen selections, same sign required; a
   write-once output directory; ``promotion_allowed`` is always false;
-* one shot, enforced through the hash-chained registry: no price is read
-  without a key, and the key exists only after ``inputs_frozen`` (every input
-  hash and ``as_of_ts``) and then ``discovery_opened`` / ``holdout_opened``
-  were appended to the chain; a second discovery or holdout is refused.
+* one shot, enforced through the hash-chained registry: the registry must
+  start with the pinned VS1 v1 registration (:data:`REGISTERED_RECORD_SHA256`);
+  no price is read without a key, and the key exists only after
+  ``inputs_frozen`` (every input hash and ``as_of_ts``) and then
+  ``discovery_opened`` / ``holdout_opened`` were appended to the chain *and*
+  an off-host anchor log (committed in the vault) already witnesses that head
+  (:func:`require_witness`); a second discovery or holdout is refused.
 
 Boundaries: no DB writes, no migrations, no timers. Prices are read only
 through ``store.observations.read_window`` with an explicit ``source=``, only
@@ -59,7 +62,7 @@ import hashlib
 import json
 import math
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 from zoneinfo import ZoneInfo
@@ -960,17 +963,18 @@ _KEY_TOKEN = object()
 
 
 class DiscoveryKey:
-    """Proof that ``discovery_opened`` was appended to the registry chain.
+    """Proof that ``discovery_opened`` is in the pinned registry chain and witnessed off-host.
 
-    Issued only by :func:`open_discovery`, after the chain showed a matching
-    ``inputs_frozen`` record and no earlier discovery. Carries the frozen
+    Issued only by :func:`resume_discovery`, after the chain showed one
+    ``discovery_opened`` with a matching ``inputs_frozen`` record and the
+    off-host anchor log already contained its head. Carries the frozen
     inputs (price-manifest digest, probe report, as_of_ts, ...) that every
     discovery price read is checked against.
     """
 
     def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict) -> None:
         if token is not _KEY_TOKEN:
-            raise TypeError("a DiscoveryKey is issued only by open_discovery")
+            raise TypeError("a DiscoveryKey is issued only by resume_discovery")
         self.inputs_frozen_sha256 = inputs_frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
@@ -978,11 +982,12 @@ class DiscoveryKey:
 
 class HoldoutKey:
     """Proof that the holdout was opened with the flag, the pinned hash and a
-    ``holdout_opened`` record appended to the registry chain."""
+    ``holdout_opened`` record in the pinned registry chain that the off-host
+    anchor log already witnesses (issued only by :func:`resume_holdout`)."""
 
     def __init__(self, token: object, frozen_sha256: str, inputs: dict) -> None:
         if token is not _HOLDOUT_TOKEN:
-            raise TypeError("a HoldoutKey is issued only by open_holdout")
+            raise TypeError("a HoldoutKey is issued only by resume_holdout")
         self.frozen_sha256 = frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
@@ -1091,12 +1096,12 @@ def load_price_panel(
     manifest.validate()
     if window == "discovery":
         if not isinstance(key, DiscoveryKey):
-            raise PermissionError("discovery prices need a DiscoveryKey from open_discovery")
+            raise PermissionError("discovery prices need a DiscoveryKey from resume_discovery")
         if as_of >= stamp(SPLIT).date():
             raise PermissionError("discovery reads stop before the split date")
     elif window == "holdout":
         if not isinstance(key, HoldoutKey):
-            raise PermissionError("holdout prices need a HoldoutKey from open_holdout")
+            raise PermissionError("holdout prices need a HoldoutKey from resume_holdout")
         if as_of >= stamp(END).date():
             raise PermissionError("holdout reads stop before the end of the frozen window")
     else:
@@ -1887,6 +1892,25 @@ REGISTRY_LOG = "granular_panel_prereg_v1.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v1.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v1.lock"
 
+#: The one real VS1 v1 registration (review of #697 at 7c28f281, blocking item 1).
+#: It was registered once, locally, on 2026-09-27T09:27:45Z against code
+#: d1e13f6e (``register`` below, unchanged since), and anchored at 2 records with
+#: chain head 5b10ff57... Every registry this harness accepts must start with
+#: exactly these two records -- line sha256 of the header, then of the
+#: ``preregistration`` record (= the chain head at 2 records). A registry
+#: started with any other time, code or content is a fork and is refused.
+#: A byte copy of this prefix is indistinguishable from the original by
+#: content; the off-host witness (:func:`require_witness`) decides which copy's
+#: continuation counts.
+REGISTERED_AT = datetime(2026, 9, 27, 9, 27, 45, 13793, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA = "d1e13f6ef90b02211b84533ef2c9fa1d14fa787d"
+REGISTERED_RECORD_SHA256: tuple[str, str] = (
+    "dc040b6dca726ae48ecb2eff26349026647ac614db63afb1c6b430726e3c8e7a",  # header
+    "5b10ff57c48c68164fbef9100c174f62d26be3c87e45928cd122549c9bcf7508",  # preregistration (head at 2)
+)
+#: The pins are for this pre-registration body only.
+REGISTERED_PREREG_SHA256 = PREREG_BODY_SHA256
+
 
 def registry(log_dir: Path, prereg_sha256: str = PREREG_BODY_SHA256):
     from analysis.research_forward_log import ForwardLog
@@ -1900,63 +1924,106 @@ def registry(log_dir: Path, prereg_sha256: str = PREREG_BODY_SHA256):
     )
 
 
+def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:
+    """The header and ``preregistration`` records (before chaining), as ``register`` writes them."""
+    header = {
+        "kind": "header",
+        "version": VERSION,
+        "run_at": now.isoformat(),
+        "code_sha": code_sha,
+        "prereg_path": PREREG_PATH.as_posix(),
+        "prereg_sha256": prereg_sha256,
+        "promotion_allowed": False,
+    }
+    record = {
+        "kind": "preregistration",
+        "run_at": now.isoformat(),
+        "code_sha": code_sha,
+        "prereg_path": PREREG_PATH.as_posix(),
+        "prereg_sha256": prereg_sha256,
+        "sector_map_sha256": SECTOR_MAP_SHA256,
+        "ledger_id": LEDGER_ID,
+        "runs": {
+            "vs1": {"sector": VS1_SECTOR, "k": VS1_RUN_K, "alpha": run_alpha(VS1_RUN_K),
+                    "trials": list(trial_names())},
+            "other_sectors": {"sectors": list(OTHER_SECTORS), "k": OTHER_SECTORS_RUN_K,
+                              "alpha": run_alpha(OTHER_SECTORS_RUN_K),
+                              "trials": list(trial_names())},
+        },
+        "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
+        "promotion_allowed": False,
+    }
+    return [header, record]
+
+
+def chained_sha256(records: list[dict]) -> list[str]:
+    """Line sha256 of each record once chained (``prev_sha256`` = the previous line's hash)."""
+    from analysis.research_forward_log import canonical
+
+    previous, out = None, []
+    for record in records:
+        previous = hashlib.sha256(canonical({**record, "prev_sha256": previous})).hexdigest()
+        out.append(previous)
+    return out
+
+
 def register(log_dir: Path, now: datetime, code_sha: str, *, repo_root: Path = REPO,
              prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:
-    """Append the pre-registration record (after a pinned header) to the local registry."""
+    """Write the pinned registration into an empty registry directory.
+
+    VS1 v1 is registered already (:data:`REGISTERED_RECORD_SHA256`). This only
+    re-materialises that exact registration (``now`` = :data:`REGISTERED_AT`,
+    ``code_sha`` = :data:`REGISTERED_CODE_SHA`); any other time or code would
+    start a fork and is refused before anything is written. A materialised copy
+    is a byte copy of the real prefix: only the off-host witness makes its
+    continuation count.
+    """
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
+    records = registration_records(now, code_sha, prereg_sha256)
+    if prereg_sha256 != REGISTERED_PREREG_SHA256 or tuple(chained_sha256(records)) != REGISTERED_RECORD_SHA256:
+        raise PermissionError(
+            "VS1 v1 is already registered (chain head "
+            f"{REGISTERED_RECORD_SHA256[1][:12]}... at 2 records); a registration with another "
+            "time, code or body starts a fork and is refused"
+        )
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         check = log.verify_chain()
         if not check["ok"]:
             raise RuntimeError(f"registry chain is broken: {check['detail']}")
-        records = log.read_all()
-        if any(r.get("kind") == "preregistration" and r.get("prereg_sha256") == prereg_sha256 for r in records):
-            raise ValueError("this pre-registration is already registered")
-        header = [] if records else [{
-            "kind": "header",
-            "version": VERSION,
-            "run_at": now.isoformat(),
-            "code_sha": code_sha,
-            "prereg_path": PREREG_PATH.as_posix(),
-            "prereg_sha256": prereg_sha256,
-            "promotion_allowed": False,
-        }]
-        record = {
-            "kind": "preregistration",
-            "run_at": now.isoformat(),
-            "code_sha": code_sha,
-            "prereg_path": PREREG_PATH.as_posix(),
-            "prereg_sha256": prereg_sha256,
-            "sector_map_sha256": SECTOR_MAP_SHA256,
-            "ledger_id": LEDGER_ID,
-            "runs": {
-                "vs1": {"sector": VS1_SECTOR, "k": VS1_RUN_K, "alpha": run_alpha(VS1_RUN_K),
-                        "trials": list(trial_names())},
-                "other_sectors": {"sectors": list(OTHER_SECTORS), "k": OTHER_SECTORS_RUN_K,
-                                  "alpha": run_alpha(OTHER_SECTORS_RUN_K),
-                                  "trials": list(trial_names())},
-            },
-            "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
-            "promotion_allowed": False,
-        }
-        return log.append_locked(header + [record])
+        if log.read_all():
+            raise ValueError("this pre-registration is already registered in this directory")
+        return log.append_locked(records)
 
 
 # --- one-shot discovery and holdout, enforced through the registry chain ------------------
 #
-# Order of records a VS1 run appends to the registry (after ``preregistration``):
+# Order of records a VS1 run appends to the pinned registry (after the two
+# registration records):
 #
 #   inputs_frozen     hashes of every input (before any price read; may be re-frozen
 #                     only while no discovery has been opened)
-#   discovery_opened  appended BEFORE the first discovery price read; a second
-#                     discovery is refused from here on, even if the first crashed
+#   discovery_opened  appended by open_discovery, BEFORE any discovery price read;
+#                     a second one is refused
+#   (off-host)        the operator commits and pushes the registry's anchor lines,
+#                     up to and including discovery_opened, to the off-host anchor
+#                     log (the vault); resume_discovery refuses to issue the price
+#                     key until verify_chain(external_anchors=...) shows it there
 #   discovery_frozen  the frozen discovery manifest's sha256
-#   holdout_opened    appended BEFORE the first holdout price read; needs the frozen
-#                     file to hash to the chain's discovery_frozen; a second open is refused
+#   holdout_opened    appended by open_holdout, BEFORE any holdout price read; needs
+#                     the frozen file to hash to the chain's discovery_frozen; a
+#                     second open is refused
+#   (off-host)        the same witness for holdout_opened; resume_holdout checks it
 #   holdout_result    the holdout result's sha256 and verdict state
 #
-# The price reader refuses to read without the key these steps issue.
+# The price reader refuses to read without the key resume_discovery /
+# resume_holdout issue. A registry that does not start with the pinned
+# registration is refused everywhere; a byte copy of the pinned prefix (or a
+# deleted-and-recreated registry) can open its own discovery locally, but its
+# chain differs from the one in the off-host log, so it never gets a price key.
+# A discovery or holdout whose opening record is missing from the off-host log
+# is invalid.
 
 #: Inputs every ``inputs_frozen`` record must carry (the Stage-0 power file is
 #: hashed by content, :func:`digest`, so its write-once copy in the run
@@ -1990,19 +2057,117 @@ def _record_sha256(record: dict) -> str:
     return hashlib.sha256(canonical(record)).hexdigest()
 
 
+def _line_sha256(log) -> list[str]:
+    from analysis.research_forward_log import _lines
+
+    return [hashlib.sha256(line).hexdigest() for line in _lines(log.path)]
+
+
 def _chain(log, prereg_sha256: str) -> list[dict]:
-    """Verified records of the registry; refuses a broken chain or a missing registration."""
+    """Verified records of the pinned registry.
+
+    Refuses a broken chain, a pre-registration other than the pinned one, and
+    any registry whose first two records are not the pinned registration
+    (a fresh or recreated registry is a fork).
+    """
+    if prereg_sha256 != REGISTERED_PREREG_SHA256:
+        raise PermissionError("only the pinned VS1 v1 pre-registration has a registry")
     check = log.verify_chain()
     if not check["ok"]:
         raise RuntimeError(f"registry chain is broken: {check['detail']}")
-    records = log.read_all()
-    if not any(r.get("kind") == "preregistration" and r.get("prereg_sha256") == prereg_sha256 for r in records):
-        raise PermissionError("this pre-registration is not registered (run the register stage)")
-    return records
+    heads = _line_sha256(log)
+    if tuple(heads[: len(REGISTERED_RECORD_SHA256)]) != REGISTERED_RECORD_SHA256:
+        if not heads:
+            raise PermissionError("this pre-registration is not registered here (empty registry)")
+        raise PermissionError(
+            "registry is not the pinned VS1 v1 registration (its first records do not hash to "
+            f"{REGISTERED_RECORD_SHA256[1][:12]}... at 2 records): a fork, refused"
+        )
+    return log.read_all()
 
 
 def _kind(records: list[dict], kind: str) -> list[dict]:
     return [r for r in records if r.get("kind") == kind]
+
+
+def _position(records: list[dict], kind: str) -> int:
+    """1-based record count at the single record of ``kind`` (the anchor it needs)."""
+    positions = [i + 1 for i, r in enumerate(records) if r.get("kind") == kind]
+    if len(positions) != 1:
+        raise PermissionError(f"the registry holds {len(positions)} {kind} records, not one")
+    return positions[0]
+
+
+def require_witness(log_dir: Path, external_anchors: Path | None, records_needed: int, *,
+                    prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """The off-host anchor log must already witness this chain up to ``records_needed``.
+
+    ``external_anchors`` is the off-host copy of the registry's anchor lines (a
+    plain-text log, one canonical JSON anchor per line: records, head_sha256,
+    prev_anchor_sha256, run_at), committed and pushed in the vault. It is passed
+    to ``ForwardLog.verify_chain(external_anchors=...)``: every anchor in it must
+    name a prefix this registry still has, with the same head -- so a forked or
+    rewritten registry is refused -- and its last anchor must cover at least
+    ``records_needed`` records. CRLF line endings (a Windows checkout) are
+    normalised before the check.
+    """
+    import tempfile
+
+    from analysis.research_forward_log import _lines
+
+    if external_anchors is None:
+        raise PermissionError("an off-host anchor log (--external-anchors) is required")
+    path = Path(external_anchors)
+    if not path.is_file():
+        raise PermissionError(f"off-host anchor log {path} does not exist")
+    raw = path.read_bytes().replace(b"\r\n", b"\n")
+    log = registry(log_dir, prereg_sha256)
+    with tempfile.TemporaryDirectory() as scratch:
+        normalised = Path(scratch) / path.name
+        normalised.write_bytes(raw)
+        with log.locked():
+            records = _chain(log, prereg_sha256)
+            check = log.verify_chain(external_anchors=normalised)
+            if not check["ok"]:
+                raise PermissionError(f"off-host anchor log does not witness this registry: {check['detail']}")
+            anchors = [json.loads(line) for line in _lines(normalised)]
+    covered = anchors[-1]["records"] if anchors else 0
+    if covered < records_needed:
+        raise PermissionError(
+            f"off-host anchor log covers {covered} records; it must already contain the chain head "
+            f"at {records_needed} records (commit and push the registry's anchor lines first)"
+        )
+    return {"records": len(records), "witnessed_records": covered,
+            "witnessed_head_sha256": anchors[-1]["head_sha256"]}
+
+
+def export_anchors(log_dir: Path, external_anchors: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> list[str]:
+    """Append to the off-host anchor log the registry anchor lines it does not have yet.
+
+    Refuses when the off-host log is not a prefix of this registry's anchor
+    file (it witnesses another chain). Writes the working-tree file only; the
+    operator commits and pushes it. Returns the appended lines.
+    """
+    from analysis.research_forward_log import _lines
+
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        _chain(log, prereg_sha256)
+        local = list(_lines(log.anchor_path))
+    path = Path(external_anchors)
+    existing = list(_lines(path)) if path.exists() else []
+    existing = [line.rstrip(b"\r") for line in existing]
+    if existing != local[: len(existing)]:
+        raise PermissionError("the off-host anchor log witnesses another registry chain; not appending")
+    new = local[len(existing):]
+    if new:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "ab") as stream:
+            if path.stat().st_size and not path.read_bytes().endswith(b"\n"):
+                stream.write(b"\n")
+            for line in new:
+                stream.write(line + b"\n")
+    return [line.decode("utf-8") for line in new]
 
 
 def _check_observed(frozen_inputs: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
@@ -2065,12 +2230,14 @@ def latest_frozen_inputs(log_dir: Path, *, prereg_sha256: str = PREREG_BODY_SHA2
 
 
 def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
-                   prereg_sha256: str = PREREG_BODY_SHA256) -> DiscoveryKey:
-    """One-shot discovery: check the chain, then append ``discovery_opened`` BEFORE any price read.
+                   prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """One-shot discovery, step 1: append ``discovery_opened`` (no price is read).
 
     Requires an ``inputs_frozen`` record whose hashes equal ``observed`` (the
     hashes of the files this run was given). Refused when any discovery was
-    already opened or frozen under this pre-registration.
+    already opened or frozen under this pre-registration. Returns the record
+    count and chain head the off-host anchor log must then witness before
+    :func:`resume_discovery` issues the price key.
     """
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
@@ -2084,15 +2251,38 @@ def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
             raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
         current = frozen_inputs[-1]
         _check_observed(current["inputs"], observed)
-        inputs_sha = _record_sha256(current)
         log.append_locked([{
             "kind": "discovery_opened",
             "run_at": now.isoformat(),
             "prereg_sha256": prereg_sha256,
-            "inputs_frozen_sha256": inputs_sha,
+            "inputs_frozen_sha256": _record_sha256(current),
             "promotion_allowed": False,
         }])
-    return DiscoveryKey(_KEY_TOKEN, inputs_sha, current["inputs"])
+        heads = _line_sha256(log)
+    return {"kind": "discovery_opened", "records": len(heads), "head_sha256": heads[-1]}
+
+
+def resume_discovery(log_dir: Path, observed: Mapping[str, Any], external_anchors: Path | None, *,
+                     prereg_sha256: str = PREREG_BODY_SHA256) -> DiscoveryKey:
+    """One-shot discovery, step 2: the price key, only once the off-host log witnesses it.
+
+    Requires exactly one ``discovery_opened``, no ``discovery_frozen``, inputs
+    equal to that discovery's ``inputs_frozen`` record, and the off-host anchor
+    log covering the ``discovery_opened`` head (:func:`require_witness`).
+    """
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+    if _kind(records, "discovery_frozen"):
+        raise PermissionError("a discovery is already frozen (one shot)")
+    position = _position(records, "discovery_opened")
+    opened = records[position - 1]
+    matching = [r for r in _kind(records, "inputs_frozen") if _record_sha256(r) == opened["inputs_frozen_sha256"]]
+    if len(matching) != 1:
+        raise PermissionError("discovery_opened does not name an inputs_frozen record of this chain")
+    _check_observed(matching[0]["inputs"], observed)
+    require_witness(log_dir, external_anchors, position, prereg_sha256=prereg_sha256)
+    return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"])
 
 
 def seal_discovery(log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict, *,
@@ -2125,6 +2315,22 @@ def seal_discovery(log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict
         }])[0]
 
 
+def _holdout_inputs(records: list[dict], frozen: dict, payload: dict) -> dict:
+    """The discovery's frozen inputs, after checking the chain froze exactly this file."""
+    sealed = _kind(records, "discovery_frozen")
+    if len(sealed) != 1:
+        raise PermissionError("the registry holds no single frozen discovery")
+    if sealed[0]["discovery_sha256"] != frozen["sha256"]:
+        raise PermissionError("the frozen discovery file is not the one the registry chain froze")
+    inputs_sha = sealed[0]["inputs_frozen_sha256"]
+    if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != inputs_sha:
+        raise PermissionError("the frozen discovery does not name the chain's inputs_frozen record")
+    matching = [r for r in _kind(records, "inputs_frozen") if _record_sha256(r) == inputs_sha]
+    if len(matching) != 1:
+        raise PermissionError("the discovery's inputs_frozen record is not in the chain")
+    return matching[0]["inputs"]
+
+
 def open_holdout(
     frozen: dict,
     *,
@@ -2134,13 +2340,14 @@ def open_holdout(
     now: datetime,
     observed: Mapping[str, Any],
     repo_root: Path = REPO,
-) -> HoldoutKey:
-    """One-shot holdout: explicit flag + pinned hash + the chain, then ``holdout_opened``.
+) -> dict:
+    """One-shot holdout, step 1: explicit flag + pinned hash + the chain, then ``holdout_opened``.
 
     The chain must hold exactly one ``discovery_frozen`` whose sha256 is the
     frozen file's, the inputs must equal that discovery's ``inputs_frozen``,
-    and no holdout may have been opened. ``holdout_opened`` is appended before
-    the key (and so any holdout price) exists.
+    and no holdout may have been opened. No price is read here; the off-host
+    log must witness the returned head before :func:`resume_holdout` issues
+    the price key.
     """
     payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                     repo_root=repo_root)
@@ -2149,20 +2356,10 @@ def open_holdout(
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         records = _chain(log, prereg_sha256)
-        sealed = _kind(records, "discovery_frozen")
-        if len(sealed) != 1:
-            raise PermissionError("the registry holds no single frozen discovery")
-        if sealed[0]["discovery_sha256"] != frozen["sha256"]:
-            raise PermissionError("the frozen discovery file is not the one the registry chain froze")
+        inputs = _holdout_inputs(records, frozen, payload)
         if _kind(records, "holdout_opened"):
             raise PermissionError("the holdout was already opened (evaluated once)")
-        inputs_sha = sealed[0]["inputs_frozen_sha256"]
-        if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != inputs_sha:
-            raise PermissionError("the frozen discovery does not name the chain's inputs_frozen record")
-        matching = [r for r in _kind(records, "inputs_frozen") if _record_sha256(r) == inputs_sha]
-        if len(matching) != 1:
-            raise PermissionError("the discovery's inputs_frozen record is not in the chain")
-        _check_observed(matching[0]["inputs"], observed)
+        _check_observed(inputs, observed)
         log.append_locked([{
             "kind": "holdout_opened",
             "run_at": now.isoformat(),
@@ -2170,7 +2367,35 @@ def open_holdout(
             "discovery_sha256": frozen["sha256"],
             "promotion_allowed": False,
         }])
-    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], matching[0]["inputs"])
+        heads = _line_sha256(log)
+    return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
+
+
+def resume_holdout(
+    frozen: dict,
+    *,
+    allow_holdout: bool,
+    prereg_sha256: str,
+    log_dir: Path,
+    observed: Mapping[str, Any],
+    external_anchors: Path | None,
+    repo_root: Path = REPO,
+) -> HoldoutKey:
+    """One-shot holdout, step 2: the price key, only once the off-host log witnesses it."""
+    payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
+                                    repo_root=repo_root)
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+    inputs = _holdout_inputs(records, frozen, payload)
+    if _kind(records, "holdout_result"):
+        raise PermissionError("a holdout result is already recorded (evaluated once)")
+    position = _position(records, "holdout_opened")
+    if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
+        raise PermissionError("holdout_opened names another discovery")
+    _check_observed(inputs, observed)
+    require_witness(log_dir, external_anchors, position, prereg_sha256=prereg_sha256)
+    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs)
 
 
 def seal_holdout(log_dir: Path, now: datetime, key: HoldoutKey, result: dict, *,
