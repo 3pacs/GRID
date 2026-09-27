@@ -7,11 +7,13 @@ and stores each field as a separate entry in ``raw_series``.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
 import math
 import re
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -32,6 +34,83 @@ from price_close_contract import (
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+# GRID-YF-CLOSE-REPAIR-20260926 root-cause fix: the smart scheduler
+# (ingestion/smart_scheduler.py) runs YFinancePuller.pull_all in a daemon
+# thread bounded by a thread-join timeout. If that budget is exceeded the
+# thread is *orphaned* (left running, never killed — see
+# SmartScheduler._run_puller's docstring) while the NEXT scheduler tick can
+# start a fresh pull_all() call in the same process. Two concurrent
+# pull_all() runs against an old, thread-unsafe yfinance version (fixed in
+# 1.7.0, see the module-level timeout note above) was the confirmed
+# mechanism by which one ticker's frame got written under another ticker's
+# series_id. This lock makes pull_all single-flight at the PROCESS level —
+# a non-blocking acquire — so a second concurrent call (whether from an
+# orphaned thread or an ordinary double-invocation) skips its run entirely
+# rather than racing the first one. It is a plain (non-reentrant)
+# threading.Lock at module scope, not an instance attribute, because a new
+# YFinancePuller instance is constructed for every scheduled call
+# (SmartScheduler._build_puller_instance) — the lock must survive across
+# instances and threads for the life of the process.
+_PULL_ALL_LOCK = threading.Lock()
+
+
+def _stable_advisory_lock_key(name: str) -> int:
+    """Deterministic signed-64-bit key for pg_try_advisory_lock/unlock.
+
+    Python's built-in ``hash()`` is randomised per process
+    (``PYTHONHASHSEED``) — two different processes would compute two
+    different keys for the same name, which is useless for a lock they need
+    to agree on. sha256 is deterministic across processes, interpreters, and
+    restarts, which is exactly the property this needs.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).digest()[:8]
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    # pg_try_advisory_lock takes a signed bigint; wrap the top half of the
+    # unsigned range into negative territory rather than truncating bits.
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+# Cross-process single-flight guard (coordinator review of PR #672,
+# 2026-09-26): _PULL_ALL_LOCK above only protects against two concurrent
+# calls INSIDE ONE PROCESS. It does nothing across processes, and two
+# separate, independently-deployed processes both call pull_all():
+#   - grid-scheduler (systemd unit `python3 -m ingestion.scheduler`) ->
+#     run_daily_pulls() -> pull_all(), 4x/day (ingestion/scheduler.py).
+#   - grid-hermes (systemd unit, scripts/hermes_operator.py) ->
+#     ingestion/smart_scheduler.py's SmartScheduler -> pull_all(), every 4h.
+# A session-level Postgres advisory lock is visible across every backend
+# connection to the same database regardless of which OS process opened it,
+# which makes it the actual cross-process guard the thread lock cannot be.
+# Session-level (pg_advisory_lock/pg_advisory_unlock), not transaction-level
+# (pg_advisory_xact_lock): pull_all's body opens and commits many of its own
+# short transactions per ticker (self.engine.begin() in pull_ticker), and a
+# transaction-scoped lock would release after the first one instead of
+# covering the whole run. If the holding process crashes outright (no chance
+# to run the `finally` unlock), Postgres releases every session-level
+# advisory lock held by that backend connection when the connection itself
+# drops — which is also what stops an orphaned SmartScheduler thread from
+# starving this lock forever, unlike _PULL_ALL_LOCK (an orphaned thread
+# keeps holding that one, in-process, until it happens to finish).
+_PULL_ALL_ADVISORY_LOCK_KEY: int = _stable_advisory_lock_key("grid:yfinance:pull_all")
+
+# Wrong-instrument sanity guard (GRID-YF-CLOSE-REPAIR-20260926, fix #4):
+# refuse to write a series' freshly downloaded values if they disagree
+# wildly with that exact series' own existing recent SUCCESS values on the
+# dates where both exist. A different instrument's price series will almost
+# always fail this cheaply, even when everything else about the response
+# (columns, dtypes, dates) looks well-formed.
+_WILD_RATIO_LOW = 0.5
+_WILD_RATIO_HIGH = 2.0
+# Below this many overlapping dates, a ratio is too noisy to judge (a single
+# stale or off-by-one-day existing row could otherwise trip the guard).
+_WILD_RATIO_MIN_OVERLAP = 3
+# How far back to compare — see _median_ratio_vs_existing's docstring for
+# why this must stay bounded (a full-history pull_all call would otherwise
+# make this guard's own lookup scan ~1.15M rows per field on a heavily
+# contaminated series like YF:SPY:close; measured via EXPLAIN ANALYZE on
+# grid-svr, 2026-09-26).
+_WILD_RATIO_LOOKBACK_DAYS = 30
 
 # yfinance logs missing/delisted symbols at ERROR level internally. The puller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
@@ -142,6 +221,153 @@ class YFinancePuller(BasePuller):
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
 
+    def _try_acquire_pg_advisory_lock(self) -> Any | None:
+        """Try to take the cross-process advisory lock for pull_all.
+
+        Returns the open ``Connection`` holding the lock (pass it to
+        :meth:`_release_pg_advisory_lock` when done), or ``None`` if another
+        process already holds it.
+
+        Deliberately does NOT use ``with self.engine.connect() as conn:``.
+        A session-level advisory lock lives on the specific physical backend
+        connection that took it — exiting a context manager (or otherwise
+        closing/returning the connection to the pool) releases the lock
+        immediately, even though the caller still believes it holds it. The
+        returned connection must stay open, unreturned to the pool, for the
+        entire pull_all() run.
+        """
+        conn = self.engine.connect()
+        try:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            ).scalar()
+            # pg_try_advisory_lock is session-scoped, not transaction-scoped
+            # — it is unaffected by commit/rollback. Close out the implicit
+            # transaction SQLAlchemy auto-began for that SELECT so this
+            # connection doesn't sit "idle in transaction" for the whole run.
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return None
+        return conn
+
+    def _release_pg_advisory_lock(self, conn: Any) -> None:
+        """Release the cross-process advisory lock and close its connection.
+
+        Explicit ``pg_advisory_unlock`` before ``close()`` matters: without
+        it, the connection pool could eventually hand this same physical
+        backend connection to unrelated work while it still holds the lock
+        (a normal ``close()`` returns the connection to the pool; it does
+        not itself run ``pg_advisory_unlock``). Crash safety is separate and
+        already covered — see the module-level comment on
+        ``_PULL_ALL_ADVISORY_LOCK_KEY``: if the process dies outright,
+        Postgres releases the lock when that backend connection drops.
+        """
+        try:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            )
+            conn.commit()
+        except Exception as exc:
+            log.warning(
+                "yfinance pull_all: failed to release the advisory lock "
+                "cleanly (Postgres will still release it when this "
+                "connection closes/drops): {e}",
+                e=str(exc),
+            )
+        finally:
+            conn.close()
+
+    def _median_ratio_vs_existing(
+        self,
+        series_id: str,
+        values_by_date: dict[date, float],
+        conn: Any,
+    ) -> tuple[float | None, int]:
+        """Compare freshly downloaded values to this series' own RECENT history.
+
+        Looks up existing SUCCESS rows for ``series_id`` within the last
+        ``_WILD_RATIO_LOOKBACK_DAYS`` days (see that constant — bounded
+        deliberately, not to the full min/max of ``values_by_date``) and
+        returns the median of new/old ratios plus how many dates overlapped.
+        Zero or near-zero existing values are excluded (division is
+        meaningless there). Returns ``(None, overlap_count)`` when there
+        isn't enough overlap to judge — callers must treat ``None`` as "no
+        opinion", never as "safe".
+
+        Why bounded to a recent window rather than the request's full date
+        range: ``values_by_date`` comes from whatever ``start_date`` this
+        call happened to request, which for a deliberate full-history
+        backfill (``pull_all``'s own 1990-01-01 default; see that method's
+        docstring) spans 35+ years. Measured via EXPLAIN ANALYZE on
+        grid-svr (2026-09-26): the same query unbounded over a heavily
+        contaminated series (YF:SPY:close, ~1.15M SUCCESS rows across all
+        its wrong-instrument batches — see GRID-YF-CLOSE-REPAIR-20260926)
+        took ~1.5s and read ~150MB of buffers, inside the same DB
+        transaction as the pending inserts, on EVERY field of EVERY ticker.
+        A short recent window is also literally what this guard is meant to
+        check against — "that series' existing RECENT SUCCESS values" — not
+        an ability to judge decades-old history on every call.
+
+        Parameters:
+            series_id: The raw_series series identifier being written.
+            values_by_date: Freshly downloaded {obs_date: value} pairs.
+            conn: Active database connection (used inside the same
+                transaction as the pending inserts).
+        """
+        if not values_by_date:
+            return None, 0
+
+        recent_floor = date.today() - timedelta(days=_WILD_RATIO_LOOKBACK_DAYS)
+        windowed = {d: v for d, v in values_by_date.items() if d >= recent_floor}
+        if not windowed:
+            return None, 0
+
+        rows = conn.execute(
+            text(
+                "SELECT obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src "
+                "AND pull_status = 'SUCCESS' "
+                "AND obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {
+                "sid": series_id,
+                "src": self.source_id,
+                "start_date": max(min(windowed), recent_floor),
+                "end_date": max(windowed),
+            },
+        ).fetchall()
+        existing: dict[date, float] = {}
+        for row in rows:
+            try:
+                existing[row[0]] = float(row[1])
+            except (TypeError, ValueError):
+                continue
+
+        ratios: list[float] = []
+        for obs_date_val, new_val in windowed.items():
+            old_val = existing.get(obs_date_val)
+            if old_val is None or old_val == 0 or new_val == 0:
+                continue
+            ratios.append(new_val / old_val)
+
+        if len(ratios) < _WILD_RATIO_MIN_OVERLAP:
+            return None, len(ratios)
+
+        ratios.sort()
+        mid = len(ratios) // 2
+        median = (
+            ratios[mid]
+            if len(ratios) % 2 == 1
+            else (ratios[mid - 1] + ratios[mid]) / 2
+        )
+        return median, len(ratios)
+
     def pull_ticker(
         self,
         ticker: str,
@@ -211,8 +437,33 @@ class YFinancePuller(BasePuller):
                 yf_ticker, auto_adjust=False, **download_kwargs
             )
 
-            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
+            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker).
+            # Wrong-instrument guard (GRID-YF-CLOSE-REPAIR-20260926, fix #3):
+            # verify every ticker-level entry matches what we asked for
+            # BEFORE dropping that level. A mismatch means the frame yfinance
+            # returned belongs (wholly or partly) to a different instrument
+            # — the confirmed mechanism behind the April 2026 SPY/QQQ/BTC/ETH
+            # contamination (donor tickers like CL=F, GBPUSD=X, another
+            # crypto). Fail closed for the whole ticker rather than silently
+            # writing data that isn't this ticker's.
             if isinstance(df.columns, pd.MultiIndex):
+                ticker_level = df.columns.get_level_values(-1)
+                unexpected = sorted(
+                    {str(t) for t in ticker_level if str(t) != yf_ticker}
+                )
+                if unexpected:
+                    log.warning(
+                        "yfinance {t}: downloaded frame contains other "
+                        "ticker column(s) {u} — refusing to write "
+                        "(wrong-instrument guard)",
+                        t=yf_ticker, u=unexpected,
+                    )
+                    result["status"] = "SKIPPED"
+                    result["outcome"] = "error"
+                    result["errors"].append(
+                        f"Wrong-instrument frame: unexpected ticker column(s) {unexpected}"
+                    )
+                    return result
                 df.columns = df.columns.get_level_values(0)
 
             # Drop any rows where the index is not a valid datetime
@@ -264,14 +515,21 @@ class YFinancePuller(BasePuller):
                     # producing repeated headers) yield a DataFrame instead of
                     # a Series, whose .items() iterates column names rather
                     # than the DatetimeIndex — which leaks strings like "Open"
-                    # into obs_date and poisons the insert.
+                    # into obs_date and poisons the insert. Fix #3
+                    # (GRID-YF-CLOSE-REPAIR-20260926): we can't tell which
+                    # duplicate column is correct, so fail closed for this
+                    # field instead of silently guessing via the first one.
                     if isinstance(selected, pd.DataFrame):
                         log.warning(
                             "yfinance {t}: column {c} resolved to DataFrame "
-                            "({n} duplicates); taking first column",
+                            "({n} duplicate columns) — refusing to guess; "
+                            "skipping this field",
                             t=yf_ticker, c=col_name, n=selected.shape[1],
                         )
-                        selected = selected.iloc[:, 0]
+                        result["errors"].append(
+                            f"{field_key}: ambiguous duplicate columns — skipped"
+                        )
+                        continue
                     col_data = selected.dropna()
                     # Bounded to the same window this call already requested
                     # from yfinance: col_data can only contain dates inside
@@ -286,6 +544,47 @@ class YFinancePuller(BasePuller):
                         start_date=requested_start_bound,
                         end_date=existing_end_bound,
                     )
+
+                    # Wrong-instrument sanity guard (fix #4,
+                    # GRID-YF-CLOSE-REPAIR-20260926): before writing anything
+                    # for this series, compare the freshly downloaded values
+                    # to this exact series' own existing recent SUCCESS
+                    # values on the dates where both exist. A median ratio
+                    # far from 1 — outside [0.5, 2] — means this download
+                    # disagrees wildly with the series' own history, which is
+                    # cheap, strong evidence of a wrong-instrument frame
+                    # (donor tickers off by 0.4x-30x+ per the incident
+                    # writeup) rather than a normal revision. Refuse the
+                    # whole field's writes rather than trying to salvage
+                    # individual dates.
+                    guard_values_by_date: dict[date, float] = {}
+                    for dt_idx, raw_value in col_data.items():
+                        parsed = pd.to_datetime(dt_idx, errors="coerce")
+                        if pd.isna(parsed):
+                            continue
+                        try:
+                            guard_values_by_date[parsed.date()] = float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                    median_ratio, overlap_n = self._median_ratio_vs_existing(
+                        series_id, guard_values_by_date, conn,
+                    )
+                    if median_ratio is not None and not (
+                        _WILD_RATIO_LOW <= median_ratio <= _WILD_RATIO_HIGH
+                    ):
+                        log.warning(
+                            "yfinance {t}:{f}: refusing write — median ratio "
+                            "{r:.3f} vs {n} overlapping existing SUCCESS "
+                            "dates is outside [{lo},{hi}] (wrong-instrument "
+                            "guard)",
+                            t=yf_ticker, f=field_key, r=median_ratio,
+                            n=overlap_n, lo=_WILD_RATIO_LOW, hi=_WILD_RATIO_HIGH,
+                        )
+                        result["errors"].append(
+                            f"{field_key}: wild median ratio {median_ratio:.3f} "
+                            f"vs {overlap_n} existing dates — refused"
+                        )
+                        continue
 
                     for dt_idx, value in col_data.items():
                         # Defensive: reject any index entry that isn't a real
@@ -478,54 +777,117 @@ class YFinancePuller(BasePuller):
               same dict shape with "status": "SUCCESS",
               "stopped_by_budget": False, "tickers_not_attempted": [],
               "counts": {..., "unattempted": 0}.
+            - a previous pull_all() call is still active — EITHER in this
+              same process (in-process single-flight guard, fix #1) OR in a
+              different process against the same database (cross-process
+              advisory lock — grid-scheduler and grid-hermes both call
+              pull_all independently; see the module comment on
+              ``_PULL_ALL_ADVISORY_LOCK_KEY``): this call makes NO attempt
+              at all — not even the first ticker — and returns immediately.
+              should_continue is None: an empty list ``[]`` (zero tickers
+              checked; distinguishable from a real run only by being empty,
+              since a real run over an empty ticker_list is degenerate and
+              not a supported input). should_continue given: the usual dict
+              shape with "status": "SKIPPED", "stopped_by_budget": True (so
+              callers like scripts/hermes_fixers.py::_retry_source that gate
+              "mark this source freshly checked" on `stopped_by_budget`
+              correctly do NOT advance last_pull_at), "tickers_not_attempted"
+              equal to the full requested ticker_list, "counts" all-zero
+              except "unattempted", and "skipped_reason" naming which guard
+              (in-process vs cross-process) skipped the run.
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
 
-        log.info(
-            "Starting yfinance bulk pull — checking {n} tickers from {sd}",
-            n=len(ticker_list),
-            sd=start_date,
-        )
-        results: list[dict[str, Any]] = []
-        stopped_by_budget = False
-        for idx, ticker in enumerate(ticker_list):
-            if should_continue is not None and not should_continue():
-                log.warning(
-                    "yfinance bulk pull: budget exhausted after {n}/{total} "
-                    "tickers — stopping",
-                    n=idx, total=len(ticker_list),
+        def _skip_result(reason: str) -> list[dict[str, Any]] | dict[str, Any]:
+            log.warning(
+                "yfinance pull_all: {reason} — skipping this run entirely "
+                "(no tickers attempted)",
+                reason=reason,
+            )
+            if should_continue is None:
+                return []
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0,
+                      "error": 0, "unattempted": len(ticker_list)}
+            return {
+                "status": "SKIPPED",
+                "stopped_by_budget": True,
+                "results": [],
+                "tickers_not_attempted": list(ticker_list),
+                "counts": counts,
+                "skipped_reason": reason,
+            }
+
+        # In-process single-flight guard (fix #1): non-blocking acquire so a
+        # second concurrent pull_all() call IN THIS PROCESS — most commonly
+        # the scheduler's next tick finding an earlier orphaned/still-running
+        # call — skips its run rather than racing the in-flight one. Cheap
+        # (no DB round-trip), so it stays as the first check. See the module
+        # docstring on _PULL_ALL_LOCK for why this must be module-level, not
+        # an instance attribute.
+        if not _PULL_ALL_LOCK.acquire(blocking=False):
+            return _skip_result("pull_all already running in this process")
+
+        pg_lock_conn = None
+        try:
+            # Cross-process single-flight guard: _PULL_ALL_LOCK above cannot
+            # see a concurrent pull_all() running in a DIFFERENT process
+            # (grid-scheduler vs grid-hermes — see _PULL_ALL_ADVISORY_LOCK_KEY's
+            # comment). A Postgres session-level advisory lock can.
+            pg_lock_conn = self._try_acquire_pg_advisory_lock()
+            if pg_lock_conn is None:
+                return _skip_result(
+                    "another process holds the cross-process advisory lock"
                 )
-                stopped_by_budget = True
-                break
-            res = self.pull_ticker(ticker, start_date)
-            results.append(res)
 
-        log.info(
-            "yfinance bulk pull complete — {ok}/{total} checked successfully",
-            ok=sum(1 for r in results if r["status"] == "SUCCESS"),
-            total=len(results),
-        )
+            log.info(
+                "Starting yfinance bulk pull — checking {n} tickers from {sd}",
+                n=len(ticker_list),
+                sd=start_date,
+            )
+            results: list[dict[str, Any]] = []
+            stopped_by_budget = False
+            for idx, ticker in enumerate(ticker_list):
+                if should_continue is not None and not should_continue():
+                    log.warning(
+                        "yfinance bulk pull: budget exhausted after {n}/{total} "
+                        "tickers — stopping",
+                        n=idx, total=len(ticker_list),
+                    )
+                    stopped_by_budget = True
+                    break
+                res = self.pull_ticker(ticker, start_date)
+                results.append(res)
 
-        if should_continue is None:
-            return results
+            log.info(
+                "yfinance bulk pull complete — {ok}/{total} checked successfully",
+                ok=sum(1 for r in results if r["status"] == "SUCCESS"),
+                total=len(results),
+            )
 
-        not_attempted = ticker_list[len(results):]
-        counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
-        for r in results:
-            outcome = r.get("outcome")
-            if outcome in counts:
-                counts[outcome] += 1
-            else:
-                counts["error"] += 1
-        counts["unattempted"] = len(not_attempted)
-        return {
-            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
-            "stopped_by_budget": stopped_by_budget,
-            "results": results,
-            "tickers_not_attempted": not_attempted,
-            "counts": counts,
-        }
+            if should_continue is None:
+                return results
+
+            not_attempted = ticker_list[len(results):]
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+            for r in results:
+                outcome = r.get("outcome")
+                if outcome in counts:
+                    counts[outcome] += 1
+                else:
+                    counts["error"] += 1
+            counts["unattempted"] = len(not_attempted)
+            return {
+                "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+                "stopped_by_budget": stopped_by_budget,
+                "results": results,
+                "tickers_not_attempted": not_attempted,
+                "counts": counts,
+            }
+        finally:
+            if pg_lock_conn is not None:
+                self._release_pg_advisory_lock(pg_lock_conn)
+            _PULL_ALL_LOCK.release()
 
 
 if __name__ == "__main__":
