@@ -669,6 +669,15 @@ class GRIDApi {
     async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
     async getHealth() { return this._fetch('/api/v1/system/health'); }
     async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
+
+    // God view (G8): read-only, point-in-time pillar summary. asOf is an ISO
+    // date or an offset-qualified ISO datetime; omitted means server now.
+    async getGodViewLatest({ asOf = null } = {}) {
+        const params = new URLSearchParams();
+        if (asOf) params.set('as_of', asOf);
+        const qs = params.toString();
+        return this._fetch(`/api/v1/godview/latest${qs ? `?${qs}` : ''}`);
+    }
     async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
     // Signals
