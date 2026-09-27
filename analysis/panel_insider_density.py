@@ -1,0 +1,1792 @@
+"""VS1 panel harness: insider open-market-buy density within one sector (research only).
+
+Pre-registration: ``docs/paper_log/vs1-insider-density-v1-preregistration.md``.
+The sha256 of its body (the LF bytes between :data:`BODY_START` and
+:data:`BODY_END`) is pinned in :data:`PREREG_BODY_SHA256`; every run refuses to
+start when the repository copy no longer hashes to it, and the holdout refuses
+unless the caller passes an explicit flag *and* that hash.
+
+What it is
+----------
+The cross-sectional ("panel") mode the granular-discovery plan calls Route B
+(§2.4 of ``GRID-GRANULAR-DISCOVERY-PLAN-20260927``). A trial is (feature,
+horizon) inside one sector. Its statistic is the mean over horizon-spaced
+decision dates of the Spearman rank correlation, across the sector's eligible
+issuers, between the feature at the decision and the issuer's forward return
+minus the sector ETF's forward return (the "rank IC"). The per-date rank IC is
+unchanged by subtracting a return common to every issuer, so the benchmark
+enters the reported magnitudes (buyer-minus-benchmark returns), not the test.
+
+Statistics reused from the time-series loop (``analysis.offline_research_proof``
+and ``analysis.ledger_steered_exploration``):
+
+* split first, then label: every price outside the window is blanked before a
+  label is computed, and in discovery mode no price on or after the split is
+  even read (the reader is bounded at ``split - 1 day``);
+* horizon-spaced decisions: one decision every ``h`` sessions, so outcome
+  windows never overlap;
+* the data-driven permutation block (:func:`autocorrelation_block`) sized on
+  the discovery IC series, frozen for the holdout (``MIN_BLOCKS`` cap);
+* p-values from a block null with a deterministic seed: here a block
+  sign-flip of the per-date IC series (H0: the IC series is sign-symmetric in
+  blocks, i.e. mean IC = 0); two sensitivity nulls are reported and never
+  select (a time-alignment block permutation of the outcome cross-sections,
+  the direct analogue of the time-series null, and a within-date issuer
+  shuffle);
+* selection by Holm's step-down at the ledger-issued run alpha
+  ``alpha_k = q / (k (k + 1))`` (S11 alpha spending) over every declared trial,
+  untestable ones at p = 1; BH-adjusted p-values over the same trials are
+  reported;
+* holdout: Bonferroni over the frozen selections, same sign required; a
+  write-once output directory; ``promotion_allowed`` is always false.
+
+Boundaries: no DB writes, no migrations, no timers. Prices are read only
+through ``store.observations.read_window`` with an explicit ``source=``, only
+for tickers in a frozen admitted-price manifest, never from a refused source
+(yfinance, the Kaggle bulk load). Insider events come from an off-DB file
+(the SEC Form 3/4/5 structured data sets, non-derivative transactions).
+Nothing here is a trading signal.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, time
+from pathlib import Path
+from typing import Any, Iterable, Mapping
+from zoneinfo import ZoneInfo
+
+import numpy as np
+import pandas as pd
+from pandas.tseries.holiday import USFederalHolidayCalendar
+
+from analysis.offline_research_proof import (
+    MIN_BLOCKS,
+    autocorrelation_block,
+    bh_adjusted,
+    block_permutations,
+    corrected_p,
+    digest,
+    holm_adjusted,
+    stamp,
+    write_once,
+)
+from store import observations
+
+REPO = Path(__file__).resolve().parent.parent
+
+
+def rankdata(values: np.ndarray) -> np.ndarray:
+    """Average ranks (1-based, ties share their mean rank), like ``scipy.stats.rankdata``.
+
+    A plain-numpy version: scipy's per-call overhead dominates the thousands of
+    small cross-sections ranked here.
+    """
+    x = np.asarray(values, dtype=float)
+    order = np.argsort(x, kind="mergesort")
+    ordered = x[order]
+    starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])
+    counts = np.diff(np.r_[starts, len(x)])
+    ranks = np.empty(len(x))
+    ranks[order] = np.repeat(starts + 1 + (counts - 1) / 2.0, counts)
+    return ranks
+
+# --- pinned pre-registration -------------------------------------------------------
+
+PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v1-preregistration.md")
+BODY_START = "<!-- PREREG-BODY-START -->"
+BODY_END = "<!-- PREREG-BODY-END -->"
+# sha256 of the LF bytes strictly between the two markers. Changing the body is
+# a new pre-registration (v2): re-pin only before any data is read.
+PREREG_BODY_SHA256 = "85078eeeb08fe292f4a01a295261c6594d865423cdfd505621949ba43dea7c5a"
+# sha256 (LF bytes) of analysis/sector_map_data.yaml at origin/main 1bb2f61b:
+# sector membership is computed from exactly this file.
+SECTOR_MAP_SHA256 = "2d262fe1a8ab4fbfe7abbde86c947c3ff35c12c49f00f4217b24e0dd3af3cdba"
+SECTOR_MAP_PATH = Path("analysis/sector_map_data.yaml")
+
+VERSION = "vs1-v1"
+ORIGIN = "form345_panel_research"
+
+# --- declared design ----------------------------------------------------------------
+
+#: The 11 equity sectors of the plan's generalization gate and their benchmark ETF.
+EQUITY_SECTORS: dict[str, str] = {
+    "Technology": "XLK",
+    "Energy": "XLE",
+    "Financials": "XLF",
+    "Healthcare": "XLV",
+    "Industrials": "XLI",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Real Estate": "XLRE",
+    "Utilities": "XLU",
+    "Communication Services": "XLC",
+    "Materials": "XLB",
+}
+VS1_SECTOR = "Technology"
+#: Pre-registered order of the later sector runs (all in one ledger run, k=2).
+OTHER_SECTORS: tuple[str, ...] = tuple(s for s in EQUITY_SECTORS if s != VS1_SECTOR)
+
+DISCOVERY_START = "2012-01-01T00:00:00+00:00"
+SPLIT = "2020-01-01T00:00:00+00:00"
+END = "2026-07-01T00:00:00+00:00"
+
+#: feature name -> (window W in calendar days, recency half-life tau in days)
+FEATURES: dict[str, tuple[int, float]] = {"A90": (90, 45.0), "A30": (30, 15.0)}
+HORIZONS: tuple[int, ...] = (5, 20)
+PRIMARY_TRIAL = "A90|fwd20"
+PRIMARY_DIRECTION = 1  # published prior: insider buying precedes outperformance
+
+LEDGER_ID = "grid-granular-panel"
+LEDGER_Q = 0.10
+VS1_RUN_K = 1
+OTHER_SECTORS_RUN_K = 2
+BH_Q = 0.10
+HOLDOUT_ALPHA = 0.05
+MIN_N = 30  # decision dates with a finite IC
+MIN_ENTITIES = 20  # issuers with a feature and a label on one decision date
+PERMS = 20000
+SENSITIVITY_PERMS = 2000
+SEED = 20260927
+
+# Event rules (Form 4, non-derivative table)
+PURCHASE_CODE = "P"
+PURCHASE_FORM = "4"
+MIN_TRADE_USD = 10_000.0
+MIN_SHARES = 100.0
+MAX_FILING_LAG_DAYS = 365
+ACTIVITY_LOOKBACK_DAYS = 730
+NEW_YORK = ZoneInfo("America/New_York")
+#: Reg S-T 13(a)(4): a Section 16 form submitted by 22:00 ET gets that day's
+#: filing date, so the filing date alone is public no later than 22:00 ET.
+KNOWN_AT_LOCAL = time(22, 0)
+#: A decision is taken at the session close; entry at that close.
+DECISION_LOCAL = time(16, 0)
+MOMENTUM_SESSIONS = 20
+#: Reported-only stratum (tracker audit): largest qualifying purchase line in the window.
+LARGE_LINE_USD = 500_000.0
+#: Verdict note when this share of buyer issuer-dates has no label (possible delisting).
+MISSING_LABEL_WARNING = 0.05
+
+# Stage-0 power gate (feature data only, synthetic outcomes, before any price read)
+POWER_TARGET_ICS: tuple[float, ...] = (0.01, 0.02, 0.03)
+POWER_GATE_IC = 0.01
+POWER_GATE = 0.50
+POWER_SIMS = 200
+POWER_PERMS = 999
+
+#: Price sources that are never admitted (S07/#642 basis contamination).
+REFUSED_PRICE_SOURCES = frozenset({"yfinance", "yf", "kaggle_bulk", "yfinance_adj"})
+
+TRUE_TOKENS = frozenset({"1", "TRUE", "T", "Y", "YES"})
+
+_HOLIDAYS = (
+    USFederalHolidayCalendar()
+    .holidays("1990-01-01", "2040-12-31")
+    .to_numpy()
+    .astype("datetime64[D]")
+)
+
+
+def run_alpha(k: int, q: float = LEDGER_Q) -> float:
+    """S11 alpha spending: run ``k`` of the ledger is issued ``q / (k (k + 1))``."""
+    if k < 1:
+        raise ValueError("ledger runs count from 1")
+    return q / (k * (k + 1))
+
+
+def trial_names() -> tuple[str, ...]:
+    return tuple(f"{feature}|fwd{h}" for feature in FEATURES for h in HORIZONS)
+
+
+# --- hashing ---------------------------------------------------------------------------
+
+
+def lf_sha256(data: bytes) -> str:
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def prereg_body(text: str) -> str:
+    """The pre-registration body: the text strictly between the two markers (LF)."""
+    text = text.replace("\r\n", "\n")
+    if text.count(BODY_START) != 1 or text.count(BODY_END) != 1:
+        raise ValueError("pre-registration must carry exactly one body start and end marker")
+    start = text.index(BODY_START) + len(BODY_START)
+    end = text.index(BODY_END)
+    if end <= start:
+        raise ValueError("pre-registration body markers are out of order")
+    return text[start:end]
+
+
+def prereg_body_sha256(path: Path) -> str:
+    return hashlib.sha256(prereg_body(Path(path).read_text(encoding="utf-8")).encode("utf-8")).hexdigest()
+
+
+def check_prereg(repo_root: Path = REPO) -> str:
+    """The repository pre-registration must still hash to the pinned body hash."""
+    actual = prereg_body_sha256(Path(repo_root) / PREREG_PATH)
+    if actual != PREREG_BODY_SHA256:
+        raise ValueError(
+            f"pre-registration body hashes to {actual[:12]}, pinned {PREREG_BODY_SHA256[:12]}: "
+            "the spec changed after registration (a change is a new version)"
+        )
+    return actual
+
+
+def file_sha256(path: Path) -> str:
+    return lf_sha256(Path(path).read_bytes())
+
+
+def _finite_or_none(value: float) -> float | None:
+    return float(value) if value is not None and np.isfinite(value) else None
+
+
+# --- sector membership ---------------------------------------------------------------
+
+
+def primary_sectors(sector_map: Mapping[str, Any]) -> dict[str, str | None]:
+    """Primary sector per company ticker (``None`` = ambiguous, excluded everywhere).
+
+    For each ticker and sector, the score is the largest actor ``weight`` of the
+    ticker's ``type: company`` entries in that sector's subsectors. The primary
+    sector is the unique argmax; a tie between sectors leaves the ticker
+    unassigned. The map is undated, so this is today's view applied to history.
+    """
+    scores: dict[str, dict[str, float]] = {}
+    for sector, body in sector_map.items():
+        for sub in (body.get("subsectors") or {}).values():
+            for actor in (sub or {}).get("actors") or ():
+                ticker = actor.get("ticker")
+                if not ticker or actor.get("type") != "company":
+                    continue
+                weight = float(actor.get("weight") or 0.0)
+                current = scores.setdefault(str(ticker).strip().upper(), {})
+                current[sector] = max(current.get(sector, -math.inf), weight)
+    out: dict[str, str | None] = {}
+    for ticker, by_sector in scores.items():
+        best = max(by_sector.values())
+        winners = [s for s, v in by_sector.items() if v == best]
+        out[ticker] = winners[0] if len(winners) == 1 else None
+    return out
+
+
+def load_sector_map(repo_root: Path = REPO) -> dict:
+    """The pinned sector map (refused if the file changed since registration)."""
+    import yaml
+
+    path = Path(repo_root) / SECTOR_MAP_PATH
+    raw = path.read_bytes()
+    if lf_sha256(raw) != SECTOR_MAP_SHA256:
+        raise ValueError("analysis/sector_map_data.yaml changed since the pre-registration")
+    try:
+        loader = yaml.CSafeLoader
+    except AttributeError:  # pragma: no cover - libyaml missing
+        loader = yaml.SafeLoader
+    return yaml.load(raw, Loader=loader)["SECTOR_MAP"]
+
+
+def load_issuer_map(path: Path) -> pd.DataFrame:
+    """ticker -> issuer CIK (SEC ``company_tickers.json`` rows, as CSV or JSON)."""
+    path = Path(path)
+    if path.suffix.lower() == ".json":
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        rows = raw.values() if isinstance(raw, dict) else raw
+        frame = pd.DataFrame(
+            [{"ticker": r.get("ticker"), "cik": r.get("cik_str", r.get("cik"))} for r in rows]
+        )
+    else:
+        frame = pd.read_csv(path, dtype=str)
+        frame.columns = [c.strip().lower() for c in frame.columns]
+        if "cik_str" in frame.columns and "cik" not in frame.columns:
+            frame = frame.rename(columns={"cik_str": "cik"})
+    if not {"ticker", "cik"} <= set(frame.columns):
+        raise ValueError("issuer map needs ticker and cik columns")
+    frame = frame[["ticker", "cik"]].dropna()
+    frame["ticker"] = frame["ticker"].astype(str).str.strip().str.upper()
+    frame["cik"] = pd.to_numeric(frame["cik"], errors="coerce")
+    frame = frame.dropna().astype({"cik": "int64"})
+    return frame.drop_duplicates().reset_index(drop=True)
+
+
+def sector_universe(
+    sector: str, sector_map: Mapping[str, Any], issuer_map: pd.DataFrame
+) -> tuple[pd.DataFrame, dict]:
+    """Sector members with a CIK: one row per issuer CIK (``ticker``, ``cik``).
+
+    A ticker is a member iff its primary sector is ``sector``. Members without
+    a CIK in the issuer map are dropped. When two member tickers share a CIK
+    (share classes) the alphabetically first ticker represents the issuer.
+    """
+    if sector not in EQUITY_SECTORS:
+        raise ValueError(f"{sector}: not one of the 11 pre-registered equity sectors")
+    primaries = primary_sectors(sector_map)
+    members = sorted(t for t, s in primaries.items() if s == sector)
+    ambiguous = sorted(
+        t
+        for t, s in primaries.items()
+        if s is None and _ticker_in_sector(sector_map, t, sector)
+    )
+    by_ticker = issuer_map.drop_duplicates("ticker").set_index("ticker")["cik"]
+    rows = [(t, int(by_ticker[t])) for t in members if t in by_ticker.index]
+    unmapped = [t for t in members if t not in by_ticker.index]
+    frame = (
+        pd.DataFrame(rows, columns=["ticker", "cik"])
+        .sort_values(["cik", "ticker"])
+        .drop_duplicates("cik")
+        .sort_values("ticker")
+        .reset_index(drop=True)
+    )
+    return frame, {
+        "sector": sector,
+        "rule": "sector-map primary sector (unique max actor weight; ties excluded)",
+        "members": len(members),
+        "with_cik": int(len(frame)),
+        "unmapped_no_cik": unmapped,
+        "ambiguous_tie_excluded": ambiguous,
+        "share_class_duplicates_dropped": len(rows) - int(len(frame)),
+    }
+
+
+def _ticker_in_sector(sector_map: Mapping[str, Any], ticker: str, sector: str) -> bool:
+    for sub in (sector_map.get(sector, {}).get("subsectors") or {}).values():
+        for actor in (sub or {}).get("actors") or ():
+            if str(actor.get("ticker") or "").strip().upper() == ticker and actor.get("type") == "company":
+                return True
+    return False
+
+
+# --- Form 4 events ---------------------------------------------------------------------
+
+REQUIRED_COLUMNS: dict[str, tuple[str, ...]] = {
+    "ACCESSION_NUMBER": ("ACCESSION_NUMBER", "ACCESSIONNUMBER", "ACCESSION_NO", "ACCESSION"),
+    "FILING_DATE": ("FILING_DATE", "FILINGDATE", "FILED", "DATE_FILED"),
+    "ISSUERCIK": ("ISSUERCIK", "ISSUER_CIK"),
+    "DOCUMENT_TYPE": ("DOCUMENT_TYPE", "DOCUMENTTYPE", "FORM_TYPE", "FORM"),
+    "TRANS_CODE": ("TRANS_CODE", "TRANSACTION_CODE", "TRANSCODE"),
+}
+PURCHASE_COLUMNS: dict[str, tuple[str, ...]] = {
+    "TRANS_DATE": ("TRANS_DATE", "TRANSACTION_DATE", "TRANSDATE"),
+    "TRANS_SHARES": ("TRANS_SHARES", "TRANSACTION_SHARES", "SHARES"),
+    "TRANS_PRICEPERSHARE": ("TRANS_PRICEPERSHARE", "TRANS_PRICE_PER_SHARE", "PRICE_PER_SHARE", "PRICE"),
+    "TRANS_ACQUIRED_DISP_CD": ("TRANS_ACQUIRED_DISP_CD", "ACQUIRED_DISPOSED_CODE", "ACQ_DISP_CD"),
+}
+OWNER_COLUMNS: dict[str, tuple[str, ...]] = {
+    "RPTOWNERCIK": ("RPTOWNERCIK", "RPT_OWNER_CIK", "REPORTING_OWNER_CIK", "OWNER_CIK"),
+}
+OPTIONAL_COLUMNS: dict[str, tuple[str, ...]] = {
+    "EQUITY_SWAP_INVOLVED": ("EQUITY_SWAP_INVOLVED", "EQUITYSWAPINVOLVED"),
+    "AFF10B5ONE": ("AFF10B5ONE", "AFF_10B5_ONE", "RULE_10B5_1"),
+    "AMENDED": ("AMENDED", "IS_AMENDED"),
+    "NONDERIV_TRANS_SK": ("NONDERIV_TRANS_SK", "TRANS_SK"),
+}
+
+
+def _normalise(name: str) -> str:
+    return str(name).strip().upper().replace(" ", "_").replace("-", "_")
+
+
+ALL_ALIASES = {
+    alias
+    for table in (REQUIRED_COLUMNS, PURCHASE_COLUMNS, OWNER_COLUMNS, OPTIONAL_COLUMNS)
+    for names in table.values()
+    for alias in names
+}
+
+
+def read_table(path: Path, issuers: Iterable[int] | None = None) -> pd.DataFrame:
+    """A CSV/TSV (optionally .gz) or parquet file, every column as text.
+
+    Parquet files are read column-selectively: only columns whose normalised
+    name is a declared alias are loaded (the derived Form 3/4/5 file has
+    about 8.5M rows).
+    """
+    path = Path(path)
+    suffixes = [s.lower() for s in path.suffixes]
+    if ".parquet" in suffixes:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        names = pq.ParquetFile(path).schema_arrow.names
+        wanted = [n for n in names if _normalise(n) in ALL_ALIASES]
+        table = pq.read_table(path, columns=wanted)
+        issuer_col = next(
+            (n for n in wanted if _normalise(n) in REQUIRED_COLUMNS["ISSUERCIK"]), None
+        )
+        if issuers is not None and issuer_col is not None:
+            # Filter in Arrow before any pandas string conversion (8.5M rows).
+            ciks = pd.to_numeric(
+                table.column(issuer_col).to_pandas().astype("string").str.strip(), errors="coerce"
+            )
+            keep = ciks.isin({int(i) for i in issuers}).to_numpy()
+            table = table.filter(pa.array(keep))
+        frame = table.to_pandas().astype("string")
+    else:
+        sep = "\t" if (".tsv" in suffixes or ".txt" in suffixes) else ","
+        frame = pd.read_csv(path, sep=sep, dtype=str, keep_default_na=False, na_values=[""])
+    frame.columns = [_normalise(c) for c in frame.columns]
+    return frame
+
+
+def _pick(frame: pd.DataFrame, aliases: Mapping[str, tuple[str, ...]], required: bool) -> dict[str, str]:
+    found = {}
+    for canonical_name, names in aliases.items():
+        name = next((n for n in names if n in frame.columns), None)
+        if name is None and required:
+            raise ValueError(f"Form 4 file lacks a {canonical_name} column (accepted: {names})")
+        if name is not None:
+            found[canonical_name] = name
+    return found
+
+
+def parse_dates(values: pd.Series) -> pd.Series:
+    """ISO (YYYY-MM-DD[...]) or SEC data-set (DD-MON-YYYY) dates; NaT otherwise."""
+    text = values.astype("string").str.strip().str.upper()
+    iso = pd.to_datetime(text.str.slice(0, 10), format="%Y-%m-%d", errors="coerce")
+    sec = pd.to_datetime(text, format="%d-%b-%Y", errors="coerce")
+    return iso.fillna(sec)
+
+
+def filing_known_at(filing_dates: pd.Series) -> pd.Series:
+    """Filing date at 22:00 America/New_York, in UTC (Reg S-T 13(a)(4) cutoff)."""
+    local = pd.to_datetime(filing_dates) + pd.Timedelta(
+        hours=KNOWN_AT_LOCAL.hour, minutes=KNOWN_AT_LOCAL.minute
+    )
+    return local.dt.tz_localize(NEW_YORK).dt.tz_convert("UTC")
+
+
+def _truthy(values: pd.Series) -> pd.Series:
+    return values.astype("string").str.strip().str.upper().isin(TRUE_TOKENS).fillna(False).astype(bool)
+
+
+def _to_int(values: pd.Series) -> pd.Series:
+    return pd.to_numeric(values.astype("string").str.strip(), errors="coerce")
+
+
+@dataclass(frozen=True)
+class Form4Events:
+    """Open-market purchases and Section 16 activity, with the receipt of their build."""
+
+    purchases: pd.DataFrame  # issuer_cik, actor, known_at, filing_date, trans_date, shares, price, n_reports
+    activity: pd.DataFrame  # issuer_cik, known_at (one row per accession)
+    receipt: dict
+
+    @property
+    def receipt_sha256(self) -> str:
+        return digest(self.receipt)
+
+
+def build_events(
+    transactions: pd.DataFrame,
+    owners: pd.DataFrame | None = None,
+    *,
+    inputs: dict | None = None,
+    issuers: Iterable[int] | None = None,
+) -> Form4Events:
+    """Apply the pre-registered event rules to the non-derivative transactions table.
+
+    ``transactions``: one row per non-derivative transaction line (or one per
+    line x reporting owner, as in the derived file, which fans joint filings
+    out once per owner). ``owners``: the REPORTINGOWNER table (accession, owner
+    CIK) when the transactions file does not carry the owner CIK.
+    ``issuers``: optional issuer-CIK filter applied first (the sector universe).
+    """
+    frame = transactions.rename(columns=_normalise)
+    cols = _pick(frame, REQUIRED_COLUMNS, True)
+    pcols = _pick(frame, PURCHASE_COLUMNS, True)
+    ocols = _pick(frame, OPTIONAL_COLUMNS, False)
+    counts: dict[str, int] = {"rows": int(len(frame))}
+    if issuers is not None:
+        wanted = {int(i) for i in issuers}
+        frame = frame[_to_int(frame[cols["ISSUERCIK"]]).isin(wanted).to_numpy()]
+        counts["rows_in_issuer_filter"] = int(len(frame))
+
+    accession = frame[cols["ACCESSION_NUMBER"]].astype("string").str.strip()
+    issuer = _to_int(frame[cols["ISSUERCIK"]])
+    filed = parse_dates(frame[cols["FILING_DATE"]])
+    valid = accession.notna() & (accession != "") & issuer.notna() & filed.notna()
+    counts["excluded_missing_accession_issuer_or_filing_date"] = int((~valid).sum())
+    base = pd.DataFrame(
+        {
+            "accession": accession,
+            "issuer_cik": issuer,
+            "filing_date": filed,
+            "document_type": frame[cols["DOCUMENT_TYPE"]].astype("string").str.strip().str.upper(),
+            "code": frame[cols["TRANS_CODE"]].astype("string").str.strip().str.upper(),
+            "trans_date": parse_dates(frame[pcols["TRANS_DATE"]]),
+            "shares": pd.to_numeric(frame[pcols["TRANS_SHARES"]], errors="coerce"),
+            "price": pd.to_numeric(frame[pcols["TRANS_PRICEPERSHARE"]], errors="coerce"),
+            "acq_disp": frame[pcols["TRANS_ACQUIRED_DISP_CD"]].astype("string").str.strip().str.upper(),
+            "swap": _truthy(frame[ocols["EQUITY_SWAP_INVOLVED"]]) if "EQUITY_SWAP_INVOLVED" in ocols else False,
+            "plan_10b5_1": _truthy(frame[ocols["AFF10B5ONE"]]) if "AFF10B5ONE" in ocols else False,
+            "amended": _truthy(frame[ocols["AMENDED"]]) if "AMENDED" in ocols else False,
+            "line": (
+                frame[ocols["NONDERIV_TRANS_SK"]].astype("string").str.strip()
+                if "NONDERIV_TRANS_SK" in ocols
+                else pd.Series(pd.NA, index=frame.index, dtype="string")
+            ),
+        }
+    )[valid.to_numpy()]
+    counts["flag_columns_present"] = sorted(k for k in ("AFF10B5ONE", "EQUITY_SWAP_INVOLVED", "AMENDED", "NONDERIV_TRANS_SK") if k in ocols)
+    base["issuer_cik"] = base["issuer_cik"].astype("int64")
+
+    # Owner CIK per accession (from the rows, else from the owner table).
+    ocol = _pick(frame, OWNER_COLUMNS, False)
+    if ocol:
+        owner_rows = pd.DataFrame(
+            {"accession": accession, "owner_cik": _to_int(frame[ocol["RPTOWNERCIK"]])}
+        )[valid.to_numpy()]
+    elif owners is not None:
+        owner_frame = owners.rename(columns=_normalise)
+        oc = _pick(owner_frame, {"ACCESSION_NUMBER": REQUIRED_COLUMNS["ACCESSION_NUMBER"], **OWNER_COLUMNS}, True)
+        owner_rows = pd.DataFrame(
+            {
+                "accession": owner_frame[oc["ACCESSION_NUMBER"]].astype("string").str.strip(),
+                "owner_cik": _to_int(owner_frame[oc["RPTOWNERCIK"]]),
+            }
+        )
+    else:
+        raise ValueError("no reporting-owner CIK: pass the REPORTINGOWNER table as owners")
+    actors = owner_rows.dropna().groupby("accession")["owner_cik"].min().astype("int64")
+
+    # Section 16 activity: every accession with any row, any code or form type.
+    activity = (
+        base.drop_duplicates("accession")[["issuer_cik", "filing_date"]]
+        .assign(known_at=lambda d: filing_known_at(d["filing_date"]))
+        [["issuer_cik", "known_at"]]
+        .sort_values(["issuer_cik", "known_at"])
+        .reset_index(drop=True)
+    )
+    counts["activity_accessions"] = int(len(activity))
+
+    # One row per (accession, transaction): the owner join may have repeated it.
+    purchase = base[base["code"] == PURCHASE_CODE]
+    counts["code_p_rows"] = int(len(purchase))
+    steps = (
+        ("excluded_not_form_4", purchase["document_type"] != PURCHASE_FORM),
+        ("excluded_amended", purchase["amended"].astype(bool)),
+        ("excluded_not_acquired", purchase["acq_disp"] != "A"),
+        ("excluded_equity_swap", purchase["swap"].astype(bool)),
+        ("excluded_10b5_1_flag", purchase["plan_10b5_1"].astype(bool)),
+    )
+    keep = pd.Series(True, index=purchase.index)
+    for name, mask in steps:
+        mask = mask.fillna(True).astype(bool) & keep
+        counts[name] = int(mask.sum())
+        keep &= ~mask
+    lag = (purchase["filing_date"] - purchase["trans_date"]).dt.days
+    bad_date = keep & (
+        purchase["trans_date"].isna() | (lag < 0) | (lag > MAX_FILING_LAG_DAYS)
+    ).fillna(True)
+    counts["excluded_transaction_date"] = int(bad_date.sum())
+    keep &= ~bad_date
+    value = purchase["shares"] * purchase["price"]
+    small = keep & (
+        purchase["shares"].isna()
+        | purchase["price"].isna()
+        | (purchase["price"] <= 0)
+        | (purchase["shares"] < MIN_SHARES)
+        | (value < MIN_TRADE_USD)
+    ).fillna(True)
+    counts["excluded_small_or_unpriced"] = int(small.sum())
+    keep &= ~small
+    kept = purchase[keep].copy()
+    kept["actor"] = kept["accession"].map(actors)
+    no_owner = kept["actor"].isna()
+    counts["excluded_no_owner_cik"] = int(no_owner.sum())
+    kept = kept[~no_owner]
+    kept["actor"] = kept["actor"].astype("int64")
+    # Owner-join repeats of one transaction line: the line key when present.
+    has_line = kept["line"].notna()
+    kept = pd.concat(
+        [
+            kept[has_line].drop_duplicates(["accession", "line"]),
+            kept[~has_line].drop_duplicates(["accession", "trans_date", "shares", "price"]),
+        ]
+    )
+    counts["purchase_transactions"] = int(len(kept))
+
+    # One economic purchase reported in several accessions (joint filers):
+    # earliest filing, smallest owner CIK.
+    kept["shares_key"] = kept["shares"].round(0)
+    kept["price_key"] = kept["price"].round(2)
+    grouped = kept.groupby(["issuer_cik", "trans_date", "shares_key", "price_key"], as_index=False).agg(
+        filing_date=("filing_date", "min"),
+        actor=("actor", "min"),
+        shares=("shares", "first"),
+        price=("price", "first"),
+        n_reports=("accession", "nunique"),
+    )
+    counts["purchases_after_dedup"] = int(len(grouped))
+    grouped["known_at"] = filing_known_at(grouped["filing_date"])
+    grouped["value"] = grouped["shares"] * grouped["price"]
+    purchases = grouped[
+        ["issuer_cik", "actor", "known_at", "filing_date", "trans_date", "shares", "price", "value",
+         "n_reports"]
+    ].sort_values(["issuer_cik", "known_at", "actor"]).reset_index(drop=True)
+    receipt = {
+        "version": VERSION,
+        "inputs": inputs or {},
+        "rules": {
+            "code": PURCHASE_CODE,
+            "form": PURCHASE_FORM,
+            "acquired_disposed": "A",
+            "exclude": [
+                "every form type other than 4 (4/A, 5, 5/A)",
+                "rows flagged amended",
+                "equity swaps (when flagged)",
+                "10b5-1 (only when an AFF10B5ONE flag is present)",
+            ],
+            "min_shares": MIN_SHARES,
+            "min_trade_usd": MIN_TRADE_USD,
+            "max_filing_lag_days": MAX_FILING_LAG_DAYS,
+            "actor": "smallest reporting-owner CIK on the accession",
+            "dedup": "(issuer CIK, transaction date, round(shares), round(price, 2)): earliest filing, smallest actor",
+            "known_at": "filing date 22:00 America/New_York",
+        },
+        "counts": counts,
+        "purchases_sha256": digest(_records(purchases)),
+        "activity_sha256": digest(_records(activity)),
+    }
+    return Form4Events(purchases=purchases, activity=activity, receipt=receipt)
+
+
+def _records(frame: pd.DataFrame) -> list:
+    out = []
+    for row in frame.itertuples(index=False):
+        out.append(
+            [
+                (value.isoformat() if hasattr(value, "isoformat") else
+                 (None if isinstance(value, float) and not math.isfinite(value) else
+                  (int(value) if isinstance(value, (np.integer,)) else
+                   (float(value) if isinstance(value, (np.floating,)) else value))))
+                for value in row
+            ]
+        )
+    return out
+
+
+def data_sha256(path: Path) -> str:
+    """sha256 of a data file's exact bytes (streamed; no line-ending normalisation)."""
+    h = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for chunk in iter(lambda: stream.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def load_events(
+    path: Path, owners_path: Path | None = None, issuers: Iterable[int] | None = None
+) -> Form4Events:
+    inputs = {"transactions": {"name": Path(path).name, "sha256": data_sha256(path)}}
+    owners = None
+    if owners_path is not None:
+        owners = read_table(owners_path)
+        inputs["owners"] = {"name": Path(owners_path).name, "sha256": data_sha256(owners_path)}
+    if issuers is not None:
+        issuers = sorted({int(i) for i in issuers})
+        inputs["issuer_filter_sha256"] = digest(issuers)
+    return build_events(read_table(path, issuers), owners, inputs=inputs, issuers=issuers)
+
+
+# --- features --------------------------------------------------------------------------
+
+
+def decision_instants(sessions: Iterable[date]) -> pd.DatetimeIndex:
+    """16:00 America/New_York of each session date, in UTC."""
+    days = pd.DatetimeIndex([pd.Timestamp(d) for d in sessions])
+    local = days + pd.Timedelta(hours=DECISION_LOCAL.hour, minutes=DECISION_LOCAL.minute)
+    return local.tz_localize(NEW_YORK).tz_convert("UTC")
+
+
+def proxy_sessions(start: date, end: date) -> list[date]:
+    """Weekdays that are not US federal holidays (Stage-0 power only, no price read)."""
+    days = np.arange(np.datetime64(start, "D"), np.datetime64(end, "D"))
+    mask = np.is_busday(days, holidays=_HOLIDAYS)
+    return [pd.Timestamp(d).date() for d in days[mask]]
+
+
+def _ns(stamps: pd.Series) -> np.ndarray:
+    """UTC nanoseconds since the epoch (independent of the column's time unit)."""
+    return stamps.dt.tz_convert("UTC").dt.as_unit("ns").astype("int64").to_numpy()
+
+
+def density(
+    purchases: pd.DataFrame,
+    issuers: Iterable[int],
+    decisions: pd.DatetimeIndex,
+    window_days: int,
+    tau_days: float,
+) -> pd.DataFrame:
+    """``A(e, t)``: sum over distinct actors of exp(-age/tau) of their latest in-window purchase.
+
+    An event counts at decision ``t`` iff ``t - W < known_at <= t``. Each actor
+    counts once per issuer (its most recent qualifying event). Returns a
+    decisions x issuers frame of floats (0.0 where there is no event).
+    """
+    if decisions.tz is None:
+        raise ValueError("decisions must be tz-aware")
+    issuers = [int(i) for i in issuers]
+    t_ns = decisions.tz_convert("UTC").as_unit("ns").asi8.astype(np.float64)
+    day_ns = 86_400e9
+    window_ns = window_days * day_ns
+    out = np.zeros((len(decisions), len(issuers)))
+    by_issuer = {cik: g for cik, g in purchases.groupby("issuer_cik")}
+    for j, cik in enumerate(issuers):
+        events = by_issuer.get(cik)
+        if events is None or events.empty:
+            continue
+        events = events.sort_values(["actor", "known_at"])
+        known = _ns(events["known_at"]).astype(np.float64)
+        age = t_ns[None, :] - known[:, None]  # events x decisions
+        inside = (age >= 0) & (age < window_ns)
+        weight = np.where(inside, np.exp(-age / (tau_days * day_ns)), 0.0)
+        actors = events["actor"].to_numpy()
+        starts = np.flatnonzero(np.r_[True, actors[1:] != actors[:-1]])
+        per_actor = np.maximum.reduceat(weight, starts, axis=0)  # latest event = largest weight
+        out[:, j] = per_actor.sum(axis=0)
+    return pd.DataFrame(out, index=decisions, columns=issuers)
+
+
+def active_mask(
+    activity: pd.DataFrame,
+    issuers: Iterable[int],
+    decisions: pd.DatetimeIndex,
+    lookback_days: int = ACTIVITY_LOOKBACK_DAYS,
+) -> pd.DataFrame:
+    """Issuer is a Section 16 filer at ``t``: an accession known in (t - lookback, t]."""
+    issuers = [int(i) for i in issuers]
+    t = decisions.tz_convert("UTC").as_unit("ns").asi8
+    lo = t - np.int64(lookback_days) * np.int64(86_400_000_000_000)
+    out = np.zeros((len(decisions), len(issuers)), dtype=bool)
+    by_issuer = {cik: g for cik, g in activity.groupby("issuer_cik")}
+    for j, cik in enumerate(issuers):
+        events = by_issuer.get(cik)
+        if events is None:
+            continue
+        known = np.sort(_ns(events["known_at"]))
+        count = np.searchsorted(known, t, side="right") - np.searchsorted(known, lo, side="right")
+        out[:, j] = count > 0
+    return pd.DataFrame(out, index=decisions, columns=issuers)
+
+
+def largest_value(
+    purchases: pd.DataFrame, issuers: Iterable[int], decisions: pd.DatetimeIndex, window_days: int
+) -> pd.DataFrame:
+    """Largest qualifying purchase value (USD) known in (t - W, t]; 0 when none."""
+    issuers = [int(i) for i in issuers]
+    t_ns = decisions.tz_convert("UTC").as_unit("ns").asi8.astype(np.float64)
+    window_ns = window_days * 86_400e9
+    out = np.zeros((len(decisions), len(issuers)))
+    by_issuer = {cik: g for cik, g in purchases.groupby("issuer_cik")}
+    for j, cik in enumerate(issuers):
+        events = by_issuer.get(cik)
+        if events is None or events.empty:
+            continue
+        age = t_ns[None, :] - _ns(events["known_at"]).astype(np.float64)[:, None]
+        inside = (age >= 0) & (age < window_ns)
+        out[:, j] = np.where(inside, events["value"].to_numpy(dtype=float)[:, None], 0.0).max(axis=0)
+    return pd.DataFrame(out, index=decisions, columns=issuers)
+
+
+def entry_positions(purchases: pd.DataFrame, sessions: Iterable[date]) -> pd.DataFrame:
+    """One position per (issuer, entry session): the tracker-v2 event key.
+
+    The entry session of a purchase is the first session whose 16:00 ET close
+    is strictly after its known_at (never a close printed before the filing
+    was public). Purchases sharing an issuer and entry session are one
+    position, carrying the distinct actors, the purchase count, the total and
+    the largest line value. A purchase known after the last session gets no
+    entry and is kept with status ``no_entry_session`` (reported, not dropped).
+    """
+    closes = decision_instants(sorted(set(sessions)))
+    position = np.searchsorted(_index_ns(closes), _ns(purchases["known_at"]), side="right")
+    has = position < len(closes)
+    entry = pd.Series(pd.NaT, index=purchases.index, dtype="datetime64[ns, UTC]")
+    entry[has] = closes.as_unit("ns")[position[has]]
+    frame = purchases.assign(entry_close=entry)
+    grouped = frame.groupby(["issuer_cik", "entry_close"], dropna=False).agg(
+        actors=("actor", lambda a: sorted({int(x) for x in a})),
+        purchases=("actor", "size"),
+        total_value=("value", "sum"),
+        largest_value=("value", "max"),
+        first_known_at=("known_at", "min"),
+        last_known_at=("known_at", "max"),
+    ).reset_index()
+    grouped["n_actors"] = grouped["actors"].map(len)
+    grouped["status"] = np.where(grouped["entry_close"].isna(), "no_entry_session", "opened")
+    return grouped
+
+
+def _index_ns(index: pd.DatetimeIndex) -> np.ndarray:
+    return index.tz_convert("UTC").as_unit("ns").asi8
+
+
+def feature_panel(
+    events: Form4Events, issuers: Iterable[int], decisions: pd.DatetimeIndex, feature: str
+) -> pd.DataFrame:
+    """The declared feature, NaN where the issuer is not a Section 16 filer at ``t``."""
+    window, tau = FEATURES[feature]
+    issuers = list(issuers)
+    values = density(events.purchases, issuers, decisions, window, tau)
+    return values.where(active_mask(events.activity, issuers, decisions))
+
+
+# --- prices ----------------------------------------------------------------------------
+
+HEX64 = frozenset("0123456789abcdef")
+
+
+@dataclass(frozen=True)
+class PriceManifest:
+    """The admitted-price contract, frozen before any label is computed.
+
+    ``source``: the ``source_catalog.name`` every read is constrained to.
+    ``series_template``: e.g. ``"YF:{ticker}:close"`` (the id the source writes).
+    ``basis``: the declared adjustment basis of the closes.
+    ``admitted``: tickers that passed the basis probe (the benchmark included).
+    ``probe_report_sha256``: the probe report this list came from.
+    """
+
+    source: str
+    series_template: str
+    basis: str
+    benchmark: str
+    admitted: tuple[str, ...]
+    probe_report_sha256: str
+
+    def validate(self) -> None:
+        if not self.source or self.source.strip().lower() in REFUSED_PRICE_SOURCES:
+            raise ValueError(f"price source {self.source!r} is refused (unverified basis)")
+        if "{ticker}" not in self.series_template:
+            raise ValueError("series_template must contain {ticker}")
+        if self.benchmark not in self.admitted:
+            raise ValueError("the benchmark must be an admitted ticker")
+        if len(self.probe_report_sha256) != 64 or set(self.probe_report_sha256) - HEX64:
+            raise ValueError("probe_report_sha256 must be a sha256 hex digest")
+        if not self.basis:
+            raise ValueError("declare the price basis")
+
+    @classmethod
+    def from_file(cls, path: Path) -> "PriceManifest":
+        raw = json.loads(Path(path).read_text(encoding="utf-8"))
+        manifest = cls(**{**raw, "admitted": tuple(sorted(raw["admitted"]))})
+        manifest.validate()
+        return manifest
+
+
+_PRICE_LOADER = object()
+
+
+class HoldoutKey:
+    """Proof that the holdout was opened with the flag and the pinned hash."""
+
+    def __init__(self, token: object, frozen_sha256: str) -> None:
+        if token is not _HOLDOUT_TOKEN:
+            raise TypeError("a HoldoutKey is issued only by open_holdout")
+        self.frozen_sha256 = frozen_sha256
+
+
+_HOLDOUT_TOKEN = object()
+
+
+def open_holdout(
+    frozen: dict, *, allow_holdout: bool, prereg_sha256: str, repo_root: Path = REPO
+) -> HoldoutKey:
+    """Refuse the holdout unless explicitly allowed with the matching pre-registration hash."""
+    if allow_holdout is not True:
+        raise PermissionError("holdout evaluation needs an explicit allow_holdout=True")
+    if prereg_sha256 != PREREG_BODY_SHA256:
+        raise PermissionError("the pre-registration hash given does not match the pinned one")
+    check_prereg(repo_root)
+    payload = frozen.get("payload") or {}
+    if digest(payload) != frozen.get("sha256"):
+        raise PermissionError("frozen discovery manifest changed")
+    if payload.get("prereg_sha256") != PREREG_BODY_SHA256:
+        raise PermissionError("the discovery was not run under this pre-registration")
+    if payload.get("state") != "DISCOVERY_FROZEN":
+        raise PermissionError("no frozen discovery to evaluate")
+    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"])
+
+
+class PricePanel:
+    """Closes read through ``store.observations.read_window``, with a receipt."""
+
+    def __init__(
+        self,
+        *,
+        token: object,
+        manifest: PriceManifest,
+        start: date,
+        as_of: date,
+        as_of_ts: datetime,
+        window: str,
+        data: dict[str, tuple[observations.Observation, ...]],
+    ) -> None:
+        if token is not _PRICE_LOADER:
+            raise TypeError("PricePanel is built only by load_price_panel")
+        self.manifest = manifest
+        self.start, self.as_of, self.as_of_ts, self.window = start, as_of, as_of_ts, window
+        self._data = dict(data)
+        self.receipt = self._receipt()
+        self.receipt_sha = digest(self.receipt)
+
+    def _receipt(self) -> dict:
+        return {
+            "reader": "store.observations.read_window",
+            "manifest": asdict(self.manifest),
+            "window": self.window,
+            "start": self.start.isoformat(),
+            "as_of": self.as_of.isoformat(),
+            "as_of_ts": self.as_of_ts.isoformat(),
+            "series": {
+                ticker: {
+                    "n": len(obs),
+                    "first": obs[0].obs_date.isoformat() if obs else None,
+                    "last": obs[-1].obs_date.isoformat() if obs else None,
+                    "sha256": digest([[o.obs_date.isoformat(), o.value] for o in obs]),
+                }
+                for ticker, obs in sorted(self._data.items())
+            },
+        }
+
+    def verify(self) -> None:
+        if digest(self._receipt()) != self.receipt_sha:
+            raise ValueError("price panel changed after its read")
+
+    def closes(self) -> pd.DataFrame:
+        """Session-date x ticker closes; sessions are the benchmark's dates."""
+        bench = self._data[self.manifest.benchmark]
+        index = pd.DatetimeIndex([pd.Timestamp(o.obs_date) for o in bench])
+        frame = pd.DataFrame(index=index)
+        for ticker, obs in self._data.items():
+            series = pd.Series(
+                [o.value for o in obs],
+                index=pd.DatetimeIndex([pd.Timestamp(o.obs_date) for o in obs]),
+                dtype=float,
+            )
+            frame[ticker] = series.reindex(index)
+        return frame
+
+
+def load_price_panel(
+    conn,
+    manifest: PriceManifest,
+    tickers: Iterable[str],
+    *,
+    start: date,
+    as_of: date,
+    as_of_ts: datetime,
+    window: str,
+    holdout_key: HoldoutKey | None = None,
+) -> PricePanel:
+    """Read admitted closes, bounded so discovery never sees a price on/after the split."""
+    manifest.validate()
+    if as_of_ts.tzinfo is None:
+        raise ValueError("as_of_ts must carry a timezone")
+    if window == "discovery":
+        if as_of >= stamp(SPLIT).date():
+            raise PermissionError("discovery reads stop before the split date")
+    elif window == "holdout":
+        if not isinstance(holdout_key, HoldoutKey):
+            raise PermissionError("holdout prices need a HoldoutKey from open_holdout")
+        if as_of >= stamp(END).date():
+            raise PermissionError("holdout reads stop before the end of the frozen window")
+    else:
+        raise ValueError("window must be discovery or holdout")
+    wanted = sorted(set(tickers) | {manifest.benchmark})
+    refused = [t for t in wanted if t not in manifest.admitted]
+    if refused:
+        raise PermissionError(f"tickers not in the admitted-price manifest: {refused[:10]}")
+    data = {}
+    for ticker in wanted:
+        data[ticker] = tuple(
+            observations.read_window(
+                conn,
+                manifest.series_template.format(ticker=ticker),
+                source=manifest.source,
+                start=start,
+                as_of=as_of,
+                as_of_ts=as_of_ts,
+            )
+        )
+    if not data[manifest.benchmark]:
+        raise ValueError("no benchmark closes in the read window")
+    return PricePanel(
+        token=_PRICE_LOADER,
+        manifest=manifest,
+        start=start,
+        as_of=as_of,
+        as_of_ts=as_of_ts,
+        window=window,
+        data=data,
+    )
+
+
+# --- labels (split first, then label) ------------------------------------------------
+
+
+@dataclass
+class TrialPanel:
+    """One trial's decisions x issuers feature and label matrices for one window."""
+
+    trial: str
+    window: str
+    horizon: int
+    decision_at: list[str]
+    label_end: list[str]
+    entities: list[str]
+    feature: np.ndarray  # decisions x entities (NaN = abstain)
+    label: np.ndarray  # decisions x entities (NaN = no label)
+    momentum: np.ndarray | None = None  # past relative return (baseline only)
+    largest: np.ndarray | None = None  # largest purchase line in the window (stratum only)
+
+    def as_record(self) -> dict:
+        def matrix(values):
+            return None if values is None else [[_finite_or_none(v) for v in row] for row in values]
+
+        return {
+            "trial": self.trial,
+            "window": self.window,
+            "horizon": self.horizon,
+            "decision_at": self.decision_at,
+            "label_end": self.label_end,
+            "entities": self.entities,
+            "feature": matrix(self.feature),
+            "label": matrix(self.label),
+        }
+
+
+def window_bounds(window: str) -> tuple[pd.Timestamp, pd.Timestamp]:
+    if window == "discovery":
+        return pd.Timestamp(stamp(DISCOVERY_START)), pd.Timestamp(stamp(SPLIT))
+    if window == "holdout":
+        return pd.Timestamp(stamp(SPLIT)), pd.Timestamp(stamp(END))
+    raise ValueError("window must be discovery or holdout")
+
+
+def relative_labels(
+    closes: pd.DataFrame, benchmark: str, tickers: list[str], horizon: int, window: str
+) -> tuple[list[int], np.ndarray, np.ndarray]:
+    """Horizon-spaced decisions and (issuer - benchmark) forward returns in one window.
+
+    Every close outside ``[lo, hi)`` is blanked before labelling (purge by
+    construction). Decisions are the window's sessions every ``horizon``
+    sessions from its first session; a decision whose label end is not a
+    session inside the window is dropped. Returns (decision positions,
+    labels, momentum baseline).
+    """
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+    lo, hi = window_bounds(window)
+    dates = closes.index
+    day = pd.DatetimeIndex(dates).tz_localize("UTC")
+    inside = np.asarray((day >= lo.normalize()) & (day < hi.normalize()))
+    raw = closes[tickers + [benchmark]].to_numpy(dtype=float)
+    visible = raw.copy()
+    visible[~inside, :] = np.nan
+    positions = [i for i in np.flatnonzero(inside)[::horizon] if i + horizon < len(dates) and inside[i + horizon]]
+    labels, momentum = [], []
+    for i in positions:
+        start, end = visible[i], visible[i + horizon]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rel = (end[:-1] / start[:-1] - 1.0) - (end[-1] / start[-1] - 1.0)
+        rel[~np.isfinite(rel)] = np.nan
+        labels.append(rel)
+        # Baseline: past MOMENTUM_SESSIONS relative return, from closes <= t only.
+        if i >= MOMENTUM_SESSIONS:
+            past, now = raw[i - MOMENTUM_SESSIONS], raw[i]
+            with np.errstate(divide="ignore", invalid="ignore"):
+                mom = (now[:-1] / past[:-1] - 1.0) - (now[-1] / past[-1] - 1.0)
+            mom[~np.isfinite(mom)] = np.nan
+        else:
+            mom = np.full(len(tickers), np.nan)
+        momentum.append(mom)
+    shape = (len(positions), len(tickers))
+    return (
+        positions,
+        np.array(labels).reshape(shape),
+        np.array(momentum).reshape(shape),
+    )
+
+
+def build_trial_panels(
+    events: Form4Events,
+    universe: pd.DataFrame,
+    prices: PricePanel,
+    window: str,
+) -> dict[str, TrialPanel]:
+    """Every declared trial's panel for one window, from verified inputs only."""
+    prices.verify()
+    if prices.window != window:
+        raise ValueError("price panel window differs")
+    closes = prices.closes()
+    benchmark = prices.manifest.benchmark
+    universe = universe[universe["ticker"].isin(closes.columns)]
+    tickers = list(universe["ticker"])
+    ciks = list(universe["cik"].astype(int))
+    panels = {}
+    for h in HORIZONS:
+        positions, labels, momentum = relative_labels(closes, benchmark, tickers, h, window)
+        sessions = [closes.index[i].date() for i in positions]
+        decided = decision_instants(sessions)
+        ends = decision_instants([closes.index[i + h].date() for i in positions])
+        for name in FEATURES:
+            feature = feature_panel(events, ciks, decided, name).to_numpy(dtype=float)
+            # abstain where the issuer has no close at t (not trading)
+            listed = np.isfinite(closes[tickers].to_numpy(dtype=float)[positions]) if positions else np.zeros((0, len(tickers)), bool)
+            feature = np.where(listed, feature, np.nan)
+            largest = largest_value(events.purchases, ciks, decided, FEATURES[name][0])
+            trial = f"{name}|fwd{h}"
+            panels[trial] = TrialPanel(
+                trial=trial,
+                window=window,
+                horizon=h,
+                decision_at=[d.isoformat() for d in decided],
+                label_end=[d.isoformat() for d in ends],
+                entities=tickers,
+                feature=feature,
+                label=labels,
+                momentum=momentum,
+                largest=np.where(np.isfinite(feature), largest.to_numpy(dtype=float), np.nan),
+            )
+    return panels
+
+
+def validate_panel(panel: TrialPanel) -> None:
+    """Non-overlapping, ordered, in-window decisions and finite-or-NaN matrices."""
+    lo, hi = window_bounds(panel.window)
+    previous_end = None
+    for decided, ended in zip(panel.decision_at, panel.label_end):
+        d, e = stamp(decided), stamp(ended)
+        if e <= d or d < lo or e >= hi:
+            raise ValueError("decision or label outside its window")
+        if previous_end is not None and d < previous_end:
+            raise ValueError("overlapping outcome windows")
+        previous_end = e
+    shape = (len(panel.decision_at), len(panel.entities))
+    for matrix in (panel.feature, panel.label):
+        if matrix.shape != shape or np.isinf(matrix).any():
+            raise ValueError("panel matrices must be decisions x entities, finite or NaN")
+
+
+# --- statistics ------------------------------------------------------------------------
+
+
+def _row_ranks(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Average ranks within each row over ``mask`` (vectorised; NaN outside the mask)."""
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return np.full(values.shape, np.nan)
+    rows, cols = values.shape
+    x = np.where(mask, values, np.inf)  # masked cells sort last, in their own group
+    order = np.argsort(x, axis=1, kind="mergesort")
+    ordered = np.take_along_axis(x, order, axis=1)
+    position = np.broadcast_to(np.arange(cols), (rows, cols))
+    starts = np.ones((rows, cols), dtype=bool)
+    starts[:, 1:] = ordered[:, 1:] != ordered[:, :-1]
+    ends = np.ones((rows, cols), dtype=bool)
+    ends[:, :-1] = starts[:, 1:]
+    first = np.maximum.accumulate(np.where(starts, position, 0), axis=1)
+    last = np.minimum.accumulate(np.where(ends, position, cols)[:, ::-1], axis=1)[:, ::-1]
+    ranks = np.empty((rows, cols))
+    np.put_along_axis(ranks, order, (first + last) / 2.0 + 1.0, axis=1)
+    return np.where(mask, ranks, np.nan)
+
+
+def _rank_rows(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Per-row average ranks over ``mask``, centred to mean 0 (NaN elsewhere)."""
+    ranks = _row_ranks(values, mask)
+    with np.errstate(invalid="ignore"):
+        centre = np.nanmean(np.where(mask, ranks, np.nan), axis=1, keepdims=True) if ranks.size else 0
+    return ranks - centre
+
+
+def rank_ic_series(
+    feature: np.ndarray, label: np.ndarray, min_entities: int = MIN_ENTITIES
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-date Spearman IC over issuers with both values; NaN when it abstains.
+
+    A date abstains with fewer than ``min_entities`` joint observations or a
+    constant feature or label cross-section (e.g. no buyer anywhere).
+    """
+    feature = np.asarray(feature, dtype=float)
+    label = np.asarray(label, dtype=float)
+    mask = np.isfinite(feature) & np.isfinite(label)
+    counts = mask.sum(axis=1).astype(int)
+    ic = np.full(feature.shape[0], np.nan)
+    use = counts >= min_entities
+    if not use.any():
+        return ic, counts
+    m = mask[use]
+    with np.errstate(invalid="ignore"):
+        x = np.nan_to_num(_rank_rows(feature[use], m))
+        y = np.nan_to_num(_rank_rows(label[use], m))
+    scale = np.sqrt((x * x).sum(axis=1) * (y * y).sum(axis=1))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        values = np.where(scale > 1e-12, (x * y).sum(axis=1) / scale, np.nan)
+    ic[use] = values
+    return ic, counts
+
+
+def block_signs(n: int, block: int, perms: int, seed: int) -> np.ndarray:
+    """perms x n +/-1 signs, constant within contiguous blocks (seeded by shape only)."""
+    rng = np.random.default_rng([seed, n, block, perms, 2])
+    n_blocks = -(-n // block)
+    signs = rng.choice(np.array([-1.0, 1.0]), size=(perms, n_blocks))
+    return signs[:, np.arange(n) // block]
+
+
+def signflip_pvalues(ic: np.ndarray, block: int, perms: int, seed: int, direction: int) -> tuple[float, float, float]:
+    """Mean IC, its two-sided p and its one-sided p (in ``direction``) under block sign-flips."""
+    ic = np.asarray(ic, dtype=float)
+    observed = float(ic.mean())
+    null = block_signs(len(ic), block, perms, seed) @ ic / len(ic)
+    two = (1 + int((np.abs(null) >= abs(observed) - 1e-12).sum())) / (perms + 1)
+    one = (1 + int((direction * null >= direction * observed - 1e-12).sum())) / (perms + 1)
+    return observed, two, one
+
+
+def time_alignment_pvalue(
+    feature: np.ndarray, label: np.ndarray, rows: np.ndarray, block: int, perms: int, seed: int,
+    min_entities: int = MIN_ENTITIES,
+) -> tuple[float, float]:
+    """Sensitivity null: permute blocks of outcome cross-sections over dates.
+
+    The feature cross-sections stay in place (the time-series loop's null,
+    lifted to panels). ``C[t, s]`` is the rank correlation of the feature at
+    ``t`` with the outcomes at ``s`` over their common issuers; the observed
+    statistic is the mean of the diagonal, the null the mean of
+    ``C[t, pi(t)]``. Two-sided around 0, like ``block_permutation_pvalue``.
+    """
+    f, y = feature[rows], label[rows]
+    joint = np.isfinite(f) & np.isfinite(y)
+    fr, yr = _rank_rows(f, joint), _rank_rows(y, joint)
+    mf, my = np.isfinite(fr), np.isfinite(yr)
+    f0, y0 = np.nan_to_num(fr), np.nan_to_num(yr)
+    n = mf.astype(float) @ my.T.astype(float)
+    sx, sy = f0 @ my.T.astype(float), mf.astype(float) @ y0.T
+    sxy = f0 @ y0.T
+    sxx, syy = (f0**2) @ my.T.astype(float), mf.astype(float) @ (y0**2).T
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cov = sxy - sx * sy / n
+        var = (sxx - sx**2 / n) * (syy - sy**2 / n)
+        c = np.where((n >= min_entities) & (var > 0), cov / np.sqrt(var), np.nan)
+    observed = float(np.nanmean(np.diag(c)))
+    index = block_permutations(len(rows), block, perms, seed)
+    null = np.nanmean(c[np.arange(len(rows))[None, :], index], axis=1)
+    null = null[np.isfinite(null)]
+    p = (1 + int((np.abs(null) >= abs(observed) - 1e-12).sum())) / (len(null) + 1)
+    return observed, p
+
+
+def entity_shuffle_pvalue(
+    feature: np.ndarray, label: np.ndarray, rows: np.ndarray, perms: int, seed: int
+) -> float:
+    """Sensitivity null: shuffle outcomes across issuers within each date (two-sided)."""
+    rng = np.random.default_rng([seed, len(rows), perms, 3])
+    total, observed, used = np.zeros(perms), 0.0, 0
+    for i in rows:
+        m = np.isfinite(feature[i]) & np.isfinite(label[i])
+        x, y = rankdata(feature[i, m]), rankdata(label[i, m])
+        x, y = x - x.mean(), y - y.mean()
+        scale = math.sqrt(float(x @ x) * float(y @ y))
+        if scale <= 0:
+            continue
+        shuffled = rng.permuted(np.tile(y, (perms, 1)), axis=1)
+        total += shuffled @ x / scale
+        observed += float(x @ y) / scale
+        used += 1
+    if not used:
+        return 1.0
+    null, observed = total / used, observed / used
+    return (1 + int((np.abs(null) >= abs(observed) - 1e-12).sum())) / (perms + 1)
+
+
+def buyer_excess(panel: TrialPanel, rows: np.ndarray) -> dict:
+    """Reported magnitude: mean relative return of issuers with a buyer (A > 0) vs without."""
+    buyers, others, dates = [], [], 0
+    for i in rows:
+        m = np.isfinite(panel.feature[i]) & np.isfinite(panel.label[i])
+        b = m & (panel.feature[i] > 0)
+        o = m & (panel.feature[i] == 0)
+        if b.any() and o.any():
+            buyers.append(float(panel.label[i, b].mean()))
+            others.append(float(panel.label[i, o].mean()))
+            dates += 1
+    if not dates:
+        return {"dates": 0, "buyer_minus_benchmark": None, "nonbuyer_minus_benchmark": None,
+                "buyer_minus_nonbuyer": None, "buyer_issuer_dates": 0}
+    b, o = np.array(buyers), np.array(others)
+    count = int(sum(((np.isfinite(panel.feature[i]) & (panel.feature[i] > 0) & np.isfinite(panel.label[i])).sum()) for i in rows))
+    out = {
+        "dates": dates,
+        "buyer_minus_benchmark": float(b.mean()),
+        "nonbuyer_minus_benchmark": float(o.mean()),
+        "buyer_minus_nonbuyer": float((b - o).mean()),
+        "buyer_issuer_dates": count,
+    }
+    if panel.largest is not None:
+        # Reported-only stratum: the largest qualifying line in the window.
+        for name, large in (("large_line", True), ("small_line", False)):
+            flat = []
+            for i in rows:
+                lines = panel.largest[i]
+                size = lines >= LARGE_LINE_USD if large else (lines > 0) & (lines < LARGE_LINE_USD)
+                m = np.isfinite(panel.label[i]) & (np.nan_to_num(panel.feature[i]) > 0) & size
+                flat.extend(panel.label[i, m].tolist())
+            out[f"{name}_buyer_minus_benchmark"] = float(np.mean(flat)) if flat else None
+            out[f"{name}_buyer_issuer_dates"] = len(flat)
+    return out
+
+
+def missing_labels(panel: TrialPanel) -> dict:
+    """No silent drops: issuer-dates with a feature but no label (delisted, halted, no close)."""
+    has_feature = np.isfinite(panel.feature)
+    missing = has_feature & ~np.isfinite(panel.label)
+    buyers = has_feature & (np.nan_to_num(panel.feature) > 0)
+    buyer_missing = int((missing & buyers).sum())
+    return {
+        "issuer_dates_with_feature": int(has_feature.sum()),
+        "missing_label": int(missing.sum()),
+        "buyer_issuer_dates": int(buyers.sum()),
+        "buyer_missing_label": buyer_missing,
+        "buyer_missing_share": buyer_missing / int(buyers.sum()) if buyers.any() else 0.0,
+    }
+
+
+def momentum_baseline(panel: TrialPanel, rows: np.ndarray) -> dict:
+    """Reported only (never a trial): momentum IC and the feature-momentum rank correlation."""
+    if panel.momentum is None:
+        return {"momentum_mean_ic": None, "feature_momentum_mean_rank_corr": None}
+    mom_ic, _ = rank_ic_series(panel.momentum[rows], panel.label[rows])
+    cross, _ = rank_ic_series(panel.feature[rows], panel.momentum[rows])
+    return {
+        "momentum_mean_ic": _finite_or_none(np.nanmean(mom_ic)) if np.isfinite(mom_ic).any() else None,
+        "feature_momentum_mean_rank_corr": _finite_or_none(np.nanmean(cross)) if np.isfinite(cross).any() else None,
+    }
+
+
+def measure_trial(
+    panel: TrialPanel,
+    *,
+    block: int | None = None,
+    perms: int = PERMS,
+    seed: int = SEED,
+    sensitivity_perms: int = SENSITIVITY_PERMS,
+    min_n: int = MIN_N,
+    sensitivity: bool = True,
+) -> dict:
+    """Mean rank IC, its block sign-flip p-values and (optionally) the sensitivity nulls."""
+    ic, counts = rank_ic_series(panel.feature, panel.label)
+    rows = np.flatnonzero(np.isfinite(ic))
+    series = ic[rows]
+    base = {
+        "n": int(len(rows)),
+        "decisions": len(panel.decision_at),
+        "median_entities": int(np.median(counts[rows])) if len(rows) else 0,
+        "labels": missing_labels(panel),
+    }
+    if len(rows) < min_n:
+        return {**base, "mean_ic": None, "p": 1.0, "p_one_sided_positive": 1.0,
+                "status": "insufficient_data", "block": None, "block_basis": None}
+    if block is None:
+        block, basis = autocorrelation_block(series.tolist(), 0)
+        basis = {**basis, "block": block}
+    else:
+        basis = {"rule": "frozen", "block": block}
+    mean_ic, p, p_one = signflip_pvalues(series, block, perms, seed, PRIMARY_DIRECTION)
+    out = {
+        **base,
+        "mean_ic": mean_ic,
+        "ic_sd": float(series.std(ddof=1)) if len(series) > 1 else None,
+        "ic_positive_share": float((series > 0).mean()),
+        "p": p,
+        "p_one_sided_positive": p_one,
+        "status": "tested",
+        "block": int(block),
+        "block_basis": basis,
+    }
+    if sensitivity:
+        ta_stat, ta_p = time_alignment_pvalue(panel.feature, panel.label, rows, block, sensitivity_perms, seed)
+        out["sensitivity"] = {
+            "time_alignment_mean": ta_stat,
+            "time_alignment_p": ta_p,
+            "entity_shuffle_p": entity_shuffle_pvalue(panel.feature, panel.label, rows, sensitivity_perms, seed),
+            "note": "reported only; never selects",
+        }
+        out["magnitude"] = buyer_excess(panel, rows)
+        out["baseline"] = momentum_baseline(panel, rows)
+    return out
+
+
+# --- discovery, holdout, verdict ---------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RunSpec:
+    """The run's declared identity (frozen into the discovery manifest)."""
+
+    run_id: str
+    sector: str
+    ledger_id: str = LEDGER_ID
+    ledger_q: float = LEDGER_Q
+    run_k: int = VS1_RUN_K
+    trials: tuple[str, ...] = ()
+    perms: int = PERMS
+    seed: int = SEED
+    min_n: int = MIN_N
+
+    def validate(self) -> None:
+        if self.sector not in EQUITY_SECTORS or not self.run_id:
+            raise ValueError("invalid run spec")
+        if self.sector != VS1_SECTOR:
+            # The other 10 sectors are ONE ledger run (k=2): Holm over all 40
+            # trials jointly. This harness runs one sector's 4 trials, so it
+            # refuses them rather than apply the wrong denominator.
+            raise ValueError(
+                "only the VS1 sector runs here; the 10-sector run needs a joint "
+                "40-trial Holm (pre-registration section 13)"
+            )
+        if tuple(self.trials) != trial_names():
+            raise ValueError("a run declares exactly the pre-registered trials")
+        expected_k = VS1_RUN_K if self.sector == VS1_SECTOR else OTHER_SECTORS_RUN_K
+        if self.run_k != expected_k or self.ledger_id != LEDGER_ID or self.ledger_q != LEDGER_Q:
+            raise ValueError("ledger id, q and run index are pre-registered")
+        if self.perms < 999 or self.min_n < 30:
+            raise ValueError("invalid statistical settings")
+
+    @property
+    def alpha(self) -> float:
+        return run_alpha(self.run_k, self.ledger_q)
+
+
+def discover_panel(
+    spec: RunSpec,
+    panels: Mapping[str, TrialPanel],
+    *,
+    inputs: dict,
+    repo_root: Path = REPO,
+    sensitivity: bool = True,
+) -> dict:
+    """Freeze the discovery ledger. Never receives holdout rows."""
+    prereg = check_prereg(repo_root)
+    spec.validate()
+    if set(panels) != set(spec.trials):
+        raise ValueError("panels must be exactly the declared trials")
+    ledger = []
+    for trial in spec.trials:
+        panel = panels[trial]
+        if panel.window != "discovery":
+            raise ValueError("discovery received a non-discovery panel")
+        validate_panel(panel)
+        result = measure_trial(panel, perms=spec.perms, seed=spec.seed, min_n=spec.min_n,
+                               sensitivity=sensitivity)
+        ledger.append({"trial_id": digest([spec.run_id, spec.sector, trial]), "trial": trial,
+                       "sector": spec.sector, **result})
+    pvalues = [t["p"] for t in ledger]
+    for trial, holm, bh in zip(ledger, holm_adjusted(pvalues), bh_adjusted(pvalues)):
+        trial["holm_adjusted_p"] = holm
+        trial["bh_adjusted_p"] = bh
+        trial["selected"] = trial["status"] == "tested" and holm <= spec.alpha
+    payload = {
+        "version": VERSION,
+        "origin": ORIGIN,
+        "prereg_sha256": prereg,
+        "spec": asdict(spec),
+        "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
+        "selection": f"Holm at ledger run alpha {spec.alpha:.6g} (q={spec.ledger_q}, k={spec.run_k}) "
+                     "over every declared trial incl. untestable; BH-adjusted p reported only",
+        "null": "block sign-flip of the per-date rank-IC series; block from discovery IC acf1 "
+                f"(autocorrelation_block, >= {MIN_BLOCKS} blocks)",
+        "inputs": inputs,
+        "discovery_sha256": digest({t: panels[t].as_record() for t in spec.trials}),
+        "ledger": ledger,
+        "calibration": calibration(ledger),
+        "state": "DISCOVERY_FROZEN",
+        "promotion_allowed": False,
+    }
+    return {"payload": payload, "sha256": digest(payload)}
+
+
+def calibration(ledger: list[dict]) -> dict:
+    """Discovery-only check against the published direction (see the pre-registration)."""
+    by = {t["trial"]: t for t in ledger}
+    primary = by[PRIMARY_TRIAL]
+    contrary = [
+        t["trial"] for t in ledger
+        if t["status"] == "tested" and t["mean_ic"] is not None and t["mean_ic"] < 0 and t["p"] <= 0.05
+    ]
+    consistent = (
+        primary["status"] == "tested"
+        and primary["mean_ic"] > 0
+        and primary["p_one_sided_positive"] <= 0.10
+    ) or any(t["selected"] and t["mean_ic"] > 0 for t in ledger)
+    if contrary:
+        state = "CONTRARY"
+    elif consistent:
+        state = "CONSISTENT"
+    elif primary["status"] == "tested" and primary["mean_ic"] > 0:
+        state = "WEAK_POSITIVE"
+    else:
+        state = "ABSENT"
+    return {"state": state, "primary_trial": PRIMARY_TRIAL, "contrary_trials": contrary}
+
+
+def evaluate_panel_holdout(
+    frozen: dict,
+    panels: Mapping[str, TrialPanel],
+    key: HoldoutKey,
+    *,
+    power: dict | None = None,
+) -> dict:
+    """Frozen selections (and the pre-registered primary trial) on the holdout, once."""
+    if not isinstance(key, HoldoutKey) or key.frozen_sha256 != frozen.get("sha256"):
+        raise PermissionError("holdout needs the HoldoutKey opened for this frozen discovery")
+    payload = frozen["payload"]
+    spec = RunSpec(**{**payload["spec"], "trials": tuple(payload["spec"]["trials"])})
+    ledger = {t["trial"]: t for t in payload["ledger"]}
+    selected = [t for t in payload["ledger"] if t["selected"]]
+    evaluated = sorted({t["trial"] for t in selected} | {PRIMARY_TRIAL})
+    checks = []
+    for trial in evaluated:
+        panel = panels[trial]
+        if panel.window != "holdout":
+            raise ValueError("holdout received a non-holdout panel")
+        validate_panel(panel)
+        frozen_block = ledger[trial]["block"] or 1
+        ic, _ = rank_ic_series(panel.feature, panel.label)
+        n = int(np.isfinite(ic).sum())
+        block = max(1, min(frozen_block, max(1, n // MIN_BLOCKS)))
+        result = measure_trial(panel, block=block, perms=spec.perms, seed=spec.seed,
+                               min_n=spec.min_n, sensitivity=True)
+        is_selected = ledger[trial]["selected"]
+        adjusted = corrected_p(result["p"], len(selected)) if is_selected else None
+        survives = bool(
+            is_selected
+            and result["status"] == "tested"
+            and adjusted <= HOLDOUT_ALPHA
+            and result["mean_ic"] * ledger[trial]["mean_ic"] > 0
+        )
+        checks.append({
+            "trial_id": ledger[trial]["trial_id"],
+            "trial": trial,
+            "selected_in_discovery": is_selected,
+            **result,
+            "bonferroni_p": adjusted,
+            "retrospective_survivor": survives,
+            "primary_one_sided_p": result["p_one_sided_positive"] if trial == PRIMARY_TRIAL else None,
+        })
+    result = {
+        "discovery_manifest": frozen["sha256"],
+        "prereg_sha256": payload["prereg_sha256"],
+        "holdout_sha256": digest({t: panels[t].as_record() for t in evaluated}),
+        "holdout_checks": checks,
+        "promotion_allowed": False,
+    }
+    result["verdict"] = verdict(payload, checks, power)
+    return result
+
+
+def verdict(payload: dict, checks: list[dict], power: dict | None) -> dict:
+    """NO_SURVIVOR, HOLDOUT_SURVIVOR_FORWARD_PENDING or MACHINERY_SUSPECT (pre-registered)."""
+    calib = payload["calibration"]["state"]
+    survivors = [c for c in checks if c["retrospective_survivor"]]
+    positive = [c for c in survivors if c["mean_ic"] > 0]
+    powered = bool(power and power.get("gate_passed"))
+    notes = []
+    if calib == "CONTRARY" or any(c["mean_ic"] < 0 for c in survivors):
+        state = "MACHINERY_SUSPECT"
+        notes.append("a significant negative insider-buy IC contradicts the published prior: audit the "
+                     "event parse, dates and prices before reading anything else")
+    elif positive:
+        state = "HOLDOUT_SURVIVOR_FORWARD_PENDING"
+    elif calib == "ABSENT" and powered:
+        state = "MACHINERY_SUSPECT"
+        notes.append("powered for IC 0.01 yet the primary discovery IC is not positive")
+    else:
+        state = "NO_SURVIVOR"
+        if not powered:
+            notes.append("UNDERPOWERED: the Stage-0 power gate did not pass; a null here is not "
+                         "evidence against the published effect")
+    shares = [
+        t.get("labels", {}).get("buyer_missing_share", 0.0)
+        for t in [*payload.get("ledger", []), *checks]
+        if t.get("trial") == PRIMARY_TRIAL
+    ]
+    if any(share > MISSING_LABEL_WARNING for share in shares):
+        notes.append(
+            f"SURVIVORSHIP_WARNING: more than {MISSING_LABEL_WARNING:.0%} of the primary trial's "
+            "buyer issuer-dates have no label (possible delistings; no delisting return)"
+        )
+    return {"state": state, "calibration": calib, "notes": notes,
+            "survivors": [c["trial"] for c in positive], "promotion_allowed": False,
+            "statement": "Nothing here is a trading signal."}
+
+
+# --- Stage 0: power on the real feature panel with synthetic outcomes ---------------------
+
+
+def _planted_ics(usable: list, rho: float, sims: int, rng: np.random.Generator) -> np.ndarray:
+    """sims x dates rank ICs of ``rho * z + noise`` against the feature ranks."""
+    out = np.empty((sims, len(usable)))
+    noise = math.sqrt(max(0.0, 1 - rho**2))
+    for k, z in enumerate(usable):
+        x = rankdata(z)
+        x = x - x.mean()
+        y = rho * z[None, :] + noise * rng.standard_normal((sims, len(z)))
+        yr = y.argsort(axis=1).argsort(axis=1) + 1.0  # continuous: no ties
+        yr = yr - yr.mean(axis=1, keepdims=True)
+        out[:, k] = (yr @ x) / (math.sqrt(float(x @ x)) * np.sqrt((yr**2).sum(axis=1)))
+    return out
+
+
+def planted_power(
+    feature: np.ndarray,
+    target_ic: float,
+    *,
+    sims: int = POWER_SIMS,
+    perms: int = POWER_PERMS,
+    seed: int = SEED,
+    threshold: float | None = None,
+    min_n: int = MIN_N,
+) -> dict:
+    """P(selection) for a planted effect of mean rank IC ``target_ic`` on this feature geometry.
+
+    Outcomes are synthetic: per usable date, ``rho * z + sqrt(1 - rho^2) * noise``
+    with ``z`` the standardised feature rank among eligible issuers. ``rho`` is
+    scaled by a pilot run so the expected realised mean rank IC equals
+    ``target_ic`` (ties in a mostly-zero feature shrink the rank IC). Uses
+    feature data only (never a price or an outcome). ``threshold`` defaults to
+    the smallest Holm threshold of a 4-trial run at the VS1 run alpha.
+    Idiosyncratic noise only (no common factor), so it is an optimistic power.
+    """
+    threshold = run_alpha(VS1_RUN_K) / len(trial_names()) if threshold is None else threshold
+    rng = np.random.default_rng([seed, int(round(target_ic * 1e6)), sims, 4])
+    usable = []
+    for row in feature:
+        m = np.isfinite(row)
+        if m.sum() >= MIN_ENTITIES and np.ptp(row[m]) > 0:
+            r = rankdata(row[m])
+            usable.append((r - r.mean()) / r.std())
+    if len(usable) < min_n:
+        return {"target_ic": target_ic, "usable_dates": len(usable), "power": 0.0,
+                "realized_mean_ic": None, "threshold": threshold, "sims": 0}
+    pilot_rho = 0.2
+    scale = float(_planted_ics(usable, pilot_rho, 50, rng).mean()) / pilot_rho
+    rho = min(0.99, target_ic / scale) if scale > 0 else 0.99
+    ics = _planted_ics(usable, rho, sims, rng)
+    block, _ = autocorrelation_block(ics[0].tolist(), 0)
+    hits = 0
+    for s in range(sims):
+        _, p, _ = signflip_pvalues(ics[s], block, perms, seed + s, PRIMARY_DIRECTION)
+        hits += p <= threshold
+    return {
+        "target_ic": target_ic,
+        "usable_dates": len(usable),
+        "planted_rho": rho,
+        "power": hits / sims,
+        "realized_mean_ic": float(ics.mean()),
+        "threshold": threshold,
+        "sims": sims,
+    }
+
+
+def stage0_power(features: Mapping[str, np.ndarray], **settings) -> dict:
+    """Power per trial feature panel and target IC, and the pre-registered gate."""
+    table = {
+        trial: [planted_power(matrix, ic, **settings) for ic in POWER_TARGET_ICS]
+        for trial, matrix in features.items()
+    }
+    primary = next(r for r in table[PRIMARY_TRIAL] if r["target_ic"] == POWER_GATE_IC)
+    return {
+        "table": table,
+        "gate": f"power(primary {PRIMARY_TRIAL}, IC {POWER_GATE_IC}) >= {POWER_GATE}",
+        "gate_passed": primary["power"] >= POWER_GATE,
+        "note": "feature data only; synthetic outcomes; idiosyncratic noise (optimistic)",
+    }
+
+
+def power_features(events: Form4Events, universe: pd.DataFrame, window: str = "discovery") -> dict[str, np.ndarray]:
+    """Feature panels on proxy sessions (no price read) for the Stage-0 gate."""
+    lo, hi = window_bounds(window)
+    sessions = proxy_sessions(lo.date(), hi.date())
+    ciks = list(universe["cik"].astype(int))
+    out = {}
+    for h in HORIZONS:
+        decided = decision_instants(sessions[::h])
+        for name in FEATURES:
+            out[f"{name}|fwd{h}"] = feature_panel(events, ciks, decided, name).to_numpy(dtype=float)
+    return out
+
+
+# --- pre-registration registry (hash-chained, research_forward_log mechanism) -----------
+
+REGISTRY_LOG = "granular_panel_prereg_v1.jsonl"
+REGISTRY_ANCHORS = "granular_panel_prereg_v1.anchors.jsonl"
+REGISTRY_LOCK = ".granular_panel_prereg_v1.lock"
+
+
+def registry(log_dir: Path, prereg_sha256: str = PREREG_BODY_SHA256):
+    from analysis.research_forward_log import ForwardLog
+
+    return ForwardLog(
+        log_dir,
+        log_filename=REGISTRY_LOG,
+        anchor_filename=REGISTRY_ANCHORS,
+        lock_filename=REGISTRY_LOCK,
+        prereg_sha256=prereg_sha256,
+    )
+
+
+def register(log_dir: Path, now: datetime, code_sha: str, *, repo_root: Path = REPO,
+             prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:
+    """Append the pre-registration record (after a pinned header) to the local registry."""
+    if now.tzinfo is None:
+        raise ValueError("now must carry a timezone")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        check = log.verify_chain()
+        if not check["ok"]:
+            raise RuntimeError(f"registry chain is broken: {check['detail']}")
+        records = log.read_all()
+        if any(r.get("kind") == "preregistration" and r.get("prereg_sha256") == prereg_sha256 for r in records):
+            raise ValueError("this pre-registration is already registered")
+        header = [] if records else [{
+            "kind": "header",
+            "version": VERSION,
+            "run_at": now.isoformat(),
+            "code_sha": code_sha,
+            "prereg_path": PREREG_PATH.as_posix(),
+            "prereg_sha256": prereg_sha256,
+            "promotion_allowed": False,
+        }]
+        record = {
+            "kind": "preregistration",
+            "run_at": now.isoformat(),
+            "code_sha": code_sha,
+            "prereg_path": PREREG_PATH.as_posix(),
+            "prereg_sha256": prereg_sha256,
+            "sector_map_sha256": SECTOR_MAP_SHA256,
+            "ledger_id": LEDGER_ID,
+            "runs": {
+                "vs1": {"sector": VS1_SECTOR, "k": VS1_RUN_K, "alpha": run_alpha(VS1_RUN_K),
+                        "trials": list(trial_names())},
+                "other_sectors": {"sectors": list(OTHER_SECTORS), "k": OTHER_SECTORS_RUN_K,
+                                  "alpha": run_alpha(OTHER_SECTORS_RUN_K),
+                                  "trials": list(trial_names())},
+            },
+            "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
+            "promotion_allowed": False,
+        }
+        return log.append_locked(header + [record])
+
+
+# --- orchestration -------------------------------------------------------------------------
+
+
+def write_frozen(output: Path, name: str, value: Any) -> None:
+    Path(output).mkdir(parents=True, exist_ok=True)
+    write_once(Path(output) / name, value)
