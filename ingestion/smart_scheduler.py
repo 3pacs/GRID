@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+# CFTC's own publication clock (15:30 America/New_York) — used by the
+# cftc_cot release gate below, kept in sync with cftc_markets._ET.
+_CFTC_ET = ZoneInfo("America/New_York")
 
 # GRID-YF-CLOSE-REPAIR-20260926 fix #2 ("timeout honestly sized"): without
 # an explicit start_date, YFinancePuller.pull_all() defaults to "1990-01-01"
@@ -53,67 +58,87 @@ def _yfinance_incremental_start() -> str:
     ).isoformat()
 
 
-# GRID task A1 (owner-approved 2026-09-27): the plain freq_h>=168 cadence let
+# GRID task A1 (owner-approved 2026-09-27; DST/holiday fix per coordinator
+# REQUEST CHANGES on PR #681 @ dd53a3dd): the plain freq_h>=168 cadence let
 # cftc_cot fire on whatever hour the previous success happened to land on,
 # which could be mid-week — well before that week's CFTC report exists, so
 # the pull would silently re-store the prior week's report under a fresh
 # pull_timestamp instead of catching the new one. CFTC publishes the COT
-# report every Friday at 15:30 ET (19:30 UTC EDT / 20:30 UTC EST). This gate
-# restricts cftc_cot to a Friday>=19:45 UTC / Saturday-retry window — a
-# 15-minute margin past the latest EDT/EST publish time — and is fail-closed:
-# outside that window it is never due, even if far more than freq_h hours
-# have elapsed. freq_h stays on the registry entry for the overdue-priority
-# sort in _get_due_pullers (harmless there — it only affects ordering among
-# pullers that ARE due) but no longer drives cftc_cot's due/not-due decision.
-CFTC_RELEASE_WEEKDAY_UTC = 4  # Friday (Monday=0 .. Sunday=6)
-CFTC_RELEASE_MIN_HOUR_UTC = 19
-CFTC_RELEASE_MIN_MINUTE_UTC = 45
-CFTC_RETRY_WEEKDAY_UTC = 5  # Saturday
+# report every Friday at 15:30 America/New_York — 19:30 UTC in EDT but
+# 20:30 UTC in EST, and shifted to the next federal business day when a
+# holiday falls Tue-Fri of that week. A fixed 19:45 UTC anchor (the first
+# version of this gate) is wrong for 4-5 months a year: in EST it fires 45
+# minutes BEFORE the report exists, re-stores the prior week under a fresh
+# pull_timestamp, and — because that premature run counts as a success at
+# or after the (wrong) anchor — the Saturday retry never fires either. This
+# version computes the scheduled release_at in America/New_York via
+# zoneinfo and cftc_markets.compute_release(), the same holiday-aware rule
+# G1 stores on every payload (cftc_markets.ReleaseTime), so DST and holiday
+# shifts are handled identically here and there, then adds a 15-minute
+# margin (CFTC_RELEASE_MARGIN_MINUTES) past that instant. Due from
+# release_at+margin through the end of the next America/New_York calendar
+# day (the retry window); never due before release_at+margin or after the
+# retry window elapses, regardless of staleness — a missed/failed week
+# waits for the next Tuesday report's release rather than firing off-
+# schedule. freq_h stays on the registry entry only for the
+# overdue-priority sort in _get_due_pullers.
+CFTC_RELEASE_MARGIN_MINUTES = 15  # grace past the scheduled 15:30 ET release
+CFTC_RELEASE_RETRY_DAYS = 1  # retry through the ET calendar day after release
 
 
-def _cftc_release_anchor(now: datetime) -> datetime:
-    """The most recent Friday 19:45 UTC at or before ``now``."""
-    days_since_friday = (now.weekday() - CFTC_RELEASE_WEEKDAY_UTC) % 7
-    anchor = now.replace(
-        hour=CFTC_RELEASE_MIN_HOUR_UTC,
-        minute=CFTC_RELEASE_MIN_MINUTE_UTC,
-        second=0,
-        microsecond=0,
-    ) - timedelta(days=days_since_friday)
-    if anchor > now:
-        anchor -= timedelta(days=7)
-    return anchor
+def _cftc_current_report_date(today_et: date) -> date:
+    """The Tuesday report_date whose weekly release covers ``today_et``.
+
+    Reports are always for a Tuesday. On Mon this is last week's Tuesday
+    (this week's report doesn't exist yet); Tue-Sun it's this week's.
+    """
+    days_since_tuesday = (today_et.weekday() - 1) % 7  # Mon=0 .. Sun=6, Tue=1
+    return today_et - timedelta(days=days_since_tuesday)
 
 
 def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
     """Fail-closed weekly release gate for cftc_cot.
 
-    Due only on Friday at/after 19:45 UTC, or on Saturday as a retry if
-    Friday's run has not yet succeeded since this week's release anchor.
-    Never due on any other day, regardless of how stale the last success
-    is — a missed week waits for the next Friday rather than firing off-
-    schedule mid-week and risking a duplicate pull of the prior report.
+    Due from the current week's scheduled ``release_at`` (holiday- and
+    DST-aware, via ``cftc_markets.compute_release``) through the end of the
+    next America/New_York calendar day, as long as no success has landed
+    since that release_at. Never due before release_at, and never due once
+    the retry window has elapsed, no matter how stale — a missed week waits
+    for the next Tuesday report's own release rather than firing off-
+    schedule.
     """
-    weekday = now.weekday()
-    if weekday not in (CFTC_RELEASE_WEEKDAY_UTC, CFTC_RETRY_WEEKDAY_UTC):
+    from ingestion.altdata.cftc_markets import compute_release
+
+    now_et = now.astimezone(_CFTC_ET)
+    report_date = _cftc_current_report_date(now_et.date())
+    release = compute_release(report_date)
+    if release.release_at is None:
+        # compute_release() only returns None for a non-Tuesday report_date;
+        # _cftc_current_report_date always returns a Tuesday. Unreachable
+        # in practice — fail closed defensively if that ever changes.
         return False
-    if weekday == CFTC_RELEASE_WEEKDAY_UTC:
-        today_release = now.replace(
-            hour=CFTC_RELEASE_MIN_HOUR_UTC,
-            minute=CFTC_RELEASE_MIN_MINUTE_UTC,
-            second=0,
-            microsecond=0,
-        )
-        if now < today_release:
-            return False
+
+    # release.release_at is the CFTC's own 15:30 ET moment, already
+    # expressed as a correct tz-aware UTC instant for whichever of
+    # EDT/EST applies that day (and for the actual holiday-shifted day,
+    # if any) via compute_release(). Adding a fixed 15-minute timedelta to
+    # a tz-aware instant is unambiguous (15:45 ET either way) — there is no
+    # DST transition anywhere near 15:30/15:45 local time.
+    release_at = release.release_at + timedelta(minutes=CFTC_RELEASE_MARGIN_MINUTES)
+    retry_window_end = datetime.combine(
+        release_at.astimezone(_CFTC_ET).date() + timedelta(days=CFTC_RELEASE_RETRY_DAYS + 1),
+        datetime.min.time(),
+        tzinfo=_CFTC_ET,
+    ).astimezone(timezone.utc)
+    if not (release_at <= now < retry_window_end):
+        return False
+
     if last_success is None:
         return True
     if last_success.tzinfo is None:
         last_success = last_success.replace(tzinfo=timezone.utc)
-    anchor = _cftc_release_anchor(now)
-    # Already succeeded at/after this week's anchor: the Friday run landed,
-    # so a Saturday retry (or a second same-day check) is not due again.
-    return last_success < anchor
+    # Already succeeded at/after this week's release: no retry needed.
+    return last_success < release_at
 
 
 # ── Puller Registry ──────────────────────────────────────────────────────
@@ -215,7 +240,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Government / regulatory ──
     {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
-    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (Friday>=19:45 UTC + Saturday retry), not freq_h — see the GRID task A1 note above _cftc_release_anchor
+    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
     # ── Sentiment / alt ──
     {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
