@@ -186,3 +186,16 @@ def test_gex_rows_can_only_be_modeled():
 def test_grant_footer_covers_the_new_table():
     joined = "\n".join(_emit("upgrade"))
     assert "GRANT ALL ON godview_runs TO grid" in joined
+
+
+@pytest.mark.unit
+def test_run_status_check_matches_the_declared_domain():
+    migration = importlib.import_module(MODULE)
+    create = next(s for s in _emit("upgrade") if "CREATE TABLE IF NOT EXISTS godview_runs" in s)
+    m = re.search(r"CONSTRAINT godview_runs_status_chk CHECK \( status IN \(([^)]*)\) \)", create)
+    assert m, "godview_runs_status_chk not found"
+    in_check = tuple(re.findall(r"'(\w+)'", m.group(1)))
+    assert in_check == migration.GODVIEW_RUN_STATUSES
+    assert "partial_blocked_by_legacy" in in_check
+    # Downgrade drops the whole table, so the CHECK goes with it.
+    assert _emit("downgrade")[-1] == "DROP TABLE IF EXISTS godview_runs"
