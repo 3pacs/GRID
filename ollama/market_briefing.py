@@ -130,20 +130,66 @@ class MarketBriefingEngine:
                                 "date": str(row[1]),
                             }
 
-                # Get latest feature values from resolved_series
-                feature_rows = conn.execute(
-                    text(
-                        "SELECT fr.name, rs.value, rs.obs_date "
-                        "FROM resolved_series rs "
-                        "JOIN feature_registry fr ON fr.id = rs.feature_id "
-                        "WHERE fr.model_eligible = TRUE "
-                        "AND rs.obs_date = ("
-                        "  SELECT MAX(obs_date) FROM resolved_series "
-                        "  WHERE feature_id = rs.feature_id"
-                        ") "
-                        "ORDER BY fr.name"
-                    )
-                ).fetchall()
+                # Get latest feature values from resolved_series.
+                #
+                # This used to be a single query with a correlated
+                # `obs_date = (SELECT MAX(obs_date) FROM resolved_series
+                # WHERE feature_id = rs.feature_id)` subquery, which
+                # re-scans every historical vintage of resolved_series once
+                # per outer row and reliably tripped the DB's
+                # statement_timeout (hourly QueryCanceled failures).
+                #
+                # A plain `DISTINCT ON (feature_id) ... ORDER BY feature_id,
+                # obs_date DESC, release_date DESC` (the store/pit.py idiom)
+                # was tried first but forces Postgres to sort every matching
+                # row across all vintages/features before deduping — with
+                # ~13.5M matching rows here that spilled to an external disk
+                # sort and took ~48s (measured read-only on grid-svr,
+                # 2026-09-27), i.e. still over budget.
+                #
+                # This LATERAL "top-1-per-feature" rewrite instead does one
+                # bounded, per-feature index probe: for each model-eligible
+                # feature_id (parameterized via ANY(:fids), same idiom as
+                # PITStore.get_pit), take the single row with the greatest
+                # obs_date, tiebroken by release_date DESC for deterministic
+                # same-obs_date multi-vintage rows — per data-integrity.md's
+                # release_date convention. Same meaning as before: the
+                # latest available value per model-eligible feature, as of
+                # now. Hits idx_resolved_series_pit_latest (feature_id,
+                # obs_date, vintage_date DESC) INCLUDE (value, release_date)
+                # WHERE release_date IS NOT NULL via an Index Only Scan
+                # Backward + Incremental Sort + Limit 1 per feature —
+                # measured ~62ms end-to-end read-only on grid-svr vs. a
+                # cost-12.4M plan (and reliable timeout) for the original.
+                feature_ids = [
+                    row[0]
+                    for row in conn.execute(
+                        text(
+                            "SELECT id FROM feature_registry "
+                            "WHERE model_eligible = TRUE"
+                        )
+                    ).fetchall()
+                ]
+
+                feature_rows: list[Any] = []
+                if feature_ids:
+                    feature_rows = conn.execute(
+                        text(
+                            "SELECT fr.name, latest.value, latest.obs_date "
+                            "FROM feature_registry fr "
+                            "JOIN LATERAL ("
+                            "  SELECT rs.value, rs.obs_date "
+                            "  FROM resolved_series rs "
+                            "  WHERE rs.feature_id = fr.id "
+                            "  AND rs.release_date IS NOT NULL "
+                            "  ORDER BY rs.obs_date DESC, rs.release_date DESC "
+                            "  LIMIT 1"
+                            ") latest ON TRUE "
+                            "WHERE fr.id = ANY(:fids) "
+                            "ORDER BY fr.name"
+                        ),
+                        {"fids": feature_ids},
+                    ).fetchall()
 
                 snapshot["features"] = {
                     row[0]: {"value": round(row[1], 4), "date": str(row[2])}

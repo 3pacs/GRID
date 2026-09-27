@@ -1456,14 +1456,27 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         # Currency through 2026-09-18 was traced and verified only for
         # YF:SPY:close, YF:XLI:close, and YF:EMB:close (see the handoff
         # doc) — do not generalise that to "equities are current".
-        try:
-            with engine.begin() as conn:
-                conn.execute(text(
-                    "UPDATE source_catalog SET last_pull_at = NOW() "
-                    "WHERE LOWER(name) = LOWER(:name)"
-                ), {"name": "yfinance"})
-        except Exception:
-            pass
+        #
+        # GRID-YF-CLOSE-REPAIR-20260926 fix #1 follow-up: pull_all() can now
+        # return an empty list when its single-flight lock finds a previous
+        # run still active in this process (see ingestion/yfinance_pull.py's
+        # module docstring on _PULL_ALL_LOCK) — that means NO ticker was
+        # attempted this call, so it must not be recorded as a fresh check.
+        if results:
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE source_catalog SET last_pull_at = NOW() "
+                        "WHERE LOWER(name) = LOWER(:name)"
+                    ), {"name": "yfinance"})
+            except Exception:
+                pass
+        else:
+            log.warning(
+                "yfinance daily pull: pull_all() returned no results "
+                "(single-flight lock likely skipped this run) — "
+                "last_pull_at NOT advanced",
+            )
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))
         try:
