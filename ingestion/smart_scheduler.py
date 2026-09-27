@@ -53,6 +53,69 @@ def _yfinance_incremental_start() -> str:
     ).isoformat()
 
 
+# GRID task A1 (owner-approved 2026-09-27): the plain freq_h>=168 cadence let
+# cftc_cot fire on whatever hour the previous success happened to land on,
+# which could be mid-week — well before that week's CFTC report exists, so
+# the pull would silently re-store the prior week's report under a fresh
+# pull_timestamp instead of catching the new one. CFTC publishes the COT
+# report every Friday at 15:30 ET (19:30 UTC EDT / 20:30 UTC EST). This gate
+# restricts cftc_cot to a Friday>=19:45 UTC / Saturday-retry window — a
+# 15-minute margin past the latest EDT/EST publish time — and is fail-closed:
+# outside that window it is never due, even if far more than freq_h hours
+# have elapsed. freq_h stays on the registry entry for the overdue-priority
+# sort in _get_due_pullers (harmless there — it only affects ordering among
+# pullers that ARE due) but no longer drives cftc_cot's due/not-due decision.
+CFTC_RELEASE_WEEKDAY_UTC = 4  # Friday (Monday=0 .. Sunday=6)
+CFTC_RELEASE_MIN_HOUR_UTC = 19
+CFTC_RELEASE_MIN_MINUTE_UTC = 45
+CFTC_RETRY_WEEKDAY_UTC = 5  # Saturday
+
+
+def _cftc_release_anchor(now: datetime) -> datetime:
+    """The most recent Friday 19:45 UTC at or before ``now``."""
+    days_since_friday = (now.weekday() - CFTC_RELEASE_WEEKDAY_UTC) % 7
+    anchor = now.replace(
+        hour=CFTC_RELEASE_MIN_HOUR_UTC,
+        minute=CFTC_RELEASE_MIN_MINUTE_UTC,
+        second=0,
+        microsecond=0,
+    ) - timedelta(days=days_since_friday)
+    if anchor > now:
+        anchor -= timedelta(days=7)
+    return anchor
+
+
+def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
+    """Fail-closed weekly release gate for cftc_cot.
+
+    Due only on Friday at/after 19:45 UTC, or on Saturday as a retry if
+    Friday's run has not yet succeeded since this week's release anchor.
+    Never due on any other day, regardless of how stale the last success
+    is — a missed week waits for the next Friday rather than firing off-
+    schedule mid-week and risking a duplicate pull of the prior report.
+    """
+    weekday = now.weekday()
+    if weekday not in (CFTC_RELEASE_WEEKDAY_UTC, CFTC_RETRY_WEEKDAY_UTC):
+        return False
+    if weekday == CFTC_RELEASE_WEEKDAY_UTC:
+        today_release = now.replace(
+            hour=CFTC_RELEASE_MIN_HOUR_UTC,
+            minute=CFTC_RELEASE_MIN_MINUTE_UTC,
+            second=0,
+            microsecond=0,
+        )
+        if now < today_release:
+            return False
+    if last_success is None:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    anchor = _cftc_release_anchor(now)
+    # Already succeeded at/after this week's anchor: the Friday run landed,
+    # so a Saturday retry (or a second same-day check) is not due again.
+    return last_success < anchor
+
+
 # ── Puller Registry ──────────────────────────────────────────────────────
 # Every puller with its import path, method, and expected update frequency.
 # Frequency is in hours. "8" means run every 8 hours at most.
@@ -152,7 +215,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Government / regulatory ──
     {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
-    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (Friday>=19:45 UTC + Saturday retry), not freq_h — see the GRID task A1 note above _cftc_release_anchor
 
     # ── Sentiment / alt ──
     {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
@@ -335,6 +398,21 @@ class SmartScheduler:
         """Check if a puller needs to run based on its frequency."""
         name = puller["name"]
         state = self._state.get(name)
+
+        # cftc_cot is gated to its weekly release window (see
+        # _cftc_cot_is_due) instead of the plain freq_h cadence — CFTC only
+        # publishes once a week, on Friday, so "due" must mean "in Friday's
+        # release window or Saturday's retry", not "168h since last run" (or
+        # "never run" — a never-run cftc_cot still waits for the window
+        # instead of firing off-schedule the instant this process starts).
+        if name == "cftc_cot":
+            cooldown = state.get("cooldown_until") if state else None
+            if cooldown and datetime.now(timezone.utc) < cooldown:
+                return False
+            last = state.get("last_success") if state else None
+            if last is not None and hasattr(last, "tzinfo") and last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            return _cftc_cot_is_due(last, datetime.now(timezone.utc))
 
         # Never run before → definitely due
         if state is None:
