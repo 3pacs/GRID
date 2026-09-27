@@ -1704,6 +1704,7 @@ def _get_latest_resolved(
                     "FROM resolved_series rs "
                     "JOIN feature_registry fr ON rs.feature_id = fr.id "
                     "WHERE fr.name = :name "
+                    "AND rs.obs_date <= CURRENT_DATE "
                     "ORDER BY rs.obs_date DESC LIMIT 1"
                 ),
                 {"name": feature_name},

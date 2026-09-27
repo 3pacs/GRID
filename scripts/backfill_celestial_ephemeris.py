@@ -41,6 +41,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 from config import settings
+from normalization.entity_map import canonical_feature_name
 
 # ============================================================================
 # Ephemeris computation engine (standalone)
@@ -258,11 +259,6 @@ EPHEMERIS_SOURCE_CONFIG = {
 DEFAULT_START_DATE = date(2000, 1, 1)
 DEFAULT_END_DATE = date(2026, 3, 26)
 DEFAULT_BATCH_SIZE = 1000
-
-
-def canonical_feature_name(series_id: str) -> str:
-    """Convert raw ephemeris series ids to canonical GRID feature names."""
-    return series_id.replace(".", "_")
 
 
 def parse_args() -> argparse.Namespace:

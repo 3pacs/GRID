@@ -10,11 +10,32 @@ from __future__ import annotations
 
 import difflib
 import re
+from datetime import date
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+def canonical_feature_name(series_id: str) -> str:
+    """Convert a raw series id into the canonical ``feature_registry.name``.
+
+    Centralised here so every auto-registration code path normalizes the
+    same way. A raw dotted id (``ephemeris.tithi_index``) and its
+    underscore form (``ephemeris_tithi_index``) MUST resolve to the same
+    feature_registry row — never two. Any code that mints a new
+    feature_registry row from a raw series_id should call this first (or
+    use ``EntityMap.ensure_canonical_feature``) rather than inserting the
+    raw series_id as ``name`` directly.
+
+    See the 2026-03-29 ephemeris duplication (F8 investigation,
+    docs/... GRID-FUTURE-DATED-ROWS-20260927.md): feature_ids 27734-27739
+    (canonical, underscore) and 27740-27745 (duplicate, raw dotted) were
+    created 10 minutes apart because the writer did not normalize first.
+    """
+    return series_id.strip().replace(".", "_")
+
 
 # Hardcoded seed mappings: raw series_id -> feature_registry.name
 SEED_MAPPINGS: dict[str, str] = {
@@ -1139,6 +1160,76 @@ class EntityMap:
         count = self._miss_counts.get(series_id, 0) + 1
         self._miss_counts[series_id] = count
         return count
+
+    def ensure_canonical_feature(
+        self,
+        series_id: str,
+        *,
+        family: str = "alternative",
+        description: str | None = None,
+        eligible_from_date: date | None = None,
+        model_eligible: bool = True,
+    ) -> int:
+        """Look up or create the feature_registry row for a raw series_id,
+        always under its canonical name.
+
+        This is the guarded path for auto-registration: it never inserts
+        the raw ``series_id`` as ``name`` directly, so a dotted raw id
+        (``ephemeris.tithi_index``) can never mint a second,
+        un-normalized feature_registry row alongside the canonical
+        underscore id (``ephemeris_tithi_index``). Any ingestion/backfill
+        code that currently does its own
+        ``INSERT INTO feature_registry (name, ...) VALUES (:series_id, ...)``
+        from a raw series_id should call this instead.
+
+        Parameters:
+            series_id: Raw series identifier as produced by a puller
+                (may contain dots, e.g. ``ephemeris.tithi_index``).
+            family: feature_registry.family for a newly-created row.
+            description: feature_registry.description; defaults to the
+                canonical name with underscores replaced by spaces.
+            eligible_from_date: feature_registry.eligible_from_date;
+                defaults to 2000-01-01.
+            model_eligible: feature_registry.model_eligible for a new row.
+
+        Returns:
+            int: feature_registry.id for the canonical name (existing or
+            newly created).
+        """
+        canonical_name = canonical_feature_name(series_id)
+
+        feature_id = self._feature_cache.get(canonical_name)
+        if feature_id is not None:
+            return feature_id
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO feature_registry "
+                    "(name, family, description, transformation, "
+                    "transformation_version, lag_days, normalization, "
+                    "missing_data_policy, eligible_from_date, model_eligible) "
+                    "VALUES (:name, :family, :description, 'RAW', 1, 0, "
+                    "'ZSCORE', 'FORWARD_FILL', :eligible_from_date, "
+                    ":model_eligible) "
+                    "ON CONFLICT (name) DO NOTHING"
+                ),
+                {
+                    "name": canonical_name,
+                    "family": family,
+                    "description": description or canonical_name.replace("_", " "),
+                    "eligible_from_date": eligible_from_date or date(2000, 1, 1),
+                    "model_eligible": model_eligible,
+                },
+            )
+            row = conn.execute(
+                text("SELECT id FROM feature_registry WHERE name = :name"),
+                {"name": canonical_name},
+            ).fetchone()
+
+        feature_id = row[0]
+        self._feature_cache[canonical_name] = feature_id
+        return feature_id
 
     def missing_feature_report(self) -> dict[str, Any]:
         """Summarise every lookup this instance could not resolve.

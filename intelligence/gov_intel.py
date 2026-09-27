@@ -188,6 +188,7 @@ def detect_contract_insider_overlap(
                 "FROM signal_sources "
                 "WHERE source_type = 'gov_contract' "
                 "AND signal_date >= :cutoff "
+                "AND signal_date <= CURRENT_DATE "
                 "ORDER BY signal_date DESC"
             ),
             {"cutoff": cutoff},

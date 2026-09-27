@@ -267,6 +267,7 @@ def _fetch_contracts(engine: Engine, ticker: str, days: int = 365) -> tuple[floa
                 "WHERE source_type = 'gov_contract' "
                 "AND ticker = :ticker "
                 "AND signal_date >= :cutoff "
+                "AND signal_date <= CURRENT_DATE "
                 "ORDER BY signal_date DESC"
             ),
             {"ticker": ticker, "cutoff": cutoff},
