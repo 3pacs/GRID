@@ -116,7 +116,7 @@ class MarketBriefingEngine:
                         row = conn.execute(
                             text(
                                 "SELECT value, obs_date FROM raw_series "
-                                "WHERE series_id = :sid "
+                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                                 "ORDER BY obs_date DESC LIMIT 1"
                             ),
                             {"sid": sid},

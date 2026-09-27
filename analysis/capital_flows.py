@@ -242,7 +242,8 @@ class CapitalFlowResearchEngine:
                         rows = conn.execute(
                             text(
                                 "SELECT obs_date, value FROM raw_series "
-                                "WHERE series_id = :sid AND obs_date >= :start "
+                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                "AND obs_date >= :start "
                                 "AND obs_date <= :end ORDER BY obs_date"
                             ),
                             {"sid": f"YF:{etf}:close", "start": start, "end": as_of},
@@ -266,7 +267,8 @@ class CapitalFlowResearchEngine:
                     vol_rows = conn.execute(
                         text(
                             "SELECT obs_date, value FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date >= :start "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                            "AND obs_date >= :start "
                             "AND obs_date <= :end ORDER BY obs_date"
                         ),
                         {
@@ -311,7 +313,8 @@ class CapitalFlowResearchEngine:
                     rows = conn.execute(
                         text(
                             "SELECT obs_date, value FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date >= :start "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                            "AND obs_date >= :start "
                             "AND obs_date <= :end ORDER BY obs_date"
                         ),
                         {"sid": f"YF:{BENCHMARK}:close", "start": start, "end": as_of},
@@ -379,7 +382,8 @@ class CapitalFlowResearchEngine:
                         rows = conn.execute(
                             text(
                                 "SELECT obs_date, value FROM raw_series "
-                                "WHERE series_id = :sid AND obs_date >= :start "
+                                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                                "AND obs_date >= :start "
                                 "AND obs_date <= :end ORDER BY obs_date"
                             ),
                             {"sid": f"YF:{etf}:close", "start": start, "end": end},
@@ -395,7 +399,8 @@ class CapitalFlowResearchEngine:
                     rows = conn.execute(
                         text(
                             "SELECT obs_date, value FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date >= :start "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                            "AND obs_date >= :start "
                             "AND obs_date <= :end ORDER BY obs_date"
                         ),
                         {"sid": f"YF:{etf}:close", "start": current_start, "end": as_of},
@@ -492,7 +497,7 @@ class CapitalFlowResearchEngine:
                     rows = conn.execute(
                         text(
                             "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :end "
                             "ORDER BY obs_date DESC LIMIT 2"
                         ),
                         {"sid": sid, "end": as_of},
@@ -572,7 +577,7 @@ class CapitalFlowResearchEngine:
                     rows = conn.execute(
                         text(
                             "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :end "
                             "ORDER BY obs_date DESC LIMIT 4"
                         ),
                         {"sid": sid, "end": as_of},
@@ -611,7 +616,7 @@ class CapitalFlowResearchEngine:
                     row = conn.execute(
                         text(
                             "SELECT value, obs_date FROM raw_series "
-                            "WHERE series_id = :sid AND obs_date <= :end "
+                            "WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :end "
                             "ORDER BY obs_date DESC LIMIT 1"
                         ),
                         {"sid": sid, "end": as_of},

@@ -394,6 +394,7 @@ def _discover_insiders(engine: Engine, min_value: float = 0.0) -> dict:
                     COUNT(*)                      AS trade_count
                 FROM raw_series
                 WHERE series_id LIKE 'INSIDER:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'insider_name' IS NOT NULL
                 GROUP BY
                     raw_payload->>'insider_name',
@@ -475,6 +476,7 @@ def _discover_congressional(engine: Engine) -> dict:
                     COUNT(*)                     AS trade_count
                 FROM raw_series
                 WHERE series_id LIKE 'CONGRESS:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'member_name' IS NOT NULL
                 GROUP BY
                     raw_payload->>'member_name',
@@ -591,6 +593,7 @@ def _discover_13f_filers(engine: Engine) -> dict:
                     COUNT(*) AS filings
                 FROM raw_series
                 WHERE series_id LIKE '13F:%'
+                  AND pull_status = 'SUCCESS'
                 GROUP BY SPLIT_PART(series_id, ':', 2)
                 ORDER BY COUNT(*) DESC
                 LIMIT 500
@@ -610,6 +613,7 @@ def _discover_13f_filers(engine: Engine) -> dict:
                     SELECT raw_payload->>'manager_name'
                     FROM raw_series
                     WHERE series_id LIKE :prefix
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'manager_name' IS NOT NULL
                     LIMIT 1
                 """), {"prefix": f"13F:{cik}:%"}).fetchone()
@@ -677,6 +681,7 @@ def _discover_board_crossrefs(engine: Engine) -> dict:
                     COUNT(DISTINCT raw_payload->>'ticker') AS ticker_count
                 FROM raw_series
                 WHERE series_id LIKE 'INSIDER:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'insider_name' IS NOT NULL
                 GROUP BY raw_payload->>'insider_name'
                 HAVING COUNT(DISTINCT raw_payload->>'ticker') >= 2
@@ -771,6 +776,7 @@ def _discover_lobbyists(engine: Engine) -> dict:
                     COUNT(*)                        AS filing_count
                 FROM raw_series
                 WHERE series_id LIKE 'LOBBYING:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload IS NOT NULL
                 GROUP BY
                     raw_payload->>'registrant_name',
@@ -907,6 +913,7 @@ def _discover_gov_officials(engine: Engine) -> dict:
                     COUNT(*)                            AS award_count
                 FROM raw_series
                 WHERE series_id LIKE 'GOV_CONTRACT:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload IS NOT NULL
                 GROUP BY
                     raw_payload->>'awarding_agency',
@@ -1065,6 +1072,7 @@ def enrich_actor(engine: Engine, actor_id: str) -> dict:
                            raw_payload->>'transaction_type' AS txn_type
                     FROM raw_series
                     WHERE series_id LIKE 'INSIDER:%'
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'insider_name' ILIKE :name
                     ORDER BY obs_date DESC
                     LIMIT 50
@@ -1084,6 +1092,7 @@ def enrich_actor(engine: Engine, actor_id: str) -> dict:
                            raw_payload->>'transaction_type' AS txn_type
                     FROM raw_series
                     WHERE series_id LIKE 'CONGRESS:%'
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'member_name' ILIKE :name
                     ORDER BY obs_date DESC
                     LIMIT 50
@@ -1223,6 +1232,8 @@ def discover_connections(engine: Engine) -> list[dict]:
                     AND ABS(a.obs_date - b.obs_date) <= :window
                 WHERE a.series_id LIKE 'INSIDER:%'
                   AND b.series_id LIKE 'INSIDER:%'
+                  AND a.pull_status = 'SUCCESS'
+                  AND b.pull_status = 'SUCCESS'
                   AND a.obs_date >= CURRENT_DATE - INTERVAL '90 days'
                 GROUP BY
                     a.raw_payload->>'insider_name',
@@ -1278,6 +1289,8 @@ def discover_connections(engine: Engine) -> list[dict]:
                     AND a.raw_payload->>'member_name' < b.raw_payload->>'member_name'
                 WHERE a.series_id LIKE 'CONGRESS:%'
                   AND b.series_id LIKE 'CONGRESS:%'
+                  AND a.pull_status = 'SUCCESS'
+                  AND b.pull_status = 'SUCCESS'
                   AND a.raw_payload->>'committee' IS NOT NULL
                   AND a.raw_payload->>'committee' != ''
                 GROUP BY
@@ -1327,6 +1340,8 @@ def discover_connections(engine: Engine) -> list[dict]:
                     AND ABS(ins.obs_date - cong.obs_date) <= :window
                 WHERE ins.series_id LIKE 'INSIDER:%'
                   AND cong.series_id LIKE 'CONGRESS:%'
+                  AND ins.pull_status = 'SUCCESS'
+                  AND cong.pull_status = 'SUCCESS'
                   AND ins.obs_date >= CURRENT_DATE - INTERVAL '180 days'
                 GROUP BY
                     ins.raw_payload->>'insider_name',
@@ -1538,6 +1553,7 @@ def _enrich_actor_with_prefetch(
                            raw_payload->>'transaction_type' AS txn_type
                     FROM raw_series
                     WHERE series_id LIKE 'INSIDER:%'
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'insider_name' ILIKE :name
                     ORDER BY obs_date DESC
                     LIMIT 50
@@ -1556,6 +1572,7 @@ def _enrich_actor_with_prefetch(
                            raw_payload->>'transaction_type' AS txn_type
                     FROM raw_series
                     WHERE series_id LIKE 'CONGRESS:%'
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'member_name' ILIKE :name
                     ORDER BY obs_date DESC
                     LIMIT 50
@@ -2229,6 +2246,7 @@ def batch_discover_insiders(engine: Engine, days_back: int = 365) -> dict:
                     MAX(obs_date)                 AS last_trade
                 FROM raw_series
                 WHERE series_id LIKE 'INSIDER:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'insider_name' IS NOT NULL
                   AND obs_date >= CURRENT_DATE - MAKE_INTERVAL(days => :days)
                 GROUP BY
@@ -2370,6 +2388,7 @@ def discover_all_13f_filers(engine: Engine) -> dict:
                     SUM(value)                                   AS total_value
                 FROM raw_series
                 WHERE series_id LIKE '13F:%'
+                  AND pull_status = 'SUCCESS'
                 GROUP BY SPLIT_PART(series_id, ':', 2)
                 ORDER BY COUNT(*) DESC
             """)).fetchall()
@@ -2388,6 +2407,7 @@ def discover_all_13f_filers(engine: Engine) -> dict:
                     SELECT raw_payload->>'manager_name'
                     FROM raw_series
                     WHERE series_id LIKE :prefix
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'manager_name' IS NOT NULL
                     LIMIT 1
                 """), {"prefix": f"13F:{cik}:%"}).fetchone()
@@ -2528,6 +2548,7 @@ def discover_all_congress(engine: Engine) -> dict:
                         AS tickers
                 FROM raw_series
                 WHERE series_id LIKE 'CONGRESS:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'member_name' IS NOT NULL
                 GROUP BY
                     raw_payload->>'member_name',
@@ -3153,6 +3174,7 @@ def discover_board_interlocks(engine: Engine) -> dict:
                     COUNT(DISTINCT raw_payload->>'ticker') AS ticker_count
                 FROM raw_series
                 WHERE series_id LIKE 'INSIDER:%'
+                  AND pull_status = 'SUCCESS'
                   AND raw_payload->>'insider_name' IS NOT NULL
                 GROUP BY
                     raw_payload->>'insider_name',

@@ -337,6 +337,7 @@ class GoogleTrendsPuller(BasePuller):
                     "FROM raw_series "
                     "WHERE series_id = ANY(:features) "
                     "AND source_id = :src "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= :cutoff "
                     "GROUP BY obs_date "
                     "HAVING COUNT(DISTINCT series_id) >= 3"

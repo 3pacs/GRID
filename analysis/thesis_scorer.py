@@ -520,7 +520,7 @@ def _score_supply_chain(engine: Engine, accuracy: float) -> dict:
             for sid in _SC_SERIES:
                 recent = conn.execute(text(
                     "SELECT value, obs_date FROM raw_series "
-                    "WHERE series_id = :sid "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
 
@@ -529,7 +529,7 @@ def _score_supply_chain(engine: Engine, accuracy: float) -> dict:
 
                 prior = conn.execute(text(
                     "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                     "AND obs_date <= CURRENT_DATE - 90 "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
@@ -1132,6 +1132,7 @@ def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text(
                     "SELECT COUNT(DISTINCT series_id) FROM raw_series "
                     "WHERE series_id LIKE 'crucix.%' "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= CURRENT_DATE - 1 "
                     "AND value IS NOT NULL AND value != 0"
                 )).fetchone()
@@ -1145,6 +1146,7 @@ def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text(
                     "SELECT COUNT(*) FROM raw_series "
                     "WHERE series_id LIKE 'gdelt_tension_%' "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= CURRENT_DATE - 1"
                 )).fetchone()
                 gdelt_events = r[0] if r else 0
@@ -1317,6 +1319,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 SELECT value, obs_date FROM raw_series
                 WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
                                     'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                AND pull_status = 'SUCCESS'
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()
 
@@ -1324,6 +1327,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 SELECT value FROM raw_series
                 WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
                                     'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                AND pull_status = 'SUCCESS'
                 AND obs_date <= CURRENT_DATE - 30
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()
@@ -1352,6 +1356,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text("""
                     SELECT value FROM raw_series
                     WHERE series_id LIKE 'defillama%tvl%'
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date DESC LIMIT 1
                 """)).fetchone()
                 if r:
@@ -2079,7 +2084,8 @@ def _score_crucix_osint(engine: Engine, accuracy: float) -> dict:
             def _latest(sid: str) -> float | None:
                 r = conn.execute(text(
                     "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - 3 "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= CURRENT_DATE - 3 "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
                 return float(r[0]) if r and r[0] is not None else None
@@ -2274,7 +2280,8 @@ def _score_gdelt_geopolitical(engine: Engine, accuracy: float) -> dict:
                 """Average of recent values (GDELT can have multiple per day)."""
                 r = conn.execute(text(
                     "SELECT AVG(value) FROM raw_series "
-                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - :d"
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= CURRENT_DATE - :d"
                 ), {"sid": sid, "d": days}).fetchone()
                 return float(r[0]) if r and r[0] is not None else None
 

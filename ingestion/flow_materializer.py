@@ -395,6 +395,7 @@ def sync_dark_pool_weekly(engine: Engine) -> int:
         rs_rows = conn.execute(text(
             "SELECT series_id, obs_date, value "
             "FROM raw_series WHERE series_id LIKE 'DARKPOOL:%' "
+            "AND pull_status = 'SUCCESS' "
             "ORDER BY obs_date DESC LIMIT 50000"
         )).fetchall()
 
@@ -526,6 +527,7 @@ def sync_etf_flows(engine: Engine) -> int:
             "SELECT series_id, obs_date, value "
             "FROM raw_series WHERE series_id LIKE :prefix "
             "AND series_id LIKE :suffix "
+            "AND pull_status = 'SUCCESS' "
             "ORDER BY obs_date DESC LIMIT 20000"
         ), {"prefix": "ETF_FLOW:%", "suffix": "%:5d"}).fetchall()
 
@@ -596,6 +598,7 @@ def sync_junction_points(engine: Engine) -> int:
             hist_rows = conn.execute(text(
                 "SELECT obs_date, value FROM raw_series "
                 "WHERE series_id = :sid "
+                "AND pull_status = 'SUCCESS' "
                 "AND obs_date >= :start "
                 "ORDER BY obs_date ASC"
             ), {"sid": fred_id, "start": two_years_ago}).fetchall()
