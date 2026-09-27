@@ -26,6 +26,12 @@ from discovery.orthogonality import OrthogonalityAudit  # noqa: F401
 
 router = APIRouter(prefix="/api/v1/discovery", tags=["discovery"])
 
+# A feature whose last PIT observation is older than this is excluded from
+# on-demand orthogonality/clustering runs (and listed in the result) instead
+# of truncating the whole matrix to its last date. Same value the scheduled
+# job (scripts/run_analytics_snapshots.py) uses.
+DISCOVERY_MAX_STALENESS_DAYS = 10
+
 # In-memory job tracking (guarded by lock for thread safety)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -39,7 +45,7 @@ def _run_orthogonality(job_id: str) -> None:
         engine = get_db_engine()
         pit = get_pit_store()
         audit = OrthogonalityAudit(engine, pit)
-        result = audit.run_full_audit()
+        result = audit.run_full_audit(max_staleness_days=DISCOVERY_MAX_STALENESS_DAYS)
         with _jobs_lock:
             _jobs[job_id]["status"] = "complete"
             _jobs[job_id]["result"] = result
@@ -60,7 +66,10 @@ def _run_clustering(job_id: str, n_components: int) -> None:
         engine = get_db_engine()
         pit = get_pit_store()
         cd = ClusterDiscovery(engine, pit)
-        result = cd.run_cluster_discovery(n_components=n_components)
+        result = cd.run_cluster_discovery(
+            n_components=n_components,
+            max_staleness_days=DISCOVERY_MAX_STALENESS_DAYS,
+        )
         with _jobs_lock:
             _jobs[job_id]["status"] = "complete"
             _jobs[job_id]["result"] = result
@@ -126,30 +135,135 @@ async def get_jobs(
     return {"jobs": jobs_list}
 
 
-@router.get("/results/orthogonality")
-async def get_orthogonality_results(
-    _token: str = Depends(require_auth),
-) -> dict:
-    """Return most recent orthogonality results."""
+def _latest_job_result(job_type: str) -> dict | None:
+    """Most recent completed in-process job result of ``job_type``."""
     with _jobs_lock:
         sorted_jobs = sorted(_jobs.values(), key=lambda j: j["started"], reverse=True)
     for job in sorted_jobs:
-        if job["type"] == "orthogonality" and job["status"] == "complete":
-            return {"result": job["result"]}
-    return {"result": None, "message": "No completed orthogonality audit found"}
+        if job["type"] == job_type and job["status"] == "complete":
+            return job["result"]
+    return None
+
+
+def latest_snapshot_result(category: str, subcategory: str | None = None) -> dict | None:
+    """Latest persisted ``analytical_snapshots`` row for a category.
+
+    ``subcategory=None`` selects the unpartitioned (global) row only, so a
+    per-sector row can never be served as the global result. Returns
+    ``{"result", "source", "as_of_date", "created_at", "snapshot_id"}`` or
+    None. Read-only: a single SELECT, no table creation.
+    """
+    engine = get_db_engine()
+    with engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT id, as_of_date, created_at, payload "
+                "FROM analytical_snapshots "
+                "WHERE category = :cat "
+                "  AND subcategory IS NOT DISTINCT FROM :sub "
+                "ORDER BY as_of_date DESC, created_at DESC "
+                "LIMIT 1"
+            ),
+            {"cat": category, "sub": subcategory},
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "result": row[3],
+        "source": "analytical_snapshots",
+        "snapshot_id": row[0],
+        "as_of_date": row[1].isoformat() if row[1] is not None else None,
+        "created_at": row[2].isoformat() if row[2] is not None else None,
+    }
+
+
+def _result_with_snapshot_fallback(
+    job_type: str, category: str, subcategory: str | None, missing_message: str,
+) -> dict:
+    """In-process job result first, else the latest persisted snapshot."""
+    if subcategory is None:
+        result = _latest_job_result(job_type)
+        if result is not None:
+            return {"result": result, "source": "in_process_job"}
+    try:
+        snap = latest_snapshot_result(category, subcategory)
+    except Exception as exc:
+        log.warning("{c} snapshot read failed: {e}", c=category, e=str(exc))
+        return {"result": None, "message": f"{category} snapshot unavailable"}
+    if snap is not None:
+        return snap
+    return {"result": None, "message": missing_message}
+
+
+@router.get("/results/orthogonality")
+def get_orthogonality_results(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return the most recent orthogonality result.
+
+    A run triggered in this API process wins; otherwise the latest
+    ``orthogonality`` analytical snapshot (written by the scheduled
+    analytics job) is served with its ``as_of_date``.
+    """
+    return _result_with_snapshot_fallback(
+        "orthogonality", "orthogonality", None,
+        "No completed orthogonality audit found",
+    )
 
 
 @router.get("/results/clustering")
-async def get_clustering_results(
+def get_clustering_results(
+    sector: str | None = Query(
+        default=None,
+        description="Sector name (analysis/sector_map.py) for a per-sector result",
+    ),
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return most recent clustering results."""
-    with _jobs_lock:
-        sorted_jobs = sorted(_jobs.values(), key=lambda j: j["started"], reverse=True)
-    for job in sorted_jobs:
-        if job["type"] == "clustering" and job["status"] == "complete":
-            return {"result": job["result"]}
-    return {"result": None, "message": "No completed clustering run found"}
+    """Return the most recent clustering result (global or one sector).
+
+    Global: a run triggered in this API process wins, else the latest
+    ``clustering`` snapshot. ``sector=...``: the latest
+    ``clustering_sector`` snapshot for that sector.
+    """
+    if sector:
+        return _result_with_snapshot_fallback(
+            "clustering", "clustering_sector", sector,
+            f"No clustering result for sector {sector!r}",
+        )
+    return _result_with_snapshot_fallback(
+        "clustering", "clustering", None, "No completed clustering run found",
+    )
+
+
+@router.get("/results/clustering/sectors")
+def list_sector_clustering_results(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """List the sectors that have a persisted per-sector clustering result."""
+    engine = get_db_engine()
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT subcategory, MAX(as_of_date) AS as_of_date, COUNT(*) AS n "
+                    "FROM analytical_snapshots "
+                    "WHERE category = 'clustering_sector' AND subcategory IS NOT NULL "
+                    "GROUP BY subcategory ORDER BY subcategory"
+                )
+            ).fetchall()
+    except Exception as exc:
+        log.warning("clustering_sector listing failed: {e}", e=str(exc))
+        return {"sectors": [], "message": "clustering_sector snapshots unavailable"}
+    return {
+        "sectors": [
+            {
+                "sector": r[0],
+                "as_of_date": r[1].isoformat() if r[1] is not None else None,
+                "snapshots": int(r[2]),
+            }
+            for r in rows
+        ]
+    }
 
 
 @router.get("/hypotheses/results")
@@ -434,6 +548,69 @@ def promote_hypothesis_to_feature(
     }
 
 
+# Maintained cross-asset set for the correlation-matrix view: (feature_registry
+# name, display name). Chosen 2026-09-27 from feature_registry rows that were
+# model_eligible, not deprecated and observed within the last 10 days on
+# grid-svr. It replaces 13 legacy names (spy_close, qqq_close, iwm_close,
+# treasury_10y, treasury_2y, yield_curve_10y2y, gold_price, crude_oil,
+# btc_price, dollar_index, vix, hy_spread, ig_spread): six of them no longer
+# exist in the registry and the other seven stopped updating in March/April
+# 2026. The names below are resolved to ids at request time and every
+# feature is re-checked (eligible, not deprecated, fresh) on every call.
+# IWM, the 10y-2y curve and VIX itself have no model-eligible maintained
+# series today (iwm_full / yld_curve_2s10s / vix_spot are model_eligible =
+# FALSE), so they are not substituted with something else under their name.
+CROSS_ASSET_FEATURES: tuple[tuple[str, str], ...] = (
+    ("spy_full", "SPY"),
+    ("qqq_full", "QQQ"),
+    ("tlt_full", "TLT"),
+    ("shy_full", "SHY (1-3Y UST)"),
+    ("gld_full", "GLD"),
+    ("cl_close", "WTI crude"),
+    ("btc_usd_full", "BTC"),
+    ("uup_etf_close", "UUP (USD)"),
+    ("spy_iv_atm", "SPY ATM IV"),
+    ("vvix", "VVIX"),
+    ("hy_oas_spread", "HY OAS"),
+    ("ig_oas_spread", "IG OAS"),
+)
+
+
+def resolve_cross_asset_features(engine) -> tuple[list[int], dict[int, str], list[dict]]:
+    """Resolve ``CROSS_ASSET_FEATURES`` to usable feature ids, failing closed.
+
+    Returns (usable_ids, id_to_name, excluded) where ``excluded`` lists every
+    configured feature that cannot be used, with a reason:
+    ``not_in_registry``, ``deprecated`` or ``not_model_eligible``. Freshness
+    is checked later against the PIT matrix itself.
+    """
+    names = [n for n, _ in CROSS_ASSET_FEATURES]
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT id, name, model_eligible, deprecated_at "
+                "FROM feature_registry WHERE name = ANY(:names)"
+            ),
+            {"names": names},
+        ).fetchall()
+    by_name = {r[1]: r for r in rows}
+    usable: list[int] = []
+    id_to_name: dict[int, str] = {}
+    excluded: list[dict] = []
+    for name in names:
+        row = by_name.get(name)
+        if row is None:
+            excluded.append({"feature": name, "reason": "not_in_registry"})
+        elif row[3] is not None:
+            excluded.append({"feature": name, "reason": "deprecated"})
+        elif not row[2]:
+            excluded.append({"feature": name, "reason": "not_model_eligible"})
+        else:
+            usable.append(int(row[0]))
+            id_to_name[int(row[0])] = name
+    return usable, id_to_name, excluded
+
+
 @router.get("/correlation-matrix")
 def get_correlation_matrix(
     period: int = Query(default=90, ge=30, le=1000, description="Lookback days"),
@@ -442,8 +619,12 @@ def get_correlation_matrix(
 ) -> dict:
     """Return cross-asset correlation matrix with regime breakdowns and PCA summary.
 
-    Computes correlations from resolved_series for 10-15 key assets
-    covering equities, bonds, commodities, crypto, FX, vol, and credit.
+    Computes correlations from PIT ``resolved_series`` for the maintained
+    cross-asset set in ``CROSS_ASSET_FEATURES``. Each feature fails closed
+    on its own: one that is missing from the registry, deprecated, not
+    model-eligible, or whose last observation is older than
+    ``DISCOVERY_MAX_STALENESS_DAYS`` is left out and listed in
+    ``excluded_features`` with the reason; the rest are still returned.
     Optionally breaks down by market regime detected from decision_journal.
     """
     import numpy as np
@@ -451,49 +632,20 @@ def get_correlation_matrix(
     from sklearn.decomposition import PCA
     from sklearn.preprocessing import StandardScaler
 
+    from discovery.matrix_guard import drop_stale_columns
+
     engine = get_db_engine()
     pit_store = get_pit_store()
 
-    # ── Key assets covering major cross-asset classes ──
-    TARGET_FEATURES = [
-        "spy_close", "qqq_close", "iwm_close",          # equities
-        "treasury_10y", "treasury_2y", "yield_curve_10y2y",  # bonds
-        "gold_price", "crude_oil",                        # commodities
-        "btc_price",                                      # crypto
-        "dollar_index",                                   # FX
-        "vix",                                            # vol
-        "hy_spread", "ig_spread",                         # credit
-    ]
-    DISPLAY_NAMES = {
-        "spy_close": "SPY", "qqq_close": "QQQ", "iwm_close": "IWM",
-        "treasury_10y": "TLT (10Y)", "treasury_2y": "UST 2Y",
-        "yield_curve_10y2y": "Curve 10-2",
-        "gold_price": "GLD", "crude_oil": "OIL",
-        "btc_price": "BTC", "dollar_index": "DXY",
-        "vix": "VIX", "hy_spread": "HYG (spread)", "ig_spread": "IG (spread)",
-    }
+    empty = {"features": [], "matrix": [], "regime_matrices": {},
+             "breakdowns": [], "current_regime": "UNKNOWN",
+             "pca": {"components": [], "total_variance": 0}}
 
-    # Resolve feature IDs from registry
-    placeholders = ", ".join([f":f{i}" for i in range(len(TARGET_FEATURES))])
-    params = {f"f{i}": name for i, name in enumerate(TARGET_FEATURES)}
-
-    with engine.connect() as conn:
-        # placeholders is built from validated bind names (:f0, :f1, ...)
-        feat_sql = (
-            "SELECT id, name FROM feature_registry WHERE name IN ("
-            + placeholders
-            + ")"
-        )
-        feat_rows = conn.execute(text(feat_sql), params).fetchall()
-
-    if not feat_rows:
-        return {"features": [], "matrix": [], "regime_matrices": {},
-                "breakdowns": [], "current_regime": "UNKNOWN",
-                "pca": {"components": [], "total_variance": 0}}
-
-    id_to_name = {r[0]: r[1] for r in feat_rows}
-    {r[1]: r[0] for r in feat_rows}
-    feature_ids = [r[0] for r in feat_rows]
+    feature_ids, id_to_name, excluded = resolve_cross_asset_features(engine)
+    empty["excluded_features"] = excluded
+    if not feature_ids:
+        return empty
+    DISPLAY_NAMES = dict(CROSS_ASSET_FEATURES)
 
     # Build feature matrix using PIT store
     from datetime import date as _date, timedelta as _td
@@ -509,23 +661,36 @@ def get_correlation_matrix(
     )
 
     if matrix is None or matrix.empty:
-        return {"features": [], "matrix": [], "regime_matrices": {},
-                "breakdowns": [], "current_regime": "UNKNOWN",
-                "pca": {"components": [], "total_variance": 0}}
+        for fid in feature_ids:
+            excluded.append({"feature": id_to_name[fid], "reason": "no_observations"})
+        return empty
 
-    # Rename columns to display names
-    matrix.columns = [DISPLAY_NAMES.get(id_to_name.get(c, ""), str(c))
-                       for c in matrix.columns]
+    # Features with no PIT rows in the window never become columns.
+    for fid in feature_ids:
+        if fid not in matrix.columns:
+            excluded.append({"feature": id_to_name[fid], "reason": "no_observations"})
+
+    # Fail closed per feature: a series that stopped updating would
+    # otherwise truncate every row after its last date via dropna().
+    matrix, stale = drop_stale_columns(matrix, today, DISCOVERY_MAX_STALENESS_DAYS)
+    for fid, last in stale.items():
+        excluded.append({"feature": id_to_name.get(fid, str(fid)),
+                         "reason": "stale", "last_obs_date": last})
+
+    # Rename columns to display names (keep display -> id for provenance)
+    display_to_id = {DISPLAY_NAMES.get(id_to_name.get(c, ""), str(c)): int(c)
+                     for c in matrix.columns}
+    matrix.columns = list(display_to_id)
 
     # Clean: drop >50% missing, ffill, dropna
     missing_pct = matrix.isnull().mean()
+    for col in missing_pct[missing_pct > 0.5].index:
+        excluded.append({"feature": col, "reason": "sparse"})
     matrix = matrix.loc[:, missing_pct <= 0.5]
     matrix = matrix.ffill(limit=5).dropna()
 
     if matrix.empty or matrix.shape[1] < 2:
-        return {"features": [], "matrix": [], "regime_matrices": {},
-                "breakdowns": [], "current_regime": "UNKNOWN",
-                "pca": {"components": [], "total_variance": 0}}
+        return empty
 
     features = list(matrix.columns)
 
@@ -628,13 +793,12 @@ def get_correlation_matrix(
                     {"feature": features[k], "loading": round(float(loadings[k]), 3)}
                     for k in top_idx if k < len(features)
                 ]
-                # Human interpretation
-                if idx == 0:
-                    interp = f"{var_pct:.0%} of variance explained by risk-on/risk-off"
-                elif idx == 1:
-                    interp = f"{var_pct:.0%} explained by rates/duration factor"
-                else:
-                    interp = f"{var_pct:.0%} explained by idiosyncratic factor"
+                # Describe the component by its measured loadings only; the
+                # components are unsupervised, so no factor name is implied.
+                interp = (
+                    f"{var_pct:.0%} of variance; largest loadings: "
+                    + ", ".join(t["feature"] for t in top_features)
+                )
 
                 components.append({
                     "id": f"PC{idx + 1}",
@@ -659,6 +823,11 @@ def get_correlation_matrix(
         "pca": pca_result,
         "period": period,
         "n_observations": len(matrix_period),
+        "as_of_date": today.isoformat(),
+        "window_start": matrix_period.index.min().date().isoformat(),
+        "window_end": matrix_period.index.max().date().isoformat(),
+        "feature_ids": {name: display_to_id[name] for name in features},
+        "excluded_features": excluded,
     }
 
 

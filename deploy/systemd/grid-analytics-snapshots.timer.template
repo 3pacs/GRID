@@ -1,0 +1,18 @@
+[Unit]
+Description=Daily GRID analytics snapshots (after the resolver's daily refresh)
+
+# NOT INSTALLED. Template only — see deploy/systemd/README.md.
+
+[Timer]
+# grid-resolved-series-backfill.timer runs at 06:30 UTC (+ up to 2 min
+# randomized delay, TimeoutStartSec=600). 07:15 UTC leaves that refresh
+# time to finish. Ordering is also enforced by the job itself: readiness
+# check G5 refuses to run until spy_full has a PIT observation within
+# GRID_ANALYTICS_MAX_RESOLVER_LAG_DAYS.
+OnCalendar=*-*-* 07:15:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=grid-analytics-snapshots.service
+
+[Install]
+WantedBy=timers.target

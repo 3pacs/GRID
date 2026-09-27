@@ -79,7 +79,6 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "api/routers/astrogrid_helpers.py": 4,
     "api/routers/chat.py": 4,
     "api/routers/dad.py": 3,
-    "api/routers/discovery.py": 1,
     "api/routers/flows.py": 6,
     "api/routers/forecasts.py": 3,
     "api/routers/intelligence_risk.py": 14,

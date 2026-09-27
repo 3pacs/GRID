@@ -385,6 +385,26 @@ jobs:
             exit 1
           fi
 
+      # Analytics snapshots job (scripts/run_analytics_snapshots.py): the
+      # readiness gate (G1-G5), sector-restricted clustering eligibility
+      # (CAST(:restrict AS INTEGER[])), global-vs-sector snapshot reads,
+      # correlation-matrix fail-closed ids, options scan summary, and one
+      # gated end-to-end write — against a disposable schema.
+      - name: Analytics snapshots job PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_analytics_snapshots_pg.py -q -rA | tee /tmp/grid-analytics-snapshots-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-analytics-snapshots-pg.txt; then
+            echo "::error::Analytics snapshots PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # GRID-YF-CLOSE-REPAIR-20260926 / coordinator review of PR #672:
       # proves ingestion/yfinance_pull.py's cross-process advisory lock
       # (pg_try_advisory_lock/pg_advisory_unlock) actually blocks a second,

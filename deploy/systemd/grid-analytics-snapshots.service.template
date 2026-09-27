@@ -1,0 +1,47 @@
+[Unit]
+Description=GRID analytics snapshots (orthogonality, clustering incl. per-sector, feature engineering/importance, options scan summary)
+Documentation=file:///data/grid_v4/grid_release/deploy/systemd/README.md
+After=network-online.target postgresql.service grid-resolved-series-backfill.service
+Wants=network-online.target
+
+# NOT INSTALLED. Template only — see deploy/systemd/README.md
+# ("grid-analytics-snapshots"). The job itself refuses to compute anything
+# until its readiness gate passes (retraction run tag present and settled,
+# operator ready-flag written, resolver refresh landed); a not-ready exit
+# (status 3) is a clean skip, not a unit failure.
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+# Current deployed release (same tree grid-api runs from).
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=GRID_ANALYTICS_REQUIRED_RUN_TAG=reresolve_20260927
+Environment=GRID_ANALYTICS_READY_FLAG=/data/grid/state/analytics-snapshots.ready
+Environment=GRID_ANALYTICS_SETTLE_MINUTES=60
+Environment=GRID_ANALYTICS_MAX_RESOLVER_LAG_DAYS=4
+
+# flock -n: a run that is still going when the next timer fires is not
+# doubled; the second invocation exits 1 immediately (logged by systemd).
+ExecStart=/usr/bin/flock -n /tmp/grid-analytics-snapshots.lock \
+    /usr/bin/python3 /data/grid_v4/grid_release/scripts/run_analytics_snapshots.py
+
+# 3 = readiness gate not satisfied (nothing computed, nothing written).
+SuccessExitStatus=3
+
+# Global clustering + orthogonality load every model-eligible feature's PIT
+# history; allow for it, but never let a wedged run overlap the next day.
+TimeoutStartSec=3h
+TimeoutStopSec=60
+
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
