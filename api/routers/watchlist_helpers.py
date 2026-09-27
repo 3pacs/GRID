@@ -502,7 +502,7 @@ def _preload_one(tk: str) -> str | None:
         period = "3M"
         lookback_days = 90
 
-        _init_table()
+        # Runs under GET /preload: read-only, no _init_table DDL.
         engine = get_db_engine()
         feature_names = _resolve_feature_names(ticker_upper)
 

@@ -38,7 +38,9 @@ async def get_unified_thesis(
     supply chain, prediction markets, and trust convergence into a single
     directional view with conviction, key drivers, risk factors, and narrative.
 
-    Cached for 10 minutes.
+    Cached for 10 minutes. Read-only: the ``thesis_snapshots`` row that
+    accuracy tracking needs is written by the Hermes trust cycle
+    (``scripts/hermes_operator.py``), never by this GET.
     """
     import asyncio
 
@@ -47,15 +49,10 @@ async def get_unified_thesis(
         return cached
 
     def _build_thesis():
-        from analysis.thesis_scorer import score_thesis, snapshot_thesis, _build_narrative
+        from analysis.thesis_scorer import score_thesis, _build_narrative
 
         engine = get_db_engine()
         thesis = score_thesis(engine)
-
-        try:
-            snapshot_thesis(engine, thesis)
-        except Exception as e:
-            log.warning("Thesis: snapshot failed: {e}", e=str(e))
 
         thesis["overall_direction"] = thesis["direction"]
         thesis["bullish_score"] = thesis["bull_pct"]

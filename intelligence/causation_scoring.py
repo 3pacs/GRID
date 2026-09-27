@@ -98,17 +98,22 @@ def find_causes(
 # ── 2. batch_find_causes ─────────────────────────────────────────────────
 
 
-def batch_find_causes(engine: Engine, days: int = 30) -> list[CausalLink]:
+def batch_find_causes(
+    engine: Engine, days: int = 30, persist: bool = True,
+) -> list[CausalLink]:
     """Run find_causes for all recent signal_sources entries, store results.
 
     Parameters:
         engine: SQLAlchemy engine.
         days: How far back to search for signals.
+        persist: When True (default), ensure ``causal_links`` and store the
+            results. GET routes pass False so reads never write.
 
     Returns:
         All CausalLink objects found.
     """
-    ensure_table(engine)
+    if persist:
+        ensure_table(engine)
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
@@ -138,8 +143,8 @@ def batch_find_causes(engine: Engine, days: int = 30) -> list[CausalLink]:
         causes = find_causes(engine, actor, action, ticker, action_date, signal_id=sig_id)
         all_causes.extend(causes)
 
-    # Store results
-    if all_causes:
+    # Store results (explicit writers only; read paths pass persist=False)
+    if all_causes and persist:
         _store_causal_links(engine, all_causes)
 
     log.info(
