@@ -198,6 +198,26 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_watchlist_portfolio_pg.py -q -rA
 
+      # God view G2 (migrations/versions/godview_writers_20260926.py): runs the
+      # real upgrade/downgrade in a throwaway schema on top of the real
+      # god_view_market_tables_20260918 tables and matview -- legacy rows kept,
+      # matview still refreshes, receipt/modeled/ledger guards enforced,
+      # downgrade refused once writer rows exist, otherwise exact restore.
+      - name: God view G2 schema migration PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_godview_schema_migration_pg.py -q -rA | tee /tmp/grid-godview-g2-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-godview-g2-pg.txt; then
+            echo "::error::God view G2 PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Snapshot GET PostgreSQL read contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
