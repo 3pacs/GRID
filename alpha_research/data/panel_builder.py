@@ -20,7 +20,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.split_adjuster import adjust_panel
-from store.pit import PITStore
+from store.pit import PITStore, retraction_cutoff
 
 #: Exact feature_registry name for the CBOE VIX close/spot (~11-20 scale).
 #: VERIFIED 2026-09-24: id 11, fed by VIXCLS + YF:^VIX:close via
@@ -146,6 +146,7 @@ def build_volume_panel(
         "start": start_date,
         "end": end_date,
         "as_of": as_of_date,
+        "retraction_cutoff": retraction_cutoff(as_of_date),
     }
 
     if tickers:
@@ -160,6 +161,13 @@ def build_volume_panel(
         WHERE fr.name LIKE '%%_avg_volume'
           AND rs.obs_date BETWEEN :start AND :end
           AND rs.release_date <= :as_of
+          AND NOT EXISTS (
+              SELECT 1 FROM resolved_series_retractions rr
+              WHERE rr.feature_id = rs.feature_id
+                AND rr.obs_date = rs.obs_date
+                AND rr.vintage_date = rs.vintage_date
+                AND rr.retracted_at <= :retraction_cutoff
+          )
           {ticker_filter}
         ORDER BY rs.obs_date, fr.name
     """)
