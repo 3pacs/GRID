@@ -1,7 +1,7 @@
 """God view G2: provenance and point-in-time columns for the three pillar tables.
 
 Revision ID: godview_writers_20260926
-Revises: robinhood_guards_20260924
+Revises: raw_series_quarantined_20260926
 
 Slice G2 of the god-view materialization plan
 (GRID-GODVIEW-MATERIALIZATION-PLAN-20260926.md, sections 2, 3, 4 and 6).
@@ -81,7 +81,7 @@ constraints and drops ``godview_runs``.
 from alembic import op
 
 revision = "godview_writers_20260926"
-down_revision = "robinhood_guards_20260924"
+down_revision = "raw_series_quarantined_20260926"
 branch_labels = None
 depends_on = None
 
