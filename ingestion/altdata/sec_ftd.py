@@ -1,9 +1,15 @@
 """
 GRID SEC Fails-to-Deliver (FTD) puller.
 
-CONTRACT-FIRST / NOT ACTIVATED: this puller is not imported by
-``ingestion/scheduler.py``. A proposed (unapplied) registration patch is at
-``docs/handoffs/2026-09-18/fable-w5b-scheduler-registration.patch``. See
+ACTIVATED (Wave 1, 2026-09-27): registered as ``sec_ftd`` in
+``ingestion/smart_scheduler.py::PULLER_REGISTRY`` via
+``_SECFTDSchedulerAdapter``, catching up over every published half-month
+in the last ~2 months (see :meth:`SECFTDPuller.pull_recent`) on a 24h
+cadence -- NOT via the unapplied
+``docs/handoffs/2026-09-18/fable-w5b-scheduler-registration.patch``
+(which targets ``ingestion/scheduler.py``, a module nothing schedules;
+see the "Wave 1 activation helpers" comment above
+``smart_scheduler.PULLER_REGISTRY``). See
 ``docs/handoffs/2026-09-18/fable-w5b-source-contracts.md`` for the full
 identifier/units/cadence table, the exact documentation quotes this module
 was built from, and the ``raw_series`` ``release_date`` contract gap.
@@ -110,6 +116,7 @@ pipe-delimited 6-field layout exactly.
 
 from __future__ import annotations
 
+import calendar
 import zipfile
 from datetime import date
 from io import BytesIO
@@ -120,7 +127,12 @@ from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from config import settings
-from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
+from ingestion.base import (
+    BasePuller,
+    _http_status_from_exc,
+    log_pull_failure,
+    retry_on_failure,
+)
 
 # ---- Series-id namespace (disjoint from any "finra:*" or "finra.*") ----
 _SERIES_PREFIX = "sec:ftd_balance"
@@ -232,6 +244,53 @@ def parse_ftd_file(raw_text: str) -> dict[str, Any]:
     return {"rows": rows, "skipped": skipped}
 
 
+def _half_month_date_bounds(yyyymm: str, half: str) -> tuple[date, date]:
+    """Approximate settlement-date bounds covered by one half-month period.
+
+    Used only to scope the cheap "already ingested" existence check in
+    :meth:`SECFTDPuller.pull_recent` to a bounded date range -- NOT to
+    validate or reject rows the file itself reports (a settlement date is
+    always taken as-is from the file; see the module docstring's balance
+    semantics). First half = the 1st-15th of the month; second half = the
+    16th-last day. This is a reasonable approximation, not a documented
+    SEC fact.
+    """
+    y, m = int(yyyymm[:4]), int(yyyymm[4:6])
+    last_day = calendar.monthrange(y, m)[1]
+    if half == "a":
+        return date(y, m, 1), date(y, m, 15)
+    return date(y, m, 16), date(y, m, last_day)
+
+
+def _default_recent_half_months(lookback_months: int) -> list[dict[str, str]]:
+    """Every half-month (both "a" and "b") in the last ``lookback_months``
+    months, oldest first -- INCLUDING the current month, and without
+    filtering on whether SEC has actually published it yet.
+
+    Fallback used only when :meth:`SECFTDPuller.pull_recent` is called
+    without an explicit ``periods`` list (e.g. direct/manual use, tests).
+    The scheduler always passes an explicit list computed by
+    ``ingestion.smart_scheduler._sec_ftd_published_halves_since``, which
+    knows SEC's actual publish-date model (see that function's
+    docstring) and filters out not-yet-published halves; deliberately
+    kept separate here so this module has no dependency on
+    ``ingestion.smart_scheduler`` (which imports THIS module, to build
+    ``_SECFTDSchedulerAdapter`` -- a dependency the other direction would
+    be circular).
+    """
+    today = date.today()
+    total = today.year * 12 + (today.month - 1)
+    out: list[dict[str, str]] = []
+    for back in range(lookback_months, -1, -1):
+        t = total - back
+        y, m = divmod(t, 12)
+        m += 1
+        yyyymm = f"{y:04d}{m:02d}"
+        out.append({"yyyymm": yyyymm, "half": "a"})
+        out.append({"yyyymm": yyyymm, "half": "b"})
+    return out
+
+
 def extract_ftd_text_from_zip(zip_bytes: bytes) -> str:
     """Extract and decode the single data file inside an SEC FTD zip.
 
@@ -255,7 +314,7 @@ def extract_ftd_text_from_zip(zip_bytes: bytes) -> str:
 class SECFTDPuller(BasePuller):
     """Pulls SEC Fails-to-Deliver (FTD) outstanding-balance data.
 
-    NOT registered in the scheduler (see module docstring).
+    Registered in the scheduler as ``sec_ftd`` (see module docstring).
     """
 
     SOURCE_NAME: str = "SEC_FTD"
@@ -388,8 +447,13 @@ class SECFTDPuller(BasePuller):
                 ``rows_would_insert`` instead of ``rows_inserted``.
 
         Returns:
-            dict with status ("SUCCESS" or "FAILED"), rows_inserted (or
-            rows_would_insert if dry_run), rows_skipped, and dry_run.
+            dict with status ("SUCCESS", "SKIPPED" or "FAILED"),
+            rows_inserted (or rows_would_insert if dry_run), rows_skipped,
+            and dry_run. "SKIPPED" means the half-month zip does not exist
+            yet at this URL (HTTP 403/404 -- requested before SEC's
+            approximate publish date, see
+            ``smart_scheduler._sec_ftd_latest_published_half``'s
+            docstring) -- not a failure of this puller.
         """
         if publication_half is None:
             publication_half = half
@@ -397,6 +461,23 @@ class SECFTDPuller(BasePuller):
             zip_bytes = self._fetch_zip_bytes(url=url, yyyymm=yyyymm, half=half)
             raw_text = extract_ftd_text_from_zip(zip_bytes)
         except Exception as exc:  # noqa: BLE001 -- bounded below
+            status = _http_status_from_exc(exc)
+            if status in (403, 404):
+                log.info(
+                    "{s}: no file yet for {ym}{h} (HTTP {c}) -- treated as "
+                    "not-yet-published, not a failure",
+                    s=self.SOURCE_NAME, ym=yyyymm, h=half, c=status,
+                )
+                return {
+                    "status": "SKIPPED",
+                    "rows_inserted": 0,
+                    "rows_skipped": 0,
+                    "skipped_reason": (
+                        f"HTTP {status} -- no file published yet for "
+                        f"{yyyymm}{half}"
+                    ),
+                    "dry_run": dry_run,
+                }
             log_pull_failure(self.SOURCE_NAME, publication_half or "unknown", exc)
             return {
                 "status": "FAILED",
@@ -459,16 +540,28 @@ class SECFTDPuller(BasePuller):
                 "dry_run": dry_run,
             }
 
+        # One cheap query for the WHOLE file instead of one per unique
+        # series_id -- a half-month FTD file can carry thousands of
+        # distinct CUSIPs. Bounded by the settlement-date range actually
+        # present in the file (an FTD half-month spans ~10-16 business
+        # days), not by a series_id list. See
+        # ingestion/base.py::_get_existing_pairs_in_range.
+        file_min_date = min(row["date"] for row in rows)
+        file_max_date = max(row["date"] for row in rows)
+
         if dry_run:
-            would_insert = 0
-            existing_cache: dict[str, set[date]] = {}
             with self.engine.connect() as conn:
-                for row in rows:
-                    sid = self.series_id(row["cusip"])
-                    if sid not in existing_cache:
-                        existing_cache[sid] = self._get_existing_dates(sid, conn)
-                    if row["date"] not in existing_cache[sid]:
-                        would_insert += 1
+                existing_pairs = self._get_existing_pairs_in_range(
+                    conn, file_min_date, file_max_date
+                )
+            would_insert = 0
+            for row in rows:
+                sid = self.series_id(row["cusip"])
+                existing_dates = existing_pairs.setdefault(sid, set())
+                if row["date"] in existing_dates:
+                    continue  # two rows in this file for the same CUSIP+date
+                existing_dates.add(row["date"])
+                would_insert += 1
             return {
                 "status": "SUCCESS",
                 "rows_inserted": 0,
@@ -478,13 +571,22 @@ class SECFTDPuller(BasePuller):
             }
 
         inserted = 0
-        existing_cache = {}
         with self.engine.begin() as conn:
+            # Transaction-scoped lock for this exact half-month -- closes
+            # the race where an abandoned SmartScheduler-timeout thread for
+            # this same half finishes late, concurrently with a fresh
+            # retry, and both would otherwise see "not yet ingested" and
+            # both insert (see ingestion/base.py::_file_advisory_lock).
+            self._file_advisory_lock(
+                conn, "pull", publication_half or f"{file_min_date}:{file_max_date}"
+            )
+            existing_pairs = self._get_existing_pairs_in_range(
+                conn, file_min_date, file_max_date
+            )
             for row in rows:
                 sid = self.series_id(row["cusip"])
-                if sid not in existing_cache:
-                    existing_cache[sid] = self._get_existing_dates(sid, conn)
-                if row["date"] in existing_cache[sid]:
+                existing_dates = existing_pairs.setdefault(sid, set())
+                if row["date"] in existing_dates:
                     continue  # idempotent: balance already stored for this date
 
                 self._insert_raw(
@@ -503,7 +605,7 @@ class SECFTDPuller(BasePuller):
                         "docs_url": _DOCS_URL,
                     },
                 )
-                existing_cache[sid].add(row["date"])
+                existing_dates.add(row["date"])
                 inserted += 1
 
         log.info(
@@ -517,4 +619,85 @@ class SECFTDPuller(BasePuller):
             "rows_inserted": inserted,
             "rows_skipped": skipped,
             "dry_run": False,
+        }
+
+    def pull_recent(
+        self,
+        *,
+        periods: list[dict[str, str]] | None = None,
+        lookback_months: int = 2,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Catch-up pull over every published half-month not already stored.
+
+        This is the method the scheduler runs on its 24h cadence (see
+        ``ingestion/smart_scheduler.py::PULLER_REGISTRY``'s ``sec_ftd``
+        entry, via ``_SECFTDSchedulerAdapter``) instead of a single
+        latest-half :meth:`pull` -- a scheduler that only ever tries the
+        latest half silently never retries one that failed, wasn't
+        published yet when its tick ran, or was missed by a deploy
+        restart. For each candidate half this does a file-level
+        "already ingested" check (one cheap query bounded to that half's
+        approximate settlement-date range, see
+        ``ingestion/base.py::_get_existing_source_dates`` and
+        :func:`_half_month_date_bounds`) rather than re-downloading and
+        re-parsing a multi-MB zip just to find every row already stored.
+
+        Parameters:
+            periods: Explicit list of ``{"yyyymm", "half"}`` dicts to try,
+                oldest first. When omitted, computed locally via
+                :func:`_default_recent_half_months` (see its docstring for
+                why this module doesn't import the scheduler's own
+                publish-date-aware version). The scheduler adapter always
+                passes an explicit list.
+            lookback_months: Used only when ``periods`` is omitted.
+            dry_run: Forwarded to :meth:`pull` for each half tried.
+
+        Returns:
+            dict with aggregate ``status`` ("FAILED" if any half's
+            fetch/parse genuinely failed for a reason other than
+            "not yet published"; "SUCCESS" otherwise -- an already-stored
+            or not-yet-published half is SKIPPED, never a failure),
+            aggregate ``rows_inserted``/``rows_skipped``, and a
+            per-period ``periods`` breakdown.
+        """
+        if periods is None:
+            periods = _default_recent_half_months(lookback_months)
+
+        per_period: list[dict[str, Any]] = []
+        total_inserted = 0
+        total_skipped_rows = 0
+        any_hard_failure = False
+
+        for period in periods:
+            yyyymm, half = period["yyyymm"], period["half"]
+            start, end = _half_month_date_bounds(yyyymm, half)
+            with self.engine.connect() as conn:
+                already = self._get_existing_source_dates(
+                    conn, start_date=start, end_date=end
+                )
+            if already:
+                per_period.append(
+                    {
+                        "yyyymm": yyyymm,
+                        "half": half,
+                        "status": "SKIPPED",
+                        "reason": "already stored",
+                    }
+                )
+                continue
+
+            result = self.pull(yyyymm=yyyymm, half=half, dry_run=dry_run)
+            per_period.append({"yyyymm": yyyymm, "half": half, **result})
+            if result["status"] == "FAILED":
+                any_hard_failure = True
+            total_inserted += result.get("rows_inserted", 0) or 0
+            total_skipped_rows += result.get("rows_skipped", 0) or 0
+
+        return {
+            "status": "FAILED" if any_hard_failure else "SUCCESS",
+            "rows_inserted": total_inserted,
+            "rows_skipped": total_skipped_rows,
+            "periods": per_period,
+            "dry_run": dry_run,
         }

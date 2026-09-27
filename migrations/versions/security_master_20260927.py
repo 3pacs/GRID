@@ -1,7 +1,7 @@
 """security_master — GD1 point-in-time issuer/company crosswalk.
 
 Revision ID: security_master_20260927
-Revises: raw_series_quarantined_20260926
+Revises: people_events_20260927
 
 GD1 from ``GRID-GRANULAR-DISCOVERY-PLAN-20260927.md`` §4 (schema drafted in
 ``GRID-GD0-SECURITY-MASTER-AUDIT-20260927.md`` §5, this migration reshapes it
@@ -65,7 +65,7 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "security_master_20260927"
-down_revision: Union[str, Sequence[str], None] = "raw_series_quarantined_20260926"
+down_revision: Union[str, Sequence[str], None] = "people_events_20260927"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

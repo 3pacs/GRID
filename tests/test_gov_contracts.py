@@ -8,7 +8,7 @@ mocked database results.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 import json
 
@@ -117,6 +117,7 @@ class TestAwardNormalization:
             "Award Amount": 50_000_000,
             "Total Outlays": 10_000_000,
             "Description": "Aircraft maintenance contract",
+            "Action Date": "2025-01-10",
             "Start Date": "2025-01-15",
             "Awarding Agency": "Department of Defense",
             "Awarding Sub Agency": "Army",
@@ -130,7 +131,56 @@ class TestAwardNormalization:
         assert result["award_id"] == "W31P4Q-20-C-0123"
         assert result["amount"] == 50_000_000
         assert result["recipient_name"] == "Lockheed Martin Corp"
-        assert result["award_date"] == date(2025, 1, 15)
+        # GD-FIX: the event date is the Action Date (when the award was
+        # signed), not the period-of-performance Start Date.
+        assert result["award_date"] == date(2025, 1, 10)
+        assert result["award_date_basis"] == "action_date"
+        assert result["start_date"] == "2025-01-15"
+
+    @patch.object(GovContractsPuller, "_resolve_source_id", return_value=1)
+    def test_normalize_award_missing_action_date_uses_first_seen_not_start_date(self, mock_src):
+        """GD-FIX: without an Action Date, fall back to ingestion date — never
+        to Start Date, which USASpending can report in the future (the plan's
+        evidence found rows with a Start Date up to 2027-02-01)."""
+        puller = GovContractsPuller.__new__(GovContractsPuller)
+        puller.engine = MagicMock()
+        puller.source_id = 1
+
+        future_start = (date.today() + timedelta(days=90)).isoformat()
+        raw = {
+            "Award ID": "W31P4Q-20-C-0999",
+            "Recipient Name": "Boeing",
+            "Award Amount": 20_000_000,
+            "Start Date": future_start,
+            "Awarding Agency": "Department of Defense",
+        }
+
+        result = puller._normalize_award(raw)
+        assert result is not None
+        assert result["award_date"] == date.today()
+        assert result["award_date_basis"] == "first_seen"
+        # Never the future Start Date.
+        assert result["award_date"] != date.fromisoformat(future_start)
+
+    @patch.object(GovContractsPuller, "_resolve_source_id", return_value=1)
+    def test_normalize_award_malformed_action_date_falls_back(self, mock_src):
+        puller = GovContractsPuller.__new__(GovContractsPuller)
+        puller.engine = MagicMock()
+        puller.source_id = 1
+
+        raw = {
+            "Award ID": "W31P4Q-20-C-0888",
+            "Recipient Name": "Boeing",
+            "Award Amount": 20_000_000,
+            "Action Date": "not-a-date",
+            "Start Date": "2025-01-15",
+            "Awarding Agency": "Department of Defense",
+        }
+
+        result = puller._normalize_award(raw)
+        assert result is not None
+        assert result["award_date"] == date.today()
+        assert result["award_date_basis"] == "first_seen"
 
     @patch.object(GovContractsPuller, "_resolve_source_id", return_value=1)
     def test_normalize_below_threshold(self, mock_src):

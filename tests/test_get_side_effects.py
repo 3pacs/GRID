@@ -109,26 +109,19 @@ class TestCausationPersistFlag:
     def test_batch_find_causes_read_only_when_not_persisting(self):
         from intelligence import causation_scoring as cs
 
-        rows = [(1, "congressional", "Rep A", "AAA", "BUY", "2026-09-20")]
-        link = MagicMock()
-        with patch.object(cs, "ensure_table") as ensure, \
-             patch.object(cs, "_store_causal_links") as store, \
-             patch.object(cs, "find_causes", return_value=[link]):
-            out = cs.batch_find_causes(_engine_with_rows(rows), days=30, persist=False)
-        assert out == [link]
-        ensure.assert_not_called()
-        store.assert_not_called()
+        summary = MagicMock(edges=[], actions_processed=0, status="succeeded")
+        with patch.object(cs._cl, "run_causal_links", return_value=summary) as run:
+            out = cs.batch_find_causes(MagicMock(), days=30, persist=False)
+        assert out == []
+        assert run.call_args.kwargs["dry_run"] is True
 
     def test_batch_find_causes_default_still_persists(self):
         from intelligence import causation_scoring as cs
 
-        rows = [(1, "congressional", "Rep A", "AAA", "BUY", "2026-09-20")]
-        with patch.object(cs, "ensure_table") as ensure, \
-             patch.object(cs, "_store_causal_links") as store, \
-             patch.object(cs, "find_causes", return_value=[MagicMock()]):
-            cs.batch_find_causes(_engine_with_rows(rows), days=30)
-        ensure.assert_called_once()
-        store.assert_called_once()
+        summary = MagicMock(edges=[], actions_processed=0, status="succeeded")
+        with patch.object(cs._cl, "run_causal_links", return_value=summary) as run:
+            cs.batch_find_causes(MagicMock(), days=30)
+        assert run.call_args.kwargs["dry_run"] is False
 
     def test_trace_and_detect_skip_ddl_when_read_only(self):
         from intelligence import causation_graph as cg
@@ -152,14 +145,19 @@ class TestCausationPersistFlag:
     def test_get_routes_pass_persist_false(self):
         from api.routers import intelligence_forensics as f
 
+        payload = {"links": [], "generated": False, "as_of": None, "last_run": None}
         with patch.object(f, "get_db_engine", return_value=MagicMock()), \
-             patch("intelligence.causation.batch_find_causes", return_value=[]) as batch, \
+             patch("intelligence.causal_links.read_links_payload", return_value=dict(payload)) as read, \
+             patch("intelligence.causal_links.run_causal_links") as run, \
              patch("intelligence.causation.trace_causal_chain", return_value=[]) as trace, \
              patch("intelligence.causation.find_longest_chains", return_value=[]) as longest:
-            f.get_causation(ticker=None, days=30, _token="t")
+            out = f.get_causation(ticker=None, days=30, _token="t")
             asyncio.run(f.get_causal_chains(ticker="AAA", hops=5, days=180, _token="t"))
             asyncio.run(f.get_causal_chains(ticker=None, hops=5, days=180, _token="t"))
-        assert batch.call_args.kwargs["persist"] is False
+        # The causation GET reads persisted rows; it never computes or writes.
+        read.assert_called_once()
+        run.assert_not_called()
+        assert out["generated"] is False and out["causes"] == []
         assert trace.call_args.kwargs["persist"] is False
         assert longest.call_args.kwargs["persist"] is False
 
@@ -172,11 +170,15 @@ class TestCausationPersistFlag:
         }
         assert ("/causation/refresh", ("POST",)) in paths
         assert ("/causal-chains/refresh", ("POST",)) in paths
+        summary = MagicMock(edges_written=2)
+        summary.to_dict.return_value = {"run_id": "r1", "status": "succeeded"}
         with patch.object(f, "get_db_engine", return_value=MagicMock()), \
-             patch("intelligence.causation.batch_find_causes", return_value=[1, 2]) as batch:
-            out = f.refresh_causation(days=30, _token="t")
-        assert out == {"status": "stored", "days": 30, "stored": 2}
-        assert batch.call_args.kwargs["persist"] is True
+             patch("intelligence.causal_links.resolve_code_sha", return_value="abc"), \
+             patch("intelligence.causal_links.run_causal_links", return_value=summary) as run:
+            out = f.refresh_causation(days=30, max_tickers=50, _token="t")
+        assert out["status"] == "stored" and out["stored"] == 2
+        assert run.call_args.kwargs["max_tickers"] == 50
+        assert run.call_args.kwargs.get("dry_run", False) is False
 
 
 # ── forensics ─────────────────────────────────────────────────────────────

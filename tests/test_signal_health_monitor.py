@@ -269,12 +269,23 @@ def _make_stats_handler(
     history_mean: float | None,
     history_std: float | None,
 ):
-    """Build a dispatch handler that responds to the three queries in
+    """Build a dispatch handler that responds to the four queries in
     ``_fetch_series_stats`` with canned values.
+
+    2026-09-27 (#679 review follow-up): last_observation and
+    row_count/nan_count used to come from one combined query (a 3-tuple
+    matched on "MAX(obs_date)"). They are now two separate queries --
+    last_observation alone (still matched on "MAX(obs_date)", now a
+    1-tuple) requires pull_status = 'SUCCESS' so a QUARANTINED/FAILED
+    newest row can't make a stale series look fresh; row_count/nan_count
+    (matched on "COUNT(*) AS row_count", a 2-tuple) stays unfiltered by
+    design.
     """
     def handler(sql: str, params: dict):
         if "MAX(obs_date)" in sql:
-            return [(last_obs, row_count, nan_count)]
+            return [(last_obs,)]
+        if "COUNT(*) AS row_count" in sql:
+            return [(row_count, nan_count)]
         if "ORDER BY obs_date DESC LIMIT 1" in sql:
             if latest_value is None:
                 return []
@@ -379,7 +390,9 @@ class TestAuditAllSeries:
             if "DISTINCT series_id" in sql:
                 return [("fed_h8:loans",), ("pboc:omo",)]
             if "MAX(obs_date)" in sql:
-                return [(today, 5, 0)]
+                return [(today,)]
+            if "COUNT(*) AS row_count" in sql:
+                return [(5, 0)]
             if "ORDER BY obs_date DESC LIMIT 1" in sql:
                 return [(100.0,)]
             if "STDDEV_SAMP" in sql:
@@ -431,7 +444,9 @@ class TestGetSignalDampening:
             if "signal_health_history" in sql:
                 return []  # cache miss
             if "MAX(obs_date)" in sql:
-                return [(today, 5, 0)]
+                return [(today,)]
+            if "COUNT(*) AS row_count" in sql:
+                return [(5, 0)]
             if "ORDER BY obs_date DESC LIMIT 1" in sql:
                 return [(100.0,)]
             if "STDDEV_SAMP" in sql:

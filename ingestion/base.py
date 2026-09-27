@@ -128,6 +128,21 @@ _CODE_BUG_EXC_TYPES: tuple[type[BaseException], ...] = (
 )
 
 
+def _stable_lock_key(*parts: Any) -> int:
+    """Deterministic signed-63-bit key for ``pg_advisory_xact_lock``.
+
+    Postgres advisory-lock keys are a signed bigint. Deriving the key from
+    a SHA-256 of the given parts means the same ``(source, period)`` pair
+    always maps to the same lock without needing a separate keyspace
+    registry -- advisory locks are mutual-exclusion tokens, not secrets, so
+    a shared 63-bit hash space is fine.
+    """
+    import hashlib
+
+    digest = hashlib.sha256("|".join(str(p) for p in parts).encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
+
+
 def log_pull_failure(
     source: str,
     series_or_topic: str,
@@ -454,6 +469,114 @@ class BasePuller:
 
         rows = conn.execute(text(sql), params).fetchall()
         return {r[0] for r in rows}
+
+    def _file_advisory_lock(self, conn: Any, *key_parts: Any) -> None:
+        """Take a transaction-scoped advisory lock for one logical "file".
+
+        Held for the lifetime of the CURRENT transaction and released
+        automatically on commit or rollback (``pg_advisory_xact_lock``) --
+        callers must call this from INSIDE the same ``with engine.begin()
+        as conn:`` block that does the existence check and the inserts for
+        one file/period. That closes the race where a SmartScheduler
+        timeout leaves a puller's thread orphaned (see
+        ``smart_scheduler.SmartScheduler`` class docstring) and it finishes
+        late, concurrently with a fresh retry for the same file: without
+        this lock both transactions can read "not yet ingested" and both
+        insert, producing duplicate SUCCESS rows for the same
+        (series_id, obs_date). A second caller for the same key blocks
+        here until the first transaction finishes, then re-reads
+        "already ingested" and skips.
+
+        Parameters:
+            conn: Active connection, INSIDE a transaction (``engine.begin()``).
+            key_parts: Anything that identifies the file/period being
+                ingested (e.g. the source name + trade date, or + half-month
+                key). Combined with ``self.SOURCE_NAME`` so two different
+                sources never collide on the same lock by coincidence.
+        """
+        key = _stable_lock_key(self.SOURCE_NAME, *key_parts)
+        conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+
+    def _get_existing_source_dates(
+        self,
+        conn: Any,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> set[date]:
+        """obs_dates already stored for this source (ANY series), one query.
+
+        A single upstream "file" (a FINRA daily short-volume file, an SEC
+        FTD half-month file) writes many series ids (one per symbol/CUSIP)
+        under the same handful of obs_dates. Checking "has this file's
+        period already been ingested" only needs to know which obs_dates
+        this source already has SUCCESS rows for -- not which specific
+        series ids -- so this is one cheap query regardless of how many
+        series ids the file contains.
+
+        Parameters:
+            conn: Active database connection.
+            start_date: If given, only consider obs_date >= start_date.
+            end_date: If given, only consider obs_date <= end_date.
+
+        Returns:
+            set[date]: obs_dates with at least one SUCCESS row for this
+                source, within the given bounds.
+        """
+        sql = (
+            "SELECT DISTINCT obs_date FROM raw_series "
+            "WHERE source_id = :src AND pull_status = 'SUCCESS'"
+        )
+        params: dict[str, Any] = {"src": self.source_id}
+        if start_date is not None:
+            sql += " AND obs_date >= :start_date"
+            params["start_date"] = start_date
+        if end_date is not None:
+            sql += " AND obs_date <= :end_date"
+            params["end_date"] = end_date
+
+        rows = conn.execute(text(sql), params).fetchall()
+        return {r[0] for r in rows}
+
+    def _get_existing_pairs_in_range(
+        self,
+        conn: Any,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, set[date]]:
+        """All (series_id, obs_date) pairs already stored in ONE query.
+
+        Bounded by the obs_date range actually present in the file being
+        processed rather than filtered by a series_id list, this stays a
+        single cheap query no matter how many distinct series ids
+        (CUSIPs / symbols) the file contains -- a FINRA daily file has
+        exactly one obs_date; an SEC FTD half-month file spans roughly
+        10-16 business days. Replaces a per-unique-series-id
+        ``_get_existing_dates`` loop, which was issuing up to ~10k SELECTs
+        for a large FTD file.
+
+        Parameters:
+            conn: Active database connection.
+            start_date: Earliest obs_date present in the file (inclusive).
+            end_date: Latest obs_date present in the file (inclusive).
+
+        Returns:
+            dict mapping series_id -> set of obs_dates already stored
+            (SUCCESS) for that series_id within the range. A series_id
+            with no existing rows is simply absent -- callers should treat
+            a missing key as an empty set.
+        """
+        rows = conn.execute(
+            text(
+                "SELECT series_id, obs_date FROM raw_series "
+                "WHERE source_id = :src AND pull_status = 'SUCCESS' "
+                "AND obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {"src": self.source_id, "start_date": start_date, "end_date": end_date},
+        ).fetchall()
+        out: dict[str, set[date]] = {}
+        for sid, od in rows:
+            out.setdefault(sid, set()).add(od)
+        return out
 
     def _get_latest_date(
         self,

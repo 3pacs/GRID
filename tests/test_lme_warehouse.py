@@ -234,6 +234,7 @@ class TestParseLmeHtml:
 
     def test_handles_dash_and_na_cells(self):
         html = """
+        <p>Report date: 2026-04-13</p>
         <table>
           <thead><tr><th>Metal</th><th>Total</th><th>Cancelled</th></tr></thead>
           <tr><td>Copper</td><td>—</td><td>N/A</td></tr>
@@ -269,11 +270,28 @@ class TestParseLmeJson:
         assert _parse_lme_json(None) == []  # type: ignore[arg-type]
         assert _parse_lme_json([]) == []
 
+    def test_bare_flat_list_with_no_date_anywhere_returns_nothing(self):
+        """A bare flat list has no top-level field that could ever carry a
+        report_date (see _parse_lme_json's "report_date_raw = None" for
+        the list branch) -- 2026-09-27 review: this must return zero
+        snapshots rather than fabricating date.today() for every metal in
+        it, same as an explicitly unparseable date string."""
+        payload = [{"code": "Cu", "total": 200, "cancelled": 50}]
+        assert _parse_lme_json(payload) == []
+
     def test_alternate_field_names(self):
-        payload = [
-            {"code": "Cu", "total": 200, "cancelled": 50},
-            {"code": "Pb", "total": 80, "cancelled": 8},
-        ]
+        # A bare flat list (unlike the dict shape above) has nowhere to
+        # carry a report_date -- _parse_lme_json returns [] for one with
+        # no date rather than fabricating date.today(). Use the
+        # "data"-keyed dict alternative instead, which still exercises the
+        # alternate metal/numeric field names this test targets.
+        payload = {
+            "date": "2026-04-13",
+            "data": [
+                {"code": "Cu", "total": 200, "cancelled": 50},
+                {"code": "Pb", "total": 80, "cancelled": 8},
+            ],
+        }
         snaps = _parse_lme_json(payload)
         assert {s.metal for s in snaps} == {"copper", "lead"}
 

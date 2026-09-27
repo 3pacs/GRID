@@ -2573,7 +2573,35 @@ def _simple_kmeans(data, k=3, max_iter=50):
 # Image Generation Endpoints
 # ══════════════════════════════════════════════════════════════════
 
-@router.get("/generate-image/{image_type}")
+@router.post("/generate-image/custom")
+async def generate_custom_image(
+    prompt: str,
+    style: str = "dark",
+    model_tier: str = "fast",
+    _token: str = Depends(require_auth),
+) -> dict[str, Any]:
+    """Generate a custom AI image from a user prompt.
+
+    Paid call (Imagen) — POST only, gated behind GRID_ALLOW_PAID_LLM.
+    Registered ahead of ``/generate-image/{image_type}`` so this literal
+    path is matched first (Starlette matches routes in registration order).
+    """
+    from fastapi import HTTPException
+
+    from intelligence.image_gen import generate_custom
+
+    try:
+        result = generate_custom(prompt=prompt, style=style, model_tier=model_tier)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
+    return {
+        "type": "custom",
+        "image": result.to_dict(),
+    }
+
+
+@router.post("/generate-image/{image_type}")
 async def generate_flow_image(
     image_type: str,
     style: str = "dark",
@@ -2587,7 +2615,12 @@ async def generate_flow_image(
 
     Styles: dark, light, cnbc, minimal.
     Model tiers: fast, standard, ultra.
+
+    Paid call (Imagen) — POST only (never a GET, which would spend money
+    on every page load / prefetch), gated behind GRID_ALLOW_PAID_LLM.
     """
+    from fastapi import HTTPException
+
     from intelligence.image_gen import (
         generate_flow_infographic,
         generate_sector_heatmap,
@@ -2606,7 +2639,10 @@ async def generate_flow_image(
     }
 
     if image_type == "daily_pack":
-        results = generate_daily_briefing_pack(engine, style=style)
+        try:
+            results = generate_daily_briefing_pack(engine, style=style)
+        except PermissionError as exc:
+            raise HTTPException(status_code=403, detail=str(exc)) from exc
         return {
             "type": "daily_pack",
             "images": [r.to_dict() for r in results],
@@ -2620,26 +2656,13 @@ async def generate_flow_image(
             "available": list(generators.keys()) + ["daily_pack"],
         }
 
-    result = gen_func(engine, style=style, model_tier=model_tier)
+    try:
+        result = gen_func(engine, style=style, model_tier=model_tier)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+
     return {
         "type": image_type,
-        "image": result.to_dict(),
-    }
-
-
-@router.post("/generate-image/custom")
-async def generate_custom_image(
-    prompt: str,
-    style: str = "dark",
-    model_tier: str = "fast",
-    _token: str = Depends(require_auth),
-) -> dict[str, Any]:
-    """Generate a custom AI image from a user prompt."""
-    from intelligence.image_gen import generate_custom
-
-    result = generate_custom(prompt=prompt, style=style, model_tier=model_tier)
-    return {
-        "type": "custom",
         "image": result.to_dict(),
     }
 

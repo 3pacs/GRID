@@ -94,7 +94,18 @@ class ImageResult:
 # ── Core Generation ──────────────────────────────────────────────
 
 def _get_client():
-    """Lazy-load Gemini client."""
+    """Lazy-load Gemini (Imagen) client.
+
+    Calls the ``genai`` SDK directly, bypassing ``llm.router``'s paid-provider
+    gate, so it is gated here explicitly.
+    """
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise PermissionError(
+            "Paid generation disabled: set GRID_ALLOW_PAID_LLM=1 to enable Imagen."
+        )
+
     from google import genai
     key = _API_KEY or os.getenv("GEMINI_API_KEY", "")
     if not key:
@@ -125,9 +136,10 @@ def _generate_image(
     Returns:
         ImageResult with the generated image bytes and metadata.
     """
+    client = _get_client()  # raises PermissionError before importing the SDK if the gate is off
+
     from google.genai import types
 
-    client = _get_client()
     model_name = MODELS.get(model_tier, MODELS[DEFAULT_MODEL])
     style_text = STYLES.get(style, STYLES["dark"])
 
@@ -401,6 +413,12 @@ def generate_daily_briefing_pack(engine, style: str = "dark") -> list[ImageResul
             result = gen_func(engine, style=style)
             results.append(result)
             log.info("Generated {n}: {p}", n=name, p=result.file_path)
+        except PermissionError:
+            # Paid generation is disabled — that applies to every generator
+            # in this batch, so surface it instead of quietly returning an
+            # empty/partial pack that reads as "0 images today" rather than
+            # "generation is disabled".
+            raise
         except Exception as exc:
             log.error("Failed to generate {n}: {e}", n=name, e=str(exc))
 

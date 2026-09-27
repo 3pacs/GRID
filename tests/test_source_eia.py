@@ -369,3 +369,57 @@ class TestDryRunMode:
         for fn in (EIAPuller.__init__, EIAPuller.pull, EIAPuller._fetch_series):
             params = inspect.signature(fn).parameters
             assert "dry_run" not in params, f"{fn.__qualname__} unexpectedly has dry_run"
+
+
+# ---------------------------------------------------------------------------
+# 9. Per-facet failure status: FAILED (all facets) vs PARTIAL (some) vs
+#    SUCCESS (none) -- 2026-09-27 review fix.
+#
+# Before this fix, `pull()` unconditionally returned {"status": "SUCCESS"}
+# regardless of how many facet fetches raised -- indistinguishable from a
+# clean run with nothing new to insert. That fed straight into
+# SmartScheduler._run_puller's old bug of trusting any non-SKIPPED dict as
+# SUCCESS (now also fixed -- see tests/test_wave1_puller_registration.py).
+# ---------------------------------------------------------------------------
+
+
+class TestPerFacetFailureStatus:
+    @patch("ingestion.altdata.eia_puller.requests.get")
+    def test_all_facets_fail_returns_failed(self, mock_get, engine, monkeypatch):
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
+        mock_get.side_effect = ConnectionError("simulated total outage")
+
+        result = EIAPuller(db_engine=engine).pull()
+
+        assert result["status"] == "FAILED"
+        assert result["rows_inserted"] == 0
+        assert "error" in result
+        assert engine.store.rows == []
+
+    @patch("ingestion.altdata.eia_puller.requests.get")
+    def test_one_of_two_facets_fails_returns_partial(self, mock_get, engine, monkeypatch):
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
+        good = _load_json("good_response.json")
+        # _SERIES_MAP order is RBRTE then RWTC -- RBRTE succeeds, RWTC's
+        # fetch raises.
+        mock_get.side_effect = [_resp(good), ConnectionError("RWTC outage")]
+
+        result = EIAPuller(db_engine=engine).pull()
+
+        assert result["status"] == "PARTIAL"
+        assert result["rows_inserted"] == 3  # RBRTE's rows still committed
+        assert "error" in result
+        assert len(engine.store.rows_for("eia.brent_spot")) == 3
+
+    @patch("ingestion.altdata.eia_puller.requests.get")
+    def test_both_facets_succeed_returns_success_not_partial(
+        self, mock_get, engine, monkeypatch
+    ):
+        monkeypatch.setenv("EIA_API_KEY", "REDACTED-FIXTURE")
+        good = _load_json("good_response.json")
+        empty = _load_json("empty_response.json")
+        mock_get.side_effect = [_resp(good), _resp(empty)]
+
+        result = EIAPuller(db_engine=engine).pull()
+
+        assert result["status"] == "SUCCESS"

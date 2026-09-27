@@ -1,0 +1,24 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) is the
+# activation step for slice N2 and needs an explicit operator decision.
+# Install (on grid-svr, after `alembic upgrade head` has applied
+# causal_links_provenance_20260927):
+#   sudo cp deploy/systemd/grid-causal-links.service.template /etc/systemd/system/grid-causal-links.service
+#   sudo cp deploy/systemd/grid-causal-links.timer.template   /etc/systemd/system/grid-causal-links.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-causal-links.timer
+# Paths follow server_setup/grid-compute-producer.service.
+[Unit]
+Description=GRID causal-link writer (preceding public events per trade, point-in-time)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Bounded: <=500 most recently active tickers, 25 per transaction, idempotent upsert.
+ExecStart=/usr/bin/flock -n /tmp/grid-causal-links.lock /usr/bin/python3 scripts/run_causal_links.py --days 30 --max-tickers 500 --batch-size 25
+TimeoutStartSec=20min
+Nice=10
+StandardOutput=journal
+StandardError=journal

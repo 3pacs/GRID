@@ -43,6 +43,7 @@ import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date
+from datetime import datetime as _datetime
 from typing import Any
 
 import requests
@@ -357,14 +358,26 @@ class LatestFiling:
     form: str
 
 
-def find_latest_13f(cik: str) -> LatestFiling | None:
-    """Locate the most recent 13F-HR (or amendment) for a CIK.
+def list_recent_13f_filings(cik: str) -> list[LatestFiling]:
+    """List every 13F-HR / 13F-HR/A filing in a CIK's ``recent`` submissions.
 
-    We look at the ``filings.recent`` block of the submissions index and
-    pick the newest row whose form is ``13F-HR`` or ``13F-HR/A`` with the
-    latest ``filingDate``. Amendments supersede originals for the same
-    ``reportDate``, which matches our upsert semantics (amendments will
-    overwrite the base row via ON CONFLICT DO UPDATE).
+    The SEC submissions endpoint's ``filings.recent`` block holds up to
+    ~1000 of the filer's most recent filings *of any form type*. Because
+    quarterly 13F filers rarely file anything else, this block in practice
+    covers many years of 13F history — which is what makes it safe to use
+    for catch-up: a caller that has gone stale for one or more quarters
+    (see ``SEC13FLiveIngestor._process_filer``) can diff this list against
+    what is already on file and backfill exactly the missing quarters,
+    bounded by whatever this endpoint returns (never an unbounded crawl).
+
+    Amendments supersede originals for the same ``reportDate`` — when two
+    entries share a ``reportDate`` we keep only the one with the latest
+    ``filingDate``, matching our upsert semantics (``ON CONFLICT DO
+    UPDATE`` on ``(holder_name, ticker, report_date)``).
+
+    Returns:
+        Filings sorted newest ``report_date`` first. Empty list if the
+        CIK has no 13F-HR filings in the recent window.
     """
     url = _EDGAR_SUBMISSIONS_URL.format(cik=cik.zfill(10))
     data = _get_json(url)
@@ -374,7 +387,7 @@ def find_latest_13f(cik: str) -> LatestFiling | None:
     filing_dates: list[str] = recent.get("filingDate", [])
     report_dates: list[str] = recent.get("reportDate", [])
 
-    best: LatestFiling | None = None
+    by_report_date: dict[date, LatestFiling] = {}
     for i, form in enumerate(forms):
         if form not in ("13F-HR", "13F-HR/A"):
             continue
@@ -384,10 +397,21 @@ def find_latest_13f(cik: str) -> LatestFiling | None:
         except (ValueError, IndexError):
             continue
         cand = LatestFiling(accession=accessions[i], filing_date=fd, report_date=rd, form=form)
-        if best is None or cand.filing_date > best.filing_date:
-            best = cand
+        existing = by_report_date.get(rd)
+        if existing is None or cand.filing_date > existing.filing_date:
+            by_report_date[rd] = cand
 
-    return best
+    return sorted(by_report_date.values(), key=lambda f: f.report_date, reverse=True)
+
+
+def find_latest_13f(cik: str) -> LatestFiling | None:
+    """Locate the most recent 13F-HR (or amendment) for a CIK.
+
+    Thin convenience wrapper over :func:`list_recent_13f_filings` for
+    callers that only care about the single newest filing.
+    """
+    filings = list_recent_13f_filings(cik)
+    return filings[0] if filings else None
 
 
 def _infotable_df_to_positions(df: Any) -> list[dict[str, Any]]:
@@ -574,15 +598,29 @@ _UPSERT_SQL = text(
 )
 
 
+_KNOWN_REPORT_DATES_SQL = text(
+    """
+    SELECT DISTINCT report_date FROM institutional_holdings
+    WHERE holder_name = :holder AND source = 'sec_13f_live'
+    """
+)
+
+
 @dataclass
 class FilerResult:
     """Outcome of processing a single filer.
 
     Attributes:
         filer: Filer metadata.
-        status: ``ok``, ``no_filing``, ``no_positions``, or ``error``.
-        filing: The resolved filing (if any).
-        positions_total: Total positions parsed from the filing.
+        status: ``ok``, ``up_to_date``, ``no_filing``, ``no_positions``, or
+            ``error``. ``up_to_date`` means 13F-HR filings exist for this
+            filer but every ``report_date`` is already on file — the
+            common case once the writer is running on a steady cadence.
+        filing: The newest filing considered (if any).
+        filings_processed: Number of *new* filings upserted this run (can
+            be more than one right after a stale period — see
+            ``_process_filer``'s catch-up behavior).
+        positions_total: Total positions parsed across processed filings.
         positions_matched: Positions successfully resolved to a ticker.
         rows_written: Rows upserted into ``institutional_holdings``.
         error: Error string (if status == ``error``).
@@ -591,6 +629,7 @@ class FilerResult:
     filer: Filer
     status: str
     filing: LatestFiling | None = None
+    filings_processed: int = 0
     positions_total: int = 0
     positions_matched: int = 0
     rows_written: int = 0
@@ -657,45 +696,117 @@ class SEC13FLiveIngestor:
         )
         return results
 
+    def _known_report_dates(self, filer: Filer) -> set[date]:
+        """``report_date``s already on file for this filer's ``sec_13f_live`` rows.
+
+        Scoped to ``source = 'sec_13f_live'`` so the hand-curated
+        ``sec_13f_curated`` bootstrap rows (different provenance, no
+        ``filed_date`` guarantee) never mask a quarter this writer hasn't
+        actually ingested yet.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                _KNOWN_REPORT_DATES_SQL, {"holder": filer.display_name}
+            )
+            known: set[date] = set()
+            for (value,) in rows:
+                # Postgres (production) returns a native ``date``. SQLite
+                # (unit tests, and the module's ``if __name__`` demo) can
+                # hand back an ISO string for a raw-``text()`` DATE column
+                # since there is no real DATE type to coerce through —
+                # normalize both to ``date`` so the ``not in known`` check
+                # in ``_process_filer`` actually matches.
+                if isinstance(value, _datetime):
+                    known.add(value.date())
+                elif isinstance(value, date):
+                    known.add(value)
+                elif isinstance(value, str):
+                    known.add(date.fromisoformat(value[:10]))
+            return known
+
     def _process_filer(self, filer: Filer, verbose: bool = False) -> FilerResult:
-        """Process a single filer end-to-end."""
+        """Process a single filer end-to-end.
+
+        Fetches every 13F-HR/13F-HR/A filing EDGAR's ``recent`` submissions
+        window has for this CIK (see :func:`list_recent_13f_filings`) and
+        upserts whichever ``report_date``s are not already in
+        ``institutional_holdings`` for this filer. This makes the writer
+        self-healing after any gap (e.g. the 2026-04-12 -> 2026-09
+        outage): the first run after a gap silently backfills every missed
+        quarter still inside EDGAR's recent window instead of jumping
+        straight to the newest quarter and leaving the skipped ones
+        permanently missing.
+        """
         log.info("13F: {k} (CIK={c})", k=filer.key, c=filer.cik)
 
-        filing = find_latest_13f(filer.cik)
-        if filing is None:
+        filings = list_recent_13f_filings(filer.cik)
+        if not filings:
             log.warning("No 13F-HR found for {k}", k=filer.key)
             return FilerResult(filer=filer, status="no_filing")
 
-        log.info(
-            "  -> latest {form} filed={f} report={r} accession={a}",
-            form=filing.form, f=filing.filing_date,
-            r=filing.report_date, a=filing.accession,
-        )
-        time.sleep(_EDGAR_RATE_DELAY)
+        known = self._known_report_dates(filer)
+        new_filings = [f for f in filings if f.report_date not in known]
+        if not new_filings:
+            return FilerResult(filer=filer, status="up_to_date", filing=filings[0])
 
-        positions = fetch_infotable(filer.cik, filing)
-        if not positions:
-            return FilerResult(filer=filer, status="no_positions", filing=filing)
+        # Oldest-first so a multi-quarter catch-up ingests (and logs) in
+        # chronological order — easier to audit than newest-first.
+        new_filings.sort(key=lambda f: f.report_date)
 
-        matched: list[tuple[dict[str, Any], str]] = []
-        for pos in positions:
-            ticker = self._cusip_map.lookup(pos.get("cusip", ""))
-            if ticker:
-                matched.append((pos, ticker))
-
-        if verbose:
+        positions_total = 0
+        positions_matched = 0
+        rows_written = 0
+        last_filing = filings[0]
+        for filing in new_filings:
             log.info(
-                "  -> {n} positions, {m} resolved to ticker",
-                n=len(positions), m=len(matched),
+                "  -> new {form} filed={f} report={r} accession={a}",
+                form=filing.form, f=filing.filing_date,
+                r=filing.report_date, a=filing.accession,
+            )
+            # Unconditional: EDGAR rate-limits per-second across *all*
+            # requests, not just infotable-to-infotable gaps. Without this,
+            # the first fetch_infotable per filer fires immediately after
+            # the submissions request that list_recent_13f_filings() just
+            # made, with no delay between them.
+            time.sleep(_EDGAR_RATE_DELAY)
+
+            positions = fetch_infotable(filer.cik, filing)
+            positions_total += len(positions)
+            if not positions:
+                continue
+
+            matched: list[tuple[dict[str, Any], str]] = []
+            for pos in positions:
+                ticker = self._cusip_map.lookup(pos.get("cusip", ""))
+                if ticker:
+                    matched.append((pos, ticker))
+            positions_matched += len(matched)
+
+            if verbose:
+                log.info(
+                    "  -> {n} positions, {m} resolved to ticker",
+                    n=len(positions), m=len(matched),
+                )
+
+            rows_written += self._upsert_positions(filer, filing, matched)
+            last_filing = filing
+
+        if rows_written == 0:
+            return FilerResult(
+                filer=filer,
+                status="no_positions",
+                filing=last_filing,
+                filings_processed=len(new_filings),
+                positions_total=positions_total,
             )
 
-        rows_written = self._upsert_positions(filer, filing, matched)
         return FilerResult(
             filer=filer,
             status="ok",
-            filing=filing,
-            positions_total=len(positions),
-            positions_matched=len(matched),
+            filing=last_filing,
+            filings_processed=len(new_filings),
+            positions_total=positions_total,
+            positions_matched=positions_matched,
             rows_written=rows_written,
         )
 
@@ -770,6 +881,7 @@ def run(engine: Engine | None = None, **kwargs: Any) -> dict[str, Any]:
 
     summary = {
         "filers_ok": sum(1 for r in results if r.status == "ok"),
+        "filers_up_to_date": sum(1 for r in results if r.status == "up_to_date"),
         "filers_total": len(results),
         "rows_written": sum(r.rows_written for r in results),
         "positions_total": sum(r.positions_total for r in results),

@@ -407,7 +407,19 @@ RULES:
 
 
 def _get_gemini_client():
-    """Lazy-load Gemini client."""
+    """Lazy-load Gemini client.
+
+    Calls the ``genai`` SDK directly, bypassing ``llm.router``'s paid-provider
+    gate, so it is gated here explicitly. Used for both script generation and
+    the Imagen title card.
+    """
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise PermissionError(
+            "Paid generation disabled: set GRID_ALLOW_PAID_LLM=1 to enable Gemini."
+        )
+
     from google import genai
 
     key = _GEMINI_API_KEY or os.getenv("GEMINI_API_KEY", "")
@@ -471,7 +483,19 @@ def _generate_script_text(data: dict[str, Any]) -> str:
 # -- Audio Generation via OpenAI TTS ----------------------------------------
 
 def _get_openai_client():
-    """Lazy-load OpenAI client."""
+    """Lazy-load OpenAI client for TTS.
+
+    ``llm.router`` does not expose audio synthesis, so this calls the OpenAI
+    SDK directly — gated here explicitly since it bypasses the router's own
+    paid-provider gate.
+    """
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise PermissionError(
+            "Paid generation disabled: set GRID_ALLOW_PAID_LLM=1 to enable OpenAI TTS."
+        )
+
     from openai import OpenAI
 
     key = _OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", "")

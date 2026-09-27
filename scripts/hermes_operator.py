@@ -485,6 +485,11 @@ _SOURCE_ALIASES: dict[str, str] = {
 # but are catalogued for ``hermes_fixers._resolve_puller`` consumers.
 _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     # ── Module-level fn pullers (not class-based, scheduled via dedicated paths)
+    # sec_13f_live IS also invoked on a real cadence now — from
+    # ingestion/scheduler.py::run_monthly_pulls() (2026-09-27 revive; it sat
+    # unwired here for months, which is why institutional_holdings stopped
+    # ingesting new quarters after 2026-04-12). Kept in this dict too so
+    # hermes_fixers._resolve_puller can still resolve it for a scoped retry.
     "sec_13f_live":                {"mod": "ingestion.altdata.sec_13f_live",            "fn": "run",          "interval_h": 168},
     "supply_chain_parser":         {"mod": "ingestion.altdata.supply_chain_parser",     "fn": "run_weekly",   "interval_h": 168},
     "pct_cogs_enrichment":         {"mod": "intelligence.pct_cogs_enrichment",          "fn": "run_weekly",   "interval_h": 168},
@@ -538,6 +543,20 @@ _SOURCE_OVERRIDES: dict[str, dict[str, Any]] = {
     # scheduler's bounded pull_recent path which is tuned for breaking-news
     # cadence, not for catch-up after a failure).
     "gdelt":           {"pull_method": None, "pull_kwargs": None},
+    # "eia" carries "api_key": "EIA_API_KEY" in PULLER_REGISTRY because the
+    # SCHEDULER's own _build_puller_instance needs it to raise
+    # MissingPullerApiKey when unset (api_key_mode="env" -> it still builds
+    # via cls(db_engine=...) either way). hermes_fixers._resolve_puller has
+    # a DIFFERENT (older) convention: any "api_key" in the derived registry
+    # entry gets passed as an EXPLICIT ctor kwarg
+    # (`ctor_kwargs["api_key"] = ...`), but EIAPuller.__init__ only accepts
+    # `db_engine` (it reads EIA_API_KEY from os.environ itself) -- so
+    # without this override, a REPULL/retry for "eia" raises
+    # `TypeError: EIAPuller.__init__() got an unexpected keyword argument
+    # 'api_key'` every time. Popping the key here (via the `None` sentinel)
+    # keeps the scheduler-side fail-closed behaviour while fixing the
+    # retry-side ctor mismatch.
+    "eia":             {"api_key": None},
 }
 
 

@@ -1,7 +1,12 @@
 # GRID systemd units
 
-This directory ships the systemd unit template for the idle-fleet goal
-worker (Day 1 of `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
+This directory ships systemd unit templates. None of them is installed by
+any code path, CI job or deploy workflow.
+
+* `grid-goal-worker@.service`: the idle-fleet goal worker (Day 1 of
+  `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
+* `grid-godview-{fed,cftc}.{service,timer}`: the god view pillar writers
+  (materialization plan slice G7). See the section at the end.
 
 ## `grid-goal-worker@.service`
 
@@ -102,3 +107,128 @@ The worker handles `SIGTERM` cleanly — in-flight goals complete, then
 the next `claim_goal` returns the loop. No forcible kill is needed
 unless the lease has to be reaped (it will be, automatically, on the
 next worker startup or by the Day 2 reaper).
+
+## `grid-causal-links.service` / `.timer` (templates, not installed)
+
+Slice N2's scheduled writer for `causal_links`
+(`scripts/run_causal_links.py` -> `intelligence/causal_links.py`). Each run
+links recent insider / congressional trades to public events on the same
+ticker that were knowable *before* the trade day, upserts them keyed on
+`edge_key` with run id, code sha and known_at, and records the run in
+`causal_link_runs`. The Timeline / Causal Map / Why views show those rows
+with the last finished run's as-of time.
+
+Prerequisite: `alembic upgrade head` has applied
+`causal_links_provenance_20260927` (the script exits 2 without writing
+otherwise). Installing the timer is the activation decision; the install
+commands are in the service template's header. Try it first with
+`python3 scripts/run_causal_links.py --dry-run --json`.
+
+## `grid-analytics-snapshots` (service + timer) — NOT installed
+
+Daily run of `scripts/run_analytics_snapshots.py`, which refreshes the
+`analytical_snapshots` categories behind the discovery, associations,
+snapshots and models views: `feature_engineering`, `orthogonality`,
+`clustering` (global), `clustering_sector` (one row per sector of
+`analysis/sector_map.py`, `subcategory` = sector name), `feature_importance`
+and `options_scan` (a summary of the scan grid-scheduler already persists).
+It writes nothing else: no ingestion, no resolver, no email, no
+`feature_importance_log`, no hypothesis/weights/autoresearch tables, no LLM
+calls. Every run tags each payload with a `provenance` block (release SHA,
+as-of date, vintage policy, gate result, stale inputs it excluded).
+
+Schedule: 07:15 UTC daily (`OnCalendar`, `Persistent=true`), after
+`grid-resolved-series-backfill.timer` (06:30 UTC). Runs from the deployed
+release `/data/grid_v4/grid_release` as `User=grid` with the repo `.env`,
+under `flock -n`, `TimeoutStartSec=3h`.
+
+### Readiness gate (checked by the job on every run)
+
+The job exits 3 without computing or writing anything unless **all** pass
+(`SuccessExitStatus=3`, so a not-ready day is a clean skip):
+
+| id | check |
+|----|-------|
+| G1 | table `resolved_series_retractions` exists (PR #683 migration) |
+| G2 | it holds rows with `run_tag = $GRID_ANALYTICS_REQUIRED_RUN_TAG` (default `reresolve_20260927`) |
+| G3 | the newest of those rows is older than `$GRID_ANALYTICS_SETTLE_MINUTES` (default 60) — the retraction insert has finished |
+| G4 | the operator flag file `$GRID_ANALYTICS_READY_FLAG` (default `/data/grid/state/analytics-snapshots.ready`) exists and its first line is the run tag |
+| G5 | `spy_full` has a PIT observation within `$GRID_ANALYTICS_MAX_RESOLVER_LAG_DAYS` (default 4) of the as-of date — the resolver refresh landed |
+
+G4 is the explicit go: write it only after the re-resolve run order is
+complete and `07_verify_retractions.sql` passed
+(`GRID-RERESOLVE-PLAN-20260927` §5, step 8):
+
+```bash
+sudo install -d -m 0755 -o grid -g grid /data/grid/state
+echo reresolve_20260927 | sudo -u grid tee /data/grid/state/analytics-snapshots.ready
+```
+
+Check the gate without computing anything (read-only):
+
+```bash
+cd /data/grid_v4/grid_release && set -a && . /home/grid/grid_v4/grid_repo/.env && set +a
+python3 scripts/run_analytics_snapshots.py --check-only     # exit 0 = ready, 3 = not ready
+python3 scripts/run_analytics_snapshots.py --dry-run        # compute, write nothing
+```
+
+### Install (owner decision — not done by the PR)
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-analytics-snapshots.service.template \
+    /etc/systemd/system/grid-analytics-snapshots.service
+sudo install -m 0644 deploy/systemd/grid-analytics-snapshots.timer.template \
+    /etc/systemd/system/grid-analytics-snapshots.timer
+sudo systemctl daemon-reload
+sudo systemctl start grid-analytics-snapshots.service   # one gated run first
+journalctl -u grid-analytics-snapshots.service -n 200 --no-pager
+sudo systemctl enable --now grid-analytics-snapshots.timer
+```
+
+Stop / roll back: `sudo systemctl disable --now grid-analytics-snapshots.timer`.
+Rows it wrote are ordinary `analytical_snapshots` rows (identifiable by
+`payload->'provenance'->>'job' = 'run_analytics_snapshots'`).
+
+## `grid-godview-fed` / `grid-godview-cftc` (god view writers)
+
+Oneshot services plus weekly timers that run
+`scripts/run_godview_writers.py --pillar fed|cftc --code-sha-from-git` from
+the deployed release tree `/data/grid_v4/grid_release`, as `grid`, with the
+GRID env file `/home/grid/grid_v4/grid_repo/.env`, under a shared
+`flock /tmp/grid-godview-writers.lock` (one writer at a time).
+
+| Timer | Calendar (America/New_York) | UTC (EDT / EST) | Why |
+|---|---|---|---|
+| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00 | 21:30 / 22:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later |
+| `grid-godview-cftc.timer` | Fri 16:00, retry Sat 14:00 | 20:00 / 21:00 | COT publishes Fri 15:30 ET; the puller moves to Fri >= 19:45 UTC + a Saturday retry (plan A1) |
+
+Every run writes a `godview_runs` row (`complete`, `noop`,
+`partial_blocked_by_legacy`, `inputs_missing` or `failed`); exit codes are in
+the script's docstring. `partial_blocked_by_legacy` exits 0: keys held by
+legacy (NULL-provenance) rows are skipped until the A2 archive clears them.
+
+**Activation is the owner's step (plan A3). Do not install before:** the G2
+migration is applied (A2), the CFTC backfill under the new ids is done (A1)
+for the cftc pillar, and a manual dry run on the host looks right:
+
+```bash
+cd /data/grid_v4/grid_release
+set -a; . /home/grid/grid_v4/grid_repo/.env; set +a
+python3 scripts/run_godview_writers.py --pillar fed  --code-sha-from-git --dry-run
+python3 scripts/run_godview_writers.py --pillar cftc --code-sha-from-git --dry-run
+systemd-analyze calendar 'Thu *-*-* 17:30:00 America/New_York'   # needs systemd >= 235
+git -C /data/grid_v4/grid_release rev-parse HEAD                 # must work as grid
+```
+
+Then:
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-godview-fed.service  /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-fed.timer    /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-cftc.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-cftc.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start grid-godview-fed.service && journalctl -u grid-godview-fed.service -n 50
+sudo systemctl enable --now grid-godview-fed.timer    # fed can go before cftc
+sudo systemctl enable --now grid-godview-cftc.timer
+```
