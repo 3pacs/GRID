@@ -77,7 +77,7 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "^VIX": "VIX",
             }
             for yf_ticker, label in index_tickers.items():
-                rows = read_latest_n(conn, f"YF:{yf_ticker}:close", 2, as_of=target_date)
+                rows = read_latest_n(conn, f"YF:{yf_ticker}:close", 2, source="yfinance", as_of=target_date)
                 if len(rows) >= 2:
                     today_val, prior_val = rows[0].value, rows[1].value
                     chg = today_val - prior_val
@@ -97,7 +97,7 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
             }
             sector_perf: list[dict] = []
             for etf, name in sector_etfs.items():
-                rows = read_latest_n(conn, f"YF:{etf}:close", 2, as_of=target_date)
+                rows = read_latest_n(conn, f"YF:{etf}:close", 2, source="yfinance", as_of=target_date)
                 if len(rows) >= 2:
                     t, p = rows[0].value, rows[1].value
                     pct = (t - p) / p * 100 if p else 0
@@ -115,7 +115,7 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "YF:TLT:close": "Long Bonds (TLT)",
             }
             for sid, label in notable_series.items():
-                rows = read_latest_n(conn, sid, 2, as_of=target_date)
+                rows = read_latest_n(conn, sid, 2, source="yfinance", as_of=target_date)
                 if len(rows) >= 2:
                     t, p = rows[0].value, rows[1].value
                     pct = (t - p) / p * 100 if p else 0
@@ -235,7 +235,7 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 
         # Determine actual market direction from S&P close
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 2, as_of=target_date)
+            rows = read_latest_n(conn, "YF:^GSPC:close", 2, source="yfinance", as_of=target_date)
             if len(rows) >= 2:
                 today_close, prior_close = rows[0].value, rows[1].value
                 daily_return = (today_close - prior_close) / prior_close * 100

@@ -23,6 +23,8 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
+    Integer,
     MetaData,
     String,
     Table,
@@ -68,11 +70,16 @@ def tgt_proxy_group(monkeypatch):
 def engine():
     engine = create_engine("sqlite://")
     md = MetaData()
+    source_catalog = Table(
+        "source_catalog", md,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, nullable=False),
+    )
     raw = Table(
         "raw_series",
         md,
         Column("series_id", String, nullable=False),
-        Column("source_id", String, nullable=False),
+        Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
         Column("obs_date", Date, nullable=False),
         Column("pull_timestamp", DateTime, nullable=False),
         Column("value", Float, nullable=False),
@@ -80,6 +87,7 @@ def engine():
         Column("pull_status", String, nullable=False),
     )
     md.create_all(engine)
+    FRED_SRC = 1
     rng = np.random.default_rng(9)
     days = pd.bdate_range(START, AS_OF)
     rows = []
@@ -88,7 +96,7 @@ def engine():
         rows.append(
             {
                 "series_id": sid,
-                "source_id": "fred",
+                "source_id": FRED_SRC,
                 "obs_date": d,
                 "pull_timestamp": pulled,
                 "value": float(v),
@@ -111,6 +119,7 @@ def engine():
     row("TGT", date(2022, 1, 3), 99.0)  # observed after as_of
     row("snap:llm_tokens", date(2021, 1, 4), 5.0)
     with engine.begin() as c:
+        c.execute(source_catalog.insert(), [{"id": FRED_SRC, "name": "fred"}])
         c.execute(raw.insert(), rows)
     return engine
 
