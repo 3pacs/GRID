@@ -4,6 +4,7 @@
 Description=GRID god view writer: Fed net liquidity (H.4.1) (godview_runs pillar 'fed_liquidity')
 Documentation=file:///data/grid_v4/grid_release/deploy/systemd/README.md
 After=network-online.target postgresql.service
+Requires=postgresql.service
 Wants=network-online.target
 
 [Service]
@@ -22,6 +23,6 @@ Environment=PYTHONUNBUFFERED=1
 ExecStart=/usr/bin/flock -w 600 /tmp/grid-godview-writers.lock /usr/bin/python3 scripts/run_godview_writers.py --pillar fed --code-sha-from-git
 # 0 = success / no-op / partial (legacy-blocked keys, see godview_runs);
 # 1 = writer failed; 2 = refused (code sha); 3 = no upstream inputs.
-TimeoutStartSec=15min
+TimeoutStartSec=30min
 StandardOutput=journal
 StandardError=journal
