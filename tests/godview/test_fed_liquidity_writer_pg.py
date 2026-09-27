@@ -427,20 +427,29 @@ class TestB3NeverTouchLegacyRow:
         legacy_date = date(2026, 4, 8)
         clean_date = date(2026, 9, 16)
 
+        legacy_release_at, _ = compute_release_at(legacy_date)
+        legacy_after_release = legacy_release_at + timedelta(hours=4)
         with engine.begin() as conn:
             _insert_legacy_row(
                 conn, legacy_date, walcl=6_780_000.0, wtregen=790_000.0, rrp_stored=500.0,
                 net_liquidity_usd_m=5_490_000.0,
             )
+            # A candidate must have FRED observations to be considered at
+            # all -- otherwise it never reaches the legacy-row pre-check,
+            # and this test would (wrongly) pass by never exercising it.
+            _insert_component(conn, WALCL_SERIES_ID, legacy_date, 7_400_000.0, pull_timestamp=legacy_after_release)
+            _insert_component(conn, WTREGEN_SERIES_ID, legacy_date, 650_000.0, pull_timestamp=legacy_after_release)
+            _insert_component(conn, RRP_SERIES_ID, legacy_date, 280.0, pull_timestamp=legacy_after_release)
 
-        release_at, _ = compute_release_at(clean_date)
-        after_release = release_at + timedelta(hours=4)
+        clean_release_at, _ = compute_release_at(clean_date)
+        clean_after_release = clean_release_at + timedelta(hours=4)
         with engine.begin() as conn:
-            _insert_component(conn, WALCL_SERIES_ID, clean_date, 7_500_000.0, pull_timestamp=after_release)
-            _insert_component(conn, WTREGEN_SERIES_ID, clean_date, 700_000.0, pull_timestamp=after_release)
-            _insert_component(conn, RRP_SERIES_ID, clean_date, 300.0, pull_timestamp=after_release)
+            _insert_component(conn, WALCL_SERIES_ID, clean_date, 7_500_000.0, pull_timestamp=clean_after_release)
+            _insert_component(conn, WTREGEN_SERIES_ID, clean_date, 700_000.0, pull_timestamp=clean_after_release)
+            _insert_component(conn, RRP_SERIES_ID, clean_date, 300.0, pull_timestamp=clean_after_release)
 
-        result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=after_release + timedelta(minutes=5))
+        as_of_ts = max(legacy_after_release, clean_after_release) + timedelta(minutes=5)
+        result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=as_of_ts)
 
         assert result.rows_written == 1
         assert any(r.obs_date == clean_date and r.status == "written" for r in result.rows)
@@ -582,12 +591,21 @@ def test_thanksgiving_wednesday_is_refused_until_the_shifted_friday_release(godv
         _insert_component(conn, WTREGEN_SERIES_ID, obs_date, 700_000.0, pull_timestamp=pulled)
         _insert_component(conn, RRP_SERIES_ID, obs_date, 300.0, pull_timestamp=pulled)
 
+    # obs_date (2026-11-25) is in the future relative to materialize_fed_liquidity's
+    # default `as_of` (date.today()) whenever this test runs before that date --
+    # read_window bounds obs_date <= as_of, so without an explicit as_of the
+    # observations would not even be found (EMPTY), which is a different
+    # failure mode than the PIT-gate refusal this test is pinning.
     naive_thursday_release = datetime.combine(date(2026, 11, 26), datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=21)
-    result_thursday = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=naive_thursday_release)
+    result_thursday = materialize_fed_liquidity(
+        engine, code_sha=_CODE_SHA, as_of=obs_date, as_of_ts=naive_thursday_release
+    )
     assert result_thursday.rows_written == 0
     assert any(r.obs_date == obs_date and r.reason == SKIP_BEFORE_RELEASE for r in result_thursday.rows)
 
-    result_friday = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=release_at + timedelta(minutes=1))
+    result_friday = materialize_fed_liquidity(
+        engine, code_sha=_CODE_SHA, as_of=obs_date, as_of_ts=release_at + timedelta(minutes=1)
+    )
     assert result_friday.rows_written == 1
 
 
