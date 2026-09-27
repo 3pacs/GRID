@@ -378,7 +378,14 @@ def query_gemini(prompt: str) -> str | None:
 
 
 def query_groq(prompt: str, model: str = "llama-3.3-70b-versatile") -> str | None:
-    """Query Groq API — free tier, blazing fast inference."""
+    """Query Groq API (hosted; gated like its siblings even though most
+    models here fit Groq's free tier -- consistent with this file's other
+    query_* functions and the operator's "paid providers off by default,
+    everywhere" direction)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_groq blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return None

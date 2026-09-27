@@ -571,6 +571,31 @@ class TestBaselinePredictionsPaidGate:
             assert mod.query_openrouter("prompt") is None
         post_mock.assert_not_called()
 
+    def test_query_groq_returns_none_when_gate_off(self, monkeypatch):
+        from llm import router as llm_router
+
+        mod = self._load_module()
+        monkeypatch.setattr(llm_router, "_paid_llm_allowed", lambda: False)
+        monkeypatch.setenv("GROQ_API_KEY", "sk-should-not-be-used")
+
+        with patch("requests.post") as post_mock:
+            assert mod.query_groq("prompt") is None
+        post_mock.assert_not_called()
+
+    def test_query_groq_proceeds_when_gate_on(self, monkeypatch):
+        from llm import router as llm_router
+
+        mod = self._load_module()
+        monkeypatch.setattr(llm_router, "_paid_llm_allowed", lambda: True)
+        monkeypatch.setenv("GROQ_API_KEY", "sk-real")
+
+        fake_resp = MagicMock()
+        fake_resp.json.return_value = {"choices": [{"message": {"content": "ok"}}]}
+        with patch("requests.post", return_value=fake_resp) as post_mock:
+            result = mod.query_groq("prompt")
+        post_mock.assert_called_once()
+        assert result == "ok"
+
     def test_query_openai_proceeds_when_gate_on(self, monkeypatch):
         from llm import router as llm_router
 
@@ -636,3 +661,48 @@ class TestRegressionEvalArmBGate:
         client = mod._make_arm_b_client()
         assert client.api_key == "sk-real"
         assert client.model == mod.ARM_B_MODEL
+
+
+# ---------------------------------------------------------------------------
+# config.py — GRID_ALLOW_PAID_LLM must never crash the app on a blank value
+# ---------------------------------------------------------------------------
+
+class TestGridAllowPaidLlmFlagCoercion:
+    """An unset/blank flag must mean "paid off", never "refuse to start".
+
+    Pydantic's default bool coercion raises a ValidationError on an empty
+    string, which is exactly what a templated ``.env`` line
+    (``GRID_ALLOW_PAID_LLM=``) or an unset shell var substituted into one
+    produces -- the fail-safe default this flag exists to guarantee would
+    instead crash the whole app at startup.
+    """
+
+    @staticmethod
+    def _build(value):
+        import config as config_module
+
+        return config_module.Settings(GRID_ALLOW_PAID_LLM=value)
+
+    def test_empty_string_coerces_to_false(self):
+        assert self._build("").GRID_ALLOW_PAID_LLM is False
+
+    def test_whitespace_only_coerces_to_false(self):
+        assert self._build("   ").GRID_ALLOW_PAID_LLM is False
+
+    @pytest.mark.parametrize("value", ["0", "false", "False", "FALSE", "no", "NO", "off", "OFF"])
+    def test_falsy_strings_coerce_to_false(self, value):
+        assert self._build(value).GRID_ALLOW_PAID_LLM is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "True", "TRUE", "yes", "YES", "on", "ON"])
+    def test_truthy_strings_coerce_to_true(self, value):
+        assert self._build(value).GRID_ALLOW_PAID_LLM is True
+
+    def test_real_bool_values_pass_through(self):
+        assert self._build(True).GRID_ALLOW_PAID_LLM is True
+        assert self._build(False).GRID_ALLOW_PAID_LLM is False
+
+    def test_garbage_string_still_raises(self):
+        import pydantic
+
+        with pytest.raises(pydantic.ValidationError):
+            self._build("maybe")
