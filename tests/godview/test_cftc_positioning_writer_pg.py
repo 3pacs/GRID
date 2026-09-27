@@ -22,6 +22,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
 
 import godview.cftc_positioning as cp
+from ingestion.altdata import cftc_markets
 from ingestion.altdata.cftc_markets import compute_release, series_id
 from scripts import run_godview_writers as runner
 
@@ -338,18 +339,68 @@ def test_legacy_name_keyed_ids_are_never_read(gv):
         assert _ledger(conn, res.run_id)["status"] == "inputs_missing"
 
 
-def test_non_tuesday_report_date_is_skipped_but_counts_as_history(gv):
+def test_confirmed_holiday_shifted_monday_is_written_with_the_confirmed_release(gv):
+    """2018-12-24 is now in ``CONFIRMED_HOLIDAY_RELEASES`` (#682 fix): it writes
+
+    a row using that confirmed release/available time instead of being
+    skipped with ``no_computable_release_time``.
+    """
     monday = date(2018, 12, 24)
+    with gv.begin() as conn:
+        _insert_week(conn, ES, monday, net=2)
+    res = cp.materialize_cftc_positioning(gv, code_sha=_CODE_SHA, as_of_ts=NOW, market_codes=[ES])
+    assert res.no_release_rule_dates == {}
+    assert res.rows_written == 1
+    expected_release = compute_release(monday).release_at
+    assert expected_release == datetime(2019, 2, 1, 20, 32, tzinfo=timezone.utc)
+    with gv.begin() as conn:
+        row = _row(conn, monday)
+    assert row["release_at"] == expected_release
+    assert row["availability_basis"] == "inferred_schedule"  # pulled (2026) long after release (2019)
+
+
+def test_conservative_fallback_release_still_gates_before_and_writes_at_release(gv):
+    """An unconfirmed non-Tuesday date (no primary source pinned) still gets a
+
+    computed, conservative ``release_at`` -- and the before-release PIT gate
+    applies to it exactly as it does to a confirmed or ordinary Tuesday
+    release: a pull that leaked before that instant is invisible until it.
+    """
+    d = date(2009, 11, 9)  # Monday; no confirmed source, uses the fallback rule
+    release_at = compute_release(d).release_at
+    assert compute_release(d).reason == cftc_markets.RELEASE_REASON_CONSERVATIVE_ESTIMATE
+    with gv.begin() as conn:
+        _insert_week(conn, ES, d, pull=release_at - timedelta(hours=2))  # an early (leaked) pull
+    early = cp.materialize_cftc_positioning(
+        gv, code_sha=_CODE_SHA, as_of_ts=release_at - timedelta(minutes=1), market_codes=[ES]
+    )
+    assert [r.reason for r in early.rows] == [cp.SKIP_BEFORE_RELEASE]
+    ok = cp.materialize_cftc_positioning(gv, code_sha=_CODE_SHA, as_of_ts=release_at, market_codes=[ES])
+    assert ok.rows_written == 1
+    with gv.begin() as conn:
+        row = _row(conn, d)
+    assert row["release_at"] == release_at
+    assert row["available_at"] == release_at  # clamped: never before release
+
+
+def test_no_computable_release_is_still_skipped_but_counts_as_history(gv):
+    """Defensive: a report date that is neither Tuesday, Monday, nor Wednesday
+
+    (never observed in real CFTC data) still fails closed with
+    ``no_computable_release_time`` and is skipped from the written table,
+    while its measured positions still feed later windows as history.
+    """
+    thursday = date(2018, 12, 27)
     next_tuesday = date(2019, 1, 8)
     with gv.begin() as conn:
         _insert_week(conn, ES, date(2018, 12, 18), net=1)
-        _insert_week(conn, ES, monday, net=2)
+        _insert_week(conn, ES, thursday, net=2)
         _insert_week(conn, ES, next_tuesday, net=3)
     res = cp.materialize_cftc_positioning(gv, code_sha=_CODE_SHA, as_of_ts=NOW, market_codes=[ES])
-    assert res.no_release_rule_dates == {ES: (monday,)}
-    assert [r.reason for r in res.rows if r.report_date == monday] == [cp.SKIP_NO_RELEASE_RULE]
+    assert res.no_release_rule_dates == {ES: (thursday,)}
+    assert [r.reason for r in res.rows if r.report_date == thursday] == [cp.SKIP_NO_RELEASE_RULE]
     with gv.begin() as conn:
-        assert _row(conn, monday) is None
+        assert _row(conn, thursday) is None
         after = _row(conn, next_tuesday)
         assert _ledger(conn, res.run_id)["reasons"][cp.SKIP_NO_RELEASE_RULE] == 1
     assert after["source_ref"]["window"]["n_obs_1y"] == 3

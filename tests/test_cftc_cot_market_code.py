@@ -305,10 +305,29 @@ def test_release_time(report, expected_utc, shifted):
     assert rel.reason is None
 
 
-def test_non_tuesday_report_date_has_no_release_time():
-    rel = compute_release(date(2025, 11, 10))  # Monday position date
+def test_monday_or_wednesday_report_date_now_has_a_computed_release_time():
+    """#682 fix: a Monday/Wednesday report date (the CFTC's known holiday-shift
+
+    pattern) now resolves via ``CONFIRMED_HOLIDAY_RELEASES`` or the
+    conservative fallback instead of always returning ``None``.
+    """
+    confirmed = compute_release(date(2025, 11, 10))  # Monday; in the confirmed table
+    assert confirmed.release_at is not None
+    assert confirmed.holiday_shifted is True
+
+    fallback = compute_release(date(2009, 11, 9))  # Monday; not in the confirmed table
+    assert fallback.release_at is not None
+    assert fallback.holiday_shifted is True
+
+
+def test_report_date_with_no_rule_at_all_has_no_release_time():
+    """A report date that is neither Tuesday, Monday, nor Wednesday (never
+
+    observed in real CFTC data) still has no computable release.
+    """
+    rel = compute_release(date(2018, 12, 27))  # a synthetic Thursday
     assert rel.release_at is None
-    assert "not a Tuesday" in rel.reason
+    assert "not a Tuesday, Monday, or Wednesday" in rel.reason
     assert rel.to_payload()["release_at"] is None
 
 
