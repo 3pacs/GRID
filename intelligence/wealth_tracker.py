@@ -43,6 +43,39 @@ def _parse_signal_value(val: Any) -> dict:
     return {}
 
 
+def _institutional_amount(value_data: dict) -> float:
+    """Read a 13F position-change dollar amount honestly.
+
+    GD-FIX: institutional_flows.py's NET_POSITION_DELTA signal_value carries
+    the amount as ``value_usd`` (see ingestion/altdata/institutional_flows.py).
+    This used to look for ``amount``/``market_value``, neither of which that
+    writer ever sets, so every 13F-derived wealth flow silently amounted to
+    $0 while still being reported as a "confirmed" flow. The old keys are
+    kept as a fallback in case an older or alternate 13F path still uses them.
+    """
+    amount = value_data.get("value_usd", 0) or value_data.get("amount", 0) or value_data.get("market_value", 0)
+    return float(amount) if amount else 0.0
+
+
+def _congressional_amount(value_data: dict) -> float:
+    """Read a congressional trade's dollar amount honestly.
+
+    GD-FIX: congressional.py's ``_emit_signal`` writes the disclosed
+    range's midpoint as ``amount_midpoint`` (there is no ``amount``,
+    ``amount_low``, or ``amount_high`` key — Congress never discloses an
+    exact figure, only a range). Reading those nonexistent keys meant every
+    congressional wealth flow silently amounted to $0.
+    """
+    amount = value_data.get("amount_midpoint", 0)
+    if amount:
+        return float(amount)
+    low = value_data.get("amount_low", 0)
+    high = value_data.get("amount_high", 0)
+    if low and high:
+        return (float(low) + float(high)) / 2
+    return 0.0
+
+
 def track_wealth_migration(
     engine: Engine,
     days: int = 90,
@@ -83,11 +116,11 @@ def track_wealth_migration(
 
             for r in rows:
                 value_data = _parse_signal_value(r[4])
-                amount = value_data.get("amount", 0) or value_data.get("market_value", 0)
+                amount = _institutional_amount(value_data)
                 flows.append(WealthFlow(
                     from_actor=str(r[0]),
                     to_actor=str(r[1]),
-                    amount_estimate=float(amount) if amount else 0,
+                    amount_estimate=amount,
                     confidence="confirmed" if r[5] and float(r[5]) > 0.7 else "likely",
                     evidence=["13f_filing"],
                     timestamp=str(r[3]),
@@ -111,16 +144,16 @@ def track_wealth_migration(
 
             for r in rows:
                 value_data = _parse_signal_value(r[4])
-                amount = value_data.get("amount", 0)
-                low = value_data.get("amount_low", 0)
-                high = value_data.get("amount_high", 0)
-                if low and high:
-                    amount = (float(low) + float(high)) / 2
+                amount = _congressional_amount(value_data)
                 flows.append(WealthFlow(
                     from_actor=str(r[0]),
                     to_actor=str(r[1]),
-                    amount_estimate=float(amount) if amount else 0,
-                    confidence="confirmed",
+                    amount_estimate=amount,
+                    # GD-FIX: a congressional disclosure gives a dollar
+                    # *range*, never an exact figure — the amount here is
+                    # always a midpoint estimate, so "confirmed" overclaimed
+                    # certainty the source never provided.
+                    confidence="estimated",
                     evidence=["congressional_disclosure"],
                     timestamp=str(r[3]),
                     implication=f"Congress member {r[0]} {r[2]} {r[1]}",
@@ -195,20 +228,52 @@ def persist_wealth_flows(
 ) -> int:
     """Persist WealthFlow objects to the wealth_flows table.
 
+    GD-FIX: wealth_flows has no unique constraint (it never got one in a
+    migration), so re-running track_wealth_migration + persist_wealth_flows
+    over the same lookback window — which happens on every scheduled call —
+    re-inserted the same underlying disclosure as a brand-new row every
+    time. This adds an application-level existence check that mimics
+    ``ON CONFLICT DO NOTHING`` on the natural key (from_actor, to_entity,
+    amount_estimate, flow_date, implication) so repeat runs stop duplicating
+    rows without needing a schema change. A real unique index is the
+    correct long-term fix (see PR description follow-ups).
+
     Parameters:
         engine: SQLAlchemy engine.
         flows: List of WealthFlow objects to persist.
 
     Returns:
-        Number of rows inserted.
+        Number of rows inserted (existing duplicates are skipped, not
+        counted).
     """
     from intelligence.actor_network import _ensure_tables  # lazy — avoids circular import
 
     _ensure_tables(engine)
     count = 0
+    skipped_dup = 0
     with engine.begin() as conn:
         for flow in flows:
+            flow_date = flow.timestamp[:10] if flow.timestamp else None
             try:
+                existing = conn.execute(text("""
+                    SELECT 1 FROM wealth_flows
+                    WHERE from_actor = :from_actor
+                      AND to_entity = :to_entity
+                      AND amount_estimate = :amount
+                      AND flow_date IS NOT DISTINCT FROM :flow_date
+                      AND implication = :impl
+                    LIMIT 1
+                """), {
+                    "from_actor": flow.from_actor,
+                    "to_entity": flow.to_actor,
+                    "amount": flow.amount_estimate,
+                    "flow_date": flow_date,
+                    "impl": flow.implication,
+                }).fetchone()
+                if existing:
+                    skipped_dup += 1
+                    continue
+
                 conn.execute(text("""
                     INSERT INTO wealth_flows
                         (from_actor, to_entity, amount_estimate,
@@ -222,11 +287,11 @@ def persist_wealth_flows(
                     "amount": flow.amount_estimate,
                     "conf": flow.confidence,
                     "evidence": json.dumps(flow.evidence),
-                    "flow_date": flow.timestamp[:10] if flow.timestamp else None,
+                    "flow_date": flow_date,
                     "impl": flow.implication,
                 })
                 count += 1
             except Exception as exc:
                 log.debug("Failed to persist flow: {e}", e=str(exc))
-    log.info("Persisted {n} wealth flows", n=count)
+    log.info("Persisted {n} wealth flows ({d} duplicates skipped)", n=count, d=skipped_dup)
     return count
