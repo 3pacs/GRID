@@ -493,9 +493,14 @@ def pull_options_history(engine) -> list[dict]:
                         if value is None or pd.isna(value):
                             continue
                         sid = f"OPT:{ticker_sym}:{metric_name.split('_', 1)[1] if '_' in metric_name else metric_name}"
-                        # Check if already exists
+                        # Check if already exists. Excludes QUARANTINED like
+                        # the other existence checks in this file (_bulk_insert
+                        # above) -- a quarantined row is not valid data for
+                        # this (series_id, obs_date), so it must not block a
+                        # fresh insert.
                         existing = conn.execute(text(
-                            "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src AND obs_date = :od LIMIT 1"
+                            "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
+                            "AND obs_date = :od AND pull_status != 'QUARANTINED' LIMIT 1"
                         ), {"sid": sid, "src": source_id, "od": today}).fetchone()
                         if not existing:
                             conn.execute(text(

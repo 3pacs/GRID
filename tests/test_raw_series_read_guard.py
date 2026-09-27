@@ -43,6 +43,20 @@ _FROM_RAW = re.compile(r"from\s+raw_series\b", re.I)
 # count dropped from 4 to 2: its row_count/nan_count pull-activity probe
 # stays unfiltered by design, but its latest_value/history_mean/history_std
 # queries (which feed anomaly thresholds) now require SUCCESS.
+#
+# Corrected 2026-09-27 (branch fix/pre-retraction-and-679-followups-20260927,
+# #679 review follow-up): the paragraph above was itself stale/incomplete —
+# `_fetch_series_stats`'s remaining unfiltered "FROM raw_series" in the 2026-
+# 09-27 combined query was NOT only the row_count/nan_count probe; that same
+# query's MAX(obs_date) (-> last_observation -> days_since_last -> staleness)
+# was riding along unfiltered too, so a series whose newest rows were
+# QUARANTINED or FAILED could still read as freshly pulled. That is now
+# split into its own query with an explicit `pull_status = 'SUCCESS'` filter.
+# The count stays at 2 (last_observation's occurrence is now filtered, but
+# row_count/nan_count -- unfiltered by design, unchanged -- now has its own
+# unfiltered occurrence instead of sharing last_observation's), so no baseline
+# number changed here; this note exists only so the next reader does not
+# mistake "count stayed 2" for "nothing changed".
 LEGACY_UNFILTERED_READS: dict[str, int] = {
     "alerts/email.py": 1,
     "analysis/money_flow.py": 1,

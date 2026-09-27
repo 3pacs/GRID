@@ -381,6 +381,31 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
 
+      # PR #688 review (2026-09-27): resolved_series' real unique index is
+      # (feature_id, obs_date, vintage_date), so rows sharing
+      # (feature_id, obs_date) are always distinct vintages that
+      # store/pit.py's FIRST_RELEASE/LATEST_AS_OF policies read -- never
+      # true duplicates. intelligence/resolution_audit.py and
+      # scripts/hermes_fixers.py no longer delete any resolved_series row
+      # in their "dedup"/data-quality paths at all; this proves against
+      # real Postgres that a multi-vintage group survives both functions
+      # completely intact, whether or not PR #683's
+      # resolved_series_retractions exists.
+      - name: resolved_series dedup retraction-guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_dedup_retraction_guard_pg.py -q -rA | tee /tmp/grid-dedup-retraction-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-dedup-retraction-pg.txt; then
+            echo "::error::resolved_series dedup retraction-guard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

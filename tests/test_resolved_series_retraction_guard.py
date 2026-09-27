@@ -106,7 +106,13 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "intelligence/freshness_guard.py": 1,
     "intelligence/post_query_scanner.py": 1,
     "intelligence/prediction_calibration.py": 4,
-    "intelligence/resolution_audit.py": 11,
+    # PR #688 review (2026-09-27): auto_fix_issues' "duplicate"/NaN dedup
+    # deletes were removed entirely (see the module's own comments) --
+    # that dropped several blind resolved_series reads/writes at once,
+    # including the retirement of the old delete predicate whose
+    # anti-join is now a plain report-only COUNT. Lowered 11 -> 8 to lock
+    # in the improvement; this file is not yet migrated onto store.pit.
+    "intelligence/resolution_audit.py": 8,
     "intelligence/scheduler.py": 1,
     "intelligence/sleuth.py": 5,
     "intelligence/trend_tracker.py": 2,
