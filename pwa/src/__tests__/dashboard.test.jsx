@@ -25,7 +25,7 @@ vi.mock('../api.js', () => ({
         refreshWatchlistPrices: vi.fn(),
         getWatchlistEnriched: vi.fn(),
         listFlowBriefings: vi.fn(),
-        getFlowBriefingAudioUrl: vi.fn((name) => `/audio/${name}`),
+        loadFlowBriefingAudio: vi.fn(async (name) => `blob:/audio/${name}`),
         getPostmortemLessons: vi.fn(),
     },
 }));
@@ -69,7 +69,7 @@ describe('Dashboard watchlist loading', () => {
         api.refreshWatchlistPrices.mockReset();
         api.getWatchlistEnriched.mockReset();
         api.listFlowBriefings.mockReset();
-        api.getFlowBriefingAudioUrl.mockClear();
+        api.loadFlowBriefingAudio.mockClear();
 
         api.getCurrent.mockResolvedValue({ state: 'NEUTRAL', confidence: 0.5 });
         api.getStatus.mockResolvedValue({ database: { connected: true } });

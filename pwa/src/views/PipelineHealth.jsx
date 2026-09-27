@@ -391,9 +391,12 @@ export default function PipelineHealth() {
         );
     }
 
-    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {}, availability, stale_reason } = data || {};
+    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {}, availability, stale_reason, daily_audit } = data || {};
     const byFamily = coverage.by_family || {};
     const isUnavailable = availability === 'unavailable';
+    const dailyAudit = daily_audit || {};
+    const auditUnavailable = dailyAudit.availability === 'unavailable';
+    const auditBuckets = dailyAudit.buckets || [];
 
     const freshnessPct = (src) => {
         if (src.freshness === 'green') return 100;
@@ -430,6 +433,47 @@ export default function PipelineHealth() {
                     </div>
                 </div>
             )}
+
+            {/* ── Daily Freshness Audit ──────────────────────────── */}
+            <div style={s.section}>
+                <div style={s.sectionTitle}>DAILY FRESHNESS AUDIT</div>
+                <div style={s.card}>
+                    {auditUnavailable ? (
+                        <div style={{ color: colors.red }}>
+                            Audit unavailable: {staleReasonText(dailyAudit.stale_reason) || 'unknown reason'}
+                            {dailyAudit.audited_at && (
+                                <span style={{ color: colors.textMuted }}>
+                                    {' '}(last run {timeAgo(dailyAudit.audited_at)}, {auditBuckets.reduce((n, b) => n + b.ticker_count, 0)} tickers)
+                                </span>
+                            )}
+                        </div>
+                    ) : dailyAudit.audited_at ? (
+                        <>
+                            <div style={{ fontSize: '11px', color: colors.textMuted, marginBottom: '10px' }}>
+                                As of {timeAgo(dailyAudit.audited_at)} · {dailyAudit.total_tickers} tickers
+                                {dailyAudit.source_tables?.length > 0 && ` · ${dailyAudit.source_tables.join(', ')}`}
+                            </div>
+                            <div style={s.resolverGrid}>
+                                {auditBuckets.map((b) => (
+                                    <div key={b.bucket} style={s.resolverItem}>
+                                        <div style={{
+                                            ...s.resolverValue,
+                                            color: b.bucket === 'FRESH' ? colors.green
+                                                : b.bucket === 'STALE_7_30' ? colors.yellow
+                                                : colors.red,
+                                        }}>
+                                            {b.ticker_count}
+                                        </div>
+                                        <div style={s.resolverLabel}>{b.bucket}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ color: colors.textMuted }}>No audit data.</div>
+                    )}
+                </div>
+            </div>
 
             {/* ── Source Table ────────────────────────────────────── */}
             <div style={s.section}>

@@ -118,3 +118,96 @@ describe('PipelineHealth availability contract', () => {
         expect(screen.getByText(/never configured/)).toBeTruthy();
     });
 });
+
+// F3: pipeline-health now carries a `daily_audit` snapshot of the
+// pre-computed data_freshness_audit table, independent of the live
+// sources/coverage sections above. It must never be presented as current
+// when the underlying daily run is stale or missing.
+describe('PipelineHealth daily freshness audit panel', () => {
+    const baseResponse = {
+        summary: { total_sources: 0, healthy: 0, stale: 0, broken: 0 },
+        sources: [],
+        coverage: {},
+        recent_errors: [],
+        resolver_status: {},
+        availability: 'available',
+        stale_reason: null,
+    };
+
+    it('shows bucket counts and the as-of time when the audit is fresh', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            ...baseResponse,
+            daily_audit: {
+                audited_at: new Date(Date.now() - 2 * 3600 * 1000).toISOString(),
+                total_tickers: 718,
+                buckets: [
+                    { bucket: 'FRESH', ticker_count: 118 },
+                    { bucket: 'DEAD', ticker_count: 217 },
+                ],
+                source_tables: ['ticker_metrics_daily'],
+                availability: 'available',
+                stale_reason: null,
+            },
+        });
+
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText('DAILY FRESHNESS AUDIT')).toBeTruthy();
+        });
+        expect(screen.getByText(/718 tickers/)).toBeTruthy();
+        expect(screen.getByText('118')).toBeTruthy();
+        expect(screen.getByText('217')).toBeTruthy();
+        expect(screen.queryByText(/Audit unavailable/)).toBeNull();
+    });
+
+    it('renders an honest unavailable state instead of the buckets when the audit is stale', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            ...baseResponse,
+            daily_audit: {
+                audited_at: new Date(Date.now() - 72 * 3600 * 1000).toISOString(),
+                total_tickers: 700,
+                buckets: [{ bucket: 'DEAD', ticker_count: 700 }],
+                source_tables: ['ticker_metrics_daily'],
+                availability: 'unavailable',
+                stale_reason: 'stale',
+            },
+        });
+
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText(/Audit unavailable: stale/)).toBeTruthy();
+        });
+    });
+
+    it('renders the never-configured state when the audit table has no rows', async () => {
+        api.getPipelineHealth.mockResolvedValue({
+            ...baseResponse,
+            daily_audit: {
+                audited_at: null,
+                total_tickers: 0,
+                buckets: [],
+                source_tables: [],
+                availability: 'unavailable',
+                stale_reason: 'never_configured',
+            },
+        });
+
+        render(<PipelineHealth />);
+
+        await waitFor(() => {
+            expect(screen.getByText(/Audit unavailable: never configured/)).toBeTruthy();
+        });
+    });
+
+    it('does not crash when the backend response predates the daily_audit field', async () => {
+        api.getPipelineHealth.mockResolvedValue({ ...baseResponse });
+
+        expect(() => render(<PipelineHealth />)).not.toThrow();
+
+        await waitFor(() => {
+            expect(screen.getByText('No audit data.')).toBeTruthy();
+        });
+    });
+});

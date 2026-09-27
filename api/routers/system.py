@@ -15,8 +15,10 @@ from sqlalchemy import text
 from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
+    DailyFreshnessAudit,
     DatabaseStatus,
     FamilyFreshness,
+    FreshnessAuditBucket,
     FreshnessResponse,
     GridStats,
     HealthResponse,
@@ -409,6 +411,116 @@ def _classify_query_failure(exc: Exception) -> str:
     return STALE_UNKNOWN
 
 
+# The daily audit timer (`grid-data-freshness-check.timer`) runs once at
+# 05:00 UTC via scripts/freshness_audit_universe.sql. Anything older than
+# two full cycles means a run was missed outright, not just "running a bit
+# late" -- treat it the same as a missing audit rather than presenting
+# last-night's (or older) numbers as if they were current.
+_DAILY_AUDIT_STALE_AFTER_HOURS = 48
+
+
+def _read_daily_freshness_audit(engine) -> DailyFreshnessAudit:
+    """Read the pre-computed `data_freshness_audit` table.
+
+    This table is refreshed once daily by a host timer (see module-level
+    comment) and indexed on `audited_at`/`bucket`, so every query here is a
+    handful of index lookups over ~700 rows -- unlike the live lateral
+    scans over `raw_series`/`resolved_series` used elsewhere in this file,
+    it cannot time out regardless of how large the source tables grow.
+
+    Returns availability="unavailable" when the audit has never run (no
+    rows at all) or when its most recent run is more than
+    `_DAILY_AUDIT_STALE_AFTER_HOURS` old -- in both cases the honest answer
+    is "we don't have a current audit," not a stale number rendered as if
+    fresh. The last known buckets/total are still returned alongside a
+    stale `field_record` so a caller that wants the historical context has
+    it, but must key off `availability`/`stale_reason`, never assume the
+    numbers are current.
+    """
+    try:
+        with engine.connect() as conn:
+            prior_timeout = conn.execute(
+                text("SELECT current_setting('statement_timeout')")
+            ).scalar_one()
+            conn.execute(text("SET LOCAL statement_timeout = '3s'"))
+            try:
+                audited_at = conn.execute(
+                    text("SELECT MAX(audited_at) FROM data_freshness_audit")
+                ).scalar_one_or_none()
+
+                buckets: list[FreshnessAuditBucket] = []
+                source_tables: list[str] = []
+                if audited_at is not None:
+                    bucket_rows = conn.execute(
+                        text(
+                            "SELECT bucket, COUNT(*) "
+                            "FROM data_freshness_audit "
+                            "WHERE audited_at = :audited_at "
+                            "GROUP BY bucket ORDER BY bucket"
+                        ),
+                        {"audited_at": audited_at},
+                    ).fetchall()
+                    buckets = [
+                        FreshnessAuditBucket(bucket=row[0], ticker_count=row[1])
+                        for row in bucket_rows
+                    ]
+                    src_rows = conn.execute(
+                        text(
+                            "SELECT DISTINCT source_table FROM data_freshness_audit "
+                            "WHERE audited_at = :audited_at ORDER BY source_table"
+                        ),
+                        {"audited_at": audited_at},
+                    ).fetchall()
+                    source_tables = [row[0] for row in src_rows]
+            finally:
+                conn.execute(
+                    text("SELECT set_config('statement_timeout', :timeout, true)"),
+                    {"timeout": prior_timeout},
+                )
+    except Exception as exc:
+        log.debug("System: data_freshness_audit query failed: {e}", e=str(exc))
+        reason = _classify_query_failure(exc)
+        return DailyFreshnessAudit(
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=reason,
+            field_record=unavailable_field(reason).to_dict(),
+        )
+
+    if audited_at is None:
+        return DailyFreshnessAudit(
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=STALE_NEVER_CONFIGURED,
+            field_record=unavailable_field(STALE_NEVER_CONFIGURED).to_dict(),
+        )
+
+    audited_at_utc = (
+        audited_at.replace(tzinfo=timezone.utc) if audited_at.tzinfo is None else audited_at
+    )
+    total = sum(b.ticker_count for b in buckets)
+    age_hours = (datetime.now(timezone.utc) - audited_at_utc).total_seconds() / 3600
+
+    if age_hours > _DAILY_AUDIT_STALE_AFTER_HOURS:
+        return DailyFreshnessAudit(
+            audited_at=audited_at_utc.isoformat(),
+            total_tickers=total,
+            buckets=buckets,
+            source_tables=source_tables,
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=STALE_STALE,
+            field_record=unavailable_field(STALE_STALE, ingested_at=audited_at_utc).to_dict(),
+        )
+
+    return DailyFreshnessAudit(
+        audited_at=audited_at_utc.isoformat(),
+        total_tickers=total,
+        buckets=buckets,
+        source_tables=source_tables,
+        availability=FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=None,
+        field_record=measured_field(total, unit="tickers", ingested_at=audited_at_utc).to_dict(),
+    )
+
+
 @router.get("/freshness", response_model=FreshnessResponse)
 def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """Per-family data freshness report.
@@ -494,12 +606,15 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     except Exception as exc:
         log.debug("System: stale sources query failed: {e}", e=str(exc))
 
+    daily_audit = _read_daily_freshness_audit(engine)
+
     return FreshnessResponse(
         families=families,
         overall_status=overall,
         stale_sources=stale_sources,
         availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
         stale_reason=query_failed_reason,
+        daily_audit=daily_audit,
     )
 
 
@@ -816,6 +931,8 @@ def pipeline_health(
         broken=broken,
     )
 
+    daily_audit = _read_daily_freshness_audit(engine)
+
     return PipelineHealthResponse(
         summary=summary,
         sources=sources,
@@ -824,6 +941,7 @@ def pipeline_health(
         resolver_status=resolver,
         availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
         stale_reason=query_failed_reason,
+        daily_audit=daily_audit,
     )
 
 
