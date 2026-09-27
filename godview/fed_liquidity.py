@@ -150,6 +150,13 @@ REGIME_NEUTRAL = "neutral"
 
 STATUS_SUCCESS = "SUCCESS"
 STATUS_SUCCESS_NOOP = "SUCCESS_NOOP"
+#: At least one candidate date was withheld specifically because a legacy
+#: (provenance IS NULL) row already occupies its obs_date -- distinct from
+#: plain SUCCESS/SUCCESS_NOOP so a caller/health-check cannot mistake "ran
+#: cleanly" for "some dates are still blocked pending the plan's A2 archive."
+#: Never silently folded into SUCCESS even when other dates in the same run
+#: did write.
+STATUS_PARTIAL_BLOCKED_BY_LEGACY = "PARTIAL_BLOCKED_BY_LEGACY"
 STATUS_EMPTY = "EMPTY"
 STATUS_FAILED = "FAILED"
 
@@ -392,7 +399,7 @@ class RowResult:
 
 @dataclass(frozen=True)
 class MaterializationResult:
-    status: str  # SUCCESS | SUCCESS_NOOP | EMPTY | FAILED
+    status: str  # SUCCESS | SUCCESS_NOOP | PARTIAL_BLOCKED_BY_LEGACY | EMPTY | FAILED
     rows_written: int = 0
     rows_skipped: int = 0
     rows: tuple[RowResult, ...] = ()
@@ -679,8 +686,7 @@ def materialize_fed_liquidity(
                 pull_timestamps = [
                     t for t in (walcl_o.pull_timestamp, wtregen_o.pull_timestamp, rrp_o.pull_timestamp) if t is not None
                 ]
-                available_at = min(pull_timestamps) if pull_timestamps else None
-                if available_at is None:
+                if not pull_timestamps:
                     # Defensive fail-closed: raw_series.pull_timestamp is NOT
                     # NULL in production, so this should not happen, but
                     # #674's receipt CHECK requires available_at whenever
@@ -690,6 +696,26 @@ def materialize_fed_liquidity(
                         RowResult(obs_date=obs_date, status="skipped", reason=SKIP_MISSING_PULL_TIMESTAMP)
                     )
                     continue
+                # The row is a function of all three legs, so it is only
+                # actually knowable once the LAST of them was pulled -- MAX,
+                # never MIN. Production example (independent review of PR
+                # #677 @ bff082af): obs_date=2026-09-23, RRP pulled Wed
+                # 09-23 18:08Z (RRP publishes same day), but WALCL was not
+                # pulled until Thu 09-24 21:02Z, ~32 min after the 20:30Z
+                # H.4.1 release. MIN gives available_at=09-23 18:08Z --
+                # ~26.9 hours before the row was actually complete, and
+                # classify_availability_basis's 1-day early-slack allowance
+                # would still (wrongly) call that "observed_acquisition,"
+                # letting a strict-PIT consumer trust a value ~26h earlier
+                # than it genuinely existed.
+                #
+                # Also clamp to release_at: never report availability
+                # earlier than the official release, even if every leg
+                # happened to be pulled before it (a leak, a clock skew, or
+                # an early test run) -- the same principle as the
+                # publication-lag PIT gate above, applied to the metadata
+                # rather than the write-or-refuse decision.
+                available_at = max(release_at, max(pull_timestamps))
 
                 net_liq_m = compute_net_liquidity_millions(walcl_o.value, wtregen_o.value, rrp_o.value)
                 rrp_m = rrp_billions_to_stored_millions(rrp_o.value)  # B1: store in millions, not raw billions
@@ -784,10 +810,45 @@ def materialize_fed_liquidity(
                 _log_row(row, code_sha=code_sha, run_id=run_id)
 
             finished_at = datetime.now(timezone.utc)
-            status = STATUS_SUCCESS if written else STATUS_SUCCESS_NOOP
+            legacy_blocked = [r for r in skipped if r.reason == SKIP_BLOCKED_BY_LEGACY_ROW]
+            # PARTIAL_BLOCKED_BY_LEGACY takes precedence over SUCCESS: a run
+            # that wrote some rows but was also refused on others because of
+            # a legacy row must never report as plain "ran cleanly" -- an
+            # operator/health-check reading only .status would otherwise
+            # have no way to see that some dates are stuck pending the
+            # plan's A2 archive.
+            if legacy_blocked:
+                status = STATUS_PARTIAL_BLOCKED_BY_LEGACY
+            elif written:
+                status = STATUS_SUCCESS
+            else:
+                status = STATUS_SUCCESS_NOOP
+            # godview_runs.status has a closed CHECK domain (running/complete/
+            # failed/noop/inputs_missing/inputs_stale/non_session/
+            # no_completed_capture/no_verified_spot) that #674 does not add a
+            # "partial" value to, and adding one is a migration (out of scope
+            # here) -- so the persisted ledger status stays within that
+            # domain. The legacy-block signal is still operator-visible on
+            # the ledger row via `reasons` (below) and this warning log, and
+            # fully visible to any caller via the returned status.
             run_status = RUN_STATUS_COMPLETE if written else RUN_STATUS_NOOP
+            if legacy_blocked:
+                log.warning(
+                    "godview.fed_liquidity BLOCKED_BY_LEGACY_ROW {n} obs_date(s)={dates} run_id={run_id} "
+                    "code_sha={sha} -- requires the materialization plan's A2 archive before this pillar "
+                    "can ever write these dates",
+                    n=len(legacy_blocked),
+                    dates=[r.obs_date.isoformat() for r in legacy_blocked],
+                    run_id=run_id,
+                    sha=code_sha,
+                )
             reasons = _count_reasons(skipped)
             watermarks = _input_watermarks(walcl_obs, wtregen_obs, rrp_obs)
+            # rows_skipped is genuinely-skipped candidates only (no row
+            # exists / no action taken) -- the same definition the returned
+            # MaterializationResult uses below. `noop` candidates already
+            # have a correct, unchanged row in place; they are not "skipped"
+            # and are not double-counted here.
             _insert_run_ledger(
                 conn,
                 run_id=run_id,
@@ -795,7 +856,7 @@ def materialize_fed_liquidity(
                 finished_at=finished_at,
                 status=run_status,
                 rows_written=len(written),
-                rows_skipped=len(noop) + len(skipped),
+                rows_skipped=len(skipped),
                 reasons=reasons,
                 input_watermarks=watermarks,
                 code_sha=code_sha,
@@ -803,10 +864,11 @@ def materialize_fed_liquidity(
 
         log.info(
             "godview.fed_liquidity run complete: {n_written} written, {n_noop} unchanged, "
-            "{n_skipped} skipped, run_id={run_id} code_sha={sha}",
+            "{n_skipped} skipped, status={status} run_id={run_id} code_sha={sha}",
             n_written=len(written),
             n_noop=len(noop),
             n_skipped=len(skipped),
+            status=status,
             run_id=run_id,
             sha=code_sha,
         )

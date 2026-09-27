@@ -41,6 +41,7 @@ from godview.fed_liquidity import (
     SKIP_BLOCKED_BY_LEGACY_ROW,
     SKIP_MISSING_RRP,
     SKIP_MISSING_WALCL,
+    STATUS_PARTIAL_BLOCKED_BY_LEGACY,
     WALCL_SERIES_ID,
     WTREGEN_SERIES_ID,
     compute_release_at,
@@ -411,6 +412,10 @@ class TestB3NeverTouchLegacyRow:
 
         assert result.rows_written == 0
         assert any(r.obs_date == obs_date and r.reason == SKIP_BLOCKED_BY_LEGACY_ROW for r in result.rows)
+        # A run that was blocked by a legacy row must never report as plain
+        # success -- a caller/health-check reading only .status needs to
+        # see that this date is stuck pending the plan's A2 archive.
+        assert result.status == STATUS_PARTIAL_BLOCKED_BY_LEGACY
 
         with engine.begin() as conn:
             row = _row(conn, obs_date)
@@ -454,6 +459,9 @@ class TestB3NeverTouchLegacyRow:
         assert result.rows_written == 1
         assert any(r.obs_date == clean_date and r.status == "written" for r in result.rows)
         assert any(r.obs_date == legacy_date and r.reason == SKIP_BLOCKED_BY_LEGACY_ROW for r in result.rows)
+        # Even though clean_date DID write, the run still carries the
+        # legacy-block signal -- PARTIAL_BLOCKED_BY_LEGACY, not plain SUCCESS.
+        assert result.status == STATUS_PARTIAL_BLOCKED_BY_LEGACY
 
     def test_our_own_prior_row_can_still_be_updated(self, godview_engine):
         """The B3 protection is specific to provenance IS NULL -- a row this
@@ -484,6 +492,135 @@ class TestB3NeverTouchLegacyRow:
             row = _row(conn, obs_date)
         assert row["fed_assets_walcl"] == pytest.approx(7_150_000.0)
         assert row["provenance"] == "measured"
+
+
+class TestAvailableAt:
+    """available_at must be the LAST leg's pull_timestamp, never the first --
+    the row is only actually knowable once every leg is in hand -- and never
+    earlier than release_at itself (belt-and-suspenders: a leak that pulled
+    every leg before the official release must not be reported as available
+    before that release). Both fixed after an independent review of PR #677
+    @ bff082af found `available_at = min(pull_timestamps)`."""
+
+    def test_available_at_is_the_last_leg_not_the_first(self, godview_engine):
+        """The exact production scenario from the review: obs_date=2026-09-23,
+        RRP pulled Wed afternoon (same-day, normal cadence), but WALCL/WTREGEN
+        not pulled until Thursday evening, ~32 min after the H.4.1 release.
+        MIN would report available_at ~27 hours before the row was complete;
+        MAX correctly reports it at the last (WALCL/WTREGEN) pull."""
+        engine = godview_engine
+        obs_date = date(2026, 9, 23)
+        assert obs_date.weekday() == 2  # a Wednesday
+
+        release_at, _ = compute_release_at(obs_date)
+        assert release_at == datetime(2026, 9, 24, 16, 30, tzinfo=release_at.tzinfo)
+
+        rrp_pulled = datetime(2026, 9, 23, 18, 8, tzinfo=timezone.utc)  # Wed afternoon
+        walcl_wtregen_pulled = datetime(2026, 9, 24, 21, 2, tzinfo=timezone.utc)  # ~32 min after release
+        assert walcl_wtregen_pulled > release_at  # sanity: after release, not a leak
+
+        with engine.begin() as conn:
+            _insert_component(conn, RRP_SERIES_ID, obs_date, 300.0, pull_timestamp=rrp_pulled)
+            _insert_component(conn, WALCL_SERIES_ID, obs_date, 7_500_000.0, pull_timestamp=walcl_wtregen_pulled)
+            _insert_component(conn, WTREGEN_SERIES_ID, obs_date, 700_000.0, pull_timestamp=walcl_wtregen_pulled)
+
+        result = materialize_fed_liquidity(
+            engine, code_sha=_CODE_SHA, as_of_ts=walcl_wtregen_pulled + timedelta(minutes=5)
+        )
+        assert result.rows_written == 1
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT available_at, availability_basis FROM fed_net_liquidity_daily WHERE obs_date = :d"),
+                {"d": obs_date},
+            ).mappings().fetchone()
+
+        assert row["available_at"] == walcl_wtregen_pulled  # the LAST leg, not the first (RRP)
+        assert row["available_at"] != rrp_pulled
+        # Correctly close to release_at (~32 min after) -> observed_acquisition,
+        # not the false "observed_acquisition ~27h early" the review flagged
+        # when MIN let a stale available_at slip through the 1-day slack.
+        assert row["availability_basis"] == "observed_acquisition"
+
+    def test_available_at_is_never_earlier_than_release_at(self, godview_engine):
+        """Even if every leg was (implausibly) pulled before the official
+        release -- a leak -- available_at must be clamped to release_at, not
+        report availability earlier than the release itself."""
+        engine = godview_engine
+        obs_date = date(2026, 9, 16)
+        release_at, _ = compute_release_at(obs_date)
+        leaked_pull = datetime.combine(obs_date, datetime.min.time(), tzinfo=timezone.utc) + timedelta(hours=10)
+        assert leaked_pull < release_at
+
+        with engine.begin() as conn:
+            _insert_component(conn, WALCL_SERIES_ID, obs_date, 7_500_000.0, pull_timestamp=leaked_pull)
+            _insert_component(conn, WTREGEN_SERIES_ID, obs_date, 700_000.0, pull_timestamp=leaked_pull)
+            _insert_component(conn, RRP_SERIES_ID, obs_date, 300.0, pull_timestamp=leaked_pull)
+
+        # as_of_ts after release, so the leaked pull now clears the
+        # publication-lag PIT gate (that gate is about the caller's
+        # reference time, not the row's stored available_at metadata).
+        result = materialize_fed_liquidity(engine, code_sha=_CODE_SHA, as_of_ts=release_at + timedelta(minutes=1))
+        assert result.rows_written == 1
+
+        with engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT available_at FROM fed_net_liquidity_daily WHERE obs_date = :d"), {"d": obs_date}
+            ).mappings().fetchone()
+
+        assert row["available_at"] == release_at  # clamped up to release_at, not the earlier leaked pull
+        assert row["available_at"] > leaked_pull
+
+
+class TestLedgerConsistency:
+    """The ledger row and the returned MaterializationResult must agree on
+    rows_skipped (an independent review of PR #677 @ bff082af found the
+    ledger folding in `noop` counts that the returned result did not)."""
+
+    def test_ledger_rows_skipped_matches_returned_result(self, godview_engine):
+        engine = godview_engine
+        noop_date = date(2026, 6, 3)
+        written_date = date(2026, 6, 10)
+        skipped_date = date(2026, 6, 17)  # missing RRP
+
+        noop_release_at, _ = compute_release_at(noop_date)
+        noop_after_release = noop_release_at + timedelta(hours=4)
+        with engine.begin() as conn:
+            _insert_component(conn, WALCL_SERIES_ID, noop_date, 7_000_000.0, pull_timestamp=noop_after_release)
+            _insert_component(conn, WTREGEN_SERIES_ID, noop_date, 700_000.0, pull_timestamp=noop_after_release)
+            _insert_component(conn, RRP_SERIES_ID, noop_date, 300.0, pull_timestamp=noop_after_release)
+        # A prior run writes noop_date; the run under test below leaves it
+        # unchanged (a genuine noop, not a skip).
+        setup = materialize_fed_liquidity(
+            engine, code_sha=_CODE_SHA, as_of_ts=noop_after_release + timedelta(minutes=5)
+        )
+        assert setup.rows_written == 1
+
+        written_release_at, _ = compute_release_at(written_date)
+        written_after_release = written_release_at + timedelta(hours=4)
+        with engine.begin() as conn:
+            _insert_component(conn, WALCL_SERIES_ID, written_date, 7_100_000.0, pull_timestamp=written_after_release)
+            _insert_component(conn, WTREGEN_SERIES_ID, written_date, 710_000.0, pull_timestamp=written_after_release)
+            _insert_component(conn, RRP_SERIES_ID, written_date, 310.0, pull_timestamp=written_after_release)
+            # skipped_date: WALCL/WTREGEN present, RRP deliberately missing.
+            _insert_component(conn, WALCL_SERIES_ID, skipped_date, 7_200_000.0, pull_timestamp=written_after_release)
+            _insert_component(conn, WTREGEN_SERIES_ID, skipped_date, 720_000.0, pull_timestamp=written_after_release)
+
+        result = materialize_fed_liquidity(
+            engine, code_sha=_CODE_SHA, as_of_ts=written_after_release + timedelta(minutes=5)
+        )
+
+        assert any(r.obs_date == written_date and r.status == "written" for r in result.rows)
+        assert any(r.obs_date == noop_date and r.status == "noop" for r in result.rows)
+        assert any(r.obs_date == skipped_date and r.reason == "missing_rrp" for r in result.rows)
+
+        with engine.begin() as conn:
+            ledger = _run_ledger_row(conn, result.run_id)
+
+        assert ledger is not None
+        assert ledger["rows_skipped"] == result.rows_skipped
+        # And the definition itself: only the genuine skip counts, not the noop.
+        assert result.rows_skipped == 1
 
 
 # ══════════════════════════════════════════════════════════════════════════
