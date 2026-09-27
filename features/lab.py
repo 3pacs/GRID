@@ -13,7 +13,7 @@ intelligence signal).
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 import numpy as np
@@ -141,15 +141,33 @@ class FeatureLab:
         pit_store: PITStore instance for point-in-time queries.
     """
 
-    def __init__(self, db_engine: Engine, pit_store: PITStore) -> None:
+    def __init__(
+        self,
+        db_engine: Engine,
+        pit_store: PITStore,
+        max_input_age_days: int | None = None,
+        input_age_overrides: dict[str, int] | None = None,
+    ) -> None:
         """Initialise the Feature Lab.
 
         Parameters:
             db_engine: SQLAlchemy engine connected to the GRID database.
             pit_store: PITStore instance for point-in-time data access.
+            max_input_age_days: When set, an input series whose last PIT
+                observation is older than this many days before the as-of
+                date is treated as missing (the derived value becomes None)
+                instead of silently reporting its last, stale value as
+                current. ``None`` keeps the legacy behaviour.
+            input_age_overrides: Per-input limits (e.g. a monthly series
+                with a publication lag) that replace ``max_input_age_days``.
         """
         self.engine = db_engine
         self.pit_store = pit_store
+        self.max_input_age_days = max_input_age_days
+        self.input_age_overrides = dict(input_age_overrides or {})
+        # feature_name -> {feature_id, last_obs_date, n_obs, status}; filled
+        # by _get_pit_series so callers can publish what each value rests on.
+        self.input_provenance: dict[str, dict[str, Any]] = {}
         log.info("FeatureLab initialised")
 
     def _get_feature_id_by_name(self, name: str) -> int | None:
@@ -187,16 +205,48 @@ class FeatureLab:
         fid = self._get_feature_id_by_name(feature_name)
         if fid is None:
             log.warning("Feature '{n}' not found in registry", n=feature_name)
+            self.input_provenance[feature_name] = {
+                "feature_id": None, "last_obs_date": None, "n_obs": 0,
+                "status": "not_in_registry",
+            }
             return None
 
         start = as_of_date - timedelta(days=lookback_days)
         df = self.pit_store.get_pit([fid], as_of_date)
         if df.empty:
+            self.input_provenance[feature_name] = {
+                "feature_id": fid, "last_obs_date": None, "n_obs": 0,
+                "status": "no_observations",
+            }
             return None
 
         df = df[df["obs_date"] >= start].sort_values("obs_date")
         series = df.set_index("obs_date")["value"]
         series.name = feature_name
+
+        last_obs = series.index.max() if not series.empty else None
+        if isinstance(last_obs, datetime):  # includes pandas.Timestamp
+            last_obs = last_obs.date()
+        limit = self.input_age_overrides.get(feature_name, self.max_input_age_days)
+        status = "ok"
+        if series.empty:
+            status = "no_observations"
+        elif limit is not None and last_obs is not None and (as_of_date - last_obs).days > limit:
+            status = "stale"
+        self.input_provenance[feature_name] = {
+            "feature_id": fid,
+            "last_obs_date": last_obs.isoformat() if last_obs is not None else None,
+            "n_obs": int(len(series)),
+            "max_age_days": limit,
+            "status": status,
+        }
+        if status != "ok":
+            if status == "stale":
+                log.warning(
+                    "Feature '{n}' is stale (last obs {d}, limit {l}d) — treated as missing",
+                    n=feature_name, d=last_obs, l=limit,
+                )
+            return None
         return series
 
     def compute_feature(

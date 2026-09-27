@@ -1889,7 +1889,13 @@ async def _ask_grid_impl(
                 model_b = None
                 try:
                     from config import settings
+                    from llm.router import _paid_llm_allowed
                     or_key = getattr(settings, "OPENROUTER_API_KEY", "")
+                    if or_key and not _paid_llm_allowed():
+                        log.debug(
+                            "A/B Opus call skipped — GRID_ALLOW_PAID_LLM not set"
+                        )
+                        or_key = ""
                     if or_key:
                         from llm.router import OpenAIClient
                         opus_client = OpenAIClient(

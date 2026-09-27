@@ -478,13 +478,26 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
     """Call the best available LLM. Returns (response, model, provider).
 
     Preference: Claude Opus → Claude Sonnet → GPT-4o → Gemini.
+
+    The Anthropic and Gemini branches call their SDKs/REST APIs directly,
+    bypassing ``llm.router``'s own paid-provider gate — so both are gated
+    here on ``GRID_ALLOW_PAID_LLM`` explicitly. The BATCH-tier branch goes
+    through ``llm.router.get_llm``, which already gates paid fallbacks.
     """
     from config import settings
+    from llm.router import _paid_llm_allowed
 
-    # 1. Try Claude Opus (Max plan)
+    paid_ok = _paid_llm_allowed()
+
+    # 1. Try Claude Opus (Max plan) -- direct Anthropic call, gated.
     anthropic_key = (
         settings.ANTHROPIC_API_KEY or settings.AGENTS_ANTHROPIC_API_KEY
     )
+    if anthropic_key and not paid_ok:
+        log.warning(
+            "Deep dive: direct Anthropic call blocked — GRID_ALLOW_PAID_LLM not set"
+        )
+        anthropic_key = ""
     if anthropic_key:
         for model in [OPUS_MODEL, SONNET_MODEL]:
             try:
@@ -545,8 +558,13 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
     except Exception as exc:
         log.warning("BATCH tier deep dive failed: {e}", e=str(exc))
 
-    # 3. Try Gemini
+    # 3. Try Gemini -- direct genai.Client call, gated (bypasses llm.router).
     gemini_key = os.getenv("GEMINI_API_KEY", "")
+    if gemini_key and not paid_ok:
+        log.warning(
+            "Deep dive: direct Gemini call blocked — GRID_ALLOW_PAID_LLM not set"
+        )
+        gemini_key = ""
     if gemini_key:
         try:
             from google import genai
@@ -561,6 +579,11 @@ def _call_best_llm(prompt: str) -> tuple[str, str, str]:
         except Exception as exc:
             log.warning("Gemini deep dive failed: {e}", e=str(exc))
 
+    if not paid_ok:
+        raise RuntimeError(
+            "All LLM providers failed for deep dive "
+            "(paid providers blocked: GRID_ALLOW_PAID_LLM is not set)"
+        )
     raise RuntimeError("All LLM providers failed for deep dive")
 
 

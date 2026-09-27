@@ -1,6 +1,7 @@
-"""Tests for the SEC Fails-to-Deliver (FTD) puller (contract-first, not
-scheduled). See ingestion/altdata/sec_ftd.py's module docstring for the
-exact SEC documentation quotes this module was built from.
+"""Tests for the SEC Fails-to-Deliver (FTD) puller. Registered in the
+scheduler as ``sec_ftd`` (Wave 1 activation, 2026-09-27). See
+ingestion/altdata/sec_ftd.py's module docstring for the exact SEC
+documentation quotes this module was built from.
 
 Pure Python: no real database, no network. Uses a small in-memory
 FakeEngine/FakeConn standing in for Postgres, and monkeypatches the
@@ -16,10 +17,13 @@ from io import BytesIO
 from pathlib import Path
 
 import pytest
+import requests
 
 from ingestion.altdata.finra_short_volume import FINRAShortVolumePuller
 from ingestion.altdata.sec_ftd import (
     SECFTDPuller,
+    _default_recent_half_months,
+    _half_month_date_bounds,
     extract_ftd_text_from_zip,
     parse_ftd_file,
 )
@@ -52,16 +56,39 @@ class _FakeConn:
     def execute(self, stmt, params=None):
         sql = str(stmt)
         params = params or {}
-        if "SELECT DISTINCT obs_date FROM raw_series" in sql:
-            sid, src = params["sid"], params["src"]
-            dates = sorted(
-                {
-                    r["obs_date"]
-                    for r in self.store["rows"]
-                    if r["series_id"] == sid and r["source_id"] == src
-                }
-            )
-            return _FakeResult([(d,) for d in dates])
+
+        if "pg_advisory_xact_lock" in sql:
+            return _FakeResult([])
+
+        if "SELECT series_id, obs_date FROM raw_series" in sql:
+            # BasePuller._get_existing_pairs_in_range: one query for the
+            # whole file, bounded by obs_date range (not by series_id).
+            src = params["src"]
+            start, end = params["start_date"], params["end_date"]
+            rows = [
+                (r["series_id"], r["obs_date"])
+                for r in self.store["rows"]
+                if r["source_id"] == src
+                and r["pull_status"] == "SUCCESS"
+                and start <= r["obs_date"] <= end
+            ]
+            return _FakeResult(rows)
+
+        if "SELECT DISTINCT obs_date FROM raw_series" in sql and "series_id" not in sql:
+            # BasePuller._get_existing_source_dates: file-level check used
+            # by pull_recent's catch-up loop.
+            src = params["src"]
+            dates = {
+                r["obs_date"]
+                for r in self.store["rows"]
+                if r["source_id"] == src and r["pull_status"] == "SUCCESS"
+            }
+            if "start_date" in params:
+                dates = {d for d in dates if d >= params["start_date"]}
+            if "end_date" in params:
+                dates = {d for d in dates if d <= params["end_date"]}
+            return _FakeResult([(d,) for d in sorted(dates)])
+
         if "INSERT INTO raw_series" in sql:
             self.store["rows"].append(
                 {
@@ -212,6 +239,27 @@ def test_pull_fetch_failure_returns_failed_status_no_writes():
     assert result["rows_inserted"] == 0
     assert "error" in result
     assert len(result["error"]) < 400  # bounded, credential-safe
+    assert p.engine.store["rows"] == []
+
+
+def test_pull_404_returns_skipped_not_failed():
+    """A 403/404 means the half-month zip does not exist yet at this URL
+    (requested before SEC's approximate publish date) -- NOT a failure of
+    this puller."""
+    p = _puller()
+
+    def _not_found(url=None, yyyymm=None, half=None):
+        resp = requests.Response()
+        resp.status_code = 404
+        raise requests.HTTPError("404 Client Error", response=resp)
+
+    p._fetch_zip_bytes = _not_found
+
+    result = p.pull(yyyymm="202609", half="a")
+
+    assert result["status"] == "SKIPPED"
+    assert result["rows_inserted"] == 0
+    assert "skipped_reason" in result
     assert p.engine.store["rows"] == []
 
 
@@ -397,6 +445,106 @@ def test_real_fixture_same_cusip_across_dates_not_summed():
     assert sum(stored_by_date.values()) != stored_by_date[date(2026, 8, 17)]
 
 
+# ── pull_recent() catch-up loop ──────────────────────────────────────────
+
+
+def test_half_month_date_bounds():
+    assert _half_month_date_bounds("202609", "a") == (date(2026, 9, 1), date(2026, 9, 15))
+    assert _half_month_date_bounds("202609", "b") == (date(2026, 9, 16), date(2026, 9, 30))
+    assert _half_month_date_bounds("202602", "b") == (date(2026, 2, 16), date(2026, 2, 28))
+
+
+def test_default_recent_half_months_covers_lookback_window():
+    periods = _default_recent_half_months(2)
+    assert len(periods) == 6  # 3 months (current + 2 back) x 2 halves
+    assert all(set(p) == {"yyyymm", "half"} for p in periods)
+    assert all(p["half"] in ("a", "b") for p in periods)
+
+
+def test_pull_recent_skips_half_already_stored_for_the_source():
+    """A half whose settlement-date range already has ANY existing
+    SUCCESS row for this source is skipped -- a file-level check, not a
+    per-CUSIP one."""
+    engine = FakeEngine()
+    engine.store["rows"].append(
+        {
+            "series_id": "sec:ftd_balance:ZZZZZZZZZ",
+            "source_id": 11,
+            "obs_date": date(2026, 9, 5),
+            "value": 1.0,
+            "raw_payload": None,
+            "pull_status": "SUCCESS",
+        }
+    )
+    p = _puller(engine)
+    calls = []
+
+    def _fetch(url=None, yyyymm=None, half=None):
+        calls.append((yyyymm, half))
+        raise ConnectionError("should not be called for an already-stored half")
+
+    p._fetch_zip_bytes = _fetch
+
+    result = p.pull_recent(periods=[{"yyyymm": "202609", "half": "a"}])
+
+    assert calls == []  # never attempted -- already stored
+    assert result["status"] == "SUCCESS"
+    assert result["periods"][0]["status"] == "SKIPPED"
+    assert result["periods"][0]["reason"] == "already stored"
+
+
+def _zip_bytes(text: str) -> bytes:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("cnsfails.txt", text)
+    return buf.getvalue()
+
+
+def test_pull_recent_tries_and_aggregates_not_yet_stored_halves():
+    p = _puller()
+    good_bytes = _zip_bytes(_load("good.txt"))
+    p._fetch_zip_bytes = lambda url=None, yyyymm=None, half=None: good_bytes
+
+    result = p.pull_recent(
+        periods=[
+            {"yyyymm": "202607", "half": "a"},
+            {"yyyymm": "202607", "half": "b"},
+        ]
+    )
+
+    assert result["status"] == "SUCCESS"
+    # Both periods share the same fixture (good.txt, all rows dated
+    # 2026-07-31) via the monkeypatched _fetch_zip_bytes. The FIRST
+    # period tried ("a", bounds 2026-07-01..07-15) has nothing stored yet
+    # in that window, so it fetches and inserts the 3 rows -- landing them
+    # at their real obs_date, 2026-07-31, regardless of "a"'s own nominal
+    # window (publication_half is descriptive metadata only, never a row
+    # filter). The SECOND period ("b", bounds 2026-07-16..07-31) then sees
+    # those same 2026-07-31 rows already present in ITS window and is
+    # SKIPPED by the file-level check rather than re-fetched.
+    assert len(result["periods"]) == 2
+    first, second = result["periods"]
+    assert first["yyyymm"] == "202607" and first["half"] == "a"
+    assert first["status"] == "SUCCESS"
+    assert first["rows_inserted"] == 3
+    assert second["status"] == "SKIPPED"
+    assert result["rows_inserted"] == 3
+
+
+def test_pull_recent_hard_failure_marks_overall_failed():
+    p = _puller()
+
+    def _boom(url=None, yyyymm=None, half=None):
+        raise ConnectionError("simulated network failure")
+
+    p._fetch_zip_bytes = _boom
+
+    result = p.pull_recent(periods=[{"yyyymm": "202609", "half": "a"}])
+
+    assert result["status"] == "FAILED"
+    assert result["periods"][0]["status"] == "FAILED"
+
+
 # ── Cross-source isolation: neither dataset lands under the other's ids ────
 
 
@@ -422,7 +570,7 @@ def test_finra_short_volume_and_sec_ftd_never_share_series_ids():
     sec_p = _puller(engine, source_id=11)
     sec_result = sec_p.pull_from_text(_load("good.txt"))
 
-    assert finra_result["rows_inserted"] == 8
+    assert finra_result["rows_inserted"] == 3  # 8 raw rows -> 3 unique symbols
     assert sec_result["rows_inserted"] == 3
 
     finra_ids = {

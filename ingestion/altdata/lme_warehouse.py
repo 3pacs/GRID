@@ -243,14 +243,20 @@ def _parse_numeric_cell(cell: str) -> float | None:
         return None
 
 
-def _parse_date_from_header(text_block: str, fallback: date) -> date:
+def _parse_date_from_header(text_block: str) -> date | None:
     """Best-effort date extraction from an LME report header.
 
-    Tries ISO (``2026-04-13``), LME day-month-year (``13 April 2026``),
-    and falls back to ``fallback`` (usually ``date.today()``).
+    Tries ISO (``2026-04-13``) and LME day-month-year (``13 April 2026``).
+
+    Returns:
+        The parsed date, or ``None`` when no recognizable date is found
+        (never a fallback like ``date.today()`` -- see the module-level
+        callers, which skip the whole batch of rows rather than mis-date
+        them; a wrong obs_date is a PIT-correctness hazard, not something
+        a plausible-looking substitute can paper over).
     """
     if not text_block:
-        return fallback
+        return None
     # ISO
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})", text_block)
     if m:
@@ -278,17 +284,18 @@ def _parse_date_from_header(text_block: str, fallback: date) -> date:
                 continue
 
     # `text_block` was non-empty but matched neither the ISO nor the
-    # "13 April 2026" pattern -- silently substituting `fallback` (usually
+    # "13 April 2026" pattern -- silently substituting a fallback (e.g.
     # `date.today()`) here would corrupt the observation date without any
     # trace, which is a PIT-correctness hazard. Log it so a format change
     # upstream (LME) is visible in `.server-logs/errors.jsonl` instead of
-    # quietly mis-dating every row.
+    # quietly mis-dating every row, and return None so the caller skips
+    # the whole batch rather than guessing.
     log.warning(
-        "LME: could not parse observation date from {t!r} -- using fallback {f}",
+        "LME: could not parse observation date from {t!r} -- skipping "
+        "this batch (no fabricated fallback date)",
         t=text_block[:120],
-        f=fallback,
     )
-    return fallback
+    return None
 
 
 def _build_snapshot(
@@ -335,8 +342,13 @@ def _parse_lme_html(html: str) -> list[LMEStockSnapshot]:
 
     soup = BeautifulSoup(html, "html.parser")
 
-    # Date: best-effort from anywhere in the document.
-    obs_date = _parse_date_from_header(soup.get_text(" ", strip=True), date.today())
+    # Date: best-effort from anywhere in the document. No fallback to
+    # date.today() -- an unparseable date means we don't know what day
+    # this report is for, so nothing in it can be safely stored (a wrong
+    # obs_date is a PIT-correctness hazard, not a cosmetic gap).
+    obs_date = _parse_date_from_header(soup.get_text(" ", strip=True))
+    if obs_date is None:
+        return []
 
     snapshots: list[LMEStockSnapshot] = []
     seen_metals: set[str] = set()
@@ -359,15 +371,19 @@ def _parse_lme_html(html: str) -> list[LMEStockSnapshot]:
             total_val = _value_from_row(cells, total_idx, fallback_index=1)
             cancelled_val = _value_from_row(cells, cancelled_idx, fallback_index=2)
 
-            if total_val is None and cancelled_val is None:
+            # Both columns must have parsed -- a missing one used to
+            # fall back to 0.0 (`total_val or 0.0`), which fabricates a
+            # "zero warehouse stock" or "zero cancelled warrants" reading
+            # that was never actually reported. Skip the row instead.
+            if total_val is None or cancelled_val is None:
                 continue
 
             snapshots.append(
                 _build_snapshot(
                     obs_date=obs_date,
                     metal=metal,
-                    total=total_val or 0.0,
-                    cancelled=cancelled_val or 0.0,
+                    total=total_val,
+                    cancelled=cancelled_val,
                 )
             )
             seen_metals.add(metal)
@@ -447,7 +463,12 @@ def _parse_lme_json(payload: Any) -> list[LMEStockSnapshot]:
     else:
         return []
 
+    # No fallback to date.today() -- an unparseable/missing report date
+    # means we don't know what day this payload is for, so nothing in it
+    # can be safely stored (see _parse_lme_html's identical guard).
     obs_date = _coerce_date(report_date_raw)
+    if obs_date is None:
+        return []
 
     snapshots: list[LMEStockSnapshot] = []
     seen: set[str] = set()
@@ -475,23 +496,31 @@ def _parse_lme_json(payload: Any) -> list[LMEStockSnapshot]:
             entry.get("cancelled"),
             entry.get("cancelled_mt"),
         )
-        if total is None and cancelled is None:
+        # Both must have parsed -- see _parse_lme_html's identical guard
+        # for why a missing one is skipped rather than fabricated as 0.0.
+        if total is None or cancelled is None:
             continue
 
         snapshots.append(
             _build_snapshot(
                 obs_date=obs_date,
                 metal=metal,
-                total=total or 0.0,
-                cancelled=cancelled or 0.0,
+                total=total,
+                cancelled=cancelled,
             )
         )
         seen.add(metal)
     return snapshots
 
 
-def _coerce_date(value: Any) -> date:
-    """Coerce an arbitrary value into a ``date`` (falls back to today)."""
+def _coerce_date(value: Any) -> date | None:
+    """Coerce an arbitrary value into a ``date``.
+
+    Returns:
+        The coerced date, or ``None`` when ``value`` is missing or
+        unparseable -- never a fallback like ``date.today()`` (a wrong
+        obs_date is a PIT-correctness hazard; see ``_parse_date_from_header``).
+    """
     if isinstance(value, date):
         return value
     if isinstance(value, datetime):
@@ -500,8 +529,8 @@ def _coerce_date(value: Any) -> date:
         try:
             return datetime.fromisoformat(value).date()
         except ValueError:
-            return _parse_date_from_header(value, date.today())
-    return date.today()
+            return _parse_date_from_header(value)
+    return None
 
 
 def _coerce_float(*candidates: Any) -> float | None:

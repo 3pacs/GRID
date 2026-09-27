@@ -17,14 +17,20 @@ Usage from Hermes:
 
 from __future__ import annotations
 
+import calendar
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+# CFTC's own publication clock (15:30 America/New_York) — used by the
+# cftc_cot release gate below, kept in sync with cftc_markets._ET.
+_CFTC_ET = ZoneInfo("America/New_York")
 
 # GRID-YF-CLOSE-REPAIR-20260926 fix #2 ("timeout honestly sized"): without
 # an explicit start_date, YFinancePuller.pull_all() defaults to "1990-01-01"
@@ -51,6 +57,325 @@ def _yfinance_incremental_start() -> str:
         datetime.now(timezone.utc).date()
         - timedelta(days=YFINANCE_SCHEDULED_LOOKBACK_DAYS)
     ).isoformat()
+
+
+# ── Wave 1 activation helpers (2026-09-27) ──────────────────────────────
+# Registers pullers merged in PR #564 (FINRA short volume + SEC FTD) and
+# PR #553 (EIA + LME) that landed "contract-first, unregistered". Both PRs
+# shipped an *unapplied* .patch file under docs/handoffs/2026-09-18/ that
+# targets ``ingestion/scheduler.py::_get_pullers_for_group`` -- but that
+# function is wired to ``cli.py`` / ``orchestration/tasks.py`` /
+# ``scripts/run_full_pipeline.py`` only, none of which run on a schedule
+# (no cron calls run_full_pipeline; CLAUDE.md #39 calling scheduler.py
+# "the authoritative scheduler" is aspirational docs, not current fact).
+# The scheduler Hermes actually ticks every cycle is THIS module's
+# PULLER_REGISTRY, via scripts/hermes_operator.py's main loop ("3. Smart
+# ingestion") -> SmartScheduler.tick(). So these pullers are registered
+# here instead, adapted rather than patch-applied verbatim.
+
+
+def _finra_short_volume_trade_date() -> date:
+    """Most recent trade date whose Reg SHO daily short-volume file
+    should already be published.
+
+    Evaluated at call time (like ``_yfinance_incremental_start`` above),
+    not once at import. FINRA posts each trading day's file that same
+    evening -- the task/ops cadence for this source is "daily after
+    ~18:00 ET" -- so before that cutoff the prior trading day's file is
+    the latest one that can exist yet.
+
+    Bounded, documented limitation: this rolls back over weekends only,
+    with no market-holiday calendar. A market holiday is NOT the same
+    case as the weekend roll above: FINRA's "still publishes a
+    header+trailer-only file for no-trading days" guarantee (module
+    docstring quote) is about a file that GOT published, just with zero
+    data rows -- it says nothing about whether a file exists AT ALL for a
+    day the exchanges never opened. In practice a holiday trade_date can
+    come back as a plain HTTP 403/404 (no file was ever created for that
+    date), which ``FINRAShortVolumePuller.pull``/``pull_recent`` now
+    treats as SKIPPED rather than a failure (see that method's
+    docstring) -- so a holiday landing here just means one extra SKIPPED
+    date in the catch-up window, not an error.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        # Bounded fallback if tzdata is unavailable: UTC-4 approximates ET
+        # closely enough for a same-day/prior-day weekday roll. Never used
+        # for anything PIT-sensitive -- obs_date always comes from the
+        # fetched file's own "Date" column, not from this clock.
+        now_et = datetime.now(timezone.utc) - timedelta(hours=4)
+    trade_date = now_et.date()
+    if now_et.hour < 18:
+        trade_date -= timedelta(days=1)
+    while trade_date.weekday() >= 5:  # Sat=5, Sun=6 -- no trading, no file
+        trade_date -= timedelta(days=1)
+    return trade_date
+
+
+def _sec_ftd_latest_published_half(today: date | None = None) -> dict[str, str]:
+    """Roll to the most recently PUBLISHED SEC FTD half-month period.
+
+    Per docs/handoffs/2026-09-18/fable-w5b-source-contracts.md (quoting
+    SEC): "The first half ... at the end of the month. The second half
+    ... at about the 15th of the next month." This walks back over the
+    last few half-months and returns the most recent whose approximate
+    publish date has already passed. Re-requesting an already-ingested
+    half-month is a harmless no-op -- SECFTDPuller skips obs_dates it has
+    already stored -- so drifting a few days early/late on the exact SEC
+    publish day is bounded, not silently wrong.
+    """
+    today = today or date.today()
+    candidates: list[tuple[date, str, str]] = []
+    for back in range(3):
+        total = (today.year * 12 + (today.month - 1)) - back
+        y, m = divmod(total, 12)
+        m += 1
+        yyyymm = f"{y:04d}{m:02d}"
+        last_day = calendar.monthrange(y, m)[1]
+        publish_a = date(y, m, last_day)
+        next_total = y * 12 + (m - 1) + 1
+        ny, nm = divmod(next_total, 12)
+        nm += 1
+        publish_b = date(ny, nm, 15)
+        candidates.append((publish_a, yyyymm, "a"))
+        candidates.append((publish_b, yyyymm, "b"))
+    published = [c for c in candidates if c[0] <= today] or [min(candidates)]
+    published.sort()
+    _pub_date, yyyymm, half = published[-1]
+    return {"yyyymm": yyyymm, "half": half}
+
+
+def _sec_ftd_published_halves_since(
+    lookback_months: int = 2, today: date | None = None
+) -> list[dict[str, str]]:
+    """Every published SEC FTD half-month period in the last ~lookback_months
+    months, oldest first.
+
+    Same publish-date model as :func:`_sec_ftd_latest_published_half` (see
+    its docstring for the exact SEC quote this rolls against), but returns
+    ALL published halves in the window instead of only the most recent
+    one -- used by :class:`_SECFTDSchedulerAdapter` to feed
+    ``SECFTDPuller.pull_recent``'s catch-up loop, so a missed tick (a
+    deploy restart mid-tick, a transient network failure, the source
+    simply not existing yet in ``source_catalog`` on the day it was first
+    registered) does not silently drop a whole half-month forever the way
+    a single "just the latest half" call would.
+    """
+    today = today or date.today()
+    candidates: list[tuple[date, str, str]] = []
+    for back in range(lookback_months + 2):  # +2 months slack: a half's
+        # publish date can land in the month AFTER the one it covers.
+        total = (today.year * 12 + (today.month - 1)) - back
+        y, m = divmod(total, 12)
+        m += 1
+        yyyymm = f"{y:04d}{m:02d}"
+        last_day = calendar.monthrange(y, m)[1]
+        publish_a = date(y, m, last_day)
+        next_total = y * 12 + (m - 1) + 1
+        ny, nm = divmod(next_total, 12)
+        nm += 1
+        publish_b = date(ny, nm, 15)
+        candidates.append((publish_a, yyyymm, "a"))
+        candidates.append((publish_b, yyyymm, "b"))
+    cutoff = today - timedelta(days=31 * lookback_months)
+    published = sorted(c for c in candidates if cutoff <= c[0] <= today)
+    return [{"yyyymm": yyyymm, "half": half} for (_pub, yyyymm, half) in published]
+
+
+class _LMEWarehouseSchedulerAdapter:
+    """Fetch-then-save shim for LMEWarehousePuller.
+
+    NOT in ``PULLER_REGISTRY`` (2026-09-27 review): both the JSON-probe and
+    HTML-report LME URLs returned HTTP 403 from grid-svr when checked live
+    -- registering this would just burn a slot every 24h returning
+    ``{"fetched": 0, ...}`` forever. Kept defined (unregistered) rather
+    than deleted so the fetch-then-save shape is still available/testable
+    if a working LME endpoint is found later; see
+    ``ingestion/altdata/lme_warehouse.py``'s module docstring for the
+    fallback chain this wraps.
+
+    ``LMEWarehousePuller.pull()`` only fetches/parses -- it does not write
+    to ``raw_series`` on its own (see its ``save_to_db()``). Every
+    PULLER_REGISTRY entry assumes ``getattr(instance, method)(**kwargs)``
+    both fetches AND writes, so a bare registration would "succeed" every
+    tick while inserting zero rows. Carries forward the adapter drafted in
+    the unapplied ``fable-w5-scheduler-registration.patch`` (written
+    against ``ingestion/scheduler.py``), wired here instead -- see the
+    module comment above for why.
+    """
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.altdata.lme_warehouse import LMEWarehousePuller
+
+        self._puller = LMEWarehousePuller(db_engine)
+
+    def pull(self) -> dict[str, Any]:
+        snapshots = self._puller.pull()
+        inserted = self._puller.save_to_db(snapshots)
+        return {
+            "status": "SUCCESS",
+            "fetched": len(snapshots),
+            "inserted": inserted,
+            "source": self._puller._last_source,
+        }
+
+
+class _SECFTDSchedulerAdapter:
+    """Config-gated, half-month-catch-up shim for SECFTDPuller.
+
+    ``SECFTDPuller.pull()`` raises ``RuntimeError`` when
+    ``settings.SEC_USER_AGENT`` is unset (SEC requires a descriptive
+    contact User-Agent on every request) -- correct fail-closed behaviour
+    at the puller layer, but ``SmartScheduler._run_puller`` only treats a
+    *returned* ``{"status": "SKIPPED", ...}`` dict specially (see its
+    "mitigation 2" docstring); an uncaught exception instead lands as a
+    FAILED result with an escalating cooldown. This adapter turns the
+    missing-config case into a clean SKIPPED with an operator-actionable
+    reason, and — only once configured — feeds
+    ``SECFTDPuller.pull_recent`` every published half-month in the last
+    ~2 months (see :func:`_sec_ftd_published_halves_since`) instead of
+    either the unapplied patch's fixed placeholder
+    (``{"yyyymm": "202608", "half": "b"}``) or a single latest-half call
+    -- a 24h cadence (see PULLER_REGISTRY) that only ever tried the
+    latest half would silently never retry a half that failed or was
+    missed.
+    """
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.altdata.sec_ftd import SECFTDPuller
+
+        self._puller = SECFTDPuller(db_engine)
+
+    def pull(self) -> dict[str, Any]:
+        from config import settings
+
+        if not settings.SEC_USER_AGENT:
+            return {
+                "status": "SKIPPED",
+                "skipped_reason": (
+                    "SEC_USER_AGENT not set -- SEC requires a descriptive "
+                    "contact User-Agent on every request. Set "
+                    "SEC_USER_AGENT in .env (see .env.example, format like "
+                    "'GRID research aniksrobot@gmail.com') before this "
+                    "puller can run."
+                ),
+            }
+        periods = _sec_ftd_published_halves_since(lookback_months=2)
+        return self._puller.pull_recent(periods=periods)
+
+
+# GRID task A1 (owner-approved 2026-09-27; DST/holiday fix per coordinator
+# REQUEST CHANGES on PR #681 @ dd53a3dd): the plain freq_h>=168 cadence let
+# cftc_cot fire on whatever hour the previous success happened to land on,
+# which could be mid-week — well before that week's CFTC report exists, so
+# the pull would silently re-store the prior week's report under a fresh
+# pull_timestamp instead of catching the new one. CFTC publishes the COT
+# report every Friday at 15:30 America/New_York — 19:30 UTC in EDT but
+# 20:30 UTC in EST, and shifted to the next federal business day when a
+# holiday falls Tue-Fri of that week. A fixed 19:45 UTC anchor (the first
+# version of this gate) is wrong for 4-5 months a year: in EST it fires 45
+# minutes BEFORE the report exists, re-stores the prior week under a fresh
+# pull_timestamp, and — because that premature run counts as a success at
+# or after the (wrong) anchor — the Saturday retry never fires either. This
+# version computes the scheduled release_at in America/New_York via
+# zoneinfo and cftc_markets.compute_release(), the same holiday-aware rule
+# G1 stores on every payload (cftc_markets.ReleaseTime), so DST and holiday
+# shifts are handled identically here and there, then adds a 15-minute
+# margin (CFTC_RELEASE_MARGIN_MINUTES) past that instant. Due from
+# release_at+margin through the end of the next America/New_York calendar
+# day (the retry window); never due before release_at+margin or after the
+# retry window elapses, regardless of staleness — a missed/failed week
+# waits for the next Tuesday report's release rather than firing off-
+# schedule. freq_h stays on the registry entry only for the
+# overdue-priority sort in _get_due_pullers.
+CFTC_RELEASE_MARGIN_MINUTES = 15  # grace past the scheduled 15:30 ET release
+CFTC_RELEASE_RETRY_DAYS = 1  # retry through the ET calendar day after release
+
+
+def _cftc_current_report_date(now: datetime) -> date:
+    """The report_date whose scheduled release governs ``now``.
+
+    Chosen by release *anchor*, not weekday arithmetic: the candidates are
+    the Tuesday of "this" America/New_York week and the Tuesday of the
+    week before, and whichever candidate's
+    ``cftc_markets.compute_release().release_at`` is the most recent one
+    at-or-before ``now`` wins. Plain "map any Tuesday to itself" arithmetic
+    breaks once a holiday shifts a release onto the Monday/Tuesday that
+    opens the calendar week *after* the report's own Tuesday: on that
+    Tuesday, naive weekday arithmetic would treat it as the start of a
+    brand-new (not-yet-due) cycle instead of the retry day for the report
+    that just released the day before. Anchoring on the actual release
+    time keeps the retry window pointed at the report that was really last
+    released, however far its holiday shift moved it. Falls back to the
+    current week's own (not-yet-released) Tuesday when neither candidate
+    has released yet — the ordinary "too early" case, where the fallback's
+    own release_at simply isn't reached, so the gate below still says
+    "not due" for the right reason.
+    """
+    from ingestion.altdata.cftc_markets import compute_release
+
+    today_et = now.astimezone(_CFTC_ET).date()
+    this_tuesday = today_et - timedelta(days=(today_et.weekday() - 1) % 7)  # Tue=1
+
+    best_report_date = this_tuesday
+    best_release_at: datetime | None = None
+    for candidate in (this_tuesday, this_tuesday - timedelta(days=7)):
+        release = compute_release(candidate)
+        if release.release_at is None or release.release_at > now:
+            continue
+        if best_release_at is None or release.release_at > best_release_at:
+            best_release_at = release.release_at
+            best_report_date = candidate
+    return best_report_date
+
+
+def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
+    """Fail-closed weekly release gate for cftc_cot.
+
+    Due from the current report's scheduled ``release_at`` (holiday- and
+    DST-aware, via ``cftc_markets.compute_release``, and selected by
+    release anchor via ``_cftc_current_report_date`` so a holiday-shifted
+    release is still "current" through its own retry day) through the end
+    of the next America/New_York calendar day, as long as no success has
+    landed since that release_at. Never due before release_at, and never
+    due once the retry window has elapsed, no matter how stale — a missed
+    week waits for the next Tuesday report's own release rather than
+    firing off-schedule.
+    """
+    from ingestion.altdata.cftc_markets import compute_release
+
+    report_date = _cftc_current_report_date(now)
+    release = compute_release(report_date)
+    if release.release_at is None:
+        # compute_release() only returns None for a non-Tuesday report_date;
+        # _cftc_current_report_date always returns a Tuesday. Unreachable
+        # in practice — fail closed defensively if that ever changes.
+        return False
+
+    # release.release_at is the CFTC's own 15:30 ET moment, already
+    # expressed as a correct tz-aware UTC instant for whichever of
+    # EDT/EST applies that day (and for the actual holiday-shifted day,
+    # if any) via compute_release(). Adding a fixed 15-minute timedelta to
+    # a tz-aware instant is unambiguous (15:45 ET either way) — there is no
+    # DST transition anywhere near 15:30/15:45 local time.
+    release_at = release.release_at + timedelta(minutes=CFTC_RELEASE_MARGIN_MINUTES)
+    retry_window_end = datetime.combine(
+        release_at.astimezone(_CFTC_ET).date() + timedelta(days=CFTC_RELEASE_RETRY_DAYS + 1),
+        datetime.min.time(),
+        tzinfo=_CFTC_ET,
+    ).astimezone(timezone.utc)
+    if not (release_at <= now < retry_window_end):
+        return False
+
+    if last_success is None:
+        return True
+    if last_success.tzinfo is None:
+        last_success = last_success.replace(tzinfo=timezone.utc)
+    # Already succeeded at/after this week's release: no retry needed.
+    return last_success < release_at
 
 
 # ── Puller Registry ──────────────────────────────────────────────────────
@@ -152,7 +477,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Government / regulatory ──
     {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
-    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},
+    {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
     # ── Sentiment / alt ──
     {"name": "world_news",        "mod": "ingestion.altdata.world_news",      "cls": "WorldNewsPuller",          "method": "pull_all",      "freq_h": 6,  "timeout_s": 60, "api_key": "WORLDNEWS_API_KEY", "api_key_mode": "env"},
@@ -213,6 +538,26 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
     {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600},
     {"name": "wikidata_persons",      "mod": "ingestion.altdata.wikidata_persons",   "cls": "WikidataPersonPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 1800},
+
+    # ── Wave 1 activation (2026-09-27): merged-but-unscheduled pullers ──
+    # See the "Wave 1 activation helpers" comment above PULLER_REGISTRY for
+    # why these are registered here and not via the two .patch files in
+    # docs/handoffs/2026-09-18/ (which target the non-live scheduler.py).
+    #
+    # Registry ``name`` MUST match the source_catalog name lower-cased --
+    # ``_load_state_from_db`` keys restart state by ``name.lower()`` and
+    # ``_update_last_pull`` writes back the same way. Confirmed against
+    # grid-svr (read-only, name-only): the existing "EIA" row lower()s to
+    # "eia"; "FINRA_SHORT_VOLUME" and "SEC_FTD" don't exist yet and will be
+    # auto-created (BasePuller._resolve_source_id) with exactly the puller
+    # classes' own SOURCE_NAME the first time each runs, which already
+    # lower()s to "finra_short_volume" / "sec_ftd". LME_Warehouse is
+    # deliberately NOT registered here at all -- see
+    # _LMEWarehouseSchedulerAdapter's docstring (both LME URLs 403 from
+    # grid-svr).
+    {"name": "eia",                "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
+    {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
+    {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
 ]
 
 # How many pullers to run per tick (keeps cycles short)
@@ -335,6 +680,21 @@ class SmartScheduler:
         """Check if a puller needs to run based on its frequency."""
         name = puller["name"]
         state = self._state.get(name)
+
+        # cftc_cot is gated to its weekly release window (see
+        # _cftc_cot_is_due) instead of the plain freq_h cadence — CFTC only
+        # publishes once a week, on Friday, so "due" must mean "in Friday's
+        # release window or Saturday's retry", not "168h since last run" (or
+        # "never run" — a never-run cftc_cot still waits for the window
+        # instead of firing off-schedule the instant this process starts).
+        if name == "cftc_cot":
+            cooldown = state.get("cooldown_until") if state else None
+            if cooldown and datetime.now(timezone.utc) < cooldown:
+                return False
+            last = state.get("last_success") if state else None
+            if last is not None and hasattr(last, "tzinfo") and last.tzinfo is None:
+                last = last.replace(tzinfo=timezone.utc)
+            return _cftc_cot_is_due(last, datetime.now(timezone.utc))
 
         # Never run before → definitely due
         if state is None:
@@ -514,6 +874,46 @@ class SmartScheduler:
                 result["status"] = "SKIPPED"
                 result["reason"] = out.get("skipped_reason", "puller reported SKIPPED")
                 result["detail"] = str(out)[:200]
+                return result
+
+            # Mitigation 3 (2026-09-27 review of PR #685): a puller's own
+            # returned dict can ALSO self-report failure -- an explicit
+            # {"status": "FAILED", ...} (every puller in ingestion/altdata/
+            # uses this shape on a fetch/parse error) or, as a defensive
+            # fallback for a puller that doesn't set "status" at all, a
+            # {"rows_inserted": 0, "error": ...}-shaped result. Before this
+            # fix, EVERYTHING that reached this line except an explicit
+            # SKIPPED was recorded as SUCCESS regardless of what the puller
+            # actually reported -- so a puller that ran, hit an error, and
+            # returned {"status": "FAILED", "error": ...} still advanced
+            # last_pull_at and reset its cooldown as if it had succeeded.
+            # "PARTIAL" (some-but-not-all of a puller's series/items failed
+            # -- e.g. EIAPuller.pull when only one of Brent/WTI fetched)
+            # is treated the same as FAILED here: SmartScheduler's own
+            # vocabulary (this class, get_status(), tick()'s summary) only
+            # ever distinguishes SUCCESS / SKIPPED / FAILED, so a puller
+            # that wants "retry the still-missing part on the next cheap
+            # cooldown-gated tick" reports PARTIAL and gets that FAILED-like
+            # treatment (no last_pull_at advance, cooldown applies) even
+            # though the rows it DID insert are already committed.
+            reported_status = out.get("status") if isinstance(out, dict) else None
+            self_reported_failure = (
+                reported_status in ("FAILED", "PARTIAL")
+                or (
+                    isinstance(out, dict)
+                    and reported_status is None
+                    and out.get("rows_inserted") == 0
+                    and "error" in out
+                )
+            )
+            if self_reported_failure:
+                result["status"] = reported_status or "FAILED"
+                result["error"] = str(
+                    out.get("error", f"puller reported {result['status']}")
+                )[:200]
+                result["detail"] = str(out)[:200]
+                # Deliberately NOT calling self._update_last_pull(name) --
+                # this source did not have a clean, complete run.
                 return result
 
             result["status"] = "SUCCESS"

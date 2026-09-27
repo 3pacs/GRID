@@ -513,7 +513,7 @@ def _get_dealer_gamma_state(engine: Engine) -> dict[str, Any]:
         with engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT put_call_ratio, spot_price FROM options_daily_signals
-                WHERE ticker = 'SPY'
+                WHERE ticker = 'SPY' AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """)).fetchone()
             if row and row[0]:
@@ -542,6 +542,7 @@ def _get_vanna_charm_state(engine: Engine) -> dict[str, Any]:
             row = conn.execute(text("""
                 SELECT max_pain, spot_price, signal_date FROM options_daily_signals
                 WHERE ticker = 'SPY' AND max_pain IS NOT NULL AND spot_price > 0
+                AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """)).fetchone()
             if row:
@@ -729,6 +730,7 @@ def _get_prediction_market_state(engine: Engine) -> dict[str, Any]:
                 SELECT signal_value, signal_date FROM signal_sources
                 WHERE source_type = 'prediction_market'
                 AND signal_date >= CURRENT_DATE - 7
+                AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC
                 LIMIT 5
             """)).fetchall()

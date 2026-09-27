@@ -62,6 +62,14 @@ def build_agent_config(position_size: float = 0.0) -> dict[str, Any]:
     }
 
     if provider == "openai":
+        from llm.router import _paid_llm_allowed
+
+        if not _paid_llm_allowed():
+            log.warning(
+                "AGENTS_LLM_PROVIDER=openai blocked — GRID_ALLOW_PAID_LLM not set, "
+                "falling back to llamacpp"
+            )
+            return _llamacpp_config(config)
         if not settings.AGENTS_OPENAI_API_KEY:
             log.warning("AGENTS_OPENAI_API_KEY not set, falling back to llamacpp")
             return _llamacpp_config(config)
@@ -76,6 +84,14 @@ def build_agent_config(position_size: float = 0.0) -> dict[str, Any]:
         log.info("Agent LLM: OpenAI ({m})", m=config["deep_think_llm"])
 
     elif provider == "anthropic":
+        from llm.router import _paid_llm_allowed
+
+        if not _paid_llm_allowed():
+            log.warning(
+                "AGENTS_LLM_PROVIDER=anthropic blocked — GRID_ALLOW_PAID_LLM not set, "
+                "falling back to llamacpp"
+            )
+            return _llamacpp_config(config)
         if not settings.AGENTS_ANTHROPIC_API_KEY:
             log.warning("AGENTS_ANTHROPIC_API_KEY not set, falling back to llamacpp")
             return _llamacpp_config(config)

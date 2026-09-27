@@ -1,7 +1,7 @@
 """Create people_events — canonical, point-in-time, de-duplicated people-linked acts.
 
 Revision ID: people_events_20260927
-Revises: raw_series_quarantined_20260926
+Revises: causal_links_provenance_20260927
 
 GD2 of the 2026-09-27 granular-discovery plan
 (wha/outputs/GRID-GRANULAR-DISCOVERY-PLAN-20260927.md, section 2.1 and gap G3).
@@ -70,14 +70,14 @@ production data to migrate and no long-running statement.
 from alembic import op
 
 revision = "people_events_20260927"
-down_revision = "raw_series_quarantined_20260926"
+down_revision = "causal_links_provenance_20260927"
 branch_labels = None
 depends_on = None
 
-# NOTE (coordinator): down_revision above is the single head on origin/main
-# as of 2026-09-27 (commit 1bb2f61b, #671 merged). This migration will be
-# re-parented onto the head in place at merge time if #674/#683 land first --
-# the coordinator handles that re-parenting; this PR does not merge itself.
+# NOTE (coordinator): re-parented 2026-09-27 onto causal_links_provenance_20260927,
+# the single head on origin/main at merge time (train order: ... #690 causal-links,
+# #693 people_events). The coordinator handles this re-parenting; this PR does not
+# merge itself.
 
 
 def upgrade() -> None:

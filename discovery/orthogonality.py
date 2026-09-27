@@ -95,6 +95,9 @@ class OrthogonalityAudit:
         as_of_date: date | None = None,
         start_date: date | None = None,
         output_dir: str = "outputs/orthogonality",
+        max_staleness_days: int | None = None,
+        semantic_similarity: bool = True,
+        persist: bool = True,
     ) -> dict[str, Any]:
         """Run the complete orthogonality audit.
 
@@ -106,6 +109,15 @@ class OrthogonalityAudit:
             as_of_date: Decision date for PIT queries (default: today).
             start_date: Earliest date for feature data (default: 1947-01-01).
             output_dir: Directory for saving output files.
+            max_staleness_days: When set, features whose last PIT
+                observation is older than this many days before
+                ``as_of_date`` are excluded (and listed in
+                ``excluded_stale_features``) instead of silently truncating
+                the whole matrix to their last date. ``None`` keeps the
+                legacy behaviour.
+            semantic_similarity: Run the optional embedding-based hidden
+                redundancy check (network call to the embed providers).
+            persist: Write the ``orthogonality`` analytical snapshot.
 
         Returns:
             dict: Summary with keys including n_features_analyzed,
@@ -180,9 +192,23 @@ class OrthogonalityAudit:
             log.warning("Dropping {n} features with >50% missing: {f}", n=len(dropped), f=dropped)
             matrix = matrix.drop(columns=dropped)
 
+        from discovery.matrix_guard import drop_stale_columns, matrix_window
+
+        matrix, excluded_stale = drop_stale_columns(matrix, as_of_date, max_staleness_days)
+        if excluded_stale:
+            log.warning(
+                "Excluding {n} stale features (last obs older than {d}d before {a})",
+                n=len(excluded_stale), d=max_staleness_days, a=as_of_date,
+            )
+
         if matrix.empty or matrix.shape[1] < 2:
             log.warning("Insufficient features after dropping — need at least 2")
-            return {"n_features_analyzed": matrix.shape[1], "n_features_dropped": len(dropped)}
+            return {
+                "n_features_analyzed": matrix.shape[1],
+                "n_features_dropped": len(dropped),
+                "excluded_stale_features": excluded_stale,
+                "error": "Insufficient fresh features",
+            }
 
         # Step c: Forward-fill NaNs up to 5 trading days, log larger gaps
         for col in matrix.columns:
@@ -244,6 +270,8 @@ class OrthogonalityAudit:
         # GRIDEmbeddings returns None when no embed provider answers.
         feature_name_list = list(matrix.columns)
         try:
+            if not semantic_similarity:
+                raise RuntimeError("disabled by caller")
             from hyperspace.embeddings import GRIDEmbeddings
 
             embedder = GRIDEmbeddings()
@@ -372,26 +400,18 @@ class OrthogonalityAudit:
             "highly_correlated_pairs": highly_correlated,
             "unstable_pairs": unstable_pairs,
             "dominant_factor_loadings": dominant_loadings,
+            "as_of_date": as_of_date.isoformat(),
+            "vintage_policy": "FIRST_RELEASE",
+            "n_rows": int(matrix.shape[0]),
+            **matrix_window(matrix),
+            "max_staleness_days": max_staleness_days,
+            "excluded_stale_features": excluded_stale,
         }
 
         # Persist snapshot to database for historical comparison
-        try:
-            from store.snapshots import AnalyticalSnapshotStore
-            snap_store = AnalyticalSnapshotStore(db_engine=self.engine)
-            snap_store.save_snapshot(
-                category="orthogonality",
-                payload=summary,
-                as_of_date=as_of_date,
-                metrics={
-                    "n_features": n_features,
-                    "true_dimensionality": true_dim,
-                    "n_correlated_pairs": len(highly_correlated),
-                    "n_unstable_pairs": len(unstable_pairs),
-                    "variance_at_true_dim": summary["variance_explained_by_true_dim"],
-                },
-            )
-        except Exception as exc:
-            log.warning("Failed to persist orthogonality snapshot: {e}", e=str(exc))
+        if persist:
+            summary["snapshot_id"] = self._persist_snapshot(summary, as_of_date, n_features, true_dim,
+                                                           highly_correlated, unstable_pairs)
 
         log.info(
             "Orthogonality audit complete — {n} features, true_dim={d}, "
@@ -420,6 +440,35 @@ class OrthogonalityAudit:
                 log.info("  {a} <-> {b}: [{mn:.4f}, {mx:.4f}]", a=a, b=b, mn=mn, mx=mx)
 
         return summary
+
+    def _persist_snapshot(
+        self,
+        summary: dict[str, Any],
+        as_of_date: date,
+        n_features: int,
+        true_dim: int,
+        highly_correlated: list,
+        unstable_pairs: list,
+    ) -> int | None:
+        """Write the ``orthogonality`` analytical snapshot; None on failure."""
+        try:
+            from store.snapshots import AnalyticalSnapshotStore
+            snap_store = AnalyticalSnapshotStore(db_engine=self.engine)
+            return snap_store.save_snapshot(
+                category="orthogonality",
+                payload=summary,
+                as_of_date=as_of_date,
+                metrics={
+                    "n_features": n_features,
+                    "true_dimensionality": true_dim,
+                    "n_correlated_pairs": len(highly_correlated),
+                    "n_unstable_pairs": len(unstable_pairs),
+                    "variance_at_true_dim": summary["variance_explained_by_true_dim"],
+                },
+            )
+        except Exception as exc:
+            log.warning("Failed to persist orthogonality snapshot: {e}", e=str(exc))
+            return None
 
     def _save_heatmap(
         self,

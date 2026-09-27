@@ -32,6 +32,17 @@ DEFAULT_RESEARCH_DB = (
     "/data/agent-home/anikdang/dad-stock-analysis/work/"
     "extract-20260617/dad_stock_research.duckdb"
 )
+
+# The workbook research corpus is a one-shot DuckDB extract with no internal
+# "generated_at" column -- its only record of when it was built is the
+# "extract-YYYYMMDD" segment in DEFAULT_RESEARCH_DB's path. It has not been
+# regenerated since (GRID-FRONTEND-READINESS-MAP-20260926: "static since
+# 2026-06-17"). Surfaced on every workbook response as source.extracted_at
+# so the PWA can render an honest "static extract from <date>" instead of
+# implying the evidence is current. Update this alongside
+# DEFAULT_RESEARCH_DB / GRID_DAD_STOCK_RESEARCH_DB whenever the corpus is
+# actually rebuilt.
+RESEARCH_DB_EXTRACTED_AT = "2026-06-17"
 MAX_EVIDENCE_ROWS = 18
 COMPACT_EVIDENCE_ROWS = 5
 MAX_FILE_ROWS = 12
@@ -1624,7 +1635,7 @@ def _empty_workbook_context(ticker: str, db_path: Path, *, attached: bool, statu
         "ticker": ticker,
         "status": status,
         "message": message,
-        "source": {"attached": attached, "db_path": str(db_path)},
+        "source": {"attached": attached, "db_path": str(db_path), "extracted_at": RESEARCH_DB_EXTRACTED_AT},
         "summary": None,
         "workbook": {"files": [], "sheets": [], "evidence": []},
         "source_lanes": [],
@@ -1764,7 +1775,7 @@ def _load_workbook_context(
         "ticker": ticker,
         "status": "ready" if summary else "not_found",
         "message": None,
-        "source": {"attached": True, "db_path": str(db_path)},
+        "source": {"attached": True, "db_path": str(db_path), "extracted_at": RESEARCH_DB_EXTRACTED_AT},
         "summary": summary,
         "workbook": {"files": files, "sheets": sheets, "evidence": evidence},
         "source_lanes": _lane_counts(evidence, files, sheets),
@@ -1837,6 +1848,7 @@ def _assemble_dad_response(
         "source": {
             "attached": bool(workbook.get("source", {}).get("attached")),
             "db_path": workbook.get("source", {}).get("db_path") if not compact else None,
+            "extracted_at": workbook.get("source", {}).get("extracted_at"),
         },
         "message": workbook.get("message"),
         "summary": summary,

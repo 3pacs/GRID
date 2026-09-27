@@ -588,19 +588,28 @@ def get_client() -> Any:
     """Return the best available cached LLM client singleton.
 
     Provider order:
-    1. OpenAI when an API key is configured
+    1. OpenAI when an API key is configured AND paid LLM use is opted in
+       (``GRID_ALLOW_PAID_LLM``) — this bypasses ``llm.router``'s own gate,
+       so it is gated here explicitly.
     2. llama.cpp when the local server is enabled and reachable
     3. Ollama as the final local fallback
     """
     global _client_instance
     if _client_instance is None:
         from config import settings
+        from llm.router import _paid_llm_allowed
 
         openai_key = (
             settings.OPENAI_API_KEY
             or settings.AGENTS_OPENAI_API_KEY
             or os.getenv("OPENAI_API_KEY", "")
         )
+        if openai_key and not _paid_llm_allowed():
+            log.warning(
+                "ollama.client.get_client: OpenAI key present but blocked — "
+                "GRID_ALLOW_PAID_LLM not set"
+            )
+            openai_key = ""
         if openai_key:
             client = OpenAIClient(
                 api_key=openai_key,

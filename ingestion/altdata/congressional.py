@@ -56,6 +56,45 @@ AMOUNT_RANGES: dict[str, tuple[int, int]] = {
     "J": (50_000_001, 999_999_999),
 }
 
+# STOCK Act members must disclose within 45 days of a trade. When a source
+# doesn't carry an actual disclosure/filing timestamp, this statutory bound
+# is a defensible lower-bound estimate of when the trade became public —
+# unlike copying the transaction date, which would assert a same-day
+# disclosure the source never claimed (GD-FIX: "disclosure_date equals
+# transaction_date on all 636 April-May rows" was exactly that fabrication).
+DISCLOSURE_STATUTORY_LAG_DAYS: int = 45
+
+
+def resolve_disclosure_date(
+    transaction_date: date,
+    disclosure_date_str: str | None,
+) -> tuple[date, str]:
+    """Resolve the best-defensible disclosure date and its basis.
+
+    Parameters:
+        transaction_date: The trade's transaction date (never used as the
+            disclosure date itself — see module docstring above).
+        disclosure_date_str: A disclosure/filing date string from the
+            source, if any (e.g. QuiverQuant's ``DisclosureDate``).
+
+    Returns:
+        ``(disclosure_date, basis)`` where ``basis`` is ``"reported"`` when
+        the source gave a real disclosure date, or ``"statutory_bound"``
+        when it is estimated from the 45-day STOCK Act deadline.
+    """
+    if disclosure_date_str:
+        try:
+            parsed = date.fromisoformat(str(disclosure_date_str)[:10])
+            if parsed >= transaction_date:
+                return parsed, "reported"
+        except (ValueError, TypeError):
+            pass
+    return (
+        transaction_date + timedelta(days=DISCLOSURE_STATUTORY_LAG_DAYS),
+        "statutory_bound",
+    )
+
+
 # Normalise transaction types
 _TXN_NORMALIZE: dict[str, str] = {
     "purchase": "BUY",
@@ -319,10 +358,12 @@ class CongressionalTradingPuller(BasePuller):
             except (ValueError, TypeError):
                 continue
 
-            try:
-                disc_date = date.fromisoformat(disc_date_str[:10]) if disc_date_str else txn_date
-            except (ValueError, TypeError):
-                disc_date = txn_date
+            # GD-FIX: QuiverQuant's congress-trading endpoint does not
+            # reliably carry a DisclosureDate/FilingDate field. Falling back
+            # to the transaction date (the old behaviour) fabricated a
+            # same-day disclosure; resolve_disclosure_date() instead falls
+            # back to the 45-day STOCK Act statutory bound and says so.
+            disc_date, disc_basis = resolve_disclosure_date(txn_date, disc_date_str)
 
             trades.append({
                 "member_name": member.strip(),
@@ -337,6 +378,7 @@ class CongressionalTradingPuller(BasePuller):
                 "amount_midpoint": _midpoint_amount(str(amount)),
                 "transaction_date": txn_date,
                 "disclosure_date": disc_date,
+                "disclosure_basis": disc_basis,
             })
 
         return trades
@@ -439,6 +481,7 @@ class CongressionalTradingPuller(BasePuller):
                     "amount_range": trade["amount_range"],
                     "amount_midpoint": trade["amount_midpoint"],
                     "disclosure_date": trade["disclosure_date"].isoformat(),
+                    "disclosure_basis": trade.get("disclosure_basis", "reported"),
                     "disclosure_lag_days": (
                         trade["disclosure_date"] - trade["transaction_date"]
                     ).days,
@@ -533,6 +576,7 @@ class CongressionalTradingPuller(BasePuller):
                         "transaction_type": trade["transaction_type"],
                         "amount_range": trade["amount_range"],
                         "disclosure_date": trade["disclosure_date"].isoformat(),
+                        "disclosure_basis": trade.get("disclosure_basis", "reported"),
                         "transaction_date": trade["transaction_date"].isoformat(),
                     },
                 )

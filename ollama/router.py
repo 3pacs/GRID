@@ -218,37 +218,49 @@ def get_router() -> TaskRouter:
             timeout=settings.OLLAMA_TIMEOUT_SECONDS,
         )
     elif quick_provider == "openai":
-        from ollama.client import OpenAIClient
-        key = settings.OPENAI_API_KEY or settings.AGENTS_OPENAI_API_KEY
-        if key:
-            quick_client = OpenAIClient(
-                api_key=key,
-                base_url=settings.OPENAI_BASE_URL,
-                model="gpt-4o-mini",
-                timeout=settings.OPENAI_TIMEOUT_SECONDS,
-            )
+        from llm.router import _paid_llm_allowed
+        if not _paid_llm_allowed():
+            log.warning("LLM_QUICK_PROVIDER=openai blocked — GRID_ALLOW_PAID_LLM not set")
+        else:
+            from ollama.client import OpenAIClient
+            key = settings.OPENAI_API_KEY or settings.AGENTS_OPENAI_API_KEY
+            if key:
+                quick_client = OpenAIClient(
+                    api_key=key,
+                    base_url=settings.OPENAI_BASE_URL,
+                    model="gpt-4o-mini",
+                    timeout=settings.OPENAI_TIMEOUT_SECONDS,
+                )
 
     # Build deep client
     if deep_provider == "anthropic":
-        key = settings.AGENTS_ANTHROPIC_API_KEY
-        if key:
-            from ollama.client import OpenAIClient
-            deep_client = OpenAIClient(
-                api_key=key,
-                base_url="https://api.anthropic.com/v1",
-                model="claude-sonnet-4-6",
-                timeout=180,
-            )
+        from llm.router import _paid_llm_allowed
+        if not _paid_llm_allowed():
+            log.warning("LLM_DEEP_PROVIDER=anthropic blocked — GRID_ALLOW_PAID_LLM not set")
+        else:
+            key = settings.AGENTS_ANTHROPIC_API_KEY
+            if key:
+                from ollama.client import OpenAIClient
+                deep_client = OpenAIClient(
+                    api_key=key,
+                    base_url="https://api.anthropic.com/v1",
+                    model="claude-sonnet-4-6",
+                    timeout=180,
+                )
     elif deep_provider == "openai":
-        key = settings.OPENAI_API_KEY or settings.AGENTS_OPENAI_API_KEY
-        if key:
-            from ollama.client import OpenAIClient
-            deep_client = OpenAIClient(
-                api_key=key,
-                base_url=settings.OPENAI_BASE_URL,
-                model="gpt-4o",
-                timeout=settings.OPENAI_TIMEOUT_SECONDS,
-            )
+        from llm.router import _paid_llm_allowed
+        if not _paid_llm_allowed():
+            log.warning("LLM_DEEP_PROVIDER=openai blocked — GRID_ALLOW_PAID_LLM not set")
+        else:
+            key = settings.OPENAI_API_KEY or settings.AGENTS_OPENAI_API_KEY
+            if key:
+                from ollama.client import OpenAIClient
+                deep_client = OpenAIClient(
+                    api_key=key,
+                    base_url=settings.OPENAI_BASE_URL,
+                    model="gpt-4o",
+                    timeout=settings.OPENAI_TIMEOUT_SECONDS,
+                )
     elif deep_provider == "gemma":
         from gemma.client import get_client as get_gemma
         deep_client = get_gemma()
