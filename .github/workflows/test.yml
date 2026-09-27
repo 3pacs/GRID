@@ -284,6 +284,26 @@ jobs:
             exit 1
           fi
 
+      # God view G6 (migrations/versions/godview_view_v2_20260927.py): the
+      # legacy matview replaced by a PIT plain view on the real G2 schema;
+      # rows join a day only once released and acquired, legacy rows never
+      # appear, stale flags, downgrade restores the matview, and the upgrade
+      # refuses (rolls back) when something depends on the matview. A skip
+      # must fail this step.
+      - name: Godview G6 view PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_godview_view_pg.py -q -rA | tee /tmp/grid-godview-g6-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g6-pg.txt; then
+            echo "::error::Godview G6 view PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # God view G8 API (api/routers/godview.py + godview/read_model.py), on
       # the real G2 schema: pre-G2 = schema_not_migrated, legacy rows never
       # served, PIT by available_at / finished_at, stale / partial / ledger
