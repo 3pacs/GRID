@@ -650,6 +650,18 @@ def _load_latest_findings(engine: Engine, limit: int = 200) -> list[dict]:
 # checks for the table at runtime (to_regclass) and, when present, anti-joins
 # retracted rows out of the delete set — it works identically whether or not
 # the migration has been applied.
+#
+# 2026-09-27: `:od::date` (no space before the cast) is a live SQLAlchemy
+# 2.0 bind-parameter parsing trap -- discovered by
+# tests/test_dedup_retraction_guard_pg.py, the first test to exercise this
+# delete against real Postgres. SQLAlchemy's bind-param regex mis-parses a
+# name immediately followed by `::`, silently binding a truncated name
+# (`:od::date` -> parameter "o", dropping the "d") instead of raising, so
+# "od" was never actually substituted and Postgres received the literal
+# text `:od::date`, a syntax error. Fixed by spacing the cast (`:od ::date`)
+# so SQLAlchemy's negative lookahead does not see `:` immediately after the
+# name; verify with `sqlalchemy.text("...:od::date...")._bindparams` if this
+# pattern is ever reintroduced.
 _DEDUP_KEEP_BEST_PREDICATE = """
     id NOT IN (
         SELECT DISTINCT ON (feature_id, obs_date)
@@ -657,14 +669,14 @@ _DEDUP_KEEP_BEST_PREDICATE = """
         FROM resolved_series rs
         JOIN feature_registry fr ON fr.id = rs.feature_id
         WHERE fr.name = :fname
-          AND rs.obs_date = :od::date
+          AND rs.obs_date = :od ::date
         ORDER BY feature_id, obs_date,
                  source_priority_used ASC
     )
     AND feature_id = (
         SELECT id FROM feature_registry WHERE name = :fname
     )
-    AND obs_date = :od::date
+    AND obs_date = :od ::date
 """
 
 _RETRACTED_KEY_MATCH = """
