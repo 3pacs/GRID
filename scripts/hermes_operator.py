@@ -538,6 +538,20 @@ _SOURCE_OVERRIDES: dict[str, dict[str, Any]] = {
     # scheduler's bounded pull_recent path which is tuned for breaking-news
     # cadence, not for catch-up after a failure).
     "gdelt":           {"pull_method": None, "pull_kwargs": None},
+    # "eia" carries "api_key": "EIA_API_KEY" in PULLER_REGISTRY because the
+    # SCHEDULER's own _build_puller_instance needs it to raise
+    # MissingPullerApiKey when unset (api_key_mode="env" -> it still builds
+    # via cls(db_engine=...) either way). hermes_fixers._resolve_puller has
+    # a DIFFERENT (older) convention: any "api_key" in the derived registry
+    # entry gets passed as an EXPLICIT ctor kwarg
+    # (`ctor_kwargs["api_key"] = ...`), but EIAPuller.__init__ only accepts
+    # `db_engine` (it reads EIA_API_KEY from os.environ itself) -- so
+    # without this override, a REPULL/retry for "eia" raises
+    # `TypeError: EIAPuller.__init__() got an unexpected keyword argument
+    # 'api_key'` every time. Popping the key here (via the `None` sentinel)
+    # keeps the scheduler-side fail-closed behaviour while fixing the
+    # retry-side ctor mismatch.
+    "eia":             {"api_key": None},
 }
 
 

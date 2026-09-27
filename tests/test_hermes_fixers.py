@@ -396,3 +396,157 @@ def test_retry_source_handles_function_based_registry_entries(monkeypatch) -> No
 
     assert result == {"status": "ok", "source": "fn"}
     assert calls == [{"db_engine": engine, "days_back": 7}]
+
+
+def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None:
+    """PULLER_REGISTRY kwargs may be zero-arg callables (e.g. FINRA's
+    "anchor_date": _finra_short_volume_trade_date, resolved fresh on every
+    call rather than frozen at import time -- see
+    SmartScheduler._run_puller's identical resolution). Before this fix,
+    _retry_source passed such a callable STRAIGHT THROUGH to the puller's
+    method as a function object instead of the value it computes.
+    """
+    calls: list[dict] = []
+    module_name = "_grid_test_callable_kwarg_puller"
+    fake_module = ModuleType(module_name)
+
+    class _Puller:
+        def __init__(self, db_engine=None):
+            self.db_engine = db_engine
+
+        def pull_recent(self, anchor_date=None, weekdays_back=None):
+            calls.append({"anchor_date": anchor_date, "weekdays_back": weekdays_back})
+            return {"status": "SUCCESS", "rows_inserted": 0}
+
+    fake_module._Puller = _Puller
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    from scripts import hermes_operator
+
+    monkeypatch.setitem(
+        hermes_operator._SOURCE_REGISTRY,
+        "finra_short_volume",
+        {
+            "mod": module_name,
+            "cls": "_Puller",
+            "pull_method": "pull_recent",
+            "pull_kwargs": {
+                "anchor_date": lambda: "2026-09-16",
+                "weekdays_back": 5,
+            },
+        },
+    )
+
+    engine = MagicMock()
+
+    result = hermes_fixers._retry_source("finra_short_volume", engine)
+
+    assert result == {"status": "SUCCESS", "rows_inserted": 0}
+    # The callable was CALLED, not passed through as a function object.
+    assert calls == [{"anchor_date": "2026-09-16", "weekdays_back": 5}]
+
+
+def test_retry_source_never_resolves_should_continue_kwarg(monkeypatch) -> None:
+    """should_continue is a cooperative-cancellation callback BY CONTRACT
+    (called repeatedly BY the puller, not a value to precompute once) --
+    the new callable-kwarg resolution loop must skip it by name, same as
+    SmartScheduler._run_puller does. Uses a puller method whose signature
+    does NOT itself declare "should_continue" (unlike YFinancePuller-style
+    pullers) so _retry_source's OWN "wire a combined should_continue"
+    branch (which would overwrite it regardless) never fires -- isolating
+    exactly the callable-kwarg-resolution behaviour this test targets.
+    """
+    module_name = "_grid_test_should_continue_puller"
+    fake_module = ModuleType(module_name)
+    captured: dict = {}
+
+    class _Puller:
+        def __init__(self, db_engine=None):
+            pass
+
+        # Deliberately no literal "should_continue" PARAMETER NAME (a
+        # **_kwargs catch-all instead) -- that keeps _retry_source's own
+        # "if 'should_continue' in params: wire a combined one" branch
+        # from firing, which would otherwise overwrite kwargs
+        # unconditionally and mask what this test is actually checking.
+        def pull_all(self, other=None, **_kwargs):
+            captured["should_continue"] = _kwargs.get("should_continue")
+            captured["other"] = other
+            return {"status": "SUCCESS"}
+
+    fake_module._Puller = _Puller
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+
+    from scripts import hermes_operator
+
+    sentinel = lambda: True  # noqa: E731
+    monkeypatch.setitem(
+        hermes_operator._SOURCE_REGISTRY,
+        "should_continue_source",
+        {
+            "mod": module_name,
+            "cls": "_Puller",
+            "pull_kwargs": {"should_continue": sentinel, "other": lambda: "resolved"},
+        },
+    )
+
+    hermes_fixers._retry_source("should_continue_source", MagicMock())
+
+    assert captured["should_continue"] is sentinel  # untouched, not called
+    assert captured["other"] == "resolved"  # a normal callable WAS resolved
+
+
+def test_catalog_to_registry_eia_maps_to_eia_not_fred() -> None:
+    """2026-09-27 review: this used to map "EIA" -> "fred", so a REPULL/
+    retry for the "EIA" source silently pulled FRED's data under EIA's
+    name instead of raising or resolving to EIAPuller."""
+    assert hermes_fixers._CATALOG_TO_REGISTRY["EIA"] == "eia"
+
+
+def test_source_overrides_pops_api_key_for_eia() -> None:
+    """EIAPuller.__init__ only accepts db_engine (it reads EIA_API_KEY from
+    os.environ itself) -- PULLER_REGISTRY's "eia" entry carries
+    "api_key": "EIA_API_KEY" for the SCHEDULER's own fail-closed check
+    (SmartScheduler._build_puller_instance), but
+    hermes_fixers._resolve_puller's OLDER ctor-kwargs convention would
+    otherwise pass that straight through as an EXPLICIT kwarg, raising
+    `TypeError: EIAPuller.__init__() got an unexpected keyword argument
+    'api_key'` on every REPULL/retry. `_SOURCE_OVERRIDES["eia"] =
+    {"api_key": None}` pops it back out of the DERIVED registry (see
+    `_build_source_registry`'s `if value is None: entry.pop(field, None)`)
+    without touching PULLER_REGISTRY / the scheduler's own copy."""
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+    from scripts import hermes_operator
+
+    puller_entry = next(p for p in PULLER_REGISTRY if p["name"] == "eia")
+    assert puller_entry["api_key"] == "EIA_API_KEY"  # scheduler side: unchanged
+
+    assert "api_key" not in hermes_operator._SOURCE_REGISTRY["eia"]
+
+
+def test_resolve_puller_for_eia_does_not_pass_api_key_kwarg(monkeypatch) -> None:
+    """End-to-end through `_resolve_puller`: building an "eia" puller
+    instance must not raise from an unexpected `api_key` ctor kwarg."""
+    from scripts import hermes_operator
+
+    captured: dict = {}
+
+    class _FakeEIAPullerCls:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    module_name = "_grid_test_eia_ctor"
+    fake_module = ModuleType(module_name)
+    fake_module.EIAPuller = _FakeEIAPullerCls
+    monkeypatch.setitem(sys.modules, module_name, fake_module)
+    monkeypatch.setitem(
+        hermes_operator._SOURCE_REGISTRY,
+        "eia",
+        {**hermes_operator._SOURCE_REGISTRY["eia"], "mod": module_name, "cls": "EIAPuller"},
+    )
+
+    puller, _method, _kwargs = hermes_fixers._resolve_puller("eia", MagicMock())
+
+    assert isinstance(puller, _FakeEIAPullerCls)
+    assert "api_key" not in captured
+    assert "db_engine" in captured

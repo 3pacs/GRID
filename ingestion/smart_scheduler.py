@@ -80,10 +80,17 @@ def _finra_short_volume_trade_date() -> date:
     the latest one that can exist yet.
 
     Bounded, documented limitation: this rolls back over weekends only,
-    with no market-holiday calendar. A holiday trade_date is not an
-    error -- FINRA still publishes a header+trailer-only file for
-    no-trading days (module docstring), so the puller returns SUCCESS
-    with 0 rows inserted rather than failing.
+    with no market-holiday calendar. A market holiday is NOT the same
+    case as the weekend roll above: FINRA's "still publishes a
+    header+trailer-only file for no-trading days" guarantee (module
+    docstring quote) is about a file that GOT published, just with zero
+    data rows -- it says nothing about whether a file exists AT ALL for a
+    day the exchanges never opened. In practice a holiday trade_date can
+    come back as a plain HTTP 403/404 (no file was ever created for that
+    date), which ``FINRAShortVolumePuller.pull``/``pull_recent`` now
+    treats as SKIPPED rather than a failure (see that method's
+    docstring) -- so a holiday landing here just means one extra SKIPPED
+    date in the catch-up window, not an error.
     """
     try:
         from zoneinfo import ZoneInfo
@@ -136,8 +143,54 @@ def _sec_ftd_latest_published_half(today: date | None = None) -> dict[str, str]:
     return {"yyyymm": yyyymm, "half": half}
 
 
+def _sec_ftd_published_halves_since(
+    lookback_months: int = 2, today: date | None = None
+) -> list[dict[str, str]]:
+    """Every published SEC FTD half-month period in the last ~lookback_months
+    months, oldest first.
+
+    Same publish-date model as :func:`_sec_ftd_latest_published_half` (see
+    its docstring for the exact SEC quote this rolls against), but returns
+    ALL published halves in the window instead of only the most recent
+    one -- used by :class:`_SECFTDSchedulerAdapter` to feed
+    ``SECFTDPuller.pull_recent``'s catch-up loop, so a missed tick (a
+    deploy restart mid-tick, a transient network failure, the source
+    simply not existing yet in ``source_catalog`` on the day it was first
+    registered) does not silently drop a whole half-month forever the way
+    a single "just the latest half" call would.
+    """
+    today = today or date.today()
+    candidates: list[tuple[date, str, str]] = []
+    for back in range(lookback_months + 2):  # +2 months slack: a half's
+        # publish date can land in the month AFTER the one it covers.
+        total = (today.year * 12 + (today.month - 1)) - back
+        y, m = divmod(total, 12)
+        m += 1
+        yyyymm = f"{y:04d}{m:02d}"
+        last_day = calendar.monthrange(y, m)[1]
+        publish_a = date(y, m, last_day)
+        next_total = y * 12 + (m - 1) + 1
+        ny, nm = divmod(next_total, 12)
+        nm += 1
+        publish_b = date(ny, nm, 15)
+        candidates.append((publish_a, yyyymm, "a"))
+        candidates.append((publish_b, yyyymm, "b"))
+    cutoff = today - timedelta(days=31 * lookback_months)
+    published = sorted(c for c in candidates if cutoff <= c[0] <= today)
+    return [{"yyyymm": yyyymm, "half": half} for (_pub, yyyymm, half) in published]
+
+
 class _LMEWarehouseSchedulerAdapter:
     """Fetch-then-save shim for LMEWarehousePuller.
+
+    NOT in ``PULLER_REGISTRY`` (2026-09-27 review): both the JSON-probe and
+    HTML-report LME URLs returned HTTP 403 from grid-svr when checked live
+    -- registering this would just burn a slot every 24h returning
+    ``{"fetched": 0, ...}`` forever. Kept defined (unregistered) rather
+    than deleted so the fetch-then-save shape is still available/testable
+    if a working LME endpoint is found later; see
+    ``ingestion/altdata/lme_warehouse.py``'s module docstring for the
+    fallback chain this wraps.
 
     ``LMEWarehousePuller.pull()`` only fetches/parses -- it does not write
     to ``raw_series`` on its own (see its ``save_to_db()``). Every
@@ -166,7 +219,7 @@ class _LMEWarehouseSchedulerAdapter:
 
 
 class _SECFTDSchedulerAdapter:
-    """Config-gated, half-month-rolling shim for SECFTDPuller.
+    """Config-gated, half-month-catch-up shim for SECFTDPuller.
 
     ``SECFTDPuller.pull()`` raises ``RuntimeError`` when
     ``settings.SEC_USER_AGENT`` is unset (SEC requires a descriptive
@@ -176,9 +229,14 @@ class _SECFTDSchedulerAdapter:
     "mitigation 2" docstring); an uncaught exception instead lands as a
     FAILED result with an escalating cooldown. This adapter turns the
     missing-config case into a clean SKIPPED with an operator-actionable
-    reason, and — only once configured — rolls ``yyyymm``/``half`` to the
-    most recently published period instead of the unapplied patch's fixed
-    placeholder (``{"yyyymm": "202608", "half": "b"}``).
+    reason, and — only once configured — feeds
+    ``SECFTDPuller.pull_recent`` every published half-month in the last
+    ~2 months (see :func:`_sec_ftd_published_halves_since`) instead of
+    either the unapplied patch's fixed placeholder
+    (``{"yyyymm": "202608", "half": "b"}``) or a single latest-half call
+    -- a 24h cadence (see PULLER_REGISTRY) that only ever tried the
+    latest half would silently never retry a half that failed or was
+    missed.
     """
 
     def __init__(self, db_engine: Engine) -> None:
@@ -200,8 +258,8 @@ class _SECFTDSchedulerAdapter:
                     "puller can run."
                 ),
             }
-        period = _sec_ftd_latest_published_half()
-        return self._puller.pull(yyyymm=period["yyyymm"], half=period["half"])
+        periods = _sec_ftd_published_halves_since(lookback_months=2)
+        return self._puller.pull_recent(periods=periods)
 
 
 # ── Puller Registry ──────────────────────────────────────────────────────
@@ -369,10 +427,21 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # See the "Wave 1 activation helpers" comment above PULLER_REGISTRY for
     # why these are registered here and not via the two .patch files in
     # docs/handoffs/2026-09-18/ (which target the non-live scheduler.py).
-    {"name": "EIA_Energy",        "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
-    {"name": "LME_Warehouse",     "mod": "ingestion.smart_scheduler",         "cls": "_LMEWarehouseSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
-    {"name": "FINRA_Short_Volume","mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull", "freq_h": 24, "timeout_s": 60, "kwargs": {"trade_date": _finra_short_volume_trade_date}},
-    {"name": "SEC_FTD",           "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 336, "timeout_s": 60},
+    #
+    # Registry ``name`` MUST match the source_catalog name lower-cased --
+    # ``_load_state_from_db`` keys restart state by ``name.lower()`` and
+    # ``_update_last_pull`` writes back the same way. Confirmed against
+    # grid-svr (read-only, name-only): the existing "EIA" row lower()s to
+    # "eia"; "FINRA_SHORT_VOLUME" and "SEC_FTD" don't exist yet and will be
+    # auto-created (BasePuller._resolve_source_id) with exactly the puller
+    # classes' own SOURCE_NAME the first time each runs, which already
+    # lower()s to "finra_short_volume" / "sec_ftd". LME_Warehouse is
+    # deliberately NOT registered here at all -- see
+    # _LMEWarehouseSchedulerAdapter's docstring (both LME URLs 403 from
+    # grid-svr).
+    {"name": "eia",                "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
+    {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
+    {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
 ]
 
 # How many pullers to run per tick (keeps cycles short)
@@ -674,6 +743,46 @@ class SmartScheduler:
                 result["status"] = "SKIPPED"
                 result["reason"] = out.get("skipped_reason", "puller reported SKIPPED")
                 result["detail"] = str(out)[:200]
+                return result
+
+            # Mitigation 3 (2026-09-27 review of PR #685): a puller's own
+            # returned dict can ALSO self-report failure -- an explicit
+            # {"status": "FAILED", ...} (every puller in ingestion/altdata/
+            # uses this shape on a fetch/parse error) or, as a defensive
+            # fallback for a puller that doesn't set "status" at all, a
+            # {"rows_inserted": 0, "error": ...}-shaped result. Before this
+            # fix, EVERYTHING that reached this line except an explicit
+            # SKIPPED was recorded as SUCCESS regardless of what the puller
+            # actually reported -- so a puller that ran, hit an error, and
+            # returned {"status": "FAILED", "error": ...} still advanced
+            # last_pull_at and reset its cooldown as if it had succeeded.
+            # "PARTIAL" (some-but-not-all of a puller's series/items failed
+            # -- e.g. EIAPuller.pull when only one of Brent/WTI fetched)
+            # is treated the same as FAILED here: SmartScheduler's own
+            # vocabulary (this class, get_status(), tick()'s summary) only
+            # ever distinguishes SUCCESS / SKIPPED / FAILED, so a puller
+            # that wants "retry the still-missing part on the next cheap
+            # cooldown-gated tick" reports PARTIAL and gets that FAILED-like
+            # treatment (no last_pull_at advance, cooldown applies) even
+            # though the rows it DID insert are already committed.
+            reported_status = out.get("status") if isinstance(out, dict) else None
+            self_reported_failure = (
+                reported_status in ("FAILED", "PARTIAL")
+                or (
+                    isinstance(out, dict)
+                    and reported_status is None
+                    and out.get("rows_inserted") == 0
+                    and "error" in out
+                )
+            )
+            if self_reported_failure:
+                result["status"] = reported_status or "FAILED"
+                result["error"] = str(
+                    out.get("error", f"puller reported {result['status']}")
+                )[:200]
+                result["detail"] = str(out)[:200]
+                # Deliberately NOT calling self._update_last_pull(name) --
+                # this source did not have a clean, complete run.
                 return result
 
             result["status"] = "SUCCESS"

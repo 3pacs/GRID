@@ -113,13 +113,41 @@ class EIAPuller(BasePuller):
         return resp.json().get("response", {}).get("data", [])
 
     def pull(self, days_back: int = 90) -> dict[str, Any]:
-        """Pull recent EIA spot prices for Brent and WTI."""
+        """Pull recent EIA spot prices for Brent and WTI.
+
+        Returns:
+            dict with ``status``:
+
+            - ``"FAILED"`` when EVERY series facet's fetch failed (nothing
+              was inserted this call) -- e.g. an expired/invalid API key,
+              EIA's API down, or a network partition.
+            - ``"PARTIAL"`` when SOME (not all) facets failed -- rows from
+              the facet(s) that DID succeed are already committed, but
+              this call was not a clean run. SmartScheduler's own
+              vocabulary only distinguishes SUCCESS/SKIPPED/FAILED (see
+              ``SmartScheduler._run_puller``'s "Mitigation 3" docstring),
+              so this is treated the same as FAILED at the scheduler layer
+              -- no ``last_pull_at`` advance, cooldown applies -- so the
+              still-missing facet gets retried on the next cheap tick
+              instead of waiting a full ``freq_h``.
+            - ``"SUCCESS"`` when every facet's fetch succeeded (this can
+              still mean ``rows_inserted == 0`` if every row was already
+              stored -- that is a normal idempotent no-op, not a failure).
+
+            Before this fix, a total fetch failure across BOTH facets
+            still returned ``{"status": "SUCCESS", "rows_inserted": 0}``
+            -- indistinguishable from "ran cleanly, nothing new to
+            insert" -- which fed straight into
+            ``SmartScheduler._run_puller``'s old bug of trusting any
+            non-SKIPPED dict as SUCCESS (see that method's docstring).
+        """
         if not self._api_key:
             return {"status": "FAILED", "rows_inserted": 0, "error": "EIA_API_KEY not set"}
 
         end_str = date.today().isoformat()
         start_str = (date.today() - timedelta(days=days_back)).isoformat()
         total = 0
+        failed_facets: list[str] = []
 
         for facet, suffix in _SERIES_MAP.items():
             sid = f"{_SERIES_PREFIX}.{suffix}"
@@ -136,6 +164,7 @@ class EIAPuller(BasePuller):
                     f=facet,
                     e=_redact_api_key(str(exc)),
                 )
+                failed_facets.append(facet)
                 continue
 
             with self.engine.begin() as conn:
@@ -164,6 +193,19 @@ class EIAPuller(BasePuller):
             time.sleep(1.0)
 
         log.info("EIA: {n} rows inserted", n=total)
+
+        if len(failed_facets) == len(_SERIES_MAP):
+            return {
+                "status": "FAILED",
+                "rows_inserted": total,
+                "error": f"every facet fetch failed: {failed_facets}",
+            }
+        if failed_facets:
+            return {
+                "status": "PARTIAL",
+                "rows_inserted": total,
+                "error": f"facet fetch failed: {failed_facets}",
+            }
         return {"status": "SUCCESS", "rows_inserted": total}
 
 
