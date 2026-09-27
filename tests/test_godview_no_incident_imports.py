@@ -55,6 +55,7 @@ def _is_incident(name: str) -> bool:
 def _scanned_files() -> list[pathlib.Path]:
     files = sorted((REPO / "godview").rglob("*.py"))
     files.append(REPO / "scripts" / "run_godview_writers.py")
+    files.append(REPO / "api" / "routers" / "godview.py")  # G8 API
     return files
 
 
@@ -127,5 +128,8 @@ def test_no_tracked_file_at_an_incident_path_or_named_god_view():
     ).stdout.splitlines()
     at_incident = sorted(set(tracked) & set(INCIDENT_PATHS))
     assert not at_incident, f"tracked file collides with an untracked incident file: {at_incident}"
-    named = [t for t in tracked if t.startswith(("godview/", "scripts/run_godview")) and "god_view" in t]
+    named = [
+        t for t in tracked
+        if t.startswith(("godview/", "scripts/run_godview", "api/routers/godview")) and "god_view" in t
+    ]
     assert not named, named

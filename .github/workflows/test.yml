@@ -284,6 +284,26 @@ jobs:
             exit 1
           fi
 
+      # God view G8 API (api/routers/godview.py + godview/read_model.py), on
+      # the real G2 schema: pre-G2 = schema_not_migrated, legacy rows never
+      # served, PIT by available_at / finished_at, stale / partial / ledger
+      # reasons, modeled GEX label, the G3 writer's rows round-tripping, and
+      # every statement the API issues being a SELECT. A skip must fail this
+      # step (same anchored grep as G3's step).
+      - name: Godview API read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_godview_api_readonly_pg.py -q -rA | tee /tmp/grid-godview-g8-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g8-pg.txt; then
+            echo "::error::Godview API read-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Snapshot GET PostgreSQL read contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
