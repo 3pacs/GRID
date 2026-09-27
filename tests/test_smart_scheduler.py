@@ -7,6 +7,7 @@ import pytest
 
 from ingestion.altdata.cftc_markets import compute_release
 from ingestion.smart_scheduler import (
+    _CFTC_ET,
     MissingPullerApiKey,
     SmartScheduler,
     _cftc_cot_is_due,
@@ -275,25 +276,50 @@ _HOLIDAY_RELEASE = _release_plus_margin(_HOLIDAY_REPORT_DATE)  # Mon 2026-07-06 
 assert compute_release(_HOLIDAY_REPORT_DATE).holiday_shifted is True
 
 
-def test_current_report_date_maps_the_week_to_its_tuesday() -> None:
-    # Tue..Sun of a week all resolve to that week's own Tuesday; Monday
-    # resolves to the PRIOR week's Tuesday (this week's report isn't out).
+def test_current_report_date_matches_this_weeks_tuesday_once_released() -> None:
+    """From the moment of an ordinary week's own release through the
+    following Monday (the next Tuesday's report isn't due yet), the
+    current report is that week's Tuesday.
+    """
+    tuesday = date(2026, 9, 22)  # ordinary EDT week, release Fri 2026-09-25
+    release_at = compute_release(tuesday).release_at
+    for probe in (
+        release_at,
+        release_at + timedelta(hours=6),  # later Friday
+        release_at + timedelta(days=1),  # Saturday
+        release_at + timedelta(days=2),  # Sunday
+        release_at + timedelta(days=3),  # Monday
+    ):
+        assert _cftc_current_report_date(probe) == tuesday
+
+
+def test_current_report_date_falls_back_to_last_released_report_before_this_weeks() -> None:
+    """Before this week's own release, "current" falls back to whichever
+    report actually released most recently (last week's). This is
+    functionally harmless for _cftc_cot_is_due -- last week's retry window
+    is long closed either way -- but pins the fallback's own behavior.
+    """
     tuesday = date(2026, 9, 22)
-    for offset in range(6):  # Tue..Sun
-        assert _cftc_current_report_date(tuesday + timedelta(days=offset)) == tuesday
-    assert _cftc_current_report_date(date(2026, 9, 28)) == tuesday  # next Monday
+    prior_tuesday = date(2026, 9, 15)
+    release_at = compute_release(tuesday).release_at
+    for probe in (release_at - timedelta(minutes=1), release_at - timedelta(days=3)):
+        assert _cftc_current_report_date(probe) == prior_tuesday
 
 
-def test_current_report_date_holds_through_a_holiday_shifted_week() -> None:
-    # Every ET calendar day from the report Tuesday through the shifted
-    # Monday release still maps to that same report_date -- the mapping is
-    # purely calendar-based; compute_release (not this function) is what
-    # knows the release itself moved.
-    for offset in range(7):  # Tue 06-30 .. Mon 07-06 inclusive (7 days)
-        assert (
-            _cftc_current_report_date(_HOLIDAY_REPORT_DATE + timedelta(days=offset))
-            == _HOLIDAY_REPORT_DATE
-        )
+def test_current_report_date_anchors_on_holiday_shifted_release_not_weekday() -> None:
+    """The coordinator's regression: on the Tuesday that follows a
+    holiday-shifted Monday release, the current report must still be the
+    one that just released (06-30) -- not "itself" (07-07, a naive
+    weekday match, whose own release is the FOLLOWING Friday and hasn't
+    happened). This is what keeps the retry window pointed at the report
+    that was really last released, however far its holiday shift moved it.
+    """
+    monday_release = compute_release(_HOLIDAY_REPORT_DATE).release_at  # Mon 2026-07-06
+    genuine_tuesday = monday_release + timedelta(hours=20)  # 2026-07-07, ET morning
+    assert genuine_tuesday.astimezone(_CFTC_ET).date() == date(2026, 7, 7)  # sanity: really Tuesday
+
+    assert _cftc_current_report_date(monday_release) == _HOLIDAY_REPORT_DATE
+    assert _cftc_current_report_date(genuine_tuesday) == _HOLIDAY_REPORT_DATE
 
 
 def test_cftc_cot_not_due_before_release_plus_margin_edt() -> None:
@@ -383,10 +409,13 @@ def test_cftc_cot_holiday_shifted_week_is_due_on_the_shifted_day_not_friday() ->
 
     assert _cftc_cot_is_due(None, _HOLIDAY_RELEASE - timedelta(minutes=1)) is False
     assert _cftc_cot_is_due(None, _HOLIDAY_RELEASE) is True
-    # Retry still available the next ET day (Tuesday 07-07) before the new
-    # week's own Tuesday report_date takes over mid-day.
-    early_tuesday = _HOLIDAY_RELEASE + timedelta(hours=2)
-    assert _cftc_cot_is_due(_HOLIDAY_RELEASE - timedelta(days=7), early_tuesday) is True
+    # Retry still available on the genuine Tuesday ET day after the
+    # shifted Monday release. (+2h is still Monday in ET -- the previous
+    # version of this test used that offset and never actually exercised
+    # the Tuesday-retry path; +20h lands in ET morning on the 7th.)
+    genuine_tuesday = _HOLIDAY_RELEASE + timedelta(hours=20)
+    assert genuine_tuesday.astimezone(_CFTC_ET).date() == date(2026, 7, 7)
+    assert _cftc_cot_is_due(_HOLIDAY_RELEASE - timedelta(days=7), genuine_tuesday) is True
 
 
 def test_is_due_dispatches_cftc_cot_through_the_release_gate() -> None:

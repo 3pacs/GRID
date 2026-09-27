@@ -86,31 +86,59 @@ CFTC_RELEASE_MARGIN_MINUTES = 15  # grace past the scheduled 15:30 ET release
 CFTC_RELEASE_RETRY_DAYS = 1  # retry through the ET calendar day after release
 
 
-def _cftc_current_report_date(today_et: date) -> date:
-    """The Tuesday report_date whose weekly release covers ``today_et``.
+def _cftc_current_report_date(now: datetime) -> date:
+    """The report_date whose scheduled release governs ``now``.
 
-    Reports are always for a Tuesday. On Mon this is last week's Tuesday
-    (this week's report doesn't exist yet); Tue-Sun it's this week's.
+    Chosen by release *anchor*, not weekday arithmetic: the candidates are
+    the Tuesday of "this" America/New_York week and the Tuesday of the
+    week before, and whichever candidate's
+    ``cftc_markets.compute_release().release_at`` is the most recent one
+    at-or-before ``now`` wins. Plain "map any Tuesday to itself" arithmetic
+    breaks once a holiday shifts a release onto the Monday/Tuesday that
+    opens the calendar week *after* the report's own Tuesday: on that
+    Tuesday, naive weekday arithmetic would treat it as the start of a
+    brand-new (not-yet-due) cycle instead of the retry day for the report
+    that just released the day before. Anchoring on the actual release
+    time keeps the retry window pointed at the report that was really last
+    released, however far its holiday shift moved it. Falls back to the
+    current week's own (not-yet-released) Tuesday when neither candidate
+    has released yet — the ordinary "too early" case, where the fallback's
+    own release_at simply isn't reached, so the gate below still says
+    "not due" for the right reason.
     """
-    days_since_tuesday = (today_et.weekday() - 1) % 7  # Mon=0 .. Sun=6, Tue=1
-    return today_et - timedelta(days=days_since_tuesday)
+    from ingestion.altdata.cftc_markets import compute_release
+
+    today_et = now.astimezone(_CFTC_ET).date()
+    this_tuesday = today_et - timedelta(days=(today_et.weekday() - 1) % 7)  # Tue=1
+
+    best_report_date = this_tuesday
+    best_release_at: datetime | None = None
+    for candidate in (this_tuesday, this_tuesday - timedelta(days=7)):
+        release = compute_release(candidate)
+        if release.release_at is None or release.release_at > now:
+            continue
+        if best_release_at is None or release.release_at > best_release_at:
+            best_release_at = release.release_at
+            best_report_date = candidate
+    return best_report_date
 
 
 def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
     """Fail-closed weekly release gate for cftc_cot.
 
-    Due from the current week's scheduled ``release_at`` (holiday- and
-    DST-aware, via ``cftc_markets.compute_release``) through the end of the
-    next America/New_York calendar day, as long as no success has landed
-    since that release_at. Never due before release_at, and never due once
-    the retry window has elapsed, no matter how stale — a missed week waits
-    for the next Tuesday report's own release rather than firing off-
-    schedule.
+    Due from the current report's scheduled ``release_at`` (holiday- and
+    DST-aware, via ``cftc_markets.compute_release``, and selected by
+    release anchor via ``_cftc_current_report_date`` so a holiday-shifted
+    release is still "current" through its own retry day) through the end
+    of the next America/New_York calendar day, as long as no success has
+    landed since that release_at. Never due before release_at, and never
+    due once the retry window has elapsed, no matter how stale — a missed
+    week waits for the next Tuesday report's own release rather than
+    firing off-schedule.
     """
     from ingestion.altdata.cftc_markets import compute_release
 
-    now_et = now.astimezone(_CFTC_ET)
-    report_date = _cftc_current_report_date(now_et.date())
+    report_date = _cftc_current_report_date(now)
     release = compute_release(report_date)
     if release.release_at is None:
         # compute_release() only returns None for a non-Tuesday report_date;
