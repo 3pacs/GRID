@@ -214,6 +214,7 @@ def _score_signals(engine: Engine, days: int = 7) -> SentimentComponent:
             ), {"days": days}).fetchall()
 
             for signal_type, trust in rows:
+                trust = float(trust or 0)
                 if signal_type in BULLISH_SIGNALS:
                     bull_score += trust
                     total += 1
