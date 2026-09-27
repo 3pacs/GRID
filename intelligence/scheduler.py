@@ -1078,11 +1078,11 @@ def run_intelligence_loop() -> None:
             from intelligence.thesis_invalidation_monitor import run_monitor
             result = run_monitor(_ge())
             log.info(
-                "thesis invalidation: {t} theses, {i} invalidated, "
-                "{s} size-down",
-                t=result.theses_checked,
-                i=len(result.invalidations),
-                s=sum(1 for e in result.invalidations if e.size_down_applied),
+                "thesis invalidation: {t} predictions scanned, "
+                "{i} triggered, {e} errors",
+                t=result.predictions_scanned,
+                i=result.triggered_count,
+                e=len(result.errors),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("thesis invalidation hourly failed: {e}", e=str(exc))
