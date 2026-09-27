@@ -320,6 +320,12 @@ class GovContractsPuller(BasePuller):
                     "Award Amount",
                     "Total Outlays",
                     "Description",
+                    # GD-FIX: "Start Date" is the period-of-performance start,
+                    # which USASpending can carry as a future date relative to
+                    # the award action itself. "Action Date" is when the
+                    # award/modification was actually signed and is what
+                    # _normalize_award uses as the event date below.
+                    "Action Date",
                     "Start Date",
                     "End Date",
                     "Awarding Agency",
@@ -385,11 +391,24 @@ class GovContractsPuller(BasePuller):
         if not award_id:
             return None
 
-        # Parse start date
-        start_str = raw.get("Start Date", "")
-        try:
-            award_date = date.fromisoformat(start_str) if start_str else date.today()
-        except ValueError:
+        # GD-FIX: the event date used to be "Start Date" (period-of-
+        # performance start), which USASpending can report in the future
+        # relative to when the award was actually made — the plan's
+        # evidence found rows with Start Date up to 2027-02-01. "Action
+        # Date" (when the award/modification was signed) is the honest
+        # event date; when the API doesn't return one, fall back to the
+        # ingestion date (first_seen) rather than a possibly-future Start
+        # Date. Start Date/End Date are still kept in the payload below as
+        # descriptive fields, just never used as the event timestamp.
+        action_str = raw.get("Action Date", "")
+        award_date = None
+        if action_str:
+            try:
+                award_date = date.fromisoformat(str(action_str)[:10])
+            except (ValueError, TypeError):
+                award_date = None
+        award_date_basis = "action_date" if award_date is not None else "first_seen"
+        if award_date is None:
             award_date = date.today()
 
         return {
@@ -400,6 +419,8 @@ class GovContractsPuller(BasePuller):
             "total_outlays": float(raw.get("Total Outlays", 0) or 0),
             "description": (raw.get("Description") or "").strip()[:500],
             "award_date": award_date,
+            "award_date_basis": award_date_basis,
+            "start_date": raw.get("Start Date", ""),
             "end_date": raw.get("End Date", ""),
             "awarding_agency": (raw.get("Awarding Agency") or "").strip(),
             "awarding_sub_agency": (raw.get("Awarding Sub Agency") or "").strip(),
@@ -471,6 +492,8 @@ class GovContractsPuller(BasePuller):
             "total_outlays": award.get("total_outlays", 0),
             "description": award["description"],
             "award_date": obs_date.isoformat(),
+            "award_date_basis": award.get("award_date_basis", "first_seen"),
+            "start_date": award.get("start_date", ""),
             "end_date": award.get("end_date", ""),
             "awarding_agency": award["awarding_agency"],
             "awarding_sub_agency": award.get("awarding_sub_agency", ""),
@@ -526,6 +549,7 @@ class GovContractsPuller(BasePuller):
                     "description": award["description"][:200],
                     "naics_code": award.get("naics_code", ""),
                     "contract_type": award.get("contract_type", ""),
+                    "award_date_basis": award.get("award_date_basis", "first_seen"),
                 }),
             },
         )
