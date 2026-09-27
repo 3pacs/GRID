@@ -425,6 +425,47 @@ def test_process_filer_backfills_every_missed_quarter(holdings_engine, monkeypat
     assert report_dates == {date(2025, 12, 31), date(2026, 3, 31), date(2026, 6, 30)}
 
 
+def test_process_filer_sleeps_before_every_infotable_fetch(holdings_engine, monkeypatch):
+    """A sleep must precede *every* fetch_infotable call, including the first.
+
+    Regression test: the loop used to only sleep when i > 0, so the first
+    fetch_infotable per filer fired immediately after the submissions
+    request list_recent_13f_filings() just made — no delay between them.
+    """
+    q1 = m.LatestFiling(
+        accession="ACC-Q1", filing_date=date(2026, 5, 15),
+        report_date=date(2026, 3, 31), form="13F-HR",
+    )
+    q2 = m.LatestFiling(
+        accession="ACC-Q2", filing_date=date(2026, 8, 14),
+        report_date=date(2026, 6, 30), form="13F-HR",
+    )
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [q2, q1])
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        m.time, "sleep", lambda *_a, **_k: calls.append("sleep")
+    )
+
+    def fake_fetch(cik, filing):
+        calls.append("fetch")
+        return [{"cusip": "037833100", "value": 10, "shares": 1}]
+
+    monkeypatch.setattr(m, "fetch_infotable", fake_fetch)
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    ingestor._cusip_map._map = {"037833100": "AAPL"}
+
+    result = ingestor._process_filer(_FILER)
+
+    assert result.filings_processed == 2
+    # Every "fetch" must be immediately preceded by a "sleep" — including
+    # the very first one in the loop.
+    assert calls == ["sleep", "fetch", "sleep", "fetch"]
+
+
 def test_process_filer_up_to_date_skips_fetch_entirely(holdings_engine, monkeypatch):
     only_known = m.LatestFiling(
         accession="ACC-KNOWN", filing_date=date(2026, 2, 14),

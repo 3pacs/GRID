@@ -757,14 +757,18 @@ class SEC13FLiveIngestor:
         positions_matched = 0
         rows_written = 0
         last_filing = filings[0]
-        for i, filing in enumerate(new_filings):
+        for filing in new_filings:
             log.info(
                 "  -> new {form} filed={f} report={r} accession={a}",
                 form=filing.form, f=filing.filing_date,
                 r=filing.report_date, a=filing.accession,
             )
-            if i > 0:
-                time.sleep(_EDGAR_RATE_DELAY)
+            # Unconditional: EDGAR rate-limits per-second across *all*
+            # requests, not just infotable-to-infotable gaps. Without this,
+            # the first fetch_infotable per filer fires immediately after
+            # the submissions request that list_recent_13f_filings() just
+            # made, with no delay between them.
+            time.sleep(_EDGAR_RATE_DELAY)
 
             positions = fetch_infotable(filer.cik, filing)
             positions_total += len(positions)
