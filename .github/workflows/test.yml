@@ -218,6 +218,29 @@ jobs:
             exit 1
           fi
 
+      # God view G3 (godview/fed_liquidity.py): stacked on the G2 schema
+      # above. Proves B1 (RRP stored in millions, matching production's own
+      # convention), B2 (delta/peak history never reads a legacy row), B3
+      # (a legacy provenance-NULL row is never updated or displaced), plus
+      # arithmetic, missing-input skip, the H.4.1 publication-lag PIT gate
+      # (with its federal-holiday shift), and idempotent upsert. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it -- see
+      # the "SPY and Binance close" step's own comment above for the
+      # false-green trap a *_pg.py file left off this list falls into.
+      - name: Godview Fed liquidity writer PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_fed_liquidity_writer_pg.py -q -rA | tee /tmp/grid-godview-g3-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-godview-g3-pg.txt; then
+            echo "::error::Godview Fed liquidity writer PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Snapshot GET PostgreSQL read contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
