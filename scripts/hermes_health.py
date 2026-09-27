@@ -23,6 +23,9 @@ SOURCE_COOLDOWN_MINUTES = 30
 SOURCE_MAX_CONSECUTIVE_FAILS = 5
 TIMEOUT_BLACKLIST_HOURS = 24
 OPERATOR_ISSUE_DEDUPE_HOURS = 20
+# check_db_health counts QUARANTINED raw_series rows only up to this many, so a
+# large quarantine cannot turn the health check into a table-sized count.
+QUARANTINED_COUNT_CAP = 100_000
 
 
 def _ensure_issues_table(engine: Any) -> None:
@@ -790,6 +793,25 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                         "last_pull": r[1].isoformat() if r[1] else "never",
                     })
             result["stale_sources"] = stale
+
+            # QUARANTINED rows (migrations/versions/raw_series_quarantined_20260926.py)
+            # are neither observations nor failed pulls: the SUCCESS-only
+            # latest_pull above and the FAILED-only counts never see them, so
+            # they are reported on their own. Index-backed
+            # (idx_raw_series_status_source_pull) and capped by LIMIT.
+            row = conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM ("
+                    "  SELECT 1 FROM raw_series "
+                    "  WHERE pull_status = 'QUARANTINED' "
+                    "  LIMIT :cap"
+                    ") AS quarantined"
+                ),
+                {"cap": QUARANTINED_COUNT_CAP + 1},
+            ).fetchone()
+            quarantined = int(row[0]) if row else 0
+            result["quarantined_rows"] = min(quarantined, QUARANTINED_COUNT_CAP)
+            result["quarantined_rows_capped"] = quarantined > QUARANTINED_COUNT_CAP
 
     except Exception as exc:
         result["error"] = str(exc)

@@ -43,7 +43,12 @@ CREATE TABLE IF NOT EXISTS raw_series (
     pull_timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     value             DOUBLE PRECISION NOT NULL,
     raw_payload       JSONB,
-    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED'))
+    -- QUARANTINED: a once-accepted row later found untrustworthy. It is not an
+    -- observation (readers take SUCCESS only) and not a pull failure. Pullers
+    -- never write it. Production got it via
+    -- migrations/versions/raw_series_quarantined_20260926.py (added NOT VALID,
+    -- same constraint name raw_series_pull_status_check).
+    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED', 'QUARANTINED'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_series_composite
