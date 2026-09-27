@@ -1,7 +1,7 @@
 """Add resolved_series_retractions: point-in-time retraction of resolved rows.
 
 Revision ID: resolved_retractions_20260927
-Revises: raw_series_quarantined_20260926
+Revises: godview_writers_20260926
 
 Why: GRID-RERESOLVE-PLAN-20260927 found 70,633 (feature, obs_date) cells whose
 LATEST_AS_OF value in ``resolved_series`` is a wrong-instrument value with no
@@ -58,7 +58,7 @@ developer database without that role still migrates).
 from alembic import op
 
 revision = "resolved_retractions_20260927"
-down_revision = "raw_series_quarantined_20260926"
+down_revision = "godview_writers_20260926"
 branch_labels = None
 depends_on = None
 
