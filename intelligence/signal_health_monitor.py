@@ -348,11 +348,17 @@ def ensure_health_table(engine: Engine) -> None:
 def _fetch_series_stats(
     engine: Engine, series_id: str, *, lookback_days: int
 ) -> dict[str, Any]:
-    """Fetch the four signals needed for an audit in a single round trip.
+    """Fetch the four signals needed for an audit.
 
     Returns:
-        last_observation: most recent obs_date (date | None)
-        recent_row_count: rows in the lookback window
+        last_observation: most recent obs_date among pull_status = 'SUCCESS'
+            rows only (date | None). A QUARANTINED or FAILED row must not
+            advance this — it drives days_since_last / staleness below, and
+            a series whose newest rows are quarantined must show its true
+            (older) last-good date, not look freshly pulled.
+        recent_row_count: rows in the lookback window (any pull_status —
+            this one intentionally audits pull activity regardless of
+            status)
         nan_count: rows in the lookback window where value IS NULL
         latest_value: most recent non-null value (float | None)
         history_mean / history_std: trailing statistics excluding the latest row
@@ -368,10 +374,27 @@ def _fetch_series_stats(
     }
 
     with engine.connect() as conn:
+        # Freshness (last_obs): SUCCESS only -- a QUARANTINED or FAILED
+        # newest row must not inflate this, which is exactly what feeds
+        # days_since_last / staleness below.
+        last_obs_row = conn.execute(
+            text(
+                "SELECT MAX(obs_date) AS last_obs "
+                "FROM raw_series "
+                "WHERE series_id = :sid AND obs_date >= :cutoff "
+                "AND pull_status = 'SUCCESS'"
+            ),
+            {"sid": series_id, "cutoff": cutoff},
+        ).fetchone()
+        if last_obs_row is not None:
+            out["last_observation"] = last_obs_row[0]
+
+        # Pull-activity probe: every status, by design (see the docstring)
+        # -- this audits whether the puller is running at all, not data
+        # freshness, so it must not be filtered the same way as last_obs.
         row = conn.execute(
             text(
-                "SELECT MAX(obs_date) AS last_obs, "
-                "COUNT(*) AS row_count, "
+                "SELECT COUNT(*) AS row_count, "
                 "SUM(CASE WHEN value IS NULL THEN 1 ELSE 0 END) AS nan_count "
                 "FROM raw_series "
                 "WHERE series_id = :sid AND obs_date >= :cutoff"
@@ -379,9 +402,8 @@ def _fetch_series_stats(
             {"sid": series_id, "cutoff": cutoff},
         ).fetchone()
         if row is not None:
-            out["last_observation"] = row[0]
-            out["recent_row_count"] = int(row[1] or 0)
-            out["nan_count"] = int(row[2] or 0)
+            out["recent_row_count"] = int(row[0] or 0)
+            out["nan_count"] = int(row[1] or 0)
 
         # latest_value / history_mean / history_std feed anomaly thresholds
         # downstream — a QUARANTINED (migration #671) or FAILED row must not
