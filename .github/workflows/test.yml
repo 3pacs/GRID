@@ -248,6 +248,27 @@ jobs:
             exit 1
           fi
 
+      # God view G4 (godview/cftc_positioning.py) + G7 runner
+      # (scripts/run_godview_writers.py), on the G2 schema: code-keyed ids
+      # only, all legs from one market code, PIT windows (a later report never
+      # changes an earlier row), before-release gate, non-Tuesday report dates
+      # skipped explicitly, legacy rows never touched (partial status), ledger
+      # rows, and the runner's dry run rolling back rows and ledger alike. A
+      # skip must fail this step (same anchored grep as G3's step).
+      - name: Godview CFTC positioning writer and runner PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_cftc_positioning_writer_pg.py -q -rA | tee /tmp/grid-godview-g4-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g4-pg.txt; then
+            echo "::error::Godview CFTC positioning writer PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Snapshot GET PostgreSQL read contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
