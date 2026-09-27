@@ -38,13 +38,18 @@ and ``analysis.ledger_steered_exploration``):
   untestable ones at p = 1; BH-adjusted p-values over the same trials are
   reported;
 * holdout: Bonferroni over the frozen selections, same sign required; a
-  write-once output directory; ``promotion_allowed`` is always false.
+  write-once output directory; ``promotion_allowed`` is always false;
+* one shot, enforced through the hash-chained registry: no price is read
+  without a key, and the key exists only after ``inputs_frozen`` (every input
+  hash and ``as_of_ts``) and then ``discovery_opened`` / ``holdout_opened``
+  were appended to the chain; a second discovery or holdout is refused.
 
 Boundaries: no DB writes, no migrations, no timers. Prices are read only
 through ``store.observations.read_window`` with an explicit ``source=``, only
 for tickers in a frozen admitted-price manifest, never from a refused source
-(yfinance, the Kaggle bulk load). Insider events come from an off-DB file
-(the SEC Form 3/4/5 structured data sets, non-derivative transactions).
+(yfinance, the Kaggle bulk load). Insider events come from off-DB files
+(the SEC Form 3/4/5 structured data sets: non-derivative transactions for the
+purchases, the SUBMISSION table for Section 16 activity).
 Nothing here is a trading signal.
 """
 
@@ -382,6 +387,10 @@ OPTIONAL_COLUMNS: dict[str, tuple[str, ...]] = {
     "AMENDED": ("AMENDED", "IS_AMENDED"),
     "NONDERIV_TRANS_SK": ("NONDERIV_TRANS_SK", "TRANS_SK"),
 }
+#: The SUBMISSION table (one row per accession, or per accession x owner).
+SUBMISSION_COLUMNS: dict[str, tuple[str, ...]] = {
+    key: REQUIRED_COLUMNS[key] for key in ("ACCESSION_NUMBER", "FILING_DATE", "ISSUERCIK")
+}
 
 
 def _normalise(name: str) -> str:
@@ -478,10 +487,45 @@ class Form4Events:
         return digest(self.receipt)
 
 
+def section16_accessions(submissions: pd.DataFrame, issuers: Iterable[int] | None = None) -> tuple[pd.DataFrame, dict]:
+    """Every accession of the SUBMISSION table: (accession, issuer_cik, filing_date).
+
+    Pre-registration §2.1/§2.2: Section 16 activity is *every* accession of the
+    issuer -- any form type (3, 4, 5 and amendments), any code, holdings-only
+    Form 3s and derivative-only Form 4s included. The non-derivative
+    transaction table cannot supply that (it has rows only for accessions with a
+    non-derivative transaction line), so the activity comes from the SEC
+    SUBMISSION table (``derived/submissions.parquet``, built by
+    ``scripts/build_form345_submissions.py``). One row per accession; an
+    accession fanned out per reporting owner collapses.
+    """
+    frame = submissions.rename(columns=_normalise)
+    cols = _pick(frame, SUBMISSION_COLUMNS, True)
+    counts: dict[str, int] = {"submission_rows": int(len(frame))}
+    if issuers is not None:
+        wanted = {int(i) for i in issuers}
+        frame = frame[_to_int(frame[cols["ISSUERCIK"]]).isin(wanted).to_numpy()]
+        counts["submission_rows_in_issuer_filter"] = int(len(frame))
+    out = pd.DataFrame(
+        {
+            "accession": frame[cols["ACCESSION_NUMBER"]].astype("string").str.strip(),
+            "issuer_cik": _to_int(frame[cols["ISSUERCIK"]]),
+            "filing_date": parse_dates(frame[cols["FILING_DATE"]]),
+        }
+    )
+    valid = out["accession"].notna() & (out["accession"] != "") & out["issuer_cik"].notna() & out["filing_date"].notna()
+    counts["submission_rows_excluded_missing_accession_issuer_or_filing_date"] = int((~valid).sum())
+    out = out[valid.to_numpy()].drop_duplicates("accession").reset_index(drop=True)
+    out["issuer_cik"] = out["issuer_cik"].astype("int64")
+    counts["submission_accessions"] = int(len(out))
+    return out, counts
+
+
 def build_events(
     transactions: pd.DataFrame,
     owners: pd.DataFrame | None = None,
     *,
+    submissions: pd.DataFrame,
     inputs: dict | None = None,
     issuers: Iterable[int] | None = None,
 ) -> Form4Events:
@@ -491,8 +535,13 @@ def build_events(
     line x reporting owner, as in the derived file, which fans joint filings
     out once per owner). ``owners``: the REPORTINGOWNER table (accession, owner
     CIK) when the transactions file does not carry the owner CIK.
+    ``submissions``: the SUBMISSION table (every accession, see
+    :func:`section16_accessions`); required, because Section 16 activity is
+    defined over every accession, not only those with a non-derivative line.
     ``issuers``: optional issuer-CIK filter applied first (the sector universe).
     """
+    if submissions is None:
+        raise ValueError("the SUBMISSION table is required: Section 16 activity is every accession")
     frame = transactions.rename(columns=_normalise)
     cols = _pick(frame, REQUIRED_COLUMNS, True)
     pcols = _pick(frame, PURCHASE_COLUMNS, True)
@@ -551,9 +600,18 @@ def build_events(
         raise ValueError("no reporting-owner CIK: pass the REPORTINGOWNER table as owners")
     actors = owner_rows.dropna().groupby("accession")["owner_cik"].min().astype("int64")
 
-    # Section 16 activity: every accession with any row, any code or form type.
+    # Section 16 activity: every accession of the issuer (SUBMISSION table, any
+    # form type incl. holdings-only Form 3 and derivative-only Form 4), plus
+    # any transaction accession the submission table lacks (counted: it
+    # should be zero). Where both carry an accession, the submission row wins.
+    filed_accessions, submission_counts = section16_accessions(submissions, issuers)
+    counts.update(submission_counts)
+    from_transactions = base.drop_duplicates("accession")[["accession", "issuer_cik", "filing_date"]]
+    missing = ~from_transactions["accession"].isin(set(filed_accessions["accession"]))
+    counts["transaction_accessions_missing_from_submissions"] = int(missing.sum())
     activity = (
-        base.drop_duplicates("accession")[["issuer_cik", "filing_date"]]
+        pd.concat([filed_accessions, from_transactions[missing.to_numpy()]], ignore_index=True)
+        .drop_duplicates("accession")
         .assign(known_at=lambda d: filing_known_at(d["filing_date"]))
         [["issuer_cik", "known_at"]]
         .sort_values(["issuer_cik", "known_at"])
@@ -645,6 +703,8 @@ def build_events(
             "actor": "smallest reporting-owner CIK on the accession",
             "dedup": "(issuer CIK, transaction date, round(shares), round(price, 2)): earliest filing, smallest actor",
             "known_at": "filing date 22:00 America/New_York",
+            "section16_activity": "every accession of the SUBMISSION table (any form type, any code, "
+                                  "amended or not), plus transaction accessions missing from it",
         },
         "counts": counts,
         "purchases_sha256": digest(_records(purchases)),
@@ -678,9 +738,17 @@ def data_sha256(path: Path) -> str:
 
 
 def load_events(
-    path: Path, owners_path: Path | None = None, issuers: Iterable[int] | None = None
+    path: Path,
+    owners_path: Path | None = None,
+    issuers: Iterable[int] | None = None,
+    *,
+    submissions_path: Path,
 ) -> Form4Events:
-    inputs = {"transactions": {"name": Path(path).name, "sha256": data_sha256(path)}}
+    """Events from the derived non-derivative file plus the SUBMISSION table (both required)."""
+    inputs = {
+        "transactions": {"name": Path(path).name, "sha256": data_sha256(path)},
+        "submissions": {"name": Path(submissions_path).name, "sha256": data_sha256(submissions_path)},
+    }
     owners = None
     if owners_path is not None:
         owners = read_table(owners_path)
@@ -688,7 +756,13 @@ def load_events(
     if issuers is not None:
         issuers = sorted({int(i) for i in issuers})
         inputs["issuer_filter_sha256"] = digest(issuers)
-    return build_events(read_table(path, issuers), owners, inputs=inputs, issuers=issuers)
+    return build_events(
+        read_table(path, issuers),
+        owners,
+        submissions=read_table(submissions_path, issuers),
+        inputs=inputs,
+        issuers=issuers,
+    )
 
 
 # --- features --------------------------------------------------------------------------
@@ -876,26 +950,51 @@ class PriceManifest:
         manifest.validate()
         return manifest
 
+    def digest(self) -> str:
+        """Content hash of the manifest (what ``inputs_frozen`` pins)."""
+        return digest({**asdict(self), "admitted": list(self.admitted)})
+
 
 _PRICE_LOADER = object()
+_KEY_TOKEN = object()
+
+
+class DiscoveryKey:
+    """Proof that ``discovery_opened`` was appended to the registry chain.
+
+    Issued only by :func:`open_discovery`, after the chain showed a matching
+    ``inputs_frozen`` record and no earlier discovery. Carries the frozen
+    inputs (price-manifest digest, probe report, as_of_ts, ...) that every
+    discovery price read is checked against.
+    """
+
+    def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict) -> None:
+        if token is not _KEY_TOKEN:
+            raise TypeError("a DiscoveryKey is issued only by open_discovery")
+        self.inputs_frozen_sha256 = inputs_frozen_sha256
+        self.inputs = dict(inputs)
+        self.as_of_ts = stamp(inputs["as_of_ts"])
 
 
 class HoldoutKey:
-    """Proof that the holdout was opened with the flag and the pinned hash."""
+    """Proof that the holdout was opened with the flag, the pinned hash and a
+    ``holdout_opened`` record appended to the registry chain."""
 
-    def __init__(self, token: object, frozen_sha256: str) -> None:
+    def __init__(self, token: object, frozen_sha256: str, inputs: dict) -> None:
         if token is not _HOLDOUT_TOKEN:
             raise TypeError("a HoldoutKey is issued only by open_holdout")
         self.frozen_sha256 = frozen_sha256
+        self.inputs = dict(inputs)
+        self.as_of_ts = stamp(inputs["as_of_ts"])
 
 
 _HOLDOUT_TOKEN = object()
 
 
-def open_holdout(
+def check_holdout_request(
     frozen: dict, *, allow_holdout: bool, prereg_sha256: str, repo_root: Path = REPO
-) -> HoldoutKey:
-    """Refuse the holdout unless explicitly allowed with the matching pre-registration hash."""
+) -> dict:
+    """The holdout's non-registry preconditions (no side effect); returns the payload."""
     if allow_holdout is not True:
         raise PermissionError("holdout evaluation needs an explicit allow_holdout=True")
     if prereg_sha256 != PREREG_BODY_SHA256:
@@ -908,7 +1007,7 @@ def open_holdout(
         raise PermissionError("the discovery was not run under this pre-registration")
     if payload.get("state") != "DISCOVERY_FROZEN":
         raise PermissionError("no frozen discovery to evaluate")
-    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"])
+    return payload
 
 
 class PricePanel:
@@ -978,24 +1077,35 @@ def load_price_panel(
     *,
     start: date,
     as_of: date,
-    as_of_ts: datetime,
     window: str,
-    holdout_key: HoldoutKey | None = None,
+    key: DiscoveryKey | HoldoutKey,
 ) -> PricePanel:
-    """Read admitted closes, bounded so discovery never sees a price on/after the split."""
+    """Read admitted closes, bounded so discovery never sees a price on/after the split.
+
+    No price is read without a registry key: a :class:`DiscoveryKey` (the
+    chain carries ``inputs_frozen`` and now ``discovery_opened``) for the
+    discovery window, a :class:`HoldoutKey` (``holdout_opened``) for the
+    holdout. The manifest must be the frozen one and the read instant is the
+    frozen ``as_of_ts``.
+    """
     manifest.validate()
-    if as_of_ts.tzinfo is None:
-        raise ValueError("as_of_ts must carry a timezone")
     if window == "discovery":
+        if not isinstance(key, DiscoveryKey):
+            raise PermissionError("discovery prices need a DiscoveryKey from open_discovery")
         if as_of >= stamp(SPLIT).date():
             raise PermissionError("discovery reads stop before the split date")
     elif window == "holdout":
-        if not isinstance(holdout_key, HoldoutKey):
+        if not isinstance(key, HoldoutKey):
             raise PermissionError("holdout prices need a HoldoutKey from open_holdout")
         if as_of >= stamp(END).date():
             raise PermissionError("holdout reads stop before the end of the frozen window")
     else:
         raise ValueError("window must be discovery or holdout")
+    if manifest.digest() != key.inputs.get("price_manifest_sha256"):
+        raise PermissionError("price manifest differs from the one in inputs_frozen")
+    if manifest.probe_report_sha256 != key.inputs.get("probe_report_sha256"):
+        raise PermissionError("price manifest's probe report differs from the one in inputs_frozen")
+    as_of_ts = key.as_of_ts
     wanted = sorted(set(tickers) | {manifest.benchmark})
     refused = [t for t in wanted if t not in manifest.admitted]
     if refused:
@@ -1455,8 +1565,12 @@ class RunSpec:
         expected_k = VS1_RUN_K if self.sector == VS1_SECTOR else OTHER_SECTORS_RUN_K
         if self.run_k != expected_k or self.ledger_id != LEDGER_ID or self.ledger_q != LEDGER_Q:
             raise ValueError("ledger id, q and run index are pre-registered")
-        if self.perms < 999 or self.min_n < 30:
-            raise ValueError("invalid statistical settings")
+        # Pre-registration §6: 20,000 sign-flip draws, seed 20260927, 30 dates.
+        # Exactly these; any other value is a different (unregistered) test.
+        if (self.perms, self.seed, self.min_n) != (PERMS, SEED, MIN_N):
+            raise ValueError(
+                f"statistical settings are pre-registered: perms={PERMS}, seed={SEED}, min_n={MIN_N}"
+            )
 
     @property
     def alpha(self) -> float:
@@ -1694,19 +1808,64 @@ def planted_power(
     }
 
 
-def stage0_power(features: Mapping[str, np.ndarray], **settings) -> dict:
-    """Power per trial feature panel and target IC, and the pre-registered gate."""
+def power_settings() -> dict:
+    """The pre-registered Stage-0 settings (§10), recorded in and checked against power.json."""
+    return {
+        "sims": POWER_SIMS,
+        "perms": POWER_PERMS,
+        "seed": SEED,
+        "target_ics": list(POWER_TARGET_ICS),
+        "gate_ic": POWER_GATE_IC,
+        "gate_power": POWER_GATE,
+        "threshold": run_alpha(VS1_RUN_K) / len(trial_names()),
+        "min_n": MIN_N,
+    }
+
+
+def stage0_power(features: Mapping[str, np.ndarray]) -> dict:
+    """Power per trial feature panel and target IC, and the pre-registered gate.
+
+    Runs only at the pre-registered settings (:func:`power_settings`); there is
+    no override.
+    """
+    if set(features) != set(trial_names()):
+        raise ValueError("Stage-0 power needs exactly the declared trials' feature panels")
     table = {
-        trial: [planted_power(matrix, ic, **settings) for ic in POWER_TARGET_ICS]
-        for trial, matrix in features.items()
+        trial: [planted_power(features[trial], ic, sims=POWER_SIMS, perms=POWER_PERMS, seed=SEED)
+                for ic in POWER_TARGET_ICS]
+        for trial in trial_names()
     }
     primary = next(r for r in table[PRIMARY_TRIAL] if r["target_ic"] == POWER_GATE_IC)
     return {
         "table": table,
+        "settings": power_settings(),
         "gate": f"power(primary {PRIMARY_TRIAL}, IC {POWER_GATE_IC}) >= {POWER_GATE}",
         "gate_passed": primary["power"] >= POWER_GATE,
         "note": "feature data only; synthetic outcomes; idiosyncratic noise (optimistic)",
     }
+
+
+def verify_power(power: Mapping[str, Any]) -> None:
+    """Refuse a power file not computed at the pre-registered settings (§10)."""
+    if power.get("settings") != power_settings():
+        raise ValueError(
+            f"power file was not computed at the pre-registered settings "
+            f"(sims={POWER_SIMS}, perms={POWER_PERMS}, seed={SEED})"
+        )
+    table = power.get("table") or {}
+    if set(table) != set(trial_names()):
+        raise ValueError("power file must cover exactly the declared trials")
+    for trial, rows in table.items():
+        if [r.get("target_ic") for r in rows] != list(POWER_TARGET_ICS):
+            raise ValueError(f"{trial}: power rows must be the pre-registered target ICs")
+        for r in rows:
+            if r.get("sims") not in (POWER_SIMS, 0):  # 0 = too few usable dates, power 0
+                raise ValueError(f"{trial}: power row not run at {POWER_SIMS} simulations")
+            if r.get("sims") == 0 and r.get("power") != 0.0:
+                raise ValueError(f"{trial}: an unsimulated row must carry power 0")
+    primary = next(r for r in table[PRIMARY_TRIAL] if r["target_ic"] == POWER_GATE_IC)
+    if power.get("gate_passed") is not (primary["power"] >= POWER_GATE):
+        raise ValueError("power file's gate_passed disagrees with its primary power")
 
 
 def power_features(events: Form4Events, universe: pd.DataFrame, window: str = "discovery") -> dict[str, np.ndarray]:
@@ -1782,6 +1941,259 @@ def register(log_dir: Path, now: datetime, code_sha: str, *, repo_root: Path = R
             "promotion_allowed": False,
         }
         return log.append_locked(header + [record])
+
+
+# --- one-shot discovery and holdout, enforced through the registry chain ------------------
+#
+# Order of records a VS1 run appends to the registry (after ``preregistration``):
+#
+#   inputs_frozen     hashes of every input (before any price read; may be re-frozen
+#                     only while no discovery has been opened)
+#   discovery_opened  appended BEFORE the first discovery price read; a second
+#                     discovery is refused from here on, even if the first crashed
+#   discovery_frozen  the frozen discovery manifest's sha256
+#   holdout_opened    appended BEFORE the first holdout price read; needs the frozen
+#                     file to hash to the chain's discovery_frozen; a second open is refused
+#   holdout_result    the holdout result's sha256 and verdict state
+#
+# The price reader refuses to read without the key these steps issue.
+
+#: Inputs every ``inputs_frozen`` record must carry (the Stage-0 power file is
+#: hashed by content, :func:`digest`, so its write-once copy in the run
+#: directory hashes the same).
+FROZEN_INPUT_KEYS: tuple[str, ...] = (
+    "sector",
+    "price_manifest_sha256",
+    "probe_report_sha256",
+    "form4_sha256",
+    "submissions_sha256",
+    "issuer_map_sha256",
+    "power_sha256",
+    "accept_underpowered",
+    "as_of_ts",
+)
+#: Of those, the ones discovery and holdout recompute from the files they are
+#: given and must match exactly (``as_of_ts`` and ``accept_underpowered`` are
+#: taken from the record, never from the command line).
+OBSERVED_INPUT_KEYS: tuple[str, ...] = tuple(
+    k for k in FROZEN_INPUT_KEYS if k not in ("as_of_ts", "accept_underpowered")
+)
+
+
+def _is_hex64(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and not set(value) - HEX64
+
+
+def _record_sha256(record: dict) -> str:
+    from analysis.research_forward_log import canonical
+
+    return hashlib.sha256(canonical(record)).hexdigest()
+
+
+def _chain(log, prereg_sha256: str) -> list[dict]:
+    """Verified records of the registry; refuses a broken chain or a missing registration."""
+    check = log.verify_chain()
+    if not check["ok"]:
+        raise RuntimeError(f"registry chain is broken: {check['detail']}")
+    records = log.read_all()
+    if not any(r.get("kind") == "preregistration" and r.get("prereg_sha256") == prereg_sha256 for r in records):
+        raise PermissionError("this pre-registration is not registered (run the register stage)")
+    return records
+
+
+def _kind(records: list[dict], kind: str) -> list[dict]:
+    return [r for r in records if r.get("kind") == kind]
+
+
+def _check_observed(frozen_inputs: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
+    missing = [k for k in OBSERVED_INPUT_KEYS if k not in observed]
+    if missing:
+        raise ValueError(f"observed inputs lack {missing}")
+    differ = sorted(k for k in set(OBSERVED_INPUT_KEYS) | set(observed) if frozen_inputs.get(k) != observed.get(k))
+    if differ:
+        raise PermissionError(f"inputs differ from the inputs_frozen record: {differ}")
+
+
+def freeze_inputs(log_dir: Path, now: datetime, inputs: Mapping[str, Any], *,
+                  prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """Append ``inputs_frozen``: the hashes of every input, before any price read.
+
+    Refused once a discovery has been opened (the inputs of a run that has
+    read prices cannot change). A re-freeze before that supersedes the earlier
+    record (no price has been read under it).
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must carry a timezone")
+    missing = [k for k in FROZEN_INPUT_KEYS if k not in inputs]
+    if missing:
+        raise ValueError(f"inputs_frozen needs {missing}")
+    if inputs["sector"] != VS1_SECTOR:
+        raise ValueError("only the VS1 sector runs under this registry")
+    for k in FROZEN_INPUT_KEYS:
+        if k.endswith("_sha256") and not _is_hex64(inputs[k]):
+            raise ValueError(f"{k} must be a sha256 hex digest")
+    if not isinstance(inputs["accept_underpowered"], bool):
+        raise ValueError("accept_underpowered must be a boolean")
+    as_of_ts = stamp(inputs["as_of_ts"])
+    if as_of_ts > now:
+        raise ValueError("as_of_ts cannot be later than the freeze")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+        if _kind(records, "discovery_opened"):
+            raise PermissionError("a discovery was already opened: its inputs cannot be re-frozen")
+        previous = _kind(records, "inputs_frozen")
+        record = {
+            "kind": "inputs_frozen",
+            "run_at": now.isoformat(),
+            "prereg_sha256": prereg_sha256,
+            "inputs": dict(inputs),
+            "supersedes": _record_sha256(previous[-1]) if previous else None,
+            "promotion_allowed": False,
+        }
+        return log.append_locked([record])[0]
+
+
+def latest_frozen_inputs(log_dir: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """The current ``inputs_frozen`` inputs (read only; appends nothing)."""
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        frozen_inputs = _kind(_chain(log, prereg_sha256), "inputs_frozen")
+    if not frozen_inputs:
+        raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
+    return dict(frozen_inputs[-1]["inputs"])
+
+
+def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
+                   prereg_sha256: str = PREREG_BODY_SHA256) -> DiscoveryKey:
+    """One-shot discovery: check the chain, then append ``discovery_opened`` BEFORE any price read.
+
+    Requires an ``inputs_frozen`` record whose hashes equal ``observed`` (the
+    hashes of the files this run was given). Refused when any discovery was
+    already opened or frozen under this pre-registration.
+    """
+    if now.tzinfo is None:
+        raise ValueError("now must carry a timezone")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+        if _kind(records, "discovery_opened") or _kind(records, "discovery_frozen"):
+            raise PermissionError("discovery already ran under this pre-registration (one shot)")
+        frozen_inputs = _kind(records, "inputs_frozen")
+        if not frozen_inputs:
+            raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
+        current = frozen_inputs[-1]
+        _check_observed(current["inputs"], observed)
+        inputs_sha = _record_sha256(current)
+        log.append_locked([{
+            "kind": "discovery_opened",
+            "run_at": now.isoformat(),
+            "prereg_sha256": prereg_sha256,
+            "inputs_frozen_sha256": inputs_sha,
+            "promotion_allowed": False,
+        }])
+    return DiscoveryKey(_KEY_TOKEN, inputs_sha, current["inputs"])
+
+
+def seal_discovery(log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict, *,
+                   prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """Append ``discovery_frozen`` carrying the frozen discovery manifest's sha256."""
+    if not isinstance(key, DiscoveryKey):
+        raise PermissionError("sealing a discovery needs its DiscoveryKey")
+    payload = frozen.get("payload") or {}
+    if digest(payload) != frozen.get("sha256"):
+        raise ValueError("frozen discovery manifest does not hash to its sha256")
+    if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != key.inputs_frozen_sha256:
+        raise PermissionError("the discovery manifest does not carry this key's inputs_frozen hash")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+        opened = _kind(records, "discovery_opened")
+        if len(opened) != 1 or opened[0]["inputs_frozen_sha256"] != key.inputs_frozen_sha256:
+            raise PermissionError("no discovery_opened record for this key")
+        if _kind(records, "discovery_frozen"):
+            raise PermissionError("a discovery is already frozen (one shot)")
+        return log.append_locked([{
+            "kind": "discovery_frozen",
+            "run_at": now.isoformat(),
+            "prereg_sha256": prereg_sha256,
+            "inputs_frozen_sha256": key.inputs_frozen_sha256,
+            "discovery_sha256": frozen["sha256"],
+            "calibration": payload["calibration"]["state"],
+            "selected": [t["trial"] for t in payload["ledger"] if t["selected"]],
+            "promotion_allowed": False,
+        }])[0]
+
+
+def open_holdout(
+    frozen: dict,
+    *,
+    allow_holdout: bool,
+    prereg_sha256: str,
+    log_dir: Path,
+    now: datetime,
+    observed: Mapping[str, Any],
+    repo_root: Path = REPO,
+) -> HoldoutKey:
+    """One-shot holdout: explicit flag + pinned hash + the chain, then ``holdout_opened``.
+
+    The chain must hold exactly one ``discovery_frozen`` whose sha256 is the
+    frozen file's, the inputs must equal that discovery's ``inputs_frozen``,
+    and no holdout may have been opened. ``holdout_opened`` is appended before
+    the key (and so any holdout price) exists.
+    """
+    payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
+                                    repo_root=repo_root)
+    if now.tzinfo is None:
+        raise ValueError("now must carry a timezone")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+        sealed = _kind(records, "discovery_frozen")
+        if len(sealed) != 1:
+            raise PermissionError("the registry holds no single frozen discovery")
+        if sealed[0]["discovery_sha256"] != frozen["sha256"]:
+            raise PermissionError("the frozen discovery file is not the one the registry chain froze")
+        if _kind(records, "holdout_opened"):
+            raise PermissionError("the holdout was already opened (evaluated once)")
+        inputs_sha = sealed[0]["inputs_frozen_sha256"]
+        if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != inputs_sha:
+            raise PermissionError("the frozen discovery does not name the chain's inputs_frozen record")
+        matching = [r for r in _kind(records, "inputs_frozen") if _record_sha256(r) == inputs_sha]
+        if len(matching) != 1:
+            raise PermissionError("the discovery's inputs_frozen record is not in the chain")
+        _check_observed(matching[0]["inputs"], observed)
+        log.append_locked([{
+            "kind": "holdout_opened",
+            "run_at": now.isoformat(),
+            "prereg_sha256": prereg_sha256,
+            "discovery_sha256": frozen["sha256"],
+            "promotion_allowed": False,
+        }])
+    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], matching[0]["inputs"])
+
+
+def seal_holdout(log_dir: Path, now: datetime, key: HoldoutKey, result: dict, *,
+                 prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """Append ``holdout_result`` (the result's sha256 and verdict state)."""
+    if not isinstance(key, HoldoutKey) or result.get("discovery_manifest") != key.frozen_sha256:
+        raise PermissionError("the holdout result does not belong to this key")
+    log = registry(log_dir, prereg_sha256)
+    with log.locked():
+        records = _chain(log, prereg_sha256)
+        if not any(r.get("discovery_sha256") == key.frozen_sha256 for r in _kind(records, "holdout_opened")):
+            raise PermissionError("no holdout_opened record for this discovery")
+        if _kind(records, "holdout_result"):
+            raise PermissionError("a holdout result is already recorded")
+        return log.append_locked([{
+            "kind": "holdout_result",
+            "run_at": now.isoformat(),
+            "prereg_sha256": prereg_sha256,
+            "discovery_sha256": key.frozen_sha256,
+            "result_sha256": digest(result),
+            "verdict": result["verdict"]["state"],
+            "promotion_allowed": False,
+        }])[0]
 
 
 # --- orchestration -------------------------------------------------------------------------

@@ -9,8 +9,11 @@ from __future__ import annotations
 
 import functools
 import json
+import re
 import sqlite3
-from datetime import date, datetime, timezone
+import zipfile
+from dataclasses import asdict, replace
+from datetime import date, datetime, time, timezone
 from pathlib import Path
 
 import numpy as np
@@ -30,12 +33,15 @@ from sqlalchemy import (
 )
 
 from analysis import panel_insider_density as vs1
-from analysis.offline_research_proof import bh_adjusted, holm_adjusted
+from analysis.offline_research_proof import bh_adjusted, digest, holm_adjusted
 
 sqlite3.register_adapter(date, lambda d: d.isoformat())
 sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
 
 UTC = timezone.utc
+NOW = datetime(2026, 9, 27, 8, 0, tzinfo=UTC)
+AS_OF_TS = "2026-09-26T00:00:00+00:00"
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vs1"
 
 
 # --- pre-registration pin ---------------------------------------------------------------
@@ -124,12 +130,69 @@ def test_sector_universe_resolves_ciks_and_collapses_share_classes():
         vs1.sector_universe("Crypto", sector_map, issuers)
 
 
-def test_pinned_sector_map_gives_the_preregistered_technology_list():
-    primary = vs1.primary_sectors(vs1.load_sector_map())
+SECTOR_MAP_SNAPSHOT = FIXTURES / "sector_map_1bb2f61b_companies.json"
+
+
+def _companies_only(sector_map):
+    """What primary_sectors reads: company actors (ticker, type, weight) per subsector."""
+    out = {}
+    for sector, body in sector_map.items():
+        subs = {}
+        for name, sub in (body.get("subsectors") or {}).items():
+            actors = [
+                {"ticker": str(a["ticker"]), "type": "company", "weight": float(a.get("weight") or 0.0)}
+                for a in (sub or {}).get("actors") or ()
+                if a.get("ticker") and a.get("type") == "company"
+            ]
+            if actors:
+                subs[name] = {"actors": actors}
+        out[sector] = {"subsectors": subs}
+    return out
+
+
+def _snapshot():
+    raw = json.loads(SECTOR_MAP_SNAPSHOT.read_text(encoding="utf-8"))
+    assert raw["source_lf_sha256"] == vs1.SECTOR_MAP_SHA256
+    return raw["SECTOR_MAP"]
+
+
+def _prereg_body() -> str:
+    return vs1.prereg_body((vs1.REPO / vs1.PREREG_PATH).read_text(encoding="utf-8"))
+
+
+def test_pinned_sector_map_snapshot_gives_exactly_the_preregistered_technology_list():
+    """The snapshot of the pinned map (origin/main 1bb2f61b) reproduces §2.2 and §13 exactly.
+
+    Uses a fixture, not the live yaml: an edit to analysis/sector_map_data.yaml
+    makes the harness refuse to run (hash pin) but must not break CI.
+    """
+    snapshot = _snapshot()
+    primary = vs1.primary_sectors(snapshot)
     tech = sorted(t for t, s in primary.items() if s == "Technology")
-    assert len(tech) == 88
-    assert {"AAPL", "MSFT", "NVDA", "TSLA"} <= set(tech)
-    assert not {"AMZN", "GOOGL", "META", "ALB", "SQM"} & set(tech)
+    listed = re.search(r"Resulting 88 Technology tickers:(.*?)\n2\. \*\*CIK", _prereg_body(), re.S)
+    prereg = sorted(token.strip(".") for token in listed.group(1).split())
+    assert len(prereg) == 88
+    assert tech == prereg
+    ties = sorted(t for t, s in primary.items() if s is None and vs1._ticker_in_sector(snapshot, t, "Technology"))
+    assert ties == ["ALB", "LAC", "MP", "SQM", "UUUU"]
+    elsewhere = sorted(
+        t for t, s in primary.items()
+        if s not in (None, "Technology") and vs1._ticker_in_sector(snapshot, t, "Technology")
+    )
+    assert elsewhere == ["AMZN", "APD", "BABA", "BYDDF", "GOOGL", "LIN", "META"]
+    counts = {sector: sum(1 for s in primary.values() if s == sector) for sector in vs1.OTHER_SECTORS}
+    assert counts == {
+        "Energy": 97, "Financials": 118, "Healthcare": 133, "Industrials": 99,
+        "Consumer Discretionary": 154, "Consumer Staples": 124, "Real Estate": 97,
+        "Utilities": 67, "Communication Services": 56, "Materials": 75,
+    }
+
+
+def test_sector_map_snapshot_matches_the_repository_file_while_it_is_unchanged():
+    if vs1.file_sha256(vs1.REPO / vs1.SECTOR_MAP_PATH) != vs1.SECTOR_MAP_SHA256:
+        pytest.skip("sector_map_data.yaml changed since registration: the harness refuses it; "
+                    "the snapshot stays the pre-registered reference")
+    assert _companies_only(vs1.load_sector_map()) == _snapshot()
 
 
 def test_issuer_map_reads_sec_company_tickers_json(tmp_path):
@@ -159,10 +222,37 @@ def _row(**overrides):
     return {**base, **overrides}
 
 
-def _events(rows):
+def _submission(**overrides):
+    """A SUBMISSION-table row (accession x owner), as in derived/submissions.parquet."""
+    base = {
+        "accession_number": "0000000001-12-000001",
+        "filing_date": "2012-03-02",
+        "issuer_cik": "100",
+        "document_type": "4",
+        "owner_cik": "5000",
+    }
+    return {**base, **overrides}
+
+
+def _submissions_of(rows):
+    """The SUBMISSION table for transaction rows: one row per accession they name."""
+    return [
+        _submission(accession_number=r["accession_number"], filing_date=r["filing_date"],
+                    issuer_cik=r["issuer_cik"], document_type=r["document_type"], owner_cik=r["owner_cik"])
+        for r in rows
+    ]
+
+
+def _frame(rows):
     frame = pd.DataFrame(rows).astype("string")
     frame.columns = [c.upper() for c in frame.columns]
-    return vs1.build_events(frame)
+    return frame
+
+
+def _events(rows, submissions=None):
+    """Events from transaction rows; the SUBMISSION table defaults to the rows' own accessions."""
+    subs = _submissions_of(rows) if submissions is None else submissions
+    return vs1.build_events(_frame(rows), submissions=_frame(subs))
 
 
 def test_event_rules_exclude_amendments_other_codes_tiny_and_bad_dates():
@@ -191,6 +281,48 @@ def test_event_rules_exclude_amendments_other_codes_tiny_and_bad_dates():
     assert counts["excluded_missing_accession_issuer_or_filing_date"] == 1
     # every valid accession (any code, form, amendment) is Section 16 activity
     assert counts["activity_accessions"] == 11
+    assert counts["transaction_accessions_missing_from_submissions"] == 0
+
+
+def test_section16_activity_is_every_submission_incl_holdings_only_and_derivative_only_filings():
+    """§2.1/§2.2: activity is every accession of the issuer, not only those with a
+    non-derivative transaction line (the review's blocking finding 4)."""
+    # issuer 300 has no non-derivative line at all: a holdings-only Form 3 and a
+    # derivative-only Form 4; issuer 100 has one purchase line.
+    submissions = [
+        _submission(accession_number="f3-holdings", issuer_cik="300", document_type="3", filing_date="2013-01-02"),
+        _submission(accession_number="f4-deriv", issuer_cik="300", document_type="4", filing_date="2014-06-02"),
+        _submission(accession_number="f4-deriv", issuer_cik="300", document_type="4", filing_date="2014-06-02",
+                    owner_cik="5001"),  # owner fan-out: still one accession
+        _submission(),  # the purchase's own accession
+    ]
+    events = _events([_row()], submissions)
+    counts = events.receipt["counts"]
+    assert counts["submission_accessions"] == 3
+    assert counts["activity_accessions"] == 3
+    assert counts["transaction_accessions_missing_from_submissions"] == 0
+    t = vs1.decision_instants([date(2013, 1, 2), date(2013, 1, 3), date(2016, 5, 31), date(2016, 6, 3)])
+    mask = vs1.active_mask(events.activity, [300], t)
+    # Form 3 known at 22:00 ET 2013-01-02 -> active from the next close; the
+    # derivative-only Form 4 keeps it active 730 days after 2014-06-02
+    assert mask[300].tolist() == [False, True, True, False]
+    # built from the transaction table alone, issuer 300 would never be a filer
+    transactions_only = _events([_row()], [_submission()])
+    assert not vs1.active_mask(transactions_only.activity, [300], t)[300].any()
+
+
+def test_a_transaction_accession_missing_from_the_submission_table_is_counted_and_kept():
+    events = _events([_row(), _row(accession_number="late", nonderiv_trans_sk="9")], [_submission()])
+    counts = events.receipt["counts"]
+    assert counts["transaction_accessions_missing_from_submissions"] == 1
+    assert counts["activity_accessions"] == 2
+
+
+def test_build_events_requires_the_submission_table():
+    with pytest.raises(TypeError):
+        vs1.build_events(_frame([_row()]))
+    with pytest.raises(ValueError, match="SUBMISSION"):
+        vs1.build_events(_frame([_row()]), submissions=None)
 
 
 def test_joint_filings_are_one_purchase_by_one_actor():
@@ -227,10 +359,11 @@ def test_sec_dataset_date_format_is_parsed():
 
 def test_missing_owner_cik_is_refused_without_an_owner_table():
     frame = pd.DataFrame([_row()]).drop(columns=["owner_cik"]).astype("string")
+    subs = _frame([_submission()]).drop(columns=["OWNER_CIK"])
     with pytest.raises(ValueError, match="owner"):
-        vs1.build_events(frame)
+        vs1.build_events(frame, submissions=subs)
     owners = pd.DataFrame({"ACCESSION_NUMBER": ["0000000001-12-000001"], "RPTOWNERCIK": ["42"]})
-    events = vs1.build_events(frame, owners)
+    events = vs1.build_events(frame, owners, submissions=subs)
     assert list(events.purchases["actor"]) == [42]
 
 
@@ -238,9 +371,61 @@ def test_parquet_reader_filters_issuers_and_keeps_declared_columns(tmp_path):
     frame = pd.DataFrame([_row(), _row(issuer_cik="200", accession_number="z")]).assign(extra="x")
     path = tmp_path / "nonderiv.parquet"
     frame.to_parquet(path)
-    events = vs1.load_events(path, issuers=[100])
+    subs_path = tmp_path / "submissions.parquet"
+    pd.DataFrame([_submission(), _submission(accession_number="z", issuer_cik="200"),
+                  _submission(accession_number="h3", document_type="3")]).to_parquet(subs_path)
+    events = vs1.load_events(path, issuers=[100], submissions_path=subs_path)
     assert list(events.purchases["issuer_cik"]) == [100]
     assert events.receipt["inputs"]["transactions"]["sha256"] == vs1.data_sha256(path)
+    assert events.receipt["inputs"]["submissions"]["sha256"] == vs1.data_sha256(subs_path)
+    assert events.receipt["counts"]["submission_accessions"] == 2  # issuer 100 only
+    assert events.receipt["counts"]["activity_accessions"] == 2
+
+
+def _form345_zip(path: Path, submissions: list[dict], owners: list[dict]) -> None:
+    def tsv(rows, columns):
+        lines = ["\t".join(columns)] + ["\t".join(str(r.get(c, "")) for c in columns) for r in rows]
+        return "\n".join(lines) + "\n"
+
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("SUBMISSION.tsv", tsv(submissions, ["ACCESSION_NUMBER", "FILING_DATE", "PERIOD_OF_REPORT",
+                                                          "DATE_OF_ORIG_SUB", "DOCUMENT_TYPE", "ISSUERCIK",
+                                                          "ISSUERNAME", "ISSUERTRADINGSYMBOL"]))
+        zf.writestr("REPORTINGOWNER.tsv", tsv(owners, ["ACCESSION_NUMBER", "RPTOWNERCIK", "RPTOWNERNAME"]))
+        zf.writestr("NONDERIV_TRANS.tsv", "ACCESSION_NUMBER\tTRANS_CODE\n")
+
+
+def test_submissions_builder_keeps_every_accession_and_feeds_section16_activity(tmp_path):
+    from scripts import build_form345_submissions as builder
+
+    raw = tmp_path / "raw"
+    raw.mkdir()
+    _form345_zip(
+        raw / "2013q1_form345.zip",
+        [
+            {"ACCESSION_NUMBER": "f3", "FILING_DATE": "02-JAN-2013", "DOCUMENT_TYPE": "3", "ISSUERCIK": "300",
+             "ISSUERTRADINGSYMBOL": "XYZ", "PERIOD_OF_REPORT": "31-DEC-2012"},
+            {"ACCESSION_NUMBER": "f4a", "FILING_DATE": "15-MAR-2013", "DOCUMENT_TYPE": "4/A", "ISSUERCIK": "300",
+             "DATE_OF_ORIG_SUB": "01-MAR-2013"},
+            {"ACCESSION_NUMBER": "noowner", "FILING_DATE": "20-MAR-2013", "DOCUMENT_TYPE": "5", "ISSUERCIK": "301"},
+        ],
+        [{"ACCESSION_NUMBER": "f3", "RPTOWNERCIK": "11"}, {"ACCESSION_NUMBER": "f4a", "RPTOWNERCIK": "12"},
+         {"ACCESSION_NUMBER": "f4a", "RPTOWNERCIK": "13"}],
+    )
+    out = tmp_path / "derived" / "submissions.parquet"
+    receipt = builder.build(raw, out)
+    assert receipt["rows"] == 4 and receipt["accessions"] == 3
+    assert receipt["output_sha256"] == vs1.data_sha256(out)
+    table = pd.read_parquet(out)
+    assert list(table.columns) == builder.OUT_COLUMNS
+    assert table.set_index("accession_number")["amended"].groupby(level=0).first().to_dict() == {
+        "f3": False, "f4a": True, "noowner": False,
+    }
+    assert set(table["filing_date"]) == {"2013-01-02", "2013-03-15", "2013-03-20"}
+    with pytest.raises(FileExistsError):
+        builder.build(raw, out)  # write-once
+    accessions, counts = vs1.section16_accessions(vs1.read_table(out), issuers=[300])
+    assert sorted(accessions["accession"]) == ["f3", "f4a"] and counts["submission_accessions"] == 2
 
 
 # --- features ------------------------------------------------------------------------
@@ -400,15 +585,68 @@ def test_bh_false_discovery_proportion_is_controlled_with_two_true_effects():
     assert np.mean(fdp) <= vs1.BH_Q + 0.05
 
 
-def test_planted_effect_is_found_in_discovery_and_survives_the_holdout():
+# --- registry-backed one-shot helpers (synthetic input hashes; no real file) ---------------
+
+
+def _frozen_inputs(manifest=None, **overrides):
+    manifest = manifest or _manifest([])
+    base = {
+        "sector": "Technology",
+        "price_manifest_sha256": manifest.digest(),
+        "probe_report_sha256": manifest.probe_report_sha256,
+        "form4_sha256": "1" * 64,
+        "submissions_sha256": "2" * 64,
+        "issuer_map_sha256": "3" * 64,
+        "power_sha256": "4" * 64,
+        "accept_underpowered": False,
+        "as_of_ts": AS_OF_TS,
+    }
+    return {**base, **overrides}
+
+
+def _observed(inputs):
+    return {k: v for k, v in inputs.items() if k not in ("as_of_ts", "accept_underpowered")}
+
+
+def _discovery_key(log_dir, manifest=None):
+    """register -> inputs_frozen -> discovery_opened; returns the key and the frozen inputs."""
+    vs1.register(log_dir, NOW, "c" * 40)
+    inputs = _frozen_inputs(manifest)
+    vs1.freeze_inputs(log_dir, NOW, inputs)
+    return vs1.open_discovery(log_dir, NOW, _observed(inputs)), inputs
+
+
+def _spec(run_id="r"):
+    return vs1.RunSpec(run_id=run_id, sector="Technology", trials=vs1.trial_names())
+
+
+def _discover(log_dir, panels, run_id="r", manifest=None, sensitivity=False):
+    """A sealed discovery (chain: ... discovery_opened, discovery_frozen)."""
+    key, inputs = _discovery_key(log_dir, manifest)
+    frozen = vs1.discover_panel(_spec(run_id), panels, inputs={"inputs_frozen_sha256": key.inputs_frozen_sha256},
+                                sensitivity=sensitivity)
+    vs1.seal_discovery(log_dir, NOW, key, frozen)
+    return frozen, _observed(inputs)
+
+
+def _open_holdout(log_dir, frozen, observed, **overrides):
+    kwargs = {"allow_holdout": True, "prereg_sha256": vs1.PREREG_BODY_SHA256, "log_dir": log_dir, "now": NOW,
+              "observed": observed, **overrides}
+    return vs1.open_holdout(frozen, **kwargs)
+
+
+def _kinds(log_dir):
+    return [r["kind"] for r in vs1.registry(log_dir).read_all()]
+
+
+def test_planted_effect_is_found_in_discovery_and_survives_the_holdout(tmp_path):
     rng = np.random.default_rng(3)
     planted = (0.0, 0.25, 0.0, 0.0)  # the primary trial only
-    spec = vs1.RunSpec(run_id="test", sector="Technology", trials=vs1.trial_names(), perms=999)
-    frozen = vs1.discover_panel(spec, _synthetic_trials(rng, planted), inputs={}, sensitivity=False)
+    frozen, observed = _discover(tmp_path, _synthetic_trials(rng, planted), run_id="test")
     ledger = {t["trial"]: t for t in frozen["payload"]["ledger"]}
     assert ledger["A90|fwd20"]["selected"] and ledger["A90|fwd20"]["mean_ic"] > 0
     assert frozen["payload"]["calibration"]["state"] == "CONSISTENT"
-    key = vs1.open_holdout(frozen, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256)
+    key = _open_holdout(tmp_path, frozen, observed)
     result = vs1.evaluate_panel_holdout(
         frozen, _synthetic_trials(rng, planted, window="holdout"), key, power={"gate_passed": True}
     )
@@ -416,13 +654,16 @@ def test_planted_effect_is_found_in_discovery_and_survives_the_holdout():
     assert survivor["retrospective_survivor"]
     assert result["verdict"]["state"] == "HOLDOUT_SURVIVOR_FORWARD_PENDING"
     assert result["promotion_allowed"] is False
+    vs1.seal_holdout(tmp_path, NOW, key, result)
+    assert _kinds(tmp_path) == ["header", "preregistration", "inputs_frozen", "discovery_opened",
+                                "discovery_frozen", "holdout_opened", "holdout_result"]
+    assert vs1.registry(tmp_path).verify_chain()["ok"]
 
 
-def test_null_discovery_yields_no_survivor_and_flags_underpowered():
+def test_null_discovery_yields_no_survivor_and_flags_underpowered(tmp_path):
     rng = np.random.default_rng(5)
-    spec = vs1.RunSpec(run_id="null", sector="Technology", trials=vs1.trial_names(), perms=999)
-    frozen = vs1.discover_panel(spec, _synthetic_trials(rng, factor_phi=0.0), inputs={}, sensitivity=False)
-    key = vs1.open_holdout(frozen, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256)
+    frozen, observed = _discover(tmp_path, _synthetic_trials(rng, factor_phi=0.0), run_id="null")
+    key = _open_holdout(tmp_path, frozen, observed)
     result = vs1.evaluate_panel_holdout(frozen, _synthetic_trials(rng, window="holdout"), key, power=None)
     assert result["verdict"]["state"] in ("NO_SURVIVOR", "MACHINERY_SUSPECT")
     if result["verdict"]["state"] == "NO_SURVIVOR":
@@ -480,37 +721,42 @@ def test_planted_power_grows_with_the_effect_and_is_zero_without_buyers():
 
 
 @pytest.fixture()
-def frozen_null():
+def sealed_null(tmp_path):
+    """(frozen discovery, observed inputs, registry dir) with discovery_frozen in the chain."""
     rng = np.random.default_rng(9)
-    spec = vs1.RunSpec(run_id="r", sector="Technology", trials=vs1.trial_names(), perms=999)
-    return vs1.discover_panel(spec, _synthetic_trials(rng, T=40), inputs={}, sensitivity=False)
+    frozen, observed = _discover(tmp_path, _synthetic_trials(rng, T=40))
+    return frozen, observed, tmp_path
 
 
-def test_holdout_is_refused_without_the_flag_or_the_matching_hash(frozen_null):
+def test_holdout_is_refused_without_the_flag_or_the_matching_hash(sealed_null):
+    frozen, observed, log_dir = sealed_null
     with pytest.raises(PermissionError):
-        vs1.open_holdout(frozen_null, allow_holdout=False, prereg_sha256=vs1.PREREG_BODY_SHA256)
+        _open_holdout(log_dir, frozen, observed, allow_holdout=False)
     with pytest.raises(PermissionError):
-        vs1.open_holdout(frozen_null, allow_holdout="yes", prereg_sha256=vs1.PREREG_BODY_SHA256)
+        _open_holdout(log_dir, frozen, observed, allow_holdout="yes")
     with pytest.raises(PermissionError):
-        vs1.open_holdout(frozen_null, allow_holdout=True, prereg_sha256="0" * 64)
-    tampered = json.loads(json.dumps(frozen_null))
+        _open_holdout(log_dir, frozen, observed, prereg_sha256="0" * 64)
+    tampered = json.loads(json.dumps(frozen))
     tampered["payload"]["ledger"][0]["selected"] = True
     with pytest.raises(PermissionError):
-        vs1.open_holdout(tampered, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256)
+        _open_holdout(log_dir, tampered, observed)
+    # none of the refusals consumed the holdout
+    assert "holdout_opened" not in _kinds(log_dir)
 
 
-def test_holdout_evaluation_needs_a_key_for_this_manifest(frozen_null):
+def test_holdout_evaluation_needs_a_key_for_this_manifest(sealed_null):
+    frozen, observed, log_dir = sealed_null
     with pytest.raises(TypeError):
-        vs1.HoldoutKey(object(), frozen_null["sha256"])
-    other = vs1.open_holdout(frozen_null, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256)
+        vs1.HoldoutKey(object(), frozen["sha256"], {"as_of_ts": AS_OF_TS})
+    other = _open_holdout(log_dir, frozen, observed)
     other.frozen_sha256 = "f" * 64
     with pytest.raises(PermissionError):
-        vs1.evaluate_panel_holdout(frozen_null, {}, other)
+        vs1.evaluate_panel_holdout(frozen, {}, other)
 
 
 def test_discovery_refuses_holdout_panels_and_undeclared_trials():
     rng = np.random.default_rng(2)
-    spec = vs1.RunSpec(run_id="r", sector="Technology", trials=vs1.trial_names(), perms=999)
+    spec = _spec()
     with pytest.raises(ValueError):
         vs1.discover_panel(spec, _synthetic_trials(rng, T=40, window="holdout"), inputs={})
     panels = _synthetic_trials(rng, T=40)
@@ -521,6 +767,186 @@ def test_discovery_refuses_holdout_panels_and_undeclared_trials():
         vs1.RunSpec(run_id="r", sector="Energy", run_k=2, trials=vs1.trial_names()).validate()
     with pytest.raises(ValueError):
         vs1.RunSpec(run_id="r", sector="Technology", run_k=2, trials=vs1.trial_names()).validate()
+
+
+@pytest.mark.parametrize("override", [{"perms": 999}, {"perms": 20001}, {"seed": 1}, {"min_n": 31}, {"min_n": 29}])
+def test_run_spec_refuses_any_statistical_setting_other_than_the_registered_one(override):
+    vs1.RunSpec(run_id="r", sector="Technology", trials=vs1.trial_names()).validate()
+    spec = vs1.RunSpec(run_id="r", sector="Technology", trials=vs1.trial_names(), **override)
+    with pytest.raises(ValueError, match="pre-registered"):
+        spec.validate()
+    rng = np.random.default_rng(2)
+    with pytest.raises(ValueError, match="pre-registered"):
+        vs1.discover_panel(spec, _synthetic_trials(rng, T=40), inputs={}, sensitivity=False)
+
+
+# --- one-shot enforcement through the registry chain ---------------------------------------
+
+
+def test_freeze_inputs_needs_a_registration_and_every_input(tmp_path):
+    with pytest.raises(PermissionError, match="not registered"):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs())
+    vs1.register(tmp_path, NOW, "c" * 40)
+    for key in vs1.FROZEN_INPUT_KEYS:
+        partial = {k: v for k, v in _frozen_inputs().items() if k != key}
+        with pytest.raises(ValueError, match=key):
+            vs1.freeze_inputs(tmp_path, NOW, partial)
+    with pytest.raises(ValueError, match="sha256"):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(form4_sha256="nothex"))
+    with pytest.raises(ValueError, match="later than the freeze"):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(as_of_ts="2026-09-28T00:00:00+00:00"))
+    with pytest.raises(ValueError):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(as_of_ts="2026-09-26T00:00:00"))  # naive
+    with pytest.raises(ValueError, match="VS1"):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(sector="Energy"))
+    record = vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs())
+    assert record["kind"] == "inputs_frozen" and record["supersedes"] is None
+    assert record["inputs"]["as_of_ts"] == AS_OF_TS
+    # a re-freeze before any discovery supersedes (no price read under the first)
+    again = vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(form4_sha256="5" * 64))
+    assert again["supersedes"] is not None
+
+
+def test_discovery_is_refused_without_an_inputs_frozen_record(tmp_path):
+    vs1.register(tmp_path, NOW, "c" * 40)
+    with pytest.raises(PermissionError, match="inputs_frozen"):
+        vs1.open_discovery(tmp_path, NOW, _observed(_frozen_inputs()))
+    assert "discovery_opened" not in _kinds(tmp_path)
+
+
+@pytest.mark.parametrize("field", ["price_manifest_sha256", "probe_report_sha256", "form4_sha256",
+                                   "submissions_sha256", "issuer_map_sha256", "power_sha256", "sector"])
+def test_discovery_is_refused_when_any_input_differs_from_inputs_frozen(tmp_path, field):
+    vs1.register(tmp_path, NOW, "c" * 40)
+    inputs = _frozen_inputs()
+    vs1.freeze_inputs(tmp_path, NOW, inputs)
+    observed = {**_observed(inputs), field: "e" * 64}
+    with pytest.raises(PermissionError, match=field):
+        vs1.open_discovery(tmp_path, NOW, observed)
+    assert "discovery_opened" not in _kinds(tmp_path)  # the refusal did not consume discovery
+
+
+def test_discovery_runs_once_even_after_a_crash_and_its_inputs_cannot_be_refrozen(tmp_path):
+    key, inputs = _discovery_key(tmp_path)
+    assert _kinds(tmp_path)[-1] == "discovery_opened"
+    assert key.as_of_ts == datetime(2026, 9, 26, tzinfo=UTC)
+    # the first discovery "crashed" after opening (prices may have been read): no second one
+    with pytest.raises(PermissionError, match="one shot"):
+        vs1.open_discovery(tmp_path, NOW, _observed(inputs))
+    with pytest.raises(PermissionError, match="already opened"):
+        vs1.freeze_inputs(tmp_path, NOW, _frozen_inputs(form4_sha256="5" * 64))
+    with pytest.raises(TypeError):
+        vs1.DiscoveryKey(object(), key.inputs_frozen_sha256, inputs)
+
+
+def test_a_sealed_discovery_cannot_be_rerun_or_resealed(tmp_path):
+    rng = np.random.default_rng(9)
+    key, inputs = _discovery_key(tmp_path)
+    frozen = vs1.discover_panel(_spec(), _synthetic_trials(rng, T=40),
+                                inputs={"inputs_frozen_sha256": key.inputs_frozen_sha256}, sensitivity=False)
+    other = json.loads(json.dumps(frozen))
+    other["payload"]["inputs"]["inputs_frozen_sha256"] = "0" * 64
+    other["sha256"] = digest(other["payload"])
+    with pytest.raises(PermissionError, match="inputs_frozen"):
+        vs1.seal_discovery(tmp_path, NOW, key, other)
+    record = vs1.seal_discovery(tmp_path, NOW, key, frozen)
+    assert record["kind"] == "discovery_frozen" and record["discovery_sha256"] == frozen["sha256"]
+    with pytest.raises(PermissionError, match="already frozen"):
+        vs1.seal_discovery(tmp_path, NOW, key, frozen)
+    with pytest.raises(PermissionError, match="one shot"):
+        vs1.open_discovery(tmp_path, NOW, _observed(inputs))
+
+
+def test_holdout_is_refused_unless_the_chain_froze_this_discovery_file(sealed_null, tmp_path_factory):
+    frozen, observed, log_dir = sealed_null
+    # a different discovery (self-consistent file, not the one in the chain)
+    rng = np.random.default_rng(10)
+    other_dir = tmp_path_factory.mktemp("other")
+    other, _ = _discover(other_dir, _synthetic_trials(rng, T=40), run_id="other")
+    with pytest.raises(PermissionError, match="not the one the registry chain froze"):
+        _open_holdout(log_dir, other, observed)
+    # a registry with no frozen discovery at all
+    empty = tmp_path_factory.mktemp("empty")
+    vs1.register(empty, NOW, "c" * 40)
+    with pytest.raises(PermissionError, match="no single frozen discovery"):
+        _open_holdout(empty, frozen, observed)
+    # inputs that differ from the discovery's inputs_frozen
+    with pytest.raises(PermissionError, match="form4_sha256"):
+        _open_holdout(log_dir, frozen, {**observed, "form4_sha256": "e" * 64})
+    assert "holdout_opened" not in _kinds(log_dir)
+
+
+def test_holdout_opens_once_and_records_holdout_opened_before_any_holdout_price(sealed_null):
+    frozen, observed, log_dir = sealed_null
+    key = _open_holdout(log_dir, frozen, observed)
+    # the record exists as soon as the key does (no price has been read yet)
+    assert _kinds(log_dir)[-1] == "holdout_opened"
+    assert vs1.registry(log_dir).read_all()[-1]["discovery_sha256"] == frozen["sha256"]
+    assert key.as_of_ts == datetime(2026, 9, 26, tzinfo=UTC)
+    with pytest.raises(PermissionError, match="already opened"):
+        _open_holdout(log_dir, frozen, observed)
+    result = {"discovery_manifest": frozen["sha256"], "verdict": {"state": "NO_SURVIVOR"}}
+    vs1.seal_holdout(log_dir, NOW, key, result)
+    with pytest.raises(PermissionError, match="already recorded"):
+        vs1.seal_holdout(log_dir, NOW, key, result)
+    assert vs1.registry(log_dir).verify_chain()["ok"]
+
+
+def test_a_broken_chain_refuses_every_stage(sealed_null):
+    frozen, observed, log_dir = sealed_null
+    path = log_dir / vs1.REGISTRY_LOG
+    lines = path.read_bytes().split(b"\n")
+    lines[2] = lines[2].replace(b'"form4_sha256":"1111', b'"form4_sha256":"9111')
+    path.write_bytes(b"\n".join(lines))
+    with pytest.raises(RuntimeError, match="broken"):
+        _open_holdout(log_dir, frozen, observed)
+
+
+# --- Stage-0 power settings ------------------------------------------------------------------
+
+
+def _power_file(gate_power=0.4, **overrides):
+    rows = [{"target_ic": ic, "power": gate_power if ic == vs1.POWER_GATE_IC else 0.9,
+             "sims": vs1.POWER_SIMS, "usable_dates": 90} for ic in vs1.POWER_TARGET_ICS]
+    power = {
+        "table": {t: [dict(r) for r in rows] for t in vs1.trial_names()},
+        "settings": vs1.power_settings(),
+        "gate_passed": gate_power >= vs1.POWER_GATE,
+    }
+    return json.loads(json.dumps({**power, **overrides}))  # as read back from power.json
+
+
+def test_power_file_must_carry_the_registered_settings():
+    assert vs1.power_settings()["sims"] == 200 and vs1.power_settings()["perms"] == 999
+    vs1.verify_power(_power_file())
+    vs1.verify_power(_power_file(gate_power=0.6))
+    for name, value in (("sims", 30), ("perms", 199), ("seed", 1)):
+        with pytest.raises(ValueError, match="pre-registered settings"):
+            vs1.verify_power(_power_file(settings={**vs1.power_settings(), name: value}))
+    with pytest.raises(ValueError, match="pre-registered settings"):
+        vs1.verify_power({k: v for k, v in _power_file().items() if k != "settings"})
+    bad = _power_file()
+    bad["table"]["A90|fwd20"][0]["sims"] = 30
+    with pytest.raises(ValueError, match="200 simulations"):
+        vs1.verify_power(bad)
+    with pytest.raises(ValueError, match="gate_passed"):
+        vs1.verify_power(_power_file(gate_power=0.4, gate_passed=True))
+
+
+def test_stage0_power_has_no_settings_override():
+    with pytest.raises(TypeError):
+        vs1.stage0_power({}, sims=30)
+    with pytest.raises(ValueError, match="declared trials"):
+        vs1.stage0_power({"A90|fwd20": np.zeros((10, 10))})
+
+
+def test_power_cli_has_no_sims_or_perms_override(capsys):
+    from scripts import run_vs1_insider_density as cli
+
+    with pytest.raises(SystemExit):
+        cli.main(["power", "--form4", "f", "--submissions", "s", "--issuer-map", "m", "--out", "o",
+                  "--sims", "30"])
+    assert "unrecognized arguments: --sims" in capsys.readouterr().err
 
 
 def test_overlapping_or_out_of_window_decisions_are_refused():
@@ -573,39 +999,59 @@ def _manifest(tickers, source="tiingo"):
     )
 
 
-def test_price_reader_refuses_unadmitted_sources_tickers_and_reads_past_the_split():
+def test_price_reader_refuses_unadmitted_sources_tickers_and_reads_past_the_split(tmp_path):
     dates = pd.bdate_range("2019-12-20", "2020-01-10")
     engine = _price_db({"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(10.0, index=dates)})
-    ts = datetime(2026, 9, 26, tzinfo=UTC)
+    key, _ = _discovery_key(tmp_path / "a", _manifest(["AAA"]))
+    empty_key, _ = _discovery_key(tmp_path / "b", _manifest([]))
+    read = functools.partial(vs1.load_price_panel, start=date(2019, 12, 1), as_of=date(2019, 12, 31),
+                             window="discovery")
     with engine.connect() as conn:
         with pytest.raises(ValueError):
-            vs1.load_price_panel(conn, _manifest(["AAA"], "yfinance"), ["AAA"], start=date(2019, 12, 1),
-                                 as_of=date(2019, 12, 31), as_of_ts=ts, window="discovery")
-        with pytest.raises(PermissionError):
-            vs1.load_price_panel(conn, _manifest([]), ["AAA"], start=date(2019, 12, 1),
-                                 as_of=date(2019, 12, 31), as_of_ts=ts, window="discovery")
+            read(conn, _manifest(["AAA"], "yfinance"), ["AAA"], key=key)
+        with pytest.raises(PermissionError, match="not in the admitted"):
+            read(conn, _manifest([]), ["AAA"], key=empty_key)
         with pytest.raises(PermissionError):
             vs1.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], start=date(2019, 12, 1),
-                                 as_of=date(2020, 1, 1), as_of_ts=ts, window="discovery")
+                                 as_of=date(2020, 1, 1), window="discovery", key=key)
         with pytest.raises(PermissionError):
             vs1.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], start=date(2019, 12, 1),
-                                 as_of=date(2020, 1, 10), as_of_ts=ts, window="holdout")
-        panel = vs1.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], start=date(2019, 12, 1),
-                                     as_of=date(2019, 12, 31), as_of_ts=ts, window="discovery")
+                                 as_of=date(2020, 1, 10), window="holdout", key=key)
+        panel = read(conn, _manifest(["AAA"]), ["AAA"], key=key)
     assert panel.receipt["series"]["AAA"]["last"] == "2019-12-31"
     assert panel.closes().index.max() == pd.Timestamp("2019-12-31")
+    assert panel.receipt["as_of_ts"] == AS_OF_TS  # the frozen read instant
 
 
-def test_price_reader_takes_only_the_manifest_source_on_a_shared_series_id():
+def test_price_reader_refuses_without_a_registry_key_or_with_another_manifest(tmp_path):
+    dates = pd.bdate_range("2019-12-02", "2019-12-31")
+    engine = _price_db({"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(10.0, index=dates)})
+    key, _ = _discovery_key(tmp_path, _manifest(["AAA"]))
+    read = functools.partial(vs1.load_price_panel, start=date(2019, 12, 1), as_of=date(2019, 12, 31),
+                             window="discovery")
+    other_source = vs1.PriceManifest(source="twelvedata", series_template="YF:{ticker}:close",
+                                     basis="split+dividend adjusted", benchmark="XLK",
+                                     admitted=("AAA", "XLK"), probe_report_sha256="a" * 64)
+    other_probe = replace(_manifest(["AAA"]), probe_report_sha256="b" * 64)
+    with engine.connect() as conn:
+        with pytest.raises(PermissionError, match="DiscoveryKey"):
+            read(conn, _manifest(["AAA"]), ["AAA"], key=None)
+        with pytest.raises(PermissionError, match="inputs_frozen"):
+            read(conn, other_source, ["AAA"], key=key)
+        with pytest.raises(PermissionError, match="inputs_frozen"):
+            read(conn, other_probe, ["AAA"], key=key)
+
+
+def test_price_reader_takes_only_the_manifest_source_on_a_shared_series_id(tmp_path):
     dates = pd.bdate_range("2019-12-02", "2019-12-31")
     engine = _price_db(
         {"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(10.0, index=dates)},
         extra_yf={"AAA": pd.Series(99.0, index=dates)},
     )
+    key, _ = _discovery_key(tmp_path, _manifest(["AAA"]))
     with engine.connect() as conn:
         panel = vs1.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], start=date(2019, 12, 1),
-                                     as_of=date(2019, 12, 31), as_of_ts=datetime(2026, 9, 26, tzinfo=UTC),
-                                     window="discovery")
+                                     as_of=date(2019, 12, 31), window="discovery", key=key)
     assert set(panel.closes()["AAA"]) == {10.0}
 
 
@@ -621,22 +1067,27 @@ def test_labels_are_purged_at_the_split_and_horizon_spaced():
     assert dates[positions[0]] >= pd.Timestamp("2020-01-01")
 
 
-def test_end_to_end_planted_insider_effect_through_the_price_reader():
+def _holdings_only_submissions(ciks, dates):
+    """Quarterly holdings-only filings (no transaction line) keep every issuer a Section 16 filer."""
+    return [
+        _submission(accession_number=f"act-{cik}-{d.date()}", issuer_cik=str(cik), filing_date=str(d.date()),
+                    document_type="3" if k == 0 else "4", owner_cik="9")
+        for cik in ciks
+        for k, d in enumerate(dates[::60])
+    ]
+
+
+def test_end_to_end_planted_insider_effect_through_the_price_reader(tmp_path):
     """Buyers' stocks drift up after the filing; the harness must find it, and only
-    through admitted, source-filtered, split-bounded reads."""
+    through admitted, source-filtered, split-bounded reads behind the registry chain."""
     rng = np.random.default_rng(12)
     tickers = [f"T{i:02d}" for i in range(24)]
     ciks = list(range(1000, 1024))
     dates = pd.bdate_range("2010-01-04", "2026-06-30")
     n = len(dates)
     rets = rng.normal(0.0, 0.01, (n, len(tickers)))
-    rows, activity_rows = [], []
+    rows = []
     for j, cik in enumerate(ciks):
-        # quarterly routine filings keep every issuer a Section 16 filer
-        for d in dates[::60]:
-            activity_rows.append(_row(accession_number=f"act-{cik}-{d.date()}", issuer_cik=str(cik),
-                                      filing_date=str(d.date()), transaction_date=str(d.date()),
-                                      transaction_code="A", price_per_share="0"))
         for i in np.flatnonzero(rng.random(n) < 0.004):
             filed = dates[min(i + 1, n - 1)]
             rows.append(_row(accession_number=f"p-{cik}-{i}", issuer_cik=str(cik),
@@ -647,17 +1098,21 @@ def test_end_to_end_planted_insider_effect_through_the_price_reader():
     prices = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=dates, columns=tickers)
     prices["XLK"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.008, n)))
     engine = _price_db({c: prices[c] for c in prices.columns})
-    events = _events(rows + activity_rows)
+    # Section 16 activity from the SUBMISSION table only: holdings-only filings
+    # with no transaction line, plus the purchases' own accessions.
+    events = _events(rows, _submissions_of(rows) + _holdings_only_submissions(ciks, dates))
+    assert events.receipt["counts"]["transaction_accessions_missing_from_submissions"] == 0
     universe = pd.DataFrame({"ticker": tickers, "cik": ciks})
     manifest = _manifest(tickers)
-    ts = datetime(2026, 9, 26, tzinfo=UTC)
+    key, inputs = _discovery_key(tmp_path, manifest)
     with engine.connect() as conn:
         discovery = vs1.load_price_panel(conn, manifest, tickers, start=date(2011, 11, 1),
-                                         as_of=date(2019, 12, 31), as_of_ts=ts, window="discovery")
+                                         as_of=date(2019, 12, 31), window="discovery", key=key)
     assert max(o["last"] for o in discovery.receipt["series"].values()) <= "2019-12-31"
     panels = vs1.build_trial_panels(events, universe, discovery, "discovery")
-    spec = vs1.RunSpec(run_id="e2e", sector="Technology", trials=vs1.trial_names(), perms=999)
-    frozen = vs1.discover_panel(spec, panels, inputs={"price": discovery.receipt_sha}, sensitivity=True)
+    frozen = vs1.discover_panel(_spec("e2e"), panels, sensitivity=True,
+                                inputs={"price": discovery.receipt_sha, "inputs_frozen_sha256": key.inputs_frozen_sha256})
+    vs1.seal_discovery(tmp_path, NOW, key, frozen)
     ledger = {t["trial"]: t for t in frozen["payload"]["ledger"]}
     primary = ledger["A90|fwd20"]
     assert primary["selected"] and primary["mean_ic"] > 0
@@ -665,14 +1120,179 @@ def test_end_to_end_planted_insider_effect_through_the_price_reader():
     assert "momentum_mean_ic" in primary["baseline"]
     assert primary["magnitude"]["small_line_buyer_issuer_dates"] > 0  # $20k lines
     assert primary["labels"]["buyer_missing_share"] == 0.0
-    key = vs1.open_holdout(frozen, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256)
+    hkey = _open_holdout(tmp_path, frozen, _observed(inputs))
     with engine.connect() as conn:
         holdout = vs1.load_price_panel(conn, manifest, tickers, start=date(2019, 11, 1),
-                                       as_of=date(2026, 6, 30), as_of_ts=ts, window="holdout",
-                                       holdout_key=key)
+                                       as_of=date(2026, 6, 30), window="holdout", key=hkey)
     result = vs1.evaluate_panel_holdout(frozen, vs1.build_trial_panels(events, universe, holdout, "holdout"),
-                                        key, power={"gate_passed": True})
+                                        hkey, power={"gate_passed": True})
     assert result["verdict"]["state"] == "HOLDOUT_SURVIVOR_FORWARD_PENDING"
+
+
+def _pre_entry_jump_discovery(log_dir):
+    """Discovery where every purchase is followed by a +10% jump realised strictly before
+    the first close after the filing became public, and by nothing afterwards.
+
+    Filings land on decision sessions ``p`` (both horizon grids). known_at is 22:00 ET
+    on ``p``; the first close after it is ``p + 1``; the jump is the move from close
+    ``p`` to close ``p + 1`` (e.g. the next morning's reaction to the filing), so it is
+    already in the entry close. Filings are independent draws per issuer and grid
+    session (memoryless), so the feature built from earlier filings says nothing
+    about the next jump: a correct harness sees no effect in either direction.
+    """
+    rng = np.random.default_rng(21)
+    tickers = [f"T{i:02d}" for i in range(24)]
+    ciks = list(range(1000, 1024))
+    dates = pd.bdate_range("2011-10-03", "2019-12-31")
+    n = len(dates)
+    first = int(np.flatnonzero(dates >= pd.Timestamp("2012-01-01"))[0])
+    rets = rng.normal(0.0, 0.01, (n, len(tickers)))
+    rows = []
+    grid = range(first, n - 2, 20)
+    for j, cik in enumerate(ciks):
+        for p in grid:
+            if rng.random() >= 0.15:
+                continue
+            rows.append(_row(accession_number=f"p-{cik}-{p}", issuer_cik=str(cik),
+                             owner_cik=str(int(rng.integers(1, 6))), filing_date=str(dates[p].date()),
+                             transaction_date=str(dates[p - 1].date()), shares="5000"))
+            rets[p + 1, j] += np.log(1.10)
+    prices = pd.DataFrame(100 * np.exp(np.cumsum(rets, axis=0)), index=dates, columns=tickers)
+    prices["XLK"] = 100 * np.exp(np.cumsum(rng.normal(0, 0.008, n)))
+    engine = _price_db({c: prices[c] for c in prices.columns})
+    events = _events(rows, _submissions_of(rows) + _holdings_only_submissions(ciks, dates))
+    universe = pd.DataFrame({"ticker": tickers, "cik": ciks})
+    manifest = _manifest(tickers)
+    key, _ = _discovery_key(log_dir, manifest)
+    with engine.connect() as conn:
+        prices_panel = vs1.load_price_panel(conn, manifest, tickers, start=date(2011, 10, 1),
+                                            as_of=date(2019, 12, 31), window="discovery", key=key)
+    panels = vs1.build_trial_panels(events, universe, prices_panel, "discovery")
+    frozen = vs1.discover_panel(_spec("jump"), panels, sensitivity=False,
+                                inputs={"inputs_frozen_sha256": key.inputs_frozen_sha256})
+    return {t["trial"]: t for t in frozen["payload"]["ledger"]}
+
+
+def test_a_jump_before_the_first_close_after_the_filing_is_public_is_not_detected(tmp_path, monkeypatch):
+    """Negative control (review item 9): the harness must not credit a price move that
+    is already in the entry close. As a check that this test can fail, the same data
+    with the filing treated as public at 15:00 ET on its filing date (before that
+    day's close) does detect the jump."""
+    ledger = _pre_entry_jump_discovery(tmp_path / "correct")
+    assert not any(t["selected"] for t in ledger.values())
+    primary = ledger["A90|fwd20"]
+    assert primary["status"] == "tested" and abs(primary["mean_ic"]) < 0.03
+    assert all(t["p"] > 0.05 for t in ledger.values())  # not even an unadjusted hit, either sign
+    monkeypatch.setattr(vs1, "KNOWN_AT_LOCAL", time(15, 0))
+    leaky = _pre_entry_jump_discovery(tmp_path / "leaky")
+    assert leaky["A90|fwd20"]["selected"] and leaky["A90|fwd20"]["mean_ic"] > 0.05
+
+
+# --- CLI: freeze-inputs -> discover -> holdout, prices behind the chain -----------------------
+
+
+def _cli_inputs(tmp_path, monkeypatch):
+    """Synthetic input files for the CLI and a counting SQLite stand-in for the read-only engine."""
+    from scripts import run_real_panel_scan
+
+    rng = np.random.default_rng(31)
+    tickers = [f"T{i:02d}" for i in range(20)]
+    ciks = list(range(1000, 1020))
+    dates = pd.bdate_range("2011-10-03", "2019-12-31")
+    rows = []
+    for cik in ciks:
+        for i in np.flatnonzero(rng.random(len(dates)) < 0.004):
+            filed = dates[min(i + 1, len(dates) - 1)]
+            rows.append(_row(accession_number=f"p-{cik}-{i}", issuer_cik=str(cik), owner_cik="7",
+                             filing_date=str(filed.date()), transaction_date=str(dates[i].date())))
+    files = {name: tmp_path / name for name in ("form4.parquet", "submissions.parquet", "company_tickers.json",
+                                                "manifest.json", "probe.json", "power.json")}
+    pd.DataFrame(rows).to_parquet(files["form4.parquet"])
+    pd.DataFrame(_submissions_of(rows) + _holdings_only_submissions(ciks, dates)).to_parquet(
+        files["submissions.parquet"])
+    files["company_tickers.json"].write_text(json.dumps(
+        {str(k): {"cik_str": c, "ticker": t, "title": t} for k, (t, c) in enumerate(zip(tickers, ciks))}))
+    files["probe.json"].write_text(json.dumps({"probe": "synthetic"}))
+    manifest = replace(_manifest(tickers), probe_report_sha256=vs1.data_sha256(files["probe.json"]))
+    files["manifest.json"].write_text(json.dumps({**asdict(manifest), "admitted": list(manifest.admitted)}))
+    sector_map = _map([("Technology", "a", t, 0.1, "company") for t in tickers])
+    monkeypatch.setattr(vs1, "load_sector_map", lambda repo_root=None: sector_map)
+    prices = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.01, (len(dates), 21)), axis=0)),
+                          index=dates, columns=tickers + ["XLK"])
+    engine = _price_db({c: prices[c] for c in prices.columns})
+    reads = []
+
+    def fake_engine(timeout_s, name):
+        reads.append(name)
+        return engine
+
+    monkeypatch.setattr(run_real_panel_scan, "read_only_engine", fake_engine)
+    return files, reads
+
+
+def _cli_args(files, log_dir, *extra):
+    return [
+        "--form4", str(files["form4.parquet"]), "--submissions", str(files["submissions.parquet"]),
+        "--issuer-map", str(files["company_tickers.json"]), "--log-dir", str(log_dir),
+        "--price-manifest", str(files["manifest.json"]), "--probe-report", str(files["probe.json"]),
+        "--power", str(files["power.json"]), *extra,
+    ]
+
+
+def test_cli_discovery_and_holdout_are_one_shot_and_check_every_input_before_any_price_read(tmp_path, monkeypatch):
+    from argparse import Namespace
+
+    from scripts import run_vs1_insider_density as cli
+
+    files, reads = _cli_inputs(tmp_path, monkeypatch)
+    log_dir = tmp_path / "registry"
+    # the power file: pre-registered settings, computed on these inputs (a synthetic table)
+    ns = Namespace(sector="Technology", issuer_map=str(files["company_tickers.json"]),
+                   form4=str(files["form4.parquet"]), submissions=str(files["submissions.parquet"]), owners=None)
+    universe, info = cli._universe(ns)
+    events = cli._events(ns, universe)
+    files["power.json"].write_text(json.dumps({**_power_file(gate_power=0.6),
+                                               "inputs": cli._power_inputs(events, info)}))
+
+    cli.main(["register", "--log-dir", str(log_dir), "--code-sha", "c" * 40])
+    # no discovery before inputs are frozen, and the refusal reads no price
+    with pytest.raises(PermissionError, match="inputs_frozen"):
+        cli.main(["discover", *_cli_args(files, log_dir, "--out", str(tmp_path / "run0"))])
+    assert reads == [] and "discovery_opened" not in _kinds(log_dir)
+
+    cli.main(["freeze-inputs", *_cli_args(files, log_dir, "--as-of-ts", AS_OF_TS, "--code-sha", "c" * 40)])
+    frozen_inputs = vs1.latest_frozen_inputs(log_dir)
+    assert frozen_inputs["as_of_ts"] == AS_OF_TS and frozen_inputs["accept_underpowered"] is False
+
+    run_dir = tmp_path / "run"
+    cli.main(["discover", *_cli_args(files, log_dir, "--out", str(run_dir))])
+    assert reads == ["vs1_insider_density"]
+    assert _kinds(log_dir)[-3:] == ["inputs_frozen", "discovery_opened", "discovery_frozen"]
+    frozen = json.loads((run_dir / "discovery-frozen.json").read_text())
+    assert vs1.registry(log_dir).read_all()[-1]["discovery_sha256"] == frozen["sha256"]
+    with pytest.raises(PermissionError, match="one shot"):
+        cli.main(["discover", *_cli_args(files, log_dir, "--out", str(tmp_path / "run2"))])
+
+    holdout = ["holdout", "--run-dir", str(run_dir), "--allow-holdout", "--prereg-sha256", vs1.PREREG_BODY_SHA256]
+    # a different price manifest: refused before any price read and before holdout_opened
+    good_manifest = files["manifest.json"].read_text()
+    changed = json.loads(good_manifest)
+    changed["basis"] = "split adjusted"
+    files["manifest.json"].write_text(json.dumps(changed))
+    with pytest.raises(SystemExit, match="price manifest differs"):
+        cli.main([*holdout, *_cli_args(files, log_dir)])
+    files["manifest.json"].write_text(good_manifest)
+    # a different power file: same
+    good_power = files["power.json"].read_text()
+    files["power.json"].write_text(json.dumps({**json.loads(good_power), "note": "edited"}))
+    with pytest.raises(SystemExit, match="power file differs"):
+        cli.main([*holdout, *_cli_args(files, log_dir)])
+    files["power.json"].write_text(good_power)
+    # no flag
+    with pytest.raises(PermissionError, match="allow_holdout"):
+        cli.main(["holdout", "--run-dir", str(run_dir), "--prereg-sha256", vs1.PREREG_BODY_SHA256,
+                  *_cli_args(files, log_dir)])
+    assert reads == ["vs1_insider_density"] and "holdout_opened" not in _kinds(log_dir)
 
 
 # --- registry (research_forward_log chain) ---------------------------------------------------
