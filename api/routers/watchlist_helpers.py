@@ -214,8 +214,18 @@ def _row_to_dict(row: Any) -> dict:
 def _fetch_live_price(ticker: str) -> dict | None:
     """Fetch a live/recent price from yfinance as fallback.
 
-    Returns {"price": float, "prev_close": float, "pct_1d": float, "source": "live"}
-    or None on failure.
+    Returns {"price": float, "prev_close": float, "pct_1d": float,
+    "source": "live", "as_of": date | None} or None on failure.
+
+    ``as_of`` is the real trading day the returned close belongs to, read
+    from yfinance's own history — never stamped as ``date.today()`` at the
+    call site. ``fast_info`` (the ``last_price``/``previous_close`` fast
+    path) carries no timestamp field at all (verified against yfinance
+    1.7.0: it exposes ``lastPrice``, ``previousClose``, ``dayHigh``, etc.
+    and nothing dated), so on its own it cannot distinguish a live intraday
+    tick from a frozen close read on a weekend or holiday. Reading the date
+    off history instead means a caller never has to fabricate "today" (#F1
+    D5; see docs/reference/AVAILABILITY_CONTRACT.md).
     """
     try:
         import yfinance as yf
@@ -236,6 +246,7 @@ def _fetch_live_price(ticker: str) -> dict | None:
         info = tk.fast_info
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
+        hist = None
         if price is None:
             # auto_adjust=False to match the fast_info branch above:
             # last_price/previous_close are raw quotes, so the fallback must
@@ -248,12 +259,28 @@ def _fetch_live_price(ticker: str) -> dict | None:
                     prev = float(hist["Close"].iloc[-2])
         if price is None:
             return None
+
+        if hist is None:
+            # The fast_info path never fetched history — do it now, purely
+            # to read the observation date. Never let this failure sink the
+            # price we already have; an unknown as_of is honest (None), a
+            # crash on a working price fallback is not.
+            try:
+                hist = tk.history(period="5d", auto_adjust=False)
+            except Exception:
+                hist = None
+        as_of = None
+        if hist is not None and not hist.empty:
+            idx = hist.index[-1]
+            as_of = idx.date() if hasattr(idx, "date") else None
+
         pct_1d = round((price - prev) / prev, 5) if prev and prev != 0 else None
         return {
             "price": round(price, 4),
             "prev_close": round(prev, 4) if prev else None,
             "pct_1d": pct_1d,
             "source": "live",
+            "as_of": as_of,
         }
     except Exception as exc:
         log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))
@@ -475,7 +502,7 @@ def _preload_one(tk: str) -> str | None:
         period = "3M"
         lookback_days = 90
 
-        _init_table()
+        # Runs under GET /preload: read-only, no _init_table DDL.
         engine = get_db_engine()
         feature_names = _resolve_feature_names(ticker_upper)
 

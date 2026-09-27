@@ -916,7 +916,7 @@ export default function WhyView({ onNavigate }) {
                             </div>
                             {causes.length === 0 && (
                                 <div style={{ color: colors.textMuted, fontSize: '12px', padding: '12px 0' }}>
-                                    No causal links identified yet. The causation engine runs periodically.
+                                    Not generated — no causal links identified. Causal-link detection has no scheduled writer; it only runs on an explicit request for the full signal batch.
                                 </div>
                             )}
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>

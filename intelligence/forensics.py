@@ -193,6 +193,7 @@ def analyze_move(
     ticker: str,
     move_date: str,
     lookback_days: int = 14,
+    persist: bool = True,
 ) -> ForensicReport | None:
     """Generate a full forensic report for a specific price move.
 
@@ -205,11 +206,14 @@ def analyze_move(
         ticker: Stock ticker symbol.
         move_date: Date of the move (YYYY-MM-DD).
         lookback_days: How many days before the move to scan.
+        persist: When True (default), ensure ``forensic_reports`` and store
+            the report. Read paths (the forensics GET summary) pass False.
 
     Returns:
         ForensicReport or None if the move date has no price data.
     """
-    _ensure_tables(engine)
+    if persist:
+        _ensure_tables(engine)
     ticker = ticker.upper()
     target_date = _parse_date(move_date)
 
@@ -391,8 +395,9 @@ def analyze_move(
         confidence=round(confidence, 3),
     )
 
-    # Persist
-    _store_report(engine, report)
+    # Persist (explicit writers only; read paths pass persist=False)
+    if persist:
+        _store_report(engine, report)
 
     log.info(
         "Forensic report for {t} on {d}: {dir} {pct:.2f}%, "
@@ -456,6 +461,7 @@ def batch_forensics(
     ticker: str,
     days: int = 90,
     threshold: float = 0.015,
+    persist: bool = True,
 ) -> list[ForensicReport]:
     """Find all significant moves and generate forensic reports for each.
 
@@ -464,6 +470,7 @@ def batch_forensics(
         ticker: Stock ticker symbol.
         days: Lookback window for finding moves.
         threshold: Minimum absolute daily return for significance.
+        persist: Passed to :func:`analyze_move`; False keeps it read-only.
 
     Returns:
         List of ForensicReport instances, ordered most recent first.
@@ -473,7 +480,7 @@ def batch_forensics(
 
     for move in moves:
         try:
-            report = analyze_move(engine, ticker, move["date"])
+            report = analyze_move(engine, ticker, move["date"], persist=persist)
             if report:
                 reports.append(report)
         except Exception as exc:
@@ -500,6 +507,10 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
 
     Falls back to rule-based summary if LLM is unavailable.
 
+    Read-only: it is served by ``GET /intelligence/forensics/{ticker}``, so the
+    per-move reports it builds are never stored (``persist=False``). Storing
+    reports is ``POST /forensics/{ticker}/analyze`` or the batch scripts.
+
     Args:
         engine: SQLAlchemy engine.
         ticker: Stock ticker symbol.
@@ -509,7 +520,7 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
         Formatted summary string.
     """
     ticker = ticker.upper()
-    reports = batch_forensics(engine, ticker, days=days)
+    reports = batch_forensics(engine, ticker, days=days, persist=False)
 
     if not reports:
         return f"No significant moves found for {ticker} in the last {days} days."
@@ -649,8 +660,10 @@ def load_forensic_reports(
 
     Returns:
         List of forensic report dicts.
+
+    Read-only: no ``_ensure_tables`` DDL on this GET path; the writer
+    (:func:`analyze_move` with ``persist=True``) creates the table.
     """
-    _ensure_tables(engine)
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
