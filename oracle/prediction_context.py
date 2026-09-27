@@ -41,6 +41,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.pit import retraction_cutoff
+
 
 DEFAULT_REGIME = "NEUTRAL"
 DEFAULT_FCI_REGIME = "NEUTRAL"
@@ -110,33 +112,77 @@ def _latest_feature_value(
             try:
                 query = text(
                     f"""
-                    SELECT value
-                    FROM resolved_series
-                    WHERE feature_id IN (
+                    SELECT rs.value
+                    FROM resolved_series rs
+                    WHERE rs.feature_id IN (
                         SELECT id FROM {registry_table} WHERE name = :fname
                     )
-                      AND obs_date <= :aod
-                      AND obs_date >= :cut
-                      AND release_date <= :aod
-                    ORDER BY obs_date DESC, release_date DESC
+                      AND rs.obs_date <= :aod
+                      AND rs.obs_date >= :cut
+                      AND rs.release_date <= :aod
+                      AND NOT EXISTS (
+                          SELECT 1 FROM resolved_series_retractions rr
+                          WHERE rr.feature_id = rs.feature_id
+                            AND rr.obs_date = rs.obs_date
+                            AND rr.vintage_date = rs.vintage_date
+                            AND rr.retracted_at <= :retraction_cutoff
+                      )
+                    ORDER BY rs.obs_date DESC, rs.release_date DESC
                     LIMIT 1
                     """
                 )
                 with engine.connect() as conn:
                     row = conn.execute(
-                        query, {"fname": fname, "aod": as_of, "cut": cutoff}
+                        query,
+                        {
+                            "fname": fname,
+                            "aod": as_of,
+                            "cut": cutoff,
+                            "retraction_cutoff": retraction_cutoff(as_of),
+                        },
                     ).fetchone()
                 if row is not None and row[0] is not None:
                     return float(row[0])
-            except Exception as exc:  # pragma: no cover - defensive
-                log.debug(
-                    "latest_feature_value failed for {f} on {tbl}: {e}",
-                    f=fname,
-                    tbl=registry_table,
-                    e=str(exc),
-                )
+            except Exception as exc:
+                if _is_unexpected_missing_table(exc, registry_table):
+                    # e.g. resolved_series_retractions absent because the
+                    # migration did not run: the value would silently degrade
+                    # to the caller's default, so say so loudly.
+                    log.warning(
+                        "latest_feature_value: missing table while reading {f} "
+                        "via {tbl} (migration not applied?): {e}",
+                        f=fname,
+                        tbl=registry_table,
+                        e=str(exc),
+                    )
+                else:
+                    log.debug(
+                        "latest_feature_value failed for {f} on {tbl}: {e}",
+                        f=fname,
+                        tbl=registry_table,
+                        e=str(exc),
+                    )
                 continue
     return None
+
+
+# PostgreSQL SQLSTATE for "relation does not exist".
+_UNDEFINED_TABLE = "42P01"
+# The legacy registry is expected to be absent on V5 databases.
+_LEGACY_REGISTRY = "feature_catalog"
+
+
+def _is_unexpected_missing_table(exc: Exception, registry_table: str) -> bool:
+    """True when ``exc`` is a missing-relation error for anything other than
+    the expected-absent legacy ``feature_catalog`` registry."""
+    orig = getattr(exc, "orig", exc)
+    message = str(exc)
+    missing = getattr(orig, "pgcode", None) == _UNDEFINED_TABLE or (
+        "relation" in message and "does not exist" in message
+    )
+    if not missing:
+        return False
+    return f'relation "{_LEGACY_REGISTRY}" does not exist' not in message
 
 
 def fetch_vix_level(engine: Engine, as_of: date) -> float | None:
