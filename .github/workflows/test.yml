@@ -236,7 +236,14 @@ jobs:
         run: |
           set -o pipefail
           python -m pytest tests/godview/test_fed_liquidity_writer_pg.py -q -rA | tee /tmp/grid-godview-g3-pg.txt
-          if grep -q "SKIPPED" /tmp/grid-godview-g3-pg.txt; then
+          # Anchored to pytest's own -rA skip-summary line ("SKIPPED [1]
+          # path:line: reason"), never a bare "SKIPPED" substring -- the
+          # writer's own loguru output legitimately logs
+          # "godview.fed_liquidity SKIPPED obs_date=... reason=..." for a
+          # row it declined to write (missing input, legacy-row block,
+          # before its PIT release), which is expected application
+          # behaviour, not a skipped test.
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g3-pg.txt; then
             echo "::error::Godview Fed liquidity writer PostgreSQL contract was skipped"
             exit 1
           fi
