@@ -185,8 +185,11 @@ function DashboardTab({ dashboard, loading, error, onLoad }) {
             {/* News energy summary in dashboard */}
             {news_energy && news_energy.n_sources > 0 && (
                 <div style={shared.card}>
-                    <div style={{ ...shared.sectionTitle, marginTop: 0 }}>
+                    <div style={{ ...shared.sectionTitle, marginTop: 0, display: 'flex', alignItems: 'center', gap: '8px' }}>
                         News Energy ({news_energy.n_sources} sources)
+                        {news_energy.stale && (
+                            <span style={shared.badge('#5A3A00')}>STALE{news_energy.as_of ? ` · ${news_energy.as_of}` : ''}</span>
+                        )}
                     </div>
                     <div style={shared.metricGrid}>
                         <div style={shared.metric}>
@@ -216,12 +219,60 @@ function NewsEnergyTab({ data, loading, error, onLoad }) {
         </div>
     );
 
-    const { energy_by_source, total_news_energy, coherence, force_vector, regime_signal, summary } = data;
+    const {
+        energy_by_source, total_news_energy, coherence, force_vector, regime_signal, summary,
+        available, stale, freshness: dataFreshness, excluded_sources, as_of,
+    } = data;
     const maxEnergy = Math.max(...(energy_by_source || []).map(s => s.total_energy), 1);
     const maxForce = Math.max(...(force_vector || []).map(f => f.energy), 1);
 
+    // Honest unavailable state: no news source had usable data at all.
+    // Do not render the metrics grid below -- every value in it would be a
+    // fabricated "0" standing in for "we don't know", which is exactly the
+    // dishonest pattern this view used to have.
+    if (available === false) {
+        return (
+            <div style={{ ...shared.card, borderColor: colors.red }}>
+                <div style={{ ...shared.sectionTitle, marginTop: 0, color: colors.red }}>
+                    News Energy Unavailable
+                </div>
+                <div style={{ fontSize: '13px', color: colors.textDim, lineHeight: '1.6' }}>{summary}</div>
+            </div>
+        );
+    }
+
     return (
         <>
+            {/* Staleness banner -- data exists but is older than the freshness
+                threshold, e.g. GDELT's theme lane recovering after #673's fix. */}
+            {stale && (
+                <div style={{ ...shared.card, borderColor: colors.yellow }}>
+                    <div style={{ ...shared.sectionTitle, marginTop: 0, color: colors.yellow }}>
+                        Stale — as of {as_of || 'unknown date'}
+                        {dataFreshness?.age_days != null ? ` (${dataFreshness.age_days}d old)` : ''}
+                    </div>
+                    <div style={{ fontSize: '12px', color: colors.textDim }}>
+                        Newest news observation is older than the {dataFreshness?.stale_after_days ?? '?'}-day
+                        freshness window. Figures below are historical, not current.
+                    </div>
+                </div>
+            )}
+
+            {/* Excluded sources -- named explicitly instead of silently
+                shrinking the total below. */}
+            {excluded_sources?.length > 0 && (
+                <div style={{ ...shared.card, borderColor: colors.border }}>
+                    <div style={{ fontSize: '12px', color: colors.textMuted, marginBottom: '4px' }}>
+                        {excluded_sources.length} known source(s) excluded from this analysis:
+                    </div>
+                    {excluded_sources.slice(0, 8).map((s) => (
+                        <div key={s.feature} style={{ fontSize: '11px', color: colors.textMuted, padding: '2px 0' }}>
+                            <span style={{ fontFamily: colors.mono }}>{s.feature}</span> — {s.reason}
+                        </div>
+                    ))}
+                </div>
+            )}
+
             {/* Summary */}
             <div style={{ ...shared.card, borderColor: colors.accent }}>
                 <div style={{ fontSize: '13px', color: colors.textDim, lineHeight: '1.6' }}>{summary}</div>

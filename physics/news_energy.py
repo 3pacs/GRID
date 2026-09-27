@@ -25,6 +25,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.availability import freshness
 from store.pit import PITStore
 
 
@@ -39,6 +40,15 @@ _MARKET_FEATURES = [
 
 # Crucix/GDELT feature prefixes
 _NEWS_PREFIXES = ("crucix_", "gdelt_")
+
+# A news source counts as stale once its newest observation is this many
+# days behind as_of_date. Crucix/GDELT features are daily-ish (GDELT's DOC
+# API in particular); 5 days tolerates a long weekend without hiding a
+# genuinely dead lane. GDELT's theme-query lane returned 0 rows on every
+# run from 2026-03-19 (a nested-timeline parsing bug) until #673 fixed it
+# on 2026-09-26 -- this threshold is what lets the dashboard tell "caught
+# up and fresh" apart from "still silently behind" during the backfill.
+NEWS_STALE_AFTER_DAYS = 5
 
 
 class NewsEnergyEngine:
@@ -366,16 +376,39 @@ class NewsEnergyEngine:
         energy_by_source: list[dict[str, Any]] = []
         all_total_energy = pd.Series(dtype=float)
         rate_of_change_by_source: dict[str, pd.Series] = {}
+        # Sources the registry knows about but that this analysis could not
+        # use -- named explicitly rather than silently vanishing from
+        # energy_by_source, so a dead lane (e.g. GDELT theme queries with
+        # no rows since 2026-03-19) shows up as an honest gap instead of a
+        # quietly-smaller "complete" total. See AVAILABILITY_CONTRACT.md.
+        excluded_sources: list[dict[str, Any]] = []
+        last_observed_by_source: dict[str, date] = {}
 
         for fid in news_ids:
+            name = id_to_name.get(fid, str(fid))
+
             if fid not in news_matrix.columns:
+                excluded_sources.append({
+                    "feature": name,
+                    "reason": "no observations returned for this lookback window",
+                    "last_observed": None,
+                })
                 continue
 
             series = news_matrix[fid].dropna()
             if len(series) < 10:
+                last_obs = series.index[-1] if not series.empty else None
+                last_obs_date = last_obs.date() if hasattr(last_obs, "date") else last_obs
+                excluded_sources.append({
+                    "feature": name,
+                    "reason": f"only {len(series)} observations in the lookback window (need 10)",
+                    "last_observed": last_obs_date.isoformat() if last_obs_date else None,
+                })
                 continue
 
-            name = id_to_name.get(fid, str(fid))
+            last_obs = series.index[-1]
+            last_observed_by_source[name] = last_obs.date() if hasattr(last_obs, "date") else last_obs
+
             ke = self._kinetic_energy(series)
             pe = self._potential_energy(series)
             total = ke.add(pe, fill_value=0)
@@ -421,6 +454,11 @@ class NewsEnergyEngine:
             else:
                 level = "low"
 
+            source_fresh = freshness(
+                last_observed_by_source[name],
+                stale_after_days=NEWS_STALE_AFTER_DAYS,
+                today=as_of_date,
+            )
             entry = {
                 "feature": name,
                 "kinetic_energy": round(ke_latest, 4),
@@ -429,6 +467,8 @@ class NewsEnergyEngine:
                 "energy_level": level,
                 "conservation_ratio": round(conservation_ratio, 3),
                 "market_correlations": market_correlations,
+                "last_observed": last_observed_by_source[name].isoformat(),
+                "stale": bool(source_fresh.stale),
             }
             energy_by_source.append(entry)
 
@@ -484,22 +524,34 @@ class NewsEnergyEngine:
             ),
         }
 
-        # 8. Summary
+        # 8. Overall data freshness -- the newest observation across every
+        # source actually used. None when nothing qualified (all excluded).
+        newest_as_of = max(last_observed_by_source.values(), default=None)
+        overall_fresh = freshness(
+            newest_as_of, stale_after_days=NEWS_STALE_AFTER_DAYS, today=as_of_date
+        )
+
+        # 9. Summary
         summary = self._build_summary(
             energy_by_source, total_news_energy, coherence,
-            force_vector, regime_signal,
+            force_vector, regime_signal, overall_fresh, excluded_sources,
         )
 
         return {
             "as_of_date": as_of_date.isoformat(),
+            "as_of": newest_as_of.isoformat() if newest_as_of else None,
             "lookback_days": lookback_days,
             "n_news_sources": len(energy_by_source),
             "n_market_features": len(market_ids),
             "energy_by_source": energy_by_source,
+            "excluded_sources": excluded_sources,
             "total_news_energy": round(total_news_energy, 4),
             "coherence": coherence,
             "force_vector": force_vector,
             "regime_signal": regime_signal,
+            "freshness": overall_fresh.to_dict(),
+            "available": len(energy_by_source) > 0,
+            "stale": overall_fresh.stale,
             "summary": summary,
         }
 
@@ -509,13 +561,20 @@ class NewsEnergyEngine:
 
     @staticmethod
     def _empty_result(reason: str) -> dict[str, Any]:
-        """Return a structured empty result when analysis cannot proceed."""
+        """Return a structured, honestly-unavailable result when analysis cannot proceed.
+
+        Per docs/reference/AVAILABILITY_CONTRACT.md: no measured field gets
+        a placeholder number, ``available`` is explicit, and ``as_of`` stays
+        ``None`` rather than defaulting to today.
+        """
         return {
             "as_of_date": date.today().isoformat(),
+            "as_of": None,
             "lookback_days": 0,
             "n_news_sources": 0,
             "n_market_features": 0,
             "energy_by_source": [],
+            "excluded_sources": [],
             "total_news_energy": 0.0,
             "coherence": {"coherence": 0.0, "dominant_direction": "neutral",
                           "aligned_sources": [], "n_sources": 0},
@@ -523,6 +582,10 @@ class NewsEnergyEngine:
             "regime_signal": {"equilibrium": True, "violations": 0,
                               "violating_sources": [],
                               "interpretation": reason},
+            "freshness": {"as_of": None, "age_days": None, "stale": None,
+                          "stale_after_days": NEWS_STALE_AFTER_DAYS},
+            "available": False,
+            "stale": None,
             "summary": reason,
         }
 
@@ -533,9 +596,24 @@ class NewsEnergyEngine:
         coherence: dict,
         force_vector: list[dict],
         regime_signal: dict,
+        overall_fresh: Any = None,
+        excluded_sources: list[dict] | None = None,
     ) -> str:
         """Build a plain-English summary of the news energy state."""
         parts = []
+
+        if overall_fresh is not None and overall_fresh.stale:
+            parts.append(
+                f"STALE: newest news observation is {overall_fresh.age_days} day(s) old "
+                f"(as of {overall_fresh.as_of.isoformat() if overall_fresh.as_of else 'unknown'}) "
+                "-- treat the figures below as historical, not current."
+            )
+        if excluded_sources:
+            names = ", ".join(s["feature"] for s in excluded_sources[:5])
+            parts.append(
+                f"{len(excluded_sources)} known news source(s) unavailable for this window "
+                f"({names}) -- excluded from the totals below, not counted as zero."
+            )
 
         # Overall energy level
         if total_energy > 10.0:

@@ -658,6 +658,12 @@ export default function TickerLookup() {
                         </div>
                         <Layers size={21} />
                     </div>
+                    {data?.source?.extracted_at ? (
+                        <p className="tl-extract-note">
+                            Static extract from {data.source.extracted_at} — not refreshed since.
+                            The workbook corpus is a one-shot snapshot, not a live feed.
+                        </p>
+                    ) : null}
                     <EvidenceTable rows={evidence} />
                 </article>
 
@@ -910,6 +916,15 @@ const CSS = `
 }
 .tl-card-head svg,
 .tl-section-head svg { color: #f4c542; }
+.tl-extract-note {
+    margin: -4px 0 12px;
+    font-size: 12px;
+    color: #b8a15a;
+    background: rgba(244, 197, 66, 0.08);
+    border: 1px solid rgba(244, 197, 66, 0.25);
+    border-radius: 6px;
+    padding: 6px 10px;
+}
 .tl-icon-button {
     width: 38px;
     height: 38px;
