@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine.url import make_url
 
 import api.routers.dad as dad
-from api.auth import require_auth
+from api.auth import require_auth, require_stream_auth
 
 
 @pytest.mark.xdist_group("postgres")
@@ -60,6 +60,7 @@ def test_ticker_detail_stored_cold_error_and_stream_gets_have_no_writes():
     app = FastAPI()
     app.include_router(dad.router)
     app.dependency_overrides[require_auth] = lambda: "test"
+    app.dependency_overrides[require_stream_auth] = lambda: "test"
     workbook = {
         "status": "ready", "summary": {"mentions": 1},
         "workbook": {"files": [], "sheets": [], "evidence": []},

@@ -375,6 +375,7 @@ class OpenCorporatesPuller(BasePuller):
                         raw_payload->>'actor_id' AS actor_id
                     FROM raw_series
                     WHERE series_id LIKE 'OFFSHORE:%'
+                      AND pull_status = 'SUCCESS'
                       AND raw_payload->>'actor_name' IS NOT NULL
                     ORDER BY raw_payload->>'actor_name'
                     LIMIT 50

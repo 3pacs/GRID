@@ -1,9 +1,18 @@
 """CAT-35 — CFTC COT extremes + non-commercial z-scores.
 
-The existing ``ingestion/altdata/cftc_cot.py`` pulls 17 major futures
-contracts weekly. Each metric (net_speculative, commercial_long,
-commercial_short, total_open_interest, etc.) is stored under
-``cftc.<CONTRACT>.<metric>`` in raw_series.
+``ingestion/altdata/cftc_cot.py`` pulls the tracked CFTC markets weekly.
+Each metric (net_speculative, commercial_long, commercial_short,
+total_open_interest, etc.) is stored under
+``cftc.<cftc_contract_market_code>.<metric>`` in raw_series (e.g.
+``cftc.13874A.net_speculative`` for the E-mini S&P 500).
+
+This module reads ONLY those code-keyed ids. The legacy name-matched ids
+(``cftc.SP500.*``, ``cftc.GOLD.*`` ...) switched between different futures
+markets from week to week (E-mini / micro / dividend-index S&P futures,
+COMEX / micro / perp gold, ...), so a z-score or percentile over them is
+computed across mixed instruments. They are never read here. Until the
+code-keyed history is backfilled (owner step A1) a market has too little
+history and is reported unavailable, not scored.
 
 This module reads those series and computes positioning EXTREMES:
   • rolling 3-year percentile rank (how extreme is current positioning?)
@@ -38,6 +47,7 @@ import numpy as np
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.cftc_markets import LEGACY_CONTRACT_KEYS, MARKETS, series_id
 from store.observations import read_window
 
 # ── Tuning constants ──────────────────────────────────────────────────────
@@ -53,15 +63,10 @@ _PCTILE_EXTREME = 95
 # Minimum history required to emit a classification
 _MIN_HISTORY = 40
 
-# The CFTC contracts we care about most — reused from cftc_cot.py's canonical set
-CORE_CONTRACTS: tuple[str, ...] = (
-    "SP500", "NASDAQ", "RUSSELL", "DJIA",
-    "USD_INDEX", "EUR", "JPY", "GBP",
-    "TREASURY_10Y", "TREASURY_2Y", "EURODOLLAR",
-    "GOLD", "SILVER", "COPPER",
-    "CRUDE_OIL", "NATGAS",
-    "CORN", "SOYBEAN", "WHEAT",
-)
+# CFTC contract market codes scanned — every market the puller tracks.
+# (The previous list named legacy keys, several of which the puller never
+# wrote: RUSSELL, USD_INDEX, EUR, JPY, GBP, TREASURY_10Y, TREASURY_2Y.)
+CORE_CONTRACTS: tuple[str, ...] = tuple(MARKETS)
 
 # Metrics we check for extremes
 EXTREME_METRICS: tuple[str, ...] = (
@@ -87,10 +92,12 @@ class COTExtreme:
     severity: str                # 'neutral' / 'elevated' / 'extreme'
     direction: str               # 'long_crowd' / 'short_crowd' / 'neutral'
     sample_size: int
+    market_code: str | None = None  # cftc_contract_market_code (identity)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "contract": self.contract,
+            "market_code": self.market_code,
             "metric": self.metric,
             "as_of": self.as_of.isoformat(),
             "current_value": self.current_value,
@@ -111,6 +118,7 @@ def classify_extreme(
     metric: str,
     history: Sequence[float],
     as_of: date | None = None,
+    market_code: str | None = None,
 ) -> COTExtreme | None:
     """Classify the current value of ``history`` as extreme or not.
 
@@ -164,6 +172,7 @@ def classify_extreme(
         severity=severity,
         direction=direction,
         sample_size=len(finite),
+        market_code=market_code,
     )
 
 
@@ -205,33 +214,80 @@ def _read_series_history(
     return [(o.obs_date, o.value) for o in obs_rows]
 
 
+def scan_extremes_report(
+    engine: Engine,
+    *,
+    contracts: Sequence[str] = CORE_CONTRACTS,
+    metrics: Sequence[str] = EXTREME_METRICS,
+) -> dict[str, Any]:
+    """Scan code-keyed CFTC series; report what is unavailable and why.
+
+    ``contracts`` are CFTC contract market codes (``"13874A"``). A legacy
+    name key (``"SP500"``) or any unknown code is refused, never mapped to a
+    market. Returns an availability-contract payload: ``available`` is False
+    (``status: "unavailable"``) when no (market, metric) pair has enough
+    code-keyed history, and every skipped pair is listed with its reason.
+    """
+    extremes: list[COTExtreme] = []
+    unavailable: list[dict[str, Any]] = []
+    for code in contracts:
+        if code not in MARKETS:
+            reason = (
+                "legacy name-matched key (mixed markets); use a market code"
+                if code in LEGACY_CONTRACT_KEYS else "not a tracked CFTC market code"
+            )
+            log.warning("cot_extremes: refusing contract {c}: {r}", c=code, r=reason)
+            unavailable.append({"market_code": code, "metric": None, "reason": reason})
+            continue
+        root = MARKETS[code].root
+        for metric in metrics:
+            history = _read_series_history(engine, series_id(code, metric))
+            if not history:
+                unavailable.append({"market_code": code, "root": root, "metric": metric,
+                                    "reason": "no code-keyed rows"})
+                continue
+            values = [v for _, v in history]
+            as_of = history[-1][0]
+            result = classify_extreme(
+                contract=root, metric=metric,
+                history=values, as_of=as_of, market_code=code,
+            )
+            if result is None:
+                unavailable.append({"market_code": code, "root": root, "metric": metric,
+                                    "reason": f"insufficient history ({len(values)} < {_MIN_HISTORY})"})
+                continue
+            extremes.append(result)
+    log.info("cot_extremes: scanned {n} pairs, found {e} extremes, {u} unavailable",
+             n=len(contracts) * len(metrics),
+             e=sum(1 for x in extremes if x.severity != "neutral"),
+             u=len(unavailable))
+    if not extremes:
+        return {
+            "available": False,
+            "status": "unavailable",
+            "reason": "no CFTC market has enough code-keyed history "
+                      "(cftc.<market_code>.<metric>; backfill pending)",
+            "extremes": [],
+            "unavailable": unavailable,
+        }
+    return {
+        "available": True,
+        "status": "partial" if unavailable else "ok",
+        "reason": None,
+        "extremes": extremes,
+        "unavailable": unavailable,
+    }
+
+
 def scan_all_extremes(
     engine: Engine,
     *,
     contracts: Sequence[str] = CORE_CONTRACTS,
     metrics: Sequence[str] = EXTREME_METRICS,
 ) -> list[COTExtreme]:
-    """Scan every (contract, metric) pair and return classified extremes.
+    """Classified extremes over code-keyed series only (see scan_extremes_report).
 
-    Filters out None results (too-short histories). Returns the full
-    list — call ``rank_contrarian_signals`` to sort.
+    Pairs without enough code-keyed history are left out, never filled from
+    the legacy mixed-market ids. An empty list means unavailable.
     """
-    out: list[COTExtreme] = []
-    for contract in contracts:
-        for metric in metrics:
-            series_id = f"cftc.{contract}.{metric}"
-            history = _read_series_history(engine, series_id)
-            if not history:
-                continue
-            values = [v for _, v in history]
-            as_of = history[-1][0]
-            result = classify_extreme(
-                contract=contract, metric=metric,
-                history=values, as_of=as_of,
-            )
-            if result is not None:
-                out.append(result)
-    log.info("cot_extremes: scanned {n} pairs, found {e} extremes",
-             n=len(contracts) * len(metrics),
-             e=sum(1 for x in out if x.severity != "neutral"))
-    return out
+    return scan_extremes_report(engine, contracts=contracts, metrics=metrics)["extremes"]

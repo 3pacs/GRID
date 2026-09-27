@@ -4423,6 +4423,10 @@ def _build_obsidian_cycle_body(
         lines.append(f"- latest pull: {latest_pull}")
     if failed_1h is not None:
         lines.append(f"- failed pulls (1h / 24h): {failed_1h} / {failed_24h}")
+    quarantined = db.get("quarantined_rows")
+    if quarantined:
+        plus = "+" if db.get("quarantined_rows_capped") else ""
+        lines.append(f"- quarantined raw_series rows (not failures): {quarantined:,}{plus}")
     if events:
         lines.append("")
         lines.append("## Events this cycle")

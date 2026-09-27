@@ -717,6 +717,7 @@ def check_actor_in_offshore_leaks(
                       SELECT id FROM source_catalog
                       WHERE name = 'ICIJ_OFFSHORE' LIMIT 1
                   )
+                  AND pull_status = 'SUCCESS'
                 ORDER BY obs_date DESC
                 LIMIT 50
             """), {

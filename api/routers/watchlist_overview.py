@@ -146,7 +146,16 @@ def get_ticker_overview(
         if not price_info:
             live = _fetch_live_price(ticker_upper)
             if live:
-                price_info = {"price": live["price"], "pct_1d": live.get("pct_1d"), "source": "live"}
+                live_as_of = live.get("as_of")
+                price_info = {
+                    "price": live["price"],
+                    "pct_1d": live.get("pct_1d"),
+                    "source": "live",
+                    # The real trading day the price belongs to, from
+                    # yfinance's own history — None (not date.today()) when
+                    # it can't be read (#F1 D6).
+                    "date": str(live_as_of) if live_as_of is not None else None,
+                }
 
         # Options (latest)
         try:
@@ -447,6 +456,12 @@ def get_ticker_overview(
         "sentiment": sentiment,
         "sector_path": sector_info or None,
         "generated_at": datetime.utcnow().isoformat() + "Z",
+        # The price's own date/source, distinct from `generated_at` (the AI
+        # narrative's timestamp) — without this the UI has no way to tell
+        # the reader "Last" is priced as of a different, possibly stale,
+        # day (#F1 D6).
+        "price_as_of": price_info.get("date"),
+        "price_source": price_info.get("source"),
     }
 
 
@@ -577,8 +592,11 @@ def get_ticker_quote(
                 change_pct = live.get("pct_1d")
                 source = "live"
                 price_tier = "live_fallback"
-                if price is not None:
-                    as_of_date = date.today()
+                # The real trading day the price belongs to, from yfinance's
+                # own history — None (not date.today()) when it can't be
+                # read, so `stale` below stays honestly unknown rather than
+                # claiming a fresh price it can't back up (#F1 D5).
+                as_of_date = live.get("as_of")
         except Exception as exc:
             # Not a query: an outbound HTTP fetch. Always operational.
             log.warning(

@@ -973,7 +973,10 @@ def _build_globe_data() -> dict[str, Any]:
                 score_parts.append(max(0, min(1, 0.5 + fx_change * 5)))
             if lights_change is not None:
                 score_parts.append(max(0, min(1, 0.5 + lights_change * 8)))
-            activity_score = round(sum(score_parts) / len(score_parts), 2) if score_parts else 0.5
+            # No fabricated neutral score when nothing could be measured: a
+            # made-up 0.5 was indistinguishable from a genuinely neutral
+            # reading. `None` here means "not generated" for this country.
+            activity_score = round(sum(score_parts) / len(score_parts), 2) if score_parts else None
 
             countries.append({
                 "id": cfg["id"],
@@ -988,7 +991,7 @@ def _build_globe_data() -> dict[str, Any]:
             countries.append({
                 "id": cfg["id"], "name": cfg["name"],
                 "gdp_signal": "no_data", "fx_change_1m": None,
-                "night_lights_change": None, "activity_score": 0.5,
+                "night_lights_change": None, "activity_score": None,
             })
 
     # ── Trade & capital flows from Comtrade bilateral data ──

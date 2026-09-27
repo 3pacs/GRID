@@ -69,7 +69,8 @@ def _bulk_insert(engine, source_id: int, series_id: str, data: list[tuple[date, 
     with engine.begin() as conn:
         existing = set()
         rows = conn.execute(text(
-            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
         ), {"sid": series_id, "src": source_id}).fetchall()
         existing = {r[0] for r in rows}
 

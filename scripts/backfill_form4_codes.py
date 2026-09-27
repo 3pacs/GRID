@@ -94,6 +94,7 @@ _SELECT_PAYLOADS = text(
     SELECT obs_date, raw_payload
       FROM raw_series
      WHERE series_id LIKE 'INSIDER:%'
+       AND pull_status = 'SUCCESS'
        AND obs_date >= :start_date
        AND obs_date <= :end_date
     """

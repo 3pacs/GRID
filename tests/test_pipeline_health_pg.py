@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import pytest
@@ -56,11 +56,31 @@ def pipeline_pg():
             conn.execute(text("CREATE TABLE feature_registry (id integer PRIMARY KEY, name text, family text, model_eligible boolean)"))
             conn.execute(text("CREATE TABLE resolved_series (feature_id integer, vintage_date date)"))
             conn.execute(text("CREATE TABLE server_log (created_at timestamptz, source text, message text, level text)"))
+            # Mirrors scripts/freshness_audit_universe.sql's actual shape
+            # (data_freshness_audit / data_freshness_universe), not a
+            # stand-in -- pipeline_health()/freshness() read this table
+            # directly, so the fixture must match column names and types.
+            conn.execute(text(
+                "CREATE TABLE data_freshness_audit ("
+                "  ticker text NOT NULL,"
+                "  source_table text NOT NULL,"
+                "  last_obs date,"
+                "  age_days integer,"
+                "  bucket text NOT NULL,"
+                "  audited_at timestamptz NOT NULL DEFAULT now(),"
+                "  PRIMARY KEY (ticker, source_table, audited_at)"
+                ")"
+            ))
             conn.execute(text("INSERT INTO source_catalog VALUES (1, 'yfinance', now()), (2, 'Fed_Liquidity', NULL)"))
             conn.execute(text("INSERT INTO raw_series (source_id, series_id, pull_timestamp, pull_status) VALUES (1, 'YF:SPY:close', now(), 'SUCCESS')"))
             conn.execute(text("INSERT INTO feature_registry VALUES (1, 'YF:SPY:close', 'market', true)"))
             conn.execute(text("INSERT INTO resolved_series VALUES (1, CURRENT_DATE)"))
             conn.execute(text("INSERT INTO server_log VALUES (now(), 'fixture', 'sample failure', 'ERROR')"))
+            conn.execute(text(
+                "INSERT INTO data_freshness_audit (ticker, source_table, last_obs, age_days, bucket, audited_at) VALUES "
+                "('SPY', 'ticker_metrics_daily', CURRENT_DATE, 0, 'FRESH', now()), "
+                "('OLDCO', 'ticker_metrics_daily', CURRENT_DATE - 40, 40, 'STALE_30+', now())"
+            ))
         yield engine
     finally:
         engine.dispose()
@@ -91,6 +111,68 @@ def test_representative_postgres_health_is_available(pipeline_pg):
     assert data["coverage"]["by_family"]["market"]["with_data"] == 1
     assert len(data["recent_errors"]) == 1
     assert data["resolver_status"]["last_run"] == datetime.now(timezone.utc).date().isoformat()
+
+    # F3: pipeline-health also carries the pre-computed daily audit
+    # (data_freshness_audit), read as a bounded, indexed lookup rather than
+    # a live scan -- this must be "available" and reflect the fixture's
+    # two rows/buckets from today's audited_at, independent of the
+    # per-source sections asserted above.
+    audit = data["daily_audit"]
+    assert audit["availability"] == "available"
+    assert audit["stale_reason"] is None
+    assert audit["total_tickers"] == 2
+    assert audit["source_tables"] == ["ticker_metrics_daily"]
+    buckets_by_name = {b["bucket"]: b["ticker_count"] for b in audit["buckets"]}
+    assert buckets_by_name == {"FRESH": 1, "STALE_30+": 1}
+    assert audit["field_record"]["availability"] == "available"
+    assert audit["field_record"]["provenance"] == "measured"
+
+
+def test_daily_audit_is_unavailable_when_stale(pipeline_pg):
+    """An audit whose last run is more than one full missed cycle old must
+    report unavailable/"stale", not silently present last night's (or
+    older) numbers as if they were current."""
+    old_audited_at = datetime.now(timezone.utc) - timedelta(hours=72)
+    with pipeline_pg.begin() as conn:
+        conn.execute(text("DELETE FROM data_freshness_audit"))
+        conn.execute(
+            text(
+                "INSERT INTO data_freshness_audit "
+                "(ticker, source_table, last_obs, age_days, bucket, audited_at) "
+                "VALUES ('SPY', 'ticker_metrics_daily', CURRENT_DATE - 3, 3, 'FRESH', :audited_at)"
+            ),
+            {"audited_at": old_audited_at},
+        )
+
+    response = _response(pipeline_pg)
+    assert response.status_code == 200
+    data = response.json()
+    audit = data["daily_audit"]
+    assert audit["availability"] == "unavailable"
+    assert audit["stale_reason"] == "stale"
+    # The last-known numbers are still surfaced for context, just flagged.
+    assert audit["total_tickers"] == 1
+    assert audit["audited_at"] is not None
+    # This is independent of the rest of the response, which is unaffected.
+    assert data["availability"] == "available"
+
+
+def test_daily_audit_is_unavailable_when_missing(pipeline_pg):
+    """An audit table that has never been populated (the timer has not run
+    yet) must read as unavailable/"never_configured", never as zero
+    buckets that could be misread as "everything is DEAD"."""
+    with pipeline_pg.begin() as conn:
+        conn.execute(text("DELETE FROM data_freshness_audit"))
+
+    response = _response(pipeline_pg)
+    assert response.status_code == 200
+    data = response.json()
+    audit = data["daily_audit"]
+    assert audit["availability"] == "unavailable"
+    assert audit["stale_reason"] == "never_configured"
+    assert audit["audited_at"] is None
+    assert audit["buckets"] == []
+    assert audit["total_tickers"] == 0
 
 
 def test_source_cancellation_fails_closed_and_reuses_connection(pipeline_pg):

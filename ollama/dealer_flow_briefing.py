@@ -206,7 +206,7 @@ def _gather_positioning_data(engine: Engine) -> dict[str, Any]:
         with engine.connect() as conn:
             row = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'YF:^VIX:close' "
+                "WHERE series_id = 'YF:^VIX:close' AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 1"
             )).fetchone()
             if row:
@@ -219,7 +219,7 @@ def _gather_positioning_data(engine: Engine) -> dict[str, Any]:
         with engine.connect() as conn:
             rows = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'YF:^GSPC:close' "
+                "WHERE series_id = 'YF:^GSPC:close' AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 6"
             )).fetchall()
             if rows and len(rows) >= 2:

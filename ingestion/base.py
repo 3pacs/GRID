@@ -377,6 +377,15 @@ class BasePuller:
     ) -> bool:
         """Check if a raw_series row already exists within the dedup window.
 
+        A ``QUARANTINED`` row (migration #671: a wrong-instrument price batch
+        caught after the fact) does NOT count as existing here — it is not
+        valid data for this ``(series_id, obs_date)``, so a puller must be
+        allowed to re-pull and overwrite it immediately rather than being
+        throttled by the dedup window as if good data were already on file.
+        ``SUCCESS``, ``PARTIAL`` and ``FAILED`` still count as existing (the
+        FAILED case intentionally rate-limits retries against a failing
+        upstream API).
+
         Parameters:
             series_id: The series identifier.
             obs_date: Observation date.
@@ -384,14 +393,15 @@ class BasePuller:
             dedup_hours: Hours to look back for duplicates (default: 1).
 
         Returns:
-            bool: True if a matching row exists.
+            bool: True if a matching non-quarantined row exists.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=dedup_hours)
         result = conn.execute(
             text(
                 "SELECT 1 FROM raw_series "
                 "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
+                "AND obs_date = :od AND pull_timestamp >= :ts "
+                "AND pull_status != 'QUARANTINED' LIMIT 1"
             ),
             {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": cutoff},
         ).fetchone()
@@ -601,6 +611,9 @@ class BasePuller:
             value: Numeric value.
             raw_payload: Optional JSON payload.
             pull_status: Pull status ('SUCCESS', 'PARTIAL', 'FAILED').
+                The schema also allows 'QUARANTINED', but pullers never
+                write it: it is set only by an explicit quarantine of
+                already-stored rows.
         """
         import json
 

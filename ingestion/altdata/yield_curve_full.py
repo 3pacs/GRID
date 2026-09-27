@@ -284,6 +284,7 @@ class FullYieldCurvePuller(BasePuller):
                         "SELECT DISTINCT ON (obs_date) obs_date, value "
                         "FROM raw_series "
                         "WHERE series_id = :sid "
+                        "AND pull_status = 'SUCCESS' "
                         "AND obs_date >= :start AND obs_date <= :end "
                         "ORDER BY obs_date, pull_timestamp DESC"
                     ),

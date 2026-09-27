@@ -47,7 +47,7 @@ def test_analysis_and_flow_keep_measured_data_without_get_writes():
         conn.execute(text("CREATE TABLE source_catalog (id INTEGER, name TEXT)"))
         conn.execute(text("""CREATE TABLE raw_series (
             source_id INTEGER, series_id TEXT, pull_timestamp TIMESTAMPTZ,
-            value DOUBLE PRECISION, raw_payload JSONB)"""))
+            value DOUBLE PRECISION, raw_payload JSONB, pull_status TEXT)"""))
         conn.execute(text("INSERT INTO feature_registry VALUES (1, 'aapl_close', 'price')"))
         conn.execute(text("INSERT INTO resolved_series VALUES (1, :d, 100), (1, :p, 90)"), {"d": today, "p": prior})
         conn.execute(text("""INSERT INTO options_daily_signals
