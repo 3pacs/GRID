@@ -1,0 +1,27 @@
+# TEMPLATE ONLY -- not installed by any code path. Installing and enabling it
+# is the owner's activation step (god-view plan A3). See README.md.
+[Unit]
+Description=GRID god view writer: CFTC positioning (COT) (godview_runs pillar 'cftc')
+Documentation=file:///data/grid_v4/grid_release/deploy/systemd/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+# The deployed release tree (.github/workflows/deploy.yml resets it to main).
+# --code-sha-from-git stamps rows with this tree's HEAD and refuses when a
+# tracked file the writers import is modified.
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-scheduler and grid-hermes use (GRID DB settings).
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# One god-view writer at a time (fed and cftc share the lock); wait up to
+# 10 min for a running writer instead of failing.
+ExecStart=/usr/bin/flock -w 600 /tmp/grid-godview-writers.lock /usr/bin/python3 scripts/run_godview_writers.py --pillar cftc --code-sha-from-git
+# 0 = success / no-op / partial (legacy-blocked keys, see godview_runs);
+# 1 = writer failed; 2 = refused (code sha); 3 = no upstream inputs.
+TimeoutStartSec=15min
+StandardOutput=journal
+StandardError=journal

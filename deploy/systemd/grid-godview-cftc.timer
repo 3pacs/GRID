@@ -1,0 +1,22 @@
+# TEMPLATE ONLY -- not installed by any code path (god-view plan A3, owner).
+# COT publishes Friday 15:30 ET (holiday weeks: next federal business day);
+# the CFTC puller (plan A1) is moved to Friday >= 19:45 UTC plus a Saturday
+# retry. Calendar is anchored to America/New_York so it tracks DST:
+#   Fri 16:00 ET = 20:00 UTC (EDT) / 21:00 UTC (EST)
+#   Sat 14:00 ET retry, after the puller's Saturday retry
+# A holiday-shifted release (Mon-Thu) is written on the next Friday run; the
+# writer is idempotent, a retry with unchanged inputs is a no-op run.
+# Check on the host before enabling:
+#   systemd-analyze calendar 'Fri *-*-* 16:00:00 America/New_York'
+[Unit]
+Description=Weekly GRID god view CFTC positioning writer (after the COT release)
+
+[Timer]
+OnCalendar=Fri *-*-* 16:00:00 America/New_York
+OnCalendar=Sat *-*-* 14:00:00 America/New_York
+Persistent=true
+RandomizedDelaySec=120
+Unit=grid-godview-cftc.service
+
+[Install]
+WantedBy=timers.target

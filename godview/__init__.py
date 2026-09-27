@@ -1,4 +1,4 @@
-"""godview — writers for the God View pillars (materialize.py orchestrator lands in G7).
+"""godview — writers for the God View pillars (run by scripts/run_godview_writers.py, G7).
 
 Package rules (see docs at C:/Users/owner/Documents/Codex/2026-09-14/wha/outputs/
 GRID-GODVIEW-MATERIALIZATION-PLAN-20260926.md, finding 6):
