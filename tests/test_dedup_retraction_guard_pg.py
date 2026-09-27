@@ -1,38 +1,39 @@
-"""Real-PostgreSQL proof that PR #683's resolved_series_retractions FK does
-not break resolved_series dedup delete paths.
+"""Real-PostgreSQL proof that the resolved_series "dedup" paths never
+delete a vintage row.
 
-PR #683 (feat/resolved-series-retractions-20260927, not yet on main) adds
-``resolved_series_retractions``: an append-only table with an FK to the
-retracted ``resolved_series`` row, keyed on
-``(feature_id, obs_date, vintage_date)``. Its review found two dedup delete
-paths that would start hitting FK violations the moment a retracted row
-happens to also be a dedup loser:
+PR #688 review (2026-09-27) reversed an earlier fix. That fix treated two
+resolved_series rows sharing (feature_id, obs_date) as a "duplicate" and
+deleted the lower-priority one, guarded only against deleting a row PR
+#683's ``resolved_series_retractions`` had already retracted (an FK from
+that table to the retracted row, keyed on
+``(feature_id, obs_date, vintage_date)``, plus an append-only trigger).
 
-* ``intelligence/resolution_audit.py::auto_fix_issues`` ("duplicate" branch)
-* ``scripts/hermes_fixers.py::_run_data_quality_fix`` (Hermes'
-  ``FIX_DATA_QUALITY`` dedup loop), which additionally shared one
-  transaction across every dupe-group with no per-row isolation: one FK
-  violation aborted the whole transaction, so a bare ``try/except`` caught
-  the immediate exception but every later statement on that same
-  connection -- including the rest of the loop and the implicit commit --
-  failed too, silently rolling back every other dedup in the batch.
+That guard was not the fix this needed. resolved_series' real unique index
+is ``(feature_id, obs_date, vintage_date)`` -- so ANY two rows sharing
+(feature_id, obs_date) are, by construction, distinct vintages, never true
+duplicates. An exact duplicate (same feature_id, obs_date, vintage_date,
+AND value) cannot exist; the index forbids it. ``store/pit.py``'s
+FIRST_RELEASE and LATEST_AS_OF vintage policies read across exactly these
+rows, so deleting the "loser" per (feature_id, obs_date) group silently
+throws away point-in-time history -- measured against production, ~52% of
+eligible groups would have lost their FIRST_RELEASE row.
+
+Both delete paths are gone entirely:
+
+* ``intelligence/resolution_audit.py::auto_fix_issues`` -- "duplicate" and
+  NaN/Infinity findings are report-only: they count and log, never DELETE.
+* ``scripts/hermes_fixers.py::_run_data_quality_fix`` -- the
+  ``FIX_DATA_QUALITY`` dedup loop is report-only in the same way.
 
 Runs in a throwaway schema (random name, dropped afterwards) holding a
 minimal ``feature_registry``, ``resolved_series`` (production's composite
 unique key) and, where a test needs it, ``resolved_series_retractions``
-built exactly to PR #683's shape (FK + append-only trigger). Proves:
-
-* a retracted dedup-loser row survives both fix functions without ever
-  raising -- the anti-join keeps it out of the delete's target set, so the
-  FK is never actually hit;
-* an unretracted duplicate in the same batch still gets cleaned up
-  normally;
-* the SAVEPOINT this fix adds around the Hermes delete truly confines a
-  *real* Postgres FK-violation rollback to the one dupe-group that hit it
-  (monkeypatching the table-exists check off for one call proves this with
-  an actual violation, not just the fake-connection tests in
-  tests/test_dedup_retraction_guard.py, which cannot reproduce Postgres'
-  real transaction-abort semantics).
+built exactly to PR #683's shape (FK + append-only trigger). Proves, against
+real Postgres, that a two-vintage group -- the exact shape the old code
+called a "duplicate" -- survives both functions completely intact, whether
+or not resolved_series_retractions exists and whether or not either vintage
+happens to be retracted, and that the report-only counting logic (which
+does run real SELECT COUNT(*) queries) does not error.
 
 Uses the shared ``pg_engine`` fixture's URL (``GRID_TEST_DB_URL``); skips
 when no PostgreSQL is reachable (the CI step fails on a skip).
@@ -154,15 +155,16 @@ def _retract(engine: Engine, feature_id: int, obs_date: date, vintage_date: date
         )
 
 
-def _seed_duplicate(engine: Engine, feature_name: str, obs_date: date) -> tuple[int, date]:
-    """Two resolved_series rows for the same (feature, obs_date): a keeper
-    (inserted first, lower source_priority_used -- never a delete target
-    under either fix's dedup rule) and a loser (inserted second, higher
-    source_priority_used -- the row both dedup deletes target).
+def _seed_two_vintages(engine: Engine, feature_name: str, obs_date: date) -> tuple[int, date, date]:
+    """Two resolved_series rows for the same (feature, obs_date): distinct
+    vintages, exactly the shape the old code incorrectly called a
+    "duplicate". Neither is a legitimate delete target under the current
+    (report-only) code -- there is no delete target at all any more.
 
-    Returns (feature_id, loser's vintage_date).
+    Returns (feature_id, first vintage_date, second vintage_date).
     """
-    loser_vintage = obs_date - timedelta(days=1)
+    vintage_a = obs_date
+    vintage_b = obs_date - timedelta(days=1)
     with engine.begin() as conn:
         fid = conn.execute(
             text("INSERT INTO feature_registry (name) VALUES (:n) RETURNING id"),
@@ -173,9 +175,9 @@ def _seed_duplicate(engine: Engine, feature_name: str, obs_date: date) -> tuple[
                 "INSERT INTO resolved_series "
                 "(feature_id, obs_date, release_date, vintage_date, value, "
                 "source_priority_used) "
-                "VALUES (:fid, :od, :od, :od, 1.0, 1)"
+                "VALUES (:fid, :od, :vd, :vd, 1.0, 1)"
             ),
-            {"fid": fid, "od": obs_date},
+            {"fid": fid, "od": obs_date, "vd": vintage_a},
         )
         conn.execute(
             text(
@@ -184,9 +186,9 @@ def _seed_duplicate(engine: Engine, feature_name: str, obs_date: date) -> tuple[
                 "source_priority_used) "
                 "VALUES (:fid, :od, :vd, :vd, 2.0, 2)"
             ),
-            {"fid": fid, "od": obs_date, "vd": loser_vintage},
+            {"fid": fid, "od": obs_date, "vd": vintage_b},
         )
-    return fid, loser_vintage
+    return fid, vintage_a, vintage_b
 
 
 def _row_count(engine: Engine, feature_id: int, obs_date: date) -> int:
@@ -205,39 +207,70 @@ def _row_count(engine: Engine, feature_id: int, obs_date: date) -> int:
 # ---------------------------------------------------------------------------
 
 
-def test_resolution_audit_dedup_never_deletes_a_retracted_loser(scratch):
+def test_resolution_audit_duplicate_branch_never_deletes_any_vintage_no_retractions_table(scratch):
     engine = scratch
     obs_date = date.today() - timedelta(days=1)
-    fid, loser_vintage = _seed_duplicate(engine, "dedup_pg_audit_feature", obs_date)
+    fid, _va, _vb = _seed_two_vintages(engine, "dedup_pg_audit_no_table", obs_date)
+    # resolved_series_retractions is deliberately NOT installed for this case.
+
+    finding = resolution_audit.AuditFinding(
+        check_type="duplicate", severity="warning", feature="dedup_pg_audit_no_table",
+        description="dup", evidence={"obs_date": obs_date.isoformat()},
+    )
+    result = resolution_audit.auto_fix_issues(engine, [finding], dry_run=False)
+
+    assert result["duplicates_fixed"] == 0
+    assert result["multi_vintage_groups_reported"] == 1
+    assert _row_count(engine, fid, obs_date) == 2  # both vintages survive
+
+
+def test_resolution_audit_duplicate_branch_never_deletes_any_vintage_with_retractions_table(scratch):
+    engine = scratch
+    obs_date = date.today() - timedelta(days=1)
+    fid, vintage_a, _vb = _seed_two_vintages(engine, "dedup_pg_audit_with_table", obs_date)
     _install_retractions_table(engine)
-    _retract(engine, fid, obs_date, loser_vintage)
+    _retract(engine, fid, obs_date, vintage_a)  # one vintage is also retracted
 
     finding = resolution_audit.AuditFinding(
-        check_type="duplicate", severity="warning", feature="dedup_pg_audit_feature",
+        check_type="duplicate", severity="warning", feature="dedup_pg_audit_with_table",
         description="dup", evidence={"obs_date": obs_date.isoformat()},
     )
     result = resolution_audit.auto_fix_issues(engine, [finding], dry_run=False)
 
-    assert result["duplicates_fixed"] == 1  # ran without an FK violation
-    assert _row_count(engine, fid, obs_date) == 2  # keeper + FK-protected loser
+    assert result["duplicates_fixed"] == 0
+    assert result["multi_vintage_groups_reported"] == 1
+    assert _row_count(engine, fid, obs_date) == 2  # both vintages survive
 
 
-def test_resolution_audit_dedup_still_deletes_an_unretracted_loser(scratch):
-    """The anti-join must not become a blanket skip: an ordinary duplicate
-    with nothing retracted still gets cleaned up."""
+def test_resolution_audit_nan_branch_never_deletes_a_nan_value_row(scratch):
+    """A NaN/Infinity value is real production noise, but the delete this
+    branch used to run had no vintage_date filter -- report-only now."""
     engine = scratch
     obs_date = date.today() - timedelta(days=1)
-    fid, _loser_vintage = _seed_duplicate(engine, "dedup_pg_audit_clean_feature", obs_date)
-    _install_retractions_table(engine)  # table exists, but nothing retracted
+    with engine.begin() as conn:
+        fid = conn.execute(
+            text("INSERT INTO feature_registry (name) VALUES (:n) RETURNING id"),
+            {"n": "dedup_pg_audit_nan"},
+        ).scalar()
+        conn.execute(
+            text(
+                "INSERT INTO resolved_series "
+                "(feature_id, obs_date, release_date, vintage_date, value, "
+                "source_priority_used) "
+                "VALUES (:fid, :od, :od, :od, 'NaN'::DOUBLE PRECISION, 1)"
+            ),
+            {"fid": fid, "od": obs_date},
+        )
 
     finding = resolution_audit.AuditFinding(
-        check_type="duplicate", severity="warning", feature="dedup_pg_audit_clean_feature",
-        description="dup", evidence={"obs_date": obs_date.isoformat()},
+        check_type="sanity", severity="warning", feature="dedup_pg_audit_nan",
+        description="NaN detected", evidence={"obs_date": obs_date.isoformat()},
     )
     result = resolution_audit.auto_fix_issues(engine, [finding], dry_run=False)
 
-    assert result["duplicates_fixed"] == 1
-    assert _row_count(engine, fid, obs_date) == 1  # loser was deleted as before
+    assert result["nan_removed"] == 0
+    assert result["nan_values_reported"] == 1
+    assert _row_count(engine, fid, obs_date) == 1  # the NaN row survives
 
 
 # ---------------------------------------------------------------------------
@@ -245,54 +278,34 @@ def test_resolution_audit_dedup_still_deletes_an_unretracted_loser(scratch):
 # ---------------------------------------------------------------------------
 
 
-def test_hermes_dedup_respects_retraction_and_still_cleans_others(scratch, monkeypatch):
+def test_hermes_dedup_never_deletes_any_vintage_across_multiple_groups(scratch, monkeypatch):
     engine = scratch
     obs_a = date.today() - timedelta(days=1)
     obs_b = date.today() - timedelta(days=2)
-    fid_a, loser_vintage_a = _seed_duplicate(engine, "dedup_pg_hermes_feature_a", obs_a)
-    fid_b, _loser_vintage_b = _seed_duplicate(engine, "dedup_pg_hermes_feature_b", obs_b)
+    fid_a, vintage_a1, _va2 = _seed_two_vintages(engine, "dedup_pg_hermes_feature_a", obs_a)
+    fid_b, _vb1, _vb2 = _seed_two_vintages(engine, "dedup_pg_hermes_feature_b", obs_b)
     _install_retractions_table(engine)
-    _retract(engine, fid_a, obs_a, loser_vintage_a)
-    # feature_b's loser is deliberately left unretracted.
+    _retract(engine, fid_a, obs_a, vintage_a1)
+    # feature_b is left entirely unretracted.
 
     monkeypatch.setattr(hermes_fixers, "log_issue", lambda engine, **kw: None)
     result = hermes_fixers._run_data_quality_fix(engine, None, SimpleNamespace(cycle_count=1))
 
-    assert result["duplicates_fixed"] == 2  # both groups processed, no FK error
-    assert _row_count(engine, fid_a, obs_a) == 2  # keeper + FK-protected loser
-    assert _row_count(engine, fid_b, obs_b) == 1  # unretracted loser was deleted
+    assert result["duplicates_fixed"] == 0
+    assert result["multi_vintage_groups_found"] == 2
+    assert _row_count(engine, fid_a, obs_a) == 2  # both of feature_a's vintages survive
+    assert _row_count(engine, fid_b, obs_b) == 2  # both of feature_b's vintages survive
 
 
-def test_hermes_dedup_savepoint_isolates_a_real_fk_violation(scratch, monkeypatch):
-    """Force a genuine Postgres FK violation (bypass the anti-join via
-    monkeypatch, as if the guard this fix adds were absent) to prove the
-    SAVEPOINT it also adds truly confines the rollback to the one
-    dupe-group that hit it -- the real, Postgres-level regression #683's
-    review found. A fake connection (tests/test_dedup_retraction_guard.py)
-    cannot reproduce Postgres' actual transaction-abort semantics, so this
-    is the test that proves the fix rather than merely describing it.
-    """
+def test_hermes_dedup_never_deletes_when_retractions_table_absent(scratch, monkeypatch):
     engine = scratch
-    obs_a = date.today() - timedelta(days=1)
-    obs_b = date.today() - timedelta(days=2)
-    fid_a, loser_vintage_a = _seed_duplicate(engine, "dedup_pg_fk_violation_feature_a", obs_a)
-    fid_b, _loser_vintage_b = _seed_duplicate(engine, "dedup_pg_fk_violation_feature_b", obs_b)
-    _install_retractions_table(engine)
-    _retract(engine, fid_a, obs_a, loser_vintage_a)
+    obs_date = date.today() - timedelta(days=1)
+    fid, _va, _vb = _seed_two_vintages(engine, "dedup_pg_hermes_no_table", obs_date)
+    # resolved_series_retractions deliberately not installed.
 
-    # Simulate the anti-join being absent (pre-fix): the delete for
-    # feature_a's retracted loser now genuinely violates the FK inside
-    # Postgres, not just in Python.
-    monkeypatch.setattr(
-        hermes_fixers, "_hermes_retractions_table_exists", lambda conn: False,
-    )
     monkeypatch.setattr(hermes_fixers, "log_issue", lambda engine, **kw: None)
-
     result = hermes_fixers._run_data_quality_fix(engine, None, SimpleNamespace(cycle_count=1))
 
-    # feature_a's delete raised a real FK violation and was caught; only
-    # feature_b's succeeded -- proof the SAVEPOINT confined feature_a's
-    # abort to itself rather than poisoning the shared transaction.
-    assert result["duplicates_fixed"] == 1
-    assert _row_count(engine, fid_a, obs_a) == 2  # the violation blocked the delete
-    assert _row_count(engine, fid_b, obs_b) == 1  # feature_b's dedup still went through
+    assert result["duplicates_fixed"] == 0
+    assert result["multi_vintage_groups_found"] == 1
+    assert _row_count(engine, fid, obs_date) == 2  # both vintages survive

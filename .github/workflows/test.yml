@@ -273,14 +273,16 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
 
-      # fix/pre-retraction-and-679-followups-20260927: PR #683
-      # (resolved_series_retractions, not yet on main) adds an FK to the
-      # retracted resolved_series row. Proves the resolved_series dedup
-      # delete paths in intelligence/resolution_audit.py and
-      # scripts/hermes_fixers.py never hit that FK against real Postgres,
-      # still clean up an unretracted duplicate in the same batch, and that
-      # the SAVEPOINT this fix adds around the Hermes delete confines a
-      # genuine FK violation to the one dupe-group that hit it.
+      # PR #688 review (2026-09-27): resolved_series' real unique index is
+      # (feature_id, obs_date, vintage_date), so rows sharing
+      # (feature_id, obs_date) are always distinct vintages that
+      # store/pit.py's FIRST_RELEASE/LATEST_AS_OF policies read -- never
+      # true duplicates. intelligence/resolution_audit.py and
+      # scripts/hermes_fixers.py no longer delete any resolved_series row
+      # in their "dedup"/data-quality paths at all; this proves against
+      # real Postgres that a multi-vintage group survives both functions
+      # completely intact, whether or not PR #683's
+      # resolved_series_retractions exists.
       - name: resolved_series dedup retraction-guard PostgreSQL contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test

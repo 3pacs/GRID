@@ -144,7 +144,12 @@ def check_duplicates(engine: Engine, feature_filter: list[str] | None = None) ->
                 "min_value": min_val,
                 "max_value": max_val,
             },
-            suggested_fix="Delete duplicate rows, keeping the highest-priority source.",
+            suggested_fix=(
+                "Not a true duplicate -- resolved_series' unique index is "
+                "(feature_id, obs_date, vintage_date), so these rows are "
+                "distinct vintages. Investigate the source data; do not "
+                "delete (see PR #688)."
+            ),
         ))
 
     log.info("Duplicate check: {n} findings", n=len(findings))
@@ -642,44 +647,28 @@ def _load_latest_findings(engine: Engine, limit: int = 200) -> list[dict]:
 # Auto-fix logic
 # ---------------------------------------------------------------------------
 
-# PR #683 (feat/resolved-series-retractions-20260927, not yet on main) adds
-# resolved_series_retractions with an FK to the retracted resolved_series row
-# keyed on (feature_id, obs_date, vintage_date), plus an append-only trigger
-# that refuses UPDATE/DELETE on it. Once that lands, deleting a retracted
-# resolved_series row here would hit an FK violation. The dedup delete below
-# checks for the table at runtime (to_regclass) and, when present, anti-joins
-# retracted rows out of the delete set — it works identically whether or not
-# the migration has been applied.
-#
-# 2026-09-27: `:od::date` (no space before the cast) is a live SQLAlchemy
-# 2.0 bind-parameter parsing trap -- discovered by
-# tests/test_dedup_retraction_guard_pg.py, the first test to exercise this
-# delete against real Postgres. SQLAlchemy's bind-param regex mis-parses a
-# name immediately followed by `::`, silently binding a truncated name
-# (`:od::date` -> parameter "o", dropping the "d") instead of raising, so
-# "od" was never actually substituted and Postgres received the literal
-# text `:od::date`, a syntax error. Fixed by spacing the cast (`:od ::date`)
-# so SQLAlchemy's negative lookahead does not see `:` immediately after the
-# name; verify with `sqlalchemy.text("...:od::date...")._bindparams` if this
-# pattern is ever reintroduced.
-#
-# Also (same discovery): the subquery's bare `id` in the SELECT list was
-# ambiguous -- both resolved_series (aliased rs) and feature_registry
-# (aliased fr) have an `id` column, so Postgres rejected it outright
-# (psycopg2.errors.AmbiguousColumn) rather than silently misbehaving.
-# Qualified as `rs.id`.
-_DEDUP_KEEP_BEST_PREDICATE = """
-    id NOT IN (
-        SELECT DISTINCT ON (feature_id, obs_date)
-            rs.id
-        FROM resolved_series rs
-        JOIN feature_registry fr ON fr.id = rs.feature_id
-        WHERE fr.name = :fname
-          AND rs.obs_date = :od ::date
-        ORDER BY feature_id, obs_date,
-                 source_priority_used ASC
-    )
-    AND feature_id = (
+# PR #688 review (2026-09-27): this module used to DELETE dedup "losers"
+# here, keeping only the row with the best source_priority_used per
+# (feature_id, obs_date). resolved_series' actual unique index is
+# (feature_id, obs_date, vintage_date) -- every row sharing (feature_id,
+# obs_date) with another is therefore ALWAYS a distinct vintage, never a
+# true duplicate: an exact duplicate (same feature_id, obs_date,
+# vintage_date, AND value) is impossible, the index forbids it.
+# store/pit.py's FIRST_RELEASE and LATEST_AS_OF vintage policies read
+# across exactly these rows; deleting all but the best-priority row per
+# (feature_id, obs_date) collapses point-in-time history and, measured
+# against production, would have destroyed the FIRST_RELEASE row for
+# ~52% of eligible groups. There is therefore no delete path here at all
+# anymore -- the predicate below is now a plain COUNT, used only to
+# report the multi-vintage group's size (see the "duplicate" branch of
+# auto_fix_issues below). (A prior revision of this comment described a
+# `:od::date`-cast bind-parameter trap and an ambiguous bare `id` column
+# in the now-removed delete predicate; that history is preserved in git
+# blame, not repeated here since the predicate itself is gone. Note we
+# deliberately do NOT carry that trap's fix into any new delete -- see
+# the NaN branch below for why.)
+_MULTI_VINTAGE_COUNT_PREDICATE = """
+    feature_id = (
         SELECT id FROM feature_registry WHERE name = :fname
     )
     AND obs_date = :od ::date
@@ -694,37 +683,39 @@ _RETRACTED_KEY_MATCH = """
     )
 """
 
-_DEDUP_DELETE_SQL = "DELETE FROM resolved_series WHERE " + _DEDUP_KEEP_BEST_PREDICATE
-_DEDUP_DELETE_SQL_RETRACTION_SAFE = (
-    _DEDUP_DELETE_SQL + " AND NOT " + _RETRACTED_KEY_MATCH
+_MULTI_VINTAGE_COUNT_SQL = (
+    "SELECT COUNT(*) FROM resolved_series WHERE " + _MULTI_VINTAGE_COUNT_PREDICATE
 )
-_DEDUP_SKIPPED_COUNT_SQL = (
-    "SELECT COUNT(*) FROM resolved_series WHERE "
-    + _DEDUP_KEEP_BEST_PREDICATE
-    + " AND "
-    + _RETRACTED_KEY_MATCH
+_MULTI_VINTAGE_RETRACTED_COUNT_SQL = (
+    _MULTI_VINTAGE_COUNT_SQL + " AND " + _RETRACTED_KEY_MATCH
 )
 
 
 def _retractions_table_exists(conn: Any) -> bool:
     """True if resolved_series_retractions exists (PR #683's migration).
 
-    Works whether or not that migration has been applied yet on this
-    database: any failure (relation genuinely absent, or anything else)
-    is treated as "no retractions to protect" so callers fall back to the
-    pre-#683 delete behaviour rather than raising. Unqualified (relies on
-    search_path), matching how every other query in this module addresses
+    No longer used to guard a delete (there is none, see the module note
+    above) -- kept only so the "duplicate" branch of auto_fix_issues can
+    report how many of a multi-vintage group's rows are also retracted,
+    for operator context. Runs its own SAVEPOINT (PR #688 review: this
+    helper previously ran its probe query directly on the caller's
+    transaction, so a failure here -- e.g. insufficient privilege, or a
+    concurrent DDL change -- would poison that whole transaction instead
+    of being contained) so any failure here is treated as "table absent"
+    without affecting the caller. Unqualified (relies on search_path),
+    matching how every other query in this module addresses
     resolved_series itself -- a hardcoded "public." prefix would silently
     miss the table on a non-default search_path (e.g. a test's scratch
     schema).
     """
     try:
-        return bool(
-            conn.execute(
-                text("SELECT to_regclass(:table_name) IS NOT NULL"),
-                {"table_name": "resolved_series_retractions"},
-            ).scalar()
-        )
+        with conn.begin_nested():
+            return bool(
+                conn.execute(
+                    text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": "resolved_series_retractions"},
+                ).scalar()
+            )
     except Exception:
         return False
 
@@ -737,99 +728,116 @@ def auto_fix_issues(
     """Attempt automatic fixes for common issues.
 
     Fixes applied:
-    - Delete duplicate rows (keep highest-priority source)
+    - Duplicate ("multi-vintage") groups: report-only, never deletes (PR
+      #688 review, 2026-09-27) -- see the module note above
+      _retractions_table_exists for why: rows sharing (feature_id,
+      obs_date) are always distinct vintages, never true duplicates, and
+      deleting them destroys point-in-time history.
     - Flag stale features for re-pull (log only)
-    - Remove NaN/Infinity values
+    - NaN/Infinity values: report-only, never deletes (same PIT concern --
+      see the "sanity"/NaN branch below).
 
     Parameters:
         engine: SQLAlchemy engine.
         findings: List of AuditFinding to attempt fixing.
         dry_run: If True, report what would be fixed without making changes.
+            Note: the "duplicate" and NaN branches below are report-only
+            regardless of dry_run -- there is no destructive path left to
+            gate.
 
     Returns:
-        dict with keys: duplicates_fixed, nan_removed, stale_flagged, dry_run.
+        dict with keys: duplicates_fixed, nan_removed, stale_flagged,
+        dry_run, plus multi_vintage_groups_reported and
+        nan_values_reported. duplicates_fixed and nan_removed are always
+        0 (nothing is ever deleted); the *_reported counters carry the
+        actual counts.
     """
     result: dict[str, Any] = {
         "duplicates_fixed": 0,
         "nan_removed": 0,
         "stale_flagged": 0,
         "dry_run": dry_run,
+        "multi_vintage_groups_reported": 0,
+        "nan_values_reported": 0,
         "details": [],
     }
 
     for f in findings:
         if f.check_type == "duplicate":
-            # Keep only the row from the highest-priority source per (feature, obs_date)
+            # NOT a duplicate -- see the module note above
+            # _retractions_table_exists. This is a multi-vintage group:
+            # distinct (feature_id, obs_date, vintage_date) rows sharing
+            # (feature_id, obs_date). Report-only: count the group's rows
+            # and how many are already retracted, for operator context,
+            # and delete nothing.
             obs_date = f.evidence.get("obs_date")
             if not obs_date:
                 continue
 
-            if dry_run:
-                result["duplicates_fixed"] += 1
-                result["details"].append(
-                    f"Would fix duplicate for {f.feature} on {obs_date}"
+            result["multi_vintage_groups_reported"] += 1
+            try:
+                with engine.connect() as conn:
+                    params = {"fname": f.feature, "od": obs_date}
+                    vintage_count = conn.execute(
+                        text(_MULTI_VINTAGE_COUNT_SQL), params
+                    ).scalar() or 0
+                    retracted_count = 0
+                    if _retractions_table_exists(conn):
+                        retracted_count = conn.execute(
+                            text(_MULTI_VINTAGE_RETRACTED_COUNT_SQL), params
+                        ).scalar() or 0
+                log.warning(
+                    "Multi-vintage group for {f} on {d}: {n} resolved_series "
+                    "row(s) ({ret} already retracted) -- report-only, "
+                    "nothing deleted (distinct vintages, not duplicates; "
+                    "see PR #688)",
+                    f=f.feature, d=obs_date, n=vintage_count, ret=retracted_count,
                 )
-            else:
-                try:
-                    with engine.begin() as conn:
-                        params = {"fname": f.feature, "od": obs_date}
-                        has_retractions = _retractions_table_exists(conn)
-                        if has_retractions:
-                            skipped = conn.execute(
-                                text(_DEDUP_SKIPPED_COUNT_SQL), params
-                            ).scalar() or 0
-                            if skipped:
-                                log.info(
-                                    "Dedup skip: {n} retracted resolved_series row(s) "
-                                    "for {f} on {d} left in place "
-                                    "(FK-protected by resolved_series_retractions)",
-                                    n=skipped, f=f.feature, d=obs_date,
-                                )
-                            # Delete all but the best-priority row, minus any
-                            # row a retraction now protects from deletion.
-                            conn.execute(text(_DEDUP_DELETE_SQL_RETRACTION_SAFE), params)
-                        else:
-                            # Delete all but the best-priority row
-                            conn.execute(text(_DEDUP_DELETE_SQL), params)
-                    result["duplicates_fixed"] += 1
-                except Exception as exc:
-                    log.error(
-                        "Failed to fix duplicate for {f}: {e}",
-                        f=f.feature, e=str(exc),
-                    )
+                result["details"].append(
+                    f"Multi-vintage group for {f.feature} on {obs_date}: "
+                    f"{vintage_count} row(s), {retracted_count} retracted "
+                    f"(left in place, not deleted)"
+                )
+            except Exception as exc:
+                log.warning(
+                    "Could not count multi-vintage rows for {f} on {d}: {e}",
+                    f=f.feature, d=obs_date, e=str(exc),
+                )
 
         elif f.check_type == "sanity" and "NaN" in f.description:
+            # Report-only, deliberately never deletes (PR #688 review,
+            # 2026-09-27). This delete's WHERE clause matches every
+            # resolved_series row for (feature_id, obs_date) with a
+            # NaN/Infinity value -- it has no vintage_date filter, so on a
+            # feature/date with more than one vintage (the normal case --
+            # see the "duplicate" branch above) it could delete a
+            # legitimate historical vintage rather than a bad value,
+            # destroying point-in-time history exactly like the dedup
+            # delete this same review fixed. It has also never actually
+            # run in production: its date cast was written `:od::date`
+            # (no space), which SQLAlchemy 2.0's bind-parameter regex
+            # mis-parses -- silently binding a truncated parameter name so
+            # "od" was never substituted and Postgres received the
+            # literal text `:od::date`, a syntax error -- caught by the
+            # bare except below and logged at error level, so this delete
+            # has been silently failing every time it "ran". Deliberately
+            # NOT fixing that cast to bring this delete back to life:
+            # left disabled, report-only, until a vintage-scoped,
+            # PIT-safe version is designed.
             obs_date = f.evidence.get("obs_date")
             if not obs_date:
                 continue
 
-            if dry_run:
-                result["nan_removed"] += 1
-                result["details"].append(
-                    f"Would remove NaN for {f.feature} on {obs_date}"
-                )
-            else:
-                try:
-                    with engine.begin() as conn:
-                        conn.execute(
-                            text("""
-                                DELETE FROM resolved_series
-                                WHERE feature_id = (
-                                    SELECT id FROM feature_registry WHERE name = :fname
-                                )
-                                AND obs_date = :od::date
-                                AND (value = 'NaN'::DOUBLE PRECISION
-                                     OR value = 'Infinity'::DOUBLE PRECISION
-                                     OR value = '-Infinity'::DOUBLE PRECISION)
-                            """),
-                            {"fname": f.feature, "od": obs_date},
-                        )
-                    result["nan_removed"] += 1
-                except Exception as exc:
-                    log.error(
-                        "Failed to remove NaN for {f}: {e}",
-                        f=f.feature, e=str(exc),
-                    )
+            result["nan_values_reported"] += 1
+            log.warning(
+                "NaN/Infinity resolved_series value(s) reported for {f} on "
+                "{d}: report-only, nothing deleted (see PR #688)",
+                f=f.feature, d=obs_date,
+            )
+            result["details"].append(
+                f"NaN/Infinity value(s) reported for {f.feature} on "
+                f"{obs_date} (left in place, not deleted)"
+            )
 
         elif f.check_type == "stale":
             result["stale_flagged"] += 1
@@ -837,7 +845,11 @@ def auto_fix_issues(
                 f"Flagged stale: {f.feature} (last data: {f.evidence.get('latest_obs_date')})"
             )
 
-    # Mark auto-fixed findings in the audit table
+    # Mark auto-fixed findings in the audit table. duplicates_fixed and
+    # nan_removed are always 0 now (PR #688: both branches are
+    # report-only, see above) so this never fires for "duplicate"/"sanity"
+    # today -- left in place, unreachable-but-harmless, for any future
+    # check_type that performs a real fix.
     if not dry_run:
         fixed_types = set()
         if result["duplicates_fixed"] > 0:
@@ -861,11 +873,14 @@ def auto_fix_issues(
                     )
 
     log.info(
-        "Auto-fix results (dry_run={dr}): duplicates={d}, nan={n}, stale={s}",
+        "Auto-fix results (dry_run={dr}): duplicates_fixed={d}, nan_removed={n}, "
+        "stale={s}, multi_vintage_groups_reported={mv}, nan_values_reported={nr}",
         dr=dry_run,
         d=result["duplicates_fixed"],
         n=result["nan_removed"],
         s=result["stale_flagged"],
+        mv=result["multi_vintage_groups_reported"],
+        nr=result["nan_values_reported"],
     )
     return result
 
