@@ -136,9 +136,10 @@ def _generate_image(
     Returns:
         ImageResult with the generated image bytes and metadata.
     """
+    client = _get_client()  # raises PermissionError before importing the SDK if the gate is off
+
     from google.genai import types
 
-    client = _get_client()
     model_name = MODELS.get(model_tier, MODELS[DEFAULT_MODEL])
     style_text = STYLES.get(style, STYLES["dark"])
 

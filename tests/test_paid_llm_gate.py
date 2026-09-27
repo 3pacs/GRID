@@ -16,11 +16,65 @@ OpenRouter: every SDK/`requests` call is mocked or replaced with a fake.
 
 from __future__ import annotations
 
+import sys
+import types as _types
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import config
+
+
+@pytest.fixture(autouse=True)
+def _ensure_google_genai_importable():
+    """``google-genai`` isn't pinned in requirements.txt, so it may not be
+    installed everywhere this suite runs (confirmed missing in CI). When a
+    real ``import google.genai`` fails, attach a synthetic ``genai``
+    submodule -- just enough for ``from google import genai`` / ``from
+    google.genai import types`` and ``patch("google.genai.Client", ...)`` to
+    work -- to the REAL ``google`` namespace package (imported normally, so
+    its other real members like ``google.protobuf`` -- a transitive
+    dependency of langfuse/opentelemetry, used elsewhere in this same test
+    file -- are completely untouched). Never replaces ``sys.modules["google"]``
+    itself. If ``google.genai`` IS installed, this is a no-op.
+    """
+    import importlib
+
+    try:
+        importlib.import_module("google.genai")
+        yield
+        return
+    except ImportError:
+        pass
+
+    try:
+        google_mod = importlib.import_module("google")
+    except ImportError:
+        # No google.* distribution at all -- fabricate a bare namespace
+        # package as a last resort (not expected to happen in this repo).
+        google_mod = _types.ModuleType("google")
+        google_mod.__path__ = []
+        sys.modules["google"] = google_mod
+
+    genai_mod = _types.ModuleType("google.genai")
+    genai_mod.Client = MagicMock(name="StubGenaiClient")
+    genai_types_mod = _types.ModuleType("google.genai.types")
+    genai_types_mod.GenerateImagesConfig = MagicMock(name="StubGenerateImagesConfig")
+    genai_mod.types = genai_types_mod
+
+    sys.modules["google.genai"] = genai_mod
+    sys.modules["google.genai.types"] = genai_types_mod
+    google_mod.genai = genai_mod
+
+    yield
+
+    sys.modules.pop("google.genai", None)
+    sys.modules.pop("google.genai.types", None)
+    if hasattr(google_mod, "genai"):
+        try:
+            delattr(google_mod, "genai")
+        except AttributeError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -212,11 +266,19 @@ class TestImageGenPaidGate:
         with pytest.raises(PermissionError):
             image_gen.generate_custom("a prompt")
 
-    def test_daily_pack_surfaces_permission_error_instead_of_empty_success(self, monkeypatch):
+    def test_daily_pack_reraises_permission_error_instead_of_swallowing(self, monkeypatch):
+        """The pack loop must not read a PermissionError from one generator as
+        "that image failed, try the next one" -- when generation is
+        disabled, it applies to every generator in the batch, so the pack
+        should surface that instead of quietly returning fewer images than
+        expected (which reads as "0 flows today", not "generation is off").
+        """
         from intelligence import image_gen
 
-        monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", False)
-        monkeypatch.setenv("GEMINI_API_KEY", "should-not-be-used")
+        def _boom(engine, style="dark"):
+            raise PermissionError("Paid generation disabled: set GRID_ALLOW_PAID_LLM=1 to enable Gemini.")
+
+        monkeypatch.setattr(image_gen, "generate_flow_infographic", _boom)
 
         with pytest.raises(PermissionError):
             image_gen.generate_daily_briefing_pack(MagicMock())
@@ -529,6 +591,26 @@ class TestBaselinePredictionsPaidGate:
 # ---------------------------------------------------------------------------
 
 class TestRegressionEvalArmBGate:
+    @pytest.fixture(autouse=True)
+    def _ensure_env_file(self):
+        """``scripts/run_regression_eval.py`` ``sys.exit(2)``s at import time
+        if the repo has no ``.env`` (a real dev checkout always does; CI's
+        Backend Tests job passes env vars directly and has none). That's a
+        pre-existing script quirk unrelated to the paid gate -- create an
+        empty one only if missing, so importing the module in a test doesn't
+        depend on it, and remove it again so nothing is left behind.
+        """
+        import pathlib
+
+        env_path = pathlib.Path(__file__).resolve().parent.parent / ".env"
+        created = False
+        if not env_path.exists():
+            env_path.write_text("DB_PASSWORD=testpass\n")
+            created = True
+        yield
+        if created:
+            env_path.unlink(missing_ok=True)
+
     def _load_module(self):
         import importlib
 
