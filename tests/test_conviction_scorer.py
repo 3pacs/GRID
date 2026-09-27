@@ -15,6 +15,7 @@ import pandas as pd
 import pytest
 
 from alpha_research import conviction_scorer as cs
+from store.pit import retraction_cutoff
 
 
 @dataclass(frozen=True)
@@ -73,7 +74,13 @@ def test_load_latest_uses_release_date_as_of_filter() -> None:
     call = conn.calls[0]
     assert "rs.release_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
-    assert call.params == {"n": "vix_spot", "as_of": as_of}
+    assert "resolved_series_retractions" in call.sql
+    assert "rr.retracted_at <= :retraction_cutoff" in call.sql
+    assert call.params == {
+        "n": "vix_spot",
+        "as_of": as_of,
+        "retraction_cutoff": retraction_cutoff(as_of),
+    }
 
 
 def test_load_raw_latest_uses_pull_timestamp_as_release_proxy_with_source() -> None:
@@ -126,7 +133,12 @@ def test_load_price_uses_release_date_as_of_filter() -> None:
     call = conn.calls[0]
     assert "rs.release_date <= :as_of" in call.sql
     assert "rs.obs_date <= :as_of" in call.sql
-    assert call.params == {"n": "abc_full", "as_of": as_of}
+    assert "resolved_series_retractions" in call.sql
+    assert call.params == {
+        "n": "abc_full",
+        "as_of": as_of,
+        "retraction_cutoff": retraction_cutoff(as_of),
+    }
     assert list(out) == [100.0, 101.0]
 
 

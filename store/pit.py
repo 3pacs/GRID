@@ -5,19 +5,48 @@ The most critical correctness component in the entire system. Enforces strict
 no-lookahead constraints ensuring that no data with ``release_date > as_of_date``
 is ever returned.  Supports both FIRST_RELEASE and LATEST_AS_OF vintage policies
 for backtesting and live inference.
+
+Retractions (``resolved_series_retractions``,
+migrations/versions/resolved_retractions_20260927.py): a resolved row that was
+found to hold a wrong value with no clean replacement is retracted by its key
+``(feature_id, obs_date, vintage_date)`` at ``retracted_at``. Every query here
+excludes it when ``as_of`` is on or after the retraction (for a date ``as_of``:
+the retraction happened by the end of that UTC day, the same day-level
+convention as ``release_date <= as_of``). Reads with an earlier ``as_of`` still
+see it, so replays before the retraction reproduce what was actually served.
+The vintage policy then picks among the remaining vintages; a cell with none
+left returns no row -- never a zero and never another feature's value.
 """
 
 from __future__ import annotations
 
 import os
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, time, timezone
 from typing import Generator
 
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+
+def retraction_cutoff(as_of: date | datetime) -> datetime:
+    """Inclusive ``retracted_at`` cutoff for a point-in-time read.
+
+    A row retracted at ``retracted_at`` is hidden from a read when
+    ``retracted_at <= retraction_cutoff(as_of)``.
+
+    * ``datetime`` (``as_of_ts``): the instant itself. A naive value is taken
+      as UTC (the database time zone is ``Etc/UTC``).
+    * ``date``: the last microsecond of that UTC day -- "known by the end of
+      the day", matching ``release_date <= as_of``.
+
+    Pass the result as a bind parameter; never interpolate it into SQL.
+    """
+    if isinstance(as_of, datetime):
+        return as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+    return datetime.combine(as_of, time.max, tzinfo=timezone.utc)
 
 
 class PITStore:
@@ -54,6 +83,10 @@ class PITStore:
             FIRST_RELEASE  — earliest vintage_date per (feature_id, obs_date).
             LATEST_AS_OF   — latest vintage_date per (feature_id, obs_date)
                              where release_date <= as_of_date.
+        HARD CONSTRAINT 4: rows retracted in resolved_series_retractions by
+            the end of as_of_date are excluded *before* the vintage policy
+            picks a row. Earlier as_of dates still see them. A cell whose
+            every vintage is retracted returns no row.
 
         Parameters:
             feature_ids: List of feature_registry IDs to query.
@@ -93,31 +126,49 @@ class PITStore:
             # For each (feature_id, obs_date), return the row with the
             # MINIMUM vintage_date, provided release_date <= as_of_date.
             query = text("""
-                SELECT DISTINCT ON (feature_id, obs_date)
-                    feature_id, obs_date, value, release_date, vintage_date
-                FROM resolved_series
-                WHERE feature_id = ANY(:fids)
-                  AND obs_date <= :aod
-                  AND release_date <= :aod
-                ORDER BY feature_id, obs_date, vintage_date ASC
+                SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
+                    rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
+                FROM resolved_series rs
+                WHERE rs.feature_id = ANY(:fids)
+                  AND rs.obs_date <= :aod
+                  AND rs.release_date <= :aod
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolved_series_retractions rr
+                      WHERE rr.feature_id = rs.feature_id
+                        AND rr.obs_date = rs.obs_date
+                        AND rr.vintage_date = rs.vintage_date
+                        AND rr.retracted_at <= :retraction_cutoff
+                  )
+                ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date ASC
             """)
         else:
             # LATEST_AS_OF: for each (feature_id, obs_date), return the row
             # with the MAXIMUM vintage_date where release_date <= as_of_date.
             query = text("""
-                SELECT DISTINCT ON (feature_id, obs_date)
-                    feature_id, obs_date, value, release_date, vintage_date
-                FROM resolved_series
-                WHERE feature_id = ANY(:fids)
-                  AND obs_date <= :aod
-                  AND release_date <= :aod
-                ORDER BY feature_id, obs_date, vintage_date DESC
+                SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
+                    rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
+                FROM resolved_series rs
+                WHERE rs.feature_id = ANY(:fids)
+                  AND rs.obs_date <= :aod
+                  AND rs.release_date <= :aod
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolved_series_retractions rr
+                      WHERE rr.feature_id = rs.feature_id
+                        AND rr.obs_date = rs.obs_date
+                        AND rr.vintage_date = rs.vintage_date
+                        AND rr.retracted_at <= :retraction_cutoff
+                  )
+                ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date DESC
             """)
 
         with self.engine.connect() as conn:
             rows = conn.execute(
                 query,
-                {"fids": feature_ids, "aod": as_of_date},
+                {
+                    "fids": feature_ids,
+                    "aod": as_of_date,
+                    "retraction_cutoff": retraction_cutoff(as_of_date),
+                },
             ).fetchall()
 
         df = pd.DataFrame(

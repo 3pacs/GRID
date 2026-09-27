@@ -257,6 +257,28 @@ jobs:
             exit 1
           fi
 
+      # resolved_series retractions
+      # (migrations/versions/resolved_retractions_20260927.py): runs the real
+      # upgrade/downgrade in a throwaway schema and proves the PIT semantics
+      # end to end -- a retracted row is hidden from as_of on/after the
+      # retraction and visible before it, LATEST_AS_OF/FIRST_RELEASE pick the
+      # remaining vintages (none left -> no row), store/pit.py and the migrated
+      # direct readers honour it, and the table is append-only/FK-pinned.
+      - name: resolved_series retractions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_resolved_series_retractions_pg.py -q -rA | tee /tmp/grid-retractions-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-retractions-pg.txt; then
+            echo "::error::resolved_series retractions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # GRID-YF-CLOSE-REPAIR-20260926 / coordinator review of PR #672:
       # proves ingestion/yfinance_pull.py's cross-process advisory lock
       # (pg_try_advisory_lock/pg_advisory_unlock) actually blocks a second,

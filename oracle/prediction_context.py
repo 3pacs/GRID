@@ -41,6 +41,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.pit import retraction_cutoff
+
 
 DEFAULT_REGIME = "NEUTRAL"
 DEFAULT_FCI_REGIME = "NEUTRAL"
@@ -110,21 +112,34 @@ def _latest_feature_value(
             try:
                 query = text(
                     f"""
-                    SELECT value
-                    FROM resolved_series
-                    WHERE feature_id IN (
+                    SELECT rs.value
+                    FROM resolved_series rs
+                    WHERE rs.feature_id IN (
                         SELECT id FROM {registry_table} WHERE name = :fname
                     )
-                      AND obs_date <= :aod
-                      AND obs_date >= :cut
-                      AND release_date <= :aod
-                    ORDER BY obs_date DESC, release_date DESC
+                      AND rs.obs_date <= :aod
+                      AND rs.obs_date >= :cut
+                      AND rs.release_date <= :aod
+                      AND NOT EXISTS (
+                          SELECT 1 FROM resolved_series_retractions rr
+                          WHERE rr.feature_id = rs.feature_id
+                            AND rr.obs_date = rs.obs_date
+                            AND rr.vintage_date = rs.vintage_date
+                            AND rr.retracted_at <= :retraction_cutoff
+                      )
+                    ORDER BY rs.obs_date DESC, rs.release_date DESC
                     LIMIT 1
                     """
                 )
                 with engine.connect() as conn:
                     row = conn.execute(
-                        query, {"fname": fname, "aod": as_of, "cut": cutoff}
+                        query,
+                        {
+                            "fname": fname,
+                            "aod": as_of,
+                            "cut": cutoff,
+                            "retraction_cutoff": retraction_cutoff(as_of),
+                        },
                     ).fetchone()
                 if row is not None and row[0] is not None:
                     return float(row[0])

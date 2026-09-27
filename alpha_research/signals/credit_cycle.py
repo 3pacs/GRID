@@ -20,6 +20,8 @@ import pandas as pd
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.pit import retraction_cutoff
+
 HY_SPREAD_FEATURE_ID = 103
 M2_FEATURE_ID = 117
 
@@ -128,16 +130,30 @@ def _get_feature_series(
 ) -> pd.Series:
     """Fetch a single feature as a time series from resolved_series."""
     query = text("""
-        SELECT obs_date, value
-        FROM resolved_series
-        WHERE feature_id = :fid
-          AND obs_date BETWEEN :start AND :end
-          AND release_date <= :as_of
-        ORDER BY obs_date
+        SELECT rs.obs_date, rs.value
+        FROM resolved_series rs
+        WHERE rs.feature_id = :fid
+          AND rs.obs_date BETWEEN :start AND :end
+          AND rs.release_date <= :as_of
+          AND NOT EXISTS (
+              SELECT 1 FROM resolved_series_retractions rr
+              WHERE rr.feature_id = rs.feature_id
+                AND rr.obs_date = rs.obs_date
+                AND rr.vintage_date = rs.vintage_date
+                AND rr.retracted_at <= :retraction_cutoff
+          )
+        ORDER BY rs.obs_date
     """)
     with engine.connect() as conn:
         rows = conn.execute(
-            query, {"fid": feature_id, "start": start, "end": end, "as_of": end}
+            query,
+            {
+                "fid": feature_id,
+                "start": start,
+                "end": end,
+                "as_of": end,
+                "retraction_cutoff": retraction_cutoff(end),
+            },
         ).fetchall()
 
     if not rows:

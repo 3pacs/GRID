@@ -166,6 +166,52 @@ CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
     ON resolved_series (conflict_flag) WHERE conflict_flag = TRUE;
 
 -- ============================================================
+-- TABLE: resolved_series_retractions
+-- Append-only point-in-time retractions of resolved_series rows
+-- (migrations/versions/resolved_retractions_20260927.py). A retracted row is
+-- hidden from PIT reads with as_of_ts >= retracted_at and stays visible to
+-- earlier as_of, so replays before the retraction are reproducible.
+-- Nothing is deleted from resolved_series.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS resolved_series_retractions (
+    id            BIGSERIAL PRIMARY KEY,
+    feature_id    INTEGER NOT NULL,
+    obs_date      DATE NOT NULL,
+    vintage_date  DATE NOT NULL,
+    retracted_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason        TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    run_tag       TEXT NOT NULL CHECK (btrim(run_tag) <> ''),
+    CONSTRAINT uq_resolved_series_retractions_key
+        UNIQUE (feature_id, obs_date, vintage_date) INCLUDE (retracted_at),
+    CONSTRAINT fk_resolved_series_retractions_row
+        FOREIGN KEY (feature_id, obs_date, vintage_date)
+        REFERENCES resolved_series (feature_id, obs_date, vintage_date)
+);
+
+CREATE OR REPLACE FUNCTION resolved_series_retractions_guard()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.retracted_at < now() THEN
+            RAISE EXCEPTION
+                'resolved_series_retractions: retracted_at % is before now() %; '
+                'a retraction cannot be backdated into already-served history',
+                NEW.retracted_at, now();
+        END IF;
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+        'resolved_series_retractions is append-only (% refused)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_resolved_series_retractions_guard ON resolved_series_retractions;
+CREATE TRIGGER trg_resolved_series_retractions_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON resolved_series_retractions
+    FOR EACH ROW
+    EXECUTE FUNCTION resolved_series_retractions_guard();
+
+-- ============================================================
 -- TABLE: hypothesis_registry
 -- Tracks hypotheses through their lifecycle.
 -- ============================================================
