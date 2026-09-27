@@ -161,6 +161,64 @@ def test_second_source_for_the_same_act_merges_instead_of_duplicating(scratch):
     assert seen_ids == {1, 2}
 
 
+def test_transaction_code_round_trips(scratch):
+    upsert_event(scratch, _event(transaction_code="P"))
+    events = read_events(scratch, as_of=datetime(2026, 9, 3, tzinfo=timezone.utc))
+    assert len(events) == 1
+    assert events[0].transaction_code == "P"
+
+
+def test_transaction_code_defaults_to_none(scratch):
+    upsert_event(scratch, _event())
+    events = read_events(scratch, as_of=datetime(2026, 9, 3, tzinfo=timezone.utc))
+    assert events[0].transaction_code is None
+
+
+def test_second_source_with_an_earlier_known_at_pulls_known_at_earlier(scratch):
+    # First source: a same-day "first_seen" fallback known_at.
+    upsert_event(scratch, _event(
+        known_at=datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc),
+        known_at_basis="first_seen",
+        source_refs=({"source_type": "quiverquant:insider", "signal_sources_id": 1},),
+    ))
+    # Second source: the real, earlier SEC filing timestamp for the same act.
+    upsert_event(scratch, _event(
+        known_at=datetime(2026, 9, 2, 14, 30, tzinfo=timezone.utc),
+        known_at_basis="filing",
+        source_refs=({"source_type": "insider", "signal_sources_id": 2},),
+    ))
+
+    events = read_events(scratch, as_of=datetime(2026, 9, 3, tzinfo=timezone.utc))
+    assert len(events) == 1
+    got = events[0]
+    assert got.known_at == datetime(2026, 9, 2, 14, 30, tzinfo=timezone.utc)
+    assert got.known_at_basis == "filing"
+    assert got.n_sources == 2
+
+
+def test_second_source_with_a_later_known_at_does_not_move_known_at_later(scratch):
+    # First source already has the earlier, real filing timestamp.
+    upsert_event(scratch, _event(
+        known_at=datetime(2026, 9, 2, 14, 30, tzinfo=timezone.utc),
+        known_at_basis="filing",
+        source_refs=({"source_type": "insider", "signal_sources_id": 1},),
+    ))
+    # A second, later source (e.g. a slower ingestion path) must not push
+    # known_at later -- that would silently un-know something the public
+    # could already see per the first source.
+    upsert_event(scratch, _event(
+        known_at=datetime(2026, 9, 3, 12, 0, tzinfo=timezone.utc),
+        known_at_basis="first_seen",
+        source_refs=({"source_type": "quiverquant:insider", "signal_sources_id": 2},),
+    ))
+
+    events = read_events(scratch, as_of=datetime(2026, 9, 3, tzinfo=timezone.utc))
+    assert len(events) == 1
+    got = events[0]
+    assert got.known_at == datetime(2026, 9, 2, 14, 30, tzinfo=timezone.utc)
+    assert got.known_at_basis == "filing"
+
+
 def test_different_dedup_key_does_not_merge(scratch):
     upsert_event(scratch, _event(dedup_key="AAPL|TIMOTHY D COOK|2026-09-01|P|1000"))
     upsert_event(scratch, _event(dedup_key="AAPL|TIMOTHY D COOK|2026-09-02|P|1000", event_time=datetime(2026, 9, 2, tzinfo=timezone.utc)))

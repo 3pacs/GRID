@@ -127,6 +127,15 @@ def upgrade() -> None:
             CHECK (direction IS NULL OR direction IN (
                 'buy', 'sell', 'award', 'positive', 'negative', 'neutral'
             )),
+        -- Raw source transaction code, stored verbatim (e.g. SEC Form 4
+        -- TransactionCode: P/S/A/M/X/C/F/G/...) so a future feature can read
+        -- the exact code a channel supplied without having to reconstruct it
+        -- from the closed-vocabulary, lossy `direction` column above (which
+        -- deliberately maps several distinct codes, e.g. M/X/C/F/G, to the
+        -- same NULL). Nullable and unconstrained: not every channel has an
+        -- equivalent code, and this table does not hard-code the SEC code
+        -- vocabulary into a CHECK constraint the way it does for `direction`.
+        transaction_code    TEXT,
         size_usd            DOUBLE PRECISION
             CHECK (size_usd IS NULL OR size_usd >= 0),
 

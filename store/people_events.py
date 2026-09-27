@@ -93,6 +93,7 @@ class PeopleEvent:
     entity_cik: str | None = None
     security_id: int | None = None
     direction: str | None = None
+    transaction_code: str | None = None
     size_usd: float | None = None
     source_record_id: str | None = None
     source_refs: tuple[dict[str, Any], ...] = ()
@@ -127,20 +128,41 @@ _INSERT_SQL = text("""
     INSERT INTO people_events (
         channel, dedup_key, event_time, known_at, known_at_basis,
         actor_id, actor_id_basis, actor_type, co_actor_ids,
-        entity_ticker, entity_cik, security_id, direction, size_usd,
-        source, source_record_id, source_refs, n_sources, echo_of, provenance
+        entity_ticker, entity_cik, security_id, direction, transaction_code,
+        size_usd, source, source_record_id, source_refs, n_sources, echo_of,
+        provenance
     ) VALUES (
         :channel, :dedup_key, :event_time, :known_at, :known_at_basis,
         :actor_id, :actor_id_basis, :actor_type, :co_actor_ids,
-        :entity_ticker, :entity_cik, :security_id, :direction, :size_usd,
-        :source, :source_record_id, CAST(:source_refs AS jsonb), :n_sources,
-        :echo_of, CAST(:provenance AS jsonb)
+        :entity_ticker, :entity_cik, :security_id, :direction, :transaction_code,
+        :size_usd, :source, :source_record_id, CAST(:source_refs AS jsonb),
+        :n_sources, :echo_of, CAST(:provenance AS jsonb)
     )
     ON CONFLICT (channel, dedup_key) DO UPDATE SET
-        -- The act itself never changes on a re-materialize; only provenance
-        -- of *how many sources now agree* does. event_time/known_at/actor
+        -- The act itself never changes on a re-materialize; actor/entity
         -- fields are intentionally left untouched so a second source cannot
-        -- silently rewrite the first source's known_at.
+        -- silently rewrite the first source's identification of who/what.
+        --
+        -- known_at is the exception, and deliberately so: each channel's
+        -- known_at rule (intelligence/people_events_materializer.py) is
+        -- built to be a *conservative* upper bound on "the earliest instant
+        -- the public could see this act" -- it rounds up when it is only
+        -- sure of a date, and falls back to a same-day-or-later ingestion
+        -- timestamp when no filing timestamp exists at all. A second source
+        -- describing the same act can supply a tighter (earlier) valid upper
+        -- bound -- e.g. the real SEC filing timestamp arriving after this
+        -- row was first materialized from a same-day "first_seen" fallback
+        -- -- and LEAST() always prefers the earlier of two valid upper
+        -- bounds without ever moving known_at *later* than what is already
+        -- on file (which would silently un-know something the public could
+        -- already see). known_at_basis follows whichever row supplied that
+        -- earlier known_at, so a reader can still tell a filing timestamp
+        -- from a first_seen fallback after the merge.
+        known_at = LEAST(people_events.known_at, EXCLUDED.known_at),
+        known_at_basis = CASE
+            WHEN EXCLUDED.known_at < people_events.known_at THEN EXCLUDED.known_at_basis
+            ELSE people_events.known_at_basis
+        END,
         source_refs = (
             SELECT jsonb_agg(DISTINCT elem)
             FROM jsonb_array_elements(
@@ -182,6 +204,7 @@ def upsert_event(engine: Engine, event: PeopleEvent) -> int:
                 "entity_cik": event.entity_cik,
                 "security_id": event.security_id,
                 "direction": event.direction,
+                "transaction_code": event.transaction_code,
                 "size_usd": event.size_usd,
                 "source": event.source,
                 "source_record_id": event.source_record_id,
@@ -198,8 +221,9 @@ _READ_SQL_TEMPLATE = """
     SELECT
         channel, dedup_key, event_time, known_at, known_at_basis,
         actor_id, actor_id_basis, actor_type, co_actor_ids,
-        entity_ticker, entity_cik, security_id, direction, size_usd,
-        source, source_record_id, source_refs, n_sources, echo_of, provenance
+        entity_ticker, entity_cik, security_id, direction, transaction_code,
+        size_usd, source, source_record_id, source_refs, n_sources, echo_of,
+        provenance
     FROM people_events
     WHERE known_at <= :as_of
     {extra_filters}
@@ -246,8 +270,8 @@ def read_events(
 
     events = []
     for r in rows:
-        source_refs = r[16] if isinstance(r[16], list) else json.loads(r[16] or "[]")
-        provenance = r[19] if isinstance(r[19], dict) else json.loads(r[19] or "{}")
+        source_refs = r[17] if isinstance(r[17], list) else json.loads(r[17] or "[]")
+        provenance = r[20] if isinstance(r[20], dict) else json.loads(r[20] or "{}")
         events.append(
             PeopleEvent(
                 channel=r[0],
@@ -263,12 +287,13 @@ def read_events(
                 entity_cik=r[10],
                 security_id=r[11],
                 direction=r[12],
-                size_usd=r[13],
-                source=r[14],
-                source_record_id=r[15],
+                transaction_code=r[13],
+                size_usd=r[14],
+                source=r[15],
+                source_record_id=r[16],
                 source_refs=tuple(source_refs),
-                n_sources=r[17],
-                echo_of=r[18],
+                n_sources=r[18],
+                echo_of=r[19],
                 provenance=provenance,
             )
         )

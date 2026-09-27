@@ -35,9 +35,9 @@ _MIGRATION_MODULE = "migrations.versions.people_events_20260927"
 _EXPECTED_COLUMNS = {
     "id", "channel", "dedup_key", "event_time", "known_at", "known_at_basis",
     "actor_id", "actor_id_basis", "actor_type", "co_actor_ids",
-    "entity_ticker", "entity_cik", "security_id", "direction", "size_usd",
-    "source", "source_record_id", "source_refs", "n_sources", "echo_of",
-    "provenance", "ingested_at",
+    "entity_ticker", "entity_cik", "security_id", "direction",
+    "transaction_code", "size_usd", "source", "source_record_id",
+    "source_refs", "n_sources", "echo_of", "provenance", "ingested_at",
 }
 
 

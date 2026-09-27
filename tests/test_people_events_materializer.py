@@ -64,21 +64,48 @@ class TestNormalizeActorName:
 
 @pytest.mark.unit
 class TestForm4TransactionDirection:
-    def test_acquired_disposed_code_wins_over_transaction_code(self):
-        assert form4_transaction_direction("A", "S") == "buy"
-        assert form4_transaction_direction("D", "P") == "sell"
+    def test_transaction_code_wins_over_acquired_disposed_code(self):
+        # This is the production bug this function exists to fix: an award
+        # (TransactionCode=A) and an option exercise (TransactionCode=M) both
+        # carry AcquiredDisposedCode=A ("acquired"), which used to be read
+        # first and misclassified 5,625 (A,A) and 4,036 (M,A) rows as "buy".
+        assert form4_transaction_direction("A", "A") == "award"
+        assert form4_transaction_direction("A", "M") is None
+        assert form4_transaction_direction("A", "P") == "buy"
+        assert form4_transaction_direction("D", "S") == "sell"
 
-    def test_falls_back_to_transaction_code(self):
+    def test_real_world_code_pairings(self):
+        # (AcquiredDisposedCode, TransactionCode) pairs as they actually
+        # appear in QuiverQuant Form 4 rows.
+        assert form4_transaction_direction("A", "P") == "buy"    # open-market buy
+        assert form4_transaction_direction("D", "S") == "sell"   # open-market sell
+        assert form4_transaction_direction("A", "A") == "award"  # grant/award
+        assert form4_transaction_direction("D", "F") is None     # tax withholding
+        assert form4_transaction_direction("D", "G") is None     # gift
+
+    def test_falls_back_to_acquired_disposed_code_only_when_transaction_code_missing(self):
+        assert form4_transaction_direction("A", None) == "buy"
+        assert form4_transaction_direction("D", None) == "sell"
+        assert form4_transaction_direction("A", "") == "buy"
+
+    def test_falls_back_to_transaction_code_when_acquired_disposed_code_missing(self):
         assert form4_transaction_direction(None, "P") == "buy"
         assert form4_transaction_direction(None, "S") == "sell"
         assert form4_transaction_direction(None, "A") == "award"
 
     def test_unclassified_codes_return_none(self):
-        # M (option exercise), F (tax withholding), G (gift) are deliberately
-        # not forced into buy/sell/award.
+        # M/X/C (exercise or conversion), F (tax withholding), G (gift) are
+        # deliberately not forced into buy/sell/award, and AcquiredDisposedCode
+        # is not consulted as a fallback since TransactionCode is present.
         assert form4_transaction_direction(None, "M") is None
         assert form4_transaction_direction(None, "F") is None
+        assert form4_transaction_direction("A", "X") is None
+        assert form4_transaction_direction("A", "C") is None
         assert form4_transaction_direction(None, None) is None
+
+    def test_missing_both_codes_returns_none(self):
+        assert form4_transaction_direction(None, None) is None
+        assert form4_transaction_direction("", "") is None
 
 
 @pytest.mark.unit
@@ -87,28 +114,41 @@ class TestForm4DedupKey:
         # QuiverQuant and a hypothetical EDGAR-native materializer describing
         # the exact same act (same rounded share count) must produce the same
         # key, case-insensitively, so upsert merges them into one row.
-        key_a = form4_dedup_key("AAPL", "TIMOTHY D COOK", date(2026, 9, 1), "P", 1000.0)
-        key_b = form4_dedup_key("aapl", "timothy d cook", date(2026, 9, 1), "p", 1000.0)
+        key_a = form4_dedup_key(issuer_ticker="AAPL", owner_id="TIMOTHY D COOK", transaction_date=date(2026, 9, 1), transaction_code="P", shares=1000.0)
+        key_b = form4_dedup_key(issuer_ticker="aapl", owner_id="timothy d cook", transaction_date=date(2026, 9, 1), transaction_code="p", shares=1000.0)
         assert key_a == key_b
 
     def test_shares_within_rounding_noise_still_collide(self):
-        key_a = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 1000.4)
-        key_b = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 1000.49)
+        key_a = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=1000.4)
+        key_b = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=1000.49)
         assert key_a == key_b  # both round() to 1000
 
     def test_shares_far_enough_apart_do_not_collide(self):
-        key_a = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 1000.0)
-        key_b = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 1001.0)
+        key_a = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=1000.0)
+        key_b = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=1001.0)
         assert key_a != key_b
 
     def test_different_transaction_dates_do_not_collide(self):
-        key_a = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 100.0)
-        key_b = form4_dedup_key("AAPL", "X", date(2026, 9, 2), "P", 100.0)
+        key_a = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=100.0)
+        key_b = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 2), transaction_code="P", shares=100.0)
         assert key_a != key_b
 
     def test_missing_shares_still_produces_a_stable_key(self):
-        key = form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", None)
+        key = form4_dedup_key(issuer_ticker="AAPL", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=None)
         assert "NA" in key
+
+    def test_issuer_identity_convention_is_keyword_only_and_ticker_based(self):
+        # The convention this function enforces: issuer identity is passed
+        # explicitly as `issuer_ticker=` (ticker, upper-cased) -- never as a
+        # bare positional argument that leaves a reader guessing whether it
+        # is a ticker or a CIK. A positional call must fail loudly rather
+        # than silently accept an ambiguous issuer identity.
+        with pytest.raises(TypeError):
+            form4_dedup_key("AAPL", "X", date(2026, 9, 1), "P", 100.0)  # type: ignore[misc]
+
+    def test_issuer_ticker_is_upper_cased_in_the_key(self):
+        key = form4_dedup_key(issuer_ticker="aapl", owner_id="X", transaction_date=date(2026, 9, 1), transaction_code="P", shares=100.0)
+        assert key.startswith("AAPL|")
 
 
 @pytest.mark.unit

@@ -100,31 +100,56 @@ def normalize_actor_name(name: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip().upper()
 
 
-def form4_transaction_direction(acquired_disposed_code: str | None, transaction_code: str | None) -> str | None:
-    """Map SEC Form 4 codes to a coarse direction, or None when it is not one.
+# TransactionCode -> direction. Codes are the public SEC Form 4 vocabulary
+# (Table I/II transaction codes): P = open-market purchase, S = open-market
+# sale, A = grant/award. Every other code -- M/X/C (exercise or conversion of
+# a derivative security), F (payment of tax by withholding), G (gift), and
+# anything else this repo has not seen -- is deliberately left out of this
+# map rather than forced into buy/sell/award: `people_events.direction`'s
+# CHECK constraint (migrations/versions/people_events_20260927.py) has no
+# slot for "exercise"/"tax"/"gift", and the plan's own signed-density formula
+# (GRID-GRANULAR-DISCOVERY-PLAN-20260927.md section 2.2: "A_insider_buy: code
+# P only; excludes A/M/F/G award and exercise codes and 10b5-1") treats those
+# codes as their own thing, never as a buy or a sell.
+_TRANSACTION_CODE_DIRECTIONS = {
+    "P": "buy",
+    "S": "sell",
+    "A": "award",
+}
 
-    Codes are the public SEC Form 4 vocabulary (Table I/II transaction
-    codes), not inferred from this dataset: P = open-market purchase,
-    S = open-market sale, A = grant/award. Every other code (exercise,
-    gift, conversion, tax withholding, ...) is deliberately left
-    unclassified (None) rather than forced into buy/sell/award.
+
+def form4_transaction_direction(acquired_disposed_code: str | None, transaction_code: str | None) -> str | None:
+    """Map a SEC Form 4 TransactionCode to a coarse direction, or None when it is not one.
+
+    TransactionCode takes precedence -- it is the SEC's own economic-act
+    code. AcquiredDisposedCode (A = acquired, D = disposed) is used only as a
+    *fallback* when TransactionCode itself is missing: it is coarser than
+    TransactionCode (an award, an option exercise, and an open-market
+    purchase are all "A" under AcquiredDisposedCode) and reading it whenever
+    TransactionCode is present is exactly the bug this function exists to
+    fix -- on production data this counted 5,625 (TransactionCode=A,
+    AcquiredDisposedCode=A) award rows and 4,036 (TransactionCode=M,
+    AcquiredDisposedCode=A) option-exercise rows as "buy".
     """
+    code = (transaction_code or "").strip().upper()[:1]
+    if code:
+        return _TRANSACTION_CODE_DIRECTIONS.get(code)
     adc = (acquired_disposed_code or "").strip().upper()[:1]
     if adc == "A":
         return "buy"
     if adc == "D":
         return "sell"
-    code = (transaction_code or "").strip().upper()[:1]
-    if code == "P":
-        return "buy"
-    if code == "S":
-        return "sell"
-    if code == "A":
-        return "award"
     return None
 
 
-def form4_dedup_key(issuer_id: str, owner_id: str, transaction_date: date, transaction_code: str, shares: float | None) -> str:
+def form4_dedup_key(
+    *,
+    issuer_ticker: str,
+    owner_id: str,
+    transaction_date: date,
+    transaction_code: str,
+    shares: float | None,
+) -> str:
     """Plan section 2.1's Form 4 dedup key.
 
     "(issuer CIK/ticker, reporting-owner CIK, or normalized name if no CIK,
@@ -134,10 +159,28 @@ def form4_dedup_key(issuer_id: str, owner_id: str, transaction_date: date, trans
     only the QuiverQuant side writes into this table, but the key is built
     exactly as the plan specifies so a later EDGAR-native materializer
     collides into the same row instead of creating a duplicate.
+
+    Issuer identity convention (this is the enforced part): the plan allows
+    either issuer CIK or issuer ticker. This materializer's only channel
+    (QuiverQuant Form 4, via `_extract_qq_form4_fields`) does not carry an
+    issuer CIK under any documented key -- `signal_sources.ticker` is the
+    only issuer identity `materialize_qq_form4` has -- so this function's
+    convention is **ticker, upper-cased**, and the parameter is named
+    `issuer_ticker` (not `issuer_id`) to say so instead of leaving the caller
+    to guess which identity space a bare string belongs to. If a future
+    EDGAR-native materializer (see `materialize_form4_edgar_native`) turns
+    out to carry a real issuer CIK, colliding into the *same* row for the
+    same act requires that materializer to resolve CIK -> ticker (or this
+    function to grow an explicit `issuer_cik=` alternative) before calling
+    this function -- silently mixing CIK and ticker values into one
+    "issuer_ticker" slot would produce two rows for one act instead of a
+    merge. All parameters are keyword-only so a call site cannot pass the
+    issuer identity positionally and leave which convention it used
+    ambiguous to a reader.
     """
     shares_key = "NA" if shares is None else str(round(shares))
     return "|".join([
-        issuer_id.strip().upper(),
+        issuer_ticker.strip().upper(),
         owner_id.strip().upper(),
         transaction_date.isoformat(),
         (transaction_code or "").strip().upper(),
@@ -309,7 +352,7 @@ def materialize_qq_form4(engine: Engine, since: date | None = None) -> Materiali
                 size_usd = abs(fields.shares * fields.price)
 
             dedup_key = form4_dedup_key(
-                issuer_id=ticker,
+                issuer_ticker=ticker,
                 owner_id=actor_id,
                 transaction_date=signal_date,
                 transaction_code=fields.transaction_code or "",
@@ -327,6 +370,7 @@ def materialize_qq_form4(engine: Engine, since: date | None = None) -> Materiali
                 actor_type="insider",
                 entity_ticker=ticker.upper(),
                 direction=direction,
+                transaction_code=fields.transaction_code,  # raw SEC code, stored verbatim
                 size_usd=size_usd,
                 source="quiverquant",
                 source_record_id=None,
