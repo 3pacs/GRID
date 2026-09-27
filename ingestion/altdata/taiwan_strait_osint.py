@@ -391,7 +391,7 @@ class TaiwanStraitPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": MND_ENGLISH_URL,
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "EOD",
         "pit_available": False,  # MND never revises, but does not publish vintage
         "revision_behavior": "NEVER",
         "trust_score": "HIGH",
