@@ -143,17 +143,28 @@ def _classify_pair(
     return "interesting"
 
 
+# A feature whose last PIT observation is older than this is dropped (and
+# reported in ``matrix.attrs["excluded_stale"]``) before the row-wise dropna,
+# so one feature that stopped updating cannot truncate every view to its
+# last date while the response still claims to be current.
+ASSOCIATIONS_MAX_STALENESS_DAYS = 10
+
+
 def _build_feature_matrix(
     pit_store,
     feature_ids: list[int],
     days: int = 252,
     max_missing_pct: float = 0.5,
+    max_staleness_days: int | None = ASSOCIATIONS_MAX_STALENESS_DAYS,
 ) -> pd.DataFrame:
     """Build a PIT-correct feature matrix for the last N days.
 
     Drops columns with >max_missing_pct missing values before forward-filling,
-    then drops remaining rows with NaN. This prevents a single sparse feature
-    from eliminating all rows.
+    then drops stale columns (last observation older than
+    ``max_staleness_days``), then drops remaining rows with NaN. This
+    prevents a single sparse or dead feature from eliminating rows.
+    Excluded stale columns are listed in ``matrix.attrs["excluded_stale"]``
+    as ``{feature_id: last_obs_date_iso | None}``.
 
     Parameters:
         pit_store: PITStore instance.
@@ -187,8 +198,18 @@ def _build_feature_matrix(
         )
         return matrix
 
+    from discovery.matrix_guard import drop_stale_columns
+
+    matrix, excluded_stale = drop_stale_columns(matrix, today, max_staleness_days)
+    if excluded_stale:
+        log.info(
+            "Associations matrix: excluded {n} stale features (> {d}d old)",
+            n=len(excluded_stale), d=max_staleness_days,
+        )
+
     # Forward-fill gaps (up to 5 consecutive days), then drop remaining NaN rows
     matrix = matrix.ffill(limit=5).dropna()
+    matrix.attrs["excluded_stale"] = excluded_stale
 
     log.debug(
         "Feature matrix built — {r} rows x {c} columns (dropped {d} sparse columns)",
@@ -231,8 +252,13 @@ async def get_correlation_matrix(
     name_to_family = dict(zip(registry["name"], registry["family"]))
 
     matrix = _build_feature_matrix(pit_store, feature_ids, days)
+    excluded_stale = {
+        id_to_name.get(fid, str(fid)): last
+        for fid, last in (matrix.attrs.get("excluded_stale") or {}).items()
+    }
     if matrix.empty or matrix.shape[1] < 2:
-        return {"features": [], "matrix": [], "strong_pairs": []}
+        return {"features": [], "matrix": [], "strong_pairs": [],
+                "excluded_stale_features": excluded_stale}
 
     # Rename columns from feature_id to feature_name
     matrix.columns = [id_to_name.get(c, str(c)) for c in matrix.columns]
@@ -300,6 +326,10 @@ async def get_correlation_matrix(
         "matrix": corr_values,
         "strong_pairs": strong_pairs,
         "pair_counts": classification_counts,
+        "as_of_date": date.today().isoformat(),
+        "window_start": matrix.index.min().date().isoformat(),
+        "window_end": matrix.index.max().date().isoformat(),
+        "excluded_stale_features": excluded_stale,
     }
 
 
@@ -398,26 +428,34 @@ def get_lag_analysis(
 
 
 @router.get("/clusters")
-async def get_clusters(
+def get_clusters(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return latest clustering results with assignments and transitions.
 
-    Fetches from the in-memory discovery job cache, or runs a
-    lightweight computation if no cached result exists.
+    Uses the most recent clustering run triggered in this API process, else
+    the latest persisted global ``clustering`` analytical snapshot (written
+    by the scheduled analytics job). Cluster ids are unsupervised GMM
+    components; they are labelled ``CLUSTER_<i>``, never mapped onto regime
+    names they were not fitted to.
     """
-    from api.routers.discovery import _jobs, _jobs_lock
+    from api.routers.discovery import _latest_job_result, latest_snapshot_result
 
-    # Try to find most recent completed clustering job
-    cluster_result = None
-    with _jobs_lock:
-        sorted_jobs = sorted(_jobs.values(), key=lambda j: j["started"], reverse=True)
-    for job in sorted_jobs:
-        if job["type"] == "clustering" and job["status"] == "complete":
-            cluster_result = job["result"]
-            break
+    cluster_result = _latest_job_result("clustering")
+    source = "in_process_job"
+    as_of_date = None
+    if cluster_result is None:
+        try:
+            snap = latest_snapshot_result("clustering", None)
+        except Exception as exc:
+            log.warning("clustering snapshot read failed: {e}", e=str(exc))
+            snap = None
+        if snap is not None:
+            cluster_result = snap["result"]
+            source = "analytical_snapshots"
+            as_of_date = snap["as_of_date"]
 
-    if cluster_result is None or "error" in cluster_result:
+    if not isinstance(cluster_result, dict) or "error" in cluster_result:
         return {
             "clusters": [],
             "transition_matrix": [],
@@ -436,15 +474,13 @@ async def get_clusters(
             best_metrics = m
             break
 
-    regime_labels = ["GROWTH", "NEUTRAL", "FRAGILE", "CRISIS", "RECOVERY", "UNKNOWN"]
     clusters: list[dict[str, Any]] = []
     for i in range(best_k):
-        label = regime_labels[i] if i < len(regime_labels) else f"CLUSTER_{i}"
         clusters.append({
             "id": i,
-            "label": label,
-            "feature_count": cluster_result.get("pca_components_used", 0),
-            "persistence": best_metrics.get("gmm_persistence", 0) if best_metrics else 0,
+            "label": f"CLUSTER_{i}",
+            "feature_count": cluster_result.get("pca_components_used"),
+            "persistence": best_metrics.get("gmm_persistence") if best_metrics else None,
         })
 
     # Compute inter-cluster distances from transition matrix
@@ -469,8 +505,11 @@ async def get_clusters(
         "n_clusters": best_k,
         "transition_matrix": transition,
         "inter_cluster_distances": distances,
-        "variance_explained": cluster_result.get("variance_explained", 0),
-        "n_observations": cluster_result.get("n_observations", 0),
+        "variance_explained": cluster_result.get("variance_explained"),
+        "n_observations": cluster_result.get("n_observations"),
+        "current_cluster": cluster_result.get("current_cluster"),
+        "as_of_date": as_of_date or cluster_result.get("as_of_date"),
+        "source": source,
     }
 
 

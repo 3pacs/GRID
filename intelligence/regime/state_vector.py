@@ -495,7 +495,13 @@ def cache_state_vector(engine: Engine, sv: StateVector) -> None:
         )
 
 
-def load_cached_vectors(engine: Engine, min_completeness: float = 0.4) -> list[StateVector]:
+# Minimum completeness for a vector to be cached, and for a cached row to be
+# served instead of recomputed. Same floor load_cached_vectors() and
+# compute_state_vector_series() already apply when building the library.
+MIN_CACHE_COMPLETENESS = 0.4
+
+
+def load_cached_vectors(engine: Engine, min_completeness: float = MIN_CACHE_COMPLETENESS) -> list[StateVector]:
     """Load all cached state vectors from the database."""
     _ensure_cache_table(engine)
     with engine.connect() as conn:
@@ -542,7 +548,7 @@ def get_or_compute_state_vector(
                 ),
                 {"dt": as_of},
             ).fetchone()
-        if row is not None:
+        if row is not None and row[2] is not None and row[2] >= MIN_CACHE_COMPLETENESS:
             vec_dict = row[1] if isinstance(row[1], dict) else json.loads(row[1])
             values = tuple(vec_dict.get(name) for name in DIM_NAMES)
             return StateVector(
@@ -553,6 +559,16 @@ def get_or_compute_state_vector(
             )
 
     sv = compute_state_vector(engine, as_of)
+    # Never pin a mostly-empty vector (e.g. every dimension query timed out)
+    # as the day's cached state: it would be served for the rest of the day
+    # instead of being recomputed, and load_cached_vectors() filters it out
+    # of the analog library anyway.
+    if sv.completeness < MIN_CACHE_COMPLETENESS:
+        log.warning(
+            "State vector for {d} only {c:.0%} complete — not cached",
+            d=as_of, c=sv.completeness,
+        )
+        return sv
     try:
         cache_state_vector(engine, sv)
     except Exception as exc:

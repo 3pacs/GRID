@@ -102,3 +102,68 @@ The worker handles `SIGTERM` cleanly — in-flight goals complete, then
 the next `claim_goal` returns the loop. No forcible kill is needed
 unless the lease has to be reaped (it will be, automatically, on the
 next worker startup or by the Day 2 reaper).
+
+## `grid-analytics-snapshots` (service + timer) — NOT installed
+
+Daily run of `scripts/run_analytics_snapshots.py`, which refreshes the
+`analytical_snapshots` categories behind the discovery, associations,
+snapshots and models views: `feature_engineering`, `orthogonality`,
+`clustering` (global), `clustering_sector` (one row per sector of
+`analysis/sector_map.py`, `subcategory` = sector name), `feature_importance`
+and `options_scan` (a summary of the scan grid-scheduler already persists).
+It writes nothing else: no ingestion, no resolver, no email, no
+`feature_importance_log`, no hypothesis/weights/autoresearch tables, no LLM
+calls. Every run tags each payload with a `provenance` block (release SHA,
+as-of date, vintage policy, gate result, stale inputs it excluded).
+
+Schedule: 07:15 UTC daily (`OnCalendar`, `Persistent=true`), after
+`grid-resolved-series-backfill.timer` (06:30 UTC). Runs from the deployed
+release `/data/grid_v4/grid_release` as `User=grid` with the repo `.env`,
+under `flock -n`, `TimeoutStartSec=3h`.
+
+### Readiness gate (checked by the job on every run)
+
+The job exits 3 without computing or writing anything unless **all** pass
+(`SuccessExitStatus=3`, so a not-ready day is a clean skip):
+
+| id | check |
+|----|-------|
+| G1 | table `resolved_series_retractions` exists (PR #683 migration) |
+| G2 | it holds rows with `run_tag = $GRID_ANALYTICS_REQUIRED_RUN_TAG` (default `reresolve_20260927`) |
+| G3 | the newest of those rows is older than `$GRID_ANALYTICS_SETTLE_MINUTES` (default 60) — the retraction insert has finished |
+| G4 | the operator flag file `$GRID_ANALYTICS_READY_FLAG` (default `/data/grid/state/analytics-snapshots.ready`) exists and its first line is the run tag |
+| G5 | `spy_full` has a PIT observation within `$GRID_ANALYTICS_MAX_RESOLVER_LAG_DAYS` (default 4) of the as-of date — the resolver refresh landed |
+
+G4 is the explicit go: write it only after the re-resolve run order is
+complete and `07_verify_retractions.sql` passed
+(`GRID-RERESOLVE-PLAN-20260927` §5, step 8):
+
+```bash
+sudo install -d -m 0755 -o grid -g grid /data/grid/state
+echo reresolve_20260927 | sudo -u grid tee /data/grid/state/analytics-snapshots.ready
+```
+
+Check the gate without computing anything (read-only):
+
+```bash
+cd /data/grid_v4/grid_release && set -a && . /home/grid/grid_v4/grid_repo/.env && set +a
+python3 scripts/run_analytics_snapshots.py --check-only     # exit 0 = ready, 3 = not ready
+python3 scripts/run_analytics_snapshots.py --dry-run        # compute, write nothing
+```
+
+### Install (owner decision — not done by the PR)
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-analytics-snapshots.service.template \
+    /etc/systemd/system/grid-analytics-snapshots.service
+sudo install -m 0644 deploy/systemd/grid-analytics-snapshots.timer.template \
+    /etc/systemd/system/grid-analytics-snapshots.timer
+sudo systemctl daemon-reload
+sudo systemctl start grid-analytics-snapshots.service   # one gated run first
+journalctl -u grid-analytics-snapshots.service -n 200 --no-pager
+sudo systemctl enable --now grid-analytics-snapshots.timer
+```
+
+Stop / roll back: `sudo systemctl disable --now grid-analytics-snapshots.timer`.
+Rows it wrote are ordinary `analytical_snapshots` rows (identifiable by
+`payload->'provenance'->>'job' = 'run_analytics_snapshots'`).
