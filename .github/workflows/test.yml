@@ -138,6 +138,21 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
 
+      # fix/cap-future-dated-reads-20260927: the general "Run tests" step
+      # above leaves GRID_TEST_DB_URL unset, so tests/test_future_dated_reads_guard.py
+      # would silently skip there. REQUIRE_FUTURE_DATED_READS_PG makes a
+      # missing DB URL a hard failure instead of a skip (same mechanism as
+      # REQUIRE_PIPELINE_PG below), so this step can't go green without
+      # actually running all 10 look-ahead guard tests.
+      - name: Future-dated reads guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_FUTURE_DATED_READS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
+
       - name: Watchlist edge PostgreSQL identity contract
         env:
           GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
@@ -345,6 +360,28 @@ jobs:
           python -m pytest tests/test_raw_series_quarantined_migration_pg.py -q -rA | tee /tmp/grid-quarantine-pg.txt
           if grep -q "SKIPPED" /tmp/grid-quarantine-pg.txt; then
             echo "::error::raw_series QUARANTINED PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # resolved_series retractions
+      # (migrations/versions/resolved_retractions_20260927.py): runs the real
+      # upgrade/downgrade in a throwaway schema and proves the PIT semantics
+      # end to end -- a retracted row is hidden from as_of on/after the
+      # retraction and visible before it, LATEST_AS_OF/FIRST_RELEASE pick the
+      # remaining vintages (none left -> no row), store/pit.py and the migrated
+      # direct readers honour it, and the table is append-only/FK-pinned.
+      - name: resolved_series retractions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_resolved_series_retractions_pg.py -q -rA | tee /tmp/grid-retractions-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-retractions-pg.txt; then
+            echo "::error::resolved_series retractions PostgreSQL contract was skipped"
             exit 1
           fi
 

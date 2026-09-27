@@ -1,0 +1,72 @@
+diff --git a/api/main.py b/api/main.py
+index f667b66d..fa503fc3 100644
+--- a/api/main.py
++++ b/api/main.py
+@@ -446,6 +446,7 @@ for _label, _module_path, _required in [
+     ("ten_year_portfolio", "api.routers.ten_year_portfolio", False),
+     ("dad", "api.routers.dad", False),
+     ("price_alerts", "api.routers.price_alerts", False),
++    ("god_view", "api.routers.god_view", False),
+ ]:
+     _router = _load_router(_module_path, label=_label, required=_required)
+     if _router is not None:
+diff --git a/db.py b/db.py
+index 9ddb984b..862b900e 100644
+--- a/db.py
++++ b/db.py
+@@ -121,6 +121,10 @@ def get_engine() -> Engine:
+     return _engine
+ 
+ 
++# Alias for backward compatibility / explicit naming
++get_db_engine = get_engine
++
++
+ def clear_engine() -> None:
+     """Dispose the cached SQLAlchemy engine and clear the singleton.
+ 
+diff --git a/migrations/versions/phase4_fts_intelligence_search.py b/migrations/versions/phase4_fts_intelligence_search.py
+index 2794a518..45facb40 100644
+--- a/migrations/versions/phase4_fts_intelligence_search.py
++++ b/migrations/versions/phase4_fts_intelligence_search.py
+@@ -130,11 +130,15 @@ def upgrade() -> None:
+         WHERE search_vector IS NULL
+     """))
+ 
++    # analytical_snapshots has no title/summary: its text columns are
++    # category / subcategory, with the detail carried in jsonb payload and
++    # metrics. Naming title here made the statement fail outright, and made
++    # the trigger below reject every write to the table.
+     op.execute(sa.text("""
+         UPDATE analytical_snapshots
+         SET search_vector = to_tsvector(
+             'english',
+-            COALESCE(title, '') || ' ' || COALESCE(summary, '')
++            COALESCE(category, '') || ' ' || COALESCE(subcategory, '')
+         )
+         WHERE search_vector IS NULL
+     """))
+@@ -216,7 +220,7 @@ def upgrade() -> None:
+         BEGIN
+             NEW.search_vector := to_tsvector(
+                 'english',
+-                COALESCE(NEW.title, '') || ' ' || COALESCE(NEW.summary, '')
++                COALESCE(NEW.category, '') || ' ' || COALESCE(NEW.subcategory, '')
+             );
+             RETURN NEW;
+         END
+@@ -259,10 +263,10 @@ def upgrade() -> None:
+         FROM discovered_hypotheses WHERE thesis IS NOT NULL
+         UNION ALL
+         SELECT 'snapshot' AS source_type, id::text,
+-               COALESCE(title, '') AS title,
+-               COALESCE(summary, '') AS body,
+-               to_tsvector('english', COALESCE(title, '') || ' ' || COALESCE(summary, '')) AS tsv
+-        FROM analytical_snapshots WHERE summary IS NOT NULL
++               COALESCE(category, '') AS title,
++               COALESCE(subcategory, '') AS body,
++               to_tsvector('english', COALESCE(category, '') || ' ' || COALESCE(subcategory, '')) AS tsv
++        FROM analytical_snapshots WHERE category IS NOT NULL
+     """))
+ 
+     op.execute(sa.text("""
