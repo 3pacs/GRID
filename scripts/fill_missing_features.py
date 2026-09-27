@@ -27,7 +27,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,6 +42,7 @@ from db import get_engine
 from ingestion.base import BasePuller
 from normalization.entity_map import SEED_MAPPINGS
 from normalization.resolver import Resolver
+from store.pit import PITStore, retractions_table_exists
 
 # ── Trust Rankings ──────────────────────────────────────────────────────────
 
@@ -721,21 +722,59 @@ def pull_stablecoin_supply(engine):
 # ── Computed Features (ratios, slopes, changes) ────────────────────────────
 
 def compute_derived_features(engine):
-    """Compute features that are derived from other features already in the DB."""
+    """Compute features that are derived from other features already in the DB.
+
+    Inputs are read through ``store.pit.PITStore.get_pit`` with
+    vintage_policy "LATEST_AS_OF" as of the computation time (retraction-
+    aware since PR #683), instead of the previous raw SELECT over
+    ``resolved_series`` that read every vintage in an unordered window and
+    kept whichever row a Python dict happened to see last for a given
+    obs_date. See GRID-RERESOLVE-PLAN-20260927, "DERIVED FEATURES", for
+    why that unfiltered read could silently compute from a contaminated
+    vintage still kept as superseded history. Refuses to run entirely if
+    ``resolved_series_retractions`` does not exist yet.
+    """
     results = []
 
+    if not retractions_table_exists(engine):
+        log.error(
+            "compute_derived_features: resolved_series_retractions is "
+            "missing (PR #683 not deployed here) — refusing to run"
+        )
+        return results
+
+    run_date = datetime.now(timezone.utc).date()
+    pit = PITStore(engine)
+
     with engine.connect() as conn:
+        def _feature_id(feature_name: str) -> int | None:
+            row = conn.execute(
+                text("SELECT id FROM feature_registry WHERE name = :fn"),
+                {"fn": feature_name},
+            ).fetchone()
+            return row[0] if row else None
+
         # Get available resolved data for computation
         def get_series(feature_name: str, days: int = 400) -> pd.Series:
-            rows = conn.execute(text("""
-                SELECT obs_date, value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name = :fn AND rs.obs_date >= CURRENT_DATE - :days
-                ORDER BY rs.obs_date
-            """), {"fn": feature_name, "days": days}).fetchall()
-            if not rows:
+            fid = _feature_id(feature_name)
+            if fid is None:
                 return pd.Series(dtype=float)
-            return pd.Series({r[0]: r[1] for r in rows}).sort_index()
+            df = pit.get_pit([fid], run_date, vintage_policy="LATEST_AS_OF")
+            if df.empty:
+                return pd.Series(dtype=float)
+            cutoff = run_date - timedelta(days=days)
+            df = df[df["obs_date"] >= cutoff]
+            if df.empty:
+                return pd.Series(dtype=float)
+            # Plain `date` objects, matching the previous implementation's
+            # `pd.Series({date: value, ...})` index exactly (NOT a
+            # DatetimeIndex/Timestamp): _insert_computed below compares
+            # these against a set of plain `date` objects read back from
+            # raw_series, and a Timestamp never equals a `date` there.
+            return pd.Series(
+                df["value"].to_numpy(dtype=float),
+                index=df["obs_date"].to_numpy(),
+            ).sort_index()
 
         # Copper/Gold ratio
         copper = get_series("copper_futures_close")
