@@ -30,32 +30,34 @@ _FROM_RAW = re.compile(r"from\s+raw_series\b", re.I)
 
 # Legacy baseline on 2026-09-17 (branch fix/raw-series-success-vintage-reads).
 # Migrate a file onto store.observations and lower (or delete) its entry.
+#
+# Updated 2026-09-27 (branch fix/raw-series-readers-success-only-20260927):
+# ~40 production readers across api/, analysis/, intelligence/, valuation/,
+# ingestion/, ollama/, alpha_research/ and scripts/ were audited against
+# migration #671 (raw_series pull_status gets a QUARANTINED value for
+# wrong-instrument price batches). Every analytical read of `value` now
+# filters `pull_status = 'SUCCESS'`; the entries remaining below are health/
+# freshness/audit reads (recent pull activity, row counts, freshness
+# timestamps) that intentionally look at every status — see the inline
+# comments at each site for why. `intelligence/signal_health_monitor.py`'s
+# count dropped from 4 to 2: its row_count/nan_count pull-activity probe
+# stays unfiltered by design, but its latest_value/history_mean/history_std
+# queries (which feed anomaly thresholds) now require SUCCESS.
 LEGACY_UNFILTERED_READS: dict[str, int] = {
     "alerts/email.py": 1,
-    "analysis/capital_flows.py": 8,
     "analysis/money_flow.py": 1,
-    "analysis/thesis_scorer.py": 14,
-    "api/routers/dad.py": 3,
+    "analysis/thesis_scorer.py": 2,
+    "api/routers/dad.py": 1,
     "api/routers/flows.py": 1,
     "api/routers/system.py": 6,
-    "api/routers/tradingview.py": 1,
-    "api/routers/watchlist_analysis.py": 1,
-    "api/routers/watchlist_helpers.py": 1,
-    "intelligence/actor_discovery.py": 22,
-    "intelligence/contagion_backtest.py": 1,
-    "intelligence/dollar_flows.py": 7,
-    "intelligence/earnings_transcript_analyzer.py": 3,
-    "intelligence/fundamental_divergence.py": 3,
+    "intelligence/actor_discovery.py": 1,
+    "intelligence/dollar_flows.py": 3,
+    "intelligence/earnings_transcript_analyzer.py": 1,
     "intelligence/global_levers.py": 1,
-    "intelligence/news_impact.py": 1,
-    "intelligence/news_momentum.py": 3,
     "intelligence/pattern_library.py": 1,
-    "intelligence/sec_filing_extractor.py": 1,
     "intelligence/sentiment_scorer.py": 1,
-    "intelligence/signal_extractor.py": 1,
-    "intelligence/signal_health_monitor.py": 4,
-    "valuation/derivatives_support.py": 4,
-    "valuation/intrinsic.py": 3,
+    "intelligence/signal_health_monitor.py": 2,
+    "valuation/intrinsic.py": 1,
 }
 
 

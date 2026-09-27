@@ -257,6 +257,22 @@ jobs:
             exit 1
           fi
 
+      # GRID-YF-CLOSE-REPAIR-20260926 / coordinator review of PR #672:
+      # proves ingestion/yfinance_pull.py's cross-process advisory lock
+      # (pg_try_advisory_lock/pg_advisory_unlock) actually blocks a second,
+      # independent connection while the first holds it — the guard a
+      # same-process threading.Lock cannot provide, and the reason
+      # grid-scheduler and grid-hermes (two separate systemd units that
+      # both call pull_all()) can't race each other's writes.
+      - name: YFinance pull_all advisory lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_YFINANCE_LOCK_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

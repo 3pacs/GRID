@@ -81,8 +81,11 @@ print(f'Briefing generated: {result.get(\"title\", \"unknown\")}')
         check_llm
         echo "[$(date)] Running TradingAgents..." >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
         python -c "
-from agents.runner import run_agent
-result = run_agent()
+from db import get_engine
+from agents.runner import AgentRunner
+engine = get_engine()
+runner = AgentRunner(engine)
+result = runner.run()
 print(f'Agent run complete: {result}')
 " >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
         ;;

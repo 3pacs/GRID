@@ -645,8 +645,17 @@ def run_intelligence_loop() -> None:
         """CAT-35: CFTC COT extremes scan (consumes existing cftc_cot data)."""
         try:
             from db import get_engine as _ge
-            from intelligence.cot_extremes import rank_contrarian_signals, scan_all_extremes
-            extremes = scan_all_extremes(_ge())
+            from intelligence.cot_extremes import rank_contrarian_signals, scan_extremes_report
+            report = scan_extremes_report(_ge())
+            if not report["available"]:
+                # Fail closed: code-keyed CFTC history missing (backfill
+                # pending). Never fall back to the mixed-market legacy ids.
+                log.warning(
+                    "COT extremes weekly: unavailable -- {r} ({u} market/metric pairs skipped)",
+                    r=report["reason"], u=len(report["unavailable"]),
+                )
+                return
+            extremes = report["extremes"]
             ranked = rank_contrarian_signals(extremes)
             top = ranked[:10]
             log.info(
@@ -1078,11 +1087,11 @@ def run_intelligence_loop() -> None:
             from intelligence.thesis_invalidation_monitor import run_monitor
             result = run_monitor(_ge())
             log.info(
-                "thesis invalidation: {t} theses, {i} invalidated, "
-                "{s} size-down",
-                t=result.theses_checked,
-                i=len(result.invalidations),
-                s=sum(1 for e in result.invalidations if e.size_down_applied),
+                "thesis invalidation: {t} predictions scanned, "
+                "{i} triggered, {e} errors",
+                t=result.predictions_scanned,
+                i=result.triggered_count,
+                e=len(result.errors),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("thesis invalidation hourly failed: {e}", e=str(exc))

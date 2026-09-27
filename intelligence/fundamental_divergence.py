@@ -544,7 +544,7 @@ def _load_ticker_price_cagr(
         text(
             """
             SELECT COUNT(*) FROM raw_series
-            WHERE series_id = :sid AND value IS NOT NULL
+            WHERE series_id = :sid AND pull_status = 'SUCCESS' AND value IS NOT NULL
             """
         ).bindparams(sid=series_id)
     ).fetchone()
@@ -568,6 +568,7 @@ def _load_ticker_price_cagr(
             SELECT value, obs_date
             FROM raw_series
             WHERE series_id = :sid
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :d
               AND value IS NOT NULL
             ORDER BY obs_date DESC, pull_timestamp DESC
@@ -585,6 +586,7 @@ def _load_ticker_price_cagr(
             SELECT value, obs_date
             FROM raw_series
             WHERE series_id = :sid
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :d
               AND value IS NOT NULL
             ORDER BY obs_date DESC, pull_timestamp DESC

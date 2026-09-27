@@ -172,6 +172,7 @@ def _get_vwap_estimate(engine: Engine, ticker: str, obs_date: date) -> float:
                 text(
                     "SELECT value FROM raw_series "
                     "WHERE series_id LIKE :pattern "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date <= :od "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ),
@@ -577,6 +578,7 @@ def _normalize_13f_flows(engine: Engine, days: int) -> list[dict]:
                     "SELECT series_id, obs_date, value, raw_payload "
                     "FROM raw_series "
                     "WHERE series_id LIKE :pattern "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= :cutoff "
                     "ORDER BY obs_date DESC"
                 ),
@@ -652,6 +654,7 @@ def _normalize_etf_flows(engine: Engine, days: int) -> list[dict]:
                     "SELECT series_id, obs_date, value, raw_payload "
                     "FROM raw_series "
                     "WHERE series_id LIKE :pattern "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= :cutoff "
                     "ORDER BY obs_date DESC"
                 ),

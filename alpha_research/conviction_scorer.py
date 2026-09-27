@@ -90,6 +90,7 @@ def _load_raw_latest(
             SELECT value FROM raw_series
             WHERE series_id >= :lo AND series_id < :hi
               AND source_id = :s
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :as_of
               AND pull_timestamp::date <= :as_of
             ORDER BY obs_date DESC, pull_timestamp DESC
@@ -99,6 +100,7 @@ def _load_raw_latest(
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id >= :lo AND series_id < :hi
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :as_of
               AND pull_timestamp::date <= :as_of
             ORDER BY obs_date DESC, pull_timestamp DESC
@@ -119,6 +121,7 @@ def _load_raw_series(
     rows = conn.execute(text("""
         SELECT obs_date, value FROM raw_series
         WHERE series_id = :s
+          AND pull_status = 'SUCCESS'
           AND obs_date >= :d
           AND obs_date <= :as_of
           AND pull_timestamp::date <= :as_of

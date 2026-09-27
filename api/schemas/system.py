@@ -91,6 +91,38 @@ class StaleSource(BaseModel):
     field_record: dict[str, Any] | None = None
 
 
+class FreshnessAuditBucket(BaseModel):
+    bucket: str
+    ticker_count: int
+
+
+class DailyFreshnessAudit(BaseModel):
+    """Snapshot of the pre-computed `data_freshness_audit` table.
+
+    `grid-data-freshness-check.timer` refreshes this table once daily
+    (05:00 UTC) via `scripts/freshness_audit_universe.sql`. Reading it here
+    is a fixed-size, indexed lookup (audited_at DESC / bucket) regardless of
+    how large the underlying `ticker_metrics_daily` table grows — unlike a
+    live lateral scan over `raw_series`/`resolved_series`, this can never
+    time out the request.
+
+    `availability` is "unavailable" whenever the *audit itself* is missing
+    (no rows ever written) or stale (its own daily run did not complete
+    within the last 48h — twice the timer's cadence). This is a genuinely
+    separate signal from "available" per-source/per-family data above: an
+    old audit answers a different question ("was the pipeline healthy as of
+    last night") than a live query, so it must never be presented as if it
+    were current.
+    """
+    audited_at: str | None = None
+    total_tickers: int = 0
+    buckets: list[FreshnessAuditBucket] = []
+    source_tables: list[str] = []
+    availability: str = "available"
+    stale_reason: str | None = None
+    field_record: dict[str, Any] | None = None
+
+
 class FreshnessResponse(BaseModel):
     families: list[FamilyFreshness]
     overall_status: str  # GREEN, YELLOW, RED
@@ -101,6 +133,11 @@ class FreshnessResponse(BaseModel):
     # never silently returned as empty families/stale_sources with no signal.
     availability: str = "available"
     stale_reason: str | None = None
+    # The daily data_freshness_audit snapshot (see DailyFreshnessAudit). Its
+    # own availability/stale_reason are independent of the fields above —
+    # this can be "unavailable" while the live family query above succeeds,
+    # and vice versa.
+    daily_audit: DailyFreshnessAudit = DailyFreshnessAudit()
 
 
 class HermesTaskStatus(BaseModel):
@@ -188,3 +225,6 @@ class PipelineHealthResponse(BaseModel):
     # from "we could not compute this".
     availability: str = "available"
     stale_reason: str | None = None
+    # The daily data_freshness_audit snapshot (see DailyFreshnessAudit),
+    # independent of the availability/stale_reason above.
+    daily_audit: DailyFreshnessAudit = DailyFreshnessAudit()

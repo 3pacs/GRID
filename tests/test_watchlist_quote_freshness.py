@@ -179,15 +179,20 @@ class TestQuoteStaleFlag:
 
 class TestQuoteLiveFallback:
     @patch("api.routers.watchlist_overview.get_db_engine")
-    def test_live_fallback_carries_honest_as_of_and_stale(
+    def test_live_fallback_carries_the_real_price_date_not_todays_date(
         self, mock_engine
     ):
-        """Previously as_of stayed null on the live-fallback path even
-        though a fresh live price was returned."""
+        """#F1 D5 regression: the live-fallback path used to stamp
+        as_of=date.today() regardless of what day the yfinance price
+        actually belonged to (fast_info carries no timestamp at all — a
+        Saturday run would report a false "Saturday" price). It must now
+        carry through whatever real trading day `_fetch_live_price` read
+        off yfinance's own history."""
         _wire_engine(mock_engine, _mock_quote_conn([]))
+        real_price_date = date.today() - timedelta(days=1)
         with patch(
             "api.routers.watchlist_overview._fetch_live_price",
-            return_value={"price": 42.0, "pct_1d": 0.01},
+            return_value={"price": 42.0, "pct_1d": 0.01, "as_of": real_price_date},
         ):
             response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
 
@@ -195,8 +200,28 @@ class TestQuoteLiveFallback:
         assert data["source"] == "live"
         assert data["price"] == 42.0
         assert data["change_pct"] == 0.01
-        assert data["as_of"] == str(date.today())
+        assert data["as_of"] == str(real_price_date)
         assert data["stale"] is False
+
+    @patch("api.routers.watchlist_overview.get_db_engine")
+    def test_live_fallback_with_unresolvable_date_leaves_as_of_and_stale_none(
+        self, mock_engine
+    ):
+        """When `_fetch_live_price` cannot read a real date off yfinance
+        (its own history call failed too), the endpoint must say "unknown"
+        (`None`) rather than fabricate `date.today()`."""
+        _wire_engine(mock_engine, _mock_quote_conn([]))
+        with patch(
+            "api.routers.watchlist_overview._fetch_live_price",
+            return_value={"price": 42.0, "pct_1d": 0.01, "as_of": None},
+        ):
+            response = client.get("/api/v1/watchlist/ZZZ/quote", headers=_auth_header())
+
+        data = response.json()
+        assert data["source"] == "live"
+        assert data["price"] == 42.0
+        assert data["as_of"] is None
+        assert data["stale"] is None
 
 
 class TestSpyIntradayQuote:

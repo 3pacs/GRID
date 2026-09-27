@@ -65,6 +65,16 @@ def _make_engine(source_rows=None, cov_rows=None, err_rows=None, resolver_rows=N
             result.fetchone.return_value = (resolver_rows or {}).get("last_run", (None,))
         elif "vintage_date >= CURRENT_DATE - INTERVAL" in sql:
             result.fetchone.return_value = (resolver_rows or {}).get("last_resolved", (0,))
+        elif "current_setting" in sql:
+            result.scalar_one.return_value = "0"
+        elif "MAX(audited_at)" in sql:
+            # No data_freshness_audit fixture wired into this fake engine —
+            # every test here exercises the pre-existing sources/families
+            # contract, not the daily-audit reader (see
+            # tests/test_daily_freshness_audit.py for that). "Never
+            # configured" is the correct, honest default rather than a
+            # truthy MagicMock that would blow up age-in-hours arithmetic.
+            result.scalar_one_or_none.return_value = None
         else:
             result.fetchall.return_value = []
             result.fetchone.return_value = None

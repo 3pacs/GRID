@@ -26,13 +26,40 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# GRID-YF-CLOSE-REPAIR-20260926 fix #2 ("timeout honestly sized"): without
+# an explicit start_date, YFinancePuller.pull_all() defaults to "1990-01-01"
+# — a full-history download for every ticker on every call. That default is
+# meant for deliberate, explicitly authorised backfills only (see that
+# method's own docstring); the routine scheduled call below was calling it
+# with no kwargs at all, so every 4-hourly tick re-downloaded ~35 years of
+# history for 70 tickers. That is what regularly overran the old 120s
+# timeout_s and produced the orphaned daemon thread that let a later tick's
+# concurrent call race it (the confirmed April 2026 contamination
+# mechanism). A short rolling window keeps the routine scheduled download
+# small and fast while still covering weekends/holidays with margin.
+YFINANCE_SCHEDULED_LOOKBACK_DAYS = 10
+
+
+def _yfinance_incremental_start() -> str:
+    """Recent-window start_date for the routine scheduled yfinance pull.
+
+    Evaluated at call time (see _run_puller's callable-kwargs resolution
+    below), not once when PULLER_REGISTRY is built at import — otherwise
+    this would freeze at whatever date the process happened to start.
+    """
+    return (
+        datetime.now(timezone.utc).date()
+        - timedelta(days=YFINANCE_SCHEDULED_LOOKBACK_DAYS)
+    ).isoformat()
+
+
 # ── Puller Registry ──────────────────────────────────────────────────────
 # Every puller with its import path, method, and expected update frequency.
 # Frequency is in hours. "8" means run every 8 hours at most.
 
 PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Fast domestic (run frequently) ──
-    {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 120},
+    {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 240, "kwargs": {"start_date": _yfinance_incremental_start}},
     {"name": "options",           "mod": "ingestion.options",             "cls": "OptionsPuller",            "method": "pull_all",  "freq_h": 6,  "timeout_s": 180},
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
     {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 120, "api_key": "FRED_API_KEY"},
@@ -354,8 +381,29 @@ class SmartScheduler:
 
         Uses a semaphore to cap concurrent threads at MAX_CONCURRENT_THREADS
         and tracks active threads for observability.
+
+        GRID-YF-CLOSE-REPAIR-20260926 follow-up: a puller that overruns
+        ``timeout_s`` is daemon-detached and left running (see the class
+        docstring) — that orphaned thread was the confirmed mechanism behind
+        the April 2026 yfinance wrong-instrument contamination, once a
+        thread-unsafe download library shared state across the orphan and
+        the NEXT tick's fresh call. Two independent, consistent mitigations
+        now live alongside this hard join-timeout:
+          1. Any puller method that accepts a ``should_continue`` kwarg
+             (currently ``YFinancePuller.pull_all``) gets one wired
+             automatically, bound to a deadline a little inside this call's
+             own ``timeout_s``. That lets a slow multi-item pull stop itself
+             cleanly BETWEEN items before the hard join timeout fires,
+             instead of relying on abandonment.
+          2. If the puller's own return value reports
+             ``{"status": "SKIPPED", ...}`` (e.g. YFinancePuller.pull_all's
+             single-flight lock finding a previous run still active), this
+             call is recorded as SKIPPED rather than SUCCESS — critically,
+             it must NOT advance ``source_catalog.last_pull_at``, or a
+             lock-skipped run would be indistinguishable from a real one.
         """
         import importlib
+        import inspect
         import os
 
         name = puller["name"]
@@ -391,6 +439,36 @@ class SmartScheduler:
 
             method = getattr(instance, puller["method"])
             method_kwargs = dict(puller.get("kwargs") or {})
+            # Registry kwargs may be plain values or zero-arg callables
+            # (e.g. a "recent N days" start_date that must be computed at
+            # call time, not once when PULLER_REGISTRY is built at import).
+            # `should_continue` is itself always a callable BY CONTRACT (a
+            # cooperative-cancellation check, not a value to precompute) —
+            # never resolve it here, or an explicit registry-supplied one
+            # would be invoked once and replaced by its boolean result.
+            for key, val in list(method_kwargs.items()):
+                if key != "should_continue" and callable(val):
+                    method_kwargs[key] = val()
+
+            # Cooperative-cancellation wiring: if the puller's method
+            # accepts should_continue and the registry didn't already
+            # supply one, bind a deadline a bit inside this call's own
+            # timeout_s so it can stop itself between items instead of
+            # being abandoned by the hard join timeout below. See this
+            # method's docstring, mitigation 1.
+            if "should_continue" not in method_kwargs:
+                try:
+                    accepts_should_continue = (
+                        "should_continue" in inspect.signature(method).parameters
+                    )
+                except (TypeError, ValueError):
+                    accepts_should_continue = False
+                if accepts_should_continue:
+                    margin = min(15, max(timeout_s // 8, 1))
+                    deadline = time.monotonic() + max(timeout_s - margin, 1)
+                    method_kwargs["should_continue"] = (
+                        lambda _deadline=deadline: time.monotonic() < _deadline
+                    )
 
             # Run with timeout — don't let any puller block for minutes
             out_box: list[Any] = [None]
@@ -427,8 +505,19 @@ class SmartScheduler:
             if err_box[0]:
                 raise err_box[0]
 
+            out = out_box[0]
+            # Mitigation 2 (see docstring): a puller can report its own
+            # SKIPPED outcome — e.g. YFinancePuller.pull_all's single-flight
+            # lock finding a previous run still active. That is NOT a
+            # successful check and must not advance last_pull_at.
+            if isinstance(out, dict) and out.get("status") == "SKIPPED":
+                result["status"] = "SKIPPED"
+                result["reason"] = out.get("skipped_reason", "puller reported SKIPPED")
+                result["detail"] = str(out)[:200]
+                return result
+
             result["status"] = "SUCCESS"
-            result["detail"] = str(out_box[0])[:200] if out_box[0] else ""
+            result["detail"] = str(out)[:200] if out else ""
             self._update_last_pull(name)
 
         except Exception as exc:

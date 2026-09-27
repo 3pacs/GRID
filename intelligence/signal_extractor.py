@@ -185,6 +185,7 @@ def extract_from_raw_series(
                 SELECT rs.series_id, rs.obs_date, rs.value
                 FROM raw_series rs
                 WHERE rs.series_id LIKE :pattern
+                  AND rs.pull_status = 'SUCCESS'
                   AND rs.obs_date >= :since
                   AND NOT EXISTS (
                       SELECT 1 FROM signal_data sd

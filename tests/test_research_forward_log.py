@@ -27,6 +27,8 @@ from sqlalchemy import (
     Date,
     DateTime,
     Float,
+    ForeignKey,
+    Integer,
     MetaData,
     String,
     Table,
@@ -72,6 +74,9 @@ def naive(ts: pd.Timestamp) -> datetime:
     return ts.tz_convert("UTC").tz_localize(None).to_pydatetime()
 
 
+FRED_SRC = 1  # store.observations joins source_catalog since #664
+
+
 def build_engine(
     revision: tuple[date, float, datetime] | None = None,
     drop: tuple[str, date] | None = None,
@@ -79,11 +84,16 @@ def build_engine(
     """TGT responds to FEAT_X's published 5-session change; FEAT_D copies TGT."""
     engine = create_engine("sqlite://")
     md = MetaData()
+    source_catalog = Table(
+        "source_catalog", md,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, nullable=False),
+    )
     raw = Table(
         "raw_series",
         md,
         Column("series_id", String, nullable=False),
-        Column("source_id", String, nullable=False),
+        Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
         Column("obs_date", Date, nullable=False),
         Column("pull_timestamp", DateTime, nullable=False),
         Column("value", Float, nullable=False),
@@ -106,15 +116,16 @@ def build_engine(
                            ("FEAT_N", noise[i])):
             if drop == (sid, d.date()):
                 continue
-            rows.append({"series_id": sid, "source_id": "fred", "obs_date": d.date(),
+            rows.append({"series_id": sid, "source_id": FRED_SRC, "obs_date": d.date(),
                          "pull_timestamp": naive(pulled[i]), "value": float(value),
                          "raw_payload": "{}", "pull_status": "SUCCESS"})
     if revision is not None:
         obs_date, value, when = revision
-        rows.append({"series_id": "FEAT_X", "source_id": "fred", "obs_date": obs_date,
+        rows.append({"series_id": "FEAT_X", "source_id": FRED_SRC, "obs_date": obs_date,
                      "pull_timestamp": when, "value": value, "raw_payload": "{}",
                      "pull_status": "SUCCESS"})
     with engine.begin() as c:
+        c.execute(source_catalog.insert(), [{"id": FRED_SRC, "name": "fred"}])
         c.execute(raw.insert(), rows)
     return engine
 
