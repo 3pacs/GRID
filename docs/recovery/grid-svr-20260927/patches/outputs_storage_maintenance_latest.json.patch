@@ -1,0 +1,83 @@
+diff --git a/outputs/storage_maintenance/storage_maintenance_latest.json b/outputs/storage_maintenance/storage_maintenance_latest.json
+index 70de016d..b7a49bfe 100644
+--- a/outputs/storage_maintenance/storage_maintenance_latest.json
++++ b/outputs/storage_maintenance/storage_maintenance_latest.json
+@@ -153,33 +153,26 @@
+     {
+       "error": null,
+       "exists": true,
+-      "free_bytes": 8708530462720,
++      "free_bytes": 8670012968960,
+       "path": "/data",
+       "total_bytes": 11904377847808,
+-      "use_pct": 0.26845984107237186,
+-      "used_bytes": 3195847385088
++      "use_pct": 0.27169541493036165,
++      "used_bytes": 3234364878848
+     },
+     {
+       "error": null,
+       "exists": true,
+-      "free_bytes": 8037342621696,
++      "free_bytes": 2779941298176,
+       "path": "/mirror",
+       "total_bytes": 17927372771328,
+-      "use_pct": 0.5516720311327235,
+-      "used_bytes": 9890030149632
++      "use_pct": 0.844933145886157,
++      "used_bytes": 15147431473152
+     }
+   ],
+   "gdelt": {
+     "base_path": "/data/gdelt",
+     "db_tables": {
+-      "gdelt_daily_summary": {
+-        "exists": true,
+-        "rows": 1878
+-      },
+-      "gdelt_events": {
+-        "exists": true,
+-        "rows": 87887709
+-      }
++      "error": "(psycopg2.errors.QueryCanceled) canceling statement due to statement timeout\n\n[SQL: SELECT COUNT(*) FROM gdelt_events]\n(Background on this error at: https://sqlalche.me/e/20/e3q8)"
+     },
+     "directory_file_counts": {
+       "parser_root": 755,
+@@ -189,8 +182,9 @@
+       "v2_translation": 1133693
+     },
+     "exists": true,
+-    "ingest_status": "tables_populated",
++    "ingest_status": "tables_empty",
+     "recommendations": [
++      "Run a bounded GDELT parser smoke before any archive cleanup.",
+       "scripts/parse_gdelt.py only reads /data/grid/bulk/gdelt; /data/gdelt/v1/events has more files and needs parser coverage or a curated ingest symlink.",
+       "GDELT v2 English/translation archives are massive; keep them on /mirror after parser/index coverage is proven."
+     ],
+@@ -201,8 +195,15 @@
+       "v2_translation.done": 1133693
+     }
+   },
+-  "generated_at": "2026-09-11T13:11:13.240737+00:00",
+-  "ingest_plan": [],
++  "generated_at": "2026-09-26T05:00:44.708194+00:00",
++  "ingest_plan": [
++    {
++      "action": "run_gdelt_parser_smoke",
++      "blocked_by": "Parser currently ignores /data/gdelt/v1/events and GDELT v2 roots; extend parser or intentionally symlink a bounded subset first.",
++      "command": "python3 scripts/parse_gdelt.py",
++      "current_parser_root": "/data/grid/bulk/gdelt"
++    }
++  ],
+   "json_path": null,
+   "markdown_path": null,
+   "roots": [
+@@ -1168,6 +1169,6 @@
+       "truncated": false
+     }
+   ],
+-  "status": "ok",
++  "status": "ingest_gap",
+   "target_id": "grid-svr-data"
+ }
+\ No newline at end of file
