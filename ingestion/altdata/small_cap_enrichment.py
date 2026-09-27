@@ -601,6 +601,7 @@ class SmallCapEnrichmentPuller:
         SELECT value
         FROM raw_series
         WHERE series_id = ANY(:series_ids)
+          AND pull_status = 'SUCCESS'
           AND obs_date >= :since
           AND obs_date <= :as_of
           AND pull_timestamp <= :as_of_ts
@@ -647,6 +648,7 @@ class SmallCapEnrichmentPuller:
         SELECT split_part(series_id, ':', 2) AS tk, max(obs_date)
         FROM raw_series
         WHERE series_id = ANY(:series_ids)
+          AND pull_status = 'SUCCESS'
           AND obs_date >= :since
           AND obs_date <= :as_of
           AND value IS NOT NULL AND value > 0

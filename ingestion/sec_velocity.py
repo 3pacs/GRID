@@ -243,11 +243,14 @@ class SECVelocityPuller(BasePuller):
                 series_id = f"SEC_VELOCITY:{sector}"
                 self._ensure_feature_registered(sector)
 
+                # QUARANTINED (migration #671: wrong-instrument batch caught
+                # after the fact) does not count as existing — allow a fresh
+                # insert to replace it rather than silently skipping.
                 existing = conn.execute(
                     text(
                         "SELECT 1 FROM raw_series "
                         "WHERE series_id = :sid AND source_id = :src "
-                        "AND obs_date = :od LIMIT 1"
+                        "AND obs_date = :od AND pull_status != 'QUARANTINED' LIMIT 1"
                     ),
                     {
                         "sid": series_id,
@@ -360,11 +363,13 @@ class SECVelocityPuller(BasePuller):
                         series_id = f"SEC_VELOCITY:{sector}"
                         self._ensure_feature_registered(sector)
 
+                        # QUARANTINED does not count as existing — see the
+                        # comment on the equivalent check above.
                         existing = conn.execute(
                             text(
                                 "SELECT 1 FROM raw_series "
                                 "WHERE series_id = :sid AND source_id = :src "
-                                "AND obs_date = :od LIMIT 1"
+                                "AND obs_date = :od AND pull_status != 'QUARANTINED' LIMIT 1"
                             ),
                             {"sid": series_id, "src": self.source_id, "od": week_start},
                         ).fetchone()

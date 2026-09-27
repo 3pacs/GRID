@@ -177,7 +177,8 @@ def pull_fred_extended(engine):
             with engine.begin() as conn:
                 existing = set()
                 rows = conn.execute(text(
-                    "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+                    "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
                 ), {"sid": series_id, "src": source_id}).fetchall()
                 existing = {r[0] for r in rows}
 
@@ -303,7 +304,8 @@ def pull_yfinance_extended(engine):
                         series_id, provenance = _extended_yf_series(ticker, field)
                         existing = set()
                         rows = conn.execute(text(
-                            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+                            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
                         ), {"sid": series_id, "src": source_id}).fetchall()
                         existing = {
                             r[0] if isinstance(r[0], date) else date.fromisoformat(r[0])
@@ -825,7 +827,8 @@ def _insert_computed(engine, feature_name: str, series: pd.Series, results: list
     with engine.begin() as conn:
         existing = set()
         rows = conn.execute(text(
-            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
         ), {"sid": f"COMPUTED:{feature_name}", "src": source_id}).fetchall()
         existing = {r[0] for r in rows}
 

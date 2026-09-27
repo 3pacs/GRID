@@ -286,6 +286,7 @@ def get_ticker_analysis(
                     "FROM raw_series rs "
                     "JOIN source_catalog sc ON sc.id = rs.source_id "
                     "WHERE sc.name = 'TradingView' "
+                    "AND rs.pull_status = 'SUCCESS' "
                     "AND rs.series_id LIKE :pattern "
                     "ORDER BY rs.pull_timestamp DESC LIMIT 10"
                 ),

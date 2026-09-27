@@ -1102,6 +1102,7 @@ def _grid_market_context(
                         "FROM raw_series rs "
                         "JOIN source_catalog sc ON sc.id = rs.source_id "
                         "WHERE sc.name = 'yfinance' "
+                        "AND rs.pull_status = 'SUCCESS' "
                         "AND rs.series_id = ANY(:series_ids) "
                         "AND rs.obs_date >= :cutoff "
                         "ORDER BY rs.obs_date"
@@ -1310,6 +1311,7 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
                     "FROM raw_series rs "
                     "JOIN source_catalog sc ON sc.id = rs.source_id "
                     "WHERE sc.name = 'TradingView' "
+                    "AND rs.pull_status = 'SUCCESS' "
                     "AND rs.series_id LIKE :pattern "
                     "ORDER BY rs.pull_timestamp DESC LIMIT 10"
                 ),

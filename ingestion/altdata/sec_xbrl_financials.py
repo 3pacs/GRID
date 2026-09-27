@@ -442,6 +442,7 @@ def _load_fx_rates(engine: Engine) -> dict[str, float]:
                     text(
                         "SELECT value FROM raw_series "
                         "WHERE series_id = :sid AND value > 0 "
+                        "AND pull_status = 'SUCCESS' "
                         "ORDER BY obs_date DESC LIMIT 1"
                     ).bindparams(sid=series_id),
                 ).fetchone()

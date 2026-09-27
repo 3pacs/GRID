@@ -551,6 +551,7 @@ class SECFilingExtractor:
                         SELECT series_id, obs_date, raw_payload
                         FROM raw_series
                         WHERE series_id LIKE 'edgar:8k:%'
+                          AND pull_status = 'SUCCESS'
                           AND obs_date >= :cutoff
                         ORDER BY obs_date DESC
                     """),

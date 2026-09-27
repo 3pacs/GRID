@@ -765,6 +765,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 JOIN LATERAL (
@@ -773,6 +774,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date + CAST(:horizon_days AS integer)
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
             """,
@@ -826,6 +828,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 JOIN LATERAL (
@@ -834,6 +837,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date + CAST(:horizon_days AS integer)
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
             """,
@@ -881,6 +885,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 JOIN LATERAL (
@@ -889,6 +894,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date + CAST(:horizon_days AS integer)
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
             """,
@@ -927,6 +933,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), c.ticker, chr(58), 'close')
                       AND obs_date >= c.event_date
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 JOIN LATERAL (
@@ -935,6 +942,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), c.ticker, chr(58), 'close')
                       AND obs_date >= c.event_date + CAST(:horizon_days AS integer)
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
             """,
@@ -987,6 +995,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 JOIN LATERAL (
@@ -995,6 +1004,7 @@ def compute_dot_type_forward_validation(conn, generated_at: datetime | None = No
                     WHERE series_id = concat('YF', chr(58), e.ticker, chr(58), 'close')
                       AND obs_date >= e.event_date + CAST(:horizon_days AS integer)
                       AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
             """,
@@ -1179,6 +1189,7 @@ def main() -> dict:
                     WHERE series_id = concat('YF', chr(58), c.ticker, chr(58), 'close')
                     AND obs_date >= c.week
                     AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p1 ON true
                 LEFT JOIN LATERAL (
@@ -1187,6 +1198,7 @@ def main() -> dict:
                     WHERE series_id = concat('YF', chr(58), c.ticker, chr(58), 'close')
                     AND obs_date >= c.week + 14
                     AND value > 0
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date ASC LIMIT 1
                 ) p2 ON true
                 WHERE p1.price IS NOT NULL AND p2.price IS NOT NULL
@@ -1237,6 +1249,7 @@ def main() -> dict:
                         WHERE series_id = concat('YF', chr(58), ct.ticker, chr(58), 'close')
                         AND obs_date >= ct.signal_date
                         AND value > 0
+                        AND pull_status = 'SUCCESS'
                         ORDER BY obs_date ASC LIMIT 1
                     ) p1 ON true
                     LEFT JOIN LATERAL (
@@ -1245,6 +1258,7 @@ def main() -> dict:
                         WHERE series_id = concat('YF', chr(58), ct.ticker, chr(58), 'close')
                         AND obs_date >= ct.signal_date + 30
                         AND value > 0
+                        AND pull_status = 'SUCCESS'
                         ORDER BY obs_date ASC LIMIT 1
                     ) p2 ON true
                     WHERE p1.price IS NOT NULL AND p2.price IS NOT NULL

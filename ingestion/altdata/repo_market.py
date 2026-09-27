@@ -265,6 +265,7 @@ class RepoMarketPuller(BasePuller):
                     sql_text(
                         "SELECT obs_date, value FROM raw_series "
                         "WHERE series_id = :sid AND source_id = :src "
+                        "AND pull_status = 'SUCCESS' "
                         "AND obs_date >= :start AND obs_date <= :end "
                         "ORDER BY obs_date"
                     ),

@@ -383,10 +383,16 @@ def _fetch_series_stats(
             out["recent_row_count"] = int(row[1] or 0)
             out["nan_count"] = int(row[2] or 0)
 
+        # latest_value / history_mean / history_std feed anomaly thresholds
+        # downstream — a QUARANTINED (migration #671) or FAILED row must not
+        # count as a real observation here, unlike the row_count/nan_count
+        # probe above which intentionally audits pull activity regardless of
+        # status.
         latest = conn.execute(
             text(
                 "SELECT value FROM raw_series "
-                "WHERE series_id = :sid AND value IS NOT NULL "
+                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                "AND value IS NOT NULL "
                 "ORDER BY obs_date DESC LIMIT 1"
             ),
             {"sid": series_id},
@@ -399,6 +405,7 @@ def _fetch_series_stats(
                 "SELECT AVG(value) AS mean, STDDEV_SAMP(value) AS std "
                 "FROM raw_series "
                 "WHERE series_id = :sid "
+                "AND pull_status = 'SUCCESS' "
                 "AND obs_date >= :cutoff "
                 "AND value IS NOT NULL"
             ),
