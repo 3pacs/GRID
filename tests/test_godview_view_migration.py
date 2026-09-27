@@ -16,7 +16,7 @@ def test_revision_ids():
     assert len(m.revision) <= 32
     # Stacked after #683's resolved_retractions_20260927 (see the PR body for
     # the merge order that keeps a single head).
-    assert m.down_revision == "resolved_retractions_20260927"
+    assert m.down_revision == "godview_writers_20260926"
 
 
 def test_timeouts_are_literals_matching_the_constants():
