@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 import godview.cftc_positioning as cp
+from ingestion.altdata import cftc_markets
 from ingestion.altdata.cftc_markets import MARKETS, compute_release, series_id
 from intelligence.cot_extremes import classify_extreme
 
@@ -97,11 +98,108 @@ def test_g1_release_rule_matches_every_2026_published_release_including_good_fri
     assert good_friday.release_at == datetime(2026, 4, 3, 19, 30, tzinfo=timezone.utc)
 
 
-@pytest.mark.parametrize("monday", [date(2018, 12, 24), date(2018, 12, 31), date(2020, 12, 21), date(2008, 12, 22)])
-def test_known_monday_report_dates_have_no_computable_release(monday):
-    """The CFTC published these Monday-dated reports on one-off dates; no rule gives a release."""
-    assert monday.weekday() == 0
-    assert compute_release(monday).release_at is None
+@pytest.mark.parametrize(
+    "report_date,expected_utc",
+    [
+        # Verbatim from CFTC's Historical Special Announcements page (2008
+        # section, "Holiday Release Schedule" note): "the next two releases
+        # will be on Monday, December 29 ... at 3:30 p.m. ... for the prior
+        # Monday's open interest positions instead of the usual Tuesday's."
+        (date(2008, 12, 22), datetime(2008, 12, 29, 20, 30, tzinfo=timezone.utc)),
+        # Press release 7864-19 (2019-01-29): delayed by the Dec 2018-Jan
+        # 2019 shutdown from its originally-scheduled Friday, published in
+        # the post-shutdown catch-up sequence instead (Fri Feb 1 / Tue Feb
+        # 5), confirmed against the archived files' own Last-Modified.
+        (date(2018, 12, 24), datetime(2019, 2, 1, 20, 32, tzinfo=timezone.utc)),
+        (date(2018, 12, 31), datetime(2019, 2, 5, 20, 34, tzinfo=timezone.utc)),
+        # Special announcement, 2020-12-28: "we published data dated Monday
+        # December 21, 2020 on Monday December 28, 2020."
+        (date(2020, 12, 21), datetime(2020, 12, 28, 20, 30, tzinfo=timezone.utc)),
+        # Routine, unshifted Friday release; confirmed via the archived
+        # file's Last-Modified (Fri, 07 Jul 2023 19:28:53 GMT).
+        (date(2023, 7, 3), datetime(2023, 7, 7, 19, 29, tzinfo=timezone.utc)),
+        # 2025 shutdown catch-up: press release 9147-25 (2025-12-09)
+        # accelerated this report to 2025-12-10, confirmed via the archived
+        # file's Last-Modified (Wed, 10 Dec 2025 21:14:18 GMT).
+        (date(2025, 11, 10), datetime(2025, 12, 10, 21, 15, tzinfo=timezone.utc)),
+    ],
+)
+def test_confirmed_holiday_shifted_dates_use_the_documented_release_instant(report_date, expected_utc):
+    r = compute_release(report_date)
+    assert r.release_at == expected_utc
+    assert r.holiday_shifted is True
+    assert r.reason == cftc_markets.RELEASE_REASON_CONFIRMED
+    # Never earlier than the primary-source instant it was pinned against.
+    assert r.release_at >= expected_utc
+
+
+@pytest.mark.parametrize(
+    "report_date",
+    [
+        date(2006, 7, 3),
+        date(2007, 1, 3),
+        date(2007, 12, 24),
+        date(2007, 12, 31),
+        date(2009, 11, 9),
+        date(2012, 12, 24),
+        date(2012, 12, 31),
+        date(2017, 7, 3),
+    ],
+)
+def test_unconfirmed_non_tuesday_dates_use_the_conservative_fallback(report_date):
+    """No primary source pinned for these: 15:30 ET on the next federal business
+
+    day after the Friday that would normally close the report's week --
+    strictly later than that Friday, so it can never claim the row was
+    public before it truly was.
+    """
+    r = compute_release(report_date)
+    assert r.holiday_shifted is True
+    assert r.reason == cftc_markets.RELEASE_REASON_CONSERVATIVE_ESTIMATE
+    assert r.release_at is not None
+    normal_friday = report_date + timedelta(days=4 - report_date.weekday())
+    normal_friday_release = datetime.combine(
+        normal_friday, cftc_markets._RELEASE_TIME_ET, tzinfo=ZoneInfo("America/New_York")
+    ).astimezone(timezone.utc)
+    assert r.release_at > normal_friday_release
+    assert r.release_at.astimezone(ZoneInfo("America/New_York")).time() == cftc_markets._RELEASE_TIME_ET
+    # Falls on a federal business day (not a weekend or holiday).
+    release_date_et = r.release_at.astimezone(ZoneInfo("America/New_York")).date()
+    assert release_date_et.weekday() < 5
+    assert not cftc_markets.is_federal_holiday(release_date_et)
+
+
+def test_confirmed_table_covers_every_known_skipped_date_except_the_conservative_ones():
+    """The 14 report dates #682's first production run skipped as
+
+    ``no_computable_release_time`` (13 Mondays, one Wednesday) must now all
+    resolve to a release -- either confirmed or the conservative fallback,
+    never back to ``None``.
+    """
+    known_skipped = [
+        date(2006, 7, 3), date(2007, 1, 3), date(2007, 12, 24), date(2007, 12, 31),
+        date(2008, 12, 22), date(2009, 11, 9), date(2012, 12, 24), date(2012, 12, 31),
+        date(2017, 7, 3), date(2018, 12, 24), date(2018, 12, 31), date(2020, 12, 21),
+        date(2023, 7, 3), date(2025, 11, 10),
+    ]
+    for d in known_skipped:
+        assert d.weekday() in (0, 2), d  # every one is a Monday or Wednesday
+        r = compute_release(d)
+        assert r.release_at is not None, d
+        assert r.holiday_shifted is True, d
+
+
+def test_a_weekday_with_no_rule_still_returns_no_computable_release():
+    """Defensive: a report date that is neither Tuesday, Monday, nor Wednesday
+
+    (never observed in real CFTC data) still fails closed with ``None``,
+    same as before this fix.
+    """
+    thursday = date(2018, 12, 27)
+    r = compute_release(thursday)
+    assert r.release_at is None
+    assert r.holiday_shifted is False
+    assert r.reason is not None
 
 
 # ── assemble_reports: fail closed ─────────────────────────────────────────

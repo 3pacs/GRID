@@ -68,15 +68,28 @@ a row pulled on its release Friday is ``observed_acquisition``.
 
 Report dates with no computable release time
 --------------------------------------------
-``compute_release`` only describes Tuesday report dates. The CFTC moves the
-position date when the Tuesday is a holiday (Monday data on 2008-12-22,
-2018-12-24, 2018-12-31, 2020-12-21, ...; about 13 Mondays and one Wednesday
-since 2006 across the tracked markets) and publishes those on a one-off date.
-#674's receipt CHECK requires ``release_at`` on every provenance-marked row and
-no rule gives one, so such a date is never written: it is skipped with
-``SKIP_NO_RELEASE_RULE``, counted in the ledger's ``reasons`` and listed (per
-market) in the returned result and a warning log. Its measured positions still
-count as history in later windows (published in order, as above).
+The CFTC moves the position date when the usual Tuesday is a holiday (Monday
+data on 2008-12-22, 2018-12-24, 2018-12-31, 2020-12-21, ...; 13 Mondays and
+one Wednesday since 2006 across the tracked markets). #682's first
+production run skipped 220 rows across these 14 dates -- every one of the
+other 15 tracked markets plus 10 of the 14 for VX (VIX futures) -- with
+``SKIP_NO_RELEASE_RULE``, because ``compute_release`` only described
+Tuesday report dates and returned ``release_at = None`` for every one of
+them. Fixed: ``compute_release`` now also resolves Monday/Wednesday report
+dates, either from ``cftc_markets.CONFIRMED_HOLIDAY_RELEASES`` (six dates
+pinned against a CFTC primary source -- special announcement, press release,
+or the archived report file's own timestamp) or a conservative fallback (15:30
+ET on the next federal business day after the report's normal Friday, which
+is never earlier than the true release -- see that module's docstring). All
+14 of the dates above now write a row.
+
+``SKIP_NO_RELEASE_RULE`` remains for the residual case a report date is
+neither Tuesday, Monday, nor Wednesday (never observed in real CFTC data):
+#674's receipt CHECK requires ``release_at`` on every provenance-marked row
+and no rule gives one, so such a date is never written -- skipped, counted in
+the ledger's ``reasons`` and listed (per market) in the returned result and a
+warning log. Its measured positions still count as history in later windows
+(published in order, as above).
 
 Good Friday
 -----------
