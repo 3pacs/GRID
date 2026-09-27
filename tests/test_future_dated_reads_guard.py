@@ -36,14 +36,28 @@ pytestmark = pytest.mark.xdist_group("postgres")
 _FUTURE = date(2026, 12, 31)
 _PAST = date.today() - timedelta(days=2)
 
+# Set by a dedicated CI step (see .github/workflows/test.yml, "Future-dated
+# reads guard PostgreSQL contract") so this file's tests cannot silently
+# skip in CI the way they would in the general "Run tests" step, which
+# leaves GRID_TEST_DB_URL unset. Mirrors REQUIRE_PIPELINE_PG in
+# tests/test_pipeline_health_pg.py: same fail-on-skip mechanism.
+_REQUIRE_ENV = "REQUIRE_FUTURE_DATED_READS_PG"
+
 
 @pytest.fixture(scope="module")
 def guard_engine():
     """Disposable-schema engine with the minimal tables every fixed reader
     in this file touches. Skips unless GRID_TEST_DB_URL points at a local
-    throwaway database (never the shared dev DB)."""
+    throwaway database (never the shared dev DB) — unless REQUIRE_ENV is
+    set, in which case a missing DB URL fails the run instead of skipping
+    it, so CI can't go green without ever running these assertions."""
     url = os.environ.get("GRID_TEST_DB_URL")
     if not url:
+        if os.environ.get(_REQUIRE_ENV) == "1":
+            pytest.fail(
+                f"GRID_TEST_DB_URL is required for the future-dated-reads "
+                f"guard contract ({_REQUIRE_ENV}=1)"
+            )
         pytest.skip("GRID_TEST_DB_URL is required for disposable PostgreSQL proof")
     parsed = make_url(url)
     if parsed.host not in {"localhost", "127.0.0.1"} or "test" not in (parsed.database or ""):
@@ -81,6 +95,10 @@ def guard_engine():
             "CREATE TABLE dollar_flows (source_type TEXT, actor_name TEXT, ticker TEXT, "
             "amount_usd DOUBLE PRECISION, direction TEXT, confidence TEXT, "
             "flow_date DATE, evidence TEXT)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE signal_sources (source_type TEXT, ticker TEXT, signal_date DATE, "
+            "signal_value TEXT, trust_score DOUBLE PRECISION, created_at TIMESTAMPTZ DEFAULT NOW())"
         ))
 
     yield engine
@@ -257,6 +275,36 @@ def test_flow_aggregator_momentum_ignores_future_row(guard_engine):
     result = compute_flow_momentum(guard_engine, "GRDY", days=30)
     assert result["flow_count"] == 1
 
+
+# ── intelligence/influence_network.py — _fetch_contracts (gov_contract) ────
+# gov_contract rows in signal_sources are dated by the contract's own
+# performance-start date (a forward-looking business attribute, per F8 §3),
+# not by when GRID observed the award. This reader used to have only a
+# lower-bound cutoff (signal_date >= :cutoff) with no upper bound, so a
+# future performance-start date would inflate "current" contract totals.
+
+def test_influence_network_fetch_contracts_ignores_future_row(guard_engine):
+    from intelligence.influence_network import _fetch_contracts
+
+    with guard_engine.begin() as conn:
+        conn.execute(
+            text("INSERT INTO signal_sources (source_type, ticker, signal_date, signal_value) VALUES "
+                 "('gov_contract', 'GRDW', :future, '{\"amount\": 999999}'), "
+                 "('gov_contract', 'GRDW', :past, '{\"amount\": 123}')"),
+            {"future": _FUTURE, "past": _PAST},
+        )
+
+    total, contracts = _fetch_contracts(guard_engine, "GRDW", days=3650)
+    assert total == pytest.approx(123.0)
+    assert len(contracts) == 1
+    assert contracts[0]["date"] == str(_PAST)
+
+
+# ── intelligence/market_edge_scanner.py — _load_live_profiles (source_types
+# including gov_contract) — same unbounded-upper cutoff pattern, fixed by
+# capping signal_date <= :as_of. Not covered by a DB-backed test here: the
+# reader also depends on _get_profile()'s static actor/sector lookup, which
+# this disposable schema does not seed.
 
 # ── api/routers/actor_detail.py — _ticker_signals ───────────────────────────
 
