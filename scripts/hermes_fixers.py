@@ -362,9 +362,23 @@ def _require_engine(engine: Any, cmd: str) -> Any:
 # intelligence/resolution_audit.py's copy of the same predicate/helper shape
 # (per-module duplication follows this codebase's existing
 # _resolve_source_id()/_row_exists() convention rather than a shared util).
+#
+# 2026-09-27: this predicate used to key on the system column `ctid`
+# (`MIN(ctid)` in the subquery below) rather than the real primary key. That
+# raised a live PostgreSQL "aggregate functions are not allowed in WHERE"
+# error the moment dupe_rows was ever non-empty -- caught by the bare
+# try/except and logged at debug, so it silently never actually deduped
+# anything in production (discovered by
+# tests/test_dedup_retraction_guard_pg.py, the first test to exercise this
+# delete against real Postgres). Rewritten to key on `id`
+# (resolved_series' real BIGSERIAL primary key), qualified as `rs.id` in the
+# subquery since feature_registry also has an `id` column and the join
+# would otherwise make a bare `id` ambiguous -- the same "keep the
+# lowest-id survivor" idiom intelligence/resolution_audit.py's dedup delete
+# already uses successfully (there, `id` ordered by source_priority_used).
 _HERMES_DEDUP_KEEP_MIN_PREDICATE = (
-    "ctid NOT IN ("
-    "  SELECT MIN(ctid) FROM resolved_series rs "
+    "id NOT IN ("
+    "  SELECT MIN(rs.id) FROM resolved_series rs "
     "  JOIN feature_registry fr ON fr.id = rs.feature_id "
     "  WHERE fr.name = :fname AND rs.obs_date = :odate "
     "  GROUP BY rs.feature_id, rs.obs_date"
