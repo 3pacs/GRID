@@ -143,15 +143,46 @@ def _latest_feature_value(
                     ).fetchone()
                 if row is not None and row[0] is not None:
                     return float(row[0])
-            except Exception as exc:  # pragma: no cover - defensive
-                log.debug(
-                    "latest_feature_value failed for {f} on {tbl}: {e}",
-                    f=fname,
-                    tbl=registry_table,
-                    e=str(exc),
-                )
+            except Exception as exc:
+                if _is_unexpected_missing_table(exc, registry_table):
+                    # e.g. resolved_series_retractions absent because the
+                    # migration did not run: the value would silently degrade
+                    # to the caller's default, so say so loudly.
+                    log.warning(
+                        "latest_feature_value: missing table while reading {f} "
+                        "via {tbl} (migration not applied?): {e}",
+                        f=fname,
+                        tbl=registry_table,
+                        e=str(exc),
+                    )
+                else:
+                    log.debug(
+                        "latest_feature_value failed for {f} on {tbl}: {e}",
+                        f=fname,
+                        tbl=registry_table,
+                        e=str(exc),
+                    )
                 continue
     return None
+
+
+# PostgreSQL SQLSTATE for "relation does not exist".
+_UNDEFINED_TABLE = "42P01"
+# The legacy registry is expected to be absent on V5 databases.
+_LEGACY_REGISTRY = "feature_catalog"
+
+
+def _is_unexpected_missing_table(exc: Exception, registry_table: str) -> bool:
+    """True when ``exc`` is a missing-relation error for anything other than
+    the expected-absent legacy ``feature_catalog`` registry."""
+    orig = getattr(exc, "orig", exc)
+    message = str(exc)
+    missing = getattr(orig, "pgcode", None) == _UNDEFINED_TABLE or (
+        "relation" in message and "does not exist" in message
+    )
+    if not missing:
+        return False
+    return f'relation "{_LEGACY_REGISTRY}" does not exist' not in message
 
 
 def fetch_vix_level(engine: Engine, as_of: date) -> float | None:

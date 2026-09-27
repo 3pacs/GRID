@@ -21,9 +21,10 @@ Semantics (implemented by ``store/pit.py`` and the PIT readers listed in the PR)
   and PostgreSQL 14 (production) has no ``UNIQUE NULLS NOT DISTINCT``.
 * The row is excluded from a read whose ``as_of_ts >= retracted_at``. A
   date-valued ``as_of`` (``store/pit.py``) means "known by the end of that UTC
-  day", the same day-level convention as ``release_date <= as_of``. A read
-  with an earlier ``as_of`` still sees the row: replays before the retraction
-  reproduce what the system actually served.
+  day", the same day-level convention as ``release_date <= as_of``, so a
+  retraction at 15:00 UTC on day D already hides the row for ``as_of = D``.
+  Replays are reproduced exactly for ``as_of`` dates before the retraction's
+  UTC date; ``as_of = D`` itself can differ depending on when it ran.
 * Retracting a cell's only vintage makes the cell unavailable (no row). If an
   earlier, non-retracted vintage exists, the policy picks it as usual.
 
@@ -124,7 +125,8 @@ _COMMENT = """
     COMMENT ON TABLE resolved_series_retractions IS
         'Append-only point-in-time retractions of resolved_series rows. A row '
         'is hidden from PIT reads with as_of_ts >= retracted_at and stays '
-        'visible to earlier as_of. See store/pit.py and '
+        'visible to earlier as_of (date as_of: dates before the retraction''s '
+        'UTC date). See store/pit.py and '
         'migrations/versions/resolved_retractions_20260927.py.'
 """
 

@@ -10,7 +10,8 @@ unique key ``uq_resolved_series_composite``. Proves:
   reader anti-join), the FK to the retracted row, and the append-only guard;
   the SET LOCAL timeouts stay inside the migration's transaction;
 * a retracted row is hidden from reads with as_of on/after the retraction
-  and still visible to earlier as_of (replays are reproducible);
+  and still visible to as_of dates before the retraction's UTC date (those
+  replays are reproduced exactly; as_of = retraction day already hides it);
 * LATEST_AS_OF / FIRST_RELEASE pick among the remaining vintages, and a cell
   with none left returns no row (never a zero, never another feature);
 * non-retracted rows and other features are unaffected;
@@ -259,7 +260,7 @@ def test_latest_as_of_hides_retracted_rows_from_retraction_on(seeded):
     # gld's value); gld on the same obs_date is untouched.
     assert after == {(spy, D_OBS): 100.0, (gld, D_OBS): 180.0}
 
-    # Replays before the retraction reproduce what was served.
+    # Replays for as_of dates before the retraction's UTC date are unchanged.
     before = _cells(pit.get_pit([spy, gld], today - timedelta(days=1), "LATEST_AS_OF"))
     assert before == {(spy, D_OBS): 101.0, (spy, D_OBS2): 102.0, (gld, D_OBS): 180.0}
 

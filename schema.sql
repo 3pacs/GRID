@@ -169,8 +169,9 @@ CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
 -- TABLE: resolved_series_retractions
 -- Append-only point-in-time retractions of resolved_series rows
 -- (migrations/versions/resolved_retractions_20260927.py). A retracted row is
--- hidden from PIT reads with as_of_ts >= retracted_at and stays visible to
--- earlier as_of, so replays before the retraction are reproducible.
+-- hidden from PIT reads with as_of_ts >= retracted_at (a date as_of: the whole
+-- UTC day of the retraction) and stays visible to earlier as_of, so replays
+-- for as_of dates before the retraction's UTC date are reproduced exactly.
 -- Nothing is deleted from resolved_series.
 -- ============================================================
 CREATE TABLE IF NOT EXISTS resolved_series_retractions (

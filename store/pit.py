@@ -12,8 +12,12 @@ found to hold a wrong value with no clean replacement is retracted by its key
 ``(feature_id, obs_date, vintage_date)`` at ``retracted_at``. Every query here
 excludes it when ``as_of`` is on or after the retraction (for a date ``as_of``:
 the retraction happened by the end of that UTC day, the same day-level
-convention as ``release_date <= as_of``). Reads with an earlier ``as_of`` still
-see it, so replays before the retraction reproduce what was actually served.
+convention as ``release_date <= as_of``). Because the comparison is at day
+level, a retraction at 15:00 UTC on day D already hides the row for
+``as_of = D``, including for a read made earlier that day. Replays are
+reproduced exactly only for ``as_of`` dates *before* the retraction's UTC
+date; ``as_of = D`` can differ depending on when it ran (the resolver's own
+same-day vintages behave the same way).
 The vintage policy then picks among the remaining vintages; a cell with none
 left returns no row -- never a zero and never another feature's value.
 """
@@ -85,8 +89,10 @@ class PITStore:
                              where release_date <= as_of_date.
         HARD CONSTRAINT 4: rows retracted in resolved_series_retractions by
             the end of as_of_date are excluded *before* the vintage policy
-            picks a row. Earlier as_of dates still see them. A cell whose
-            every vintage is retracted returns no row.
+            picks a row. as_of dates before the retraction's UTC date
+            still see them (a retraction at any time on day D hides the row
+            for as_of = D). A cell whose every vintage is retracted returns
+            no row.
 
         Parameters:
             feature_ids: List of feature_registry IDs to query.

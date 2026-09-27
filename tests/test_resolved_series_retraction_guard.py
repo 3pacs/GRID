@@ -4,8 +4,9 @@ Background: ``resolved_series_retractions``
 (migrations/versions/resolved_retractions_20260927.py) marks resolved rows that
 hold a wrong-instrument value with no clean replacement (GRID-RERESOLVE-PLAN-
 20260927: 70,633 LATEST_AS_OF and 76,204 FIRST_RELEASE cells). A retracted row
-must read as "no data" to point-in-time readers from ``retracted_at`` on, and
-stay visible to earlier ``as_of`` so replays are reproducible.
+must read as "no data" to point-in-time readers from ``retracted_at`` on (a
+date ``as_of``: from the retraction's UTC date on), and stay visible to
+``as_of`` dates before that day, so those replays are reproduced exactly.
 
 ``store/pit.py`` (``PITStore.get_pit`` / ``get_feature_matrix`` /
 ``get_latest_values``) is the sanctioned reader and honours retractions. The
