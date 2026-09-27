@@ -645,8 +645,17 @@ def run_intelligence_loop() -> None:
         """CAT-35: CFTC COT extremes scan (consumes existing cftc_cot data)."""
         try:
             from db import get_engine as _ge
-            from intelligence.cot_extremes import rank_contrarian_signals, scan_all_extremes
-            extremes = scan_all_extremes(_ge())
+            from intelligence.cot_extremes import rank_contrarian_signals, scan_extremes_report
+            report = scan_extremes_report(_ge())
+            if not report["available"]:
+                # Fail closed: code-keyed CFTC history missing (backfill
+                # pending). Never fall back to the mixed-market legacy ids.
+                log.warning(
+                    "COT extremes weekly: unavailable -- {r} ({u} market/metric pairs skipped)",
+                    r=report["reason"], u=len(report["unavailable"]),
+                )
+                return
+            extremes = report["extremes"]
             ranked = rank_contrarian_signals(extremes)
             top = ranked[:10]
             log.info(

@@ -1426,16 +1426,23 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
     - VIX net long spike → fear hedging, contrarian bullish (+30)
 
     Data is weekly (Tuesday snapshot, Friday release).
+
+    Reads only the code-keyed ids (``cftc.<cftc_contract_market_code>.*``);
+    the legacy ``cftc.SP500.*`` etc. mixed several markets under one id.
+    With no code-keyed rows the verdict is ``no_data``.
     """
-    KEY_CONTRACTS = ["SP500", "GOLD", "CRUDE_OIL", "VIX"]
+    from ingestion.altdata.cftc_markets import series_id_for_root
+
+    # root -> display name; identity is the market code behind the root
+    KEY_CONTRACTS = {"ES": "E-mini S&P", "GC": "Gold", "CL": "WTI", "VX": "VIX"}
     try:
         with engine.connect() as conn:
             scores = []
             details = []
             oldest_date = None
 
-            for contract in KEY_CONTRACTS:
-                sid = f"cftc.{contract}.net_speculative"
+            for root, contract in KEY_CONTRACTS.items():
+                sid = series_id_for_root(root, "net_speculative")
                 cur = conn.execute(text(
                     "SELECT value, obs_date FROM raw_series "
                     "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
@@ -1456,11 +1463,11 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                 obs = cur[1]
                 if oldest_date is None or (obs and obs < oldest_date):
                     oldest_date = obs
-                prev = float(prior[0]) if prior else 0.0
-                momentum = val - prev
+                # No prior observation -> momentum unknown (never "val - 0").
+                momentum = val - float(prior[0]) if prior else None
 
                 # VIX is contrarian: net long VIX = fear = bullish for equities
-                if contract == "VIX":
+                if root == "VX":
                     if val > 50000:
                         s = 30  # extreme fear → contrarian bullish
                     elif val > 20000:
@@ -1471,7 +1478,7 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                         s = 0
                 else:
                     # SP500/Gold/Crude: net long = bullish, momentum matters
-                    if val > 100000 and momentum > 0:
+                    if val > 100000 and momentum is not None and momentum > 0:
                         s = 60
                     elif val > 50000:
                         s = 30

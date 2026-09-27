@@ -108,7 +108,7 @@ def test_liquidity_regime_read_series_drops_failed_zero_and_duplicate_vintage():
 def test_cot_extremes_history_drops_failed_zero():
     from intelligence.cot_extremes import _read_series_history
 
-    sid = "cftc.SP500.net_speculative"
+    sid = "cftc.13874A.net_speculative"
     rows = [_row(sid, TODAY - timedelta(weeks=k), 100_000 + k * 500, h=k) for k in range(20, 0, -1)]
     rows.append(_row(sid, TODAY, 0.0, status="FAILED", h=99))
     got = _read_series_history(_engine(rows), sid, lookback_weeks=52)

@@ -1,9 +1,32 @@
 """
 GRID CFTC Commitments of Traders (COT) data ingestion module.
 
-Pulls weekly COT reports from the CFTC Socrata API (futures-only) and stores
-positioning data (commercial, noncommercial, open interest, net speculative)
-as separate series in ``raw_series``.
+Pulls weekly COT reports from the CFTC Socrata API (legacy, futures-only) and
+stores positioning data (commercial, noncommercial, open interest, net
+speculative) as separate series in ``raw_series``.
+
+Identity (2026-09-26): each series is keyed by the CFTC
+``cftc_contract_market_code`` — ``cftc.<market_code>.<metric>``, e.g.
+``cftc.13874A.net_speculative`` for the CME E-mini S&P 500. The puller asks
+Socrata for exactly that code and never matches on a market name, so a
+renamed, micro, dividend-index or other-exchange market cannot enter a
+series. A configured code missing from the report is logged and skipped;
+nothing is substituted. See ``ingestion/altdata/cftc_markets.py`` for the
+market registry, the reasons, and the publication-time rule.
+
+The legacy name-matched ids (``cftc.SP500.*``, ``cftc.GOLD.*`` ...) are no
+longer written. Their rows stay in ``raw_series`` untouched as history.
+
+Every stored row carries in ``raw_payload``: the market code, root and
+label, the market name *as reported that week*, the Socrata row id, the
+Tuesday ``report_date`` and the scheduled ``release_at`` (Friday 15:30 ET,
+holiday-shifted; a floor, see cftc_markets). ``raw_series.pull_timestamp``
+is the binding known-at.
+
+Scheduled runs only fetch forward from the newest stored report (or the last
+``_BOOTSTRAP_LOOKBACK_DAYS`` when a market has no rows yet). Full history
+under the new ids is a separate, owner-approved backfill:
+``scripts/backfill_cftc_market_codes.py`` (dry-run by default).
 
 Data source: https://publicreporting.cftc.gov/resource/6dca-aqww.json
 No API key required (public dataset).
@@ -13,6 +36,8 @@ from __future__ import annotations
 
 import json
 import time
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 from typing import Any
 
@@ -22,10 +47,19 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.base import BasePuller, retry_on_failure
+from ingestion.altdata.cftc_markets import (
+    COT_METRICS,
+    MARKET_CODE_FIELD,
+    MARKETS,
+    RAW_FIELD_MAP,
+    SOCRATA_DATASET,
+    compute_release,
+    series_id,
+)
+from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
 
 # CFTC Socrata API endpoint — Futures-Only COT reports
-_API_BASE: str = "https://publicreporting.cftc.gov/resource/6dca-aqww.json"
+_API_BASE: str = f"https://publicreporting.cftc.gov/resource/{SOCRATA_DATASET}.json"
 
 # Minimum delay between CFTC API calls (seconds)
 _RATE_LIMIT_DELAY: float = 1.0
@@ -36,126 +70,135 @@ _REQUEST_TIMEOUT: int = 30
 # Socrata API page size limit
 _PAGE_LIMIT: int = 5000
 
-# Contract name mappings: short key -> CFTC market_and_exchange_names substring
-# The CFTC uses long descriptive names; we match on substrings.
-CONTRACT_MAP: dict[str, dict[str, str]] = {
-    "SP500": {
-        "match": "S&P 500",
-        "description": "S&P 500 futures positioning",
-    },
-    "NASDAQ": {
-        "match": "NASDAQ",
-        "description": "NASDAQ-100 futures positioning",
-    },
-    "DJIA": {
-        "match": "DOW JONES",
-        "description": "DJIA futures positioning",
-    },
-    "USBOND": {
-        "match": "U.S. TREASURY BONDS",
-        "description": "US Treasury Bond futures positioning",
-    },
-    "NOTE10Y": {
-        "match": "10-YEAR",
-        "description": "10-Year Treasury Note futures positioning",
-    },
-    "NOTE5Y": {
-        "match": "5-YEAR",
-        "description": "5-Year Treasury Note futures positioning",
-    },
-    "NOTE2Y": {
-        "match": "2-YEAR",
-        "description": "2-Year Treasury Note futures positioning",
-    },
-    "EURODOLLAR": {
-        "match": "EURODOLLAR",
-        "description": "Eurodollar futures positioning",
-    },
-    "GOLD": {
-        "match": "GOLD",
-        "description": "Gold futures positioning",
-    },
-    "SILVER": {
-        "match": "SILVER",
-        "description": "Silver futures positioning",
-    },
-    "CRUDE_OIL": {
-        "match": "CRUDE OIL, LIGHT SWEET",
-        "description": "Crude Oil WTI futures positioning",
-    },
-    "NATGAS": {
-        "match": "NATURAL GAS",
-        "description": "Natural Gas futures positioning",
-    },
-    "COPPER": {
-        "match": "COPPER",
-        "description": "Copper futures positioning",
-    },
-    "CORN": {
-        "match": "CORN",
-        "description": "Corn futures positioning",
-    },
-    "SOYBEANS": {
-        "match": "SOYBEANS",
-        "description": "Soybeans futures positioning",
-    },
-    "WHEAT": {
-        "match": "WHEAT",
-        "description": "Wheat futures positioning",
-    },
-    "VIX": {
-        "match": "VIX",
-        "description": "VIX futures positioning",
-    },
-}
+# Re-fetch overlap behind the newest stored report (dedup makes it a no-op
+# unless a week was missed).
+_INCREMENTAL_OVERLAP_DAYS: int = 7
 
-# Metrics extracted from each COT report row
-COT_METRICS: list[str] = [
-    "commercial_long",
-    "commercial_short",
-    "noncommercial_long",
-    "noncommercial_short",
-    "total_open_interest",
-    "net_speculative",
-]
+# A market with no rows under its code-keyed ids gets only this much history
+# from a scheduled run; the full history is the explicit backfill script.
+_BOOTSTRAP_LOOKBACK_DAYS: int = 56
 
-# Mapping from metric name to CFTC API field name
-_FIELD_MAP: dict[str, str] = {
-    "commercial_long": "comm_positions_long_all",
-    "commercial_short": "comm_positions_short_all",
-    "noncommercial_long": "noncomm_positions_long_all",
-    "noncommercial_short": "noncomm_positions_short_all",
-    "total_open_interest": "open_interest_all",
-}
+# Earliest report date the backfill asks for by default.
+BACKFILL_DEFAULT_START: date = date(2006, 1, 1)
 
 
-def _build_series_id(contract_key: str, metric: str) -> str:
-    """Build a series_id in the form ``cftc.{CONTRACT}.{metric}``.
+@dataclass(frozen=True)
+class ParsedReport:
+    """One week's positions for one market code, all metrics present."""
 
-    Parameters:
-        contract_key: Short contract key (e.g. 'SP500', 'GOLD').
-        metric: Metric name (e.g. 'net_speculative').
+    report_date: date
+    metrics: dict[str, float]
+    market_name: str
+    contract_market_name: str
+    socrata_id: str | None
 
-    Returns:
-        Formatted series_id string.
+
+@dataclass
+class ParseOutcome:
+    reports: list[ParsedReport] = field(default_factory=list)
+    skipped: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _parse_report_date(raw: Any) -> date | None:
+    if raw is None:
+        return None
+    try:
+        return pd.Timestamp(raw).date()
+    except Exception:
+        log.warning("CFTC COT: could not parse report date: {v}", v=raw)
+        return None
+
+
+def _parse_metrics(record: dict[str, Any]) -> tuple[dict[str, float] | None, str | None]:
+    """All five raw metrics as floats plus net_speculative, or (None, reason)."""
+    out: dict[str, float] = {}
+    for metric, fld in RAW_FIELD_MAP.items():
+        raw_val = record.get(fld)
+        if raw_val is None or str(raw_val).strip() == "":
+            return None, f"missing field {fld}"
+        try:
+            out[metric] = float(raw_val)
+        except (TypeError, ValueError):
+            log.warning("CFTC COT: could not parse {f}={v} as float", f=fld, v=raw_val)
+            return None, f"unparseable field {fld}"
+    out["net_speculative"] = out["noncommercial_long"] - out["noncommercial_short"]
+    return out, None
+
+
+def parse_market_records(code: str, records: Iterable[dict[str, Any]]) -> ParseOutcome:
+    """Turn Socrata rows into one ``ParsedReport`` per report date for ``code``.
+
+    Fail-closed rules (each skipped row is returned with a reason):
+
+    * a row whose ``cftc_contract_market_code`` is not exactly ``code`` is
+      dropped — whatever its name says;
+    * a row missing any of the five raw metrics is dropped (no zero fill);
+    * two rows for the same report date with different numbers drop that
+      date entirely (identical duplicates collapse to one).
     """
-    return f"cftc.{contract_key}.{metric}"
+    outcome = ParseOutcome()
+    by_date: dict[date, list[ParsedReport]] = {}
+    for rec in records:
+        rec_code = str(rec.get(MARKET_CODE_FIELD) or "").strip()
+        if rec_code != code:
+            outcome.skipped.append({
+                "reason": "market_code_mismatch",
+                "expected": code,
+                "got": rec_code or None,
+                "market_name": rec.get("market_and_exchange_names"),
+            })
+            continue
+        rd = _parse_report_date(rec.get("report_date_as_yyyy_mm_dd"))
+        if rd is None:
+            outcome.skipped.append({"reason": "bad_report_date", "raw": rec.get("report_date_as_yyyy_mm_dd")})
+            continue
+        metrics, why = _parse_metrics(rec)
+        if metrics is None:
+            outcome.skipped.append({"reason": "incomplete_metrics", "report_date": rd.isoformat(), "detail": why})
+            continue
+        by_date.setdefault(rd, []).append(ParsedReport(
+            report_date=rd,
+            metrics=metrics,
+            market_name=str(rec.get("market_and_exchange_names") or ""),
+            contract_market_name=str(rec.get("contract_market_name") or ""),
+            socrata_id=rec.get("id"),
+        ))
+
+    for rd in sorted(by_date):
+        rows = by_date[rd]
+        if any(r.metrics != rows[0].metrics for r in rows[1:]):
+            outcome.skipped.append({
+                "reason": "conflicting_rows_same_report_date",
+                "report_date": rd.isoformat(),
+                "n": len(rows),
+            })
+            continue
+        outcome.reports.append(rows[0])
+    return outcome
+
+
+def build_payload(code: str, report: ParsedReport, metric: str) -> dict[str, Any]:
+    """``raw_payload`` for one stored metric row."""
+    market = MARKETS[code]
+    return {
+        "identity": MARKET_CODE_FIELD,
+        "market_code": code,
+        "root": market.root,
+        "label": market.label,
+        "market_name": report.market_name,
+        "contract_market_name": report.contract_market_name,
+        "metric": metric,
+        "socrata_dataset": SOCRATA_DATASET,
+        "socrata_id": report.socrata_id,
+        **compute_release(report.report_date).to_payload(),
+    }
 
 
 class CFTCCOTPuller(BasePuller):
-    """Pulls CFTC Commitments of Traders (futures-only) data.
+    """Pulls CFTC Commitments of Traders (futures-only) data by market code.
 
-    Data source: CFTC Socrata open data portal (no API key required).
-
-    Extracts positioning metrics for 17 major futures contracts across
-    equity indices, treasuries, metals, energy, and agriculture.
-
-    Each metric is stored as a separate series_id:
-        ``cftc.SP500.net_speculative``, ``cftc.GOLD.commercial_long``, etc.
-
-    Attributes:
-        engine: SQLAlchemy engine for database operations.
-        source_id: Resolved source_catalog.id for CFTC_COT.
+    Each metric is stored as ``cftc.<market_code>.<metric>``, e.g.
+    ``cftc.13874A.net_speculative``, ``cftc.088691.commercial_long``.
     """
 
     SOURCE_NAME: str = "CFTC_COT"
@@ -170,11 +213,6 @@ class CFTCCOTPuller(BasePuller):
     }
 
     def __init__(self, db_engine: Engine) -> None:
-        """Initialise the CFTC COT puller.
-
-        Parameters:
-            db_engine: SQLAlchemy engine connected to the GRID database.
-        """
         super().__init__(db_engine)
         log.info("CFTCCOTPuller initialised -- source_id={sid}", sid=self.source_id)
 
@@ -183,356 +221,209 @@ class CFTCCOTPuller(BasePuller):
         backoff=3.0,
         retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
     )
-    def _fetch_cot_data(
+    def _fetch_market_page(
         self,
-        contract_match: str,
-        start_date: date | None = None,
+        code: str,
+        start_date: date,
         offset: int = 0,
     ) -> list[dict[str, Any]]:
-        """Fetch COT records from the CFTC Socrata API for a contract.
+        """Fetch one page of rows for exactly one market code.
 
-        Parameters:
-            contract_match: Substring to match in market_and_exchange_names.
-            start_date: Only fetch reports on or after this date.
-            offset: Pagination offset for Socrata API.
-
-        Returns:
-            List of JSON records from the API.
-
-        Raises:
-            requests.RequestException: On HTTP errors.
+        The code goes in as a Socrata equality filter parameter (URL-encoded
+        by requests), never into a LIKE on the market name.
         """
         params: dict[str, Any] = {
+            MARKET_CODE_FIELD: code,
+            "$where": f"report_date_as_yyyy_mm_dd >= '{start_date.isoformat()}'",
+            "$order": "report_date_as_yyyy_mm_dd ASC, id ASC",
             "$limit": _PAGE_LIMIT,
             "$offset": offset,
-            "$order": "report_date_as_yyyy_mm_dd DESC",
         }
-
-        # Build SoQL where clause
-        where_parts: list[str] = [
-            f"upper(market_and_exchange_names) like upper('%{contract_match}%')",
-        ]
-        if start_date is not None:
-            where_parts.append(
-                f"report_date_as_yyyy_mm_dd >= '{start_date.isoformat()}'"
-            )
-        params["$where"] = " AND ".join(where_parts)
-
-        headers = {
-            "User-Agent": "GRID-DataPuller/1.0",
-            "Accept": "application/json",
-        }
-
         resp = requests.get(
             _API_BASE,
             params=params,
-            headers=headers,
+            headers={"User-Agent": "GRID-DataPuller/1.0", "Accept": "application/json"},
             timeout=_REQUEST_TIMEOUT,
         )
         resp.raise_for_status()
-        records: list[dict[str, Any]] = resp.json()
-        return records
+        return resp.json()
 
-    def _extract_metrics(self, record: dict[str, Any]) -> dict[str, float | None]:
-        """Extract positioning metrics from a single COT API record.
+    def _fetch_market(self, code: str, start_date: date) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            page = self._fetch_market_page(code, start_date, offset)
+            if not page:
+                break
+            out.extend(page)
+            if len(page) < _PAGE_LIMIT:
+                break
+            offset += _PAGE_LIMIT
+            time.sleep(_RATE_LIMIT_DELAY)
+        return out
 
-        Computes net_speculative as noncommercial_long - noncommercial_short.
+    def _incremental_start(self, code: str) -> tuple[date, str]:
+        """Oldest per-metric latest date minus overlap, or a bootstrap window."""
+        latest: list[date] = []
+        for metric in COT_METRICS:
+            d = self._get_latest_date(series_id(code, metric))
+            if d is None:
+                start = date.today() - timedelta(days=_BOOTSTRAP_LOOKBACK_DAYS)
+                return start, "bootstrap"
+            latest.append(d)
+        return min(latest) - timedelta(days=_INCREMENTAL_OVERLAP_DAYS), "incremental"
 
-        Parameters:
-            record: Single JSON record from the CFTC API.
-
-        Returns:
-            dict mapping metric name to float value (or None if missing).
-        """
-        metrics: dict[str, float | None] = {}
-
-        for metric_name, field_name in _FIELD_MAP.items():
-            raw_val = record.get(field_name)
-            if raw_val is not None:
-                try:
-                    metrics[metric_name] = float(raw_val)
-                except (ValueError, TypeError):
-                    log.warning(
-                        "CFTC COT: could not parse {f}={v} as float",
-                        f=field_name,
-                        v=raw_val,
-                    )
-                    metrics[metric_name] = None
-            else:
-                metrics[metric_name] = None
-
-        # Compute net speculative position
-        nc_long = metrics.get("noncommercial_long")
-        nc_short = metrics.get("noncommercial_short")
-        if nc_long is not None and nc_short is not None:
-            metrics["net_speculative"] = nc_long - nc_short
-        else:
-            metrics["net_speculative"] = None
-
-        return metrics
-
-    def _parse_report_date(self, record: dict[str, Any]) -> date | None:
-        """Parse the report date from a CFTC record.
-
-        The API returns ``report_date_as_yyyy_mm_dd`` as a string or
-        ISO timestamp.
-
-        Parameters:
-            record: Single JSON record from the CFTC API.
-
-        Returns:
-            Parsed date, or None if unparseable.
-        """
-        raw = record.get("report_date_as_yyyy_mm_dd")
-        if raw is None:
-            return None
-        try:
-            # API may return ISO datetime string like '2024-01-02T00:00:00.000'
-            dt = pd.Timestamp(raw)
-            return dt.date()
-        except Exception:
-            log.warning("CFTC COT: could not parse report date: {v}", v=raw)
-            return None
-
-    def pull_contract(
+    def pull_market(
         self,
-        contract_key: str,
-        start_date: str | date = "2006-01-01",
+        code: str,
+        start_date: str | date | None = None,
+        *,
+        dry_run: bool = False,
     ) -> dict[str, Any]:
-        """Pull COT data for a single contract and store in raw_series.
+        """Pull one market code into ``cftc.<code>.<metric>`` series.
 
         Parameters:
-            contract_key: Short key from CONTRACT_MAP (e.g. 'SP500', 'GOLD').
-            start_date: Earliest report date to fetch.
-
-        Returns:
-            dict with status, rows_inserted, contract_key, errors.
+            code: A key of ``cftc_markets.MARKETS`` (e.g. ``"13874A"``).
+            start_date: Earliest report date to fetch. ``None`` = incremental
+                from the newest stored report (bootstrap window if none).
+            dry_run: Fetch and parse, count what would be inserted, write nothing.
         """
-        if contract_key not in CONTRACT_MAP:
-            return {
-                "status": "FAILED",
-                "rows_inserted": 0,
-                "contract_key": contract_key,
-                "errors": [f"Unknown contract key: {contract_key}"],
-            }
-
-        config = CONTRACT_MAP[contract_key]
-        log.info(
-            "Pulling CFTC COT for {key} (match={m})",
-            key=contract_key,
-            m=config["match"],
-        )
-
         result: dict[str, Any] = {
-            "contract_key": contract_key,
-            "rows_inserted": 0,
+            "market_code": code,
+            "root": MARKETS[code].root if code in MARKETS else None,
             "status": "SUCCESS",
+            "rows_inserted": 0,
+            "rows_would_insert": 0,
+            "reports": 0,
+            "skipped": [],
             "errors": [],
+            "dry_run": dry_run,
         }
+        if code not in MARKETS:
+            result["status"] = "FAILED"
+            result["errors"].append(f"Unknown market code: {code}")
+            return result
 
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
-
-        # Use incremental start: check the earliest latest_date across all
-        # metrics for this contract, so we only fetch new data
-        incremental_start = start_date
-        for metric in COT_METRICS:
-            sid = _build_series_id(contract_key, metric)
-            latest = self._get_latest_date(sid)
-            if latest is not None:
-                # Overlap by 7 days to catch revisions in weekly data
-                candidate = latest - timedelta(days=7)
-                if candidate > incremental_start:
-                    incremental_start = candidate
-
-        if incremental_start > start_date:
-            log.info(
-                "CFTC {key}: incremental from {d}",
-                key=contract_key,
-                d=incremental_start,
-            )
+        if start_date is None:
+            start, mode = self._incremental_start(code)
+        else:
+            start, mode = start_date, "explicit"
+        result["start_date"] = start.isoformat()
+        result["mode"] = mode
 
         try:
-            # Fetch all pages of data
-            all_records: list[dict[str, Any]] = []
-            offset = 0
-            while True:
-                records = self._fetch_cot_data(
-                    contract_match=config["match"],
-                    start_date=incremental_start,
-                    offset=offset,
-                )
-                if not records:
-                    break
-                all_records.extend(records)
-                if len(records) < _PAGE_LIMIT:
-                    break
-                offset += _PAGE_LIMIT
-                time.sleep(_RATE_LIMIT_DELAY)
-
-            if not all_records:
-                log.warning(
-                    "CFTC COT: no data returned for {key}", key=contract_key
-                )
-                result["status"] = "PARTIAL"
-                result["errors"].append("No data returned")
-                return result
-
-            log.info(
-                "CFTC {key}: fetched {n} records from API",
-                key=contract_key,
-                n=len(all_records),
-            )
-
-            inserted = 0
-
-            with self.engine.begin() as conn:
-                # Pre-fetch existing dates for all metrics in this contract
-                existing_dates_map: dict[str, set[date]] = {}
-                for metric in COT_METRICS:
-                    sid = _build_series_id(contract_key, metric)
-                    existing_dates_map[metric] = self._get_existing_dates(sid, conn)
-
-                for record in all_records:
-                    report_date = self._parse_report_date(record)
-                    if report_date is None:
-                        continue
-                    if report_date < start_date:
-                        continue
-
-                    metrics = self._extract_metrics(record)
-
-                    for metric_name, value in metrics.items():
-                        if value is None:
-                            continue
-
-                        sid = _build_series_id(contract_key, metric_name)
-
-                        # Batch dedup check
-                        if report_date in existing_dates_map.get(metric_name, set()):
-                            continue
-
-                        try:
-                            insert_result = conn.execute(
-                                text(
-                                    "INSERT INTO raw_series "
-                                    "(series_id, source_id, obs_date, value, "
-                                    "raw_payload, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
-                                ),
-                                {
-                                    "sid": sid,
-                                    "src": self.source_id,
-                                    "od": report_date,
-                                    "val": value,
-                                    "payload": json.dumps({
-                                        "contract": contract_key,
-                                        "market_name": record.get(
-                                            "market_and_exchange_names", ""
-                                        ),
-                                        "metric": metric_name,
-                                    }),
-                                },
-                            )
-                            rowcount = getattr(insert_result, "rowcount", 1)
-                            if rowcount and rowcount > 0:
-                                inserted += 1
-                                existing_dates_map.setdefault(metric_name, set()).add(report_date)
-                        except Exception:
-                            pass  # skip dupes silently
-
-            result["rows_inserted"] = inserted
-            log.info(
-                "CFTC {key}: inserted {n} rows",
-                key=contract_key,
-                n=inserted,
-            )
-
+            records = self._fetch_market(code, start)
         except Exception as exc:
-            log.error(
-                "CFTC COT pull failed for {key}: {err}",
-                key=contract_key,
-                err=str(exc),
-            )
+            log_pull_failure("CFTC_COT", code, exc)
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
+            return result
 
-            # Record the failure row
-            try:
-                with self.engine.begin() as conn:
-                    conn.execute(
-                        text(
-                            "INSERT INTO raw_series "
-                            "(series_id, source_id, obs_date, value, "
-                            "raw_payload, pull_status) "
-                            "VALUES (:sid, :src, :od, 0, :payload, 'FAILED')"
-                        ),
-                        {
-                            "sid": _build_series_id(contract_key, "net_speculative"),
-                            "src": self.source_id,
-                            "od": date.today(),
-                            "payload": json.dumps({"error": str(exc)}),
-                        },
-                    )
-            except Exception as insert_exc:
-                log.error(
-                    "Failed to record error row for CFTC {key}: {err}",
-                    key=contract_key,
-                    err=str(insert_exc),
-                )
+        parsed = parse_market_records(code, records)
+        result["skipped"] = parsed.skipped
+        for s in parsed.skipped:
+            log.warning("CFTC {c}: skipped row ({r})", c=code, r=s)
+        if not parsed.reports:
+            # Fail closed: the configured code is absent from the report.
+            # No other market is looked up in its place.
+            log.warning(
+                "CFTC COT: market code {c} ({l}) not present in report since {d}; nothing stored",
+                c=code, l=MARKETS[code].label, d=start,
+            )
+            result["status"] = "SKIPPED"
+            result["errors"].append(f"market code {code} not in report since {start.isoformat()}")
+            return result
 
+        result["reports"] = len(parsed.reports)
+        result["first_report_date"] = parsed.reports[0].report_date.isoformat()
+        result["last_report_date"] = parsed.reports[-1].report_date.isoformat()
+        result["market_names_seen"] = sorted({r.market_name for r in parsed.reports})
+
+        try:
+            ctx = self.engine.connect() if dry_run else self.engine.begin()
+            with ctx as conn:
+                existing = {
+                    m: self._get_existing_dates(series_id(code, m), conn, start_date=start)
+                    for m in COT_METRICS
+                }
+                for report in parsed.reports:
+                    for metric in COT_METRICS:
+                        if report.report_date in existing[metric]:
+                            continue
+                        if dry_run:
+                            result["rows_would_insert"] += 1
+                            continue
+                        conn.execute(
+                            text(
+                                "INSERT INTO raw_series "
+                                "(series_id, source_id, obs_date, value, "
+                                "raw_payload, pull_status) "
+                                "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                            ),
+                            {
+                                "sid": series_id(code, metric),
+                                "src": self.source_id,
+                                "od": report.report_date,
+                                "val": report.metrics[metric],
+                                "payload": json.dumps(build_payload(code, report, metric)),
+                            },
+                        )
+                        existing[metric].add(report.report_date)
+                        result["rows_inserted"] += 1
+        except Exception as exc:
+            # The transaction rolls back; no FAILED/zero marker row is written
+            # (a zero is an observation of nothing).
+            log_pull_failure("CFTC_COT", code, exc)
+            result["status"] = "FAILED"
+            result["errors"].append(str(exc))
+            result["rows_inserted"] = 0
+            return result
+
+        if parsed.skipped:
+            result["status"] = "PARTIAL"
+        log.info(
+            "CFTC {c} ({r}): {n} reports, {i} rows {verb}",
+            c=code, r=MARKETS[code].root, n=len(parsed.reports),
+            i=result["rows_would_insert"] if dry_run else result["rows_inserted"],
+            verb="would insert (dry run)" if dry_run else "inserted",
+        )
         return result
 
     def pull_all(
         self,
-        contract_keys: list[str] | None = None,
-        start_date: str | date = "2006-01-01",
+        market_codes: list[str] | None = None,
+        start_date: str | date | None = None,
+        *,
+        dry_run: bool = False,
     ) -> list[dict[str, Any]]:
-        """Pull COT data for all configured contracts.
+        """Pull every tracked market code. Never stops on one market's failure.
 
-        Never stops on a single-contract failure -- logs and continues.
-
-        Parameters:
-            contract_keys: List of contract keys to pull. Defaults to all
-                contracts in CONTRACT_MAP.
-            start_date: Earliest report date to fetch.
-
-        Returns:
-            List of result dicts, one per contract.
+        The scheduler calls this with no arguments: incremental per market,
+        bootstrap window only for markets with no rows yet (no full backfill).
         """
-        if contract_keys is None:
-            contract_keys = list(CONTRACT_MAP.keys())
-
+        codes = list(market_codes) if market_codes is not None else list(MARKETS)
         log.info(
-            "Starting CFTC COT bulk pull -- {n} contracts from {sd}",
-            n=len(contract_keys),
-            sd=start_date,
+            "Starting CFTC COT pull -- {n} market codes, start={sd}, dry_run={dr}",
+            n=len(codes), sd=start_date or "incremental", dr=dry_run,
         )
-
         results: list[dict[str, Any]] = []
-        for key in contract_keys:
-            res = self.pull_contract(key, start_date)
-            results.append(res)
+        for code in codes:
+            results.append(self.pull_market(code, start_date, dry_run=dry_run))
             time.sleep(_RATE_LIMIT_DELAY)
 
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
-        total_rows = sum(r["rows_inserted"] for r in results)
         log.info(
-            "CFTC COT bulk pull complete -- {ok}/{total} contracts, {rows} rows",
-            ok=succeeded,
+            "CFTC COT pull complete -- {ok}/{total} markets SUCCESS, {rows} rows inserted",
+            ok=sum(1 for r in results if r["status"] == "SUCCESS"),
             total=len(results),
-            rows=total_rows,
+            rows=sum(r["rows_inserted"] for r in results),
         )
         return results
 
 
 if __name__ == "__main__":
-    from db import get_engine
-
-    puller = CFTCCOTPuller(db_engine=get_engine())
-    results = puller.pull_all(start_date="2020-01-01")
-    for r in results:
-        status = r["status"]
-        rows = r["rows_inserted"]
-        key = r["contract_key"]
-        print(f"  {key}: {status} ({rows} rows)")
+    print(
+        "Run the scheduled path via SmartScheduler, or the owner-gated history "
+        "backfill via scripts/backfill_cftc_market_codes.py (dry-run by default)."
+    )

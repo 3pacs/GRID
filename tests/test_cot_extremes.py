@@ -117,7 +117,7 @@ class TestScanAllExtremes:
             return_value=[],
         ):
             eng = MagicMock()
-            out = scan_all_extremes(eng, contracts=["SP500"], metrics=["net_speculative"])
+            out = scan_all_extremes(eng, contracts=["13874A"], metrics=["net_speculative"])
         assert out == []
 
     def test_patched_history(self):
@@ -129,10 +129,24 @@ class TestScanAllExtremes:
         ):
             eng = MagicMock()
             out = scan_all_extremes(
-                eng, contracts=["GOLD"], metrics=["net_speculative"],
+                eng, contracts=["088691"], metrics=["net_speculative"],
             )
         assert len(out) == 1
         assert out[0].severity == "extreme"
+        assert out[0].market_code == "088691"
+        assert out[0].contract == "GC"
+
+    def test_legacy_key_refused_even_with_history(self):
+        history = [(date(2025, 1, 1 + i % 28), float(i)) for i in range(60)]
+        with patch(
+            "intelligence.cot_extremes._read_series_history",
+            return_value=history,
+        ) as read:
+            out = scan_all_extremes(
+                MagicMock(), contracts=["GOLD"], metrics=["net_speculative"],
+            )
+        assert out == []
+        read.assert_not_called()
 
 
 class TestConstants:
