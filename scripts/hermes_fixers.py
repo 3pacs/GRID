@@ -1346,7 +1346,13 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "USDA_NASS": "fred",
     "nowcast": "fred",
     "world_bank": "fred",
-    "EIA": "fred",
+    # 2026-09-27 Wave 1 review: was "fred", which is wrong now that "eia"
+    # has its own class-based PULLER_REGISTRY entry (source_catalog's
+    # real row is named "EIA" -- confirmed read-only on grid-svr). Mapping
+    # a REPULL/retry for "EIA" to the FRED puller silently pulled the
+    # wrong source's data under EIA's name; "computed" below is a
+    # separate, pre-existing, unrelated mapping.
+    "EIA": "eia",
     "computed": "fred",
     "FRED": "fred",
     "BLS": "bls",
@@ -1540,6 +1546,19 @@ def _retry_source(
         puller, method, kwargs = _resolve_puller(source_name, engine)
         kwargs = dict(kwargs)
         pull_fn = getattr(puller, method)
+
+        # Registry kwargs may be plain values OR zero-arg callables (e.g.
+        # FINRA's "anchor_date": _finra_short_volume_trade_date, which must
+        # be evaluated at call time, not once when PULLER_REGISTRY is built
+        # at import -- see smart_scheduler.SmartScheduler._run_puller's
+        # identical resolution). _resolve_puller/_build_source_registry
+        # copy PULLER_REGISTRY's "kwargs" through verbatim into
+        # "pull_kwargs", so a callable value reaching here unresolved would
+        # get passed to pull_fn AS a function object instead of the date
+        # string it computes -- resolve it the same way the scheduler does.
+        for key, val in list(kwargs.items()):
+            if key != "should_continue" and callable(val):
+                kwargs[key] = val()
 
         try:
             params = inspect.signature(pull_fn).parameters
