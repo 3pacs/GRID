@@ -163,13 +163,33 @@ def _lines(path: Path) -> Iterator[bytes]:
 
 
 class ForwardLog:
-    """One append-only, hash-chained JSONL file plus its lock, in ``log_dir``."""
+    """One append-only, hash-chained JSONL file plus its lock, in ``log_dir``.
 
-    def __init__(self, log_dir: Path) -> None:
+    The file names and the pinned pre-registration default to the S10 forward
+    log. Another pre-registered log (e.g. the granular-panel pre-registration
+    registry, ``analysis.panel_insider_density``) reuses the same chain, anchor
+    and lock mechanism under its own file names and its own pinned hash; the
+    first record must then be a header carrying that hash.
+    """
+
+    def __init__(
+        self,
+        log_dir: Path,
+        *,
+        log_filename: str = LOG_FILENAME,
+        anchor_filename: str = ANCHOR_FILENAME,
+        lock_filename: str = LOCK_FILENAME,
+        prereg_sha256: str = PREREG_SHA256,
+    ) -> None:
+        if not HEX64.fullmatch(prereg_sha256):
+            raise ValueError("prereg_sha256 must be a sha256 hex digest")
+        if len({log_filename, anchor_filename, lock_filename}) != 3:
+            raise ValueError("log, anchor and lock file names must differ")
         self.log_dir = Path(log_dir)
-        self.path = self.log_dir / LOG_FILENAME
-        self.anchor_path = self.log_dir / ANCHOR_FILENAME
-        self.lock_path = self.log_dir / LOCK_FILENAME
+        self.path = self.log_dir / log_filename
+        self.anchor_path = self.log_dir / anchor_filename
+        self.lock_path = self.log_dir / lock_filename
+        self.prereg_sha256 = prereg_sha256
 
     def read_all(self) -> list[dict]:
         return [json.loads(line) for line in _lines(self.path)]
@@ -197,7 +217,7 @@ class ForwardLog:
                 return _broken(len(lines), i, "prev_sha256 does not match the previous line")
             if i == 0 and (
                 record.get("kind") != "header"
-                or record.get("prereg_sha256") != PREREG_SHA256
+                or record.get("prereg_sha256") != self.prereg_sha256
             ):
                 return _broken(len(lines), 0, "first record is not the pinned header")
             if i > 0 and record.get("kind") == "header":
