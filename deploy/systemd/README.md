@@ -108,6 +108,22 @@ the next `claim_goal` returns the loop. No forcible kill is needed
 unless the lease has to be reaped (it will be, automatically, on the
 next worker startup or by the Day 2 reaper).
 
+## `grid-causal-links.service` / `.timer` (templates, not installed)
+
+Slice N2's scheduled writer for `causal_links`
+(`scripts/run_causal_links.py` -> `intelligence/causal_links.py`). Each run
+links recent insider / congressional trades to public events on the same
+ticker that were knowable *before* the trade day, upserts them keyed on
+`edge_key` with run id, code sha and known_at, and records the run in
+`causal_link_runs`. The Timeline / Causal Map / Why views show those rows
+with the last finished run's as-of time.
+
+Prerequisite: `alembic upgrade head` has applied
+`causal_links_provenance_20260927` (the script exits 2 without writing
+otherwise). Installing the timer is the activation decision; the install
+commands are in the service template's header. Try it first with
+`python3 scripts/run_causal_links.py --dry-run --json`.
+
 ## `grid-analytics-snapshots` (service + timer) — NOT installed
 
 Daily run of `scripts/run_analytics_snapshots.py`, which refreshes the

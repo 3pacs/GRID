@@ -1,15 +1,16 @@
 """
 GRID Intelligence — Causal Connection Engine.
 
-Connects actor actions to the events, policies, and contracts that likely
-drove them.  For every trade in signal_sources, this module searches for
-the probable CAUSE — a government contract, legislation, earnings event,
-committee hearing, macro release, or cluster signal — and scores its
-likelihood.
+Connects actor trades to the public events that preceded them. Since slice
+N2 (2026-09-27) a single-hop "cause" is only an event that was public
+before the trade day (a reported earnings release, or a contract award GRID
+had already seen), stamped with known_at — a time-ordered co-occurrence,
+not proof of cause. See intelligence.causal_links for the rules and the
+scheduled writer.
 
 Key entry points:
-  find_causes              — all probable causes for a single action
-  batch_find_causes        — run find_causes for all recent signal_sources
+  find_causes              — public events knowable before a single action
+  batch_find_causes        — the same for all recent trades (bounded batches)
   get_suspicious_trades    — trades where the cause is likely non-public info
   generate_causal_narrative — LLM or rule-based "why is everyone trading X?"
 
