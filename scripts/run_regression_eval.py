@@ -166,9 +166,18 @@ def _make_arm_b_client() -> Any:
     """Build the OpenRouter Opus client used for arm B.
 
     Reads OPENROUTER_API_KEY from env (falls back to settings if available).
-    Raises RuntimeError when the key is missing — the caller decides whether
-    that fails the whole run or downgrades to arm-A-only.
+    Raises RuntimeError when the key is missing, or when paid LLM use is not
+    opted in via GRID_ALLOW_PAID_LLM -- this calls OpenRouter directly
+    (mirroring chat.py's background A/B call), bypassing llm.router's own
+    paid-provider gate, so it is gated here explicitly. The caller decides
+    whether that fails the whole run or downgrades to arm-A-only.
     """
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise RuntimeError(
+            "Arm B (OpenRouter -> Opus) blocked: GRID_ALLOW_PAID_LLM is not set"
+        )
     api_key = os.getenv("OPENROUTER_API_KEY", "")
     if not api_key:
         try:
