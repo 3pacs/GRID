@@ -18,8 +18,7 @@ Inputs (files only, built off-DB on grid-svr):
   the GD4 probe report it names by sha256.
 
 Stages, in order. Discovery and holdout are one-shot through the pinned,
-hash-chained registry (``--log-dir``) and an off-host anchor log
-(``--external-anchors``, a file in the vault git repo):
+hash-chained registry (``--log-dir``) and the pinned off-host anchor log:
 
 * The registry is pinned in code: it must start with the one real VS1 v1
   registration (header + ``preregistration``, chain head
@@ -27,14 +26,23 @@ hash-chained registry (``--log-dir``) and an off-host anchor log
   d1e13f6e; the original lives in the operator's
   ``Documents/Codex/2026-09-14/wha/outputs/vs1-prereg-registry/``). Any other
   registry (fresh, recreated, re-registered) is refused as a fork.
-* A byte copy of the registered prefix is not distinguishable by content, so
-  the off-host anchor log decides which chain counts: ``discover`` and
-  ``holdout`` refuse to read a price until the committed, pushed vault log
-  already contains the ``discovery_opened`` / ``holdout_opened`` chain head
-  (``ForwardLog.verify_chain(external_anchors=...)``), and the vault log can
-  witness only one chain. **A discovery or holdout whose opening record is
-  missing from the off-host anchor log is invalid**, whatever its local
-  registry says; so is one whose off-host log was rewritten in git history.
+* The off-host anchor log is pinned in code too: the file
+  ``05-GRID/Paper-Log/vs1/granular_panel_prereg_v1.anchors.jsonl`` on branch
+  ``main`` of ``https://github.com/3pacs/obsidian-vault.git``
+  (``WITNESS_REMOTE_URL`` / ``WITNESS_BRANCH`` / ``WITNESS_PATH``), seeded with
+  the registration's anchor line. ``discover`` and ``holdout`` fetch that branch
+  (``--vault-repo`` is only a local git repository to fetch into) and refuse
+  unless every committed version of the file lived at that path, starts with the
+  pinned registration anchor and strictly extends the previous one line by line
+  (append-only), and the file already contains the ``discovery_opened`` /
+  ``holdout_opened`` chain head (``ForwardLog.verify_chain(external_anchors=...)``).
+  A byte copy of the registered prefix can open a discovery locally, but its
+  chain never matches that file. **A discovery or holdout whose opening record
+  is missing from the pinned off-host anchor log is invalid**, whatever its
+  local registry says.
+* Every price read is recorded (``prices_read``: receipt sha256 and the witness
+  commit); a resumed run must read identical prices, and the pinned ``main``
+  must still contain every witness commit seen before.
 
     # 0. hash of the pre-registration body (prints it; reads nothing else)
     python -m scripts.run_vs1_insider_density hash-prereg
@@ -57,24 +65,23 @@ hash-chained registry (``--log-dir``) and an off-host anchor log
         [--accept-underpowered]
 
     # 4a. open the discovery (appends discovery_opened; reads no price; refused if any
-    #     discovery was opened before) and append the new anchor lines to the vault log
-    python -m scripts.run_vs1_insider_density open-discovery --log-dir DIR ... \
-        --external-anchors VAULT/.../granular_panel_prereg_v1.anchors.jsonl
-    # 4b. commit and push that vault file (off-host witness of discovery_opened)
-    # 4c. discovery (2012-01 .. 2019-12): refused unless the committed, pushed vault log
-    #     contains discovery_opened; then reads prices and appends discovery_frozen
-    python -m scripts.run_vs1_insider_density discover --log-dir DIR ... \
-        --external-anchors VAULT/... --out NEW_RUN_DIR
-    # 4d. export (open-holdout does it) and commit the discovery_frozen anchor line
+    #     discovery was opened before) and append the new anchor lines to the witness
+    #     file in a vault worktree on main
+    python -m scripts.run_vs1_insider_density open-discovery --log-dir DIR ...         --vault-worktree VAULT_WORKTREE
+    # 4b. in VAULT_WORKTREE: commit 05-GRID/Paper-Log/vs1/granular_panel_prereg_v1.anchors.jsonl
+    #     and push it to main of the GitHub vault
+    # 4c. discovery (2012-01 .. 2019-12): fetches the pinned main, refused unless the
+    #     witness file there contains discovery_opened; reads prices, appends discovery_frozen
+    python -m scripts.run_vs1_insider_density discover --log-dir DIR ...         --vault-repo VAULT_CLONE --out NEW_RUN_DIR
 
     # 5a. open the holdout (flag + hash + a chain whose discovery_frozen is this run's
     #     file; appends holdout_opened, reads no price; a second open is refused)
-    python -m scripts.run_vs1_insider_density open-holdout --log-dir DIR --run-dir NEW_RUN_DIR \
-        ... --allow-holdout --prereg-sha256 <pinned body sha256> --external-anchors VAULT/...
-    # 5b. commit and push the vault log (off-host witness of holdout_opened)
-    # 5c. holdout (2020-01 .. 2026-06): refused unless the vault log contains holdout_opened
-    python -m scripts.run_vs1_insider_density holdout --log-dir DIR --run-dir NEW_RUN_DIR \
-        ... --allow-holdout --prereg-sha256 <pinned body sha256> --external-anchors VAULT/...
+    python -m scripts.run_vs1_insider_density open-holdout --log-dir DIR --run-dir NEW_RUN_DIR         ... --allow-holdout --prereg-sha256 <pinned body sha256> --vault-worktree VAULT_WORKTREE
+    # 5b. commit and push the witness file to main again (it now covers holdout_opened)
+    # 5c. holdout (2020-01 .. 2026-06): refused unless the pinned main contains holdout_opened
+    python -m scripts.run_vs1_insider_density holdout --log-dir DIR --run-dir NEW_RUN_DIR         ... --allow-holdout --prereg-sha256 <pinned body sha256> --vault-repo VAULT_CLONE
+    # 4d/5d. after discover and holdout, append their anchor lines too, then commit and push
+    python -m scripts.run_vs1_insider_density export-anchors --log-dir DIR --vault-worktree VAULT_WORKTREE
 
 (``...`` = the same --form4 --submissions --issuer-map --price-manifest
 --probe-report --power as step 3.)
@@ -98,7 +105,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -209,50 +215,29 @@ def cmd_register(args) -> None:
                               "log witnesses counts"}, indent=2))
 
 
-def _git(repo: Path, *argv: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, text=True, check=False)
-
-
-def check_offhost(path: Path) -> dict:
-    """The off-host anchor log must be a committed, pushed file of a git work tree (the vault).
-
-    Refuses when the file is untracked, differs from HEAD (uncommitted or
-    staged edits), or the last commit touching it is on no remote-tracking
-    branch (not pushed, as far as this clone knows after its last fetch/push).
-    """
-    path = Path(path).resolve()
-    if not path.is_file():
-        raise SystemExit(f"off-host anchor log {path} does not exist")
-    top = _git(path.parent, "rev-parse", "--show-toplevel")
-    if top.returncode != 0:
-        raise SystemExit(f"{path} is not inside a git work tree (the off-host log lives in the vault repo)")
-    repo = Path(top.stdout.strip())
-    rel = path.relative_to(repo.resolve()).as_posix()
-    if _git(repo, "ls-files", "--error-unmatch", rel).returncode != 0:
-        raise SystemExit(f"{rel} is not committed in {repo}: commit and push the anchor log first")
-    if _git(repo, "diff", "--quiet", "HEAD", "--", rel).returncode != 0:
-        raise SystemExit(f"{rel} has changes not committed in {repo}: commit and push the anchor log first")
-    commit = _git(repo, "log", "-1", "--format=%H", "--", rel).stdout.strip()
-    remotes = _git(repo, "branch", "-r", "--contains", commit).stdout.split()
-    if not commit or not remotes:
-        raise SystemExit(f"{rel} at {commit[:12] or '?'} is on no remote-tracking branch: push it first")
-    return {"repo": str(repo), "path": rel, "commit": commit, "remote_branches": remotes}
-
-
 def _print_witness_instructions(opened: dict, args) -> None:
     appended = []
-    if args.external_anchors:
-        appended = vs1.export_anchors(Path(args.log_dir), Path(args.external_anchors))
+    if args.vault_worktree:
+        appended = vs1.export_anchors(Path(args.log_dir), Path(args.vault_worktree))
     print(json.dumps({
         "appended": opened["kind"],
         "records": opened["records"],
         "head_sha256": opened["head_sha256"],
-        "external_anchors": args.external_anchors,
+        "witness": f"{vs1.WITNESS_REMOTE_URL} {vs1.WITNESS_BRANCH}:{vs1.WITNESS_PATH}",
         "anchor_lines_written": appended,
-        "next": "commit and push the off-host anchor log (vault) so it contains this head, then run "
+        "next": f"commit {vs1.WITNESS_PATH} in the vault worktree and push it to {vs1.WITNESS_BRANCH} of "
+                f"{vs1.WITNESS_REMOTE_URL} so it contains this head, then run "
                 + ("discover" if opened["kind"] == "discovery_opened" else "holdout")
-                + "; a run whose opening record is missing from the off-host log is invalid",
+                + "; a run whose opening record is missing from that file is invalid",
     }, indent=2))
+
+
+def cmd_export_anchors(args) -> None:
+    """Append the registry's new anchor lines to the witness file in a vault worktree."""
+    appended = vs1.export_anchors(Path(args.log_dir), Path(args.vault_worktree))
+    print(json.dumps({"anchor_lines_written": appended,
+                      "next": f"commit {vs1.WITNESS_PATH} and push it to {vs1.WITNESS_BRANCH} of "
+                              f"{vs1.WITNESS_REMOTE_URL}"}, indent=2))
 
 
 def cmd_open_discovery(args) -> None:
@@ -358,8 +343,8 @@ def cmd_discover(args) -> None:
     events = _events(args, universe)
     power = _load_power(args, events, info)
     observed = _observed(args, manifest, power)
-    offhost = check_offhost(Path(args.external_anchors))
-    key = vs1.resume_discovery(log_dir, observed, Path(args.external_anchors))  # off-host witness
+    witness = vs1.check_offhost(Path(args.vault_repo))  # fetch the pinned vault main
+    key = vs1.resume_discovery(log_dir, observed, witness)
     if not power["gate_passed"] and key.inputs["accept_underpowered"] is not True:
         raise SystemExit("Stage-0 power gate failed and inputs_frozen did not accept an underpowered run")
     output.mkdir(parents=True, exist_ok=False)
@@ -370,7 +355,7 @@ def cmd_discover(args) -> None:
         "file_sha256": observed["code_file_sha256"],
         "inputs_frozen_sha256": key.inputs_frozen_sha256,
         "frozen_inputs": key.inputs,
-        "offhost_witness": offhost,
+        "offhost_witness": witness.receipt(),
         "sector_map_sha256": vs1.SECTOR_MAP_SHA256,
         "universe": dict(info),
         "price_excluded_not_admitted": excluded,
@@ -429,10 +414,10 @@ def cmd_open_holdout(args) -> None:
 def cmd_holdout(args) -> None:
     run_dir = Path(args.run_dir)
     frozen, universe, events, power, observed = _holdout_inputs(args)
-    check_offhost(Path(args.external_anchors))
+    witness = vs1.check_offhost(Path(args.vault_repo))  # fetch the pinned vault main
     key = vs1.resume_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                              log_dir=Path(args.log_dir), observed=observed,
-                             external_anchors=Path(args.external_anchors), repo_root=REPO)
+                             witness=witness, repo_root=REPO)
     _, admitted, _, prices = _prices(args, universe, "holdout", key)
     panels = vs1.build_trial_panels(events, admitted, prices, "holdout")
     result = vs1.evaluate_panel_holdout(frozen, panels, key, power=power)
@@ -469,16 +454,28 @@ def main(argv: list[str] | None = None) -> None:
             p.add_argument("--power", required=True)
 
     def witness(p, required: bool) -> None:
-        p.add_argument(
-            "--external-anchors", required=required,
-            help="off-host anchor log in the vault repo (a committed, pushed copy of the registry's "
-                 "anchor lines)" + ("" if required else "; if given, the new anchor lines are appended to it"),
-        )
+        if required:
+            p.add_argument(
+                "--vault-repo", required=True,
+                help=f"a local git repository (e.g. a vault clone) to fetch {vs1.WITNESS_BRANCH} of the pinned "
+                     "vault remote into; only the fetched commits are read",
+            )
+        else:
+            p.add_argument(
+                "--vault-worktree",
+                help=f"a vault worktree on {vs1.WITNESS_BRANCH}: the new anchor lines are appended to "
+                     f"{vs1.WITNESS_PATH} there (commit and push them)",
+            )
 
     def holdout_request(p) -> None:
         p.add_argument("--run-dir", required=True)
         p.add_argument("--allow-holdout", action="store_true")
         p.add_argument("--prereg-sha256", required=True)
+
+    p = sub.add_parser("export-anchors", help="append new anchor lines to the witness file in a vault worktree")
+    p.add_argument("--log-dir", required=True)
+    p.add_argument("--vault-worktree", required=True)
+    p.set_defaults(func=cmd_export_anchors)
 
     p = sub.add_parser("power")
     inputs(p, prices=False)

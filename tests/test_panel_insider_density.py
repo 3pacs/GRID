@@ -613,15 +613,74 @@ def _register(log_dir):
     return vs1.register(log_dir, vs1.REGISTERED_AT, vs1.REGISTERED_CODE_SHA)
 
 
-def _offhost(log_dir) -> Path:
-    """The registry's off-host anchor log (stands in for the committed vault file)."""
-    return Path(log_dir).parent / f"{Path(log_dir).name}.offhost-anchors.jsonl"
+def _git(cwd, *argv, check=True):
+    import subprocess
+
+    result = subprocess.run(
+        ["git", "-c", "user.name=vs1-test", "-c", "user.email=vs1-test@example.invalid",
+         "-c", "commit.gpgsign=false", "-c", "core.autocrlf=false", "-c", "init.defaultBranch=main", *argv],
+        cwd=cwd, capture_output=True, text=True, check=False,
+    )
+    if check:
+        assert result.returncode == 0, result.stderr
+    return result.stdout
 
 
-def _witness(log_dir) -> Path:
-    """Export the registry's anchor lines to its off-host log (the operator's commit + push)."""
-    vs1.export_anchors(log_dir, _offhost(log_dir))
-    return _offhost(log_dir)
+class _Vault:
+    """A stand-in for the GitHub vault: a bare 'remote', a worktree on main, a fetch cache."""
+
+    def __init__(self, root: Path) -> None:
+        root.mkdir(parents=True, exist_ok=True)
+        self.remote, self.worktree, self.cache = root / "remote.git", root / "worktree", root / "cache"
+        _git(root, "init", "-q", "--bare", str(self.remote))
+        _git(self.remote, "symbolic-ref", "HEAD", "refs/heads/main")
+        _git(root, "init", "-q", str(self.worktree))
+        _git(self.worktree, "checkout", "-q", "-b", "main")
+        (self.worktree / "README.md").write_text("vault\n")
+        _git(self.worktree, "add", "README.md")
+        _git(self.worktree, "commit", "-q", "-m", "init")
+        _git(self.worktree, "remote", "add", "origin", str(self.remote))
+        self.push()
+        _git(root, "init", "-q", str(self.cache))
+
+    @property
+    def file(self) -> Path:
+        return self.worktree / vs1.WITNESS_PATH
+
+    def commit(self, message="vs1 anchors", *paths, push=True):
+        _git(self.worktree, "add", "-A", *paths)
+        _git(self.worktree, "commit", "-q", "-m", message)
+        if push:
+            self.push()
+
+    def push(self, ref="HEAD:refs/heads/main", force=False):
+        _git(self.worktree, "push", "-q", *(["--force"] if force else []), "origin", ref)
+
+    def publish(self, log_dir, push=True):
+        """The operator's step: append the registry's new anchor lines, commit, push to main."""
+        vs1.export_anchors(log_dir, self.worktree)
+        self.commit("vs1 anchors", push=push)
+
+    def witness(self):
+        return vs1.check_offhost(self.cache, remote_url=str(self.remote))
+
+
+_VAULTS: dict = {}
+
+
+def _offhost(log_dir) -> _Vault:
+    """The registry's vault (created on first use, next to the registry)."""
+    key = str(Path(log_dir).resolve())
+    if key not in _VAULTS:
+        _VAULTS[key] = _Vault(Path(log_dir).parent / f"{Path(log_dir).name}.vault")
+    return _VAULTS[key]
+
+
+def _witness(log_dir):
+    """Publish the registry's anchor lines to its vault main and fetch the witness."""
+    vault = _offhost(log_dir)
+    vault.publish(log_dir)
+    return vault.witness()
 
 
 def _discovery_key(log_dir, manifest=None):
@@ -652,9 +711,9 @@ def _open_holdout(log_dir, frozen, observed, **overrides):
     return vs1.open_holdout(frozen, **kwargs)
 
 
-def _resume_holdout(log_dir, frozen, observed, external_anchors):
+def _resume_holdout(log_dir, frozen, observed, witness):
     return vs1.resume_holdout(frozen, allow_holdout=True, prereg_sha256=vs1.PREREG_BODY_SHA256, log_dir=log_dir,
-                              observed=observed, external_anchors=external_anchors)
+                              observed=observed, witness=witness)
 
 
 def _holdout_key(log_dir, frozen, observed):
@@ -775,7 +834,7 @@ def test_holdout_is_refused_without_the_flag_or_the_matching_hash(sealed_null):
 def test_holdout_evaluation_needs_a_key_for_this_manifest(sealed_null):
     frozen, observed, log_dir = sealed_null
     with pytest.raises(TypeError):
-        vs1.HoldoutKey(object(), frozen["sha256"], {"as_of_ts": AS_OF_TS})
+        vs1.HoldoutKey(object(), frozen["sha256"], {"as_of_ts": AS_OF_TS}, log_dir=log_dir, witness_tip="0" * 40)
     other = _holdout_key(log_dir, frozen, observed)
     other.frozen_sha256 = "f" * 64
     with pytest.raises(PermissionError):
@@ -1269,40 +1328,17 @@ def _cli_args(files, log_dir, *extra):
     ]
 
 
-def _git(cwd, *argv):
-    import subprocess
-
-    result = subprocess.run(
-        ["git", "-c", "user.name=vs1-test", "-c", "user.email=vs1-test@example.invalid",
-         "-c", "commit.gpgsign=false", *argv],
-        cwd=cwd, capture_output=True, text=True, check=False,
-    )
-    assert result.returncode == 0, result.stderr
-    return result.stdout
-
-
-def _vault(tmp_path):
-    """A stand-in vault: a git work tree with a bare 'origin' to push to."""
-    remote, vault = tmp_path / "remote.git", tmp_path / "vault"
-    _git(tmp_path, "init", "-q", "--bare", str(remote))
-    _git(tmp_path, "init", "-q", str(vault))
-    _git(vault, "remote", "add", "origin", str(remote))
-    (vault / "README.md").write_text("vault\n")
-    _git(vault, "add", "README.md")
-    _git(vault, "commit", "-q", "-m", "init")
-    _git(vault, "push", "-q", "origin", "HEAD:refs/heads/main")
-    return vault, vault / "05-GRID" / "vs1" / vs1.REGISTRY_ANCHORS
-
-
-def test_cli_discovery_and_holdout_are_one_shot_and_need_a_pushed_offhost_witness(tmp_path, monkeypatch):
+def test_cli_discovery_and_holdout_are_one_shot_and_need_the_pinned_witness(tmp_path, monkeypatch):
     from argparse import Namespace
 
     from scripts import run_vs1_insider_density as cli
 
     files, reads = _cli_inputs(tmp_path, monkeypatch)
     log_dir = tmp_path / "registry"
-    vault, anchors = _vault(tmp_path)
-    witness = ["--external-anchors", str(anchors)]
+    vault = _Vault(tmp_path / "vault")
+    # the pinned URL, redirected to the test's bare remote (the CLI has no URL option)
+    monkeypatch.setattr(vs1, "WITNESS_REMOTE_URL", str(vault.remote))
+    fetch = ["--vault-repo", str(vault.cache)]
     # the power file: pre-registered settings, computed on these inputs (a synthetic table)
     ns = Namespace(sector="Technology", issuer_map=str(files["company_tickers.json"]),
                    form4=str(files["form4.parquet"]), submissions=str(files["submissions.parquet"]), owners=None)
@@ -1314,46 +1350,37 @@ def test_cli_discovery_and_holdout_are_one_shot_and_need_a_pushed_offhost_witnes
     cli.main(["register", "--log-dir", str(log_dir)])
     assert vs1.registry(log_dir).verify_chain()["head_sha256"] == vs1.REGISTERED_RECORD_SHA256[1]
     run_dir = tmp_path / "run"
-    discover = ["discover", *_cli_args(files, log_dir, *witness, "--out", str(run_dir))]
-    # nothing is read before inputs are frozen, a discovery is opened and witnessed off-host
-    with pytest.raises(SystemExit, match="does not exist"):
-        cli.main(discover)
+    discover = ["discover", *_cli_args(files, log_dir, *fetch, "--out", str(run_dir))]
+    with pytest.raises(PermissionError, match="is not on main"):
+        cli.main(discover)  # no witness file on main yet
     with pytest.raises(PermissionError, match="inputs_frozen"):
         cli.main(["open-discovery", *_cli_args(files, log_dir)])
     cli.main(["freeze-inputs", *_cli_args(files, log_dir, "--as-of-ts", AS_OF_TS, "--code-sha", "c" * 40)])
     frozen_inputs = vs1.latest_frozen_inputs(log_dir)
     assert frozen_inputs["as_of_ts"] == AS_OF_TS and frozen_inputs["accept_underpowered"] is False
 
-    # the vault log witnesses the chain up to inputs_frozen (committed and pushed) ...
-    vs1.export_anchors(log_dir, anchors)
-    _git(vault, "add", "-A")
-    _git(vault, "commit", "-q", "-m", "vs1 anchors: inputs_frozen")
-    _git(vault, "push", "-q", "origin", "HEAD:refs/heads/main")
-    # ... but not discovery_opened: discover refuses (the missing-anchor refusal)
-    cli.main(["open-discovery", *_cli_args(files, log_dir)])
+    # open-discovery appends the anchor lines to the vault worktree; not yet pushed: refused
+    cli.main(["open-discovery", *_cli_args(files, log_dir, "--vault-worktree", str(vault.worktree))])
     assert _kinds(log_dir)[-1] == "discovery_opened"
-    with pytest.raises(PermissionError, match="covers 3 records"):
-        cli.main(discover)
-    # exported but not committed, then committed but not pushed: still refused
-    vs1.export_anchors(log_dir, anchors)
-    with pytest.raises(SystemExit, match="not committed"):
-        cli.main(discover)
-    _git(vault, "commit", "-q", "-am", "vs1 anchors: discovery_opened")
-    with pytest.raises(SystemExit, match="push it first"):
+    vault.commit("vs1 anchors: discovery_opened", push=False)
+    with pytest.raises(PermissionError, match="is not on main"):
         cli.main(discover)
     assert reads == [] and not run_dir.exists()
-    # pushed: the discovery reads prices once and seals
-    _git(vault, "push", "-q", "origin", "HEAD:refs/heads/main")
+    # pushed to main: the discovery reads prices once and seals
+    vault.push()
     cli.main(discover)
     assert reads == ["vs1_insider_density"]
-    assert _kinds(log_dir)[-3:] == ["inputs_frozen", "discovery_opened", "discovery_frozen"]
+    assert _kinds(log_dir)[-4:] == ["inputs_frozen", "discovery_opened", "prices_read", "discovery_frozen"]
     frozen = json.loads((run_dir / "discovery-frozen.json").read_text())
     assert vs1.registry(log_dir).read_all()[-1]["discovery_sha256"] == frozen["sha256"]
-    assert frozen["payload"]["inputs"]["offhost_witness"]["path"] == "05-GRID/vs1/" + vs1.REGISTRY_ANCHORS
+    witnessed = frozen["payload"]["inputs"]["offhost_witness"]
+    assert witnessed["path"] == vs1.WITNESS_PATH and witnessed["branch"] == "main"
     with pytest.raises(PermissionError, match="one shot"):
-        cli.main(["discover", *_cli_args(files, log_dir, *witness, "--out", str(tmp_path / "run2"))])
+        cli.main(["discover", *_cli_args(files, log_dir, *fetch, "--out", str(tmp_path / "run2"))])
     with pytest.raises(PermissionError, match="one shot"):
         cli.main(["open-discovery", *_cli_args(files, log_dir)])
+    cli.main(["export-anchors", "--log-dir", str(log_dir), "--vault-worktree", str(vault.worktree)])
+    vault.commit("vs1 anchors: discovery_frozen")
 
     request = ["--run-dir", str(run_dir), "--allow-holdout", "--prereg-sha256", vs1.PREREG_BODY_SHA256]
     # a different price manifest: refused before any price read and before holdout_opened
@@ -1364,13 +1391,13 @@ def test_cli_discovery_and_holdout_are_one_shot_and_need_a_pushed_offhost_witnes
     with pytest.raises(SystemExit, match="price manifest differs"):
         cli.main(["open-holdout", *request, *_cli_args(files, log_dir)])
     with pytest.raises(SystemExit, match="price manifest differs"):
-        cli.main(["holdout", *request, *_cli_args(files, log_dir, *witness)])
+        cli.main(["holdout", *request, *_cli_args(files, log_dir, *fetch)])
     files["manifest.json"].write_text(good_manifest)
     # a different power file: same
     good_power = files["power.json"].read_text()
     files["power.json"].write_text(json.dumps({**json.loads(good_power), "note": "edited"}))
     with pytest.raises(SystemExit, match="power file differs"):
-        cli.main(["holdout", *request, *_cli_args(files, log_dir, *witness)])
+        cli.main(["holdout", *request, *_cli_args(files, log_dir, *fetch)])
     files["power.json"].write_text(good_power)
     # no flag
     with pytest.raises(PermissionError, match="allow_holdout"):
@@ -1379,12 +1406,12 @@ def test_cli_discovery_and_holdout_are_one_shot_and_need_a_pushed_offhost_witnes
     assert "holdout_opened" not in _kinds(log_dir)
     # holdout before holdout_opened: refused
     with pytest.raises(PermissionError, match="0 holdout_opened"):
-        cli.main(["holdout", *request, *_cli_args(files, log_dir, *witness)])
-    # opened and exported to the vault log, but not committed: refused, no price read
-    cli.main(["open-holdout", *request, *_cli_args(files, log_dir, *witness)])
+        cli.main(["holdout", *request, *_cli_args(files, log_dir, *fetch)])
+    # opened and appended in the worktree, but not pushed to main: refused, no price read
+    cli.main(["open-holdout", *request, *_cli_args(files, log_dir, "--vault-worktree", str(vault.worktree))])
     assert _kinds(log_dir)[-1] == "holdout_opened"
-    with pytest.raises(SystemExit, match="not committed"):
-        cli.main(["holdout", *request, *_cli_args(files, log_dir, *witness)])
+    with pytest.raises(PermissionError, match="covers"):
+        cli.main(["holdout", *request, *_cli_args(files, log_dir, *fetch)])
     with pytest.raises(PermissionError, match="already opened"):
         cli.main(["open-holdout", *request, *_cli_args(files, log_dir)])
     assert reads == ["vs1_insider_density"]
@@ -1466,8 +1493,8 @@ def test_a_fresh_or_re_registered_registry_is_refused_as_a_fork(tmp_path):
 
 def test_a_prefix_copy_fork_can_open_locally_but_never_gets_a_price_key(tmp_path):
     real, fork = tmp_path / "real", tmp_path / "fork"
-    key, inputs = _discovery_key(real)  # the real run, witnessed off-host
-    offhost = _offhost(real)
+    key, inputs = _discovery_key(real)  # the real run, witnessed on the pinned main
+    vault = _offhost(real)
     # fork: a byte copy of the registered 2-record prefix, other inputs
     fork.mkdir()
     for name in (vs1.REGISTRY_LOG, vs1.REGISTRY_ANCHORS):
@@ -1478,10 +1505,10 @@ def test_a_prefix_copy_fork_can_open_locally_but_never_gets_a_price_key(tmp_path
     vs1.freeze_inputs(fork, NOW, other)
     vs1.open_discovery(fork, NOW, _observed(other))  # locally indistinguishable
     with pytest.raises(PermissionError, match="does not witness"):
-        vs1.resume_discovery(fork, _observed(other), offhost)
-    # and the off-host log cannot be extended with the fork's chain
+        vs1.resume_discovery(fork, _observed(other), vault.witness())
+    # and the witness file cannot be extended with the fork's chain
     with pytest.raises(PermissionError, match="another registry chain"):
-        vs1.export_anchors(fork, offhost)
+        vs1.export_anchors(fork, vault.worktree)
     assert key.inputs_frozen_sha256 != vs1.latest_frozen_inputs(fork)
 
 
@@ -1489,63 +1516,195 @@ def test_a_deleted_and_recreated_registry_is_refused_by_the_offhost_log(tmp_path
     import shutil
 
     log_dir = tmp_path / "registry"
-    _, inputs = _discovery_key(log_dir)
-    offhost = _offhost(log_dir)
+    _discovery_key(log_dir)
+    vault = _offhost(log_dir)
     shutil.rmtree(log_dir)
     _register(log_dir)
     retry = _frozen_inputs(as_of_ts="2026-09-26T12:00:00+00:00")
     vs1.freeze_inputs(log_dir, NOW, retry)
     vs1.open_discovery(log_dir, NOW, _observed(retry))
     with pytest.raises(PermissionError, match="does not witness"):
-        vs1.resume_discovery(log_dir, _observed(retry), offhost)
+        vs1.resume_discovery(log_dir, _observed(retry), vault.witness())
 
 
-def test_discovery_is_refused_until_the_offhost_log_contains_discovery_opened(tmp_path):
+def test_the_witness_location_is_pinned():
+    assert vs1.WITNESS_REMOTE_URL == "https://github.com/3pacs/obsidian-vault.git"
+    assert vs1.WITNESS_BRANCH == "main"
+    assert vs1.WITNESS_PATH == "05-GRID/Paper-Log/vs1/granular_panel_prereg_v1.anchors.jsonl"
+    # the seed line is the pinned registration's anchor, byte for byte
+    anchor = json.loads(vs1.REGISTERED_ANCHOR_LINE)
+    assert anchor["records"] == 2 and anchor["head_sha256"] == vs1.REGISTERED_RECORD_SHA256[1]
+    with pytest.raises(TypeError):
+        vs1.OffhostWitness(object(), Path("."), "0" * 40, b"", [], "x")
+
+
+def test_discovery_is_refused_until_the_pinned_main_contains_discovery_opened(tmp_path):
     _register(tmp_path)
     inputs = _frozen_inputs()
     vs1.freeze_inputs(tmp_path, NOW, inputs)
-    early = _witness(tmp_path)  # witnessed up to inputs_frozen only
+    vault = _offhost(tmp_path)
+    vault.publish(tmp_path)  # main witnesses the chain up to inputs_frozen only
     opened = vs1.open_discovery(tmp_path, NOW, _observed(inputs))
     assert opened["records"] == 4 and opened["head_sha256"] == vs1.registry(tmp_path).verify_chain()["head_sha256"]
     with pytest.raises(PermissionError, match="off-host anchor log"):
         vs1.resume_discovery(tmp_path, _observed(inputs), None)
-    with pytest.raises(PermissionError, match="does not exist"):
-        vs1.resume_discovery(tmp_path, _observed(inputs), tmp_path.parent / "missing.jsonl")
     with pytest.raises(PermissionError, match="covers 3 records"):
-        vs1.resume_discovery(tmp_path, _observed(inputs), early)
-    # a hand-edited off-host log (head not this chain's) is refused too
-    lines = early.read_bytes().split(b"\n")
-    edited = tmp_path.parent / "edited.jsonl"
-    edited.write_bytes(lines[0].replace(b"5b10ff57", b"5b10ff58") + b"\n")
-    with pytest.raises(PermissionError, match="does not witness"):
-        vs1.resume_discovery(tmp_path, _observed(inputs), edited)
-    # once exported (and, for the CLI, committed and pushed): the key
-    key = vs1.resume_discovery(tmp_path, _observed(inputs), _witness(tmp_path))
-    assert key.as_of_ts == datetime(2026, 9, 26, tzinfo=UTC)
+        vs1.resume_discovery(tmp_path, _observed(inputs), vault.witness())
+    # appended and committed but not pushed: main does not have it
+    vault.publish(tmp_path, push=False)
+    with pytest.raises(PermissionError, match="covers 3 records"):
+        vs1.resume_discovery(tmp_path, _observed(inputs), vault.witness())
+    # pushed to another branch only: still not main
+    vault.push("HEAD:refs/heads/elsewhere")
+    with pytest.raises(PermissionError, match="covers 3 records"):
+        vs1.resume_discovery(tmp_path, _observed(inputs), vault.witness())
+    # pushed to main: the key
+    vault.push()
+    witness = vault.witness()
+    key = vs1.resume_discovery(tmp_path, _observed(inputs), witness)
+    assert key.as_of_ts == datetime(2026, 9, 26, tzinfo=UTC) and key.witness_tip == witness.tip
+    assert witness.witnessing_commit(4) == witness.tip
     # the witness does not reopen anything: inputs still have to match
     with pytest.raises(PermissionError, match="form4_sha256"):
-        vs1.resume_discovery(tmp_path, {**_observed(inputs), "form4_sha256": "e" * 64}, _offhost(tmp_path))
+        vs1.resume_discovery(tmp_path, {**_observed(inputs), "form4_sha256": "e" * 64}, witness)
 
 
-def test_an_offhost_log_with_windows_line_endings_is_accepted(tmp_path):
+def test_a_witness_file_at_another_path_does_not_count(tmp_path):
+    _register(tmp_path)
+    inputs = _frozen_inputs()
+    vs1.freeze_inputs(tmp_path, NOW, inputs)
+    vault = _offhost(tmp_path)
+    vault.publish(tmp_path)
+    vs1.open_discovery(tmp_path, NOW, _observed(inputs))
+    # the full anchor file committed and pushed to main, but at a different path
+    other = vault.worktree / "05-GRID" / "Paper-Log" / "vs1-copy" / "anchors.jsonl"
+    other.parent.mkdir(parents=True)
+    other.write_bytes((tmp_path / vs1.REGISTRY_ANCHORS).read_bytes())
+    vault.commit("anchors at another path")
+    with pytest.raises(PermissionError, match="covers 3 records"):
+        vs1.resume_discovery(tmp_path, _observed(inputs), vault.witness())
+
+
+def test_a_witness_file_renamed_from_another_path_is_refused(tmp_path):
+    _register(tmp_path)
+    vault = _Vault(tmp_path / "vault")
+    staged = vault.worktree / "05-GRID" / "staging.jsonl"
+    staged.parent.mkdir(parents=True)
+    staged.write_bytes((tmp_path / vs1.REGISTRY_ANCHORS).read_bytes())
+    vault.commit("stage anchors elsewhere")
+    vault.file.parent.mkdir(parents=True)
+    _git(vault.worktree, "mv", str(staged), str(vault.file))
+    vault.commit("move into place")
+    with pytest.raises(PermissionError, match="another path"):
+        vault.witness()
+
+
+def test_a_truncation_commit_on_main_is_refused(tmp_path):
     _register(tmp_path)
     inputs = _frozen_inputs()
     vs1.freeze_inputs(tmp_path, NOW, inputs)
     vs1.open_discovery(tmp_path, NOW, _observed(inputs))
-    witness = _witness(tmp_path)
-    witness.write_bytes(witness.read_bytes().replace(b"\n", b"\r\n"))
-    vs1.resume_discovery(tmp_path, _observed(inputs), witness)
-    assert vs1.export_anchors(tmp_path, witness) == []  # nothing new, prefix recognised
+    vault = _offhost(tmp_path)
+    vault.publish(tmp_path)
+    assert vault.witness().lines[-1] == (tmp_path / vs1.REGISTRY_ANCHORS).read_bytes().split(b"\n")[-2]
+    # truncate back to the seed and push: every later check refuses
+    lines = vault.file.read_bytes().split(b"\n")
+    vault.file.write_bytes(lines[0] + b"\n")
+    vault.commit("truncate")
+    with pytest.raises(PermissionError, match="not append-only"):
+        vault.witness()
+    # re-appending afterwards does not repair the history
+    vault.publish(tmp_path)
+    with pytest.raises(PermissionError, match="not append-only"):
+        vault.witness()
 
 
-def test_holdout_is_refused_until_the_offhost_log_contains_holdout_opened(sealed_null):
+def test_an_edited_or_deleted_witness_file_is_refused(tmp_path):
+    _register(tmp_path)
+    vault = _Vault(tmp_path / "edit")
+    vault.publish(tmp_path)
+    vault.file.write_bytes(vault.file.read_bytes().replace(b'"records":2', b'"records":3'))
+    vault.commit("edit a line")
+    with pytest.raises(PermissionError, match="does not start with the pinned registration"):
+        vault.witness()
+    vault = _Vault(tmp_path / "delete")
+    vault.publish(tmp_path)
+    _git(vault.worktree, "rm", "-q", str(vault.file))
+    vault.commit("delete")
+    with pytest.raises(PermissionError, match="deleted"):
+        vault.witness()
+    vault = _Vault(tmp_path / "foreign")
+    vault.file.parent.mkdir(parents=True)
+    vault.file.write_bytes(b'{"head_sha256":"' + b"0" * 64 + b'","prev_anchor_sha256":null,"records":2,"run_at":"x"}\n')
+    vault.commit("a different genesis")
+    with pytest.raises(PermissionError, match="pinned registration"):
+        vault.witness()
+    with pytest.raises(PermissionError, match="is not on main"):
+        _Vault(tmp_path / "empty").witness()
+
+
+def test_a_witness_file_committed_with_windows_line_endings_is_accepted(tmp_path):
+    _register(tmp_path)
+    inputs = _frozen_inputs()
+    vs1.freeze_inputs(tmp_path, NOW, inputs)
+    vs1.open_discovery(tmp_path, NOW, _observed(inputs))
+    vault = _offhost(tmp_path)
+    vs1.export_anchors(tmp_path, vault.worktree)
+    vault.file.write_bytes(vault.file.read_bytes().replace(b"\n", b"\r\n"))
+    vault.commit("crlf")
+    vs1.resume_discovery(tmp_path, _observed(inputs), vault.witness())
+    assert vs1.export_anchors(tmp_path, vault.worktree) == []  # nothing new, prefix recognised
+
+
+def test_a_rewritten_main_is_refused_after_a_price_read(tmp_path):
+    dates = pd.bdate_range("2019-12-02", "2019-12-31")
+    engine = _price_db({"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(10.0, index=dates)})
+    key, inputs = _discovery_key(tmp_path / "registry", _manifest(["AAA"]))
+    log_dir = tmp_path / "registry"
+    with engine.connect() as conn:
+        vs1.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], start=date(2019, 12, 1),
+                             as_of=date(2019, 12, 31), window="discovery", key=key)
+    assert _kinds(log_dir)[-1] == "prices_read"
+    # main force-pushed to a new, internally append-only history that still witnesses the chain
+    vault = _offhost(log_dir)
+    _git(vault.worktree, "checkout", "-q", "--orphan", "rewrite")
+    _git(vault.worktree, "rm", "-rq", "--cached", ".")
+    vault.commit("rewritten history", push=False)
+    vault.push("HEAD:refs/heads/main", force=True)
+    rewritten = vault.witness()
+    assert not rewritten.descends_from(key.witness_tip)
+    with pytest.raises(PermissionError, match="history rewritten"):
+        vs1.resume_discovery(log_dir, _observed(inputs), rewritten)
+
+
+def test_a_resumed_price_read_must_match_the_first(tmp_path):
+    dates = pd.bdate_range("2019-12-02", "2019-12-31")
+    first = _price_db({"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(10.0, index=dates)})
+    changed = _price_db({"XLK": pd.Series(100.0, index=dates), "AAA": pd.Series(11.0, index=dates)})
+    key, inputs = _discovery_key(tmp_path / "registry", _manifest(["AAA"]))
+    log_dir = tmp_path / "registry"
+    read = functools.partial(vs1.load_price_panel, start=date(2019, 12, 1), as_of=date(2019, 12, 31),
+                             window="discovery")
+    with first.connect() as conn:
+        panel = read(conn, _manifest(["AAA"]), ["AAA"], key=key)
+    # a crash here; the resumed run gets a new key and reads again
+    again = vs1.resume_discovery(log_dir, _observed(inputs), _offhost(log_dir).witness())
+    with first.connect() as conn:
+        assert read(conn, _manifest(["AAA"]), ["AAA"], key=again).receipt_sha == panel.receipt_sha
+    with changed.connect() as conn, pytest.raises(PermissionError, match="differ from the first read"):
+        read(conn, _manifest(["AAA"]), ["AAA"], key=again)
+    reads = [r for r in vs1.registry(log_dir).read_all() if r["kind"] == "prices_read"]
+    assert [r["price_receipt_sha256"] for r in reads] == [panel.receipt_sha] * 2
+
+
+def test_holdout_is_refused_until_the_pinned_main_contains_holdout_opened(sealed_null):
     frozen, observed, log_dir = sealed_null
     before = _witness(log_dir)  # covers discovery_frozen, not holdout_opened
     with pytest.raises(PermissionError, match="0 holdout_opened"):
         _resume_holdout(log_dir, frozen, observed, before)
     _open_holdout(log_dir, frozen, observed)
     with pytest.raises(PermissionError, match="covers"):
-        _resume_holdout(log_dir, frozen, observed, before)
+        _resume_holdout(log_dir, frozen, observed, _offhost(log_dir).witness())
     with pytest.raises(PermissionError, match="off-host anchor log"):
         _resume_holdout(log_dir, frozen, observed, None)
     key = _resume_holdout(log_dir, frozen, observed, _witness(log_dir))

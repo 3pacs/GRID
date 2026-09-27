@@ -44,7 +44,8 @@ and ``analysis.ledger_steered_exploration``):
   no price is read without a key, and the key exists only after
   ``inputs_frozen`` (every input hash and ``as_of_ts``) and then
   ``discovery_opened`` / ``holdout_opened`` were appended to the chain *and*
-  an off-host anchor log (committed in the vault) already witnesses that head
+  the pinned off-host anchor log (``main`` of the GitHub vault, append-only)
+  already witnesses that head
   (:func:`require_witness`); a second discovery or holdout is refused.
 
 Boundaries: no DB writes, no migrations, no timers. Prices are read only
@@ -972,12 +973,19 @@ class DiscoveryKey:
     discovery price read is checked against.
     """
 
-    def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict) -> None:
+    window = "discovery"
+
+    def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict, *,
+                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
         if token is not _KEY_TOKEN:
             raise TypeError("a DiscoveryKey is issued only by resume_discovery")
+        if log_dir is None or witness_tip is None:
+            raise TypeError("a DiscoveryKey needs its registry and off-host witness")
         self.inputs_frozen_sha256 = inputs_frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
+        self.log_dir = Path(log_dir)
+        self.witness_tip = witness_tip
 
 
 class HoldoutKey:
@@ -985,12 +993,19 @@ class HoldoutKey:
     ``holdout_opened`` record in the pinned registry chain that the off-host
     anchor log already witnesses (issued only by :func:`resume_holdout`)."""
 
-    def __init__(self, token: object, frozen_sha256: str, inputs: dict) -> None:
+    window = "holdout"
+
+    def __init__(self, token: object, frozen_sha256: str, inputs: dict, *,
+                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
         if token is not _HOLDOUT_TOKEN:
             raise TypeError("a HoldoutKey is issued only by resume_holdout")
+        if log_dir is None or witness_tip is None:
+            raise TypeError("a HoldoutKey needs its registry and off-host witness")
         self.frozen_sha256 = frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
+        self.log_dir = Path(log_dir)
+        self.witness_tip = witness_tip
 
 
 _HOLDOUT_TOKEN = object()
@@ -1129,7 +1144,7 @@ def load_price_panel(
         )
     if not data[manifest.benchmark]:
         raise ValueError("no benchmark closes in the read window")
-    return PricePanel(
+    panel = PricePanel(
         token=_PRICE_LOADER,
         manifest=manifest,
         start=start,
@@ -1138,6 +1153,9 @@ def load_price_panel(
         window=window,
         data=data,
     )
+    # Every read is recorded; a re-read (a resumed run) must return the same prices.
+    record_prices_read(key, panel.receipt_sha)
+    return panel
 
 
 # --- labels (split first, then label) ------------------------------------------------
@@ -2006,15 +2024,19 @@ def register(log_dir: Path, now: datetime, code_sha: str, *, repo_root: Path = R
 #                     only while no discovery has been opened)
 #   discovery_opened  appended by open_discovery, BEFORE any discovery price read;
 #                     a second one is refused
-#   (off-host)        the operator commits and pushes the registry's anchor lines,
-#                     up to and including discovery_opened, to the off-host anchor
-#                     log (the vault); resume_discovery refuses to issue the price
-#                     key until verify_chain(external_anchors=...) shows it there
+#   (off-host)        the operator appends the registry's anchor lines (up to and
+#                     including discovery_opened) to WITNESS_PATH in a vault worktree,
+#                     commits and pushes to main of WITNESS_REMOTE_URL; resume_discovery
+#                     fetches that branch (check_offhost: pinned remote, branch, path,
+#                     append-only history) and refuses the price key until
+#                     verify_chain(external_anchors=<committed file>) shows the head
+#   prices_read       the price receipt of every read (a resumed run must match it)
 #   discovery_frozen  the frozen discovery manifest's sha256
 #   holdout_opened    appended by open_holdout, BEFORE any holdout price read; needs
 #                     the frozen file to hash to the chain's discovery_frozen; a
 #                     second open is refused
 #   (off-host)        the same witness for holdout_opened; resume_holdout checks it
+#   prices_read       the holdout read's receipt
 #   holdout_result    the holdout result's sha256 and verdict state
 #
 # The price reader refuses to read without the key resume_discovery /
@@ -2098,55 +2120,176 @@ def _position(records: list[dict], kind: str) -> int:
     return positions[0]
 
 
-def require_witness(log_dir: Path, external_anchors: Path | None, records_needed: int, *,
-                    prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """The off-host anchor log must already witness this chain up to ``records_needed``.
+#: The off-host witness, pinned (re-review of #697 at a6875ac5): the anchor log
+#: lives at exactly this path on branch ``main`` of the GitHub vault repository.
+#: No other repository, branch, path or local file counts.
+WITNESS_REMOTE_URL = "https://github.com/3pacs/obsidian-vault.git"
+WITNESS_BRANCH = "main"
+WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_v1.anchors.jsonl"
+#: Private ref the pinned branch is fetched into (never a local branch or ``origin/*``,
+#: which a local clone can point anywhere).
+WITNESS_REF = "refs/vs1-witness/main"
+#: The first line every committed version of the witness file starts with: the
+#: registry's anchor after the pinned 2-record registration (head 5b10ff57...).
+REGISTERED_ANCHOR_LINE = (
+    b'{"head_sha256":"5b10ff57c48c68164fbef9100c174f62d26be3c87e45928cd122549c9bcf7508",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-27T09:27:45.013793+00:00"}'
+)
+_WITNESS_TOKEN = object()
 
-    ``external_anchors`` is the off-host copy of the registry's anchor lines (a
-    plain-text log, one canonical JSON anchor per line: records, head_sha256,
-    prev_anchor_sha256, run_at), committed and pushed in the vault. It is passed
-    to ``ForwardLog.verify_chain(external_anchors=...)``: every anchor in it must
-    name a prefix this registry still has, with the same head -- so a forked or
-    rewritten registry is refused -- and its last anchor must cover at least
-    ``records_needed`` records. CRLF line endings (a Windows checkout) are
-    normalised before the check.
+
+def _git(repo: Path, *argv: str, binary: bool = False):
+    import subprocess
+
+    result = subprocess.run(["git", "-C", str(repo), *argv], capture_output=True, check=False)
+    if result.returncode != 0:
+        raise PermissionError(
+            f"git {' '.join(argv[:2])} failed in {repo}: {result.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    return result.stdout if binary else result.stdout.decode("utf-8")
+
+
+class OffhostWitness:
+    """The witness file as committed on the pinned remote's ``main`` (issued by :func:`check_offhost`)."""
+
+    def __init__(self, token: object, repo: Path, tip: str, content: bytes, versions: list[dict],
+                 remote_url: str) -> None:
+        if token is not _WITNESS_TOKEN:
+            raise TypeError("an OffhostWitness is issued only by check_offhost")
+        self.repo, self.tip, self.content, self.versions = Path(repo), tip, content, versions
+        self.remote_url = remote_url
+
+    @property
+    def lines(self) -> list[bytes]:
+        return [line for line in self.content.split(b"\n") if line]
+
+    def descends_from(self, commit: str) -> bool:
+        """``commit`` is an ancestor of (or equal to) the fetched tip."""
+        import subprocess
+
+        result = subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", commit, self.tip],
+                                capture_output=True, check=False)
+        return result.returncode == 0
+
+    def witnessing_commit(self, records: int) -> str | None:
+        """The first committed version whose anchors cover ``records`` records."""
+        for version in self.versions:
+            if version["covered_records"] >= records:
+                return version["commit"]
+        return None
+
+    def receipt(self) -> dict:
+        return {"remote_url": self.remote_url, "branch": WITNESS_BRANCH, "path": WITNESS_PATH,
+                "tip": self.tip, "versions": self.versions}
+
+
+def check_offhost(vault_repo: Path, *, remote_url: str | None = None) -> OffhostWitness:
+    """Fetch the pinned vault ``main`` and return the witness file as committed there.
+
+    ``vault_repo`` is any local git repository (a clone of the vault is
+    convenient: objects are reused); its working tree, index, branches and
+    remotes are never read. The pinned branch of :data:`WITNESS_REMOTE_URL` is
+    fetched into :data:`WITNESS_REF`. Then, over ``git log --first-parent -m
+    --follow`` of :data:`WITNESS_PATH` on that ref, every committed version must
+
+    * live at exactly :data:`WITNESS_PATH` (no rename or copy from another
+      path, no deletion);
+    * start with the pinned registration anchor (:data:`REGISTERED_ANCHOR_LINE`);
+    * be a strict line-prefix extension of the version before it
+      (append-only: no truncation, no edit, no reorder).
+
+    The file at the fetched tip must equal the last version walked. Any
+    failure refuses. ``remote_url`` exists for tests (a local bare remote);
+    the CLI always uses the pinned URL.
+    """
+    url = WITNESS_REMOTE_URL if remote_url is None else remote_url
+    repo = Path(vault_repo)
+    _git(repo, "rev-parse", "--git-dir")
+    _git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", url,
+         f"+refs/heads/{WITNESS_BRANCH}:{WITNESS_REF}")
+    tip = _git(repo, "rev-parse", "--verify", f"{WITNESS_REF}^{{commit}}").strip()
+    log = _git(repo, "log", "--first-parent", "-m", "--follow", "--name-status", "--format=%x00%H",
+               WITNESS_REF, "--", WITNESS_PATH)
+    entries = []
+    for chunk in log.split("\x00")[1:]:
+        head, *rest = chunk.strip("\n").split("\n")
+        changes = [line.split("\t") for line in rest if line.strip()]
+        entries.append((head.strip(), changes))
+    if not entries:
+        raise PermissionError(f"{WITNESS_PATH} is not on {WITNESS_BRANCH} of {url}")
+    versions, previous = [], None
+    for commit, changes in reversed(entries):  # oldest first
+        for change in changes:
+            status, paths = change[0], change[1:]
+            if status.startswith(("R", "C")) or any(p != WITNESS_PATH for p in paths):
+                raise PermissionError(f"{commit[:12]}: the witness file came from another path ({paths})")
+            if status.startswith("D"):
+                raise PermissionError(f"{commit[:12]}: the witness file was deleted (not append-only)")
+        content = _git(repo, "show", f"{commit}:{WITNESS_PATH}", binary=True).replace(b"\r\n", b"\n")
+        lines = [line for line in content.split(b"\n") if line]
+        if not lines or lines[0] != REGISTERED_ANCHOR_LINE:
+            raise PermissionError(f"{commit[:12]}: the witness file does not start with the pinned registration")
+        if previous is not None and not (len(lines) > len(previous) and lines[: len(previous)] == previous):
+            raise PermissionError(
+                f"{commit[:12]}: the witness file is not a strict line-prefix extension of its previous "
+                "version (truncated, edited or unchanged): not append-only"
+            )
+        covered = json.loads(lines[-1]).get("records", 0)
+        versions.append({"commit": commit, "lines": len(lines), "covered_records": covered})
+        previous = lines
+    at_tip = _git(repo, "show", f"{tip}:{WITNESS_PATH}", binary=True).replace(b"\r\n", b"\n")
+    if [line for line in at_tip.split(b"\n") if line] != previous:
+        raise PermissionError("the witness file at the fetched tip is not its last walked version")
+    return OffhostWitness(_WITNESS_TOKEN, repo, tip, b"\n".join(previous) + b"\n", versions, url)
+
+
+def require_witness(log_dir: Path, witness: OffhostWitness | None, records_needed: int, *,
+                    prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
+    """The pinned off-host anchor log must already witness this chain up to ``records_needed``.
+
+    The witness content (the committed file on the pinned ``main``) is passed
+    to ``ForwardLog.verify_chain(external_anchors=...)``: every anchor in it
+    must name a prefix this registry still has, with the same head -- so a
+    forked or rewritten registry is refused -- and its last anchor must cover
+    at least ``records_needed`` records.
     """
     import tempfile
 
-    from analysis.research_forward_log import _lines
-
-    if external_anchors is None:
-        raise PermissionError("an off-host anchor log (--external-anchors) is required")
-    path = Path(external_anchors)
-    if not path.is_file():
-        raise PermissionError(f"off-host anchor log {path} does not exist")
-    raw = path.read_bytes().replace(b"\r\n", b"\n")
+    if not isinstance(witness, OffhostWitness):
+        raise PermissionError("the pinned off-host anchor log (check_offhost) is required")
     log = registry(log_dir, prereg_sha256)
     with tempfile.TemporaryDirectory() as scratch:
-        normalised = Path(scratch) / path.name
-        normalised.write_bytes(raw)
+        path = Path(scratch) / Path(WITNESS_PATH).name
+        path.write_bytes(witness.content)
         with log.locked():
             records = _chain(log, prereg_sha256)
-            check = log.verify_chain(external_anchors=normalised)
-            if not check["ok"]:
-                raise PermissionError(f"off-host anchor log does not witness this registry: {check['detail']}")
-            anchors = [json.loads(line) for line in _lines(normalised)]
-    covered = anchors[-1]["records"] if anchors else 0
+            check = log.verify_chain(external_anchors=path)
+    if not check["ok"]:
+        raise PermissionError(f"off-host anchor log does not witness this registry: {check['detail']}")
+    covered = json.loads(witness.lines[-1])["records"]
     if covered < records_needed:
         raise PermissionError(
             f"off-host anchor log covers {covered} records; it must already contain the chain head "
-            f"at {records_needed} records (commit and push the registry's anchor lines first)"
+            f"at {records_needed} records (commit and push the registry's anchor lines to "
+            f"{WITNESS_BRANCH}:{WITNESS_PATH} first)"
         )
-    return {"records": len(records), "witnessed_records": covered,
-            "witnessed_head_sha256": anchors[-1]["head_sha256"]}
+    for record in _kind(records, "prices_read"):
+        if not witness.descends_from(record["witness_tip"]):
+            raise PermissionError(
+                f"the pinned {WITNESS_BRANCH} no longer contains the witness commit "
+                f"{record['witness_tip'][:12]} an earlier price read saw (history rewritten)"
+            )
+    return {"records": len(records), "witnessed_records": covered, "tip": witness.tip,
+            "witnessing_commit": witness.witnessing_commit(records_needed)}
 
 
-def export_anchors(log_dir: Path, external_anchors: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> list[str]:
-    """Append to the off-host anchor log the registry anchor lines it does not have yet.
+def export_anchors(log_dir: Path, vault_worktree: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> list[str]:
+    """Append to ``<vault_worktree>/WITNESS_PATH`` the registry anchor lines it lacks.
 
-    Refuses when the off-host log is not a prefix of this registry's anchor
-    file (it witnesses another chain). Writes the working-tree file only; the
-    operator commits and pushes it. Returns the appended lines.
+    Refuses when the file there is not a prefix of this registry's anchor file
+    (it witnesses another chain). Writes the working-tree file only; the
+    operator commits it and pushes it to the pinned ``main``. Returns the
+    appended lines.
     """
     from analysis.research_forward_log import _lines
 
@@ -2154,20 +2297,49 @@ def export_anchors(log_dir: Path, external_anchors: Path, *, prereg_sha256: str 
     with log.locked():
         _chain(log, prereg_sha256)
         local = list(_lines(log.anchor_path))
-    path = Path(external_anchors)
-    existing = list(_lines(path)) if path.exists() else []
-    existing = [line.rstrip(b"\r") for line in existing]
+    path = Path(vault_worktree) / WITNESS_PATH
+    existing = [line.rstrip(b"\r") for line in _lines(path)] if path.exists() else []
     if existing != local[: len(existing)]:
         raise PermissionError("the off-host anchor log witnesses another registry chain; not appending")
     new = local[len(existing):]
     if new:
         path.parent.mkdir(parents=True, exist_ok=True)
+        tail = path.read_bytes() if path.exists() else b""
         with open(path, "ab") as stream:
-            if path.stat().st_size and not path.read_bytes().endswith(b"\n"):
+            if tail and not tail.endswith(b"\n"):
                 stream.write(b"\n")
             for line in new:
                 stream.write(line + b"\n")
     return [line.decode("utf-8") for line in new]
+
+
+def record_prices_read(key: DiscoveryKey | HoldoutKey, price_receipt_sha256: str) -> dict:
+    """Append ``prices_read`` (window, price-receipt sha256, witness tip) after a price read.
+
+    A resumed run re-reads its window; its receipt must equal the first read's,
+    otherwise it is refused (the prices changed under the same frozen inputs).
+    """
+    if not isinstance(key, (DiscoveryKey, HoldoutKey)):
+        raise PermissionError("recording a price read needs its key")
+    log = registry(key.log_dir)
+    with log.locked():
+        records = _chain(log, PREREG_BODY_SHA256)
+        earlier = [r for r in _kind(records, "prices_read") if r["window"] == key.window]
+        differ = [r for r in earlier if r["price_receipt_sha256"] != price_receipt_sha256]
+        if differ:
+            raise PermissionError(
+                f"{key.window} prices differ from the first read under this registry "
+                f"(receipt {differ[0]['price_receipt_sha256'][:12]} then {price_receipt_sha256[:12]}): refused"
+            )
+        return log.append_locked([{
+            "kind": "prices_read",
+            "run_at": datetime.now(timezone.utc).isoformat(),
+            "prereg_sha256": PREREG_BODY_SHA256,
+            "window": key.window,
+            "price_receipt_sha256": price_receipt_sha256,
+            "witness_tip": key.witness_tip,
+            "promotion_allowed": False,
+        }])[0]
 
 
 def _check_observed(frozen_inputs: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
@@ -2262,7 +2434,7 @@ def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
     return {"kind": "discovery_opened", "records": len(heads), "head_sha256": heads[-1]}
 
 
-def resume_discovery(log_dir: Path, observed: Mapping[str, Any], external_anchors: Path | None, *,
+def resume_discovery(log_dir: Path, observed: Mapping[str, Any], witness: OffhostWitness | None, *,
                      prereg_sha256: str = PREREG_BODY_SHA256) -> DiscoveryKey:
     """One-shot discovery, step 2: the price key, only once the off-host log witnesses it.
 
@@ -2281,8 +2453,9 @@ def resume_discovery(log_dir: Path, observed: Mapping[str, Any], external_anchor
     if len(matching) != 1:
         raise PermissionError("discovery_opened does not name an inputs_frozen record of this chain")
     _check_observed(matching[0]["inputs"], observed)
-    require_witness(log_dir, external_anchors, position, prereg_sha256=prereg_sha256)
-    return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"])
+    require_witness(log_dir, witness, position, prereg_sha256=prereg_sha256)
+    return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"],
+                        log_dir=log_dir, witness_tip=witness.tip)
 
 
 def seal_discovery(log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict, *,
@@ -2378,7 +2551,7 @@ def resume_holdout(
     prereg_sha256: str,
     log_dir: Path,
     observed: Mapping[str, Any],
-    external_anchors: Path | None,
+    witness: OffhostWitness | None,
     repo_root: Path = REPO,
 ) -> HoldoutKey:
     """One-shot holdout, step 2: the price key, only once the off-host log witnesses it."""
@@ -2394,8 +2567,8 @@ def resume_holdout(
     if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
         raise PermissionError("holdout_opened names another discovery")
     _check_observed(inputs, observed)
-    require_witness(log_dir, external_anchors, position, prereg_sha256=prereg_sha256)
-    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs)
+    require_witness(log_dir, witness, position, prereg_sha256=prereg_sha256)
+    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, log_dir=log_dir, witness_tip=witness.tip)
 
 
 def seal_holdout(log_dir: Path, now: datetime, key: HoldoutKey, result: dict, *,
