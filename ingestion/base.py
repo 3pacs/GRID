@@ -611,6 +611,9 @@ class BasePuller:
             value: Numeric value.
             raw_payload: Optional JSON payload.
             pull_status: Pull status ('SUCCESS', 'PARTIAL', 'FAILED').
+                The schema also allows 'QUARANTINED', but pullers never
+                write it: it is set only by an explicit quarantine of
+                already-stored rows.
         """
         import json
 

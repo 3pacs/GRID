@@ -38,8 +38,9 @@ Contract
 --------
 Every function here:
 
-* returns only ``pull_status = 'SUCCESS'`` rows (``PARTIAL`` and ``FAILED``
-  are never observations);
+* returns only ``pull_status = 'SUCCESS'`` rows (``PARTIAL``, ``FAILED`` and
+  ``QUARANTINED`` -- a once-accepted row later found untrustworthy -- are
+  never observations);
 * collapses vintages to one row per ``obs_date`` — the latest
   ``pull_timestamp`` (``LATEST_AS_OF`` semantics, matching the default in
   ``store/pit.py``) — deterministically, in Python, so the SQL stays
