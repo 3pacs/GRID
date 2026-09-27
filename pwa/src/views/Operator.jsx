@@ -21,6 +21,19 @@ const CATEGORY_OPTIONS = ['ALL', 'ingestion', 'normalization', 'discovery', 'inf
 
 const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 
+// Human text for the daily_audit.stale_reason values
+// _read_daily_freshness_audit() can actually produce (store/
+// availability_fields.py's stale_reason enum has more values, but this
+// reader only ever returns these two plus the generic query-failure
+// classifications) -- never render the raw backend enum or exception text.
+const DAILY_AUDIT_REASON_TEXT = {
+    never_configured: 'audit has never run',
+    stale: 'audit run is overdue',
+    fetch_failed: 'query failed',
+    consumer_query_mismatch: 'query/schema mismatch',
+    unknown: 'unknown reason',
+};
+
 // Normalises a list-bearing API response into { list, error }.
 // api.js never throws on network/HTTP/parse failure — it resolves an
 // `{ error: true, status, message }` marker instead (see api.js's request
@@ -279,6 +292,29 @@ export default function Operator() {
                             );
                         })}
                     </div>
+                </div>
+            )}
+
+            {/* Daily Freshness Audit (data_freshness_audit, refreshed once
+                daily by grid-data-freshness-check.timer -- a separate,
+                bounded signal from the live family query above). */}
+            {freshness?.daily_audit && !loading && (
+                <div style={shared.card}>
+                    <div style={shared.sectionTitle}>DAILY AUDIT</div>
+                    {freshness.daily_audit.availability === 'unavailable' ? (
+                        <div style={{ marginTop: '8px', fontSize: '11px', color: colors.red }}>
+                            Unavailable ({DAILY_AUDIT_REASON_TEXT[freshness.daily_audit.stale_reason] || 'unknown reason'})
+                            {freshness.daily_audit.audited_at && (
+                                <span style={{ color: colors.textMuted }}>
+                                    {' '}— last run {fmtDate(freshness.daily_audit.audited_at)}
+                                </span>
+                            )}
+                        </div>
+                    ) : (
+                        <div style={{ marginTop: '8px', fontSize: '11px', color: colors.textMuted }}>
+                            As of {fmtDate(freshness.daily_audit.audited_at)} · {freshness.daily_audit.total_tickers} tickers audited
+                        </div>
+                    )}
                 </div>
             )}
 
