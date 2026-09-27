@@ -7,6 +7,7 @@ and stores each field as a separate entry in ``raw_series``.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -53,6 +54,46 @@ def _utc_now() -> datetime:
 # instances and threads for the life of the process.
 _PULL_ALL_LOCK = threading.Lock()
 
+
+def _stable_advisory_lock_key(name: str) -> int:
+    """Deterministic signed-64-bit key for pg_try_advisory_lock/unlock.
+
+    Python's built-in ``hash()`` is randomised per process
+    (``PYTHONHASHSEED``) — two different processes would compute two
+    different keys for the same name, which is useless for a lock they need
+    to agree on. sha256 is deterministic across processes, interpreters, and
+    restarts, which is exactly the property this needs.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).digest()[:8]
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    # pg_try_advisory_lock takes a signed bigint; wrap the top half of the
+    # unsigned range into negative territory rather than truncating bits.
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+# Cross-process single-flight guard (coordinator review of PR #672,
+# 2026-09-26): _PULL_ALL_LOCK above only protects against two concurrent
+# calls INSIDE ONE PROCESS. It does nothing across processes, and two
+# separate, independently-deployed processes both call pull_all():
+#   - grid-scheduler (systemd unit `python3 -m ingestion.scheduler`) ->
+#     run_daily_pulls() -> pull_all(), 4x/day (ingestion/scheduler.py).
+#   - grid-hermes (systemd unit, scripts/hermes_operator.py) ->
+#     ingestion/smart_scheduler.py's SmartScheduler -> pull_all(), every 4h.
+# A session-level Postgres advisory lock is visible across every backend
+# connection to the same database regardless of which OS process opened it,
+# which makes it the actual cross-process guard the thread lock cannot be.
+# Session-level (pg_advisory_lock/pg_advisory_unlock), not transaction-level
+# (pg_advisory_xact_lock): pull_all's body opens and commits many of its own
+# short transactions per ticker (self.engine.begin() in pull_ticker), and a
+# transaction-scoped lock would release after the first one instead of
+# covering the whole run. If the holding process crashes outright (no chance
+# to run the `finally` unlock), Postgres releases every session-level
+# advisory lock held by that backend connection when the connection itself
+# drops — which is also what stops an orphaned SmartScheduler thread from
+# starving this lock forever, unlike _PULL_ALL_LOCK (an orphaned thread
+# keeps holding that one, in-process, until it happens to finish).
+_PULL_ALL_ADVISORY_LOCK_KEY: int = _stable_advisory_lock_key("grid:yfinance:pull_all")
+
 # Wrong-instrument sanity guard (GRID-YF-CLOSE-REPAIR-20260926, fix #4):
 # refuse to write a series' freshly downloaded values if they disagree
 # wildly with that exact series' own existing recent SUCCESS values on the
@@ -64,6 +105,12 @@ _WILD_RATIO_HIGH = 2.0
 # Below this many overlapping dates, a ratio is too noisy to judge (a single
 # stale or off-by-one-day existing row could otherwise trip the guard).
 _WILD_RATIO_MIN_OVERLAP = 3
+# How far back to compare — see _median_ratio_vs_existing's docstring for
+# why this must stay bounded (a full-history pull_all call would otherwise
+# make this guard's own lookup scan ~1.15M rows per field on a heavily
+# contaminated series like YF:SPY:close; measured via EXPLAIN ANALYZE on
+# grid-svr, 2026-09-26).
+_WILD_RATIO_LOOKBACK_DAYS = 30
 
 # yfinance logs missing/delisted symbols at ERROR level internally. The puller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
@@ -174,21 +221,98 @@ class YFinancePuller(BasePuller):
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
 
+    def _try_acquire_pg_advisory_lock(self) -> Any | None:
+        """Try to take the cross-process advisory lock for pull_all.
+
+        Returns the open ``Connection`` holding the lock (pass it to
+        :meth:`_release_pg_advisory_lock` when done), or ``None`` if another
+        process already holds it.
+
+        Deliberately does NOT use ``with self.engine.connect() as conn:``.
+        A session-level advisory lock lives on the specific physical backend
+        connection that took it — exiting a context manager (or otherwise
+        closing/returning the connection to the pool) releases the lock
+        immediately, even though the caller still believes it holds it. The
+        returned connection must stay open, unreturned to the pool, for the
+        entire pull_all() run.
+        """
+        conn = self.engine.connect()
+        try:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            ).scalar()
+            # pg_try_advisory_lock is session-scoped, not transaction-scoped
+            # — it is unaffected by commit/rollback. Close out the implicit
+            # transaction SQLAlchemy auto-began for that SELECT so this
+            # connection doesn't sit "idle in transaction" for the whole run.
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return None
+        return conn
+
+    def _release_pg_advisory_lock(self, conn: Any) -> None:
+        """Release the cross-process advisory lock and close its connection.
+
+        Explicit ``pg_advisory_unlock`` before ``close()`` matters: without
+        it, the connection pool could eventually hand this same physical
+        backend connection to unrelated work while it still holds the lock
+        (a normal ``close()`` returns the connection to the pool; it does
+        not itself run ``pg_advisory_unlock``). Crash safety is separate and
+        already covered — see the module-level comment on
+        ``_PULL_ALL_ADVISORY_LOCK_KEY``: if the process dies outright,
+        Postgres releases the lock when that backend connection drops.
+        """
+        try:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            )
+            conn.commit()
+        except Exception as exc:
+            log.warning(
+                "yfinance pull_all: failed to release the advisory lock "
+                "cleanly (Postgres will still release it when this "
+                "connection closes/drops): {e}",
+                e=str(exc),
+            )
+        finally:
+            conn.close()
+
     def _median_ratio_vs_existing(
         self,
         series_id: str,
         values_by_date: dict[date, float],
         conn: Any,
     ) -> tuple[float | None, int]:
-        """Compare freshly downloaded values to this series' own history.
+        """Compare freshly downloaded values to this series' own RECENT history.
 
-        Looks up existing SUCCESS rows for ``series_id`` on the same dates
-        (bounded to the min/max of ``values_by_date``, not a full scan) and
+        Looks up existing SUCCESS rows for ``series_id`` within the last
+        ``_WILD_RATIO_LOOKBACK_DAYS`` days (see that constant — bounded
+        deliberately, not to the full min/max of ``values_by_date``) and
         returns the median of new/old ratios plus how many dates overlapped.
         Zero or near-zero existing values are excluded (division is
         meaningless there). Returns ``(None, overlap_count)`` when there
         isn't enough overlap to judge — callers must treat ``None`` as "no
         opinion", never as "safe".
+
+        Why bounded to a recent window rather than the request's full date
+        range: ``values_by_date`` comes from whatever ``start_date`` this
+        call happened to request, which for a deliberate full-history
+        backfill (``pull_all``'s own 1990-01-01 default; see that method's
+        docstring) spans 35+ years. Measured via EXPLAIN ANALYZE on
+        grid-svr (2026-09-26): the same query unbounded over a heavily
+        contaminated series (YF:SPY:close, ~1.15M SUCCESS rows across all
+        its wrong-instrument batches — see GRID-YF-CLOSE-REPAIR-20260926)
+        took ~1.5s and read ~150MB of buffers, inside the same DB
+        transaction as the pending inserts, on EVERY field of EVERY ticker.
+        A short recent window is also literally what this guard is meant to
+        check against — "that series' existing RECENT SUCCESS values" — not
+        an ability to judge decades-old history on every call.
 
         Parameters:
             series_id: The raw_series series identifier being written.
@@ -197,6 +321,11 @@ class YFinancePuller(BasePuller):
                 transaction as the pending inserts).
         """
         if not values_by_date:
+            return None, 0
+
+        recent_floor = date.today() - timedelta(days=_WILD_RATIO_LOOKBACK_DAYS)
+        windowed = {d: v for d, v in values_by_date.items() if d >= recent_floor}
+        if not windowed:
             return None, 0
 
         rows = conn.execute(
@@ -209,8 +338,8 @@ class YFinancePuller(BasePuller):
             {
                 "sid": series_id,
                 "src": self.source_id,
-                "start_date": min(values_by_date),
-                "end_date": max(values_by_date),
+                "start_date": max(min(windowed), recent_floor),
+                "end_date": max(windowed),
             },
         ).fetchall()
         existing: dict[date, float] = {}
@@ -221,7 +350,7 @@ class YFinancePuller(BasePuller):
                 continue
 
         ratios: list[float] = []
-        for obs_date_val, new_val in values_by_date.items():
+        for obs_date_val, new_val in windowed.items():
             old_val = existing.get(obs_date_val)
             if old_val is None or old_val == 0 or new_val == 0:
                 continue
@@ -648,36 +777,33 @@ class YFinancePuller(BasePuller):
               same dict shape with "status": "SUCCESS",
               "stopped_by_budget": False, "tickers_not_attempted": [],
               "counts": {..., "unattempted": 0}.
-            - a previous pull_all() call is still active in this process
-              (single-flight guard, GRID-YF-CLOSE-REPAIR-20260926 fix #1):
-              this call makes NO attempt at all — not even the first
-              ticker — and returns immediately. should_continue is None:
-              an empty list ``[]`` (zero tickers checked; distinguishable
-              from a real run only by being empty, since a real run over an
-              empty ticker_list is degenerate and not a supported input).
-              should_continue given: the usual dict shape with
-              "status": "SKIPPED", "stopped_by_budget": True (so callers
-              like scripts/hermes_fixers.py::_retry_source that gate
+            - a previous pull_all() call is still active — EITHER in this
+              same process (in-process single-flight guard, fix #1) OR in a
+              different process against the same database (cross-process
+              advisory lock — grid-scheduler and grid-hermes both call
+              pull_all independently; see the module comment on
+              ``_PULL_ALL_ADVISORY_LOCK_KEY``): this call makes NO attempt
+              at all — not even the first ticker — and returns immediately.
+              should_continue is None: an empty list ``[]`` (zero tickers
+              checked; distinguishable from a real run only by being empty,
+              since a real run over an empty ticker_list is degenerate and
+              not a supported input). should_continue given: the usual dict
+              shape with "status": "SKIPPED", "stopped_by_budget": True (so
+              callers like scripts/hermes_fixers.py::_retry_source that gate
               "mark this source freshly checked" on `stopped_by_budget`
               correctly do NOT advance last_pull_at), "tickers_not_attempted"
               equal to the full requested ticker_list, "counts" all-zero
-              except "unattempted", and "skipped_reason" naming why.
+              except "unattempted", and "skipped_reason" naming which guard
+              (in-process vs cross-process) skipped the run.
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
 
-        # Single-flight guard (fix #1): non-blocking acquire so a second
-        # concurrent pull_all() — most commonly the scheduler's NEXT tick
-        # finding an earlier orphaned/still-running call, but any
-        # accidental double-invocation is equally dangerous — skips its
-        # entire run rather than racing the in-flight one. See the module
-        # docstring on _PULL_ALL_LOCK for why this must be a module-level
-        # lock rather than an instance attribute.
-        if not _PULL_ALL_LOCK.acquire(blocking=False):
+        def _skip_result(reason: str) -> list[dict[str, Any]] | dict[str, Any]:
             log.warning(
-                "yfinance pull_all: a previous run is still active in this "
-                "process — skipping this run entirely (single-flight guard, "
-                "no tickers attempted)",
+                "yfinance pull_all: {reason} — skipping this run entirely "
+                "(no tickers attempted)",
+                reason=reason,
             )
             if should_continue is None:
                 return []
@@ -689,10 +815,31 @@ class YFinancePuller(BasePuller):
                 "results": [],
                 "tickers_not_attempted": list(ticker_list),
                 "counts": counts,
-                "skipped_reason": "pull_all already running in this process",
+                "skipped_reason": reason,
             }
 
+        # In-process single-flight guard (fix #1): non-blocking acquire so a
+        # second concurrent pull_all() call IN THIS PROCESS — most commonly
+        # the scheduler's next tick finding an earlier orphaned/still-running
+        # call — skips its run rather than racing the in-flight one. Cheap
+        # (no DB round-trip), so it stays as the first check. See the module
+        # docstring on _PULL_ALL_LOCK for why this must be module-level, not
+        # an instance attribute.
+        if not _PULL_ALL_LOCK.acquire(blocking=False):
+            return _skip_result("pull_all already running in this process")
+
+        pg_lock_conn = None
         try:
+            # Cross-process single-flight guard: _PULL_ALL_LOCK above cannot
+            # see a concurrent pull_all() running in a DIFFERENT process
+            # (grid-scheduler vs grid-hermes — see _PULL_ALL_ADVISORY_LOCK_KEY's
+            # comment). A Postgres session-level advisory lock can.
+            pg_lock_conn = self._try_acquire_pg_advisory_lock()
+            if pg_lock_conn is None:
+                return _skip_result(
+                    "another process holds the cross-process advisory lock"
+                )
+
             log.info(
                 "Starting yfinance bulk pull — checking {n} tickers from {sd}",
                 n=len(ticker_list),
@@ -738,6 +885,8 @@ class YFinancePuller(BasePuller):
                 "counts": counts,
             }
         finally:
+            if pg_lock_conn is not None:
+                self._release_pg_advisory_lock(pg_lock_conn)
             _PULL_ALL_LOCK.release()
 
 

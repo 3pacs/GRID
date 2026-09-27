@@ -25,7 +25,7 @@ if "multitasking" not in sys.modules:
     _shim.wait_for_tasks = lambda *a, **k: None
     sys.modules["multitasking"] = _shim
 
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock, create_autospec, patch
 
 import pandas as pd
@@ -646,7 +646,10 @@ def test_wild_ratio_guard_refuses_write_for_wrong_instrument_values(engine_recor
     from ingestion import yfinance_pull
 
     engine, conn = engine_recording_inserts
-    dates = [date(2026, 9, d) for d in range(1, 9)]
+    # Recent (within _WILD_RATIO_LOOKBACK_DAYS), relative to the real clock
+    # rather than a hardcoded date — the guard's own lookup is now bounded
+    # to "recent" (see _median_ratio_vs_existing's docstring).
+    dates = [date.today() - timedelta(days=17 - i) for i in range(8)]
     frame = pd.DataFrame(
         # ~30-37: plausible for some instrument, wildly off vs the
         # existing ~680-687 SPY-scale values on the very same dates.
@@ -671,7 +674,8 @@ def test_wild_ratio_guard_refuses_write_for_wrong_instrument_values(engine_recor
          patch.object(yfinance_pull.yf, "download", return_value=frame):
         puller = yfinance_pull.YFinancePuller(engine)
         result = puller.pull_ticker(
-            "TLT", start_date="2026-09-01", end_date="2026-09-09",
+            "TLT", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
         )
 
     assert result["rows_inserted"] == 0
@@ -687,7 +691,7 @@ def test_wild_ratio_guard_allows_a_small_normal_revision(engine_recording_insert
     from ingestion import yfinance_pull
 
     engine, conn = engine_recording_inserts
-    dates = [date(2026, 9, d) for d in range(1, 6)]
+    dates = [date.today() - timedelta(days=10 - i) for i in range(5)]
     frame = pd.DataFrame(
         {"Close": [680.1, 681.2, 682.0, 683.5, 684.0]},
         index=pd.DatetimeIndex([pd.Timestamp(d) for d in dates], name="Date"),
@@ -709,7 +713,10 @@ def test_wild_ratio_guard_allows_a_small_normal_revision(engine_recording_insert
          patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
          patch.object(yfinance_pull.yf, "download", return_value=frame):
         puller = yfinance_pull.YFinancePuller(engine)
-        result = puller.pull_ticker("TLT", start_date="2026-09-01", end_date="2026-09-06")
+        result = puller.pull_ticker(
+            "TLT", start_date=dates[0].isoformat(),
+            end_date=(dates[-1] + timedelta(days=1)).isoformat(),
+        )
 
     assert result["errors"] == []
     assert result["rows_inserted"] == 5
@@ -721,11 +728,12 @@ def test_wild_ratio_guard_needs_minimum_overlap_before_judging(engine_recording_
     from ingestion import yfinance_pull
 
     engine, conn = engine_recording_inserts
+    recent_date = date.today() - timedelta(days=5)
     frame = pd.DataFrame(
         {"Close": [5.0]},  # wildly different from the one existing row...
-        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+        index=pd.DatetimeIndex([pd.Timestamp(recent_date)], name="Date"),
     )
-    existing_rows = [(date(2026, 9, 11), 680.0)]  # ...but only 1 overlap.
+    existing_rows = [(recent_date, 680.0)]  # ...but only 1 overlap.
 
     def execute(statement, params=None):
         result = MagicMock()
@@ -742,10 +750,98 @@ def test_wild_ratio_guard_needs_minimum_overlap_before_judging(engine_recording_
          patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
          patch.object(yfinance_pull.yf, "download", return_value=frame):
         puller = yfinance_pull.YFinancePuller(engine)
-        result = puller.pull_ticker("TLT", start_date="2026-09-11")
+        result = puller.pull_ticker("TLT", start_date=recent_date.isoformat())
 
     assert result["errors"] == []
     assert result["rows_inserted"] == 1
+
+
+def test_pull_all_skips_when_pg_advisory_lock_held_by_another_process(engine_recording_inserts):
+    """Cross-process guard (coordinator review of PR #672): pg_try_advisory_lock
+    returning falsy (another OS process already holds it — grid-scheduler
+    and grid-hermes both call pull_all independently) must skip the whole
+    run just like the in-process thread lock, release the in-process lock
+    again (so this process's own next attempt isn't blocked by it too), and
+    must not call pg_advisory_unlock for a lock it never actually took."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    engine.connect.return_value.execute.return_value.scalar.return_value = False
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.yf, "download") as mock_download:
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_all(ticker_list=["AAA"], start_date="2026-09-11")
+
+    assert result == []
+    mock_download.assert_not_called()
+    assert not yfinance_pull._PULL_ALL_LOCK.locked()
+    engine.connect.return_value.close.assert_called()
+    unlock_calls = [
+        c for c in engine.connect.return_value.execute.call_args_list
+        if "pg_advisory_unlock" in str(c.args[0] if c.args else "")
+    ]
+    assert not unlock_calls, "must not unlock a lock that was never acquired"
+
+
+def test_pull_all_skip_reason_names_the_cross_process_guard(engine_recording_inserts):
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    engine.connect.return_value.execute.return_value.scalar.return_value = False
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.yf, "download"):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_all(
+            ticker_list=["AAA"], start_date="2026-09-11", should_continue=lambda: True,
+        )
+
+    assert result["status"] == "SKIPPED"
+    assert result["stopped_by_budget"] is True
+    assert "cross-process" in result["skipped_reason"]
+
+
+def test_pull_all_releases_pg_advisory_lock_after_a_normal_run(engine_recording_inserts):
+    """When the advisory lock IS acquired, a normal run must release it
+    (pg_advisory_unlock) and close that connection afterward — otherwise
+    the lock would starve every future pull_all() call, in this process or
+    any other, exactly like an orphaned thread starves _PULL_ALL_LOCK."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    engine.connect.return_value.execute.return_value.scalar.return_value = True
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_all(ticker_list=["AAA"], start_date="2026-09-11")
+
+    assert len(result) == 1
+    unlock_calls = [
+        c for c in engine.connect.return_value.execute.call_args_list
+        if "pg_advisory_unlock" in str(c.args[0] if c.args else "")
+    ]
+    assert len(unlock_calls) == 1
+    engine.connect.return_value.close.assert_called()
+
+
+def test_advisory_lock_key_is_deterministic_across_processes(engine_recording_inserts):
+    """Python's hash() is randomised per process (PYTHONHASHSEED) — the key
+    two separate OS processes need to agree on must come from something
+    deterministic instead."""
+    from ingestion import yfinance_pull
+
+    key1 = yfinance_pull._stable_advisory_lock_key("grid:yfinance:pull_all")
+    key2 = yfinance_pull._stable_advisory_lock_key("grid:yfinance:pull_all")
+    assert key1 == key2 == yfinance_pull._PULL_ALL_ADVISORY_LOCK_KEY
+    assert isinstance(key1, int)
+    assert -(2**63) <= key1 < 2**63  # must fit Postgres's signed bigint
 
 
 def test_pull_all_with_should_continue_reports_per_outcome_counts(engine_recording_inserts):
