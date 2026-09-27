@@ -190,10 +190,21 @@ class WikiHistoryPuller:
             with self.engine.begin() as conn:
                 # Ensure source exists
                 conn.execute(text(
-                    "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class) "
-                    "VALUES ('WikiHistory', 'https://api.wikimedia.org', 'free', 'batch') "
+                    "INSERT INTO source_catalog "
+                    "(name, base_url, cost_tier, latency_class, pit_available, "
+                    "revision_behavior, trust_score, priority_rank) "
+                    "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
                     "ON CONFLICT (name) DO NOTHING"
-                ))
+                ), {
+                    "name": "WikiHistory",
+                    "url": "https://api.wikimedia.org",
+                    "cost": "FREE",
+                    "latency": "EOD",
+                    "pit": False,
+                    "rev": "NEVER",
+                    "trust": "MED",
+                    "rank": 80,
+                })
                 src = conn.execute(
                     text("SELECT id FROM source_catalog WHERE name = 'WikiHistory'")
                 ).fetchone()

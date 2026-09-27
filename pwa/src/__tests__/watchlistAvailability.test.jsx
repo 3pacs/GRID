@@ -5,6 +5,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import FlowTimeline from '../components/FlowTimeline.jsx';
 import WatchlistAnalysis from '../views/WatchlistAnalysis.jsx';
 import { api } from '../api.js';
+import { formatDate } from '../utils/formatTime.js';
 
 vi.mock('../api.js', () => ({
     api: {
@@ -84,5 +85,41 @@ describe('Watchlist overview availability', () => {
         render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
         expect(await screen.findByText('Measured context')).toBeInTheDocument();
         expect(screen.queryByText(/AI overview unavailable/)).not.toBeInTheDocument();
+    });
+
+    it("shows the price's own date and source, distinct from the AI-generated timestamp (#F1 D6)", async () => {
+        api.getTickerOverview.mockResolvedValue({
+            sentiment: 'neutral', overview: 'Measured context',
+            generated_at: '2026-09-26T12:00:00Z',
+            price_as_of: '2026-09-20', price_source: 'grid',
+        });
+        render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
+        expect(await screen.findByText(`Price as of ${formatDate('2026-09-20')} · grid`)).toBeInTheDocument();
+    });
+
+    it('labels a live-fallback price\'s source as an estimate, not a bare "live"', async () => {
+        api.getTickerOverview.mockResolvedValue({
+            sentiment: 'neutral', overview: 'Measured context',
+            price_as_of: '2026-09-20', price_source: 'live',
+        });
+        render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
+        expect(await screen.findByText(/yfinance estimate/)).toBeInTheDocument();
+    });
+
+    it('shows "date unknown" rather than a fabricated date when only the source is known', async () => {
+        api.getTickerOverview.mockResolvedValue({
+            sentiment: 'neutral', overview: 'Measured context',
+            price_as_of: null, price_source: 'live',
+        });
+        render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
+        expect(await screen.findByText(/Price \(date unknown\) . yfinance estimate/)).toBeInTheDocument();
+    });
+
+    it('omits the price-provenance line when neither field is present', async () => {
+        api.getTickerOverview.mockResolvedValue({ sentiment: 'neutral', overview: 'Measured context' });
+        render(<WatchlistAnalysis ticker="AAPL" onBack={() => {}} />);
+        await screen.findByText('Measured context');
+        expect(screen.queryByText(/Price as of/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/date unknown/)).not.toBeInTheDocument();
     });
 });

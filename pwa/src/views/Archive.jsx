@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { formatRelative, formatFullDateTime } from '../utils/formatTime.js';
@@ -296,6 +296,8 @@ export default function Archive() {
     const [activeTab, setActiveTab] = useState('deep_dives');
     const [generating, setGenerating] = useState(false);
     const [playerUrl, setPlayerUrl] = useState(null);
+    const [playerError, setPlayerError] = useState(null);
+    const playerUrlRef = useRef(null);
     const [days, setDays] = useState(90);
 
     const { data: archive, loading, error, refetch: loadArchive } = useAsyncData(async () => {
@@ -312,8 +314,26 @@ export default function Archive() {
         setGenerating(false);
     };
 
-    const playAudio = (filename) => {
-        setPlayerUrl(api.getFlowBriefingAudioUrl(filename));
+    // <audio src> cannot send headers, so the MP3 is fetched with the
+    // Authorization header and played from an object URL; the session token
+    // never goes in a URL.
+    const setPlayer = (url) => {
+        if (playerUrlRef.current) URL.revokeObjectURL?.(playerUrlRef.current);
+        playerUrlRef.current = url;
+        setPlayerUrl(url);
+    };
+    useEffect(() => () => {
+        if (playerUrlRef.current) URL.revokeObjectURL?.(playerUrlRef.current);
+    }, []);
+
+    const playAudio = async (filename) => {
+        setPlayerError(null);
+        const url = await api.loadFlowBriefingAudio(filename);
+        if (!url) {
+            setPlayerError('Could not load that briefing audio.');
+            return;
+        }
+        setPlayer(url);
     };
 
     const counts = useMemo(() => ({
@@ -357,6 +377,12 @@ export default function Archive() {
                 </div>
             </div>
 
+            {playerError && (
+                <div role="status" aria-live="polite" style={{
+                    fontFamily: MONO, fontSize: '11px', color: colors.red, marginBottom: '12px',
+                }}>{playerError}</div>
+            )}
+
             {/* Audio Player (sticky) */}
             {playerUrl && (
                 <div style={{
@@ -368,7 +394,7 @@ export default function Archive() {
                         letterSpacing: '1px', flexShrink: 0 }}>NOW PLAYING</span>
                     <audio src={playerUrl} controls autoPlay
                         style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }} />
-                    <button onClick={() => setPlayerUrl(null)} style={{
+                    <button onClick={() => setPlayer(null)} style={{
                         fontFamily: MONO, fontSize: '12px', background: 'transparent',
                         border: 'none', color: colors.textDim, cursor: 'pointer',
                     }}>{'\u2715'}</button>

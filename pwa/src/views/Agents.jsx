@@ -389,7 +389,7 @@ export default function Agents() {
             <div style={styles.card}>
                 {runs.length === 0 && (
                     <div style={{ color: '#5A7080', fontSize: '13px' }}>
-                        No agent runs yet
+                        Not generated — no agent run has completed yet. Trigger a run above or check the scheduled job's logs.
                     </div>
                 )}
                 {runs.map((run) => (
