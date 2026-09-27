@@ -273,6 +273,29 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
 
+      # fix/pre-retraction-and-679-followups-20260927: PR #683
+      # (resolved_series_retractions, not yet on main) adds an FK to the
+      # retracted resolved_series row. Proves the resolved_series dedup
+      # delete paths in intelligence/resolution_audit.py and
+      # scripts/hermes_fixers.py never hit that FK against real Postgres,
+      # still clean up an unretracted duplicate in the same batch, and that
+      # the SAVEPOINT this fix adds around the Hermes delete confines a
+      # genuine FK violation to the one dupe-group that hit it.
+      - name: resolved_series dedup retraction-guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_dedup_retraction_guard_pg.py -q -rA | tee /tmp/grid-dedup-retraction-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-dedup-retraction-pg.txt; then
+            echo "::error::resolved_series dedup retraction-guard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

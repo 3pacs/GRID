@@ -642,6 +642,74 @@ def _load_latest_findings(engine: Engine, limit: int = 200) -> list[dict]:
 # Auto-fix logic
 # ---------------------------------------------------------------------------
 
+# PR #683 (feat/resolved-series-retractions-20260927, not yet on main) adds
+# resolved_series_retractions with an FK to the retracted resolved_series row
+# keyed on (feature_id, obs_date, vintage_date), plus an append-only trigger
+# that refuses UPDATE/DELETE on it. Once that lands, deleting a retracted
+# resolved_series row here would hit an FK violation. The dedup delete below
+# checks for the table at runtime (to_regclass) and, when present, anti-joins
+# retracted rows out of the delete set — it works identically whether or not
+# the migration has been applied.
+_DEDUP_KEEP_BEST_PREDICATE = """
+    id NOT IN (
+        SELECT DISTINCT ON (feature_id, obs_date)
+            id
+        FROM resolved_series rs
+        JOIN feature_registry fr ON fr.id = rs.feature_id
+        WHERE fr.name = :fname
+          AND rs.obs_date = :od::date
+        ORDER BY feature_id, obs_date,
+                 source_priority_used ASC
+    )
+    AND feature_id = (
+        SELECT id FROM feature_registry WHERE name = :fname
+    )
+    AND obs_date = :od::date
+"""
+
+_RETRACTED_KEY_MATCH = """
+    EXISTS (
+        SELECT 1 FROM resolved_series_retractions rsr
+        WHERE rsr.feature_id = resolved_series.feature_id
+          AND rsr.obs_date = resolved_series.obs_date
+          AND rsr.vintage_date = resolved_series.vintage_date
+    )
+"""
+
+_DEDUP_DELETE_SQL = "DELETE FROM resolved_series WHERE " + _DEDUP_KEEP_BEST_PREDICATE
+_DEDUP_DELETE_SQL_RETRACTION_SAFE = (
+    _DEDUP_DELETE_SQL + " AND NOT " + _RETRACTED_KEY_MATCH
+)
+_DEDUP_SKIPPED_COUNT_SQL = (
+    "SELECT COUNT(*) FROM resolved_series WHERE "
+    + _DEDUP_KEEP_BEST_PREDICATE
+    + " AND "
+    + _RETRACTED_KEY_MATCH
+)
+
+
+def _retractions_table_exists(conn: Any) -> bool:
+    """True if resolved_series_retractions exists (PR #683's migration).
+
+    Works whether or not that migration has been applied yet on this
+    database: any failure (relation genuinely absent, or anything else)
+    is treated as "no retractions to protect" so callers fall back to the
+    pre-#683 delete behaviour rather than raising. Unqualified (relies on
+    search_path), matching how every other query in this module addresses
+    resolved_series itself -- a hardcoded "public." prefix would silently
+    miss the table on a non-default search_path (e.g. a test's scratch
+    schema).
+    """
+    try:
+        return bool(
+            conn.execute(
+                text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                {"table_name": "resolved_series_retractions"},
+            ).scalar()
+        )
+    except Exception:
+        return False
+
 
 def auto_fix_issues(
     engine: Engine,
@@ -686,27 +754,25 @@ def auto_fix_issues(
             else:
                 try:
                     with engine.begin() as conn:
-                        # Delete all but the best-priority row
-                        conn.execute(
-                            text("""
-                                DELETE FROM resolved_series
-                                WHERE id NOT IN (
-                                    SELECT DISTINCT ON (feature_id, obs_date)
-                                        id
-                                    FROM resolved_series rs
-                                    JOIN feature_registry fr ON fr.id = rs.feature_id
-                                    WHERE fr.name = :fname
-                                      AND rs.obs_date = :od::date
-                                    ORDER BY feature_id, obs_date,
-                                             source_priority_used ASC
+                        params = {"fname": f.feature, "od": obs_date}
+                        has_retractions = _retractions_table_exists(conn)
+                        if has_retractions:
+                            skipped = conn.execute(
+                                text(_DEDUP_SKIPPED_COUNT_SQL), params
+                            ).scalar() or 0
+                            if skipped:
+                                log.info(
+                                    "Dedup skip: {n} retracted resolved_series row(s) "
+                                    "for {f} on {d} left in place "
+                                    "(FK-protected by resolved_series_retractions)",
+                                    n=skipped, f=f.feature, d=obs_date,
                                 )
-                                AND feature_id = (
-                                    SELECT id FROM feature_registry WHERE name = :fname
-                                )
-                                AND obs_date = :od::date
-                            """),
-                            {"fname": f.feature, "od": obs_date},
-                        )
+                            # Delete all but the best-priority row, minus any
+                            # row a retraction now protects from deletion.
+                            conn.execute(text(_DEDUP_DELETE_SQL_RETRACTION_SAFE), params)
+                        else:
+                            # Delete all but the best-priority row
+                            conn.execute(text(_DEDUP_DELETE_SQL), params)
                     result["duplicates_fixed"] += 1
                 except Exception as exc:
                     log.error(

@@ -352,6 +352,75 @@ def _require_engine(engine: Any, cmd: str) -> Any:
     return engine
 
 
+# PR #683 (feat/resolved-series-retractions-20260927, not yet on main) adds
+# resolved_series_retractions with an FK to the retracted resolved_series row
+# keyed on (feature_id, obs_date, vintage_date), plus an append-only trigger
+# that refuses UPDATE/DELETE on it. The dedup delete in
+# _run_data_quality_fix below checks for the table at runtime (to_regclass)
+# and, when present, anti-joins retracted rows out of the delete set -- it
+# works identically whether or not the migration has been applied. Mirrors
+# intelligence/resolution_audit.py's copy of the same predicate/helper shape
+# (per-module duplication follows this codebase's existing
+# _resolve_source_id()/_row_exists() convention rather than a shared util).
+_HERMES_DEDUP_KEEP_MIN_PREDICATE = (
+    "ctid NOT IN ("
+    "  SELECT MIN(ctid) FROM resolved_series rs "
+    "  JOIN feature_registry fr ON fr.id = rs.feature_id "
+    "  WHERE fr.name = :fname AND rs.obs_date = :odate "
+    "  GROUP BY rs.feature_id, rs.obs_date"
+    ") AND feature_id = (SELECT id FROM feature_registry WHERE name = :fname) "
+    "AND obs_date = :odate"
+)
+
+_HERMES_RETRACTED_KEY_MATCH = (
+    "EXISTS ("
+    "  SELECT 1 FROM resolved_series_retractions rsr"
+    "  WHERE rsr.feature_id = resolved_series.feature_id"
+    "    AND rsr.obs_date = resolved_series.obs_date"
+    "    AND rsr.vintage_date = resolved_series.vintage_date"
+    ")"
+)
+
+_HERMES_DEDUP_DELETE_SQL = (
+    "DELETE FROM resolved_series WHERE " + _HERMES_DEDUP_KEEP_MIN_PREDICATE
+)
+_HERMES_DEDUP_DELETE_SQL_RETRACTION_SAFE = (
+    _HERMES_DEDUP_DELETE_SQL + " AND NOT " + _HERMES_RETRACTED_KEY_MATCH
+)
+_HERMES_DEDUP_SKIPPED_COUNT_SQL = (
+    "SELECT COUNT(*) FROM resolved_series WHERE "
+    + _HERMES_DEDUP_KEEP_MIN_PREDICATE
+    + " AND "
+    + _HERMES_RETRACTED_KEY_MATCH
+)
+
+
+def _hermes_retractions_table_exists(conn: Any) -> bool:
+    """True if resolved_series_retractions exists (PR #683's migration).
+
+    Runs its own SAVEPOINT so a failure here (e.g. insufficient privilege)
+    can never poison the caller's outer transaction; any failure is treated
+    as "table absent" so the caller falls back to the pre-#683 delete
+    behaviour instead of raising. Unqualified (relies on search_path),
+    matching how every other query in this function addresses
+    resolved_series itself -- a hardcoded "public." prefix would silently
+    miss the table on a non-default search_path (e.g. a test's scratch
+    schema).
+    """
+    from sqlalchemy import text as sa_text
+
+    try:
+        with conn.begin_nested():
+            return bool(
+                conn.execute(
+                    sa_text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": "resolved_series_retractions"},
+                ).scalar()
+            )
+    except Exception:
+        return False
+
+
 def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState) -> dict[str, Any]:
     from sqlalchemy import text as sa_text
 
@@ -405,21 +474,43 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
         for r in outlier_rows:
             dq_issues.append({"type": "outlier", "feature": r[0], "value": float(r[1]), "date": str(r[2])})
 
-        # Auto-fix exact duplicates, keeping one row per feature/date.
+        # Auto-fix exact duplicates, keeping one row per feature/date. Each
+        # delete runs inside its own SAVEPOINT (conn.begin_nested()): before
+        # this fix, one FK violation (a retracted, FK-protected row -- PR
+        # #683) raised inside the single transaction shared by this whole
+        # `with engine.begin() as conn:` block, which Postgres then leaves
+        # aborted -- the bare try/except caught the Python exception but
+        # every later statement on that connection, including the rest of
+        # this loop and the implicit commit, failed too, so one protected
+        # row silently rolled back every other dedup in the batch. A
+        # SAVEPOINT per row confines that rollback to the one row.
+        has_retractions = _hermes_retractions_table_exists(conn)
+        skipped_total = 0
         for r in dupe_rows:
+            row_params = {"fname": r[0], "odate": r[1]}
             try:
-                conn.execute(sa_text(
-                    "DELETE FROM resolved_series WHERE ctid NOT IN ("
-                    "  SELECT MIN(ctid) FROM resolved_series rs "
-                    "  JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "  WHERE fr.name = :fname AND rs.obs_date = :odate "
-                    "  GROUP BY rs.feature_id, rs.obs_date"
-                    ") AND feature_id = (SELECT id FROM feature_registry WHERE name = :fname) "
-                    "AND obs_date = :odate"
-                ), {"fname": r[0], "odate": r[1]})
+                with conn.begin_nested():
+                    if has_retractions:
+                        skipped = conn.execute(
+                            sa_text(_HERMES_DEDUP_SKIPPED_COUNT_SQL), row_params
+                        ).scalar() or 0
+                        skipped_total += skipped
+                        conn.execute(
+                            sa_text(_HERMES_DEDUP_DELETE_SQL_RETRACTION_SAFE),
+                            row_params,
+                        )
+                    else:
+                        conn.execute(sa_text(_HERMES_DEDUP_DELETE_SQL), row_params)
                 fixes += 1
             except Exception as exc:
                 log.debug("Hermes: duplicate resolved_series delete failed for {f}: {e}", f=r[0], e=str(exc))
+        if skipped_total:
+            log.info(
+                "Hermes dedup: {n} retracted resolved_series row(s) left in place "
+                "across {k} feature/date group(s) (FK-protected by "
+                "resolved_series_retractions)",
+                n=skipped_total, k=len(dupe_rows),
+            )
 
     severity = "WARNING" if len(dq_issues) < 5 else "ERROR" if len(dq_issues) < 20 else "CRITICAL"
     if dq_issues:
