@@ -831,8 +831,9 @@ class GRIDApi {
     async getFlowLayerDetail(layerId) { return this._fetch(`/api/v1/flows/layers/${encodeURIComponent(layerId)}`); }
     async getFlowWaterfall(source = 'fed') { return this._fetch(`/api/v1/flows/waterfall?source=${encodeURIComponent(source)}`); }
     async getFlowOrthogonality() { return this._fetch('/api/v1/flows/orthogonality'); }
+    /** Paid call (Imagen) — POST only, gated server-side behind GRID_ALLOW_PAID_LLM. */
     async generateFlowImage(type, style = 'dark') {
-        return this._fetch(`/api/v1/flows/generate-image/${encodeURIComponent(type)}?style=${style}`);
+        return this._fetch(`/api/v1/flows/generate-image/${encodeURIComponent(type)}?style=${style}`, { method: 'POST' });
     }
     async getCdsDashboard() { return this._fetch('/api/v1/flows/cds'); }
     async getCdsHistory(seriesKey, days = 365) {
