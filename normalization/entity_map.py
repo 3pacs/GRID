@@ -249,11 +249,11 @@ SEED_MAPPINGS: dict[str, str] = {
     "baltic.panamax": "baltic.panamax",
     "baltic.supramax": "baltic.supramax",
 
-    # ── CFTC COT positioning series (pattern: cftc.{CONTRACT}.{metric}) ───
-    # Major contracts: SP500, DJIA, NASDAQ, NOTE10Y, NOTE5Y, NOTE2Y,
-    # EURODOLLAR, GOLD, SILVER, CRUDE_OIL, NATGAS, COPPER, CORN,
-    # SOYBEANS, WHEAT, VIX
-    # (These use dynamic series_id like cftc.SP500.net_speculative)
+    # ── CFTC COT positioning series (pattern: cftc.{MARKET_CODE}.{metric}) ─
+    # Keyed by cftc_contract_market_code, e.g. cftc.13874A.net_speculative
+    # (E-mini S&P 500). Registry: ingestion/altdata/cftc_markets.py.
+    # Legacy name-matched ids (cftc.SP500.*, cftc.GOLD.* ...) mixed several
+    # markets per id; they are frozen history, not mapped to features.
 
     # ── Comtrade series (puller writes labels directly as series_id) ───────
     "us_exports_total": "us_exports_total",

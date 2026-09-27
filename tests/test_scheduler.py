@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import sys
+from datetime import datetime
 from types import SimpleNamespace
 
 import config
@@ -108,3 +109,111 @@ def test_intelligence_loop_registers_expected_jobs(monkeypatch):
     assert jobs_by_name["_options_tracker"]["unit"] == "days"
     assert jobs_by_name["_fci_compute_6h"]["interval"] == 6
     assert jobs_by_name["_credit_novelty_daily"]["at"] == "04:30"
+
+
+class _CapturingSchedule:
+    """Minimal fake `schedule` module that captures the real job callables
+    (by function name) instead of just recording their cadence, so a test
+    can invoke one job's closure directly."""
+
+    def __init__(self) -> None:
+        self.callables: dict[str, object] = {}
+
+    def every(self, interval: int = 1) -> "_CapturingJob":
+        return _CapturingJob(self)
+
+    def run_pending(self) -> None:
+        pass
+
+
+class _CapturingJob:
+    _UNITS = {"minutes", "hours", "day", "days"}
+    _DAYS = {
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday",
+    }
+
+    def __init__(self, fake_schedule: _CapturingSchedule) -> None:
+        self._schedule = fake_schedule
+
+    def __getattr__(self, name: str) -> "_CapturingJob":
+        if name in self._UNITS or name in self._DAYS:
+            return self
+        raise AttributeError(name)
+
+    def at(self, when: str) -> "_CapturingJob":
+        return self
+
+    def do(self, func):
+        self._schedule.callables[func.__name__] = func
+        return self
+
+
+def test_thesis_invalidation_hourly_logs_real_monitor_run_fields(monkeypatch):
+    """CAT-190 regression: the hourly job's summary log line must read
+    fields that actually exist on `MonitorRun`/`InvalidationEvent`
+    ('MonitorRun' object has no attribute 'theses_checked' was the
+    production failure). Runs the job's own summary-logging path against
+    a real MonitorRun instance — not a mock — so a stale field name would
+    raise AttributeError here exactly as it did in production."""
+    import db
+    import intelligence.thesis_invalidation_monitor as tim
+    from intelligence.thesis_invalidation_monitor import (
+        InvalidationEvent,
+        MonitorRun,
+    )
+
+    captured = _CapturingSchedule()
+
+    monkeypatch.setattr(config, "Settings", lambda: object())
+    monkeypatch.setattr(scheduler, "_sched", captured)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+
+    thesis_job = captured.callables["_thesis_invalidation_hourly"]
+
+    real_run = MonitorRun(
+        as_of=datetime(2026, 4, 13),
+        predictions_scanned=7,
+        events=[
+            InvalidationEvent(
+                journal_id=1,
+                ticker="AAPL",
+                inval_type="price_level",
+                triggered_at=datetime(2026, 4, 13),
+                reason="close 170 < 180",
+                current_value=170.0,
+                threshold_value=180.0,
+                auto_size_down_to=0.0,
+            ),
+        ],
+        errors=["pred 9: malformed invalidation"],
+    )
+
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(tim, "run_monitor", lambda engine: real_run)
+
+    warnings: list[str] = []
+    infos: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append((msg, kw))
+    )
+
+    thesis_job()
+
+    # No AttributeError should have been swallowed into a warning log.
+    assert warnings == []
+    assert len(infos) == 1
+    msg, kw = infos[0]
+    assert kw["t"] == real_run.predictions_scanned == 7
+    assert kw["i"] == real_run.triggered_count == 1
+    assert kw["e"] == len(real_run.errors) == 1
