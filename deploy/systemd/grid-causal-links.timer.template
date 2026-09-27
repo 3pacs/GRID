@@ -1,0 +1,13 @@
+# TEMPLATE — NOT INSTALLED. See grid-causal-links.service.template.
+# Daily after the morning Form 4 / QuiverQuant pulls (~04:00 and ~06:35 UTC).
+[Unit]
+Description=Run the GRID causal-link writer once a day
+
+[Timer]
+OnCalendar=*-*-* 07:40:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=grid-causal-links.service
+
+[Install]
+WantedBy=timers.target

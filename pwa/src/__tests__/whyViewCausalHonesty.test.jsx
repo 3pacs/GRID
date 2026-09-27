@@ -37,7 +37,7 @@ const MOVE = {
 describe('WhyView — causal-link honesty', () => {
     it('never claims the causation engine "runs periodically" when nothing was generated', async () => {
         api.getForensicReports.mockResolvedValue({ reports: [MOVE] });
-        api.getCausalLinks.mockResolvedValue({ causes: [] });
+        api.getCausalLinks.mockResolvedValue({ causes: [], generated: false, as_of: null });
         api.getEventTimeline.mockResolvedValue({ events: [] });
 
         render(<WhyView />);
@@ -55,5 +55,36 @@ describe('WhyView — causal-link honesty', () => {
         });
         // The false claim this replaces ("runs periodically") must be gone.
         expect(screen.queryByText(/causation engine runs periodically/)).not.toBeInTheDocument();
+    });
+
+    it('shows persisted links as preceding events with a heuristic score and as-of label', async () => {
+        api.getForensicReports.mockResolvedValue({ reports: [MOVE] });
+        api.getCausalLinks.mockResolvedValue({
+            generated: true,
+            as_of: '2026-09-27T07:40:00+00:00',
+            causes: [{
+                ticker: 'SPY', cause_type: 'earnings', probable_cause: 'Earnings beat released 2026-09-10',
+                actor: 'Jane Doe', action: 'SELL', action_date: '2026-09-15', score: 0.62,
+                probability: 0.62, lead_time_days: 4, known_at: '2026-09-17T00:00:00+00:00', evidence: [],
+            }],
+        });
+        api.getEventTimeline.mockResolvedValue({ events: [] });
+
+        render(<WhyView />);
+
+        fireEvent.change(screen.getByPlaceholderText('Ticker (e.g. NVDA)'), { target: { value: 'SPY' } });
+        fireEvent.click(screen.getByText('Investigate'));
+        await waitFor(() => {
+            expect(screen.getByText(/SIGNIFICANT MOVES DETECTED/)).toBeInTheDocument();
+        });
+        fireEvent.click(screen.getByText('2026-09-20'));
+
+        await waitFor(() => {
+            expect(screen.getByText('PRECEDING PUBLIC EVENTS')).toBeInTheDocument();
+        });
+        expect(screen.getByText(/timing, not proof of cause/)).toBeInTheDocument();
+        expect(screen.getByText(/As of 2026-09-27 07:40 UTC/)).toBeInTheDocument();
+        expect(screen.getByText('score 0.62')).toBeInTheDocument();
+        expect(screen.queryByText('62%')).not.toBeInTheDocument();
     });
 });

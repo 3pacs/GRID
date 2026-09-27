@@ -9,7 +9,7 @@
  *   2. The Move: price chart with highlighted move period
  *   3. The Timeline: D3 zoomed timeline with causal connection lines
  *   4. The Actors: who was active, dollar amounts, motivation
- *   5. The Causes: what events explain why actors traded
+ *   5. Preceding public events: what was public before each trade (persisted causal links, as-of labelled)
  *   6. The Dollar Story: total flow breakdown pie chart
  *   7. The Narrative: LLM-generated forensic story
  *   8. Pattern Match: recurring pattern badge
@@ -87,6 +87,11 @@ function formatUSD(val) {
     return `$${val.toFixed(0)}`;
 }
 
+function fmtAsOf(ts) {
+    if (!ts) return '--';
+    return String(ts).slice(0, 16).replace('T', ' ');
+}
+
 function formatPct(pct) {
     if (pct == null) return '--';
     const sign = pct >= 0 ? '+' : '';
@@ -143,6 +148,8 @@ export default function WhyView({ onNavigate }) {
     const [selectedMove, setSelectedMove] = useState(null);
     const [forensicReport, setForensicReport] = useState(null);
     const [causalLinks, setCausalLinks] = useState([]);
+    // { generated, as_of } from the persisted causal-link payload.
+    const [causalMeta, setCausalMeta] = useState(null);
     const [timelineEvents, setTimelineEvents] = useState([]);
 
     const [loading, setLoading] = useState(false);
@@ -182,6 +189,7 @@ export default function WhyView({ onNavigate }) {
         setSelectedMove(null);
         setForensicReport(null);
         setCausalLinks([]);
+        setCausalMeta(null);
         setTimelineEvents([]);
         setAnimPhase(0);
 
@@ -233,6 +241,9 @@ export default function WhyView({ onNavigate }) {
             if (causalRes && !causalRes.error) {
                 const links = causalRes.causes || causalRes.links || causalRes || [];
                 setCausalLinks(Array.isArray(links) ? links : []);
+                setCausalMeta({ generated: causalRes.generated !== false, as_of: causalRes.as_of || null });
+            } else {
+                setCausalMeta({ generated: false, as_of: null });
             }
             if (eventsRes && !eventsRes.error) {
                 const evts = eventsRes.events || [];
@@ -293,7 +304,7 @@ export default function WhyView({ onNavigate }) {
         if (!causalLinks.length) return [];
         return causalLinks
             .filter(c => c.ticker === ticker)
-            .sort((a, b) => (b.probability || 0) - (a.probability || 0));
+            .sort((a, b) => ((b.score ?? b.probability) || 0) - ((a.score ?? a.probability) || 0));
     }, [causalLinks, ticker]);
 
     // Dollar flow breakdown by source type
@@ -791,7 +802,7 @@ export default function WhyView({ onNavigate }) {
             {selectedMove && (
                 <button
                     style={{ ...shared.buttonSmall, background: colors.card, color: colors.textDim, marginBottom: '16px' }}
-                    onClick={() => { setSelectedMove(null); setForensicReport(null); setCausalLinks([]); setTimelineEvents([]); setAnimPhase(0); }}
+                    onClick={() => { setSelectedMove(null); setForensicReport(null); setCausalLinks([]); setCausalMeta(null); setTimelineEvents([]); setAnimPhase(0); }}
                 >
                     &larr; Back to moves
                 </button>
@@ -910,13 +921,18 @@ export default function WhyView({ onNavigate }) {
 
                         {/* ── Section 5: The Causes ─────────────────── */}
                         <div style={{ ...shared.card, overflow: 'hidden' }}>
-                            <div style={shared.sectionTitle}>THE CAUSES</div>
+                            <div style={shared.sectionTitle}>PRECEDING PUBLIC EVENTS</div>
                             <div style={{ fontSize: '10px', color: colors.textMuted, marginBottom: '10px' }}>
-                                What events explain why actors traded?
+                                Events that were public before each trade — timing, not proof of cause.
+                                {causalMeta && causalMeta.generated && causalMeta.as_of && (
+                                    <span> As of {fmtAsOf(causalMeta.as_of)} UTC.</span>
+                                )}
                             </div>
                             {causes.length === 0 && (
                                 <div style={{ color: colors.textMuted, fontSize: '12px', padding: '12px 0' }}>
-                                    Not generated — no causal links identified. Causal-link detection has no scheduled writer; it only runs on an explicit request for the full signal batch.
+                                    {causalMeta && causalMeta.generated
+                                        ? `No preceding public events linked to ${ticker} trades in the last 30d (causal-link run as of ${fmtAsOf(causalMeta.as_of)} UTC).`
+                                        : 'Not generated — no causal links identified. No causal-link run has completed; the causal-link job is not scheduled.'}
                                 </div>
                             )}
                             <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
@@ -938,12 +954,15 @@ export default function WhyView({ onNavigate }) {
                                                     {(cause.cause_type || 'unknown').replace(/_/g, ' ')}
                                                 </span>
                                             </div>
-                                            {cause.probability != null && (
-                                                <span style={{
-                                                    fontFamily: MONO, fontSize: '11px', fontWeight: 700,
-                                                    color: cause.probability > 0.7 ? colors.green : cause.probability > 0.4 ? colors.yellow : colors.textMuted,
-                                                }}>
-                                                    {(cause.probability * 100).toFixed(0)}%
+                                            {(cause.score ?? cause.probability) != null && (
+                                                <span
+                                                    title="Heuristic recency score (not a probability)"
+                                                    style={{
+                                                        fontFamily: MONO, fontSize: '11px', fontWeight: 700,
+                                                        color: colors.textMuted,
+                                                    }}
+                                                >
+                                                    score {Number(cause.score ?? cause.probability).toFixed(2)}
                                                 </span>
                                             )}
                                         </div>
@@ -953,8 +972,14 @@ export default function WhyView({ onNavigate }) {
                                         {cause.actor && (
                                             <div style={{ fontSize: '10px', color: colors.textMuted }}>
                                                 Actor: <span style={{ color: colors.textDim }}>{cause.actor}</span>
+                                                {cause.action && cause.action_date && (
+                                                    <span style={{ marginLeft: '8px' }}>{cause.action} on {cause.action_date}</span>
+                                                )}
                                                 {cause.lead_time_days != null && (
-                                                    <span style={{ marginLeft: '8px' }}>{cause.lead_time_days.toFixed(0)}d lead</span>
+                                                    <span style={{ marginLeft: '8px' }}>event public {Number(cause.lead_time_days).toFixed(0)}d before</span>
+                                                )}
+                                                {cause.known_at && (
+                                                    <span style={{ marginLeft: '8px' }}>link known {fmtAsOf(cause.known_at)} UTC</span>
                                                 )}
                                             </div>
                                         )}
@@ -962,7 +987,9 @@ export default function WhyView({ onNavigate }) {
                                             <div style={{ marginTop: '4px', fontSize: '9px', color: colors.textMuted }}>
                                                 {cause.evidence.slice(0, 2).map((e, j) => (
                                                     <div key={j} style={{ marginTop: '2px' }}>
-                                                        {typeof e === 'string' ? e : (e.description || e.title || JSON.stringify(e).slice(0, 100))}
+                                                        {typeof e === 'string' ? e : (e.event_known_at
+                                                            ? `${e.type || 'event'} public ${fmtAsOf(e.event_known_at)} UTC (${e.event_known_at_basis || 'basis n/a'})${e.description ? ` — ${e.description}` : ''}`
+                                                            : (e.description || e.title || JSON.stringify(e).slice(0, 100)))}
                                                     </div>
                                                 ))}
                                             </div>

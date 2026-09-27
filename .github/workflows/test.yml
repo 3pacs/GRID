@@ -257,6 +257,28 @@ jobs:
             exit 1
           fi
 
+      # Slice N2 causal-link persistence
+      # (migrations/versions/causal_links_provenance_20260927.py,
+      # intelligence/causal_links.py, scripts/run_causal_links.py): additive
+      # migration on the legacy table + downgrade, writer refuses without it,
+      # only events public before the trade day are persisted, idempotent
+      # re-runs keep first_run_id, and the Timeline/Why GETs are SELECT-only
+      # with an as-of label.
+      - name: Causal-link writer and readers PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_causal_links_pg.py -q -rA | tee /tmp/grid-causal-links-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-causal-links-pg.txt; then
+            echo "::error::causal-link PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # GRID-YF-CLOSE-REPAIR-20260926 / coordinator review of PR #672:
       # proves ingestion/yfinance_pull.py's cross-process advisory lock
       # (pg_try_advisory_lock/pg_advisory_unlock) actually blocks a second,

@@ -1,32 +1,68 @@
 """
 GRID Intelligence — Causal Connection Engine (scoring module).
 
-Cause-checking helpers, suspicious trade detection, storage,
-and narrative generation for single-hop causal analysis.
+Single-hop "what public event preceded this trade" lookups, suspicious
+trade detection and narrative generation.
+
+Since slice N2 (2026-09-27) ``find_causes`` / ``batch_find_causes`` are thin
+adapters over :mod:`intelligence.causal_links`, which only links events that
+were public BEFORE the trade day and stamps every edge with known_at. The
+previous checks (post-trade events scored as causes, macro series that
+matched nothing, same-direction co-trading labelled ``insider_knowledge``,
+committee-basket legislation matches) were removed; see that module.
 """
 
 from __future__ import annotations
 
-import json
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence import causal_links as _cl
 from intelligence.causation_core import (
     CausalLink,
-    ensure_table,
-    _PRE_WINDOW_DAYS,
-    _POST_WINDOW_DAYS,
-    _MACRO_SERIES_PATTERNS,
     _parse_json,
     _safe_float,
-    _macro_series_to_name,
 )
 
 
 # ── 1. find_causes ───────────────────────────────────────────────────────
+
+
+def _edge_to_causal_link(
+    aid: str, actor: str, action: str, ev: "_cl.AntecedentEvent", lead: float,
+    act_date: date, action_known_at: str | None = None, known_at: str | None = None,
+    edge_key: str | None = None,
+) -> CausalLink:
+    return CausalLink(
+        action_id=aid,
+        actor=actor,
+        action=action,
+        ticker=ev.ticker,
+        action_date=str(act_date),
+        probable_cause=ev.description,
+        cause_type=ev.kind,
+        evidence=[{
+            "type": ev.kind,
+            "event_key": ev.key,
+            "date": ev.event_date.isoformat(),
+            "event_known_at": ev.known_at.isoformat(),
+            "event_known_at_basis": ev.known_at_basis,
+            "claim": "public event preceded the trade; not proof of cause",
+            **ev.evidence,
+        }],
+        probability=_cl.recency_score(lead, ev.window_days),
+        lead_time_days=round(lead, 3),
+        event_date=ev.event_date.isoformat(),
+        event_known_at=ev.known_at.isoformat(),
+        event_known_at_basis=ev.known_at_basis,
+        action_known_at=action_known_at,
+        known_at=known_at,
+        score_method=_cl.SCORE_METHOD,
+        edge_key=edge_key,
+    )
 
 
 def find_causes(
@@ -37,59 +73,48 @@ def find_causes(
     action_date: str,
     signal_id: int | str | None = None,
 ) -> list[CausalLink]:
-    """Search for probable causes of a specific actor action.
+    """Public events on ``ticker`` that were knowable before ``action_date``.
 
-    Checks in order:
-      1. Government contracts awarded to this company
-      2. Legislation / bills affecting this ticker/sector
-      3. Committee hearings near the date
-      4. Upcoming or recent earnings
-      5. Other insider activity on the same ticker (cluster signal)
-      6. Macro events (FOMC, CPI, payrolls) near the date
-
-    Parameters:
-        engine: SQLAlchemy engine.
-        actor: Actor name / source_id.
-        action: 'BUY' or 'SELL'.
-        ticker: Ticker symbol.
-        action_date: ISO date string of the action.
-        signal_id: Optional signal_sources row id.
+    Only events whose known_at is at or before the start of the trade day
+    are returned (earnings releases; contract awards GRID had already seen).
+    ``probability`` is the heuristic recency score (``score_method``), not a
+    calibrated probability. Read-only.
 
     Returns:
-        List of CausalLink sorted by probability descending.
+        List of CausalLink sorted by score descending.
     """
     try:
-        act_date = date.fromisoformat(action_date[:10])
+        act_date = date.fromisoformat(str(action_date)[:10])
     except (ValueError, TypeError):
         log.warning("Invalid action_date: {d}", d=action_date)
         return []
 
+    ticker = (ticker or "").strip().upper()
+    if not ticker:
+        return []
     aid = str(signal_id) if signal_id else f"{actor}:{ticker}:{action_date}"
+    as_of = datetime.now(timezone.utc)
+    trade_start = _cl.day_start(act_date)
+
+    try:
+        with engine.connect() as conn:
+            earn_rows, contract_rows = _cl.load_event_rows(conn, [ticker], act_date, as_of)
+    except Exception as exc:
+        log.debug("find_causes: event load failed for {t}: {e}", t=ticker, e=str(exc))
+        return []
+
     causes: list[CausalLink] = []
+    for ev in _cl.earnings_events(earn_rows) + _cl.contract_events(contract_rows):
+        if ev.known_at > trade_start or ev.known_at > as_of:
+            continue
+        lead = (trade_start - ev.known_at).total_seconds() / 86400.0
+        if lead > ev.window_days:
+            continue
+        causes.append(_edge_to_causal_link(aid, actor, action, ev, lead, act_date))
 
-    # 1. Government contracts
-    causes.extend(_check_contracts(engine, aid, actor, action, ticker, act_date))
-
-    # 2. Legislation / bills
-    causes.extend(_check_legislation(engine, aid, actor, action, ticker, act_date))
-
-    # 3. Committee hearings
-    causes.extend(_check_hearings(engine, aid, actor, action, ticker, act_date))
-
-    # 4. Earnings
-    causes.extend(_check_earnings(engine, aid, actor, action, ticker, act_date))
-
-    # 5. Cluster / other insider activity
-    causes.extend(_check_cluster_signals(engine, aid, actor, action, ticker, act_date))
-
-    # 6. Macro events
-    causes.extend(_check_macro_events(engine, aid, actor, action, ticker, act_date))
-
-    # Sort by probability descending
     causes.sort(key=lambda c: c.probability, reverse=True)
-
-    log.info(
-        "Causation: {n} causes found for {a} {act} {t} on {d}",
+    log.debug(
+        "Causation: {n} preceding events for {a} {act} {t} on {d}",
         n=len(causes), a=actor, act=action, t=ticker, d=action_date,
     )
     return causes
@@ -101,57 +126,42 @@ def find_causes(
 def batch_find_causes(
     engine: Engine, days: int = 30, persist: bool = True,
 ) -> list[CausalLink]:
-    """Run find_causes for all recent signal_sources entries, store results.
+    """Antecedent edges for every recent trade (bounded batches).
 
     Parameters:
         engine: SQLAlchemy engine.
-        days: How far back to search for signals.
-        persist: When True (default), ensure ``causal_links`` and store the
-            results. GET routes pass False so reads never write.
+        days: How far back to look for trades.
+        persist: When True (default), upsert into ``causal_links`` with a
+            ``causal_link_runs`` record (requires the
+            ``causal_links_provenance_20260927`` migration). False computes
+            without writing.
 
     Returns:
-        All CausalLink objects found.
+        All edges as CausalLink objects.
     """
-    if persist:
-        ensure_table(engine)
-    cutoff = date.today() - timedelta(days=days)
-
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT id, source_type, source_id, ticker, signal_type, signal_date "
-                "FROM signal_sources "
-                "WHERE signal_date >= :cutoff "
-                "AND source_type IN ('congressional', 'insider') "
-                "ORDER BY signal_date DESC"
-            ),
-            {"cutoff": cutoff},
-        ).fetchall()
-
-    if not rows:
-        log.info("batch_find_causes: no signals in last {d} days", d=days)
-        return []
-
-    all_causes: list[CausalLink] = []
-    for row in rows:
-        sig_id = row[0]
-        actor = row[2]
-        ticker = row[3]
-        action = row[4]
-        action_date = str(row[5])
-
-        causes = find_causes(engine, actor, action, ticker, action_date, signal_id=sig_id)
-        all_causes.extend(causes)
-
-    # Store results (explicit writers only; read paths pass persist=False)
-    if all_causes and persist:
-        _store_causal_links(engine, all_causes)
-
-    log.info(
-        "batch_find_causes: {n} causes from {r} signals",
-        n=len(all_causes), r=len(rows),
+    summary = _cl.run_causal_links(
+        engine,
+        days=days,
+        code_sha=_cl.resolve_code_sha(),
+        dry_run=not persist,
+        keep_edges=True,
     )
-    return all_causes
+    links = [
+        _edge_to_causal_link(
+            str(e.action.source_refs[0]) if e.action.source_refs else e.action.actor_key,
+            e.action.actor, e.action.direction, e.event, e.lead_time_days,
+            e.action.action_date,
+            action_known_at=e.action.known_at.isoformat(),
+            known_at=e.known_at.isoformat(),
+            edge_key=e.edge_key,
+        )
+        for e in summary.edges
+    ]
+    log.info(
+        "batch_find_causes: {n} edges from {a} trades ({s})",
+        n=len(links), a=summary.actions_processed, s=summary.status,
+    )
+    return links
 
 
 # ── 3. get_suspicious_trades ─────────────────────────────────────────────
@@ -299,16 +309,16 @@ def get_suspicious_trades(engine: Engine, days: int = 90) -> list[dict]:
 
 
 def generate_causal_narrative(engine: Engine, ticker: str) -> str:
-    """Generate an LLM or rule-based narrative explaining trading activity.
+    """Narrative text only; see :func:`generate_causal_narrative_with_source`."""
+    return generate_causal_narrative_with_source(engine, ticker)[0]
 
-    "Here's why people are trading NVDA right now..."
 
-    Parameters:
-        engine: SQLAlchemy engine.
-        ticker: Ticker symbol.
+def generate_causal_narrative_with_source(engine: Engine, ticker: str) -> tuple[str, str]:
+    """Generate an LLM or rule-based narrative about recent trading activity.
 
-    Returns:
-        Narrative string.
+    Returns ``(text, source)`` with source ``'llm'``, ``'rule_based'`` or
+    ``'none'`` so callers can label LLM prose as interpretation, not fact.
+    The events it cites are only those public before each trade.
     """
     ticker = ticker.strip().upper()
     cutoff = date.today() - timedelta(days=30)
@@ -328,7 +338,7 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
         ).fetchall()
 
     if not rows:
-        return f"No recent trading activity found for {ticker}."
+        return f"No recent trading activity found for {ticker}.", "none"
 
     # Gather causes for recent signals
     causes: list[CausalLink] = []
@@ -360,11 +370,11 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
     # Try LLM
     llm_narrative = _try_llm_narrative(ticker, rows, causes)
     if llm_narrative:
-        return llm_narrative
+        return llm_narrative, "llm"
 
     # Rule-based fallback
     lines: list[str] = []
-    lines.append(f"## Why People Are Trading {ticker}")
+    lines.append(f"## Recent Trading in {ticker}")
     lines.append("")
     lines.append(
         f"In the last 30 days: {len(buys)} buy signal(s), {len(sells)} sell signal(s) "
@@ -373,18 +383,13 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
 
     if cause_summary.get("contract"):
         lines.append(
-            f"\n**Government Contracts:** {cause_summary['contract']['count']} contract-related cause(s) "
-            f"detected. {cause_summary['contract']['top']}"
-        )
-    if cause_summary.get("legislation"):
-        lines.append(
-            f"\n**Legislation:** {cause_summary['legislation']['count']} legislation-related cause(s). "
-            f"{cause_summary['legislation']['top']}"
+            f"\n**Government Contracts:** {cause_summary['contract']['count']} contract award(s) "
+            f"GRID had seen before a trade. {cause_summary['contract']['top']}"
         )
     if cause_summary.get("earnings"):
         lines.append(
-            f"\n**Earnings:** {cause_summary['earnings']['count']} earnings-related cause(s). "
-            f"{cause_summary['earnings']['top']}"
+            f"\n**Earnings:** {cause_summary['earnings']['count']} earnings release(s) "
+            f"public before a trade. {cause_summary['earnings']['top']}"
         )
     # ── Actor intelligence section ──
     if actor_context:
@@ -404,425 +409,22 @@ def generate_causal_narrative(engine: Engine, ticker: str) -> str:
                 f"[trust={trust_pct}%, influence={inf_pct}%]{conn_str}"
             )
 
-    if cause_summary.get("insider_knowledge"):
+    if causes:
         lines.append(
-            f"\n**Insider Knowledge:** {cause_summary['insider_knowledge']['count']} signal(s) "
-            f"suggest possible non-public information. {cause_summary['insider_knowledge']['top']}"
+            "\nThese events were public before the trades; timing alone does not "
+            "establish that they caused them."
         )
-    if cause_summary.get("macro"):
+    else:
         lines.append(
-            f"\n**Macro Events:** {cause_summary['macro']['count']} macro-related cause(s). "
-            f"{cause_summary['macro']['top']}"
-        )
-
-    if not causes:
-        lines.append(
-            "\nNo clear causal link found — activity may be routine rebalancing "
-            "or driven by signals outside our current data sources."
+            "\nNo public earnings release or known contract award preceded these "
+            "trades within the lookback windows."
         )
 
     # Top actors
     if actors[:5]:
         lines.append(f"\n**Key actors:** {', '.join(actors[:5])}")
 
-    return "\n".join(lines)
-
-
-# ── Cause-Checking Helpers ───────────────────────────────────────────────
-
-
-def _check_contracts(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for government contracts near the action date."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=_PRE_WINDOW_DAYS)
-    window_end = act_date + timedelta(days=_POST_WINDOW_DAYS)
-
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT signal_date, signal_value "
-                    "FROM signal_sources "
-                    "WHERE source_type = 'gov_contract' "
-                    "AND ticker = :ticker "
-                    "AND signal_date BETWEEN :wstart AND :wend "
-                    "ORDER BY signal_date"
-                ),
-                {"ticker": ticker, "wstart": window_start, "wend": window_end},
-            ).fetchall()
-
-        for row in rows:
-            c_date = row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0])[:10])
-            c_value = _parse_json(row[1])
-            lead_days = (c_date - act_date).days  # negative = cause before action
-
-            # Trade BEFORE contract award is more suspicious
-            if lead_days > 0:
-                prob = min(0.85, 0.5 + 0.35 * (1.0 - abs(lead_days) / _POST_WINDOW_DAYS))
-            else:
-                prob = max(0.1, 0.4 - 0.3 * (abs(lead_days) / _PRE_WINDOW_DAYS))
-
-            amount = c_value.get("amount", 0)
-            agency = c_value.get("awarding_agency", c_value.get("recipient_name", "unknown"))
-            desc = c_value.get("description", "government contract")
-
-            cause_desc = (
-                f"${amount:,.0f} contract from {agency}" if amount
-                else f"Contract from {agency}: {desc[:80]}"
-            )
-
-            causes.append(CausalLink(
-                action_id=aid,
-                actor=actor,
-                action=action,
-                ticker=ticker,
-                action_date=str(act_date),
-                probable_cause=cause_desc,
-                cause_type="contract",
-                evidence=[{
-                    "type": "gov_contract",
-                    "date": str(c_date),
-                    "amount": amount,
-                    "agency": agency,
-                    "description": desc[:200],
-                }],
-                probability=round(prob, 3),
-                lead_time_days=abs(lead_days),
-            ))
-    except Exception as exc:
-        log.debug("Contract cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
-
-
-def _check_legislation(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for legislation / bills affecting this ticker near the action date."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=_PRE_WINDOW_DAYS)
-    window_end = act_date + timedelta(days=_POST_WINDOW_DAYS)
-
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT series_id, obs_date, raw_payload "
-                    "FROM raw_series "
-                    "WHERE series_id LIKE :pattern "
-                    "AND obs_date BETWEEN :wstart AND :wend "
-                    "AND pull_status = 'SUCCESS' "
-                    "AND series_id NOT LIKE :hearing_exclude "
-                    "ORDER BY obs_date"
-                ),
-                {
-                    "pattern": "LEGISLATION:%",
-                    "wstart": window_start,
-                    "wend": window_end,
-                    "hearing_exclude": "%:hearing",
-                },
-            ).fetchall()
-
-        for row in rows:
-            payload = _parse_json(row[2])
-            affected = payload.get("affected_tickers", [])
-            if ticker not in affected:
-                continue
-
-            obs_date = row[1] if isinstance(row[1], date) else date.fromisoformat(str(row[1])[:10])
-            lead_days = (obs_date - act_date).days
-
-            bill_id = payload.get("bill_id", "")
-            title = payload.get("title", "")
-            status = payload.get("status", "")
-
-            if lead_days <= 0:
-                prob = min(0.7, 0.3 + 0.4 * (1.0 - abs(lead_days) / _PRE_WINDOW_DAYS))
-            else:
-                prob = min(0.6, 0.2 + 0.4 * (1.0 - lead_days / _POST_WINDOW_DAYS))
-
-            causes.append(CausalLink(
-                action_id=aid,
-                actor=actor,
-                action=action,
-                ticker=ticker,
-                action_date=str(act_date),
-                probable_cause=f"Bill {bill_id}: {title[:80]}" if title else f"Legislation {bill_id} ({status})",
-                cause_type="legislation",
-                evidence=[{
-                    "type": "legislation",
-                    "bill_id": bill_id,
-                    "title": title[:200],
-                    "status": status,
-                    "date": str(obs_date),
-                    "committees": payload.get("committees", []),
-                }],
-                probability=round(prob, 3),
-                lead_time_days=abs(lead_days),
-            ))
-    except Exception as exc:
-        log.debug("Legislation cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
-
-
-def _check_hearings(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for committee hearings near the action date."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=14)
-    window_end = act_date + timedelta(days=14)
-
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT series_id, obs_date, raw_payload "
-                    "FROM raw_series "
-                    "WHERE series_id LIKE :pattern "
-                    "AND obs_date BETWEEN :wstart AND :wend "
-                    "AND pull_status = 'SUCCESS' "
-                    "ORDER BY obs_date"
-                ),
-                {"pattern": "LEGISLATION:%:hearing", "wstart": window_start, "wend": window_end},
-            ).fetchall()
-
-        for row in rows:
-            payload = _parse_json(row[2])
-            affected = payload.get("affected_tickers", [])
-            if ticker not in affected:
-                continue
-
-            obs_date = row[1] if isinstance(row[1], date) else date.fromisoformat(str(row[1])[:10])
-            lead_days = (obs_date - act_date).days
-
-            title = payload.get("title", "Committee hearing")
-            committees = payload.get("committees", [])
-
-            prob = 0.5 if lead_days > 0 else 0.35
-            if abs(lead_days) <= 3:
-                prob += 0.2
-
-            causes.append(CausalLink(
-                action_id=aid,
-                actor=actor,
-                action=action,
-                ticker=ticker,
-                action_date=str(act_date),
-                probable_cause=f"Hearing: {title[:80]} ({', '.join(committees[:2])})",
-                cause_type="legislation",
-                evidence=[{
-                    "type": "hearing",
-                    "title": title[:200],
-                    "committees": committees,
-                    "date": str(obs_date),
-                }],
-                probability=round(min(1.0, prob), 3),
-                lead_time_days=abs(lead_days),
-            ))
-    except Exception as exc:
-        log.debug("Hearing cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
-
-
-def _check_earnings(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for earnings events near the action date."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=30)
-    window_end = act_date + timedelta(days=14)
-
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT earnings_date, eps_estimate, eps_actual, "
-                    "       eps_surprise_pct, classification "
-                    "FROM earnings_calendar "
-                    "WHERE ticker = :ticker "
-                    "AND earnings_date BETWEEN :wstart AND :wend "
-                    "ORDER BY earnings_date"
-                ),
-                {"ticker": ticker, "wstart": window_start, "wend": window_end},
-            ).fetchall()
-
-        for row in rows:
-            e_date = row[0] if isinstance(row[0], date) else date.fromisoformat(str(row[0])[:10])
-            eps_est = _safe_float(row[1])
-            eps_act = _safe_float(row[2])
-            surprise_pct = _safe_float(row[3])
-            classification = row[4]
-
-            lead_days = (e_date - act_date).days
-
-            if lead_days > 0:
-                prob = min(0.75, 0.35 + 0.4 * (1.0 - lead_days / 14))
-                if action == "BUY" and surprise_pct and surprise_pct > 0:
-                    prob = min(0.9, prob + 0.15)
-                elif action == "SELL" and surprise_pct and surprise_pct < 0:
-                    prob = min(0.9, prob + 0.15)
-            else:
-                prob = max(0.15, 0.3 - 0.2 * (abs(lead_days) / 30))
-
-            if eps_act is not None and eps_est is not None:
-                if eps_act > eps_est:
-                    desc = f"Earnings beat ({eps_act:.2f} vs {eps_est:.2f} est)"
-                elif eps_act < eps_est:
-                    desc = f"Earnings miss ({eps_act:.2f} vs {eps_est:.2f} est)"
-                else:
-                    desc = f"Earnings inline ({eps_act:.2f})"
-            else:
-                desc = f"Earnings event on {e_date}" + (
-                    f" ({classification})" if classification else ""
-                )
-
-            causes.append(CausalLink(
-                action_id=aid,
-                actor=actor,
-                action=action,
-                ticker=ticker,
-                action_date=str(act_date),
-                probable_cause=desc,
-                cause_type="earnings",
-                evidence=[{
-                    "type": "earnings",
-                    "date": str(e_date),
-                    "eps_estimate": eps_est,
-                    "eps_actual": eps_act,
-                    "surprise_pct": surprise_pct,
-                    "classification": classification,
-                }],
-                probability=round(prob, 3),
-                lead_time_days=abs(lead_days),
-            ))
-    except Exception as exc:
-        log.debug("Earnings cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
-
-
-def _check_cluster_signals(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for other insider/congressional activity on the same ticker."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=14)
-    window_end = act_date + timedelta(days=3)
-
-    try:
-        with engine.connect() as conn:
-            rows = conn.execute(
-                text(
-                    "SELECT source_type, source_id, signal_type, signal_date "
-                    "FROM signal_sources "
-                    "WHERE ticker = :ticker "
-                    "AND source_type IN ('congressional', 'insider') "
-                    "AND source_id != :actor "
-                    "AND signal_date BETWEEN :wstart AND :wend "
-                    "ORDER BY signal_date"
-                ),
-                {"ticker": ticker, "actor": actor, "wstart": window_start, "wend": window_end},
-            ).fetchall()
-
-        if len(rows) < 2:
-            return causes
-
-        same_direction = [r for r in rows if r[2] == action]
-        cluster_size = len(same_direction)
-
-        if cluster_size >= 2:
-            actors_in_cluster = list({r[1] for r in same_direction})
-            prob = min(0.8, 0.3 + 0.1 * cluster_size)
-
-            causes.append(CausalLink(
-                action_id=aid,
-                actor=actor,
-                action=action,
-                ticker=ticker,
-                action_date=str(act_date),
-                probable_cause=(
-                    f"Cluster {action}: {cluster_size} actors traded {ticker} "
-                    f"in same direction within 14 days"
-                ),
-                cause_type="insider_knowledge",
-                evidence=[{
-                    "type": "cluster_signal",
-                    "cluster_size": cluster_size,
-                    "actors": actors_in_cluster[:10],
-                    "direction": action,
-                    "window_days": 14,
-                }],
-                probability=round(prob, 3),
-                lead_time_days=0,
-            ))
-    except Exception as exc:
-        log.debug("Cluster cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
-
-
-def _check_macro_events(
-    engine: Engine, aid: str, actor: str, action: str, ticker: str, act_date: date,
-) -> list[CausalLink]:
-    """Check for macro events (FOMC, CPI, payrolls) near the action date."""
-    causes: list[CausalLink] = []
-    window_start = act_date - timedelta(days=7)
-    window_end = act_date + timedelta(days=7)
-
-    try:
-        for pattern in _MACRO_SERIES_PATTERNS:
-            with engine.connect() as conn:
-                rows = conn.execute(
-                    text(
-                        "SELECT series_id, obs_date, value "
-                        "FROM raw_series "
-                        "WHERE series_id LIKE :pattern "
-                        "AND obs_date BETWEEN :wstart AND :wend "
-                        "AND pull_status = 'SUCCESS' "
-                        "ORDER BY obs_date DESC "
-                        "LIMIT 3"
-                    ),
-                    {"pattern": pattern + "%", "wstart": window_start, "wend": window_end},
-                ).fetchall()
-
-            for row in rows:
-                obs_date = row[1] if isinstance(row[1], date) else date.fromisoformat(str(row[1])[:10])
-                lead_days = (obs_date - act_date).days
-                series = row[0]
-
-                prob = 0.25
-                if abs(lead_days) <= 2:
-                    prob = 0.35
-
-                macro_name = _macro_series_to_name(series)
-
-                causes.append(CausalLink(
-                    action_id=aid,
-                    actor=actor,
-                    action=action,
-                    ticker=ticker,
-                    action_date=str(act_date),
-                    probable_cause=f"Macro release: {macro_name} on {obs_date}",
-                    cause_type="rebalancing",
-                    evidence=[{
-                        "type": "macro_event",
-                        "series": series,
-                        "name": macro_name,
-                        "date": str(obs_date),
-                        "value": float(row[2]) if row[2] else None,
-                    }],
-                    probability=round(prob, 3),
-                    lead_time_days=abs(lead_days),
-                ))
-    except Exception as exc:
-        log.debug("Macro cause check failed for {t}: {e}", t=ticker, e=str(exc))
-
-    return causes
+    return "\n".join(lines), "rule_based"
 
 
 # ── Suspicious Trade Helpers ─────────────────────────────────────────────
@@ -960,43 +562,6 @@ def _committee_has_jurisdiction(committee: str, ticker: str) -> bool:
     return False
 
 
-# ── Storage ──────────────────────────────────────────────────────────────
-
-
-def _store_causal_links(engine: Engine, causes: list[CausalLink]) -> None:
-    """Persist CausalLink objects to the causal_links table."""
-    ensure_table(engine)
-
-    with engine.begin() as conn:
-        for c in causes:
-            try:
-                sig_id = int(c.action_id)
-            except (ValueError, TypeError):
-                sig_id = None
-
-            conn.execute(
-                text(
-                    "INSERT INTO causal_links "
-                    "(signal_id, actor, ticker, action_date, cause_type, "
-                    " probable_cause, evidence, probability) "
-                    "VALUES (:sig_id, :actor, :ticker, :action_date, :cause_type, "
-                    "        :probable_cause, :evidence, :probability)"
-                ),
-                {
-                    "sig_id": sig_id,
-                    "actor": c.actor,
-                    "ticker": c.ticker,
-                    "action_date": c.action_date,
-                    "cause_type": c.cause_type,
-                    "probable_cause": c.probable_cause,
-                    "evidence": json.dumps(c.evidence),
-                    "probability": c.probability,
-                },
-            )
-
-    log.info("Stored {n} causal links", n=len(causes))
-
-
 # ── Narrative Helpers ────────────────────────────────────────────────────
 
 
@@ -1044,7 +609,7 @@ def _try_llm_narrative(
     cause_lines = []
     for c in causes[:15]:
         cause_lines.append(
-            f"  - [{c.cause_type}] {c.probable_cause} (prob={c.probability:.2f}, "
+            f"  - [{c.cause_type}] {c.probable_cause} (score={c.probability:.2f}, "
             f"lead={c.lead_time_days:.0f}d)"
         )
 
@@ -1071,13 +636,14 @@ def _try_llm_narrative(
     prompt += (
         "Recent trading signals:\n"
         + "\n".join(signal_lines)
-        + "\n\nProbable causes:\n"
+        + "\n\nPublic events that preceded the trades (timing only, not established causes):\n"
         + "\n".join(cause_lines)
         + "\n\nFor each cause, state:\n"
         "LEVER: [Who] did [what] affecting [which valve]\n"
         "CONDITION: [Environmental factor] that amplifies/dampens the lever\n\n"
         "Write 3-5 sentences. Reference historical patterns if relevant. "
-        "Be direct. No disclaimers."
+        "Be direct, but do not state that any event caused a trade: these are "
+        "time-ordered co-occurrences, not established causes."
     )
 
     try:

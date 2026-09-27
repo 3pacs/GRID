@@ -119,6 +119,8 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
         return initial;
     });
     const [causalLinks, setCausalLinks] = useState([]);
+    // { generated, as_of, reason } from the persisted causal-link payload.
+    const [causalMeta, setCausalMeta] = useState(null);
     const [showCausalArrows, setShowCausalArrows] = useState(true);
     const [isPlaying, setIsPlaying] = useState(false);
     const [playIndex, setPlayIndex] = useState(0);
@@ -204,16 +206,22 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
 
     // Fetch causal links alongside events
     useEffect(() => {
-        if (!ticker) { setCausalLinks([]); return; }
+        if (!ticker) { setCausalLinks([]); setCausalMeta(null); return; }
         api.get(`/api/v1/intelligence/causal-links?ticker=${encodeURIComponent(ticker)}&days=${period}`)
             .then(res => {
                 if (res && !res.error && Array.isArray(res.links)) {
                     setCausalLinks(res.links);
+                    setCausalMeta({
+                        generated: res.generated !== false,
+                        as_of: res.as_of || null,
+                        reason: res.reason || null,
+                    });
                 } else {
                     setCausalLinks([]);
+                    setCausalMeta({ generated: false, as_of: null, reason: null });
                 }
             })
-            .catch(() => setCausalLinks([]));
+            .catch(() => { setCausalLinks([]); setCausalMeta({ generated: false, as_of: null, reason: null }); });
     }, [ticker, period]);
 
     // Filter events by visible types
@@ -423,17 +431,19 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                         if (tooltipRef.current) {
                             const tt = tooltipRef.current;
                             tt.style.display = 'block';
-                            const probPct = Math.round((link.probability || 0.5) * 100);
-                            const leadDays = link.lead_time_days != null ? link.lead_time_days.toFixed(1) : '--';
+                            const score = link.score != null ? link.score : link.probability;
+                            const scoreTxt = score != null ? Number(score).toFixed(2) : '--';
+                            const leadDays = link.lead_time_days != null ? Number(link.lead_time_days).toFixed(1) : '--';
+                            const knownAt = link.known_at ? String(link.known_at).slice(0, 16).replace('T', ' ') : '--';
                             tt.innerHTML = `
                                 <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
                                     <span style="width:8px;height:8px;border-radius:2px;background:${cfg.color};display:inline-block"></span>
-                                    <span style="color:${colors.text};font-weight:600;font-size:11px">CAUSAL LINK</span>
-                                    <span style="color:${colors.textMuted};font-size:10px">${probPct}% confidence</span>
+                                    <span style="color:${colors.text};font-weight:600;font-size:11px">PRECEDING EVENT</span>
+                                    <span style="color:${colors.textMuted};font-size:10px">score ${escapeHtml(scoreTxt)} (heuristic, not a probability)</span>
                                 </div>
-                                <div style="color:${colors.yellow};font-size:10px;margin-bottom:2px">LEVER: ${escapeHtml(link.lever_actor)} — ${escapeHtml(link.cause_description)}</div>
-                                <div style="color:${colors.textDim};font-size:10px;margin-bottom:2px">EFFECT: ${escapeHtml(link.effect_description)}</div>
-                                <div style="color:${colors.textMuted};font-size:9px">Lead time: ${escapeHtml(String(leadDays))}d | Type: ${escapeHtml(link.cause_type)}</div>
+                                <div style="color:${colors.yellow};font-size:10px;margin-bottom:2px">EVENT: ${escapeHtml(link.cause_description)}</div>
+                                <div style="color:${colors.textDim};font-size:10px;margin-bottom:2px">THEN TRADE: ${escapeHtml(link.effect_description)} on ${escapeHtml(String(link.effect_date || '--'))}</div>
+                                <div style="color:${colors.textMuted};font-size:9px">Event public ${escapeHtml(String(leadDays))}d before the trade | Link known ${escapeHtml(knownAt)} UTC | Timing, not proof of cause</div>
                             `;
                             const rect = event.target.getBoundingClientRect();
                             const containerRect = containerRef.current.getBoundingClientRect();
@@ -820,7 +830,17 @@ export default function Timeline({ onNavigate, selectedTicker = '' }) {
                     fontSize: '10px', fontFamily: MONO, color: colors.textMuted,
                     padding: '2px 4px 10px',
                 }}>
-                    No causal links generated for {ticker || 'this ticker'} in the last {period}d — causal-link detection has no scheduled writer.
+                    {causalMeta && causalMeta.generated && causalMeta.as_of
+                        ? `No preceding-event links for ${ticker || 'this ticker'} in the last ${period}d (causal-link run as of ${String(causalMeta.as_of).slice(0, 16).replace('T', ' ')} UTC).`
+                        : `No causal links generated for ${ticker || 'this ticker'} in the last ${period}d — no causal-link run has completed (the job is not scheduled).`}
+                </div>
+            )}
+            {showCausalArrows && !loading && causalLinks.length > 0 && causalMeta && causalMeta.as_of && (
+                <div style={{
+                    fontSize: '10px', fontFamily: MONO, color: colors.textMuted,
+                    padding: '2px 4px 10px',
+                }}>
+                    {`Arrows: public event → later trade, as of ${String(causalMeta.as_of).slice(0, 16).replace('T', ' ')} UTC. Timing, not proof of cause.`}
                 </div>
             )}
 
