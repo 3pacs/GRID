@@ -662,10 +662,16 @@ def _load_latest_findings(engine: Engine, limit: int = 200) -> list[dict]:
 # so SQLAlchemy's negative lookahead does not see `:` immediately after the
 # name; verify with `sqlalchemy.text("...:od::date...")._bindparams` if this
 # pattern is ever reintroduced.
+#
+# Also (same discovery): the subquery's bare `id` in the SELECT list was
+# ambiguous -- both resolved_series (aliased rs) and feature_registry
+# (aliased fr) have an `id` column, so Postgres rejected it outright
+# (psycopg2.errors.AmbiguousColumn) rather than silently misbehaving.
+# Qualified as `rs.id`.
 _DEDUP_KEEP_BEST_PREDICATE = """
     id NOT IN (
         SELECT DISTINCT ON (feature_id, obs_date)
-            id
+            rs.id
         FROM resolved_series rs
         JOIN feature_registry fr ON fr.id = rs.feature_id
         WHERE fr.name = :fname
