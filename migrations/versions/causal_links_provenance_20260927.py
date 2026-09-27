@@ -21,7 +21,7 @@ Downgrade drops the run table, the indexes and the added columns.
 from alembic import op
 
 revision = "causal_links_provenance_20260927"
-down_revision = "raw_series_quarantined_20260926"
+down_revision = "godview_view_v2_20260927"
 branch_labels = None
 depends_on = None
 

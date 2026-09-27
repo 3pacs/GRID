@@ -189,7 +189,7 @@ HERMES_REPAIR_SKILLS: tuple[tuple[str, str], ...] = (
     ("REPULL:<source_name>", "Re-pull a specific source if it is not in cooldown (bounded to the last few days — never a full-history backfill)."),
     ("RUN_PIPELINE", "Trigger the standard full pipeline."),
     ("VACUUM_DB", "Run VACUUM ANALYZE on hot data tables."),
-    ("FIX_DATA_QUALITY[:family]", "Scan recent resolved_series quality and remove exact duplicates."),
+    ("FIX_DATA_QUALITY[:family]", "Scan recent resolved_series quality and report multi-vintage groups (read-only)."),
     ("FIX_OUTPUT_DIRS", "Repair or create common output directories used by reports and widgets."),
     ("ENSURE_OPERATOR_TABLES", "Create Hermes operator issue tables and indexes if missing."),
     ("CHECK_SCHEMA:<table>", "Verify a required public table exists and log a critical issue if not."),
@@ -352,12 +352,76 @@ def _require_engine(engine: Any, cmd: str) -> Any:
     return engine
 
 
+# PR #688 review (2026-09-27): this module used to DELETE dedup "losers"
+# here, keyed on grouping resolved_series rows by (feature_id, obs_date)
+# and keeping only the lowest-`id` row per group. resolved_series' actual
+# unique index is (feature_id, obs_date, vintage_date) -- every row sharing
+# (feature_id, obs_date) with another is therefore ALWAYS a distinct
+# vintage, never a true duplicate: an exact duplicate (same feature_id,
+# obs_date, vintage_date, AND value) is impossible, the index forbids it.
+# store/pit.py's FIRST_RELEASE and LATEST_AS_OF vintage policies read
+# across exactly these rows; deleting all but one per (feature_id,
+# obs_date) collapses point-in-time history and, measured against
+# production, would have destroyed the FIRST_RELEASE row for ~52% of
+# eligible groups. There is therefore no delete path here at all anymore
+# -- see the report-only loop in _run_data_quality_fix below. (A prior
+# revision of this comment described a `ctid`-vs-`id` bug in the now-
+# removed delete predicate; that history is preserved in git blame, not
+# repeated here since the predicate itself is gone.)
+
+
+def _hermes_retractions_table_exists(conn: Any) -> bool:
+    """True if resolved_series_retractions exists (PR #683's migration).
+
+    No longer used to guard a delete (there is none, see the module note
+    above) -- kept only so FIX_DATA_QUALITY's report-only logging can note
+    how many reported multi-vintage rows are also retracted, for operator
+    context. Runs its own SAVEPOINT so a failure here (e.g. insufficient
+    privilege) can never poison the caller's outer transaction; any
+    failure is treated as "table absent". Unqualified (relies on
+    search_path), matching how every other query in this function
+    addresses resolved_series itself -- a hardcoded "public." prefix would
+    silently miss the table on a non-default search_path (e.g. a test's
+    scratch schema).
+    """
+    from sqlalchemy import text as sa_text
+
+    try:
+        with conn.begin_nested():
+            return bool(
+                conn.execute(
+                    sa_text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": "resolved_series_retractions"},
+                ).scalar()
+            )
+    except Exception:
+        return False
+
+
+# Purely informational -- counts, never deletes. Used only to enrich the
+# report-only log line in _run_data_quality_fix below with how many of the
+# reported multi-vintage rows are also retracted (PR #683,
+# resolved_series_retractions). Qualified with the `rs`/`fr` aliases used in
+# q_dupes above so the join is unambiguous.
+_HERMES_MULTI_VINTAGE_RETRACTED_COUNT_SQL = (
+    "SELECT COUNT(*) FROM resolved_series rs "
+    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+    "WHERE fr.name = :fname AND rs.obs_date = :odate "
+    "AND EXISTS ("
+    "  SELECT 1 FROM resolved_series_retractions rsr"
+    "  WHERE rsr.feature_id = rs.feature_id"
+    "    AND rsr.obs_date = rs.obs_date"
+    "    AND rsr.vintage_date = rs.vintage_date"
+    ")"
+)
+
+
 def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState) -> dict[str, Any]:
     from sqlalchemy import text as sa_text
 
     engine = _require_engine(engine, "FIX_DATA_QUALITY")
     dq_issues: list[dict[str, Any]] = []
-    fixes = 0
+    multi_vintage_groups = 0
     with engine.begin() as conn:
         # Check for NaN/null values in recent resolved_series.
         q_nulls = (
@@ -405,21 +469,39 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
         for r in outlier_rows:
             dq_issues.append({"type": "outlier", "feature": r[0], "value": float(r[1]), "date": str(r[2])})
 
-        # Auto-fix exact duplicates, keeping one row per feature/date.
-        for r in dupe_rows:
-            try:
-                conn.execute(sa_text(
-                    "DELETE FROM resolved_series WHERE ctid NOT IN ("
-                    "  SELECT MIN(ctid) FROM resolved_series rs "
-                    "  JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "  WHERE fr.name = :fname AND rs.obs_date = :odate "
-                    "  GROUP BY rs.feature_id, rs.obs_date"
-                    ") AND feature_id = (SELECT id FROM feature_registry WHERE name = :fname) "
-                    "AND obs_date = :odate"
-                ), {"fname": r[0], "odate": r[1]})
-                fixes += 1
-            except Exception as exc:
-                log.debug("Hermes: duplicate resolved_series delete failed for {f}: {e}", f=r[0], e=str(exc))
+        # Report multi-vintage groups. PR #688 review (2026-09-27): this
+        # used to DELETE dedup "losers" here -- see the module note above
+        # _hermes_retractions_table_exists for why that was PIT-destroying
+        # and is gone. Report-only now: log the group/row counts and, for
+        # operator context, how many of those rows are already retracted
+        # (PR #683's resolved_series_retractions) -- purely informational,
+        # nothing here is a guard because nothing is deleted.
+        multi_vintage_groups = len(dupe_rows)
+        if dupe_rows:
+            multi_vintage_rows = sum(max(int(r[2]) - 1, 0) for r in dupe_rows)
+            retracted_total = 0
+            if _hermes_retractions_table_exists(conn):
+                for r in dupe_rows:
+                    row_params = {"fname": r[0], "odate": r[1]}
+                    try:
+                        with conn.begin_nested():
+                            retracted_total += conn.execute(
+                                sa_text(_HERMES_MULTI_VINTAGE_RETRACTED_COUNT_SQL),
+                                row_params,
+                            ).scalar() or 0
+                    except Exception as exc:
+                        log.warning(
+                            "Hermes: could not count retracted vintages for "
+                            "{f} on {d}: {e}", f=r[0], d=r[1], e=str(exc),
+                        )
+            log.warning(
+                "Hermes FIX_DATA_QUALITY: {g} multi-vintage resolved_series "
+                "group(s) ({r} row(s) beyond the first vintage, {ret} "
+                "already retracted) in the last 7 days -- report-only, "
+                "nothing deleted (these are distinct vintages, not "
+                "duplicates; see PR #688)",
+                g=multi_vintage_groups, r=multi_vintage_rows, ret=retracted_total,
+            )
 
     severity = "WARNING" if len(dq_issues) < 5 else "ERROR" if len(dq_issues) < 20 else "CRITICAL"
     if dq_issues:
@@ -429,8 +511,8 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
             source=target or "all",
             title=f"Data quality: {len(dq_issues)} issues found",
             detail=str(dq_issues[:10]),
-            fix_applied="dedup" if fixes > 0 else None,
-            fix_result="SUCCESS" if fixes > 0 else None,
+            fix_applied=None,
+            fix_result=None,
             cycle_number=getattr(state, "cycle_count", None),
         )
 
@@ -438,7 +520,8 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
         "cmd": f"FIX_DATA_QUALITY:{target}" if target else "FIX_DATA_QUALITY",
         "status": "ok",
         "issues_found": len(dq_issues),
-        "duplicates_fixed": fixes,
+        "duplicates_fixed": 0,
+        "multi_vintage_groups_found": multi_vintage_groups,
     }
 
 
@@ -1263,7 +1346,13 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "USDA_NASS": "fred",
     "nowcast": "fred",
     "world_bank": "fred",
-    "EIA": "fred",
+    # 2026-09-27 Wave 1 review: was "fred", which is wrong now that "eia"
+    # has its own class-based PULLER_REGISTRY entry (source_catalog's
+    # real row is named "EIA" -- confirmed read-only on grid-svr). Mapping
+    # a REPULL/retry for "EIA" to the FRED puller silently pulled the
+    # wrong source's data under EIA's name; "computed" below is a
+    # separate, pre-existing, unrelated mapping.
+    "EIA": "eia",
     "computed": "fred",
     "FRED": "fred",
     "BLS": "bls",
@@ -1457,6 +1546,19 @@ def _retry_source(
         puller, method, kwargs = _resolve_puller(source_name, engine)
         kwargs = dict(kwargs)
         pull_fn = getattr(puller, method)
+
+        # Registry kwargs may be plain values OR zero-arg callables (e.g.
+        # FINRA's "anchor_date": _finra_short_volume_trade_date, which must
+        # be evaluated at call time, not once when PULLER_REGISTRY is built
+        # at import -- see smart_scheduler.SmartScheduler._run_puller's
+        # identical resolution). _resolve_puller/_build_source_registry
+        # copy PULLER_REGISTRY's "kwargs" through verbatim into
+        # "pull_kwargs", so a callable value reaching here unresolved would
+        # get passed to pull_fn AS a function object instead of the date
+        # string it computes -- resolve it the same way the scheduler does.
+        for key, val in list(kwargs.items()):
+            if key != "should_continue" and callable(val):
+                kwargs[key] = val()
 
         try:
             params = inspect.signature(pull_fn).parameters

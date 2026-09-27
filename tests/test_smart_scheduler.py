@@ -1,10 +1,18 @@
 from __future__ import annotations
 
 import types
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
-from ingestion.smart_scheduler import MissingPullerApiKey, SmartScheduler
+from ingestion.altdata.cftc_markets import compute_release
+from ingestion.smart_scheduler import (
+    _CFTC_ET,
+    MissingPullerApiKey,
+    SmartScheduler,
+    _cftc_cot_is_due,
+    _cftc_current_report_date,
+)
 
 
 class _EnvPuller:
@@ -205,3 +213,244 @@ def test_get_status_reports_orphan_thread_count() -> None:
     assert status["orphan_thread_count_total"] == 7
     assert status["active_threads"] == ["foo"]
     assert status["max_concurrent_threads"] == SmartScheduler.MAX_CONCURRENT_THREADS
+
+
+# ── GRID task A1: cftc_cot holiday/DST-aware release gate ───────────────
+#
+# Coordinator REQUEST CHANGES on PR #681 @ dd53a3dd (BLOCKER: fixed 19:45
+# UTC anchor is wrong in EST — fires 45min before the report exists and the
+# Saturday retry never fires because the premature run counts as a
+# success). These fixtures use compute_release() itself (also exercised
+# directly in tests/test_cftc_cot_market_code.py) as the source of truth
+# for each report_date's actual release_at, then add the 15-minute margin
+# the gate applies, so a bug in the fixture math can't hide a bug in the
+# gate — both use the one holiday/DST-aware rule.
+
+_MARGIN = timedelta(minutes=15)
+
+
+def _release_plus_margin(report_date) -> datetime:
+    release = compute_release(report_date)
+    assert release.release_at is not None
+    return release.release_at + _MARGIN
+
+
+# Ordinary EDT week (no holiday): Tue 2026-09-22 -> Fri 2026-09-25 19:30 UTC.
+_EDT_REPORT_DATE = date(2026, 9, 22)
+_EDT_RELEASE = _release_plus_margin(_EDT_REPORT_DATE)  # Fri 19:45 UTC
+_EDT_FRIDAY_BEFORE = _EDT_RELEASE - timedelta(minutes=1)
+_EDT_FRIDAY_AFTER = _EDT_RELEASE + timedelta(hours=1, minutes=15)  # Fri 21:00 UTC
+_EDT_SATURDAY = _EDT_RELEASE + timedelta(hours=16, minutes=15)  # Sat noon UTC
+_EDT_SUNDAY_PAST_WINDOW = _EDT_RELEASE + timedelta(days=1, hours=16, minutes=15)  # Sun noon UTC
+_EDT_MONDAY = _EDT_RELEASE + timedelta(days=3)
+
+# EST week (Dec/Jan): Tue 2026-12-01 -> Fri 2026-12-04 20:30 UTC. This is
+# the exact regression case: the OLD fixed-19:45-UTC anchor would have
+# fired here 61 minutes before this release_at+margin (20:45 UTC).
+_EST_REPORT_DATE = date(2026, 12, 1)
+_EST_RELEASE = _release_plus_margin(_EST_REPORT_DATE)  # Fri 20:45 UTC
+_EST_OLD_WRONG_ANCHOR = datetime(2026, 12, 4, 19, 45, tzinfo=timezone.utc)
+_EST_FRIDAY_AFTER = _EST_RELEASE + timedelta(hours=1)
+_EST_SATURDAY = _EST_RELEASE + timedelta(hours=16)
+
+# DST spring-forward 2026 (clocks go EST->EDT on Sun 2026-03-08 02:00 ET):
+# the Friday immediately before is still EST, the one immediately after is
+# already EDT.
+_SPRING_BEFORE_REPORT_DATE = date(2026, 3, 3)   # Fri 2026-03-06, EST
+_SPRING_AFTER_REPORT_DATE = date(2026, 3, 10)   # Fri 2026-03-13, EDT
+_SPRING_BEFORE_RELEASE = _release_plus_margin(_SPRING_BEFORE_REPORT_DATE)  # 20:45 UTC
+_SPRING_AFTER_RELEASE = _release_plus_margin(_SPRING_AFTER_REPORT_DATE)    # 19:45 UTC
+
+# DST fall-back 2026 (clocks go EDT->EST on Sun 2026-11-01 02:00 ET).
+_FALL_BEFORE_REPORT_DATE = date(2026, 10, 27)  # Fri 2026-10-30, EDT
+_FALL_AFTER_REPORT_DATE = date(2026, 11, 3)    # Fri 2026-11-06, EST
+_FALL_BEFORE_RELEASE = _release_plus_margin(_FALL_BEFORE_REPORT_DATE)  # 19:45 UTC
+_FALL_AFTER_RELEASE = _release_plus_margin(_FALL_AFTER_REPORT_DATE)    # 20:45 UTC
+
+# Holiday-shifted week: Tue 2026-06-30's Friday (2026-07-03) is the
+# Independence Day observed holiday (Jul 4 falls on a Saturday in 2026),
+# so compute_release shifts the release to the next federal business day,
+# Mon 2026-07-06 -- matching cftc_markets.py's own worked 2026 example.
+_HOLIDAY_REPORT_DATE = date(2026, 6, 30)
+_HOLIDAY_RELEASE = _release_plus_margin(_HOLIDAY_REPORT_DATE)  # Mon 2026-07-06 19:45 UTC
+assert compute_release(_HOLIDAY_REPORT_DATE).holiday_shifted is True
+
+
+def test_current_report_date_matches_this_weeks_tuesday_once_released() -> None:
+    """From the moment of an ordinary week's own release through the
+    following Monday (the next Tuesday's report isn't due yet), the
+    current report is that week's Tuesday.
+    """
+    tuesday = date(2026, 9, 22)  # ordinary EDT week, release Fri 2026-09-25
+    release_at = compute_release(tuesday).release_at
+    for probe in (
+        release_at,
+        release_at + timedelta(hours=6),  # later Friday
+        release_at + timedelta(days=1),  # Saturday
+        release_at + timedelta(days=2),  # Sunday
+        release_at + timedelta(days=3),  # Monday
+    ):
+        assert _cftc_current_report_date(probe) == tuesday
+
+
+def test_current_report_date_falls_back_to_last_released_report_before_this_weeks() -> None:
+    """Before this week's own release, "current" falls back to whichever
+    report actually released most recently (last week's). This is
+    functionally harmless for _cftc_cot_is_due -- last week's retry window
+    is long closed either way -- but pins the fallback's own behavior.
+    """
+    tuesday = date(2026, 9, 22)
+    prior_tuesday = date(2026, 9, 15)
+    release_at = compute_release(tuesday).release_at
+    for probe in (release_at - timedelta(minutes=1), release_at - timedelta(days=3)):
+        assert _cftc_current_report_date(probe) == prior_tuesday
+
+
+def test_current_report_date_anchors_on_holiday_shifted_release_not_weekday() -> None:
+    """The coordinator's regression: on the Tuesday that follows a
+    holiday-shifted Monday release, the current report must still be the
+    one that just released (06-30) -- not "itself" (07-07, a naive
+    weekday match, whose own release is the FOLLOWING Friday and hasn't
+    happened). This is what keeps the retry window pointed at the report
+    that was really last released, however far its holiday shift moved it.
+    """
+    monday_release = compute_release(_HOLIDAY_REPORT_DATE).release_at  # Mon 2026-07-06
+    genuine_tuesday = monday_release + timedelta(hours=20)  # 2026-07-07, ET morning
+    assert genuine_tuesday.astimezone(_CFTC_ET).date() == date(2026, 7, 7)  # sanity: really Tuesday
+
+    assert _cftc_current_report_date(monday_release) == _HOLIDAY_REPORT_DATE
+    assert _cftc_current_report_date(genuine_tuesday) == _HOLIDAY_REPORT_DATE
+
+
+def test_cftc_cot_not_due_before_release_plus_margin_edt() -> None:
+    assert _cftc_cot_is_due(None, _EDT_FRIDAY_BEFORE) is False
+    assert _cftc_cot_is_due(_EDT_RELEASE - timedelta(days=14), _EDT_FRIDAY_BEFORE) is False
+
+
+def test_cftc_cot_due_at_or_after_release_plus_margin_edt() -> None:
+    assert _cftc_cot_is_due(None, _EDT_RELEASE) is True
+    assert _cftc_cot_is_due(_EDT_RELEASE - timedelta(days=7), _EDT_FRIDAY_AFTER) is True
+
+
+def test_cftc_cot_saturday_retries_when_friday_was_missed_edt() -> None:
+    stale = _EDT_RELEASE - timedelta(days=7)
+    assert _cftc_cot_is_due(stale, _EDT_SATURDAY) is True
+    assert _cftc_cot_is_due(None, _EDT_SATURDAY) is True
+
+
+def test_cftc_cot_no_rerun_after_friday_succeeded_edt() -> None:
+    assert _cftc_cot_is_due(_EDT_FRIDAY_AFTER, _EDT_SATURDAY) is False
+    assert _cftc_cot_is_due(_EDT_RELEASE, _EDT_SATURDAY) is False
+
+
+def test_cftc_cot_never_due_outside_window_even_if_very_stale_edt() -> None:
+    ancient = _EDT_RELEASE - timedelta(days=365)
+    for probe in (_EDT_SUNDAY_PAST_WINDOW, _EDT_MONDAY):
+        assert _cftc_cot_is_due(ancient, probe) is False
+        assert _cftc_cot_is_due(None, probe) is False
+
+
+def test_cftc_cot_is_due_accepts_naive_last_success_as_utc() -> None:
+    naive_stale = (_EDT_RELEASE - timedelta(days=7)).replace(tzinfo=None)
+    assert _cftc_cot_is_due(naive_stale, _EDT_SATURDAY) is True
+
+
+def test_cftc_cot_est_release_is_2030_utc_not_1930() -> None:
+    """DST regression pin: in EST, 15:30 ET is 20:30 UTC (not 19:30), so
+    release+margin is 20:45 UTC, not 19:45.
+    """
+    assert _EST_RELEASE == datetime(2026, 12, 4, 20, 45, tzinfo=timezone.utc)
+
+
+def test_cftc_cot_not_due_at_the_old_fixed_1945_utc_anchor_in_est() -> None:
+    """The exact bug the coordinator flagged: at the OLD hardcoded 19:45
+    UTC anchor, an EST Friday's real release+margin (20:45 UTC) is still
+    61 minutes away -- must not be due, or it would re-store the prior
+    week's report and (per the old code) suppress the Saturday retry too.
+    """
+    assert _cftc_cot_is_due(None, _EST_OLD_WRONG_ANCHOR) is False
+    assert _cftc_cot_is_due(_EST_RELEASE - timedelta(days=7), _EST_OLD_WRONG_ANCHOR) is False
+
+
+def test_cftc_cot_due_at_or_after_release_plus_margin_est() -> None:
+    assert _cftc_cot_is_due(None, _EST_RELEASE) is True
+    assert _cftc_cot_is_due(_EST_RELEASE - timedelta(days=7), _EST_FRIDAY_AFTER) is True
+
+
+def test_cftc_cot_saturday_retries_when_friday_was_missed_est() -> None:
+    assert _cftc_cot_is_due(_EST_RELEASE - timedelta(days=7), _EST_SATURDAY) is True
+    assert _cftc_cot_is_due(_EST_RELEASE, _EST_SATURDAY) is False  # already succeeded
+
+
+@pytest.mark.parametrize(
+    "before_release,after_release",
+    [
+        (_SPRING_BEFORE_RELEASE, _SPRING_AFTER_RELEASE),
+        (_FALL_BEFORE_RELEASE, _FALL_AFTER_RELEASE),
+    ],
+)
+def test_cftc_cot_dst_transition_weeks_both_sides_correct(before_release, after_release) -> None:
+    """The Friday immediately before a DST transition and the Friday
+    immediately after must each use their OWN correct UTC offset (not the
+    offset in effect on whichever day `now` happens to be evaluated).
+    """
+    for release_at in (before_release, after_release):
+        assert _cftc_cot_is_due(None, release_at - timedelta(minutes=1)) is False
+        assert _cftc_cot_is_due(None, release_at) is True
+
+
+def test_cftc_cot_holiday_shifted_week_is_due_on_the_shifted_day_not_friday() -> None:
+    # The (observed-holiday) Friday itself must NOT be due -- the report
+    # doesn't exist until the shifted Monday.
+    holiday_friday = datetime.combine(
+        date(2026, 7, 3), datetime.min.time(), tzinfo=timezone.utc
+    ) + timedelta(hours=20)
+    assert _cftc_cot_is_due(None, holiday_friday) is False
+
+    assert _cftc_cot_is_due(None, _HOLIDAY_RELEASE - timedelta(minutes=1)) is False
+    assert _cftc_cot_is_due(None, _HOLIDAY_RELEASE) is True
+    # Retry still available on the genuine Tuesday ET day after the
+    # shifted Monday release. (+2h is still Monday in ET -- the previous
+    # version of this test used that offset and never actually exercised
+    # the Tuesday-retry path; +20h lands in ET morning on the 7th.)
+    genuine_tuesday = _HOLIDAY_RELEASE + timedelta(hours=20)
+    assert genuine_tuesday.astimezone(_CFTC_ET).date() == date(2026, 7, 7)
+    assert _cftc_cot_is_due(_HOLIDAY_RELEASE - timedelta(days=7), genuine_tuesday) is True
+
+
+def test_is_due_dispatches_cftc_cot_through_the_release_gate() -> None:
+    """SmartScheduler._is_due must route cftc_cot through the holiday/DST
+    -aware gate instead of the generic freq_h cadence, for both a
+    never-run puller and one with a recent (but off-window) last_success.
+    """
+    from ingestion import smart_scheduler as ss
+
+    sched = SmartScheduler.__new__(SmartScheduler)
+    sched._state = {}
+    puller = {"name": "cftc_cot", "freq_h": 168}
+
+    real_datetime = ss.datetime
+
+    class _FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _EDT_FRIDAY_BEFORE if tz is None else _EDT_FRIDAY_BEFORE
+
+    ss.datetime = _FrozenDatetime
+    try:
+        # Never run + before this week's release+margin → not due (would
+        # be True under the old "state is None → definitely due" shortcut).
+        assert sched._is_due(puller) is False
+
+        # A recent success (well within 168h) that predates this week's
+        # release must still not be treated as "satisfied" before the
+        # window opens.
+        sched._state = {
+            "cftc_cot": {
+                "last_success": _EDT_FRIDAY_BEFORE - timedelta(hours=1),
+                "cooldown_until": None,
+            }
+        }
+        assert sched._is_due(puller) is False
+    finally:
+        ss.datetime = real_datetime

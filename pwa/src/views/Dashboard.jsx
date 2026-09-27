@@ -172,7 +172,10 @@ function AudioBriefingPlayer({ onNavigate }) {
                 setAudioFile(filename);
                 setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
             } else {
-                setBriefingError(r?.message || 'Audio briefing generation failed.');
+                // Backend returns {error, status:'FAILED'} on failure (e.g. paid
+                // generation disabled) — prefer that honest message over the
+                // generic fallback so the operator sees *why* it failed.
+                setBriefingError(r?.error || r?.message || 'Audio briefing generation failed.');
             }
         } catch {
             setBriefingError('Audio briefing generation failed.');

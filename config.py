@@ -436,6 +436,28 @@ class Settings(BaseSettings):
     # directly and already honoured it.
     GRID_ALLOW_PAID_LLM: bool = False
 
+    @field_validator("GRID_ALLOW_PAID_LLM", mode="before")
+    @classmethod
+    def _coerce_paid_llm_flag(cls, v: object) -> object:
+        """Treat a blank/whitespace env value as False instead of raising.
+
+        Pydantic's built-in bool coercion accepts "0"/"false"/"no"/"off"
+        (and the true-ish equivalents) but rejects "" outright with a
+        ValidationError -- so ``GRID_ALLOW_PAID_LLM=`` (present but empty,
+        e.g. a templated .env line, or a shell var substituted in unset)
+        would crash the whole app at startup instead of leaving the paid
+        gate closed, which is exactly the fail-safe this flag exists to
+        guarantee. Anything else (including an already-bool value) is
+        passed through unchanged for pydantic's own validator to handle.
+        """
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("", "0", "false", "no", "off"):
+                return False
+            if s in ("1", "true", "yes", "on"):
+                return True
+        return v
+
     # Gemma 4 main server is disabled until a live port-8080 Gemma service is restored.
     # The Gemma micro endpoints below remain separate and active.
     GEMMA_BASE_URL: str = "http://localhost:8080"

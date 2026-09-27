@@ -29,6 +29,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence.lever_pullers import AGGREGATE_SOURCE_TYPES, puller_identity
+
 
 # raw_series is a TimescaleDB hypertable. The unbounded ``series_id LIKE``
 # scan ran across every chunk twelve times per cycle and hit the statement
@@ -283,14 +285,6 @@ def extract_from_signal_sources(
 
         for source_type, source_id, ticker, signal_date, signal_type, signal_value in rows:
             try:
-                # source_id in signal_sources IS the actor name (e.g., "Nancy Pelosi")
-                actor = source_id
-                # signal_type.lower() is a categorical leak, not a direction.
-                # Stash it as subtype; leave direction NULL since we cannot
-                # derive bull/bear from the source_type alone.
-                subtype = signal_type.lower() if signal_type else None
-                direction = None
-
                 # Parse signal_value JSON for extra context
                 extra = {}
                 if signal_value:
@@ -298,6 +292,32 @@ def extract_from_signal_sources(
                         extra = json.loads(signal_value) if isinstance(signal_value, str) else signal_value
                     except (json.JSONDecodeError, TypeError):
                         extra = {"raw": str(signal_value)}
+
+                # GD-FIX: source_id in signal_sources IS the actor name for
+                # GRID's own pullers (e.g. "Nancy Pelosi" for congressional),
+                # but for QuiverQuant feeds it is a *constant per endpoint*
+                # (e.g. "qq_senate_trading" for every row that endpoint ever
+                # writes, regardless of ticker or date). Writing that
+                # constant straight into signal_data.actor made the feed
+                # itself look like a market actor connected to every ticker
+                # it ever reported on (the plan's evidence:
+                # pol_qq_senate_trading -> corp_GEHC via
+                # scripts/enrich_connections.py, and a `signal_linked` edge
+                # from the raw feed id via signal_backlinker.py). Resolve
+                # the real actor from the payload the same way
+                # lever_pullers.puller_identity() already does, and write
+                # no actor at all for feeds that are ticker-level aggregates
+                # with nobody behind them (quarterly gov-contract totals,
+                # off-exchange DPI, WSB mentions, ...).
+                if source_type in AGGREGATE_SOURCE_TYPES:
+                    actor = None
+                else:
+                    actor = puller_identity(source_type, source_id, extra or signal_value)
+                # signal_type.lower() is a categorical leak, not a direction.
+                # Stash it as subtype; leave direction NULL since we cannot
+                # derive bull/bear from the source_type alone.
+                subtype = signal_type.lower() if signal_type else None
+                direction = None
 
                 magnitude = extra.get("amount_midpoint", 0.0) if isinstance(extra, dict) else 0.0
 
