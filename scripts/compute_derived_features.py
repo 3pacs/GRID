@@ -298,7 +298,7 @@ def load_raw(engine, series_id: str) -> pd.Series:
         rows = conn.execute(
             text("""
                 SELECT obs_date, value FROM raw_series
-                WHERE series_id = :sid
+                WHERE series_id = :sid AND pull_status = 'SUCCESS'
                 ORDER BY obs_date
             """),
             {"sid": series_id},

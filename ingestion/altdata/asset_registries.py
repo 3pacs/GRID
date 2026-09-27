@@ -438,6 +438,7 @@ class AssetRegistryPuller(BasePuller):
                         SELECT id FROM source_catalog
                         WHERE name = 'ICIJ_OFFSHORE' LIMIT 1
                     )
+                    AND pull_status = 'SUCCESS'
                     AND raw_payload->>'officer_name' IS NOT NULL
                     ORDER BY officer_name
                     LIMIT 200

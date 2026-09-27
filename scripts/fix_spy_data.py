@@ -86,7 +86,8 @@ def main():
                 existing = conn.execute(
                     text(
                         "SELECT DISTINCT obs_date FROM raw_series "
-                        "WHERE series_id = :sid AND source_id = :src"
+                        "WHERE series_id = :sid AND source_id = :src "
+                        "AND pull_status != 'QUARANTINED'"
                     ),
                     {"sid": sid, "src": source_id},
                 ).fetchall()

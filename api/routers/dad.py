@@ -23,7 +23,7 @@ from fastapi.responses import StreamingResponse
 from loguru import logger as log
 from sqlalchemy import text
 
-from api.auth import require_auth
+from api.auth import require_auth, require_stream_auth
 from api.dependencies import get_db_engine
 
 router = APIRouter(prefix="/api/v1/dad", tags=["dad"])
@@ -1102,6 +1102,7 @@ def _grid_market_context(
                         "FROM raw_series rs "
                         "JOIN source_catalog sc ON sc.id = rs.source_id "
                         "WHERE sc.name = 'yfinance' "
+                        "AND rs.pull_status = 'SUCCESS' "
                         "AND rs.series_id = ANY(:series_ids) "
                         "AND rs.obs_date >= :cutoff "
                         "ORDER BY rs.obs_date"
@@ -1310,6 +1311,7 @@ def _latest_signal_context(engine: Any, ticker: str) -> dict[str, Any]:
                     "FROM raw_series rs "
                     "JOIN source_catalog sc ON sc.id = rs.source_id "
                     "WHERE sc.name = 'TradingView' "
+                    "AND rs.pull_status = 'SUCCESS' "
                     "AND rs.series_id LIKE :pattern "
                     "ORDER BY rs.pull_timestamp DESC LIMIT 10"
                 ),
@@ -2408,9 +2410,14 @@ def get_dad_ticker_options(
 def stream_dad_ticker_gold(
     ticker: str,
     refresh_finviz: bool = Query(False),
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_stream_auth),
 ) -> StreamingResponse:
-    """Stream compact payload first, then hydrate evidence, chart, Finviz, and options."""
+    """Stream compact payload first, then hydrate evidence, chart, Finviz, and options.
+
+    ``EventSource`` cannot send headers, so browsers authenticate with a
+    single-use ``?ticket=`` from ``POST /api/v1/auth/stream-ticket``; header
+    callers may still send ``Authorization: Bearer``.
+    """
     ticker_upper = _normalize_ticker(ticker)
 
     def generate():

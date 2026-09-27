@@ -128,14 +128,21 @@ function TickerPulseCard({ title, props }) {
     );
     const price = data?.price;
     const change = data?.change_pct;
+    // `stale` comes from the API (as_of more than 3 calendar days old) — a
+    // stale price must never be narrated as "today's" move (#F1 D4).
+    const isStale = data?.stale === true;
     // One plain sentence: what does today look like for this stock?
     const moodWord = data ? plainSentiment(data.sentiment).label.toLowerCase() : '';
     const line = (() => {
         if (!data || typeof price !== 'number') return null;
+        const name = tickerName(ticker);
+        if (isStale) {
+            const when = data?.as_of ? ` as of ${data.as_of}` : '';
+            return `${name}'s last known price${when} — not today's, so take it as a reference, not a live read.`;
+        }
         const dir = typeof change === 'number'
             ? (change > 0.3 ? 'up' : change < -0.3 ? 'down' : 'about flat')
             : null;
-        const name = tickerName(ticker);
         if (dir === 'up') return `${name} is up today — ${moodWord}.`;
         if (dir === 'down') return `${name} is down today — ${moodWord}.`;
         return `${name} is steady today — ${moodWord}.`;
@@ -163,7 +170,14 @@ function TickerPulseCard({ title, props }) {
                         </div>
                     )}
                     {data?.price_tier === 'daily' && data?.as_of && (
-                        <div style={CS.body}>Daily price · {data.as_of}</div>
+                        <div style={CS.body}>
+                            Daily price · {data.as_of}{isStale ? ' · stale' : ''}
+                        </div>
+                    )}
+                    {data?.price_tier === 'live_fallback' && (
+                        <div style={CS.body}>
+                            Live estimate (yfinance){data?.as_of ? ` · ${data.as_of}` : ' · date unconfirmed'}
+                        </div>
                     )}
                     {data?.sentiment && <MoodBadge raw={data.sentiment} />}
                     {line ? <div style={CS.body}>{line}</div>

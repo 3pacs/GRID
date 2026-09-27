@@ -657,7 +657,9 @@ class AISGroundTruthPuller(BasePuller):
         """Check whether a row already exists in the current 4h bucket.
 
         Prevents duplicate inserts when the puller is re-run inside the
-        same bucket window (e.g. operator manually triggers).
+        same bucket window (e.g. operator manually triggers). A
+        ``QUARANTINED`` row (migration #671) does not count as present — it
+        is not valid data, so a re-run must be allowed to replace it.
         """
         bucket_start = bucket_ts
         bucket_end = bucket_ts + timedelta(hours=_BUCKET_HOURS)
@@ -667,7 +669,8 @@ class AISGroundTruthPuller(BasePuller):
                     "SELECT 1 FROM raw_series "
                     "WHERE series_id = :sid AND source_id = :src "
                     "AND pull_timestamp >= :start "
-                    "AND pull_timestamp < :end LIMIT 1"
+                    "AND pull_timestamp < :end "
+                    "AND pull_status != 'QUARANTINED' LIMIT 1"
                 ),
                 {
                     "sid": series_id,

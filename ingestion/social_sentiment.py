@@ -269,10 +269,21 @@ class SocialSentimentPuller:
             from sqlalchemy import text
             with self.engine.begin() as conn:
                 conn.execute(text(
-                    "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class) "
-                    "VALUES ('SocialSentiment', 'https://reddit.com', 'free', 'batch') "
+                    "INSERT INTO source_catalog "
+                    "(name, base_url, cost_tier, latency_class, pit_available, "
+                    "revision_behavior, trust_score, priority_rank) "
+                    "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
                     "ON CONFLICT (name) DO NOTHING"
-                ))
+                ), {
+                    "name": "SocialSentiment",
+                    "url": "https://reddit.com",
+                    "cost": "FREE",
+                    "latency": "EOD",
+                    "pit": False,
+                    "rev": "NEVER",
+                    "trust": "MED",
+                    "rank": 60,
+                })
                 src = conn.execute(text(
                     "SELECT id FROM source_catalog WHERE name = 'SocialSentiment'"
                 )).fetchone()
