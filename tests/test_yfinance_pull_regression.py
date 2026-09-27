@@ -467,6 +467,287 @@ def test_download_omits_timeout_when_unsupported(engine_recording_inserts):
     assert "timeout" not in captured
 
 
+def test_pull_all_single_flight_skips_when_already_running(engine_recording_inserts):
+    """Fix #1 (GRID-YF-CLOSE-REPAIR-20260926): a second concurrent
+    pull_all() must skip entirely — not even the first ticker attempted —
+    when a previous run's single-flight lock is still held (simulating an
+    orphaned thread the scheduler abandoned after a timeout)."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.yf, "download") as mock_download:
+        puller = yfinance_pull.YFinancePuller(engine)
+        acquired = yfinance_pull._PULL_ALL_LOCK.acquire(blocking=False)
+        assert acquired, "test setup: lock should be free before this test runs"
+        try:
+            result = puller.pull_all(ticker_list=["AAA", "BBB"], start_date="2026-09-11")
+        finally:
+            yfinance_pull._PULL_ALL_LOCK.release()
+
+    assert result == []
+    mock_download.assert_not_called()
+
+
+def test_pull_all_single_flight_skip_reports_dict_shape_with_should_continue(engine_recording_inserts):
+    """When called with should_continue (the shape hermes_fixers._retry_source
+    consumes), a lock-skip must report stopped_by_budget=True — that's what
+    the caller uses to decide NOT to advance source_catalog.last_pull_at."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.yf, "download") as mock_download:
+        puller = yfinance_pull.YFinancePuller(engine)
+        yfinance_pull._PULL_ALL_LOCK.acquire(blocking=False)
+        try:
+            result = puller.pull_all(
+                ticker_list=["AAA", "BBB"],
+                start_date="2026-09-11",
+                should_continue=lambda: True,
+            )
+        finally:
+            yfinance_pull._PULL_ALL_LOCK.release()
+
+    assert result["status"] == "SKIPPED"
+    assert result["stopped_by_budget"] is True
+    assert result["tickers_not_attempted"] == ["AAA", "BBB"]
+    assert result["counts"]["unattempted"] == 2
+    assert sum(result["counts"].values()) == 2
+    mock_download.assert_not_called()
+
+
+def test_pull_all_releases_lock_after_a_normal_run(engine_recording_inserts):
+    """The lock must not leak across calls — a normal (non-orphaned) run
+    releases it so the next scheduled tick can proceed."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        first = puller.pull_all(ticker_list=["AAA"], start_date="2026-09-11")
+        second = puller.pull_all(ticker_list=["BBB"], start_date="2026-09-11")
+
+    assert isinstance(first, list) and len(first) == 1
+    assert isinstance(second, list) and len(second) == 1
+    assert not yfinance_pull._PULL_ALL_LOCK.locked()
+
+
+def test_pull_all_concurrent_calls_only_one_attempts_tickers(engine_recording_inserts):
+    """End-to-end proof of single-flight: two REAL concurrent pull_all()
+    calls (separate threads, one genuinely in-flight inside yf.download)
+    must result in exactly one of them attempting any ticker at all."""
+    import threading
+
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    entered_first = threading.Event()
+    release_first = threading.Event()
+    frame = pd.DataFrame(
+        {"Open": [87.35]},
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+
+    def slow_download(ticker, **kwargs):
+        entered_first.set()
+        release_first.wait(timeout=5)
+        return frame
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", side_effect=slow_download):
+        puller = yfinance_pull.YFinancePuller(engine)
+        results = {}
+
+        def run_first():
+            results["first"] = puller.pull_all(ticker_list=["AAA"], start_date="2026-09-11")
+
+        t1 = threading.Thread(target=run_first)
+        t1.start()
+        assert entered_first.wait(timeout=5), "first call never started its download"
+
+        # Second call starts while the first is still inside pull_all().
+        results["second"] = puller.pull_all(ticker_list=["BBB"], start_date="2026-09-11")
+        release_first.set()
+        t1.join(timeout=5)
+
+    assert results["second"] == [], "concurrent call must skip — no ticker attempted"
+    assert len(results["first"]) == 1
+    assert results["first"][0]["ticker"] == "AAA"
+
+
+def test_multiindex_ticker_mismatch_refuses_whole_ticker(engine_recording_inserts):
+    """Fix #3: if the downloaded frame's MultiIndex ticker level doesn't
+    match the ticker we requested, refuse the WHOLE ticker instead of
+    silently dropping the ticker level and writing data that may belong to
+    a different instrument — the confirmed April 2026 mechanism (donor
+    tickers like CL=F, GBPUSD=X landing under SPY/QQQ/etc. series ids)."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        [[100.0, 68.5]],
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+        columns=pd.MultiIndex.from_tuples(
+            [("Close", "SPY"), ("Close", "CL=F")], names=["Price", "Ticker"]
+        ),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("SPY", start_date="2026-09-11")
+
+    assert result["rows_inserted"] == 0
+    assert result["status"] == "SKIPPED"
+    assert result["outcome"] == "error"
+    assert any("CL=F" in e for e in result["errors"])
+    for call in conn.execute.call_args_list:
+        assert "INSERT INTO raw_series" not in str(call.args[0] if call.args else "")
+
+
+def test_multiindex_matching_ticker_still_writes_normally(engine_recording_inserts):
+    """Sanity counterpart: a MultiIndex frame whose ticker level DOES match
+    the requested ticker must be unaffected by the new guard."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        [[100.0]],
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+        columns=pd.MultiIndex.from_tuples([("Close", "TLT")], names=["Price", "Ticker"]),
+    )
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("TLT", start_date="2026-09-11")
+
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 1
+    assert result["outcome"] == "inserted"
+
+
+def test_wild_ratio_guard_refuses_write_for_wrong_instrument_values(engine_recording_inserts):
+    """Fix #4: refuse to write when a series' freshly downloaded values
+    disagree wildly (median ratio outside [0.5, 2]) with that exact
+    series' own existing recent SUCCESS values on overlapping dates — cheap
+    defense against a wrong-instrument frame that otherwise looks
+    well-formed (single ticker column, valid dates, numeric values)."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    dates = [date(2026, 9, d) for d in range(1, 9)]
+    frame = pd.DataFrame(
+        # ~30-37: plausible for some instrument, wildly off vs the
+        # existing ~680-687 SPY-scale values on the very same dates.
+        {"Close": [30.0 + i for i in range(len(dates))]},
+        index=pd.DatetimeIndex([pd.Timestamp(d) for d in dates], name="Date"),
+    )
+    existing_rows = [(d, 680.0 + i) for i, d in enumerate(dates)]
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT obs_date, value FROM raw_series" in str(statement):
+            result.fetchall.return_value = existing_rows
+        else:
+            result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        return result
+
+    conn.execute.side_effect = execute
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker(
+            "TLT", start_date="2026-09-01", end_date="2026-09-09",
+        )
+
+    assert result["rows_inserted"] == 0
+    assert any("wild median ratio" in e for e in result["errors"])
+    for call in conn.execute.call_args_list:
+        if len(call.args) >= 2 and "INSERT INTO raw_series" in str(call.args[0]):
+            pytest.fail(f"must not write when the wrong-instrument guard trips: {call.args[1]}")
+
+
+def test_wild_ratio_guard_allows_a_small_normal_revision(engine_recording_inserts):
+    """Counterpart: an ordinary close-to-1 ratio (ordinary same-instrument
+    values) must not be refused by the wrong-instrument guard."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    dates = [date(2026, 9, d) for d in range(1, 6)]
+    frame = pd.DataFrame(
+        {"Close": [680.1, 681.2, 682.0, 683.5, 684.0]},
+        index=pd.DatetimeIndex([pd.Timestamp(d) for d in dates], name="Date"),
+    )
+    existing_rows = [(d, 680.0 + i) for i, d in enumerate(dates)]
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT obs_date, value FROM raw_series" in str(statement):
+            result.fetchall.return_value = existing_rows
+        else:
+            result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        return result
+
+    conn.execute.side_effect = execute
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("TLT", start_date="2026-09-01", end_date="2026-09-06")
+
+    assert result["errors"] == []
+    assert result["rows_inserted"] == 5
+
+
+def test_wild_ratio_guard_needs_minimum_overlap_before_judging(engine_recording_inserts):
+    """Fewer than _WILD_RATIO_MIN_OVERLAP overlapping dates must not trip
+    the guard — a single stale/off-by-one existing row is too noisy."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    frame = pd.DataFrame(
+        {"Close": [5.0]},  # wildly different from the one existing row...
+        index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
+    )
+    existing_rows = [(date(2026, 9, 11), 680.0)]  # ...but only 1 overlap.
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT obs_date, value FROM raw_series" in str(statement):
+            result.fetchall.return_value = existing_rows
+        else:
+            result.fetchall.return_value = []
+        result.fetchone.return_value = None
+        return result
+
+    conn.execute.side_effect = execute
+
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        result = puller.pull_ticker("TLT", start_date="2026-09-11")
+
+    assert result["errors"] == []
+    assert result["rows_inserted"] == 1
+
+
 def test_pull_all_with_should_continue_reports_per_outcome_counts(engine_recording_inserts):
     """Check 1a: pull_all's dict-shaped (should_continue given) return
     carries top-level counts per outcome, including "unattempted" for

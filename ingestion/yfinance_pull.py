@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import re
+import threading
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -32,6 +33,37 @@ from price_close_contract import (
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+# GRID-YF-CLOSE-REPAIR-20260926 root-cause fix: the smart scheduler
+# (ingestion/smart_scheduler.py) runs YFinancePuller.pull_all in a daemon
+# thread bounded by a thread-join timeout. If that budget is exceeded the
+# thread is *orphaned* (left running, never killed — see
+# SmartScheduler._run_puller's docstring) while the NEXT scheduler tick can
+# start a fresh pull_all() call in the same process. Two concurrent
+# pull_all() runs against an old, thread-unsafe yfinance version (fixed in
+# 1.7.0, see the module-level timeout note above) was the confirmed
+# mechanism by which one ticker's frame got written under another ticker's
+# series_id. This lock makes pull_all single-flight at the PROCESS level —
+# a non-blocking acquire — so a second concurrent call (whether from an
+# orphaned thread or an ordinary double-invocation) skips its run entirely
+# rather than racing the first one. It is a plain (non-reentrant)
+# threading.Lock at module scope, not an instance attribute, because a new
+# YFinancePuller instance is constructed for every scheduled call
+# (SmartScheduler._build_puller_instance) — the lock must survive across
+# instances and threads for the life of the process.
+_PULL_ALL_LOCK = threading.Lock()
+
+# Wrong-instrument sanity guard (GRID-YF-CLOSE-REPAIR-20260926, fix #4):
+# refuse to write a series' freshly downloaded values if they disagree
+# wildly with that exact series' own existing recent SUCCESS values on the
+# dates where both exist. A different instrument's price series will almost
+# always fail this cheaply, even when everything else about the response
+# (columns, dtypes, dates) looks well-formed.
+_WILD_RATIO_LOW = 0.5
+_WILD_RATIO_HIGH = 2.0
+# Below this many overlapping dates, a ratio is too noisy to judge (a single
+# stale or off-by-one-day existing row could otherwise trip the guard).
+_WILD_RATIO_MIN_OVERLAP = 3
 
 # yfinance logs missing/delisted symbols at ERROR level internally. The puller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
@@ -142,6 +174,71 @@ class YFinancePuller(BasePuller):
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
 
+    def _median_ratio_vs_existing(
+        self,
+        series_id: str,
+        values_by_date: dict[date, float],
+        conn: Any,
+    ) -> tuple[float | None, int]:
+        """Compare freshly downloaded values to this series' own history.
+
+        Looks up existing SUCCESS rows for ``series_id`` on the same dates
+        (bounded to the min/max of ``values_by_date``, not a full scan) and
+        returns the median of new/old ratios plus how many dates overlapped.
+        Zero or near-zero existing values are excluded (division is
+        meaningless there). Returns ``(None, overlap_count)`` when there
+        isn't enough overlap to judge — callers must treat ``None`` as "no
+        opinion", never as "safe".
+
+        Parameters:
+            series_id: The raw_series series identifier being written.
+            values_by_date: Freshly downloaded {obs_date: value} pairs.
+            conn: Active database connection (used inside the same
+                transaction as the pending inserts).
+        """
+        if not values_by_date:
+            return None, 0
+
+        rows = conn.execute(
+            text(
+                "SELECT obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src "
+                "AND pull_status = 'SUCCESS' "
+                "AND obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {
+                "sid": series_id,
+                "src": self.source_id,
+                "start_date": min(values_by_date),
+                "end_date": max(values_by_date),
+            },
+        ).fetchall()
+        existing: dict[date, float] = {}
+        for row in rows:
+            try:
+                existing[row[0]] = float(row[1])
+            except (TypeError, ValueError):
+                continue
+
+        ratios: list[float] = []
+        for obs_date_val, new_val in values_by_date.items():
+            old_val = existing.get(obs_date_val)
+            if old_val is None or old_val == 0 or new_val == 0:
+                continue
+            ratios.append(new_val / old_val)
+
+        if len(ratios) < _WILD_RATIO_MIN_OVERLAP:
+            return None, len(ratios)
+
+        ratios.sort()
+        mid = len(ratios) // 2
+        median = (
+            ratios[mid]
+            if len(ratios) % 2 == 1
+            else (ratios[mid - 1] + ratios[mid]) / 2
+        )
+        return median, len(ratios)
+
     def pull_ticker(
         self,
         ticker: str,
@@ -211,8 +308,33 @@ class YFinancePuller(BasePuller):
                 yf_ticker, auto_adjust=False, **download_kwargs
             )
 
-            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
+            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker).
+            # Wrong-instrument guard (GRID-YF-CLOSE-REPAIR-20260926, fix #3):
+            # verify every ticker-level entry matches what we asked for
+            # BEFORE dropping that level. A mismatch means the frame yfinance
+            # returned belongs (wholly or partly) to a different instrument
+            # — the confirmed mechanism behind the April 2026 SPY/QQQ/BTC/ETH
+            # contamination (donor tickers like CL=F, GBPUSD=X, another
+            # crypto). Fail closed for the whole ticker rather than silently
+            # writing data that isn't this ticker's.
             if isinstance(df.columns, pd.MultiIndex):
+                ticker_level = df.columns.get_level_values(-1)
+                unexpected = sorted(
+                    {str(t) for t in ticker_level if str(t) != yf_ticker}
+                )
+                if unexpected:
+                    log.warning(
+                        "yfinance {t}: downloaded frame contains other "
+                        "ticker column(s) {u} — refusing to write "
+                        "(wrong-instrument guard)",
+                        t=yf_ticker, u=unexpected,
+                    )
+                    result["status"] = "SKIPPED"
+                    result["outcome"] = "error"
+                    result["errors"].append(
+                        f"Wrong-instrument frame: unexpected ticker column(s) {unexpected}"
+                    )
+                    return result
                 df.columns = df.columns.get_level_values(0)
 
             # Drop any rows where the index is not a valid datetime
@@ -264,14 +386,21 @@ class YFinancePuller(BasePuller):
                     # producing repeated headers) yield a DataFrame instead of
                     # a Series, whose .items() iterates column names rather
                     # than the DatetimeIndex — which leaks strings like "Open"
-                    # into obs_date and poisons the insert.
+                    # into obs_date and poisons the insert. Fix #3
+                    # (GRID-YF-CLOSE-REPAIR-20260926): we can't tell which
+                    # duplicate column is correct, so fail closed for this
+                    # field instead of silently guessing via the first one.
                     if isinstance(selected, pd.DataFrame):
                         log.warning(
                             "yfinance {t}: column {c} resolved to DataFrame "
-                            "({n} duplicates); taking first column",
+                            "({n} duplicate columns) — refusing to guess; "
+                            "skipping this field",
                             t=yf_ticker, c=col_name, n=selected.shape[1],
                         )
-                        selected = selected.iloc[:, 0]
+                        result["errors"].append(
+                            f"{field_key}: ambiguous duplicate columns — skipped"
+                        )
+                        continue
                     col_data = selected.dropna()
                     # Bounded to the same window this call already requested
                     # from yfinance: col_data can only contain dates inside
@@ -286,6 +415,47 @@ class YFinancePuller(BasePuller):
                         start_date=requested_start_bound,
                         end_date=existing_end_bound,
                     )
+
+                    # Wrong-instrument sanity guard (fix #4,
+                    # GRID-YF-CLOSE-REPAIR-20260926): before writing anything
+                    # for this series, compare the freshly downloaded values
+                    # to this exact series' own existing recent SUCCESS
+                    # values on the dates where both exist. A median ratio
+                    # far from 1 — outside [0.5, 2] — means this download
+                    # disagrees wildly with the series' own history, which is
+                    # cheap, strong evidence of a wrong-instrument frame
+                    # (donor tickers off by 0.4x-30x+ per the incident
+                    # writeup) rather than a normal revision. Refuse the
+                    # whole field's writes rather than trying to salvage
+                    # individual dates.
+                    guard_values_by_date: dict[date, float] = {}
+                    for dt_idx, raw_value in col_data.items():
+                        parsed = pd.to_datetime(dt_idx, errors="coerce")
+                        if pd.isna(parsed):
+                            continue
+                        try:
+                            guard_values_by_date[parsed.date()] = float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                    median_ratio, overlap_n = self._median_ratio_vs_existing(
+                        series_id, guard_values_by_date, conn,
+                    )
+                    if median_ratio is not None and not (
+                        _WILD_RATIO_LOW <= median_ratio <= _WILD_RATIO_HIGH
+                    ):
+                        log.warning(
+                            "yfinance {t}:{f}: refusing write — median ratio "
+                            "{r:.3f} vs {n} overlapping existing SUCCESS "
+                            "dates is outside [{lo},{hi}] (wrong-instrument "
+                            "guard)",
+                            t=yf_ticker, f=field_key, r=median_ratio,
+                            n=overlap_n, lo=_WILD_RATIO_LOW, hi=_WILD_RATIO_HIGH,
+                        )
+                        result["errors"].append(
+                            f"{field_key}: wild median ratio {median_ratio:.3f} "
+                            f"vs {overlap_n} existing dates — refused"
+                        )
+                        continue
 
                     for dt_idx, value in col_data.items():
                         # Defensive: reject any index entry that isn't a real
@@ -478,54 +648,97 @@ class YFinancePuller(BasePuller):
               same dict shape with "status": "SUCCESS",
               "stopped_by_budget": False, "tickers_not_attempted": [],
               "counts": {..., "unattempted": 0}.
+            - a previous pull_all() call is still active in this process
+              (single-flight guard, GRID-YF-CLOSE-REPAIR-20260926 fix #1):
+              this call makes NO attempt at all — not even the first
+              ticker — and returns immediately. should_continue is None:
+              an empty list ``[]`` (zero tickers checked; distinguishable
+              from a real run only by being empty, since a real run over an
+              empty ticker_list is degenerate and not a supported input).
+              should_continue given: the usual dict shape with
+              "status": "SKIPPED", "stopped_by_budget": True (so callers
+              like scripts/hermes_fixers.py::_retry_source that gate
+              "mark this source freshly checked" on `stopped_by_budget`
+              correctly do NOT advance last_pull_at), "tickers_not_attempted"
+              equal to the full requested ticker_list, "counts" all-zero
+              except "unattempted", and "skipped_reason" naming why.
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
 
-        log.info(
-            "Starting yfinance bulk pull — checking {n} tickers from {sd}",
-            n=len(ticker_list),
-            sd=start_date,
-        )
-        results: list[dict[str, Any]] = []
-        stopped_by_budget = False
-        for idx, ticker in enumerate(ticker_list):
-            if should_continue is not None and not should_continue():
-                log.warning(
-                    "yfinance bulk pull: budget exhausted after {n}/{total} "
-                    "tickers — stopping",
-                    n=idx, total=len(ticker_list),
-                )
-                stopped_by_budget = True
-                break
-            res = self.pull_ticker(ticker, start_date)
-            results.append(res)
+        # Single-flight guard (fix #1): non-blocking acquire so a second
+        # concurrent pull_all() — most commonly the scheduler's NEXT tick
+        # finding an earlier orphaned/still-running call, but any
+        # accidental double-invocation is equally dangerous — skips its
+        # entire run rather than racing the in-flight one. See the module
+        # docstring on _PULL_ALL_LOCK for why this must be a module-level
+        # lock rather than an instance attribute.
+        if not _PULL_ALL_LOCK.acquire(blocking=False):
+            log.warning(
+                "yfinance pull_all: a previous run is still active in this "
+                "process — skipping this run entirely (single-flight guard, "
+                "no tickers attempted)",
+            )
+            if should_continue is None:
+                return []
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0,
+                      "error": 0, "unattempted": len(ticker_list)}
+            return {
+                "status": "SKIPPED",
+                "stopped_by_budget": True,
+                "results": [],
+                "tickers_not_attempted": list(ticker_list),
+                "counts": counts,
+                "skipped_reason": "pull_all already running in this process",
+            }
 
-        log.info(
-            "yfinance bulk pull complete — {ok}/{total} checked successfully",
-            ok=sum(1 for r in results if r["status"] == "SUCCESS"),
-            total=len(results),
-        )
+        try:
+            log.info(
+                "Starting yfinance bulk pull — checking {n} tickers from {sd}",
+                n=len(ticker_list),
+                sd=start_date,
+            )
+            results: list[dict[str, Any]] = []
+            stopped_by_budget = False
+            for idx, ticker in enumerate(ticker_list):
+                if should_continue is not None and not should_continue():
+                    log.warning(
+                        "yfinance bulk pull: budget exhausted after {n}/{total} "
+                        "tickers — stopping",
+                        n=idx, total=len(ticker_list),
+                    )
+                    stopped_by_budget = True
+                    break
+                res = self.pull_ticker(ticker, start_date)
+                results.append(res)
 
-        if should_continue is None:
-            return results
+            log.info(
+                "yfinance bulk pull complete — {ok}/{total} checked successfully",
+                ok=sum(1 for r in results if r["status"] == "SUCCESS"),
+                total=len(results),
+            )
 
-        not_attempted = ticker_list[len(results):]
-        counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
-        for r in results:
-            outcome = r.get("outcome")
-            if outcome in counts:
-                counts[outcome] += 1
-            else:
-                counts["error"] += 1
-        counts["unattempted"] = len(not_attempted)
-        return {
-            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
-            "stopped_by_budget": stopped_by_budget,
-            "results": results,
-            "tickers_not_attempted": not_attempted,
-            "counts": counts,
-        }
+            if should_continue is None:
+                return results
+
+            not_attempted = ticker_list[len(results):]
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+            for r in results:
+                outcome = r.get("outcome")
+                if outcome in counts:
+                    counts[outcome] += 1
+                else:
+                    counts["error"] += 1
+            counts["unattempted"] = len(not_attempted)
+            return {
+                "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+                "stopped_by_budget": stopped_by_budget,
+                "results": results,
+                "tickers_not_attempted": not_attempted,
+                "counts": counts,
+            }
+        finally:
+            _PULL_ALL_LOCK.release()
 
 
 if __name__ == "__main__":
