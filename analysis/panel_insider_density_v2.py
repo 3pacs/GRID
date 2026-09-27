@@ -946,10 +946,18 @@ REGISTRY_LOG = "granular_panel_prereg_v2.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v2.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v2.lock"
 
-#: The one real v2 registration (header + ``preregistration``), pinned once registered.
-REGISTERED_AT: datetime | None = None
-REGISTERED_CODE_SHA: str | None = None
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
+#: The one real v2 registration: registered once, locally, on 2026-09-27T22:43:29Z
+#: against code 6f3d2892 (``register`` below), chain head 05b20c31... at 2 records.
+#: Every registry this harness accepts must start with exactly these two records
+#: (line sha256 of the header, then of the ``preregistration`` record). The
+#: original lives in the operator's ``Documents/Codex/2026-09-14/wha/outputs/
+#: vs1-v2-prereg-registry/``; the off-host witness decides which copy counts.
+REGISTERED_AT: datetime | None = datetime(2026, 9, 27, 22, 43, 29, 131530, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA: str | None = "6f3d2892cbf66b23f408b0794c397b9ff1798dc4"
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "e39371bed56e43131fb0d3f69247ccd3f7764b867d76291b44e94b60afba99f1",  # header
+    "05b20c31273a926d1be56d2afe4fce4e3cf7a8ca2769f394cad9e2fb773ceff8",  # preregistration (head at 2)
+)
 REGISTERED_PREREG_SHA256 = PREREG_BODY_SHA256
 
 #: The off-host witness, pinned: this path on ``main`` of the GitHub vault.
@@ -957,7 +965,11 @@ WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
 WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_v2.anchors.jsonl"
 WITNESS_REF = "refs/vs1-v2-witness/main"
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The first line every committed version of the v2 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"05b20c31273a926d1be56d2afe4fce4e3cf7a8ca2769f394cad9e2fb773ceff8",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-27T22:43:29.131530+00:00"}'
+)
 _WITNESS_TOKEN = object()
 
 #: v1's registration stays at exactly its 2 records if v1 never opened a discovery.

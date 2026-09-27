@@ -77,6 +77,13 @@ def test_the_v2_witness_location_is_pinned():
         "run_at": v2.REGISTERED_AT.isoformat()}
 
 
+def test_the_pin_is_the_real_v2_registration():
+    """Header + preregistration as registered 2026-09-27T22:43:29Z against 6f3d2892."""
+    assert v2.REGISTERED_RECORD_SHA256[1] == "05b20c31273a926d1be56d2afe4fce4e3cf7a8ca2769f394cad9e2fb773ceff8"
+    assert v2.REGISTERED_CODE_SHA == "6f3d2892cbf66b23f408b0794c397b9ff1798dc4"
+    assert v2.REGISTERED_PREREG_SHA256 == v2.PREREG_BODY_SHA256
+
+
 def test_the_prereg_states_the_pinned_inputs():
     body = v1.prereg_body((v2.REPO / v2.PREREG_PATH).read_text(encoding="utf-8"))
     for pin in (v2.ISSUER_MAP_SHA256, v2.SIC_MAP_SHA256, v1.SECTOR_MAP_SHA256, v1.PREREG_BODY_SHA256):
