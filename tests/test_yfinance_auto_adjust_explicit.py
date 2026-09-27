@@ -243,6 +243,84 @@ def test_watchlist_live_price_history_fallback_passes_auto_adjust_false():
     assert fake_ticker.history.call_args.kwargs["auto_adjust"] is False
 
 
+# ── 5b. #F1 D5 — the live fallback must report the price's real date ───────
+#
+# fast_info (checked against yfinance 1.7.0) exposes lastPrice/
+# previousClose/dayHigh/... and no timestamp field at all, so it cannot say
+# which day a "live" price belongs to. `_fetch_live_price` must read that
+# date off history rather than let the caller stamp `date.today()`.
+
+def test_watchlist_live_price_history_fallback_reports_the_frame_date():
+    """When the history() fallback supplies the price, its own last row's
+    date is the honest `as_of` — no separate lookup needed."""
+    from api.routers.watchlist_helpers import _fetch_live_price
+
+    frame = _ohlc_frame(["2026-03-10", "2026-03-11"], [180.0, 182.0])
+
+    fake_info = MagicMock()
+    fake_info.last_price = None
+    fake_info.previous_close = None
+
+    fake_ticker = MagicMock()
+    fake_ticker.fast_info = fake_info
+    fake_ticker.history.return_value = frame
+
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        result = _fetch_live_price("AAPL")
+
+    assert result is not None
+    assert result["as_of"] == date(2026, 3, 11)
+    # Exactly one history() call — the price and the date come from the
+    # same frame, so a second lookup would be wasted work.
+    assert fake_ticker.history.call_count == 1
+
+
+def test_watchlist_live_price_fast_info_path_reads_date_from_a_second_history_call():
+    """fast_info has no timestamp at all, so when it supplies the price,
+    `_fetch_live_price` must make a second call purely to read the real
+    observation date rather than assume "today"."""
+    from api.routers.watchlist_helpers import _fetch_live_price
+
+    frame = _ohlc_frame(["2026-03-10", "2026-03-11"], [180.0, 182.0])
+
+    fake_info = MagicMock()
+    fake_info.last_price = 183.5
+    fake_info.previous_close = 180.0
+
+    fake_ticker = MagicMock()
+    fake_ticker.fast_info = fake_info
+    fake_ticker.history.return_value = frame
+
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        result = _fetch_live_price("AAPL")
+
+    assert result is not None
+    assert result["price"] == pytest.approx(183.5), "fast_info's price must win, not history's stale close"
+    assert result["as_of"] == date(2026, 3, 11)
+    assert fake_ticker.history.call_args.kwargs["auto_adjust"] is False
+
+
+def test_watchlist_live_price_reports_as_of_none_when_history_is_unreadable():
+    """A working fast_info price must not be sunk by a failed history()
+    call — and the caller must get an honest `None`, not a fabricated date."""
+    from api.routers.watchlist_helpers import _fetch_live_price
+
+    fake_info = MagicMock()
+    fake_info.last_price = 183.5
+    fake_info.previous_close = 180.0
+
+    fake_ticker = MagicMock()
+    fake_ticker.fast_info = fake_info
+    fake_ticker.history.side_effect = RuntimeError("network down")
+
+    with patch("yfinance.Ticker", return_value=fake_ticker):
+        result = _fetch_live_price("AAPL")
+
+    assert result is not None
+    assert result["price"] == pytest.approx(183.5)
+    assert result["as_of"] is None
+
+
 # ── 6. Guard: no live yfinance call site may rely on the library default ───
 
 def test_no_unspecified_auto_adjust_in_live_price_paths():

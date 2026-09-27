@@ -169,6 +169,19 @@ function AIOverviewCard({ overview }) {
                 </span>
             </div>
 
+            {/* Price provenance — distinct from the "AI Generated" timestamp
+                above, which is when the narrative was written, not the date
+                or source of the price it describes (#F1 D6). */}
+            {(overview.price_as_of || overview.price_source) && (
+                <div style={{
+                    fontSize: '10px', color: colors.textMuted, fontFamily: "'JetBrains Mono', monospace",
+                    marginTop: '-6px', marginBottom: '10px', letterSpacing: '0.3px',
+                }}>
+                    Price {overview.price_as_of ? `as of ${formatDate(overview.price_as_of)}` : '(date unknown)'}
+                    {overview.price_source ? ` · ${overview.price_source === 'live' ? 'yfinance estimate' : overview.price_source}` : ''}
+                </div>
+            )}
+
             {/* Bottom line — prominent */}
             {overview.bottom_line && (
                 <div style={{

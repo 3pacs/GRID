@@ -16,7 +16,6 @@ from api.routers.watchlist_helpers import (
     _guess_asset_type,
     _init_table,
     _fetch_live_price,
-    _cache_price_to_db,
     _resolve_feature_names,
     _row_to_dict,
     _preload_one,
@@ -69,23 +68,32 @@ def list_watchlist(
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return all watchlist items with pagination."""
-    _init_table()
-    engine = get_db_engine()
+    """Return all watchlist items with pagination.
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT * FROM watchlist"
-                " ORDER BY added_at DESC"
-                " LIMIT :limit OFFSET :offset"
-            ),
-            {"limit": limit, "offset": offset},
-        ).fetchall()
+    Read-only: no table DDL here (the POST/DELETE writers own
+    ``_init_table``). A missing table is reported as 503, not created.
+    """
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT * FROM watchlist"
+                    " ORDER BY added_at DESC"
+                    " LIMIT :limit OFFSET :offset"
+                ),
+                {"limit": limit, "offset": offset},
+            ).fetchall()
 
-        total = conn.execute(
-            text("SELECT COUNT(*) FROM watchlist")
-        ).fetchone()[0]
+            total = conn.execute(
+                text("SELECT COUNT(*) FROM watchlist")
+            ).fetchone()[0]
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     items = [_row_to_dict(row) for row in rows]
     return {
@@ -336,14 +344,20 @@ def list_watchlist_enriched(
     """
     from datetime import date, timedelta
 
-    _init_table()
-    engine = get_db_engine()
-
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT * FROM watchlist ORDER BY added_at DESC LIMIT :limit"),
-            {"limit": limit},
-        ).fetchall()
+    # Read-only: no _init_table DDL on this GET (see list_watchlist).
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM watchlist ORDER BY added_at DESC LIMIT :limit"),
+                {"limit": limit},
+            ).fetchall()
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     if not rows:
         return {"items": [], "suggestions": []}
@@ -446,8 +460,8 @@ def list_watchlist_enriched(
                             "pct_1m": None,
                             "source": "live",
                         }
-                        # Write back to DB so next lookup is fast
-                        _cache_price_to_db(engine, tk, live["price"], today)
+                        # No write-back on this GET; POST /refresh-prices owns
+                        # persisting fetched prices.
     except Exception as exc:
         log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
 
@@ -710,11 +724,17 @@ def preload_watchlist(
     import time
     import concurrent.futures
 
-    _init_table()
-    engine = get_db_engine()
-
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+    # Read-only: no _init_table DDL on this GET (see list_watchlist).
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     tickers = [row[0] for row in rows]
     if not tickers:

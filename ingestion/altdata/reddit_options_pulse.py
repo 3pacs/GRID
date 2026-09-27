@@ -544,7 +544,7 @@ class RedditOptionsPulsePuller(BasePuller):
     SOURCE_CONFIG = {
         "base_url": "https://www.reddit.com/r/options/",
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "EOD",
         "pit_available": True,
         "revision_behavior": "NEVER",
         "trust_score": "MED",
