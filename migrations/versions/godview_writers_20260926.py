@@ -10,7 +10,9 @@ Schema only. Nothing here writes, rewrites, archives or deletes a row.
 What it adds
 ------------
 * ``godview_runs``: the run ledger every pillar writer (G3-G5) records into,
-  in the same transaction as its rows. The API's never-run / failed / stale
+  in the same transaction as its rows. ``status`` is a closed domain
+  (``GODVIEW_RUN_STATUSES``), including ``partial_blocked_by_legacy`` for a
+  run that skipped keys still held by legacy rows (cleared by the A2 archive). The API's never-run / failed / stale
   states come from this table, not from guessing.
 * On ``cftc_positioning_daily``, ``fed_net_liquidity_daily`` and
   ``dealer_gex_daily``: ``release_at``, ``available_at``,
@@ -86,6 +88,22 @@ depends_on = None
 _LOCK_TIMEOUT = "5s"
 _STATEMENT_TIMEOUT = "30s"
 
+# godview_runs.status domain (must match the CHECK in upgrade()).
+# 'partial_blocked_by_legacy': the run wrote what it could but skipped keys
+# still occupied by legacy (NULL-provenance) rows; the A2 archive clears them.
+GODVIEW_RUN_STATUSES = (
+    "running",
+    "complete",
+    "failed",
+    "noop",
+    "inputs_missing",
+    "inputs_stale",
+    "non_session",
+    "no_completed_capture",
+    "no_verified_spot",
+    "partial_blocked_by_legacy",
+)
+
 # Legacy dealer_gex_daily value columns whose NOT NULL is dropped. obs_date and
 # ticker (the natural key) stay NOT NULL.
 GEX_LEGACY_VALUE_COLUMNS = (
@@ -133,7 +151,8 @@ def upgrade() -> None:
                 status IN (
                     'running', 'complete', 'failed', 'noop',
                     'inputs_missing', 'inputs_stale', 'non_session',
-                    'no_completed_capture', 'no_verified_spot'
+                    'no_completed_capture', 'no_verified_spot',
+                    'partial_blocked_by_legacy'
                 )
             ),
             CONSTRAINT godview_runs_counts_chk CHECK (

@@ -352,6 +352,25 @@ def test_ledger_status_and_lifecycle_checks(scratch):
         ), {"r": run_id})
 
 
+def test_every_declared_run_status_is_accepted(scratch):
+    migration = importlib.import_module(_MIGRATION_MODULE)
+    _run(scratch, _MIGRATION_MODULE, "upgrade")
+    assert "partial_blocked_by_legacy" in migration.GODVIEW_RUN_STATUSES
+    with scratch.begin() as conn:
+        for status in migration.GODVIEW_RUN_STATUSES:
+            conn.execute(
+                text(
+                    "INSERT INTO godview_runs (pillar, status, finished_at, rows_written, rows_skipped, "
+                    "reasons, code_sha) VALUES ('fed_liquidity', :s, "
+                    "CASE WHEN :s = 'running' THEN NULL ELSE NOW() END, 3, 2, "
+                    "CAST(:reasons AS JSONB), 'abc1234')"
+                ),
+                {"s": status, "reasons": json.dumps({"blocked_by_legacy": ["2026-09-16"]})},
+            )
+        count = conn.execute(text("SELECT count(DISTINCT status) FROM godview_runs")).scalar()
+    assert count == len(migration.GODVIEW_RUN_STATUSES)
+
+
 # ------------------------------------------------------------------- downgrade
 
 
