@@ -430,3 +430,56 @@ def test_no_analytical_reader_uses_legacy_cftc_ids():
         "series_id_for_root (cftc.<market_code>.<metric>); the legacy "
         "name-keyed ids mix markets:\n" + "\n".join(offenders)
     )
+
+
+# ── GRID task A1 (coordinator follow-up): a missed scheduler week must ──
+# still be recovered by the puller's own forward fetch, since
+# ingestion/smart_scheduler.py's cftc_cot gate (_cftc_cot_is_due) is now
+# fail-closed to a Friday/holiday-release + 1-day retry window and will
+# NOT fire again mid-week if that window is missed entirely (e.g. grid-svr
+# down through the whole window). The gate can only be safe to leave that
+# way if the next successful run still picks up every report published
+# since the last success, not just the latest one.
+
+
+def test_incremental_start_ignores_gap_size_and_rewinds_to_last_stored_date():
+    """CFTCCOTPuller._incremental_start must key off the oldest per-metric
+    stored date minus the fixed overlap -- not "since the last scheduled
+    tick" -- so a scheduler gap of any length (one missed Friday, or a
+    month of downtime) is closed by the very next successful run.
+    """
+    puller = CFTCCOTPuller.__new__(CFTCCOTPuller)
+    stale = date(2026, 8, 7)  # ~7 weeks before a hypothetical "now"
+    puller._get_latest_date = lambda series_id: stale
+
+    start, mode = puller._incremental_start("13874A")
+
+    assert mode == "incremental"
+    assert start == stale - timedelta(days=cftc_cot._INCREMENTAL_OVERLAP_DAYS)
+
+
+def test_fetch_market_page_query_has_no_upper_date_bound():
+    """The Socrata $where clause is an open-ended ">= start_date" with no
+    end date, so one call from an old `start_date` returns every report
+    published since then -- an arbitrary number of missed weeks, not just
+    the most recent one. This is what makes the scheduler's fail-closed
+    Friday/Saturday-only gate (which never fires mid-week to "catch up")
+    safe: the eventual next Friday run still backfills the gap.
+    """
+    puller = CFTCCOTPuller.__new__(CFTCCOTPuller)
+    captured: dict = {}
+
+    def fake_get(url, params=None, headers=None, timeout=None):
+        captured["params"] = params
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.json.return_value = []
+        resp.raise_for_status.return_value = None
+        return resp
+
+    with patch.object(cftc_cot.requests, "get", side_effect=fake_get):
+        puller._fetch_market_page("13874A", date(2026, 8, 7), offset=0)
+
+    where = captured["params"]["$where"]
+    assert "report_date_as_yyyy_mm_dd >= '2026-08-07'" in where
+    assert "<=" not in where and " < " not in where

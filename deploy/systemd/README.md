@@ -1,7 +1,12 @@
 # GRID systemd units
 
-This directory ships the systemd unit template for the idle-fleet goal
-worker (Day 1 of `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
+This directory ships systemd unit templates. None of them is installed by
+any code path, CI job or deploy workflow.
+
+* `grid-goal-worker@.service`: the idle-fleet goal worker (Day 1 of
+  `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
+* `grid-godview-{fed,cftc}.{service,timer}`: the god view pillar writers
+  (materialization plan slice G7). See the section at the end.
 
 ## `grid-goal-worker@.service`
 
@@ -102,3 +107,47 @@ The worker handles `SIGTERM` cleanly — in-flight goals complete, then
 the next `claim_goal` returns the loop. No forcible kill is needed
 unless the lease has to be reaped (it will be, automatically, on the
 next worker startup or by the Day 2 reaper).
+
+## `grid-godview-fed` / `grid-godview-cftc` (god view writers)
+
+Oneshot services plus weekly timers that run
+`scripts/run_godview_writers.py --pillar fed|cftc --code-sha-from-git` from
+the deployed release tree `/data/grid_v4/grid_release`, as `grid`, with the
+GRID env file `/home/grid/grid_v4/grid_repo/.env`, under a shared
+`flock /tmp/grid-godview-writers.lock` (one writer at a time).
+
+| Timer | Calendar (America/New_York) | UTC (EDT / EST) | Why |
+|---|---|---|---|
+| `grid-godview-fed.timer` | Thu 17:30, retry Fri 09:00 | 21:30 / 22:30 | H.4.1 publishes Thu ~16:30 ET; FRED lands WALCL/WTREGEN ~30 min later |
+| `grid-godview-cftc.timer` | Fri 16:00, retry Sat 14:00 | 20:00 / 21:00 | COT publishes Fri 15:30 ET; the puller moves to Fri >= 19:45 UTC + a Saturday retry (plan A1) |
+
+Every run writes a `godview_runs` row (`complete`, `noop`,
+`partial_blocked_by_legacy`, `inputs_missing` or `failed`); exit codes are in
+the script's docstring. `partial_blocked_by_legacy` exits 0: keys held by
+legacy (NULL-provenance) rows are skipped until the A2 archive clears them.
+
+**Activation is the owner's step (plan A3). Do not install before:** the G2
+migration is applied (A2), the CFTC backfill under the new ids is done (A1)
+for the cftc pillar, and a manual dry run on the host looks right:
+
+```bash
+cd /data/grid_v4/grid_release
+set -a; . /home/grid/grid_v4/grid_repo/.env; set +a
+python3 scripts/run_godview_writers.py --pillar fed  --code-sha-from-git --dry-run
+python3 scripts/run_godview_writers.py --pillar cftc --code-sha-from-git --dry-run
+systemd-analyze calendar 'Thu *-*-* 17:30:00 America/New_York'   # needs systemd >= 235
+git -C /data/grid_v4/grid_release rev-parse HEAD                 # must work as grid
+```
+
+Then:
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-godview-fed.service  /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-fed.timer    /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-cftc.service /etc/systemd/system/
+sudo install -m 0644 deploy/systemd/grid-godview-cftc.timer   /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl start grid-godview-fed.service && journalctl -u grid-godview-fed.service -n 50
+sudo systemctl enable --now grid-godview-fed.timer    # fed can go before cftc
+sudo systemctl enable --now grid-godview-cftc.timer
+```
