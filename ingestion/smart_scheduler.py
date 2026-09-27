@@ -17,9 +17,10 @@ Usage from Hermes:
 
 from __future__ import annotations
 
+import calendar
 import threading
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -51,6 +52,156 @@ def _yfinance_incremental_start() -> str:
         datetime.now(timezone.utc).date()
         - timedelta(days=YFINANCE_SCHEDULED_LOOKBACK_DAYS)
     ).isoformat()
+
+
+# ── Wave 1 activation helpers (2026-09-27) ──────────────────────────────
+# Registers pullers merged in PR #564 (FINRA short volume + SEC FTD) and
+# PR #553 (EIA + LME) that landed "contract-first, unregistered". Both PRs
+# shipped an *unapplied* .patch file under docs/handoffs/2026-09-18/ that
+# targets ``ingestion/scheduler.py::_get_pullers_for_group`` -- but that
+# function is wired to ``cli.py`` / ``orchestration/tasks.py`` /
+# ``scripts/run_full_pipeline.py`` only, none of which run on a schedule
+# (no cron calls run_full_pipeline; CLAUDE.md #39 calling scheduler.py
+# "the authoritative scheduler" is aspirational docs, not current fact).
+# The scheduler Hermes actually ticks every cycle is THIS module's
+# PULLER_REGISTRY, via scripts/hermes_operator.py's main loop ("3. Smart
+# ingestion") -> SmartScheduler.tick(). So these pullers are registered
+# here instead, adapted rather than patch-applied verbatim.
+
+
+def _finra_short_volume_trade_date() -> date:
+    """Most recent trade date whose Reg SHO daily short-volume file
+    should already be published.
+
+    Evaluated at call time (like ``_yfinance_incremental_start`` above),
+    not once at import. FINRA posts each trading day's file that same
+    evening -- the task/ops cadence for this source is "daily after
+    ~18:00 ET" -- so before that cutoff the prior trading day's file is
+    the latest one that can exist yet.
+
+    Bounded, documented limitation: this rolls back over weekends only,
+    with no market-holiday calendar. A holiday trade_date is not an
+    error -- FINRA still publishes a header+trailer-only file for
+    no-trading days (module docstring), so the puller returns SUCCESS
+    with 0 rows inserted rather than failing.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        # Bounded fallback if tzdata is unavailable: UTC-4 approximates ET
+        # closely enough for a same-day/prior-day weekday roll. Never used
+        # for anything PIT-sensitive -- obs_date always comes from the
+        # fetched file's own "Date" column, not from this clock.
+        now_et = datetime.now(timezone.utc) - timedelta(hours=4)
+    trade_date = now_et.date()
+    if now_et.hour < 18:
+        trade_date -= timedelta(days=1)
+    while trade_date.weekday() >= 5:  # Sat=5, Sun=6 -- no trading, no file
+        trade_date -= timedelta(days=1)
+    return trade_date
+
+
+def _sec_ftd_latest_published_half(today: date | None = None) -> dict[str, str]:
+    """Roll to the most recently PUBLISHED SEC FTD half-month period.
+
+    Per docs/handoffs/2026-09-18/fable-w5b-source-contracts.md (quoting
+    SEC): "The first half ... at the end of the month. The second half
+    ... at about the 15th of the next month." This walks back over the
+    last few half-months and returns the most recent whose approximate
+    publish date has already passed. Re-requesting an already-ingested
+    half-month is a harmless no-op -- SECFTDPuller skips obs_dates it has
+    already stored -- so drifting a few days early/late on the exact SEC
+    publish day is bounded, not silently wrong.
+    """
+    today = today or date.today()
+    candidates: list[tuple[date, str, str]] = []
+    for back in range(3):
+        total = (today.year * 12 + (today.month - 1)) - back
+        y, m = divmod(total, 12)
+        m += 1
+        yyyymm = f"{y:04d}{m:02d}"
+        last_day = calendar.monthrange(y, m)[1]
+        publish_a = date(y, m, last_day)
+        next_total = y * 12 + (m - 1) + 1
+        ny, nm = divmod(next_total, 12)
+        nm += 1
+        publish_b = date(ny, nm, 15)
+        candidates.append((publish_a, yyyymm, "a"))
+        candidates.append((publish_b, yyyymm, "b"))
+    published = [c for c in candidates if c[0] <= today] or [min(candidates)]
+    published.sort()
+    _pub_date, yyyymm, half = published[-1]
+    return {"yyyymm": yyyymm, "half": half}
+
+
+class _LMEWarehouseSchedulerAdapter:
+    """Fetch-then-save shim for LMEWarehousePuller.
+
+    ``LMEWarehousePuller.pull()`` only fetches/parses -- it does not write
+    to ``raw_series`` on its own (see its ``save_to_db()``). Every
+    PULLER_REGISTRY entry assumes ``getattr(instance, method)(**kwargs)``
+    both fetches AND writes, so a bare registration would "succeed" every
+    tick while inserting zero rows. Carries forward the adapter drafted in
+    the unapplied ``fable-w5-scheduler-registration.patch`` (written
+    against ``ingestion/scheduler.py``), wired here instead -- see the
+    module comment above for why.
+    """
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.altdata.lme_warehouse import LMEWarehousePuller
+
+        self._puller = LMEWarehousePuller(db_engine)
+
+    def pull(self) -> dict[str, Any]:
+        snapshots = self._puller.pull()
+        inserted = self._puller.save_to_db(snapshots)
+        return {
+            "status": "SUCCESS",
+            "fetched": len(snapshots),
+            "inserted": inserted,
+            "source": self._puller._last_source,
+        }
+
+
+class _SECFTDSchedulerAdapter:
+    """Config-gated, half-month-rolling shim for SECFTDPuller.
+
+    ``SECFTDPuller.pull()`` raises ``RuntimeError`` when
+    ``settings.SEC_USER_AGENT`` is unset (SEC requires a descriptive
+    contact User-Agent on every request) -- correct fail-closed behaviour
+    at the puller layer, but ``SmartScheduler._run_puller`` only treats a
+    *returned* ``{"status": "SKIPPED", ...}`` dict specially (see its
+    "mitigation 2" docstring); an uncaught exception instead lands as a
+    FAILED result with an escalating cooldown. This adapter turns the
+    missing-config case into a clean SKIPPED with an operator-actionable
+    reason, and — only once configured — rolls ``yyyymm``/``half`` to the
+    most recently published period instead of the unapplied patch's fixed
+    placeholder (``{"yyyymm": "202608", "half": "b"}``).
+    """
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.altdata.sec_ftd import SECFTDPuller
+
+        self._puller = SECFTDPuller(db_engine)
+
+    def pull(self) -> dict[str, Any]:
+        from config import settings
+
+        if not settings.SEC_USER_AGENT:
+            return {
+                "status": "SKIPPED",
+                "skipped_reason": (
+                    "SEC_USER_AGENT not set -- SEC requires a descriptive "
+                    "contact User-Agent on every request. Set "
+                    "SEC_USER_AGENT in .env (see .env.example, format like "
+                    "'GRID research aniksrobot@gmail.com') before this "
+                    "puller can run."
+                ),
+            }
+        period = _sec_ftd_latest_published_half()
+        return self._puller.pull(yyyymm=period["yyyymm"], half=period["half"])
 
 
 # ── Puller Registry ──────────────────────────────────────────────────────
@@ -213,6 +364,15 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
     {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600},
     {"name": "wikidata_persons",      "mod": "ingestion.altdata.wikidata_persons",   "cls": "WikidataPersonPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 1800},
+
+    # ── Wave 1 activation (2026-09-27): merged-but-unscheduled pullers ──
+    # See the "Wave 1 activation helpers" comment above PULLER_REGISTRY for
+    # why these are registered here and not via the two .patch files in
+    # docs/handoffs/2026-09-18/ (which target the non-live scheduler.py).
+    {"name": "EIA_Energy",        "mod": "ingestion.altdata.eia_puller",       "cls": "EIAPuller",        "method": "pull",  "freq_h": 24,  "timeout_s": 60, "api_key": "EIA_API_KEY", "api_key_mode": "env"},
+    {"name": "LME_Warehouse",     "mod": "ingestion.smart_scheduler",         "cls": "_LMEWarehouseSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
+    {"name": "FINRA_Short_Volume","mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull", "freq_h": 24, "timeout_s": 60, "kwargs": {"trade_date": _finra_short_volume_trade_date}},
+    {"name": "SEC_FTD",           "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 336, "timeout_s": 60},
 ]
 
 # How many pullers to run per tick (keeps cycles short)
