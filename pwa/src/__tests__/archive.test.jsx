@@ -8,7 +8,7 @@ vi.mock('../api.js', () => ({
     api: {
         getResearchArchive: vi.fn(),
         triggerDeepDive: vi.fn(),
-        getFlowBriefingAudioUrl: vi.fn(() => 'https://example.test/audio.mp3'),
+        loadFlowBriefingAudio: vi.fn(async () => 'blob:https://example.test/audio'),
     },
 }));
 

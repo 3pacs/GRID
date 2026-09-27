@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
@@ -105,6 +105,9 @@ def get_causation(
     If ticker is provided, generates a causal narrative for that ticker
     and returns causes for its recent signals.  Otherwise returns batch
     results across all recent signals.
+
+    Read-only: causes are computed, never stored. Persisting them to
+    ``causal_links`` is ``POST /causation/refresh``.
     """
     try:
         from intelligence.causation import (
@@ -152,7 +155,7 @@ def get_causation(
                 "total_causes": len(causes),
             }
 
-        all_causes = _batch(engine, days=days)
+        all_causes = _batch(engine, days=days, persist=False)
         return {
             "days": days,
             "causes": [c.to_dict() for c in all_causes[:200]],
@@ -162,6 +165,22 @@ def get_causation(
     except Exception as exc:
         log.warning("Causation endpoint failed: {e}", e=str(exc))
         return {"error": str(exc), "causes": [], "total_causes": 0}
+
+
+@router.post("/causation/refresh")
+def refresh_causation(
+    days: int = Query(30, ge=1, le=365, description="Look-back window in days"),
+    _token: str = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Explicit writer: compute causes for recent signals and store them in ``causal_links``."""
+    try:
+        from intelligence.causation import batch_find_causes
+
+        causes = batch_find_causes(get_db_engine(), days=days, persist=True)
+        return {"status": "stored", "days": days, "stored": len(causes)}
+    except Exception as exc:
+        log.warning("Causation refresh failed: {e}", e=str(exc))
+        return {"status": "failed", "days": days, "stored": 0, "error": str(exc)}
 
 
 @router.get("/causation/suspicious")
@@ -234,6 +253,9 @@ async def get_causal_chains(
 
     If ticker is provided, traces chains for that ticker (up to `hops` deep).
     Otherwise, finds the longest chains across all tickers in the system.
+
+    Read-only: chains are traced, never stored. Persisting them to
+    ``causal_chains`` is ``POST /causal-chains/refresh``.
     """
     try:
         from intelligence.causation import (
@@ -245,7 +267,7 @@ async def get_causal_chains(
 
         if ticker:
             ticker_upper = ticker.strip().upper()
-            chains = trace_causal_chain(engine, ticker_upper, max_hops=hops)
+            chains = trace_causal_chain(engine, ticker_upper, max_hops=hops, persist=False)
             return {
                 "ticker": ticker_upper,
                 "max_hops": hops,
@@ -254,7 +276,7 @@ async def get_causal_chains(
                 "longest_chain": chains[0].total_hops if chains else 0,
             }
 
-        chains = find_longest_chains(engine, days=days)
+        chains = find_longest_chains(engine, days=days, persist=False)
         return {
             "days": days,
             "chains": [c.to_dict() for c in chains[:100]],
@@ -266,6 +288,30 @@ async def get_causal_chains(
     except Exception as exc:
         log.warning("Causal chains endpoint failed: {e}", e=str(exc))
         return {"error": str(exc), "chains": [], "total_chains": 0}
+
+
+@router.post("/causal-chains/refresh")
+def refresh_causal_chains(
+    ticker: str | None = Query(None, max_length=20, description="Trace one ticker; omit for all"),
+    hops: int = Query(5, ge=2, le=10, description="Max hops for chain tracing"),
+    days: int = Query(180, ge=1, le=730, description="Look-back window when no ticker"),
+    _token: str = Depends(require_role("admin")),
+) -> dict[str, Any]:
+    """Explicit writer: trace causal chains and store them in ``causal_chains``."""
+    try:
+        from intelligence.causation import find_longest_chains, trace_causal_chain
+
+        engine = get_db_engine()
+        if ticker:
+            chains = trace_causal_chain(
+                engine, ticker.strip().upper(), max_hops=hops, persist=True,
+            )
+        else:
+            chains = find_longest_chains(engine, days=days, persist=True)
+        return {"status": "stored", "stored": len(chains)}
+    except Exception as exc:
+        log.warning("Causal chain refresh failed: {e}", e=str(exc))
+        return {"status": "failed", "stored": 0, "error": str(exc)}
 
 
 @router.get("/causal-chains/active")

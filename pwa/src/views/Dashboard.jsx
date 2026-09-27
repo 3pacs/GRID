@@ -106,12 +106,29 @@ function buildChangeFeed(intel) {
 /* ═══════════════════════════ DASHBOARD ═════���═════════════════════ */
 
 function AudioBriefingPlayer({ onNavigate }) {
+    // audioFile: the saved briefing we can play; audioUrl: its object URL,
+    // fetched with the Authorization header only when the user presses play
+    // (an <audio src> cannot send headers, and the session token must never
+    // be put in a URL).
+    const [audioFile, setAudioFile] = useState(null);
     const [audioUrl, setAudioUrl] = useState(null);
+    const [loadingAudio, setLoadingAudio] = useState(false);
     const [briefingMeta, setBriefingMeta] = useState(null);
     const [playing, setPlaying] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [briefingError, setBriefingError] = useState(null);
     const audioRef = React.useRef(null);
+    const audioUrlRef = React.useRef(null);
+
+    const replaceAudioUrl = useCallback((url) => {
+        if (audioUrlRef.current) URL.revokeObjectURL?.(audioUrlRef.current);
+        audioUrlRef.current = url;
+        setAudioUrl(url);
+    }, []);
+
+    useEffect(() => () => {
+        if (audioUrlRef.current) URL.revokeObjectURL?.(audioUrlRef.current);
+    }, []);
 
     useEffect(() => {
         // Check for latest briefing
@@ -119,13 +136,26 @@ function AudioBriefingPlayer({ onNavigate }) {
             const list = r?.briefings || [];
             if (list.length > 0) {
                 const latest = list[0];
-                setAudioUrl(api.getFlowBriefingAudioUrl(latest.filename));
+                setAudioFile(latest.filename);
                 setBriefingMeta(latest);
             }
         }).catch(() => {});
     }, []);
 
-    const togglePlay = () => {
+    const togglePlay = async () => {
+        if (!audioUrl) {
+            if (!audioFile || loadingAudio) return;
+            setLoadingAudio(true);
+            setBriefingError(null);
+            const url = await api.loadFlowBriefingAudio(audioFile);
+            setLoadingAudio(false);
+            if (!url) {
+                setBriefingError('Could not load the briefing audio.');
+                return;
+            }
+            replaceAudioUrl(url);
+            return;
+        }
         if (!audioRef.current) return;
         if (playing) { audioRef.current.pause(); }
         else { audioRef.current.play().catch(() => {}); }
@@ -135,10 +165,11 @@ function AudioBriefingPlayer({ onNavigate }) {
         setGenerating(true);
         setBriefingError(null);
         try {
-            const r = await api.getFlowBriefing(true);
+            const r = await api.generateFlowBriefing(true);
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
                 const filename = r.briefing.audio_path.split('/').pop();
-                setAudioUrl(api.getFlowBriefingAudioUrl(filename));
+                replaceAudioUrl(null);
+                setAudioFile(filename);
                 setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
             } else {
                 setBriefingError(r?.message || 'Audio briefing generation failed.');
@@ -200,20 +231,28 @@ function AudioBriefingPlayer({ onNavigate }) {
                     <span style={{ minWidth: 0, flex: 1 }}>{briefingError}</span>
                 </div>
             )}
-            {audioUrl ? (
+            {audioFile ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <button onClick={togglePlay} style={{
+                    <button onClick={togglePlay} disabled={loadingAudio}
+                        aria-label={audioUrl ? (playing ? 'Pause briefing' : 'Play briefing') : 'Load and play briefing'}
+                        style={{
                         width: '36px', height: '36px', borderRadius: '50%',
                         background: `${colors.accent}20`, border: `1px solid ${colors.accent}50`,
-                        color: colors.accent, fontSize: '14px', cursor: 'pointer',
+                        color: colors.accent, fontSize: '14px', cursor: loadingAudio ? 'wait' : 'pointer',
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
                         flexShrink: 0,
-                    }}>{playing ? '\u23F8' : '\u25B6'}</button>
-                    <audio ref={audioRef} src={audioUrl} preload="metadata"
-                        onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-                        onEnded={() => setPlaying(false)}
-                        style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }}
-                        controls />
+                    }}>{loadingAudio ? '\u2026' : (playing ? '\u23F8' : '\u25B6')}</button>
+                    {audioUrl ? (
+                        <audio ref={audioRef} src={audioUrl} preload="metadata" autoPlay
+                            onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+                            onEnded={() => setPlaying(false)}
+                            style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }}
+                            controls />
+                    ) : (
+                        <span style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim }}>
+                            {loadingAudio ? 'Loading briefing audio\u2026' : 'Press play to load the latest briefing.'}
+                        </span>
+                    )}
                 </div>
             ) : (
                 <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim, fontStyle: 'italic' }}>

@@ -2688,16 +2688,38 @@ async def get_cds_history(
 
 @router.get("/briefing")
 async def get_briefing(
+    _token: str = Depends(require_auth),
+) -> dict:
+    """Return the latest saved audio briefing. Read-only.
+
+    Never generates: script writing (LLM) and text-to-speech run only on
+    ``POST /briefing``. When no briefing has been saved, returns
+    ``status: "not_generated"`` with ``briefing: null`` instead of making one.
+    """
+    from intelligence.audio_briefing import get_latest_briefing
+
+    latest = get_latest_briefing()
+    if latest is None:
+        return {
+            "status": "not_generated",
+            "briefing": None,
+            "message": "No audio briefing has been generated yet.",
+        }
+    return {"status": "SUCCESS", "briefing": latest.to_dict()}
+
+
+@router.post("/briefing")
+async def generate_briefing(
     audio: bool = True,
     _token: str = Depends(require_auth),
 ) -> dict:
     """Generate a daily intelligence briefing (text + optional audio).
 
-    Query params:
-        audio: If true (default), also generates the MP3 audio file.
+    Explicit write: calls the script LLM and, when ``audio`` is true (the
+    default), text-to-speech, saving the MP3 and its JSON sidecar.
 
     Returns:
-        Script text, audio URL, flow/credit/thesis summaries.
+        Script text, audio path, flow/credit/thesis summaries.
     """
     from intelligence.audio_briefing import (
         generate_briefing_audio,
@@ -2737,7 +2759,7 @@ async def get_briefing_audio(_token: str = Depends(require_auth)):
     latest = get_latest_briefing()
 
     if latest is None or latest.audio_path is None:
-        return {"error": "No briefing audio found. Generate one via GET /briefing first."}
+        return {"error": "No briefing audio found. Generate one via POST /briefing first."}
 
     audio_path = Path(latest.audio_path)
     if not audio_path.exists():

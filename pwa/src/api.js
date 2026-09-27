@@ -367,6 +367,61 @@ class GRIDApi {
         return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
     }
 
+    /**
+     * Exchange the Bearer session for a short-lived, single-use stream ticket.
+     * EventSource cannot send headers, and the session JWT must never travel in
+     * a URL (it lands in proxy/access logs). Returns the ticket or null.
+     */
+    async createStreamTicket(path) {
+        const token = this.token;
+        if (!token) return null;
+        try {
+            const response = await fetch(`${this.baseUrl}/api/v1/auth/stream-ticket`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({ path }),
+            });
+            if (!response.ok) return null;
+            const data = await response.json();
+            return typeof data?.ticket === 'string' ? data.ticket : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Open a ticket-authenticated EventSource. Returns a handle with close()
+     * synchronously; the EventSource opens once the ticket arrives. If no
+     * ticket can be obtained, onTicketError fires and nothing is opened.
+     */
+    openTicketedEventSource(path, params = null, { onOpen = null, onTicketError = null, relative = false } = {}) {
+        let closed = false;
+        let source = null;
+        const handle = {
+            get source() { return source; },
+            close() {
+                closed = true;
+                source?.close();
+            },
+        };
+        this.createStreamTicket(path).then(ticket => {
+            if (closed) return;
+            if (!ticket) {
+                onTicketError?.({ type: 'ticket', message: 'Stream authorization failed' });
+                return;
+            }
+            const query = new URLSearchParams(params || undefined);
+            query.set('ticket', ticket);
+            const base = relative ? '' : this.baseUrl;
+            source = new EventSource(`${base}${path}?${query.toString()}`);
+            onOpen?.(source);
+        });
+        return handle;
+    }
+
     streamDadTickerGold(ticker, {
         refreshFinviz = false,
         onEvent = null,
@@ -375,35 +430,37 @@ class GRIDApi {
     } = {}) {
         const params = new URLSearchParams();
         if (refreshFinviz) params.set('refresh_finviz', 'true');
-        if (this.token) params.set('token', this.token);
-        const suffix = params.toString() ? `?${params.toString()}` : '';
-        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const path = `/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream`;
         const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
-        const handleNamedEvent = (name, event) => {
-            let payload = {};
-            try {
-                payload = event?.data ? JSON.parse(event.data) : {};
-            } catch (_) {
-                payload = { raw: event?.data || '' };
-            }
-            onEvent?.(name, payload);
-            if (name === 'done') {
-                onDone?.(payload);
-                source.close();
-            }
-        };
+        return this.openTicketedEventSource(path, params, {
+            onTicketError: event => onError?.(event),
+            onOpen: source => {
+                const handleNamedEvent = (name, event) => {
+                    let payload = {};
+                    try {
+                        payload = event?.data ? JSON.parse(event.data) : {};
+                    } catch (_) {
+                        payload = { raw: event?.data || '' };
+                    }
+                    onEvent?.(name, payload);
+                    if (name === 'done') {
+                        onDone?.(payload);
+                        source.close();
+                    }
+                };
 
-        eventNames.forEach(name => {
-            source.addEventListener(name, event => handleNamedEvent(name, event));
+                eventNames.forEach(name => {
+                    source.addEventListener(name, event => handleNamedEvent(name, event));
+                });
+                source.addEventListener('error', event => {
+                    if (event?.data) {
+                        handleNamedEvent('error', event);
+                    } else {
+                        onError?.(event);
+                    }
+                });
+            },
         });
-        source.addEventListener('error', event => {
-            if (event?.data) {
-                handleNamedEvent('error', event);
-            } else {
-                onError?.(event);
-            }
-        });
-        return source;
     }
 
     async _fetchForm(path, form) {
@@ -783,14 +840,34 @@ class GRIDApi {
     }
 
     // Audio Briefing (flow-engine powered, OpenAI TTS)
-    async getFlowBriefing(audio = true) {
-        return this._fetch(`/api/v1/flows/briefing?audio=${audio}`);
+    /** Latest saved briefing, read-only: {status: 'SUCCESS'|'not_generated', briefing}. */
+    async getFlowBriefing() {
+        return this._fetch('/api/v1/flows/briefing');
     }
-    getFlowBriefingAudioUrl(filename = null) {
+    /** Explicitly generate a new briefing (LLM script + optional TTS). */
+    async generateFlowBriefing(audio = true) {
+        return this._fetch(`/api/v1/flows/briefing?audio=${audio ? 'true' : 'false'}`, { method: 'POST' });
+    }
+    /**
+     * Fetch a briefing MP3 with the Authorization header and return an object
+     * URL for <audio src>. The session token never goes in the URL. Callers
+     * own the returned URL and should URL.revokeObjectURL it when done.
+     */
+    async loadFlowBriefingAudio(filename = null) {
         const path = filename
             ? `/api/v1/flows/briefing/audio/${encodeURIComponent(filename)}`
             : '/api/v1/flows/briefing/audio';
-        return `${this.baseUrl}${path}?token=${encodeURIComponent(this.token || '')}`;
+        const headers = this.token ? { Authorization: `Bearer ${this.token}` } : {};
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, { headers });
+            if (!response.ok) return null;
+            const type = response.headers?.get?.('content-type') || '';
+            if (!type.startsWith('audio/')) return null;
+            const blob = await response.blob();
+            return URL.createObjectURL(blob);
+        } catch (_) {
+            return null;
+        }
     }
     async listFlowBriefings() {
         return this._fetch('/api/v1/flows/briefing/list');
