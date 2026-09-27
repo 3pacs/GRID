@@ -485,6 +485,11 @@ _SOURCE_ALIASES: dict[str, str] = {
 # but are catalogued for ``hermes_fixers._resolve_puller`` consumers.
 _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     # ── Module-level fn pullers (not class-based, scheduled via dedicated paths)
+    # sec_13f_live IS also invoked on a real cadence now — from
+    # ingestion/scheduler.py::run_monthly_pulls() (2026-09-27 revive; it sat
+    # unwired here for months, which is why institutional_holdings stopped
+    # ingesting new quarters after 2026-04-12). Kept in this dict too so
+    # hermes_fixers._resolve_puller can still resolve it for a scoped retry.
     "sec_13f_live":                {"mod": "ingestion.altdata.sec_13f_live",            "fn": "run",          "interval_h": 168},
     "supply_chain_parser":         {"mod": "ingestion.altdata.supply_chain_parser",     "fn": "run_weekly",   "interval_h": 168},
     "pct_cogs_enrichment":         {"mod": "intelligence.pct_cogs_enrichment",          "fn": "run_weekly",   "interval_h": 168},
