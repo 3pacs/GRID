@@ -1,11 +1,13 @@
-"""Tests for the FINRA Daily Short Sale Volume puller (contract-first, not
-scheduled). See ingestion/altdata/finra_short_volume.py's module docstring
-for the exact FINRA documentation quotes this module was built from.
+"""Tests for the FINRA Daily Short Sale Volume puller. Registered in the
+scheduler as ``finra_short_volume`` (Wave 1 activation, 2026-09-27). See
+ingestion/altdata/finra_short_volume.py's module docstring for the exact
+FINRA documentation quotes this module was built from.
 
 Pure Python: no real database, no network. Uses a small in-memory
 FakeEngine/FakeConn standing in for Postgres (records INSERT params and
-answers the same SELECT DISTINCT obs_date query BasePuller._get_existing_dates
-issues), and monkeypatches the puller's fetch method as a fake HTTP layer.
+answers the batched existence queries BasePuller._get_existing_pairs_in_range
+/ _get_existing_source_dates / _file_advisory_lock issue), and monkeypatches
+the puller's fetch method as a fake HTTP layer.
 """
 
 from __future__ import annotations
@@ -15,6 +17,7 @@ from datetime import date
 from pathlib import Path
 
 import pytest
+import requests
 
 from ingestion.altdata.finra_short_volume import (
     FINRAShortVolumePuller,
@@ -49,16 +52,39 @@ class _FakeConn:
     def execute(self, stmt, params=None):
         sql = str(stmt)
         params = params or {}
-        if "SELECT DISTINCT obs_date FROM raw_series" in sql:
-            sid, src = params["sid"], params["src"]
-            dates = sorted(
-                {
-                    r["obs_date"]
-                    for r in self.store["rows"]
-                    if r["series_id"] == sid and r["source_id"] == src
-                }
-            )
-            return _FakeResult([(d,) for d in dates])
+
+        if "pg_advisory_xact_lock" in sql:
+            return _FakeResult([])
+
+        if "SELECT series_id, obs_date FROM raw_series" in sql:
+            # BasePuller._get_existing_pairs_in_range: one query for the
+            # whole file, bounded by obs_date range (not by series_id).
+            src = params["src"]
+            start, end = params["start_date"], params["end_date"]
+            rows = [
+                (r["series_id"], r["obs_date"])
+                for r in self.store["rows"]
+                if r["source_id"] == src
+                and r["pull_status"] == "SUCCESS"
+                and start <= r["obs_date"] <= end
+            ]
+            return _FakeResult(rows)
+
+        if "SELECT DISTINCT obs_date FROM raw_series" in sql and "series_id" not in sql:
+            # BasePuller._get_existing_source_dates: file-level check used
+            # by pull_recent's catch-up loop.
+            src = params["src"]
+            dates = {
+                r["obs_date"]
+                for r in self.store["rows"]
+                if r["source_id"] == src and r["pull_status"] == "SUCCESS"
+            }
+            if "start_date" in params:
+                dates = {d for d in dates if d >= params["start_date"]}
+            if "end_date" in params:
+                dates = {d for d in dates if d <= params["end_date"]}
+            return _FakeResult([(d,) for d in sorted(dates)])
+
         if "INSERT INTO raw_series" in sql:
             self.store["rows"].append(
                 {
@@ -153,13 +179,17 @@ def test_pull_success_writes_series_id_scheme_and_payload():
     result = p.pull("2026-09-16")
 
     assert result["status"] == "SUCCESS"
-    assert result["rows_inserted"] == 8
+    # good.txt has 8 raw rows: AAPL/MSFT/SPY x multiple markets each.
+    # Keyed on symbol ALONE (not symbol+market) -- see module docstring's
+    # "Design decision needing owner sign-off" note -- so only the FIRST
+    # row per (date, symbol) in file order is kept: 3 symbols -> 3 rows.
+    assert result["rows_inserted"] == 3
     assert result["rows_skipped"] == 0
     assert result["dry_run"] is False
 
     rows = p.engine.store["rows"]
-    assert len(rows) == 8
-    row = next(r for r in rows if r["series_id"] == "finra:short_volume:AAPL:D")
+    assert len(rows) == 3
+    row = next(r for r in rows if r["series_id"] == "finra:short_volume:AAPL")
     assert row["value"] == 123456.0
     payload = json.loads(row["raw_payload"])
     assert payload["short_exempt_volume"] == 1000.0
@@ -208,6 +238,45 @@ def test_pull_fetch_failure_returns_failed_status_no_writes():
     assert p.engine.store["rows"] == []
 
 
+def test_pull_404_returns_skipped_not_failed():
+    """A 403/404 means no file exists for this trade_date yet (requested
+    too early, or FINRA never files for this date) -- NOT a failure of
+    this puller, and must not feed the exponential-backoff cooldown as a
+    real failure would (see SmartScheduler._record_result)."""
+    p = _puller()
+
+    def _not_found(trade_date, url=None, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 404
+        raise requests.HTTPError("404 Client Error", response=resp)
+
+    p._fetch_raw_text = _not_found
+
+    result = p.pull("2026-09-16")
+
+    assert result["status"] == "SKIPPED"
+    assert result["rows_inserted"] == 0
+    assert "skipped_reason" in result
+    assert "404" in result["skipped_reason"]
+    assert p.engine.store["rows"] == []
+
+
+def test_pull_403_returns_skipped_not_failed():
+    p = _puller()
+
+    def _forbidden(trade_date, url=None, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 403
+        raise requests.HTTPError("403 Client Error", response=resp)
+
+    p._fetch_raw_text = _forbidden
+
+    result = p.pull("2026-09-16")
+
+    assert result["status"] == "SKIPPED"
+    assert p.engine.store["rows"] == []
+
+
 def test_pull_unparseable_file_returns_failed_status_no_writes():
     p = _puller()
     p._fetch_raw_text = lambda trade_date, url=None, **kwargs: "not a finra file at all\n"
@@ -230,7 +299,7 @@ def test_pull_is_idempotent_across_repeated_calls():
     result2 = p2.pull("2026-09-16")
 
     assert result2["rows_inserted"] == 0  # everything already stored
-    assert len(engine.store["rows"]) == 8  # not duplicated to 16
+    assert len(engine.store["rows"]) == 3  # not duplicated to 6
 
 
 def test_pull_revised_same_date_does_not_overwrite_existing_value():
@@ -243,11 +312,11 @@ def test_pull_revised_same_date_does_not_overwrite_existing_value():
     p2._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("revised_same_date.txt")
     result2 = p2.pull("2026-09-16")
 
-    # revised_same_date.txt has the same (date, symbol=AAPL, market=D) key
-    # as a row already stored -- it must be skipped, not overwritten.
+    # revised_same_date.txt has the same (date, symbol=AAPL) key as a row
+    # already stored -- it must be skipped, not overwritten.
     assert result2["rows_inserted"] == 0
     stored = [
-        r for r in engine.store["rows"] if r["series_id"] == "finra:short_volume:AAPL:D"
+        r for r in engine.store["rows"] if r["series_id"] == "finra:short_volume:AAPL"
     ]
     assert len(stored) == 1
     assert stored[0]["value"] == 123456.0  # original value, not 999999.0
@@ -262,7 +331,9 @@ def test_pull_dry_run_writes_nothing():
     assert result["status"] == "SUCCESS"
     assert result["dry_run"] is True
     assert result["rows_inserted"] == 0
-    assert result["rows_would_insert"] == 8
+    # 8 raw rows collapse to 3 (symbol-only keying, see
+    # test_pull_success_writes_series_id_scheme_and_payload).
+    assert result["rows_would_insert"] == 3
     assert p.engine.store["rows"] == []
 
 
@@ -342,6 +413,104 @@ def test_fetch_raw_text_explicit_url_overrides_built_one(monkeypatch):
     assert captured["url"] == "https://example.test/override.txt"
 
 
+# ── pull_recent() catch-up loop ──────────────────────────────────────────
+
+
+def test_pull_recent_walks_back_weekdays_only():
+    """anchor on a Tuesday, weekdays_back=5 -> the prior Tue/Wed/Thu/Fri/Mon
+    (never a Saturday or Sunday)."""
+    p = _puller()
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("empty.txt")
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=5)  # Wed
+
+    dates = [d["date"] for d in result["dates"]]
+    assert dates == [
+        "2026-09-10",  # Thu
+        "2026-09-11",  # Fri
+        "2026-09-14",  # Mon
+        "2026-09-15",  # Tue
+        "2026-09-16",  # Wed (anchor)
+    ]
+    assert all(date.fromisoformat(d).weekday() < 5 for d in dates)
+
+
+def test_pull_recent_skips_dates_already_stored_for_the_source():
+    """A date with ANY existing SUCCESS row for this source (any series)
+    is skipped without calling pull() again -- the one cheap file-level
+    query, not a per-symbol check."""
+    engine = FakeEngine()
+    engine.store["rows"].append(
+        {
+            "series_id": "finra:short_volume:ZZZZ",
+            "source_id": 7,
+            "obs_date": date(2026, 9, 15),
+            "value": 1.0,
+            "raw_payload": None,
+            "pull_status": "SUCCESS",
+        }
+    )
+    p = _puller(engine)
+    calls = []
+
+    def _fetch(trade_date, url=None, **kwargs):
+        calls.append(trade_date)
+        return _load("empty.txt")
+
+    p._fetch_raw_text = _fetch
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=2)
+
+    # Only 2026-09-16 fetched; 2026-09-15 short-circuited as already stored.
+    assert calls == [date(2026, 9, 16)]
+    by_date = {d["date"]: d for d in result["dates"]}
+    assert by_date["2026-09-15"]["status"] == "SKIPPED"
+    assert by_date["2026-09-15"]["reason"] == "already stored"
+
+
+def test_pull_recent_aggregates_inserted_rows_across_dates():
+    p = _puller()
+    p._fetch_raw_text = lambda trade_date, url=None, **kwargs: _load("good.txt")
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=1)
+
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 3  # 8 raw rows -> 3 unique symbols
+
+
+def test_pull_recent_one_hard_failure_marks_overall_failed():
+    p = _puller()
+
+    def _fetch(trade_date, url=None, **kwargs):
+        if trade_date == date(2026, 9, 16):
+            raise ConnectionError("boom")
+        return _load("empty.txt")
+
+    p._fetch_raw_text = _fetch
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=2)
+
+    assert result["status"] == "FAILED"
+
+
+def test_pull_recent_all_skipped_not_failed():
+    """A run where every date is either already-stored or not-yet-
+    published (SKIPPED) is a normal outcome, not a failure."""
+    p = _puller()
+
+    def _not_found(trade_date, url=None, **kwargs):
+        resp = requests.Response()
+        resp.status_code = 404
+        raise requests.HTTPError("404", response=resp)
+
+    p._fetch_raw_text = _not_found
+
+    result = p.pull_recent(anchor_date="2026-09-16", weekdays_back=2)
+
+    assert result["status"] == "SUCCESS"
+    assert all(d["status"] == "SKIPPED" for d in result["dates"])
+
+
 # ── Real captured fixture (see REAL_CAPTURE_NOTE.txt for provenance) ───────
 
 
@@ -373,8 +542,8 @@ def test_real_fixture_reconciles_short_le_total():
 
 
 def test_series_id_namespace_is_disjoint_from_finra_ats_dot_namespace():
-    sid = FINRAShortVolumePuller.series_id("aapl", "d")
-    assert sid == "finra:short_volume:AAPL:D"
+    sid = FINRAShortVolumePuller.series_id("aapl")
+    assert sid == "finra:short_volume:AAPL"
     # finra_ats.py uses a dot-delimited "finra.<feature>" namespace
     # (finra.ats_total_volume, finra.short_interest_total, ...) -- this
     # module's colon-delimited ids must never collide with that.

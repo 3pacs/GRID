@@ -312,7 +312,11 @@ def query_llamacpp(prompt: str) -> str | None:
 
 
 def query_openai(prompt: str, model: str = "gpt-4o") -> str | None:
-    """Query OpenAI API (requires OPENAI_API_KEY)."""
+    """Query OpenAI API (requires OPENAI_API_KEY and GRID_ALLOW_PAID_LLM)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_openai blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
         return None
@@ -330,7 +334,11 @@ def query_openai(prompt: str, model: str = "gpt-4o") -> str | None:
 
 
 def query_anthropic(prompt: str, model: str = "claude-sonnet-4-20250514") -> str | None:
-    """Query Anthropic API (requires ANTHROPIC_API_KEY)."""
+    """Query Anthropic API (requires ANTHROPIC_API_KEY and GRID_ALLOW_PAID_LLM)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_anthropic blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("ANTHROPIC_API_KEY")
     if not api_key:
         return None
@@ -349,7 +357,11 @@ def query_anthropic(prompt: str, model: str = "claude-sonnet-4-20250514") -> str
 
 
 def query_gemini(prompt: str) -> str | None:
-    """Query Google Gemini API (requires GEMINI_API_KEY)."""
+    """Query Google Gemini API (requires GEMINI_API_KEY and GRID_ALLOW_PAID_LLM)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_gemini blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         return None
@@ -366,7 +378,14 @@ def query_gemini(prompt: str) -> str | None:
 
 
 def query_groq(prompt: str, model: str = "llama-3.3-70b-versatile") -> str | None:
-    """Query Groq API — free tier, blazing fast inference."""
+    """Query Groq API (hosted; gated like its siblings even though most
+    models here fit Groq's free tier -- consistent with this file's other
+    query_* functions and the operator's "paid providers off by default,
+    everywhere" direction)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_groq blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("GROQ_API_KEY")
     if not api_key:
         return None
@@ -384,7 +403,11 @@ def query_groq(prompt: str, model: str = "llama-3.3-70b-versatile") -> str | Non
 
 
 def query_openrouter(prompt: str, model: str = "meta-llama/llama-3.1-70b-instruct") -> str | None:
-    """Query OpenRouter — aggregated access to many models."""
+    """Query OpenRouter — aggregated access to many models (paid; gated)."""
+    from llm.router import _paid_llm_allowed
+    if not _paid_llm_allowed():
+        log.info("  query_openrouter blocked — GRID_ALLOW_PAID_LLM not set")
+        return None
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         return None

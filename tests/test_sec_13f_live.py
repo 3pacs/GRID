@@ -250,3 +250,251 @@ def test_upsert_aggregates_share_classes(holdings_engine):
     assert row[0] == 150
     assert row[1] == 1500
     assert row[2] == "sec_13f_live"
+
+
+# ── list_recent_13f_filings / find_latest_13f (bounded catch-up) ──────────────
+
+
+def _submissions_payload(rows: list[tuple[str, str, str]]) -> dict:
+    """Build a fake ``CIK{...}.json`` payload from (form, filingDate, reportDate)."""
+    return {
+        "filings": {
+            "recent": {
+                "form": [r[0] for r in rows],
+                "accessionNumber": [f"ACC-{i}" for i in range(len(rows))],
+                "filingDate": [r[1] for r in rows],
+                "reportDate": [r[2] for r in rows],
+            }
+        }
+    }
+
+
+def test_list_recent_13f_filings_returns_all_report_dates_newest_first():
+    payload = _submissions_payload(
+        [
+            ("13F-HR", "2026-05-15", "2026-03-31"),
+            ("10-K", "2026-03-01", "2026-01-01"),  # not a 13F — ignored
+            ("13F-HR", "2026-02-14", "2025-12-31"),
+            ("13F-HR", "2026-08-14", "2026-06-30"),
+        ]
+    )
+    with patch.object(m, "_get_json", return_value=payload):
+        filings = m.list_recent_13f_filings("1067983")
+
+    assert [f.report_date for f in filings] == [
+        date(2026, 6, 30),
+        date(2026, 3, 31),
+        date(2025, 12, 31),
+    ]
+
+
+def test_list_recent_13f_filings_amendment_supersedes_original_same_quarter():
+    payload = _submissions_payload(
+        [
+            ("13F-HR", "2026-05-15", "2026-03-31"),
+            ("13F-HR/A", "2026-06-01", "2026-03-31"),  # amends the same quarter
+        ]
+    )
+    with patch.object(m, "_get_json", return_value=payload):
+        filings = m.list_recent_13f_filings("1067983")
+
+    assert len(filings) == 1
+    assert filings[0].form == "13F-HR/A"
+    assert filings[0].filing_date == date(2026, 6, 1)
+
+
+def test_list_recent_13f_filings_empty_when_no_13f_forms():
+    payload = _submissions_payload([("10-K", "2026-03-01", "2026-01-01")])
+    with patch.object(m, "_get_json", return_value=payload):
+        assert m.list_recent_13f_filings("1067983") == []
+
+
+def test_find_latest_13f_returns_newest_report_date():
+    payload = _submissions_payload(
+        [
+            ("13F-HR", "2026-02-14", "2025-12-31"),
+            ("13F-HR", "2026-08-14", "2026-06-30"),
+        ]
+    )
+    with patch.object(m, "_get_json", return_value=payload):
+        filing = m.find_latest_13f("1067983")
+
+    assert filing is not None
+    assert filing.report_date == date(2026, 6, 30)
+
+
+def test_find_latest_13f_returns_none_when_no_filings():
+    with patch.object(m, "_get_json", return_value=_submissions_payload([])):
+        assert m.find_latest_13f("1067983") is None
+
+
+# ── _process_filer catch-up (backfill bounded by EDGAR's recent window) ───────
+
+
+_FILER = m.Filer("berkshire_hathaway", "1067983", "Berkshire Hathaway")
+
+
+def _seed_known_report_date(engine, holder: str, ticker: str, report_date: date) -> None:
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO institutional_holdings
+                    (holder_name, ticker, report_date, source)
+                VALUES (:holder, :ticker, :report_date, 'sec_13f_live')
+                """
+            ),
+            {"holder": holder, "ticker": ticker, "report_date": report_date},
+        )
+
+
+def test_known_report_dates_scoped_to_sec_13f_live_source(holdings_engine):
+    _seed_known_report_date(
+        holdings_engine, "Berkshire Hathaway", "AAPL", date(2025, 12, 31)
+    )
+    # A curated/bootstrap row for the same holder+quarter must NOT count as
+    # "already ingested" by the live writer — different provenance.
+    with holdings_engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                INSERT INTO institutional_holdings
+                    (holder_name, ticker, report_date, source)
+                VALUES ('Berkshire Hathaway', 'MSFT', :report_date, 'sec_13f_curated')
+                """
+            ),
+            {"report_date": date(2024, 12, 31)},
+        )
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    known = ingestor._known_report_dates(_FILER)
+    assert known == {date(2025, 12, 31)}
+
+
+def test_process_filer_backfills_every_missed_quarter(holdings_engine, monkeypatch):
+    """A gap of several quarters must not be collapsed to just the latest one."""
+    _seed_known_report_date(
+        holdings_engine, "Berkshire Hathaway", "AAPL", date(2025, 12, 31)
+    )
+    q1 = m.LatestFiling(
+        accession="ACC-Q1", filing_date=date(2026, 5, 15),
+        report_date=date(2026, 3, 31), form="13F-HR",
+    )
+    q2 = m.LatestFiling(
+        accession="ACC-Q2", filing_date=date(2026, 8, 14),
+        report_date=date(2026, 6, 30), form="13F-HR",
+    )
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [q2, q1])
+    monkeypatch.setattr(m.time, "sleep", lambda *_a, **_k: None)
+
+    def fake_fetch(cik, filing):
+        return [{"cusip": "037833100", "value": 10, "shares": 1}]
+
+    monkeypatch.setattr(m, "fetch_infotable", fake_fetch)
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    ingestor._cusip_map._map = {"037833100": "AAPL"}
+
+    result = ingestor._process_filer(_FILER)
+
+    assert result.status == "ok"
+    assert result.filings_processed == 2
+    assert result.rows_written == 2  # one upsert per newly-seen quarter
+    assert result.filing.report_date == date(2026, 6, 30)  # newest processed
+
+    with holdings_engine.connect() as conn:
+        # sqlite's raw text() DATE column hands back ISO strings, not
+        # `date` objects (there is no real DATE type to coerce through) —
+        # normalize before comparing, same as production code must for
+        # Postgres-vs-sqlite portability.
+        report_dates = {
+            date.fromisoformat(str(row[0])[:10])
+            for row in conn.execute(
+                text(
+                    "SELECT report_date FROM institutional_holdings "
+                    "WHERE holder_name = 'Berkshire Hathaway' AND ticker = 'AAPL'"
+                )
+            )
+        }
+    # The pre-seeded 2025-12-31 row (simulating the quarter already on file
+    # before this run) must survive untouched alongside the two new ones —
+    # the backfill only adds rows for previously-missing report_dates.
+    assert report_dates == {date(2025, 12, 31), date(2026, 3, 31), date(2026, 6, 30)}
+
+
+def test_process_filer_sleeps_before_every_infotable_fetch(holdings_engine, monkeypatch):
+    """A sleep must precede *every* fetch_infotable call, including the first.
+
+    Regression test: the loop used to only sleep when i > 0, so the first
+    fetch_infotable per filer fired immediately after the submissions
+    request list_recent_13f_filings() just made — no delay between them.
+    """
+    q1 = m.LatestFiling(
+        accession="ACC-Q1", filing_date=date(2026, 5, 15),
+        report_date=date(2026, 3, 31), form="13F-HR",
+    )
+    q2 = m.LatestFiling(
+        accession="ACC-Q2", filing_date=date(2026, 8, 14),
+        report_date=date(2026, 6, 30), form="13F-HR",
+    )
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [q2, q1])
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        m.time, "sleep", lambda *_a, **_k: calls.append("sleep")
+    )
+
+    def fake_fetch(cik, filing):
+        calls.append("fetch")
+        return [{"cusip": "037833100", "value": 10, "shares": 1}]
+
+    monkeypatch.setattr(m, "fetch_infotable", fake_fetch)
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    ingestor._cusip_map._map = {"037833100": "AAPL"}
+
+    result = ingestor._process_filer(_FILER)
+
+    assert result.filings_processed == 2
+    # Every "fetch" must be immediately preceded by a "sleep" — including
+    # the very first one in the loop.
+    assert calls == ["sleep", "fetch", "sleep", "fetch"]
+
+
+def test_process_filer_up_to_date_skips_fetch_entirely(holdings_engine, monkeypatch):
+    only_known = m.LatestFiling(
+        accession="ACC-KNOWN", filing_date=date(2026, 2, 14),
+        report_date=date(2025, 12, 31), form="13F-HR",
+    )
+    _seed_known_report_date(
+        holdings_engine, "Berkshire Hathaway", "AAPL", date(2025, 12, 31)
+    )
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [only_known])
+    fetch_mock = MagicMock()
+    monkeypatch.setattr(m, "fetch_infotable", fetch_mock)
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    result = ingestor._process_filer(_FILER)
+
+    assert result.status == "up_to_date"
+    assert result.rows_written == 0
+    fetch_mock.assert_not_called()
+
+
+def test_process_filer_no_filing_when_edgar_has_no_13f(holdings_engine, monkeypatch):
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [])
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    result = ingestor._process_filer(_FILER)
+
+    assert result.status == "no_filing"
+    assert result.rows_written == 0

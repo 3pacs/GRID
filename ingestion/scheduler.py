@@ -1702,6 +1702,38 @@ def run_monthly_pulls(start_date: str | date = "1990-01-01") -> None:
         except Exception as exc2:
             log.debug("Scheduler: EDGAR 13F alert send failed: {e}", e=str(exc2))
 
+    # institutional_holdings (13F, live) — a separate table/writer from the
+    # signal_sources-based InstitutionalFlowsPuller above. This was
+    # catalogued in scripts/hermes_operator.py's _SOURCE_EXTRAS (for the
+    # PULL FIXER's diagnostics) but never actually invoked by anything, so
+    # institutional_holdings silently stopped ingesting new quarters after
+    # 2026-04-12. Wiring it in here — the job that already runs monthly —
+    # revives it. SEC13FLiveIngestor.run() catches up on every report_date
+    # missed while this was dormant, bounded by EDGAR's per-CIK "recent"
+    # filings window (see list_recent_13f_filings), then is a cheap no-op
+    # ("up_to_date") every month after that.
+    try:
+        from db import get_engine
+        from ingestion.altdata.sec_13f_live import SEC13FLiveIngestor
+
+        engine = get_engine()
+        ingestor = SEC13FLiveIngestor(engine=engine)
+        results = ingestor.run()
+        ok = sum(1 for r in results if r.status == "ok")
+        rows = sum(r.rows_written for r in results)
+        log.info(
+            "13F live (institutional_holdings) pull complete — "
+            "{ok}/{n} filers ok, {r} rows written",
+            ok=ok, n=len(results), r=rows,
+        )
+    except Exception as exc:
+        log.error("13F live (institutional_holdings) pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure
+            alert_on_failure("SEC 13F live (institutional_holdings)", str(exc))
+        except Exception as exc2:
+            log.debug("Scheduler: SEC 13F live alert send failed: {e}", e=str(exc2))
+
     log.info("Monthly pulls finished")
 
 

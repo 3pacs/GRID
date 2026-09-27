@@ -204,44 +204,57 @@ class TestMalformedResponse:
         assert engine.store.rows_for("lme:stocks_total_mt:copper") == []
 
     @patch("ingestion.altdata.lme_warehouse.requests.get")
-    def test_malformed_report_date_logs_warning_not_silent(self, mock_get, engine):
-        """Defect proved + fixed in this commit.
+    def test_malformed_report_date_is_skipped_honestly_not_backdated(
+        self, mock_get, engine
+    ):
+        """Defect proved + fixed across two passes.
 
-        Before the fix, `_parse_date_from_header` silently substituted
-        `fallback` (`date.today()`) for any non-empty, unparseable date
-        string with no log line at all -- a malformed `report_date` (as in
-        this fixture, "not-a-real-date") would silently mis-date every row
-        to today with zero trace in `.server-logs/errors.jsonl`. That is a
-        PIT-correctness hazard per this repo's own data-integrity rules.
-        The fix adds a `log.warning` on that fallback path.
+        Originally, `_parse_date_from_header` silently substituted
+        `date.today()` for any non-empty, unparseable date string with no
+        log line at all -- a malformed `report_date` would silently
+        mis-date every row to today with zero trace in
+        `.server-logs/errors.jsonl`. A first fix added a `log.warning` on
+        that fallback path but kept the fallback itself.
+
+        The 2026-09-27 Wave 1 review tightened this further: an
+        unparseable/missing report_date now discards the WHOLE batch
+        (zero snapshots), rather than logging a warning and still writing
+        every other metal under a fabricated `date.today()` -- a wrong
+        obs_date is exactly as much a PIT-correctness hazard as a wrong
+        value, so "parse everything else, just warn about the date" was
+        still silently corrupting data underneath the warning.
         """
-        malformed = _load_json("malformed_response.json")
-        mock_get.return_value = _resp_json(malformed)
+        malformed_date = _load_json("malformed_date_response.json")
+        mock_get.side_effect = [
+            _resp_json(malformed_date),
+            _resp_html("<html><body>no table here</body></html>"),
+        ]
 
         with patch("ingestion.altdata.lme_warehouse.log") as mock_log:
-            run_lme_warehouse_puller(engine)
+            result = run_lme_warehouse_puller(engine)
 
+        assert result["fetched"] == 0
+        assert result["inserted"] == 0
+        assert engine.store.rows == []
         assert mock_log.warning.call_count >= 1
         all_warn_text = " ".join(
             str(call) for call in mock_log.warning.call_args_list
         )
         assert "could not parse observation date" in all_warn_text
 
-    def test_parse_date_from_header_fallback_direct(self):
-        fallback = date(2020, 1, 1)
+    def test_parse_date_from_header_unparseable_text_returns_none_and_warns(self):
         with patch("ingestion.altdata.lme_warehouse.log") as mock_log:
-            result = _parse_date_from_header("totally not a date", fallback)
-        assert result == fallback
+            result = _parse_date_from_header("totally not a date")
+        assert result is None
         mock_log.warning.assert_called_once()
 
     def test_parse_date_from_header_empty_text_is_silent(self):
         """The "no text at all" case is a different, expected situation
         (nothing to parse) and intentionally stays silent -- only a
         non-empty-but-unparseable string should warn."""
-        fallback = date(2020, 1, 1)
         with patch("ingestion.altdata.lme_warehouse.log") as mock_log:
-            result = _parse_date_from_header("", fallback)
-        assert result == fallback
+            result = _parse_date_from_header("")
+        assert result is None
         mock_log.warning.assert_not_called()
 
 
