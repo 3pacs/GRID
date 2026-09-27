@@ -1174,6 +1174,7 @@ def _load_live_profiles(engine: Engine, as_of: date) -> dict[str, TickerSignalPr
                 WHERE ticker = ANY(:tickers)
                   AND source_type = ANY(:source_types)
                   AND signal_date >= :min_signal_date
+                  AND signal_date <= :as_of
                 ORDER BY signal_date DESC NULLS LAST, created_at DESC NULLS LAST
                 """
             ),
@@ -1181,6 +1182,7 @@ def _load_live_profiles(engine: Engine, as_of: date) -> dict[str, TickerSignalPr
                 "tickers": TARGET_UNIVERSE,
                 "source_types": list(SOURCE_WINDOWS_DAYS.keys()),
                 "min_signal_date": min_signal_date,
+                "as_of": as_of,
             },
         )
 

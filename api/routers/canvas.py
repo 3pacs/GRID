@@ -542,6 +542,7 @@ def _load_signals_for_actors(
             "       direction, magnitude, confidence, description "
             "FROM signal_data "
             "WHERE (actor = :actor_id OR actor = :actor_name) "
+            "AND signal_date <= CURRENT_DATE "
             + since_clause + " "
             "ORDER BY signal_date DESC LIMIT :lim"
         )
@@ -626,7 +627,8 @@ def _load_wealth_flows(
                     "SELECT from_actor, to_entity, amount_estimate, confidence, "
                     "       evidence, flow_date "
                     "FROM wealth_flows "
-                    "WHERE from_actor = :aid OR to_entity = :aid "
+                    "WHERE (from_actor = :aid OR to_entity = :aid) "
+                    "AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC LIMIT 50"
                 ).bindparams(aid=actor_id),
             ).mappings().fetchall()
@@ -667,6 +669,7 @@ def _load_dollar_flows(
                     "       direction, confidence, flow_date "
                     "FROM dollar_flows "
                     "WHERE actor_name = :aid "
+                    "AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC LIMIT 20"
                 ).bindparams(aid=actor_id),
             ).mappings().fetchall()
@@ -712,6 +715,7 @@ def _detect_co_traded(
                     "FROM signal_data "
                     "WHERE actor = :aid AND ticker IS NOT NULL "
                     "AND signal_date >= CURRENT_DATE - :window "
+                    "AND signal_date <= CURRENT_DATE "
                     "ORDER BY signal_date DESC LIMIT 30"
                 ).bindparams(aid=actor_id, window=window_days * 3),
             ).mappings().fetchall()
@@ -820,6 +824,7 @@ def _load_signals_for_ticker(
             "       direction, magnitude, confidence, description "
             "FROM signal_data "
             "WHERE UPPER(ticker) = :ticker "
+            "AND signal_date <= CURRENT_DATE "
             + since_clause + " "
             "ORDER BY signal_date DESC LIMIT :lim"
         )
@@ -1005,6 +1010,7 @@ def get_canvas_graph(
                             "WHERE sd.actor = ANY(:aids) "
                             "AND sd.ticker IS NOT NULL "
                             "AND sd.signal_date >= CURRENT_DATE - 90 "
+                            "AND sd.signal_date <= CURRENT_DATE "
                             "ORDER BY sd.signal_date DESC "
                             "LIMIT 10000"
                         ).bindparams(aids=all_actor_ids),
@@ -1313,6 +1319,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
                 "       confidence, description "
                 "FROM signal_data "
                 "WHERE actor = :aid AND signal_date >= CURRENT_DATE - 30 "
+                "AND signal_date <= CURRENT_DATE "
                 "ORDER BY signal_date DESC LIMIT 50"
             ).bindparams(aid=actor_id),
         ).mappings().fetchall()
@@ -1322,6 +1329,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             text(
                 "SELECT to_entity, amount_estimate, confidence, flow_date "
                 "FROM wealth_flows WHERE from_actor = :aid "
+                "AND flow_date <= CURRENT_DATE "
                 "ORDER BY flow_date DESC LIMIT 20"
             ).bindparams(aid=actor_id),
         ).mappings().fetchall()
@@ -1330,6 +1338,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
             text(
                 "SELECT from_actor, amount_estimate, confidence, flow_date "
                 "FROM wealth_flows WHERE to_entity = :aid "
+                "AND flow_date <= CURRENT_DATE "
                 "ORDER BY flow_date DESC LIMIT 20"
             ).bindparams(aid=actor_id),
         ).mappings().fetchall()
@@ -1354,6 +1363,7 @@ async def _actor_detail(engine: Engine, actor_id: str) -> dict[str, Any]:
                 "SELECT source_type, ticker, amount_usd, direction, confidence, "
                 "       flow_date "
                 "FROM dollar_flows WHERE actor_name = :aid "
+                "AND flow_date <= CURRENT_DATE "
                 "ORDER BY flow_date DESC LIMIT 30"
             ).bindparams(aid=actor_id),
         ).mappings().fetchall()
@@ -1402,6 +1412,7 @@ async def _ticker_detail(engine: Engine, ticker: str) -> dict[str, Any]:
                 "SELECT signal_type, signal_date, actor, direction, magnitude, "
                 "       confidence, description "
                 "FROM signal_data WHERE UPPER(ticker) = :t "
+                "AND signal_date <= CURRENT_DATE "
                 "ORDER BY signal_date DESC LIMIT 50"
             ).bindparams(t=ticker_upper),
         ).mappings().fetchall()
@@ -1425,6 +1436,7 @@ async def _ticker_detail(engine: Engine, ticker: str) -> dict[str, Any]:
                 "SELECT source_type, actor_name, amount_usd, direction, "
                 "       confidence, flow_date "
                 "FROM dollar_flows WHERE UPPER(ticker) = :t "
+                "AND flow_date <= CURRENT_DATE "
                 "ORDER BY flow_date DESC LIMIT 30"
             ).bindparams(t=ticker_upper),
         ).mappings().fetchall()

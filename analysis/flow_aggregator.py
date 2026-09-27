@@ -153,7 +153,7 @@ def _fetch_flows(engine: Engine, days: int) -> list[dict]:
                     "SELECT source_type, actor_name, ticker, amount_usd, "
                     "direction, confidence, flow_date, evidence "
                     "FROM dollar_flows "
-                    "WHERE flow_date >= :cutoff "
+                    "WHERE flow_date >= :cutoff AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC"
                 ),
                 {"cutoff": cutoff},
@@ -576,6 +576,7 @@ def compute_flow_momentum(engine: Engine, ticker: str, days: int = 30) -> dict[s
                     "FROM dollar_flows "
                     "WHERE UPPER(ticker) = :ticker "
                     "AND flow_date >= :cutoff "
+                    "AND flow_date <= CURRENT_DATE "
                     "ORDER BY flow_date DESC"
                 ),
                 {"ticker": ticker.upper(), "cutoff": cutoff},

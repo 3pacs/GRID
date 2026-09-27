@@ -467,7 +467,7 @@ def _get_put_call_ratio(engine: Engine, ticker: str) -> str | None:
         with engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT put_call_ratio FROM options_daily_signals
-                WHERE ticker = :t
+                WHERE ticker = :t AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
             if row and row[0]:
@@ -484,7 +484,7 @@ def _get_dark_pool_signal(engine: Engine, ticker: str) -> str | None:
             row = conn.execute(text("""
                 SELECT signal_value FROM signal_sources
                 WHERE source_type = 'darkpool' AND ticker = :t
-                AND signal_date >= :d
+                AND signal_date >= :d AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker, "d": date.today() - timedelta(days=14)}).fetchone()
             if row and row[0]:
@@ -560,7 +560,7 @@ def _get_whale_flow(engine: Engine, ticker: str) -> str | None:
         with engine.connect() as conn:
             row = conn.execute(text("""
                 SELECT pcr, total_volume FROM options_daily_signals
-                WHERE ticker = :t
+                WHERE ticker = :t AND signal_date <= CURRENT_DATE
                 ORDER BY signal_date DESC LIMIT 1
             """), {"t": ticker}).fetchone()
             if row:
@@ -1149,7 +1149,8 @@ def _build_intelligence(engine: Engine) -> dict:
                 SELECT source_type, source_id, ticker, signal_type,
                        signal_date, trust_score
                 FROM signal_sources
-                WHERE signal_date >= :d AND trust_score >= 0.6
+                WHERE signal_date >= :d AND signal_date <= CURRENT_DATE
+                AND trust_score >= 0.6
                 ORDER BY trust_score DESC, signal_date DESC
                 LIMIT 10
             """), {"d": date.today() - timedelta(days=14)}).fetchall()
