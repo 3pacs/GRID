@@ -43,7 +43,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from fractions import Fraction
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -687,8 +687,10 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
         if "crosscheck" not in r:
             continue
         tickers[t] = {**r["crosscheck"], "twelvedata": r["twelvedata"]}
+    # TIINGO has the window's last date but TwelveData (end_date exclusive) does not
     td_end_missing = sorted(t for t, r in tickers.items()
-                            if r["last"] is not None and r["twelvedata"]["state"] == "ok"
+                            if (recs[t].get("coverage") or {}).get("last_date") == hi.isoformat()
+                            and r["twelvedata"]["state"] == "ok"
                             and all((x.get("last") or "") < hi.isoformat() for x in r["twelvedata"]["receipts"].values()))
     return {
         "report": "vs1-v6-twelvedata-crosscheck",
