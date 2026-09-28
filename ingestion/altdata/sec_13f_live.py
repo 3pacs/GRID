@@ -168,103 +168,30 @@ def _call_with_timeout(fn: Callable[..., _T], *args: Any, timeout: float, **kwar
 
 
 # ── Filer universe ────────────────────────────────────────────────────────────
-# Curated set of ~35 high-signal 13F filers. CIKs are the canonical SEC
-# Central Index Keys. We keep a human-friendly short key for CLI
-# selection (``--filers berkshire_hathaway``) plus the pretty display name
-# stored in ``institutional_holdings.holder_name``.
 #
-# CIKs for the original 20 come from
-# ``scripts/populate_institutional_holdings.py`` so the new rows merge
-# cleanly with the curated bootstrap rows on the
-# (holder_name, ticker, report_date) unique index.
-
-
-@dataclass(frozen=True)
-class Filer:
-    """Metadata for a tracked 13F filer.
-
-    Attributes:
-        key: Short slug used in CLI selection and logs.
-        cik: SEC Central Index Key (unpadded string form).
-        display_name: Human-friendly holder name stored in the DB.
-    """
-
-    key: str
-    cik: str
-    display_name: str
-
-
-FILERS: tuple[Filer, ...] = (
-    # ── From populate_institutional_holdings.py bootstrap ─────────────
-    Filer("berkshire_hathaway",   "1067983", "Berkshire Hathaway"),
-    Filer("pershing_square",      "1336528", "Pershing Square Capital"),
-    Filer("trian",                "1345471", "Trian Fund Management"),
-    Filer("3g_capital",           "1421669", "3G Capital"),
-    Filer("bridgewater",          "1350694", "Bridgewater Associates"),
-    Filer("elliott_management",   "1791786", "Elliott Investment Management"),
-    Filer("icahn_enterprises",    "921669",  "Icahn Enterprises"),
-    Filer("valueact",             "1418814", "ValueAct Capital"),
-    Filer("third_point",          "1159159", "Third Point"),
-    Filer("starboard_value",      "1517137", "Starboard Value"),
-    Filer("jana_partners",        "1027451", "Jana Partners"),
-    Filer("soros_fund",           "1029160", "Soros Fund Management"),
-    # ── New additions (big hedge funds + family offices + LPs) ────────
-    Filer("renaissance",          "1037389", "Renaissance Technologies"),
-    Filer("two_sigma",            "1649339", "Two Sigma Investments"),
-    Filer("citadel",              "1423053", "Citadel Advisors"),
-    Filer("millennium",           "1273087", "Millennium Management"),
-    Filer("point72",              "1603466", "Point72 Asset Management"),
-    Filer("tiger_global",         "1167483", "Tiger Global Management"),
-    Filer("coatue",               "1135730", "Coatue Management"),
-    Filer("viking_global",        "1103804", "Viking Global Investors"),
-    Filer("de_shaw",              "1009207", "D.E. Shaw"),
-    Filer("baupost",              "1061165", "Baupost Group"),
-    Filer("aqr",                  "1167557", "AQR Capital Management"),
-    Filer("lone_pine",            "1061768", "Lone Pine Capital"),
-    Filer("appaloosa",            "1656456", "Appaloosa Management"),
-    # ── Index / active large cap sponsors ─────────────────────────────
-    Filer("sequoia_capital",      "1607841", "Sequoia Capital (SC US TTGP)"),
-    Filer("altimeter",            "1541617", "Altimeter Capital"),
-    Filer("baillie_gifford",      "1088875", "Baillie Gifford"),
-    Filer("t_rowe_price",         "1897612", "T. Rowe Price Investment Mgmt"),
-    Filer("capital_research",     "1422848", "Capital Research Global"),
-    Filer("wellington",           "902219",  "Wellington Management"),
-    Filer("geode_capital",        "1214717", "Geode Capital Management"),
-    Filer("blackrock",            "2012383", "BlackRock Inc"),
-    Filer("vanguard",             "102909",  "Vanguard Group"),
-    Filer("state_street",         "93751",   "State Street"),
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; **corrected**
+# 2026-09-28 by the coordinator after an initial cut of this remediation
+# shrank the tracked universe from ~50 filers to this module's original 35 --
+# see ``ingestion/altdata/verified_13f_filers.py``'s module docstring for the
+# full story). The single verified 13F filer-CIK map now lives in
+# ``ingestion/altdata/verified_13f_filers`` -- built from the **union** of
+# this module's original 35-entry list plus ``ingestion/edgar.py`` and
+# ``ingestion/altdata/institutional_flows.py``'s old independent lists,
+# every CIK checked against SEC's own registrant data. ``Filer``, ``FILERS``,
+# ``filer_by_key`` and ``filer_by_cik`` are re-exported here (not a second
+# copy) so existing callers (``SEC13FLiveIngestor.run()``,
+# ``scripts/run_sec_13f_live.py``) keep working unchanged. This module has no
+# reason of its own to run a *smaller* subset than the verified list --
+# ``SEC13FLiveIngestor.run()`` already supports a per-call ``limit=`` for
+# rate/testing purposes, so ``FILERS`` here is the full verified set, not an
+# independently curated subset.
+from ingestion.altdata.verified_13f_filers import (  # noqa: E402
+    DROPPED_FILERS as DROPPED_FILERS,
+    Filer as Filer,
+    VERIFIED_FILERS as FILERS,
+    filer_by_cik as filer_by_cik,
+    filer_by_key as filer_by_key,
 )
-
-
-def filer_by_key(key: str) -> Filer | None:
-    """Look up a filer by its short slug."""
-    for f in FILERS:
-        if f.key == key:
-            return f
-    return None
-
-
-def filer_by_cik(cik: str | int) -> Filer | None:
-    """Look up a filer by CIK (unpadded or zero-padded, str or int).
-
-    GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28): this module's
-    ``FILERS`` is the single verified source of truth for the 13F
-    **filer**-CIK space. ``ingestion/edgar.py`` and
-    ``ingestion/altdata/institutional_flows.py`` used to carry their own
-    independent hardcoded CIK->name maps that disagreed with each other and
-    with this one on the same CIK (e.g. ``1167483`` was claimed as three
-    different funds across the three files). Both now derive their
-    CIK/name lookups from ``FILERS`` via this function instead of
-    maintaining a second copy.
-    """
-    try:
-        target = int(str(cik).strip())
-    except (TypeError, ValueError):
-        return None
-    for f in FILERS:
-        if int(f.cik) == target:
-            return f
-    return None
 
 
 # ── CUSIP -> ticker resolution ───────────────────────────────────────────────

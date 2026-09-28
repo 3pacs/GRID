@@ -40,7 +40,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.sec_13f_live import FILERS
+from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
 from ingestion.base import BasePuller, retry_on_failure
 
 # yfinance logs expected missing/delisted ticker misses at ERROR internally.
@@ -89,16 +89,16 @@ _EDGAR_HEADERS: dict[str, str] = {
 
 # Top institutional filers by AUM (CIK numbers).
 #
-# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28): this module used
-# to carry its own hardcoded ``CIK -> fund name`` dict that disagreed with
-# both ``ingestion/edgar.py`` and ``ingestion/altdata/sec_13f_live.py`` on
-# the *same* CIK for different funds (e.g. CIK 1167483 was "Elliott
-# Management" here, "Eton Park Capital" in edgar.py, and "Tiger Global
-# Management" — the verified-correct entry — in sec_13f_live.py). The owner
-# decision retires this independent map in favor of ``sec_13f_live.FILERS``,
-# the 13F writer's own map, verified correct: this is now a derived view
-# over it, not a second copy that can drift out of sync.
-TOP_13F_FILERS: dict[str, str] = {f.cik: f.display_name for f in FILERS}
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; corrected
+# 2026-09-28 -- see ``ingestion/altdata/verified_13f_filers.py``'s module
+# docstring): this module used to carry its own hardcoded ``CIK -> fund
+# name`` dict that disagreed with both ``ingestion/edgar.py`` and
+# ``ingestion/altdata/sec_13f_live.py`` on the *same* CIK for different
+# funds (e.g. CIK 1167483 was "Elliott Management" here, "Eton Park
+# Capital" in edgar.py, and "Tiger Global Management" -- SEC's verified
+# registrant name -- in sec_13f_live.py). This is now a derived view over
+# the single verified map, not a second copy that can drift out of sync.
+TOP_13F_FILERS: dict[str, str] = {f.cik: f.display_name for f in VERIFIED_FILERS}
 
 # Rate limit between EDGAR API calls (SEC is strict: 10 req/sec max)
 _EDGAR_RATE_DELAY: float = 0.15

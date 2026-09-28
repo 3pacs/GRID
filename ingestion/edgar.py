@@ -18,24 +18,26 @@ from edgar import Company, get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from ingestion.altdata.sec_13f_live import FILERS
+from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
 from ingestion.base import BasePuller
 
 # 13F filer CIK numbers for institutional-holdings tracking.
 #
-# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28): this module used
-# to carry its own hardcoded 50-fund CIK list that disagreed with both
-# ``ingestion/altdata/institutional_flows.py`` and
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; corrected
+# 2026-09-28 -- see ``ingestion/altdata/verified_13f_filers.py``'s module
+# docstring): this module used to carry its own hardcoded 50-fund CIK list
+# that disagreed with both ``ingestion/altdata/institutional_flows.py`` and
 # ``ingestion/altdata/sec_13f_live.py`` on the same CIK for different funds
 # (e.g. CIK 1167483 was "Eton Park Capital" here, "Elliott Management" in
-# institutional_flows.py, and "Tiger Global Management" — the
-# verified-correct entry — in sec_13f_live.py). The owner decision retires
-# this independent list in favor of ``sec_13f_live.FILERS``, the 13F
-# writer's own map, verified correct: this is now a derived, zero-padded
-# view over it, not a second copy that can drift out of sync. The resulting
-# universe is smaller/different from the old list by design — it is the
-# single verified set, not a superset of every previously (mis)tracked CIK.
-TOP_HEDGE_FUND_CIKS: list[str] = [f.cik.zfill(10) for f in FILERS]
+# institutional_flows.py, and "Tiger Global Management" -- SEC's verified
+# registrant name). This is now a derived, zero-padded view over the single
+# verified 13F filer-CIK map (the union of all three old lists, each CIK
+# checked against SEC's own registrant data), not a second copy that can
+# drift out of sync. 72 verified filers, up from this module's old 50 (2
+# managers -- Balyasny Asset Management, GIC Private Limited -- could not be
+# matched to any SEC-registered filer after multiple search attempts and are
+# documented as dropped in verified_13f_filers.py, not silently omitted).
+TOP_HEDGE_FUND_CIKS: list[str] = [f.cik.zfill(10) for f in VERIFIED_FILERS]
 
 # Rate limit between EDGAR requests (be polite to SEC servers)
 _RATE_LIMIT_DELAY: float = 0.12  # SEC asks for <=10 req/sec
