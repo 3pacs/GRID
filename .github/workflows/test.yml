@@ -176,6 +176,29 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
 
+      # tests/test_get_side_effects_readonly_pg.py: the general "Run tests"
+      # step above uses -n auto/--dist loadgroup and doesn't surface
+      # per-file skip/pass results in its tail -300 log, so a silent skip
+      # there (no PostgreSQL reachable) would never be caught. This step
+      # reruns the same file on its own and fails if any test skipped --
+      # thesis/causation/forensics/watchlist GETs are SELECT-only, and
+      # (added for Wave 3 W3.2, PR #713) GET /regime and /regime/analogs
+      # never call cache_state_vector or create regime_state_vectors.
+      - name: GET side-effects read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_get_side_effects_readonly_pg.py -q -rA | tee /tmp/grid-get-side-effects-readonly-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-get-side-effects-readonly-pg.txt; then
+            echo "::error::GET side-effects read-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Watchlist edge PostgreSQL identity contract
         env:
           GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
