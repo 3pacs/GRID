@@ -58,10 +58,20 @@ WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
 WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = v1.canonical_witness_path(REGISTRY_ID)
 
-REGISTERED_AT: datetime | None = None
-REGISTERED_CODE_SHA: str | None = None
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The one sectors-v3 registration: registered once, locally, on 2026-09-28T03:11:31Z against
+#: code 4dcd7db8, chain head a9a34982... at 2 records. The original lives in the operator's
+#: ``Documents/Codex/2026-09-14/wha/outputs/vs1-sectors-v3-prereg-registry/``.
+REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 3, 11, 31, 686738, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA: str | None = "4dcd7db8b4183db3881430f351aa15001d580eb6"
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "5a08d8284d83197d8d03d4c5897514e8b950c855c83e8f996bfd9202d3d7e380",  # header
+    "a9a349823cba1dd92b23d9716222c6f3924a759fd99803d4a2a591dcbcdf7120",  # preregistration (head at 2)
+)
+#: The first line every committed version of the sectors-v3 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"a9a349823cba1dd92b23d9716222c6f3924a759fd99803d4a2a591dcbcdf7120",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T03:11:31.686738+00:00"}'
+)
 SUPERSEDED_BY: dict | None = None
 
 

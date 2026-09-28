@@ -90,7 +90,7 @@ WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v2.anchors.j
 SUPERSEDED_BY: dict | None = {
     "version": "vs1-sectors-v3",
     "prereg_sha256": "7b6eecae453cc71a0af021d96c259c65de5ab3d03f835746c7d413dcda7e4103",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "a9a349823cba1dd92b23d9716222c6f3924a759fd99803d4a2a591dcbcdf7120",
 }
 REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 2, 34, 55, 80814, tzinfo=timezone.utc)
 REGISTERED_CODE_SHA: str | None = "f6588eba8aa54f0b6e45215bff5b2afcabfdb8a1"
