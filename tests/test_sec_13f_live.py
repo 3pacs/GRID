@@ -453,17 +453,19 @@ def test_find_latest_13f_returns_none_when_no_filings():
 _FILER = m.Filer("berkshire_hathaway", "1067983", "Berkshire Hathaway")
 
 
-def _seed_known_report_date(engine, holder: str, ticker: str, report_date: date) -> None:
+def _seed_known_report_date(
+    engine, holder: str, ticker: str, report_date: date, cik: str = "1067983",
+) -> None:
     with engine.begin() as conn:
         conn.execute(
             text(
                 """
                 INSERT INTO institutional_holdings
-                    (holder_name, ticker, report_date, source)
-                VALUES (:holder, :ticker, :report_date, 'sec_13f_live')
+                    (cik, holder_name, ticker, report_date, source)
+                VALUES (:cik, :holder, :ticker, :report_date, 'sec_13f_live')
                 """
             ),
-            {"holder": holder, "ticker": ticker, "report_date": report_date},
+            {"cik": cik, "holder": holder, "ticker": ticker, "report_date": report_date},
         )
 
 
@@ -617,3 +619,144 @@ def test_process_filer_no_filing_when_edgar_has_no_13f(holdings_engine, monkeypa
 
     assert result.status == "no_filing"
     assert result.rows_written == 0
+
+
+# ── GD0 §6 item 4 coordinator fix: continuity/upserts must key on cik,  ───────
+# ── not the (correctable) display_name -- regression tests, 2026-09-28  ───────
+
+
+def test_known_report_dates_recognizes_a_renamed_filer_by_cik(holdings_engine):
+    # Historical rows were written under the OLD display_name (pre-fix).
+    _seed_known_report_date(
+        holdings_engine, "Citadel Advisors", "AAPL", date(2025, 12, 31),
+        cik="1423053",
+    )
+    renamed_filer = m.Filer("citadel", "1423053", "Citadel Advisors LLC")
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    # Continuity must be recognized by cik even though display_name changed.
+    known = ingestor._known_report_dates(renamed_filer)
+    assert known == {date(2025, 12, 31)}
+
+
+def test_renamed_filer_rerun_inserts_zero_rows(holdings_engine, monkeypatch):
+    """The exact scenario the coordinator flagged: a filer whose
+    display_name changed must still be recognized as up to date by cik, and
+    a re-run must insert zero rows -- not re-pull and duplicate the whole
+    history under the new name."""
+    _seed_known_report_date(
+        holdings_engine, "Citadel Advisors", "AAPL", date(2025, 12, 31),
+        cik="1423053",
+    )
+    only_known = m.LatestFiling(
+        accession="ACC-KNOWN", filing_date=date(2026, 2, 14),
+        report_date=date(2025, 12, 31), form="13F-HR",
+    )
+    renamed_filer = m.Filer("citadel", "1423053", "Citadel Advisors LLC")
+    monkeypatch.setattr(m, "list_recent_13f_filings", lambda cik: [only_known])
+    fetch_mock = MagicMock()
+    monkeypatch.setattr(m, "fetch_infotable", fetch_mock)
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    result = ingestor._process_filer(renamed_filer)
+
+    assert result.status == "up_to_date"
+    assert result.rows_written == 0
+    fetch_mock.assert_not_called()
+
+    with holdings_engine.connect() as conn:
+        count = conn.execute(
+            text("SELECT count(*) FROM institutional_holdings WHERE cik = '1423053'")
+        ).scalar()
+    # Still exactly the one pre-seeded row -- no duplicate under the new name.
+    assert count == 1
+
+
+def test_upsert_refuses_to_write_under_a_new_name_when_old_name_exists_same_quarter(
+    holdings_engine,
+):
+    """Write-side backstop: even if something bypasses the cik-scoped
+    continuity check (e.g. an explicit ``filers=`` override reprocessing an
+    already-known quarter), the upsert itself must refuse to create a
+    second holder_name key for the same (cik, report_date) instead of
+    silently duplicating the underlying 13F fact."""
+    _seed_known_report_date(
+        holdings_engine, "Citadel Advisors", "AAPL", date(2025, 12, 31),
+        cik="1423053",
+    )
+    renamed_filer = m.Filer("citadel", "1423053", "Citadel Advisors LLC")
+    filing = m.LatestFiling(
+        accession="ACC-X", filing_date=date(2026, 2, 14),
+        report_date=date(2025, 12, 31), form="13F-HR",
+    )
+    matched = [({"cusip": "037833100", "shares": 100, "value": 1000}, "AAPL")]
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    rows_written = ingestor._upsert_positions(renamed_filer, filing, matched)
+
+    assert rows_written == 0
+    with holdings_engine.connect() as conn:
+        rows = conn.execute(
+            text(
+                "SELECT holder_name FROM institutional_holdings "
+                "WHERE cik = '1423053' AND report_date = '2025-12-31'"
+            )
+        ).fetchall()
+    # Still exactly the one row, still under the OLD name -- no duplicate,
+    # no silent overwrite under the new name either.
+    assert [r[0] for r in rows] == ["Citadel Advisors"]
+
+
+def test_upsert_writes_normally_for_a_new_report_date_despite_old_rows_elsewhere(
+    holdings_engine,
+):
+    """The guard is scoped to (cik, report_date), not the filer as a whole
+    -- a brand-new quarter must write under the corrected name immediately,
+    even though older quarters for the same cik are still under the old
+    name (and awaiting the one-time relabel)."""
+    _seed_known_report_date(
+        holdings_engine, "Citadel Advisors", "MSFT", date(2025, 9, 30),
+        cik="1423053",
+    )
+    renamed_filer = m.Filer("citadel", "1423053", "Citadel Advisors LLC")
+    filing = m.LatestFiling(
+        accession="ACC-NEW", filing_date=date(2026, 5, 15),
+        report_date=date(2026, 3, 31), form="13F-HR",
+    )
+    matched = [({"cusip": "037833100", "shares": 100, "value": 1000}, "AAPL")]
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    rows_written = ingestor._upsert_positions(renamed_filer, filing, matched)
+
+    assert rows_written == 1
+    with holdings_engine.connect() as conn:
+        row = conn.execute(
+            text(
+                "SELECT holder_name FROM institutional_holdings "
+                "WHERE cik = '1423053' AND report_date = '2026-03-31'"
+            )
+        ).one()
+    assert row[0] == "Citadel Advisors LLC"
+
+
+def test_upsert_no_collision_when_no_existing_rows_for_this_cik(holdings_engine):
+    """A brand-new filer with no prior rows at all must never be blocked."""
+    filer = m.Filer("some_new_filer", "9999999", "Some New Filer LLC")
+    filing = m.LatestFiling(
+        accession="ACC-BRANDNEW", filing_date=date(2026, 5, 15),
+        report_date=date(2026, 3, 31), form="13F-HR",
+    )
+    matched = [({"cusip": "037833100", "shares": 100, "value": 1000}, "AAPL")]
+
+    ingestor = m.SEC13FLiveIngestor(
+        engine=holdings_engine, cusip_map=m.CusipTickerMap(data_dirs=[])
+    )
+    rows_written = ingestor._upsert_positions(filer, filing, matched)
+    assert rows_written == 1
