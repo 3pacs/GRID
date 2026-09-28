@@ -130,11 +130,14 @@ def test_the_current_v3_holdout_is_not_refused_by_a_later_registration(tmp_path)
 # --- fix 2: every VS1 witness on main (A3, A6, A7) -----------------------------------------------------
 
 
+V4_PATH = v1.canonical_witness_path("vs1-v4")
+
+
 def _v4(earlier):
-    """A hypothetical v4 on the same Harness whose witness is v3's (synthetic; only supersession is exercised)."""
+    """A hypothetical v4 on the same Harness, witnessed at its canonical path (synthetic seed line)."""
     pins = dataclasses.replace(v3.V3.pins, version="vs1-v4", number=4, registry_log="v4.jsonl",
                                registry_anchors="v4.anchors.jsonl", registry_lock=".v4.lock",
-                               witness_ref="refs/vs1-v4-witness/main", earlier=earlier)
+                               witness_path=V4_PATH, witness_ref="refs/vs1-v4-witness/main", earlier=earlier)
     return v2.Harness(pins)
 
 
@@ -146,6 +149,7 @@ V3_EARLIER = v2.EarlierVersion(version="vs1-v3", number=3, prereg_sha256=v3.PRER
 def test_A3_a_later_version_cannot_open_while_v3_is_opened_whatever_its_earlier_list(tmp_path):
     vault = _vault(tmp_path / "vault")
     _v3_sealed_discovery(tmp_path, vault)  # the v3 witness now covers more than 2 records
+    vault.add_file(V4_PATH, v3.REGISTERED_ANCHOR_LINE + b"\n")  # synthetic v4 seed at its canonical path
     for earlier in ((v2.V1_EARLIER, v2.V2_EARLIER, V3_EARLIER), (v2.V1_EARLIER, v2.V2_EARLIER)):
         harness = _v4(earlier)
         witness = harness.check_offhost(vault.cache, remote_url=str(vault.remote))
