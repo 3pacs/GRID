@@ -141,11 +141,24 @@ _MAX_RUNTIME_SECS: int = 3600
 # Lookup table of known ADR → ordinary-share ratios. Tickers not in
 # this table default to 1 (1:1 listing or true US-domiciled common).
 # When updating, the rule is: ratio = (number of ordinary shares
-# represented by 1 ADR).
+# represented by 1 ADR) — i.e. ordinary shares per unit of the US
+# price in raw_series. A ratio below 1 means one ADR is a *fraction*
+# of an ordinary share (SNY, HEINY: 2 ADRs = 1 share → 0.5).
+#
+# This is the ratio in force TODAY. When a ticker's ratio has changed
+# over time, also add its effective-dated history to
+# ``_ADR_RATIO_HISTORY`` below; ``_adr_ratio_for(ticker, obs_date)``
+# then returns the ratio in force on ``obs_date``. YF:{TICKER}:close in
+# raw_series is stored unadjusted (e.g. YF:AZN:close jumps ×2.03 from
+# 2026-01-30 to 2026-02-02), so every historical row must use the
+# ratio that matched the security trading on that date.
 _ADR_RATIOS: dict[str, float] = {
     "TSM": 5,      # 1 ADR = 5 common shares
     "NVO": 1,      # 1 ADR = 1 share
-    "AZN": 0.5,    # 1 ADR = 0.5 share
+    # AZN: ADS programme terminated; ordinary shares trade directly on
+    # the NYSE from 2026-02-02, so 1 US-listed unit = 1 ordinary share.
+    # Before that, 1 ADS = 0.5 ordinary share — see _ADR_RATIO_HISTORY.
+    "AZN": 1,
     "BABA": 8,     # 1 ADR = 8 ordinary shares
     "JD": 2,       # 1 ADR = 2 ordinary shares
     "BP": 6,       # 1 ADR = 6 ordinary shares
@@ -157,26 +170,63 @@ _ADR_RATIOS: dict[str, float] = {
     "SHOP": 1,
     "SE": 1,
     "BUD": 1,
-    "HEINY": 2,
+    # HEINY: 2 ADRs = 1 Heineken N.V. ordinary share (sponsored Level I,
+    # Deutsche Bank depositary; theheinekencompany.com ADR page).
+    "HEINY": 0.5,
     "NSRGY": 1,
     "BTI": 1,
     "FMX": 10,     # 1 ADR = 10 shares
     "KOF": 10,
     "CCEP": 1,
     "TM": 10,
-    "SNY": 2,
+    # SNY: each ADS represents one-half of one Sanofi ordinary share
+    # (JPMorgan depositary; Sanofi 20-F FY2025 exhibit 2.2). Unchanged
+    # since the NYSE listing on 2002-07-01. Was wrongly 2 (inverted),
+    # which understated market cap 4x.
+    "SNY": 0.5,
     "ASML": 1,
     "RIO": 1,
     "BHP": 2,
 }
 
+# Effective-dated ratio history for tickers whose ratio has changed.
+# Each entry is ``(effective_from, ratio)``: the ratio applies to every
+# obs_date >= effective_from until the next entry. The first entry must
+# be ``date.min`` and the last entry must equal ``_ADR_RATIOS[ticker]``
+# (enforced by tests).
+_ADR_RATIO_HISTORY: dict[str, tuple[tuple[date, float], ...]] = {
+    "AZN": (
+        # 1 ADS = 1 ordinary share before the 2015 ratio change.
+        (date.min, 1.0),
+        # 6-K 2015-06-26: ratio changes from 1 ADS : 1 share to
+        # 2 ADSs : 1 share, effective 2015-07-27.
+        (date(2015, 7, 27), 0.5),
+        # 6-K 2026-01-20: ADS listing on Nasdaq ceases 2026-01-30;
+        # ordinary shares trade on the NYSE from Monday 2026-02-02.
+        (date(2026, 2, 2), 1.0),
+    ),
+}
 
-def _adr_ratio_for(ticker: str) -> float:
-    """Return ordinary-shares-per-ADR for ``ticker``. Defaults to 1."""
+
+def _adr_ratio_for(ticker: str, obs_date: date | None = None) -> float:
+    """Return ordinary shares per US-listed unit for ``ticker``.
+
+    With ``obs_date``, returns the ratio in force on that date (using
+    ``_ADR_RATIO_HISTORY`` when the ticker has one); without it, the
+    current ratio. Defaults to 1 for tickers not in the table.
+    """
     if not ticker:
         return 1.0
+    key = ticker.strip().upper()
     try:
-        return float(_ADR_RATIOS.get(ticker.strip().upper(), 1))
+        if obs_date is not None and key in _ADR_RATIO_HISTORY:
+            ratio = _ADR_RATIO_HISTORY[key][0][1]
+            for effective_from, r in _ADR_RATIO_HISTORY[key]:
+                if effective_from > obs_date:
+                    break
+                ratio = r
+            return float(ratio)
+        return float(_ADR_RATIOS.get(key, 1))
     except (TypeError, ValueError):
         return 1.0
 
@@ -499,16 +549,16 @@ class SECXBRLSharesPuller:
                 processed += 1
                 continue
 
-            adr_ratio = _adr_ratio_for(ticker)
             day_rows: list[dict[str, Any]] = []
             for obs, close in closes:
                 raw_shares = _shares_for_date(timeline, obs)
                 if raw_shares is None:
                     continue
                 # ADR adjustment: divide ordinary-share count by the
-                # ADR ratio so (shares * ADR price) yields the correct
-                # market cap. For non-ADRs and 1:1 listings the ratio
-                # is 1.0 and this is a no-op.
+                # ADR ratio in force on ``obs`` so (shares * ADR price)
+                # yields the correct market cap. For non-ADRs and 1:1
+                # listings the ratio is 1.0 and this is a no-op.
+                adr_ratio = _adr_ratio_for(ticker, obs)
                 try:
                     adj_shares = int(round(float(raw_shares) / adr_ratio))
                 except (TypeError, ValueError, ZeroDivisionError):
