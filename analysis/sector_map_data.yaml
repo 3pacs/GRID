@@ -895,11 +895,11 @@ SECTOR_MAP:
           features:
           - smci
           - smci_full
-        - name: Everpure
-          ticker: P
+        - name: Pure Storage
+          ticker: PSTG
           weight: 0.02
           type: company
-          description: All-flash storage — AI training data layer (renamed from Pure Storage/PSTG, effective 2026-02-23; ticker changed PSTG->P 2026-03-26 - 2026-05-03)
+          description: All-flash storage — AI training data layer
           features:
           - pstg
           - pstg_full
