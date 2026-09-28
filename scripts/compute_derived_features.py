@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from sqlalchemy import text
 # Allow running from repo root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from db import get_engine
+from store.pit import PITStore, retractions_table_exists
 
 # ── Source catalog ID for computed features ──────────────────────────────────
 COMPUTED_SOURCE_ID = 183  # source_catalog.name = 'computed'
@@ -269,27 +271,37 @@ COMPUTATIONS = [
 
 # ── Helper: load a resolved series as a pandas Series ──────���─────────────────
 
-def load_resolved(engine, feature_name: str) -> pd.Series:
-    """Load a resolved_series feature into a pandas Series indexed by obs_date."""
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("""
-                SELECT rs.obs_date, rs.value
-                FROM resolved_series rs
-                JOIN feature_registry fr ON fr.id = rs.feature_id
-                WHERE fr.name = :name
-                ORDER BY rs.obs_date
-            """),
-            {"name": feature_name},
-        ).fetchall()
-    if not rows:
+def load_resolved(
+    engine, feature_name: str, as_of: date, pit: PITStore | None = None
+) -> pd.Series:
+    """Load a resolved_series feature into a pandas Series indexed by obs_date.
+
+    Reads through ``store.pit.PITStore.get_pit`` with vintage_policy
+    "LATEST_AS_OF" as of ``as_of`` (the computation time), so:
+      * a row a retraction (``resolved_series_retractions``, PR #683) has
+        hidden is never used;
+      * the vintage picked for each obs_date is the policy's own choice,
+        never an arbitrary "whichever row this dict happened to see last"
+        pick across every vintage in history.
+    Previously this read every vintage unordered (ORDER BY obs_date only,
+    no vintage_date tiebreak) and kept the last one for a given obs_date
+    — see GRID-RERESOLVE-PLAN-20260927, "DERIVED FEATURES", for why that
+    could silently compute from a contaminated April vintage still kept
+    as superseded history.
+    """
+    fid = get_feature_id(engine, feature_name)
+    if fid is None:
+        return pd.Series(dtype=float)
+    store = pit if pit is not None else PITStore(engine)
+    df = store.get_pit([fid], as_of, vintage_policy="LATEST_AS_OF")
+    if df.empty:
         return pd.Series(dtype=float)
     s = pd.Series(
-        [float(r[1]) for r in rows],
-        index=pd.DatetimeIndex([r[0] for r in rows]),
+        df["value"].to_numpy(dtype=float),
+        index=pd.DatetimeIndex(df["obs_date"]),
         name=feature_name,
     )
-    return s[~s.index.duplicated(keep="last")]
+    return s.sort_index()
 
 
 def load_raw(engine, series_id: str) -> pd.Series:
@@ -625,8 +637,26 @@ OPS = {
 BATCH_SIZE = 5000
 
 
-def insert_computed(engine, feature_id: int, series: pd.Series, dry_run: bool = False) -> int:
-    """Insert a computed pd.Series into resolved_series. Returns rows inserted."""
+def insert_computed(
+    engine, feature_id: int, series: pd.Series, run_date: date, dry_run: bool = False
+) -> int:
+    """Insert a computed pd.Series into resolved_series. Returns rows inserted.
+
+    ``vintage_date`` and ``release_date`` are stamped to ``run_date`` (the
+    computation time, one value shared by every row this run writes) —
+    never to each row's own ``obs_date``. The old ``vintage_date =
+    release_date = obs_date`` behaviour backdated every row: a value
+    computed today from stale or since-corrected inputs looked, to every
+    PIT reader, as if it had been known on the observation date itself
+    (GRID-RERESOLVE-PLAN-20260927, "DERIVED FEATURES"). Stamping at
+    computation time matches the resolver's own and Mode A's convention
+    (`GRID-RERESOLVE-PLAN-20260927` §4.1) and keeps replays with
+    ``as_of`` before this run's date exactly as they were: no look-ahead.
+    The composite unique index (feature_id, obs_date, vintage_date) plus
+    ``ON CONFLICT ... DO NOTHING`` below means a vintage already on file
+    (from this run or an earlier one) is never overwritten; a re-run the
+    same UTC day is a no-op for rows it already wrote.
+    """
     if series.empty:
         return 0
 
@@ -638,8 +668,8 @@ def insert_computed(engine, feature_id: int, series: pd.Series, dry_run: bool = 
         rows.append({
             "feature_id": feature_id,
             "obs_date": obs,
-            "release_date": obs,
-            "vintage_date": obs,
+            "release_date": run_date,
+            "vintage_date": run_date,
             "value": float(val),
             "source_priority_used": COMPUTED_SOURCE_ID,
             "conflict_flag": False,
@@ -677,6 +707,22 @@ def insert_computed(engine, feature_id: int, series: pd.Series, dry_run: bool = 
 
 def run(family_filter: str | None = None, dry_run: bool = False):
     engine = get_engine()
+
+    # Refuse to run at all if resolved_series_retractions is missing: every
+    # input load below goes through PIT's LATEST_AS_OF, which honours
+    # retractions since PR #683. Without the table, there is nothing to
+    # honour and this job would silently be back to computing from
+    # arbitrary, possibly-contaminated vintages (GRID-RERESOLVE-PLAN-20260927,
+    # "DERIVED FEATURES").
+    if not retractions_table_exists(engine):
+        log.error(
+            "compute_derived_features: resolved_series_retractions is "
+            "missing (PR #683 not deployed here) — refusing to run"
+        )
+        return
+
+    run_date = datetime.now(timezone.utc).date()
+    pit = PITStore(engine)
     t0 = time.time()
 
     total_inserted = 0
@@ -704,7 +750,7 @@ def run(family_filter: str | None = None, dry_run: bool = False):
 
         # Standard resolved inputs
         for inp_name in comp.get("inputs", []):
-            s = load_resolved(engine, inp_name)
+            s = load_resolved(engine, inp_name, run_date, pit)
             if s.empty:
                 log.warning("  Input '{inp}' has no resolved data — skipping", inp=inp_name)
                 break
@@ -724,7 +770,7 @@ def run(family_filter: str | None = None, dry_run: bool = False):
 
             # Load additional resolved inputs (for mixed ops like vix_term_structure)
             for inp_name in comp.get("resolved_inputs", []):
-                s = load_resolved(engine, inp_name)
+                s = load_resolved(engine, inp_name, run_date, pit)
                 if s.empty:
                     log.warning("  Resolved input '{inp}' has no data — skipping", inp=inp_name)
                     break
@@ -761,7 +807,7 @@ def run(family_filter: str | None = None, dry_run: bool = False):
                  n=len(result), mn=result.index.min().date(), mx=result.index.max().date())
 
         # Insert
-        n_ins = insert_computed(engine, fid, result, dry_run=dry_run)
+        n_ins = insert_computed(engine, fid, result, run_date, dry_run=dry_run)
         log.info("  Inserted {n} rows for {name} (feature_id={fid})", n=n_ins, name=name, fid=fid)
         total_inserted += n_ins
         total_features += 1

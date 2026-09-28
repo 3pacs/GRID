@@ -53,6 +53,39 @@ def retraction_cutoff(as_of: date | datetime) -> datetime:
     return datetime.combine(as_of, time.max, tzinfo=timezone.utc)
 
 
+def retractions_table_exists(engine: Engine) -> bool:
+    """True if ``resolved_series_retractions`` exists (PR #683's migration).
+
+    A caller that writes derived rows into ``resolved_series`` from inputs
+    read across *all* vintages (no PIT, no retraction filter) can silently
+    compute from a contaminated or since-retracted vintage that is still
+    kept as superseded history -- see
+    ``GRID-RERESOLVE-PLAN-20260927``, "DERIVED FEATURES". Any writer that
+    switches its reads to ``get_pit(..., "LATEST_AS_OF")`` should call this
+    first and refuse to run entirely when it returns ``False``, rather than
+    silently falling back to an unfiltered read.
+
+    Runs on its own connection so a failure here (missing table, or any
+    other error) can never poison a caller's outer transaction; any
+    failure is treated as "table absent". Unqualified (relies on
+    ``search_path``), matching how every other query against
+    ``resolved_series_retractions`` in this codebase addresses it -- a
+    hardcoded ``public.`` prefix would silently miss the table on a
+    non-default search_path (e.g. a test's scratch schema).
+    """
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                return bool(
+                    conn.execute(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": "resolved_series_retractions"},
+                    ).scalar()
+                )
+    except Exception:
+        return False
+
+
 class PITStore:
     """Point-in-time query engine for resolved_series.
 

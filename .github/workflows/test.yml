@@ -473,6 +473,30 @@ jobs:
             exit 1
           fi
 
+      # Derived-feature writers PIT fix (GRID-RERESOLVE-PLAN-20260927,
+      # "DERIVED FEATURES"): scripts/compute_derived_features.py and
+      # scripts/fill_missing_features.py::compute_derived_features now read
+      # every input through store.pit.PITStore's LATEST_AS_OF (retraction-
+      # aware since PR #683) instead of an unfiltered all-vintage read, the
+      # first writer stamps new resolved_series rows at computation time
+      # instead of backdating to obs_date, neither ever overwrites an
+      # existing vintage, and both refuse to run at all when
+      # resolved_series_retractions does not exist. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Derived-feature writers PIT PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_derived_feature_writers_pit_20260927_pg.py -q -rA | tee /tmp/grid-derived-features-pit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-derived-features-pit-pg.txt; then
+            echo "::error::Derived-feature writers PIT PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Analytics snapshots job (scripts/run_analytics_snapshots.py): the
       # readiness gate (G1-G5), sector-restricted clustering eligibility
       # (CAST(:restrict AS INTEGER[])), global-vs-sector snapshot reads,
