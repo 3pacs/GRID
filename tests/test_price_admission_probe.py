@@ -69,7 +69,7 @@ def _td(close, adj, *, scale=1.0, bad_days=()):
         all_[d.isoformat()] *= 1.02
         none[d.isoformat()] *= 1.02
     return {"all": all_, "none": none,
-            "receipts": {"all": {"outcome": "ok"}, "none": {"outcome": "ok"}}, "refused_holdout_dates": 0}
+            "receipts": {"all": {"outcome": "ok"}, "none": {"outcome": "ok"}}}
 
 
 def _rows(values: dict, pull=PULL) -> list[gd4.Row]:
@@ -185,7 +185,9 @@ def test_twelvedata_disagreement_and_missing_twelvedata_fail():
     assert not rec["admitted"] and rec["reasons"] == ["crosscheck_disagreement"]
     two = _td(close, adj, bad_days=CAL[10:11])  # one bad print (2 pairs) still passes at N ~ 299
     assert _assess(close, adj, td=two)["admitted"]
-    none = _assess(close, adj, td={"receipts": {}, "refused_holdout_dates": 0})
+    leaked = _assess(close, adj, td={"receipts": {"all": {}, "none": {}}, "state": "holdout_rows", "holdout_rows": 3})
+    assert "twelvedata_holdout_rows" in leaked["reasons"] and not leaked["admitted"]
+    none = _assess(close, adj, td={"receipts": {}})
     assert "twelvedata_not_fetched" in none["reasons"] and "crosscheck_too_few_pairs" in none["reasons"]
     gone = _assess(close, adj, td={"receipts": {"all": {"outcome": "unavailable"}, "none": {"outcome": "unavailable"}}})
     assert "twelvedata_unavailable" in gone["reasons"] and not gone["admitted"]
@@ -376,8 +378,9 @@ class _Vendors:
                 return 200, json.dumps({"code": 400, "message": "symbol not found", "status": "error"}).encode()
             close, adj = self.series[sym]
             vals = adj if params["adjust"] == "all" else close
-            if sym == "XLK":  # the benchmark's TwelveData history starts at the window start (plan check)
-                vals = {LO: vals[min(vals)], **vals}
+            assert params["end_date"] == "2020-01-01"
+            if sym == "XLK":  # the benchmark's TwelveData history spans the whole window (plan check)
+                vals = {LO: vals[min(vals)], **vals, HI: vals[max(vals)]}
             bad = sym in self.td_bad
             values = [{"datetime": d.isoformat(), "close": f"{v * (1.03 if bad and i % 3 == 0 else 1.0):.5f}"}
                       for i, (d, v) in enumerate(sorted(vals.items()))]
@@ -481,7 +484,10 @@ def test_cli_writes_reports_and_a_manifest_the_v6_harness_accepts(tmp_path, monk
     assert report["summary"]["c1_interval"]["tickers"] == len(TICKERS)
     assert report["tickers"]["AAA"]["c1"]["first_inside"] == "2018-06-04"
     assert cross["summary"]["twelvedata_unavailable"] == ["FFF", "ZZZ"] and cross["rule"]["min_pairs"] == 250
-    assert cross["summary"]["twelvedata_end_date_exclusive_tickers"] == 0
+    assert cross["summary"]["twelvedata_missing_window_end"] == []
+    impl = cross["window_implementation"]
+    assert impl["assertion_passed"] is True and impl["rows_dated_2020_or_later"] == 0
+    assert impl["end_date_exclusive_bound"] == "2020-01-01" and "exclusive end bound" in impl["note"]
     assert meta["summary"]["entity_mismatch"] == ["EEE"] and meta["summary"]["no_meta"] == ["FFF", "ZZZ"]
     for line in (out / "sha256s.txt").read_text().splitlines():
         h, name = line.split()

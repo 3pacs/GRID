@@ -111,9 +111,12 @@ INTERPRETATION = (
     "C1 (§2.2 rule 3, §2.3): the ticker interval and Tiingo startDate blank closes in the harness "
     "(v6.build_trial_panels). The probe reports the number of window sessions each would blank; the checks "
     "above run over the whole window, as §2.3 states.",
-    "TwelveData: the pinned request is start_date=2011-11-02, end_date=2019-12-31. TwelveData treats end_date "
-    "as exclusive, so 2019-12-31 is absent from its responses; the pair (2019-12-30, 2019-12-31) is then not a "
-    "common-date pair. The report counts the tickers affected.",
+    "TwelveData: the registered window 2011-11-02..2019-12-31 is inclusive. TwelveData's end_date is exclusive, "
+    "so the window is requested with end_date=2020-01-01 (a market holiday; coordinator decision 2026-09-28). "
+    "Receipts made earlier with end_date=2019-12-31 are completed by a receipted 2019-12-20..2020-01-01 "
+    "supplement whose overlapping dates must agree exactly. Any TwelveData row dated on or after 2020-01-01 fails "
+    "closed (the fetch stops without saving it; a saved file carrying one drops that mode, reason "
+    "twelvedata_holdout_rows).",
     "Low prices (run-report note 3): tickers with any raw TIINGO close below $1 in the window are counted, and "
     "how many of them the splice check or the cross-check exclude.",
 )
@@ -361,8 +364,10 @@ def assess_ticker(
     td = td or {}
     td_all, td_none = td.get("all"), td.get("none")
     td_receipts = td.get("receipts") or {}
-    td_state = ("ok" if td_all and td_none else
-                "not_fetched" if len(td_receipts) < len(fetch.TD_ADJUST_MODES) else "unavailable")
+    td_state = td.get("state") or ("ok" if td_all and td_none else
+                                   "not_fetched" if len(td_receipts) < len(fetch.TD_ADJUST_MODES) else "unavailable")
+    if td_state == "ok" and not (td_all and td_none):
+        td_state = "not_fetched"
 
     sessions = [d.isoformat() for d in calendar]
     adj_iso, close_iso = _iso(adj), _iso(close)
@@ -438,7 +443,10 @@ def assess_ticker(
         "crosscheck": cross,
         "twelvedata": {"state": td_state, "receipts": td_receipts,
                        "dates": {a: len(td.get(a) or {}) for a in fetch.TD_ADJUST_MODES},
-                       "refused_holdout_dates": td.get("refused_holdout_dates", 0)},
+                       "has_window_end": bool(td_all and td_none and fetch.TD_WINDOW_END in td_all
+                                              and fetch.TD_WINDOW_END in td_none),
+                       "holdout_rows": int(td.get("holdout_rows", 0)),
+                       "supplemented": td.get("supplemented") or [], "problems": td.get("problems") or []},
         "tiingo_meta": {"receipt": (meta or {}).get("receipt"), "meta": m},
         "entity": entity,
         "c1": interval_counts(inside_interval, calendar, start_date, adj),
@@ -687,17 +695,28 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
         if "crosscheck" not in r:
             continue
         tickers[t] = {**r["crosscheck"], "twelvedata": r["twelvedata"]}
-    # TIINGO has the window's last date but TwelveData (end_date exclusive) does not
+    # TIINGO has the window's last date but the merged TwelveData series does not
     td_end_missing = sorted(t for t, r in tickers.items()
                             if (recs[t].get("coverage") or {}).get("last_date") == hi.isoformat()
-                            and r["twelvedata"]["state"] == "ok"
-                            and all((x.get("last") or "") < hi.isoformat() for x in r["twelvedata"]["receipts"].values()))
+                            and r["twelvedata"]["state"] == "ok" and not r["twelvedata"].get("has_window_end"))
+    holdout_rows = sum(int(r["twelvedata"].get("holdout_rows", 0)) for r in tickers.values())
     return {
         "report": "vs1-v6-twelvedata-crosscheck",
         **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
         "rule": dataclasses.asdict(CROSSCHECK),
         "request": {"url": fetch.TD_URL, "params": {**fetch.td_params("{ticker}", "all"), "adjust": ["all", "none"]},
+                    "supplement_params": {**fetch.td_params("{ticker}", "all", start=fetch.TD_SUPPLEMENT_START),
+                                          "adjust": ["all", "none"]},
                     "fetch_log_sha256": twelvedata_fetch_log_sha256},
+        "window_implementation": {
+            "note": fetch.TD_WINDOW_NOTE,
+            "registered_window": [fetch.TD_START, fetch.TD_WINDOW_END],
+            "end_date_exclusive_bound": fetch.TD_END_EXCLUSIVE,
+            "assertion": "no TwelveData row dated on or after 2020-01-01",
+            "rows_dated_2020_or_later": holdout_rows,
+            "assertion_passed": holdout_rows == 0,
+            "tickers_supplemented": sorted(t for t, r in tickers.items() if r["twelvedata"].get("supplemented")),
+        },
         "what": "agreement statistics only: common dates, consecutive-session pairs, within-Y share, excluded "
                 "adjustment pairs, dropped pairs, first/last; no event, label or forward return",
         "summary": {
@@ -710,7 +729,9 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
             "below_n_pairs": sorted(t for t, r in tickers.items() if r["pairs"] < CROSSCHECK.min_pairs),
             "excluded_adjustment_pairs_total": sum(r["excluded_adjustment_pairs"] for r in tickers.values()),
             "dropped_nonconsecutive_total": sum(r["dropped_nonconsecutive"] for r in tickers.values()),
-            "twelvedata_end_date_exclusive_tickers": len(td_end_missing),
+            "twelvedata_missing_window_end": td_end_missing,
+            "twelvedata_holdout_rows_tickers": sorted(t for t, r in tickers.items()
+                                                      if r["twelvedata"]["state"] == "holdout_rows"),
         },
         "tickers": tickers,
     }
