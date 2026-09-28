@@ -44,13 +44,16 @@ def test_the_witness_is_the_canonical_sectors_v3_path():
     assert v1.SECTORS_WITNESS.match(s3.WITNESS_PATH)
 
 
-def test_v1_refuses_the_superseded_sector_plan():
-    assert v1.SECTOR_PLAN_SUPERSEDED_BY["version"] == "vs1-sectors-v3"
-    assert v1.SECTOR_PLAN_SUPERSEDED_BY["prereg_sha256"] == s3.PREREG_BODY_SHA256
-    assert v1.SECTOR_PLAN_SUPERSEDED_BY["registry_head_sha256"] == s3.REGISTERED_RECORD_SHA256[1]
-    spec = v1.RunSpec(run_id="x", sector="Energy", run_k=2, trials=v1.trial_names())
-    with pytest.raises(ValueError, match="superseded by vs1-sectors-v3"):
-        spec.validate()
+def test_sectors_v3_is_superseded_by_sectors_v4_and_never_opens():
+    """Review round 3: sectors v3's §7 gates on VS1 v3's holdout, and v3 was superseded, so it could never open."""
+    from analysis import panel_insider_density_sectors_v4 as s4
+
+    assert s3.SUPERSEDED_BY["version"] == v1.SECTOR_PLAN_SUPERSEDED_BY["version"] == "vs1-sectors-v4"
+    assert s3.SUPERSEDED_BY["prereg_sha256"] == s4.PREREG_BODY_SHA256
+    with pytest.raises(PermissionError, match="superseded by vs1-sectors-v4"):
+        s3.check_open()
+    body = v1.prereg_body((s3.REPO / s3.PREREG_PATH).read_text(encoding="utf-8"))
+    assert "**VS1 v3** may cover more than 2 records **only once v3's holdout is\n    sealed.**" in body
 
 
 def test_the_sectors_v3_registration_is_pinned(tmp_path):

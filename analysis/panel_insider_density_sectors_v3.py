@@ -14,7 +14,8 @@ module unchanged.
 This module holds the pinned registration (own chain, own canonical witness
 ``05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v3.anchors.jsonl``) and
 re-exports the universe definition. **It contains no stage that opens a run or
-reads a price.** Nothing here is a trading signal.
+reads a price.** It is superseded by "sectors v4" (:data:`SUPERSEDED_BY`, #701
+review round 3) and :func:`check_open` refuses. Nothing here is a trading signal.
 """
 
 from __future__ import annotations
@@ -72,7 +73,21 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"a9a349823cba1dd92b23d9716222c6f3924a759fd99803d4a2a591dcbcdf7120",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T03:11:31.686738+00:00"}'
 )
-SUPERSEDED_BY: dict | None = None
+#: Superseded by "sectors v4" before any use: this text's §7 gates on VS1 v3's sealed holdout and admits
+#: no VS1 registry beyond v1-v3, but v3 was superseded by v4-v6, so it could never open (#701 round 3).
+SUPERSEDED_BY: dict | None = {
+    "version": "vs1-sectors-v4",
+    "prereg_sha256": "e3f41ace1bfbfed12c82e16b3b438a62ba759bc1c54dfdf743fb8b2d27b4e712",
+    "registry_head_sha256": None,
+}
+
+
+def check_open() -> None:
+    """Sectors v3 can never open a run: it is superseded by sectors v4 (pinned)."""
+    if SUPERSEDED_BY:
+        raise PermissionError(
+            f"VS1 sectors-v3 is superseded by {SUPERSEDED_BY['version']} (pinned in code): it can never open a run"
+        )
 
 
 def stage0_attainable() -> bool:
