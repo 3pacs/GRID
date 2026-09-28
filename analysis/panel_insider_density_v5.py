@@ -221,7 +221,12 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"e4df0c357f43ca0d6b4f9fc0bc058284d7330f0b90973358f5faed3ae06d8bda",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T04:03:19.009425+00:00"}'
 )
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+#: v5 was superseded by v6 before any price read (the price bound becomes C1: one ticker interval).
+SUPERSEDED_BY: Mapping[str, Any] | None = {
+    "version": "vs1-v6",
+    "prereg_sha256": "5a87d4a4130e184a8b9e53d7eec040a7b26b697a3ad07500aac6ef4b17d6a32d",
+    "registry_head_sha256": None,
+}
 
 V3_EARLIER = v4.V3_EARLIER
 V4_EARLIER = v2.EarlierVersion(

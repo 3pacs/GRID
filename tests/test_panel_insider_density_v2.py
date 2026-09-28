@@ -462,10 +462,10 @@ def test_pinned_supersession_refuses_every_v2_opening(tmp_path, monkeypatch):
     inputs = _inputs()
     v2.freeze_inputs(log_dir, NOW, inputs)
     monkeypatch.undo()  # the real pin: superseded by v3
-    assert v2.SUPERSEDED_BY["version"] == "vs1-v5"
-    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
+    assert v2.SUPERSEDED_BY["version"] == "vs1-v6"
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
         v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
-    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
         v2.resume_discovery(log_dir, _observed(inputs), vault.witness())
 
 

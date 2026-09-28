@@ -469,12 +469,15 @@ class TrialPanel(v1.TrialPanel):
 
 def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
                        prices: v1.PricePanel, window: str, *,
-                       blank_before_listing: bool = False) -> dict[str, TrialPanel]:
+                       blank_before_listing: bool = False,
+                       close_mask: Any = None) -> dict[str, TrialPanel]:
     """Every declared trial's panel for one window (v1 construction, v2 admission).
 
     ``blank_before_listing`` (v5 §2.3): closes of a ticker before its manifest
     ``listed_from`` date are blanked before any label, feature mask or baseline
     is computed (a reused symbol's earlier history is never used).
+    ``close_mask`` (v6 §2.3): a callable ``(closes, universe) -> DataFrame[bool]``
+    (session dates x tickers); closes where it is False are blanked first too.
     """
     prices.verify()
     if prices.window != window:
@@ -491,6 +494,12 @@ def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: p
         for ticker, start in listed.items():
             if ticker in closes.columns and ticker != benchmark:
                 closes.loc[closes.index < pd.Timestamp(start), ticker] = np.nan
+    if close_mask is not None:
+        keep = close_mask(closes, universe)
+        closes = closes.copy()
+        for ticker in keep.columns:
+            if ticker in closes.columns and ticker != benchmark:
+                closes.loc[~keep[ticker].reindex(closes.index, fill_value=False).to_numpy(), ticker] = np.nan
     panels = {}
     for h in v1.HORIZONS:
         positions, labels, momentum = v1.relative_labels(closes, benchmark, tickers, h, window)
@@ -1634,9 +1643,9 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 )
 #: v2 was superseded by v3 before any price read (v3 makes A90|fwd5 primary).
 SUPERSEDED_BY: Mapping[str, Any] | None = {
-    "version": "vs1-v5",
-    "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
-    "registry_head_sha256": "e4df0c357f43ca0d6b4f9fc0bc058284d7330f0b90973358f5faed3ae06d8bda",
+    "version": "vs1-v6",
+    "prereg_sha256": "5a87d4a4130e184a8b9e53d7eec040a7b26b697a3ad07500aac6ef4b17d6a32d",
+    "registry_head_sha256": None,
 }
 
 

@@ -39,7 +39,7 @@ def test_v4_prereg_hashes_to_the_pin_and_states_the_rule():
     assert v4.check_prereg() == v4.PREREG_BODY_SHA256
     body = v1.prereg_body((v4.REPO / v4.PREREG_PATH).read_text(encoding="utf-8"))
     for text in ("**n ≥ N = 250**", "**≥ X = 99%**", "Y = 10 basis points (0.0010)", "TWELVEDATA_API_KEY",
-                 "adjust=all", "adjust=none", "more than 10% of its pairs excluded"):
+                 "adjust=all", "adjust=none", "more than 10% of its consecutive-session pairs excluded"):
         assert text in body, text
     for pin in (v3.PREREG_BODY_SHA256, v3.REGISTERED_RECORD_SHA256[1], v2.SIC_MAP_SHA256):
         assert pin in body
@@ -58,8 +58,8 @@ def test_v4_changes_only_the_price_rule_and_gates():
 
 
 def test_v4_is_superseded_by_v5():
-    assert v3.SUPERSEDED_BY["version"] == v4.SUPERSEDED_BY["version"] == "vs1-v5"
-    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
+    assert v3.SUPERSEDED_BY["version"] == v4.SUPERSEDED_BY["version"] == "vs1-v6"
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
         v1.refuse_superseded(4, v4.SUPERSEDED_BY)
 
 

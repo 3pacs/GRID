@@ -17,7 +17,7 @@ from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_v2 as v2
 from analysis import panel_insider_density_v4 as v4
 from analysis import panel_insider_density_v5 as v5
-from tests.test_panel_insider_density import NOW, _price_db, _row, _submission
+from tests.test_panel_insider_density import NOW, _row, _submission
 from tests.test_panel_insider_density_v2 import (
     _discovery_key,
     _holdings,
@@ -29,8 +29,41 @@ from tests.test_panel_insider_density_v2 import (
 )
 
 
+def _tiingo_db(series, kaggle=None):
+    """SQLite raw_series shaped like production: TIINGO adj_close rows (+ refused KAGGLE_BULK rows, same ids)."""
+    from sqlalchemy import Column, Date, DateTime, Float, Integer, MetaData, String, Table, Text, create_engine
+
+    engine = create_engine("sqlite://")
+    md = MetaData()
+    catalog = Table("source_catalog", md, Column("id", Integer, primary_key=True), Column("name", String))
+    raw = Table("raw_series", md, Column("series_id", String), Column("source_id", Integer),
+                Column("obs_date", Date), Column("pull_timestamp", DateTime), Column("value", Float),
+                Column("raw_payload", Text), Column("pull_status", String))
+    md.create_all(engine)
+    from datetime import datetime as _dt
+
+    pulled = _dt(2026, 9, 20, 6, 0)  # before the frozen as_of_ts of the synthetic registry
+    rows = []
+    for source, table in ((524, series), (522, kaggle or {})):
+        for ticker, values in table.items():
+            rows.extend({"series_id": f"YF:{ticker}:adj_close", "source_id": source, "obs_date": d.date(),
+                         "pull_timestamp": pulled, "value": float(v), "raw_payload": "{}",
+                         "pull_status": "SUCCESS"} for d, v in values.items())
+    with engine.begin() as c:
+        c.execute(catalog.insert(), [{"id": 524, "name": "TIINGO"}, {"id": 522, "name": "KAGGLE_BULK"}])
+        c.execute(raw.insert(), rows)
+    return engine
+
+
 def _vault(root, **kw):
     return _Vault(root, h=v5, seeds=("vs1-v1", "vs1-v2"), **kw)
+
+
+@pytest.fixture(autouse=True)
+def _v5_not_superseded(request, monkeypatch):
+    """v5 is superseded by v6 (pinned); the machinery tests exercise v5 as if it were current."""
+    if request.node.name != "test_v4_refuses_on_its_pin":
+        monkeypatch.setattr(v5, "SUPERSEDED_BY", None)
 
 
 def _seed_v3_v4(vault):
@@ -160,7 +193,7 @@ def test_closes_before_l_t_are_blanked_before_any_label(tmp_path):
     dates = pd.bdate_range("2011-11-01", "2019-12-31")
     prices = pd.DataFrame(100 * np.exp(np.cumsum(rng.normal(0, 0.01, (len(dates), 23)), axis=0)),
                           index=dates, columns=tickers + ["XLK"])
-    engine = _price_db({c: prices[c] for c in prices.columns})
+    engine = _tiingo_db({c: prices[c] for c in prices.columns})
     rows = [_row(accession_number=f"p-{c}-{i}", issuer_cik=str(c), owner_cik="7",
                  filing_date=str(dates[i + 1].date()), transaction_date=str(dates[i].date()))
             for c in ciks for i in range(100, len(dates) - 2, 150)]
@@ -214,8 +247,10 @@ def test_v5_opens_only_while_v1_to_v4_are_unopened(tmp_path):
 
 
 def test_v4_refuses_on_its_pin():
-    assert v4.SUPERSEDED_BY["version"] == "vs1-v5"
-    assert v4.SUPERSEDED_BY["registry_head_sha256"] == v5.REGISTERED_RECORD_SHA256[1]
-    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
+    from analysis import panel_insider_density_v6 as v6
+
+    assert v4.SUPERSEDED_BY["version"] == v5.SUPERSEDED_BY["version"] == "vs1-v6"
+    assert v4.SUPERSEDED_BY["registry_head_sha256"] == v6.REGISTERED_RECORD_SHA256[1]
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
         v1.refuse_superseded(4, v4.SUPERSEDED_BY)
     assert json.loads(v5.REGISTERED_ANCHOR_LINE)["records"] == 2

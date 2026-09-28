@@ -68,6 +68,7 @@ CODE_FILES = (
     "analysis/panel_insider_density_v3.py",
     "analysis/panel_insider_density_v4.py",
     "analysis/panel_insider_density_v5.py",
+    "analysis/panel_insider_density_v6.py",
     "analysis/offline_research_proof.py",
     "analysis/research_forward_log.py",
     "store/observations.py",
@@ -75,6 +76,7 @@ CODE_FILES = (
     "scripts/run_vs1_v3_insider_density.py",
     "scripts/run_vs1_v4_insider_density.py",
     "scripts/run_vs1_v5_insider_density.py",
+    "scripts/run_vs1_v6_insider_density.py",
 )
 
 
