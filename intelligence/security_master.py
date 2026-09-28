@@ -340,3 +340,173 @@ def propose_primary_sector(weights: dict[str, float]) -> tuple[Optional[str], bo
     max_weight = max(weights.values())
     tied = sorted(s for s, w in weights.items() if w == max_weight)
     return tied[0], True
+
+
+def propose_primary_sector_with_sic(
+    weights: dict[str, float],
+    sic_sector_hint: Optional[dict[str, int]] = None,
+) -> tuple[Optional[str], bool, str]:
+    """GD0 §6 owner decision #1, as adopted: highest subsector weight wins;
+    a true tie among the max-weight sectors is broken by a SIC cross-check
+    *where available*, alphabetically otherwise.
+
+    ``sic_sector_hint`` is an optional ``{sector: match_count}`` map — e.g.
+    "this entity's latest SIC code falls in a SIC range associated with N
+    sector-map sectors" — supplied by a caller that has done the SIC->sector
+    cross-check (GD0 §6 item 7; full crosswalk coverage is a separate,
+    deferred decision, so this stays a hint the caller may or may not have).
+    When ``None`` (the common case today — SIC coverage is partial per GD0
+    §6 item 7), behavior is identical to :func:`propose_primary_sector`.
+
+    Returns ``(proposed_primary_sector, is_multi_sector, tie_break_method)``
+    where ``tie_break_method`` is one of:
+        ``"single_sector"``            — not multi-sector, nothing to break.
+        ``"subsector_weight"``         — weight alone picked a clear winner.
+        ``"subsector_weight+sic"``     — a weight tie was broken by SIC.
+        ``"subsector_weight+alpha"``   — a weight tie broke alphabetically
+                                          (no SIC hint, or SIC didn't help).
+    """
+    if not weights:
+        return None, False, "single_sector"
+    if len(weights) == 1:
+        return next(iter(weights)), False, "single_sector"
+
+    max_weight = max(weights.values())
+    tied = sorted(s for s, w in weights.items() if w == max_weight)
+    if len(tied) == 1:
+        return tied[0], True, "subsector_weight"
+
+    if sic_sector_hint:
+        tied_hints = {s: sic_sector_hint.get(s, 0) for s in tied}
+        max_hint = max(tied_hints.values())
+        if max_hint > 0:
+            sic_winners = sorted(s for s, h in tied_hints.items() if h == max_hint)
+            if len(sic_winners) == 1:
+                return sic_winners[0], True, "subsector_weight+sic"
+
+    return tied[0], True, "subsector_weight+alpha"
+
+
+# ── Delisting criteria (owner decision #2 — adopted 2026-09-28) ───────────
+#
+# GD0 §6 item 2 left open whether SEC company_tickers.json absence alone is
+# enough to flip is_active=false. Adopted rule: absence alone is a
+# *candidate* signal, never sufficient by itself — a second, independent
+# corroborating source (an EDGAR Form 15 filing, or an explicit manual
+# owner-confirmed list) is required before is_active is ever flipped. This
+# mirrors what the seed script already did in practice (never flips
+# is_active); this function makes the rule explicit, testable, and reusable
+# by any future resolver/seed path instead of leaving it implicit.
+
+
+@dataclass(frozen=True)
+class DelistingAssessment:
+    is_active: bool
+    delisted_reason: Optional[str]
+    delisted_basis: Optional[str]
+
+
+def evaluate_delisting_candidate(
+    has_live_cik: bool,
+    corroborating_evidence: Optional[dict[str, Any]] = None,
+) -> DelistingAssessment:
+    """Apply the adopted delisting-corroboration rule (GD0 §6 item 2).
+
+    ``has_live_cik``: whether the ticker resolved against a freshly fetched
+    SEC ``company_tickers.json`` (the only signal GD0's audit had for
+    ``CFLT``/``CYBR``/``JNPR``/``PSTG``).
+
+    ``corroborating_evidence``: optional second-source evidence, e.g.
+    ``{"kind": "form_15", "filed": "2025-11-03"}`` or
+    ``{"kind": "manual_owner_confirmed", "reason": "acquired"}``. ``None``
+    means no second source exists yet.
+
+    Rule:
+        * live CIK found -> active, no basis recorded.
+        * no live CIK, no corroborating evidence -> **still active**
+          (absence alone is not proof); ``delisted_basis`` records the
+          candidate signal so it surfaces in review, but nothing is flipped.
+        * no live CIK, corroborating evidence present -> inactive, with
+          ``delisted_reason`` taken from the evidence and ``delisted_basis``
+          recording both signals.
+    """
+    if has_live_cik:
+        return DelistingAssessment(is_active=True, delisted_reason=None, delisted_basis=None)
+
+    if not corroborating_evidence:
+        return DelistingAssessment(
+            is_active=True,
+            delisted_reason=None,
+            delisted_basis="candidate_sec_absence_only",
+        )
+
+    reason = str(corroborating_evidence.get("reason") or corroborating_evidence.get("kind") or "unknown")
+    return DelistingAssessment(
+        is_active=False,
+        delisted_reason=reason,
+        delisted_basis=f"sec_absence+{corroborating_evidence.get('kind', 'corroborated')}",
+    )
+
+
+# ── Canonical sector taxonomy + crosswalk (owner decision #3 — adopted) ───
+#
+# GD0 §6 item 3: three incompatible sector vocabularies coexist today —
+# sector_map's 20-sector scheme, fundamental_divergence's ~14-sector
+# GICS-like scheme, and company_profiles' Yahoo/GICS-style scheme. Adopted
+# rule: sector_map's 20-sector scheme (``sector_map_v1``) is canonical.
+# The other two are mapped onto it through this explicit crosswalk table,
+# never by name-string equality — GD0 measured that string equality already
+# silently mismatches ``Consumer Discretionary``/``Consumer Cyclical`` and
+# similar pairs. Unmapped labels return ``None`` (fail closed: the caller
+# must flag a conflict rather than guess).
+
+CANONICAL_TAXONOMY = DEFAULT_TAXONOMY  # "sector_map_v1"
+
+# {source_taxonomy: {raw_label: canonical_sector_map_v1_label}}
+SECTOR_TAXONOMY_CROSSWALK: dict[str, dict[str, str]] = {
+    "fundamental_divergence_v1": {
+        "Technology": "Technology",
+        "Healthcare": "Healthcare",
+        "Financials": "Financials",
+        "Energy": "Energy",
+        "Materials": "Materials",
+        "Industrials": "Industrials",
+        "Utilities": "Utilities",
+        "Consumer Discretionary": "Consumer Discretionary",
+        "Consumer Staples": "Consumer Staples",
+        "Communication Services": "Communication Services",
+        "Real Estate": "Real Estate",
+    },
+    "company_profiles_yahoo": {
+        "Technology": "Technology",
+        "Semiconductors": "Technology",
+        "Healthcare": "Healthcare",
+        "Financial Services": "Financials",
+        "Financials": "Financials",
+        "Energy": "Energy",
+        "Basic Materials": "Materials",
+        "Materials": "Materials",
+        "Industrials": "Industrials",
+        "Utilities": "Utilities",
+        "Consumer Cyclical": "Consumer Discretionary",
+        "Consumer Defensive": "Consumer Staples",
+        "Communication Services": "Communication Services",
+        "Real Estate": "Real Estate",
+    },
+}
+
+
+def crosswalk_sector(source_taxonomy: str, raw_label: str) -> Optional[str]:
+    """Map a ``source_taxonomy`` sector label onto the canonical
+    ``sector_map_v1`` label, or ``None`` when unmapped (fail closed — the
+    caller should set ``conflict_flag`` rather than fabricate a mapping).
+
+    ``source_taxonomy == CANONICAL_TAXONOMY`` is the identity mapping (the
+    label is already canonical).
+    """
+    if source_taxonomy == CANONICAL_TAXONOMY:
+        return raw_label
+    table = SECTOR_TAXONOMY_CROSSWALK.get(source_taxonomy)
+    if not table:
+        return None
+    return table.get(raw_label)

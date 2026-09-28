@@ -244,6 +244,29 @@ def filer_by_key(key: str) -> Filer | None:
     return None
 
 
+def filer_by_cik(cik: str | int) -> Filer | None:
+    """Look up a filer by CIK (unpadded or zero-padded, str or int).
+
+    GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28): this module's
+    ``FILERS`` is the single verified source of truth for the 13F
+    **filer**-CIK space. ``ingestion/edgar.py`` and
+    ``ingestion/altdata/institutional_flows.py`` used to carry their own
+    independent hardcoded CIK->name maps that disagreed with each other and
+    with this one on the same CIK (e.g. ``1167483`` was claimed as three
+    different funds across the three files). Both now derive their
+    CIK/name lookups from ``FILERS`` via this function instead of
+    maintaining a second copy.
+    """
+    try:
+        target = int(str(cik).strip())
+    except (TypeError, ValueError):
+        return None
+    for f in FILERS:
+        if int(f.cik) == target:
+            return f
+    return None
+
+
 # ── CUSIP -> ticker resolution ───────────────────────────────────────────────
 
 

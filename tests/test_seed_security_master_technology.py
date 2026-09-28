@@ -196,3 +196,22 @@ def test_write_report_never_writes_outside_output_dir(tmp_path):
     seed.write_report(plan, target)
     assert target.exists()
     assert len(list(target.iterdir())) == 2  # exactly the .json and .md
+
+
+# ── owner decision #2 (adopted 2026-09-28): delisted_basis on SEC absence ──
+
+
+def test_build_ticker_plan_unmatched_records_candidate_basis_but_stays_active():
+    # DELIST has no live CIK in _SEC_MAP -- the CFLT/CYBR/JNPR/PSTG case.
+    # GD0 §6 item 2's adopted rule: SEC absence alone is a candidate signal,
+    # never sufficient to flip is_active.
+    plan = seed.build_ticker_plan("DELIST", "Delisted Co", None, _SECTOR_MAP, date(2026, 9, 27))
+    assert plan.security_master["is_active"] is True
+    assert plan.security_master["delisted_reason"] is None
+    assert plan.security_master["delisted_basis"] == "candidate_sec_absence_only"
+
+
+def test_build_ticker_plan_matched_cik_has_no_delisting_basis():
+    plan = seed.build_ticker_plan("NVDA", "NVIDIA", _SEC_MAP["NVDA"], _SECTOR_MAP, date(2026, 9, 27))
+    assert plan.security_master["is_active"] is True
+    assert plan.security_master["delisted_basis"] is None
