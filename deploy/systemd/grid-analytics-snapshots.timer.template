@@ -5,11 +5,18 @@ Description=Daily GRID analytics snapshots (after the resolver's daily refresh)
 
 [Timer]
 # grid-resolved-series-backfill.timer runs at 06:30 UTC (+ up to 2 min
-# randomized delay, TimeoutStartSec=600). 07:15 UTC leaves that refresh
-# time to finish. Ordering is also enforced by the job itself: readiness
-# check G5 refuses to run until spy_full has a PIT observation within
-# GRID_ANALYTICS_MAX_RESOLVER_LAG_DAYS.
-OnCalendar=*-*-* 07:15:00 UTC
+# randomized delay, TimeoutStartSec=600); this used to fire at 07:15 UTC to
+# leave that refresh time to finish, but 07:15 sits inside the nightly
+# core pg_dump window (grid-pg-backup.timer fires 03:30 UTC and has taken
+# until ~10:05-10:30 UTC on recent runs, per PR #712/#713/#714 review and
+# a live 2026-09-27 override.conf) and this job does a heavy multi-feature
+# scan against resolved_series -- undesirable to run concurrently with the
+# DB dump. Moved to 10:45 UTC, safely after the dump window closes, while
+# staying well after the resolver backfill and G5's freshness check (which
+# still enforces ordering independent of clock time). Systemd template
+# sweep, 2026-09-28 -- supersedes the 09:15 UTC override.conf on grid-svr;
+# drop that drop-in once this template is deployed.
+OnCalendar=*-*-* 10:45:00 UTC
 RandomizedDelaySec=5min
 Persistent=true
 Unit=grid-analytics-snapshots.service

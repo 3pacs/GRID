@@ -190,10 +190,15 @@ It writes nothing else: no ingestion, no resolver, no email, no
 calls. Every run tags each payload with a `provenance` block (release SHA,
 as-of date, vintage policy, gate result, stale inputs it excluded).
 
-Schedule: 07:15 UTC daily (`OnCalendar`, `Persistent=true`), after
-`grid-resolved-series-backfill.timer` (06:30 UTC). Runs from the deployed
-release `/data/grid_v4/grid_release` as `User=grid` with the repo `.env`,
-under `flock -n`, `TimeoutStartSec=3h`.
+Schedule: 10:45 UTC daily (`OnCalendar`, `Persistent=true`) — after
+`grid-resolved-series-backfill.timer` (06:30 UTC) and clear of the nightly
+encrypted Postgres backup window (`grid-pg-backup.timer` fires 03:30 UTC
+and recent runs have taken until roughly 10:05-10:30 UTC). Moved from the
+original 07:15 UTC slot, which overlapped that window (systemd template
+sweep, 2026-09-28 — supersedes the 09:15 UTC `timer.d/override.conf` on
+grid-svr; drop that drop-in once this template is deployed). Runs from the
+deployed release `/data/grid_v4/grid_release` as `User=grid` with the repo
+`.env`, under `flock -n`, `TimeoutStartSec=3h`.
 
 ### Readiness gate (checked by the job on every run)
 
@@ -372,8 +377,9 @@ archive under `/data/grid/paper_log/code/<sha>/` is unnecessary here).
 Schedule: 11:30 UTC daily (`OnCalendar`, `Persistent=true`), well clear of
 the nightly encrypted Postgres backup window (`grid-pg-backup.timer` fires
 03:30 UTC and recent runs have taken until roughly 10:05-10:30 UTC;
-`grid-analytics-snapshots.timer` was moved off 07:15 UTC for the same
-reason — see its `timer.d/override.conf` on grid-svr).
+`grid-analytics-snapshots.timer` was moved off its original 07:15 UTC slot
+to 10:45 UTC for the same reason in the systemd template sweep,
+2026-09-28).
 
 ### Verify before installing (read-only, no DB, writes nothing)
 
