@@ -57,3 +57,8 @@ llm/autoresearch/host_profiles.json
 
 # Hermes-generated wiki reports (regenerated each cycle; not source)
 docs/wiki/
+
+# Run-ledgers written by one-shot backfill scripts as an idempotency guard
+# (e.g. scripts/backfill_adr_market_caps.py) — per-host runtime state, not
+# source; each machine that runs a backfill keeps its own record.
+scripts/.state/
