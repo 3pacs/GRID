@@ -1,0 +1,27 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) is the
+# activation step for Wave 3 W3.2 (regime state vectors) and needs an
+# explicit operator decision.
+# Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-regime-state-vectors.service.template /etc/systemd/system/grid-regime-state-vectors.service
+#   sudo cp deploy/systemd/grid-regime-state-vectors.timer.template   /etc/systemd/system/grid-regime-state-vectors.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-regime-state-vectors.timer
+# Paths follow grid-causal-links.service.template.
+[Unit]
+Description=GRID regime state-vector writer (prior completed session only, point-in-time)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Computes and persists ONLY the prior completed trading session's vector;
+# never the current/in-progress session (scripts/run_regime_state_vectors.py
+# :func:`resolve_target_date`). The /regime and /regime/analogs GETs never
+# write -- this is the only writer of regime_state_vectors.
+ExecStart=/usr/bin/flock -n /tmp/grid-regime-state-vectors.lock /usr/bin/python3 scripts/run_regime_state_vectors.py --json
+TimeoutStartSec=10min
+Nice=10
+StandardOutput=journal
+StandardError=journal

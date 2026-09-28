@@ -21,6 +21,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from store.observations import MixedSourceError, read_window
+
 
 # ── Dimension specification ──────────────────────────────────────────────
 
@@ -88,6 +90,14 @@ class StateVector:
     values: tuple[float | None, ...]    # one per dimension, None = missing
     completeness: float                 # fraction of non-null dims
     stale_dimensions: tuple[str, ...]   # dims with data >30d old
+    # Which SPY price series fed the momentum/RSI dimensions: "spy_full"
+    # (the resolved, post re-resolve feature) or the raw "YF:SPY:close"
+    # fallback, or None when neither was available (see _fetch_spy_prices).
+    price_basis: str | None = None
+    # True when this vector was served from regime_state_vectors rather
+    # than freshly computed. GET routes (persist=False) return cached=False
+    # for an in-memory computation that was never written.
+    cached: bool = False
 
     @property
     def array(self) -> np.ndarray:
@@ -105,51 +115,96 @@ class StateVector:
             'dimensions': {DIM_NAMES[i]: self.values[i] for i in range(len(self.values))},
             'completeness': self.completeness,
             'stale_dimensions': list(self.stale_dimensions),
+            'price_basis': self.price_basis,
+            'cached': self.cached,
         }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
 def _fetch_series(engine: Engine, series_id: str, as_of: date, lookback_days: int = 2520) -> pd.Series:
-    """Fetch series values up to as_of date (PIT-correct)."""
+    """Fetch series values up to as_of date (PIT-correct).
+
+    Goes through ``store.observations.read_window``: SUCCESS-only, one row
+    per ``obs_date`` (latest vintage wins), bounded by ``as_of`` — replacing
+    the direct, un-collapsed ``raw_series`` read this module used to do (a
+    revision day or a FAILED zero marker could otherwise leak in). A
+    series_id whose rows span more than one source (see
+    ``store.observations.MixedSourceError``) degrades to an empty series
+    rather than silently mixing sources; the caller already treats a short
+    or empty series as "dimension unavailable".
+    """
     cutoff = as_of - timedelta(days=lookback_days)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT obs_date, value FROM raw_series "
-                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of "
-                "ORDER BY obs_date"
-            ),
-            {"sid": series_id, "cutoff": cutoff, "as_of": as_of},
-        ).fetchall()
-    if not rows:
+    try:
+        with engine.connect() as conn:
+            obs = read_window(conn, series_id, start=cutoff, as_of=as_of)
+    except MixedSourceError as exc:
+        log.warning("state_vector: {sid} is mixed-source, skipping: {e}", sid=series_id, e=str(exc))
+        return pd.Series(dtype=float)
+    if not obs:
         return pd.Series(dtype=float)
     return pd.Series(
-        {r[0]: float(r[1]) for r in rows},
+        {o.obs_date: o.value for o in obs},
         dtype=float,
     ).sort_index()
 
 
-def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> pd.Series:
-    """Fetch SPY close prices for momentum/RSI computation."""
+def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
+    """Best-effort PIT read of the resolved ``spy_full`` feature.
+
+    Mirrors ``alpha_research.realized_alpha.resolve_spy_feature`` +
+    ``load_price_path`` (the re-resolve's own PIT reader, through
+    ``store.pit.PITStore`` — ``LATEST_AS_OF``, retraction-aware). Returns
+    ``None`` — never raises — when ``feature_registry``/``resolved_series``
+    aren't there yet (the re-resolve hasn't landed) or the query fails for
+    any other reason, so the caller can degrade to the raw YF series
+    instead of crashing or assuming infra state this module can't verify.
+    """
+    try:
+        from alpha_research.realized_alpha import load_price_path, resolve_spy_feature
+
+        feature_id, _name = resolve_spy_feature(engine)
+        series = load_price_path(engine, feature_id, cutoff, as_of, as_of)
+    except Exception as exc:
+        log.debug("state_vector: resolved spy_full unavailable ({e}); falling back to raw YF series", e=str(exc))
+        return None
+    if series is None or series.empty:
+        return None
+    idx = [d.date() if hasattr(d, "date") else d for d in series.index]
+    return pd.Series(series.to_numpy(dtype=float), index=idx, dtype=float).sort_index()
+
+
+def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> tuple[pd.Series, str | None]:
+    """SPY close series for momentum/RSI computation, PIT-correct.
+
+    Prefers the resolved ``spy_full`` feature (the post re-resolve price
+    basis, with retractions honoured) so momentum/RSI agree with the rest
+    of the platform. Falls back to the raw ``YF:SPY:close`` observation
+    series (SUCCESS-only, vintage-collapsed, ``source="yfinance"`` per
+    ``store.observations``'s mixed-source rule) when the resolved feature
+    isn't available yet. Returns ``(empty series, None)`` — an honest
+    "unavailable", not a crash or a silent stale read — when neither path
+    has data.
+
+    Returns ``(prices, price_basis)`` where ``price_basis`` is
+    ``"spy_full"``, ``"YF:SPY:close"``, or ``None``.
+    """
     cutoff = as_of - timedelta(days=lookback_days)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT obs_date, value FROM raw_series "
-                "WHERE series_id = 'YF:SPY:close' AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of "
-                "ORDER BY obs_date"
-            ),
-            {"cutoff": cutoff, "as_of": as_of},
-        ).fetchall()
-    if not rows:
-        return pd.Series(dtype=float)
-    return pd.Series(
-        {r[0]: float(r[1]) for r in rows},
-        dtype=float,
-    ).sort_index()
+
+    resolved = _fetch_resolved_spy_full(engine, as_of, cutoff)
+    if resolved is not None and not resolved.empty:
+        return resolved, "spy_full"
+
+    try:
+        with engine.connect() as conn:
+            obs = read_window(conn, "YF:SPY:close", source="yfinance", start=cutoff, as_of=as_of)
+    except Exception as exc:
+        log.debug("state_vector: raw SPY:close fallback failed: {e}", e=str(exc))
+        return pd.Series(dtype=float), None
+    if not obs:
+        return pd.Series(dtype=float), None
+    series = pd.Series({o.obs_date: o.value for o in obs}, dtype=float).sort_index()
+    return series, "YF:SPY:close"
 
 
 def _percentile_rank(series: pd.Series, window: int) -> float | None:
@@ -238,26 +293,53 @@ def _get_crossref_score(engine: Engine, as_of: date) -> float | None:
 
 
 def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
-    """Net insider sentiment from SEC Form 4 filings (30d window)."""
+    """Net insider sentiment from SEC Form 4 filings (30d window), PIT.
+
+    ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` series ids are enumerated
+    first (a cheap, values-free query bounded by ``pull_status='SUCCESS'``
+    and ``[cutoff, as_of]``), then each is read through
+    ``store.observations.read_window`` — vintage-collapsed, PIT — before
+    being summed. This replaces a single unbounded-vintage ``SUM(...)`` over
+    ``raw_series`` that could double-count a revised filing's old and new
+    value on the same obs_date.
+    """
     cutoff = as_of - timedelta(days=30)
-    with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT "
-                "  SUM(CASE WHEN series_id LIKE :buy_pat THEN value ELSE 0 END), "
-                "  SUM(CASE WHEN series_id LIKE :sell_pat THEN value ELSE 0 END) "
-                "FROM raw_series "
-                "WHERE series_id LIKE :insider_pat "
-                "AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of"
-            ),
-            {"buy_pat": "%:BUY", "sell_pat": "%:SELL", "insider_pat": "INSIDER:%",
-             "cutoff": cutoff, "as_of": as_of},
-        ).fetchone()
-    if row is None:
+    try:
+        with engine.connect() as conn:
+            series_ids = [
+                r[0]
+                for r in conn.execute(
+                    text(
+                        "SELECT DISTINCT series_id FROM raw_series "
+                        "WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS' "
+                        "AND obs_date >= :cutoff AND obs_date <= :as_of"
+                    ),
+                    {"insider_pat": "INSIDER:%", "cutoff": cutoff, "as_of": as_of},
+                ).fetchall()
+            ]
+    except Exception as exc:
+        log.debug("insider sentiment: series discovery failed: {e}", e=str(exc))
         return None
-    buy_vol = float(row[0] or 0)
-    sell_vol = float(row[1] or 0)
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+    with engine.connect() as conn:
+        for sid in series_ids:
+            is_buy = sid.endswith(":BUY")
+            is_sell = sid.endswith(":SELL")
+            if not (is_buy or is_sell):
+                continue
+            try:
+                obs = read_window(conn, sid, start=cutoff, as_of=as_of)
+            except MixedSourceError as exc:
+                log.debug("insider sentiment: {sid} mixed-source, skipping: {e}", sid=sid, e=str(exc))
+                continue
+            total_val = sum(o.value for o in obs)
+            if is_buy:
+                buy_vol += total_val
+            else:
+                sell_vol += total_val
+
     total = buy_vol + sell_vol
     if total == 0:
         return None
@@ -311,7 +393,7 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         as_of = date.today()
 
     norm_stats = _get_normalization_stats(engine)
-    spy_prices = _fetch_spy_prices(engine, as_of)
+    spy_prices, price_basis = _fetch_spy_prices(engine, as_of)
     values: list[float | None] = []
     stale: list[str] = []
 
@@ -342,6 +424,8 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         values=tuple(values),
         completeness=completeness,
         stale_dimensions=tuple(stale),
+        price_basis=price_basis,
+        cached=False,
     )
 
 
@@ -436,7 +520,7 @@ def compute_state_vector_series(
     while current <= end:
         try:
             sv = compute_state_vector(engine, current)
-            if sv.completeness >= 0.4:  # at least 40% of dims populated
+            if sv.completeness >= MIN_CACHE_COMPLETENESS:
                 vectors.append(sv)
             computed += 1
             if computed % 100 == 0:
@@ -474,9 +558,20 @@ def _ensure_cache_table(engine: Engine) -> None:
 
 
 def cache_state_vector(engine: Engine, sv: StateVector) -> None:
-    """Store a state vector in the cache table."""
+    """Store a state vector in the cache table.
+
+    The only callers of this function are the nightly job
+    (``scripts/run_regime_state_vectors.py``) and, indirectly,
+    ``get_or_compute_state_vector(..., persist=True)`` — never a GET route.
+    ``price_basis`` rides along inside the existing ``vector`` JSONB column
+    under a reserved key rather than a new column, so no migration is
+    needed and the 1,927 pre-existing rows (computed before this field
+    existed) are read back with ``price_basis=None``, unchanged.
+    """
     _ensure_cache_table(engine)
     dim_dict = {DIM_NAMES[i]: sv.values[i] for i in range(len(sv.values))}
+    if sv.price_basis is not None:
+        dim_dict["__price_basis__"] = sv.price_basis
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -501,62 +596,111 @@ def cache_state_vector(engine: Engine, sv: StateVector) -> None:
 MIN_CACHE_COMPLETENESS = 0.4
 
 
-def load_cached_vectors(engine: Engine, min_completeness: float = MIN_CACHE_COMPLETENESS) -> list[StateVector]:
-    """Load all cached state vectors from the database."""
-    _ensure_cache_table(engine)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT as_of_date, vector, completeness, stale_dims "
-                "FROM regime_state_vectors "
-                "WHERE completeness >= :mc "
-                "ORDER BY as_of_date"
-            ),
-            {"mc": min_completeness},
-        ).fetchall()
+def _row_to_state_vector(row: tuple, *, cached: bool) -> StateVector:
+    dt, vec_json, comp, stale = row
+    vec_dict = vec_json if isinstance(vec_json, dict) else json.loads(vec_json)
+    values = tuple(vec_dict.get(name) for name in DIM_NAMES)
+    return StateVector(
+        as_of_date=dt,
+        values=values,
+        completeness=comp,
+        stale_dimensions=tuple(stale or []),
+        price_basis=vec_dict.get("__price_basis__"),
+        cached=cached,
+    )
 
-    vectors: list[StateVector] = []
-    for row in rows:
-        dt, vec_json, comp, stale = row
-        vec_dict = vec_json if isinstance(vec_json, dict) else json.loads(vec_json)
-        values = tuple(vec_dict.get(name) for name in DIM_NAMES)
-        vectors.append(StateVector(
-            as_of_date=dt,
-            values=values,
-            completeness=comp,
-            stale_dimensions=tuple(stale or []),
-        ))
-    return vectors
+
+def load_cached_vectors(engine: Engine, min_completeness: float = MIN_CACHE_COMPLETENESS) -> list[StateVector]:
+    """Load all cached state vectors from the database. Read-only.
+
+    Deliberately does not call ``_ensure_cache_table`` — this is a GET-path
+    reader (``/regime/history`` and the analog library build). A missing
+    table means "no vectors yet", not "create it now"; it degrades to an
+    empty list rather than issuing DDL. Excludes any future-dated row
+    defensively, even if one exists (it never should — see
+    ``get_or_compute_state_vector``).
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT as_of_date, vector, completeness, stale_dims "
+                    "FROM regime_state_vectors "
+                    "WHERE completeness >= :mc AND as_of_date <= :today "
+                    "ORDER BY as_of_date"
+                ),
+                {"mc": min_completeness, "today": date.today()},
+            ).fetchall()
+    except Exception as exc:
+        log.debug("load_cached_vectors: cache table unavailable: {e}", e=str(exc))
+        return []
+
+    return [_row_to_state_vector(row, cached=True) for row in rows]
+
+
+def _read_cached_row(engine: Engine, as_of: date, today: date) -> tuple | None:
+    """Best-effort read of one cached row for ``as_of``, or ``None``.
+
+    Never issues DDL: a missing table (or any other read failure) is
+    treated as "no cached row", not created. ``as_of_date <= :today`` is a
+    defensive belt-and-suspenders filter — the caller already refuses to
+    cache or serve a future ``as_of`` — so a future-dated row can never be
+    served even if one somehow ended up in the table.
+    """
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT as_of_date, vector, completeness, stale_dims "
+                    "FROM regime_state_vectors "
+                    "WHERE as_of_date = :dt AND as_of_date <= :today"
+                ),
+                {"dt": as_of, "today": today},
+            ).fetchone()
+    except Exception as exc:
+        log.debug("state_vector: cache read unavailable: {e}", e=str(exc))
+        return None
 
 
 def get_or_compute_state_vector(
     engine: Engine,
     as_of: date | None = None,
     force_recompute: bool = False,
+    persist: bool = True,
 ) -> StateVector:
-    """Get from cache or compute fresh."""
+    """Get from cache, or compute fresh.
+
+    persist: True (default) is the nightly job's contract
+        (``scripts/run_regime_state_vectors.py``) — it may ensure the cache
+        table exists and, if the computed vector clears
+        ``MIN_CACHE_COMPLETENESS``, write it. GET-triggered callers (the
+        ``/regime`` and ``/regime/analogs`` routes) MUST pass
+        ``persist=False``: with that, this function issues no DDL and calls
+        ``cache_state_vector`` under no circumstance. A cache hit is still
+        served (``cached=True``); a miss is computed in memory and returned
+        with ``cached=False`` — never written.
+
+    A future ``as_of`` (no observations exist yet) is always computed in
+    memory only, regardless of ``persist`` — it is never read from or
+    written to the cache.
+    """
+    today = date.today()
     if as_of is None:
-        as_of = date.today()
+        as_of = today
+
+    if as_of > today:
+        log.warning(
+            "state_vector: as_of {d} is in the future — computing in memory only, never cached",
+            d=as_of,
+        )
+        return compute_state_vector(engine, as_of)
 
     if not force_recompute:
-        _ensure_cache_table(engine)
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT as_of_date, vector, completeness, stale_dims "
-                    "FROM regime_state_vectors WHERE as_of_date = :dt"
-                ),
-                {"dt": as_of},
-            ).fetchone()
+        if persist:
+            _ensure_cache_table(engine)
+        row = _read_cached_row(engine, as_of, today)
         if row is not None and row[2] is not None and row[2] >= MIN_CACHE_COMPLETENESS:
-            vec_dict = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-            values = tuple(vec_dict.get(name) for name in DIM_NAMES)
-            return StateVector(
-                as_of_date=row[0],
-                values=values,
-                completeness=row[2],
-                stale_dimensions=tuple(row[3] or []),
-            )
+            return _row_to_state_vector(row, cached=True)
 
     sv = compute_state_vector(engine, as_of)
     # Never pin a mostly-empty vector (e.g. every dimension query timed out)
@@ -568,6 +712,8 @@ def get_or_compute_state_vector(
             "State vector for {d} only {c:.0%} complete — not cached",
             d=as_of, c=sv.completeness,
         )
+        return sv
+    if not persist:
         return sv
     try:
         cache_state_vector(engine, sv)
