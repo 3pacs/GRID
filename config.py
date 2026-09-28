@@ -464,19 +464,30 @@ class Settings(BaseSettings):
     # directly and already honoured it.
     GRID_ALLOW_PAID_LLM: bool = False
 
-    @field_validator("GRID_ALLOW_PAID_LLM", mode="before")
+    @field_validator(
+        "GRID_ALLOW_PAID_LLM",
+        "GRID_ENABLE_SCANNER_WEIGHTS_JOB",
+        "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
+        "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
+        mode="before",
+    )
     @classmethod
-    def _coerce_paid_llm_flag(cls, v: object) -> object:
+    def _coerce_blank_bool_flag(cls, v: object) -> object:
         """Treat a blank/whitespace env value as False instead of raising.
 
         Pydantic's built-in bool coercion accepts "0"/"false"/"no"/"off"
         (and the true-ish equivalents) but rejects "" outright with a
-        ValidationError -- so ``GRID_ALLOW_PAID_LLM=`` (present but empty,
-        e.g. a templated .env line, or a shell var substituted in unset)
-        would crash the whole app at startup instead of leaving the paid
-        gate closed, which is exactly the fail-safe this flag exists to
-        guarantee. Anything else (including an already-bool value) is
-        passed through unchanged for pydantic's own validator to handle.
+        ValidationError -- so e.g. ``GRID_ALLOW_PAID_LLM=`` (present but
+        empty, e.g. a templated .env line, or a shell var substituted in
+        unset) would crash the whole app at startup instead of leaving the
+        gate closed, which is exactly the fail-safe every flag on this
+        validator exists to guarantee (originally #699 for
+        GRID_ALLOW_PAID_LLM; extended here to the Wave 3 held-writer job
+        flags, which are default-off gates of the same shape). Anything
+        else (including an already-bool value, or genuine garbage like
+        "maybe") is passed through unchanged for pydantic's own validator
+        to handle -- so a real typo still raises instead of silently
+        resolving to a boolean.
         """
         if isinstance(v, str):
             s = v.strip().lower()
