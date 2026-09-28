@@ -13,14 +13,17 @@ After=network.target postgresql.service
 [Service]
 Type=oneshot
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo
+# Current deployed release (same tree grid-api runs from) -- not the
+# /home/grid/grid_v4/grid_repo checkout the earlier grid-causal-links
+# template used as its model; that checkout is not what's live.
+WorkingDirectory=/data/grid_v4/grid_release
 EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 Environment=PYTHONUNBUFFERED=1
 # Computes and persists ONLY the prior completed trading session's vector;
 # never the current/in-progress session (scripts/run_regime_state_vectors.py
 # :func:`resolve_target_date`). The /regime and /regime/analogs GETs never
 # write -- this is the only writer of regime_state_vectors.
-ExecStart=/usr/bin/flock -n /tmp/grid-regime-state-vectors.lock /usr/bin/python3 scripts/run_regime_state_vectors.py --json
+ExecStart=/usr/bin/flock -n /tmp/grid-regime-state-vectors.lock /usr/bin/python3 /data/grid_v4/grid_release/scripts/run_regime_state_vectors.py --json
 TimeoutStartSec=10min
 Nice=10
 StandardOutput=journal

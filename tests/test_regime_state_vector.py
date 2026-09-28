@@ -124,6 +124,53 @@ def _insert(engine, sid, d, v, *, status="SUCCESS", ts_offset_h=0, source_id=FRE
         )
 
 
+def _reference_insider_sentiment(engine, as_of: date) -> float | None:
+    """Pre-#713-review reference implementation: one ``read_window`` call
+    per distinct ``INSIDER:*`` series_id, summed by ``:BUY``/``:SELL``
+    suffix. Kept only as a parity oracle for the batched query that
+    replaced it — same filters (SUCCESS-only, ``[cutoff, as_of]``), same
+    vintage rule (latest pull wins), same fail-closed mixed-source skip.
+    """
+    from store.observations import MixedSourceError, read_window
+
+    cutoff = as_of - timedelta(days=30)
+    with engine.connect() as conn:
+        series_ids = [
+            r[0]
+            for r in conn.execute(
+                text(
+                    "SELECT DISTINCT series_id FROM raw_series "
+                    "WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= :cutoff AND obs_date <= :as_of"
+                ),
+                {"insider_pat": "INSIDER:%", "cutoff": cutoff, "as_of": as_of},
+            ).fetchall()
+        ]
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+    with engine.connect() as conn:
+        for sid in series_ids:
+            is_buy = sid.endswith(":BUY")
+            is_sell = sid.endswith(":SELL")
+            if not (is_buy or is_sell):
+                continue
+            try:
+                obs = read_window(conn, sid, start=cutoff, as_of=as_of)
+            except MixedSourceError:
+                continue
+            total_val = sum(o.value for o in obs)
+            if is_buy:
+                buy_vol += total_val
+            else:
+                sell_vol += total_val
+
+    total = buy_vol + sell_vol
+    if total == 0:
+        return None
+    return float((buy_vol - sell_vol) / total)
+
+
 # ── 1. PIT readers ──────────────────────────────────────────────────────
 
 
@@ -237,6 +284,70 @@ class TestInsiderSentimentVintageCollapse:
         _insert(engine, "INSIDER:OLD:jdoe:BUY", AS_OF - timedelta(days=60), 999.0)
 
         assert _get_insider_sentiment(engine, AS_OF) is None
+
+    def test_mixed_source_series_excluded_from_sum(self, engine):
+        """A series_id whose accepted rows come from two sources (the
+        MixedSourceError scenario) must be dropped entirely, not mixed in —
+        same fail-closed rule store.observations enforces one series at a
+        time, now applied inside the batched query."""
+        from intelligence.regime.state_vector import _get_insider_sentiment
+
+        _insert(engine, "INSIDER:MIXED:x:BUY", date(2026, 9, 11), 5000.0, source_id=FRED_SRC)
+        _insert(engine, "INSIDER:MIXED:x:BUY", date(2026, 9, 12), 5000.0, source_id=YF_SRC)
+        _insert(engine, "INSIDER:CLEAN:y:SELL", date(2026, 9, 12), 300.0, source_id=FRED_SRC)
+
+        sentiment = _get_insider_sentiment(engine, AS_OF)
+
+        # MIXED contributes nothing; only CLEAN's 300 SELL counts ->
+        # (0 - 300) / 300 = -1.0.
+        assert sentiment == pytest.approx(-1.0)
+
+    def test_batched_query_matches_reference_per_series_implementation(self, engine):
+        """Parity check against the pre-#713-review per-series_id
+        read_window loop this replaced: same fixture, same result."""
+        from intelligence.regime.state_vector import _get_insider_sentiment
+
+        _insert(engine, "INSIDER:AAA:jdoe:BUY", date(2026, 9, 10), 1000.0, ts_offset_h=0)
+        _insert(engine, "INSIDER:AAA:jdoe:BUY", date(2026, 9, 10), 1200.0, ts_offset_h=5)  # revision
+        _insert(engine, "INSIDER:BBB:msmith:SELL", date(2026, 9, 12), 400.0, ts_offset_h=0)
+        _insert(engine, "INSIDER:CCC:x:BUY", date(2026, 9, 12), 0.0, status="FAILED")
+        _insert(engine, "INSIDER:DDD:z:SELL", date(2026, 9, 5), 250.0, ts_offset_h=0)
+        _insert(engine, "INSIDER:DDD:z:SELL", date(2026, 9, 6), 50.0, ts_offset_h=0)
+        _insert(engine, "INSIDER:EEE:q:BUY", date(2026, 9, 1), 800.0, ts_offset_h=0)
+        _insert(engine, "INSIDER:MIXED:x:BUY", date(2026, 9, 11), 9999.0, source_id=FRED_SRC)
+        _insert(engine, "INSIDER:MIXED:x:BUY", date(2026, 9, 13), 9999.0, source_id=YF_SRC)
+        _insert(engine, "INSIDER:OLD:jdoe:BUY", AS_OF - timedelta(days=60), 999.0)
+
+        batched = _get_insider_sentiment(engine, AS_OF)
+        reference = _reference_insider_sentiment(engine, AS_OF)
+
+        assert batched == pytest.approx(reference)
+
+    def test_only_one_query_executes(self, engine):
+        """The N+1 this replaced issued one read_window call per distinct
+        INSIDER:* series_id (~1,500 round trips at production volume for a
+        single uncached GET) — this must now be exactly one statement."""
+        from sqlalchemy import event
+
+        from intelligence.regime.state_vector import _get_insider_sentiment
+
+        _insert(engine, "INSIDER:AAA:jdoe:BUY", date(2026, 9, 10), 1000.0)
+        _insert(engine, "INSIDER:BBB:msmith:SELL", date(2026, 9, 12), 400.0)
+        _insert(engine, "INSIDER:CCC:z:BUY", date(2026, 9, 13), 200.0)
+
+        statements: list[str] = []
+
+        def record(_conn, _cursor, statement, _params, _context, _many):
+            statements.append(statement.strip())
+
+        event.listen(engine, "before_cursor_execute", record)
+        try:
+            _get_insider_sentiment(engine, AS_OF)
+        finally:
+            event.remove(engine, "before_cursor_execute", record)
+
+        assert len(statements) == 1, statements
+        assert statements[0].upper().startswith(("SELECT", "WITH"))
 
 
 # ── 2. GET must never write ──────────────────────────────────────────────

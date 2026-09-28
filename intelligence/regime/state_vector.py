@@ -292,54 +292,72 @@ def _get_crossref_score(engine: Engine, as_of: date) -> float | None:
     return float(row[0]) if row[0] is not None else None
 
 
+# One batched, vintage-collapsed read of every INSIDER:* series in the
+# window, replacing a per-series_id loop over store.observations.read_window
+# (PR #713 review: ~1,548 distinct INSIDER:* series active in a 30-day
+# window meant ~1,500 round trips per uncached GET). Semantics preserved
+# exactly: pull_status='SUCCESS' only, bounded by [cutoff, as_of], one row
+# per (series_id, obs_date) — the latest pull_timestamp wins via
+# ROW_NUMBER() (portable to SQLite and Postgres, unlike DISTINCT ON) — and
+# a series_id whose accepted rows span more than one source_id is excluded
+# entirely (the same fail-closed rule store.observations.MixedSourceError
+# enforces one series at a time), not silently mixed into the sum.
+_INSIDER_SENTIMENT_SQL = text(
+    "WITH candidates AS ("
+    "  SELECT series_id, obs_date, value, pull_timestamp, source_id"
+    "  FROM raw_series"
+    "  WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
+    "    AND obs_date >= :cutoff AND obs_date <= :as_of"
+    "),"
+    "mixed_source AS ("
+    "  SELECT series_id FROM candidates"
+    "  GROUP BY series_id HAVING COUNT(DISTINCT source_id) > 1"
+    "),"
+    "ranked AS ("
+    "  SELECT series_id, value,"
+    "         ROW_NUMBER() OVER ("
+    "             PARTITION BY series_id, obs_date ORDER BY pull_timestamp DESC"
+    "         ) AS rn"
+    "  FROM candidates"
+    "  WHERE series_id NOT IN (SELECT series_id FROM mixed_source)"
+    ")"
+    "SELECT"
+    "  SUM(CASE WHEN series_id LIKE :buy_pat THEN value ELSE 0 END),"
+    "  SUM(CASE WHEN series_id LIKE :sell_pat THEN value ELSE 0 END)"
+    "FROM ranked WHERE rn = 1"
+)
+
+
 def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
     """Net insider sentiment from SEC Form 4 filings (30d window), PIT.
 
-    ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` series ids are enumerated
-    first (a cheap, values-free query bounded by ``pull_status='SUCCESS'``
-    and ``[cutoff, as_of]``), then each is read through
-    ``store.observations.read_window`` — vintage-collapsed, PIT — before
-    being summed. This replaces a single unbounded-vintage ``SUM(...)`` over
-    ``raw_series`` that could double-count a revised filing's old and new
-    value on the same obs_date.
+    A single query (``_INSIDER_SENTIMENT_SQL``) reads every
+    ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` series in the window at
+    once: SUCCESS-only, one row per ``(series_id, obs_date)`` (latest
+    ``pull_timestamp`` wins), a mixed-source series_id excluded rather than
+    mixed in, then summed by the ``:BUY``/``:SELL`` suffix. This is the
+    batched equivalent of calling ``store.observations.read_window`` once
+    per series_id and summing the results — same filters, same vintage
+    rule, one round trip instead of one per series.
     """
     cutoff = as_of - timedelta(days=30)
     try:
         with engine.connect() as conn:
-            series_ids = [
-                r[0]
-                for r in conn.execute(
-                    text(
-                        "SELECT DISTINCT series_id FROM raw_series "
-                        "WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS' "
-                        "AND obs_date >= :cutoff AND obs_date <= :as_of"
-                    ),
-                    {"insider_pat": "INSIDER:%", "cutoff": cutoff, "as_of": as_of},
-                ).fetchall()
-            ]
+            row = conn.execute(
+                _INSIDER_SENTIMENT_SQL,
+                {
+                    "insider_pat": "INSIDER:%", "buy_pat": "%:BUY", "sell_pat": "%:SELL",
+                    "cutoff": cutoff, "as_of": as_of,
+                },
+            ).fetchone()
     except Exception as exc:
-        log.debug("insider sentiment: series discovery failed: {e}", e=str(exc))
+        log.debug("insider sentiment: batched read failed: {e}", e=str(exc))
         return None
 
-    buy_vol = 0.0
-    sell_vol = 0.0
-    with engine.connect() as conn:
-        for sid in series_ids:
-            is_buy = sid.endswith(":BUY")
-            is_sell = sid.endswith(":SELL")
-            if not (is_buy or is_sell):
-                continue
-            try:
-                obs = read_window(conn, sid, start=cutoff, as_of=as_of)
-            except MixedSourceError as exc:
-                log.debug("insider sentiment: {sid} mixed-source, skipping: {e}", sid=sid, e=str(exc))
-                continue
-            total_val = sum(o.value for o in obs)
-            if is_buy:
-                buy_vol += total_val
-            else:
-                sell_vol += total_val
-
+    if row is None:
+        return None
+    buy_vol = float(row[0] or 0)
+    sell_vol = float(row[1] or 0)
     total = buy_vol + sell_vol
     if total == 0:
         return None
