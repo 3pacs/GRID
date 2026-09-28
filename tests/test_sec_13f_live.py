@@ -10,6 +10,7 @@ All SEC network access is mocked — no live endpoints are hit.
 
 from __future__ import annotations
 
+import threading
 from datetime import date
 from unittest.mock import MagicMock, patch
 
@@ -153,6 +154,124 @@ def test_edgartools_path_converts_infotable(monkeypatch):
     fake_edgar.find.assert_called_once_with(_FILING.accession)
     assert positions[0]["name_of_issuer"] == "APPLE INC"
     assert positions[0]["value"] == 7
+
+
+# ── HTTP/2 deadlock guard: hard timeout + forcing HTTP/1.1 ─────────────────────
+#
+# Context: edgartools's HTTP layer deadlocked repeatedly in prod inside an
+# httpcore HTTP/2 lock that takes no timeout of its own -- a real hang, never
+# an exception, so `except Exception` around a direct call could never catch
+# it. `_call_with_timeout` bounds any call from the outside via a daemon
+# thread + `Thread.join(timeout=)`; `_ensure_http1_transport` removes the
+# HTTP/2 code path entirely (httpxthrottlecache auto-enables HTTP/2 whenever
+# `h2` is importable, with no opt-out via edgartools's own `configure_http()`).
+
+
+def test_call_with_timeout_returns_the_wrapped_result():
+    assert m._call_with_timeout(lambda a, b: a + b, 2, 3, timeout=5) == 5
+
+
+def test_call_with_timeout_reraises_the_wrapped_exception():
+    def _boom():
+        raise ValueError("api drift")
+
+    with pytest.raises(ValueError, match="api drift"):
+        m._call_with_timeout(_boom, timeout=5)
+
+
+def test_call_with_timeout_raises_timeout_error_on_a_hang_and_does_not_block():
+    """A function that never returns (our stand-in for the httpcore deadlock)
+    must not hang the caller: join(timeout=) must return, and the leftover
+    thread must be daemonic so it can never block interpreter/test exit."""
+    released = threading.Event()
+    before = {t.ident for t in threading.enumerate()}
+
+    def _hangs_forever():
+        released.wait()  # never set; simulates the unkillable httpcore lock
+
+    with pytest.raises(TimeoutError, match="_hangs_forever"):
+        m._call_with_timeout(_hangs_forever, timeout=0.05)
+
+    leaked = [t for t in threading.enumerate() if t.ident not in before]
+    assert len(leaked) == 1
+    assert leaked[0].daemon is True, "a stuck worker must be daemonic or it would block process exit"
+    released.set()  # let it finish so it doesn't linger across other tests
+
+
+def test_fetch_infotable_falls_back_when_edgartools_hangs(monkeypatch):
+    """fetch_infotable must not hang forever if edgartools deadlocks -- it
+    should time out and fall through to the raw path, same as any other
+    edgartools failure."""
+    released = threading.Event()
+
+    def _hangs(_filing):
+        released.wait()
+
+    rows = [{"name_of_issuer": "RAW CO", "cusip": "999999999", "value": 1}]
+    monkeypatch.setattr(m, "_EDGARTOOLS_FETCH_TIMEOUT", 0.05)
+    with patch.object(m, "_fetch_infotable_edgartools", side_effect=_hangs), patch.object(
+        m, "_fetch_infotable_raw", return_value=rows
+    ) as raw:
+        out = m.fetch_infotable("1067983", _FILING)
+    assert out == rows
+    raw.assert_called_once()
+    released.set()
+
+
+def test_ensure_http1_transport_disables_http2_and_recreates_the_client(monkeypatch):
+    """Mirrors exactly what edgartools's own configure_http() does when a
+    setting changes: flip the flag in httpx_params, close and drop any
+    already-created client so the new setting takes effect on the very next
+    request."""
+    monkeypatch.setattr(m, "_http1_forced", False)
+    fake_client = MagicMock()
+    fake_mgr = MagicMock(httpx_params={"http2": True}, _client=fake_client)
+    fake_httpclient_module = MagicMock(HTTP_MGR=fake_mgr)
+    # `from edgar import httpclient` resolves via getattr on whatever object
+    # sys.modules["edgar"] holds -- same pattern the existing
+    # test_edgartools_path_converts_infotable test uses for `from edgar
+    # import find`, so it works regardless of what the real edgar package
+    # has already cached as an attribute.
+    fake_edgar = MagicMock(httpclient=fake_httpclient_module)
+
+    with patch.dict("sys.modules", {"edgar": fake_edgar}):
+        m._ensure_http1_transport()
+
+    assert fake_mgr.httpx_params["http2"] is False
+    fake_client.close.assert_called_once()
+    assert fake_mgr._client is None
+
+
+def test_ensure_http1_transport_is_only_applied_once_per_process(monkeypatch):
+    monkeypatch.setattr(m, "_http1_forced", False)
+    fake_mgr = MagicMock(httpx_params={"http2": True}, _client=None)
+    fake_edgar = MagicMock(httpclient=MagicMock(HTTP_MGR=fake_mgr))
+
+    with patch.dict("sys.modules", {"edgar": fake_edgar}):
+        m._ensure_http1_transport()
+        first_params = dict(fake_mgr.httpx_params)
+        m._ensure_http1_transport()
+
+    # The second call is a no-op guarded by _http1_forced -- httpx_params is
+    # unchanged from what the first call already set.
+    assert dict(fake_mgr.httpx_params) == first_params
+    assert m._http1_forced is True
+
+
+def test_fetch_infotable_edgartools_path_forces_http1(monkeypatch):
+    """_fetch_infotable_edgartools must call _ensure_http1_transport alongside
+    _ensure_identity, so every edgartools attempt runs on HTTP/1.1."""
+    calls: list[str] = []
+    monkeypatch.setattr(m, "_ensure_identity", lambda: calls.append("identity"))
+    monkeypatch.setattr(m, "_ensure_http1_transport", lambda: calls.append("http1"))
+
+    fake_obj = MagicMock()
+    fake_obj.obj.return_value = MagicMock(infotable=pd.DataFrame())
+    fake_edgar = MagicMock(find=MagicMock(return_value=fake_obj))
+    with patch.dict("sys.modules", {"edgar": fake_edgar}):
+        m._fetch_infotable_edgartools(_FILING)
+
+    assert calls == ["identity", "http1"]
 
 
 # ── pure XML parser (raw fallback core) ────────────────────────────────────────
