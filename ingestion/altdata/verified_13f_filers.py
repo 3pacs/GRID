@@ -1,5 +1,40 @@
 """The single verified 13F filer-CIK map (GD0 §1.3 / §6 item 4 remediation).
 
+**Owner-approved follow-up, 2026-09-28** (same day as the coordinator
+correction below): the relabel dry-run for the correction below surfaced 4
+CIKs with existing ``institutional_holdings`` rows whose ``cik`` wasn't in
+this map at all -- left untouched at the time, flagged for a separate
+decision. The owner approved fixing them. Each was independently confirmed
+from **two** SEC EDGAR primary sources before being added: the
+``data.sec.gov/submissions`` registrant name, and the ``filingManager/name``
+field inside that filer's own most recent 13F-HR cover page
+(``primary_doc.xml``) -- not company-name search, not inference.
+
+    * CIK ``1027451`` -- confirmed **Tiger Management L.L.C.** (Julian
+      Robertson's original fund; former names on file: "TIGER MANAGEMENT
+      LLC/NY", "TIGER MANAGEMENT L L C/NY"). Was mislabeled "Jana Partners"
+      by the old institutional_flows.py/sec_13f_live.py maps -- a real
+      Tiger-family fund, but not Jana Partners (Jana's real CIK is
+      ``1159159``, already correct in this map).
+    * CIK ``1649339`` -- confirmed **Scion Asset Management, LLC** (Michael
+      Burry's fund). Was mislabeled "Two Sigma Investments" by the old maps
+      -- an entirely unrelated fund.
+    * CIK ``1656456`` -- confirmed **Appaloosa LP**, a second, legitimate
+      SEC-registered Appaloosa-family filer entity distinct from
+      ``appaloosa`` (CIK ``1006438``, "Appaloosa Management LP") already in
+      this map. Added as its own tracked entry, not a replacement.
+
+A 4th CIK found in the same dry-run, ``1517302`` (1 stray
+``institutional_holdings`` row labeled "Starboard Value"), was checked the
+same way and turned out to be **Artisan Partners Asset Management Inc.**
+-- a real, unrelated, publicly traded asset manager with no plausible
+connection to Starboard Value (whose real CIK, ``1517137``, is already
+correct in this map). This is not a case of "wrong CIK for a tracked
+manager"; it has every appearance of a data-entry typo of ``1517137``
+propagated into `` `institutional_holdings` `` once. **Left out of this
+map, not added** -- see the follow-up report for the reasoning; the one
+stray row was left untouched, not relabeled to anything.
+
 **Coordinator correction, 2026-09-28** (supersedes the first cut of this
 remediation in PR #711's earlier revision): that revision retired the two
 contradictory maps in ``ingestion/edgar.py`` and
@@ -161,6 +196,10 @@ VERIFIED_FILERS: tuple[Filer, ...] = (
     Filer('kingdon_capital', '1000097', 'Kingdon Capital Management, L.L.C.'),
     Filer('king_street_capital', '1218199', 'King Street Capital Management, L.P.'),
     Filer('jpmorgan_investment_mgmt', '1363391', 'J.P. Morgan Investment Management Inc.'),
+    # ── owner-approved follow-up, 2026-09-28 (see module docstring) ────────
+    Filer('tiger_management', '1027451', 'Tiger Management L.L.C.'),
+    Filer('scion_asset_management', '1649339', 'Scion Asset Management, LLC'),
+    Filer('appaloosa_lp', '1656456', 'Appaloosa LP'),
 )
 
 # Managers from the old union that could NOT be matched to any SEC-registered

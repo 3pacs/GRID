@@ -1370,5 +1370,61 @@
       "outcome": "no SEC company-info match for any variant -- dropped"
     }
   ],
-  "final_verified_filer_count": 72
+  "final_verified_filer_count": 75,
+  "owner_approved_followup_20260928": {
+    "methodology": "The 4 CIKs the relabel dry-run found outside the 72-filer verified map were each checked against TWO independent SEC EDGAR primary sources: (1) data.sec.gov/submissions registrant name, (2) the filingManager/name field inside that CIK own most recent 13F-HR primary_doc.xml cover page (fetched via the filing index.json listing). UA read from the SEC_USER_AGENT env var (project convention), value never printed. 3 of 4 confirmed unambiguously (both sources agree) and added to VERIFIED_FILERS; 1 (1517302) confirmed as an unrelated company with no plausible connection to its institutional_holdings label and left out.",
+    "fetch_date": "2026-09-28",
+    "confirmed_added": [
+      {
+        "cik": "1027451",
+        "old_label_in_institutional_holdings": "Jana Partners",
+        "submissions_name": "TIGER MANAGEMENT L.L.C.",
+        "filing_13f_hr_accession": "0000919574-24-006401",
+        "filing_13f_hr_filed_date": "2024-11-13",
+        "filingManager_name_in_primary_doc": "TIGER MANAGEMENT L.L.C.",
+        "added_as": {
+          "key": "tiger_management",
+          "cik": "1027451",
+          "display_name": "Tiger Management L.L.C."
+        }
+      },
+      {
+        "cik": "1649339",
+        "old_label_in_institutional_holdings": "Two Sigma Investments",
+        "submissions_name": "Scion Asset Management, LLC",
+        "filing_13f_hr_accession": "0001649339-25-000007",
+        "filing_13f_hr_filed_date": "2025-11-03",
+        "filingManager_name_in_primary_doc": "Scion Asset Management, LLC",
+        "added_as": {
+          "key": "scion_asset_management",
+          "cik": "1649339",
+          "display_name": "Scion Asset Management, LLC"
+        }
+      },
+      {
+        "cik": "1656456",
+        "old_label_in_institutional_holdings": "Appaloosa Management",
+        "submissions_name": "Appaloosa LP",
+        "filing_13f_hr_accession": "0001656456-26-000003",
+        "filing_13f_hr_filed_date": "2026-08-14",
+        "filingManager_name_in_primary_doc": "APPALOOSA LP",
+        "added_as": {
+          "key": "appaloosa_lp",
+          "cik": "1656456",
+          "display_name": "Appaloosa LP"
+        }
+      }
+    ],
+    "confirmed_but_excluded": [
+      {
+        "cik": "1517302",
+        "old_label_in_institutional_holdings": "Starboard Value",
+        "rows_in_institutional_holdings": 1,
+        "submissions_name": "Artisan Partners Asset Management Inc.",
+        "submissions_entityType": "operating",
+        "submissions_sicDescription": "Investment Advice",
+        "reason_excluded": "Confirmed identity has no plausible relationship to Starboard Value (real CIK 1517137, already correct in this map). Reads as a data-entry typo of 1517137 that produced exactly one stray row, not a genuine wrong-CIK-for-a-tracked-manager case. Not added to VERIFIED_FILERS; the row is left untouched."
+      }
+    ]
+  }
 }
