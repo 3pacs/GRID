@@ -262,8 +262,8 @@ def fetch_twelvedata(
             summary = td_summary(body) if body else {}
             if status == 200 and summary.get("td_status") == "ok" and summary.get("values"):
                 outcome = "ok"
-            elif status == 200 and summary.get("td_status") == "error" and summary.get("td_code") in (400, 404):
-                outcome = "unavailable"  # symbol unknown to TwelveData / no data for the window
+            elif status in (200, 400, 404) and summary.get("td_status") == "error" and summary.get("td_code") in (400, 404):
+                outcome = "unavailable"  # symbol unknown to TwelveData / no data for the window (HTTP 200 or 400)
             elif status == 429 or summary.get("td_code") == 429:
                 entry = {}
                 sleep(65.0)  # the minute window is full (shared key): wait it out and retry

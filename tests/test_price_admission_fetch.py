@@ -35,7 +35,7 @@ def td_body(closes: dict[date, float], symbol: str = "XLK") -> bytes:
 class FakeVendors:
     """TwelveData + Tiingo stand-in: records every call; serves synthetic closes."""
 
-    def __init__(self, known=("XLK", "AAA"), *, daily_usage=100, limit=800, rate_limit_first=0, first_date=None):
+    def __init__(self, known=("XLK", "AAA", "NODATA"), *, daily_usage=100, limit=800, rate_limit_first=0, first_date=None):
         self.calls: list[tuple[str, dict, dict]] = []
         self.known = set(known)
         self.usage = daily_usage
@@ -57,6 +57,9 @@ class FakeVendors:
             sym = params["symbol"]
             if sym not in self.known:
                 return 200, json.dumps({"code": 400, "message": f"symbol not found: {sym}", "status": "error"}).encode()
+            if sym == "NODATA":  # TwelveData answers "no data for these dates" with HTTP 400
+                return 400, json.dumps({"code": 400, "message": "No data is available on the specified dates.",
+                                        "status": "error"}).encode()
             start = self.first_date or date.fromisoformat(params["start_date"])
             days = _weekdays(start, date.fromisoformat(params["end_date"]))  # end_date exclusive, as TwelveData
             scale = 1.0 if params["adjust"] == "none" else 0.9
@@ -109,6 +112,13 @@ def test_twelvedata_fetch_writes_receipted_files_and_resumes(tmp_path):
     again = FakeVendors()
     second = _run_td(tmp_path, again)
     assert second["skipped_done"] == 6 and not [c for c in again.calls if c[0] == fetch.TD_URL]
+
+
+def test_twelvedata_no_data_http_400_is_final_and_not_retried(tmp_path):
+    vendors = FakeVendors()
+    result = _run_td(tmp_path, vendors, tickers=("NODATA",))
+    assert result["unavailable"] == 2 and result["error"] == 0
+    assert len([c for c in vendors.calls if c[0] == fetch.TD_URL and c[1]["symbol"] == "NODATA"]) == 2
 
 
 def test_twelvedata_fetch_retries_rate_limits_and_refetches_a_tampered_file(tmp_path):
