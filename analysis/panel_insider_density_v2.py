@@ -697,8 +697,14 @@ def calibration(ledger: list[dict], alpha: float = v1.run_alpha(v1.VS1_RUN_K), *
     }
 
 
-def verdict(payload: dict, checks: list[dict], power: dict | None, *, primary: str = v1.PRIMARY_TRIAL) -> dict:
-    """v2/v3 §11 verdict; v1's rule outcome is reported as ``v1_rule_state``."""
+def verdict(payload: dict, checks: list[dict], power: dict | None, *, primary: str = v1.PRIMARY_TRIAL,
+            contamination: Mapping[str, Any] | None = None) -> dict:
+    """v2/v3 §11 verdict; v1's rule outcome is reported as ``v1_rule_state``.
+
+    ``contamination`` (:func:`contamination`): when another VS1 registry's
+    witness grew past its 2 registration records at any recorded instant of
+    this run, the verdict carries ``contaminated: true`` and a CONTAMINATED note.
+    """
     calib = payload["calibration"]
     survivors = [c for c in checks if c["retrospective_survivor"]]
     positive = [c for c in survivors if c["mean_ic"] > 0]
@@ -726,11 +732,32 @@ def verdict(payload: dict, checks: list[dict], power: dict | None, *, primary: s
     if any((t.get("delisting_sensitivity") or {}).get("sign_survives_pessimistic") is False for t in primary_rows):
         notes.append("DELISTING_SENSITIVE: the primary trial's IC changes sign under the pessimistic "
                      "delisting bound (reported only)")
+    contaminated = bool(contamination and contamination.get("contaminated"))
+    if contaminated:
+        notes.insert(0, "CONTAMINATED: another VS1 registry's off-host witness grew past its 2 registration "
+                        f"records (or an unknown VS1 witness appeared) during this run: {contamination.get('detail')}")
     v1_state = v1.verdict({"calibration": {"state": (calib.get("v1_rule") or {}).get("state", "ABSENT")},
                            "ledger": payload.get("ledger", [])}, checks, power)["state"]
     return {"state": state, "calibration": calib["state"], "primary_trial": primary, "notes": notes,
-            "v1_rule_state": v1_state, "survivors": [c["trial"] for c in positive], "promotion_allowed": False,
-            "statement": "Nothing here is a trading signal."}
+            "contaminated": contaminated, "v1_rule_state": v1_state, "survivors": [c["trial"] for c in positive],
+            "promotion_allowed": False, "statement": "Nothing here is a trading signal."}
+
+
+def contamination(censuses: Iterable[Mapping[str, Any] | None], own: str) -> dict:
+    """Whether any recorded census shows another VS1 registry opened (records != 2) or an unknown witness."""
+    found = {}
+    unknown: set[str] = set()
+    seen = 0
+    for census in censuses:
+        if not census:
+            continue
+        seen += 1
+        for key, records in (census.get("records") or {}).items():
+            if key != own and records != V1_REGISTRATION_RECORDS:
+                found[key] = max(found.get(key) or 0, records or 0) if records is not None else None
+        unknown.update(census.get("unknown") or ())
+    return {"contaminated": bool(found or unknown), "censuses": seen,
+            "detail": {"other_registries_past_registration": found, "unknown_witness_files": sorted(unknown)}}
 
 
 # --- Stage 0 (v1 §10 settings, SIC-expanded universe and admission) ---------------------------
@@ -763,12 +790,13 @@ class DiscoveryKey:
     window = "discovery"
 
     def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict, *, version: str | None = None,
-                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
+                 log_dir: Path | None = None, witness_tip: str | None = None, census: dict | None = None) -> None:
         if token is not _KEY_TOKEN:
             raise TypeError("a DiscoveryKey is issued only by resume_discovery")
         if log_dir is None or witness_tip is None or version is None:
             raise TypeError("a DiscoveryKey needs its version, registry and off-host witness")
         self.version = version
+        self.census = census
         self.inputs_frozen_sha256 = inputs_frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
@@ -782,12 +810,13 @@ class HoldoutKey:
     window = "holdout"
 
     def __init__(self, token: object, frozen_sha256: str, inputs: dict, *, version: str | None = None,
-                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
+                 log_dir: Path | None = None, witness_tip: str | None = None, census: dict | None = None) -> None:
         if token is not _HOLDOUT_TOKEN:
             raise TypeError("a HoldoutKey is issued only by resume_holdout")
         if log_dir is None or witness_tip is None or version is None:
             raise TypeError("a HoldoutKey needs its version, registry and off-host witness")
         self.version = version
+        self.census = census
         self.frozen_sha256 = frozen_sha256
         self.inputs = dict(inputs)
         self.as_of_ts = stamp(inputs["as_of_ts"])
@@ -799,17 +828,20 @@ class OffhostWitness:
     """A version's witness file as committed on the pinned remote's ``main`` (issued by ``check_offhost``).
 
     ``earlier``: records covered by each earlier version's witness file at the
-    same tip; ``versions_on_main``: every VS1 witness file present at the tip.
+    same tip; ``census``: every VS1 registry witness at the tip and the records
+    each covers, plus unknown VS1 witness files (:func:`v1.vs1_witness_census`);
+    ``versions_on_main``: the Technology versions among them.
     """
 
     def __init__(self, token: object, repo: Path, tip: str, content: bytes, versions: list[dict],
-                 remote_url: str, *, path: str, branch: str, earlier: dict[str, int],
-                 versions_on_main: dict[int, str]) -> None:
+                 remote_url: str, *, path: str, branch: str, earlier: dict[str, int], census: dict) -> None:
         if token is not _WITNESS_TOKEN:
             raise TypeError("an OffhostWitness is issued only by check_offhost")
         self.repo, self.tip, self.content, self.versions = Path(repo), tip, content, versions
         self.remote_url, self.path, self.branch = remote_url, path, branch
-        self.earlier, self.versions_on_main = dict(earlier), dict(versions_on_main)
+        self.earlier, self.census = dict(earlier), dict(census)
+        self.versions_on_main = {int(k[len("vs1-v"):]): v for k, v in census["files"].items()
+                                 if k.startswith("vs1-v")}
 
     @property
     def lines(self) -> list[bytes]:
@@ -831,7 +863,7 @@ class OffhostWitness:
     def receipt(self) -> dict:
         return {"remote_url": self.remote_url, "branch": self.branch, "path": self.path, "tip": self.tip,
                 "versions": self.versions, "earlier_versions_covered_records": self.earlier,
-                "versions_on_main": {str(k): v for k, v in sorted(self.versions_on_main.items())}}
+                "vs1_witness_census": self.census}
 
 
 def _walk_witness(repo: Path, ref: str, path: str, first_line: bytes, url: str,
@@ -992,8 +1024,9 @@ class Harness:
     def calibration(self, ledger: list[dict], alpha: float = v1.run_alpha(v1.VS1_RUN_K)) -> dict:
         return calibration(ledger, alpha, primary=self.primary)
 
-    def verdict(self, payload: dict, checks: list[dict], power: dict | None) -> dict:
-        return verdict(payload, checks, power, primary=self.primary)
+    def verdict(self, payload: dict, checks: list[dict], power: dict | None,
+                contamination: Mapping[str, Any] | None = None) -> dict:
+        return verdict(payload, checks, power, primary=self.primary, contamination=contamination)
 
     def discover_panel(self, spec: v1.RunSpec, panels: Mapping[str, v1.TrialPanel], *, inputs: dict,
                        repo_root: Path = REPO, sensitivity: bool = True) -> dict:
@@ -1083,7 +1116,8 @@ class Harness:
         result = {"discovery_manifest": frozen["sha256"], "prereg_sha256": payload["prereg_sha256"],
                   "holdout_sha256": digest({t: panels[t].as_record() for t in evaluated}),
                   "holdout_checks": checks, "promotion_allowed": False}
-        result["verdict"] = self.verdict(payload, checks, power)
+        result["contamination"] = self.run_contamination(key)
+        result["verdict"] = self.verdict(payload, checks, power, result["contamination"])
         return result
 
     # -- registry --
@@ -1160,20 +1194,57 @@ class Harness:
             earlier[old.version] = walked[-1]["covered_records"]
         return OffhostWitness(_WITNESS_TOKEN, repo, tip, b"\n".join(previous) + b"\n", versions, url,
                               path=self.pins.witness_path, branch=v1.WITNESS_BRANCH, earlier=earlier,
-                              versions_on_main=v1.witnessed_versions(repo, tip))
+                              census=v1.vs1_witness_census(repo, tip))
+
+    @property
+    def registry_id(self) -> str:
+        """This registry's key in :func:`v1.vs1_witness_census` (``vs1-v<n>``)."""
+        return f"vs1-v{self.pins.number}"
 
     def require_supersession(self, witness: OffhostWitness | None) -> dict:
-        """This version may open: not superseded, no later version on main, every earlier one unopened."""
+        """This version may open a discovery only if no other VS1 registry was ever opened.
+
+        Refuses when: this version is pinned as superseded; a later Technology
+        version or an unknown VS1 witness file is on the pinned ``main``
+        (:func:`v1.refuse_superseded`); the pinned ``earlier`` list is not
+        exactly every lower version; a lower version on ``main`` is not in it;
+        or ANY other VS1 registry witness on ``main`` (every version, the
+        sector registries included) covers anything but its 2 registration
+        records -- no version may open while another shows a discovery_opened.
+        """
         v1.refuse_superseded(self.pins.number, self.superseded_by, witness)
         if not isinstance(witness, OffhostWitness):
             raise PermissionError(f"the pinned {self.version} off-host witness (check_offhost) is required")
-        opened = {v: n for v, n in witness.earlier.items() if n != V1_REGISTRATION_RECORDS}
-        if opened or set(witness.earlier) != {e.version for e in self.pins.earlier}:
+        pinned = {e.number for e in self.pins.earlier}
+        lower = set(range(1, self.pins.number))
+        if pinned != lower:
             raise PermissionError(
-                f"an earlier VS1 registration was opened after its registration ({opened}): {self.version} "
-                "cannot take ledger run k=1 (owner decision needed)"
+                f"{self.version} pins earlier versions {sorted(pinned)}, not every lower version {sorted(lower)}: "
+                "a superseding registry must list them all"
             )
-        return {"earlier_witnessed_records": dict(witness.earlier), "witness_tip": witness.tip}
+        on_main_lower = {n for n in witness.versions_on_main if n < self.pins.number}
+        if on_main_lower - pinned:
+            raise PermissionError(f"lower VS1 versions on main that {self.version} does not pin: "
+                                  f"{sorted(on_main_lower - pinned)}")
+        opened = {k: r for k, r in witness.census["records"].items()
+                  if k != self.registry_id and r != V1_REGISTRATION_RECORDS}
+        stale = {v: n for v, n in witness.earlier.items() if n != V1_REGISTRATION_RECORDS}
+        if opened or stale or set(witness.earlier) != {e.version for e in self.pins.earlier}:
+            raise PermissionError(
+                f"another VS1 registry was opened after its registration ({opened or stale}): {self.version} "
+                "cannot open while any other VS1 witness shows a discovery_opened (owner decision needed)"
+            )
+        return {"earlier_witnessed_records": dict(witness.earlier), "witness_tip": witness.tip,
+                "vs1_witness_census": witness.census}
+
+    def run_contamination(self, key: DiscoveryKey | HoldoutKey) -> dict:
+        """Contamination over every census this run recorded (chain records and the key's own)."""
+        log = self.registry(key.log_dir)
+        with log.locked():
+            records = self._chain(log)
+        censuses = [r.get("vs1_witness_census") or (r.get("supersession") or {}).get("vs1_witness_census")
+                    for r in records]
+        return contamination([*censuses, key.census], self.registry_id)
 
     def require_witness(self, log_dir: Path, witness: OffhostWitness | None, records_needed: int) -> dict:
         import tempfile
@@ -1282,7 +1353,7 @@ class Harness:
                 "kind": "prices_read", "run_at": datetime.now(timezone.utc).isoformat(),
                 "prereg_sha256": self.prereg_sha256, "window": key.window,
                 "price_receipt_sha256": price_receipt_sha256, "witness_tip": key.witness_tip,
-                "promotion_allowed": False,
+                "vs1_witness_census": key.census, "promotion_allowed": False,
             }])[0]
 
     # -- one-shot stages --
@@ -1367,7 +1438,7 @@ class Harness:
         _check_observed(matching[0]["inputs"], observed)
         self.require_witness(log_dir, witness, position)
         return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"], version=self.version,
-                            log_dir=log_dir, witness_tip=witness.tip)
+                            log_dir=log_dir, witness_tip=witness.tip, census=witness.census)
 
     def seal_discovery(self, log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict) -> dict:
         if not isinstance(key, DiscoveryKey) or key.version != self.version:
@@ -1394,7 +1465,17 @@ class Harness:
             }])[0]
 
     def open_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path, now: datetime,
-                     observed: Mapping[str, Any], repo_root: Path = REPO) -> dict:
+                     observed: Mapping[str, Any], witness: OffhostWitness | None, repo_root: Path = REPO) -> dict:
+        """One-shot holdout, step 1: ``holdout_opened`` with the VS1 witness census (no price read).
+
+        Refused when this version is pinned as superseded (the pin only: a later
+        registration does not stop a legitimately opened run). Another
+        registry's opening is not refused here; it is recorded and flags the
+        verdict as contaminated.
+        """
+        v1.refuse_superseded(self.pins.number, self.superseded_by)
+        if not isinstance(witness, OffhostWitness) or witness.path != self.pins.witness_path:
+            raise PermissionError(f"the pinned {self.version} off-host witness (check_offhost) is required")
         payload = self.check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                              repo_root=repo_root)
         if now.tzinfo is None:
@@ -1408,7 +1489,8 @@ class Harness:
             _check_observed(inputs, observed)
             log.append_locked([{
                 "kind": "holdout_opened", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
-                "discovery_sha256": frozen["sha256"], "promotion_allowed": False,
+                "discovery_sha256": frozen["sha256"], "vs1_witness_census": witness.census,
+                "promotion_allowed": False,
             }])
             heads = v1._line_sha256(log)
         return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
@@ -1416,6 +1498,7 @@ class Harness:
     def resume_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path,
                        observed: Mapping[str, Any], witness: OffhostWitness | None,
                        repo_root: Path = REPO) -> HoldoutKey:
+        v1.refuse_superseded(self.pins.number, self.superseded_by)
         payload = self.check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                              repo_root=repo_root)
         log = self.registry(log_dir)
@@ -1430,7 +1513,7 @@ class Harness:
         _check_observed(inputs, observed)
         self.require_witness(log_dir, witness, position)
         return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, version=self.version, log_dir=log_dir,
-                          witness_tip=witness.tip)
+                          witness_tip=witness.tip, census=witness.census)
 
     def seal_holdout(self, log_dir: Path, now: datetime, key: HoldoutKey, result: dict) -> dict:
         if not isinstance(key, HoldoutKey) or key.version != self.version or (
@@ -1446,7 +1529,8 @@ class Harness:
             return log.append_locked([{
                 "kind": "holdout_result", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
                 "discovery_sha256": key.frozen_sha256, "result_sha256": digest(result),
-                "verdict": result["verdict"]["state"], "promotion_allowed": False,
+                "verdict": result["verdict"]["state"], "contaminated": result["verdict"].get("contaminated"),
+                "promotion_allowed": False,
             }])[0]
 
 

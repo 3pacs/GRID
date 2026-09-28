@@ -346,8 +346,10 @@ def _holdout_inputs(args):
 def cmd_open_holdout(args) -> None:
     h = args.h
     frozen, _, _, _, _, observed = _holdout_inputs(args)
+    witness = h.check_offhost(Path(args.vault_repo))  # recorded in holdout_opened (VS1 witness census)
     opened = h.open_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
-                             log_dir=Path(args.log_dir), now=_now(), observed=observed, repo_root=REPO)
+                            log_dir=Path(args.log_dir), now=_now(), observed=observed, witness=witness,
+                            repo_root=REPO)
     _print_witness_instructions(opened, args)
 
 
@@ -431,6 +433,7 @@ def main(argv: list[str] | None = None, h=v2) -> None:
     p = sub.add_parser("open-holdout", help="append holdout_opened; reads no price")
     inputs(p, prices=True)
     holdout_request(p)
+    p.add_argument("--vault-repo", required=True, help="local git repo to fetch the pinned vault main into")
     p.add_argument("--vault-worktree")
     p.set_defaults(func=cmd_open_holdout)
 

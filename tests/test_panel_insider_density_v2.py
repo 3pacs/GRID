@@ -448,7 +448,7 @@ def test_v2_discovery_is_refused_once_v1_was_opened(tmp_path):
     vault.publish(log_dir)
     inputs = _inputs()
     v2.freeze_inputs(log_dir, NOW, inputs)
-    with pytest.raises(PermissionError, match="earlier VS1 registration was opened"):
+    with pytest.raises(PermissionError, match="VS1 registry was opened"):
         v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
     with pytest.raises(PermissionError, match="off-host witness"):
         v2.open_discovery(log_dir, NOW, _observed(inputs), None)
@@ -599,12 +599,12 @@ def test_end_to_end_planted_effect_with_admission_through_the_v2_price_reader(tm
     # holdout: flag, pinned hash, the chain, the witness
     with pytest.raises(PermissionError, match="allow_holdout"):
         v2.open_holdout(frozen, allow_holdout=False, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
-                        now=NOW, observed=_observed(inputs))
+                        now=NOW, observed=_observed(inputs), witness=vault.witness())
     with pytest.raises(PermissionError, match="pinned vs1-v2"):
         v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
-                        now=NOW, observed=_observed(inputs))
+                        now=NOW, observed=_observed(inputs), witness=vault.witness())
     v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
-                    now=NOW, observed=_observed(inputs))
+                    now=NOW, observed=_observed(inputs), witness=vault.witness())
     vault.publish(tmp_path / "reg")
     hkey = v2.resume_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
                              observed=_observed(inputs), witness=vault.witness())

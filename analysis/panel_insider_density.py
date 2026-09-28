@@ -2147,40 +2147,86 @@ SUPERSEDED_BY: dict | None = {
     "registry_head_sha256": "c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",
 }
 OWN_VERSION_NUMBER = 1
-#: Witness files of every VS1 registry version on the pinned vault ``main``.
+#: Witness files of every VS1 (Technology) registry version on the pinned vault ``main``.
 VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
+#: Witness files of the other-10-sector registries (``sectors-v2`` onward; v1's plan lived in v1's registry).
+SECTORS_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v(\d+)\.anchors\.jsonl$")
+
+
+WITNESS_DIR = "05-GRID/Paper-Log/vs1/"
+#: Non-witness files tolerated in the witness directory.
+WITNESS_DIR_ALLOWED = frozenset({"README.md", ".gitattributes"})
+
+
+def vs1_witness_census(repo: Path, tip: str) -> dict:
+    """Every VS1 registry witness on the pinned ``main`` at ``tip`` and the records each covers.
+
+    ``files``/``records``: registry id (``vs1-v<n>`` for the Technology
+    versions, ``sectors-v<n>`` for the other-10-sector registries) -> path /
+    records covered by its last anchor line (None when unreadable).
+    ``unknown``: any other file in the witness directory (except README.md,
+    .gitattributes) and any ``*.anchors.jsonl`` whose path mentions ``vs1``
+    anywhere else in the tree -- a witness under a name or path no version knows.
+    """
+    files, unknown = {}, []
+    for path in _git(repo, "ls-tree", "-r", "--name-only", tip).splitlines():
+        path = path.strip()
+        match, sectors = VERSIONED_WITNESS.match(path), SECTORS_WITNESS.match(path)
+        if match:
+            files[f"vs1-v{int(match.group(1))}"] = path
+        elif sectors:
+            files[f"sectors-v{int(sectors.group(1))}"] = path
+        elif path.startswith(WITNESS_DIR):
+            if path[len(WITNESS_DIR):] not in WITNESS_DIR_ALLOWED:
+                unknown.append(path)
+        elif "vs1" in path.lower() and path.lower().endswith(".anchors.jsonl"):
+            unknown.append(path)
+    records = {}
+    for key, path in files.items():
+        content = _git(repo, "show", f"{tip}:{path}", binary=True).replace(b"\r\n", b"\n")
+        lines = [line for line in content.split(b"\n") if line]
+        try:
+            covered = json.loads(lines[-1])["records"] if lines else None
+            records[key] = covered if isinstance(covered, int) else None
+        except (ValueError, KeyError, TypeError):
+            records[key] = None
+    return {"tip": tip, "files": dict(sorted(files.items())), "records": dict(sorted(records.items())),
+            "unknown": sorted(unknown)}
 
 
 def witnessed_versions(repo: Path, tip: str) -> dict[int, str]:
-    """Version number -> witness path of every VS1 registry witness file present at ``tip``."""
-    listing = _git(repo, "ls-tree", "-r", "--name-only", tip, "--", "05-GRID/Paper-Log/vs1/")
-    out = {}
-    for path in listing.splitlines():
-        match = VERSIONED_WITNESS.match(path.strip())
-        if match:
-            out[int(match.group(1))] = path.strip()
-    return out
+    """Version number -> witness path of every VS1 (Technology) registry witness present at ``tip``."""
+    return {int(k[len("vs1-v"):]): p for k, p in vs1_witness_census(repo, tip)["files"].items()
+            if k.startswith("vs1-v")}
 
 
 def refuse_superseded(own: int, superseded_by: Mapping[str, Any] | None, witness: Any = None) -> None:
-    """Refuse a discovery opening of VS1 version ``own`` once any later version is registered.
+    """Refuse an opening of VS1 version ``own`` once any later version is registered.
 
-    Two checks: the supersession pinned in this version's code, and (when the
-    fetched off-host witness is given) any witness file of a later version on the
-    pinned vault ``main`` -- so a checkout that predates the pin is refused too
-    once it fetches the witness it needs for a price key.
+    The supersession pinned in this version's code always refuses (discovery and
+    holdout). When the fetched off-host witness is given (discovery openings),
+    a witness file of a later version on the pinned vault ``main``, or an
+    unknown VS1 witness file, refuses too -- so a checkout that predates the pin
+    is refused once it fetches the witness it needs for a price key.
     """
     if superseded_by:
         raise PermissionError(
             f"VS1 v{own} is superseded by {superseded_by.get('version')} (pinned in code): "
-            "it can never open a discovery"
+            "it can never open a discovery or a holdout"
         )
     if witness is not None:
-        later = sorted(n for n in witnessed_versions(witness.repo, witness.tip) if n > own)
+        census = vs1_witness_census(witness.repo, witness.tip)
+        later = sorted(int(k[len("vs1-v"):]) for k in census["files"]
+                       if k.startswith("vs1-v") and int(k[len("vs1-v"):]) > own)
         if later:
             raise PermissionError(
                 f"a later VS1 registry (v{later[-1]}) is witnessed on the pinned {WITNESS_BRANCH}: "
                 f"v{own} can never open a discovery"
+            )
+        if census["unknown"]:
+            raise PermissionError(
+                f"unknown VS1 witness files on the pinned {WITNESS_BRANCH} ({census['unknown'][:5]}): "
+                "refused until an owner accounts for them"
             )
 
 
@@ -2570,6 +2616,7 @@ def open_holdout(
     log must witness the returned head before :func:`resume_holdout` issues
     the price key.
     """
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                     repo_root=repo_root)
     if now.tzinfo is None:
@@ -2603,6 +2650,7 @@ def resume_holdout(
     repo_root: Path = REPO,
 ) -> HoldoutKey:
     """One-shot holdout, step 2: the price key, only once the off-host log witnesses it."""
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                     repo_root=repo_root)
     log = registry(log_dir, prereg_sha256)

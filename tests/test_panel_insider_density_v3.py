@@ -141,7 +141,7 @@ def test_v3_opens_only_while_v1_and_v2_stay_unopened(tmp_path):
         vault.publish(log_dir)
         inputs = _inputs()
         v3.freeze_inputs(log_dir, NOW, inputs)
-        with pytest.raises(PermissionError, match="earlier VS1 registration was opened"):
+        with pytest.raises(PermissionError, match="VS1 registry was opened"):
             v3.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
 
 
@@ -229,7 +229,7 @@ def test_end_to_end_planted_5_session_effect_is_the_v3_primary_survivor(tmp_path
     assert ledger["A90|fwd5"]["primary"] and ledger["A90|fwd5"]["selected"]
     v3.seal_discovery(tmp_path / "reg", NOW, key, frozen)
     v3.open_holdout(frozen, allow_holdout=True, prereg_sha256=v3.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
-                    now=NOW, observed=_observed(inputs))
+                    now=NOW, observed=_observed(inputs), witness=vault.witness())
     vault.publish(tmp_path / "reg")
     hkey = v3.resume_holdout(frozen, allow_holdout=True, prereg_sha256=v3.PREREG_BODY_SHA256,
                              log_dir=tmp_path / "reg", observed=_observed(inputs), witness=vault.witness())
