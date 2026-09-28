@@ -83,10 +83,20 @@ WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
 WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v2.anchors.jsonl"
 
-REGISTERED_AT: datetime | None = None
-REGISTERED_CODE_SHA: str | None = None
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The one sectors-v2 registration: registered once, locally, on 2026-09-28T02:34:55Z against
+#: code f6588eba, chain head bcfc31b0... at 2 records. The original lives in the operator's
+#: ``Documents/Codex/2026-09-14/wha/outputs/vs1-sectors-v2-prereg-registry/``.
+REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 2, 34, 55, 80814, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA: str | None = "f6588eba8aa54f0b6e45215bff5b2afcabfdb8a1"
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "ec4f1534bf119ea10d4305e739b5fb0380e6da6cd9af8d1b44c45509f1687745",  # header
+    "bcfc31b0f355dc04bfbd252b1705a5bd441701649bcd2b9bb4e136adbff23a04",  # preregistration (head at 2)
+)
+#: The first line every committed version of the sectors-v2 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"bcfc31b0f355dc04bfbd252b1705a5bd441701649bcd2b9bb4e136adbff23a04",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T02:34:55.080814+00:00"}'
+)
 
 
 def check_ranges() -> None:
