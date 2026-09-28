@@ -78,7 +78,7 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 SUPERSEDED_BY: dict | None = {
     "version": "vs1-sectors-v4",
     "prereg_sha256": "e3f41ace1bfbfed12c82e16b3b438a62ba759bc1c54dfdf743fb8b2d27b4e712",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "0512baf5cbae66310130e7219d589e3d992c438dd2ea2ae612903b456da58f5f",
 }
 
 

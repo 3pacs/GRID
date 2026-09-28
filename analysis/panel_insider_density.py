@@ -2155,7 +2155,7 @@ SECTOR_PLAN_SUPERSEDED_BY: dict = {
     "version": "vs1-sectors-v4",
     "prereg_path": "docs/paper_log/vs1-sectors-v4-preregistration.md",
     "prereg_sha256": "e3f41ace1bfbfed12c82e16b3b438a62ba759bc1c54dfdf743fb8b2d27b4e712",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "0512baf5cbae66310130e7219d589e3d992c438dd2ea2ae612903b456da58f5f",
 }
 #: Witness files of every VS1 (Technology) registry version on the pinned vault ``main``.
 VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
