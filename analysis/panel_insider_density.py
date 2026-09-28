@@ -2143,9 +2143,9 @@ _WITNESS_TOKEN = object()
 #: v3 (primary trial A90|fwd5) were registered (docs/paper_log/
 #: vs1-insider-density-v3-preregistration.md). v1 can never open a discovery.
 SUPERSEDED_BY: dict | None = {
-    "version": "vs1-v4",
-    "prereg_sha256": "0b5e8c559743da83affe82549069994b0146b9185d1e968ae7961bc8b6107425",
-    "registry_head_sha256": "425047c26e57eff55928272a88f6c3490da8c431aaaf4e4911d147986c51cac8",
+    "version": "vs1-v5",
+    "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
+    "registry_head_sha256": None,
 }
 OWN_VERSION_NUMBER = 1
 #: v1 section 13's other-10-sector plan (carried into v2/v3 section 13) is superseded by the

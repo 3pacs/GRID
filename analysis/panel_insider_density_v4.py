@@ -193,7 +193,13 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"425047c26e57eff55928272a88f6c3490da8c431aaaf4e4911d147986c51cac8",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T03:43:05.115607+00:00"}'
 )
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+#: v4 was superseded by v5 before any price read (the #706 backfill review: source filtering,
+#: pull-batch splice check, ticker-reuse price bound).
+SUPERSEDED_BY: Mapping[str, Any] | None = {
+    "version": "vs1-v5",
+    "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
+    "registry_head_sha256": None,
+}
 
 V3_EARLIER = v2.EarlierVersion(
     version=v3.VERSION, number=3, prereg_sha256=v3.PREREG_BODY_SHA256,

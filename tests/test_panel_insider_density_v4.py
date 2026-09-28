@@ -25,13 +25,20 @@ def _vault(root, **kw):
     return _Vault(root, h=v4, seeds=("vs1-v1", "vs1-v2"), **kw)
 
 
+@pytest.fixture(autouse=True)
+def _v4_not_superseded(request, monkeypatch):
+    """v4 is superseded by v5 (pinned); the machinery tests exercise v4 as if it were current."""
+    if request.node.name != "test_v4_is_superseded_by_v5":
+        monkeypatch.setattr(v4, "SUPERSEDED_BY", None)
+
+
 # --- pins and text ---------------------------------------------------------------------------------
 
 
 def test_v4_prereg_hashes_to_the_pin_and_states_the_rule():
     assert v4.check_prereg() == v4.PREREG_BODY_SHA256
     body = v1.prereg_body((v4.REPO / v4.PREREG_PATH).read_text(encoding="utf-8"))
-    for text in ("**N = 250**", "**X = 99%**", "Y = 10 basis points (0.0010)", "TWELVEDATA_API_KEY",
+    for text in ("**n ≥ N = 250**", "**≥ X = 99%**", "Y = 10 basis points (0.0010)", "TWELVEDATA_API_KEY",
                  "adjust=all", "adjust=none", "more than 10% of its pairs excluded"):
         assert text in body, text
     for pin in (v3.PREREG_BODY_SHA256, v3.REGISTERED_RECORD_SHA256[1], v2.SIC_MAP_SHA256):
@@ -50,10 +57,10 @@ def test_v4_changes_only_the_price_rule_and_gates():
     assert records[1]["price_admission"]["crosscheck"]["N_min_pairs"] == 250
 
 
-def test_v3_is_superseded_by_v4():
-    assert v3.SUPERSEDED_BY["version"] == "vs1-v4"
-    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
-        v1.refuse_superseded(3, v3.SUPERSEDED_BY)
+def test_v4_is_superseded_by_v5():
+    assert v3.SUPERSEDED_BY["version"] == v4.SUPERSEDED_BY["version"] == "vs1-v5"
+    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
+        v1.refuse_superseded(4, v4.SUPERSEDED_BY)
 
 
 # --- the price manifest --------------------------------------------------------------------------------

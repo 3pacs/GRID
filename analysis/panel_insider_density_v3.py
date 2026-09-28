@@ -90,9 +90,9 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 #: v3 was superseded by v4 before any price read (owner decisions 2026-09-28 03:40Z: TIINGO-only
 #: price admission with a TwelveData cross-check, and a post-admission power gate).
 SUPERSEDED_BY: Mapping[str, Any] | None = {
-    "version": "vs1-v4",
-    "prereg_sha256": "0b5e8c559743da83affe82549069994b0146b9185d1e968ae7961bc8b6107425",
-    "registry_head_sha256": "425047c26e57eff55928272a88f6c3490da8c431aaaf4e4911d147986c51cac8",
+    "version": "vs1-v5",
+    "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
+    "registry_head_sha256": None,
 }
 
 

@@ -67,11 +67,12 @@ def test_the_v3_registry_and_witness_are_their_own():
 
 def test_v1_v2_and_v3_are_pinned_as_superseded_by_the_registered_v4():
     from analysis import panel_insider_density_v4 as v4
+    from analysis import panel_insider_density_v5 as v5
 
-    for pin in (v1.SUPERSEDED_BY, v2.SUPERSEDED_BY, v3.SUPERSEDED_BY):
-        assert pin == {"version": "vs1-v4", "prereg_sha256": v4.PREREG_BODY_SHA256,
-                       "registry_head_sha256": v4.REGISTERED_RECORD_SHA256[1]}
-    assert v4.SUPERSEDED_BY is None
+    for pin in (v1.SUPERSEDED_BY, v2.SUPERSEDED_BY, v3.SUPERSEDED_BY, v4.SUPERSEDED_BY):
+        assert pin == {"version": "vs1-v5", "prereg_sha256": v5.PREREG_BODY_SHA256,
+                       "registry_head_sha256": v5.REGISTERED_RECORD_SHA256[1]}
+    assert v5.SUPERSEDED_BY is None
 
 
 @pytest.fixture(autouse=True)

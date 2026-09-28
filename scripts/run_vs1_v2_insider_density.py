@@ -67,12 +67,14 @@ CODE_FILES = (
     "analysis/panel_insider_density_v2.py",
     "analysis/panel_insider_density_v3.py",
     "analysis/panel_insider_density_v4.py",
+    "analysis/panel_insider_density_v5.py",
     "analysis/offline_research_proof.py",
     "analysis/research_forward_log.py",
     "store/observations.py",
     "scripts/run_vs1_v2_insider_density.py",
     "scripts/run_vs1_v3_insider_density.py",
     "scripts/run_vs1_v4_insider_density.py",
+    "scripts/run_vs1_v5_insider_density.py",
 )
 
 
@@ -138,6 +140,10 @@ def _manifest(args) -> v2.PriceManifest:
     if crosscheck is not None:
         if not getattr(args, "crosscheck_report", None) or v1.data_sha256(Path(args.crosscheck_report)) != crosscheck:
             raise SystemExit("the TwelveData cross-check report does not hash to the manifest's crosscheck_report_sha256")
+    meta = getattr(manifest, "tiingo_meta_report_sha256", None)
+    if meta is not None:
+        if not getattr(args, "tiingo_meta_report", None) or v1.data_sha256(Path(args.tiingo_meta_report)) != meta:
+            raise SystemExit("the Tiingo metadata report does not hash to the manifest's tiingo_meta_report_sha256")
     return manifest
 
 
@@ -421,6 +427,7 @@ def main(argv: list[str] | None = None, h=v2) -> None:
             p.add_argument("--probe-report", required=True)
             p.add_argument("--power", required=True)
         p.add_argument("--crosscheck-report", help="v4 on: the TwelveData cross-check report the manifest names")
+        p.add_argument("--tiingo-meta-report", help="v5 on: the Tiingo metadata report the manifest names")
 
     def holdout_request(p) -> None:
         p.add_argument("--run-dir", required=True)

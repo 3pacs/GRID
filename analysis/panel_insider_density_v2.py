@@ -468,8 +468,14 @@ class TrialPanel(v1.TrialPanel):
 
 
 def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
-                       prices: v1.PricePanel, window: str) -> dict[str, TrialPanel]:
-    """Every declared trial's panel for one window (v1 construction, v2 admission)."""
+                       prices: v1.PricePanel, window: str, *,
+                       blank_before_listing: bool = False) -> dict[str, TrialPanel]:
+    """Every declared trial's panel for one window (v1 construction, v2 admission).
+
+    ``blank_before_listing`` (v5 §2.3): closes of a ticker before its manifest
+    ``listed_from`` date are blanked before any label, feature mask or baseline
+    is computed (a reused symbol's earlier history is never used).
+    """
     prices.verify()
     if prices.window != window:
         raise ValueError("price panel window differs")
@@ -480,6 +486,11 @@ def build_trial_panels(events: v1.Form4Events, admission: Admission, universe: p
     ciks = list(universe["cik"].astype(int))
     groups = list(universe["sic_group"])
     listed = dict(getattr(prices.manifest, "listed_from", ()) or ())
+    if blank_before_listing:
+        closes = closes.copy()
+        for ticker, start in listed.items():
+            if ticker in closes.columns and ticker != benchmark:
+                closes.loc[closes.index < pd.Timestamp(start), ticker] = np.nan
     panels = {}
     for h in v1.HORIZONS:
         positions, labels, momentum = v1.relative_labels(closes, benchmark, tickers, h, window)
@@ -1623,9 +1634,9 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 )
 #: v2 was superseded by v3 before any price read (v3 makes A90|fwd5 primary).
 SUPERSEDED_BY: Mapping[str, Any] | None = {
-    "version": "vs1-v4",
-    "prereg_sha256": "0b5e8c559743da83affe82549069994b0146b9185d1e968ae7961bc8b6107425",
-    "registry_head_sha256": "425047c26e57eff55928272a88f6c3490da8c431aaaf4e4911d147986c51cac8",
+    "version": "vs1-v5",
+    "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
+    "registry_head_sha256": None,
 }
 
 

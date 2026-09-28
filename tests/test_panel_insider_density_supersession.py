@@ -38,9 +38,15 @@ def _vault(root, **kw):
 
 
 @pytest.fixture(autouse=True)
-def _v3_not_superseded(monkeypatch):
-    """v3 is superseded by v4 (pinned); these replays exercise the Harness through v3 as if it were current."""
-    monkeypatch.setattr(v3, "SUPERSEDED_BY", None)
+def _v3_not_superseded(request, monkeypatch):
+    """v3 is superseded (pinned); these replays exercise the Harness through v3 as if it were current."""
+    if request.node.name != "test_every_harness_module_pins_every_lower_version_as_earlier":
+        monkeypatch.setattr(v3, "SUPERSEDED_BY", None)
+
+
+def _unpinned(pins, **over):
+    """A synthetic harness's pins: v3's, not superseded (no module attached, so the pin is the dataclass's)."""
+    return dataclasses.replace(pins, superseded_by=None, **over)
 
 
 def _open_other(vault, path):
@@ -99,8 +105,8 @@ def test_A5_a_superseded_v2_gets_no_holdout_key_even_with_a_forged_chain(tmp_pat
     _register(log_dir, v2)
     vault.publish(log_dir)
     frozen, inputs = _forged_v2_discovery(log_dir)
-    assert v2.SUPERSEDED_BY["version"] == "vs1-v4"  # the real pin
-    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
+    assert v2.SUPERSEDED_BY["version"] == "vs1-v5"  # the real pin
+    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
         v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=log_dir,
                         now=NOW, observed=_observed(inputs), witness=vault.witness())
     # even with a holdout_opened forged into the chain, the key is refused on the pin
@@ -109,17 +115,17 @@ def test_A5_a_superseded_v2_gets_no_holdout_key_even_with_a_forged_chain(tmp_pat
         log.append_locked([{"kind": "holdout_opened", "run_at": NOW.isoformat(),
                             "prereg_sha256": v2.PREREG_BODY_SHA256, "discovery_sha256": frozen["sha256"]}])
     vault.publish(log_dir)
-    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
         v2.resume_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=log_dir,
                           observed=_observed(inputs), witness=vault.witness())
 
 
 def test_A5_the_superseded_v1_holdout_steps_refuse_on_the_pin():
-    assert v1.SUPERSEDED_BY["version"] == "vs1-v4"
-    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
+    assert v1.SUPERSEDED_BY["version"] == "vs1-v5"
+    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
         v1.open_holdout({}, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=Path("unused"),
                         now=NOW, observed={})
-    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v5"):
         v1.resume_holdout({}, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=Path("unused"),
                           observed={}, witness=None)
 
@@ -141,9 +147,9 @@ V4_PATH = v1.canonical_witness_path("vs1-v4")
 
 def _v4(earlier):
     """A hypothetical v4 on the same Harness, witnessed at its canonical path (synthetic seed line)."""
-    pins = dataclasses.replace(v3.V3.pins, version="vs1-v4", number=4, registry_log="v4.jsonl",
-                               registry_anchors="v4.anchors.jsonl", registry_lock=".v4.lock",
-                               witness_path=V4_PATH, witness_ref="refs/vs1-v4-witness/main", earlier=earlier)
+    pins = _unpinned(v3.V3.pins, version="vs1-v4", number=4, registry_log="v4.jsonl",
+                     registry_anchors="v4.anchors.jsonl", registry_lock=".v4.lock",
+                     witness_path=V4_PATH, witness_ref="refs/vs1-v4-witness/main", earlier=earlier)
     return v2.Harness(pins)
 
 
@@ -167,7 +173,7 @@ def test_an_incomplete_earlier_list_is_refused_even_when_nothing_was_opened(tmp_
     vault = _vault(tmp_path / "vault")
     _register(tmp_path / "reg", v3)
     vault.publish(tmp_path / "reg")
-    sloppy = v2.Harness(dataclasses.replace(v3.V3.pins, earlier=(v2.V1_EARLIER,)))
+    sloppy = v2.Harness(_unpinned(v3.V3.pins, earlier=(v2.V1_EARLIER,)))
     witness = sloppy.check_offhost(vault.cache, remote_url=str(vault.remote))
     with pytest.raises(PermissionError, match="not every lower version"):
         sloppy.require_supersession(witness)
@@ -322,7 +328,7 @@ def test_R1_a_leading_zero_witness_path_is_unknown_and_cannot_pose_as_v3(tmp_pat
     census = v1.vs1_witness_census(vault.remote, "main")
     assert fake in census["unknown"] and census["by_path"][fake]["id"] is None
     assert census["files"]["vs1-v3"] == v3.WITNESS_PATH and fake not in census["files"].values()
-    disguised = v2.Harness(dataclasses.replace(
+    disguised = v2.Harness(_unpinned(
         v3.V3.pins, version="vs1-v4", number=3, registry_log="v4.jsonl", registry_anchors="v4.anchors.jsonl",
         registry_lock=".v4.lock", witness_path=fake, witness_ref="refs/vs1-v4-witness/main"))
     witness = disguised.check_offhost(vault.cache, remote_url=str(vault.remote))
@@ -334,8 +340,8 @@ def test_R1_a_registry_whose_witness_is_not_its_canonical_path_is_refused(tmp_pa
     vault = _vault(tmp_path / "vault")
     _register(tmp_path / "reg", v3)
     vault.publish(tmp_path / "reg")
-    elsewhere = v2.Harness(dataclasses.replace(v3.V3.pins, witness_path=v2.WITNESS_PATH,
-                                               registered_anchor_line=v2.REGISTERED_ANCHOR_LINE))
+    elsewhere = v2.Harness(_unpinned(v3.V3.pins, witness_path=v2.WITNESS_PATH,
+                                     registered_anchor_line=v2.REGISTERED_ANCHOR_LINE))
     witness = elsewhere.check_offhost(vault.cache, remote_url=str(vault.remote))
     with pytest.raises(PermissionError, match="canonical path"):
         elsewhere.require_supersession(witness)
