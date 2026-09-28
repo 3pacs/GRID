@@ -1,0 +1,15 @@
+# TEMPLATE — NOT INSTALLED. See grid-market-diary.service.template.
+# Weekday 22:30Z run, after the US close and after grid-causal-links
+# (07:40Z) / grid-analytics-snapshots (07:15Z) — no dependency between
+# them, just spread across the day.
+[Unit]
+Description=Run the GRID market diary writer once a weekday evening
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 22:30:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=grid-market-diary.service
+
+[Install]
+WantedBy=timers.target

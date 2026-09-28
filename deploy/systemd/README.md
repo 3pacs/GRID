@@ -124,6 +124,29 @@ otherwise). Installing the timer is the activation decision; the install
 commands are in the service template's header. Try it first with
 `python3 scripts/run_causal_links.py --dry-run --json`.
 
+## `grid-market-diary.service` / `.timer` (templates, not installed)
+
+Wave 3 slice W3.1's scheduled writer for `market_diary`
+(`scripts/run_market_diary.py` -> `intelligence/market_diary.py`). Each run
+writes one entry: rule-based market-move / active-actor sections, an LLM
+narrative over them, and a pre-open thesis verdict read from the last
+`thesis_snapshots` row before 13:30Z that day (never computed at write
+time — that was the look-ahead this slice fixed). The Market Diary view
+shows the result.
+
+**Before installing:** confirm the YF quarantine
+(`raw_series_quarantined_20260926`) has actually been run against
+`raw_series` on this host, then set `GRID_MARKET_DIARY_PRICES_ENABLED=true`
+in `/home/grid/grid_v4/grid_repo/.env`. Until that flag is set, the job
+still runs and still writes a diary entry (actors, pre-open thesis verdict,
+narrative) — it just reports every price-dependent field as unavailable
+instead of reading `raw_series`. Setting the flag does not bypass the
+per-series freshness check: every price read still requires the newest
+accepted observation to be dated exactly the target trading date, or that
+entry is reported "no close for date" rather than a stale value.
+
+Try it first with `python3 scripts/run_market_diary.py --dry-run --json`.
+
 ## `grid-analytics-snapshots` (service + timer) — NOT installed
 
 Daily run of `scripts/run_analytics_snapshots.py`, which refreshes the
