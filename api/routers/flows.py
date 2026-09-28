@@ -2079,14 +2079,15 @@ _money_map_cache: TTLCache = TTLCache(ttl=_MONEY_MAP_TTL, max_size=1)
 
 
 @router.get("/money-map")
-async def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
+def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     """Return the full global money flow map.
 
     Aggregates Fed balance sheet, banking credit, market prices, sector
     rotation, options positioning, dark pool signals, insider/congressional
     trades, and trust scorer convergence into a single hierarchical structure.
 
-    Cached for 15 minutes.
+    Cached for 15 minutes. Synchronous database work runs in FastAPI's worker
+    pool so a slow build cannot block the main request event loop.
     """
     cached = _money_map_cache.get("money_map")
     if cached is not None:
