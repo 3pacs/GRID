@@ -39,12 +39,13 @@ from __future__ import annotations
 import csv
 import glob
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date
 from datetime import datetime as _datetime
-from typing import Any
+from typing import Any, Callable, TypeVar
 
 import requests
 from loguru import logger as log
@@ -83,6 +84,88 @@ def _ensure_identity() -> None:
 
     set_identity(_EDGAR_IDENTITY)
     _identity_set = True
+
+
+# ── edgartools HTTP/2 deadlock guard ─────────────────────────────────────────
+#
+# edgartools's HTTP layer (httpxthrottlecache) auto-enables HTTP/2 whenever the
+# optional `h2` package happens to be importable -- no opt-in required
+# (httpxthrottlecache/httpxclientmanager.py: `HTTP2 = importlib.util.find_spec
+# ("h2") is not None`, used as the default for httpx_params["http2"]). That
+# HTTP/2 path deadlocked repeatedly in prod fetching 13F infotables:
+# faulthandler showed the main thread permanently blocked in
+# httpcore/_sync/http2.py:131 acquiring a stream-allocation lock that takes no
+# timeout of its own (pyrate_limiter's asyncio rate-limit bucket thread was
+# still alive, so it was not a process-wide hang -- just this one call, forever).
+#
+# edgartools's public `configure_http()` has no `http2` parameter, so there is
+# no supported way to ask for HTTP/1.1. We flip the same private knob
+# `configure_http()` itself mutates (`edgar.httpclient.HTTP_MGR.httpx_params`)
+# and recreate the client the same way it does when a setting changes.
+_http1_forced: bool = False
+
+
+def _ensure_http1_transport() -> None:
+    """Force edgartools's shared HTTP client onto HTTP/1.1, once per process.
+
+    HTTP/1.1 has no stream-multiplexing lock, so the httpcore deadlock class
+    described above cannot occur on this transport.
+    """
+    global _http1_forced
+    if _http1_forced:
+        return
+    from edgar import httpclient as _edgar_httpclient
+
+    _edgar_httpclient.HTTP_MGR.httpx_params["http2"] = False
+    if _edgar_httpclient.HTTP_MGR._client is not None:
+        _edgar_httpclient.HTTP_MGR._client.close()
+        _edgar_httpclient.HTTP_MGR._client = None
+    _http1_forced = True
+
+
+_T = TypeVar("_T")
+
+# Hard ceiling on the whole edgartools attempt (resolve + fetch + parse), not
+# just one HTTP request. Belt-and-suspenders alongside _ensure_http1_transport:
+# httpcore's lock.acquire() that deadlocked in prod takes no timeout of its
+# own, so no request-level timeout (edgartools's or httpx's default) can ever
+# catch it -- disabling HTTP/2 removes that specific lock, but nothing rules
+# out edgartools hanging some other way in the future, so every attempt is
+# still capped from the outside.
+_EDGARTOOLS_FETCH_TIMEOUT: float = 45.0
+
+
+def _call_with_timeout(fn: Callable[..., _T], *args: Any, timeout: float, **kwargs: Any) -> _T:
+    """Run ``fn(*args, **kwargs)`` with a hard wall-clock timeout.
+
+    A genuine deadlock (like the httpcore lock above) never raises, so
+    ``except Exception`` around a direct call cannot catch it -- there is
+    nothing to catch, the call just never returns. Running it on a daemon
+    thread and bounding it with ``Thread.join(timeout=)`` is the only way to
+    cap a call we cannot make well-behaved from the outside: on timeout we
+    raise ``TimeoutError`` (the caller treats this exactly like any other
+    edgartools failure) and abandon the thread. It is daemonic, so a thread
+    that stays stuck forever never blocks process exit.
+    """
+    result: list[_T] = []
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            error.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        name = getattr(fn, "__name__", repr(fn))
+        raise TimeoutError(f"{name} did not return within {timeout}s")
+    if error:
+        raise error[0]
+    return result[0]
+
 
 # ── Filer universe ────────────────────────────────────────────────────────────
 # Curated set of ~35 high-signal 13F filers. CIKs are the canonical SEC
@@ -482,6 +565,7 @@ def _fetch_infotable_edgartools(filing: LatestFiling) -> list[dict[str, Any]]:
     failure so the caller can fall back to the raw path.
     """
     _ensure_identity()
+    _ensure_http1_transport()
     from edgar import find
 
     resolved = find(filing.accession)
@@ -496,13 +580,18 @@ def fetch_infotable(cik: str, filing: LatestFiling) -> list[dict[str, Any]]:
     """Download and parse the infotable for a specific 13F filing.
 
     Primary path uses edgartools, which resolves the filing and parses the
-    structured positions table for us. If edgartools is unavailable or
-    errors (e.g. an API change or transient resolution failure), we fall
-    back to the raw-HTTP path in :func:`_fetch_infotable_raw`, so a live
-    pull never loses data over a library hiccup.
+    structured positions table for us. If edgartools is unavailable, errors
+    (e.g. an API change or transient resolution failure), or does not return
+    within ``_EDGARTOOLS_FETCH_TIMEOUT`` seconds (it deadlocked repeatedly in
+    prod on an httpcore HTTP/2 lock -- see ``_ensure_http1_transport`` /
+    ``_call_with_timeout``), we fall back to the raw-HTTP path in
+    :func:`_fetch_infotable_raw`, so a live pull never loses data or hangs
+    forever over a library hiccup.
     """
     try:
-        positions = _fetch_infotable_edgartools(filing)
+        positions = _call_with_timeout(
+            _fetch_infotable_edgartools, filing, timeout=_EDGARTOOLS_FETCH_TIMEOUT
+        )
         if positions:
             return positions
         log.debug(
