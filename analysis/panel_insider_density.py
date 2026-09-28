@@ -2144,7 +2144,7 @@ _WITNESS_TOKEN = object()
 SUPERSEDED_BY: dict | None = {
     "version": "vs1-v3",
     "prereg_sha256": "fa7eda1c70906720b36dd84d0bb8b65a53f7badc35cd05055e08d7a9b40c2e42",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",
 }
 OWN_VERSION_NUMBER = 1
 #: Witness files of every VS1 registry version on the pinned vault ``main``.

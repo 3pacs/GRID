@@ -21,7 +21,7 @@ Nothing here is a trading signal.
 from __future__ import annotations
 
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -66,16 +66,27 @@ REGISTRY_LOG = "granular_panel_prereg_v3.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v3.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v3.lock"
 
-REGISTERED_AT: datetime | None = None
-REGISTERED_CODE_SHA: str | None = None
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
+#: The one real v3 registration: registered once, locally, on 2026-09-28T01:05:51Z
+#: against code 061a097d, chain head c110b193... at 2 records. The original lives in
+#: the operator's ``Documents/Codex/2026-09-14/wha/outputs/vs1-v3-prereg-registry/``;
+#: the off-host witness decides which copy counts.
+REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 1, 5, 51, 160636, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA: str | None = "061a097d2664607bdebdb4e35805dc8b1c5265f5"
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "02f8a473314b3ad66288cd2c7a358690f522b1045e17d8582b25463cbf65c519",  # header
+    "c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",  # preregistration (head at 2)
+)
 REGISTERED_PREREG_SHA256 = PREREG_BODY_SHA256
 
 WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
 WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_v3.anchors.jsonl"
 WITNESS_REF = "refs/vs1-v3-witness/main"
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The first line every committed version of the v3 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T01:05:51.160636+00:00"}'
+)
 #: v3 is the current version.
 SUPERSEDED_BY: Mapping[str, Any] | None = None
 
