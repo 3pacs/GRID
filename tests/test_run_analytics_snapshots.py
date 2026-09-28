@@ -98,6 +98,103 @@ def test_orthogonality_excludes_stale_feature_and_reports_window(tmp_path, monke
     assert "snapshot_id" not in out                  # persist=False wrote nothing
 
 
+# ---------------------------------------------------------------------------
+# Orthogonality gets a bounded per-job statement_timeout (not the app-wide
+# default from db.py), scoped to just this step's own connections.
+# ---------------------------------------------------------------------------
+
+class _RecordingConn:
+    """Connection stub that records executed SQL and returns no rows."""
+
+    def __init__(self, log: list[str]) -> None:
+        self._log = log
+
+    def execute(self, stmt, params=None):
+        self._log.append(str(getattr(stmt, "text", stmt)))
+        res = MagicMock()
+        res.fetchall.return_value = []
+        return res
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class _RecordingEngine:
+    """Engine stub whose ``connect()`` yields a recording connection."""
+
+    def __init__(self) -> None:
+        self.sql_log: list[str] = []
+
+    def connect(self):
+        return _RecordingConn(self.sql_log)
+
+
+def test_scoped_timeout_engine_lifts_statement_timeout_first():
+    real = _RecordingEngine()
+    scoped = job._ScopedTimeoutEngine(real, "600s")
+
+    with scoped.connect() as conn:
+        conn.execute("SELECT 1")
+
+    assert real.sql_log == ["SET LOCAL statement_timeout = '600s'", "SELECT 1"]
+
+
+def test_scoped_timeout_engine_uses_set_local_not_global():
+    real = _RecordingEngine()
+    scoped = job._ScopedTimeoutEngine(real, "600s")
+    with scoped.connect():
+        pass
+    assert real.sql_log == ["SET LOCAL statement_timeout = '600s'"]
+    assert real.sql_log[0].strip().startswith("SET LOCAL "), (
+        "must be transaction-scoped SET LOCAL, never a bare global SET "
+        "that would change the default for every other caller on the conn"
+    )
+
+
+def test_scoped_timeout_engine_passes_through_other_attributes():
+    real = MagicMock()
+    real.dialect = "postgresql"
+    scoped = job._ScopedTimeoutEngine(real, "600s")
+    assert scoped.dialect == "postgresql"
+
+
+def test_orthogonality_step_uses_a_dedicated_scoped_engine(monkeypatch):
+    """Job.orthogonality() must not hand its own self.engine / self.pit
+    (shared with every other step) to OrthogonalityAudit -- it needs a
+    private _ScopedTimeoutEngine + PITStore pair so the timeout bump can
+    never leak into feature_engineering / clustering / etc."""
+    from store.pit import PITStore
+
+    captured: dict = {}
+
+    class _FakeAudit:
+        def __init__(self, db_engine, pit_store):
+            captured["db_engine"] = db_engine
+            captured["pit_store"] = pit_store
+
+        def run_full_audit(self, **kwargs):
+            return {"error": "stubbed, not under test"}
+
+    monkeypatch.setattr("discovery.orthogonality.OrthogonalityAudit", _FakeAudit)
+
+    shared_engine = MagicMock(name="shared_engine")
+    j = job.Job(shared_engine, AS_OF, dry_run=True, gate={"ok": None, "run_tag": None})
+    out = j.orthogonality()
+
+    assert out["status"] == "skipped"
+    scoped_engine = captured["db_engine"]
+    assert isinstance(scoped_engine, job._ScopedTimeoutEngine)
+    assert scoped_engine._engine is shared_engine
+    assert scoped_engine._timeout == job.ORTHOGONALITY_STATEMENT_TIMEOUT
+    # A fresh PITStore bound to the scoped engine, not the job's shared self.pit.
+    assert isinstance(captured["pit_store"], PITStore)
+    assert captured["pit_store"] is not j.pit
+    assert captured["pit_store"].engine is scoped_engine
+
+
 def _fast_clustering(monkeypatch):
     """Stub the expensive k-sweep and plot; the plumbing is under test here."""
     from discovery.clustering import ClusterDiscovery

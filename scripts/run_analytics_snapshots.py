@@ -94,6 +94,20 @@ FEATURE_INPUT_AGE_OVERRIDES = {"cpi_yoy": 75}
 OPTIONS_SCAN_MAX_AGE_DAYS = 4
 OPTIONS_TOP_N = 10
 
+# The orthogonality step's PIT query (get_feature_matrix -> get_pit) builds a
+# ~2,480-feature matrix through the retraction anti-join in store/pit.py.
+# That single statement hit the app-wide 120s default (db.py's
+# statement_timeout, set on every pooled connection) once in prod and
+# succeeded at 79s on retry -- it is legitimately heavier than the rest of
+# this job's queries, not a runaway. db.py documents the escape hatch for
+# exactly this ("Override per-call with `SET LOCAL statement_timeout = 0`
+# for jobs that legitimately need longer") and scripts/enrich_connections.py
+# is the established pattern: SET LOCAL as the first statement of the same
+# connection/transaction the heavy query runs in, so the bump is
+# transaction-scoped and never touches the shared engine default any other
+# step or caller gets.
+ORTHOGONALITY_STATEMENT_TIMEOUT = os.getenv("GRID_ANALYTICS_ORTHOGONALITY_STATEMENT_TIMEOUT", "600s")
+
 CLUSTER_COMPONENTS = 3
 MIN_SECTOR_FEATURES = 3
 # Name shapes that belong to one ticker in feature_registry (e.g. nvda_full,
@@ -300,6 +314,32 @@ def resolve_sector_feature_ids(engine: Any, names: list[str]) -> list[int]:
     return [int(r[0]) for r in rows]
 
 
+class _ScopedTimeoutEngine:
+    """Engine proxy that lifts ``statement_timeout`` only for connections
+    opened through THIS wrapper, leaving the shared engine (and every other
+    step's / caller's connections) on the app-wide default from db.py.
+
+    ``SET LOCAL`` is transaction-scoped, so it must be the first statement
+    executed on a connection to cover the query that follows in the same
+    connect()/with-block; it is discarded automatically when that connection
+    closes, so nothing needs to reset it afterwards. Any attribute other
+    than ``connect`` (e.g. ``.dialect``, ``.url``) passes through to the
+    real engine unchanged.
+    """
+
+    def __init__(self, engine: Any, timeout: str) -> None:
+        self._engine = engine
+        self._timeout = timeout
+
+    def connect(self) -> Any:
+        conn = self._engine.connect()
+        conn.execute(text(f"SET LOCAL statement_timeout = '{self._timeout}'"))
+        return conn
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._engine, name)
+
+
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
@@ -384,8 +424,15 @@ class Job:
 
     def orthogonality(self) -> dict[str, Any]:
         from discovery.orthogonality import OrthogonalityAudit
+        from store.pit import PITStore
 
-        audit = OrthogonalityAudit(db_engine=self.engine, pit_store=self.pit)
+        # Dedicated engine/PITStore bound to this step only (see
+        # ORTHOGONALITY_STATEMENT_TIMEOUT / _ScopedTimeoutEngine above) so
+        # the bounded higher timeout never leaks into self.engine /
+        # self.pit, which every other step in this job shares.
+        scoped_engine = _ScopedTimeoutEngine(self.engine, ORTHOGONALITY_STATEMENT_TIMEOUT)
+        scoped_pit = PITStore(scoped_engine)
+        audit = OrthogonalityAudit(db_engine=scoped_engine, pit_store=scoped_pit)
         summary = audit.run_full_audit(
             as_of_date=self.as_of,
             max_staleness_days=MAX_STALENESS_DAYS,
