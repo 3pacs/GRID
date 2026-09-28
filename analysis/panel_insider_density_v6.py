@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -141,11 +141,21 @@ WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = v1.canonical_witness_path("vs1-v6")
 WITNESS_REF = "refs/vs1-v6-witness/main"
 
-REGISTERED_AT: datetime | None = None
-REGISTERED_CODE_SHA: str | None = None
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
+#: The one v6 registration: registered once, locally, on 2026-09-28T05:03:48Z against code
+#: 25dcda41, chain head 3dfa6ee3... at 2 records. The original lives in the operator's
+#: ``Documents/Codex/2026-09-14/wha/outputs/vs1-v6-prereg-registry/``.
+REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 5, 3, 48, 895875, tzinfo=timezone.utc)
+REGISTERED_CODE_SHA: str | None = "25dcda410d8e769e698c54f4f4f38dfa2174d9a2"
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "a1e0455b910f6e5b4fd8bf7d8008b8b0b6d0590109c7c47c8af80031bb10edeb",  # header
+    "3dfa6ee30359205c84ba4fb3bdb0858eba13b6ed0c8aa0711d98fa6aade505e7",  # preregistration (head at 2)
+)
 REGISTERED_PREREG_SHA256 = PREREG_BODY_SHA256
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The first line every committed version of the v6 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"3dfa6ee30359205c84ba4fb3bdb0858eba13b6ed0c8aa0711d98fa6aade505e7",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T05:03:48.895875+00:00"}'
+)
 SUPERSEDED_BY: Mapping[str, Any] | None = None
 
 V3_EARLIER = v4.V3_EARLIER
