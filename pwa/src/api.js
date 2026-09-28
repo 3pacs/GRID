@@ -61,6 +61,7 @@ class GRIDApi {
         if (!path.startsWith('/api/v1/')) return false;
         if (
             path.startsWith('/api/v1/auth/')
+            || path.startsWith('/api/v1/gamma-watch/')
             || path.startsWith('/api/v1/realtime/')
             || path.startsWith('/api/v1/chat/')
             || path.startsWith('/api/v1/alerts')
