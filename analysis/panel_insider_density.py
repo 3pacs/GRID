@@ -1582,7 +1582,8 @@ class RunSpec:
             # refuses them rather than apply the wrong denominator.
             raise ValueError(
                 "only the VS1 sector runs here; the 10-sector run needs a joint "
-                "40-trial Holm (pre-registration section 13)"
+                "40-trial Holm (pre-registration section 13), and that plan is superseded by "
+                f"{SECTOR_PLAN_SUPERSEDED_BY['version']} (analysis.panel_insider_density_sectors_v2)"
             )
         if tuple(self.trials) != trial_names():
             raise ValueError("a run declares exactly the pre-registered trials")
@@ -2147,6 +2148,14 @@ SUPERSEDED_BY: dict | None = {
     "registry_head_sha256": "c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",
 }
 OWN_VERSION_NUMBER = 1
+#: v1 section 13's other-10-sector plan (carried into v2/v3 section 13) is superseded by the
+#: "sectors v2" pre-registration (all sectors on 5 sessions, SIC-expanded universes).
+SECTOR_PLAN_SUPERSEDED_BY: dict = {
+    "version": "vs1-sectors-v2",
+    "prereg_path": "docs/paper_log/vs1-sectors-v2-preregistration.md",
+    "prereg_sha256": "ed7cacb99cd010963dedfa842677784d0e7ffa95ec4534a2a005238a03a6815e",
+    "registry_head_sha256": None,
+}
 #: Witness files of every VS1 (Technology) registry version on the pinned vault ``main``.
 VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
 #: Witness files of the other-10-sector registries (``sectors-v2`` onward; v1's plan lived in v1's registry).
