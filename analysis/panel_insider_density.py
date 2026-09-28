@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -1581,7 +1582,8 @@ class RunSpec:
             # refuses them rather than apply the wrong denominator.
             raise ValueError(
                 "only the VS1 sector runs here; the 10-sector run needs a joint "
-                "40-trial Holm (pre-registration section 13)"
+                "40-trial Holm (pre-registration section 13), and that plan is superseded by "
+                f"{SECTOR_PLAN_SUPERSEDED_BY['version']} (analysis.panel_insider_density_sectors_v4)"
             )
         if tuple(self.trials) != trial_names():
             raise ValueError("a run declares exactly the pre-registered trials")
@@ -2137,6 +2139,124 @@ REGISTERED_ANCHOR_LINE = (
 )
 _WITNESS_TOKEN = object()
 
+#: VS1 v1 was superseded before any price read: v2 (SIC-expanded universe) and then
+#: v3 (primary trial A90|fwd5) were registered (docs/paper_log/
+#: vs1-insider-density-v3-preregistration.md). v1 can never open a discovery.
+SUPERSEDED_BY: dict | None = {
+    "version": "vs1-v6",
+    "prereg_sha256": "5a87d4a4130e184a8b9e53d7eec040a7b26b697a3ad07500aac6ef4b17d6a32d",
+    "registry_head_sha256": "3dfa6ee30359205c84ba4fb3bdb0858eba13b6ed0c8aa0711d98fa6aade505e7",
+}
+OWN_VERSION_NUMBER = 1
+#: v1 section 13's other-10-sector plan (carried into v2/v3 section 13) is superseded by the
+#: "sectors v4" pre-registration (all sectors on 5 sessions, SIC-expanded universes, gated on the
+#: VS1 v6 Technology run), which superseded "sectors v3" and "sectors v2" (neither ever opened).
+SECTOR_PLAN_SUPERSEDED_BY: dict = {
+    "version": "vs1-sectors-v4",
+    "prereg_path": "docs/paper_log/vs1-sectors-v4-preregistration.md",
+    "prereg_sha256": "e3f41ace1bfbfed12c82e16b3b438a62ba759bc1c54dfdf743fb8b2d27b4e712",
+    "registry_head_sha256": "0512baf5cbae66310130e7219d589e3d992c438dd2ea2ae612903b456da58f5f",
+}
+#: Witness files of every VS1 (Technology) registry version on the pinned vault ``main``.
+VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
+#: Witness files of the other-10-sector registries (``sectors-v2`` onward; v1's plan lived in v1's registry).
+SECTORS_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v(\d+)\.anchors\.jsonl$")
+
+
+WITNESS_DIR = "05-GRID/Paper-Log/vs1/"
+#: Non-witness files tolerated in the witness directory.
+WITNESS_DIR_ALLOWED = frozenset({"README.md", ".gitattributes"})
+
+
+def vs1_witness_census(repo: Path, tip: str) -> dict:
+    """Every VS1 registry witness on the pinned ``main`` at ``tip`` and the records each covers.
+
+    Keyed by exact path (review round 2, R1): ``by_path`` maps every
+    witness-like path to its registry id (None when unknown) and covered records.
+    ``files``/``records``: registry id (``vs1-v<n>`` for the Technology versions,
+    ``sectors-v<n>`` for the other-10-sector registries) -> canonical path /
+    records covered by its last anchor line (None when unreadable). Only the
+    canonical path of an id counts (:func:`canonical_witness_path`): a path with a
+    leading-zero or otherwise non-canonical number (``..._v03...``) is unknown.
+    ``unknown``: those, any other file in the witness directory (except
+    README.md, .gitattributes) and any ``*.anchors.jsonl`` whose path mentions
+    ``vs1`` anywhere else in the tree -- a witness under a name or path no
+    version knows.
+    """
+    files, unknown = {}, []
+    for path in _git(repo, "ls-tree", "-r", "--name-only", tip).splitlines():
+        path = path.strip()
+        match, sectors = VERSIONED_WITNESS.match(path), SECTORS_WITNESS.match(path)
+        key = (f"vs1-v{int(match.group(1))}" if match else
+               f"sectors-v{int(sectors.group(1))}" if sectors else None)
+        if key is not None and canonical_witness_path(key) == path:
+            files[key] = path
+        elif key is not None or (path.startswith(WITNESS_DIR) and path[len(WITNESS_DIR):] not in WITNESS_DIR_ALLOWED):
+            unknown.append(path)
+        elif "vs1" in path.lower() and path.lower().endswith(".anchors.jsonl"):
+            unknown.append(path)
+
+    def covered(path: str) -> int | None:
+        content = _git(repo, "show", f"{tip}:{path}", binary=True).replace(b"\r\n", b"\n")
+        lines = [line for line in content.split(b"\n") if line]
+        try:
+            value = json.loads(lines[-1])["records"] if lines else None
+        except (ValueError, KeyError, TypeError):
+            return None
+        return value if isinstance(value, int) else None
+
+    records = {key: covered(path) for key, path in files.items()}
+    by_path = {path: {"id": key, "records": records[key]} for key, path in files.items()}
+    for path in unknown:
+        by_path[path] = {"id": None, "records": covered(path) if path.endswith(".jsonl") else None}
+    return {"tip": tip, "files": dict(sorted(files.items())), "records": dict(sorted(records.items())),
+            "unknown": sorted(unknown), "by_path": dict(sorted(by_path.items()))}
+
+
+def canonical_witness_path(registry_id: str) -> str:
+    """The one path the witness of ``registry_id`` (``vs1-v<n>`` / ``sectors-v<n>``) may live at."""
+    family, _, number = registry_id.rpartition("-v")
+    if not number.isdigit() or str(int(number)) != number or family not in ("vs1", "sectors"):
+        raise ValueError(f"not a VS1 registry id: {registry_id!r}")
+    stem = "granular_panel_prereg_v" if family == "vs1" else "granular_panel_prereg_sectors_v"
+    return f"{WITNESS_DIR}{stem}{number}.anchors.jsonl"
+
+
+def witnessed_versions(repo: Path, tip: str) -> dict[int, str]:
+    """Version number -> witness path of every VS1 (Technology) registry witness present at ``tip``."""
+    return {int(k[len("vs1-v"):]): p for k, p in vs1_witness_census(repo, tip)["files"].items()
+            if k.startswith("vs1-v")}
+
+
+def refuse_superseded(own: int, superseded_by: Mapping[str, Any] | None, witness: Any = None) -> None:
+    """Refuse an opening of VS1 version ``own`` once any later version is registered.
+
+    The supersession pinned in this version's code always refuses (discovery and
+    holdout). When the fetched off-host witness is given (discovery openings),
+    a witness file of a later version on the pinned vault ``main``, or an
+    unknown VS1 witness file, refuses too -- so a checkout that predates the pin
+    is refused once it fetches the witness it needs for a price key.
+    """
+    if superseded_by:
+        raise PermissionError(
+            f"VS1 v{own} is superseded by {superseded_by.get('version')} (pinned in code): "
+            "it can never open a discovery or a holdout"
+        )
+    if witness is not None:
+        census = vs1_witness_census(witness.repo, witness.tip)
+        later = sorted(int(k[len("vs1-v"):]) for k in census["files"]
+                       if k.startswith("vs1-v") and int(k[len("vs1-v"):]) > own)
+        if later:
+            raise PermissionError(
+                f"a later VS1 registry (v{later[-1]}) is witnessed on the pinned {WITNESS_BRANCH}: "
+                f"v{own} can never open a discovery"
+            )
+        if census["unknown"]:
+            raise PermissionError(
+                f"unknown VS1 witness files on the pinned {WITNESS_BRANCH} ({census['unknown'][:5]}): "
+                "refused until an owner accounts for them"
+            )
+
 
 def _git(repo: Path, *argv: str, binary: bool = False):
     import subprocess
@@ -2413,6 +2533,7 @@ def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
     """
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         records = _chain(log, prereg_sha256)
@@ -2442,6 +2563,7 @@ def resume_discovery(log_dir: Path, observed: Mapping[str, Any], witness: Offhos
     equal to that discovery's ``inputs_frozen`` record, and the off-host anchor
     log covering the ``discovery_opened`` head (:func:`require_witness`).
     """
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY, witness)
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         records = _chain(log, prereg_sha256)
@@ -2522,6 +2644,7 @@ def open_holdout(
     log must witness the returned head before :func:`resume_holdout` issues
     the price key.
     """
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                     repo_root=repo_root)
     if now.tzinfo is None:
@@ -2555,6 +2678,7 @@ def resume_holdout(
     repo_root: Path = REPO,
 ) -> HoldoutKey:
     """One-shot holdout, step 2: the price key, only once the off-host log witnesses it."""
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
                                     repo_root=repo_root)
     log = registry(log_dir, prereg_sha256)
