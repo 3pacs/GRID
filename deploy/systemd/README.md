@@ -7,6 +7,8 @@ any code path, CI job or deploy workflow.
   `docs/planning/IDLE-FLEET-AGENT-LOOP.md`).
 * `grid-godview-{fed,cftc}.{service,timer}`: the god view pillar writers
   (materialization plan slice G7). See the section at the end.
+* `grid-hypothesis-forward-log.{service,timer}`: the S10 hypothesis-loop
+  forward log's daily run. See its section below.
 
 ## `grid-goal-worker@.service`
 
@@ -232,3 +234,59 @@ sudo systemctl start grid-godview-fed.service && journalctl -u grid-godview-fed.
 sudo systemctl enable --now grid-godview-fed.timer    # fed can go before cftc
 sudo systemctl enable --now grid-godview-cftc.timer
 ```
+
+## `grid-hypothesis-forward-log` (service + timer)
+
+Daily run of `scripts.research_forward_log run` (S10; see
+`analysis/research_forward_log.py` and
+`docs/paper_log/hypothesis-forward-v1-preregistration.md`). Runs from the
+deployed release `/data/grid_v4/grid_release` as `User=grid` with the repo
+`.env`, under `flock -n`. Opens a read-only, short-statement-timeout DB
+connection, reads only through the latest-vintage adapter
+(`store/observations.py`), appends due prediction/outcome/verdict records
+to the hash-chained, append-only JSONL log at
+`/data/grid/paper_log/hypothesis_forward_v1/` (a persistent path outside
+the per-commit release tree), and rewrites `STATUS.md`. No orders, no
+weights, no promotion — every record carries `promotion_allowed: false`.
+On an empty log (no admitted candidates yet) it writes only the header
+record.
+
+This unit supersedes the crontab + `git archive` install path proposed in
+`deploy/paper_log/hypothesis_forward_v1.sh` for grid-svr (that script is
+kept for reference / other hosts, but grid-svr's actual copy of the code
+already lives at `/data/grid_v4/grid_release`, so a separate per-commit
+archive under `/data/grid/paper_log/code/<sha>/` is unnecessary here).
+
+Schedule: 11:30 UTC daily (`OnCalendar`, `Persistent=true`), well clear of
+the nightly encrypted Postgres backup window (`grid-pg-backup.timer` fires
+03:30 UTC and recent runs have taken until roughly 10:05-10:30 UTC;
+`grid-analytics-snapshots.timer` was moved off 07:15 UTC for the same
+reason — see its `timer.d/override.conf` on grid-svr).
+
+### Verify before installing (read-only, no DB, writes nothing)
+
+```bash
+cd /data/grid_v4/grid_release
+PYTHONPATH=/data/grid_v4/grid_release /usr/bin/python3 -m scripts.research_forward_log status --log-dir /tmp/some-throwaway-dir
+```
+
+`status` and `verify` never open a database connection and never write to
+the log directory (`run` and `admit` are the only writing commands) — see
+the module's own docstring before running anything else by hand.
+
+### Install (owner decision)
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-hypothesis-forward-log.service.template \
+    /etc/systemd/system/grid-hypothesis-forward-log.service
+sudo install -m 0644 deploy/systemd/grid-hypothesis-forward-log.timer.template \
+    /etc/systemd/system/grid-hypothesis-forward-log.timer
+sudo systemctl daemon-reload
+sudo systemctl enable --now grid-hypothesis-forward-log.timer   # timer only — let the job fire on its own schedule, don't `systemctl start` the service by hand
+systemctl list-timers grid-hypothesis-forward-log.timer
+```
+
+Stop / roll back: `sudo systemctl disable --now grid-hypothesis-forward-log.timer`.
+Never delete `/data/grid/paper_log/hypothesis_forward_v1/hypothesis_forward_v1.jsonl`
+— it is the permanent, append-only research record; archive it first if
+v1 is ever abandoned (see the pre-registration's Integrity section).
