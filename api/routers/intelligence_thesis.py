@@ -20,6 +20,29 @@ from utils.ttl_cache import TTLCache
 router = APIRouter(tags=["intelligence"])
 
 
+def _postmortems_as_of(postmortems: list[dict[str, Any]]) -> dict[str, Any]:
+    """Honest freshness label for a list of thesis postmortems.
+
+    Item #16 (Wave 3 triage report): thesis scoring/postmortems are held
+    (``intelligence.thesis_tracker.THESIS_SCORING_HELD``) because of a
+    look-ahead bug, and nothing has scored a new outcome since 2026-04-17
+    in practice. Callers must never present this list as live — every
+    response using it carries ``as_of`` (the newest ``generated_at`` in the
+    data, or ``None`` if there is none) plus a `note` explaining why.
+    """
+    newest = max((pm.get("generated_at") for pm in postmortems if pm.get("generated_at")), default=None)
+    return {
+        "as_of": newest,
+        "note": (
+            f"most recent postmortem generated {newest}; scoring is held "
+            "(look-ahead bug, item #16) — this is a frozen historical "
+            "record, not a live feed"
+            if newest else
+            "no postmortems on record; scoring is held (look-ahead bug, item #16)"
+        ),
+    }
+
+
 # ── Unified Thesis Endpoint ───────────────────────────────────────────────
 
 _THESIS_CACHE_TTL = 600  # 10 minutes
@@ -179,6 +202,7 @@ async def get_thesis_postmortems_endpoint(
             "count": len(postmortems),
             "root_cause_counts": root_cause_counts,
             "days": days,
+            **_postmortems_as_of(postmortems),
         }
     except Exception as exc:
         log.warning("Thesis postmortems failed: {e}", e=str(exc))
@@ -299,8 +323,11 @@ async def get_research_archive(
     try:
         from intelligence.thesis_tracker import load_thesis_postmortems
         pms = load_thesis_postmortems(engine, days=days)
+        as_of = _postmortems_as_of(pms)
         archive["postmortems"] = pms
         archive["postmortem_count"] = len(pms)
+        archive["postmortem_as_of"] = as_of["as_of"]
+        archive["postmortem_note"] = as_of["note"]
     except Exception as exc:
         archive["postmortems"] = []
         archive["postmortem_count"] = 0

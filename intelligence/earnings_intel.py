@@ -97,11 +97,32 @@ def _ensure_tables(engine: Engine) -> None:
 
 # ── 1. Earnings Calendar ────────────────────────────────────────────────
 
+PREDICTION_SCORECARD_FROZEN_SINCE = "2026-04-06"
+PREDICTION_SCORECARD_FROZEN_NOTE = (
+    "run_earnings_cycle has not scored/predicted since "
+    f"{PREDICTION_SCORECARD_FROZEN_SINCE}; the cycle is unscheduled and "
+    "confidence = clamp(net/3, 0.1, 0.9) is a tuned constant, not a "
+    "calibrated probability (Wave 3 triage report item #15). Treat "
+    "'prediction'/confidence fields here as a frozen, unmaintained "
+    "artifact — the calendar fields above them (eps_estimate, iv_rank, "
+    "etc.) are fresh and unaffected."
+)
+
+
 def get_earnings_calendar(engine: Engine, days_ahead: int = 30) -> list[dict]:
     """Upcoming earnings for watchlist tickers.
 
     Returns enriched calendar entries with IV data, historical surprise
     patterns, and any pre-existing predictions.
+
+    The calendar fields themselves (ticker/date/eps_estimate/iv_rank/...)
+    are fresh, but the optional ``prediction`` sub-object on each entry is
+    NOT: it comes from ``earnings_predictions``, which nothing has scored
+    or generated since ``PREDICTION_SCORECARD_FROZEN_SINCE`` — see
+    ``PREDICTION_SCORECARD_FROZEN_NOTE`` and the Wave 3 triage report item
+    #15. Every entry that carries a ``prediction`` also carries
+    ``prediction["frozen_since"]``/``prediction["note"]`` so callers never
+    have to infer that from silence.
 
     Args:
         engine: SQLAlchemy engine.
@@ -145,6 +166,8 @@ def get_earnings_calendar(engine: Engine, days_ahead: int = 30) -> list[dict]:
                 "move_pct": r[7],
                 "confidence": r[8],
                 "verdict": r[9],
+                "frozen_since": PREDICTION_SCORECARD_FROZEN_SINCE,
+                "note": PREDICTION_SCORECARD_FROZEN_NOTE,
             }
 
         # Enrich with IV data
@@ -545,6 +568,8 @@ def get_prediction_scorecard(engine: Engine) -> dict[str, Any]:
         "per_direction": per_direction,
         "calibration": calibration_data,
         "recent": recent_list,
+        "frozen_since": PREDICTION_SCORECARD_FROZEN_SINCE,
+        "note": PREDICTION_SCORECARD_FROZEN_NOTE,
     }
 
 

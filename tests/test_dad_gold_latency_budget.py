@@ -304,38 +304,33 @@ def test_stale_marking_does_not_mutate_the_cached_row(monkeypatch):
 
 
 def test_stale_flag_reflects_actual_row_age_not_the_query_window():
-    """A stale-tier query (wide max_age_seconds) landing on an actually-fresh row must not be mislabeled stale."""
+    """A stale-tier query (wide max_age_seconds) landing on an actually-fresh
+    in-memory entry must not be mislabeled stale.
+
+    Item #22 (Wave 3 triage report) removed `_read_summary_cache`'s DB
+    fallback SELECT (dead read -- nothing on main writes
+    `dad_ticker_summary_cache`); this now exercises the same
+    actual-age-vs-query-window property against the in-memory
+    `_GOLD_MEMORY_CACHE` the function still reads.
+    """
     from datetime import datetime, timedelta, timezone
+    from pathlib import Path
+    from unittest.mock import MagicMock
 
+    db_path = Path("/tmp/does-not-exist.duckdb")
+    key = ("FRESHROW", dad.DAD_CACHE_VERSION, *dad._research_db_fingerprint(db_path))
     very_recent = datetime.now(timezone.utc) - timedelta(seconds=5)
-
-    class _FakeConn:
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *exc):
-            return False
-
-        def execute(self, statement, params=None):
-            class _Result:
-                def fetchone(self_inner):
-                    if "SELECT payload" not in str(statement):
-                        return None
-                    return ('{"ticker": "FRESHROW"}', very_recent, "{}")
-
-            return _Result()
-
-    class _FakeEngine:
-        def begin(self):
-            return _FakeConn()
-
-        def connect(self):
-            return _FakeConn()
-
-    result = dad._read_summary_cache(
-        _FakeEngine(), "FRESHROW", __import__("pathlib").Path("/tmp/does-not-exist.duckdb"),
-        max_age_seconds=dad.GOLD_STALE_MAX_AGE_SECONDS,  # the wide stale-tier window
-    )
+    with dad._GOLD_MEMORY_CACHE_LOCK:
+        dad._GOLD_MEMORY_CACHE.clear()
+        dad._GOLD_MEMORY_CACHE[key] = (very_recent, {"ticker": "FRESHROW"})
+    try:
+        result = dad._read_summary_cache(
+            MagicMock(), "FRESHROW", db_path,
+            max_age_seconds=dad.GOLD_STALE_MAX_AGE_SECONDS,  # the wide stale-tier window
+        )
+    finally:
+        with dad._GOLD_MEMORY_CACHE_LOCK:
+            dad._GOLD_MEMORY_CACHE.clear()
 
     assert result is not None
     assert result["cache"]["stale"] is False  # the row itself is only 5s old
@@ -413,42 +408,25 @@ def test_inflight_key_distinguishes_refresh_finviz(monkeypatch):
 #     interval into the SQL string) -----------------------------------------
 
 
-def test_read_summary_cache_binds_max_age_as_a_parameter():
-    """max_age_seconds must be a bound param via make_interval, never string-interpolated."""
-    executed = []
+def test_read_summary_cache_never_queries_the_engine():
+    """Item #22 (Wave 3 triage report): `_read_summary_cache`'s DB fallback
+    SELECT (previously bound `max_age_seconds` via make_interval against
+    `dad_ticker_summary_cache`) was removed as a dead read -- nothing on
+    main writes that table. The function must not touch the engine at all
+    any more; see tests/test_dad_summary_cache_no_db_fallback.py for the
+    full in-memory-only behavior coverage."""
+    from unittest.mock import MagicMock
 
-    class _FakeConn:
-        def __enter__(self):
-            return self
+    engine = MagicMock()
 
-        def __exit__(self, *exc):
-            return False
+    result = dad._read_summary_cache(
+        engine, "AAPL", __import__("pathlib").Path("/tmp/does-not-exist.duckdb"),
+        max_age_seconds=999,
+    )
 
-        def execute(self, statement, params=None):
-            executed.append((str(statement), params))
-
-            class _Result:
-                def fetchone(self_inner):
-                    return None
-
-            return _Result()
-
-    class _FakeEngine:
-        def begin(self):
-            return _FakeConn()
-
-        def connect(self):
-            return _FakeConn()
-
-    dad._read_summary_cache(_FakeEngine(), "AAPL", __import__("pathlib").Path("/tmp/does-not-exist.duckdb"),
-                             max_age_seconds=999)
-
-    select_calls = [(sql, params) for sql, params in executed if "SELECT payload" in sql]
-    assert len(select_calls) == 1, executed
-    sql, params = select_calls[0]
-    assert "make_interval" in sql
-    assert "999" not in sql
-    assert params["max_age_seconds"] == 999
+    assert result is None
+    engine.connect.assert_not_called()
+    engine.begin.assert_not_called()
 
 
 # --- bounding background work across *different* tickers --------------------

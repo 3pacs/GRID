@@ -219,6 +219,14 @@ async def get_recurring_patterns(
 # ── Pattern Engine Endpoints ─────────────────────────────────────────────
 
 
+_PATTERN_ACTIONABLE_NOTE = (
+    "'actionable' is a threshold on in-sample hit_rate/avg_return_after and a "
+    "hand-weighted confidence heuristic (item #23, Wave 3 triage report) -- "
+    "the pattern miner has no out-of-sample holdout. Treat it as a filter "
+    "hint, not a validated trading signal."
+)
+
+
 @router.get("/patterns")
 async def get_discovered_patterns(
     min_occurrences: int = Query(3, ge=2, le=50, description="Minimum pattern occurrences"),
@@ -230,6 +238,14 @@ async def get_discovered_patterns(
     Scans historical event sequences across all watchlist tickers to find
     recurring 2-, 3-, and 4-event sequences.  Only returns patterns with a
     hit rate above 50%.  Sorted by confidence x actionable return.
+
+    Read-only (``persist=False``): this GET used to upsert its findings into
+    ``event_patterns`` on every call (item #23, Wave 3 triage report --
+    write-on-GET), matching the same bug class already fixed elsewhere via
+    ``persist=False`` (see ``intelligence_forensics.py``'s ``/causation`` GET
+    and 865194dd's fix to ``GET /flows/briefing``). Persisting mined
+    patterns is not currently wired to any endpoint or schedule -- see the
+    triage report for the standing hold on this noise-generator class.
     """
     try:
         from intelligence.pattern_engine import discover_patterns
@@ -239,11 +255,13 @@ async def get_discovered_patterns(
             engine,
             min_occurrences=min_occurrences,
             max_sequence_length=max_sequence_length,
+            persist=False,
         )
         return {
             "patterns": [p.to_dict() for p in patterns],
             "count": len(patterns),
             "actionable_count": sum(1 for p in patterns if p.actionable),
+            "actionable_note": _PATTERN_ACTIONABLE_NOTE,
             "min_occurrences": min_occurrences,
             "max_sequence_length": max_sequence_length,
         }

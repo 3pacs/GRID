@@ -56,7 +56,11 @@ def test_gold_get_absent_schema_legacy_hit_and_live_refresh_are_read_only():
             assert not any("CREATE TABLE" in sql for sql in statements)
             assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE")) for sql in statements)
 
-            # Legacy persisted cache rows remain readable without schema bootstrap.
+            # dad_ticker_summary_cache (item #22, Wave 3 triage report): the
+            # DB fallback SELECT was removed as a dead read -- nothing on
+            # main writes that table, so a cache miss now stays a miss
+            # rather than falling through to a legacy row. A row existing
+            # in the table must NOT be surfaced as a cache hit any more.
             dad._GOLD_MEMORY_CACHE.clear()
             with engine.begin() as conn:
                 conn.execute(text("""CREATE TABLE dad_ticker_summary_cache (
@@ -72,9 +76,17 @@ def test_gold_get_absent_schema_legacy_hit_and_live_refresh_are_read_only():
                         "ticker": "MSFT", "status": "ready", "gold": {"score": 77}, "performance": {},
                     })})
             statements.clear()
-            hit = dad.get_dad_ticker_gold("MSFT", refresh_finviz=False, _token="test")
-            assert hit["cache"]["hit"] is True
-            assert hit["gold"]["score"] == 77
+            with patch.object(dad, "_load_workbook_context", return_value={
+                "status": "ready", "summary": {"mentions": 0, "file_count": 0, "sheet_count": 0},
+                "workbook": {"files": [], "sheets": [], "evidence": []},
+                "source_lanes": [], "dad_stats": [], "fit_signals": [],
+                "source": {"attached": True, "db_path": "synthetic"},
+            }):
+                miss = dad.get_dad_ticker_gold("MSFT", refresh_finviz=False, _token="test")
+            assert miss["cache"]["hit"] is False
+            assert not any(
+                "DAD_TICKER_SUMMARY_CACHE" in sql for sql in statements
+            ), "the dead DB fallback read must not run"
             assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE")) for sql in statements)
 
             # Explicit refresh uses provider data immediately, without persisting raw rows.

@@ -333,7 +333,18 @@ def catalyst_timeline(
 
             for r in ms_rows:
                 event_date = str(r[3] or r[4] or r[15])
-                status = r[13] or "PENDING"
+                target_date = r[3]
+                raw_status = r[13] or "PENDING"
+                # Wave 3 triage report item #14: 3,282 of these rows are
+                # PENDING with a target_date already in the past (never
+                # resolved by any writer). Rendering them as plain
+                # "PENDING" implies they are still on track; call out that
+                # they are stale instead.
+                status = (
+                    "unresolved"
+                    if raw_status == "PENDING" and target_date is not None and target_date < today
+                    else raw_status
+                )
                 events.append({
                     "id": f"ms-{r[0]}",
                     "type": "milestone",
@@ -341,17 +352,26 @@ def catalyst_timeline(
                     "date": event_date,
                     "label": r[2] or r[1],
                     "status": status,
+                    "raw_status": raw_status,
                     "target_value": r[5],
                     "target_unit": r[6],
                     "actual_value": r[7],
                     "achievement_pct": r[8],
-                    "probability": r[9],
+                    # `company_milestones` was a one-shot seed
+                    # (scripts/populate_milestones.py, 2026-04-11, 5,673
+                    # rows) that defaulted probability to 0.5 / a
+                    # direction→probability map and value_impact_pct to
+                    # `r[7] or 0.25` when the source row had nothing —
+                    # i.e. these are fabricated placeholders, not scored
+                    # estimates, and the table has had no maintaining
+                    # writer since. Hide them rather than render fake
+                    # confidence; see `unscored`/`seeded_note` below.
+                    "probability": None,
                     "confidence_source": r[10],
-                    # `is not None`, not truthiness: a stored 0.0 impact is a
-                    # measurement, a NULL is unknown. `x if x else None`
-                    # silently turned the former into the latter.
-                    "value_impact_ps": float(r[11]) if r[11] is not None else None,
-                    "value_impact_pct": float(r[12]) if r[12] is not None else None,
+                    "value_impact_ps": None,
+                    "value_impact_pct": None,
+                    "unscored": True,
+                    "seeded_note": "seeded 2026-04-11, unmaintained",
                     "notes": r[14],
                     "invalidation": _milestone_invalidation(r[1], r[5], r[6], status),
                 })
@@ -511,6 +531,8 @@ def _milestone_invalidation(ms_type: str, target_val, target_unit, status: str) 
     """Generate a human-readable invalidation condition for a milestone."""
     if status in ("ACHIEVED", "MISSED", "CANCELLED"):
         return f"Already resolved: {status}"
+    if status == "unresolved":
+        return "Target date passed with no resolution recorded — unmaintained data, not still pending"
 
     type_map = {
         "EARNINGS_GUIDANCE": "Misses guidance by >10% or withdraws forecast",

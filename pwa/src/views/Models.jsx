@@ -108,6 +108,18 @@ export default function Models() {
 
     const stateOrder = ['PRODUCTION', 'STAGING', 'SHADOW', 'CANDIDATE', 'FLAGGED', 'RETIRED'];
 
+    // Wave 3 triage report item #19: the PRODUCTION row(s) in this registry
+    // can be an autoresearch-lineage artifact (created via
+    // POST /models/from-hypothesis after a PASSED hypothesis validation —
+    // `hypothesis_id` is set only on that path) rather than an actively
+    // maintained model. Surface that honestly per production model instead
+    // of silently treating every PRODUCTION row as current. This mirrors
+    // the stale/empty-state banner pattern in TickerLookup.jsx / Physics.jsx
+    // / AssociationsLegacy.jsx (PR #692).
+    const autoresearchProdModels = ['REGIME', 'TACTICAL', 'EXECUTION']
+        .map(layer => productionModels?.[layer])
+        .filter(m => m && m.hypothesis_id != null);
+
     return (
         <div style={styles.container}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
@@ -121,9 +133,26 @@ export default function Models() {
                 <ErrorState error={error} onRetry={loadModels} title="Model registry unavailable" />
             ) : (
             <>
+            {autoresearchProdModels.length > 0 && (
+                <div style={{
+                    fontSize: '11px', color: '#C8A83A',
+                    background: '#8A600022', border: '1px solid #8A600055',
+                    borderRadius: '8px', padding: '10px 14px', marginBottom: '14px',
+                    lineHeight: 1.5, fontFamily: "'JetBrains Mono', monospace",
+                }} data-testid="models-autoresearch-banner">
+                    {autoresearchProdModels.map(m => (
+                        <div key={m.id}>
+                            The PRODUCTION model "{m.name}" (created {(m.created_at || '').substring(0, 10) || 'unknown date'})
+                            {' '}is an autoresearch-lineage artifact (from a PASSED hypothesis), not an actively
+                            maintained model — treat it as such. It also gates TradingAgents journal writes.
+                        </div>
+                    ))}
+                </div>
+            )}
             <div style={styles.prodCards}>
                 {['REGIME', 'TACTICAL', 'EXECUTION'].map(layer => {
                     const model = productionModels?.[layer];
+                    const isAutoresearch = model && model.hypothesis_id != null;
                     return (
                         <div key={layer} style={styles.prodCard}>
                             <div style={styles.layerLabel}>{layer}</div>
@@ -133,6 +162,11 @@ export default function Models() {
                             {model && (
                                 <div style={{ fontSize: '10px', color: '#5A7080', marginTop: '2px' }}>
                                     v{model.version}
+                                </div>
+                            )}
+                            {isAutoresearch && (
+                                <div style={{ fontSize: '9px', color: '#C8A83A', marginTop: '4px' }}>
+                                    autoresearch artifact
                                 </div>
                             )}
                         </div>

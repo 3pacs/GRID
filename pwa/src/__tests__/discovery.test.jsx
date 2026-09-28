@@ -17,6 +17,7 @@ vi.mock('../api.js', () => ({
         getJobs: vi.fn(),
         getResults: vi.fn(),
         getHypotheses: vi.fn(),
+        getHypothesisResults: vi.fn(),
         triggerOrthogonality: vi.fn(),
         triggerClustering: vi.fn(),
         // ResearchRunPanel (GRID W4c) calls the generic GET helper directly —
@@ -51,8 +52,37 @@ describe('Discovery view async data', () => {
         api.getHypotheses.mockReset();
         api.getHypotheses.mockResolvedValue({ hypotheses: [] });
         api.getResults.mockResolvedValue(null);
+        api.getHypothesisResults.mockReset();
+        api.getHypothesisResults.mockResolvedValue({
+            results: [], count: 0, research_lane_off: true, note: 'research lane off',
+        });
         api.get.mockReset();
         api.get.mockResolvedValue({ status: 'no_runs' });
+    });
+
+    // Item #20 (Wave 3 triage report): hypothesis_registry/validation_results
+    // are noise-generator output with no ledger/FDR/holdout — a PASSED
+    // verdict or a correlation number must never render as a validated
+    // finding, and there must be no "promote to feature" action driven by it.
+    it('shows the honest "research lane off" state instead of per-hypothesis PASSED/correlation findings', async () => {
+        api.getJobs.mockResolvedValue({ jobs: [] });
+        api.getHypothesisResults.mockResolvedValue({
+            results: [
+                { id: 1, statement: 'X leads Y', state: 'PASSED', correlation: 0.91, r_squared: 0.8 },
+            ],
+            count: 2040,
+            research_lane_off: true,
+            note: 'research lane off',
+        });
+
+        render(<Discovery />);
+
+        expect(await screen.findByText('RESEARCH LANE OFF')).toBeInTheDocument();
+        expect(screen.getByText(/2040 tested hypotheses on record/)).toBeInTheDocument();
+        expect(screen.queryByText(/Strong relationship confirmed/)).not.toBeInTheDocument();
+        expect(screen.queryByText('Promote to Feature')).not.toBeInTheDocument();
+        expect(screen.queryByText(/r=\+0\.910/)).not.toBeInTheDocument();
+        expect(screen.queryByText('X leads Y')).not.toBeInTheDocument();
     });
 
     it('shows a loading skeleton while fetching, then renders the jobs list', async () => {

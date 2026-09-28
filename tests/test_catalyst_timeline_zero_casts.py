@@ -2,19 +2,25 @@
 
 ``api/routers/valuation.py::catalyst_timeline`` serialised measurement columns
 with ``float(x) if x else None``. That test is truthiness, and ``0.0`` is
-falsy, so a milestone whose value impact was measured at exactly zero, or a
-scored prediction whose actual move was 0.0%, reached the PWA as ``null`` —
-indistinguishable from "never measured". The casts for the five measurement
-fields now use ``is not None``:
+falsy, so a scored prediction whose actual move was 0.0% reached the PWA as
+``null`` — indistinguishable from "never measured". The casts for these
+measurement fields now use ``is not None``:
 
-  milestones:   value_impact_ps, value_impact_pct
   predictions:  expected_move_pct, actual_price, actual_move_pct
 
 ``target_price`` / ``entry_price`` are deliberately NOT changed here: a zero
 entry price has its own contract (``oracle/entry_price_policy.py`` on the
 confidence-policy branch, not yet on main) and is settled before any division
-rather than reported as a plain 0.0. ``confidence`` is likewise out of scope —
-it is the handoff patch ``handoff/catalyst-timeline-unscored``.
+rather than reported as a plain 0.0. ``confidence`` is likewise out of scope.
+
+Milestone ``value_impact_ps``/``value_impact_pct`` (and ``probability``) are
+now unconditionally hidden regardless of what the DB row holds — see
+``TestMilestoneValueImpactCasts`` below. ``company_milestones`` was a
+one-shot seed (``scripts/populate_milestones.py``, 2026-04-11) whose
+``value_impact_pct``/``probability`` were fabricated defaults, not scores
+(Wave 3 triage report item #14); the route now ships ``unscored: True`` and
+a ``seeded_note`` instead of a fake number, so the zero-vs-null distinction
+those fields used to need no longer applies to them.
 
 The route is exercised through the FastAPI app with the engine mocked, so the
 pin is on the JSON the PWA actually receives.
@@ -112,14 +118,19 @@ def _events(ticker: str = "ACME") -> dict[str, dict]:
 
 
 class TestMilestoneValueImpactCasts:
+    """Item #14: value_impact_ps/value_impact_pct/probability are hidden for
+    EVERY milestone row now, regardless of the stored value — they were
+    fabricated defaults from the 2026-04-11 seed, not scores. ``unscored``
+    and ``seeded_note`` replace them."""
+
     @patch("api.routers.valuation.get_db_engine")
-    def test_zero_impact_ships_as_zero(self, mock_db):
+    def test_zero_impact_is_hidden_not_shipped_as_zero(self, mock_db):
         _wire_db(mock_db, ms_rows=[_milestone_row(1, value_impact_ps=0.0, value_impact_pct=0.0)])
         ev = _events()["ms-1"]
-        assert ev["value_impact_ps"] == 0.0
-        assert ev["value_impact_ps"] is not None
-        assert ev["value_impact_pct"] == 0.0
-        assert ev["value_impact_pct"] is not None
+        assert ev["value_impact_ps"] is None
+        assert ev["value_impact_pct"] is None
+        assert ev["unscored"] is True
+        assert "unmaintained" in ev["seeded_note"]
 
     @patch("api.routers.valuation.get_db_engine")
     def test_null_impact_ships_as_null(self, mock_db):
@@ -129,11 +140,30 @@ class TestMilestoneValueImpactCasts:
         assert ev["value_impact_pct"] is None
 
     @patch("api.routers.valuation.get_db_engine")
-    def test_nonzero_impact_unchanged(self, mock_db):
+    def test_nonzero_impact_is_also_hidden(self, mock_db):
         _wire_db(mock_db, ms_rows=[_milestone_row(3, value_impact_ps=1.25, value_impact_pct=0.05)])
         ev = _events()["ms-3"]
-        assert ev["value_impact_ps"] == pytest.approx(1.25)
-        assert ev["value_impact_pct"] == pytest.approx(0.05)
+        assert ev["value_impact_ps"] is None
+        assert ev["value_impact_pct"] is None
+        assert ev["probability"] is None
+
+    @patch("api.routers.valuation.get_db_engine")
+    def test_pending_row_past_target_date_renders_unresolved(self, mock_db):
+        past_row = list(_milestone_row(4, value_impact_ps=None, value_impact_pct=None))
+        past_row[3] = _today() - timedelta(days=5)  # target_date in the past
+        past_row[13] = "PENDING"  # status
+        _wire_db(mock_db, ms_rows=[tuple(past_row)])
+        ev = _events()["ms-4"]
+        assert ev["status"] == "unresolved"
+        assert ev["raw_status"] == "PENDING"
+        assert "unmaintained" in ev["invalidation"]
+
+    @patch("api.routers.valuation.get_db_engine")
+    def test_pending_row_with_future_target_date_stays_pending(self, mock_db):
+        _wire_db(mock_db, ms_rows=[_milestone_row(5, value_impact_ps=None, value_impact_pct=None)])
+        ev = _events()["ms-5"]
+        assert ev["status"] == "PENDING"
+        assert ev["raw_status"] == "PENDING"
 
 
 # ── oracle predictions ─────────────────────────────────────────────────────

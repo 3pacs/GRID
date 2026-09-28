@@ -173,124 +173,48 @@ export function ResearchRunPanel() {
     );
 }
 
+// Item #20 (Wave 3 triage report): hypothesis_registry/validation_results
+// are noise-generator output (41,521 rows, 2,040 "PASSED", no trial
+// ledger, FDR correction or holdout — autoresearch is paused and Hermes
+// hypothesis scoring/discovery/review are held). This must never render a
+// PASSED verdict or a correlation/Sharpe number as a validated finding, or
+// offer to act on one (the previous version showed "Strong relationship
+// confirmed — consider promoting to feature" and a Promote button driven
+// purely by |correlation| > 0.4). Show the honest "research lane off"
+// state instead — count only, no per-hypothesis metrics, no promote action.
 function TestedHypotheses() {
-    const { addNotification } = useStore();
-    const [results, setResults] = useState([]);
-    const [verdictFilter, setVerdictFilter] = useState('');
+    const [summary, setSummary] = useState(null);
     const [loaded, setLoaded] = useState(false);
 
-    useEffect(() => { loadResults(); }, [verdictFilter]);
+    useEffect(() => {
+        (async () => {
+            try {
+                const data = await api.getHypothesisResults({});
+                setSummary({ count: data.count || 0, note: data.note || null });
+            } catch { /* fallback: no results endpoint yet */ }
+            setLoaded(true);
+        })();
+    }, []);
 
-    const loadResults = async () => {
-        try {
-            const params = {};
-            if (verdictFilter) params.verdict = verdictFilter;
-            const data = await api.getHypothesisResults(params);
-            setResults(data.results || []);
-        } catch { /* fallback: no results endpoint yet */ }
-        setLoaded(true);
-    };
-
-    if (!loaded || results.length === 0) return null;
-
-    const verdicts = ['', 'PASSED', 'FAILED', 'TESTING'];
+    if (!loaded || !summary) return null;
 
     return (
         <div style={{ marginBottom: tokens.space.xl }}>
             <div style={shared.sectionTitle}>TESTED HYPOTHESES</div>
-            <div style={{ display: 'flex', gap: '4px', marginBottom: tokens.space.md, overflowX: 'auto' }}>
-                {verdicts.map(v => {
-                    const isActive = verdictFilter === v;
-                    const sc = v ? (hypoStateColors[v] || hypoStateColors.KILLED) : null;
-                    return (
-                        <button key={v || 'ALL'} onClick={() => setVerdictFilter(v)}
-                            style={{
-                                padding: '6px 12px', borderRadius: tokens.radius.sm,
-                                border: `1px solid ${isActive ? (sc?.color || colors.accent) : colors.border}`,
-                                background: isActive ? (sc?.bg || colors.accentGlow) : 'transparent',
-                                color: isActive ? (sc?.color || colors.accent) : colors.textMuted,
-                                fontSize: tokens.fontSize.sm, cursor: 'pointer', whiteSpace: 'nowrap',
-                                fontFamily: "'JetBrains Mono', monospace",
-                            }}>
-                            {v || 'ALL'}
-                        </button>
-                    );
-                })}
+            <div style={{
+                ...shared.card, borderLeft: `3px solid ${colors.textMuted}`,
+                color: colors.textMuted, fontSize: tokens.fontSize.sm, lineHeight: 1.6,
+            }}>
+                <div style={{ fontWeight: 700, marginBottom: '4px', color: colors.text }}>
+                    RESEARCH LANE OFF
+                </div>
+                <div>
+                    {summary.count} tested hypotheses on record, but autoresearch is paused and
+                    Hermes hypothesis scoring/discovery/review are held. There is no trial ledger,
+                    FDR correction or out-of-sample holdout behind any PASSED verdict — none of
+                    these are validated findings, and this view will not act on them.
+                </div>
             </div>
-            {results.map((h, i) => {
-                const sc = hypoStateColors[h.state] || hypoStateColors.KILLED;
-                const corrColor = h.correlation != null
-                    ? (Math.abs(h.correlation) > 0.5 ? colors.green : colors.textMuted)
-                    : colors.textMuted;
-                return (
-                    <div key={h.id || i} style={{ ...shared.card, minHeight: '52px' }}>
-                        <div style={{
-                            fontSize: tokens.fontSize.md, color: colors.text,
-                            marginBottom: '6px', lineHeight: '1.4',
-                        }}>
-                            {h.statement}
-                        </div>
-                        <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center', flexWrap: 'wrap' }}>
-                            <span style={{
-                                fontSize: tokens.fontSize.xs, fontWeight: 600,
-                                padding: '3px 10px', borderRadius: tokens.radius.sm,
-                                fontFamily: "'JetBrains Mono', monospace",
-                                background: sc.bg, color: sc.color,
-                            }}>{h.state}</span>
-                            {h.correlation != null && (
-                                <span style={{
-                                    fontSize: tokens.fontSize.xs, color: corrColor,
-                                    fontFamily: "'JetBrains Mono', monospace",
-                                }}>r={h.correlation >= 0 ? '+' : ''}{h.correlation.toFixed(3)}</span>
-                            )}
-                            {h.optimal_lag != null && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    lag {h.optimal_lag}d
-                                </span>
-                            )}
-                            {h.r_squared != null && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    R²={h.r_squared.toFixed(3)}
-                                </span>
-                            )}
-                            {h.layer && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    {h.layer}
-                                </span>
-                            )}
-                        </div>
-                        {/* Interpretation */}
-                        {h.correlation != null && (
-                            <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '4px' }}>
-                                {Math.abs(h.correlation) > 0.7
-                                    ? 'Strong relationship confirmed — consider promoting to feature'
-                                    : Math.abs(h.correlation) > 0.4
-                                    ? 'Moderate relationship — may be conditionally useful'
-                                    : 'Weak relationship — likely noise'}
-                            </div>
-                        )}
-                        {h.state === 'PASSED' && h.correlation != null && Math.abs(h.correlation) > 0.4 && (
-                            <button onClick={async (e) => {
-                                e.stopPropagation();
-                                try {
-                                    const result = await api.promoteHypothesis(h.id);
-                                    addNotification('success', `Promoted: ${result.feature_name}`);
-                                    loadResults();
-                                } catch (err) {
-                                    addNotification('error', err.message || 'Promote failed');
-                                }
-                            }} style={{
-                                marginTop: '6px', background: colors.accent + '20',
-                                border: `1px solid ${colors.accent}40`, borderRadius: '4px',
-                                padding: '4px 10px', fontSize: '10px', color: colors.accent,
-                                cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
-                            }}>
-                                Promote to Feature
-                            </button>
-                        )}
-                    </div>
-                );
-            })}
         </div>
     );
 }
@@ -530,6 +454,10 @@ export default function Discovery({ focusHypothesis = '' }) {
 
             <div style={{ marginBottom: tokens.space.xl }}>
                 <div style={shared.sectionTitle}>HYPOTHESES</div>
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textDim, marginBottom: tokens.space.sm }}>
+                    Raw registry browse — research lane off (see above); state badges reflect
+                    registry rows only, not validated findings.
+                </div>
                 <div style={{
                     ...shared.tabs, marginBottom: tokens.space.md,
                 }}>

@@ -32,6 +32,26 @@ router = APIRouter(prefix="/api/v1/discovery", tags=["discovery"])
 # job (scripts/run_analytics_snapshots.py) uses.
 DISCOVERY_MAX_STALENESS_DAYS = 10
 
+# Wave 3 triage report item #20. hypothesis_registry/validation_results are
+# noise-generator output (autoresearch + Hermes hypothesis_discovery/
+# hypothesis_review, both paused/held — see intelligence.hypothesis_engine.
+# ACTIVE_HYPOTHESIS_SCORING_HELD and scripts.hermes_operator.
+# DAILY_INTEL_HOLD_REASONS): 41,521 rows, 2,040 "PASSED" with no trial
+# ledger, FDR correction or holdout. A PASSED verdict here is NOT a
+# validated finding — it is an unfiltered hypothesis scan result. Every
+# response that surfaces hypothesis_registry rows carries this note so a
+# caller (or the PWA) never has to infer that from silence. This does NOT
+# apply to /results/orthogonality or /results/clustering (PR #691's
+# on-demand, staleness-guarded jobs), which are a different, still-in-scope
+# feature.
+RESEARCH_LANE_OFF_NOTE = (
+    "research lane off — hypothesis_registry/validation_results are "
+    "noise-generator output (autoresearch paused, Hermes hypothesis "
+    "scoring/discovery/review held) with no trial ledger, FDR correction "
+    "or out-of-sample holdout. A PASSED verdict or a correlation/Sharpe "
+    "figure here is not a validated finding."
+)
+
 # In-memory job tracking (guarded by lock for thread safety)
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -369,7 +389,12 @@ def get_hypothesis_results(
             "tested_at": d.get("run_timestamp"),
         })
 
-    return {"results": results, "count": len(results)}
+    return {
+        "results": results,
+        "count": len(results),
+        "research_lane_off": True,
+        "note": RESEARCH_LANE_OFF_NOTE,
+    }
 
 
 @router.get("/hypotheses")
@@ -400,7 +425,11 @@ def get_hypotheses(
                 d[key] = str(d[key])
         hypotheses.append(d)
 
-    return {"hypotheses": hypotheses}
+    return {
+        "hypotheses": hypotheses,
+        "research_lane_off": True,
+        "note": RESEARCH_LANE_OFF_NOTE,
+    }
 
 
 @router.get("/backtest-results")
