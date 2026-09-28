@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from datetime import date
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -270,3 +271,110 @@ class TestWatchlistGetsHaveNoDDL:
         assert "_cache_price_to_db" not in inspect.getsource(watchlist_core.list_watchlist_enriched)
         # The explicit POST writer keeps its init path.
         assert "_init_table()" in inspect.getsource(watchlist_core.refresh_watchlist_prices)
+
+
+# ── intelligence/regime ───────────────────────────────────────────────────
+
+
+class TestRegimeReadOnly:
+    """``/regime`` and ``/regime/analogs`` used to write-on-GET via
+    ``cache_state_vector`` (Wave 3 W3.2). Both routes now call
+    ``get_or_compute_state_vector(..., persist=False)``; this pins that
+    neither route ever persists, regardless of what the state vector looks
+    like, and that a thin vector is reported as unavailable rather than
+    served as if it were good.
+    """
+
+    def test_get_regime_never_persists_and_reports_cached_flag(self):
+        from api.routers import intelligence_regime as ir
+        from intelligence.regime import state_vector as sv_mod
+
+        full = sv_mod.StateVector(
+            as_of_date=date(2026, 9, 27), values=tuple([0.5] * len(sv_mod.DIM_NAMES)),
+            completeness=1.0, stale_dimensions=(), price_basis="YF:SPY:close",
+        )
+        fake_regime = MagicMock()
+        fake_regime.to_dict.return_value = {"composite_label": "TEST"}
+
+        with patch.object(ir, "get_db_engine", return_value=MagicMock()), \
+             patch.object(sv_mod, "compute_state_vector", return_value=full), \
+             patch.object(sv_mod, "_read_cached_row", return_value=None), \
+             patch.object(sv_mod, "_ensure_cache_table") as ensure, \
+             patch.object(sv_mod, "cache_state_vector") as cache_spy, \
+             patch("intelligence.regime.classifier.classify_regime", return_value=fake_regime):
+            body = asyncio.run(ir.get_regime(_token="t"))
+
+        assert body["available"] is True
+        assert body["cached"] is False
+        assert body["regime"] == {"composite_label": "TEST"}
+        cache_spy.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_get_regime_below_floor_reports_unavailable_not_partial(self):
+        from api.routers import intelligence_regime as ir
+        from intelligence.regime import state_vector as sv_mod
+
+        thin = sv_mod.StateVector(
+            as_of_date=date(2026, 9, 27), values=tuple([None] * len(sv_mod.DIM_NAMES)),
+            completeness=0.1, stale_dimensions=(),
+        )
+        with patch.object(ir, "get_db_engine", return_value=MagicMock()), \
+             patch.object(sv_mod, "compute_state_vector", return_value=thin), \
+             patch.object(sv_mod, "_read_cached_row", return_value=None), \
+             patch.object(sv_mod, "cache_state_vector") as cache_spy:
+            body = asyncio.run(ir.get_regime(_token="t"))
+
+        assert body["available"] is False
+        assert "reason" in body and "state_vector" not in body
+        cache_spy.assert_not_called()
+
+    def test_get_regime_analogs_never_persists(self):
+        from api.routers import intelligence_regime as ir
+        from intelligence.regime import state_vector as sv_mod
+
+        full = sv_mod.StateVector(
+            as_of_date=date(2026, 9, 27), values=tuple([0.5] * len(sv_mod.DIM_NAMES)),
+            completeness=1.0, stale_dimensions=(),
+        )
+        fake_regime = MagicMock()
+        fake_regime.to_dict.return_value = {"composite_label": "TEST"}
+        fake_matches = MagicMock()
+        fake_matches.to_dict.return_value = {"episodes": []}
+        fake_forecast = MagicMock()
+        fake_forecast.to_dict.return_value = {}
+
+        with patch.object(ir, "get_db_engine", return_value=MagicMock()), \
+             patch.object(sv_mod, "compute_state_vector", return_value=full), \
+             patch.object(sv_mod, "_read_cached_row", return_value=None), \
+             patch.object(sv_mod, "_ensure_cache_table") as ensure, \
+             patch.object(sv_mod, "cache_state_vector") as cache_spy, \
+             patch("intelligence.regime.classifier.classify_regime", return_value=fake_regime), \
+             patch("intelligence.regime.episode_matcher.find_analogous_episodes", return_value=fake_matches), \
+             patch("intelligence.regime.forecast.generate_conditional_forecast", return_value=fake_forecast):
+            body = asyncio.run(
+                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+            )
+
+        assert body["available"] is True
+        cache_spy.assert_not_called()
+        ensure.assert_not_called()
+
+    def test_get_regime_analogs_below_floor_reports_unavailable(self):
+        from api.routers import intelligence_regime as ir
+        from intelligence.regime import state_vector as sv_mod
+
+        thin = sv_mod.StateVector(
+            as_of_date=date(2026, 9, 27), values=tuple([None] * len(sv_mod.DIM_NAMES)),
+            completeness=0.1, stale_dimensions=(),
+        )
+        with patch.object(ir, "get_db_engine", return_value=MagicMock()), \
+             patch.object(sv_mod, "compute_state_vector", return_value=thin), \
+             patch.object(sv_mod, "_read_cached_row", return_value=None), \
+             patch.object(sv_mod, "cache_state_vector") as cache_spy:
+            body = asyncio.run(
+                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+            )
+
+        assert body["available"] is False
+        assert "reason" in body
+        cache_spy.assert_not_called()

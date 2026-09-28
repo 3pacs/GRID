@@ -214,6 +214,67 @@ Stop / roll back: `sudo systemctl disable --now grid-analytics-snapshots.timer`.
 Rows it wrote are ordinary `analytical_snapshots` rows (identifiable by
 `payload->'provenance'->>'job' = 'run_analytics_snapshots'`).
 
+## `grid-regime-state-vectors` (service + timer) — NOT installed
+
+Wave 3 W3.2's scheduled writer for `regime_state_vectors`
+(`scripts/run_regime_state_vectors.py` -> `intelligence.regime.state_vector`).
+It is the *only* writer of that table: the `/regime` and `/regime/analogs`
+GET routes (`api/routers/intelligence_regime.py`) call
+`get_or_compute_state_vector(..., persist=False)` and never write, computing
+a vector in memory (`cached: false`) when nothing is cached for the
+requested date instead of caching a possibly-partial or same-day one. Each
+run computes and persists **only the prior completed trading session's**
+vector (`resolve_target_date()`: `last_trading_day(today - 1 day)`, so it
+can never pick up today's still-open or just-closed session regardless of
+what time it runs), and only if the vector clears
+`intelligence.regime.state_vector.MIN_CACHE_COMPLETENESS` (0.4).
+
+Readers go through `store.observations.read_window` (SUCCESS-only,
+vintage-collapsed, PIT) instead of raw `raw_series` queries, and the SPY
+momentum/RSI dimensions prefer the resolved `spy_full` feature (via
+`alpha_research.realized_alpha.resolve_spy_feature` + `store.pit.PITStore`)
+over the raw `YF:SPY:close` series when it's available — the vector's
+`price_basis` field records which one was actually used, and is `null` when
+neither had data (an honest "unavailable", not a silent stale read).
+
+Schedule: weekdays 23:00Z (`OnCalendar=Mon..Fri`, `Persistent=true`),
+comfortably after the US market close.
+
+**Deliberately excluded from this PR:** rebuilding the 1,927 existing
+`regime_state_vectors` rows (computed 2026-05-08, before the YF quarantine)
+through `compute_state_vector_series` into a scratch table and diffing/
+swapping them in — per the Wave 3 triage report, "any history rebuild is a
+data write that needs a separate GO" from the operator. Those rows are
+untouched; only new rows (from the prior session onward, once this timer is
+installed) use the PIT readers.
+
+Try it first, read-only:
+
+```bash
+cd /data/grid_v4/grid_release && set -a && . /home/grid/grid_v4/grid_repo/.env && set +a
+python3 scripts/run_regime_state_vectors.py --dry-run --json      # compute, write nothing
+python3 scripts/run_regime_state_vectors.py --as-of 2026-09-24 --dry-run --json  # backfill preview
+```
+
+### Install (owner decision — not done by the PR)
+
+```bash
+sudo install -m 0644 deploy/systemd/grid-regime-state-vectors.service.template \
+    /etc/systemd/system/grid-regime-state-vectors.service
+sudo install -m 0644 deploy/systemd/grid-regime-state-vectors.timer.template \
+    /etc/systemd/system/grid-regime-state-vectors.timer
+sudo systemctl daemon-reload
+sudo systemctl start grid-regime-state-vectors.service   # one real run first
+journalctl -u grid-regime-state-vectors.service -n 50 --no-pager
+sudo systemctl enable --now grid-regime-state-vectors.timer
+```
+
+Stop / roll back: `sudo systemctl disable --now grid-regime-state-vectors.timer`.
+Rows it wrote are ordinary `regime_state_vectors` rows; there is no
+provenance column to filter on (the table predates that convention), but
+new rows carry a `price_basis` key inside the `vector` JSONB blob that the
+2026-05-08 backfill's rows never had.
+
 ## `grid-godview-fed` / `grid-godview-cftc` (god view writers)
 
 Oneshot services plus weekly timers that run

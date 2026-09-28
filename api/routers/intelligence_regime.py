@@ -17,18 +17,39 @@ router = APIRouter(prefix="/api/v1/intelligence", tags=["intelligence", "regime"
 async def get_regime(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Current regime classification and state vector."""
+    """Current regime classification and state vector.
+
+    Read-only: never persists a state vector. If today's vector is already
+    cached (written by the nightly job, ``scripts/run_regime_state_vectors.py``),
+    it is served (``cached: true``). Otherwise it is computed in memory for
+    this response only (``cached: false``) and discarded — this route must
+    never write ``regime_state_vectors``.
+    """
     try:
-        from intelligence.regime.state_vector import get_or_compute_state_vector
+        from intelligence.regime.state_vector import MIN_CACHE_COMPLETENESS, get_or_compute_state_vector
         from intelligence.regime.classifier import classify_regime
 
         engine = get_db_engine()
-        sv = get_or_compute_state_vector(engine)
+        sv = get_or_compute_state_vector(engine, persist=False)
+
+        if sv.completeness < MIN_CACHE_COMPLETENESS:
+            return {
+                "available": False,
+                "reason": (
+                    f"state vector for {sv.as_of_date.isoformat()} is only "
+                    f"{sv.completeness:.0%} complete (need >= {MIN_CACHE_COMPLETENESS:.0%})"
+                ),
+                "as_of_date": sv.as_of_date.isoformat(),
+                "cached": sv.cached,
+            }
+
         regime = classify_regime(sv)
 
         return {
+            "available": True,
             "state_vector": sv.to_dict(),
             "regime": regime.to_dict(),
+            "cached": sv.cached,
         }
     except Exception as exc:
         log.warning("Regime classification failed: {e}", e=str(exc))
@@ -47,23 +68,43 @@ async def get_regime_analogs(
     Optionally includes TimesFM foundation model forecast for side-by-side
     comparison. The analog forecast is the primary signal; TimesFM is a
     second opinion from a different methodology.
+
+    Read-only: never persists a state vector (see ``get_regime``'s docstring
+    for the same contract). If the query vector's completeness is below the
+    analog threshold, returns ``available: false`` with a reason instead of
+    matching against a partial/misleading vector.
     """
     try:
-        from intelligence.regime.state_vector import get_or_compute_state_vector
+        from intelligence.regime.state_vector import MIN_CACHE_COMPLETENESS, get_or_compute_state_vector
         from intelligence.regime.episode_matcher import find_analogous_episodes
         from intelligence.regime.forecast import generate_conditional_forecast
         from intelligence.regime.classifier import classify_regime
 
         engine = get_db_engine()
-        sv = get_or_compute_state_vector(engine)
+        sv = get_or_compute_state_vector(engine, persist=False)
+
+        if sv.completeness < MIN_CACHE_COMPLETENESS:
+            return {
+                "available": False,
+                "reason": (
+                    f"state vector for {sv.as_of_date.isoformat()} is only "
+                    f"{sv.completeness:.0%} complete (need >= {MIN_CACHE_COMPLETENESS:.0%}) "
+                    "— too thin to match against historical episodes"
+                ),
+                "as_of_date": sv.as_of_date.isoformat(),
+                "cached": sv.cached,
+            }
+
         regime = classify_regime(sv)
         matches = find_analogous_episodes(engine, sv, n=n, min_quality=min_quality)
         forecast = generate_conditional_forecast(engine, matches)
 
         result: dict[str, Any] = {
+            "available": True,
             "regime": regime.to_dict(),
             "matches": matches.to_dict(),
             "forecast": forecast.to_dict(),
+            "cached": sv.cached,
         }
 
         # TimesFM comparison (non-blocking — failure doesn't break the response)

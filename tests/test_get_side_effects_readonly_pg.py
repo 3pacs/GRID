@@ -226,3 +226,56 @@ def test_watchlist_gets_are_select_only_and_missing_table_is_503():
         assert enriched.status_code == 200
         assert preload.status_code == 200
         _assert_select_only(statements)
+
+
+def _seed_observations_tables(engine) -> None:
+    """Empty ``source_catalog``/``raw_series`` — enough for
+    ``store.observations.read_window`` (and the regime state-vector
+    dimension reads built on it) to run and return no rows, rather than
+    erroring on a missing table."""
+    with engine.begin() as conn:
+        conn.execute(text("""
+            CREATE TABLE source_catalog (
+                id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE raw_series (
+                series_id TEXT NOT NULL,
+                source_id BIGINT NOT NULL REFERENCES source_catalog(id),
+                obs_date DATE NOT NULL,
+                pull_timestamp TIMESTAMPTZ NOT NULL,
+                value DOUBLE PRECISION,
+                pull_status TEXT NOT NULL
+            )
+        """))
+
+
+def test_regime_gets_are_select_only():
+    """``/regime`` and ``/regime/analogs`` used to write-on-GET via
+    ``cache_state_vector`` (Wave 3 W3.2, PR #713). Both now call
+    ``get_or_compute_state_vector(..., persist=False)``; this is the
+    real-Postgres proof that neither route issues a write, and that
+    ``regime_state_vectors`` — the table the old code created and filled
+    on every GET — is never created."""
+    from api.routers import intelligence_regime as ir
+
+    with _schema() as engine:
+        _seed_observations_tables(engine)
+        with _recording(engine) as statements, \
+             patch.object(ir, "get_db_engine", return_value=engine):
+            regime_body = asyncio.run(ir.get_regime(_token="t"))
+            analogs_body = asyncio.run(
+                ir.get_regime_analogs(n=20, min_quality=0.4, include_timesfm=False, _token="t")
+            )
+
+        # Empty raw_series -> every dimension is missing -> below the
+        # completeness floor -> both routes report "available: false"
+        # rather than computing/serving a partial vector.
+        assert regime_body["available"] is False
+        assert "reason" in regime_body
+        assert analogs_body["available"] is False
+        assert "reason" in analogs_body
+
+        _assert_select_only(statements)
+        assert _regclass(engine, "regime_state_vectors") is None
