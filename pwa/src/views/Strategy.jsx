@@ -55,8 +55,12 @@ function StrategyCard({ strategy }) {
                             {strategy.posture}
                         </span>
                         {strategy.source === 'default' && (
-                            <span style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '3px',
-                                background: '#5A708022', color: '#5A7080' }}>DEFAULT</span>
+                            <span
+                                title="Default — no explicit strategy has been assigned for this regime yet"
+                                style={{ fontSize: '9px', padding: '1px 5px', borderRadius: '3px',
+                                    background: '#5A708022', color: '#5A7080' }}>
+                                DEFAULT (unassigned)
+                            </span>
                         )}
                     </div>
                 </div>

@@ -219,6 +219,11 @@ def test_watchlist_batch_fetch_passes_auto_adjust_false():
     assert mock_dl.call_count == 1
     assert mock_dl.call_args.kwargs["auto_adjust"] is False
     assert result["AAPL"]["price"] == pytest.approx(182.0)
+    # Wave 3 #11 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md): every quote
+    # from this path is unlabelled live yfinance data -- callers/UI need the
+    # source and the per-ticker fetch time to render it honestly.
+    assert result["AAPL"]["source"] == "yfinance"
+    assert result["AAPL"]["updated_at"]
 
 
 def test_watchlist_live_price_history_fallback_passes_auto_adjust_false():

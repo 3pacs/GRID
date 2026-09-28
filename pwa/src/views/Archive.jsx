@@ -2,6 +2,18 @@ import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { formatRelative, formatFullDateTime } from '../utils/formatTime.js';
+
+// Deep dives, audio briefings, etc. only ever run when a human clicks a
+// button (see GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md — there is no
+// schedule behind any of them). Label every timestamp as "generated on
+// request" so this archive never implies a live/scheduled feed.
+function onRequestLabel(generatedAt, extra) {
+    if (!generatedAt) return extra ? `generated on request — ${extra}` : 'generated on request';
+    const when = formatFullDateTime(new Date(generatedAt));
+    const rel = formatRelative(new Date(generatedAt));
+    const base = `generated on request ${when} (${rel})`;
+    return extra ? `${base} — ${extra}` : base;
+}
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
@@ -77,12 +89,12 @@ function ExpandableCard({ title, subtitle, badges, children, defaultOpen = false
 }
 
 function DeepDiveList({ dives }) {
-    if (!dives?.length) return <Empty msg="No deep dives yet. They auto-generate with each thesis." />;
+    if (!dives?.length) return <Empty msg="No deep dives yet. Generated on request only — click 'Run Deep Dive' above." />;
     return dives.map(d => (
         <ExpandableCard
             key={d.id}
             title={`Deep Dive #${d.id} — ${d.thesis_direction || 'N/A'}`}
-            subtitle={`${formatRelative(new Date(d.generated_at))} via ${d.model_used} (${d.provider_used})`}
+            subtitle={onRequestLabel(d.generated_at, `${d.model_used} (${d.provider_used})`)}
             badges={<>
                 <Badge text={d.thesis_direction || '?'} color={DIR_COLOR[d.thesis_direction]} />
                 <Badge text={`${d.duration_ms}ms`} color={colors.textMuted} />
@@ -147,7 +159,8 @@ function AudioList({ briefings, onPlay }) {
                     {b.has_script && <span style={{ marginLeft: '8px', color: colors.green }}>transcript saved</span>}
                 </div>
             </div>
-            <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
+            <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}
+                title={onRequestLabel(b.generated_at, b.provider)}>
                 {formatRelative(new Date(b.generated_at))}
             </div>
         </div>

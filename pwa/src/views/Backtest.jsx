@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from 'react';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
+import { formatFullDateTime } from '../utils/formatTime.js';
 
 const REGIME_COLORS = {
     GROWTH: '#22C55E', NEUTRAL: '#F59E0B', FRAGILE: '#F97316', CRISIS: '#EF4444',
@@ -214,6 +215,19 @@ export default function Backtest() {
                     {/* Performance Metrics */}
                     {summary && (
                         <>
+                            {(summary.note || summary.generated_at) && (
+                                <div style={{
+                                    ...shared.card, borderLeft: `3px solid ${colors.yellow || '#F59E0B'}`,
+                                    fontSize: '11px', color: colors.textMuted, padding: '10px 12px',
+                                }}>
+                                    {summary.note || 'Pitch backtest — in-sample regime mapping, not an out-of-sample result.'}
+                                    {summary.generated_at && (
+                                        <span style={{ display: 'block', marginTop: '4px', color: colors.textDim, fontFamily: colors.mono }}>
+                                            {`Generated on request: ${formatFullDateTime(new Date(summary.generated_at))}`}
+                                        </span>
+                                    )}
+                                </div>
+                            )}
                             <div style={{ ...shared.sectionTitle }}>GRID Performance</div>
                             <div style={shared.metricGrid}>
                                 <MetricCard label="Total Return" value={`${((gm.cumulative_return || 0) * 100).toFixed(1)}%`}

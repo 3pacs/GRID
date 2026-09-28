@@ -8,7 +8,7 @@ import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
 import DashboardFlows from '../components/DashboardFlows.jsx';
 import LessonsWidget from '../components/LessonsWidget.jsx';
-import { formatUtcClock } from '../utils/formatTime.js';
+import { formatUtcClock, formatRelative } from '../utils/formatTime.js';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -117,6 +117,9 @@ function AudioBriefingPlayer({ onNavigate }) {
     const [playing, setPlaying] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [briefingError, setBriefingError] = useState(null);
+    // Text-only result (no audio_path) — GRID_ALLOW_PAID_LLM is not set, so
+    // there is no paid TTS provider. See audio_briefing.py's audio_note.
+    const [textBriefing, setTextBriefing] = useState(null);
     const audioRef = React.useRef(null);
     const audioUrlRef = React.useRef(null);
 
@@ -164,13 +167,23 @@ function AudioBriefingPlayer({ onNavigate }) {
     const generateNew = async () => {
         setGenerating(true);
         setBriefingError(null);
+        setTextBriefing(null);
         try {
             const r = await api.generateFlowBriefing(true);
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
                 const filename = r.briefing.audio_path.split('/').pop();
                 replaceAudioUrl(null);
                 setAudioFile(filename);
-                setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
+                setBriefingMeta({
+                    briefing_date: r.briefing.briefing_date, size_bytes: 0,
+                    generated_at: r.briefing.generated_at, provider: r.briefing.provider,
+                });
+            } else if (r?.status === 'SUCCESS' && r.briefing?.script_text) {
+                // On-demand, text-only: no paid TTS provider is enabled
+                // (GRID_ALLOW_PAID_LLM unset), so the local-LLM script is the
+                // whole result. See audio_briefing.py's "text-only via local
+                // LLM" fix (Wave 3 #5) — never invent audio that wasn't made.
+                setTextBriefing(r.briefing);
             } else {
                 // Backend returns {error, status:'FAILED'} on failure (e.g. paid
                 // generation disabled) — prefer that honest message over the
@@ -191,12 +204,13 @@ function AudioBriefingPlayer({ onNavigate }) {
             borderRadius: tokens.radius.md, padding: pad,
         }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                     <span style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
                         letterSpacing: '1.5px', color: colors.textMuted }}>AUDIO BRIEFING</span>
                     {briefingMeta && (
                         <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
                             {briefingMeta.briefing_date}
+                            {briefingMeta.provider && ` · ${briefingMeta.provider}`}
                         </span>
                     )}
                 </div>
@@ -211,9 +225,13 @@ function AudioBriefingPlayer({ onNavigate }) {
                             border: `1px solid ${generating ? colors.border : colors.accent}40`,
                             color: generating ? colors.textDim : colors.accent,
                             cursor: generating ? 'wait' : 'pointer' }}>
-                        {generating ? 'Generating...' : 'New'}
+                        {generating ? 'Generating...' : 'Generate on request'}
                     </button>
                 </div>
+            </div>
+            <div style={{ fontFamily: SANS, fontSize: '11px', color: colors.textDim, marginBottom: '8px' }}>
+                {'On-demand only — no schedule behind this button. Script text comes from a ' +
+                    'local LLM; audio needs a paid TTS provider (off by default).'}
             </div>
             {briefingError && (
                 <div style={{
@@ -232,6 +250,20 @@ function AudioBriefingPlayer({ onNavigate }) {
                 }} role="status" aria-live="polite">
                     <AlertTriangle size={13} color={colors.red} style={{ flexShrink: 0, marginTop: '2px' }} />
                     <span style={{ minWidth: 0, flex: 1 }}>{briefingError}</span>
+                </div>
+            )}
+            {textBriefing && (
+                <div data-testid="text-briefing" style={{
+                    padding: '10px 12px', borderRadius: '8px', marginBottom: '10px',
+                    background: colors.bg, border: `1px solid ${colors.border}`,
+                }}>
+                    <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim, marginBottom: '6px' }}>
+                        {`Generated on request (${textBriefing.provider || 'local'}) \u2014 text only, no audio`}
+                    </div>
+                    <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.text, lineHeight: 1.6,
+                        whiteSpace: 'pre-wrap' }}>
+                        {textBriefing.script_text}
+                    </div>
                 </div>
             )}
             {audioFile ? (
@@ -257,9 +289,9 @@ function AudioBriefingPlayer({ onNavigate }) {
                         </span>
                     )}
                 </div>
-            ) : (
+            ) : !textBriefing && (
                 <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim, fontStyle: 'italic' }}>
-                    No briefing yet. Click "New" to generate one.
+                    No briefing yet. Click "Generate on request" above.
                 </div>
             )}
         </div>
@@ -342,7 +374,12 @@ export default function Dashboard({ onNavigate }) {
 
     const pulse = useMemo(() => PULSE_TICKERS.map(({ key, label }) => {
         const best = livePriceUpdates?.[key] || wsPrices?.[key] || pulsePrices[key];
-        return { key, label, price: best?.price, pct: best?.pct_1d };
+        return {
+            key, label, price: best?.price, pct: best?.pct_1d,
+            // Wave 3 #11: label source/time on the quote itself rather than
+            // letting the pulse row imply a managed feed.
+            source: best?.source, updatedAt: best?.updated_at,
+        };
     }), [pulsePrices, livePriceUpdates, wsPrices]);
 
     const direction = thesis?.overall_direction || 'NEUTRAL';
@@ -613,10 +650,14 @@ export default function Dashboard({ onNavigate }) {
                 fontFamily: MONO, fontSize: isMobile ? '11px' : '12px' }}>
                 <span style={{ fontFamily: MONO, fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                     color: colors.textDim, marginRight: isMobile ? 0 : '12px',
-                    width: isMobile ? '100%' : 'auto', marginBottom: isMobile ? '4px' : 0 }}>PULSE</span>
+                    width: isMobile ? '100%' : 'auto', marginBottom: isMobile ? '4px' : 0 }}
+                    title="Live quotes via yfinance, 5-minute cache, refreshed on request">PULSE</span>
                 {pulse.map((p, i) => (
                     <React.Fragment key={p.key}>
                         <span onClick={() => onNavigate('watchlist-analysis', p.key)}
+                            title={p.updatedAt
+                                ? `${p.source || 'yfinance'} · ${formatRelative(new Date(p.updatedAt))}`
+                                : (p.source || 'yfinance')}
                             style={{ display: 'inline-flex', alignItems: 'baseline', gap: '5px',
                                 cursor: 'pointer', padding: '2px 6px', borderRadius: '3px', transition: 'background 0.15s' }}
                             onMouseEnter={e => { e.currentTarget.style.background = `${colors.accent}10`; }}
