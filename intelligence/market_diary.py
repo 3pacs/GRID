@@ -1,11 +1,23 @@
 """
 GRID — Automated Daily Market Diary.
 
-Every trading day at 10 PM UTC, the system writes a diary entry —
-a structured research note covering what happened, why, who was
-active, what the data shows, thesis accuracy, and what to watch
-tomorrow.  Think of it as a hedge fund's daily research journal
-that the LLM narrates while the data sections are rule-based.
+Each trading day, the system writes a diary entry — a structured research
+note covering what happened, who was active, what the data shows, pre-open
+thesis accuracy, and what to watch tomorrow. The LLM narrates while the
+data sections are rule-based, and the narrative is instructed to say so
+when a driver or verdict isn't actually in the supplied data rather than
+invent one (Wave 3 §4.1 fix).
+
+Triggered today only via ``POST intelligence/diary/generate``
+(``api/routers/intelligence_thesis.py``) or ``scripts/run_market_diary.py``
+(supports ``--dry-run``). ``schedule_daily_diary`` below (a 22:00 UTC
+thread) is defined but not called from anywhere — see
+``deploy/systemd/grid-market-diary.timer.template`` for the reviewed,
+not-yet-installed weekday 22:30Z alternative.
+
+Price reads are gated by ``GRID_MARKET_DIARY_PRICES_ENABLED`` (default
+off) pending operator confirmation of the YF quarantine; see the comment
+above ``PRICES_ENABLED`` below.
 
 Usage::
 
@@ -14,6 +26,9 @@ Usage::
     # Generate today's diary
     result = write_diary_entry(engine)
 
+    # Dry run — compute and render, do not persist
+    result = write_diary_entry(engine, dry_run=True)
+
     # Retrieve a past entry
     entry = get_diary_entry(engine, date(2026, 3, 27))
 """
@@ -21,7 +36,8 @@ Usage::
 from __future__ import annotations
 
 import json
-from datetime import date, datetime, timedelta, timezone
+import os
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
@@ -29,6 +45,41 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from store.observations import read_latest_n
+
+# ──────────────────────────────────────────────────────────────────
+# Price-freshness gate (Wave 3 §4.1 fix #2)
+# ──────────────────────────────────────────────────────────────────
+#
+# ``read_latest_n`` is already SUCCESS-only, vintage-collapsed and carries
+# an ``as_of`` bound (store/observations.py) — but it must only feed this
+# diary once the "YF quarantine" (migration raw_series_quarantined_20260926,
+# which lets a once-accepted row be marked QUARANTINED and excluded) has
+# actually been run against the contaminated raw_series batches. Whether
+# that quarantine run has happened is an operator/host fact this worktree
+# cannot see. Mirrors the module-local env-bool "wait for infra" gate used
+# by intelligence/edge_signals.py (``GRID_EDGE_SIGNALS_ENABLED``): defaults
+# OFF so un-holding this job does not silently start reporting prices
+# before the operator has confirmed the quarantine landed. Flip on with
+# ``GRID_MARKET_DIARY_PRICES_ENABLED=true`` once confirmed.
+#
+# This flag is the operator's explicit "go" — it is NOT, by itself, what
+# makes a flip-on safe. The obs_date freshness check in
+# ``_gather_market_moves`` (every price read requires
+# ``rows[0].obs_date == target_date`` or the entry is refused, never
+# reported from a stale/wrong vintage) is the actual safety mechanism, and
+# it applies whether or not the quarantine is complete.
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name, "")
+    if not raw.strip():
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on", "enabled")
+
+
+PRICES_ENABLED: bool = _env_bool("GRID_MARKET_DIARY_PRICES_ENABLED", False)
+PRICE_BASIS = "raw_close"  # YF:*:close is pulled with auto_adjust=False (ingestion/yfinance_pull.py)
+_PRICE_SOURCE = "yfinance"
 
 # ──────────────────────────────────────────────────────────────────
 # Schema
@@ -42,20 +93,62 @@ CREATE TABLE IF NOT EXISTS market_diary (
     market_moves JSONB,
     active_actors JSONB,
     thesis_accuracy JSONB,
+    narrative_model TEXT,
+    narrative_fallback BOOLEAN NOT NULL DEFAULT FALSE,
     generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
+
+# Added after the table's first release (2026-04) — a pre-existing table
+# in production predates these columns, so add them on top rather than
+# assuming CREATE TABLE IF NOT EXISTS filled them in.
+_ENSURE_COLUMNS_SQL: tuple[str, ...] = (
+    "ALTER TABLE market_diary ADD COLUMN IF NOT EXISTS narrative_model TEXT",
+    "ALTER TABLE market_diary ADD COLUMN IF NOT EXISTS narrative_fallback BOOLEAN NOT NULL DEFAULT FALSE",
+)
 
 
 def ensure_table(engine: Engine) -> None:
     """Create the market_diary table if it does not exist."""
     with engine.begin() as conn:
         conn.execute(text(_CREATE_TABLE))
+    _ensure_diary_columns(engine)
+
+
+def _ensure_diary_columns(engine: Engine) -> None:
+    """Add narrative_model/narrative_fallback if this table predates them.
+
+    Idempotent; never raises (mirrors intelligence/trial_outcomes.py's
+    ``ensure_outcome_columns``) — each ALTER runs in its own transaction so
+    a permission error on one does not poison ``ensure_table``'s CREATE
+    TABLE or block reads/writes of the columns that already exist.
+    """
+    for ddl in _ENSURE_COLUMNS_SQL:
+        try:
+            with engine.begin() as conn:
+                conn.execute(text(ddl))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("market_diary: ensure_table column add failed: {e}", e=str(exc))
 
 
 # ──────────────────────────────────────────────────────────────────
 # Data gatherers (rule-based sections)
 # ──────────────────────────────────────────────────────────────────
+
+def _fresh_pair(conn: Any, series_id: str, target_date: date) -> tuple[Any, Any] | None:
+    """The (today, prior) Observation pair for ``series_id``, or None.
+
+    Requires >= 2 accepted observation dates AND the newest one dated
+    exactly ``target_date`` — a stale or wrong-vintage read (the newest
+    accepted row dated before ``target_date``, e.g. because today hasn't
+    pulled yet, or a re-pull landed on a different day) is refused rather
+    than silently reported as "today's" move. See §4.1 fix #2(b).
+    """
+    rows = read_latest_n(conn, series_id, 2, source=_PRICE_SOURCE, as_of=target_date)
+    if len(rows) < 2 or rows[0].obs_date != target_date:
+        return None
+    return rows[0], rows[1]
+
 
 def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
     """Section 1: What happened — major index moves, sector leaders/laggards."""
@@ -64,7 +157,18 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
         "sector_leaders": [],
         "sector_laggards": [],
         "notable": [],
+        "prices_enabled": PRICES_ENABLED,
+        "price_basis": PRICE_BASIS,
+        "price_source": _PRICE_SOURCE,
     }
+
+    if not PRICES_ENABLED:
+        moves["disabled_reason"] = (
+            "price reads held pending operator confirmation that the YF "
+            "quarantine (migration raw_series_quarantined_20260926) has "
+            "run; set GRID_MARKET_DIARY_PRICES_ENABLED=true once confirmed"
+        )
+        return moves
 
     try:
         with engine.connect() as conn:
@@ -77,16 +181,21 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "^VIX": "VIX",
             }
             for yf_ticker, label in index_tickers.items():
-                rows = read_latest_n(conn, f"YF:{yf_ticker}:close", 2, source="yfinance", as_of=target_date)
-                if len(rows) >= 2:
-                    today_val, prior_val = rows[0].value, rows[1].value
-                    chg = today_val - prior_val
-                    chg_pct = (chg / prior_val * 100) if prior_val else 0
-                    moves["indices"][label] = {
-                        "close": round(today_val, 2),
-                        "change": round(chg, 2),
-                        "change_pct": round(chg_pct, 2),
-                    }
+                pair = _fresh_pair(conn, f"YF:{yf_ticker}:close", target_date)
+                if pair is None:
+                    moves["indices"][label] = {"status": "no close for date"}
+                    continue
+                today, prior = pair
+                chg = today.value - prior.value
+                chg_pct = (chg / prior.value * 100) if prior.value else None
+                moves["indices"][label] = {
+                    "close": round(today.value, 2),
+                    "change": round(chg, 2),
+                    "change_pct": round(chg_pct, 2) if chg_pct is not None else None,
+                    "obs_date": today.obs_date.isoformat(),
+                    "price_basis": PRICE_BASIS,
+                    "source": today.source or _PRICE_SOURCE,
+                }
 
             # Sector ETFs for leaders/laggards
             sector_etfs = {
@@ -96,16 +205,29 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "XLC": "Communications", "XLB": "Materials",
             }
             sector_perf: list[dict] = []
+            sector_no_close: list[str] = []
             for etf, name in sector_etfs.items():
-                rows = read_latest_n(conn, f"YF:{etf}:close", 2, source="yfinance", as_of=target_date)
-                if len(rows) >= 2:
-                    t, p = rows[0].value, rows[1].value
-                    pct = (t - p) / p * 100 if p else 0
-                    sector_perf.append({"sector": name, "etf": etf, "change_pct": round(pct, 2)})
+                pair = _fresh_pair(conn, f"YF:{etf}:close", target_date)
+                if pair is None:
+                    sector_no_close.append(etf)
+                    continue
+                today, prior = pair
+                pct = (today.value - prior.value) / prior.value * 100 if prior.value else None
+                if pct is None:
+                    sector_no_close.append(etf)
+                    continue
+                sector_perf.append({
+                    "sector": name, "etf": etf, "change_pct": round(pct, 2),
+                    "obs_date": today.obs_date.isoformat(),
+                    "price_basis": PRICE_BASIS,
+                    "source": today.source or _PRICE_SOURCE,
+                })
 
             sector_perf.sort(key=lambda x: x["change_pct"], reverse=True)
             moves["sector_leaders"] = sector_perf[:3]
             moves["sector_laggards"] = sector_perf[-3:]
+            if sector_no_close:
+                moves["sector_no_close"] = sector_no_close
 
             # Notable single-day moves (VIX spike, gold, oil, DXY)
             notable_series = {
@@ -114,17 +236,28 @@ def _gather_market_moves(engine: Engine, target_date: date) -> dict[str, Any]:
                 "YF:UUP:close": "Dollar (UUP)",
                 "YF:TLT:close": "Long Bonds (TLT)",
             }
+            notable_no_close: list[str] = []
             for sid, label in notable_series.items():
-                rows = read_latest_n(conn, sid, 2, source="yfinance", as_of=target_date)
-                if len(rows) >= 2:
-                    t, p = rows[0].value, rows[1].value
-                    pct = (t - p) / p * 100 if p else 0
-                    if abs(pct) >= 0.5:
-                        moves["notable"].append({
-                            "asset": label,
-                            "close": round(t, 2),
-                            "change_pct": round(pct, 2),
-                        })
+                pair = _fresh_pair(conn, sid, target_date)
+                if pair is None:
+                    notable_no_close.append(label)
+                    continue
+                today, prior = pair
+                pct = (today.value - prior.value) / prior.value * 100 if prior.value else None
+                if pct is None:
+                    notable_no_close.append(label)
+                    continue
+                if abs(pct) >= 0.5:
+                    moves["notable"].append({
+                        "asset": label,
+                        "close": round(today.value, 2),
+                        "change_pct": round(pct, 2),
+                        "obs_date": today.obs_date.isoformat(),
+                        "price_basis": PRICE_BASIS,
+                        "source": today.source or _PRICE_SOURCE,
+                    })
+            if notable_no_close:
+                moves["notable_no_close"] = notable_no_close
 
     except Exception as exc:
         log.warning("market_diary: failed to gather market moves: {e}", e=str(exc))
@@ -202,76 +335,110 @@ def _gather_active_actors(engine: Engine, target_date: date) -> dict[str, Any]:
     return actors
 
 
+_PRE_OPEN_CUTOFF_UTC = time(13, 30)  # roughly US market open
+
+
 def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]:
-    """Section 5/6: Compare morning thesis to actual outcome."""
+    """Section 5/6: Compare the pre-open thesis to the actual outcome.
+
+    Deliberately does not compute a fresh unified thesis at write time --
+    doing so at 22:00Z graded the diary against a thesis that had already
+    seen the whole trading day (look-ahead / self-grading). Instead this
+    reads the actual pre-open snapshot that was archived that morning. See
+    §4.1 fix #1.
+    """
     accuracy: dict[str, Any] = {
         "morning_thesis": None,
+        "morning_conviction": None,
         "actual_outcome": None,
-        "verdict": "unknown",  # correct / wrong / partial
+        "verdict": None,  # correct / wrong / partial / None (no basis to grade)
+        "reason": None,
         "details": [],
     }
 
     try:
-        from analysis.flow_thesis import generate_unified_thesis
+        cutoff = datetime.combine(target_date, _PRE_OPEN_CUTOFF_UTC, tzinfo=timezone.utc)
+        day_start = datetime.combine(target_date, time.min, tzinfo=timezone.utc)
 
-        # Get the thesis generated in the morning (or most recent before market open)
         with engine.connect() as conn:
-            conn.execute(
+            snap = conn.execute(
                 text(
-                    "SELECT content, generated_at FROM market_diary "
-                    "WHERE date = :dt - 1 "
-                    "ORDER BY generated_at DESC LIMIT 1"
+                    "SELECT overall_direction, conviction, timestamp "
+                    "FROM thesis_snapshots "
+                    "WHERE timestamp >= :day_start AND timestamp < :cutoff "
+                    "ORDER BY timestamp DESC LIMIT 1"
                 ),
-                {"dt": target_date},
+                {"day_start": day_start, "cutoff": cutoff},
             ).fetchone()
 
-        # Get today's unified thesis for current state
-        try:
-            current_thesis = generate_unified_thesis(engine)
-            accuracy["morning_thesis"] = current_thesis.get("overall_direction", "NEUTRAL")
-            accuracy["morning_conviction"] = current_thesis.get("conviction", 0)
-        except Exception as exc:
-            log.warning("Failed to get morning thesis for diary: {e}", e=exc)
+        if snap is None:
+            accuracy["reason"] = "no pre-open thesis snapshot"
+        else:
+            direction = (snap[0] or "").strip().upper() or None
+            accuracy["morning_thesis"] = direction
+            accuracy["morning_conviction"] = float(snap[1]) if snap[1] is not None else None
+            ts = snap[2]
+            accuracy["morning_thesis_timestamp"] = ts.isoformat() if hasattr(ts, "isoformat") else str(ts)
 
-        # Determine actual market direction from S&P close
-        with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 2, source="yfinance", as_of=target_date)
-            if len(rows) >= 2:
-                today_close, prior_close = rows[0].value, rows[1].value
-                daily_return = (today_close - prior_close) / prior_close * 100
-                accuracy["actual_outcome"] = "BULLISH" if daily_return > 0.1 else ("BEARISH" if daily_return < -0.1 else "NEUTRAL")
-                accuracy["sp500_return_pct"] = round(daily_return, 2)
+        # Determine actual market direction from S&P close — gated by the
+        # same price-freshness rule as _gather_market_moves (§4.1 fix #2).
+        if PRICES_ENABLED:
+            with engine.connect() as conn:
+                pair = _fresh_pair(conn, "YF:^GSPC:close", target_date)
+            if pair is not None:
+                today, prior = pair
+                if prior.value:
+                    daily_return = (today.value - prior.value) / prior.value * 100
+                    accuracy["actual_outcome"] = (
+                        "BULLISH" if daily_return > 0.1 else ("BEARISH" if daily_return < -0.1 else "NEUTRAL")
+                    )
+                    accuracy["sp500_return_pct"] = round(daily_return, 2)
+                    accuracy["sp500_obs_date"] = today.obs_date.isoformat()
+            if accuracy["actual_outcome"] is None and accuracy["reason"] is None:
+                accuracy["reason"] = "no close for date"
+        elif accuracy["reason"] is None:
+            accuracy["reason"] = "prices disabled pending YF quarantine confirmation"
 
-                # Compare
-                if accuracy["morning_thesis"] and accuracy["actual_outcome"]:
-                    if accuracy["morning_thesis"] == accuracy["actual_outcome"]:
-                        accuracy["verdict"] = "correct"
-                    elif accuracy["morning_thesis"] == "NEUTRAL" or accuracy["actual_outcome"] == "NEUTRAL":
-                        accuracy["verdict"] = "partial"
-                    else:
-                        accuracy["verdict"] = "wrong"
+        # Compare — only when both sides of the comparison are honest.
+        if accuracy["morning_thesis"] and accuracy["actual_outcome"]:
+            if accuracy["morning_thesis"] == accuracy["actual_outcome"]:
+                accuracy["verdict"] = "correct"
+            elif accuracy["morning_thesis"] == "NEUTRAL" or accuracy["actual_outcome"] == "NEUTRAL":
+                accuracy["verdict"] = "partial"
+            else:
+                accuracy["verdict"] = "wrong"
+        elif accuracy["reason"] is None:
+            accuracy["reason"] = "morning thesis or actual outcome unavailable"
 
-        # Get any cross-reference anomalies for the day
+        # Cross-reference anomalies for the day. cross_reference_reports is
+        # empty in production (see the Wave 3 triage report) and is never
+        # read here; cross_reference_checks is the table every other
+        # consumer (api/routers/chat.py, api/routers/intel.py,
+        # intelligence/regime/state_vector.py, etc.) reads for the same
+        # "anomalies detected today" purpose. See §4.1 fix #4.
         try:
             with engine.connect() as conn:
-                cr_row = conn.execute(
+                cr_rows = conn.execute(
                     text(
-                        "SELECT report_data FROM cross_reference_reports "
-                        "WHERE DATE(created_at) = :dt "
-                        "ORDER BY created_at DESC LIMIT 1"
+                        "SELECT name, category, assessment, implication "
+                        "FROM cross_reference_checks "
+                        "WHERE DATE(checked_at) = :dt "
+                        "AND assessment IS NOT NULL AND assessment != 'consistent' "
+                        "ORDER BY checked_at DESC LIMIT 5"
                     ),
                     {"dt": target_date},
-                ).fetchone()
-                if cr_row and cr_row[0]:
-                    data = cr_row[0] if isinstance(cr_row[0], dict) else json.loads(cr_row[0])
-                    red_flags = data.get("red_flags", [])
-                    accuracy["anomalies_detected"] = len(red_flags)
-                    accuracy["details"] = [
-                        {"type": "cross_reference", "flag": str(f)[:200]}
-                    for f in red_flags[:5]
+                ).fetchall()
+            if cr_rows:
+                accuracy["anomalies_detected"] = len(cr_rows)
+                accuracy["details"] = [
+                    {
+                        "type": "cross_reference",
+                        "flag": f"{r[0]} ({r[1]}): {r[2]} — {(r[3] or '')[:180]}",
+                    }
+                    for r in cr_rows
                 ]
         except Exception as cr_exc:
-            log.debug("cross_reference_reports query failed (table may not exist): {e}", e=str(cr_exc))
+            log.debug("cross_reference_checks query failed (table may not exist): {e}", e=str(cr_exc))
 
     except Exception as exc:
         log.warning("market_diary: failed to assess thesis accuracy: {e}", e=str(exc))
@@ -284,15 +451,19 @@ def _gather_thesis_accuracy(engine: Engine, target_date: date) -> dict[str, Any]
 # ──────────────────────────────────────────────────────────────────
 
 _DIARY_SYSTEM_PROMPT = """\
-Daily market diary. Each diary entry must identify the primary LEVER (actor + valve) \
-that drove the day's action. Conditions (vol, sentiment, positioning) are secondary — \
-never present a condition as the cause. \
-Sections: WHAT HAPPENED (lead with #1 move, specific numbers), \
-WHY (name the lever: actor + action + valve, then the condition that amplified it), \
-RIGHT (which signal/model called it), \
-WRONG (failed thesis + why — was the lever wrong or the condition?), \
-WATCH TOMORROW (catalysts with ticker + time + expected impact). \
-Under 500 words. Present tense. No hedging. Take a stand.\
+Daily market diary. Sections: WHAT HAPPENED (lead with #1 move, specific \
+numbers, only from the data supplied below), WHY (state an actor + action \
+that drove the day's move ONLY if the supplied actors/signals data below \
+actually names one; if no such actor or signal is present, say "cause not \
+identified" — do not invent a driver. Conditions like volatility, \
+sentiment or positioning may be described but never presented as a \
+cause), RIGHT (which pre-open signal/model called it, if a pre-open \
+thesis snapshot is present below), WRONG (what the pre-open thesis missed \
+and why, if applicable — state "no pre-open thesis to grade" if none is \
+present), WATCH TOMORROW (catalysts with ticker + time + expected impact, \
+only ones present in the supplied context). Under 500 words. Present \
+tense. State only what the supplied data shows; where the data is absent \
+or marked unavailable, say so instead of filling the gap.\
 """
 
 
@@ -309,8 +480,13 @@ def _build_diary_prompt(
 
     # Index performance
     lines.append("### INDEX PERFORMANCE")
+    if not moves.get("prices_enabled", True):
+        lines.append(f"- prices unavailable: {moves.get('disabled_reason', 'disabled')}")
     for name, data in moves.get("indices", {}).items():
-        lines.append(f"- {name}: {data['close']} ({data['change_pct']:+.2f}%)")
+        if data.get("change_pct") is None or data.get("close") is None:
+            lines.append(f"- {name}: {data.get('status', 'no close for date')}")
+        else:
+            lines.append(f"- {name}: {data['close']} ({data['change_pct']:+.2f}%)")
 
     # Sector leaders / laggards
     if moves.get("sector_leaders"):
@@ -340,10 +516,13 @@ def _build_diary_prompt(
 
     # Thesis accuracy
     lines.append("\n### THESIS PERFORMANCE")
-    lines.append(f"- Morning thesis: {thesis_accuracy.get('morning_thesis', 'N/A')}")
-    lines.append(f"- Actual outcome: {thesis_accuracy.get('actual_outcome', 'N/A')}")
-    lines.append(f"- S&P 500 return: {thesis_accuracy.get('sp500_return_pct', 'N/A')}%")
-    lines.append(f"- Verdict: {thesis_accuracy.get('verdict', 'unknown')}")
+    lines.append(f"- Pre-open thesis: {thesis_accuracy.get('morning_thesis') or 'none (no pre-open snapshot)'}")
+    lines.append(f"- Actual outcome: {thesis_accuracy.get('actual_outcome') or 'unavailable'}")
+    if thesis_accuracy.get("sp500_return_pct") is not None:
+        lines.append(f"- S&P 500 return: {thesis_accuracy['sp500_return_pct']}%")
+    lines.append(f"- Verdict: {thesis_accuracy.get('verdict') or 'no verdict'}")
+    if thesis_accuracy.get("reason"):
+        lines.append(f"- Reason: {thesis_accuracy['reason']}")
     if thesis_accuracy.get("anomalies_detected"):
         lines.append(f"- Cross-reference anomalies: {thesis_accuracy['anomalies_detected']}")
 
@@ -379,8 +558,15 @@ def _generate_narrative(
     actors: dict,
     thesis_accuracy: dict,
     ollama_client: Any = None,
-) -> str:
-    """Use the LLM to write the narrative sections of the diary entry."""
+) -> tuple[str, str | None, bool]:
+    """Use the LLM to write the narrative sections of the diary entry.
+
+    Returns ``(content, narrative_model, narrative_fallback)``.
+    ``narrative_model`` is the LLM's model name when an LLM answered, or
+    ``None`` when the rule-based fallback was used (``narrative_fallback``
+    True). Mirrors how ``intelligence/deep_dive.py`` records
+    ``model_used``/``provider_used`` alongside its LLM narrative.
+    """
     user_prompt = _build_diary_prompt(target_date, moves, actors, thesis_accuracy)
 
     # Try to get an LLM client (LOCAL tier — high-volume narrative)
@@ -402,12 +588,13 @@ def _generate_narrative(
                 num_predict=1200,
             )
             if content:
-                return content
+                model_name = getattr(ollama_client, "model", None) or "local"
+                return content, model_name, False
         except Exception as exc:
             log.warning("market_diary: LLM generation failed: {e}", e=str(exc))
 
     # Fallback: rule-based summary
-    return _build_fallback_narrative(target_date, moves, actors, thesis_accuracy)
+    return _build_fallback_narrative(target_date, moves, actors, thesis_accuracy), None, True
 
 
 def _build_fallback_narrative(
@@ -424,7 +611,12 @@ def _build_fallback_narrative(
     lines.append("")
 
     lines.append("## What Happened")
+    if not moves.get("prices_enabled", True):
+        lines.append(f"*{moves.get('disabled_reason', 'Prices unavailable.')}*")
     for name, data in moves.get("indices", {}).items():
+        if data.get("change_pct") is None or data.get("close") is None:
+            lines.append(f"- **{name}**: {data.get('status', 'no close for date')}")
+            continue
         direction = "up" if data["change_pct"] > 0 else "down"
         lines.append(f"- **{name}** closed at {data['close']}, {direction} {abs(data['change_pct']):.2f}%")
 
@@ -451,9 +643,11 @@ def _build_fallback_narrative(
         lines.append("- No notable actor activity today")
 
     lines.append("\n## Thesis Accuracy")
-    lines.append(f"- Morning call: **{thesis_accuracy.get('morning_thesis', 'N/A')}**")
-    lines.append(f"- Actual: **{thesis_accuracy.get('actual_outcome', 'N/A')}**")
-    lines.append(f"- Verdict: **{thesis_accuracy.get('verdict', 'unknown')}**")
+    lines.append(f"- Pre-open call: **{thesis_accuracy.get('morning_thesis') or 'none (no pre-open snapshot)'}**")
+    lines.append(f"- Actual: **{thesis_accuracy.get('actual_outcome') or 'unavailable'}**")
+    lines.append(f"- Verdict: **{thesis_accuracy.get('verdict') or 'no verdict'}**")
+    if thesis_accuracy.get("reason"):
+        lines.append(f"- Reason: {thesis_accuracy['reason']}")
 
     lines.append("\n---")
     lines.append(f"*Generated: {datetime.now(timezone.utc).isoformat()}*")
@@ -469,6 +663,7 @@ def write_diary_entry(
     engine: Engine,
     target_date: date | None = None,
     ollama_client: Any = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     """Generate and store today's market diary entry.
 
@@ -476,15 +671,19 @@ def write_diary_entry(
         engine: SQLAlchemy engine.
         target_date: Date to write the diary for (defaults to today).
         ollama_client: Optional Ollama client for LLM narrative.
+        dry_run: When True, gather and render the entry but do not upsert
+            it into ``market_diary`` or log it to the LLM insight archive
+            (used by ``scripts/run_market_diary.py --dry-run``).
 
     Returns:
         dict with date, content, market_moves, active_actors,
-        thesis_accuracy, generated_at.
+        thesis_accuracy, narrative_model, narrative_fallback,
+        generated_at, dry_run.
     """
     if target_date is None:
         target_date = date.today()
 
-    log.info("Writing market diary for {d}", d=target_date)
+    log.info("Writing market diary for {d}{dr}", d=target_date, dr=" [dry-run]" if dry_run else "")
     ensure_table(engine)
 
     # Gather structured data
@@ -493,7 +692,7 @@ def write_diary_entry(
     thesis_acc = _gather_thesis_accuracy(engine, target_date)
 
     # Generate narrative
-    narrative = _generate_narrative(
+    narrative, narrative_model, narrative_fallback = _generate_narrative(
         target_date, moves, actors, thesis_acc, ollama_client,
     )
 
@@ -507,9 +706,12 @@ def write_diary_entry(
         content_parts.append("| Index | Close | Change |")
         content_parts.append("|-------|-------|--------|")
         for name, data in moves["indices"].items():
-            content_parts.append(
-                f"| {name} | {data['close']} | {data['change_pct']:+.2f}% |"
-            )
+            if data.get("change_pct") is None or data.get("close") is None:
+                content_parts.append(f"| {name} | {data.get('status', 'no close for date')} | — |")
+            else:
+                content_parts.append(
+                    f"| {name} | {data['close']} | {data['change_pct']:+.2f}% |"
+                )
         content_parts.append("")
 
     # Actor table
@@ -526,50 +728,61 @@ def write_diary_entry(
     full_content = "\n".join(content_parts)
     generated_at = datetime.now(timezone.utc)
 
-    # Upsert into DB
-    try:
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO market_diary (date, content, market_moves, "
-                    "active_actors, thesis_accuracy, generated_at) "
-                    "VALUES (:dt, :content, :moves, :actors, :accuracy, :gen_at) "
-                    "ON CONFLICT (date) DO UPDATE SET "
-                    "content = EXCLUDED.content, "
-                    "market_moves = EXCLUDED.market_moves, "
-                    "active_actors = EXCLUDED.active_actors, "
-                    "thesis_accuracy = EXCLUDED.thesis_accuracy, "
-                    "generated_at = EXCLUDED.generated_at"
-                ),
-                {
-                    "dt": target_date,
-                    "content": full_content,
-                    "moves": json.dumps(moves),
-                    "actors": json.dumps(actors),
-                    "accuracy": json.dumps(thesis_acc),
-                    "gen_at": generated_at,
-                },
-            )
-        log.info("Market diary saved for {d}", d=target_date)
-    except Exception as exc:
-        log.error("Failed to save market diary: {e}", e=str(exc))
+    if dry_run:
+        log.info("Market diary dry-run for {d}: not persisted", d=target_date)
+    else:
+        # Upsert into DB
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO market_diary (date, content, market_moves, "
+                        "active_actors, thesis_accuracy, narrative_model, "
+                        "narrative_fallback, generated_at) "
+                        "VALUES (:dt, :content, :moves, :actors, :accuracy, "
+                        ":narrative_model, :narrative_fallback, :gen_at) "
+                        "ON CONFLICT (date) DO UPDATE SET "
+                        "content = EXCLUDED.content, "
+                        "market_moves = EXCLUDED.market_moves, "
+                        "active_actors = EXCLUDED.active_actors, "
+                        "thesis_accuracy = EXCLUDED.thesis_accuracy, "
+                        "narrative_model = EXCLUDED.narrative_model, "
+                        "narrative_fallback = EXCLUDED.narrative_fallback, "
+                        "generated_at = EXCLUDED.generated_at"
+                    ),
+                    {
+                        "dt": target_date,
+                        "content": full_content,
+                        "moves": json.dumps(moves),
+                        "actors": json.dumps(actors),
+                        "accuracy": json.dumps(thesis_acc),
+                        "narrative_model": narrative_model,
+                        "narrative_fallback": narrative_fallback,
+                        "gen_at": generated_at,
+                    },
+                )
+            log.info("Market diary saved for {d}", d=target_date)
+        except Exception as exc:
+            log.error("Failed to save market diary: {e}", e=str(exc))
 
-    # Also log to the LLM insight archive
-    try:
-        from outputs.llm_logger import log_insight
-        log_insight(
-            category="briefing",
-            title=f"Market Diary — {target_date}",
-            content=full_content,
-            metadata={
-                "date": str(target_date),
-                "verdict": thesis_acc.get("verdict"),
-                "sp500_return": thesis_acc.get("sp500_return_pct"),
-            },
-            provider="market_diary",
-        )
-    except Exception as exc:
-        log.warning("Failed to store diary entry: {e}", e=exc)
+        # Also log to the LLM insight archive
+        try:
+            from outputs.llm_logger import log_insight
+            log_insight(
+                category="briefing",
+                title=f"Market Diary — {target_date}",
+                content=full_content,
+                metadata={
+                    "date": str(target_date),
+                    "verdict": thesis_acc.get("verdict"),
+                    "sp500_return": thesis_acc.get("sp500_return_pct"),
+                    "narrative_model": narrative_model,
+                    "narrative_fallback": narrative_fallback,
+                },
+                provider="market_diary",
+            )
+        except Exception as exc:
+            log.warning("Failed to store diary entry: {e}", e=exc)
 
     result = {
         "date": str(target_date),
@@ -577,7 +790,10 @@ def write_diary_entry(
         "market_moves": moves,
         "active_actors": actors,
         "thesis_accuracy": thesis_acc,
+        "narrative_model": narrative_model,
+        "narrative_fallback": narrative_fallback,
         "generated_at": generated_at.isoformat(),
+        "dry_run": dry_run,
     }
 
     return result
@@ -599,7 +815,7 @@ def get_diary_entry(engine: Engine, target_date: date | None = None) -> dict[str
             row = conn.execute(
                 text(
                     "SELECT id, date, content, market_moves, active_actors, "
-                    "thesis_accuracy, generated_at "
+                    "thesis_accuracy, generated_at, narrative_model, narrative_fallback "
                     "FROM market_diary WHERE date = :dt"
                 ),
                 {"dt": target_date},
@@ -616,6 +832,8 @@ def get_diary_entry(engine: Engine, target_date: date | None = None) -> dict[str
                 "active_actors": row[4] if isinstance(row[4], dict) else (json.loads(row[4]) if row[4] else {}),
                 "thesis_accuracy": row[5] if isinstance(row[5], dict) else (json.loads(row[5]) if row[5] else {}),
                 "generated_at": str(row[6]),
+                "narrative_model": row[7] if len(row) > 7 else None,
+                "narrative_fallback": bool(row[8]) if len(row) > 8 and row[8] is not None else False,
             }
     except Exception as exc:
         log.warning("Failed to retrieve diary entry: {e}", e=str(exc))

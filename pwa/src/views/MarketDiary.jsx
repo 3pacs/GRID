@@ -503,6 +503,11 @@ export default function MarketDiary() {
                             <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '4px', fontFamily: "'IBM Plex Mono', monospace" }}>
                                 Generated {currentEntry.generated_at ? formatDateTime(currentEntry.generated_at) : 'N/A'}
                             </div>
+                            <div style={{ fontSize: '11px', color: colors.textMuted, marginTop: '2px', fontFamily: "'IBM Plex Mono', monospace" }}>
+                                {currentEntry.narrative_fallback
+                                    ? 'Rule-based summary (LLM unavailable) over the listed inputs'
+                                    : `LLM narrative (local${currentEntry.narrative_model ? `, ${currentEntry.narrative_model}` : ''}) over the listed inputs`}
+                            </div>
                         </div>
                         <div style={s.statRow}>
                             <div style={s.statItem}>
