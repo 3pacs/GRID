@@ -390,6 +390,7 @@ for _label, _module_path, _required in [
     ("options", "api.routers.options", False),
     ("celestial", "api.routers.celestial", False),
     ("derivatives", "api.routers.derivatives", False),
+    ("gamma_watch", "api.routers.gamma_watch", False),
     ("watchlist", "api.routers.watchlist", False),
     ("associations", "api.routers.associations", False),
     ("strategy", "api.routers.strategy", False),

@@ -6,8 +6,9 @@ import { interpretPCR, interpretIV, interpretMaxPain } from '../utils/interpret.
 import GEXProfile from '../components/GEXProfile.jsx';
 import VannaCharmViz from '../components/VannaCharmViz.jsx';
 import FlowTimeline from '../components/FlowTimeline.jsx';
+import GammaWatch from '../components/GammaWatch.jsx';
 
-const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow', 'Trades'];
+const tabs = ['Signals', 'Scanner', '100x', 'Dealer Flow', 'Gamma Watch', 'Trades'];
 
 const scoreColor = (score) => {
     if (score >= 7) return '#EF4444';
@@ -973,6 +974,7 @@ export default function Options({ selectedTicker = '' }) {
     };
 
     const renderContent = () => {
+        if (activeTab === 'Gamma Watch') return <GammaWatch />;
         if (loading) {
             return <div style={styles.loadingState}>Loading options data...</div>;
         }
