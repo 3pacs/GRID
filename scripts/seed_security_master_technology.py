@@ -62,6 +62,7 @@ from intelligence.security_master import (
     compute_sector_weights,
     entity_id_for_cik,
     entity_id_for_ticker,
+    evaluate_delisting_candidate,
     propose_primary_sector,
 )
 
@@ -188,15 +189,22 @@ def build_ticker_plan(
         "cik_source": "sec_company_tickers" if cik else None,
     }
 
+    # Owner decision #2 (adopted 2026-09-28): SEC absence alone is a
+    # candidate signal, never sufficient to flip is_active — see
+    # intelligence.security_master.evaluate_delisting_candidate. This seed
+    # script has no second-source corroboration wired in, so every ticker
+    # without a live CIK stays active with the candidate basis recorded.
+    delisting = evaluate_delisting_candidate(has_live_cik=bool(cik))
+
     security_master_row = {
         "entity_id": entity_id,
         "cik": cik,
         "name": name,
         "security_type": "equity",
-        "is_active": True,  # never flipped by this seed script — GD0 §6 item 2
+        "is_active": delisting.is_active,
         "delisted_at": None,
-        "delisted_reason": None,
-        "delisted_basis": None,
+        "delisted_reason": delisting.delisted_reason,
+        "delisted_basis": delisting.delisted_basis,
         "sic": None,
         "source": "sector_map+sec_company_tickers" if cik else "sector_map",
         "provenance": provenance,

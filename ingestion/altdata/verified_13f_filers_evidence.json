@@ -1,0 +1,1374 @@
+{
+  "methodology": "Union of the three pre-2026-09-28 hardcoded 13F filer-CIK maps (ingestion/edgar.py TOP_HEDGE_FUND_CIKS, ingestion/altdata/institutional_flows.py TOP_13F_FILERS, ingestion/altdata/sec_13f_live.py FILERS) = 99 distinct CIKs. Each fetched from data.sec.gov/submissions/CIK{10-digit}.json with UA GRID Intelligence ops@stepdad.finance, ~6.7 req/s. A CIK is kept when SEC's registrant name token-overlaps at least one of its old labels; every non-match (64 mismatches + 5 HTTP 404s = 69 of 99) was treated as this manager's real CIK is wrong or missing, and searched directly via SEC's browse-edgar company-name search, re-verified against data.sec.gov/submissions.",
+  "fetch_date": "2026-09-28",
+  "union_pull_99_ciks": [
+    {
+      "cik": "93751",
+      "sec_name": "STATE STREET CORP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "State Street"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "102909",
+      "sec_name": "VANGUARD GROUP INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Vanguard Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "902219",
+      "sec_name": "WELLINGTON MANAGEMENT GROUP LLP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Wellington Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "921669",
+      "sec_name": "ICAHN CARL C",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Icahn Enterprises"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1004244",
+      "sec_name": "NEW ENGLAND ASSET MANAGEMENT INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Wellington Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1006438",
+      "sec_name": "APPALOOSA MANAGEMENT LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Omega Advisors",
+        "institutional_flows.py": "Canyon Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1009207",
+      "sec_name": "D. E. Shaw & Co., Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Marshall Wace",
+        "sec_13f_live.py": "D.E. Shaw"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1027451",
+      "sec_name": "TIGER MANAGEMENT L.L.C.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Jana Partners",
+        "sec_13f_live.py": "Jana Partners"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1029160",
+      "sec_name": "SOROS FUND MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Soros Fund Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1031390",
+      "sec_name": null,
+      "http_status": 404,
+      "error": "HTTPError 404",
+      "old_labels": {
+        "edgar.py": "Anchorage Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1037389",
+      "sec_name": "RENAISSANCE TECHNOLOGIES LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Renaissance Technologies",
+        "institutional_flows.py": "Renaissance Technologies",
+        "sec_13f_live.py": "Renaissance Technologies"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1037529",
+      "sec_name": "BOOTH CREEK SKI ACQUISITION CORP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Appaloosa Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1040273",
+      "sec_name": "Third Point LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Tiger Global Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1040280",
+      "sec_name": null,
+      "http_status": 404,
+      "error": "HTTPError 404",
+      "old_labels": {
+        "edgar.py": "Greenlight Capital",
+        "institutional_flows.py": "Tiger Global Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1040971",
+      "sec_name": "SL GREEN REALTY CORP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Druckenmiller (Duquesne)"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1044316",
+      "sec_name": null,
+      "http_status": 404,
+      "error": "HTTPError 404",
+      "old_labels": {
+        "edgar.py": "Cerberus Capital",
+        "institutional_flows.py": "BlackRock"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1046187",
+      "sec_name": "AEW CAPITAL MANAGEMENT L P",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Highfields Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1050470",
+      "sec_name": "LSV ASSET MANAGEMENT",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Soros Fund Management",
+        "institutional_flows.py": "Paulson & Co"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1056796",
+      "sec_name": null,
+      "http_status": 404,
+      "error": "HTTPError 404",
+      "old_labels": {
+        "edgar.py": "Viking Global Investors"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1056831",
+      "sec_name": "FAIRHOLME CAPITAL MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "ValueAct Capital",
+        "institutional_flows.py": "SAC Capital (now Point72)"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1061165",
+      "sec_name": "LONE PINE CAPITAL LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Winton Group",
+        "sec_13f_live.py": "Baupost Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1061768",
+      "sec_name": "BAUPOST GROUP LLC/MA",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Millennium Management",
+        "institutional_flows.py": "D.E. Shaw",
+        "sec_13f_live.py": "Lone Pine Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1067701",
+      "sec_name": "UNITED RENTALS, INC.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "MSD Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1067983",
+      "sec_name": "BERKSHIRE HATHAWAY INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Berkshire Hathaway",
+        "institutional_flows.py": "Berkshire Hathaway",
+        "sec_13f_live.py": "Berkshire Hathaway"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1079114",
+      "sec_name": "GREENLIGHT CAPITAL INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Tudor Investment Corp"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1080014",
+      "sec_name": "Innoviva, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Icahn Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1085392",
+      "sec_name": "PUGET ENERGY INC /WA",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Magnetar Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1088875",
+      "sec_name": "BAILLIE GIFFORD & CO",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Baillie Gifford"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1091439",
+      "sec_name": "ALLIANZ VARIABLE INSURANCE PRODUCTS TRUST",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Fidelity Management & Research"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1096343",
+      "sec_name": "MARKEL GROUP INC.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Duquesne Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1099281",
+      "sec_name": "THIRD AVENUE MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Tudor Investment Corp"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1103804",
+      "sec_name": "VIKING GLOBAL INVESTORS LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "DE Shaw",
+        "institutional_flows.py": "Capital Group",
+        "sec_13f_live.py": "Viking Global Investors"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1105497",
+      "sec_name": "MSD CAPITAL, L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "T. Rowe Price"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1106500",
+      "sec_name": "JOHO CAPITAL LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Man Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1135730",
+      "sec_name": "COATUE MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "AQR Capital Management",
+        "sec_13f_live.py": "Coatue Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1159159",
+      "sec_name": "JANA PARTNERS LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Appaloosa Management",
+        "institutional_flows.py": "Third Point",
+        "sec_13f_live.py": "Third Point"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1159830",
+      "sec_name": "DOBBS MOTORS OF ARIZONA INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Och-Ziff Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1166559",
+      "sec_name": "GATES FOUNDATION TRUST",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "State Street Global Advisors"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1167483",
+      "sec_name": "TIGER GLOBAL MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Eton Park Capital",
+        "institutional_flows.py": "Elliott Management",
+        "sec_13f_live.py": "Tiger Global Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1167557",
+      "sec_name": "AQR CAPITAL MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Elliott Management",
+        "sec_13f_live.py": "AQR Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1169819",
+      "sec_name": "OWENS BRIGAM MEDICAL CO",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "JPMorgan Investment Mgmt"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1169825",
+      "sec_name": "OWENS ILLINOIS PRESCRIPTION PRODUCTS INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "King Street Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1179245",
+      "sec_name": "FRANCHOICE INC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "York Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1199818",
+      "sec_name": "ALABAMA REASSURANCE CO",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Maverick Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1214717",
+      "sec_name": "GEODE CAPITAL MANAGEMENT, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Geode Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1273087",
+      "sec_name": "MILLENNIUM MANAGEMENT LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Canyon Capital Advisors",
+        "sec_13f_live.py": "Millennium Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1279708",
+      "sec_name": "MENLO ADVISORS LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Baupost Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1326380",
+      "sec_name": "GameStop Corp.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Cadian Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1334955",
+      "sec_name": "STRICTLY PEDIATRICS LAND CO LLP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Pershing Square Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1336326",
+      "sec_name": "Rafferty Charles K",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Farallon Capital",
+        "institutional_flows.py": "Greenlight Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1336528",
+      "sec_name": "Pershing Square Capital Management, L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Bridgewater Associates",
+        "institutional_flows.py": "Baupost Group",
+        "sec_13f_live.py": "Pershing Square Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1345197",
+      "sec_name": "FLORIDIAN LAND INVESTMENT I LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "ValueAct Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1345471",
+      "sec_name": "TRIAN FUND MANAGEMENT, L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Jana Partners",
+        "sec_13f_live.py": "Trian Fund Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1350694",
+      "sec_name": "Bridgewater Associates, LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Two Sigma",
+        "institutional_flows.py": "Bridgewater Associates",
+        "sec_13f_live.py": "Bridgewater Associates"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1352575",
+      "sec_name": "Driskill Jackie Chad",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Grantham Mayo Van Otterloo",
+        "institutional_flows.py": "Soros Fund Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1357955",
+      "sec_name": "ProShare Advisors LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Senator Investment Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1359842",
+      "sec_name": "Locricchio Sam A",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Two Sigma Advisers"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1363545",
+      "sec_name": "Bon-Ton Stores of Lancaster, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Starboard Value"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1364742",
+      "sec_name": "BlackRock Finance, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Viking Global Investors"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1395250",
+      "sec_name": "Wright Alexander B",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Vanguard Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1397545",
+      "sec_name": "HHR Asset Management, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Marshall Wace"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1403256",
+      "sec_name": "Sculptor Capital Management, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Matrix Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1418135",
+      "sec_name": "Keurig Dr Pepper Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Paulson & Co"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1418814",
+      "sec_name": "ValueAct Holdings, L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Marcato Capital",
+        "sec_13f_live.py": "ValueAct Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1421669",
+      "sec_name": "3G Capital Partners LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "3G Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1422848",
+      "sec_name": "Capital Research Global Investors",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Capital Research Global"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1423053",
+      "sec_name": "CITADEL ADVISORS LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Citadel Advisors",
+        "sec_13f_live.py": "Citadel Advisors"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1424847",
+      "sec_name": "LORILLARD, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Kingdon Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1439289",
+      "sec_name": "Toscafund Asset Management LLP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Lone Pine Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1484148",
+      "sec_name": "Turtle Creek Asset Management Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Coatue Management",
+        "institutional_flows.py": "Lone Pine Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1510085",
+      "sec_name": "LYNCH ROBERT M",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Temasek Holdings"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1510310",
+      "sec_name": "WIOFFER, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Third Point"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1510387",
+      "sec_name": "Gotham Asset Management, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Pershing Square Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1512673",
+      "sec_name": "Block, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Dragoneer Investment Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1517137",
+      "sec_name": "Starboard Value LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Starboard Value"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1527166",
+      "sec_name": "Carlyle Group Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Discovery Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1533444",
+      "sec_name": "Acadian Emerging Markets Small-Cap Equity Fund, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Ares Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1534067",
+      "sec_name": "Haer Gary",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Balyasny Asset Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1535392",
+      "sec_name": "MANGROVE PARTNERS IM, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Point72 Asset Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1536411",
+      "sec_name": "Duquesne Family Office LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Millennium Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1541617",
+      "sec_name": "Altimeter Capital Management, LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Point72 Asset Management",
+        "sec_13f_live.py": "Altimeter Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1544012",
+      "sec_name": "Medley SBIC GP, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Sculptor Capital (Och-Ziff)"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1569391",
+      "sec_name": "Virtu KCG Holdings LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Glenview Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1582243",
+      "sec_name": "OHARA MICHAEL JOSEPH",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Coatue Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1595082",
+      "sec_name": "DAVIDSON KEMPNER CAPITAL MANAGEMENT LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Winton Group"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1599901",
+      "sec_name": "Avidity Biosciences, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "GIC Private Limited"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1602119",
+      "sec_name": "1060 Capital, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Whale Rock Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1603466",
+      "sec_name": "Point72 Asset Management, L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Point72 Asset Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1607841",
+      "sec_name": "SC US (TTGP), LTD.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Sequoia Capital (SC US TTGP)"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1608050",
+      "sec_name": "TUBE Inc",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Farallon Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1632420",
+      "sec_name": "Imperative Group, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Norges Bank Investment Mgmt"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1633907",
+      "sec_name": "Zelnick Edward J.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "AQR Capital Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1649339",
+      "sec_name": "Scion Asset Management, LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "edgar.py": "Citadel Advisors",
+        "institutional_flows.py": "Two Sigma Investments",
+        "sec_13f_live.py": "Two Sigma Investments"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1656456",
+      "sec_name": "Appaloosa LP",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Appaloosa Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1697748",
+      "sec_name": "ARK Investment Management LLC",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "institutional_flows.py": "Maverick Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1699161",
+      "sec_name": null,
+      "http_status": 404,
+      "error": "HTTPError 404",
+      "old_labels": {
+        "institutional_flows.py": "ExodusPoint Capital"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1791786",
+      "sec_name": "Elliott Investment Management L.P.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "Elliott Investment Management"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "1897612",
+      "sec_name": "T. Rowe Price Investment Management, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "T. Rowe Price Investment Mgmt"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    },
+    {
+      "cik": "2012383",
+      "sec_name": "BlackRock, Inc.",
+      "http_status": 200,
+      "error": null,
+      "old_labels": {
+        "sec_13f_live.py": "BlackRock Inc"
+      },
+      "fetch_date": "2026-09-28",
+      "endpoint": "data.sec.gov/submissions"
+    }
+  ],
+  "replacement_ciks_found_via_sec_search": [
+    {
+      "cik": "1138995",
+      "sec_name": "GLENVIEW CAPITAL MANAGEMENT, LLC",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Glenview Capital -> single match"
+    },
+    {
+      "cik": "1389507",
+      "sec_name": "DISCOVERY CAPITAL MANAGEMENT, LLC / CT",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Discovery Capital Management -> single match"
+    },
+    {
+      "cik": "1602189",
+      "sec_name": "Dragoneer Investment Group, LLC",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Dragoneer Investment Group -> single match"
+    },
+    {
+      "cik": "1300714",
+      "sec_name": "Anchorage Capital Group, L.L.C.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Anchorage Capital Group -> single match"
+    },
+    {
+      "cik": "1480532",
+      "sec_name": "York Capital Management Global Advisors, LLC",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search York Capital Management -> single match"
+    },
+    {
+      "cik": "1525907",
+      "sec_name": "Cerberus Capital Management, L.P.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Cerberus Capital Management -> single match"
+    },
+    {
+      "cik": "898202",
+      "sec_name": "Omega Advisors Inc.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Omega Advisors -> single match"
+    },
+    {
+      "cik": "1079563",
+      "sec_name": "HIGHFIELDS CAPITAL MANAGEMENT LP",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Highfields Capital Management -> single match"
+    },
+    {
+      "cik": "1443689",
+      "sec_name": "Senator Investment Group LP",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Senator Investment Group -> single match"
+    },
+    {
+      "cik": "1541996",
+      "sec_name": "Marcato Capital Management LP",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Marcato Capital Management -> single match"
+    },
+    {
+      "cik": "1314588",
+      "sec_name": "Eton Park Capital Management, L.P.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Eton Park Capital Management -> single match"
+    },
+    {
+      "cik": "1612063",
+      "sec_name": "WINTON GROUP Ltd",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Winton Group -> single match"
+    },
+    {
+      "cik": "1423686",
+      "sec_name": "CADIAN CAPITAL MANAGEMENT, LP",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Cadian Capital Management -> single match"
+    },
+    {
+      "cik": "923093",
+      "sec_name": "TUDOR INVESTMENT CORP ET AL",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Tudor Investment Corp -> single match"
+    },
+    {
+      "cik": "1387322",
+      "sec_name": "Whale Rock Capital Management LLC",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Whale Rock Capital Management -> single match"
+    },
+    {
+      "cik": "732812",
+      "sec_name": "Capital Group Companies, Inc.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Capital Group Companies -> single match"
+    },
+    {
+      "cik": "1021944",
+      "sec_name": "Temasek Holdings (Private) Ltd",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Temasek Holdings -> single match"
+    },
+    {
+      "cik": "1637460",
+      "sec_name": "Man Group plc",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Man Group -> single match"
+    },
+    {
+      "cik": "1736225",
+      "sec_name": "ExodusPoint Capital Management, LP",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search ExodusPoint Capital Management -> single match"
+    },
+    {
+      "cik": "1478735",
+      "sec_name": "TWO SIGMA ADVISERS, LP",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Two Sigma candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1352662",
+      "sec_name": "Grantham, Mayo, Van Otterloo & Co. LLC",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Grantham -> single match"
+    },
+    {
+      "cik": "1374170",
+      "sec_name": "NORGES BANK",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search Norges Bank -> single match"
+    },
+    {
+      "cik": "1352851",
+      "sec_name": "Magnetar Financial LLC",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Magnetar candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1000097",
+      "sec_name": "KINGDON CAPITAL MANAGEMENT, L.L.C.",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Kingdon candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1218199",
+      "sec_name": "KING STREET CAPITAL MANAGEMENT, L.P.",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous King Street Capital candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1363391",
+      "sec_name": "J.P. Morgan Investment Management Inc.",
+      "fetch_date": "2026-09-28",
+      "method": "browse-edgar company search J.P. Morgan Investment Management -> single match"
+    },
+    {
+      "cik": "1318757",
+      "sec_name": "MARSHALL WACE, LLP",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Marshall Wace candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1074034",
+      "sec_name": "CANYON CAPITAL ADVISORS LLC",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Canyon Capital candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "909661",
+      "sec_name": "FARALLON CAPITAL MANAGEMENT, L.L.C.",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Farallon Capital candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1035674",
+      "sec_name": "PAULSON & CO. INC.",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Paulson candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "934639",
+      "sec_name": "MAVERICK CAPITAL LTD",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Maverick Capital candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1410830",
+      "sec_name": "Matrix Capital Management Company, LP",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Matrix Capital Management candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1259313",
+      "sec_name": "ARES MANAGEMENT LLC",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous Ares Management candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1145247",
+      "sec_name": "FMR CO INC",
+      "fetch_date": "2026-09-28",
+      "method": "resolved from ambiguous FMR candidate list via data.sec.gov/submissions on each candidate CIK"
+    },
+    {
+      "cik": "1040273",
+      "sec_name": "Third Point LLC",
+      "fetch_date": "2026-09-28",
+      "method": "found already in the 99-CIK union pull (originally mislabeled Tiger Global Management by edgar.py); Third Point was missed in the first reconciliation pass and added on review before finalizing"
+    }
+  ],
+  "dropped_unconfirmed": [
+    {
+      "manager_label": "Balyasny Asset Management",
+      "old_cik": "1534067",
+      "old_sec_name_for_old_cik": "Haer Gary",
+      "searched_terms": [
+        "Balyasny Asset Management",
+        "Balyasny Asset",
+        "Balyasny",
+        "Balyasny Asset Management LLC"
+      ],
+      "fetch_date": "2026-09-28",
+      "outcome": "no SEC company-info match for any variant -- dropped"
+    },
+    {
+      "manager_label": "GIC Private Limited",
+      "old_cik": "1599901",
+      "old_sec_name_for_old_cik": "Avidity Biosciences, Inc.",
+      "searched_terms": [
+        "GIC Private Limited",
+        "Government of Singapore",
+        "Government of Singapore Investment",
+        "GIC",
+        "GIC (Ventures)",
+        "GIC Pte"
+      ],
+      "fetch_date": "2026-09-28",
+      "outcome": "no SEC company-info match for any variant -- dropped"
+    }
+  ],
+  "final_verified_filer_count": 72
+}

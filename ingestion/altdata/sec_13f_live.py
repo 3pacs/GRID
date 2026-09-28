@@ -168,80 +168,30 @@ def _call_with_timeout(fn: Callable[..., _T], *args: Any, timeout: float, **kwar
 
 
 # ── Filer universe ────────────────────────────────────────────────────────────
-# Curated set of ~35 high-signal 13F filers. CIKs are the canonical SEC
-# Central Index Keys. We keep a human-friendly short key for CLI
-# selection (``--filers berkshire_hathaway``) plus the pretty display name
-# stored in ``institutional_holdings.holder_name``.
 #
-# CIKs for the original 20 come from
-# ``scripts/populate_institutional_holdings.py`` so the new rows merge
-# cleanly with the curated bootstrap rows on the
-# (holder_name, ticker, report_date) unique index.
-
-
-@dataclass(frozen=True)
-class Filer:
-    """Metadata for a tracked 13F filer.
-
-    Attributes:
-        key: Short slug used in CLI selection and logs.
-        cik: SEC Central Index Key (unpadded string form).
-        display_name: Human-friendly holder name stored in the DB.
-    """
-
-    key: str
-    cik: str
-    display_name: str
-
-
-FILERS: tuple[Filer, ...] = (
-    # ── From populate_institutional_holdings.py bootstrap ─────────────
-    Filer("berkshire_hathaway",   "1067983", "Berkshire Hathaway"),
-    Filer("pershing_square",      "1336528", "Pershing Square Capital"),
-    Filer("trian",                "1345471", "Trian Fund Management"),
-    Filer("3g_capital",           "1421669", "3G Capital"),
-    Filer("bridgewater",          "1350694", "Bridgewater Associates"),
-    Filer("elliott_management",   "1791786", "Elliott Investment Management"),
-    Filer("icahn_enterprises",    "921669",  "Icahn Enterprises"),
-    Filer("valueact",             "1418814", "ValueAct Capital"),
-    Filer("third_point",          "1159159", "Third Point"),
-    Filer("starboard_value",      "1517137", "Starboard Value"),
-    Filer("jana_partners",        "1027451", "Jana Partners"),
-    Filer("soros_fund",           "1029160", "Soros Fund Management"),
-    # ── New additions (big hedge funds + family offices + LPs) ────────
-    Filer("renaissance",          "1037389", "Renaissance Technologies"),
-    Filer("two_sigma",            "1649339", "Two Sigma Investments"),
-    Filer("citadel",              "1423053", "Citadel Advisors"),
-    Filer("millennium",           "1273087", "Millennium Management"),
-    Filer("point72",              "1603466", "Point72 Asset Management"),
-    Filer("tiger_global",         "1167483", "Tiger Global Management"),
-    Filer("coatue",               "1135730", "Coatue Management"),
-    Filer("viking_global",        "1103804", "Viking Global Investors"),
-    Filer("de_shaw",              "1009207", "D.E. Shaw"),
-    Filer("baupost",              "1061165", "Baupost Group"),
-    Filer("aqr",                  "1167557", "AQR Capital Management"),
-    Filer("lone_pine",            "1061768", "Lone Pine Capital"),
-    Filer("appaloosa",            "1656456", "Appaloosa Management"),
-    # ── Index / active large cap sponsors ─────────────────────────────
-    Filer("sequoia_capital",      "1607841", "Sequoia Capital (SC US TTGP)"),
-    Filer("altimeter",            "1541617", "Altimeter Capital"),
-    Filer("baillie_gifford",      "1088875", "Baillie Gifford"),
-    Filer("t_rowe_price",         "1897612", "T. Rowe Price Investment Mgmt"),
-    Filer("capital_research",     "1422848", "Capital Research Global"),
-    Filer("wellington",           "902219",  "Wellington Management"),
-    Filer("geode_capital",        "1214717", "Geode Capital Management"),
-    Filer("blackrock",            "2012383", "BlackRock Inc"),
-    Filer("vanguard",             "102909",  "Vanguard Group"),
-    Filer("state_street",         "93751",   "State Street"),
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; **corrected**
+# 2026-09-28 by the coordinator after an initial cut of this remediation
+# shrank the tracked universe from ~50 filers to this module's original 35 --
+# see ``ingestion/altdata/verified_13f_filers.py``'s module docstring for the
+# full story). The single verified 13F filer-CIK map now lives in
+# ``ingestion/altdata/verified_13f_filers`` -- built from the **union** of
+# this module's original 35-entry list plus ``ingestion/edgar.py`` and
+# ``ingestion/altdata/institutional_flows.py``'s old independent lists,
+# every CIK checked against SEC's own registrant data. ``Filer``, ``FILERS``,
+# ``filer_by_key`` and ``filer_by_cik`` are re-exported here (not a second
+# copy) so existing callers (``SEC13FLiveIngestor.run()``,
+# ``scripts/run_sec_13f_live.py``) keep working unchanged. This module has no
+# reason of its own to run a *smaller* subset than the verified list --
+# ``SEC13FLiveIngestor.run()`` already supports a per-call ``limit=`` for
+# rate/testing purposes, so ``FILERS`` here is the full verified set, not an
+# independently curated subset.
+from ingestion.altdata.verified_13f_filers import (  # noqa: E402
+    DROPPED_FILERS as DROPPED_FILERS,
+    Filer as Filer,
+    VERIFIED_FILERS as FILERS,
+    filer_by_cik as filer_by_cik,
+    filer_by_key as filer_by_key,
 )
-
-
-def filer_by_key(key: str) -> Filer | None:
-    """Look up a filer by its short slug."""
-    for f in FILERS:
-        if f.key == key:
-            return f
-    return None
 
 
 # ── CUSIP -> ticker resolution ───────────────────────────────────────────────
@@ -687,10 +637,39 @@ _UPSERT_SQL = text(
 )
 
 
+# GD0 §6 item 4 coordinator fix (2026-09-28): scoped by ``cik``, not
+# ``holder_name``. The unique index that guards ``_UPSERT_SQL`` is
+# ``(holder_name, ticker, report_date)`` -- it has no idea two different
+# strings are "the same filer." Scoping continuity by ``holder_name`` meant
+# that the moment ``verified_13f_filers.py`` corrected a filer's
+# ``display_name`` (almost every one of them -- e.g. "Citadel Advisors" ->
+# "Citadel Advisors LLC"), this query would find zero rows for the new
+# name, ``_process_filer`` would treat every historical quarter as
+# never-seen, and the next run would re-pull and INSERT full duplicate
+# history for that filer under the new name (1M+ rows at risk across the
+# 72-filer map). ``cik`` is stable across a relabel -- that is the whole
+# point of GD1's identifier work -- so continuity must key on it.
 _KNOWN_REPORT_DATES_SQL = text(
     """
     SELECT DISTINCT report_date FROM institutional_holdings
-    WHERE holder_name = :holder AND source = 'sec_13f_live'
+    WHERE cik = :cik AND source = 'sec_13f_live'
+    """
+)
+
+
+# Rename-collision guard for ``_upsert_positions`` (same fix, write side).
+# Even with continuity keyed on ``cik``, a write must never be allowed to
+# create a *second* holder_name key for a ``(cik, report_date)`` that
+# already has rows under a different name -- that unique index still can't
+# see the two names are the same filer, so it would duplicate the
+# underlying 13F fact instead of updating it. This is the defensive
+# backstop for cases _known_report_dates can't cover on its own (e.g. a
+# caller passing an explicit ``filers=`` override, or a partially-applied
+# historical backfill from before this fix shipped).
+_EXISTING_HOLDER_NAMES_SQL = text(
+    """
+    SELECT DISTINCT holder_name FROM institutional_holdings
+    WHERE cik = :cik AND report_date = :report_date AND source = 'sec_13f_live'
     """
 )
 
@@ -792,10 +771,20 @@ class SEC13FLiveIngestor:
         ``sec_13f_curated`` bootstrap rows (different provenance, no
         ``filed_date`` guarantee) never mask a quarter this writer hasn't
         actually ingested yet.
+
+        Scoped to ``cik``, not ``holder_name`` (GD0 §6 item 4 coordinator
+        fix, 2026-09-28): ``institutional_holdings``'s unique index is
+        ``(holder_name, ticker, report_date)``, so keying continuity on the
+        display name means any correction to that name (verified_13f_filers
+        .py corrected almost every one of them) makes every historical
+        quarter look never-seen, triggering a full re-pull that INSERTs
+        duplicate rows under the new name instead of recognizing them as
+        already on file. ``cik`` doesn't change when a display name is
+        corrected, so it is the right continuity key.
         """
         with self._engine.connect() as conn:
             rows = conn.execute(
-                _KNOWN_REPORT_DATES_SQL, {"holder": filer.display_name}
+                _KNOWN_REPORT_DATES_SQL, {"cik": filer.cik}
             )
             known: set[date] = set()
             for (value,) in rows:
@@ -911,6 +900,22 @@ class SEC13FLiveIngestor:
         (e.g. one row per share class). We aggregate shares and value
         before writing so the ``(holder_name, ticker, report_date)``
         unique index is satisfied.
+
+        Rename-collision guard (GD0 §6 item 4 coordinator fix, 2026-09-28):
+        before writing, checks whether this ``(cik, report_date)`` already
+        has rows under a *different* ``holder_name``. If so, refuses to
+        write under ``filer.display_name`` and logs a clear error instead
+        -- writing anyway would create a second holder_name key for the
+        same underlying 13F fact (the unique index can't see that the two
+        names are the same filer), i.e. a silent duplicate. This needs no
+        migration: it's a read-before-write check against the existing
+        schema, chosen over adding a new column/constraint because GD1's
+        identifier work already establishes ``cik`` as the stable key and
+        this problem is exactly "two labels, one cik" -- the fix belongs in
+        the write path that creates labels, not in a new piece of schema.
+        The one-time relabel (``relabel_13f_holders.sh``) is what clears
+        this guard for existing mislabeled rows; new report_dates for a
+        filer with no existing rows are never blocked by it.
         """
         agg: dict[str, dict[str, Any]] = {}
         for pos, ticker in matched:
@@ -927,6 +932,29 @@ class SEC13FLiveIngestor:
             bucket["value_usd"] += int(pos.get("value") or 0)
 
         if not agg:
+            return 0
+
+        with self._engine.connect() as conn:
+            existing_names = {
+                row[0]
+                for row in conn.execute(
+                    _EXISTING_HOLDER_NAMES_SQL,
+                    {"cik": filer.cik, "report_date": filing.report_date},
+                )
+                if row[0] is not None
+            }
+        conflicting = existing_names - {filer.display_name}
+        if conflicting:
+            log.error(
+                "13F rename collision: CIK={c} report_date={r} already has "
+                "institutional_holdings rows under {old} but the verified "
+                "filer map says {new!r}. Refusing to write under the new "
+                "name -- run the one-time relabel "
+                "(grid-svr:/home/grid/backups/gd0_decisions_20260928/"
+                "relabel_13f_holders.sh) first, then re-run this filer.",
+                c=filer.cik, r=filing.report_date,
+                old=sorted(conflicting), new=filer.display_name,
+            )
             return 0
 
         rows_written = 0

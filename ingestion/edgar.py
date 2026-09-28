@@ -18,62 +18,26 @@ from edgar import Company, get_filings, set_identity
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
 from ingestion.base import BasePuller
 
-# Top 50 hedge fund CIK numbers for 13F tracking
-# These are the most commonly tracked institutional investors
-TOP_HEDGE_FUND_CIKS: list[str] = [
-    "0001067983",  # Berkshire Hathaway
-    "0001336528",  # Bridgewater Associates
-    "0001649339",  # Citadel Advisors
-    "0001037389",  # Renaissance Technologies
-    "0001103804",  # DE Shaw
-    "0001061768",  # Millennium Management
-    "0001350694",  # Two Sigma
-    "0001541617",  # Point72 Asset Management
-    "0001040273",  # Tiger Global Management
-    "0001135730",  # AQR Capital Management
-    "0001056796",  # Viking Global Investors
-    "0001167557",  # Elliott Management
-    "0001510310",  # Third Point
-    "0001279708",  # Baupost Group
-    "0001334955",  # Pershing Square Capital
-    "0001397545",  # Marshall Wace
-    "0001484148",  # Coatue Management
-    "0001439289",  # Lone Pine Capital
-    "0001159159",  # Appaloosa Management
-    "0001040280",  # Greenlight Capital
-    "0001273087",  # Canyon Capital Advisors
-    "0001569391",  # Glenview Capital
-    "0001336326",  # Farallon Capital
-    "0001418135",  # Paulson & Co
-    "0001199818",  # Maverick Capital
-    "0001345471",  # Jana Partners
-    "0001363545",  # Starboard Value
-    "0001050470",  # Soros Fund Management
-    "0001159830",  # Och-Ziff Capital
-    "0001527166",  # Discovery Capital Management
-    "0001512673",  # Dragoneer Investment Group
-    "0001056831",  # ValueAct Capital
-    "0001080014",  # Icahn Capital
-    "0001096343",  # Duquesne Capital
-    "0001424847",  # Kingdon Capital
-    "0001403256",  # Matrix Capital Management
-    "0001031390",  # Anchorage Capital
-    "0001179245",  # York Capital Management
-    "0001044316",  # Cerberus Capital
-    "0001006438",  # Omega Advisors
-    "0001046187",  # Highfields Capital
-    "0001357955",  # Senator Investment Group
-    "0001418814",  # Marcato Capital
-    "0001167483",  # Eton Park Capital
-    "0001352575",  # Grantham Mayo Van Otterloo
-    "0001061165",  # Winton Group
-    "0001169825",  # King Street Capital
-    "0001326380",  # Cadian Capital
-    "0001099281",  # Tudor Investment Corp
-    "0001067701",  # MSD Capital
-]
+# 13F filer CIK numbers for institutional-holdings tracking.
+#
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; corrected
+# 2026-09-28 -- see ``ingestion/altdata/verified_13f_filers.py``'s module
+# docstring): this module used to carry its own hardcoded 50-fund CIK list
+# that disagreed with both ``ingestion/altdata/institutional_flows.py`` and
+# ``ingestion/altdata/sec_13f_live.py`` on the same CIK for different funds
+# (e.g. CIK 1167483 was "Eton Park Capital" here, "Elliott Management" in
+# institutional_flows.py, and "Tiger Global Management" -- SEC's verified
+# registrant name). This is now a derived, zero-padded view over the single
+# verified 13F filer-CIK map (the union of all three old lists, each CIK
+# checked against SEC's own registrant data), not a second copy that can
+# drift out of sync. 72 verified filers, up from this module's old 50 (2
+# managers -- Balyasny Asset Management, GIC Private Limited -- could not be
+# matched to any SEC-registered filer after multiple search attempts and are
+# documented as dropped in verified_13f_filers.py, not silently omitted).
+TOP_HEDGE_FUND_CIKS: list[str] = [f.cik.zfill(10) for f in VERIFIED_FILERS]
 
 # Rate limit between EDGAR requests (be polite to SEC servers)
 _RATE_LIMIT_DELAY: float = 0.12  # SEC asks for <=10 req/sec
