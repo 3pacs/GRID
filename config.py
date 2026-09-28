@@ -427,6 +427,34 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
 
+    # Wave 3 held-writer jobs (owner decision 2026-09-28, see
+    # GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md §6 "Held-category writers
+    # still running in grid-intelligence"). These three `intelligence/
+    # scheduler.py` jobs kept running unattended in the same held categories
+    # Hermes already refuses to schedule (model/weight-registry writes,
+    # unvalidated hypothesis discovery, paper trading on hypothesis-derived
+    # strategies). Each defaults OFF; `intelligence/scheduler.py` never
+    # registers the job with `schedule` unless its flag is explicitly set,
+    # so it is not dispatched, not attempted, and never timed — mirroring
+    # the DAILY_INTEL_INITIAL_ALLOWLIST "held" semantics in
+    # scripts/hermes_operator.py. Re-enabling one is a reviewed code/config
+    # change, not a runtime toggle on the server.
+    #
+    # - GRID_ENABLE_SCANNER_WEIGHTS_JOB gates the weekly
+    #   `_options_tracker` -> `trading.options_tracker.run_improvement_cycle`
+    #   job, which writes `scanner_weights` (last observed write 2026-09-25).
+    # - GRID_ENABLE_BULK_HYPOTHESIS_JOB gates the nightly (02:45)
+    #   `_nightly_research` -> `analysis.research_agent.run_full_research`
+    #   job, which built 77,261 hypotheses a night and was failing to insert
+    #   them into `hypothesis_registry`.
+    # - GRID_ENABLE_LEGACY_PAPER_TRADING_JOB gates the hourly
+    #   `_paper_trading_signals` -> `trading.signal_executor.execute_signals`
+    #   job, which trades `hypothesis_registry`-derived strategies on
+    #   contaminated `*_full` resolved features with no future-date bound.
+    GRID_ENABLE_SCANNER_WEIGHTS_JOB: bool = False
+    GRID_ENABLE_BULK_HYPOTHESIS_JOB: bool = False
+    GRID_ENABLE_LEGACY_PAPER_TRADING_JOB: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
