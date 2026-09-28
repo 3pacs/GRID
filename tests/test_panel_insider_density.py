@@ -44,6 +44,13 @@ AS_OF_TS = "2026-09-26T00:00:00+00:00"
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vs1"
 
 
+@pytest.fixture(autouse=True)
+def _v1_not_superseded(monkeypatch):
+    """v1 is superseded by v3 (pinned in code, see test_the_superseded_v1_never_opens_a_discovery);
+    the machinery tests in this file exercise v1 as if it were current."""
+    monkeypatch.setattr(vs1, "SUPERSEDED_BY", None)
+
+
 # --- pre-registration pin ---------------------------------------------------------------
 
 
@@ -1718,3 +1725,37 @@ def test_forward_log_defaults_are_unchanged():
     assert log.path.name == fl.LOG_FILENAME and log.prereg_sha256 == fl.PREREG_SHA256
     with pytest.raises(ValueError):
         fl.ForwardLog(Path("x"), prereg_sha256="nothex")
+
+
+# --- supersession (VS1 v3, 2026-09-27): v1 can never open a discovery ------------------------------
+
+
+def test_the_superseded_v1_never_opens_a_discovery(tmp_path, monkeypatch):
+    log_dir = tmp_path / "registry"
+    _register(log_dir)
+    inputs = _frozen_inputs()
+    vs1.freeze_inputs(log_dir, NOW, inputs)
+    witness = _witness(log_dir)
+    monkeypatch.undo()  # the real pin
+    assert vs1.SUPERSEDED_BY["version"] == "vs1-v6"
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
+        vs1.open_discovery(log_dir, NOW, _observed(inputs))
+    with pytest.raises(PermissionError, match="superseded by vs1-v6"):
+        vs1.resume_discovery(log_dir, _observed(inputs), witness)
+    assert "discovery_opened" not in _kinds(log_dir)
+
+
+def test_a_later_version_witness_on_main_refuses_a_v1_price_key(tmp_path):
+    """A checkout without the pin is still refused once a later registry is witnessed on main."""
+    log_dir = tmp_path / "registry"
+    _register(log_dir)
+    inputs = _frozen_inputs()
+    vs1.freeze_inputs(log_dir, NOW, inputs)
+    vs1.open_discovery(log_dir, NOW, _observed(inputs))
+    vault = _offhost(log_dir)
+    vault.publish(log_dir)
+    later = vault.worktree / "05-GRID/Paper-Log/vs1/granular_panel_prereg_v3.anchors.jsonl"
+    later.write_bytes(b"{}\n")
+    vault.commit("v3 witness")
+    with pytest.raises(PermissionError, match="later VS1 registry"):
+        vs1.resume_discovery(log_dir, _observed(inputs), vault.witness())
