@@ -645,6 +645,35 @@ async def get_lessons_learned(
 
 # ── Milestone Tracker Endpoints ─────────────────────────────────────────
 
+def _av_earnings_income_freshness_note(engine: Any) -> str:
+    """Honest freshness note for the AlphaVantage inputs this scorecard scans.
+
+    ``scan_all_tickers`` reads ``av:earnings:%:eps`` / ``av:income:*`` from
+    ``raw_series`` live on every call, even though both AlphaVantage sources
+    are ``active=false`` in ``source_catalog`` (ids 6, 65 — see the Wave 3
+    triage report, item #13). This never blocks the scorecard; it only
+    states what it can determine about how stale those inputs are so the
+    response doesn't silently imply the scan is over fresh data.
+    """
+    from sqlalchemy import text
+
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(text("""
+                SELECT MAX(obs_date) FROM raw_series
+                WHERE pull_status = 'SUCCESS'
+                  AND (series_id LIKE 'av:earnings:%:eps' OR series_id LIKE 'av:income:%')
+            """)).fetchone()
+        max_obs_date = row[0] if row else None
+    except Exception as exc:
+        log.warning("Milestone scorecard freshness check failed: {e}", e=str(exc))
+        return "AlphaVantage inputs inactive; last-refresh date could not be determined"
+
+    if max_obs_date is None:
+        return "AlphaVantage inputs inactive; no successful pull on record for these series"
+    return f"AlphaVantage inputs inactive as of {max_obs_date}"
+
+
 @router.get("/milestones/scorecard")
 async def get_milestone_scorecard(
     _token: str = Depends(require_auth),
@@ -652,12 +681,19 @@ async def get_milestone_scorecard(
     """Return execution scorecard for all tracked companies.
 
     Scores each company on beat/miss rate, trend, streaks.
+
+    The AlphaVantage sources this scan reads (``av:earnings:*``,
+    ``av:income:*``) are inactive in ``source_catalog`` — see ``note``.
     """
     try:
         from intelligence.milestone_tracker import scan_all_tickers
         engine = get_db_engine()
         results = scan_all_tickers(engine)
-        return {"companies": results, "count": len(results)}
+        return {
+            "companies": results,
+            "count": len(results),
+            "note": _av_earnings_income_freshness_note(engine),
+        }
     except Exception as exc:
         log.warning("Milestone scorecard failed: {e}", e=str(exc))
         return {"companies": [], "count": 0, "error": str(exc)}

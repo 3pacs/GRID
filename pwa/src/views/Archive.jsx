@@ -167,9 +167,34 @@ function AudioList({ briefings, onPlay }) {
     ));
 }
 
-function PostmortemList({ postmortems }) {
-    if (!postmortems?.length) return <Empty msg="No post-mortems yet. They auto-generate when theses are scored wrong." />;
-    return postmortems.map((pm, i) => (
+function ThesisScoringHeldBanner({ asOf }) {
+    // Item #16 (Wave 3 triage report): thesis scoring/postmortems are held
+    // at the code level (look-ahead bug in score_old_theses) — never let
+    // this render as a live, ongoing feed.
+    return (
+        <div style={{
+            marginBottom: '10px', padding: '8px 12px', borderRadius: '6px',
+            background: colors.card, border: `1px solid ${colors.yellow}40`,
+            fontFamily: MONO, fontSize: '10px', color: colors.yellow,
+        }}>
+            SCORING HELD (look-ahead bug) — frozen historical record, not a live feed.
+            {asOf ? ` Most recent: ${asOf}.` : ' No scored data on record.'}
+        </div>
+    );
+}
+
+function PostmortemList({ postmortems, asOf }) {
+    if (!postmortems?.length) {
+        return (
+            <>
+                <ThesisScoringHeldBanner asOf={asOf} />
+                <Empty msg="No post-mortems yet. They auto-generate when theses are scored wrong." />
+            </>
+        );
+    }
+    return [
+        <ThesisScoringHeldBanner key="__banner" asOf={asOf} />,
+        ...postmortems.map((pm, i) => (
         <ExpandableCard
             key={i}
             title={`${pm.thesis_direction || '?'} thesis was ${pm.actual_direction || '?'}`}
@@ -205,7 +230,8 @@ function PostmortemList({ postmortems }) {
                 )}
             </div>
         </ExpandableCard>
-    ));
+        )),
+    ];
 }
 
 function DiaryList({ entries }) {
@@ -231,9 +257,17 @@ function DiaryList({ entries }) {
 }
 
 function ThesisList({ snapshots }) {
-    if (!snapshots?.length) return <Empty msg="No thesis snapshots yet." />;
+    // The Outcome/SPY Move columns below come from the same held scorer as
+    // the postmortems (item #16) — snapshots themselves keep being written,
+    // but nothing has scored a new outcome since the look-ahead bug was
+    // found, so "Outcome"/"SPY Move" on any recent row is frozen, not live.
+    const banner = <ThesisScoringHeldBanner asOf={null} />;
+    if (!snapshots?.length) {
+        return (<><div>{banner}</div><Empty msg="No thesis snapshots yet." /></>);
+    }
     return (
         <div style={{ overflowX: 'auto' }}>
+            {banner}
             <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: MONO, fontSize: '11px' }}>
                 <thead>
                     <tr style={{ borderBottom: `1px solid ${colors.border}` }}>
@@ -447,7 +481,7 @@ export default function Archive() {
                 <div>
                     {activeTab === 'deep_dives' && <DeepDiveList dives={archive?.deep_dives} />}
                     {activeTab === 'audio' && <AudioList briefings={archive?.audio_briefings} onPlay={playAudio} />}
-                    {activeTab === 'postmortems' && <PostmortemList postmortems={archive?.postmortems} />}
+                    {activeTab === 'postmortems' && <PostmortemList postmortems={archive?.postmortems} asOf={archive?.postmortem_as_of} />}
                     {activeTab === 'diary' && <DiaryList entries={archive?.diary_entries} />}
                     {activeTab === 'theses' && <ThesisList snapshots={archive?.thesis_snapshots} />}
                 </div>

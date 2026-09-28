@@ -65,4 +65,49 @@ describe('Archive view async data', () => {
         });
         expect(screen.queryByText('research archive unavailable')).not.toBeInTheDocument();
     });
+
+    // Item #16 (Wave 3 triage report): thesis scoring/postmortems are held
+    // (look-ahead bug in intelligence.thesis_tracker.score_old_theses) —
+    // neither tab may render as if it were a live, ongoing feed.
+    it('shows a scoring-held banner on the postmortems tab, with the as_of date from the API', async () => {
+        api.getResearchArchive.mockResolvedValueOnce({
+            deep_dive_count: 0, deep_dives: [],
+            audio_count: 0,
+            postmortem_count: 1,
+            postmortems: [{
+                thesis_direction: 'bullish', actual_direction: 'bearish',
+                root_cause: 'external_shock', what_we_missed: 'a shock',
+                lesson: 'diversify', generated_at: '2026-04-17T00:00:00Z',
+            }],
+            postmortem_as_of: '2026-04-17T00:00:00Z',
+            diary_count: 0, thesis_count: 0,
+        });
+
+        render(<Archive />);
+        await waitFor(() => expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByRole('button', { name: /Post-Mortems/ }));
+
+        expect(await screen.findByText(/SCORING HELD/)).toBeInTheDocument();
+        expect(screen.getByText(/2026-04-17T00:00:00Z/)).toBeInTheDocument();
+    });
+
+    it('shows a scoring-held banner on the theses tab even when snapshots exist', async () => {
+        api.getResearchArchive.mockResolvedValueOnce({
+            deep_dive_count: 0, deep_dives: [],
+            audio_count: 0, postmortem_count: 0, diary_count: 0,
+            thesis_count: 1,
+            thesis_snapshots: [{
+                timestamp: '2026-09-20T14:00:00Z', overall_direction: 'bullish',
+                conviction: 0.6, outcome: null, actual_market_move: null,
+            }],
+        });
+
+        render(<Archive />);
+        await waitFor(() => expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument());
+
+        fireEvent.click(screen.getByRole('button', { name: /Thesis History/ }));
+
+        expect(await screen.findByText(/SCORING HELD/)).toBeInTheDocument();
+    });
 });

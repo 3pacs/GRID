@@ -1081,6 +1081,17 @@ export default function Surfacer() {
                 <Kpi label="Main Source" value={formatSource(topSource)} />
             </div>
 
+            {/* Item #21 (Wave 3 triage report): every conviction "history"/
+                calibration gate below is downstream of the broken Hermes
+                signal meter — never let the hit-rate/Brier percentages
+                baked into a gate's detail text read as a trustworthy,
+                live track record. */}
+            {meta.calibration_note ? (
+                <div className="surfacer-calibration-note" style={styles.noteBox}>
+                    {meta.calibration_note}
+                </div>
+            ) : null}
+
             {thesis ? (
                 <section className="surfacer-thesis" style={styles.thesisStrip}>
                     <div className="surfacer-thesis-signal" style={styles.thesisSignal}>

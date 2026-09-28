@@ -36,6 +36,7 @@ const STATUS_COLORS = {
     ACHIEVED: '#10B981',
     MISSED: '#EF4444',
     CANCELLED: '#6B7280',
+    unresolved: '#78716C',
     hit: '#10B981',
     miss: '#EF4444',
     partial: '#F59E0B',
@@ -377,6 +378,15 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                     ))}
                 </div>
 
+                {typeFilter.has('milestone') && (
+                    <span style={{
+                        marginLeft: '8px', fontSize: '8px', color: '#F59E0B',
+                        fontFamily: MONO, opacity: 0.85,
+                    }} title="company_milestones was a one-shot seed on 2026-04-11 (scripts/populate_milestones.py); it has no maintaining writer, and probability/value-impact are hidden defaults, not scores">
+                        milestones: seeded 2026-04-11, unmaintained
+                    </span>
+                )}
+
                 {/* Stats */}
                 {data && (
                     <div style={{ marginLeft: 'auto', display: 'flex', gap: '12px', fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>
@@ -463,6 +473,17 @@ export default function CatalystTimeline({ selectedTicker = '' }) {
                         <div style={{ fontSize: '10px', color: colors.textMuted }}>
                             {selectedEvent.date} · {selectedEvent.subtype}
                         </div>
+
+                        {/* Unmaintained-seed banner (company_milestones, item #14) */}
+                        {selectedEvent.type === 'milestone' && selectedEvent.seeded_note && (
+                            <div style={{
+                                background: '#F59E0B15', border: '1px solid #F59E0B40',
+                                borderRadius: '6px', padding: '8px 10px',
+                                fontSize: '10px', color: '#F59E0B', lineHeight: 1.4,
+                            }}>
+                                {selectedEvent.seeded_note} — probability/value-impact hidden (fabricated defaults, never scored)
+                            </div>
+                        )}
 
                         {/* Key metrics */}
                         <div style={{ borderTop: `1px solid ${colors.border}`, paddingTop: '8px' }}>

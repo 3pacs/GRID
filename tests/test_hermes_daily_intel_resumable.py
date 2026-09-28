@@ -770,7 +770,6 @@ class TestRealTaskTableSanity:
             "rag_index",
             "actor_research",
             "icij_linking",
-            "milestone_scoring",
             "attention_anomaly",
             "edgar_transcripts",
             "corporate_actions",
@@ -810,7 +809,7 @@ class TestDailyIntelAllowlistClassification:
         # postmortems that feed learning).
         expected_holds = {
             "hypothesis_discovery", "hypothesis_review", "backtest_scan",
-            "postmortem_batch", "options_improvement", "milestone_scoring",
+            "postmortem_batch", "options_improvement",
             "actor_research", "edgar_transcripts",
             # coordinator's initial-subset holds: non-idempotent audit
             # appends + priority_rank rewrite; delete-then-rebuild index
@@ -1154,7 +1153,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         self, monkeypatch
     ) -> None:
         """Uses the REAL DAILY_INTEL_TASKS/DAILY_INTEL_INITIAL_ALLOWLIST/
-        DAILY_INTEL_HOLD_REASONS (8 allowed, 13 held) with every allow-listed
+        DAILY_INTEL_HOLD_REASONS (7 allowed, 13 held) with every allow-listed
         task's fn replaced by a no-op so no real DB/network is touched.
         Held tasks keep their real (never-called) fn."""
         calls: list[str] = []
@@ -1182,7 +1181,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
         ho._run_daily_intel_block(MagicMock(), state, NOW, results)
 
         assert len(calls) == len(ho.DAILY_INTEL_INITIAL_ALLOWLIST) == 7
-        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 14
+        assert len(ho.DAILY_INTEL_HOLD_REASONS) == 13
         assert state.daily_intel_period_outcome == "complete_for_enabled_tasks"
         assert state.last_daily_intel == NOW
 
@@ -1205,7 +1204,7 @@ class TestPeriodOutcomeWordingWithHeldTasks:
             "dedicated assertion"
         )
         assert summary["s"] == 0, "skipped_for_period must be reported separately from held"
-        assert summary["h"] == 14, "held must be reported separately from skipped_for_period"
+        assert summary["h"] == 13, "held must be reported separately from skipped_for_period"
 
     def test_bare_complete_only_when_zero_tasks_held(self, monkeypatch) -> None:
         calls: list[str] = []

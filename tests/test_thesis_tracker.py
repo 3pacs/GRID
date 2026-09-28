@@ -15,6 +15,7 @@ from intelligence.thesis_tracker import (
     ThesisSnapshot,
     ThesisPostMortem,
     ROOT_CAUSES,
+    THESIS_SCORING_HELD,
     _parse_json,
     _normalise_direction,
     _classify_root_cause,
@@ -22,6 +23,7 @@ from intelligence.thesis_tracker import (
     score_old_theses,
     get_thesis_history,
     load_thesis_postmortems,
+    run_thesis_cycle,
 )
 
 
@@ -231,6 +233,70 @@ class TestScoreOldTheses:
         assert results["correct"] == 0
         assert results["wrong"] == 0
         assert results["partial"] == 0
+
+    def test_held_by_default_and_never_touches_the_engine(self, mock_engine):
+        """Item #16 (Wave 3 triage report): score_old_theses has a real
+        look-ahead bug (_get_spy_price_near resolves a mid-session
+        snapshot's price against that SAME day's close once it exists) and
+        is reachable from scripts/grid_cron.sh's "thesis-snapshot" job, not
+        just the unscheduled run_thesis_cycle. THESIS_SCORING_HELD must
+        default True and the function must short-circuit before any query."""
+        assert THESIS_SCORING_HELD is True
+
+        results = score_old_theses(mock_engine)
+
+        assert results["held"] is True
+        assert results["correct"] == 0
+        assert results["wrong"] == 0
+        assert results["partial"] == 0
+        mock_engine.begin.assert_not_called()
+        mock_engine.connect.assert_not_called()
+
+    def test_unheld_via_monkeypatch_runs_the_real_query(self, monkeypatch, mock_engine):
+        """Sanity check that the hold is a real gate, not dead code: with it
+        patched off, the pre-existing query path still runs."""
+        import intelligence.thesis_tracker as tt
+        monkeypatch.setattr(tt, "THESIS_SCORING_HELD", False)
+        mock_conn_begin = mock_engine.begin.return_value.__enter__.return_value
+        mock_conn_begin.execute.return_value = MagicMock(fetchall=MagicMock(return_value=[]))
+
+        results = tt.score_old_theses(mock_engine, lookback_days=7)
+
+        assert "held" not in results
+        mock_engine.begin.assert_called()  # _ensure_tables + the scoring query both use begin()
+
+
+class TestRunThesisCycleHoldsPostmortems:
+    def test_postmortem_generation_is_held_and_never_queried(self, monkeypatch, mock_engine):
+        """Item #16: run_thesis_cycle step 3 (postmortem generation) is an
+        LLM-narrated write over outcomes the (held) scorer produces -- the
+        same standing 'postmortem write that feeds learning' category
+        Hermes already holds for postmortem_batch. It must not run, or even
+        query for candidate snapshots, while THESIS_SCORING_HELD is True."""
+        import intelligence.thesis_tracker as tt
+
+        monkeypatch.setattr(
+            tt, "_ensure_tables", lambda engine: None,
+        )
+        monkeypatch.setattr(
+            tt, "get_thesis_accuracy",
+            lambda engine: {"overall": {"accuracy_pct": 0, "total_scored": 0}},
+        )
+        called = {"generate_thesis_postmortem": False}
+
+        def _fail_if_called(*a, **kw):
+            called["generate_thesis_postmortem"] = True
+            raise AssertionError("generate_thesis_postmortem must not be called while held")
+
+        monkeypatch.setattr(tt, "generate_thesis_postmortem", _fail_if_called)
+
+        # Let the thesis-snapshot step fail naturally (no flow_thesis wiring
+        # in this unit test) -- run_thesis_cycle catches that itself.
+        report = tt.run_thesis_cycle(mock_engine)
+
+        assert report["postmortems_held"] is True
+        assert report["postmortems_generated"] == 0
+        assert called["generate_thesis_postmortem"] is False
 
 
 # ── History Tests ─────────────────────────────────────────────────────────

@@ -177,7 +177,7 @@ DAILY_INTEL_BOUNDARY_HOUR = 2                 # UTC hour the daily-intel due-per
 DAILY_INTEL_MAX_ATTEMPTS = 3                  # a task that fails (timeout or exception) this many times within one due period is marked skipped_for_period so it cannot block the tasks behind it forever.
 DAILY_INTEL_CYCLE_BUDGET_SECONDS = 480        # cumulative wall-time budget for the daily-intel block PER CYCLE, checked before starting each task (not mid-task). When exhausted, the block stops for this cycle and _run_daily_intel_block resumes from the first undone task on the next due call. Pin: ACTIVE_HYPO_SCORING_MAX_RUNTIME_S + DAILY_INTEL_CYCLE_BUDGET_SECONDS + 60 <= INTELLIGENCE_TASKS_TIMEOUT_SECONDS (240 + 480 + 60 = 780 <= 900) — the +60 covers the earnings-calendar-sync SQL call and active-hypo-scoring bookkeeping that run ahead of both in the same step. tests/test_hermes_timeout_budgets.py pins this.
 DAILY_INTEL_LLM_TASK_BUDGET_S = 180           # documented default per-task budget for LLM-backed daily-intel tasks (source_audit, backtest_scan, options_improvement, hypothesis_review, hypothesis_discovery, rag_index, actor_research, edgar_transcripts) — sized like the other single-to-few-call LLM steps above (e.g. TIMESFM_TIMEOUT_SECONDS, KNOWLEDGE_MAP_TIMEOUT_SECONDS), not the many-ticker ORACLE_CYCLE_TIMEOUT_SECONDS.
-DAILY_INTEL_SQL_TASK_BUDGET_S = 60            # documented default per-task budget for SQL/CPU-only daily-intel tasks (flow_materialize, icij_linking, milestone_scoring, attention_anomaly, corporate_actions, capital_flow_rollups, fundamental_divergence, holder_deal_overlap) — matches SMART_INGESTION/RESOLUTION-class steps, generous headroom over the sub-10s runtimes those steps observe.
+DAILY_INTEL_SQL_TASK_BUDGET_S = 60            # documented default per-task budget for SQL/CPU-only daily-intel tasks (flow_materialize, icij_linking, attention_anomaly, corporate_actions, capital_flow_rollups, fundamental_divergence, holder_deal_overlap) — matches SMART_INGESTION/RESOLUTION-class steps, generous headroom over the sub-10s runtimes those steps observe.
 DAILY_INTEL_CLEANUP_TASK_BUDGET_S = 30        # documented default per-task budget for the three daily-intel file/log cleanup tasks (insight_cleanup, briefing_cleanup, errors_jsonl_cleanup) — cheap filesystem work, not DB or LLM bound.
 DAILY_INTEL_POSTMORTEM_TASK_BUDGET_S = DAILY_INTEL_LLM_TASK_BUDGET_S  # postmortem_batch is LLM-backed but bounded on the WORK axis by POSTMORTEM_BATCH_LIMIT (20 rows/cycle, see above) rather than its own time constant; the time budget still uses the LLM default.
 DAILY_INTEL_DISPATCH_TASK_BUDGET_S = DAILY_INTEL_SQL_TASK_BUDGET_S  # storage_maintenance_subagent only QUEUES a subagent dispatch command (_execute_hermes_repair_command) — no LLM call in this step itself — so it gets the SQL-class default, not the LLM one.
@@ -1528,16 +1528,6 @@ def _daily_intel_icij_linking(
     log.info("ICIJ linking: {n} matches found", n=len(icij_result))
 
 
-def _daily_intel_milestone_scoring(
-    engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
-) -> None:
-    """Execution scorecards for all companies."""
-    from intelligence.milestone_tracker import scan_all_tickers
-    milestones = scan_all_tickers(engine)
-    results["milestone_scoring"] = {"companies_scored": len(milestones)}
-    log.info("Milestone scoring: {n} companies scored", n=len(milestones))
-
-
 def _daily_intel_attention_anomaly(
     engine: Any, state: OperatorState, now: datetime, results: dict[str, Any],
 ) -> None:
@@ -1758,7 +1748,6 @@ DAILY_INTEL_TASKS: tuple[DailyIntelTask, ...] = (
     DailyIntelTask("rag_index", _daily_intel_rag_index, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("actor_research", _daily_intel_actor_research, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("icij_linking", _daily_intel_icij_linking, DAILY_INTEL_SQL_TASK_BUDGET_S),
-    DailyIntelTask("milestone_scoring", _daily_intel_milestone_scoring, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("attention_anomaly", _daily_intel_attention_anomaly, DAILY_INTEL_SQL_TASK_BUDGET_S),
     DailyIntelTask("edgar_transcripts", _daily_intel_edgar_transcripts, DAILY_INTEL_LLM_TASK_BUDGET_S),
     DailyIntelTask("corporate_actions", _daily_intel_corporate_actions, DAILY_INTEL_SQL_TASK_BUDGET_S),
@@ -1909,14 +1898,6 @@ DAILY_INTEL_HOLD_REASONS: dict[str, str] = {
         "(trading/options_tracker.py) writes scanner_weights (a de-facto "
         "model registry) and updates options_recommendations scoring; "
         "its report step also calls llm.router Tier.REASON"
-    ),
-    "milestone_scoring": (
-        "scorer execution (standing hold) — scan_all_tickers "
-        "(intelligence/milestone_tracker.py) is execution/milestone "
-        "scoring by category even though the current function body is "
-        "read-only (no INSERT/UPDATE found); held on category, not on "
-        "current write footprint, since a future change to persist "
-        "scorecards must not silently graduate this task"
     ),
     "actor_research": (
         "LLM-driven write, not shown to be derived-only — research_batch "

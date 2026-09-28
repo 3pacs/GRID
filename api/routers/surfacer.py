@@ -29,6 +29,23 @@ router = APIRouter(
     dependencies=[Depends(require_auth)],
 )
 
+# Wave 3 triage report item #21: hit-rate/Brier calibration here
+# (surfacer_ticker_calibration, per_signal_brier_history,
+# regime_conditional_brier_history) is downstream of oracle_predictions
+# verdicts, i.e. the Hermes signal meter — which is broken (see the "GRID
+# Hermes signal meter is broken" note). This module does not attempt to
+# repair the meter (separate work); it only makes sure every response that
+# carries a hit-rate/Brier number also carries an honest label instead of
+# presenting it as a live, trustworthy track record. The per-record
+# "last_scored"/"note" fields (added where the row's own timestamp is
+# available) are more precise than this static text — this is the fallback
+# for call sites where no such timestamp exists.
+SURFACER_CALIBRATION_NOTE = (
+    "hit-rate/Brier calibration here is downstream of oracle_predictions "
+    "verdicts (the Hermes signal meter), which is broken and unrepaired — "
+    "treat these numbers as unreliable, not a live track record"
+)
+
 
 def _clamp(value: float, low: float = 0.0, high: float = 100.0) -> float:
     return max(low, min(high, value))
@@ -642,6 +659,13 @@ def _materialized_track_record(
     exact_horizon = all(int(row.get("horizon_days") or 0) == requested_horizon for row in selected)
     exact_regime = bool(requested_regime) and all(str(row.get("regime") or "").upper() == requested_regime for row in selected)
     exact_model = bool(model_name) and all(row.get("model_name") == model_name for row in selected)
+    # Item #21: label with the actual newest last_seen/last_scored_at across
+    # the selected rows rather than a hardcoded date, so this stays honest
+    # if the table is ever backfilled or repaired.
+    last_scored = max(
+        (v for row in selected for v in (row.get("last_scored_at"), row.get("last_seen")) if v is not None),
+        default=None,
+    )
     return {
         "samples": samples,
         "ticker_samples": samples,
@@ -656,6 +680,11 @@ def _materialized_track_record(
         "ticker_brier": round(_weighted_average(selected, "brier"), 6) if _weighted_average(selected, "brier") is not None else None,
         "ticker_ece": round(_weighted_average(selected, "ece"), 6) if _weighted_average(selected, "ece") is not None else None,
         "source": "surfacer_ticker_calibration",
+        "last_scored": _iso(last_scored),
+        "note": (
+            f"surfacer_ticker_calibration last scored {_iso(last_scored)}; {SURFACER_CALIBRATION_NOTE}"
+            if last_scored is not None else SURFACER_CALIBRATION_NOTE
+        ),
         "calibration_level": level,
         "requested_horizon_days": requested_horizon,
         "exact_horizon": exact_horizon,
@@ -733,6 +762,7 @@ def _fetch_track_record(
         "avg_pnl_pct": round(_safe_float(data.get("avg_pnl_pct")), 2) if data.get("avg_pnl_pct") is not None else None,
         "avg_confidence": round(_safe_float(data.get("avg_confidence")), 4) if data.get("avg_confidence") is not None else None,
         "source": "oracle_predictions",
+        "note": SURFACER_CALIBRATION_NOTE,
     }
 
 
@@ -796,6 +826,7 @@ def _scorecard_from_row(row: Any, source: str, horizon: int, regime: str | None 
         "conviction_weight": round(conviction_weight, 4),
         "last_updated": _iso(data.get("last_updated")),
         "calibrated": samples >= (10 if regime else 20),
+        "note": SURFACER_CALIBRATION_NOTE,
     }
 
 
@@ -955,6 +986,7 @@ def _merge_track_records(ticker_record: dict[str, Any], signal_cards: list[dict[
         "hit_rate": round(combined_hit, 4),
         "signal_brier": round(signal_brier, 6),
         "source": source,
+        "note": result.get("note") or SURFACER_CALIBRATION_NOTE,
     })
     return result
 
@@ -2307,6 +2339,8 @@ def list_candidates(
     meta["missing_data_by_type"] = missing_queue["by_type"]
     meta["queue_missing_data_enabled"] = queue_missing_data
     brief = _build_operator_brief(selected, meta, thesis)
+
+    meta["calibration_note"] = SURFACER_CALIBRATION_NOTE
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),

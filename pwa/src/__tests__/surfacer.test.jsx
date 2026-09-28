@@ -100,6 +100,28 @@ describe('Surfacer operator brief', () => {
         expect(screen.getByText('Do Next')).toBeInTheDocument();
         expect(screen.getByRole('button', { name: 'Show me this setup' })).toBeInTheDocument();
     });
+
+    // Item #21 (Wave 3 triage report): hit-rate/Brier calibration is
+    // downstream of the broken Hermes signal meter — the view must show
+    // that label whenever the backend sends one, not just when it feels
+    // like it.
+    it('shows the calibration honesty note from meta.calibration_note', async () => {
+        api.get.mockResolvedValue({
+            generated_at: '2026-09-28T00:00:00Z',
+            brief: null,
+            candidates: [],
+            meta: {
+                count: 0,
+                actionable_count: 0,
+                average_conviction: 0,
+                calibration_note: 'hit-rate/Brier calibration here is downstream of oracle_predictions verdicts (the Hermes signal meter), which is broken and unrepaired — treat these numbers as unreliable, not a live track record',
+            },
+        });
+
+        render(<Surfacer />);
+
+        expect(await screen.findByText(/broken and unrepaired/)).toBeInTheDocument();
+    });
 });
 
 describe('Surfacer candidate honesty', () => {

@@ -188,20 +188,27 @@ function PreEarningsCard({ entry, onPredict }) {
                 <div style={{
                     marginTop: tokens.space.sm, padding: tokens.space.sm,
                     background: colors.bg, borderRadius: tokens.radius.sm,
-                    display: 'flex', alignItems: 'center', gap: tokens.space.md,
+                    display: 'flex', flexDirection: 'column', gap: tokens.space.xs || 4,
                 }}>
-                    <span style={{
-                        fontSize: '12px', fontWeight: 700, fontFamily: colors.mono,
-                        color: entry.prediction.direction === 'up' ? colors.green
-                            : entry.prediction.direction === 'down' ? colors.red
-                            : colors.textMuted,
-                    }}>
-                        {entry.prediction.direction?.toUpperCase()} {fmtPct(entry.prediction.move_pct)}
+                    <div style={{ display: 'flex', alignItems: 'center', gap: tokens.space.md }}>
+                        <span style={{
+                            fontSize: '12px', fontWeight: 700, fontFamily: colors.mono,
+                            color: entry.prediction.direction === 'up' ? colors.green
+                                : entry.prediction.direction === 'down' ? colors.red
+                                : colors.textMuted,
+                        }}>
+                            {entry.prediction.direction?.toUpperCase()} {fmtPct(entry.prediction.move_pct)}
+                        </span>
+                        <VerdictBadge verdict={entry.prediction.verdict} />
+                    </div>
+                    {/* Item #15: predicted confidence is a frozen, unmaintained
+                        heuristic — never render it as a live number. */}
+                    <span
+                        style={{ fontSize: '10px', color: colors.textMuted, fontStyle: 'italic' }}
+                        title={entry.prediction.note || ''}
+                    >
+                        Confidence frozen since {entry.prediction.frozen_since || 'unknown'} (unmaintained prediction, not a live score)
                     </span>
-                    <span style={{ fontSize: '11px', color: colors.textMuted }}>
-                        Confidence: {((entry.prediction.confidence || 0) * 100).toFixed(0)}%
-                    </span>
-                    <VerdictBadge verdict={entry.prediction.verdict} />
                 </div>
             )}
         </div>
@@ -269,6 +276,18 @@ function Scorecard({ data }) {
     return (
         <div>
             <div style={shared.sectionTitle}>PREDICTION TRACK RECORD</div>
+            {/* Item #15: run_earnings_cycle has not scored/predicted since
+                2026-04-06 and confidence is a tuned constant, not a
+                calibrated probability — this whole section is a frozen,
+                unmaintained artifact, not a live scorecard. */}
+            <div style={{
+                marginBottom: tokens.space.sm, padding: tokens.space.sm,
+                background: colors.yellowBg, borderRadius: tokens.radius.sm,
+                fontSize: '11px', color: colors.yellow,
+            }}>
+                FROZEN since {data.frozen_since || 'unknown'} — unmaintained; not a live scorecard.
+                {data.note ? ` ${data.note}` : ''}
+            </div>
             <div style={shared.cardGradient}>
                 <div style={shared.metricGrid}>
                     <div style={shared.metric}>
@@ -370,7 +389,7 @@ function Scorecard({ data }) {
 
 /* ─────────────── Main View ─────────────── */
 
-const TABS = ['Calendar', 'Upcoming', 'Reported', 'Scorecard'];
+const TABS = ['Calendar', 'Upcoming', 'Reported', 'Scorecard (frozen)'];
 
 export default function EarningsCalendar() {
     const [tab, setTab] = useState('Calendar');
@@ -466,7 +485,7 @@ export default function EarningsCalendar() {
                 </div>
             )}
 
-            {tab === 'Scorecard' && (
+            {tab === 'Scorecard (frozen)' && (
                 <Scorecard data={scorecard} />
             )}
         </div>

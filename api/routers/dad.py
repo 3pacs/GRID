@@ -569,74 +569,30 @@ def _read_summary_cache(
 
     Callers pass SUMMARY_CACHE_TTL_SECONDS (the default) for a "fresh" read,
     or GOLD_STALE_MAX_AGE_SECONDS for the stale-while-revalidate fallback
-    when a fresh compute can't finish inside its budget. `max_age_seconds`
-    is caller-supplied (not always the fixed module constant), so it's bound
-    as a parameter via make_interval rather than interpolated into the SQL
-    string -- see .claude/rules/security.md.
+    when a fresh compute can't finish inside its budget.
+
+    In-memory only (see `_GOLD_MEMORY_CACHE`). This used to fall through to
+    a `dad_ticker_summary_cache` SELECT when the process cache missed, but
+    nothing on `main` writes that table anymore (Wave 3 triage report item
+    #22: the only rows found were 4 leftover from older code, 2026-09-21..
+    23) -- it was a dead read kept alive only by this function still
+    checking it. `engine` is kept as a parameter for call-site compatibility
+    even though it is now unused here.
     """
     path, mtime = _research_db_fingerprint(db_path)
     key = (ticker, DAD_CACHE_VERSION, path, mtime)
     with _GOLD_MEMORY_CACHE_LOCK:
         remembered = _GOLD_MEMORY_CACHE.get(key)
-    if remembered:
-        generated_at, memory_payload = remembered
-        age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
-        if age_seconds <= max_age_seconds:
-            payload = copy.deepcopy(memory_payload)
-            payload["cache"] = {
-                "hit": True, "stale": age_seconds > SUMMARY_CACHE_TTL_SECONDS,
-                "generated_at": generated_at.isoformat(), "age_seconds": age_seconds,
-                "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
-            }
-            return payload
-    try:
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT payload, generated_at, timings "
-                    "FROM dad_ticker_summary_cache "
-                    "WHERE ticker = :ticker "
-                    "AND payload_version = :version "
-                    "AND research_db_path = :path "
-                    "AND research_db_mtime IS NOT DISTINCT FROM :mtime "
-                    "AND generated_at >= NOW() - make_interval(secs => :max_age_seconds) "
-                    "LIMIT 1"
-                ),
-                {
-                    "ticker": ticker,
-                    "version": DAD_CACHE_VERSION,
-                    "path": path,
-                    "mtime": mtime,
-                    "max_age_seconds": max_age_seconds,
-                },
-            ).fetchone()
-    except Exception as exc:
-        log.debug("Dad summary cache read failed for {t}: {e}", t=ticker, e=str(exc))
+    if not remembered:
         return None
-    if not row:
+    generated_at, memory_payload = remembered
+    age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds()
+    if age_seconds > max_age_seconds:
         return None
-    payload = row[0]
-    if isinstance(payload, str):
-        try:
-            payload = json.loads(payload)
-        except Exception:
-            return None
-    if not isinstance(payload, dict):
-        return None
-    generated_at = _as_utc(row[1])
-    age_seconds = (datetime.now(timezone.utc) - generated_at).total_seconds() if generated_at else None
-    # Staleness reflects the row's *actual* age, not the max_age_seconds
-    # window it was queried with -- a stale-tier query (max_age_seconds =
-    # GOLD_STALE_MAX_AGE_SECONDS) can still land on a row that happens to be
-    # brand new (e.g. another concurrent single-flight compute just finished
-    # and wrote it), and that must not be mislabeled stale.
-    is_fresh = age_seconds is not None and age_seconds <= SUMMARY_CACHE_TTL_SECONDS
-    payload = dict(payload)
+    payload = copy.deepcopy(memory_payload)
     payload["cache"] = {
-        "hit": True,
-        "stale": not is_fresh,
-        "generated_at": generated_at.isoformat() if generated_at else str(row[1]),
-        "age_seconds": age_seconds,
+        "hit": True, "stale": age_seconds > SUMMARY_CACHE_TTL_SECONDS,
+        "generated_at": generated_at.isoformat(), "age_seconds": age_seconds,
         "ttl_seconds": SUMMARY_CACHE_TTL_SECONDS,
     }
     return payload
