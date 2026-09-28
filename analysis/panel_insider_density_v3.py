@@ -87,8 +87,13 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T01:05:51.160636+00:00"}'
 )
-#: v3 is the current version.
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+#: v3 was superseded by v4 before any price read (owner decisions 2026-09-28 03:40Z: TIINGO-only
+#: price admission with a TwelveData cross-check, and a post-admission power gate).
+SUPERSEDED_BY: Mapping[str, Any] | None = {
+    "version": "vs1-v4",
+    "prereg_sha256": "0b5e8c559743da83affe82549069994b0146b9185d1e968ae7961bc8b6107425",
+    "registry_head_sha256": None,
+}
 
 
 def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:

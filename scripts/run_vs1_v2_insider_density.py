@@ -66,11 +66,13 @@ CODE_FILES = (
     "analysis/panel_insider_density.py",
     "analysis/panel_insider_density_v2.py",
     "analysis/panel_insider_density_v3.py",
+    "analysis/panel_insider_density_v4.py",
     "analysis/offline_research_proof.py",
     "analysis/research_forward_log.py",
     "store/observations.py",
     "scripts/run_vs1_v2_insider_density.py",
     "scripts/run_vs1_v3_insider_density.py",
+    "scripts/run_vs1_v4_insider_density.py",
 )
 
 
@@ -99,8 +101,19 @@ def _code_files() -> dict:
     return {f: v1.file_sha256(REPO / f) for f in CODE_FILES}
 
 
-def _power_inputs(h, events, admission, info) -> dict:
-    return {
+def _admitted_universe(args, universe):
+    """v4 on: the post-admission Stage-0 runs on the price-admitted issuers of the manifest."""
+    if not getattr(args.h, "POST_ADMISSION_POWER", False):
+        return universe, None
+    if not getattr(args, "price_manifest", None):
+        raise SystemExit(f"{args.h.VERSION} Stage-0 is post-admission: pass --price-manifest (and its reports)")
+    manifest = _manifest(args)
+    return universe[universe["ticker"].isin(manifest.admitted)].reset_index(drop=True), manifest
+
+
+def _power_inputs(h, events, admission, info, manifest=None) -> dict:
+    extra = {"price_manifest_sha256": manifest.digest()} if manifest is not None else {}
+    return {**extra,
         "form4_receipt_sha256": events.receipt_sha256,
         "admission_receipt_sha256": admission.receipt_sha256,
         "universe_sha256": info["universe_sha256"],
@@ -111,7 +124,8 @@ def _power_inputs(h, events, admission, info) -> dict:
 def _load_power(args, events, admission, info) -> dict:
     power = json.loads(Path(args.power).read_text(encoding="utf-8"))
     args.h.verify_power(power)
-    if power.get("inputs") != _power_inputs(args.h, events, admission, info):
+    manifest = _manifest(args) if getattr(args.h, "POST_ADMISSION_POWER", False) else None
+    if power.get("inputs") != _power_inputs(args.h, events, admission, info, manifest):
         raise SystemExit("power file was computed on other inputs")
     return power
 
@@ -120,6 +134,10 @@ def _manifest(args) -> v2.PriceManifest:
     manifest = args.h.PriceManifest.from_file(Path(args.price_manifest))
     if v1.data_sha256(Path(args.probe_report)) != manifest.probe_report_sha256:
         raise SystemExit("probe report does not hash to the manifest's probe_report_sha256")
+    crosscheck = getattr(manifest, "crosscheck_report_sha256", None)
+    if crosscheck is not None:
+        if not getattr(args, "crosscheck_report", None) or v1.data_sha256(Path(args.crosscheck_report)) != crosscheck:
+            raise SystemExit("the TwelveData cross-check report does not hash to the manifest's crosscheck_report_sha256")
     return manifest
 
 
@@ -188,9 +206,13 @@ def cmd_power(args) -> None:
     output.mkdir(parents=True, exist_ok=False)
     universe, info = _universe(args)
     events, admission = _events(args, universe)
-    power = h.stage0_power(h.power_features(events, admission, universe, "discovery"))
-    power["inputs"] = _power_inputs(h, events, admission, info)
-    report = h.admission_report(events, admission, universe, "discovery")
+    power_universe, manifest = _admitted_universe(args, universe)
+    power = h.stage0_power(h.power_features(events, admission, power_universe, "discovery"))
+    power["inputs"] = _power_inputs(h, events, admission, info, manifest)
+    if manifest is not None:
+        power["post_admission"] = {"price_admitted_issuers": int(len(power_universe)),
+                                   "filings_universe_issuers": int(len(universe))}
+    report = h.admission_report(events, admission, power_universe, "discovery")
     h.write_frozen(output, "power.json", power)
     h.write_frozen(output, "form4-receipt.json", events.receipt)
     h.write_frozen(output, "admission-receipt.json", admission.receipt)
@@ -347,9 +369,13 @@ def cmd_open_holdout(args) -> None:
     h = args.h
     frozen, _, _, _, _, observed = _holdout_inputs(args)
     witness = h.check_offhost(Path(args.vault_repo))  # recorded in holdout_opened (VS1 witness census)
+    probe = None
+    if getattr(args, "holdout_probe_report", None):
+        path = Path(args.holdout_probe_report)
+        probe = {"sha256": v1.data_sha256(path), "report": json.loads(path.read_text(encoding="utf-8"))}
     opened = h.open_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                             log_dir=Path(args.log_dir), now=_now(), observed=observed, witness=witness,
-                            repo_root=REPO)
+                            repo_root=REPO, holdout_probe=probe)
     _print_witness_instructions(opened, args)
 
 
@@ -394,6 +420,7 @@ def main(argv: list[str] | None = None, h=v2) -> None:
             p.add_argument("--price-manifest", required=True)
             p.add_argument("--probe-report", required=True)
             p.add_argument("--power", required=True)
+        p.add_argument("--crosscheck-report", help="v4 on: the TwelveData cross-check report the manifest names")
 
     def holdout_request(p) -> None:
         p.add_argument("--run-dir", required=True)
@@ -408,6 +435,8 @@ def main(argv: list[str] | None = None, h=v2) -> None:
     p = sub.add_parser("power")
     inputs(p, prices=False)
     p.add_argument("--out", required=True)
+    p.add_argument("--price-manifest", help="v4 on: post-admission Stage-0 on the manifest's admitted issuers")
+    p.add_argument("--probe-report")
     p.set_defaults(func=cmd_power)
 
     p = sub.add_parser("freeze-inputs")
@@ -435,6 +464,7 @@ def main(argv: list[str] | None = None, h=v2) -> None:
     holdout_request(p)
     p.add_argument("--vault-repo", required=True, help="local git repo to fetch the pinned vault main into")
     p.add_argument("--vault-worktree")
+    p.add_argument("--holdout-probe-report", help="v4 on: the holdout-period basis report (required by v4)")
     p.set_defaults(func=cmd_open_holdout)
 
     p = sub.add_parser("holdout")

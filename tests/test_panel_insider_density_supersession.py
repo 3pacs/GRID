@@ -37,6 +37,12 @@ def _vault(root, **kw):
     return _Vault(root, h=v3, seeds=("vs1-v1", "vs1-v2"), **kw)
 
 
+@pytest.fixture(autouse=True)
+def _v3_not_superseded(monkeypatch):
+    """v3 is superseded by v4 (pinned); these replays exercise the Harness through v3 as if it were current."""
+    monkeypatch.setattr(v3, "SUPERSEDED_BY", None)
+
+
 def _open_other(vault, path):
     """Another registry opens: its witness gains an anchor line (records 4)."""
     with open(vault.worktree / path, "ab") as stream:
@@ -93,8 +99,8 @@ def test_A5_a_superseded_v2_gets_no_holdout_key_even_with_a_forged_chain(tmp_pat
     _register(log_dir, v2)
     vault.publish(log_dir)
     frozen, inputs = _forged_v2_discovery(log_dir)
-    assert v2.SUPERSEDED_BY["version"] == "vs1-v3"  # the real pin
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    assert v2.SUPERSEDED_BY["version"] == "vs1-v4"  # the real pin
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=log_dir,
                         now=NOW, observed=_observed(inputs), witness=vault.witness())
     # even with a holdout_opened forged into the chain, the key is refused on the pin
@@ -103,17 +109,17 @@ def test_A5_a_superseded_v2_gets_no_holdout_key_even_with_a_forged_chain(tmp_pat
         log.append_locked([{"kind": "holdout_opened", "run_at": NOW.isoformat(),
                             "prereg_sha256": v2.PREREG_BODY_SHA256, "discovery_sha256": frozen["sha256"]}])
     vault.publish(log_dir)
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         v2.resume_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=log_dir,
                           observed=_observed(inputs), witness=vault.witness())
 
 
 def test_A5_the_superseded_v1_holdout_steps_refuse_on_the_pin():
-    assert v1.SUPERSEDED_BY["version"] == "vs1-v3"
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    assert v1.SUPERSEDED_BY["version"] == "vs1-v4"
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         v1.open_holdout({}, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=Path("unused"),
                         now=NOW, observed={})
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         v1.resume_holdout({}, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=Path("unused"),
                           observed={}, witness=None)
 

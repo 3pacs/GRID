@@ -932,6 +932,8 @@ class Pins:
     registered_anchor_line: bytes | None = None
     earlier: tuple[EarlierVersion, ...] = ()
     superseded_by: Mapping[str, Any] | None = None
+    #: v4 on: a holdout-period basis report is required at open-holdout (and only then).
+    holdout_probe_required: bool = False
 
 
 class Harness:
@@ -1472,7 +1474,8 @@ class Harness:
             }])[0]
 
     def open_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path, now: datetime,
-                     observed: Mapping[str, Any], witness: OffhostWitness | None, repo_root: Path = REPO) -> dict:
+                     observed: Mapping[str, Any], witness: OffhostWitness | None, repo_root: Path = REPO,
+                     holdout_probe: Mapping[str, Any] | None = None) -> dict:
         """One-shot holdout, step 1: ``holdout_opened`` with the VS1 witness census (no price read).
 
         Refused when this version is pinned as superseded (the pin only: a later
@@ -1494,13 +1497,35 @@ class Harness:
             if v1._kind(records, "holdout_opened"):
                 raise PermissionError("the holdout was already opened (evaluated once)")
             _check_observed(inputs, observed)
+            probe = self._holdout_probe(records, holdout_probe)
             log.append_locked([{
                 "kind": "holdout_opened", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
                 "discovery_sha256": frozen["sha256"], "vs1_witness_census": witness.census,
-                "promotion_allowed": False,
+                **({"holdout_probe": probe} if probe else {}), "promotion_allowed": False,
             }])
             heads = v1._line_sha256(log)
         return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
+
+    def _holdout_probe(self, records: list[dict], holdout_probe: Mapping[str, Any] | None) -> dict | None:
+        """The holdout-period basis report (v4 §8): only at open-holdout, after the discovery is sealed.
+
+        ``holdout_probe`` = ``{"sha256": <report file sha256>, "report": <parsed report>}``; the
+        report must declare ``window == "holdout"`` and a ``snapshot_as_of_ts`` later than the
+        chain's ``discovery_frozen`` record (it was produced after the discovery, never earlier).
+        """
+        if not self.pins.holdout_probe_required:
+            return None
+        if not holdout_probe or not v1._is_hex64(holdout_probe.get("sha256")):
+            raise PermissionError(f"{self.version} opens its holdout only with the holdout-period basis report")
+        report = holdout_probe.get("report") or {}
+        sealed = v1._kind(records, "discovery_frozen")
+        if report.get("window") != "holdout":
+            raise PermissionError("the holdout basis report must declare window 'holdout'")
+        snapshot = stamp(report["snapshot_as_of_ts"]) if report.get("snapshot_as_of_ts") else None
+        if not sealed or snapshot is None or snapshot <= stamp(sealed[-1]["run_at"]):
+            raise PermissionError("the holdout basis report must be produced after the discovery was sealed")
+        return {"sha256": holdout_probe["sha256"], "snapshot_as_of_ts": report["snapshot_as_of_ts"],
+                "admitted": sorted(report.get("admitted") or [])}
 
     def resume_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path,
                        observed: Mapping[str, Any], witness: OffhostWitness | None,
@@ -1517,6 +1542,8 @@ class Harness:
         position = v1._position(records, "holdout_opened")
         if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
             raise PermissionError("holdout_opened names another discovery")
+        if self.pins.holdout_probe_required and not records[position - 1].get("holdout_probe"):
+            raise PermissionError("holdout_opened carries no holdout-period basis report")
         _check_observed(inputs, observed)
         self.require_witness(log_dir, witness, position)
         return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, version=self.version, log_dir=log_dir,
@@ -1596,9 +1623,9 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 )
 #: v2 was superseded by v3 before any price read (v3 makes A90|fwd5 primary).
 SUPERSEDED_BY: Mapping[str, Any] | None = {
-    "version": "vs1-v3",
-    "prereg_sha256": "fa7eda1c70906720b36dd84d0bb8b65a53f7badc35cd05055e08d7a9b40c2e42",
-    "registry_head_sha256": "c110b193660d5ce073d7badcddf360c739811fd86799874f3c786a16c2babbc9",
+    "version": "vs1-v4",
+    "prereg_sha256": "0b5e8c559743da83affe82549069994b0146b9185d1e968ae7961bc8b6107425",
+    "registry_head_sha256": None,
 }
 
 

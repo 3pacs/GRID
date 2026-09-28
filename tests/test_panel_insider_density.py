@@ -1737,10 +1737,10 @@ def test_the_superseded_v1_never_opens_a_discovery(tmp_path, monkeypatch):
     vs1.freeze_inputs(log_dir, NOW, inputs)
     witness = _witness(log_dir)
     monkeypatch.undo()  # the real pin
-    assert vs1.SUPERSEDED_BY["version"] == "vs1-v3"
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    assert vs1.SUPERSEDED_BY["version"] == "vs1-v4"
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         vs1.open_discovery(log_dir, NOW, _observed(inputs))
-    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v4"):
         vs1.resume_discovery(log_dir, _observed(inputs), witness)
     assert "discovery_opened" not in _kinds(log_dir)
 
