@@ -408,6 +408,10 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
                     "pct_1d": pct_1d,
                     "pct_1w": pct_1w,
                     "updated_at": now_iso,
+                    # Wave 3 #11 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md):
+                    # this is a live yfinance quote, button/cache-triggered
+                    # only — label it so the UI never implies a managed feed.
+                    "source": "yfinance",
                 }
             except Exception as exc:
                 log.debug("Batch price parse failed for {t}: {e}", t=tk, e=str(exc))

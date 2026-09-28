@@ -227,6 +227,111 @@ class TestAudioBriefingPaidGate:
 
 
 # ---------------------------------------------------------------------------
+# intelligence/audio_briefing.py -- W3.4 fix (GRID-WAVE3-HELD-WRITERS-TRIAGE-
+# 20260927.md #5): script generation tries a LOCAL LLM first (free, always
+# attempted) and only falls back to the paid Gemini/OpenAI path -- unchanged,
+# still gated -- when no local node answers. Audio synthesis is skipped (not
+# an error) when GRID_ALLOW_PAID_LLM is off, since there is no local TTS
+# option today.
+# ---------------------------------------------------------------------------
+
+class TestAudioBriefingLocalFirst:
+    def _data(self):
+        return {"date": "2026-09-28", "flow": {}, "credit": {}, "thesis": {}}
+
+    def test_script_uses_local_llm_first_when_available(self, monkeypatch):
+        from intelligence import audio_briefing
+        from llm import router as llm_router
+
+        local_client = MagicMock()
+        local_client.is_available = True
+        local_client.chat.return_value = "Good morning. GRID briefing."
+        monkeypatch.setattr(llm_router, "get_llm", lambda *a, **kw: local_client)
+
+        def _boom_gemini():
+            raise AssertionError("must not reach the paid Gemini fallback when local answers")
+        monkeypatch.setattr(audio_briefing, "_get_gemini_client", _boom_gemini)
+
+        script, provider = audio_briefing._generate_script_text(self._data())
+        assert provider == "local"
+        assert script == "Good morning. GRID briefing."
+        local_client.chat.assert_called_once()
+
+    def test_script_falls_back_to_gemini_when_local_unavailable_and_gate_on(self, monkeypatch):
+        from intelligence import audio_briefing
+        from llm import router as llm_router
+
+        dead_client = MagicMock()
+        dead_client.is_available = False
+        monkeypatch.setattr(llm_router, "get_llm", lambda *a, **kw: dead_client)
+        monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", True)
+        monkeypatch.setenv("GEMINI_API_KEY", "real-key")
+
+        fake_response = MagicMock()
+        fake_response.text = "gemini script"
+        fake_client = MagicMock()
+        fake_client.models.generate_content.return_value = fake_response
+        with patch("google.genai.Client", return_value=fake_client):
+            script, provider = audio_briefing._generate_script_text(self._data())
+        assert provider == "gemini"
+        assert script == "gemini script"
+
+    def test_script_raises_when_local_unavailable_and_gate_off(self, monkeypatch):
+        """No local node, and paid use not opted in: honest failure, never a
+        silent placeholder script."""
+        from intelligence import audio_briefing
+        from llm import router as llm_router
+
+        dead_client = MagicMock()
+        dead_client.is_available = False
+        monkeypatch.setattr(llm_router, "get_llm", lambda *a, **kw: dead_client)
+        monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", False)
+
+        with pytest.raises(RuntimeError, match="Local LLM, Gemini, and OpenAI all failed"):
+            audio_briefing._generate_script_text(self._data())
+
+    def test_generate_briefing_audio_is_text_only_when_gate_off(self, monkeypatch):
+        """generate_briefing_audio must degrade to a text-only on-demand
+        result (audio_path=None, audio_note explains why) instead of raising
+        or attempting the paid TTS call."""
+        from intelligence import audio_briefing
+
+        monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", False)
+        monkeypatch.setattr(audio_briefing, "_collect_all_data", lambda engine: self._data())
+        monkeypatch.setattr(
+            audio_briefing, "_generate_script_text", lambda data: ("local script", "local"),
+        )
+
+        def _boom_audio(*a, **kw):
+            raise AssertionError("must not synthesize audio when GRID_ALLOW_PAID_LLM is off")
+        monkeypatch.setattr(audio_briefing, "_generate_audio_file", _boom_audio)
+
+        result = audio_briefing.generate_briefing_audio(MagicMock())
+        assert result.audio_path is None
+        assert result.script_text == "local script"
+        assert result.provider == "local"
+        assert result.audio_note
+
+    def test_generate_briefing_audio_synthesizes_when_gate_on(self, monkeypatch):
+        from intelligence import audio_briefing
+
+        monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", True)
+        monkeypatch.setattr(audio_briefing, "_collect_all_data", lambda engine: self._data())
+        monkeypatch.setattr(
+            audio_briefing, "_generate_script_text", lambda data: ("local script", "local"),
+        )
+        monkeypatch.setattr(
+            audio_briefing, "_generate_audio_file",
+            lambda script, briefing_date: "/tmp/briefing_2026-09-28_x.mp3",
+        )
+        monkeypatch.setattr(audio_briefing, "_save_metadata", lambda result: None)
+
+        result = audio_briefing.generate_briefing_audio(MagicMock())
+        assert result.audio_path == "/tmp/briefing_2026-09-28_x.mp3"
+        assert result.audio_note == ""
+
+
+# ---------------------------------------------------------------------------
 # intelligence/image_gen.py — direct Imagen bypass
 # ---------------------------------------------------------------------------
 

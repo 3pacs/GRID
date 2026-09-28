@@ -214,6 +214,7 @@ class TestWatchlistPriceEndpoints:
             "prices": {"SPY": {"price": 500.0, "pct_1d": 0.01}},
             "fresh": True,
             "cached": True,
+            "source": "yfinance",
         }
         mock_batch_fetch.assert_not_called()
 
@@ -245,6 +246,7 @@ class TestWatchlistPriceEndpoints:
         assert response.json() == {
             "prices": {"SPY": {"price": 501.0, "pct_1d": 0.02}},
             "cached": False,
+            "source": "yfinance",
         }
         mock_batch_fetch.assert_called_once_with(["SPY", "QQQ"])
         mock_broadcast.assert_called_once_with(
