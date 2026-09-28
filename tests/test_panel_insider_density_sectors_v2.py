@@ -62,12 +62,16 @@ def test_universes_are_disjoint_tech_first_then_sector_map_then_sic():
     assert info["sector_map_conflicts_resolved_to_sector_map"] == 1  # OILCO's SIC is a utility code
 
 
-def test_v1_refuses_the_superseded_sector_plan():
-    assert v1.SECTOR_PLAN_SUPERSEDED_BY["prereg_sha256"] == s2.PREREG_BODY_SHA256
-    assert v1.SECTOR_PLAN_SUPERSEDED_BY["registry_head_sha256"] == s2.REGISTERED_RECORD_SHA256[1]
-    spec = v1.RunSpec(run_id="x", sector="Energy", run_k=2, trials=v1.trial_names())
-    with pytest.raises(ValueError, match="superseded by vs1-sectors-v2"):
-        spec.validate()
+def test_sectors_v2_is_superseded_by_sectors_v3_and_never_opens():
+    from analysis import panel_insider_density_sectors_v3 as s3
+
+    assert s2.SUPERSEDED_BY["version"] == "vs1-sectors-v3"
+    assert s2.SUPERSEDED_BY["prereg_sha256"] == s3.PREREG_BODY_SHA256
+    assert s2.SUPERSEDED_BY["registry_head_sha256"] == s3.REGISTERED_RECORD_SHA256[1]
+    with pytest.raises(PermissionError, match="superseded by vs1-sectors-v3"):
+        s2.check_open()
+    # the review-round-2 defect sectors v3 fixes: alpha_2/40 below the smallest p of 999 sign-flips
+    assert s2.RUN_ALPHA / 40 < 1 / (v1.POWER_PERMS + 1)
 
 
 def test_the_sectors_registration_is_pinned(tmp_path):

@@ -86,6 +86,12 @@ WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_sectors_v2.anchors.j
 #: The one sectors-v2 registration: registered once, locally, on 2026-09-28T02:34:55Z against
 #: code f6588eba, chain head bcfc31b0... at 2 records. The original lives in the operator's
 #: ``Documents/Codex/2026-09-14/wha/outputs/vs1-sectors-v2-prereg-registry/``.
+#: Superseded by "sectors v3" before any use (its §10 Stage-0 threshold was unattainable).
+SUPERSEDED_BY: dict | None = {
+    "version": "vs1-sectors-v3",
+    "prereg_sha256": "7b6eecae453cc71a0af021d96c259c65de5ab3d03f835746c7d413dcda7e4103",
+    "registry_head_sha256": None,
+}
 REGISTERED_AT: datetime | None = datetime(2026, 9, 28, 2, 34, 55, 80814, tzinfo=timezone.utc)
 REGISTERED_CODE_SHA: str | None = "f6588eba8aa54f0b6e45215bff5b2afcabfdb8a1"
 REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
@@ -97,6 +103,14 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"bcfc31b0f355dc04bfbd252b1705a5bd441701649bcd2b9bb4e136adbff23a04",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T02:34:55.080814+00:00"}'
 )
+
+
+def check_open() -> None:
+    """Sectors v2 can never open a run: it is superseded by sectors v3 (pinned)."""
+    if SUPERSEDED_BY:
+        raise PermissionError(
+            f"VS1 sectors-v2 is superseded by {SUPERSEDED_BY['version']} (pinned in code): it can never open a run"
+        )
 
 
 def check_ranges() -> None:

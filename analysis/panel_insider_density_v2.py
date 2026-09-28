@@ -1215,6 +1215,13 @@ class Harness:
         v1.refuse_superseded(self.pins.number, self.superseded_by, witness)
         if not isinstance(witness, OffhostWitness):
             raise PermissionError(f"the pinned {self.version} off-host witness (check_offhost) is required")
+        own_path = witness.census["files"].get(self.registry_id)
+        if (self.pins.witness_path != v1.canonical_witness_path(self.registry_id)
+                or own_path != self.pins.witness_path or witness.path != self.pins.witness_path):
+            raise PermissionError(
+                f"{self.version}'s witness path {self.pins.witness_path!r} is not the canonical path of registry "
+                f"{self.registry_id} on main ({own_path!r}): refused"
+            )
         pinned = {e.number for e in self.pins.earlier}
         lower = set(range(1, self.pins.number))
         if pinned != lower:

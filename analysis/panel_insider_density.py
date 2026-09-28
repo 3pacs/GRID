@@ -1583,7 +1583,7 @@ class RunSpec:
             raise ValueError(
                 "only the VS1 sector runs here; the 10-sector run needs a joint "
                 "40-trial Holm (pre-registration section 13), and that plan is superseded by "
-                f"{SECTOR_PLAN_SUPERSEDED_BY['version']} (analysis.panel_insider_density_sectors_v2)"
+                f"{SECTOR_PLAN_SUPERSEDED_BY['version']} (analysis.panel_insider_density_sectors_v3)"
             )
         if tuple(self.trials) != trial_names():
             raise ValueError("a run declares exactly the pre-registered trials")
@@ -2149,12 +2149,13 @@ SUPERSEDED_BY: dict | None = {
 }
 OWN_VERSION_NUMBER = 1
 #: v1 section 13's other-10-sector plan (carried into v2/v3 section 13) is superseded by the
-#: "sectors v2" pre-registration (all sectors on 5 sessions, SIC-expanded universes).
+#: "sectors v3" pre-registration (all sectors on 5 sessions, SIC-expanded universes), which in
+#: turn superseded "sectors v2" (never opened).
 SECTOR_PLAN_SUPERSEDED_BY: dict = {
-    "version": "vs1-sectors-v2",
-    "prereg_path": "docs/paper_log/vs1-sectors-v2-preregistration.md",
-    "prereg_sha256": "ed7cacb99cd010963dedfa842677784d0e7ffa95ec4534a2a005238a03a6815e",
-    "registry_head_sha256": "bcfc31b0f355dc04bfbd252b1705a5bd441701649bcd2b9bb4e136adbff23a04",
+    "version": "vs1-sectors-v3",
+    "prereg_path": "docs/paper_log/vs1-sectors-v3-preregistration.md",
+    "prereg_sha256": "7b6eecae453cc71a0af021d96c259c65de5ab3d03f835746c7d413dcda7e4103",
+    "registry_head_sha256": None,
 }
 #: Witness files of every VS1 (Technology) registry version on the pinned vault ``main``.
 VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
@@ -2170,37 +2171,55 @@ WITNESS_DIR_ALLOWED = frozenset({"README.md", ".gitattributes"})
 def vs1_witness_census(repo: Path, tip: str) -> dict:
     """Every VS1 registry witness on the pinned ``main`` at ``tip`` and the records each covers.
 
-    ``files``/``records``: registry id (``vs1-v<n>`` for the Technology
-    versions, ``sectors-v<n>`` for the other-10-sector registries) -> path /
-    records covered by its last anchor line (None when unreadable).
-    ``unknown``: any other file in the witness directory (except README.md,
-    .gitattributes) and any ``*.anchors.jsonl`` whose path mentions ``vs1``
-    anywhere else in the tree -- a witness under a name or path no version knows.
+    Keyed by exact path (review round 2, R1): ``by_path`` maps every
+    witness-like path to its registry id (None when unknown) and covered records.
+    ``files``/``records``: registry id (``vs1-v<n>`` for the Technology versions,
+    ``sectors-v<n>`` for the other-10-sector registries) -> canonical path /
+    records covered by its last anchor line (None when unreadable). Only the
+    canonical path of an id counts (:func:`canonical_witness_path`): a path with a
+    leading-zero or otherwise non-canonical number (``..._v03...``) is unknown.
+    ``unknown``: those, any other file in the witness directory (except
+    README.md, .gitattributes) and any ``*.anchors.jsonl`` whose path mentions
+    ``vs1`` anywhere else in the tree -- a witness under a name or path no
+    version knows.
     """
     files, unknown = {}, []
     for path in _git(repo, "ls-tree", "-r", "--name-only", tip).splitlines():
         path = path.strip()
         match, sectors = VERSIONED_WITNESS.match(path), SECTORS_WITNESS.match(path)
-        if match:
-            files[f"vs1-v{int(match.group(1))}"] = path
-        elif sectors:
-            files[f"sectors-v{int(sectors.group(1))}"] = path
-        elif path.startswith(WITNESS_DIR):
-            if path[len(WITNESS_DIR):] not in WITNESS_DIR_ALLOWED:
-                unknown.append(path)
+        key = (f"vs1-v{int(match.group(1))}" if match else
+               f"sectors-v{int(sectors.group(1))}" if sectors else None)
+        if key is not None and canonical_witness_path(key) == path:
+            files[key] = path
+        elif key is not None or (path.startswith(WITNESS_DIR) and path[len(WITNESS_DIR):] not in WITNESS_DIR_ALLOWED):
+            unknown.append(path)
         elif "vs1" in path.lower() and path.lower().endswith(".anchors.jsonl"):
             unknown.append(path)
-    records = {}
-    for key, path in files.items():
+
+    def covered(path: str) -> int | None:
         content = _git(repo, "show", f"{tip}:{path}", binary=True).replace(b"\r\n", b"\n")
         lines = [line for line in content.split(b"\n") if line]
         try:
-            covered = json.loads(lines[-1])["records"] if lines else None
-            records[key] = covered if isinstance(covered, int) else None
+            value = json.loads(lines[-1])["records"] if lines else None
         except (ValueError, KeyError, TypeError):
-            records[key] = None
+            return None
+        return value if isinstance(value, int) else None
+
+    records = {key: covered(path) for key, path in files.items()}
+    by_path = {path: {"id": key, "records": records[key]} for key, path in files.items()}
+    for path in unknown:
+        by_path[path] = {"id": None, "records": covered(path) if path.endswith(".jsonl") else None}
     return {"tip": tip, "files": dict(sorted(files.items())), "records": dict(sorted(records.items())),
-            "unknown": sorted(unknown)}
+            "unknown": sorted(unknown), "by_path": dict(sorted(by_path.items()))}
+
+
+def canonical_witness_path(registry_id: str) -> str:
+    """The one path the witness of ``registry_id`` (``vs1-v<n>`` / ``sectors-v<n>``) may live at."""
+    family, _, number = registry_id.rpartition("-v")
+    if not number.isdigit() or str(int(number)) != number or family not in ("vs1", "sectors"):
+        raise ValueError(f"not a VS1 registry id: {registry_id!r}")
+    stem = "granular_panel_prereg_v" if family == "vs1" else "granular_panel_prereg_sectors_v"
+    return f"{WITNESS_DIR}{stem}{number}.anchors.jsonl"
 
 
 def witnessed_versions(repo: Path, tip: str) -> dict[int, str]:

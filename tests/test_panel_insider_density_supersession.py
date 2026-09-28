@@ -299,3 +299,36 @@ def test_every_prices_read_record_carries_the_census(tmp_path):
     assert census["records"]["vs1-v1"] == census["records"]["vs1-v2"] == 2
     assert census["records"]["vs1-v3"] >= 4  # its own witness covers discovery_opened
     assert census["unknown"] == [] and census["tip"] == key.witness_tip
+
+
+# --- review round 2 (R1): the census is keyed by exact, canonical path --------------------------------------
+
+
+def test_R1_a_leading_zero_witness_path_is_unknown_and_cannot_pose_as_v3(tmp_path):
+    vault = _vault(tmp_path / "vault")
+    _v3_sealed_discovery(tmp_path, vault)  # the v3 witness now covers more than 2 records
+    fake = "05-GRID/Paper-Log/vs1/granular_panel_prereg_v03.anchors.jsonl"
+    vault.add_file(fake, v3.REGISTERED_ANCHOR_LINE + b"\n")
+    census = v1.vs1_witness_census(vault.remote, "main")
+    assert fake in census["unknown"] and census["by_path"][fake]["id"] is None
+    assert census["files"]["vs1-v3"] == v3.WITNESS_PATH and fake not in census["files"].values()
+    disguised = v2.Harness(dataclasses.replace(
+        v3.V3.pins, version="vs1-v4", number=3, registry_log="v4.jsonl", registry_anchors="v4.anchors.jsonl",
+        registry_lock=".v4.lock", witness_path=fake, witness_ref="refs/vs1-v4-witness/main"))
+    witness = disguised.check_offhost(vault.cache, remote_url=str(vault.remote))
+    with pytest.raises(PermissionError, match="unknown VS1 witness files|canonical path"):
+        disguised.require_supersession(witness)
+
+
+def test_R1_a_registry_whose_witness_is_not_its_canonical_path_is_refused(tmp_path):
+    vault = _vault(tmp_path / "vault")
+    _register(tmp_path / "reg", v3)
+    vault.publish(tmp_path / "reg")
+    elsewhere = v2.Harness(dataclasses.replace(v3.V3.pins, witness_path=v2.WITNESS_PATH,
+                                               registered_anchor_line=v2.REGISTERED_ANCHOR_LINE))
+    witness = elsewhere.check_offhost(vault.cache, remote_url=str(vault.remote))
+    with pytest.raises(PermissionError, match="canonical path"):
+        elsewhere.require_supersession(witness)
+    assert v1.canonical_witness_path("vs1-v3") == v3.WITNESS_PATH
+    with pytest.raises(ValueError):
+        v1.canonical_witness_path("vs1-v03")
