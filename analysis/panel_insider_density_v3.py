@@ -92,7 +92,7 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
 SUPERSEDED_BY: Mapping[str, Any] | None = {
     "version": "vs1-v5",
     "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "e4df0c357f43ca0d6b4f9fc0bc058284d7330f0b90973358f5faed3ae06d8bda",
 }
 
 

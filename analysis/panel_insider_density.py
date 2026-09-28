@@ -2145,7 +2145,7 @@ _WITNESS_TOKEN = object()
 SUPERSEDED_BY: dict | None = {
     "version": "vs1-v5",
     "prereg_sha256": "6242a45f2f21f3429bf20b36bc13d6c1c382f28e1f0970e1f802374079e1b556",
-    "registry_head_sha256": None,
+    "registry_head_sha256": "e4df0c357f43ca0d6b4f9fc0bc058284d7330f0b90973358f5faed3ae06d8bda",
 }
 OWN_VERSION_NUMBER = 1
 #: v1 section 13's other-10-sector plan (carried into v2/v3 section 13) is superseded by the
