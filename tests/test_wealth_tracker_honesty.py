@@ -1,20 +1,34 @@
 """Tests for GD-FIX: wealth_tracker.py field-name honesty and wealth_flows
-dedup-on-persist.
+dedup-on-persist, plus the GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3
+item 2 future-date guard.
 
-Before this fix, ``track_wealth_migration`` read ``amount``/``market_value``
+Before the GD-FIX, ``track_wealth_migration`` read ``amount``/``market_value``
 keys for 13F flows and ``amount``/``amount_low``/``amount_high`` keys for
 congressional flows — none of which the actual writers
 (ingestion/altdata/institutional_flows.py, ingestion/altdata/congressional.py)
 ever set — so every 13F- and congressional-derived wealth flow silently
 amounted to $0 while still being reported with a "confirmed"/"likely"
 confidence.
+
+Before the W3.3 fix, neither ``track_wealth_migration``'s signal_sources
+reads nor ``persist_wealth_flows`` bounded ``signal_date``/``flow_date`` on
+the upper end, so a future-dated row (16 found, max 2027-02-01) could reach
+``wealth_flows``.
 """
 
 from __future__ import annotations
 
+import json
+import sqlite3
+from datetime import date, timedelta
 from unittest.mock import MagicMock
 
+import pytest
+from sqlalchemy import create_engine, text
+
 from intelligence import wealth_tracker
+
+sqlite3.register_adapter(date, lambda d: d.isoformat())
 
 
 # ── _institutional_amount ────────────────────────────────────────────────
@@ -122,3 +136,100 @@ def test_persist_wealth_flows_inserts_new_flow(monkeypatch):
     assert count == 1
     assert len(conn.inserted) == 1
     assert conn.inserted[0]["from_actor"] == "ins_jane_doe"
+
+
+# ── persist_wealth_flows future-date guard (GRID-WAVE3 §4.3 item 2) ────────
+
+def test_persist_wealth_flows_rejects_future_flow_date(monkeypatch):
+    """A flow whose timestamp resolves to a future flow_date must be
+    skipped, never inserted — GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3
+    item 2 found 16 wealth_flows rows dated as far out as 2027-02-01."""
+    monkeypatch.setattr(
+        "intelligence.actor_network._ensure_tables", lambda engine: None
+    )
+    future = (date.today() + timedelta(days=30)).isoformat()
+    flow = _FakeFlow(
+        "ins_jane_doe", "corp_AAPL", 100_000.0, "confirmed", ["form4"],
+        future, "Insider bought",
+    )
+    conn = _FakeConn(existing_keys=set())
+    engine = _engine_with(conn)
+
+    count = wealth_tracker.persist_wealth_flows(engine, [flow])
+
+    assert count == 0
+    assert conn.inserted == []
+
+
+def test_persist_wealth_flows_still_inserts_past_dated_flow(monkeypatch):
+    """The future-date guard must not become a blanket break: a normal
+    past-dated flow still persists."""
+    monkeypatch.setattr(
+        "intelligence.actor_network._ensure_tables", lambda engine: None
+    )
+    past = (date.today() - timedelta(days=1)).isoformat()
+    flow = _FakeFlow(
+        "ins_jane_doe", "corp_AAPL", 100_000.0, "confirmed", ["form4"],
+        past, "Insider bought",
+    )
+    conn = _FakeConn(existing_keys=set())
+    engine = _engine_with(conn)
+
+    count = wealth_tracker.persist_wealth_flows(engine, [flow])
+
+    assert count == 1
+    assert len(conn.inserted) == 1
+
+
+# ── track_wealth_migration future-date guard (real SQLite, not mocked) ─────
+
+@pytest.fixture()
+def signal_sources_engine():
+    eng = create_engine("sqlite://")
+    with eng.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE signal_sources (source_type TEXT, source_id TEXT, "
+            "ticker TEXT, signal_date DATE, signal_type TEXT, "
+            "signal_value TEXT, trust_score REAL)"
+        ))
+    return eng
+
+
+def _insert_signal_source(engine, source_type, source_id, ticker, signal_date, signal_type, signal_value, trust_score=0.9):
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "INSERT INTO signal_sources "
+                "(source_type, source_id, ticker, signal_date, signal_type, signal_value, trust_score) "
+                "VALUES (:st, :sid, :t, :d, :typ, :v, :ts)"
+            ),
+            {
+                "st": source_type, "sid": source_id, "t": ticker, "d": signal_date,
+                "typ": signal_type, "v": json.dumps(signal_value), "ts": trust_score,
+            },
+        )
+
+
+def test_track_wealth_migration_excludes_future_signal_date(monkeypatch, signal_sources_engine):
+    """GRID-WAVE3 §4.3 item 2: a future-dated congressional/institutional/
+    insider/darkpool signal_source row must never surface as a wealth flow."""
+    monkeypatch.setattr(
+        "intelligence.actor_network._ensure_tables", lambda engine: None
+    )
+    past = date.today() - timedelta(days=1)
+    future = date.today() + timedelta(days=30)
+
+    _insert_signal_source(
+        signal_sources_engine, "congressional", "rep-x", "GRDX", past, "BUY",
+        {"amount_midpoint": 50_000},
+    )
+    _insert_signal_source(
+        signal_sources_engine, "congressional", "rep-y", "GRDY", future, "BUY",
+        {"amount_midpoint": 999_000},
+    )
+
+    flows = wealth_tracker.track_wealth_migration(signal_sources_engine, days=90)
+
+    tickers = {f.to_actor for f in flows}
+    assert "GRDX" in tickers, "past-dated row should still surface"
+    assert "GRDY" not in tickers, "future-dated row must never surface"

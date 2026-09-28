@@ -98,7 +98,8 @@ def track_wealth_migration(
     from intelligence.actor_network import WealthFlow, _ensure_tables  # lazy — avoids circular import
 
     _ensure_tables(engine)
-    cutoff = date.today() - timedelta(days=days)
+    today = date.today()
+    cutoff = today - timedelta(days=days)
     flows: list = []
 
     # ── 13F-derived flows (institutional) ─────────────────────────────
@@ -110,9 +111,10 @@ def track_wealth_migration(
                 FROM signal_sources ss
                 WHERE ss.source_type = 'institutional'
                   AND ss.signal_date >= :cutoff
+                  AND ss.signal_date <= :today
                 ORDER BY ss.signal_date DESC
                 LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
+            """), {"cutoff": cutoff, "today": today}).fetchall()
 
             for r in rows:
                 value_data = _parse_signal_value(r[4])
@@ -138,9 +140,10 @@ def track_wealth_migration(
                 FROM signal_sources
                 WHERE source_type = 'congressional'
                   AND signal_date >= :cutoff
+                  AND signal_date <= :today
                 ORDER BY signal_date DESC
                 LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
+            """), {"cutoff": cutoff, "today": today}).fetchall()
 
             for r in rows:
                 value_data = _parse_signal_value(r[4])
@@ -170,9 +173,10 @@ def track_wealth_migration(
                 FROM signal_sources
                 WHERE source_type = 'insider'
                   AND signal_date >= :cutoff
+                  AND signal_date <= :today
                 ORDER BY signal_date DESC
                 LIMIT 500
-            """), {"cutoff": cutoff}).fetchall()
+            """), {"cutoff": cutoff, "today": today}).fetchall()
 
             for r in rows:
                 value_data = _parse_signal_value(r[4])
@@ -198,9 +202,10 @@ def track_wealth_migration(
                 FROM signal_sources
                 WHERE source_type = 'darkpool'
                   AND signal_date >= :cutoff
+                  AND signal_date <= :today
                 ORDER BY signal_date DESC
                 LIMIT 200
-            """), {"cutoff": cutoff}).fetchall()
+            """), {"cutoff": cutoff, "today": today}).fetchall()
 
             for r in rows:
                 value_data = _parse_signal_value(r[3])
@@ -238,22 +243,37 @@ def persist_wealth_flows(
     rows without needing a schema change. A real unique index is the
     correct long-term fix (see PR description follow-ups).
 
+    GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 2 also flagged 16
+    future-dated ``wealth_flows`` rows (max 2027-02-01). ``track_wealth_migration``
+    now bounds ``signal_date <= CURRENT_DATE`` at the read, but this function
+    rejects a future ``flow_date`` too — belt-and-suspenders for any other
+    caller that builds ``WealthFlow`` objects directly.
+
     Parameters:
         engine: SQLAlchemy engine.
         flows: List of WealthFlow objects to persist.
 
     Returns:
-        Number of rows inserted (existing duplicates are skipped, not
-        counted).
+        Number of rows inserted (existing duplicates and future-dated flows
+        are skipped, not counted).
     """
     from intelligence.actor_network import _ensure_tables  # lazy — avoids circular import
 
     _ensure_tables(engine)
+    today = date.today()
     count = 0
     skipped_dup = 0
+    skipped_future = 0
     with engine.begin() as conn:
         for flow in flows:
             flow_date = flow.timestamp[:10] if flow.timestamp else None
+            if flow_date:
+                try:
+                    if date.fromisoformat(flow_date) > today:
+                        skipped_future += 1
+                        continue
+                except ValueError:
+                    pass
             try:
                 existing = conn.execute(text("""
                     SELECT 1 FROM wealth_flows
@@ -293,5 +313,8 @@ def persist_wealth_flows(
                 count += 1
             except Exception as exc:
                 log.debug("Failed to persist flow: {e}", e=str(exc))
-    log.info("Persisted {n} wealth flows ({d} duplicates skipped)", n=count, d=skipped_dup)
+    log.info(
+        "Persisted {n} wealth flows ({d} duplicates skipped, {f} future-dated skipped)",
+        n=count, d=skipped_dup, f=skipped_future,
+    )
     return count

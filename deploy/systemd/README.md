@@ -126,6 +126,34 @@ otherwise). Installing the timer is the activation decision; the install
 commands are in the service template's header. Try it first with
 `python3 scripts/run_causal_links.py --dry-run --json`.
 
+## `grid-dollar-flows.service` / `.timer` (templates, not installed)
+
+Wave 3 item W3.3's scheduled writer for `dollar_flows`
+(`scripts/run_dollar_flows.py` -> `intelligence/dollar_flows.py`'s
+`normalize_all_flows`). Each run scans `signal_sources` + `raw_series` for
+the last 7 days, converts every signal to an estimated USD amount, and
+persists via a DELETE-then-INSERT over the touched date range. The
+`#/geo-flows` view reads the result.
+
+Three honesty guards (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3, plus the
+staleness bound added per PR #712 review), all counted in the run's summary
+rather than silently absorbed:
+  - A dark-pool row with no real VWAP observation (via
+    `store/observations.py::read_latest` on `YF:{ticker}:close`,
+    SUCCESS-only, PIT) is dropped, never fabricated from the old
+    `_DEFAULT_VWAP_ESTIMATE` ($50 flat).
+  - A dark-pool row whose only VWAP observation is older than 5 trading
+    days (`intelligence.dollar_flows._VWAP_MAX_AGE_TRADING_DAYS`, via the
+    real NYSE calendar in `ingestion/market_calendar.py`) is dropped rather
+    than priced off a stale close.
+  - A row whose `signal_date` (or, for 13F/ETF flows, `obs_date`) is in the
+    future is dropped, never persisted.
+
+Try it first with `python3 scripts/run_dollar_flows.py --dry-run --json` —
+no DELETE/INSERT against `dollar_flows` happens in a dry run. Installing
+the timer is the activation decision; the install commands are in the
+service template's header.
+
 ## `grid-market-diary.service` / `.timer` (templates, not installed)
 
 Wave 3 slice W3.1's scheduled writer for `market_diary`
