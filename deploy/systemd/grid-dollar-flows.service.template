@@ -1,0 +1,30 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) is the
+# activation step for Wave 3 item W3.3 and needs an explicit operator
+# decision. Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-dollar-flows.service.template /etc/systemd/system/grid-dollar-flows.service
+#   sudo cp deploy/systemd/grid-dollar-flows.timer.template   /etc/systemd/system/grid-dollar-flows.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-dollar-flows.timer
+# Paths follow grid-causal-links.service.template.
+[Unit]
+Description=GRID dollar-flows normalizer (signal_sources + raw_series -> dollar_flows, PIT VWAP)
+After=network.target postgresql.service
+# grid-flow-materializer.timer (host-installed, not tracked in this repo —
+# see docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md) runs
+# every 30 min, so any daily time is "after" a materializer pass. This
+# unit's own timer picks a time comfortably after the morning ingestion
+# pulls instead of an After= on that unit (see .timer.template).
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/home/grid/grid_v4/grid_repo
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Last 7 days: dark-pool rows with no real VWAP and future-dated signal_date
+# rows are dropped and counted, never fabricated/persisted (see
+# intelligence/dollar_flows.py FlowNormalizationSummary).
+ExecStart=/usr/bin/flock -n /tmp/grid-dollar-flows.lock /usr/bin/python3 scripts/run_dollar_flows.py --days 7
+TimeoutStartSec=20min
+Nice=10
+StandardOutput=journal
+StandardError=journal

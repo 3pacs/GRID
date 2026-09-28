@@ -117,14 +117,13 @@ print(f'Scoring: {result[\"scoring\"]}')
 
     flows)
         echo "[$(date)] Refreshing dollar flows..." >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
-        python -c "
-from intelligence.dollar_flows import normalize_all_flows, _persist_flows
-from db import get_engine
-engine = get_engine()
-flows = normalize_all_flows(engine, days=7)
-n = _persist_flows(engine, flows)
-print(f'Persisted {n} flows ({len(flows)} normalized)')
-" >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
+        # GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 W3.3: normalize_all_flows()
+        # already persists internally now (and returns a
+        # FlowNormalizationSummary, not a bare list), so this calls the
+        # single-entry-point script instead of persisting a second time.
+        # See scripts/run_dollar_flows.py --dry-run to preview a run first.
+        python scripts/run_dollar_flows.py --days 7 \
+            >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
         ;;
 
     paper-review)

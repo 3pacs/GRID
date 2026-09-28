@@ -100,7 +100,12 @@ LEGACY_READS_WITHOUT_RETRACTIONS: dict[str, int] = {
     "intelligence/attention_anomaly.py": 1,
     "intelligence/codebase_context.py": 1,
     "intelligence/cross_reference.py": 2,
-    "intelligence/dollar_flows.py": 3,
+    # GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 1: this was never a
+    # real `resolved_series` SQL read (dollar_flows.py always read
+    # `raw_series`) — the match was a stale docstring mention of
+    # "VWAP estimate from resolved_series". The docstring is now accurate
+    # (the VWAP proxy reads `raw_series` via `store.observations.read_latest`,
+    # not `resolved_series` at all), so the count drops to 0.
     "intelligence/forensics.py": 1,
     "intelligence/freshness_guard.py": 1,
     "intelligence/post_query_scanner.py": 1,
