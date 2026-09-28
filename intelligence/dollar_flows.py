@@ -40,6 +40,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.market_calendar import trading_days_between
 from store.observations import read_latest
 
 
@@ -58,6 +59,13 @@ _AMOUNT_RANGES: dict[str, tuple[int, int]] = {
     "I": (25_000_001, 50_000_000),
     "J": (50_000_001, 999_999_999),
 }
+
+# A VWAP observation older than this (in trading days, via
+# ingestion/market_calendar.py's real NYSE calendar) relative to the
+# signal's own date is too stale to price a dark-pool row with — the row is
+# dropped and counted in skipped_stale_vwap rather than priced off a stale
+# close. Pinned per code review on PR #712.
+_VWAP_MAX_AGE_TRADING_DAYS: int = 5
 
 # Source types we normalize
 _SOURCE_TYPES = [
@@ -206,6 +214,26 @@ def _get_vwap_observation(engine: Engine, ticker: str, obs_date: date):
     except Exception as exc:
         log.warning("VWAP observation lookup failed for {t}: {e}", t=ticker, e=exc)
         return None
+
+
+def _vwap_age_trading_days(vwap_obs_date: date, signal_date: date) -> int:
+    """Trading days between a VWAP observation and the signal it prices.
+
+    0 when they fall on the same session. Uses the real NYSE calendar
+    (``ingestion/market_calendar.py``), not a flat weekday count, so a
+    Friday close pricing a Monday signal is correctly 1 trading day old,
+    not 3.
+    """
+    if vwap_obs_date >= signal_date:
+        return 0
+    return len(trading_days_between(vwap_obs_date, signal_date)) - 1
+
+
+def _is_vwap_too_stale(vwap_obs, signal_date: date) -> bool:
+    """True when ``vwap_obs`` is older than ``_VWAP_MAX_AGE_TRADING_DAYS``
+    relative to ``signal_date`` — too old to price this row with, per code
+    review on PR #712."""
+    return _vwap_age_trading_days(vwap_obs.obs_date, signal_date) > _VWAP_MAX_AGE_TRADING_DAYS
 
 
 def _build_sector_lookup() -> dict[str, str]:
@@ -357,26 +385,30 @@ def _normalize_insider(row: dict) -> dict | None:
     }
 
 
-def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, bool]:
+def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, str | None]:
     """Normalize a dark pool volume spike to estimated USD.
 
     Multiplies spike volume by a real observed VWAP proxy (see
     ``_get_vwap_observation``). Never substitutes a fabricated default
-    price: when no real VWAP observation exists, the row is dropped rather
-    than persisted with an invented dollar amount
-    (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 1). ``flow_date``
-    always comes from the row's own ``signal_date`` — never ``date.today()``
-    (§4.3 item 2).
+    price: when no real VWAP observation exists, or the newest one found is
+    older than ``_VWAP_MAX_AGE_TRADING_DAYS``, the row is dropped rather
+    than persisted with an invented or stale dollar amount
+    (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3 item 1, staleness bound
+    added per PR #712 review). ``flow_date`` always comes from the row's
+    own ``signal_date`` — never ``date.today()`` (§4.3 item 2).
 
     Parameters:
         row: Dict with signal_sources columns.
         engine: SQLAlchemy engine for the VWAP lookup.
 
     Returns:
-        ``(flow_dict_or_None, skipped_no_vwap)``. ``skipped_no_vwap`` is
-        True only when the row had a usable volume and date but no real
-        VWAP observation was found — callers should count this separately
-        from an unparseable/zero-volume/missing-date row.
+        ``(flow_dict_or_None, skip_reason)``. ``skip_reason`` is
+        ``"no_vwap"`` when no real VWAP observation was found at all,
+        ``"stale_vwap"`` when one was found but is too old to price this
+        row with, or ``None`` for a normal skip (zero volume / missing
+        date) or a successful normalization — callers should count the
+        first two separately from each other and from an
+        unparseable/zero-volume/missing-date row.
     """
     sv = row.get("signal_value") or {}
     if isinstance(sv, str):
@@ -387,17 +419,19 @@ def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, bool]:
 
     volume = float(sv.get("volume", 0))
     if volume <= 0:
-        return None, False
+        return None, None
 
     ticker = row.get("ticker") or ""
     obs_date = row.get("signal_date")
     if not obs_date:
         # flow_date must come from the row — never default to today.
-        return None, False
+        return None, None
 
     vwap_obs = _get_vwap_observation(engine, ticker, obs_date)
     if vwap_obs is None:
-        return None, True
+        return None, "no_vwap"
+    if _is_vwap_too_stale(vwap_obs, obs_date):
+        return None, "stale_vwap"
 
     amount = volume * vwap_obs.value
 
@@ -416,7 +450,7 @@ def _normalize_darkpool(row: dict, engine: Engine) -> tuple[dict | None, bool]:
             "signal_type": row.get("signal_type"),
         },
         "flow_date": obs_date,
-    }, False
+    }, None
 
 
 def _normalize_whale_options(row: dict) -> dict | None:
@@ -754,8 +788,9 @@ class FlowNormalizationSummary(list):
     Adds this run's honesty counters from
     GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3: how many rows were
     dropped for lacking a real VWAP (never fabricated at the old $50
-    default) or for carrying a future-dated ``signal_date``/``obs_date``
-    (never persisted).
+    default), for carrying only a stale VWAP (older than
+    ``_VWAP_MAX_AGE_TRADING_DAYS``, per PR #712 review), or for carrying a
+    future-dated ``signal_date``/``obs_date`` (never persisted).
     """
 
     def __init__(
@@ -763,6 +798,7 @@ class FlowNormalizationSummary(list):
         flows: list[dict],
         *,
         skipped_no_vwap: int = 0,
+        skipped_stale_vwap: int = 0,
         skipped_future_date: int = 0,
         by_source: dict[str, int] | None = None,
         persisted: int = 0,
@@ -770,6 +806,7 @@ class FlowNormalizationSummary(list):
     ) -> None:
         super().__init__(flows)
         self.skipped_no_vwap = skipped_no_vwap
+        self.skipped_stale_vwap = skipped_stale_vwap
         self.skipped_future_date = skipped_future_date
         self.by_source = by_source or {}
         self.persisted = persisted
@@ -780,6 +817,7 @@ class FlowNormalizationSummary(list):
             "flows_count": len(self),
             "persisted": self.persisted,
             "skipped_no_vwap": self.skipped_no_vwap,
+            "skipped_stale_vwap": self.skipped_stale_vwap,
             "skipped_future_date": self.skipped_future_date,
             "by_source": self.by_source,
             "dry_run": self.dry_run,
@@ -791,10 +829,14 @@ def normalize_all_flows(
 ) -> FlowNormalizationSummary:
     """Scan signal_sources + raw_series, normalize all signals to USD, and persist.
 
-    Two honesty guards (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3):
+    Three honesty guards (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3, plus
+    the staleness bound added per PR #712 review):
       - A dark-pool row with no real VWAP observation is dropped, never
         fabricated from the old ``_DEFAULT_VWAP_ESTIMATE`` ($50). Counted
         in the returned summary's ``skipped_no_vwap``.
+      - A dark-pool row whose only VWAP observation is older than
+        ``_VWAP_MAX_AGE_TRADING_DAYS`` is dropped rather than priced off a
+        stale close. Counted in ``skipped_stale_vwap``.
       - A row whose ``signal_date`` (or, for 13F/ETF raw_series flows,
         ``obs_date``) is in the future is dropped, never persisted.
         Counted in ``skipped_future_date``.
@@ -810,8 +852,8 @@ def normalize_all_flows(
     Returns:
         A ``FlowNormalizationSummary`` (list subclass) of the normalized
         flows kept from this run, with ``.skipped_no_vwap``,
-        ``.skipped_future_date``, ``.by_source``, ``.persisted`` and
-        ``.dry_run`` attributes.
+        ``.skipped_stale_vwap``, ``.skipped_future_date``, ``.by_source``,
+        ``.persisted`` and ``.dry_run`` attributes.
     """
     if not dry_run:
         _ensure_table(engine)
@@ -820,6 +862,7 @@ def normalize_all_flows(
     cutoff = today - timedelta(days=days)
     all_flows: list[dict] = []
     skipped_no_vwap = 0
+    skipped_stale_vwap = 0
     skipped_future_date = 0
     by_source: dict[str, int] = defaultdict(int)
 
@@ -865,9 +908,11 @@ def normalize_all_flows(
         elif stype == "insider":
             normalized = _normalize_insider(row_dict)
         elif stype == "darkpool":
-            normalized, no_vwap = _normalize_darkpool(row_dict, engine)
-            if no_vwap:
+            normalized, skip_reason = _normalize_darkpool(row_dict, engine)
+            if skip_reason == "no_vwap":
                 skipped_no_vwap += 1
+            elif skip_reason == "stale_vwap":
+                skipped_stale_vwap += 1
         elif stype == "options_flow":
             normalized = _normalize_whale_options(row_dict)
         elif stype == "prediction_market":
@@ -897,17 +942,20 @@ def normalize_all_flows(
 
     log.info(
         "Normalized {n} dollar flows across {d} days (persisted={p}, "
-        "skipped_no_vwap={sv}, skipped_future_date={sf}, dry_run={dr})",
+        "skipped_no_vwap={sv}, skipped_stale_vwap={ss}, "
+        "skipped_future_date={sf}, dry_run={dr})",
         n=len(all_flows),
         d=days,
         p=persisted,
         sv=skipped_no_vwap,
+        ss=skipped_stale_vwap,
         sf=skipped_future_date,
         dr=dry_run,
     )
     return FlowNormalizationSummary(
         all_flows,
         skipped_no_vwap=skipped_no_vwap,
+        skipped_stale_vwap=skipped_stale_vwap,
         skipped_future_date=skipped_future_date,
         by_source=dict(by_source),
         persisted=persisted,

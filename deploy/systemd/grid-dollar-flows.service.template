@@ -4,25 +4,39 @@
 #   sudo cp deploy/systemd/grid-dollar-flows.service.template /etc/systemd/system/grid-dollar-flows.service
 #   sudo cp deploy/systemd/grid-dollar-flows.timer.template   /etc/systemd/system/grid-dollar-flows.timer
 #   sudo systemctl daemon-reload && sudo systemctl enable --now grid-dollar-flows.timer
-# Paths follow grid-causal-links.service.template.
+# WorkingDirectory/EnvironmentFile follow grid-godview-*.service and
+# grid-analytics-snapshots.service.template (the deployed release tree),
+# not grid-causal-links.service.template's older /home/grid/grid_v4/grid_repo
+# convention — that checkout is stale/diverged and no live service runs
+# from it (PR #712 review).
 [Unit]
 Description=GRID dollar-flows normalizer (signal_sources + raw_series -> dollar_flows, PIT VWAP)
-After=network.target postgresql.service
+Documentation=file:///data/grid_v4/grid_release/deploy/systemd/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
 # grid-flow-materializer.timer (host-installed, not tracked in this repo —
 # see docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md) runs
 # every 30 min, so any daily time is "after" a materializer pass. This
 # unit's own timer picks a time comfortably after the morning ingestion
-# pulls instead of an After= on that unit (see .timer.template).
+# pulls and outside the nightly pg_dump window instead of an After= on
+# that unit (see .timer.template).
 
 [Service]
 Type=oneshot
 User=grid
-WorkingDirectory=/home/grid/grid_v4/grid_repo
+Group=grid
+# The deployed release tree (same tree grid-api runs from; .github/workflows/
+# deploy.yml resets it to main) — not the old /home/grid/grid_v4/grid_repo
+# checkout, which is stale/diverged.
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-scheduler, grid-hermes and the godview writers use
+# (GRID DB settings) — this file itself still lives in the repo checkout.
 EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 Environment=PYTHONUNBUFFERED=1
-# Last 7 days: dark-pool rows with no real VWAP and future-dated signal_date
-# rows are dropped and counted, never fabricated/persisted (see
-# intelligence/dollar_flows.py FlowNormalizationSummary).
+# Last 7 days: dark-pool rows with no real VWAP, a VWAP older than
+# _VWAP_MAX_AGE_TRADING_DAYS, or a future-dated signal_date are dropped and
+# counted, never fabricated/persisted (see intelligence/dollar_flows.py
+# FlowNormalizationSummary).
 ExecStart=/usr/bin/flock -n /tmp/grid-dollar-flows.lock /usr/bin/python3 scripts/run_dollar_flows.py --days 7
 TimeoutStartSec=20min
 Nice=10

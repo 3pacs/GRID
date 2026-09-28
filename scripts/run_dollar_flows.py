@@ -6,13 +6,17 @@ Normalizes ``signal_sources`` + ``raw_series`` rows into
 over the touched date range. See ``intelligence/dollar_flows.py`` for the
 per-source-type conversion rules.
 
-Two honesty guards (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3):
+Three honesty guards (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 §4.3, plus the
+staleness bound added per PR #712 review):
   - No real VWAP observation for a dark-pool row -> the row is dropped,
     never fabricated from the old ``_DEFAULT_VWAP_ESTIMATE`` ($50 flat).
+  - A VWAP observation older than 5 trading days (see
+    ``intelligence.dollar_flows._VWAP_MAX_AGE_TRADING_DAYS``) -> dropped
+    rather than pricing off a stale close.
   - A future-dated ``signal_date``/``obs_date`` -> dropped, never persisted.
 
-Both are counted in the printed summary (``skipped_no_vwap`` /
-``skipped_future_date``), never silently absorbed.
+All three are counted in the printed summary (``skipped_no_vwap`` /
+``skipped_stale_vwap`` / ``skipped_future_date``), never silently absorbed.
 
 Usage:
     python3 scripts/run_dollar_flows.py                    # last 90 days, persist
@@ -69,6 +73,7 @@ def main(argv: list[str] | None = None, engine=None) -> int:
             f"dollar-flows run: {out['flows_count']} normalized, "
             f"{out['persisted']} persisted, "
             f"skipped_no_vwap={out['skipped_no_vwap']}, "
+            f"skipped_stale_vwap={out['skipped_stale_vwap']}, "
             f"skipped_future_date={out['skipped_future_date']}, "
             f"by_source={out['by_source']}"
             + (" [dry-run]" if out["dry_run"] else "")

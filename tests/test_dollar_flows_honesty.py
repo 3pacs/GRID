@@ -132,9 +132,9 @@ def test_normalize_darkpool_skips_when_no_vwap_not_fabricated(engine):
         "signal_date": YESTERDAY,
         "signal_value": json.dumps({"volume": 100_000, "spike_ratio": 3.2}),
     }
-    flow, no_vwap = dollar_flows._normalize_darkpool(row, engine)
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
     assert flow is None
-    assert no_vwap is True
+    assert skip_reason == "no_vwap"
 
 
 def test_normalize_darkpool_uses_real_vwap_and_records_obs_date(engine):
@@ -149,9 +149,9 @@ def test_normalize_darkpool_uses_real_vwap_and_records_obs_date(engine):
         "signal_date": YESTERDAY,
         "signal_value": json.dumps({"volume": 1_000, "spike_ratio": 3.2}),
     }
-    flow, no_vwap = dollar_flows._normalize_darkpool(row, engine)
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
 
-    assert no_vwap is False
+    assert skip_reason is None
     assert flow is not None
     assert flow["amount_usd"] == pytest.approx(1_000 * 123.45)
     assert flow["amount_usd"] != pytest.approx(1_000 * 50.0), "must not use the old $50 default"
@@ -171,9 +171,9 @@ def test_normalize_darkpool_missing_signal_date_is_dropped_not_defaulted_to_toda
         "signal_date": None,
         "signal_value": json.dumps({"volume": 1_000}),
     }
-    flow, no_vwap = dollar_flows._normalize_darkpool(row, engine)
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
     assert flow is None
-    assert no_vwap is False  # not a VWAP problem — there is no usable date at all
+    assert skip_reason is None  # not a VWAP problem — there is no usable date at all
 
 
 def test_normalize_darkpool_zero_volume_is_not_counted_as_no_vwap(engine):
@@ -186,9 +186,59 @@ def test_normalize_darkpool_zero_volume_is_not_counted_as_no_vwap(engine):
         "signal_date": YESTERDAY,
         "signal_value": json.dumps({"volume": 0}),
     }
-    flow, no_vwap = dollar_flows._normalize_darkpool(row, engine)
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
     assert flow is None
-    assert no_vwap is False
+    assert skip_reason is None
+
+
+# ── _normalize_darkpool: VWAP staleness bound (PR #712 review) ─────────────
+
+def test_normalize_darkpool_skips_stale_vwap_not_priced_off_old_close(engine):
+    """A VWAP observation far older than _VWAP_MAX_AGE_TRADING_DAYS must be
+    dropped and counted as stale, never used to price the row."""
+    stale_date = YESTERDAY - timedelta(days=30)  # far more than 5 trading days back
+    _insert_yf_close(engine, "ZZZZ", stale_date, 999.99)
+
+    row = {
+        "source_id": "finra_ats",
+        "ticker": "ZZZZ",
+        "signal_type": "VOLUME_SPIKE",
+        "signal_date": YESTERDAY,
+        "signal_value": json.dumps({"volume": 1_000}),
+    }
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
+    assert flow is None
+    assert skip_reason == "stale_vwap"
+
+
+def test_normalize_darkpool_accepts_vwap_within_staleness_bound(engine):
+    """A VWAP just inside the staleness bound (a handful of trading days
+    back, well under _VWAP_MAX_AGE_TRADING_DAYS) still prices the row —
+    the bound must not become a blanket break."""
+    recent_date = YESTERDAY - timedelta(days=2)
+    _insert_yf_close(engine, "ZZZZ", recent_date, 200.0)
+
+    row = {
+        "source_id": "finra_ats",
+        "ticker": "ZZZZ",
+        "signal_type": "VOLUME_SPIKE",
+        "signal_date": YESTERDAY,
+        "signal_value": json.dumps({"volume": 1_000}),
+    }
+    flow, skip_reason = dollar_flows._normalize_darkpool(row, engine)
+    assert skip_reason is None
+    assert flow is not None
+    assert flow["amount_usd"] == pytest.approx(1_000 * 200.0)
+
+
+def test_vwap_age_trading_days_same_session_is_zero():
+    assert dollar_flows._vwap_age_trading_days(YESTERDAY, YESTERDAY) == 0
+
+
+def test_vwap_max_age_is_a_named_pinned_constant():
+    """The staleness bound must be a discoverable constant, not a magic
+    number buried in a comparison."""
+    assert dollar_flows._VWAP_MAX_AGE_TRADING_DAYS == 5
 
 
 # ── normalize_all_flows: dry run counts, never fabricates, never persists ──
@@ -210,6 +260,13 @@ def test_normalize_all_flows_dry_run_counts_and_never_persists(engine):
         engine, "darkpool", "finra_ats", "NOPRICE", YESTERDAY, "VOLUME_SPIKE",
         {"volume": 5_000},
     )
+    # A dark-pool signal whose only YF price is far too old -> must be
+    # dropped, never priced off a stale close.
+    _insert_yf_close(engine, "STALEPRICE", YESTERDAY - timedelta(days=30), 40.0)
+    _insert_signal(
+        engine, "darkpool", "finra_ats", "STALEPRICE", YESTERDAY, "VOLUME_SPIKE",
+        {"volume": 2_000},
+    )
 
     summary = dollar_flows.normalize_all_flows(engine, days=30, dry_run=True)
 
@@ -217,6 +274,7 @@ def test_normalize_all_flows_dry_run_counts_and_never_persists(engine):
     assert summary.persisted == 0
     assert summary.skipped_future_date == 1
     assert summary.skipped_no_vwap == 1
+    assert summary.skipped_stale_vwap == 1
     assert len(summary) == 1  # only the valid congressional row survives
     assert summary[0]["ticker"] == "GRDX"
     assert summary[0]["flow_date"] == YESTERDAY
