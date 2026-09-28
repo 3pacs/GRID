@@ -2,8 +2,15 @@
 GRID Intelligence Scheduler — background loop for periodic intelligence tasks.
 
 Runs hourly briefings, capital flow refreshes, daily context pulls,
-nightly research, taxonomy audits, celestial briefings, dealer flow
-briefings, options recommendations/tracking, and paper trading signals.
+taxonomy audits, celestial briefings, dealer flow briefings, and options
+recommendations. Three jobs — nightly bulk hypothesis generation
+(``_nightly_research``), the weekly scanner-weights writer
+(``_options_tracker``), and hourly legacy paper trading
+(``_paper_trading_signals``) — are held off by default per the 2026-09-28
+owner decision (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md §6) and are
+only registered with `schedule` when their respective
+``GRID_ENABLE_*_JOB`` flag is set; see the "Schedule registration"
+section below.
 
 Extracted from api/main.py lifespan to keep the API entry point lean
 and make the scheduler independently testable.
@@ -25,7 +32,7 @@ def run_intelligence_loop() -> None:
     """
     from config import Settings
 
-    _s = Settings()  # noqa: F841 — kept for future use by scheduled tasks
+    _s = Settings()  # gates the three Wave 3 held-writer jobs below
 
     # ── Task definitions ────────────────────────────────────────────────
 
@@ -272,7 +279,17 @@ def run_intelligence_loop() -> None:
     # ── Schedule registration ───────────────────────────────────────────
 
     _sched.every(15).minutes.do(_crucix_ingest)
-    _sched.every(1).hours.do(_paper_trading_signals)
+    # Wave 3 owner decision (2026-09-28, GRID-WAVE3-HELD-WRITERS-TRIAGE-
+    # 20260927.md §6): this job trades hypothesis_registry-derived
+    # strategies (noise-generator lineage) on contaminated *_full resolved
+    # features with no future-date bound. Held off by default — see
+    # config.GRID_ENABLE_LEGACY_PAPER_TRADING_JOB for the full writer
+    # trail. Not registered with `schedule` unless explicitly enabled, so
+    # it is never dispatched, attempted, or timed (mirrors the Hermes
+    # DAILY_INTEL_INITIAL_ALLOWLIST hold semantics in scripts/
+    # hermes_operator.py). Re-enabling is a reviewed code/config change.
+    if getattr(_s, "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB", False):
+        _sched.every(1).hours.do(_paper_trading_signals)
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)
     _sched.every(6).hours.do(_price_fallback)
@@ -281,7 +298,13 @@ def run_intelligence_loop() -> None:
     # Both services run at the same hour; staggering prevents DB contention
     # and duplicate hypothesis writes. See scripts/hermes_operator.py
     # "Daily at 2:00 AM" block.
-    _sched.every().day.at("02:45").do(_nightly_research)
+    # Wave 3 owner decision (2026-09-28, same triage doc §6): this job
+    # built 77,261 hypotheses a night and was failing to insert them into
+    # hypothesis_registry, plus spending nightly ORACLE GPU time on sector
+    # research. Held off by default — see
+    # config.GRID_ENABLE_BULK_HYPOTHESIS_JOB.
+    if getattr(_s, "GRID_ENABLE_BULK_HYPOTHESIS_JOB", False):
+        _sched.every().day.at("02:45").do(_nightly_research)
     _sched.every().day.at("03:15").do(_taxonomy_audit)
     _sched.every().day.at("06:00").do(_daily_context)
     _sched.every().day.at("07:00").do(_options_recommendations)
@@ -289,7 +312,12 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("15:00").do(_dealer_flow_briefing)
     _sched.every().day.at("18:00").do(_daily_context)
     _sched.every().sunday.at("03:00").do(_weekly_astro_correlations)
-    _sched.every(7).days.do(_options_tracker)
+    # Wave 3 owner decision (2026-09-28, same triage doc §6): this job
+    # writes scanner_weights, a model/weight-registry class of write Hermes
+    # already holds elsewhere. Held off by default — see
+    # config.GRID_ENABLE_SCANNER_WEIGHTS_JOB.
+    if getattr(_s, "GRID_ENABLE_SCANNER_WEIGHTS_JOB", False):
+        _sched.every(7).days.do(_options_tracker)
     _sched.every().day.at("03:30").do(_actor_news_top200)
     _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 

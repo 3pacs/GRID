@@ -41,6 +41,10 @@ describe('Archive view async data', () => {
             expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument();
         });
         expect(screen.getByText(/Deep Dive #7/)).toBeInTheDocument();
+        // Wave 3 W3.4: on-demand writers must read "generated on request",
+        // never imply a live/scheduled feed (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #4).
+        expect(screen.getByText(/generated on request/i)).toBeInTheDocument();
+        expect(screen.getByText(/qwen3\.8-27b \(local\)/i)).toBeInTheDocument();
     });
 
     it('shows an error state on failure and refetches on retry', async () => {

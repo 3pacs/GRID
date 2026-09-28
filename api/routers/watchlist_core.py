@@ -105,6 +105,12 @@ def list_watchlist(
     }
 
 
+# Wave 3 #11: every price this router serves is a live yfinance quote behind
+# a 5-minute cache, button-triggered only (no scheduled writer) — label the
+# source explicitly so responses never imply a managed/vendor feed.
+_PRICE_SOURCE = "yfinance"
+
+
 @router.post("/refresh-prices")
 def refresh_watchlist_prices(
     _token: str = Depends(require_auth),
@@ -118,7 +124,7 @@ def refresh_watchlist_prices(
     # Return cached if fresh
     cached = _get_cached_prices()
     if cached is not None:
-        return {"prices": cached, "cached": True}
+        return {"prices": cached, "cached": True, "source": _PRICE_SOURCE}
 
     _init_table()
     engine = get_db_engine()
@@ -128,7 +134,7 @@ def refresh_watchlist_prices(
 
     tickers = [row[0] for row in rows]
     if not tickers:
-        return {"prices": {}, "cached": False}
+        return {"prices": {}, "cached": False, "source": _PRICE_SOURCE}
 
     prices = _batch_fetch_prices(tickers)
 
@@ -142,7 +148,7 @@ def refresh_watchlist_prices(
     except Exception as exc:
         log.debug("Watchlist: broadcast_event failed: {e}", e=str(exc))
 
-    return {"prices": prices, "cached": False}
+    return {"prices": prices, "cached": False, "source": _PRICE_SOURCE}
 
 
 @router.get("/prices")
@@ -152,8 +158,8 @@ async def get_watchlist_prices(
     """Return cached batch prices without triggering refresh or broadcast side effects."""
     cached = _get_cached_prices()
     if cached is not None:
-        return {"prices": cached, "fresh": True, "cached": True}
-    return {"prices": {}, "fresh": False, "cached": False}
+        return {"prices": cached, "fresh": True, "cached": True, "source": _PRICE_SOURCE}
+    return {"prices": {}, "fresh": False, "cached": False, "source": _PRICE_SOURCE}
 
 
 @router.get("/portfolio")

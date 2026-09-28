@@ -110,7 +110,13 @@ BRIEFING_DURATION_TARGET = "45-60 seconds when read aloud"
 
 @dataclass(frozen=True)
 class BriefingResult:
-    """Immutable result from briefing generation."""
+    """Immutable result from briefing generation.
+
+    Wave 3 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5): this is always an
+    on-demand, button-triggered result — never a scheduled job. ``provider``
+    and ``generated_at`` let the UI say "generated on request <ts> (<provider>)"
+    instead of implying a live/scheduled briefing.
+    """
 
     script_text: str
     audio_path: str | None = None
@@ -119,6 +125,8 @@ class BriefingResult:
     briefing_date: str = ""
     generated_at: str = ""
     duration_ms: int = 0
+    provider: str = ""
+    audio_note: str = ""
     flow_summary: dict = field(default_factory=dict)
     credit_summary: dict = field(default_factory=dict)
     thesis_summary: dict = field(default_factory=dict)
@@ -132,6 +140,8 @@ class BriefingResult:
             "briefing_date": self.briefing_date,
             "generated_at": self.generated_at,
             "duration_ms": self.duration_ms,
+            "provider": self.provider,
+            "audio_note": self.audio_note,
             "flow_summary": self.flow_summary,
             "credit_summary": self.credit_summary,
             "thesis_summary": self.thesis_summary,
@@ -428,15 +438,82 @@ def _get_gemini_client():
     return genai.Client(api_key=key)
 
 
-def _generate_script_text(data: dict[str, Any]) -> str:
-    """Generate briefing script. Tries Gemini first (paid), falls back to OpenAI."""
+_SCRIPT_SYSTEM_PROMPT = (
+    "Generate a spoken-word market briefing. Structure each insight as: LEVER "
+    "(who did what) → CONDITION (what amplified it) → OUTCOME (price effect). "
+    "Never present a condition as the cause. Lead with levers: policy actions, "
+    "earnings surprises, or actor moves that shift liquidity. Tag each claim as "
+    "confirmed, expected, or rumored. No markdown. Pure broadcast speech, "
+    "150-250 words."
+)
+
+
+def _generate_script_text(data: dict[str, Any]) -> tuple[str, str]:
+    """Generate the briefing script text.
+
+    Wave 3 fix (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5, "text-only via
+    local LLM"): tries a LOCAL LLM first via ``llm.router`` — the same
+    Tier.REASON pattern ``intelligence/market_diary.py`` and
+    ``intelligence/forensics.py`` use for local narrative generation. This is
+    free and needs no paid opt-in. Only when no local node answers does this
+    fall back to the paid Gemini -> OpenAI path, and that path is unchanged
+    from before other than being second: it is still gated behind
+    ``GRID_ALLOW_PAID_LLM`` by ``_get_gemini_client`` / ``llm.router``'s own
+    paid-provider gate.
+
+    Returns ``(script_text, provider)`` where ``provider`` is ``"local"``,
+    ``"gemini"``, or ``"openai"`` — stored on the result so the UI can label
+    it "generated on request <ts> (<provider>)".
+    """
     prompt = _build_briefing_prompt(data)
 
-    # Try Gemini first (paid credits available)
+    # 1. Local LLM first (free, tried unconditionally).
+    try:
+        from llm.router import (
+            AnthropicClient,
+            GeminiClient,
+            HuggingFaceClient,
+            OpenAIClient,
+            Tier,
+            get_llm,
+        )
+
+        local_client = get_llm(Tier.REASON)
+        is_paid_client = isinstance(
+            local_client, (GeminiClient, OpenAIClient, AnthropicClient, HuggingFaceClient)
+        )
+        if (
+            local_client is not None
+            and not is_paid_client
+            and getattr(local_client, "is_available", False)
+        ):
+            script = local_client.chat(
+                messages=[
+                    {"role": "system", "content": _SCRIPT_SYSTEM_PROMPT},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.7,
+                num_predict=2000,
+                extra_metadata={"module": "audio_briefing.script", "tier": "REASON"},
+            )
+            if script:
+                script = script.strip()
+                log.info(
+                    "Briefing script generated via local LLM: {w} words",
+                    w=len(script.split()),
+                )
+                return script, "local"
+        else:
+            log.info("No local LLM available for briefing script; checking paid fallback")
+    except Exception as exc:
+        log.warning("Local LLM script gen failed: {e}", e=str(exc))
+
+    # 2. Paid fallback: Gemini direct, then OpenAI via router. Both stay
+    # gated behind GRID_ALLOW_PAID_LLM (unchanged from before this fix).
     gemini_exc: Exception | None = None
     try:
         client = _get_gemini_client()
-        log.info("Generating briefing script via Gemini ({m})", m=GEMINI_SCRIPT_MODEL)
+        log.info("Generating briefing script via Gemini ({m}) [paid fallback]", m=GEMINI_SCRIPT_MODEL)
         response = client.models.generate_content(
             model=GEMINI_SCRIPT_MODEL,
             contents=prompt,
@@ -445,7 +522,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
             raise RuntimeError("Gemini returned empty response")
         script = response.text.strip()
         log.info("Briefing script generated via Gemini: {w} words", w=len(script.split()))
-        return script
+        return script, "gemini"
     except Exception as exc:
         gemini_exc = exc
         log.warning("Gemini script gen failed, trying OpenAI: {e}", e=str(exc))
@@ -463,7 +540,7 @@ def _generate_script_text(data: dict[str, Any]) -> str:
 
         script = router_client.chat(
             messages=[
-                {"role": "system", "content": "Generate a spoken-word market briefing. Structure each insight as: LEVER (who did what) → CONDITION (what amplified it) → OUTCOME (price effect). Never present a condition as the cause. Lead with levers: policy actions, earnings surprises, or actor moves that shift liquidity. Tag each claim as confirmed, expected, or rumored. No markdown. Pure broadcast speech, 150-250 words."},
+                {"role": "system", "content": _SCRIPT_SYSTEM_PROMPT},
                 {"role": "user", "content": prompt},
             ],
             model="gpt-4o",
@@ -475,9 +552,12 @@ def _generate_script_text(data: dict[str, Any]) -> str:
             raise RuntimeError("OpenAI router returned empty briefing script")
         script = script.strip()
         log.info("Briefing script generated via OpenAI: {w} words", w=len(script.split()))
-        return script
+        return script, "openai"
     except Exception as exc2:
-        raise RuntimeError(f"Both Gemini and OpenAI failed: Gemini={gemini_exc}, OpenAI={exc2}")
+        raise RuntimeError(
+            f"Local LLM, Gemini, and OpenAI all failed to generate a briefing "
+            f"script: Gemini={gemini_exc}, OpenAI={exc2}"
+        )
 
 
 # -- Audio Generation via OpenAI TTS ----------------------------------------
@@ -777,13 +857,14 @@ def generate_briefing_script(engine) -> BriefingResult:
     """Generate the briefing script text only (no audio).
 
     Collects live data from the flow engine, CDS tracker, and thesis
-    system, then uses Gemini to write the script.
+    system, then writes the script via a local LLM first, falling back to
+    paid Gemini/OpenAI only when GRID_ALLOW_PAID_LLM is set.
     """
     t0 = time.monotonic()
     briefing_date = date.today().isoformat()
 
     data = _collect_all_data(engine)
-    script = _generate_script_text(data)
+    script, provider = _generate_script_text(data)
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
@@ -792,6 +873,7 @@ def generate_briefing_script(engine) -> BriefingResult:
         briefing_date=briefing_date,
         generated_at=datetime.now(timezone.utc).isoformat(),
         duration_ms=duration_ms,
+        provider=provider,
         flow_summary=data.get("flow", {}),
         credit_summary=data.get("credit", {}),
         thesis_summary=data.get("thesis", {}),
@@ -814,26 +896,46 @@ def _save_metadata(result: BriefingResult) -> None:
 
 
 def generate_briefing_audio(engine) -> BriefingResult:
-    """Generate the full briefing with script + audio MP3.
+    """Generate the briefing script (local LLM first) and, only when paid
+    generation is explicitly allowed, synthesize it to audio via OpenAI TTS.
+
+    Wave 3 fix (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5): TTS has no
+    local option today (Kokoro on koala has been offline ~48 days), so when
+    ``GRID_ALLOW_PAID_LLM`` is not set this returns a text-only on-demand
+    result (``audio_path=None``, ``audio_note`` explains why) instead of
+    raising. Setting ``GRID_ALLOW_PAID_LLM=1`` restores the MP3.
 
     Steps:
         1. Collect data from all GRID engines
-        2. Generate script via Gemini
-        3. Convert to audio via OpenAI TTS
-        4. Save JSON metadata sidecar for archival
+        2. Generate script (local LLM, or paid fallback if opted in)
+        3. Convert to audio via OpenAI TTS -- only if paid is allowed
+        4. Save JSON metadata sidecar for archival -- only if audio was made
     """
+    from llm.router import _paid_llm_allowed
+
     t0 = time.monotonic()
     briefing_date = date.today().isoformat()
 
     data = _collect_all_data(engine)
-    script = _generate_script_text(data)
-    audio_path = _generate_audio_file(script, briefing_date)
+    script, provider = _generate_script_text(data)
+
+    audio_path: str | None = None
+    audio_note = ""
+    if _paid_llm_allowed():
+        audio_path = _generate_audio_file(script, briefing_date)
+    else:
+        audio_note = (
+            "Text-only on-demand briefing: audio synthesis needs a paid TTS "
+            "provider (set GRID_ALLOW_PAID_LLM=1 to enable OpenAI TTS; the "
+            "local Kokoro option has been offline)."
+        )
+        log.info("Skipping audio synthesis (GRID_ALLOW_PAID_LLM not set): text-only briefing")
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
     log.info(
-        "Briefing audio complete: {ms}ms, audio={a}",
-        ms=duration_ms, a=audio_path,
+        "Briefing complete: {ms}ms, provider={p}, audio={a}",
+        ms=duration_ms, p=provider, a=audio_path or "(text-only)",
     )
 
     result = BriefingResult(
@@ -842,12 +944,15 @@ def generate_briefing_audio(engine) -> BriefingResult:
         briefing_date=briefing_date,
         generated_at=datetime.now(timezone.utc).isoformat(),
         duration_ms=duration_ms,
+        provider=provider,
+        audio_note=audio_note,
         flow_summary=data.get("flow", {}),
         credit_summary=data.get("credit", {}),
         thesis_summary=data.get("thesis", {}),
     )
 
-    _save_metadata(result)
+    if audio_path:
+        _save_metadata(result)
     return result
 
 
@@ -865,7 +970,7 @@ def generate_briefing_video(engine) -> BriefingResult:
     briefing_date = date.today().isoformat()
 
     data = _collect_all_data(engine)
-    script = _generate_script_text(data)
+    script, provider = _generate_script_text(data)
     audio_path = _generate_audio_file(script, briefing_date)
     title_card_path = _generate_title_card(briefing_date)
     video_path = _combine_to_video(audio_path, title_card_path, briefing_date)
@@ -885,6 +990,7 @@ def generate_briefing_video(engine) -> BriefingResult:
         briefing_date=briefing_date,
         generated_at=datetime.now(timezone.utc).isoformat(),
         duration_ms=duration_ms,
+        provider=provider,
         flow_summary=data.get("flow", {}),
         credit_summary=data.get("credit", {}),
         thesis_summary=data.get("thesis", {}),
@@ -909,6 +1015,10 @@ def _load_metadata(mp3_path: Path) -> BriefingResult:
                 briefing_date=data.get("briefing_date", briefing_date),
                 generated_at=data.get("generated_at", ""),
                 duration_ms=data.get("duration_ms", 0),
+                # Pre-fix recordings never wrote a provider field — they were
+                # all generated via the (then paid-only) Gemini/OpenAI path.
+                provider=data.get("provider", "gemini"),
+                audio_note=data.get("audio_note", ""),
                 flow_summary=data.get("flow_summary", {}),
                 credit_summary=data.get("credit_summary", {}),
                 thesis_summary=data.get("thesis_summary", {}),
@@ -923,6 +1033,7 @@ def _load_metadata(mp3_path: Path) -> BriefingResult:
         generated_at=datetime.fromtimestamp(
             mp3_path.stat().st_mtime, tz=timezone.utc
         ).isoformat(),
+        provider="unknown",
     )
 
 

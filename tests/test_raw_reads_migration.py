@@ -181,17 +181,31 @@ def test_sentiment_momentum_uses_distinct_dates_not_rows():
 
 # ── market diary ─────────────────────────────────────────────────────────
 
-def test_market_diary_index_moves_skip_failed_zero():
+def test_market_diary_index_moves_skip_failed_zero(monkeypatch):
+    from intelligence import market_diary
     from intelligence.market_diary import _gather_market_moves
 
+    # Price reads are held behind GRID_MARKET_DIARY_PRICES_ENABLED (Wave 3
+    # §4.1 fix #2) pending operator confirmation of the YF quarantine; flip
+    # it on for this test so the FAILED-zero-skipping behaviour under test
+    # is still exercised.
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+
     sid = "YF:^GSPC:close"
-    rows = _daily(sid, 3, start_value=5000.0, step=10.0, days_back=1)
+    # A real close exists for TODAY (5020) alongside a same-day FAILED zero
+    # (e.g. an earlier failed attempt superseded by a later successful
+    # pull) -- read_latest_n excludes FAILED regardless of pull_timestamp,
+    # so the real close must still win and obs_date must still equal
+    # target_date (Wave 3 §4.1 fix #2: a stale/failed close must never be
+    # reported as today's move).
+    rows = _daily(sid, 3, start_value=5000.0, step=10.0, days_back=0)
     rows.append(_row(sid, TODAY, 0.0, status="FAILED", h=50))
     moves = _gather_market_moves(_engine(rows), TODAY)
 
     sp = moves["indices"].get("S&P 500")
     assert sp is not None
     assert sp["close"] == 5020.0 and sp["change"] == 10.0
+    assert sp["obs_date"] == TODAY.isoformat()
 
 
 # ── crowdedness / credit event ───────────────────────────────────────────
