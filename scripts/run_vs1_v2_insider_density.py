@@ -34,9 +34,13 @@ Stages (``...`` = the same input flags):
         --prereg-sha256 <pinned v2 body sha256> --vault-repo CLONE
     python -m scripts.run_vs1_v2_insider_density export-anchors --log-dir DIR --vault-worktree VAULT_WORKTREE
 
-``open-discovery`` and ``discover`` also fetch VS1 v1's pinned witness and refuse
-unless it still covers only v1's 2 registration records (v2 takes v1's ledger
-slot k = 1; v1 must never have been opened).
+The same CLI drives VS1 v3 (``scripts/run_vs1_v3_insider_density.py`` passes the v3
+harness). v2 is superseded by v3: its ``open-discovery`` and ``discover`` refuse
+(pinned ``SUPERSEDED_BY``); its remaining use is ``hash-prereg``, ``register`` (a copy
+of the pinned registration) and ``power`` (the Stage-0 record). For any version,
+``open-discovery`` and ``discover`` refuse unless the version is not superseded, no
+later version's witness file is on the pinned vault ``main``, and every earlier
+version's witness still covers only its 2 registration records.
 
 Database access (discover and holdout only) is read-only by construction (the S09
 ``read_only_engine``) and limited to ``store.observations.read_window`` with an
@@ -61,10 +65,12 @@ PRICE_WARMUP_DAYS = 60
 CODE_FILES = (
     "analysis/panel_insider_density.py",
     "analysis/panel_insider_density_v2.py",
+    "analysis/panel_insider_density_v3.py",
     "analysis/offline_research_proof.py",
     "analysis/research_forward_log.py",
     "store/observations.py",
     "scripts/run_vs1_v2_insider_density.py",
+    "scripts/run_vs1_v3_insider_density.py",
 )
 
 
@@ -73,10 +79,11 @@ def _now() -> datetime:
 
 
 def _universe(args) -> tuple:
+    h = args.h
     sector_map = v1.load_sector_map(REPO)
-    issuer_map = v2.load_issuer_map(Path(args.issuer_map))
-    sic_map = v2.load_sic_map(Path(args.sic_map))
-    universe, info = v2.v2_universe(sector_map, issuer_map, sic_map)
+    issuer_map = h.load_issuer_map(Path(args.issuer_map))
+    sic_map = h.load_sic_map(Path(args.sic_map))
+    universe, info = h.v2_universe(sector_map, issuer_map, sic_map)
     info["issuer_map_sha256"] = v1.data_sha256(Path(args.issuer_map))
     info["sic_map_sha256"] = v1.data_sha256(Path(args.sic_map))
     info["universe_sha256"] = digest(universe.to_dict("records"))
@@ -85,32 +92,32 @@ def _universe(args) -> tuple:
 
 def _events(args, universe):
     owners = Path(args.owners) if getattr(args, "owners", None) else None
-    return v2.load_inputs(Path(args.form4), Path(args.submissions), universe, owners)
+    return args.h.load_inputs(Path(args.form4), Path(args.submissions), universe, owners)
 
 
 def _code_files() -> dict:
     return {f: v1.file_sha256(REPO / f) for f in CODE_FILES}
 
 
-def _power_inputs(events, admission, info) -> dict:
+def _power_inputs(h, events, admission, info) -> dict:
     return {
         "form4_receipt_sha256": events.receipt_sha256,
         "admission_receipt_sha256": admission.receipt_sha256,
         "universe_sha256": info["universe_sha256"],
-        "prereg_sha256": v2.PREREG_BODY_SHA256,
+        "prereg_sha256": h.PREREG_BODY_SHA256,
     }
 
 
 def _load_power(args, events, admission, info) -> dict:
     power = json.loads(Path(args.power).read_text(encoding="utf-8"))
-    v2.verify_power(power)
-    if power.get("inputs") != _power_inputs(events, admission, info):
+    args.h.verify_power(power)
+    if power.get("inputs") != _power_inputs(args.h, events, admission, info):
         raise SystemExit("power file was computed on other inputs")
     return power
 
 
 def _manifest(args) -> v2.PriceManifest:
-    manifest = v2.PriceManifest.from_file(Path(args.price_manifest))
+    manifest = args.h.PriceManifest.from_file(Path(args.price_manifest))
     if v1.data_sha256(Path(args.probe_report)) != manifest.probe_report_sha256:
         raise SystemExit("probe report does not hash to the manifest's probe_report_sha256")
     return manifest
@@ -132,66 +139,72 @@ def _observed(args, manifest: v2.PriceManifest, power: dict) -> dict:
 
 
 def cmd_hash(args) -> None:
-    path = Path(args.path) if args.path else REPO / v2.PREREG_PATH
-    actual = v2.prereg_body_sha256(path)
-    print(json.dumps({"path": str(path), "body_sha256": actual, "pinned": v2.PREREG_BODY_SHA256,
-                      "matches_pinned": actual == v2.PREREG_BODY_SHA256}, indent=2))
+    h = args.h
+    path = Path(args.path) if args.path else REPO / h.PREREG_PATH
+    actual = h.prereg_body_sha256(path)
+    print(json.dumps({"path": str(path), "body_sha256": actual, "pinned": h.PREREG_BODY_SHA256,
+                      "matches_pinned": actual == h.PREREG_BODY_SHA256}, indent=2))
 
 
 def cmd_register(args) -> None:
     """The one v2 registration (before the pins exist), or a copy of the pinned one."""
-    v2.check_prereg(REPO)
-    if v2.REGISTERED_RECORD_SHA256 is None:
+    h = args.h
+    h.check_prereg(REPO)
+    if h.REGISTERED_RECORD_SHA256 is None:
         if not args.code_sha:
             raise SystemExit("the first v2 registration needs --code-sha (the commit carrying the final text)")
-        records = v2.register(Path(args.log_dir), _now(), args.code_sha)
+        records = h.register(Path(args.log_dir), _now(), args.code_sha)
     else:
-        records = v2.register(Path(args.log_dir), v2.REGISTERED_AT, v2.REGISTERED_CODE_SHA)
-    log = v2.registry(Path(args.log_dir))
+        records = h.register(Path(args.log_dir), h.REGISTERED_AT, h.REGISTERED_CODE_SHA)
+    log = h.registry(Path(args.log_dir))
     print(json.dumps({"appended": [r["kind"] for r in records], "chain": log.verify_chain(),
-                      "anchor_line": (Path(args.log_dir) / v2.REGISTRY_ANCHORS).read_text(encoding="utf-8")},
+                      "anchor_line": (Path(args.log_dir) / h.REGISTRY_ANCHORS).read_text(encoding="utf-8")},
                      indent=2))
 
 
 def _print_witness_instructions(opened: dict, args) -> None:
-    appended = v2.export_anchors(Path(args.log_dir), Path(args.vault_worktree)) if args.vault_worktree else []
+    h = args.h
+    appended = h.export_anchors(Path(args.log_dir), Path(args.vault_worktree)) if args.vault_worktree else []
     print(json.dumps({
         "appended": opened["kind"], "records": opened["records"], "head_sha256": opened["head_sha256"],
-        "witness": f"{v2.WITNESS_REMOTE_URL} {v2.WITNESS_BRANCH}:{v2.WITNESS_PATH}",
+        "witness": f"{h.WITNESS_REMOTE_URL} {h.WITNESS_BRANCH}:{h.WITNESS_PATH}",
         "anchor_lines_written": appended,
-        "next": f"commit {v2.WITNESS_PATH} in the vault worktree and push it to {v2.WITNESS_BRANCH}, then run "
+        "next": f"commit {h.WITNESS_PATH} in the vault worktree and push it to {h.WITNESS_BRANCH}, then run "
                 + ("discover" if opened["kind"] == "discovery_opened" else "holdout"),
     }, indent=2))
 
 
 def cmd_export_anchors(args) -> None:
-    appended = v2.export_anchors(Path(args.log_dir), Path(args.vault_worktree))
+    h = args.h
+    appended = h.export_anchors(Path(args.log_dir), Path(args.vault_worktree))
     print(json.dumps({"anchor_lines_written": appended,
-                      "next": f"commit {v2.WITNESS_PATH} and push it to {v2.WITNESS_BRANCH}"}, indent=2))
+                      "next": f"commit {h.WITNESS_PATH} and push it to {h.WITNESS_BRANCH}"}, indent=2))
 
 
 def cmd_power(args) -> None:
-    v2.check_prereg(REPO)
+    h = args.h
+    h.check_prereg(REPO)
     output = Path(args.out)
     output.mkdir(parents=True, exist_ok=False)
     universe, info = _universe(args)
     events, admission = _events(args, universe)
-    power = v2.stage0_power(v2.power_features(events, admission, universe, "discovery"))
-    power["inputs"] = _power_inputs(events, admission, info)
-    report = v2.admission_report(events, admission, universe, "discovery")
-    v2.write_frozen(output, "power.json", power)
-    v2.write_frozen(output, "form4-receipt.json", events.receipt)
-    v2.write_frozen(output, "admission-receipt.json", admission.receipt)
-    v2.write_frozen(output, "admission-report.json", report)
+    power = h.stage0_power(h.power_features(events, admission, universe, "discovery"))
+    power["inputs"] = _power_inputs(h, events, admission, info)
+    report = h.admission_report(events, admission, universe, "discovery")
+    h.write_frozen(output, "power.json", power)
+    h.write_frozen(output, "form4-receipt.json", events.receipt)
+    h.write_frozen(output, "admission-receipt.json", admission.receipt)
+    h.write_frozen(output, "admission-report.json", report)
     members = universe.assign(current_tickers=universe["current_tickers"].map(list)).to_dict("records")
-    v2.write_frozen(output, "universe.json", {**info, "members": members})
+    h.write_frozen(output, "universe.json", {**info, "members": members})
     summary = {trial: [(r["target_ic"], r["power"], r["usable_dates"]) for r in rows]
                for trial, rows in power["table"].items()}
     print(json.dumps({"gate_passed": power["gate_passed"], "power": summary, "admission": report}, indent=2))
 
 
 def cmd_freeze_inputs(args) -> None:
-    v2.check_prereg(REPO)
+    h = args.h
+    h.check_prereg(REPO)
     as_of_ts = stamp(args.as_of_ts)
     manifest = _manifest(args)
     universe, info = _universe(args)
@@ -211,25 +224,27 @@ def cmd_freeze_inputs(args) -> None:
         "admission_receipt_sha256": admission.receipt_sha256,
         "universe_sha256": info["universe_sha256"],
     }
-    record = v2.freeze_inputs(Path(args.log_dir), _now(), inputs)
+    record = h.freeze_inputs(Path(args.log_dir), _now(), inputs)
     print(json.dumps({"appended": record["kind"], "inputs": record["inputs"]}, indent=2))
 
 
 def cmd_open_discovery(args) -> None:
-    v2.check_prereg(REPO)
+    h = args.h
+    h.check_prereg(REPO)
     manifest = _manifest(args)
     universe, info = _universe(args)
     events, admission = _events(args, universe)
     power = _load_power(args, events, admission, info)
-    frozen_inputs = v2.latest_frozen_inputs(Path(args.log_dir))
+    frozen_inputs = h.latest_frozen_inputs(Path(args.log_dir))
     if not power["gate_passed"] and frozen_inputs["accept_underpowered"] is not True:
         raise SystemExit("Stage-0 power gate failed and inputs_frozen did not accept an underpowered run")
-    v1_witness = v1.check_offhost(Path(args.vault_repo))
-    opened = v2.open_discovery(Path(args.log_dir), _now(), _observed(args, manifest, power), v1_witness)
+    witness = h.check_offhost(Path(args.vault_repo))  # the pinned vault main (earlier versions included)
+    opened = h.open_discovery(Path(args.log_dir), _now(), _observed(args, manifest, power), witness)
     _print_witness_instructions(opened, args)
 
 
 def _prices(args, universe, window: str, key):
+    h = args.h
     manifest = _manifest(args)
     admitted = universe[universe["ticker"].isin(manifest.admitted)]
     excluded = sorted(set(universe["ticker"]) - set(admitted["ticker"]))
@@ -239,7 +254,7 @@ def _prices(args, universe, window: str, key):
     engine = read_only_engine(args.statement_timeout_s, "vs1_v2_insider_density")
     try:
         with engine.connect() as conn:
-            prices = v2.load_price_panel(conn, manifest, list(admitted["ticker"]),
+            prices = h.load_price_panel(conn, manifest, list(admitted["ticker"]),
                                          start=lo.date() - timedelta(days=PRICE_WARMUP_DAYS),
                                          as_of=hi.date() - timedelta(days=1), window=window, key=key)
     finally:
@@ -258,7 +273,8 @@ def _ledger_csv(path: Path, ledger: list[dict]) -> None:
 
 
 def cmd_discover(args) -> None:
-    v2.check_prereg(REPO)
+    h = args.h
+    h.check_prereg(REPO)
     log_dir, output = Path(args.log_dir), Path(args.out)
     if output.exists():
         raise SystemExit(f"{output} exists: discovery output directories are write-once")
@@ -267,21 +283,19 @@ def cmd_discover(args) -> None:
     events, admission = _events(args, universe)
     power = _load_power(args, events, admission, info)
     observed = _observed(args, manifest, power)
-    v1_witness = v1.check_offhost(Path(args.vault_repo))
-    witness = v2.check_offhost(Path(args.vault_repo))
-    key = v2.resume_discovery(log_dir, observed, witness, v1_witness)
+    witness = h.check_offhost(Path(args.vault_repo))  # the pinned vault main (earlier versions included)
+    key = h.resume_discovery(log_dir, observed, witness)
     if not power["gate_passed"] and key.inputs["accept_underpowered"] is not True:
         raise SystemExit("Stage-0 power gate failed and inputs_frozen did not accept an underpowered run")
     output.mkdir(parents=True, exist_ok=False)
     _, admitted, excluded, prices = _prices(args, universe, "discovery", key)
-    panels = v2.build_trial_panels(events, admission, admitted, prices, "discovery")
+    panels = h.build_trial_panels(events, admission, admitted, prices, "discovery")
     inputs = {
         "code_sha": key.inputs.get("code_sha"),
         "file_sha256": observed["code_file_sha256"],
         "inputs_frozen_sha256": key.inputs_frozen_sha256,
         "frozen_inputs": key.inputs,
         "offhost_witness": witness.receipt(),
-        "v1_witness": v1_witness.receipt(),
         "sector_map_sha256": v1.SECTOR_MAP_SHA256,
         "universe": {k: v for k, v in info.items() if k != "members"},
         "price_excluded_not_admitted": excluded,
@@ -292,14 +306,14 @@ def cmd_discover(args) -> None:
         "power": {"gate_passed": power["gate_passed"], "accept_underpowered": key.inputs["accept_underpowered"],
                   "sha256": digest(power)},
     }
-    frozen = v2.discover_panel(v2.run_spec(), panels, inputs=inputs, repo_root=REPO)
-    v2.write_frozen(output, "discovery-frozen.json", frozen)
-    v2.write_frozen(output, "price-receipt.json", prices.receipt)
-    v2.write_frozen(output, "form4-receipt.json", events.receipt)
-    v2.write_frozen(output, "admission-receipt.json", admission.receipt)
-    v2.write_frozen(output, "power.json", power)
+    frozen = h.discover_panel(h.run_spec(), panels, inputs=inputs, repo_root=REPO)
+    h.write_frozen(output, "discovery-frozen.json", frozen)
+    h.write_frozen(output, "price-receipt.json", prices.receipt)
+    h.write_frozen(output, "form4-receipt.json", events.receipt)
+    h.write_frozen(output, "admission-receipt.json", admission.receipt)
+    h.write_frozen(output, "power.json", power)
     _ledger_csv(output / "ledger.csv", frozen["payload"]["ledger"])
-    v2.seal_discovery(log_dir, _now(), key, frozen)
+    h.seal_discovery(log_dir, _now(), key, frozen)
     print(json.dumps({"sha256": frozen["sha256"], "calibration": frozen["payload"]["calibration"]["state"],
                       "selected": [t["trial"] for t in frozen["payload"]["ledger"] if t["selected"]],
                       "next": "export the registry's new anchor line (discovery_frozen) to the off-host log"},
@@ -307,9 +321,10 @@ def cmd_discover(args) -> None:
 
 
 def _holdout_inputs(args):
+    h = args.h
     run_dir = Path(args.run_dir)
     frozen = json.loads((run_dir / "discovery-frozen.json").read_text(encoding="utf-8"))
-    payload = v2.check_holdout_request(frozen, allow_holdout=args.allow_holdout,
+    payload = h.check_holdout_request(frozen, allow_holdout=args.allow_holdout,
                                        prereg_sha256=args.prereg_sha256, repo_root=REPO)
     universe, info = _universe(args)
     events, admission = _events(args, universe)
@@ -329,29 +344,31 @@ def _holdout_inputs(args):
 
 
 def cmd_open_holdout(args) -> None:
+    h = args.h
     frozen, _, _, _, _, observed = _holdout_inputs(args)
-    opened = v2.open_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
+    opened = h.open_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                              log_dir=Path(args.log_dir), now=_now(), observed=observed, repo_root=REPO)
     _print_witness_instructions(opened, args)
 
 
 def cmd_holdout(args) -> None:
+    h = args.h
     run_dir = Path(args.run_dir)
     frozen, universe, events, admission, power, observed = _holdout_inputs(args)
-    witness = v2.check_offhost(Path(args.vault_repo))
-    key = v2.resume_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
+    witness = h.check_offhost(Path(args.vault_repo))
+    key = h.resume_holdout(frozen, allow_holdout=args.allow_holdout, prereg_sha256=args.prereg_sha256,
                             log_dir=Path(args.log_dir), observed=observed, witness=witness, repo_root=REPO)
     _, admitted, _, prices = _prices(args, universe, "holdout", key)
-    panels = v2.build_trial_panels(events, admission, admitted, prices, "holdout")
-    result = v2.evaluate_panel_holdout(frozen, panels, key, power=power)
+    panels = h.build_trial_panels(events, admission, admitted, prices, "holdout")
+    result = h.evaluate_panel_holdout(frozen, panels, key, power=power)
     result["price_receipt_sha256"] = prices.receipt_sha
-    v2.write_frozen(run_dir, "holdout-result.json", result)
-    v2.write_frozen(run_dir, "holdout-price-receipt.json", prices.receipt)
-    v2.seal_holdout(Path(args.log_dir), _now(), key, result)
+    h.write_frozen(run_dir, "holdout-result.json", result)
+    h.write_frozen(run_dir, "holdout-price-receipt.json", prices.receipt)
+    h.seal_holdout(Path(args.log_dir), _now(), key, result)
     print(json.dumps(result["verdict"], indent=2))
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(argv: list[str] | None = None, h=v2) -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -424,6 +441,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--statement-timeout-s", type=int, default=60)
     p.set_defaults(func=cmd_holdout)
 
+    parser.set_defaults(h=h)
     args = parser.parse_args(argv)
     args.func(args)
 

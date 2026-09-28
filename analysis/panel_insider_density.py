@@ -62,6 +62,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -2137,6 +2138,51 @@ REGISTERED_ANCHOR_LINE = (
 )
 _WITNESS_TOKEN = object()
 
+#: VS1 v1 was superseded before any price read: v2 (SIC-expanded universe) and then
+#: v3 (primary trial A90|fwd5) were registered (docs/paper_log/
+#: vs1-insider-density-v3-preregistration.md). v1 can never open a discovery.
+SUPERSEDED_BY: dict | None = {
+    "version": "vs1-v3",
+    "prereg_sha256": "fa7eda1c70906720b36dd84d0bb8b65a53f7badc35cd05055e08d7a9b40c2e42",
+    "registry_head_sha256": None,
+}
+OWN_VERSION_NUMBER = 1
+#: Witness files of every VS1 registry version on the pinned vault ``main``.
+VERSIONED_WITNESS = re.compile(r"^05-GRID/Paper-Log/vs1/granular_panel_prereg_v(\d+)\.anchors\.jsonl$")
+
+
+def witnessed_versions(repo: Path, tip: str) -> dict[int, str]:
+    """Version number -> witness path of every VS1 registry witness file present at ``tip``."""
+    listing = _git(repo, "ls-tree", "-r", "--name-only", tip, "--", "05-GRID/Paper-Log/vs1/")
+    out = {}
+    for path in listing.splitlines():
+        match = VERSIONED_WITNESS.match(path.strip())
+        if match:
+            out[int(match.group(1))] = path.strip()
+    return out
+
+
+def refuse_superseded(own: int, superseded_by: Mapping[str, Any] | None, witness: Any = None) -> None:
+    """Refuse a discovery opening of VS1 version ``own`` once any later version is registered.
+
+    Two checks: the supersession pinned in this version's code, and (when the
+    fetched off-host witness is given) any witness file of a later version on the
+    pinned vault ``main`` -- so a checkout that predates the pin is refused too
+    once it fetches the witness it needs for a price key.
+    """
+    if superseded_by:
+        raise PermissionError(
+            f"VS1 v{own} is superseded by {superseded_by.get('version')} (pinned in code): "
+            "it can never open a discovery"
+        )
+    if witness is not None:
+        later = sorted(n for n in witnessed_versions(witness.repo, witness.tip) if n > own)
+        if later:
+            raise PermissionError(
+                f"a later VS1 registry (v{later[-1]}) is witnessed on the pinned {WITNESS_BRANCH}: "
+                f"v{own} can never open a discovery"
+            )
+
 
 def _git(repo: Path, *argv: str, binary: bool = False):
     import subprocess
@@ -2413,6 +2459,7 @@ def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], *,
     """
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY)
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         records = _chain(log, prereg_sha256)
@@ -2442,6 +2489,7 @@ def resume_discovery(log_dir: Path, observed: Mapping[str, Any], witness: Offhos
     equal to that discovery's ``inputs_frozen`` record, and the off-host anchor
     log covering the ``discovery_opened`` head (:func:`require_witness`).
     """
+    refuse_superseded(OWN_VERSION_NUMBER, SUPERSEDED_BY, witness)
     log = registry(log_dir, prereg_sha256)
     with log.locked():
         records = _chain(log, prereg_sha256)

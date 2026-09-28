@@ -313,54 +313,79 @@ def test_machinery_alarm_false_positive_rate_under_the_synthetic_null():
     assert v1_alarm / reps >= 0.3
 
 
-# --- registry, v1 supersession and the off-host witness ------------------------------------------
+# --- registry, supersession and the off-host witness --------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _v2_not_superseded(monkeypatch):
+    """v2 is superseded by v3 (pinned); the machinery tests below exercise it as if it were current."""
+    monkeypatch.setattr(v2, "SUPERSEDED_BY", None)
+
+
+_SEEDS = {"vs1-v1": (v1.WITNESS_PATH, v1.REGISTERED_ANCHOR_LINE),
+          "vs1-v2": (v2.WITNESS_PATH, v2.REGISTERED_ANCHOR_LINE)}
 
 
 class _Vault:
-    """A bare 'remote' standing in for the GitHub vault, seeded with v1's registration anchor."""
+    """A bare 'remote' standing in for the GitHub vault, seeded with earlier versions' registration anchors.
 
-    def __init__(self, root: Path, v1_opened: bool = False) -> None:
+    ``opened``: versions whose witness gets a later anchor line (that version opened a discovery).
+    ``h``: the harness module whose witness this vault publishes and fetches.
+    """
+
+    def __init__(self, root: Path, *, h=v2, seeds=("vs1-v1",), opened=()) -> None:
         root.mkdir(parents=True, exist_ok=True)
+        self.h = h
         self.remote, self.worktree, self.cache = root / "remote.git", root / "worktree", root / "cache"
         _git(root, "init", "-q", "--bare", str(self.remote))
         _git(self.remote, "symbolic-ref", "HEAD", "refs/heads/main")
         _git(root, "init", "-q", str(self.worktree))
         _git(self.worktree, "checkout", "-q", "-b", "main")
-        v1_file = self.worktree / v1.WITNESS_PATH
-        v1_file.parent.mkdir(parents=True)
-        v1_file.write_bytes(v1.REGISTERED_ANCHOR_LINE + b"\n")
+        for version in seeds:
+            path, line = _SEEDS[version]
+            target = self.worktree / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(line + b"\n")
         _git(self.worktree, "add", "-A")
-        _git(self.worktree, "commit", "-q", "-m", "seed v1")
-        if v1_opened:  # a later v1 anchor line (v1 opened a discovery)
-            with open(v1_file, "ab") as stream:
+        _git(self.worktree, "commit", "-q", "-m", "seed earlier versions")
+        for version in opened:  # a later anchor line: that version opened a discovery
+            with open(self.worktree / _SEEDS[version][0], "ab") as stream:
                 stream.write(b'{"head_sha256":"' + b"e" * 64 + b'","prev_anchor_sha256":"x","records":4,'
                              b'"run_at":"2026-10-01T00:00:00+00:00"}\n')
             _git(self.worktree, "add", "-A")
-            _git(self.worktree, "commit", "-q", "-m", "v1 opened")
+            _git(self.worktree, "commit", "-q", "-m", f"{version} opened")
         _git(self.worktree, "remote", "add", "origin", str(self.remote))
-        _git(self.worktree, "push", "-q", "origin", "HEAD:refs/heads/main")
+        self.push()
         _git(root, "init", "-q", str(self.cache))
 
     def publish(self, log_dir, push=True):
-        """The operator's step: append the v2 anchor lines, commit, push to main."""
-        v2.export_anchors(log_dir, self.worktree)
+        """The operator's step: append the registry's anchor lines, commit, push to main."""
+        self.h.export_anchors(log_dir, self.worktree)
         _git(self.worktree, "add", "-A")
-        _git(self.worktree, "commit", "-q", "-m", "vs1 v2 anchors")
+        _git(self.worktree, "commit", "-q", "-m", f"{self.h.VERSION} anchors")
         if push:
             self.push()
+
+    def add_file(self, path, content: bytes):
+        target = self.worktree / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        _git(self.worktree, "add", "-A")
+        _git(self.worktree, "commit", "-q", "-m", f"add {path}")
+        self.push()
 
     def push(self):
         _git(self.worktree, "push", "-q", "origin", "HEAD:refs/heads/main")
 
     def witness(self):
-        return v2.check_offhost(self.cache, remote_url=str(self.remote))
+        return self.h.check_offhost(self.cache, remote_url=str(self.remote))
 
     def v1_witness(self):
         return v1.check_offhost(self.cache, remote_url=str(self.remote))
 
 
-def _register(log_dir):
-    return v2.register(log_dir, v2.REGISTERED_AT, v2.REGISTERED_CODE_SHA)
+def _register(log_dir, h=v2):
+    return h.register(log_dir, h.REGISTERED_AT, h.REGISTERED_CODE_SHA)
 
 
 def _inputs(manifest=None, **overrides):
@@ -382,12 +407,15 @@ def _manifest(tickers, source="tiingo", **extra):
 
 
 def _discovery_key(log_dir, vault, manifest=None):
-    _register(log_dir)
-    inputs = _inputs(manifest)
-    v2.freeze_inputs(log_dir, NOW, inputs)
-    v2.open_discovery(log_dir, NOW, _observed(inputs), vault.v1_witness())
+    """register -> seed the witness -> inputs_frozen -> discovery_opened -> witness -> key."""
+    h = vault.h
+    _register(log_dir, h)
     vault.publish(log_dir)
-    return v2.resume_discovery(log_dir, _observed(inputs), vault.witness(), vault.v1_witness()), inputs
+    inputs = _inputs(manifest)
+    h.freeze_inputs(log_dir, NOW, inputs)
+    h.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
+    vault.publish(log_dir)
+    return h.resume_discovery(log_dir, _observed(inputs), vault.witness()), inputs
 
 
 def test_register_rematerialises_only_the_pinned_registration(tmp_path):
@@ -414,14 +442,43 @@ def test_register_rematerialises_only_the_pinned_registration(tmp_path):
 
 
 def test_v2_discovery_is_refused_once_v1_was_opened(tmp_path):
-    vault = _Vault(tmp_path / "vault", v1_opened=True)
-    _register(tmp_path / "reg")
+    vault = _Vault(tmp_path / "vault", opened=("vs1-v1",))
+    log_dir = tmp_path / "reg"
+    _register(log_dir)
+    vault.publish(log_dir)
     inputs = _inputs()
-    v2.freeze_inputs(tmp_path / "reg", NOW, inputs)
-    with pytest.raises(PermissionError, match="v1 was opened"):
-        v2.open_discovery(tmp_path / "reg", NOW, _observed(inputs), vault.v1_witness())
-    with pytest.raises(PermissionError, match="v1's pinned off-host witness"):
-        v2.open_discovery(tmp_path / "reg", NOW, _observed(inputs), None)
+    v2.freeze_inputs(log_dir, NOW, inputs)
+    with pytest.raises(PermissionError, match="earlier VS1 registration was opened"):
+        v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
+    with pytest.raises(PermissionError, match="off-host witness"):
+        v2.open_discovery(log_dir, NOW, _observed(inputs), None)
+
+
+def test_pinned_supersession_refuses_every_v2_opening(tmp_path, monkeypatch):
+    vault = _Vault(tmp_path / "vault")
+    log_dir = tmp_path / "reg"
+    _register(log_dir)
+    vault.publish(log_dir)
+    inputs = _inputs()
+    v2.freeze_inputs(log_dir, NOW, inputs)
+    monkeypatch.undo()  # the real pin: superseded by v3
+    assert v2.SUPERSEDED_BY["version"] == "vs1-v3"
+    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+        v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
+    with pytest.raises(PermissionError, match="superseded by vs1-v3"):
+        v2.resume_discovery(log_dir, _observed(inputs), vault.witness())
+
+
+def test_a_later_version_witness_on_main_refuses_v2(tmp_path):
+    vault = _Vault(tmp_path / "vault")
+    log_dir = tmp_path / "reg"
+    _register(log_dir)
+    vault.publish(log_dir)
+    inputs = _inputs()
+    v2.freeze_inputs(log_dir, NOW, inputs)
+    vault.add_file("05-GRID/Paper-Log/vs1/granular_panel_prereg_v3.anchors.jsonl", b"{}\n")
+    with pytest.raises(PermissionError, match="later VS1 registry"):
+        v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
 
 
 def test_v2_discovery_needs_its_own_witness_on_main_and_runs_once(tmp_path):
@@ -430,19 +487,20 @@ def test_v2_discovery_needs_its_own_witness_on_main_and_runs_once(tmp_path):
     _register(log_dir)
     inputs = _inputs()
     v2.freeze_inputs(log_dir, NOW, inputs)
-    v2.open_discovery(log_dir, NOW, _observed(inputs), vault.v1_witness())
     with pytest.raises(PermissionError, match="is not on main"):
-        vault.witness()
+        vault.witness()  # the registration is not witnessed yet
+    vault.publish(log_dir)
+    v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
     vault.publish(log_dir, push=False)
-    with pytest.raises(PermissionError, match="is not on main"):
-        vault.witness()
+    with pytest.raises(PermissionError, match="covers 3 records"):
+        v2.resume_discovery(log_dir, _observed(inputs), vault.witness())
     vault.push()
-    key = v2.resume_discovery(log_dir, _observed(inputs), vault.witness(), vault.v1_witness())
-    assert isinstance(key, v2.DiscoveryKey)
+    key = v2.resume_discovery(log_dir, _observed(inputs), vault.witness())
+    assert isinstance(key, v2.DiscoveryKey) and key.version == "vs1-v2"
     with pytest.raises(PermissionError, match="one shot"):
-        v2.open_discovery(log_dir, NOW, _observed(inputs), vault.v1_witness())
+        v2.open_discovery(log_dir, NOW, _observed(inputs), vault.witness())
     with pytest.raises(PermissionError, match="inputs differ"):
-        v2.resume_discovery(log_dir, _observed(_inputs(form4_sha256="9" * 64)), vault.witness(), vault.v1_witness())
+        v2.resume_discovery(log_dir, _observed(_inputs(form4_sha256="9" * 64)), vault.witness())
     # a v1 key never opens v2 prices and vice versa
     with pytest.raises(TypeError):
         v1.DiscoveryKey(object(), "x", {"as_of_ts": AS_OF_TS}, log_dir=log_dir, witness_tip="t")
@@ -455,7 +513,7 @@ def test_price_reader_needs_a_v2_key_and_the_frozen_manifest(tmp_path):
     key, _ = _discovery_key(tmp_path / "reg", vault, _manifest(["AAA"]))
     read = {"start": date(2019, 12, 1), "as_of": date(2019, 12, 31), "window": "discovery"}
     with engine.connect() as conn:
-        with pytest.raises(PermissionError, match="v2 DiscoveryKey"):
+        with pytest.raises(PermissionError, match="vs1-v2 DiscoveryKey"):
             v2.load_price_panel(conn, _manifest(["AAA"]), ["AAA"], key=None, **read)
         with pytest.raises(PermissionError, match="inputs_frozen"):
             v2.load_price_panel(conn, _manifest(["AAA"], listed_from=(("AAA", "2010-01-04"),)), ["AAA"],
@@ -542,7 +600,7 @@ def test_end_to_end_planted_effect_with_admission_through_the_v2_price_reader(tm
     with pytest.raises(PermissionError, match="allow_holdout"):
         v2.open_holdout(frozen, allow_holdout=False, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
                         now=NOW, observed=_observed(inputs))
-    with pytest.raises(PermissionError, match="pinned v2"):
+    with pytest.raises(PermissionError, match="pinned vs1-v2"):
         v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v1.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",
                         now=NOW, observed=_observed(inputs))
     v2.open_holdout(frozen, allow_holdout=True, prereg_sha256=v2.PREREG_BODY_SHA256, log_dir=tmp_path / "reg",

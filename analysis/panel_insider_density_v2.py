@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -112,17 +113,6 @@ OBSERVED_INPUT_KEYS: tuple[str, ...] = tuple(
 
 def prereg_body_sha256(path: Path) -> str:
     return v1.prereg_body_sha256(path)
-
-
-def check_prereg(repo_root: Path = REPO) -> str:
-    """The repository v2 pre-registration must still hash to the pinned body hash."""
-    actual = prereg_body_sha256(Path(repo_root) / PREREG_PATH)
-    if actual != PREREG_BODY_SHA256:
-        raise ValueError(
-            f"v2 pre-registration body hashes to {actual[:12]}, pinned {PREREG_BODY_SHA256[:12]}: "
-            "the spec changed after registration (a change is a new version)"
-        )
-    return actual
 
 
 # --- universe ---------------------------------------------------------------------------
@@ -467,85 +457,6 @@ class PriceManifest(v1.PriceManifest):
                        "listed_from": [list(x) for x in self.listed_from]})
 
 
-_KEY_TOKEN = object()
-_HOLDOUT_TOKEN = object()
-
-
-class DiscoveryKey:
-    """Proof that v2's ``discovery_opened`` is in the pinned v2 chain and witnessed off-host."""
-
-    window = "discovery"
-
-    def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict, *,
-                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
-        if token is not _KEY_TOKEN:
-            raise TypeError("a v2 DiscoveryKey is issued only by resume_discovery")
-        if log_dir is None or witness_tip is None:
-            raise TypeError("a DiscoveryKey needs its registry and off-host witness")
-        self.inputs_frozen_sha256 = inputs_frozen_sha256
-        self.inputs = dict(inputs)
-        self.as_of_ts = stamp(inputs["as_of_ts"])
-        self.log_dir = Path(log_dir)
-        self.witness_tip = witness_tip
-
-
-class HoldoutKey:
-    """Proof that v2's ``holdout_opened`` is in the pinned v2 chain and witnessed off-host."""
-
-    window = "holdout"
-
-    def __init__(self, token: object, frozen_sha256: str, inputs: dict, *,
-                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
-        if token is not _HOLDOUT_TOKEN:
-            raise TypeError("a v2 HoldoutKey is issued only by resume_holdout")
-        if log_dir is None or witness_tip is None:
-            raise TypeError("a HoldoutKey needs its registry and off-host witness")
-        self.frozen_sha256 = frozen_sha256
-        self.inputs = dict(inputs)
-        self.as_of_ts = stamp(inputs["as_of_ts"])
-        self.log_dir = Path(log_dir)
-        self.witness_tip = witness_tip
-
-
-def load_price_panel(conn, manifest: PriceManifest, tickers: Iterable[str], *, start: date, as_of: date,
-                     window: str, key: DiscoveryKey | HoldoutKey) -> v1.PricePanel:
-    """v1's bounded, admitted, source-filtered read, behind a v2 registry key."""
-    manifest.validate()
-    if window == "discovery":
-        if not isinstance(key, DiscoveryKey):
-            raise PermissionError("discovery prices need a v2 DiscoveryKey from resume_discovery")
-        if as_of >= stamp(v1.SPLIT).date():
-            raise PermissionError("discovery reads stop before the split date")
-    elif window == "holdout":
-        if not isinstance(key, HoldoutKey):
-            raise PermissionError("holdout prices need a v2 HoldoutKey from resume_holdout")
-        if as_of >= stamp(v1.END).date():
-            raise PermissionError("holdout reads stop before the end of the frozen window")
-    else:
-        raise ValueError("window must be discovery or holdout")
-    if manifest.digest() != key.inputs.get("price_manifest_sha256"):
-        raise PermissionError("price manifest differs from the one in inputs_frozen")
-    if manifest.probe_report_sha256 != key.inputs.get("probe_report_sha256"):
-        raise PermissionError("price manifest's probe report differs from the one in inputs_frozen")
-    wanted = sorted(set(tickers) | {manifest.benchmark})
-    refused = [t for t in wanted if t not in manifest.admitted]
-    if refused:
-        raise PermissionError(f"tickers not in the admitted-price manifest: {refused[:10]}")
-    data = {
-        ticker: tuple(observations.read_window(
-            conn, manifest.series_template.format(ticker=ticker), source=manifest.source,
-            start=start, as_of=as_of, as_of_ts=key.as_of_ts,
-        ))
-        for ticker in wanted
-    }
-    if not data[manifest.benchmark]:
-        raise ValueError("no benchmark closes in the read window")
-    panel = v1.PricePanel(token=v1._PRICE_LOADER, manifest=manifest, start=start, as_of=as_of,
-                          as_of_ts=key.as_of_ts, window=window, data=data)
-    record_prices_read(key, panel.receipt_sha)
-    return panel
-
-
 # --- trial panels ------------------------------------------------------------------------
 
 
@@ -684,210 +595,6 @@ def measure_trial(panel: v1.TrialPanel, *, block: int | None = None, perms: int 
     return out
 
 
-# --- discovery, calibration, holdout, verdict -----------------------------------------------
-
-
-def run_spec(run_id: str | None = None) -> v1.RunSpec:
-    """The v2 run: the VS1 sector, k = 1 of the ledger, the 4 declared trials (v1 §5-§7 unchanged)."""
-    return v1.RunSpec(run_id=run_id or f"{VERSION}:{v1.VS1_SECTOR}", sector=v1.VS1_SECTOR,
-                      run_k=v1.VS1_RUN_K, trials=v1.trial_names())
-
-
-def calibration(ledger: list[dict], alpha: float = v1.run_alpha(v1.VS1_RUN_K)) -> dict:
-    """v2 §11 (C3): CONTRARY only when a negative one-sided p survives Holm at the run alpha.
-
-    ``primary_against_expectation``: the primary trial's mean IC is below 0 with
-    one-sided p <= 0.05 in the negative direction (evidence against the expected
-    sign). v1's rule outcome is reported under ``v1_rule``.
-    """
-    by = {t["trial"]: t for t in ledger}
-    primary = by[v1.PRIMARY_TRIAL]
-    negative = [t.get("p_one_sided_negative", 1.0) if t["status"] == "tested" else 1.0 for t in ledger]
-    holm_negative = holm_adjusted(negative)
-    contrary = [
-        t["trial"] for t, h in zip(ledger, holm_negative)
-        if t["status"] == "tested" and t["mean_ic"] is not None and t["mean_ic"] < 0 and h <= alpha
-    ]
-    against = bool(
-        primary["status"] == "tested" and primary["mean_ic"] < 0
-        and primary.get("p_one_sided_negative", 1.0) <= PRIMARY_AGAINST_P
-    )
-    consistent = (
-        primary["status"] == "tested" and primary["mean_ic"] > 0 and primary["p_one_sided_positive"] <= 0.10
-    ) or any(t["selected"] and t["mean_ic"] > 0 for t in ledger)
-    if contrary:
-        state = "CONTRARY"
-    elif consistent:
-        state = "CONSISTENT"
-    elif primary["status"] == "tested" and primary["mean_ic"] > 0:
-        state = "WEAK_POSITIVE"
-    else:
-        state = "ABSENT"
-    return {
-        "state": state,
-        "primary_trial": v1.PRIMARY_TRIAL,
-        "contrary_trials": contrary,
-        "holm_adjusted_negative_p": {t["trial"]: h for t, h in zip(ledger, holm_negative)},
-        "primary_against_expectation": against,
-        "v1_rule": v1.calibration(ledger),
-    }
-
-
-def discover_panel(spec: v1.RunSpec, panels: Mapping[str, v1.TrialPanel], *, inputs: dict,
-                   repo_root: Path = REPO, sensitivity: bool = True) -> dict:
-    """Freeze the v2 discovery ledger (v1 statistic and selection; v2 calibration)."""
-    prereg = check_prereg(repo_root)
-    spec.validate()
-    if set(panels) != set(spec.trials):
-        raise ValueError("panels must be exactly the declared trials")
-    ledger = []
-    for trial in spec.trials:
-        panel = panels[trial]
-        if panel.window != "discovery":
-            raise ValueError("discovery received a non-discovery panel")
-        v1.validate_panel(panel)
-        result = measure_trial(panel, perms=spec.perms, seed=spec.seed, min_n=spec.min_n, sensitivity=sensitivity)
-        ledger.append({"trial_id": digest([spec.run_id, spec.sector, trial]), "trial": trial,
-                       "sector": spec.sector, **result})
-    pvalues = [t["p"] for t in ledger]
-    for trial, holm, bh in zip(ledger, holm_adjusted(pvalues), v1.bh_adjusted(pvalues)):
-        trial["holm_adjusted_p"] = holm
-        trial["bh_adjusted_p"] = bh
-        trial["selected"] = trial["status"] == "tested" and holm <= spec.alpha
-    payload = {
-        "version": VERSION,
-        "origin": ORIGIN,
-        "prereg_sha256": prereg,
-        "spec": asdict(spec),
-        "windows": {"discovery_start": v1.DISCOVERY_START, "split": v1.SPLIT, "end": v1.END},
-        "selection": f"Holm at ledger run alpha {spec.alpha:.6g} (q={spec.ledger_q}, k={spec.run_k}) "
-                     "over every declared trial incl. untestable; BH-adjusted p reported only",
-        "null": "block sign-flip of the per-date rank-IC series; block from discovery IC acf1 "
-                f"(autocorrelation_block, >= {MIN_BLOCKS} blocks)",
-        "inputs": inputs,
-        "discovery_sha256": digest({t: panels[t].as_record() for t in spec.trials}),
-        "ledger": ledger,
-        "calibration": calibration(ledger, spec.alpha),
-        "state": "DISCOVERY_FROZEN",
-        "promotion_allowed": False,
-    }
-    return {"payload": payload, "sha256": digest(payload)}
-
-
-def verdict(payload: dict, checks: list[dict], power: dict | None) -> dict:
-    """v2 §11 verdict; v1's rule outcome is reported as ``v1_rule_state``."""
-    calib = payload["calibration"]
-    survivors = [c for c in checks if c["retrospective_survivor"]]
-    positive = [c for c in survivors if c["mean_ic"] > 0]
-    powered = bool(power and power.get("gate_passed"))
-    notes = []
-    if calib["state"] == "CONTRARY" or any(c["mean_ic"] < 0 for c in survivors):
-        state = "MACHINERY_SUSPECT"
-        notes.append("a Holm-significant negative insider-buy IC contradicts the published prior: audit the "
-                     "event parse, dates, universe and prices before reading anything else")
-    elif calib.get("primary_against_expectation"):
-        state = "MACHINERY_SUSPECT"
-        notes.append("the primary discovery IC is negative with one-sided p <= 0.05: evidence against the "
-                     "expected sign")
-    elif positive:
-        state = "HOLDOUT_SURVIVOR_FORWARD_PENDING"
-    else:
-        state = "NO_SURVIVOR"
-        if not powered:
-            notes.append("UNDERPOWERED: the Stage-0 power gate did not pass; a null here is not "
-                         "evidence against the published effect")
-    primary_rows = [t for t in [*payload.get("ledger", []), *checks] if t.get("trial") == v1.PRIMARY_TRIAL]
-    if any(t.get("labels", {}).get("buyer_missing_share", 0.0) > v1.MISSING_LABEL_WARNING for t in primary_rows):
-        notes.append(f"SURVIVORSHIP_WARNING: more than {v1.MISSING_LABEL_WARNING:.0%} of the primary trial's "
-                     "buyer issuer-dates have no label (possible delistings; no delisting return)")
-    if any((t.get("delisting_sensitivity") or {}).get("sign_survives_pessimistic") is False for t in primary_rows):
-        notes.append("DELISTING_SENSITIVE: the primary trial's IC changes sign under the pessimistic "
-                     "delisting bound (reported only)")
-    v1_state = v1.verdict({"calibration": {"state": (calib.get("v1_rule") or {}).get("state", "ABSENT")},
-                           "ledger": payload.get("ledger", [])}, checks, power)["state"]
-    return {"state": state, "calibration": calib["state"], "notes": notes, "v1_rule_state": v1_state,
-            "survivors": [c["trial"] for c in positive], "promotion_allowed": False,
-            "statement": "Nothing here is a trading signal."}
-
-
-def check_holdout_request(frozen: dict, *, allow_holdout: bool, prereg_sha256: str, repo_root: Path = REPO) -> dict:
-    if allow_holdout is not True:
-        raise PermissionError("holdout evaluation needs an explicit allow_holdout=True")
-    if prereg_sha256 != PREREG_BODY_SHA256:
-        raise PermissionError("the pre-registration hash given does not match the pinned v2 one")
-    check_prereg(repo_root)
-    payload = frozen.get("payload") or {}
-    if digest(payload) != frozen.get("sha256"):
-        raise PermissionError("frozen discovery manifest changed")
-    if payload.get("prereg_sha256") != PREREG_BODY_SHA256 or payload.get("version") != VERSION:
-        raise PermissionError("the discovery was not run under this pre-registration")
-    if payload.get("state") != "DISCOVERY_FROZEN":
-        raise PermissionError("no frozen discovery to evaluate")
-    return payload
-
-
-def evaluate_panel_holdout(frozen: dict, panels: Mapping[str, v1.TrialPanel], key: HoldoutKey, *,
-                           power: dict | None = None) -> dict:
-    """Frozen selections (and the primary trial) on the holdout, once (v1 §8 unchanged)."""
-    if not isinstance(key, HoldoutKey) or key.frozen_sha256 != frozen.get("sha256"):
-        raise PermissionError("holdout needs the v2 HoldoutKey opened for this frozen discovery")
-    payload = frozen["payload"]
-    spec = v1.RunSpec(**{**payload["spec"], "trials": tuple(payload["spec"]["trials"])})
-    ledger = {t["trial"]: t for t in payload["ledger"]}
-    selected = [t for t in payload["ledger"] if t["selected"]]
-    evaluated = sorted({t["trial"] for t in selected} | {v1.PRIMARY_TRIAL})
-    checks = []
-    for trial in evaluated:
-        panel = panels[trial]
-        if panel.window != "holdout":
-            raise ValueError("holdout received a non-holdout panel")
-        v1.validate_panel(panel)
-        ic, _ = v1.rank_ic_series(panel.feature, panel.label)
-        n = int(np.isfinite(ic).sum())
-        block = max(1, min(ledger[trial]["block"] or 1, max(1, n // MIN_BLOCKS)))
-        result = measure_trial(panel, block=block, perms=spec.perms, seed=spec.seed, min_n=spec.min_n)
-        is_selected = ledger[trial]["selected"]
-        adjusted = corrected_p(result["p"], len(selected)) if is_selected else None
-        survives = bool(is_selected and result["status"] == "tested" and adjusted <= v1.HOLDOUT_ALPHA
-                        and result["mean_ic"] * ledger[trial]["mean_ic"] > 0)
-        checks.append({"trial_id": ledger[trial]["trial_id"], "trial": trial, "selected_in_discovery": is_selected,
-                       **result, "bonferroni_p": adjusted, "retrospective_survivor": survives,
-                       "primary_one_sided_p": result["p_one_sided_positive"] if trial == v1.PRIMARY_TRIAL else None})
-    result = {"discovery_manifest": frozen["sha256"], "prereg_sha256": payload["prereg_sha256"],
-              "holdout_sha256": digest({t: panels[t].as_record() for t in evaluated}),
-              "holdout_checks": checks, "promotion_allowed": False}
-    result["verdict"] = verdict(payload, checks, power)
-    return result
-
-
-# --- Stage 0 (v1 §10 settings, v2 universe and admission) ------------------------------------
-
-
-def power_features(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
-                   window: str = "discovery") -> dict[str, np.ndarray]:
-    """Feature panels on proxy sessions (no price read) for the Stage-0 gate."""
-    lo, hi = v1.window_bounds(window)
-    sessions = v1.proxy_sessions(lo.date(), hi.date())
-    ciks = list(universe["cik"].astype(int))
-    out = {}
-    for h in v1.HORIZONS:
-        decided = v1.decision_instants(sessions[::h])
-        for name in v1.FEATURES:
-            out[f"{name}|fwd{h}"] = feature_panel(events, admission, ciks, decided, name).to_numpy(dtype=float)
-    return out
-
-
-def stage0_power(features: Mapping[str, np.ndarray]) -> dict:
-    """v1's Stage-0 power at v1's pinned settings (same run alpha, threshold and gate)."""
-    return {**v1.stage0_power(features), "version": VERSION}
-
-
-def verify_power(power: Mapping[str, Any]) -> None:
-    if power.get("version") != VERSION:
-        raise ValueError("power file was not computed by the v2 harness")
-    v1.verify_power(power)
-
-
 def admission_report(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
                      window: str = "discovery") -> dict:
     """Stage-0 description of the admitted panel (Form 4 data only): issuers and events per year."""
@@ -940,18 +647,845 @@ def admission_report(events: v1.Form4Events, admission: Admission, universe: pd.
     }
 
 
-# --- v2 registry (hash-chained, research_forward_log mechanism; separate from v1) -----------
+# --- statistics shared by every SIC-expanded version (primary trial is a parameter) ----------
+
+
+def make_run_spec(version: str, run_id: str | None = None) -> v1.RunSpec:
+    """The VS1 run: the VS1 sector, k = 1 of the ledger, the 4 declared trials (v1 §5-§7)."""
+    return v1.RunSpec(run_id=run_id or f"{version}:{v1.VS1_SECTOR}", sector=v1.VS1_SECTOR,
+                      run_k=v1.VS1_RUN_K, trials=v1.trial_names())
+
+
+def calibration(ledger: list[dict], alpha: float = v1.run_alpha(v1.VS1_RUN_K), *,
+                primary: str = v1.PRIMARY_TRIAL) -> dict:
+    """v2 §11 (C3): CONTRARY only when a negative one-sided p survives Holm at the run alpha.
+
+    ``primary_against_expectation``: the primary trial's mean IC is below 0 with
+    one-sided p <= 0.05 in the negative direction (evidence against the expected
+    sign). v1's rule outcome (v1's primary, A90|fwd20) is reported under ``v1_rule``.
+    """
+    by = {t["trial"]: t for t in ledger}
+    main = by[primary]
+    negative = [t.get("p_one_sided_negative", 1.0) if t["status"] == "tested" else 1.0 for t in ledger]
+    holm_negative = holm_adjusted(negative)
+    contrary = [
+        t["trial"] for t, h in zip(ledger, holm_negative)
+        if t["status"] == "tested" and t["mean_ic"] is not None and t["mean_ic"] < 0 and h <= alpha
+    ]
+    against = bool(
+        main["status"] == "tested" and main["mean_ic"] < 0
+        and main.get("p_one_sided_negative", 1.0) <= PRIMARY_AGAINST_P
+    )
+    consistent = (
+        main["status"] == "tested" and main["mean_ic"] > 0 and main["p_one_sided_positive"] <= 0.10
+    ) or any(t["selected"] and t["mean_ic"] > 0 for t in ledger)
+    if contrary:
+        state = "CONTRARY"
+    elif consistent:
+        state = "CONSISTENT"
+    elif main["status"] == "tested" and main["mean_ic"] > 0:
+        state = "WEAK_POSITIVE"
+    else:
+        state = "ABSENT"
+    return {
+        "state": state,
+        "primary_trial": primary,
+        "contrary_trials": contrary,
+        "holm_adjusted_negative_p": {t["trial"]: h for t, h in zip(ledger, holm_negative)},
+        "primary_against_expectation": against,
+        "v1_rule": v1.calibration(ledger),
+    }
+
+
+def verdict(payload: dict, checks: list[dict], power: dict | None, *, primary: str = v1.PRIMARY_TRIAL) -> dict:
+    """v2/v3 §11 verdict; v1's rule outcome is reported as ``v1_rule_state``."""
+    calib = payload["calibration"]
+    survivors = [c for c in checks if c["retrospective_survivor"]]
+    positive = [c for c in survivors if c["mean_ic"] > 0]
+    powered = bool(power and power.get("gate_passed"))
+    notes = []
+    if calib["state"] == "CONTRARY" or any(c["mean_ic"] < 0 for c in survivors):
+        state = "MACHINERY_SUSPECT"
+        notes.append("a Holm-significant negative insider-buy IC contradicts the published prior: audit the "
+                     "event parse, dates, universe and prices before reading anything else")
+    elif calib.get("primary_against_expectation"):
+        state = "MACHINERY_SUSPECT"
+        notes.append("the primary discovery IC is negative with one-sided p <= 0.05: evidence against the "
+                     "expected sign")
+    elif positive:
+        state = "HOLDOUT_SURVIVOR_FORWARD_PENDING"
+    else:
+        state = "NO_SURVIVOR"
+        if not powered:
+            notes.append("UNDERPOWERED: the Stage-0 power gate did not pass; a null here is not "
+                         "evidence against the published effect")
+    primary_rows = [t for t in [*payload.get("ledger", []), *checks] if t.get("trial") == primary]
+    if any(t.get("labels", {}).get("buyer_missing_share", 0.0) > v1.MISSING_LABEL_WARNING for t in primary_rows):
+        notes.append(f"SURVIVORSHIP_WARNING: more than {v1.MISSING_LABEL_WARNING:.0%} of the primary trial's "
+                     "buyer issuer-dates have no label (possible delistings; no delisting return)")
+    if any((t.get("delisting_sensitivity") or {}).get("sign_survives_pessimistic") is False for t in primary_rows):
+        notes.append("DELISTING_SENSITIVE: the primary trial's IC changes sign under the pessimistic "
+                     "delisting bound (reported only)")
+    v1_state = v1.verdict({"calibration": {"state": (calib.get("v1_rule") or {}).get("state", "ABSENT")},
+                           "ledger": payload.get("ledger", [])}, checks, power)["state"]
+    return {"state": state, "calibration": calib["state"], "primary_trial": primary, "notes": notes,
+            "v1_rule_state": v1_state, "survivors": [c["trial"] for c in positive], "promotion_allowed": False,
+            "statement": "Nothing here is a trading signal."}
+
+
+# --- Stage 0 (v1 §10 settings, SIC-expanded universe and admission) ---------------------------
+
+
+def power_features(events: v1.Form4Events, admission: Admission, universe: pd.DataFrame,
+                   window: str = "discovery") -> dict[str, np.ndarray]:
+    """Feature panels on proxy sessions (no price read) for the Stage-0 gate."""
+    lo, hi = v1.window_bounds(window)
+    sessions = v1.proxy_sessions(lo.date(), hi.date())
+    ciks = list(universe["cik"].astype(int))
+    out = {}
+    for h in v1.HORIZONS:
+        decided = v1.decision_instants(sessions[::h])
+        for name in v1.FEATURES:
+            out[f"{name}|fwd{h}"] = feature_panel(events, admission, ciks, decided, name).to_numpy(dtype=float)
+    return out
+
+
+# --- pinned, version-specific layer (registry, witness, keys, discovery, holdout) --------------
+
+_KEY_TOKEN = object()
+_HOLDOUT_TOKEN = object()
+_WITNESS_TOKEN = object()
+
+
+class DiscoveryKey:
+    """Proof that a version's ``discovery_opened`` is in its pinned chain and witnessed off-host."""
+
+    window = "discovery"
+
+    def __init__(self, token: object, inputs_frozen_sha256: str, inputs: dict, *, version: str | None = None,
+                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
+        if token is not _KEY_TOKEN:
+            raise TypeError("a DiscoveryKey is issued only by resume_discovery")
+        if log_dir is None or witness_tip is None or version is None:
+            raise TypeError("a DiscoveryKey needs its version, registry and off-host witness")
+        self.version = version
+        self.inputs_frozen_sha256 = inputs_frozen_sha256
+        self.inputs = dict(inputs)
+        self.as_of_ts = stamp(inputs["as_of_ts"])
+        self.log_dir = Path(log_dir)
+        self.witness_tip = witness_tip
+
+
+class HoldoutKey:
+    """Proof that a version's ``holdout_opened`` is in its pinned chain and witnessed off-host."""
+
+    window = "holdout"
+
+    def __init__(self, token: object, frozen_sha256: str, inputs: dict, *, version: str | None = None,
+                 log_dir: Path | None = None, witness_tip: str | None = None) -> None:
+        if token is not _HOLDOUT_TOKEN:
+            raise TypeError("a HoldoutKey is issued only by resume_holdout")
+        if log_dir is None or witness_tip is None or version is None:
+            raise TypeError("a HoldoutKey needs its version, registry and off-host witness")
+        self.version = version
+        self.frozen_sha256 = frozen_sha256
+        self.inputs = dict(inputs)
+        self.as_of_ts = stamp(inputs["as_of_ts"])
+        self.log_dir = Path(log_dir)
+        self.witness_tip = witness_tip
+
+
+class OffhostWitness:
+    """A version's witness file as committed on the pinned remote's ``main`` (issued by ``check_offhost``).
+
+    ``earlier``: records covered by each earlier version's witness file at the
+    same tip; ``versions_on_main``: every VS1 witness file present at the tip.
+    """
+
+    def __init__(self, token: object, repo: Path, tip: str, content: bytes, versions: list[dict],
+                 remote_url: str, *, path: str, branch: str, earlier: dict[str, int],
+                 versions_on_main: dict[int, str]) -> None:
+        if token is not _WITNESS_TOKEN:
+            raise TypeError("an OffhostWitness is issued only by check_offhost")
+        self.repo, self.tip, self.content, self.versions = Path(repo), tip, content, versions
+        self.remote_url, self.path, self.branch = remote_url, path, branch
+        self.earlier, self.versions_on_main = dict(earlier), dict(versions_on_main)
+
+    @property
+    def lines(self) -> list[bytes]:
+        return [line for line in self.content.split(b"\n") if line]
+
+    def descends_from(self, commit: str) -> bool:
+        import subprocess
+
+        result = subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", commit, self.tip],
+                                capture_output=True, check=False)
+        return result.returncode == 0
+
+    def witnessing_commit(self, records: int) -> str | None:
+        for version in self.versions:
+            if version["covered_records"] >= records:
+                return version["commit"]
+        return None
+
+    def receipt(self) -> dict:
+        return {"remote_url": self.remote_url, "branch": self.branch, "path": self.path, "tip": self.tip,
+                "versions": self.versions, "earlier_versions_covered_records": self.earlier,
+                "versions_on_main": {str(k): v for k, v in sorted(self.versions_on_main.items())}}
+
+
+def _walk_witness(repo: Path, ref: str, path: str, first_line: bytes, url: str,
+                  branch: str = v1.WITNESS_BRANCH) -> tuple[list[dict], list[bytes]]:
+    """Every committed version of ``path`` on ``ref``: at that path, pinned first line, append-only."""
+    log = v1._git(repo, "log", "--first-parent", "-m", "--follow", "--name-status", "--format=%x00%H", ref, "--", path)
+    entries = []
+    for chunk in log.split("\x00")[1:]:
+        head, *rest = chunk.strip("\n").split("\n")
+        entries.append((head.strip(), [line.split("\t") for line in rest if line.strip()]))
+    if not entries:
+        raise PermissionError(f"{path} is not on {branch} of {url}")
+    versions, previous = [], None
+    for commit, changes in reversed(entries):
+        for change in changes:
+            status, paths = change[0], change[1:]
+            if status.startswith(("R", "C")) or any(p != path for p in paths):
+                raise PermissionError(f"{commit[:12]}: the witness file came from another path ({paths})")
+            if status.startswith("D"):
+                raise PermissionError(f"{commit[:12]}: the witness file was deleted (not append-only)")
+        content = v1._git(repo, "show", f"{commit}:{path}", binary=True).replace(b"\r\n", b"\n")
+        lines = [line for line in content.split(b"\n") if line]
+        if not lines or lines[0] != first_line:
+            raise PermissionError(f"{commit[:12]}: the witness file does not start with the pinned registration")
+        if previous is not None and not (len(lines) > len(previous) and lines[: len(previous)] == previous):
+            raise PermissionError(
+                f"{commit[:12]}: the witness file is not a strict line-prefix extension of its previous "
+                "version (truncated, edited or unchanged): not append-only"
+            )
+        versions.append({"commit": commit, "lines": len(lines),
+                         "covered_records": json.loads(lines[-1]).get("records", 0)})
+        previous = lines
+    return versions, previous
+
+
+@dataclass(frozen=True)
+class EarlierVersion:
+    """An earlier VS1 registration this version supersedes (its witness must stay at 2 records)."""
+
+    version: str
+    number: int
+    prereg_sha256: str
+    registry_head_sha256: str
+    witness_path: str
+    anchor_line: bytes
+
+
+@dataclass(frozen=True)
+class Pins:
+    """Everything that makes one VS1 SIC-expanded version its own pinned registry."""
+
+    version: str
+    number: int
+    prereg_path: Path
+    prereg_body_sha256: str
+    primary_trial: str
+    registry_log: str
+    registry_anchors: str
+    registry_lock: str
+    witness_path: str
+    witness_ref: str
+    registration_records: Any  # (now, code_sha, prereg_sha256) -> [header, preregistration]
+    registered_at: datetime | None = None
+    registered_code_sha: str | None = None
+    registered_record_sha256: tuple[str, str] | None = None
+    registered_anchor_line: bytes | None = None
+    earlier: tuple[EarlierVersion, ...] = ()
+    superseded_by: Mapping[str, Any] | None = None
+
+
+class Harness:
+    """The pinned registry and one-shot stages of one VS1 version (v1's rules, per-version pins)."""
+
+    def __init__(self, pins: Pins, module: Any = None) -> None:
+        self.pins = pins
+        self._module = module  # the version module (monkeypatchable pins in tests)
+
+    # -- pins (read through the version module when one is attached) --
+    def _pin(self, name: str, default: Any) -> Any:
+        return getattr(self._module, name, default) if self._module is not None else default
+
+    @property
+    def version(self) -> str:
+        return self.pins.version
+
+    @property
+    def primary(self) -> str:
+        return self.pins.primary_trial
+
+    @property
+    def prereg_sha256(self) -> str:
+        return self._pin("PREREG_BODY_SHA256", self.pins.prereg_body_sha256)
+
+    @property
+    def registered_record_sha256(self) -> tuple[str, str] | None:
+        return self._pin("REGISTERED_RECORD_SHA256", self.pins.registered_record_sha256)
+
+    @property
+    def registered_anchor_line(self) -> bytes | None:
+        return self._pin("REGISTERED_ANCHOR_LINE", self.pins.registered_anchor_line)
+
+    @property
+    def superseded_by(self) -> Mapping[str, Any] | None:
+        return self._pin("SUPERSEDED_BY", self.pins.superseded_by)
+
+    @property
+    def remote_url(self) -> str:
+        return self._pin("WITNESS_REMOTE_URL", v1.WITNESS_REMOTE_URL)
+
+    # -- pre-registration --
+    def check_prereg(self, repo_root: Path = REPO) -> str:
+        actual = v1.prereg_body_sha256(Path(repo_root) / self.pins.prereg_path)
+        if actual != self.prereg_sha256:
+            raise ValueError(
+                f"{self.version} pre-registration body hashes to {actual[:12]}, pinned {self.prereg_sha256[:12]}: "
+                "the spec changed after registration (a change is a new version)"
+            )
+        return actual
+
+    def run_spec(self, run_id: str | None = None) -> v1.RunSpec:
+        return make_run_spec(self.version, run_id)
+
+    # -- Stage 0 --
+    def stage0_power(self, features: Mapping[str, np.ndarray]) -> dict:
+        """v1's Stage-0 simulation and settings; the gate is on this version's primary trial."""
+        out = v1.stage0_power(features)
+        row = next(r for r in out["table"][self.primary] if r["target_ic"] == v1.POWER_GATE_IC)
+        return {**out, "version": self.version, "primary_trial": self.primary,
+                "gate": f"power(primary {self.primary}, IC {v1.POWER_GATE_IC}) >= {v1.POWER_GATE}",
+                "gate_passed": row["power"] >= v1.POWER_GATE}
+
+    def verify_power(self, power: Mapping[str, Any]) -> None:
+        if power.get("version") != self.version:
+            raise ValueError(f"power file was not computed by the {self.version} harness")
+        if power.get("primary_trial", v1.PRIMARY_TRIAL) != self.primary:
+            raise ValueError(f"power file's gate is not on the {self.version} primary trial")
+        if power.get("settings") != v1.power_settings():
+            raise ValueError(
+                f"power file was not computed at the pre-registered settings "
+                f"(sims={v1.POWER_SIMS}, perms={v1.POWER_PERMS}, seed={v1.SEED})"
+            )
+        table = power.get("table") or {}
+        if set(table) != set(v1.trial_names()):
+            raise ValueError("power file must cover exactly the declared trials")
+        for trial, rows in table.items():
+            if [r.get("target_ic") for r in rows] != list(v1.POWER_TARGET_ICS):
+                raise ValueError(f"{trial}: power rows must be the pre-registered target ICs")
+            for r in rows:
+                if r.get("sims") not in (v1.POWER_SIMS, 0):
+                    raise ValueError(f"{trial}: power row not run at {v1.POWER_SIMS} simulations")
+                if r.get("sims") == 0 and r.get("power") != 0.0:
+                    raise ValueError(f"{trial}: an unsimulated row must carry power 0")
+        row = next(r for r in table[self.primary] if r["target_ic"] == v1.POWER_GATE_IC)
+        if power.get("gate_passed") is not (row["power"] >= v1.POWER_GATE):
+            raise ValueError("power file's gate_passed disagrees with its primary power")
+
+    # -- discovery and holdout statistics --
+    def calibration(self, ledger: list[dict], alpha: float = v1.run_alpha(v1.VS1_RUN_K)) -> dict:
+        return calibration(ledger, alpha, primary=self.primary)
+
+    def verdict(self, payload: dict, checks: list[dict], power: dict | None) -> dict:
+        return verdict(payload, checks, power, primary=self.primary)
+
+    def discover_panel(self, spec: v1.RunSpec, panels: Mapping[str, v1.TrialPanel], *, inputs: dict,
+                       repo_root: Path = REPO, sensitivity: bool = True) -> dict:
+        """Freeze the discovery ledger (v1 statistic and Holm selection; v2 calibration on this primary)."""
+        prereg = self.check_prereg(repo_root)
+        spec.validate()
+        if set(panels) != set(spec.trials):
+            raise ValueError("panels must be exactly the declared trials")
+        ledger = []
+        for trial in spec.trials:
+            panel = panels[trial]
+            if panel.window != "discovery":
+                raise ValueError("discovery received a non-discovery panel")
+            v1.validate_panel(panel)
+            result = measure_trial(panel, perms=spec.perms, seed=spec.seed, min_n=spec.min_n,
+                                   sensitivity=sensitivity)
+            ledger.append({"trial_id": digest([spec.run_id, spec.sector, trial]), "trial": trial,
+                           "sector": spec.sector, "primary": trial == self.primary, **result})
+        pvalues = [t["p"] for t in ledger]
+        for trial, holm, bh in zip(ledger, holm_adjusted(pvalues), v1.bh_adjusted(pvalues)):
+            trial["holm_adjusted_p"] = holm
+            trial["bh_adjusted_p"] = bh
+            trial["selected"] = trial["status"] == "tested" and holm <= spec.alpha
+        payload = {
+            "version": self.version,
+            "origin": ORIGIN,
+            "prereg_sha256": prereg,
+            "primary_trial": self.primary,
+            "spec": asdict(spec),
+            "windows": {"discovery_start": v1.DISCOVERY_START, "split": v1.SPLIT, "end": v1.END},
+            "selection": f"Holm at ledger run alpha {spec.alpha:.6g} (q={spec.ledger_q}, k={spec.run_k}) "
+                         "over every declared trial incl. untestable; BH-adjusted p reported only",
+            "null": "block sign-flip of the per-date rank-IC series; block from discovery IC acf1 "
+                    f"(autocorrelation_block, >= {MIN_BLOCKS} blocks)",
+            "inputs": inputs,
+            "discovery_sha256": digest({t: panels[t].as_record() for t in spec.trials}),
+            "ledger": ledger,
+            "calibration": self.calibration(ledger, spec.alpha),
+            "state": "DISCOVERY_FROZEN",
+            "promotion_allowed": False,
+        }
+        return {"payload": payload, "sha256": digest(payload)}
+
+    def check_holdout_request(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str,
+                              repo_root: Path = REPO) -> dict:
+        if allow_holdout is not True:
+            raise PermissionError("holdout evaluation needs an explicit allow_holdout=True")
+        if prereg_sha256 != self.prereg_sha256:
+            raise PermissionError(f"the pre-registration hash given does not match the pinned {self.version} one")
+        self.check_prereg(repo_root)
+        payload = frozen.get("payload") or {}
+        if digest(payload) != frozen.get("sha256"):
+            raise PermissionError("frozen discovery manifest changed")
+        if payload.get("prereg_sha256") != self.prereg_sha256 or payload.get("version") != self.version:
+            raise PermissionError("the discovery was not run under this pre-registration")
+        if payload.get("state") != "DISCOVERY_FROZEN":
+            raise PermissionError("no frozen discovery to evaluate")
+        return payload
+
+    def evaluate_panel_holdout(self, frozen: dict, panels: Mapping[str, v1.TrialPanel], key: HoldoutKey, *,
+                               power: dict | None = None) -> dict:
+        """Frozen selections (and this version's primary trial) on the holdout, once (v1 §8)."""
+        if not isinstance(key, HoldoutKey) or key.version != self.version or key.frozen_sha256 != frozen.get("sha256"):
+            raise PermissionError(f"holdout needs the {self.version} HoldoutKey opened for this frozen discovery")
+        payload = frozen["payload"]
+        spec = v1.RunSpec(**{**payload["spec"], "trials": tuple(payload["spec"]["trials"])})
+        ledger = {t["trial"]: t for t in payload["ledger"]}
+        selected = [t for t in payload["ledger"] if t["selected"]]
+        evaluated = sorted({t["trial"] for t in selected} | {self.primary})
+        checks = []
+        for trial in evaluated:
+            panel = panels[trial]
+            if panel.window != "holdout":
+                raise ValueError("holdout received a non-holdout panel")
+            v1.validate_panel(panel)
+            ic, _ = v1.rank_ic_series(panel.feature, panel.label)
+            n = int(np.isfinite(ic).sum())
+            block = max(1, min(ledger[trial]["block"] or 1, max(1, n // MIN_BLOCKS)))
+            result = measure_trial(panel, block=block, perms=spec.perms, seed=spec.seed, min_n=spec.min_n)
+            is_selected = ledger[trial]["selected"]
+            adjusted = corrected_p(result["p"], len(selected)) if is_selected else None
+            survives = bool(is_selected and result["status"] == "tested" and adjusted <= v1.HOLDOUT_ALPHA
+                            and result["mean_ic"] * ledger[trial]["mean_ic"] > 0)
+            checks.append({"trial_id": ledger[trial]["trial_id"], "trial": trial, "selected_in_discovery": is_selected,
+                           **result, "bonferroni_p": adjusted, "retrospective_survivor": survives,
+                           "primary_one_sided_p": result["p_one_sided_positive"] if trial == self.primary else None})
+        result = {"discovery_manifest": frozen["sha256"], "prereg_sha256": payload["prereg_sha256"],
+                  "holdout_sha256": digest({t: panels[t].as_record() for t in evaluated}),
+                  "holdout_checks": checks, "promotion_allowed": False}
+        result["verdict"] = self.verdict(payload, checks, power)
+        return result
+
+    # -- registry --
+    def registry(self, log_dir: Path, prereg_sha256: str | None = None):
+        from analysis.research_forward_log import ForwardLog
+
+        return ForwardLog(log_dir, log_filename=self.pins.registry_log, anchor_filename=self.pins.registry_anchors,
+                          lock_filename=self.pins.registry_lock, prereg_sha256=prereg_sha256 or self.prereg_sha256)
+
+    def registration_records(self, now: datetime, code_sha: str, prereg_sha256: str | None = None) -> list[dict]:
+        return self.pins.registration_records(now, code_sha, prereg_sha256 or self.prereg_sha256)
+
+    def register(self, log_dir: Path, now: datetime, code_sha: str, *, prereg_sha256: str | None = None) -> list[dict]:
+        """The one registration (before the pins exist), afterwards only a copy of the pinned one."""
+        prereg_sha256 = prereg_sha256 or self.prereg_sha256
+        if now.tzinfo is None:
+            raise ValueError("now must carry a timezone")
+        if prereg_sha256 != self.prereg_sha256:
+            raise PermissionError(f"only the pinned {self.version} pre-registration can be registered")
+        records = self.registration_records(now, code_sha, prereg_sha256)
+        pinned = self.registered_record_sha256
+        if pinned is not None and tuple(v1.chained_sha256(records)) != pinned:
+            raise PermissionError(
+                f"{self.version} is already registered (chain head {pinned[1][:12]}... at 2 records); a "
+                "registration with another time, code or body starts a fork and is refused"
+            )
+        log = self.registry(log_dir, prereg_sha256)
+        with log.locked():
+            check = log.verify_chain()
+            if not check["ok"]:
+                raise RuntimeError(f"registry chain is broken: {check['detail']}")
+            if log.read_all():
+                raise ValueError("this pre-registration is already registered in this directory")
+            return log.append_locked(records)
+
+    def _chain(self, log, prereg_sha256: str | None = None) -> list[dict]:
+        pinned = self.registered_record_sha256
+        if pinned is None:
+            raise PermissionError(f"{self.version} is not registered yet (no pinned registration in code)")
+        if (prereg_sha256 or self.prereg_sha256) != self.prereg_sha256:
+            raise PermissionError(f"only the pinned {self.version} pre-registration has a registry")
+        check = log.verify_chain()
+        if not check["ok"]:
+            raise RuntimeError(f"registry chain is broken: {check['detail']}")
+        heads = v1._line_sha256(log)
+        if tuple(heads[:2]) != pinned:
+            if not heads:
+                raise PermissionError("this pre-registration is not registered here (empty registry)")
+            raise PermissionError(
+                f"registry is not the pinned {self.version} registration (its first records do not hash to "
+                f"{pinned[1][:12]}... at 2 records): a fork, refused"
+            )
+        return log.read_all()
+
+    # -- off-host witness --
+    def check_offhost(self, vault_repo: Path, *, remote_url: str | None = None) -> OffhostWitness:
+        """Fetch the pinned vault ``main``: this version's witness (v1 rules) plus earlier versions' files."""
+        if self.registered_anchor_line is None:
+            raise PermissionError(f"{self.version} is not registered yet (no pinned anchor line in code)")
+        url = self.remote_url if remote_url is None else remote_url
+        repo = Path(vault_repo)
+        v1._git(repo, "rev-parse", "--git-dir")
+        v1._git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", url,
+                f"+refs/heads/{v1.WITNESS_BRANCH}:{self.pins.witness_ref}")
+        tip = v1._git(repo, "rev-parse", "--verify", f"{self.pins.witness_ref}^{{commit}}").strip()
+        versions, previous = _walk_witness(repo, self.pins.witness_ref, self.pins.witness_path,
+                                           self.registered_anchor_line, url)
+        at_tip = v1._git(repo, "show", f"{tip}:{self.pins.witness_path}", binary=True).replace(b"\r\n", b"\n")
+        if [line for line in at_tip.split(b"\n") if line] != previous:
+            raise PermissionError("the witness file at the fetched tip is not its last walked version")
+        earlier = {}
+        for old in self.pins.earlier:
+            walked, _ = _walk_witness(repo, self.pins.witness_ref, old.witness_path, old.anchor_line, url)
+            earlier[old.version] = walked[-1]["covered_records"]
+        return OffhostWitness(_WITNESS_TOKEN, repo, tip, b"\n".join(previous) + b"\n", versions, url,
+                              path=self.pins.witness_path, branch=v1.WITNESS_BRANCH, earlier=earlier,
+                              versions_on_main=v1.witnessed_versions(repo, tip))
+
+    def require_supersession(self, witness: OffhostWitness | None) -> dict:
+        """This version may open: not superseded, no later version on main, every earlier one unopened."""
+        v1.refuse_superseded(self.pins.number, self.superseded_by, witness)
+        if not isinstance(witness, OffhostWitness):
+            raise PermissionError(f"the pinned {self.version} off-host witness (check_offhost) is required")
+        opened = {v: n for v, n in witness.earlier.items() if n != V1_REGISTRATION_RECORDS}
+        if opened or set(witness.earlier) != {e.version for e in self.pins.earlier}:
+            raise PermissionError(
+                f"an earlier VS1 registration was opened after its registration ({opened}): {self.version} "
+                "cannot take ledger run k=1 (owner decision needed)"
+            )
+        return {"earlier_witnessed_records": dict(witness.earlier), "witness_tip": witness.tip}
+
+    def require_witness(self, log_dir: Path, witness: OffhostWitness | None, records_needed: int) -> dict:
+        import tempfile
+
+        if not isinstance(witness, OffhostWitness) or witness.path != self.pins.witness_path:
+            raise PermissionError(f"the pinned {self.version} off-host anchor log (check_offhost) is required")
+        log = self.registry(log_dir)
+        with tempfile.TemporaryDirectory() as scratch:
+            path = Path(scratch) / Path(self.pins.witness_path).name
+            path.write_bytes(witness.content)
+            with log.locked():
+                records = self._chain(log)
+                check = log.verify_chain(external_anchors=path)
+        if not check["ok"]:
+            raise PermissionError(f"off-host anchor log does not witness this registry: {check['detail']}")
+        covered = json.loads(witness.lines[-1])["records"]
+        if covered < records_needed:
+            raise PermissionError(
+                f"off-host anchor log covers {covered} records; it must already contain the chain head "
+                f"at {records_needed} records (commit and push the registry's anchor lines to "
+                f"{v1.WITNESS_BRANCH}:{self.pins.witness_path} first)"
+            )
+        for record in v1._kind(records, "prices_read"):
+            if not witness.descends_from(record["witness_tip"]):
+                raise PermissionError(
+                    f"the pinned {v1.WITNESS_BRANCH} no longer contains the witness commit "
+                    f"{record['witness_tip'][:12]} an earlier price read saw (history rewritten)"
+                )
+        return {"records": len(records), "witnessed_records": covered, "tip": witness.tip,
+                "witnessing_commit": witness.witnessing_commit(records_needed)}
+
+    def export_anchors(self, log_dir: Path, vault_worktree: Path) -> list[str]:
+        from analysis.research_forward_log import _lines
+
+        log = self.registry(log_dir)
+        with log.locked():
+            self._chain(log)
+            local = list(_lines(log.anchor_path))
+        path = Path(vault_worktree) / self.pins.witness_path
+        existing = [line.rstrip(b"\r") for line in _lines(path)] if path.exists() else []
+        if existing != local[: len(existing)]:
+            raise PermissionError("the off-host anchor log witnesses another registry chain; not appending")
+        new = local[len(existing):]
+        if new:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tail = path.read_bytes() if path.exists() else b""
+            with open(path, "ab") as stream:
+                if tail and not tail.endswith(b"\n"):
+                    stream.write(b"\n")
+                stream.write(b"".join(line + b"\n" for line in new))
+        return [line.decode("utf-8") for line in new]
+
+    # -- prices --
+    def load_price_panel(self, conn, manifest: PriceManifest, tickers: Iterable[str], *, start: date, as_of: date,
+                         window: str, key: DiscoveryKey | HoldoutKey) -> v1.PricePanel:
+        """v1's bounded, admitted, source-filtered read, behind this version's registry key."""
+        manifest.validate()
+        if window == "discovery":
+            if not isinstance(key, DiscoveryKey) or key.version != self.version:
+                raise PermissionError(f"discovery prices need a {self.version} DiscoveryKey from resume_discovery")
+            if as_of >= stamp(v1.SPLIT).date():
+                raise PermissionError("discovery reads stop before the split date")
+        elif window == "holdout":
+            if not isinstance(key, HoldoutKey) or key.version != self.version:
+                raise PermissionError(f"holdout prices need a {self.version} HoldoutKey from resume_holdout")
+            if as_of >= stamp(v1.END).date():
+                raise PermissionError("holdout reads stop before the end of the frozen window")
+        else:
+            raise ValueError("window must be discovery or holdout")
+        if manifest.digest() != key.inputs.get("price_manifest_sha256"):
+            raise PermissionError("price manifest differs from the one in inputs_frozen")
+        if manifest.probe_report_sha256 != key.inputs.get("probe_report_sha256"):
+            raise PermissionError("price manifest's probe report differs from the one in inputs_frozen")
+        wanted = sorted(set(tickers) | {manifest.benchmark})
+        refused = [t for t in wanted if t not in manifest.admitted]
+        if refused:
+            raise PermissionError(f"tickers not in the admitted-price manifest: {refused[:10]}")
+        data = {
+            ticker: tuple(observations.read_window(
+                conn, manifest.series_template.format(ticker=ticker), source=manifest.source,
+                start=start, as_of=as_of, as_of_ts=key.as_of_ts,
+            ))
+            for ticker in wanted
+        }
+        if not data[manifest.benchmark]:
+            raise ValueError("no benchmark closes in the read window")
+        panel = v1.PricePanel(token=v1._PRICE_LOADER, manifest=manifest, start=start, as_of=as_of,
+                              as_of_ts=key.as_of_ts, window=window, data=data)
+        self.record_prices_read(key, panel.receipt_sha)
+        return panel
+
+    def record_prices_read(self, key: DiscoveryKey | HoldoutKey, price_receipt_sha256: str) -> dict:
+        if not isinstance(key, (DiscoveryKey, HoldoutKey)) or key.version != self.version:
+            raise PermissionError(f"recording a price read needs its {self.version} key")
+        log = self.registry(key.log_dir)
+        with log.locked():
+            records = self._chain(log)
+            earlier = [r for r in v1._kind(records, "prices_read") if r["window"] == key.window]
+            differ = [r for r in earlier if r["price_receipt_sha256"] != price_receipt_sha256]
+            if differ:
+                raise PermissionError(
+                    f"{key.window} prices differ from the first read under this registry "
+                    f"(receipt {differ[0]['price_receipt_sha256'][:12]} then {price_receipt_sha256[:12]}): refused"
+                )
+            return log.append_locked([{
+                "kind": "prices_read", "run_at": datetime.now(timezone.utc).isoformat(),
+                "prereg_sha256": self.prereg_sha256, "window": key.window,
+                "price_receipt_sha256": price_receipt_sha256, "witness_tip": key.witness_tip,
+                "promotion_allowed": False,
+            }])[0]
+
+    # -- one-shot stages --
+    def freeze_inputs(self, log_dir: Path, now: datetime, inputs: Mapping[str, Any]) -> dict:
+        if now.tzinfo is None:
+            raise ValueError("now must carry a timezone")
+        missing = [k for k in FROZEN_INPUT_KEYS if k not in inputs]
+        if missing:
+            raise ValueError(f"inputs_frozen needs {missing}")
+        if inputs["sector"] != v1.VS1_SECTOR:
+            raise ValueError("only the VS1 sector runs under this registry")
+        for k in FROZEN_INPUT_KEYS:
+            if k.endswith("_sha256") and not v1._is_hex64(inputs[k]):
+                raise ValueError(f"{k} must be a sha256 hex digest")
+        if not isinstance(inputs["accept_underpowered"], bool):
+            raise ValueError("accept_underpowered must be a boolean")
+        if stamp(inputs["as_of_ts"]) > now:
+            raise ValueError("as_of_ts cannot be later than the freeze")
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+            if v1._kind(records, "discovery_opened"):
+                raise PermissionError("a discovery was already opened: its inputs cannot be re-frozen")
+            previous = v1._kind(records, "inputs_frozen")
+            return log.append_locked([{
+                "kind": "inputs_frozen", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
+                "inputs": dict(inputs), "supersedes": v1._record_sha256(previous[-1]) if previous else None,
+                "promotion_allowed": False,
+            }])[0]
+
+    def latest_frozen_inputs(self, log_dir: Path) -> dict:
+        log = self.registry(log_dir)
+        with log.locked():
+            frozen_inputs = v1._kind(self._chain(log), "inputs_frozen")
+        if not frozen_inputs:
+            raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
+        return dict(frozen_inputs[-1]["inputs"])
+
+    def open_discovery(self, log_dir: Path, now: datetime, observed: Mapping[str, Any],
+                       witness: OffhostWitness | None) -> dict:
+        """One-shot discovery, step 1: append ``discovery_opened`` (no price is read).
+
+        Refused when this version is superseded, a later version is witnessed
+        on main, or an earlier version was opened (:meth:`require_supersession`).
+        """
+        if now.tzinfo is None:
+            raise ValueError("now must carry a timezone")
+        supersession = self.require_supersession(witness)
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+            if v1._kind(records, "discovery_opened") or v1._kind(records, "discovery_frozen"):
+                raise PermissionError("discovery already ran under this pre-registration (one shot)")
+            frozen_inputs = v1._kind(records, "inputs_frozen")
+            if not frozen_inputs:
+                raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
+            current = frozen_inputs[-1]
+            _check_observed(current["inputs"], observed)
+            log.append_locked([{
+                "kind": "discovery_opened", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
+                "inputs_frozen_sha256": v1._record_sha256(current), "supersession": supersession,
+                "promotion_allowed": False,
+            }])
+            heads = v1._line_sha256(log)
+        return {"kind": "discovery_opened", "records": len(heads), "head_sha256": heads[-1]}
+
+    def resume_discovery(self, log_dir: Path, observed: Mapping[str, Any],
+                         witness: OffhostWitness | None) -> DiscoveryKey:
+        """One-shot discovery, step 2: the price key, once the off-host log witnesses the opening."""
+        self.require_supersession(witness)
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+        if v1._kind(records, "discovery_frozen"):
+            raise PermissionError("a discovery is already frozen (one shot)")
+        position = v1._position(records, "discovery_opened")
+        opened = records[position - 1]
+        matching = [r for r in v1._kind(records, "inputs_frozen")
+                    if v1._record_sha256(r) == opened["inputs_frozen_sha256"]]
+        if len(matching) != 1:
+            raise PermissionError("discovery_opened does not name an inputs_frozen record of this chain")
+        _check_observed(matching[0]["inputs"], observed)
+        self.require_witness(log_dir, witness, position)
+        return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"], version=self.version,
+                            log_dir=log_dir, witness_tip=witness.tip)
+
+    def seal_discovery(self, log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict) -> dict:
+        if not isinstance(key, DiscoveryKey) or key.version != self.version:
+            raise PermissionError(f"sealing a discovery needs its {self.version} DiscoveryKey")
+        payload = frozen.get("payload") or {}
+        if digest(payload) != frozen.get("sha256"):
+            raise ValueError("frozen discovery manifest does not hash to its sha256")
+        if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != key.inputs_frozen_sha256:
+            raise PermissionError("the discovery manifest does not carry this key's inputs_frozen hash")
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+            opened = v1._kind(records, "discovery_opened")
+            if len(opened) != 1 or opened[0]["inputs_frozen_sha256"] != key.inputs_frozen_sha256:
+                raise PermissionError("no discovery_opened record for this key")
+            if v1._kind(records, "discovery_frozen"):
+                raise PermissionError("a discovery is already frozen (one shot)")
+            return log.append_locked([{
+                "kind": "discovery_frozen", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
+                "inputs_frozen_sha256": key.inputs_frozen_sha256, "discovery_sha256": frozen["sha256"],
+                "calibration": payload["calibration"]["state"],
+                "selected": [t["trial"] for t in payload["ledger"] if t["selected"]],
+                "promotion_allowed": False,
+            }])[0]
+
+    def open_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path, now: datetime,
+                     observed: Mapping[str, Any], repo_root: Path = REPO) -> dict:
+        payload = self.check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
+                                             repo_root=repo_root)
+        if now.tzinfo is None:
+            raise ValueError("now must carry a timezone")
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+            inputs = v1._holdout_inputs(records, frozen, payload)
+            if v1._kind(records, "holdout_opened"):
+                raise PermissionError("the holdout was already opened (evaluated once)")
+            _check_observed(inputs, observed)
+            log.append_locked([{
+                "kind": "holdout_opened", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
+                "discovery_sha256": frozen["sha256"], "promotion_allowed": False,
+            }])
+            heads = v1._line_sha256(log)
+        return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
+
+    def resume_holdout(self, frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path,
+                       observed: Mapping[str, Any], witness: OffhostWitness | None,
+                       repo_root: Path = REPO) -> HoldoutKey:
+        payload = self.check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
+                                             repo_root=repo_root)
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+        inputs = v1._holdout_inputs(records, frozen, payload)
+        if v1._kind(records, "holdout_result"):
+            raise PermissionError("a holdout result is already recorded (evaluated once)")
+        position = v1._position(records, "holdout_opened")
+        if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
+            raise PermissionError("holdout_opened names another discovery")
+        _check_observed(inputs, observed)
+        self.require_witness(log_dir, witness, position)
+        return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, version=self.version, log_dir=log_dir,
+                          witness_tip=witness.tip)
+
+    def seal_holdout(self, log_dir: Path, now: datetime, key: HoldoutKey, result: dict) -> dict:
+        if not isinstance(key, HoldoutKey) or key.version != self.version or (
+                result.get("discovery_manifest") != key.frozen_sha256):
+            raise PermissionError("the holdout result does not belong to this key")
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+            if not any(r.get("discovery_sha256") == key.frozen_sha256 for r in v1._kind(records, "holdout_opened")):
+                raise PermissionError("no holdout_opened record for this discovery")
+            if v1._kind(records, "holdout_result"):
+                raise PermissionError("a holdout result is already recorded")
+            return log.append_locked([{
+                "kind": "holdout_result", "run_at": now.isoformat(), "prereg_sha256": self.prereg_sha256,
+                "discovery_sha256": key.frozen_sha256, "result_sha256": digest(result),
+                "verdict": result["verdict"]["state"], "promotion_allowed": False,
+            }])[0]
+
+
+def _check_observed(frozen_inputs: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
+    missing = [k for k in OBSERVED_INPUT_KEYS if k not in observed]
+    if missing:
+        raise ValueError(f"observed inputs lack {missing}")
+    differ = sorted(k for k in set(OBSERVED_INPUT_KEYS) | set(observed) if frozen_inputs.get(k) != observed.get(k))
+    if differ:
+        raise PermissionError(f"inputs differ from the inputs_frozen record: {differ}")
+
+
+def write_frozen(output: Path, name: str, value: Any) -> None:
+    Path(output).mkdir(parents=True, exist_ok=True)
+    write_once(Path(output) / name, value)
+
+
+#: v1's registration stays at exactly its 2 records if it was never opened (same for v2).
+V1_REGISTRATION_RECORDS = 2
+
+V1_EARLIER = EarlierVersion(
+    version=v1.VERSION, number=1, prereg_sha256=v1.PREREG_BODY_SHA256,
+    registry_head_sha256=v1.REGISTERED_RECORD_SHA256[1], witness_path=v1.WITNESS_PATH,
+    anchor_line=v1.REGISTERED_ANCHOR_LINE,
+)
+
+
+# --- VS1 v2: its pins and module-level API (superseded by v3 before any price read) ------------
 
 REGISTRY_LOG = "granular_panel_prereg_v2.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v2.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v2.lock"
+PRIMARY_TRIAL = v1.PRIMARY_TRIAL  # A90|fwd20, as v1
 
 #: The one real v2 registration: registered once, locally, on 2026-09-27T22:43:29Z
-#: against code 6f3d2892 (``register`` below), chain head 05b20c31... at 2 records.
-#: Every registry this harness accepts must start with exactly these two records
-#: (line sha256 of the header, then of the ``preregistration`` record). The
-#: original lives in the operator's ``Documents/Codex/2026-09-14/wha/outputs/
-#: vs1-v2-prereg-registry/``; the off-host witness decides which copy counts.
+#: against code 6f3d2892, chain head 05b20c31... at 2 records. Every registry
+#: this harness accepts must start with exactly these two records. The original
+#: lives in the operator's ``Documents/Codex/2026-09-14/wha/outputs/vs1-v2-prereg-registry/``;
+#: the off-host witness decides which copy counts.
 REGISTERED_AT: datetime | None = datetime(2026, 9, 27, 22, 43, 29, 131530, tzinfo=timezone.utc)
 REGISTERED_CODE_SHA: str | None = "6f3d2892cbf66b23f408b0794c397b9ff1798dc4"
 REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
@@ -960,7 +1494,6 @@ REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
 )
 REGISTERED_PREREG_SHA256 = PREREG_BODY_SHA256
 
-#: The off-host witness, pinned: this path on ``main`` of the GitHub vault.
 WITNESS_REMOTE_URL = v1.WITNESS_REMOTE_URL
 WITNESS_BRANCH = v1.WITNESS_BRANCH
 WITNESS_PATH = "05-GRID/Paper-Log/vs1/granular_panel_prereg_v2.anchors.jsonl"
@@ -970,21 +1503,16 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"05b20c31273a926d1be56d2afe4fce4e3cf7a8ca2769f394cad9e2fb773ceff8",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-27T22:43:29.131530+00:00"}'
 )
-_WITNESS_TOKEN = object()
-
-#: v1's registration stays at exactly its 2 records if v1 never opened a discovery.
-V1_REGISTRATION_RECORDS = 2
-
-
-def registry(log_dir: Path, prereg_sha256: str = PREREG_BODY_SHA256):
-    from analysis.research_forward_log import ForwardLog
-
-    return ForwardLog(log_dir, log_filename=REGISTRY_LOG, anchor_filename=REGISTRY_ANCHORS,
-                      lock_filename=REGISTRY_LOCK, prereg_sha256=prereg_sha256)
+#: v2 was superseded by v3 before any price read (v3 makes A90|fwd5 primary).
+SUPERSEDED_BY: Mapping[str, Any] | None = {
+    "version": "vs1-v3",
+    "prereg_sha256": "fa7eda1c70906720b36dd84d0bb8b65a53f7badc35cd05055e08d7a9b40c2e42",
+    "registry_head_sha256": None,
+}
 
 
 def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:
-    """The header and ``preregistration`` records (before chaining), as ``register`` writes them."""
+    """v2's header and ``preregistration`` records (exactly as registered on 2026-09-27)."""
     header = {
         "kind": "header",
         "version": VERSION,
@@ -1024,414 +1552,41 @@ def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PRER
     return [header, record]
 
 
-def register(log_dir: Path, now: datetime, code_sha: str, *, prereg_sha256: str = PREREG_BODY_SHA256) -> list[dict]:
-    """Write the v2 registration into an empty registry directory.
+V2 = Harness(Pins(
+    version=VERSION, number=2, prereg_path=PREREG_PATH, prereg_body_sha256=PREREG_BODY_SHA256,
+    primary_trial=PRIMARY_TRIAL, registry_log=REGISTRY_LOG, registry_anchors=REGISTRY_ANCHORS,
+    registry_lock=REGISTRY_LOCK, witness_path=WITNESS_PATH, witness_ref=WITNESS_REF,
+    registration_records=registration_records, registered_at=REGISTERED_AT, registered_code_sha=REGISTERED_CODE_SHA,
+    registered_record_sha256=REGISTERED_RECORD_SHA256, registered_anchor_line=REGISTERED_ANCHOR_LINE,
+    earlier=(V1_EARLIER,), superseded_by=SUPERSEDED_BY,
+), module=sys.modules[__name__])
 
-    Before the pins exist (:data:`REGISTERED_RECORD_SHA256` is None) this is the
-    one real registration; afterwards it only re-materialises that exact
-    registration (a copy is witnessed like any copy) and refuses anything else.
-    """
-    if now.tzinfo is None:
-        raise ValueError("now must carry a timezone")
-    if prereg_sha256 != PREREG_BODY_SHA256:
-        raise PermissionError("only the pinned v2 pre-registration can be registered")
-    records = registration_records(now, code_sha, prereg_sha256)
-    if REGISTERED_RECORD_SHA256 is not None and tuple(v1.chained_sha256(records)) != REGISTERED_RECORD_SHA256:
-        raise PermissionError(
-            "VS1 v2 is already registered (chain head "
-            f"{REGISTERED_RECORD_SHA256[1][:12]}... at 2 records); a registration with another "
-            "time, code or body starts a fork and is refused"
-        )
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        check = log.verify_chain()
-        if not check["ok"]:
-            raise RuntimeError(f"registry chain is broken: {check['detail']}")
-        if log.read_all():
-            raise ValueError("this pre-registration is already registered in this directory")
-        return log.append_locked(records)
+#: v2's earlier-version record (v3 requires it to stay unopened).
+V2_EARLIER = EarlierVersion(
+    version=VERSION, number=2, prereg_sha256=PREREG_BODY_SHA256,
+    registry_head_sha256=REGISTERED_RECORD_SHA256[1], witness_path=WITNESS_PATH,
+    anchor_line=REGISTERED_ANCHOR_LINE,
+)
 
-
-def _chain(log, prereg_sha256: str) -> list[dict]:
-    """Verified records of the pinned v2 registry (a fresh or recreated registry is a fork)."""
-    if REGISTERED_RECORD_SHA256 is None:
-        raise PermissionError("VS1 v2 is not registered yet (no pinned registration in code)")
-    if prereg_sha256 != REGISTERED_PREREG_SHA256:
-        raise PermissionError("only the pinned VS1 v2 pre-registration has a registry")
-    check = log.verify_chain()
-    if not check["ok"]:
-        raise RuntimeError(f"registry chain is broken: {check['detail']}")
-    heads = v1._line_sha256(log)
-    if tuple(heads[:2]) != REGISTERED_RECORD_SHA256:
-        if not heads:
-            raise PermissionError("this pre-registration is not registered here (empty registry)")
-        raise PermissionError(
-            "registry is not the pinned VS1 v2 registration (its first records do not hash to "
-            f"{REGISTERED_RECORD_SHA256[1][:12]}... at 2 records): a fork, refused"
-        )
-    return log.read_all()
-
-
-class OffhostWitness:
-    """The v2 witness file as committed on the pinned remote's ``main`` (issued by :func:`check_offhost`)."""
-
-    def __init__(self, token: object, repo: Path, tip: str, content: bytes, versions: list[dict],
-                 remote_url: str) -> None:
-        if token is not _WITNESS_TOKEN:
-            raise TypeError("a v2 OffhostWitness is issued only by check_offhost")
-        self.repo, self.tip, self.content, self.versions = Path(repo), tip, content, versions
-        self.remote_url = remote_url
-
-    @property
-    def lines(self) -> list[bytes]:
-        return [line for line in self.content.split(b"\n") if line]
-
-    def descends_from(self, commit: str) -> bool:
-        import subprocess
-
-        result = subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor", commit, self.tip],
-                                capture_output=True, check=False)
-        return result.returncode == 0
-
-    def witnessing_commit(self, records: int) -> str | None:
-        for version in self.versions:
-            if version["covered_records"] >= records:
-                return version["commit"]
-        return None
-
-    def receipt(self) -> dict:
-        return {"remote_url": self.remote_url, "branch": WITNESS_BRANCH, "path": WITNESS_PATH,
-                "tip": self.tip, "versions": self.versions}
-
-
-def _walk_witness(repo: Path, ref: str, path: str, first_line: bytes, url: str) -> tuple[list[dict], list[bytes]]:
-    """Every committed version of ``path`` on ``ref``: at that path, pinned first line, append-only."""
-    log = v1._git(repo, "log", "--first-parent", "-m", "--follow", "--name-status", "--format=%x00%H", ref, "--", path)
-    entries = []
-    for chunk in log.split("\x00")[1:]:
-        head, *rest = chunk.strip("\n").split("\n")
-        entries.append((head.strip(), [line.split("\t") for line in rest if line.strip()]))
-    if not entries:
-        raise PermissionError(f"{path} is not on {WITNESS_BRANCH} of {url}")
-    versions, previous = [], None
-    for commit, changes in reversed(entries):
-        for change in changes:
-            status, paths = change[0], change[1:]
-            if status.startswith(("R", "C")) or any(p != path for p in paths):
-                raise PermissionError(f"{commit[:12]}: the witness file came from another path ({paths})")
-            if status.startswith("D"):
-                raise PermissionError(f"{commit[:12]}: the witness file was deleted (not append-only)")
-        content = v1._git(repo, "show", f"{commit}:{path}", binary=True).replace(b"\r\n", b"\n")
-        lines = [line for line in content.split(b"\n") if line]
-        if not lines or lines[0] != first_line:
-            raise PermissionError(f"{commit[:12]}: the witness file does not start with the pinned registration")
-        if previous is not None and not (len(lines) > len(previous) and lines[: len(previous)] == previous):
-            raise PermissionError(
-                f"{commit[:12]}: the witness file is not a strict line-prefix extension of its previous "
-                "version (truncated, edited or unchanged): not append-only"
-            )
-        versions.append({"commit": commit, "lines": len(lines), "covered_records": json.loads(lines[-1]).get("records", 0)})
-        previous = lines
-    return versions, previous
-
-
-def check_offhost(vault_repo: Path, *, remote_url: str | None = None) -> OffhostWitness:
-    """Fetch the pinned vault ``main`` and return the v2 witness file as committed there (v1 rules)."""
-    if REGISTERED_ANCHOR_LINE is None:
-        raise PermissionError("VS1 v2 is not registered yet (no pinned anchor line in code)")
-    url = WITNESS_REMOTE_URL if remote_url is None else remote_url
-    repo = Path(vault_repo)
-    v1._git(repo, "rev-parse", "--git-dir")
-    v1._git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", url,
-            f"+refs/heads/{WITNESS_BRANCH}:{WITNESS_REF}")
-    tip = v1._git(repo, "rev-parse", "--verify", f"{WITNESS_REF}^{{commit}}").strip()
-    versions, previous = _walk_witness(repo, WITNESS_REF, WITNESS_PATH, REGISTERED_ANCHOR_LINE, url)
-    at_tip = v1._git(repo, "show", f"{tip}:{WITNESS_PATH}", binary=True).replace(b"\r\n", b"\n")
-    if [line for line in at_tip.split(b"\n") if line] != previous:
-        raise PermissionError("the witness file at the fetched tip is not its last walked version")
-    return OffhostWitness(_WITNESS_TOKEN, repo, tip, b"\n".join(previous) + b"\n", versions, url)
-
-
-def require_v1_unopened(v1_witness: v1.OffhostWitness | None) -> dict:
-    """v2 takes v1's ledger slot (k = 1): v1's off-host witness must still cover only its registration.
-
-    A v1 discovery needs its ``discovery_opened`` head on v1's witness file
-    before any v1 price read; a v1 witness beyond the 2 registration records
-    means v1 was opened, and then v2 is refused (both would spend alpha_1).
-    """
-    if not isinstance(v1_witness, v1.OffhostWitness):
-        raise PermissionError("v1's pinned off-host witness (panel_insider_density.check_offhost) is required")
-    covered = json.loads(v1_witness.lines[-1])["records"]
-    if covered != V1_REGISTRATION_RECORDS or len(v1_witness.lines) != 1:
-        raise PermissionError(
-            f"VS1 v1's off-host witness covers {covered} records: v1 was opened after its registration, so "
-            "v2 cannot take ledger run k=1 (owner decision needed)"
-        )
-    return {"v1_witness_tip": v1_witness.tip, "v1_witnessed_records": covered}
-
-
-def require_witness(log_dir: Path, witness: OffhostWitness | None, records_needed: int, *,
-                    prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """The pinned v2 off-host anchor log must already witness this chain up to ``records_needed``."""
-    import tempfile
-
-    if not isinstance(witness, OffhostWitness):
-        raise PermissionError("the pinned v2 off-host anchor log (check_offhost) is required")
-    log = registry(log_dir, prereg_sha256)
-    with tempfile.TemporaryDirectory() as scratch:
-        path = Path(scratch) / Path(WITNESS_PATH).name
-        path.write_bytes(witness.content)
-        with log.locked():
-            records = _chain(log, prereg_sha256)
-            check = log.verify_chain(external_anchors=path)
-    if not check["ok"]:
-        raise PermissionError(f"off-host anchor log does not witness this registry: {check['detail']}")
-    covered = json.loads(witness.lines[-1])["records"]
-    if covered < records_needed:
-        raise PermissionError(
-            f"off-host anchor log covers {covered} records; it must already contain the chain head "
-            f"at {records_needed} records (commit and push the registry's anchor lines to "
-            f"{WITNESS_BRANCH}:{WITNESS_PATH} first)"
-        )
-    for record in v1._kind(records, "prices_read"):
-        if not witness.descends_from(record["witness_tip"]):
-            raise PermissionError(
-                f"the pinned {WITNESS_BRANCH} no longer contains the witness commit "
-                f"{record['witness_tip'][:12]} an earlier price read saw (history rewritten)"
-            )
-    return {"records": len(records), "witnessed_records": covered, "tip": witness.tip,
-            "witnessing_commit": witness.witnessing_commit(records_needed)}
-
-
-def export_anchors(log_dir: Path, vault_worktree: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> list[str]:
-    """Append to ``<vault_worktree>/WITNESS_PATH`` the v2 registry anchor lines it lacks."""
-    from analysis.research_forward_log import _lines
-
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        _chain(log, prereg_sha256)
-        local = list(_lines(log.anchor_path))
-    path = Path(vault_worktree) / WITNESS_PATH
-    existing = [line.rstrip(b"\r") for line in _lines(path)] if path.exists() else []
-    if existing != local[: len(existing)]:
-        raise PermissionError("the off-host anchor log witnesses another registry chain; not appending")
-    new = local[len(existing):]
-    if new:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tail = path.read_bytes() if path.exists() else b""
-        with open(path, "ab") as stream:
-            if tail and not tail.endswith(b"\n"):
-                stream.write(b"\n")
-            for line in new:
-                stream.write(line + b"\n")
-    return [line.decode("utf-8") for line in new]
-
-
-def record_prices_read(key: DiscoveryKey | HoldoutKey, price_receipt_sha256: str) -> dict:
-    """Append ``prices_read``; a resumed run's receipt must equal the first read's."""
-    if not isinstance(key, (DiscoveryKey, HoldoutKey)):
-        raise PermissionError("recording a price read needs its v2 key")
-    log = registry(key.log_dir)
-    with log.locked():
-        records = _chain(log, PREREG_BODY_SHA256)
-        earlier = [r for r in v1._kind(records, "prices_read") if r["window"] == key.window]
-        differ = [r for r in earlier if r["price_receipt_sha256"] != price_receipt_sha256]
-        if differ:
-            raise PermissionError(
-                f"{key.window} prices differ from the first read under this registry "
-                f"(receipt {differ[0]['price_receipt_sha256'][:12]} then {price_receipt_sha256[:12]}): refused"
-            )
-        return log.append_locked([{
-            "kind": "prices_read", "run_at": datetime.now(timezone.utc).isoformat(),
-            "prereg_sha256": PREREG_BODY_SHA256, "window": key.window,
-            "price_receipt_sha256": price_receipt_sha256, "witness_tip": key.witness_tip,
-            "promotion_allowed": False,
-        }])[0]
-
-
-def _check_observed(frozen_inputs: Mapping[str, Any], observed: Mapping[str, Any]) -> None:
-    missing = [k for k in OBSERVED_INPUT_KEYS if k not in observed]
-    if missing:
-        raise ValueError(f"observed inputs lack {missing}")
-    differ = sorted(k for k in set(OBSERVED_INPUT_KEYS) | set(observed) if frozen_inputs.get(k) != observed.get(k))
-    if differ:
-        raise PermissionError(f"inputs differ from the inputs_frozen record: {differ}")
-
-
-def freeze_inputs(log_dir: Path, now: datetime, inputs: Mapping[str, Any], *,
-                  prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """Append ``inputs_frozen`` (every input hash and ``as_of_ts``) before any price read."""
-    if now.tzinfo is None:
-        raise ValueError("now must carry a timezone")
-    missing = [k for k in FROZEN_INPUT_KEYS if k not in inputs]
-    if missing:
-        raise ValueError(f"inputs_frozen needs {missing}")
-    if inputs["sector"] != v1.VS1_SECTOR:
-        raise ValueError("only the VS1 sector runs under this registry")
-    for k in FROZEN_INPUT_KEYS:
-        if k.endswith("_sha256") and not v1._is_hex64(inputs[k]):
-            raise ValueError(f"{k} must be a sha256 hex digest")
-    if not isinstance(inputs["accept_underpowered"], bool):
-        raise ValueError("accept_underpowered must be a boolean")
-    if stamp(inputs["as_of_ts"]) > now:
-        raise ValueError("as_of_ts cannot be later than the freeze")
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-        if v1._kind(records, "discovery_opened"):
-            raise PermissionError("a discovery was already opened: its inputs cannot be re-frozen")
-        previous = v1._kind(records, "inputs_frozen")
-        return log.append_locked([{
-            "kind": "inputs_frozen", "run_at": now.isoformat(), "prereg_sha256": prereg_sha256,
-            "inputs": dict(inputs), "supersedes": v1._record_sha256(previous[-1]) if previous else None,
-            "promotion_allowed": False,
-        }])[0]
-
-
-def latest_frozen_inputs(log_dir: Path, *, prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        frozen_inputs = v1._kind(_chain(log, prereg_sha256), "inputs_frozen")
-    if not frozen_inputs:
-        raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
-    return dict(frozen_inputs[-1]["inputs"])
-
-
-def open_discovery(log_dir: Path, now: datetime, observed: Mapping[str, Any], v1_witness: v1.OffhostWitness | None,
-                   *, prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """One-shot v2 discovery, step 1: append ``discovery_opened`` (no price is read).
-
-    Also requires v1's off-host witness to show v1 never opened (:func:`require_v1_unopened`).
-    """
-    if now.tzinfo is None:
-        raise ValueError("now must carry a timezone")
-    superseded = require_v1_unopened(v1_witness)
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-        if v1._kind(records, "discovery_opened") or v1._kind(records, "discovery_frozen"):
-            raise PermissionError("discovery already ran under this pre-registration (one shot)")
-        frozen_inputs = v1._kind(records, "inputs_frozen")
-        if not frozen_inputs:
-            raise PermissionError("no inputs_frozen record: run freeze-inputs before any price read")
-        current = frozen_inputs[-1]
-        _check_observed(current["inputs"], observed)
-        log.append_locked([{
-            "kind": "discovery_opened", "run_at": now.isoformat(), "prereg_sha256": prereg_sha256,
-            "inputs_frozen_sha256": v1._record_sha256(current), "v1_superseded": superseded,
-            "promotion_allowed": False,
-        }])
-        heads = v1._line_sha256(log)
-    return {"kind": "discovery_opened", "records": len(heads), "head_sha256": heads[-1]}
-
-
-def resume_discovery(log_dir: Path, observed: Mapping[str, Any], witness: OffhostWitness | None,
-                     v1_witness: v1.OffhostWitness | None, *, prereg_sha256: str = PREREG_BODY_SHA256) -> DiscoveryKey:
-    """One-shot v2 discovery, step 2: the price key, once the v2 off-host log witnesses the opening."""
-    require_v1_unopened(v1_witness)
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-    if v1._kind(records, "discovery_frozen"):
-        raise PermissionError("a discovery is already frozen (one shot)")
-    position = v1._position(records, "discovery_opened")
-    opened = records[position - 1]
-    matching = [r for r in v1._kind(records, "inputs_frozen") if v1._record_sha256(r) == opened["inputs_frozen_sha256"]]
-    if len(matching) != 1:
-        raise PermissionError("discovery_opened does not name an inputs_frozen record of this chain")
-    _check_observed(matching[0]["inputs"], observed)
-    require_witness(log_dir, witness, position, prereg_sha256=prereg_sha256)
-    return DiscoveryKey(_KEY_TOKEN, opened["inputs_frozen_sha256"], matching[0]["inputs"],
-                        log_dir=log_dir, witness_tip=witness.tip)
-
-
-def seal_discovery(log_dir: Path, now: datetime, key: DiscoveryKey, frozen: dict, *,
-                   prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """Append ``discovery_frozen`` carrying the frozen discovery manifest's sha256."""
-    if not isinstance(key, DiscoveryKey):
-        raise PermissionError("sealing a discovery needs its v2 DiscoveryKey")
-    payload = frozen.get("payload") or {}
-    if digest(payload) != frozen.get("sha256"):
-        raise ValueError("frozen discovery manifest does not hash to its sha256")
-    if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != key.inputs_frozen_sha256:
-        raise PermissionError("the discovery manifest does not carry this key's inputs_frozen hash")
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-        opened = v1._kind(records, "discovery_opened")
-        if len(opened) != 1 or opened[0]["inputs_frozen_sha256"] != key.inputs_frozen_sha256:
-            raise PermissionError("no discovery_opened record for this key")
-        if v1._kind(records, "discovery_frozen"):
-            raise PermissionError("a discovery is already frozen (one shot)")
-        return log.append_locked([{
-            "kind": "discovery_frozen", "run_at": now.isoformat(), "prereg_sha256": prereg_sha256,
-            "inputs_frozen_sha256": key.inputs_frozen_sha256, "discovery_sha256": frozen["sha256"],
-            "calibration": payload["calibration"]["state"],
-            "selected": [t["trial"] for t in payload["ledger"] if t["selected"]],
-            "promotion_allowed": False,
-        }])[0]
-
-
-def open_holdout(frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path, now: datetime,
-                 observed: Mapping[str, Any], repo_root: Path = REPO) -> dict:
-    """One-shot v2 holdout, step 1: flag + pinned hash + the chain, then ``holdout_opened``."""
-    payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
-                                    repo_root=repo_root)
-    if now.tzinfo is None:
-        raise ValueError("now must carry a timezone")
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-        inputs = v1._holdout_inputs(records, frozen, payload)
-        if v1._kind(records, "holdout_opened"):
-            raise PermissionError("the holdout was already opened (evaluated once)")
-        _check_observed(inputs, observed)
-        log.append_locked([{
-            "kind": "holdout_opened", "run_at": now.isoformat(), "prereg_sha256": prereg_sha256,
-            "discovery_sha256": frozen["sha256"], "promotion_allowed": False,
-        }])
-        heads = v1._line_sha256(log)
-    return {"kind": "holdout_opened", "records": len(heads), "head_sha256": heads[-1]}
-
-
-def resume_holdout(frozen: dict, *, allow_holdout: bool, prereg_sha256: str, log_dir: Path,
-                   observed: Mapping[str, Any], witness: OffhostWitness | None, repo_root: Path = REPO) -> HoldoutKey:
-    """One-shot v2 holdout, step 2: the price key, once the v2 off-host log witnesses the opening."""
-    payload = check_holdout_request(frozen, allow_holdout=allow_holdout, prereg_sha256=prereg_sha256,
-                                    repo_root=repo_root)
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-    inputs = v1._holdout_inputs(records, frozen, payload)
-    if v1._kind(records, "holdout_result"):
-        raise PermissionError("a holdout result is already recorded (evaluated once)")
-    position = v1._position(records, "holdout_opened")
-    if records[position - 1]["discovery_sha256"] != frozen["sha256"]:
-        raise PermissionError("holdout_opened names another discovery")
-    _check_observed(inputs, observed)
-    require_witness(log_dir, witness, position, prereg_sha256=prereg_sha256)
-    return HoldoutKey(_HOLDOUT_TOKEN, frozen["sha256"], inputs, log_dir=log_dir, witness_tip=witness.tip)
-
-
-def seal_holdout(log_dir: Path, now: datetime, key: HoldoutKey, result: dict, *,
-                 prereg_sha256: str = PREREG_BODY_SHA256) -> dict:
-    """Append ``holdout_result`` (the result's sha256 and verdict state)."""
-    if not isinstance(key, HoldoutKey) or result.get("discovery_manifest") != key.frozen_sha256:
-        raise PermissionError("the holdout result does not belong to this key")
-    log = registry(log_dir, prereg_sha256)
-    with log.locked():
-        records = _chain(log, prereg_sha256)
-        if not any(r.get("discovery_sha256") == key.frozen_sha256 for r in v1._kind(records, "holdout_opened")):
-            raise PermissionError("no holdout_opened record for this discovery")
-        if v1._kind(records, "holdout_result"):
-            raise PermissionError("a holdout result is already recorded")
-        return log.append_locked([{
-            "kind": "holdout_result", "run_at": now.isoformat(), "prereg_sha256": prereg_sha256,
-            "discovery_sha256": key.frozen_sha256, "result_sha256": digest(result),
-            "verdict": result["verdict"]["state"], "promotion_allowed": False,
-        }])[0]
-
-
-def write_frozen(output: Path, name: str, value: Any) -> None:
-    Path(output).mkdir(parents=True, exist_ok=True)
-    write_once(Path(output) / name, value)
+check_prereg = V2.check_prereg
+run_spec = V2.run_spec
+stage0_power = V2.stage0_power
+verify_power = V2.verify_power
+discover_panel = V2.discover_panel
+check_holdout_request = V2.check_holdout_request
+evaluate_panel_holdout = V2.evaluate_panel_holdout
+load_price_panel = V2.load_price_panel
+registry = V2.registry
+register = V2.register
+check_offhost = V2.check_offhost
+require_witness = V2.require_witness
+export_anchors = V2.export_anchors
+record_prices_read = V2.record_prices_read
+freeze_inputs = V2.freeze_inputs
+latest_frozen_inputs = V2.latest_frozen_inputs
+open_discovery = V2.open_discovery
+resume_discovery = V2.resume_discovery
+seal_discovery = V2.seal_discovery
+open_holdout = V2.open_holdout
+resume_holdout = V2.resume_holdout
+seal_holdout = V2.seal_holdout
