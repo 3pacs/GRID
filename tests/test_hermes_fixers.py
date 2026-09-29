@@ -394,7 +394,10 @@ def test_retry_source_handles_function_based_registry_entries(monkeypatch) -> No
 
     result = hermes_fixers._retry_source("regulatory_events", engine)
 
-    assert result == {"status": "ok", "source": "fn"}
+    assert result["status"] == "ok"
+    assert result["source"] == "fn"
+    assert result["outcome"] == "FAILED"
+    assert result["rows_inserted"] is None
     assert calls == [{"db_engine": engine, "days_back": 7}]
 
 
@@ -441,7 +444,9 @@ def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None
 
     result = hermes_fixers._retry_source("finra_short_volume", engine)
 
-    assert result == {"status": "SUCCESS", "rows_inserted": 0}
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 0
+    assert result["outcome"] == "NO_NEW_DATA"
     # The callable was CALLED, not passed through as a function object.
     assert calls == [{"anchor_date": "2026-09-16", "weekdays_back": 5}]
 

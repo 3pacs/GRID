@@ -228,13 +228,14 @@ def test_list_row_count_is_the_items_rows_not_the_list_length(monkeypatch):
         {"ticker": "ZZZ", "status": "PARTIAL", "rows_inserted": 0, "errors": ["404"]},
     ]
     assert sched._extract_rows_inserted(items) == 6  # was len(items) == 3
-    assert sched._extract_rows_inserted(["a", "b"]) == 2  # opaque list: unchanged
+    assert sched._extract_rows_inserted(["a", "b"]) is None  # opaque does not prove writes
 
     engine, summary = _run_list_result(monkeypatch, items)
-    assert summary["success_count"] == 1
-    assert engine.pull_logs[1]["status"] == "SUCCESS"
+    assert summary["success_count"] == 0
+    assert summary["partial_count"] == 1
+    assert engine.pull_logs[1]["status"] == "PARTIAL"
     assert engine.pull_logs[1]["rows_inserted"] == 6
-    assert engine.touched_source_ids == [524]
+    assert engine.touched_source_ids == []
 
 
 def test_all_items_skipped_is_not_fresh(monkeypatch):
@@ -248,6 +249,7 @@ def test_all_items_skipped_is_not_fresh(monkeypatch):
     assert (log_row["status"], log_row["rows_inserted"]) == ("SUCCESS", 0)
     assert log_row["error_message"].startswith("SKIPPED: all 2 items skipped")
     assert engine.touched_source_ids == []
+    assert json.loads(engine.events[0]["payload"])["status"] == "SKIPPED"
 
 
 def test_all_items_failed_is_failed(monkeypatch):
@@ -271,3 +273,4 @@ def test_clean_zero_row_run_is_logged_but_not_fresh(monkeypatch):
     assert (log_row["status"], log_row["rows_inserted"]) == ("SUCCESS", 0)
     assert log_row["error_message"].startswith("NO_NEW_DATA:")
     assert engine.touched_source_ids == []
+    assert json.loads(engine.events[0]["payload"])["status"] == "NO_NEW_DATA"

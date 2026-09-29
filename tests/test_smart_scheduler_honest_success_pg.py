@@ -138,7 +138,7 @@ def test_pull_log_and_freshness_match_what_each_run_wrote(pg_engine, monkeypatch
 
     statuses = {r["name"]: r["status"] for r in summary["results"]}
     assert statuses == {
-        "options": "SKIPPED", "partial": "SUCCESS", "allfail": "FAILED",
+        "options": "SKIPPED", "partial": "PARTIAL", "allfail": "FAILED",
         "nothingnew": "NO_NEW_DATA", "raiser": "FAILED",
     }
     with pg_engine.connect() as conn:
@@ -154,11 +154,13 @@ def test_pull_log_and_freshness_match_what_each_run_wrote(pg_engine, monkeypatch
         }
     # Only the run that wrote rows makes its source look fresh.
     assert fresh == {
-        "YFINANCE_OPTIONS": False, "PARTIAL_SRC": True, "ALLFAIL_SRC": False,
+        "YFINANCE_OPTIONS": False, "PARTIAL_SRC": False, "ALLFAIL_SRC": False,
         "NOTHINGNEW_SRC": False, "RAISER_SRC": False,
     }
     assert "options" not in logged  # all tickers skipped: not an attempt
-    assert logged["partial"] == ("SUCCESS", 120, "1 of 2 items failed", 2)
+    assert logged["partial"][:2] == ("PARTIAL", 120)
+    assert "1 of 2 items failed or partial" in logged["partial"][2]
+    assert logged["partial"][3] == 2
     assert logged["allfail"][:2] == ("FAILED", 0)
     assert "Yahoo 503" in logged["allfail"][2]
     assert logged["nothingnew"][:2] == ("SUCCESS", 0)
@@ -193,7 +195,7 @@ class _TiingoLike:
          "SUCCESS", 0, "NO_NEW_DATA:", False),
         ([{"ticker": "SPY", "status": "SUCCESS", "rows_inserted": 6},
           {"ticker": "ZZZ", "status": "FAILED", "rows_inserted": 0}],
-         "SUCCESS", 6, None, True),
+         "PARTIAL", 6, None, False),
     ],
 )
 def test_grid_scheduler_pull_group_is_honest_on_postgres(

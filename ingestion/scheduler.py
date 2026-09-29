@@ -212,49 +212,11 @@ def _touch_source_catalog_last_pull(
         )
 
 
-def _extract_rows_inserted(result: Any) -> int:
-    """Best-effort row count extraction from varied puller result shapes."""
-    if result is None:
-        return 0
-    if isinstance(result, bool):
-        return 0
-    if isinstance(result, int):
-        return max(result, 0)
-    if isinstance(result, dict):
-        for key in (
-            "rows_inserted",
-            "total_inserted",
-            "rows_written",
-            "rows_upserted",
-            "rows",
-            "records_inserted",
-            "records_written",
-            "articles_inserted",
-            "events_inserted",
-            "count",
-        ):
-            value = result.get(key)
-            if isinstance(value, bool):
-                continue
-            if isinstance(value, int):
-                return max(value, 0)
-            if isinstance(value, (list, tuple, set)):
-                return len(value)
-        return 0
-    if isinstance(result, (list, tuple, set)):
-        # A list of per-item result dicts (Tiingo, options, ...) is NOT a
-        # list of rows: before 2026-09-29 this returned len(result), so
-        # Tiingo_Prices logged rows_inserted=1328 (its ticker count) on
-        # every run, whatever it wrote. Sum the items' own counts instead.
-        if any(
-            isinstance(item, dict) and ("status" in item or "rows_inserted" in item)
-            for item in result
-        ):
-            from ingestion.smart_scheduler import _extract_rows
+def _extract_rows_inserted(result: Any) -> int | None:
+    """Use the same committed-write contract as every ingestion wrapper."""
+    from ingestion.smart_scheduler import _extract_rows
 
-            return _extract_rows(list(result)) or 0
-        return len(result)
-    return 0
+    return _extract_rows(result)
 
 
 class PullerReportedFailure(RuntimeError):
@@ -325,6 +287,7 @@ def run_pull_group(
         "failure_count": 0,
         "skipped_count": 0,
         "no_new_data_count": 0,
+        "partial_count": 0,
     }
 
     try:
@@ -405,20 +368,23 @@ def run_pull_group(
                 #   SKIPPED / NO_NEW_DATA -> pull_log SUCCESS with the
                 #                   honest row count (0) and the outcome in
                 #                   error_message; last_pull_at untouched;
-                #   SUCCESS      -> as before.
+                #   PARTIAL      -> preserved with committed rows, nonfresh;
+                #   SUCCESS      -> complete coverage with positive writes.
                 from ingestion.smart_scheduler import _classify_outcome
 
-                outcome, _rows, note = _classify_outcome(result)
+                outcome, rows, note = _classify_outcome(result)
+                ctx.record_rows(rows)
                 if outcome == "FAILED":
                     raise PullerReportedFailure(note or "puller reported FAILED")
-                ctx.record_rows(_extract_rows_inserted(result))
+                if outcome == "PARTIAL":
+                    ctx.set_status("PARTIAL", note)
                 if outcome in ("SKIPPED", "NO_NEW_DATA"):
                     ctx.set_note(f"{outcome}: {note}" if note else outcome)
 
             if outcome in ("SKIPPED", "NO_NEW_DATA"):
                 summary["results"].append({
                     "puller": puller_name, "status": outcome,
-                    "reason": note, "result": result,
+                    "rows_inserted": rows, "reason": note, "result": result,
                 })
                 if outcome == "SKIPPED":
                     summary["skipped_count"] += 1
@@ -430,13 +396,22 @@ def run_pull_group(
                 )
                 continue
 
-            _touch_source_catalog_last_pull(
-                db_engine,
-                source_id,
-                source_name,
-                puller_name,
-            )
-            summary["results"].append({"puller": puller_name, "status": "SUCCESS", "result": result})
+            if outcome == "PARTIAL":
+                summary["results"].append({"puller": puller_name, "status": outcome,
+                                           "rows_inserted": rows, "error": note, "result": result})
+                summary["partial_count"] = summary.get("partial_count", 0) + 1
+                continue
+
+            from ingestion.smart_scheduler import _puller_owns_catalog
+            if not _puller_owns_catalog(source_name or puller_name, puller_instance):
+                _touch_source_catalog_last_pull(
+                    db_engine,
+                    source_id,
+                    source_name,
+                    puller_name,
+                )
+            summary["results"].append({"puller": puller_name, "status": "SUCCESS",
+                                       "rows_inserted": rows, "result": result})
             summary["success_count"] += 1
             log.info("{p} complete", p=puller_name)
 
@@ -451,10 +426,11 @@ def run_pull_group(
 
     log.info(
         "Pull group {g} complete — {ok} succeeded, {nd} no new data, "
-        "{fail} failed, {skip} skipped",
+        "{part} partial, {fail} failed, {skip} skipped",
         g=group_name,
         ok=summary["success_count"],
         nd=summary.get("no_new_data_count", 0),
+        part=summary["partial_count"],
         fail=summary["failure_count"],
         skip=summary["skipped_count"],
     )
@@ -1453,8 +1429,16 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         # here) — each item now also carries an "outcome" key (Check 1a,
         # fable-hermes-repair-bound follow-up review, 2026-09-19):
         # "inserted" | "duplicate_only" | "no_data" | "error".
-        results = yf_puller.pull_all(start_date=start_date)
-        total_rows = sum(r["rows_inserted"] for r in results)
+        from ingestion.smart_scheduler import _classify_outcome
+        from ingestion.pull_context import PullContext
+        with PullContext(engine, "YFinance_Daily") as ctx:
+            results = yf_puller.pull_all(start_date=start_date)
+            outcome, total_rows, note = _classify_outcome(results)
+            ctx.record_rows(total_rows)
+            if outcome in {"FAILED", "PARTIAL"}:
+                ctx.set_status(outcome, note)
+            elif outcome in {"SKIPPED", "NO_NEW_DATA"}:
+                ctx.set_note(f"{outcome}: {note}")
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
             "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
@@ -1484,35 +1468,9 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
                 "yfinance daily pull — {n} ticker(s) did not check cleanly: {f}",
                 n=len(failing), f=failing[:20],
             )
-        # Freshness-signal fix (fable-hermes-repair-bound, 2026-09-19):
-        # run_daily_pulls is the function actually wired to the 4x/day
-        # cron in start_scheduler() below, and unlike run_pull_group's
-        # _touch_source_catalog_last_pull (used by the newer group-based
-        # path), it never updated source_catalog.last_pull_at. Traced in
-        # production: yfinance pulled fresh data here every day, but
-        # last_pull_at stayed stuck at a stale timestamp, so Hermes's
-        # staleness check (DATA_FRESHNESS_THRESHOLD_HOURS in
-        # scripts/hermes_operator.py) kept flagging yfinance as stale and
-        # triggering unnecessary REPULL repairs against data that was
-        # already current. Best-effort, same swallow-on-error pattern as
-        # the existing update in scripts/hermes_fixers.py::_retry_source.
-        #
-        # Semantics (Check 1c, review follow-up): this update means "the
-        # source was successfully CHECKED at this time" — it runs only
-        # after pull_all has returned (never on exception — the whole
-        # block above is inside this try, so an exception skips straight
-        # to the except below and this line is never reached), and it is
-        # NOT a claim that every ticker's data is current through today.
-        # Currency through 2026-09-18 was traced and verified only for
-        # YF:SPY:close, YF:XLI:close, and YF:EMB:close (see the handoff
-        # doc) — do not generalise that to "equities are current".
-        #
-        # GRID-YF-CLOSE-REPAIR-20260926 fix #1 follow-up: pull_all() can now
-        # return an empty list when its single-flight lock finds a previous
-        # run still active in this process (see ingestion/yfinance_pull.py's
-        # module docstring on _PULL_ALL_LOCK) — that means NO ticker was
-        # attempted this call, so it must not be recorded as a fresh check.
-        if results:
+        # Cadence checks are logged, but only complete positive-write runs
+        # establish source freshness (the same rule as SmartScheduler).
+        if outcome == "SUCCESS":
             try:
                 with engine.begin() as conn:
                     conn.execute(text(
@@ -1523,9 +1481,7 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
                 pass
         else:
             log.warning(
-                "yfinance daily pull: pull_all() returned no results "
-                "(single-flight lock likely skipped this run) — "
-                "last_pull_at NOT advanced",
+                "yfinance daily pull: {o} — last_pull_at NOT advanced", o=outcome,
             )
     except Exception as exc:
         log.error("yfinance daily pull failed: {err}", err=str(exc))

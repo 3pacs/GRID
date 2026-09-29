@@ -1105,6 +1105,9 @@ def _execute_hermes_repair_command(
                     "stopped_by_budget": True,
                     "pull_result": pull_result,
                 }
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source, success=True)
+                return {"cmd": raw_cmd, "status": "no_new_data", "pull_result": pull_result}
             not_fresh = retry_not_fresh_reason(pull_result)
             if not_fresh:
                 state.cooldowns.record_attempt(source, success=False, error=not_fresh)
@@ -1461,7 +1464,7 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
 
 # Outcomes (ingestion.smart_scheduler._classify_outcome) for which a repair
 # pull must not advance source_catalog.last_pull_at nor count as recovered.
-_NOT_FRESH_OUTCOMES = frozenset({"SKIPPED", "FAILED", "PARTIAL"})
+_NOT_FRESH_OUTCOMES = frozenset({"SKIPPED", "FAILED", "PARTIAL", "NO_NEW_DATA"})
 
 
 def retry_not_fresh_reason(pull_result: dict[str, Any]) -> str | None:
@@ -1643,14 +1646,15 @@ def _retry_source(
         # below and was recorded as a recovered pull by every caller.
         # Classify with the SmartScheduler's own rules; see
         # retry_not_fresh_reason() for what callers do with it.
-        from ingestion.smart_scheduler import _classify_outcome
+        from ingestion.smart_scheduler import _classify_outcome, _puller_owns_catalog
 
-        outcome, _outcome_rows, outcome_note = _classify_outcome(raw_result)
-        result = raw_result if isinstance(raw_result, dict) else {"status": "ok"}
+        outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
+        result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        result.update(outcome=outcome, rows_inserted=outcome_rows)
         not_fresh = outcome in _NOT_FRESH_OUTCOMES
         if not_fresh:
-            # Only a not-fresh result is annotated; a normal one is
-            # returned exactly as before.
+            # Every return carries a normalized outcome/count; nonfresh
+            # results also preserve the explanation for recovery callers.
             result = {**result, "outcome": outcome}
             if outcome_note:
                 result["outcome_note"] = outcome_note
@@ -1698,7 +1702,8 @@ def _retry_source(
             )
             summary_line = (
                 f"{source_name} repair: checked {total_checked} tickers "
-                f"(window {window_days}d): {counts.get('inserted', 0)} inserted rows, "
+                f"(window {window_days}d): {outcome_rows} written rows, "
+                f"{counts.get('inserted', 0)} inserted tickers, "
                 f"{counts.get('duplicate_only', 0)} duplicate-only, "
                 f"{counts.get('no_data', 0)} no_data, {counts.get('error', 0)} error, "
                 f"{counts.get('unattempted', 0)} unattempted"
@@ -1744,15 +1749,10 @@ def _retry_source(
             else:
                 state.repair_backlog.pop(source_key, None)
 
-        # Update last_pull_at in source_catalog only when the pull actually
-        # ran to completion over its (bounded) window — a budget-stopped
-        # attempt did not finish and should not be marked fresh. Semantics:
-        # this records that the source was CHECKED at this time, never that
-        # every symbol of this source is current (Check 1a). A run the
-        # puller itself reports as skipped or failed (every item skipped or
-        # failed, or an explicit SKIPPED/FAILED/PARTIAL) was not a check at
-        # all and is never marked fresh (2026-09-29).
-        if not stopped_by_budget and not not_fresh:
+        # Only complete positive-write runs advance source freshness.
+        # NO_NEW_DATA is a completed check; callers keep its cadence without
+        # reporting recovery, refreshing a stale source, or claiming filled gaps.
+        if not stopped_by_budget and outcome == "SUCCESS" and not _puller_owns_catalog(source_name, puller):
             try:
                 from sqlalchemy import text
                 with engine.begin() as conn:
@@ -1975,6 +1975,10 @@ def diagnose_and_fix_pulls(
                 result["retried"] += 1
                 log.info("Repair for {s} stopped by budget; backlog persisted", s=source_name)
                 continue
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source_name, success=True)
+                result["retried"] += 1
+                continue
             not_fresh = retry_not_fresh_reason(pull_result)
             if not_fresh:
                 state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
@@ -2141,6 +2145,9 @@ def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> 
                     s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
                 pull_result = _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
+                if pull_result.get("outcome") == "NO_NEW_DATA":
+                    state.cooldowns.record_attempt(source_name, success=True)
+                    continue
                 not_fresh = retry_not_fresh_reason(pull_result)
                 if not_fresh:
                     log.warning("Gap-fill for {s} did not fill: {r}", s=source_name, r=not_fresh)

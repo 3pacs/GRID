@@ -475,7 +475,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "pumpfun",           "mod": "ingestion.pumpfun",                 "cls": "PumpFunPuller",            "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
 
     # ── Government / regulatory ──
-    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY"},
+    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY", "hold_reason": "No pull_all contract; bounded BLS adapter required"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
@@ -484,7 +484,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
     {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
-    {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
+    {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60, "hold_reason": "No persistent write contract; narrative-only pull_today"},
 
     # ── International (missing) ──
     {"name": "eurostat",          "mod": "ingestion.international.eurostat",   "cls": "EurostatPuller",           "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
@@ -671,150 +671,163 @@ def _as_utc(value: Any) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
-_ROW_COUNT_KEYS = ("rows_inserted", "total_inserted", "inserted", "rows_written", "rows")
+_ROW_COUNT_KEYS = (
+    "rows_inserted", "total_inserted", "inserted", "rows_written", "rows",
+    "rows_upserted", "records_inserted", "records_written", "articles_inserted",
+    "events_inserted", "total_rows", "series_stored", "stored", "raw_series_inserted",
+)
+# These are write-result envelopes, never provider payloads or counts of tickers.
+_RESULT_KEYS = (
+    "results", "bills", "hearings", "votes", "member_votes", "registrants",
+    "activities", "pac_contributions", "individual_contributions",
+)
+
+
+def _puller_owns_catalog(name: str | None, puller: Any = None) -> bool:
+    """Options owns its final bounded catalog publication (#735 contract)."""
+    return str(name or "").lower() in {"options", "yfinance_options"} or (
+        str(getattr(puller, "SOURCE_NAME", "")).upper() == "YFINANCE_OPTIONS"
+    )
+
+
+def _result_children(out: dict) -> list[Any]:
+    return [out[k] for k in _RESULT_KEYS if k in out and isinstance(out[k], (dict, list))]
 
 
 def _extract_rows(out: Any) -> int | None:
-    """Best-effort row count from a puller's return value (for pull_log).
+    """Reported committed writes; unknown counts stay None, never list length.
 
-    ``None`` means "the puller did not say" -- never "zero rows".
+    Counts on an aggregate replace its leaf counts. SEC SUMMARY rows are
+    metadata when ticker results are present, so they are never added twice.
     """
+    summary = getattr(out, "summary", None)
+    if isinstance(summary, dict):
+        return _extract_rows(summary)
     if isinstance(out, bool) or out is None:
         return None
     if isinstance(out, int):
-        return max(out, 0)
+        return out if out >= 0 else None
     if isinstance(out, dict):
         for key in _ROW_COUNT_KEYS:
-            val = out.get(key)
-            if isinstance(val, int) and not isinstance(val, bool):
-                return max(val, 0)
-        return None
+            if key in out:
+                val = out[key]
+                return val if isinstance(val, int) and not isinstance(val, bool) and val >= 0 else None
+        children = _result_children(out)
+        return _extract_rows(children) if children else None
     if isinstance(out, list):
-        total = 0
-        found = False
-        for item in out:
-            item_rows = _extract_rows(item) if isinstance(item, dict) else None
-            if item_rows is not None:
-                total += item_rows
-                found = True
-        return total if found else None
+        items = [i for i in out if not isinstance(i, dict) or i.get("status") != "SUMMARY"]
+        if not items:
+            items = out  # a summary-only aggregate can report its own count
+        counts = [_extract_rows(i) for i in items]
+        known = [n for n in counts if n is not None]
+        return sum(known) if known else None
     return None
 
 
-# Outcome vocabulary for one SmartScheduler run (see _classify_outcome).
-# Only SUCCESS advances source_catalog.last_pull_at -- the freshness layer.
-# NO_NEW_DATA keeps the job's cadence (it is not re-run every tick, and not
-# backed off like a failure) but does NOT make the source look fresh.
+# Only complete runs with known positive writes advance source freshness.
 OUTCOME_SUCCESS = "SUCCESS"
 OUTCOME_NO_NEW_DATA = "NO_NEW_DATA"
 OUTCOME_SKIPPED = "SKIPPED"
 OUTCOME_FAILED = "FAILED"
 OUTCOME_PARTIAL = "PARTIAL"
 
-# Per-item statuses a list-returning puller uses (options, tiingo, ...).
-_ITEM_OK = frozenset({"SUCCESS", "OK"})
-_ITEM_SKIP = frozenset({"SKIPPED", "SKIP"})
-_ITEM_FAIL = frozenset({"FAILED", "ERROR", "PARTIAL"})
-
-
-def _first_item_note(items: list[dict], statuses: frozenset[str], *keys: str) -> str | None:
-    for item in items:
-        if str(item.get("status") or "").upper() in statuses:
-            for key in keys:
-                if item.get(key):
-                    return str(item[key])
-    return None
-
 
 def _classify_outcome(out: Any) -> tuple[str, int | None, str | None]:
-    """Map a puller's return value to ``(outcome, rows, note)`` honestly.
+    """Normalize committed writes and coverage for every ingestion caller.
 
-    Fake-success fix (2026-09-29, follow-up to PR #727 review): every
-    return value that was not an explicit SKIPPED/FAILED/PARTIAL dict used
-    to be recorded as SUCCESS -- including a *list* in which every item was
-    skipped or failed. OptionsPuller.pull_all returns one
-    ``{"status": "SKIPPED"}`` per ticker outside an equity session (#653),
-    so Hermes bumped YFINANCE_OPTIONS.last_pull_at on runs that wrote
-    nothing. The rules now are:
-
-    * rows written > 0                        -> SUCCESS (with the count);
-      a list with some failed items but rows > 0 is still SUCCESS -- the
-      note carries the failed-item count.
-    * the puller says "nothing to do" (a SKIPPED dict, or a list whose
-      every item is SKIPPED, or an empty list)  -> SKIPPED.
-    * every attempted item failed / a FAILED dict / a status-less dict
-      with ``rows_inserted == 0`` and an ``error``           -> FAILED.
-    * an explicit PARTIAL dict                 -> PARTIAL (unchanged
-      semantics, see _run_puller's mitigation 3).
-    * the run completed cleanly but reported 0 rows written -> NO_NEW_DATA.
-    * the puller reports no row count at all (``None``, a bare string, a
-      list of non-dicts, a dict with no count key) -> SUCCESS, as before;
-      its outcome can only be as honest as its return value. The puller
-      audit in the PR description lists which pullers are in that class.
+    A positive count cannot override errors, deferred work, or unknown
+    coverage. UNCHANGED is a completed zero-write check. Opaque returns are
+    failures of the write contract, not evidence of freshness.
     """
+    summary = getattr(out, "summary", None)
+    if isinstance(summary, dict):
+        return _classify_outcome(summary)
     rows = _extract_rows(out)
-
     if isinstance(out, dict):
-        status = out.get("status")
-        if status == "SKIPPED":
-            reason = out.get("skipped_reason") or out.get("reason") or "puller reported SKIPPED"
-            return OUTCOME_SKIPPED, rows, str(reason)
-        if status in (OUTCOME_FAILED, OUTCOME_PARTIAL):
-            return status, rows, str(out.get("error", f"puller reported {status}"))
-        if status is None and out.get("rows_inserted") == 0 and "error" in out:
-            return OUTCOME_FAILED, 0, str(out.get("error"))
+        status = str(out.get("status") or "").upper()
+        note = out.get("error") or out.get("errors") or out.get("reason") or out.get("skipped_reason")
+        note = str(note) if note else None
+        if status in {"SKIPPED", "SKIP", "DEFERRED"} or out.get("skipped_reason"):
+            if rows is not None and rows > 0:
+                return OUTCOME_PARTIAL, rows, note or "writes reported by an incomplete run"
+            return OUTCOME_SKIPPED, rows, note or "puller reported SKIPPED"
+        if status in {"FAILED", "ERROR", "TIMEOUT"}:
+            return OUTCOME_FAILED, rows, note or f"puller reported {status}"
+        invalid = any(
+            k in out and (not isinstance(out[k], int) or isinstance(out[k], bool) or out[k] < 0)
+            for k in _ROW_COUNT_KEYS
+        )
+        if invalid:
+            return OUTCOME_FAILED, None, "invalid or unknown reported write count"
+        children = _result_children(out)
+        child_outcome = _classify_outcome(children) if children else None
+        # YFinance's SUCCESS envelope is only a loop-completion claim; its
+        # per-ticker outcomes determine coverage and its counts count tickers.
+        if status == "PARTIAL" or out.get("stopped_by_budget") or out.get("tickers_not_attempted"):
+            if out.get("outcome") in {"error", "no_data"} and not rows:
+                return OUTCOME_FAILED, rows, note or str(out["outcome"])
+            if "counts" in out and child_outcome and child_outcome[0] == OUTCOME_FAILED:
+                return OUTCOME_FAILED, rows, child_outcome[2]
+            return OUTCOME_PARTIAL, rows, note or "puller reported PARTIAL"
+        if child_outcome and child_outcome[0] in {OUTCOME_FAILED, OUTCOME_PARTIAL, OUTCOME_SKIPPED}:
+            return child_outcome[0], rows, child_outcome[2]
+        if out.get("error") or out.get("errors") or out.get("outcome") in {"error", "no_data"}:
+            return (OUTCOME_PARTIAL if rows else OUTCOME_FAILED), rows, note or str(out.get("outcome"))
+        if "succeeded" in out and "total" in out:
+            succeeded, total = out["succeeded"], out["total"]
+            if not all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in (succeeded, total)) or succeeded > total:
+                return OUTCOME_FAILED, rows, "invalid coverage counts"
+            if succeeded < total:
+                return (OUTCOME_PARTIAL if succeeded or rows else OUTCOME_FAILED), rows, f"{succeeded} of {total} items completed"
+        if status in {"UNCHANGED", "NO_NEW_DATA"}:
+            if rows not in (None, 0):
+                return OUTCOME_FAILED, rows, "unchanged outcome reported positive writes"
+            return OUTCOME_NO_NEW_DATA, 0, "run checked, nothing changed"
+        if child_outcome and rows is None:
+            rows = child_outcome[1]
         if rows is None:
-            return OUTCOME_SUCCESS, None, None
-        if rows > 0:
-            return OUTCOME_SUCCESS, rows, None
-        return OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written"
+            return OUTCOME_FAILED, None, "puller did not report committed write count"
+        if status not in {"", "SUCCESS", "OK", "SUMMARY"}:
+            return OUTCOME_FAILED, rows, note or f"unrecognized puller status {status}"
+        return (OUTCOME_SUCCESS, rows, None) if rows > 0 else (OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written")
 
     if isinstance(out, list):
         if not out:
             return OUTCOME_SKIPPED, 0, "puller returned no per-item results"
-        items = [i for i in out if isinstance(i, dict)]
+        items = [i for i in out if not isinstance(i, dict) or i.get("status") != "SUMMARY"]
         if not items:
-            return OUTCOME_SUCCESS, rows, None  # opaque list: no status to read
-        statuses = [str(i.get("status") or "").upper() for i in items]
-        n_ok = sum(s in _ITEM_OK for s in statuses)
-        n_skip = sum(s in _ITEM_SKIP for s in statuses)
-        n_fail = sum(s in _ITEM_FAIL for s in statuses)
-        total = len(items)
-        if rows is not None and rows > 0:
-            note = f"{n_fail} of {total} items failed" if n_fail else None
-            return OUTCOME_SUCCESS, rows, note
-        if n_skip == total:
-            reason = _first_item_note(items, _ITEM_SKIP, "reason", "skipped_reason")
-            return OUTCOME_SKIPPED, 0, f"all {total} items skipped" + (f": {reason}" if reason else "")
-        if n_ok == 0 and n_fail > 0:
-            err = _first_item_note(items, _ITEM_FAIL, "error", "reason")
-            return (
-                OUTCOME_FAILED,
-                0,
-                f"{n_fail} of {total} items failed, {n_skip} skipped, 0 rows written"
-                + (f": {err}" if err else ""),
+            return _classify_outcome(out[-1])
+        classified = [_classify_outcome(i) for i in items]
+        statuses = [r[0] for r in classified]
+        n_skip = statuses.count(OUTCOME_SKIPPED)
+        n_failed = statuses.count(OUTCOME_FAILED)
+        n_partial = statuses.count(OUTCOME_PARTIAL)
+        n_checked = sum(s in {OUTCOME_SUCCESS, OUTCOME_NO_NEW_DATA} for s in statuses)
+        note = next((r[2] for r in classified if r[0] in {OUTCOME_FAILED, OUTCOME_PARTIAL} and r[2]), None)
+        if n_skip == len(items):
+            reason = next((r[2] for r in classified if r[2]), None)
+            return OUTCOME_SKIPPED, 0, f"all {len(items)} items skipped" + (f": {reason}" if reason else "")
+        if n_failed or n_partial or n_skip:
+            # A sole zero-row PARTIAL attempt with errors is a failed attempt;
+            # a clean checked item alongside it makes coverage partial.
+            only_failed = not n_checked and not rows and all(
+                r[0] in {OUTCOME_FAILED, OUTCOME_SKIPPED} or
+                (r[0] == OUTCOME_PARTIAL and isinstance(i, dict) and (i.get("errors") or i.get("error")))
+                for i, r in zip(items, classified)
             )
-        if rows is None and (n_ok > 0 or n_ok + n_skip + n_fail < total):
-            # Items succeeded (or carry no recognised status) but none
-            # reports a row count: nothing to contradict success with.
-            return OUTCOME_SUCCESS, None, None
-        return (
-            OUTCOME_NO_NEW_DATA,
-            0,
-            f"run completed, 0 rows written ({n_ok} ok, {n_skip} skipped, {n_fail} failed)",
-        )
+            outcome = OUTCOME_FAILED if only_failed else OUTCOME_PARTIAL
+            detail = f"{n_failed + n_partial} of {len(items)} items failed or partial, {n_skip} skipped, {rows if rows is not None else 'unknown'} rows written"
+            return outcome, rows, detail + (f": {note}" if note else "")
+        if rows is None:
+            # All explicit UNCHANGED leaves have a known zero-write meaning.
+            if all(r[0] == OUTCOME_NO_NEW_DATA for r in classified):
+                return OUTCOME_NO_NEW_DATA, 0, "run checked, nothing changed"
+            return OUTCOME_FAILED, None, "puller did not report committed write count"
+        return (OUTCOME_SUCCESS, rows, None) if rows > 0 else (OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written")
 
-    if isinstance(out, bool):
-        if out:
-            return OUTCOME_SUCCESS, None, None
-        return OUTCOME_FAILED, None, "puller returned False"
-
-    if isinstance(out, int):
-        if out > 0:
-            return OUTCOME_SUCCESS, out, None
-        return OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written"
-
-    return OUTCOME_SUCCESS, rows, None
+    if isinstance(out, int) and not isinstance(out, bool) and out >= 0:
+        return (OUTCOME_SUCCESS, out, None) if out > 0 else (OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written")
+    return OUTCOME_FAILED, None, "invalid or unknown committed write count"
 
 
 # How many pullers to run per tick (keeps cycles short)
@@ -924,7 +937,8 @@ class SmartScheduler:
           1. pull_log rows this scheduler wrote itself
              (``puller_name = SMART_PULL_LOG_PREFIX + name``, see
              ``_log_run``): the latest SUCCESS ``completed_at`` is
-             ``last_success``, and the trailing FAILED/PARTIAL streak inside
+             the completed-check cadence anchor (including NO_NEW_DATA markers),
+             not a freshness claim; the trailing FAILED/PARTIAL streak inside
              RESTART_FAILURE_LOOKBACK_H rebuilds ``consecutive_fails`` and
              the matching cooldown, so an entry that was backing off does
              not get retried on every restart either.
@@ -1130,6 +1144,9 @@ class SmartScheduler:
         timeout_s = puller.get("timeout_s", 120)
         result: dict[str, Any] = {"name": name, "status": "UNKNOWN"}
 
+        if puller.get("hold_reason"):
+            return {"name": name, "status": OUTCOME_SKIPPED, "reason": puller["hold_reason"]}
+
         # Acquire semaphore (non-blocking) to enforce thread limit
         if not self._thread_semaphore.acquire(blocking=False):
             with self._threads_lock:
@@ -1241,28 +1258,8 @@ class SmartScheduler:
                 result["reason"] = note or "puller reported SKIPPED"
                 return result
 
-            # Mitigation 3 (2026-09-27 review of PR #685): a puller's own
-            # returned dict can ALSO self-report failure -- an explicit
-            # {"status": "FAILED", ...} (every puller in ingestion/altdata/
-            # uses this shape on a fetch/parse error) or, as a defensive
-            # fallback for a puller that doesn't set "status" at all, a
-            # {"rows_inserted": 0, "error": ...}-shaped result. Before this
-            # fix, EVERYTHING that reached this line except an explicit
-            # SKIPPED was recorded as SUCCESS regardless of what the puller
-            # actually reported -- so a puller that ran, hit an error, and
-            # returned {"status": "FAILED", "error": ...} still advanced
-            # last_pull_at and reset its cooldown as if it had succeeded.
-            # "PARTIAL" (some-but-not-all of a puller's series/items failed
-            # -- e.g. EIAPuller.pull when only one of Brent/WTI fetched)
-            # is treated the same as FAILED here: SmartScheduler's own
-            # vocabulary (this class, get_status(), tick()'s summary) only
-            # ever distinguishes SUCCESS / SKIPPED / FAILED, so a puller
-            # that wants "retry the still-missing part on the next cheap
-            # cooldown-gated tick" reports PARTIAL and gets that FAILED-like
-            # treatment (no last_pull_at advance, cooldown applies) even
-            # though the rows it DID insert are already committed.
-            # 2026-09-29: a list in which every attempted item failed and
-            # nothing was written is FAILED too (see _classify_outcome).
+            # Incomplete coverage preserves committed rows but cannot
+            # establish freshness, even when those rows are positive.
             if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL):
                 result["status"] = outcome
                 result["error"] = (note or f"puller reported {outcome}")[:200]
@@ -1282,7 +1279,8 @@ class SmartScheduler:
             result["status"] = OUTCOME_SUCCESS
             if note:
                 result["note"] = note
-            self._update_last_pull(name)
+            if not _puller_owns_catalog(name):
+                self._update_last_pull(name)
 
         except Exception as exc:
             result["status"] = "FAILED"
@@ -1344,8 +1342,8 @@ class SmartScheduler:
 
         SKIPPED runs (thread limit, missing API key, a puller's own
         single-flight skip, an all-items-skipped list) are not attempts and
-        are not logged. NO_NEW_DATA is logged as SUCCESS with 0 rows. TIMEOUT
-        and every other non-success is logged as FAILED (pull_log's CHECK
+        are not logged. NO_NEW_DATA is logged as SUCCESS with 0 rows. PARTIAL
+        remains PARTIAL; TIMEOUT and other failures are logged as FAILED (pull_log's CHECK
         constraint allows RUNNING/SUCCESS/PARTIAL/FAILED only), with the
         original status kept in error_message. One INSERT at the end of the
         run, never a RUNNING row that a restart could orphan.
@@ -1387,7 +1385,7 @@ class SmartScheduler:
                         "started": started_at,
                         "completed": datetime.now(timezone.utc),
                         "status": log_status,
-                        "rows": result.get("rows_inserted") or 0,
+                        "rows": result.get("rows_inserted", 0),
                         "error": (str(error)[:500] if error else None),
                         "node": socket.gethostname(),
                     },

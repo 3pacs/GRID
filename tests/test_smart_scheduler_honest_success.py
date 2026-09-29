@@ -12,7 +12,7 @@ the pull_log contract on real PostgreSQL):
 
 * the real OptionsPuller outside a session -> SKIPPED, no freshness bump,
   no pull_log row, flat retry (not the failure backoff);
-* partial success (some items failed, rows written) -> SUCCESS + count;
+* partial coverage preserves PARTIAL and committed rows without freshness;
 * every item failed -> FAILED; a raised exception -> FAILED;
 * a clean run that wrote 0 rows -> NO_NEW_DATA: cadence kept, no bump;
 * ``_classify_outcome`` over every return shape pullers use.
@@ -53,7 +53,7 @@ from ingestion.smart_scheduler import (
         (7, (OUTCOME_SUCCESS, 7)),
         ([{"status": "SUCCESS", "rows_inserted": 4},
           {"status": "FAILED", "rows_inserted": 0, "error": "boom"},
-          {"status": "SKIPPED", "rows_inserted": 0}], (OUTCOME_SUCCESS, 4)),
+          {"status": "SKIPPED", "rows_inserted": 0}], (OUTCOME_PARTIAL, 4)),
         # explicit nothing-to-do -> SKIPPED
         ({"status": "SKIPPED", "skipped_reason": "lock held"}, (OUTCOME_SKIPPED, None)),
         ([{"status": "SKIPPED", "reason": "non-equity-session"}] * 3, (OUTCOME_SKIPPED, 0)),
@@ -61,7 +61,7 @@ from ingestion.smart_scheduler import (
         ([], (OUTCOME_SKIPPED, 0)),
         # every attempted item failed / explicit failure -> FAILED
         ([{"status": "FAILED", "error": "503"}, {"status": "FAILED", "error": "503"}],
-         (OUTCOME_FAILED, 0)),
+         (OUTCOME_FAILED, None)),
         ([{"status": "FAILED", "rows_inserted": 0}, {"status": "SKIPPED"}], (OUTCOME_FAILED, 0)),
         ([{"status": "PARTIAL", "rows_inserted": 0, "errors": ["404"]}], (OUTCOME_FAILED, 0)),
         ({"status": "FAILED", "error": "x"}, (OUTCOME_FAILED, None)),
@@ -73,14 +73,14 @@ from ingestion.smart_scheduler import (
         ({"status": "SUCCESS", "rows_inserted": 0}, (OUTCOME_NO_NEW_DATA, 0)),
         (0, (OUTCOME_NO_NEW_DATA, 0)),
         ([{"status": "SUCCESS", "rows_inserted": 0},
-          {"status": "PARTIAL", "rows_inserted": 0}], (OUTCOME_NO_NEW_DATA, 0)),
-        # no row count reported at all -> legacy SUCCESS (nothing to contradict it)
-        (None, (OUTCOME_SUCCESS, None)),
-        ("done", (OUTCOME_SUCCESS, None)),
-        (["ok"], (OUTCOME_SUCCESS, None)),
-        ({"status": "SUCCESS"}, (OUTCOME_SUCCESS, None)),
-        ([{"status": "SUCCESS"}], (OUTCOME_SUCCESS, None)),
-        (True, (OUTCOME_SUCCESS, None)),
+          {"status": "PARTIAL", "rows_inserted": 0}], (OUTCOME_PARTIAL, 0)),
+        # no row count reported -> FAILED contract; unknown stays unknown
+        (None, (OUTCOME_FAILED, None)),
+        ("done", (OUTCOME_FAILED, None)),
+        (["ok"], (OUTCOME_FAILED, None)),
+        ({"status": "SUCCESS"}, (OUTCOME_FAILED, None)),
+        ([{"status": "SUCCESS"}], (OUTCOME_FAILED, None)),
+        (True, (OUTCOME_FAILED, None)),
     ],
 )
 def test_classify_outcome(out: Any, expected: tuple[str, int | None]) -> None:
@@ -88,13 +88,13 @@ def test_classify_outcome(out: Any, expected: tuple[str, int | None]) -> None:
     assert (outcome, rows) == expected
 
 
-def test_partial_list_success_note_counts_failed_items() -> None:
+def test_partial_list_note_counts_incomplete_items() -> None:
     outcome, rows, note = _classify_outcome([
         {"ticker": "A", "status": "SUCCESS", "rows_inserted": 3},
         {"ticker": "B", "status": "FAILED", "rows_inserted": 0, "error": "timeout"},
     ])
-    assert (outcome, rows) == (OUTCOME_SUCCESS, 3)
-    assert note == "1 of 2 items failed"
+    assert (outcome, rows) == (OUTCOME_PARTIAL, 3)
+    assert "1 of 2 items failed or partial" in note
 
 
 def test_all_failed_note_carries_first_error() -> None:
@@ -102,7 +102,7 @@ def test_all_failed_note_carries_first_error() -> None:
         {"ticker": "A", "status": "FAILED", "error": "HTTP 503"},
     ])
     assert outcome == OUTCOME_FAILED
-    assert "HTTP 503" in note and "0 rows written" in note
+    assert "HTTP 503" in note and "unknown rows written" in note
 
 
 # ── SmartScheduler end to end (SQLite stand-in) ──────────────────────────
@@ -257,18 +257,18 @@ def test_options_all_tickers_skipped_is_not_success_and_not_fresh(sched, monkeyp
     assert s._state["options"]["consecutive_fails"] == 0  # still no escalation
 
 
-def test_partial_success_is_success_with_count(sched) -> None:
+def test_partial_preserves_count_without_freshness(sched) -> None:
     s = sched(_entry("partial", "_PartialPuller"))
     summary = s.tick()
 
     result = summary["results"][0]
-    assert result["status"] == OUTCOME_SUCCESS
+    assert result["status"] == OUTCOME_PARTIAL
     assert result["rows_inserted"] == 120
-    assert summary["succeeded"] == 1
-    assert _last_pull(sched.engine, "PARTIAL") is not None
-    assert _pull_log(sched.engine) == [
-        (SMART_PULL_LOG_PREFIX + "partial", "SUCCESS", 120, "1 of 3 items failed"),
-    ]
+    assert summary["succeeded"] == 0
+    assert _last_pull(sched.engine, "PARTIAL") is None
+    (row,) = _pull_log(sched.engine)
+    assert row[:3] == (SMART_PULL_LOG_PREFIX + "partial", "PARTIAL", 120)
+    assert "1 of 3 items failed or partial" in row[3]
 
 
 def test_every_item_failed_is_failed(sched) -> None:

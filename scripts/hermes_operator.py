@@ -583,6 +583,8 @@ def _build_source_registry() -> dict[str, dict[str, Any]]:
     for entry in PULLER_REGISTRY:
         name = entry["name"]
         cfg: dict[str, Any] = {"mod": entry["mod"], "cls": entry["cls"]}
+        if entry.get("hold_reason"):
+            cfg["skip_runtime"] = entry["hold_reason"]
         if "api_key" in entry:
             cfg["api_key"] = entry["api_key"]
         method = entry.get("method")
@@ -3576,6 +3578,10 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             if state.cooldowns.can_retry(src):
                 try:
                     pull_result = _retry_source(src, engine, attempt=1, state=state)
+                    if pull_result.get("outcome") == "NO_NEW_DATA":
+                        state.cooldowns.record_attempt(src, success=True)
+                        log.info("Stale source {s} checked with no new writes; remains stale", s=src)
+                        continue
                     not_fresh = retry_not_fresh_reason(pull_result)
                     if not_fresh:
                         # Skipped / every item failed: not a refresh, and

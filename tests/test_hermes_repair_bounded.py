@@ -273,7 +273,7 @@ class TestCooperativeBudgetAndBacklog:
 
 
 class TestRepeatedZeroInsertResultsStayBounded:
-    def test_three_consecutive_zero_insert_repairs_update_freshness_and_cool_down(self) -> None:
+    def test_three_zero_insert_repairs_keep_cadence_without_freshness(self) -> None:
         tickers = ["A", "B", "C"]
 
         class ZeroInsertPuller:
@@ -297,6 +297,7 @@ class TestRepeatedZeroInsertResultsStayBounded:
             for _ in range(3):
                 result = hf._retry_source("zerosrc", engine, attempt=1, state=state)
                 assert result["status"] == "SUCCESS"
+                assert result["outcome"] == "NO_NEW_DATA"
                 assert result["stopped_by_budget"] is False
                 state.cooldowns.record_attempt("zerosrc", success=True)
                 assert not state.cooldowns.can_retry("zerosrc"), (
@@ -308,7 +309,7 @@ class TestRepeatedZeroInsertResultsStayBounded:
             hf_mod._resolve_puller = orig_resolve
 
         update_calls = [c for c in conn.calls if "UPDATE source_catalog" in c and "last_pull_at" in c]
-        assert len(update_calls) == 3, "last_pull_at must be advanced on every completed (non-budget-stopped) repair"
+        assert update_calls == [], "a zero-write check cannot establish freshness"
         assert "zerosrc" not in state.repair_backlog
 
 

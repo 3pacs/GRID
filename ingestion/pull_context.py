@@ -49,15 +49,19 @@ class PullContext:
         self._node_name = node_name
         self._require_persisted_log = require_persisted_log
         self._log_id: int | None = None
-        self._rows_inserted: int = 0
+        self._rows_inserted: int | None = 0
         self._rows_expected: int | None = None
         self._features_affected: list[int] = []
         self._note: str | None = None
+        self._reported_status: str | None = None
         self._started_at = datetime.now(timezone.utc)
 
-    def record_rows(self, count: int) -> None:
+    def record_rows(self, count: int | None) -> None:
         """Record number of rows inserted during this pull."""
-        self._rows_inserted += count
+        if count is None or self._rows_inserted is None:
+            self._rows_inserted = None
+        else:
+            self._rows_inserted += count
 
     def set_note(self, note: str) -> None:
         """Annotate a run that ends SUCCESS without being a fresh pull.
@@ -66,6 +70,13 @@ class PullContext:
         such a run is stored as SUCCESS with its honest row count and this
         note in error_message (e.g. ``"SKIPPED: all 40 items skipped"``).
         """
+        self._note = note
+
+    def set_status(self, status: str, note: str | None = None) -> None:
+        """Preserve a puller's terminal status without losing committed rows."""
+        if status not in {"SUCCESS", "PARTIAL", "FAILED"}:
+            raise ValueError(f"Unsupported pull_log status: {status}")
+        self._reported_status = status
         self._note = note
 
     def set_expected(self, count: int) -> None:
@@ -77,7 +88,7 @@ class PullContext:
         self._features_affected.extend(feature_ids)
 
     @property
-    def rows_inserted(self) -> int:
+    def rows_inserted(self) -> int | None:
         return self._rows_inserted
 
     def __enter__(self) -> "PullContext":
@@ -128,7 +139,12 @@ class PullContext:
                 "Pull FAILED: {p} — {e}",
                 p=self._puller_name, e=error_msg,
             )
-        elif self._rows_expected and self._rows_inserted < self._rows_expected * 0.5:
+        elif self._reported_status in {"PARTIAL", "FAILED"}:
+            status = self._reported_status
+            error_msg = self._note
+            log.warning("Pull {s}: {p} — {r} rows ({e})", s=status,
+                        p=self._puller_name, r=self._rows_inserted, e=error_msg)
+        elif self._rows_expected and self._rows_inserted is not None and self._rows_inserted < self._rows_expected * 0.5:
             status = "PARTIAL"
             error_msg = (
                 f"Expected ~{self._rows_expected} rows, got {self._rows_inserted}"
@@ -200,8 +216,13 @@ class PullContext:
 
         # Emit event for bus integration (best-effort)
         try:
+            event_status = status
+            if status == "SUCCESS" and self._note:
+                marker = self._note.split(":", 1)[0]
+                if marker in {"NO_NEW_DATA", "SKIPPED"}:
+                    event_status = marker
             _emit_pull_event(
-                self._engine, self._puller_name, status,
+                self._engine, self._puller_name, event_status,
                 self._rows_inserted, self._features_affected, self._node_name,
             )
         except Exception as exc:
@@ -220,6 +241,8 @@ class PullContext:
 
         Never raises — all warnings are log-only.
         """
+        if self._rows_inserted is None:
+            return
         try:
             with self._engine.connect() as conn:
                 # Get the last 20 successful pulls for this puller
@@ -302,7 +325,7 @@ def _emit_pull_event(
     engine: Engine,
     puller_name: str,
     status: str,
-    rows: int,
+    rows: int | None,
     features: list[int],
     node: str,
 ) -> None:
