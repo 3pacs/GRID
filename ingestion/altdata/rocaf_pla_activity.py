@@ -188,10 +188,11 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
         # one other clause has a parseable count. Check all visible text so
         # an out-of-window mention cannot silently become an omitted zero.
         # Keep semicolon-linked qualifications and sentence terminators. A
-        # question must not become an assertion by losing its "?". Inspect
+        # question must not become an assertion by losing its "?", including
+        # punctuation separated by visible whitespace or HTML tags. Inspect
         # the complete sentence before applying the unchanged activity window,
         # so a qualifier just beyond that window cannot be silently dropped.
-        sentences = [m for m in re.finditer(r"[^.!?]+(?:[.!?]+|$)", text[start:])
+        sentences = [m for m in re.finditer(r"[^.!?]+(?:[.!?](?:\s*[.!?])*|$)", text[start:])
                      if "adiz" in m.group().lower()]
         if text.lower().count("adiz") != 1 or len(sentences) != 1:
             return None
