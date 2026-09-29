@@ -253,6 +253,27 @@ def test_taiwan_strait_osint_job_can_be_enabled_via_flag(monkeypatch):
     assert "_paper_trading_signals" not in jobs_by_name
 
 
+def test_lme_warehouse_job_default_off(monkeypatch):
+    """2026-09-29: LME's URLs return a Cloudflare managed challenge (403)
+    to non-browser clients; the job is only registered behind
+    GRID_ENABLE_LME_WAREHOUSE_JOB."""
+    for settings_obj in (object(), SimpleNamespace(), config.settings):
+        fake_schedule = _run_loop_with_settings(monkeypatch, settings_obj)
+        names = {job["func"] for job in fake_schedule.jobs}
+        assert "_lme_warehouse_daily" not in names
+        assert "_crucix_ingest" in names
+
+
+def test_lme_warehouse_job_can_be_enabled_via_flag(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_LME_WAREHOUSE_JOB=True)
+    )
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_lme_warehouse_daily"]["unit"] == "day"
+    assert jobs_by_name["_lme_warehouse_daily"]["at"] == "09:00"
+    assert "_taiwan_strait_osint_daily" not in jobs_by_name
+
+
 class _CapturingSchedule:
     """Minimal fake `schedule` module that captures the real job callables
     (by function name) instead of just recording their cadence, so a test

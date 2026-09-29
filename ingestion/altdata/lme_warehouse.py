@@ -1,6 +1,16 @@
 """
 LME warehouse stocks + cancelled warrant ratio puller (CAT-51, P0, Tier A).
 
+STATUS 2026-09-29 -- NOT SCHEDULED (``GRID_ENABLE_LME_WAREHOUSE_JOB``
+defaults off). One probe from grid-svr of LME_REPORT_URL returned HTTP 403
+with ``cf-mitigated: challenge`` / "Just a moment..." (Cloudflare managed
+challenge). That blocks any non-browser client; passing it would mean
+bypassing bot detection, which GRID does not do. It has never written a
+row. Free alternatives checked the same day: CME/COMEX delivery reports
+(Akamai resets non-browser HTTP/2 connections) and SHFE's daily
+warehouse-stock JSON (``/data/tradedata/future/dailydata/<date>
+dailystock.dat``, 404 from grid-svr). LME's own data is licensed (paid).
+
 Tracks daily London Metal Exchange warehouse stock levels for the six LME
 base metals — copper, aluminum, zinc, nickel, lead, tin — plus the
 "cancelled warrant" ratio. When a warehouse customer cancels a warrant,

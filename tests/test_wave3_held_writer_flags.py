@@ -25,6 +25,9 @@ FLAGS = [
     # blank-value validator (owner decision 2026-09-29): the Taiwan Strait
     # OSINT job in intelligence/scheduler.py.
     "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
+    # Same default-off gate (2026-09-29): LME warehouse job, whose LME URLs
+    # sit behind a Cloudflare managed challenge.
+    "GRID_ENABLE_LME_WAREHOUSE_JOB",
 ]
 
 
