@@ -420,12 +420,13 @@ def read_window_known_at(
       With ``lag=None`` there is no modeled path: pull evidence only.
 
     Either way the result for a given ``as_of`` depends only on rows pulled
-    by ``as_of`` or on the earliest vintage of each date, so appending data
-    later (new dates, re-pulls, revisions) never changes a past read. The
+    by ``as_of`` or on the earliest vintage of each date. Later re-pulls and
+    revisions do not replace an existing modeled vintage; a late backfill of
+    a previously absent observation date can change a past modeled read. The
     mixed-source rule of :func:`read_window` is applied to the vintages known
-    at ``as_of`` (every vintage pulled by then, plus the earliest vintage of a
-    modeled date), so a second source appearing later cannot break a past
-    read.
+    at ``as_of`` (every vintage pulled by then, plus every source tied at the
+    earliest timestamp of a modeled date), so a second source pulled strictly
+    later cannot break a past read.
 
     Each returned :class:`Observation` has ``known_at`` set and
     ``known_at_basis`` = ``"pulled"`` or ``"modeled_lag"``.
@@ -471,8 +472,9 @@ def read_window_known_at(
         elif modeled_known is not None and modeled_known <= as_of:
             v, ts, s, _ = pulled[-1]  # earliest pulled vintage
             out.append(Observation(series_id, d, v, ts, s, modeled_known, "modeled_lag"))
-            if s is not None:
-                known_sources.add(s)
+            # SQL does not order sources tied at the earliest timestamp.
+            # All tied sources must participate in the ambiguity guard.
+            known_sources.update(p[2] for p in pulled if p[1] == ts and p[2] is not None)
 
     if source is None:
         _raise_if_mixed(series_id, sorted(known_sources))

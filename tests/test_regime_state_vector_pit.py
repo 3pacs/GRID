@@ -237,6 +237,61 @@ class TestReadWindowKnownAt:
             _insert_many(engine, [_row("X", date(2026, 9, 21), 2.0, ts=datetime(2026, 9, 21, 9), src=YF_SRC)])
             self._read(engine, "X", date(2026, 9, 22), lag)
 
+    @pytest.mark.parametrize("reverse", [False, True])
+    @pytest.mark.parametrize("other_value", [4.1, 99.0])
+    def test_modeled_earliest_timestamp_ties_refuse_both_source_orders(
+        self, engine, reverse, other_value,
+    ):
+        from store.observations import MixedSourceError, PublicationLag
+
+        d = date(2025, 5, 1)
+        rows = [_row("X", d, 4.1), _row("X", d, other_value, src=YF_SRC)]
+        _insert_many(engine, list(reversed(rows)) if reverse else rows)
+        with pytest.raises(MixedSourceError, match="fred, yfinance"):
+            self._read(engine, "X", date(2025, 6, 12), PublicationLag(42))
+
+    @pytest.mark.parametrize("later_offset", [timedelta(microseconds=1), timedelta(days=1)])
+    def test_modeled_later_source_does_not_contaminate_earliest_vintage(
+        self, engine, later_offset,
+    ):
+        from store.observations import PublicationLag
+
+        d = date(2025, 5, 1)
+        _insert_many(engine, [
+            _row("X", d, 4.1),
+            _row("X", d, 99.0, ts=BACKFILL_TS + later_offset, src=YF_SRC),
+        ])
+        got = self._read(engine, "X", date(2025, 6, 12), PublicationLag(42))
+        assert [(o.value, o.source, o.pull_timestamp, o.known_at_basis) for o in got] == [
+            (4.1, "fred", BACKFILL_TS, "modeled_lag"),
+        ]
+
+    def test_modeled_earliest_tie_can_be_disambiguated_by_explicit_source(self, engine):
+        from store.observations import PublicationLag, read_window_known_at
+
+        d = date(2025, 5, 1)
+        _insert_many(engine, [_row("X", d, 4.1), _row("X", d, 99.0, src=YF_SRC)])
+        with engine.connect() as conn:
+            for source, expected in (("FRED", 4.1), ("yfinance", 99.0)):
+                got = read_window_known_at(
+                    conn, "X", as_of=date(2025, 6, 12), lag=PublicationLag(42), source=source,
+                )
+                assert [o.value for o in got] == [expected]
+
+    @pytest.mark.parametrize("lag", [None, 42])
+    def test_tied_source_pull_evidence_still_refuses(self, engine, lag):
+        from store.observations import MixedSourceError, PublicationLag
+
+        d = date(2025, 5, 1)
+        _insert_many(engine, [_row("X", d, 4.1), _row("X", d, 99.0, src=YF_SRC)])
+        with pytest.raises(MixedSourceError):
+            self._read(engine, "X", BACKFILL_TS.date(), None if lag is None else PublicationLag(lag))
+
+    def test_unproven_tie_without_lag_remains_unavailable(self, engine):
+        d = date(2025, 5, 1)
+        _insert_many(engine, [_row("X", d, 4.1), _row("X", d, 99.0, src=YF_SRC)])
+        assert self._read(engine, "X", date(2025, 6, 12), None) == []
+
 
 # ── Publication-lag table ────────────────────────────────────────────────
 
