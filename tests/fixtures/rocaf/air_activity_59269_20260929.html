@@ -1,0 +1,360 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head><meta http-equiv="Content-Type" content="text/html; charset=utf-8" /><meta id="meta_desc" name="description" content="English Airforce" /><meta id="meta_key" name="keywords" content="Airforce EN" /><meta id="SNS_img" property="og:image" content="https://air.mnd.gov.tw//Photo/News0/202609290931_407031.jpg" /><meta id="SNS_title" property="og:title" content="PLA activities in the waters and airspace around Taiwan Sep.29 2026" /><title>
+	PLA activities in the waters and airspace around Taiwan Sep.29 2026 - Air activities - Popular Info. - AIR FORCE COMMAND HEADQUARTERS, MND
+</title><link rel="shortcut" href="/favicon.ico" type="image/x-icon" /><link rel="shortcut icon" href="/favicon.ico" type="image/x-icon" /><meta name="viewport" content="width=device-width" />
+    <script src="../../JS/jquery.min.js"></script>
+    <!--Swiper-->
+    <script src="../../JS/Swiper/js/swiper.min.js?ts=202504161451"></script>
+    <link rel="stylesheet" href="../../JS/Swiper/Css/swiper.min.css" />
+    <!--SlickNav-->
+    <script src="../../JS/SlickNav/modernizr.min.js"></script>
+    <script src="../../JS/SlickNav/jquery.min.js"></script>
+    <script src="../../JS/SlickNav/jquery.slicknav.js"></script>
+    <link rel="stylesheet" href="../../JS/SlickNav/slicknav.css" />
+    <script>
+        $(function () {
+            $('#scrollToMenu').slicknav({
+				closeOnClick:true, 
+				afterOpen: function(trigger){
+					if($(trigger).attr('aria-haspopup') == 'true'){ 
+						$(trigger).attr('aria-expanded', 'true');
+					}
+				}, 
+				afterClose: function(trigger){
+					if($(trigger).attr('aria-haspopup') == 'true'){ 
+						$(trigger).attr('aria-expanded', 'false');
+					}
+				}
+			});
+			$('.slicknav_item.slicknav_row > a').keyup(function (event) {
+				if (event.key === "Enter") {
+					var $liParent = $(this).parent().parent();
+					$liParent.toggleClass("slicknav_collapsed").toggleClass("slicknav_open");
+					if($liParent.hasClass("slicknav_open")){
+						$liParent.find('> ul[role="menu"]').show().attr("aria-hidden", "false").find('a').each(function( index ) {
+							$(this).attr("tabindex", "0");
+						});
+					}else{
+						$liParent.find('> ul[role="menu"]').hide().attr("aria-hidden", "true").find('a').each(function( index ) {
+							$(this).attr("tabindex", "-1");
+						});
+					}
+					$liParent.siblings().each(function( index ) {
+					  	$(this).removeClass("slicknav_open");
+						if(!$(this).hasClass("slicknav_collapsed")) $(this).addClass("slicknav_collapsed");
+						$(this).find('> ul[role="menu"]').hide().attr("aria-hidden", "true").find('a').each(function( index ) {
+							$(this).attr("tabindex", "-1");
+						});
+					});
+				}
+			});
+        });
+    </script>
+    <!--選單開合-->
+    <script>
+        $(document).ready(function () {
+            if ($(window).width() > 960) {
+                $('.Header .Nav .NavLi').mouseenter(function (e) {
+                    $(this).children(".SubNav").stop(true, true).slideDown('fast');
+                }).mouseleave(function (e) {
+                    $(this).children(".SubNav").stop(true, true).slideUp('fast');
+                });
+                //無障礙Tab選單
+                $('.Header .Nav .NavLi').keyup(function () {
+                    $(this).children().show();
+                    $(this).siblings().focus(function () {
+                        $(this).hide();
+                    });
+                });
+                $('.Header .Nav .NavLi').keyup(function () {
+                    $(this).siblings().children('ul').hide();
+                });
+                $('.Header .Nav .NavLi .SubNav li').last().find('a').focusout(function () {
+                    $('.Header .Nav .NavLi ul').hide();
+                });
+            }
+  			$('.Accesskey_JtoC').focus(function(event){
+			  	$('#scrollToMenu').slicknav('close');
+		   	});  
+
+            $(".Search i").click(function () {
+                $(".SearchBox").stop(true, true).slideToggle();
+                $(".Search").stop(true, true).toggleClass("SearchOpen");
+            });
+
+            $(".Search i").keyup(function () {
+                $(".SearchBox").stop(true, true).slideToggle();
+                $(".Search").stop(true, true).toggleClass("SearchOpen");
+            });
+        });
+    </script>
+    <!--滑動置頂-->
+    <script>  
+        //偵測menu是否碰到螢幕頂端
+        $(window).scroll(function () {
+            var ScreenTop = $(window).scrollTop(); //螢幕頂端的座標
+            var MenuTop = 0;
+			if($('.DefHotNews').offset()){
+				MenuTop = $('.DefHotNews').offset().top; //Menu的座標
+			}
+            if (ScreenTop >= MenuTop) {
+                $('.Wrapper').addClass("WrapperFixed");
+            } else {
+                $('.Wrapper').removeClass("WrapperFixed");
+            }
+        });
+        $(function () {
+            $(".GoTop").click(function () {
+                $("html,body").animate({ scrollTop: 0 }, 900);
+                return false;
+            });
+        });
+    </script>
+    <!--首頁Wrapper加入Default Class-->
+    <script>        
+        $(document).ready(function () {
+            if ((document.location.href).toLowerCase().indexOf('/home/index.aspx') >= 0) {
+                $(".Wrapper").addClass("Home");
+                $(".Content").addClass("HomeContent");
+                $("div.Content.HomeContent > a").remove();
+
+                //有圖片才顯示
+                if ($('#hl_Ads').children().length > 0)
+                    $(".FixedAds").show();
+            }
+        });
+    </script>
+    <script>
+        if (navigator.userAgent.match(/MSIE 10/i) || navigator.userAgent.match(/Trident\/7\./) || navigator.userAgent.match(/Edge\/12\./)) {
+            $('body').on("mousewheel", function () {
+                event.preventDefault();
+                var wd = event.wheelDelta;
+                var csp = window.pageYOffset;
+                window.scrollTo(0, csp - wd);
+            });
+        }
+    </script>
+    <!--網站樣式設定-->
+    <link type="text/css" rel="stylesheet" href="../CSS/ugC_Main.css?ts=202609101638" />
+</head>
+<body id="Body">
+    <!--FB粉絲團崁入碼-->
+    <div id="fb-root"></div>
+    <script>(function (d, s, id) {
+            var js, fjs = d.getElementsByTagName(s)[0];
+            if (d.getElementById(id)) return;
+            js = d.createElement(s); js.id = id;
+            js.src = 'https://connect.facebook.net/zh_TW/sdk.js#xfbml=1&version=v3.2&appId=242567863265977&autoLogAppEvents=1';
+            fjs.parentNode.insertBefore(js, fjs);
+        }(document, 'script', 'facebook-jssdk'));</script>
+    <form method="post" action="./News_Detail.aspx?CID=214&amp;ID=59269" id="form1">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="l60jQTM+tRTCbx2wC83HHdhLFunVwXK50e+7gsgVjeDufJlMrX90Y6qkptndIaJRRLg41qt3rwIRhXUtknedblliFagPeziJU5/tKbsQnuOFpsDoHVcf2DLMUj9zxBbxqG1oL+C/SkQ25oZZnL7Ar76l8jA/VcE4tfFAlUlnzrHO9YSc0l0ycNlWsDPvtXyy6ZqSaqG28DMA/eRLj2yWWT9sAiUzX3mSuc6oSLIe83Z5aP6Jw9F1qQrcDukpgH/rqeG8iaMMHL/SD2Ev3n9JWmnUOfkRtJyim8pcZzxxyz5kYvgf7hiukAuCnGn7Sa73c9TSt/8j1cFF6ZM3y9Js4NQrGHH9tug1VZ/G1PHQD2ALKV7WC9Tjwg3RjaqERP91UF4HmIKxHZEYl1X7eCXnweqLxzdeonA/H7g4HwPnLXI3xzqJhjBs1RjlNiYKBvL7XS6wm/mw8YVxvYtgiGk9lwrutGuiB48qwziNs5dHd0WVVkBGvNcpCny0CQN6VDsXGAjd65Pg91RtXYLv8Msw7xjEc9R3aXDp6KD2kQfamHZgcqxdyizUOcRrIP8N7AXIi+nraKBxYuxqwfVIxtyYORBpaSmuR5TSs6Jzor152szrc2CNkfDFP25UiQYXi6JHrhUx/61KMQDF8Y6Zd1Sgd5HtAoj/VD+HidjwJ5FHmGKTl3Cj3VIUr2axBy1LR7PENOSG45kTd3+g2mari+HseJoLrZ7kcGksR7aG0C3lEYqer92hOsV1p4zhMyZggOQmai3bPEpijAvFt7aeM+2MxU7fLz0HBjN/RfjUVIc2NiHKxRJKPEA7J3Z1gkJVQHzXtAfZbfE/57lzR1n9AGTTVosrMHCfAxD7yTXEcvQAdc69iltyeTtPwJ0blIMXhrKdE0CoBkYr77JoS5AXysVbUw7NicW6WzUQGDRitajYBCEBF0ytMvZ5K9dsuLqlsvWswPa5fbPNwwr9Uzg3Gbg8E6AUkJ7FHyas1Q+xJ7WVLkME/cTmI7t+1SCB5dI3OVv1+G6VLHbkWEdAqAkcLDW9EZ0TTdX+Ent3BydObsFSYmt/i5+VurkPfMPqkc0awrBKKFe5ULPzBrZVQV6cgOJxfAentDpyxjvd2/TY7j8/NvTQkff1uLr4sg5lP3f2pWRwc7mHi9vZmVZqWMX7pye0Dfh1khSUAyPIRQgHUu2PhPnS2Y+yxoTMLZv2vY2kiw4OAEP7JczpUshwin59ABNHN97wCmrOSMQ7Cy3au+TCly1FGyeyU4Qspe8SccPKTlol/CzN3Xl2RC719dNhs/Ojvi3FQikLyHCB5GRzbIMB31IkZaXpGGUshn5/Cxlzd6qDzl0UcvDxmDn7k47QwCa5kzCudPIZAJ9cuSJsFkCmg9262za+ugycI1HR/2g6ikMQeTVf2putF65+mApVmxWUPjzzLiCx4zYr7nI25i2dnyJbJ8//w1uhvjCT51TZAIbEqY89FZ8hrtq/+8hcHJO+0Be0MNY/R9bXGTCnzWjq/K7VCwsVW3Wavnhlq/VZztFnL93w3K9mtpS6AKsmT5Cs6d8cdTJUDQtYxXWsFo+vSjWhNNWRZLri+ty+Y7WdFOo5P+k2sOvIE+MFQLN69OdiFPDGBQA4Fox6VerRGQfpeYWvHQ86sFXplh9jghcUvR6rmQ8BUDu1lymgkAZvkHmhguDLQJT7Rwk+DhCU2GqiFeJbAs3Pu3/T5CX+l3WE0xhl/T1k6gr7x6v6UYymrsgJoMZxJs07Qet4ZrhMc9ezMDO6ZLcyDJbiizuVyyLbQ1VgDNYfdA==" />
+
+
+<script src="/ScriptResource.axd?d=qph9tUZ6hGPLbkznkRkqTaaK4yJzaiKckIu1oEk2nW4OqJpFqsXSirbU7R9FSP8iAt9RrM-GRMaiKZ17-kDcyfNNozqqiRJWLKnB0At9aastihwT0&amp;t=ffffffffdc32f924" type="text/javascript"></script>
+<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="D630A9F3" />
+<input type="hidden" name="__EVENTVALIDATION" id="__EVENTVALIDATION" value="V37L29ak4sVqA0WX/THGuvHUn2txitkiiDENEcWwAdiMI6On0rc1mVzBNdyYhugu1ACYo+gVfqvDifIFPwUK7mEyeJgRGjnGDCT5Hq9NAhzfbVCfLAUyobzOcf3kSGSYFMR87VAPmIVqcC9t37YgtZxgm9lA56+FXafFutF4y076NeA6De9cK30zoMfxxKTMXitXjBIFu0Iu/KioyhksLr1EKw4VDCO9ex1ae9ZRCJWr6Y4rwq7zj/AnVT2KoYWiDskWdA==" />
+        
+        <!--Wrapper START-->
+        <div class="Wrapper">
+            <!--Header START-->
+            <header class="Header">
+                <noscript>
+                    <span style="color: red; font-weight: bold;">Your browser has JavaScript turned off and the site may not work as expected. To resolve this please enable JavaScript!</span>
+                </noscript>
+                <a href="#C" class="Accesskey_JtoC" title="Tab to main content area">main content area</a>
+				<a class="icon-sitemap" title="move to SiteMap" href="../WebInfo/SiteMap.aspx">SiteMap</a>
+                <!--Logo START-->
+                <div class="Logo"><a href="../index.aspx" title="Homepage">Home</a></div>
+                <!--Logo END-->
+                <!--Nav START-->
+                <nav class="Nav" id="scrollToMenu">
+                    <a id="U" href="#U" accesskey="U" class="Accesskey_U" title="Top Menu">:::</a>
+                    <ul id="ul_menu"><li class="NavLi"><a title="move to About the Air Force" role="button" href="../About/About_List.aspx">About the Air Force</a><ul class="SubNav"><li><a title="move to Air Force Profile" href="../About/About_List.aspx">Air Force Profile</a><ul><li><a title="detail" href="/EN/About/About_Detail.aspx?ID=109">Vision of the ROCAF</a></li><li><a title="detail" href="/EN/About/About_Detail.aspx?ID=100">Mission of the ROCAF</a></li><li><a title="detail" href="/EN/About/About_Detail.aspx?ID=97">History of the ROCAF</a></li><li><a title="detail" href="/EN/About/About_Detail.aspx?ID=98">The banner of the ROCAF</a></li><li><a title="detail" href="/EN/About/About_Detail.aspx?ID=96">Organizational functions</a></li></ul></li><li><a title="move to Leadership" href="../Leadership/Leader_List.aspx">Leadership</a></li></ul></li><li class="NavLi"><a title="move to Air Force Unit" role="button" href="../History/History_Category.aspx?FID=25">Air Force Unit</a><ul class="SubNav"><li><a title="move to Command" href="../History/History_Category.aspx?FID=25">Command</a><ul><li><a title="move to Air Combat Command" href="../History/History_List.aspx?FID=25&amp;CID=149">Air Combat Command</a></li><li><a title="move to Air Force Education, Training and Doctrines Development Command" href="../History/History_List.aspx?FID=25&amp;CID=150">Air Force Education, Training and Doctrines Development Command</a></li><li><a title="move to Air Force Maintenance and Support Command" href="../History/History_List.aspx?FID=25&amp;CID=151">Air Force Maintenance and Support Command</a></li><li><a title="move to Air Force Air Defense and Missile Command" href="../History/History_List.aspx?FID=25&amp;CID=152">Air Force Air Defense and Missile Command</a></li></ul></li><li><a title="move to Combatant Wing" href="../History/History_Category.aspx?FID=26">Combatant Wing</a><ul><li><a title="move to Air Force Songshan AB Command" href="../History/History_List.aspx?FID=26&amp;CID=153">Air Force Songshan AB Command</a></li><li><a title="move to The 1st Tactical Fighter Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=154">The 1st Tactical Fighter Wing of ROCAF</a></li><li><a title="move to The 2nd Tactical Fighter Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=155">The 2nd Tactical Fighter Wing of ROCAF</a></li><li><a title="move to The 3rd Tactical Fighter Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=156">The 3rd Tactical Fighter Wing of ROCAF</a></li><li><a title="move to The 4th Tactical Fighter Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=157">The 4th Tactical Fighter Wing of ROCAF</a></li><li><a title="move to The 5th Tactical Composite Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=158">The 5th Tactical Composite Wing of ROCAF</a></li><li><a title="move to The 6th Composite Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=159">The 6th Composite Wing of ROCAF</a></li><li><a title="move to The 7th Tactical Fighter Wing of ROCAF" href="../History/History_List.aspx?FID=26&amp;CID=160">The 7th Tactical Fighter Wing of ROCAF</a></li></ul></li><li><a title="move to Other Units" href="../History/History_Category.aspx?FID=27">Other Units</a><ul><li><a title="move to Air Force Academy" href="../History/History_List.aspx?FID=27&amp;CID=161">Air Force Academy</a></li><li><a title="move to Air Force Flight Training Command" href="../History/History_List.aspx?FID=27&amp;CID=217">Air Force Flight Training Command</a></li><li><a title="move to Air Force College of Technology" href="../History/History_List.aspx?FID=27&amp;CID=162">Air Force College of Technology</a></li><li><a title="move to Aerospace Technology Research And Development Center of ROCAF" href="../History/History_List.aspx?FID=27&amp;CID=163">Aerospace Technology Research And Development Center of ROCAF</a></li></ul></li></ul></li><li class="NavLi"><a title="move to Armaments" role="button" href="/EN/Weapon/Weapon_List.aspx">Armaments</a><ul class="SubNav"><li><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=221">Fighters</a></li><li><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=222">Trainers</a></li><li><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=223">Anti-Submarine, Airborne Early Warning, and Transport Aircraft</a></li><li><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=224">Rescue Aircraft</a></li><li><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=225">Air Defense Weapons</a></li></ul></li><li class="NavLi"><a title="move to Popular Info." role="button" href="News_List.aspx">Popular Info.</a><ul class="SubNav"><li><a title="move to NEWS" href="News_List.aspx?CID=89">NEWS</a></li><li><a title="move to Important Policies" href="News_List.aspx?CID=101">Important Policies</a></li><li><a title="move to Air activities" href="News_List.aspx?CID=214">Air activities</a></li></ul></li><li class="NavLi"><a title="move to Service" role="button" href="../Contact/Contact_Info.aspx">Service</a><ul class="SubNav"><li><a title="move to Contact Us" href="../Contact/Contact_Info.aspx">Contact Us</a></li><li><a title="move to FAQs(Open in new window)" href="https://www.mnd.gov.tw/CitizenServices/FAQ" target="_blank">FAQs</a></li></ul></li><li class="NavLi"><a title="move to Past and Current Facts" role="button" href="../PastCurrent/PastCurrent_Category.aspx?FID=28">Past and Current Facts</a><ul class="SubNav"><li><a title="move to Warfighting Sagas" href="../PastCurrent/PastCurrent_Category.aspx?FID=28">Warfighting Sagas</a><ul><li><a title="move to Glorious Air Battles" href="../PastCurrent/PastCurrent_List.aspx?FID=28&amp;CID=175">Glorious Air Battles</a></li><li><a title="move to Brave and Courageous Forerunners" href="../PastCurrent/PastCurrent_List.aspx?FID=28&amp;CID=176">Brave and Courageous Forerunners</a></li></ul></li><li><a title="move to Special Topics" href="../Unit/Activity_List.aspx">Special Topics</a><ul><li><a title="move to Black Bat Squadron" href="../Unit/Activity_List.aspx?CID=173">Black Bat Squadron</a></li><li><a title="move to Black Cat Squadron" href="../Unit/Activity_List.aspx?CID=174">Black Cat Squadron</a></li><li><a title="move to Thunder Tigers Aerobatic Team" href="../Unit/Activity_List.aspx?CID=177">Thunder Tigers Aerobatic Team</a></li><li><a title="Move to Air Rescue Group" href="/Airforce_Am_EN/Home/index.aspx" target="_blank">Air Rescue Group<span class="new-open">(Open in a new window)</span></a></li><li><a title="move to 10th Airlift Group" href="/10th_Airlift_Group_EN/index.aspx" target="_blank">10th Airlift Group<span class="new-open">(Open in a new window)</span></a></li></ul></li></ul></li><li class="NavLi"><a title="繁中語系" href="/" target="_blank">Chinese<span class="new-open">(Opens new window)</span></a></li></ul>
+                </nav>
+                <!--Nav END-->
+                <!--Search START-->
+                <link rel="stylesheet" href="../../JS/SpeechToText/speech-input.css">
+
+                <div class="Search search-open" id="btnOpenSearch" tabindex="0" role="button" accesskey="A" aria-label="Website search open" aria-haspopup="dialog" aria-expanded="false" aria-controls="wpSearchOverlay"><i class="material-icons Open">search</i></div>
+                <div class="SearchBox" id="wpSearchOverlay">
+                    <input name="ctl00$txb_s" type="text" id="txb_s" accesskey="S" class="speech-input" placeholder="Hot Keywords: Airforce、Command" title="Search" />
+                    <label for="txb_s"></label>
+                    <a id="lbut_s" class="material-icons" href="javascript:__doPostBack(&#39;ctl00$lbut_s&#39;,&#39;&#39;)">search</a>
+                </div>
+                <div class="Search search-close" id="btnCloseSearch" tabindex="0" role="button" aria-label="Website search close" accesskey="X"><i class="material-icons Close">close</i></div>
+                <script src="/js/SpeechToText/speech-input.js"></script>
+				<script src="/js/search.js"></script>       
+                <!--Search END-->
+            </header>
+            <!--Header END-->
+            <!--Content START-->
+            <main class="Content">
+                <a id="C" href="#C" accesskey="C" class="Accesskey_C" title="Main Content Area">:::</a>
+                <div class="FontSize">
+					<span>Font Size：</span><a id="F-S" href="javascript:void(0)" title="Smaller font" role="button" class="btn-fontsize">S</a>
+					<a id="F-M" href="javascript:void(0)" title="Medium font" role="button" class="btn-fontsize">M</a>
+					<a id="F-L" href="javascript:void(0)" title="Larger font" role="button" class="btn-fontsize">L</a>
+				</div>
+				<script src="/js/fontsize.js?ts=202609151710"></script>
+                
+          <!--內容動畫一START-->
+      <div class="Ani-Content Ani-Content1">
+        <!--ContentHeader START-->
+        <div class="ContentHeader">
+          <p><a href="../Home/index.aspx" title="Go home page">Home</a><span>/</span><a id="ContentPlaceHolder1_hl_Unit" title="move to Popular Info." href="News_List.aspx?CID=89">Popular Info.</a><span>/</span><a id="ContentPlaceHolder1_hl_Cate" title="move to Air activities" href="News_List.aspx?CID=214">Air activities</a></p>
+          <div>
+            <h1><span id="ContentPlaceHolder1_lab_Title">PLA activities in the waters and airspace around Taiwan Sep.29 2026</span></h1>
+            <div class="Share">
+              <div><a title="FaceBook Share(Open in new window)" class="icon" href="javascript:desc='';via='';if(document.referrer)via=document.referrer;if(typeof(_ref)!='undefined')via=_ref;if(window.getSelection)desc=window.getSelection();if(document.getSelection)desc=document.getSelection();if(document.selection)desc=document.selection.createRange().text;void(open('https://www.facebook.com/share.php?u='+encodeURIComponent(location.href)));">
+                <svg class="pic" focusable="false" xmlns="https://www.w3.org/2000/svg" viewBox="0 0 32 32">
+                  <path fill="#FFF" d="M17.78 27.5V17.008h3.522l.527-4.09h-4.05v-2.61c0-1.182.33-1.99 2.023-1.99h2.166V4.66c-.375-.05-1.66-.16-3.155-.16-3.123 0-5.26 1.905-5.26 5.405v3.016h-3.53v4.09h3.53V27.5h4.223z"></path>
+                </svg><span class="share-text">Facebook</span>
+                </a></div>
+              <div><a title="Line Share(Open in new window)" class="icon" href="javascript:desc='';via='';if(document.referrer)via=document.referrer;if(typeof(_ref)!='undefined')via=_ref;if(window.getSelection)desc=window.getSelection();if(document.getSelection)desc=document.getSelection();if(document.selection)desc=document.selection.createRange().text;void(open('https://lineit.line.me/share/ui?url='+encodeURIComponent(location.href)));">
+                <svg class="pic" focusable="false" xmlns="https://www.w3.org/2000/svg" viewBox="0 0 32 32">
+                  <path fill="#FFF" d="M28 14.304c0-5.37-5.384-9.738-12-9.738S4 8.936 4 14.304c0 4.814 4.27 8.846 10.035 9.608.39.084.923.258 1.058.592.122.303.08.778.04 1.084l-.172 1.028c-.05.303-.24 1.187 1.04.647s6.91-4.07 9.43-6.968c1.74-1.905 2.57-3.842 2.57-5.99zM11.302 17.5H8.918a.631.631 0 0 1-.63-.63V12.1a.63.63 0 0 1 1.26.002v4.14h1.754c.35 0 .63.28.63.628a.63.63 0 0 1-.63.63zm2.467-.63a.631.631 0 0 1-.63.628.629.629 0 0 1-.63-.63V12.1a.63.63 0 1 1 1.26 0v4.77zm5.74 0a.632.632 0 0 1-1.137.378l-2.443-3.33v2.95a.631.631 0 0 1-1.26 0V12.1a.634.634 0 0 1 .63-.63.63.63 0 0 1 .504.252l2.444 3.328V12.1a.63.63 0 0 1 1.26 0v4.77zm3.853-3.014a.63.63 0 1 1 0 1.258H21.61v1.126h1.755a.63.63 0 1 1 0 1.258H20.98a.63.63 0 0 1-.628-.63V12.1a.63.63 0 0 1 .63-.628h2.384a.63.63 0 0 1 0 1.258h-1.754v1.126h1.754z"></path>
+                </svg><span class="share-text">Line</span>
+                </a></div>
+            </div>
+              <p id="ContentPlaceHolder1_lab_Date" class="Time">2026/09/29</p>
+          </div>
+        </div>
+        <!--ContentHeader END-->
+      </div>
+      <!--內容動畫一END-->
+      <!--內容動畫二START-->
+      <div class="Ani-Content Ani-Content2">
+        <!--編輯器 START-->
+        <div class="Des">
+            <span id="ContentPlaceHolder1_lab_Descr"><p><strong>2.PLA activities:</strong><br /> 3 sorties of PLA aircraft, 6 PLAN ships and 4 official ships operating around Taiwan were detected as of 6 a.m. (UTC+8) today. 1 out of 3 sorties entered Taiwan&rsquo;s southwestern ADIZ. ROC Armed Forces have monitored the situation and employed CAP aircraft, Navy ships, and coastal missile systems in response to detected activities</p> <p>Source:Ministry of National Defense R.O.C - Military New Update(Sep.29,2026)</p> <div class="dynamics-right"> <p><img alt="1150929_臺海周邊海、空域活動示意圖" src=" ../../../Photo/NewsHTML/202609290927_397286.jpg" /></p> </div> </span><br/>
+            <span id="ContentPlaceHolder1_lab_Upd">Update：2026-09-29</span>
+        </div>
+        <!--編輯器 END-->
+          <!--檔案下載&連結 Start-->
+          <div id="ContentPlaceHolder1_div_DownList" class="DownList">
+              </div>
+          <!--檔案下載&連結 END-->
+      </div>
+      <!--內容動畫二END-->
+      <!--內容動畫三START-->
+      <div class="Ani-Content Ani-Content3">
+        <div class="GoBack">
+            <a id="ContentPlaceHolder1_hl_back" title="go Back" href="News_List.aspx?CID=214">Back</a>
+        </div>
+      </div>
+      <!--內容動畫三END-->
+
+            </main>
+            <!--Content END-->
+            <!--Footer START-->
+            <footer class="Footer">
+                <a id="B" href="#B" accesskey="B" class="Accesskey_B" title="The bottom of SiteMap and Copyright area">:::</a>
+                <!--FooterMain START-->
+                <div class="FooterMain">
+                    <!--FooterLink START-->
+                    <div class="FooterLink">
+                        <ul>
+                            <li><a href="/Airforce_Am/index.aspx" title="move to Rescue Corp">Rescue Corp</a></li>
+							<li><a href="/10th_Airlift_Group_EN/index.aspx" title="move to 10th Airlift Group">10th Airlift Group</a></li>
+                        </ul>
+                    </div>
+                    <!--FooterLink END-->
+                    <!--FooterSiteMap START-->
+                    <div id="div_SiteMap" class="FooterSiteMap"><dl><dt><a title="move to About the Air Force" href="../About/About_List.aspx">About the Air Force</a></dt><dd><a title="move to Air Force Profile" href="../About/About_List.aspx">Air Force Profile</a></dd><dd><a title="move to Leadership" href="../Leadership/Leader_List.aspx">Leadership</a></dd></dl><dl><dt><a title="move to Air Force Unit" href="../History/History_Category.aspx?FID=25">Air Force Unit</a></dt><dd><a title="move to Command" href="../History/History_Category.aspx?FID=25">Command</a></dd><dd><a title="move to Combatant Wing" href="../History/History_Category.aspx?FID=26">Combatant Wing</a></dd><dd><a title="move to Other Units" href="../History/History_Category.aspx?FID=27">Other Units</a></dd></dl><dl><dt><a title="move to Armaments">Armaments</a></dt><dd><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=221">Fighters</a></dd><dd><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=222">Trainers</a></dd><dd><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=223">Anti-Submarine, Airborne Early Warning, and Transport Aircraft</a></dd><dd><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=224">Rescue Aircraft</a></dd><dd><a title="detail" href="/EN/Weapon/Weapon_List.aspx?CID=225">Air Defense Weapons</a></dd></dl><dl><dt><a title="move to Popular Info." href="News_List.aspx">Popular Info.</a></dt><dd><a title="move to NEWS" href="News_List.aspx?CID=89">NEWS</a></dd><dd><a title="move to Important Policies" href="News_List.aspx?CID=101">Important Policies</a></dd><dd><a title="move to Air activities" href="News_List.aspx?CID=214">Air activities</a></dd></dl><dl><dt><a title="move to Service" href="../Contact/Contact_Info.aspx">Service</a></dt><dd><a title="move to Contact Us" href="../Contact/Contact_Info.aspx">Contact Us</a></dd><dd><a title="move to FAQs(Open in new window)" href="https://www.mnd.gov.tw/CitizenServices/FAQ" target="_blank">FAQs</a></dd></dl><dl><dt><a title="move to Past and Current Facts" href="../PastCurrent/PastCurrent_Category.aspx?FID=28">Past and Current Facts</a></dt><dd><a title="move to Warfighting Sagas" href="../PastCurrent/PastCurrent_Category.aspx?FID=28">Warfighting Sagas</a></dd><dd><a title="move to Special Topics" href="../Unit/Activity_List.aspx">Special Topics</a></dd></dl></div>
+                    <!--FooterSiteMap END-->
+                    <!--FooterQRcode START-->
+                    <div class="FooterQRcode">
+                        <img src="../Images/Layout/QRcode.jpg" alt="AIR FORCE HEADQUARTERS, MND Provide QRcode, Click this link to AIR FORCE HEADQUARTERS, MND index." />
+                        <p>QR Code</p>
+                    </div>
+                    <!--FooterQRcode END-->
+                </div>
+                <!--FooterMain END-->
+                <!--FooterFB START-->
+                <!--<div class="FooterFB">
+                    <img src="../Images/Layout/FBImg.jpg" title="Facebook" alt="Facebook" />
+                    <div class="fb-page" data-href="https://www.facebook.com/cafhq/" data-tabs="timeline" data-width="500" data-height="440" data-small-header="false" data-adapt-container-width="true" data-hide-cover="false" data-show-facepile="true">
+                        <blockquote xml:lang="zh" cite="https://www.facebook.com/cafhq/" class="fb-xfbml-parse-ignore"><a href="https://www.facebook.com/cafhq/" title="move to Airforce Facebook">Airforce Facebook</a></blockquote>
+                    </div>
+                </div>-->
+				<div class="FooterFB2">
+					<a href="https://www.facebook.com/cafhq/" target="_blank" rel="noreferrer noopener" title="Open in new window, Click this link to Airforce Facebook"><img src="/EN/images/Layout/DefSocial-03.jpg" alt="Airforce Facebook" /></a></div>
+                <!--FooterFB END-->
+                <!--Copyright START-->
+                <div class="Copyright">
+                    <!--SubNav START-->
+                    <div class="BottomNav">
+                        <ul>
+                            <li><a href="../WebInfo/Privacy_Info.aspx?ID=8" title="move to Privacy Policy">Privacy Policy</a></li>
+                            <li><a href="../WebInfo/Privacy_Info.aspx?ID=9" title="move to Security Policy">Security Policy</a></li>
+                            <li><a href="../WebInfo/Privacy_Info.aspx?ID=10" title="move to Open Government Declaration">Open Government Declaration</a></li>
+                        </ul>
+                        <a class="RSS" href="../WebInfo/RSS.aspx" target="_blank" rel="noreferrer noopener" title="RSS(Open in new window)"><img src="../Images/Layout/RSS.png" alt="RSS" /></a>
+                    </div>
+                    <!--SubNav END-->
+                    <!--ThemeSwitch START-->
+                    <div class="ThemeSwitch">
+                        <p>
+                            <span>Theme：</span>
+                            <a id="Switch_Default" title="Weekday Theme" class="Switch_Default" href="javascript:__doPostBack(&#39;ctl00$Switch_Default&#39;,&#39;&#39;)">Weekday</a>
+                            <a id="Switch_Spring" title="Spring Theme" class="Switch_Spring" href="javascript:__doPostBack(&#39;ctl00$Switch_Spring&#39;,&#39;&#39;)">Spring</a>
+                            <a id="Switch_Festival" title="Festival Theme" class="Switch_Festival" href="javascript:__doPostBack(&#39;ctl00$Switch_Festival&#39;,&#39;&#39;)">Festival</a>
+                            <a id="Switch_MidMoon" title="Mid Autumn Theme" class="Switch_MidMoon" href="javascript:__doPostBack(&#39;ctl00$Switch_MidMoon&#39;,&#39;&#39;)">Mid Autumn</a>
+                            
+                            
+                            <a id="Switch_Blue" title="Blue Theme" class="Switch_Blue" href="javascript:__doPostBack(&#39;ctl00$Switch_Blue&#39;,&#39;&#39;)">Blue</a>
+                            <a id="Switch_Dark" title="Black Theme" class="Switch_Dark" href="javascript:__doPostBack(&#39;ctl00$Switch_Dark&#39;,&#39;&#39;)">Black</a>
+                        </p>
+                    </div>
+                    <!--ThemeSwitch END-->
+                    <!--CopyrightText START-->
+                    <div class="CopyrightText">
+                        <p><span class="Tel">886-2-2532-1610</span><span class="Add">No. 387, Beian Road, Zhongshan District, Taipei City, 104237 </span></p>
+                        <p><span><span>Website Update：</span><span id="lab_Upd">2026-09-29</span></span><span><span>Online：</span><span id="lab_Online">300</span></span><span><span>Visitors：</span><span id="lab_Count">11516103</span></span></p>
+                        <p><small><span>Copyright &#169; 2026</span><span>Air Force Headquarters,MND.</span><span>All rights reserved.</span></small></p>
+                    </div>
+                    <!--CopyrightText END-->
+                    <!--Mark START-->
+                    <div class="Mark">
+                        <a href="http://www.taiwan.gov.tw/" title="Republic of China (Taiwan) Government Entry Point(Open in new window)" target="_blank" rel="noreferrer noopener"><img src="../Images/Layout/FooterMark_01.jpg" alt="Republic of China (Taiwan) Government Entry Point" /></a>
+						<a href="https://accessibility.moda.gov.tw/Applications/Detail?category=20250305171032" title="Link to Accessible Space Page(Open in new window)" target="_blank" rel="noreferrer noopener"><img src="../Images/Layout/FooterMark_02.png" alt="Accessible Space Mark"></a>
+                    </div>
+                    <!--Mark END-->
+                </div>
+                <!--Copyright END-->
+            </footer>
+            <!--Footer END-->
+        </div>
+        <!--Wrapper END-->
+    </form>
+</body>
+<script>
+    $(function () {
+		/*滑動顯示內容動畫*/
+        $(document).scroll(function () {
+			for (i = 0; i < $('.Content').children().length; i++) {
+				var $aniContent = $('.Ani-Content' + (i + 1));
+				if ($aniContent && $aniContent.offset()) {
+					if ($(this).scrollTop() >= $aniContent.offset().top - window.innerHeight / 2) {
+						$aniContent.addClass("Ani_o");
+					}
+					else { $aniContent.removeClass("Ani_o"); }
+				}
+			}
+		});
+    });
+	$('.FooterSiteMap dl dt').on('click', function() {
+  // 1. 取得當前被點擊 dt 的父層 dl
+  const $currentDl = $(this).closest('dl');
+  
+  // 2. 找到 .FooterSiteMap 內「除了當前 dl 以外」的所有 dl，並移除 active 類別
+  $('.FooterSiteMap dl').not($currentDl).removeClass('active');
+  
+  // 3. 切換當前 dl 的 active 狀態
+  $currentDl.toggleClass('active');
+});
+</script>
+</html>
