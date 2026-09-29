@@ -555,10 +555,7 @@ class TestComputeStateVectorMonthlyStaleness:
     ):
         from intelligence.regime import state_vector as sv_mod
 
-        # _get_normalization_stats caches globally by design (module-level
-        # _NORM_CACHE) — reset around this test so an earlier/later test's
-        # engine never leaks in, and so this test's data doesn't leak out.
-        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+        # Normalization is computed for this fixture/as_of; no process cache.
 
         as_of = date(2026, 9, 20)
         latest_obs = as_of - timedelta(days=50)  # >30d (old rule) but <70d (new rule)
@@ -583,7 +580,6 @@ class TestComputeStateVectorMonthlyStaleness:
     ):
         from intelligence.regime import state_vector as sv_mod
 
-        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
 
         as_of = date(2026, 9, 20)
         latest_obs = as_of - timedelta(days=50)
@@ -606,7 +602,6 @@ class TestComputeStateVectorMonthlyStaleness:
         publication lag the threshold covers) must still be flagged."""
         from intelligence.regime import state_vector as sv_mod
 
-        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
 
         as_of = date(2026, 9, 20)
         latest_obs = as_of - timedelta(days=90)  # > MONTHLY_STALE_DAYS (70)
@@ -631,7 +626,6 @@ class TestComputeStateVectorMonthlyStaleness:
         stand-in via QUARTERLY_FRED_SERIES."""
         from intelligence.regime import state_vector as sv_mod
 
-        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
         monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({"ICSA"}))
 
         as_of = date(2026, 9, 20)
@@ -652,12 +646,20 @@ class TestComputeStateVectorMonthlyStaleness:
 def _seed_staleness_series(engine, sid, age, *, count=120, status="SUCCESS", value=1.0):
     """Synthetic daily observations for real bounded-reader regression tests."""
     latest = AS_OF - timedelta(days=age)
+    dates = []
+    candidate = latest
+    while len(dates) < count:
+        # This synthetic daily fixture isolates threshold/window behavior.
+        # There is no official October2025 unemployment observation.
+        if sid != 'UNRATE' or candidate != date(2025, 10, 1):
+            dates.append(candidate)
+        candidate -= timedelta(days=1)
     rows = [
         {
-            "sid": sid, "src": FRED_SRC, "dt": latest - timedelta(days=i),
+            "sid": sid, "src": FRED_SRC, "dt": observation_date,
             "ts": T0, "value": value + i * 0.01, "status": status,
         }
-        for i in range(count)
+        for i, observation_date in enumerate(dates)
     ]
     with engine.begin() as conn:
         conn.execute(text(
@@ -678,7 +680,6 @@ def test_stale_flag_remains_monotonic_for_usable_values(
 ):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     if sid == "ICSA_QUARTERLY":
         sid = "ICSA"
         monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({sid}))
@@ -700,7 +701,6 @@ def test_stale_flag_remains_monotonic_for_usable_values(
 def test_unavailable_inputs_are_none_without_a_stale_flag(engine, monkeypatch, mode):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     if mode == "failed_only":
         _seed_staleness_series(engine, "UNRATE", 0, status="FAILED")
     elif mode == "insufficient_history":
@@ -722,7 +722,6 @@ def test_staleness_respects_inclusive_compute_window_and_min_history(
 ):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     # UNRATE requires 30 observations. At age 2491 exactly 30 daily
     # observations fit in the inclusive 2520-day compute window; at 2492
     # only 29 fit, even though the longer normalization read sees them all.
@@ -737,7 +736,6 @@ def test_staleness_respects_inclusive_compute_window_and_min_history(
 def test_failed_marker_cannot_hide_retained_stale_value(engine, monkeypatch):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     _seed_staleness_series(engine, "UNRATE", 131)
     _seed_staleness_series(engine, "UNRATE", 0, count=1, status="FAILED", value=0)
 
@@ -750,7 +748,7 @@ def test_failed_marker_cannot_hide_retained_stale_value(engine, monkeypatch):
 def test_retained_numeric_zero_is_usable_and_stale(engine, monkeypatch):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_get_normalization_stats", lambda _e: {})
+    monkeypatch.setattr(sv_mod, "_get_normalization_stats", lambda *_args: {})
     _seed_staleness_series(engine, "UNRATE", 131, value=0)
 
     result = sv_mod.compute_state_vector(engine, AS_OF)
@@ -762,7 +760,6 @@ def test_retained_numeric_zero_is_usable_and_stale(engine, monkeypatch):
 def test_mixed_source_compute_input_remains_unavailable_without_stale_flag(engine, monkeypatch):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     _seed_staleness_series(engine, "UNRATE", 131)
     _insert(engine, "UNRATE", AS_OF - timedelta(days=130), 4.0, source_id=YF_SRC)
 
@@ -776,7 +773,6 @@ def test_mixed_source_compute_input_remains_unavailable_without_stale_flag(engin
 def test_retained_stale_value_in_vector_above_cache_completeness_floor(engine, monkeypatch):
     from intelligence.regime import state_vector as sv_mod
 
-    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
     monkeypatch.setattr(sv_mod, "_get_crossref_score", lambda _e, _d: None)
     _seed_staleness_series(engine, "UNRATE", 131)
     for sid in [

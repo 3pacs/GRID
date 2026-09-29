@@ -348,13 +348,17 @@ class PublicationLag:
     days: int
     unit: str = "calendar"
     basis: str = ""
+    # Exact reference-date overrides for documented exceptional releases.
+    release_overrides: tuple[tuple[date, date], ...] = ()
+    unpublished_dates: frozenset[date] = frozenset()
 
     def known_dates(self, obs_dates: list[date]) -> list[date]:
         """Modeled known-at date for each of ``obs_dates`` (same order)."""
         if not obs_dates:
             return []
         if self.unit == "calendar":
-            return [d + timedelta(days=self.days) for d in obs_dates]
+            overrides = dict(self.release_overrides)
+            return [overrides.get(d, d + timedelta(days=self.days)) for d in obs_dates]
         if self.unit == "business":
             import numpy as np
 
@@ -410,8 +414,9 @@ def read_window_known_at(
       after ``as_of`` are ignored.
     * **modeled** — otherwise, when ``lag`` is given and
       ``lag.known_dates([obs_date]) <= as_of``. The value is the *earliest*
-      pulled vintage (the closest available proxy for the first release,
-      ``FIRST_RELEASE``-like), so a revision appended later never changes it.
+      pulled vintage. This is a revised vintage as of backfill, not the
+      first published value: release-date eligibility does not recover an ALFRED
+      vintage. A later re-pull of an existing date does not replace that value.
       With ``lag=None`` there is no modeled path: pull evidence only.
 
     Either way the result for a given ``as_of`` depends only on rows pulled
@@ -449,13 +454,19 @@ def read_window_known_at(
 
     out: list[Observation] = []
     known_sources: set[str] = set()
+    release_overrides = dict(lag.release_overrides) if lag is not None else {}
     for (d, vintages), modeled_known in zip(groups, modeled):
+        if lag is not None and d in lag.unpublished_dates:
+            continue  # official reference period was never published
+        if release_overrides.get(d, date.min) > as_of:
+            continue  # an anomalous early pull cannot override an official embargo
         pulled = [(v, ts, s, _utc_date(ts)) for v, ts, s in vintages]
         proven = [p for p in pulled if p[3] is not None and p[3] <= as_of]
         if proven:
             v, ts, s, pull_day = proven[0]  # latest vintage pulled by as_of
             known = pull_day if modeled_known is None else min(pull_day, modeled_known)
-            out.append(Observation(series_id, d, v, ts, s, max(d, known), "pulled"))
+            known = max(d, known, release_overrides.get(d, date.min))
+            out.append(Observation(series_id, d, v, ts, s, known, "pulled"))
             known_sources.update(p[2] for p in proven if p[2] is not None)
         elif modeled_known is not None and modeled_known <= as_of:
             v, ts, s, _ = pulled[-1]  # earliest pulled vintage

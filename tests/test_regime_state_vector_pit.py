@@ -274,27 +274,26 @@ def test_monthly_value_released_after_as_of_does_not_affect_vector(engine):
     assert before["values"]["unemployment_level"] is not None
 
     # UNRATE for May 2025 (dated 05-01, published 06-06): an extreme value.
-    # At AS_OF = 06-10 it IS public by the model (05-01 + 40d = 06-10).
+    # At AS_OF =06-10 it is not yet public by the model (05-01 +42d =06-12).
     # June 2025 (dated 06-01) is not published until July; the pre-fix
     # obs_date <= as_of read would have used it at 06-10.
     _insert_many(engine, [_row("UNRATE", date(2025, 6, 1), 99.0)])
     after = _vec(compute_state_vector(engine, AS_OF))
     assert after == before
 
-    # Once released (06-01 + 40d = 07-11), it does move the dimension.
-    later = _vec(compute_state_vector(engine, date(2025, 7, 11)))
+    # Once released (06-01 +42d =07-13), it does move the dimension.
+    later = _vec(compute_state_vector(engine, date(2025, 7, 13)))
     assert later["values"]["unemployment_level"] > 5  # 99.0 z-scored against ~50s
 
 
 def test_stale_flag_uses_the_newest_known_observation(engine):
-    """A monthly series whose newest known value is >30 days old is stale
-    (the old 60-day staleness window reported it fresh when it was >60)."""
+    """Monthly stale age respects731's70day threshold after availability filtering."""
     from intelligence.regime.state_vector import compute_state_vector
 
     _seed_history(engine, end=date(2025, 5, 31))
     sv = compute_state_vector(engine, AS_OF)
-    # Newest UNRATE known at 06-10 is dated 05-01: 40 days old.
-    assert "unemployment_level" in sv.stale_dimensions
+    # Newest UNRATE known at06-10 is dated04-01:70days old, exactly fresh.
+    assert "unemployment_level" not in sv.stale_dimensions
     # Daily VIX known through the prior business day: fresh.
     assert "vix_level" not in sv.stale_dimensions
 

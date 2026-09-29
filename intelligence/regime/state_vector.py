@@ -5,15 +5,17 @@ Each state vector captures the macro environment at a point in time across
 24 dimensions — VIX, rates, spreads, employment, liquidity, momentum, and
 cross-reference divergence scores.
 
-Point-in-time contract (``as_of`` = known by the end of that UTC day)
+Availability contract (``as_of`` = end of that UTC day)
 --------------------------------------------------------------------
 * **Macro inputs** are read with ``store.observations.read_window_known_at``:
   an observation is visible at ``as_of`` only if it was pulled by then, or —
   for history backfilled long after the fact (every FRED row on griddb was
   pulled on or after 2026-03-24) — if its declared, conservative
   :data:`PUBLICATION_LAGS` entry says it was published by then. The
-  observation date alone never makes a value visible, so a monthly series
-  dated the 1st is not seen weeks before its release.
+  observation date alone never makes a value visible. Modeled dates delay
+  eligibility but values remain revised vintage as of backfill (2026-03-24),
+  not first-release/ALFRED values. Documented UNRATE shutdown dates override
+  the ordinary lag; other exceptional release delays remain unmodeled.
   ``store.pit.PITStore`` cannot serve these reads: ``resolved_series``'s
   ``release_date`` for them is (almost always) the backfill pull date, so
   it returns little or no history before 2026-03.
@@ -21,8 +23,8 @@ Point-in-time contract (``as_of`` = known by the end of that UTC day)
   same PIT-visible series in a rolling :data:`NORM_LOOKBACK_DAYS` window
   ending at ``as_of`` — the 10,000-day window the original design used,
   anchored at ``as_of`` instead of the run date. No process-level cache: a
-  vector depends only on ``as_of`` and data known by then, not on when or in
-  which process it was computed.
+  vector no longer uses run-date normalization. Later insertion of previously
+  absent historical observations can still change modeled historical vectors.
 * **SPY** momentum/RSI keep their existing basis handling (``spy_full`` via
   ``store.pit`` where PIT-visible, else raw ``YF:SPY:close``).
 
@@ -116,9 +118,10 @@ DIM_WEIGHTS = np.array([d.weight for d in STATE_DIMENSIONS], dtype=np.float64)
 # "First pull" figures are the observed obs->first-pull lags for the dates
 # GRID ingested live (griddb, read-only, 2026-09-29).
 #
-# Known gap: releases delayed by a government shutdown (e.g. the Oct 2013 and
-# Oct-Nov 2025 BLS/BEA delays) exceed these lags; a backfilled vector for
-# those few weeks can still see a value slightly early.
+# UNRATE shutdown exceptions below use official BLS release dates. Other
+# series/delays still use modeled lags; this is not a complete release calendar.
+# Revised history uses earliest GRID vintage (backfilled >=2026-03-24), not
+# the historical first published value. Only actual vintage data can fix that.
 _NEXT_BUSINESS_DAY = PublicationLag(
     1, "business",
     "next business day; same lag as analysis.research_real_panel.PUBLICATIONS "
@@ -135,9 +138,21 @@ PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
     'BAMLC0A0CM': _NEXT_BUSINESS_DAY,
     # Monthly, dated the 1st of the reference month
     'UNRATE': PublicationLag(
-        40, "calendar",
-        "BLS Employment Situation, first Friday of the next month (latest ~day 10); "
-        "first pull 31-35d",
+        42, "calendar",
+        "BLS Employment Situation: conservative ordinary release-date proxy; "
+        "documented shutdown dates override it; revised vintage as of backfill 2026-03-24",
+        release_overrides=(
+            # https://www.bls.gov/schedule/2013/home.htm
+            (date(2013, 9, 1), date(2013, 10, 22)),
+            (date(2013, 10, 1), date(2013, 11, 8)),
+            # https://www.bls.gov/news.release/archives/empsit_11202025.htm
+            (date(2025, 9, 1), date(2025, 11, 20)),
+            # https://www.bls.gov/news.release/archives/empsit_12162025.htm
+            (date(2025, 11, 1), date(2025, 12, 16)),
+        ),
+        # CPS October data were not collected and will not be reconstructed.
+        # https://www.bls.gov/cps/methods/2025-federal-government-shutdown-impact-cps.htm
+        unpublished_dates=frozenset({date(2025, 10, 1)}),
     ),
     'INDPRO': PublicationLag(
         50, "calendar",
@@ -282,20 +297,19 @@ def _fetch_series(
 
 
 class _AsOfReader:
-    """Per-``compute_state_vector`` memo: each macro series is read once.
+    """Per-as_of memo with separate normalization and accepted compute reads.
 
-    Reads the full :data:`NORM_LOOKBACK_DAYS` PIT window (needed for the
-    normalisation stats) and serves the shorter
-    :data:`VALUE_LOOKBACK_DAYS` window to the transforms by slicing it. The
-    known-at rule is decided per observation date, so the slice equals a
-    direct read of the shorter window. Lives for one ``as_of`` only; nothing
-    is shared across dates or calls.
+    Mixed-source validation is bounded by each read. A different source outside
+    the 2520-day compute window must not make an otherwise accepted value vanish.
+    Values and stale age share one cached compute input; normalization uses its
+    distinct 10000-day window. No memo is shared across dates or calls.
     """
 
     def __init__(self, engine: Engine, as_of: date) -> None:
         self.engine = engine
         self.as_of = as_of
         self._full: dict[str, pd.Series] = {}
+        self._windows: dict[str, pd.Series] = {}
 
     def full(self, series_id: str) -> pd.Series:
         if series_id not in self._full:
@@ -305,11 +319,11 @@ class _AsOfReader:
         return self._full[series_id]
 
     def window(self, series_id: str) -> pd.Series:
-        series = self.full(series_id)
-        if series.empty:
-            return series
-        cutoff = self.as_of - timedelta(days=VALUE_LOOKBACK_DAYS)
-        return series[[d >= cutoff for d in series.index]]
+        if series_id not in self._windows:
+            self._windows[series_id] = _fetch_series(
+                self.engine, series_id, self.as_of, lookback_days=VALUE_LOOKBACK_DAYS,
+            )
+        return self._windows[series_id]
 
 
 def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
@@ -566,13 +580,13 @@ def _zscore_normalize(value: float | None, mean: float, std: float) -> float | N
 # ── Main computation ─────────────────────────────────────────────────────
 
 def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVector:
-    """Compute the macro state vector at a specific date (PIT-correct).
+    """Compute the macro state vector at a specific date with availability bounds.
 
     Each macro dimension is read point-in-time (only observations known by
     the end of ``as_of``, see :func:`_fetch_series`), transformed, and the
     ``raw`` ones z-scored against PIT stats as of ``as_of``
-    (:func:`_get_normalization_stats`). The result depends only on ``as_of``
-    and the data known by then — the nightly job
+    (:func:`_get_normalization_stats`). Backfilled values remain revised vintages,
+    not historically known first releases. The nightly job
     (``get_or_compute_state_vector``) and ``compute_state_vector_series``
     both call this and get the same vector for the same ``as_of``.
     """
