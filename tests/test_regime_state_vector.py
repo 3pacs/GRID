@@ -598,3 +598,52 @@ class TestComputeStateVectorMonthlyStaleness:
         sv = sv_mod.compute_state_vector(engine, as_of)
 
         assert "initial_claims" in sv.stale_dimensions
+
+    def test_unrate_at_90_days_is_flagged_stale(self, engine, monkeypatch):
+        """The other side of the fix: 70 days is a wider window than the
+        old flat 30, not an unconditional exemption. A monthly series
+        genuinely missing its release for ~90 days (beyond the ~4-8 week
+        publication lag the threshold covers) must still be flagged."""
+        from intelligence.regime import state_vector as sv_mod
+
+        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=90)  # > MONTHLY_STALE_DAYS (70)
+        first_obs = latest_obs - timedelta(days=34)
+        d = first_obs
+        value = 4.0
+        while d <= latest_obs:
+            _insert(engine, "UNRATE", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.01
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "unemployment_level" in sv.stale_dimensions
+        assert "unemployment_dir" in sv.stale_dimensions
+
+    def test_pretend_quarterly_series_at_200_days_is_flagged_stale(self, engine, monkeypatch):
+        """No dimension in STATE_DIMENSIONS is quarterly today, so this
+        proves QUARTERLY_STALE_DAYS (160) is enforced -- not skipped or
+        infinite -- the moment a series is classified quarterly, using
+        ICSA (already wired to the 'initial_claims' dimension) as a
+        stand-in via QUARTERLY_FRED_SERIES."""
+        from intelligence.regime import state_vector as sv_mod
+
+        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+        monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({"ICSA"}))
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=200)  # > QUARTERLY_STALE_DAYS (160)
+        first_obs = latest_obs - timedelta(days=104)  # ICSA needs 100 rows (default min_history)
+        d = first_obs
+        value = 200.0
+        while d <= latest_obs:
+            _insert(engine, "ICSA", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.5
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "initial_claims" in sv.stale_dimensions

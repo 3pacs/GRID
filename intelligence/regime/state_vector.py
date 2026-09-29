@@ -457,9 +457,18 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
             val = _compute_dimension(engine, dim, as_of, norm_stats, spy_prices)
             values.append(val)
 
-            # Check staleness for non-derived series
+            # Check staleness for non-derived series. The lookback here must
+            # reach back at least as far as this series' own stale
+            # threshold (70d monthly / 160d quarterly can both exceed a
+            # fixed 60d window) -- otherwise a series stale by MORE than the
+            # lookback silently returns an empty read here and is never
+            # flagged at all, regardless of the threshold comparison below.
+            # +60 is a buffer past the threshold itself so a series that's
+            # freshly crossed into "stale" is still found, not just one
+            # sitting exactly at the edge.
+            stale_lookback_days = max(60, _stale_threshold_days(dim.series_id) + 60)
             if not dim.series_id.startswith('DERIVED:') and val is not None:
-                series = _fetch_series(engine, dim.series_id, as_of, lookback_days=60)
+                series = _fetch_series(engine, dim.series_id, as_of, lookback_days=stale_lookback_days)
                 if len(series) > 0:
                     latest_date = series.index[-1]
                     if hasattr(latest_date, 'date'):
