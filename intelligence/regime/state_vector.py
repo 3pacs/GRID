@@ -171,6 +171,42 @@ NORM_LOOKBACK_DAYS = 10000
 # Window the dimension transforms read (unchanged).
 VALUE_LOOKBACK_DAYS = 2520
 
+# ── Cadence-aware staleness (GRID-STALE-SOURCES-AUDIT-20260929.md §4) ────
+#
+# The old rule flagged a dimension stale when its latest obs was >30 days
+# old, for every dimension regardless of publication cadence. FRED's
+# monthly macro series carry obs_date = the 1st of the reference month but
+# are published 4-8 weeks later, so a monthly dimension is *always* >30
+# days old, even the same day GRID picks up its newest release (the audit
+# measured a 4-minute-to-~51-hour GRID pickup lag across all five monthly
+# series it checked -- the flag was 100% a false positive, never a real
+# gap). These are the only monthly series among STATE_DIMENSIONS today;
+# QUARTERLY_FRED_SERIES starts empty and is ready for one, same pattern.
+MONTHLY_FRED_SERIES: frozenset[str] = frozenset({
+    "UNRATE", "INDPRO", "TCU", "M2SL", "UMCSENT",
+})
+QUARTERLY_FRED_SERIES: frozenset[str] = frozenset()
+
+DEFAULT_STALE_DAYS = 30
+# ~70 days safely covers a monthly series' worst-case release lag (4-8
+# weeks) plus GRID's own pickup delay, while still catching a release
+# that's genuinely been missed (the next one is always <45 days away) --
+# this is the audit's own suggested fix (§4: "monthly = stale only if obs
+# is more than ~70 days old").
+MONTHLY_STALE_DAYS = 70
+# Same logic one tier out: a quarterly series can be published 1-3 months
+# after quarter-end, so give it a proportionally larger window.
+QUARTERLY_STALE_DAYS = 160
+
+
+def _stale_threshold_days(series_id: str) -> int:
+    """Cadence-aware staleness threshold, in days, for one series_id."""
+    if series_id in MONTHLY_FRED_SERIES:
+        return MONTHLY_STALE_DAYS
+    if series_id in QUARTERLY_FRED_SERIES:
+        return QUARTERLY_STALE_DAYS
+    return DEFAULT_STALE_DAYS
+
 
 # ── State Vector ─────────────────────────────────────────────────────────
 
@@ -180,7 +216,7 @@ class StateVector:
     as_of_date: date
     values: tuple[float | None, ...]    # one per dimension, None = missing
     completeness: float                 # fraction of non-null dims
-    stale_dimensions: tuple[str, ...]   # dims with data >30d old
+    stale_dimensions: tuple[str, ...]   # usable non-derived dims beyond their cadence threshold
     # Which SPY price series fed the momentum/RSI dimensions: "spy_full"
     # (the resolved, post re-resolve feature) or the raw "YF:SPY:close"
     # fallback, or None when neither was available (see _fetch_spy_prices).
@@ -551,17 +587,16 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
 
     for dim in STATE_DIMENSIONS:
         try:
-            val = _compute_dimension(reader, dim, as_of, norm_stats, spy_prices)
-            values.append(val)
-
-            # Staleness for non-derived series: age of the newest observation
-            # known at as_of (the one the value came from). Before the PIT
-            # fix this looked only at a 60-day window, so a series with
-            # nothing in the last 60 days read as *not* stale.
-            if not dim.series_id.startswith('DERIVED:') and val is not None:
+            # Same accepted 2520-day series drives value and stale age.
+            series = None
+            if not dim.series_id.startswith('DERIVED:'):
                 series = reader.window(dim.series_id)
-                if len(series) > 0 and (as_of - series.index[-1]).days > 30:
+            val = _compute_dimension(reader, dim, as_of, norm_stats, spy_prices, series=series)
+            if val is not None and series is not None and not series.empty:
+                days_stale = (as_of - series.index[-1]).days
+                if days_stale > _stale_threshold_days(dim.series_id):
                     stale.append(dim.name)
+            values.append(val)
         except Exception as exc:
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))
             values.append(None)
@@ -585,8 +620,12 @@ def _compute_dimension(
     as_of: date,
     norm_stats: dict[str, tuple[float, float]],
     spy_prices: pd.Series,
+    *,
+    series: pd.Series | None = None,
 ) -> float | None:
-    """Compute a single dimension value (macro reads via the PIT ``reader``)."""
+    """Compute a dimension, reusing its accepted input when supplied."""
+    if not isinstance(reader, _AsOfReader):
+        reader = _AsOfReader(reader, as_of)
     engine = reader.engine
 
     # ── Derived dimensions (computed from other series) ──
@@ -619,7 +658,8 @@ def _compute_dimension(
         return _get_insider_sentiment(engine, as_of)
 
     # ── Standard series dimensions ──
-    series = reader.window(dim.series_id)
+    if series is None:
+        series = reader.window(dim.series_id)
     if series.empty or len(series) < dim.min_history:
         return None
 
