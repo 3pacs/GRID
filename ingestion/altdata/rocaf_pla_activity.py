@@ -186,10 +186,24 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
         # A second/unsupported mention makes the report ambiguous, even if
         # one other clause has a parseable count. Check all visible text so
         # an out-of-window mention cannot silently become an omitted zero.
-        clauses = [c.strip() for c in re.split(r"[.;!?]", body) if "adiz" in c.lower()]
-        if text.lower().count("adiz") != 1 or len(clauses) != 1:
+        # Keep semicolon-linked qualifications and sentence terminators. A
+        # question must not become an assertion by losing its "?". Inspect
+        # the complete sentence before applying the unchanged activity window,
+        # so a qualifier just beyond that window cannot be silently dropped.
+        sentences = [m for m in re.finditer(r"[^.!?]+(?:[.!?]+|$)", text[start:])
+                     if "adiz" in m.group().lower()]
+        if text.lower().count("adiz") != 1 or len(sentences) != 1:
             return None
-        m_adiz = _ADIZ_RE.fullmatch(clauses[0])
+        sentence = sentences[0]
+        if sentence.end() > len(body):
+            return None
+        statement = sentence.group().strip()
+        # A single declarative period is supported; ?, !, mixed/repeated
+        # punctuation and semicolon qualifications remain for fullmatch to
+        # reject. Unpunctuated complete statements retain prior support.
+        if statement.endswith("."):
+            statement = statement[:-1].rstrip()
+        m_adiz = _ADIZ_RE.fullmatch(statement)
         if m_adiz is None:
             return None
         adiz_entries = int(m_adiz.group("all") or m_adiz.group("part"))
