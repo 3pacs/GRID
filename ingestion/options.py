@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -271,6 +271,7 @@ class OptionsPuller(BasePuller):
         *,
         include_catalyst_universe: bool = True,
         max_expirations: int = MAX_EXPIRATIONS,
+        should_continue: Callable[[], bool] | None = None,
     ) -> list[dict[str, Any]]:
         """Pull options chains for all tickers and compute signals.
 
@@ -285,6 +286,16 @@ class OptionsPuller(BasePuller):
             max_expirations: Limit the nearest complete expiries per ticker.
                 The default preserves the scheduler's existing 12-expiry cap;
                 the legacy GEM timer used six.
+            should_continue: Optional cooperative-cancellation check, polled
+                between tickers. When it returns False the remaining tickers
+                are reported ``DEFERRED`` and the run stops cleanly (instead
+                of being orphaned by a caller's hard timeout).
+
+        On a run that covered the whole ticker list with at least one
+        SUCCESS, this puller's own ``source_catalog`` row (``YFINANCE_OPTIONS``
+        resolves case-insensitively to ``yfinance_options``) gets its
+        ``last_pull_at`` bumped. Neither scheduler path did that before, so
+        the catalog showed this working feed as stale.
 
         Returns:
             list[dict]: Per-ticker results with status and row counts.
@@ -317,18 +328,42 @@ class OptionsPuller(BasePuller):
             return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
         results: list[dict[str, Any]] = []
 
-        for ticker in tickers:
+        for idx, ticker in enumerate(tickers):
+            if should_continue is not None and not should_continue():
+                results.extend(
+                    {"ticker": t, "status": "DEFERRED", "reason": "time budget"}
+                    for t in tickers[idx:]
+                )
+                log.info(
+                    "Options pull stopped cooperatively after {n}/{total} tickers",
+                    n=idx, total=len(tickers),
+                )
+                break
             result = self._pull_ticker(ticker, today_str, max_expirations=max_expirations)
             results.append(result)
             time.sleep(0.3)  # rate limit
 
         total_snaps = sum(r.get("snapshots", 0) for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        deferred = sum(1 for r in results if r["status"] == "DEFERRED")
         log.info(
-            "Options pull complete — {ok}/{total} tickers, {snaps} snapshots",
-            ok=succeeded, total=len(tickers), snaps=total_snaps,
+            "Options pull complete — {ok}/{total} tickers, {snaps} snapshots, {d} deferred",
+            ok=succeeded, total=len(tickers), snaps=total_snaps, d=deferred,
         )
+        if succeeded and not deferred:
+            self._mark_catalog_pulled()
         return results
+
+    def _mark_catalog_pulled(self) -> None:
+        """Bump this source's source_catalog.last_pull_at (best effort)."""
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                    {"sid": self.source_id},
+                )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("options: source_catalog last_pull_at bump failed: {e}", e=str(exc))
 
     def _pull_ticker(
         self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,

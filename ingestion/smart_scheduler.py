@@ -223,6 +223,60 @@ class _LMEWarehouseSchedulerAdapter:
         }
 
 
+class _OptionsSchedulerAdapter:
+    """Budget-aware shim for OptionsPuller (registry name ``options``).
+
+    OptionsPuller.pull_all walks ~200 tickers (~10 min). Under the 180s
+    SmartScheduler timeout it was ALWAYS orphaned (``options TIMEOUT after
+    180s -- daemon thread orphaned``) and counted as a failure, so it never
+    advanced ``last_pull_at``. This adapter passes SmartScheduler's
+    cooperative ``should_continue`` deadline through, then reports:
+
+    * SKIPPED  -- not an equity session (does not advance last_pull_at);
+    * PARTIAL  -- the budget ran out before the whole list (rows already
+                  written stay; no last_pull_at advance, cooldown applies);
+    * FAILED   -- no ticker succeeded;
+    * SUCCESS  -- the whole list was covered with >=1 ticker SUCCESS.
+
+    grid-scheduler's daily equity job still runs the full universe
+    uncapped; this path adds budget-bounded intraday refreshes of the head
+    of the list (index ETFs and mega caps come first).
+    """
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.options import OptionsPuller
+
+        self._puller = OptionsPuller(db_engine=db_engine)
+
+    def pull(self, should_continue: Any = None) -> dict[str, Any]:
+        results = self._puller.pull_all(should_continue=should_continue)
+        statuses = [r.get("status") for r in results]
+        ok = statuses.count("SUCCESS")
+        deferred = statuses.count("DEFERRED")
+        summary = {
+            "tickers_total": len(results),
+            "tickers_ok": ok,
+            "tickers_deferred": deferred,
+            "snapshots": sum(r.get("snapshots", 0) for r in results),
+        }
+        if results and all(s == "SKIPPED" for s in statuses):
+            return {"status": "SKIPPED", "skipped_reason": "non-equity-session", **summary}
+        if not ok:
+            return {"status": "FAILED", "error": "no ticker succeeded", "rows_inserted": 0, **summary}
+        if deferred:
+            return {"status": "PARTIAL", "error": f"{deferred} tickers deferred (time budget)", **summary}
+        return {"status": "SUCCESS", **summary}
+
+
+# Registry names whose source_catalog row has a different name. Restart
+# state (_load_state_from_db) and last_pull_at writes (_update_last_pull)
+# go through this map. Kept deliberately narrow (the wider registry<->
+# catalog name reconciliation is a separate change).
+_REGISTRY_CATALOG_NAMES: dict[str, str] = {
+    "options": "yfinance_options",
+}
+
+
 class _SECFTDSchedulerAdapter:
     """Config-gated, half-month-catch-up shim for SECFTDPuller.
 
@@ -385,7 +439,7 @@ def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
 PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Fast domestic (run frequently) ──
     {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 240, "kwargs": {"start_date": _yfinance_incremental_start}},
-    {"name": "options",           "mod": "ingestion.options",             "cls": "OptionsPuller",            "method": "pull_all",  "freq_h": 6,  "timeout_s": 180},
+    {"name": "options",           "mod": "ingestion.smart_scheduler",     "cls": "_OptionsSchedulerAdapter", "method": "pull",      "freq_h": 6,  "timeout_s": 180},
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
     {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 120, "api_key": "FRED_API_KEY"},
 
@@ -672,6 +726,10 @@ class SmartScheduler:
                         "consecutive_fails": 0,
                         "cooldown_until": None,
                     }
+                for reg_name, catalog_name in _REGISTRY_CATALOG_NAMES.items():
+                    cat_state = self._state.get(catalog_name.lower())
+                    if cat_state is not None and reg_name not in self._state:
+                        self._state[reg_name] = dict(cat_state)
             log.debug("SmartScheduler loaded {n} source states from DB", n=len(self._state))
         except Exception as exc:
             log.warning("SmartScheduler DB state load failed: {e}", e=str(exc))
@@ -965,7 +1023,7 @@ class SmartScheduler:
                 conn.execute(text(
                     "UPDATE source_catalog SET last_pull_at = NOW() "
                     "WHERE LOWER(name) = :n"
-                ), {"n": name.lower()})
+                ), {"n": _REGISTRY_CATALOG_NAMES.get(name, name).lower()})
         except Exception:
             pass  # best effort
 
