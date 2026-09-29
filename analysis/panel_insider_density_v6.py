@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -156,7 +156,83 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"3dfa6ee30359205c84ba4fb3bdb0858eba13b6ed0c8aa0711d98fa6aade505e7",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T05:03:48.895875+00:00"}'
 )
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+# The v7 body and registry head are bound only after the owner selects its design.
+# The version pin alone is sufficient to make every v6 discovery/holdout opening refuse.
+SUPERSEDED_BY: Mapping[str, Any] | None = {"version": "vs1-v7"}
+
+STOP_STATUS = "STOP_FOR_OWNER_SUPERSEDED_BY_V7_UNOPENED"
+STOP_RAW_PRIMARY_POWER_IC_0_01 = 0.48
+
+
+def _check_stop_record(record: Mapping[str, Any]) -> None:
+    required = {
+        "kind": "status", "version": VERSION, "status": STOP_STATUS,
+        "raw_primary_power_ic_0_01": STOP_RAW_PRIMARY_POWER_IC_0_01,
+        "gate_passed": False, "discovery_opened": False, "holdout_opened": False,
+        "superseded_by": "vs1-v7", "prereg_sha256": PREREG_BODY_SHA256,
+        "promotion_allowed": False,
+    }
+    if any(record.get(key) != value for key, value in required.items()):
+        raise PermissionError("v6 terminal record is not the exact STOP status")
+    if not v1._is_hex64(record.get("power_receipt_sha256")) or not record.get("owner_decision_ref"):
+        raise PermissionError("v6 STOP needs the immutable power receipt and owner decision reference")
+    if "v7_prereg_sha256" in record or "v7_registry_head_sha256" in record:
+        raise PermissionError("the v6 STOP must not contain a v7 hash")
+
+
+def append_stop_status(log_dir: Path, now: datetime, *, power_receipt_sha256: str,
+                       owner_decision_ref: str, expected_prev_sha256: str,
+                       witness: OffhostWitness,
+                       dry_run: bool = False) -> dict:
+    """Append v6's one STOP record after checking the exact two-record witnessed chain.
+
+    ``dry_run=True`` verifies the copied chain and witness and returns the exact
+    would-be record/head without writing. Execute only once after a backup and
+    dry run; a second execution refuses rather than appending another status.
+    Publishing the anchor is a separate step, followed by verification.
+    """
+    if now.tzinfo is None or now.utcoffset() != timedelta(0) \
+            or not v1._is_hex64(power_receipt_sha256) or not owner_decision_ref.strip() \
+            or expected_prev_sha256 != REGISTERED_RECORD_SHA256[1]:
+        raise ValueError("STOP needs a UTC time, receipt sha256, owner reference and exact v6 prior head")
+    V6.require_witness(log_dir, witness, 2)
+    if witness.census.get("records", {}).get(VERSION) != 2:
+        raise PermissionError("v6's canonical witness is not at the two-record baseline")
+    log = V6.registry(log_dir)
+    with log.locked():
+        records = V6._chain(log)
+        if len(records) != 2:
+            raise PermissionError("v6 registry differs from its two-record baseline; reconcile before STOP")
+        if v1._record_sha256(records[-1]) != expected_prev_sha256:
+            raise PermissionError("v6 prior head differs from the expected head")
+        candidate = {
+            "kind": "status", "run_at": now.isoformat(), "version": VERSION,
+            "status": STOP_STATUS, "raw_primary_power_ic_0_01": STOP_RAW_PRIMARY_POWER_IC_0_01,
+            "gate_passed": False, "power_receipt_sha256": power_receipt_sha256,
+            "discovery_opened": False, "holdout_opened": False,
+            "owner_decision_ref": owner_decision_ref.strip(), "superseded_by": "vs1-v7",
+            "prereg_sha256": PREREG_BODY_SHA256, "promotion_allowed": False,
+            "prev_sha256": v1._record_sha256(records[-1]),
+        }
+        _check_stop_record(candidate)
+        if dry_run:
+            return {"dry_run": True, "would_append": candidate,
+                    "would_be_head_sha256": v1._record_sha256(candidate)}
+        return log.append_locked([candidate])[0]
+
+
+def verify_terminal_stop(log_dir: Path, witness: OffhostWitness) -> dict:
+    """Return the only acceptable v6 terminal head after exact off-host witnessing."""
+    log = V6.registry(log_dir)
+    proof = V6.require_witness(log_dir, witness, 3)
+    records = V6._chain(log)
+    if len(records) != 3 or proof["witnessed_records"] != 3:
+        raise PermissionError("v6 STOP witness must end at exactly three records")
+    _check_stop_record(records[-1])
+    if witness.census.get("records", {}).get(VERSION) != 3:
+        raise PermissionError("v6 census does not cover exactly the STOP record")
+    return {"records": 3, "head_sha256": v1._record_sha256(records[-1]),
+            "witness_path": WITNESS_PATH, "witness_tip": witness.tip}
 
 V3_EARLIER = v4.V3_EARLIER
 V4_EARLIER = v5.V4_EARLIER
