@@ -34,6 +34,22 @@ def canonical(data):
     ).encode()
 
 
+def ast_fingerprint(node):
+    """Stable across Python 3.11/3.13 ast.dump empty-field formatting changes."""
+
+    def encode(value):
+        if isinstance(value, ast.AST):
+            return [
+                type(value).__name__,
+                [[key, encode(item)] for key, item in ast.iter_fields(value)],
+            ]
+        if isinstance(value, list):
+            return [encode(item) for item in value]
+        return value
+
+    return digest(canonical(encode(node)))
+
+
 def instant(text):
     d = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if d.tzinfo is None:
@@ -167,14 +183,10 @@ def watch_kernel():
         and isinstance(n.targets[0], ast.Name)
         and n.targets[0].id in ("d1", "gamma")
     ]
-    fingerprint = digest(
-        ast.dump(
-            ast.Module(body=selected, type_ignores=[]), include_attributes=False
-        ).encode()
-    )
+    fingerprint = ast_fingerprint(ast.Module(body=selected, type_ignores=[]))
     if (
         fingerprint
-        != "0e21de0981b0c85222af54430ca8fc436877b24cbc16338e0bba861850b8b0d9"
+        != "6cb93695e08b12dadb73cb9b9d837ce88740331ba79fbb7f6d2c759c4b0f2079"
     ):
         raise ValueError("collector kernel structure changed; review adapter")
     assignments = {n.targets[0].id: n for n in selected}

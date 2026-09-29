@@ -1,6 +1,7 @@
 """Offline-only P2-A checks: synthetic packets, no environment/provider access."""
 
 import copy
+import ast
 from decimal import Decimal, localcontext
 import json
 import math
@@ -15,6 +16,82 @@ from scripts.gex_p2a import harness as h
 from scripts.gex_p2a.reference import Ball, gamma
 
 FIXTURE = Path(__file__).parent / "fixtures/gex_p2a/identical.json"
+
+
+def test_ast_fingerprint_preserves_empty_fields_and_rejects_changes(monkeypatch):
+    tree = ast.parse("gamma = x * 0.04")
+    expected = h.digest(
+        h.canonical(
+            [
+                "Module",
+                [
+                    [
+                        "body",
+                        [
+                            [
+                                "Assign",
+                                [
+                                    [
+                                        "targets",
+                                        [
+                                            [
+                                                "Name",
+                                                [
+                                                    ["id", "gamma"],
+                                                    ["ctx", ["Store", []]],
+                                                ],
+                                            ]
+                                        ],
+                                    ],
+                                    [
+                                        "value",
+                                        [
+                                            "BinOp",
+                                            [
+                                                [
+                                                    "left",
+                                                    [
+                                                        "Name",
+                                                        [
+                                                            ["id", "x"],
+                                                            ["ctx", ["Load", []]],
+                                                        ],
+                                                    ],
+                                                ],
+                                                ["op", ["Mult", []]],
+                                                [
+                                                    "right",
+                                                    [
+                                                        "Constant",
+                                                        [
+                                                            ["value", 0.04],
+                                                            ["kind", None],
+                                                        ],
+                                                    ],
+                                                ],
+                                            ],
+                                        ],
+                                    ],
+                                    ["type_comment", None],
+                                ],
+                            ]
+                        ],
+                    ],
+                    ["type_ignores", []],
+                ],
+            ]
+        )
+    )
+    assert h.ast_fingerprint(tree) == expected
+    assert h.ast_fingerprint(ast.parse("gamma=x*0.05")) != expected
+    assert h.ast_fingerprint(ast.parse("gamma=x+0.04")) != expected
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("ast.dump formatting is not a stable fingerprint")
+
+    monkeypatch.setattr(ast, "dump", forbidden)
+    assert h.ast_fingerprint(tree) == expected
+    h.watch_kernel()  # real pinned kernel still accepted with ast.dump disabled
 
 
 @pytest.fixture(autouse=True)
