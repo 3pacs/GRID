@@ -110,6 +110,9 @@ TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeo
 # Hung LLM calls used to consume the full 900s cycle budget; these caps + the
 # cooldown blacklist break the loop after a single timeout.
 ORACLE_CYCLE_TIMEOUT_SECONDS = 4000           # oracle.run_cycle: 41 tickers x ~80s + headroom (was 300, caused 24h blacklist loop)
+# Admission reserve for timeout/report bookkeeping and cycle cleanup. Do not
+# shrink the oracle's quality budget to fit a cycle delayed by ingestion.
+ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS = 300
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
@@ -3443,6 +3446,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     """Execute one operator cycle."""
     state.cycle_count += 1
     cycle_start = time.monotonic()
+    cycle_deadline = cycle_start + CYCLE_TIMEOUT_SECONDS
     cycle_result: dict[str, Any] = {
         "cycle": state.cycle_count,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -3912,7 +3916,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         # cycle picks the hour up instead of losing it.
         #
         # Ahead of the oracle this is insurance rather than the common case:
-        # only diagnose (240) + smart ingestion (300) + resolution (420) are
+        # only diagnose (240) + smart ingestion (1260) + resolution (420) are
         # budgeted before it, well inside the 4500s cap. The unbudgeted steps
         # that also run first -- pipeline, data gatherer, autoresearch,
         # self-diagnostics, the 7a-7c digests -- have no cap of their own, so
@@ -3959,36 +3963,49 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if state.last_oracle_cycle is not None:
             hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
         if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
-            state.current_step = "oracle_cycle"
-            log.info("Running Oracle prediction cycle...")
-            # Record cycle start eagerly: even if the inner timeout fires
-            # the orphan thread keeps running and writes predictions to DB.
-            # We must NOT refire oracle for another 6h regardless. (2026-05-09)
-            state.last_oracle_cycle = now
-            if not dry_run:
-                from oracle.engine import OracleEngine
-                from oracle.report import send_oracle_report
-
-                def _oracle_call():
-                    oracle = OracleEngine(db_engine=engine)
-                    return oracle.run_cycle()
-
-                oracle_result, ok = _run_with_timeout(
-                    "oracle_cycle", _oracle_call,
-                    ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+            budget_left = cycle_deadline - time.monotonic()
+            needed = ORACLE_CYCLE_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
+            if budget_left < needed:
+                log.info(
+                    "Oracle cycle deferred — {b:.0f}s of cycle budget left, needs {n}s including cleanup",
+                    b=budget_left, n=needed,
                 )
-                if ok and oracle_result:
-                    cycle_result["oracle"] = {
-                        "predictions": oracle_result["new_predictions"],
-                        "scoring": oracle_result["scoring"],
-                        "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                    }
-                    if oracle_result["new_predictions"] > 0:
-                        send_oracle_report(oracle_result)
-                    state.last_oracle_cycle = now
-                    state.cooldowns.record_attempt("oracle_cycle", success=True)
+                cycle_result["oracle"] = {
+                    "deferred": "insufficient_cycle_budget",
+                    "budget_left_s": round(budget_left, 1),
+                    "required_s": needed,
+                }
             else:
-                log.info("[DRY RUN] Would run Oracle cycle")
+                state.current_step = "oracle_cycle"
+                log.info("Running Oracle prediction cycle...")
+                # Record start only after admission: an orphan can still write
+                # predictions after its inner timeout, so an actual dispatch
+                # must not refire for 6h. A budget deferral leaves this untouched.
+                state.last_oracle_cycle = now
+                if not dry_run:
+                    from oracle.engine import OracleEngine
+                    from oracle.report import send_oracle_report
+
+                    def _oracle_call():
+                        oracle = OracleEngine(db_engine=engine)
+                        return oracle.run_cycle()
+
+                    oracle_result, ok = _run_with_timeout(
+                        "oracle_cycle", _oracle_call,
+                        ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+                    )
+                    if ok and oracle_result:
+                        cycle_result["oracle"] = {
+                            "predictions": oracle_result["new_predictions"],
+                            "scoring": oracle_result["scoring"],
+                            "leaderboard": oracle_result.get("leaderboard", [])[:3],
+                        }
+                        if oracle_result["new_predictions"] > 0:
+                            send_oracle_report(oracle_result)
+                        state.last_oracle_cycle = now
+                        state.cooldowns.record_attempt("oracle_cycle", success=True)
+                else:
+                    log.info("[DRY RUN] Would run Oracle cycle")
         elif hours_since_oracle >= 6:
             log.info(
                 "Skipping oracle_cycle — blacklisted (timed out previously, "

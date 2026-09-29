@@ -1185,7 +1185,10 @@ class SmartScheduler:
 
             result["status"] = "SUCCESS"
             result["detail"] = str(out)[:200] if out else ""
-            self._update_last_pull(name)
+            # Options owns its cancellation-aware, bounded catalog publication.
+            # A second unbounded transaction here would defeat that fence.
+            if name != "options":
+                self._update_last_pull(name)
 
         except Exception as exc:
             result["status"] = "FAILED"

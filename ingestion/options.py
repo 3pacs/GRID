@@ -21,8 +21,9 @@ import numpy as np
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
@@ -42,6 +43,9 @@ EQUITY_TICKERS: list[str] = [
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 12
 MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
+# Final catalog publication has no provider work. Short connection/statement
+# limits and a local transaction deadline fit inside the scheduler's 60s margin.
+CATALOG_PUBLICATION_SECONDS = 15
 _EQUITY_TZ = ZoneInfo("America/New_York")
 
 
@@ -71,6 +75,7 @@ class OptionsPullResults(list[dict[str, Any]]):
     def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
         super().__init__(items)
         self.full_universe = full_universe
+        self.publication_error: str | None = None
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -84,8 +89,8 @@ class OptionsPullResults(list[dict[str, Any]]):
             status, note = "SKIPPED", "no ticker capture completed"
         elif not ok and not deferred:
             status, note = "FAILED", "no ticker succeeded"
-        elif not self.full_universe or ok != len(self) or not known_rows:
-            status, note = "PARTIAL", "source coverage incomplete or row count unknown"
+        elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
+            status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
         elif not rows:
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
@@ -415,19 +420,65 @@ class OptionsPuller(BasePuller):
         )
         outcome = OptionsPullResults(results, full_universe=full_universe)
         if outcome.summary["status"] == "SUCCESS":
-            self._mark_catalog_pulled()
+            if should_continue is not None and not should_continue():
+                outcome.publication_error = "time budget expired before catalog publication"
+            elif not self._mark_catalog_pulled(should_continue=should_continue):
+                outcome.publication_error = "catalog publication deferred or failed"
         return outcome
 
-    def _mark_catalog_pulled(self) -> None:
-        """Advance freshness only after a complete default-universe capture."""
+    def _mark_catalog_pulled(self, *, should_continue: Callable[[], bool] | None = None) -> bool:
+        """Publish complete-source freshness, or roll back on cancellation.
+
+        Use a short-lived connection to avoid the shared pool's 30s checkout
+        wait, with a 5s database connection timeout configured explicitly.
+        PostgreSQL 14 has no transaction_timeout; check the local deadline at
+        each boundary and bound each statement (including commit) to 5s.
+        """
+        publication_deadline = time.monotonic() + CATALOG_PUBLICATION_SECONDS
+        catalog_engine = None
+
+        def check_publication_budget() -> None:
+            _check_budget(should_continue)
+            if time.monotonic() >= publication_deadline:
+                raise _OptionsBudgetExpired
+
         try:
-            with self.engine.begin() as conn:
+            check_publication_budget()
+            catalog_engine = create_engine(
+                self.engine.url,
+                poolclass=NullPool,
+                connect_args={
+                    "connect_timeout": 5,
+                    "options": "-c statement_timeout=5000 -c lock_timeout=3000 "
+                               "-c idle_in_transaction_session_timeout=5000",
+                },
+            )
+            check_publication_budget()
+            with catalog_engine.begin() as conn:
+                check_publication_budget()
+                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                check_publication_budget()
+                conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+                check_publication_budget()
+                conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
+                check_publication_budget()
                 conn.execute(
                     text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
                     {"sid": self.source_id},
                 )
+                # A callback that expires during UPDATE must roll back that
+                # update rather than allow context-manager exit to commit it.
+                check_publication_budget()
+            return True
+        except _OptionsBudgetExpired:
+            log.info("options: source_catalog freshness publication deferred by budget")
+            return False
         except Exception:  # best effort; never emit connection/credential text
             log.warning("options: source_catalog freshness update failed")
+            return False
+        finally:
+            if catalog_engine is not None:
+                catalog_engine.dispose()
 
     def _pull_ticker(
         self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,

@@ -12,7 +12,7 @@ import ingestion.smart_scheduler as ss
 def _puller(monkeypatch, statuses):
     obj = options.OptionsPuller.__new__(options.OptionsPuller)
     obj.engine = MagicMock()
-    obj._mark_catalog_pulled = MagicMock()
+    obj._mark_catalog_pulled = MagicMock(return_value=True)
     monkeypatch.setattr(options, "EQUITY_TICKERS", list(statuses))
     monkeypatch.setattr(options, "catalyst_options_universe", lambda _engine, **_kwargs: [])
     monkeypatch.setattr(options, "is_market_open", lambda _day: True)
@@ -36,7 +36,7 @@ def test_full_default_scope_with_rows_is_success_and_fresh(monkeypatch):
     assert result.summary["status"] == "SUCCESS"
     assert result.summary["rows_inserted"] == 24
     assert result.summary["scope"] == "full_universe"
-    obj._mark_catalog_pulled.assert_called_once_with()
+    obj._mark_catalog_pulled.assert_called_once_with(should_continue=None)
 
 
 def test_one_success_does_not_make_whole_feed_fresh(monkeypatch):
