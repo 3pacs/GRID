@@ -76,6 +76,7 @@ EXPECTED_CADENCE_BY_PREFIX: dict[str, int] = {
     "semi:":                30,   # monthly semiconductor sales
     "ecb_tltro:":           7,    # weekly ECB TLTRO drawdown
     "pboc:":                1,    # daily PBOC OMO and balance sheet
+    "pboc_omo_ann:":        1,    # daily PBoC OMO announcements (pbc.gov.cn)
     "taiwan:":              30,   # monthly Taiwan macro
     "freight:":             7,    # weekly freight rates (Drewry / Baltic)
     "lme:":                 1,    # daily LME metal warehouses
