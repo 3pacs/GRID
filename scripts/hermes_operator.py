@@ -557,6 +557,10 @@ _SOURCE_OVERRIDES: dict[str, dict[str, Any]] = {
     # keeps the scheduler-side fail-closed behaviour while fixing the
     # retry-side ctor mismatch.
     "eia":             {"api_key": None},
+    # Tiingo also reads its key from the module environment and accepts only
+    # db_engine. Preserve the scheduler's api_key_mode="env" missing-key gate;
+    # the retry adapter must not forward an unsupported api_key keyword.
+    "tiingo":          {"api_key": None},
 }
 
 
