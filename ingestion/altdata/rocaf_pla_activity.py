@@ -36,9 +36,11 @@ which hold placeholder "seed" rows written by the broken scraper.
   ``raw_payload.adiz_sentence_present = false`` so it stays auditable.
 
 Only counts actually printed in a report are stored; a report whose
-aircraft-sortie count cannot be parsed is skipped entirely (no zeros are
-invented). ``obs_date`` is the report date (counts as of 06:00 UTC+8 that
-day); ``raw_series.pull_timestamp`` keeps its default = GRID's fetch time.
+aircraft-sortie count cannot be parsed is skipped entirely. If ADIZ is
+mentioned, a positive entry count must be parsed or the report is skipped;
+zero is stored only when ADIZ is absent. ``obs_date`` is the report date
+(counts as of 06:00 UTC+8 that day); ``raw_series.pull_timestamp`` keeps
+its default = GRID's fetch time.
 
 Failure contract: list fetch/parse failure, or every new detail failing,
 -> ``status="FAILED"`` and nothing written.
@@ -90,7 +92,12 @@ _AIRCRAFT_ALT_RE = re.compile(r"(\d+)\s+PLA\s+aircraft", re.I)
 _PLAN_RE = re.compile(r"(\d+)\s+PLAN\s+(?:ships?|vessels?)", re.I)
 _OFFICIAL_RE = re.compile(r"(\d+)\s+official\s+(?:ships?|vessels?)", re.I)
 _ADIZ_RE = re.compile(
-    r"(\d+)\s+out\s+of\s+(?:the\s+)?(\d+)\s+sorties?\s+[^.]{0,120}?\bentered\b[^.]{0,80}?\bADIZ",
+    r"(\d+)\s+(?:out\s+of|of)\s+(?:the\s+)?(\d+)\s+sorties?\s+"
+    r"[^.]{0,120}?\bentered\b[^.]{0,80}?\bADIZ",
+    re.I,
+)
+_ADIZ_ALL_RE = re.compile(
+    r"\bAll\s+(\d+)\s+sorties?\s+[^.]{0,120}?\bentered\b[^.]{0,80}?\bADIZ",
     re.I,
 )
 _DATE_RE = re.compile(r"\b(20\d{2})/(\d{2})/(\d{2})\b")
@@ -143,7 +150,7 @@ def _visible_text(html: str) -> str:
 
 
 def parse_report(html: str, url: str = "", fallback_date: date | None = None) -> PLAActivityReport | None:
-    """Parse one detail page. Returns None when the sortie count is absent."""
+    """Skip reports with missing sorties or an ADIZ mention without a positive count."""
     text = _visible_text(html)
     start = text.find("PLA activities:")
     if start < 0:
@@ -167,14 +174,19 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
 
     m_plan = _PLAN_RE.search(body)
     m_off = _OFFICIAL_RE.search(body)
-    m_adiz = _ADIZ_RE.search(body)
+    m_adiz = _ADIZ_RE.search(body) or _ADIZ_ALL_RE.search(body)
+    adiz_entries = int(m_adiz.group(1)) if m_adiz else 0
+    # Check all visible text: a mention beyond the bounded parsing window
+    # must not be mistaken for MND omitting the ADIZ sentence entirely.
+    if "adiz" in text.lower() and (m_adiz is None or adiz_entries == 0):
+        return None
     return PLAActivityReport(
         url=url,
         report_date=report_date,
         aircraft_sorties=int(m_air.group(1)),
         plan_ships=int(m_plan.group(1)) if m_plan else None,
         official_ships=int(m_off.group(1)) if m_off else None,
-        adiz_entries=int(m_adiz.group(1)) if m_adiz else 0,
+        adiz_entries=adiz_entries,
         adiz_sentence_present=bool(m_adiz),
         text=body[:600],
     )

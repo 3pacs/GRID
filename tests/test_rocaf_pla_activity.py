@@ -85,6 +85,41 @@ def test_parse_report_without_sortie_count_is_skipped() -> None:
     assert parse_report("<p>2026/08/03 Press conference on budget.</p>") is None
 
 
+def _report_html(aircraft: int, adiz_sentence: str) -> str:
+    return (
+        f"<p>2026/09/29</p><p>2.PLA activities: {aircraft} sorties of PLA aircraft, "
+        "6 PLAN ships and 4 official ships operating around Taiwan were detected "
+        f"as of 6 a.m. (UTC+8) today. {adiz_sentence}</p>"
+    )
+
+
+@pytest.mark.parametrize(("aircraft", "sentence", "entries"), [
+    (12, "All 12 sorties of PLA aircraft entered Taiwan's southwestern ADIZ.", 12),
+    (32, "22 of the 32 sorties entered Taiwan's northern and southwestern ADIZ.", 22),
+    (32, "22 of 32 sorties entered Taiwan's southwestern ADIZ.", 22),
+    (3, "1 out of the 3 sorties entered Taiwan's southwestern ADIZ.", 1),
+])
+def test_parse_report_mnd_adiz_variants(aircraft: int, sentence: str, entries: int) -> None:
+    rep = parse_report(_report_html(aircraft, sentence))
+    assert rep is not None
+    assert rep.aircraft_sorties == aircraft
+    assert rep.adiz_entries == entries
+    assert rep.adiz_sentence_present is True
+
+
+@pytest.mark.parametrize("sentence", [
+    "Several sorties entered Taiwan's southwestern ADIZ.",
+    "ADIZ entry counts are unavailable.",
+    "No sorties entered Taiwan's southwestern ADIZ.",
+    "0 out of 3 sorties entered Taiwan's southwestern ADIZ.",
+    "All 0 sorties entered Taiwan's southwestern ADIZ.",
+    "3 sorties did not enter Taiwan's southwestern ADIZ.",
+    pytest.param("Additional information. " * 100 + "ADIZ activity was detected.", id="adiz-beyond-window"),
+])
+def test_parse_report_unparsed_or_zero_adiz_is_skipped(sentence: str) -> None:
+    assert parse_report(_report_html(3, sentence)) is None
+
+
 # ---------------------------------------------------------------------------
 # Puller
 # ---------------------------------------------------------------------------
@@ -171,6 +206,32 @@ def test_all_details_failing_is_failed() -> None:
     result = ROCAFPLAActivityPuller(engine, session=_Session({AF_LIST_URL: _Resp(LIST_HTML)})).pull()
     assert result["status"] == "FAILED"
     assert _inserts(engine) == []
+
+
+def test_adiz_parse_miss_is_failed_and_writes_nothing() -> None:
+    engine = _engine(latest=date(2026, 9, 28))
+    session = _Session({
+        AF_LIST_URL: _Resp(LIST_HTML),
+        URL_0929: _Resp(_report_html(3, "Several sorties entered Taiwan's ADIZ.")),
+    })
+    result = ROCAFPLAActivityPuller(engine, session=session).pull()
+    assert result["status"] == "FAILED"
+    assert result["rows_inserted"] == 0
+    assert "unparseable" in result["error"]
+    assert _inserts(engine) == []
+
+
+def test_report_without_adiz_writes_auditable_zero() -> None:
+    engine = _engine(latest=date(2026, 9, 28))
+    session = _Session({
+        AF_LIST_URL: _Resp(LIST_HTML),
+        URL_0929: _Resp(_report_html(3, "ROC Armed Forces monitored the situation.")),
+    })
+    result = ROCAFPLAActivityPuller(engine, session=session).pull()
+    assert result["status"] == "SUCCESS"
+    rows = {r["sid"]: r for r in _inserts(engine)}
+    assert rows[SERIES_ADIZ]["val"] == 0.0
+    assert '"adiz_sentence_present": false' in rows[SERIES_ADIZ]["payload"]
 
 
 def test_first_run_is_bounded() -> None:
