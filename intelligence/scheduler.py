@@ -917,20 +917,30 @@ def run_intelligence_loop() -> None:
             log.warning("iron ore ports daily failed: {e}", e=str(exc))
 
     def _taiwan_strait_osint_daily() -> None:
-        """CAT-91: Taiwan MND daily ADIZ incursion count + PLA events."""
+        """CAT-91: daily PLA activity around Taiwan (MND report as republished
+        by the ROC Air Force HQ at air.mnd.gov.tw).
+
+        2026-09-29: the old www.mnd.gov.tw pages 404 and the new MND site's
+        robots.txt disallows all non-Googlebot agents, so this job now runs
+        rocaf_pla_activity (own source_catalog row ``rocaf_pla_activity``,
+        series ``pla_activity:*``). Still registered only when
+        GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB is set.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.taiwan_strait_osint import run_taiwan_strait_puller
-            result = run_taiwan_strait_puller(_ge())
+            from ingestion.altdata.rocaf_pla_activity import run_rocaf_pla_activity_puller
+            result = run_rocaf_pla_activity_puller(_ge())
             log.info(
-                "Taiwan Strait: {f} fetched, {i} new, latest_aircraft={a} (source={s})",
-                f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
-                a=result.get("latest_aircraft_count"),
-                s=result.get("source", "none"),
+                "PLA activity (ROCAF/MND): status={st}, {n} reports, {i} rows, "
+                "latest={d} sorties={a}",
+                st=result.get("status"),
+                n=result.get("reports", 0),
+                i=result.get("rows_inserted", 0),
+                d=result.get("latest_report_date"),
+                a=result.get("latest_aircraft_sorties"),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Taiwan Strait daily failed: {e}", e=str(exc))
+            log.warning("PLA activity daily failed: {e}", e=str(exc))
 
     # Cadence:
     #   LME warehouse → daily 09:00 UTC (LME publishes ~08:00 London)
