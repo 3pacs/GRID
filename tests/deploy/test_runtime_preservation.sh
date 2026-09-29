@@ -294,6 +294,9 @@ test "$(cat "$live/marker.txt")" = next-4
 activated_pid=$!
 TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-4" \
   fail_without_swap "$root/next-4" stale-after-activation
+kill "$activated_pid"
+wait "$activated_pid" 2>/dev/null || true
+activated_pid=
 
 # Post-swap churn cannot turn success into a failed workflow build step. No
 # deletion occurs, the new pointer/marker remain, and activation may continue.
@@ -369,17 +372,29 @@ git -C "$root/scheduler-old" restore marker.txt
 
 # Now model the verified activation then postrestart record rewrite. Only the
 # three scheduler fields change; all three recovery lines remain byte-identical.
-git -C "$root/next-4" init -q
-git -C "$root/next-4" add marker.txt
-git -C "$root/next-4" -c user.name=Test -c user.email=test@example.invalid commit -qm activated
+# Earlier prune cases may remove next-4. Establish a dedicated checkout and
+# live process here, after those destructive cases, rather than reuse it.
+activated_dir="$root/activated-current"
+mkdir "$activated_dir"
+printf 'activated\n' > "$activated_dir/marker.txt"
+git -C "$activated_dir" init -q
+git -C "$activated_dir" add marker.txt
+git -C "$activated_dir" -c user.name=Test -c user.email=test@example.invalid commit -qm activated
+( cd "$activated_dir" && exec sleep 300 ) &
+activated_pid=$!
+for _ in {1..50}; do
+  [ "$(readlink "/proc/$activated_pid/cwd")" = "$activated_dir" ] && break
+  sleep 0.02
+done
+test "$(readlink "/proc/$activated_pid/cwd")" = "$activated_dir"
 grep '^recovery' "$record" > "$box/recovery-before"
-sed -i "s|^scheduler=.*|scheduler=$root/next-4|" "$record"
-sed -i "s|^scheduler_sha=.*|scheduler_sha=$(git -C "$root/next-4" rev-parse HEAD)|" "$record"
-sed -i "s|^scheduler_tree=.*|scheduler_tree=$(git -C "$root/next-4" rev-parse 'HEAD^{tree}')|" "$record"
+sed -i "s|^scheduler=.*|scheduler=$activated_dir|" "$record"
+sed -i "s|^scheduler_sha=.*|scheduler_sha=$(git -C "$activated_dir" rev-parse HEAD)|" "$record"
+sed -i "s|^scheduler_tree=.*|scheduler_tree=$(git -C "$activated_dir" rev-parse 'HEAD^{tree}')|" "$record"
 kill "$scheduler_pid"
 wait "$scheduler_pid" 2>/dev/null || true
 scheduler_pid=
-export TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-4"
+export TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$activated_dir"
 mkdir -p "$box/proc/$activated_pid"
 printf '0::/scheduler\n' > "$box/proc/$activated_pid/cgroup"
 printf '%s\n' "$activated_pid" > "$box/cgroup/scheduler/cgroup.procs"
