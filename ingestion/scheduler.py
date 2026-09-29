@@ -14,6 +14,7 @@ with exponential backoff.
 from __future__ import annotations
 
 import socket
+import threading
 import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
@@ -266,8 +267,172 @@ def _get_incremental_start(db_engine: Engine, source_name: str, overlap_days: in
                 start = row[0] - timedelta(days=overlap_days)
                 return start.isoformat()
     except Exception as exc:
-        log.debug("Scheduler: incremental start date query failed for {s}: {e}", s=source_name, e=str(exc))
+        # WARNING, not DEBUG: this fallback is a full-history re-pull. For
+        # TIINGO this query timed out (120s) on every weekday run from at
+        # least July to 2026-09-28 and nobody could see it (stale-sources
+        # audit 2026-09-29); Tiingo no longer uses this path.
+        log.warning(
+            "Scheduler: incremental start date query failed for {s} -- falling "
+            "back to a full-history pull from 1990-01-01: {e}",
+            s=source_name, e=str(exc),
+        )
     return "1990-01-01"
+
+
+# ── Tiingo daily prices: own worker thread, off the sequential loop ─────
+#
+# Stale-sources audit 2026-09-29 (root cause 2): "Tiingo_Prices" sat in the
+# middle of the sequential weekday "daily" group and took 10-14h every run
+# (pull_log: 09:45-14:10 per run since at least 09-07), so every later
+# puller in the group -- and, because this whole scheduler is one
+# schedule.run_pending() loop, every later schedule job (the 22:00
+# run_daily_pulls, sometimes the next morning's slots) -- waited for it.
+# The slowness itself is fixed in TiingoPuller.pull_incremental (the old
+# source-wide MAX(obs_date) "incremental" lookup timed out at 120s every
+# run and fell back to 1990-01-01, re-pulling full history). This moves
+# the pull onto its own daemon thread, started from its own schedule slot,
+# so even a slow run can never hold the loop again.
+#
+# 23:30 UTC is 19:30 EDT / 18:30 EST: after the 18:00 ET cut-off
+# pull_incremental uses to decide the day's EOD bar should exist, year
+# round. Weekdays only; a holiday run finds every ticker current and ends
+# in seconds. grid-hermes' SmartScheduler "tiingo" entry (4h) is the
+# backstop for a missed slot; both share one advisory lock.
+TIINGO_PRICES_SLOT_UTC = "23:30"
+TIINGO_PRICES_JOB = "Tiingo_Prices"
+
+_tiingo_worker: threading.Thread | None = None
+_tiingo_worker_guard = threading.Lock()
+
+
+def _write_job_pull_log(
+    db_engine: Engine,
+    puller_name: str,
+    source_id: int | None,
+    started_at: datetime,
+    status: str,
+    rows_inserted: int,
+    error: str | None,
+) -> None:
+    """One pull_log row at completion (no RUNNING row a restart could orphan)."""
+    try:
+        with db_engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO pull_log (puller_name, source_id, started_at, "
+                    "completed_at, status, rows_inserted, error_message, node_name) "
+                    "VALUES (:name, :sid, :started, :completed, :status, :rows, "
+                    ":error, :node)"
+                ),
+                {
+                    "name": puller_name,
+                    "sid": source_id,
+                    "started": started_at,
+                    "completed": datetime.now(timezone.utc),
+                    "status": status,
+                    "rows": rows_inserted,
+                    "error": error[:500] if error else None,
+                    "node": socket.gethostname(),
+                },
+            )
+    except Exception as exc:
+        log.warning("Scheduler: pull_log write failed for {p}: {e}", p=puller_name, e=str(exc))
+
+
+def run_tiingo_prices(db_engine: Engine, puller: Any | None = None) -> dict[str, Any]:
+    """Run one incremental Tiingo daily-price pull (the worker thread body).
+
+    Records the outcome in pull_log and advances source_catalog.last_pull_at
+    only on SUCCESS. A SKIPPED run (another process -- grid-hermes -- holds
+    the Tiingo prices advisory lock) writes nothing.
+    """
+    started_at = datetime.now(timezone.utc)
+    source_id: int | None = None
+    source_name: str | None = None
+    try:
+        if puller is None:
+            from ingestion.tiingo_pull import TiingoPuller
+
+            puller = TiingoPuller(db_engine)
+        source_id, source_name = _resolve_source_catalog_entry(
+            db_engine, TIINGO_PRICES_JOB, puller,
+        )
+        result = puller.pull_incremental()
+    except Exception as exc:
+        log.error("{p} failed: {e}", p=TIINGO_PRICES_JOB, e=str(exc))
+        _write_job_pull_log(db_engine, TIINGO_PRICES_JOB, source_id, started_at,
+                            "FAILED", 0, f"{type(exc).__name__}: {exc}")
+        return {"status": "FAILED", "error": str(exc)}
+
+    status = result.get("status") if isinstance(result, dict) else None
+    rows = int(result.get("rows_inserted") or 0) if isinstance(result, dict) else 0
+    if status == "SKIPPED":
+        log.info("{p} skipped: {r}", p=TIINGO_PRICES_JOB, r=result.get("skipped_reason"))
+        return result
+    if status == "SUCCESS":
+        _touch_source_catalog_last_pull(db_engine, source_id, source_name, TIINGO_PRICES_JOB)
+        _write_job_pull_log(db_engine, TIINGO_PRICES_JOB, source_id, started_at,
+                            "SUCCESS", rows, None)
+    else:
+        log_status = "PARTIAL" if status == "PARTIAL" else "FAILED"
+        _write_job_pull_log(
+            db_engine, TIINGO_PRICES_JOB, source_id, started_at, log_status, rows,
+            str(result.get("error") or f"pull_incremental status={status}"),
+        )
+    return result
+
+
+def _tiingo_worker_main(db_engine: Engine) -> None:
+    try:
+        run_tiingo_prices(db_engine)
+    except Exception as exc:  # never let the thread die silently
+        log.error("Tiingo prices worker crashed: {e}", e=str(exc))
+
+
+def start_tiingo_prices_worker(db_engine: Engine) -> bool:
+    """Schedule-slot entry point: start the Tiingo worker thread, return at once.
+
+    Returns False (and starts nothing) if the previous slot's worker is
+    still running -- one Tiingo price pull per process at a time.
+    """
+    global _tiingo_worker
+    with _tiingo_worker_guard:
+        if _tiingo_worker is not None and _tiingo_worker.is_alive():
+            log.warning(
+                "{p}: previous worker still running -- not starting another",
+                p=TIINGO_PRICES_JOB,
+            )
+            return False
+        worker = threading.Thread(
+            target=_tiingo_worker_main, args=(db_engine,),
+            name="tiingo-prices", daemon=True,
+        )
+        worker.start()
+        _tiingo_worker = worker
+    log.info("{p}: worker thread started", p=TIINGO_PRICES_JOB)
+    return True
+
+
+# Domestic run_daily_pulls slots skip a firing that arrives this late. The
+# schedule library runs a missed job once when the loop regains control, and
+# run_daily_pulls decides "market open" from the calendar date alone -- so a
+# 22:00 slot released at 07:30 the next morning ran the equity/options pulls
+# pre-market as that new day's pull. A skip is logged; the next slot runs.
+DOMESTIC_SLOT_MAX_LATE_MINUTES = 90
+
+
+def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
+    """How long after the most recent HH:MM occurrence ``now`` is.
+
+    ``now`` defaults to the host-local naive clock -- the same clock
+    ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on.
+    """
+    now = now or datetime.now()
+    hh, mm = (int(x) for x in slot_hhmm.split(":"))
+    slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    if slot > now:
+        slot -= timedelta(days=1)
+    return now - slot
 
 
 def run_pull_group(
@@ -678,12 +843,11 @@ def _get_pullers_for_group(
 
         # ── Sources added 2026-04-07 ────────────────────────────────────
 
-        # Tiingo prices (daily, paid API)
-        try:
-            from ingestion.tiingo_pull import TiingoPuller
-            pullers.append(("Tiingo_Prices", TiingoPuller(db_engine), "pull_all", {"start_date": "incremental"}))
-        except Exception as exc:
-            log.warning("Tiingo prices puller init failed: {err}", err=str(exc))
+        # Tiingo prices are NOT in this sequential group any more: they run
+        # on their own worker thread and schedule slot -- see
+        # run_tiingo_prices / start_tiingo_prices_worker below
+        # (stale-sources audit 2026-09-29: a 10-14h Tiingo pull here blocked
+        # every later puller in this group and every later schedule job).
         # Tiingo news (daily, paid API)
         try:
             from ingestion.tiingo_news_pull import TiingoNewsPuller
@@ -1187,7 +1351,7 @@ def run_pushshift_backfill(data_dir: str = "/data/pushshift") -> dict[str, Any]:
 # ── Domestic pull functions ───────────────────────────────────────────
 
 
-def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
+def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = None) -> None:
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
@@ -1197,10 +1361,24 @@ def run_daily_pulls(start_date: str | date = "1990-01-01") -> None:
     Parameters:
         start_date: Earliest observation date to fetch on first run.
                     Subsequent runs only fetch recent data.
+        slot: The "HH:MM" schedule slot this call was registered for, if
+              any. A slot released more than DOMESTIC_SLOT_MAX_LATE_MINUTES
+              late (an earlier job held the single-threaded loop) is
+              skipped rather than run as a mis-timed catch-up.
     """
     from datetime import date as _date
 
     from ingestion.market_calendar import is_market_open
+
+    if slot is not None:
+        late = _slot_lateness(slot)
+        if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+            log.warning(
+                "Skipping the {s} run_daily_pulls slot: released {m:.0f} min late "
+                "(limit {lim} min) by an earlier job holding the scheduler loop",
+                s=slot, m=late.total_seconds() / 60, lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+            )
+            return
 
     today = _date.today()
     market_open = is_market_open(today)
@@ -1752,6 +1930,10 @@ def start_scheduler() -> None:
     - Monthly pulls on the 5th at 9:00 AM (BLS, EDGAR 13F)
     - Weekly SEC velocity on Sundays at 10:00 AM
 
+    Tiingo daily prices:
+    - Weekdays at TIINGO_PRICES_SLOT_UTC on their own worker thread (never
+      inside the sequential loop; see start_tiingo_prices_worker)
+
     International/trade/physical:
     - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, JQuants, EDINET, etc.)
     - Weekly on Sundays at 3:00 AM (OECD, BIS, IMF, etc.)
@@ -1776,11 +1958,12 @@ def start_scheduler() -> None:
     # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
     # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
+    # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
                 "saturday", "sunday"]:
         for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
             getattr(schedule.every(), day).at(utc_time).do(
-                run_daily_pulls, start_date=ongoing_start
+                run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
@@ -1832,6 +2015,13 @@ def start_scheduler() -> None:
         for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
             getattr(schedule.every(), day).at("20:00").do(
                 run_pull_group, "daily", ext_engine
+            )
+
+        # Tiingo daily prices: own slot, own worker thread (never blocks
+        # this loop -- see TIINGO_PRICES_SLOT_UTC).
+        for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+            getattr(schedule.every(), day).at(TIINGO_PRICES_SLOT_UTC, "UTC").do(
+                start_tiingo_prices_worker, ext_engine
             )
 
         # Weekly on Sundays at 3:00 AM

@@ -4285,11 +4285,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     try:
                         from ingestion.tiingo_pull import TiingoPuller
                         tp = TiingoPuller(engine)
-                        # Pull all tracked tickers (daily update)
-                        tiingo_result = tp.pull_all(start_date=str(now_utc.date() - timedelta(days=5)))
+                        # Routine incremental update: skips tickers that are
+                        # already current and shares the cross-process
+                        # advisory lock with grid-scheduler's daily Tiingo
+                        # worker (stale-sources audit 2026-09-29) -- this
+                        # used to be an unlocked pull_all() racing it.
+                        tiingo_result = tp.pull_incremental()
                         cycle_result["tiingo_daily"] = {
-                            "succeeded": sum(1 for r in tiingo_result if r["status"] == "SUCCESS"),
-                            "total": len(tiingo_result),
+                            k: tiingo_result.get(k)
+                            for k in ("status", "current", "fetched", "succeeded",
+                                      "failed", "tickers", "rows_inserted")
                         }
                     except Exception as exc:
                         log.warning("Tiingo price pull failed: {e}", e=str(exc))

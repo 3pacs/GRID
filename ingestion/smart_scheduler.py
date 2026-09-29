@@ -465,7 +465,15 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "solar",             "mod": "ingestion.celestial.solar",           "cls": "SolarActivityPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
 
     # ── Paid APIs (MUST RUN — user is paying for these) ──
-    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_all",      "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    # tiingo: pull_incremental, not pull_all (stale-sources audit 2026-09-29).
+    # pull_all() with no start_date re-pulled every ticker from 2020 and never
+    # fit in 120s: every run TIMED OUT and left an orphan thread writing
+    # alongside grid-scheduler's own Tiingo run. pull_incremental skips
+    # tickers already holding the latest session (so most runs finish in
+    # seconds), stops cleanly on the auto-wired should_continue deadline
+    # (PARTIAL, retried next tick), and shares one advisory lock with
+    # grid-scheduler's daily Tiingo worker (SKIPPED while that holds it).
+    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_incremental", "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
