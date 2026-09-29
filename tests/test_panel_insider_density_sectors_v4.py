@@ -21,6 +21,16 @@ from tests.test_panel_insider_density_v2 import _inputs, _observed, _register
 SECTOR_LINE = b'{"records":2}\n'
 
 
+@pytest.fixture
+def historical_v6_terminal(monkeypatch):
+    """Replay the recorded sectors-v4 checks before v7 source was present."""
+    assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
+    modules = s4._technology_modules()
+    assert modules[-1].VERSION == "vs1-v7"
+    monkeypatch.setattr(s4, "_technology_modules", lambda: modules[:-1])
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
+
+
 def test_prereg_hashes_to_the_pin_gates_on_v6_and_differs_from_sectors_v3():
     assert s4.check_prereg() == s4.PREREG_BODY_SHA256 != s3.PREREG_BODY_SHA256
     body = v1.prereg_body((s4.REPO / s4.PREREG_PATH).read_text(encoding="utf-8"))
@@ -55,6 +65,19 @@ def test_the_technology_run_remains_pinned_to_v6_and_refuses_v7():
         s4.check_technology_run()
 
 
+def test_the_historical_technology_run_was_v6(historical_v6_terminal):
+    assert s4.check_technology_run() == s4.TECHNOLOGY_RUN == s4.technology_terminal()
+
+
+def test_v7_unregistered_blocks_sectors_v4_without_an_anchor(tmp_path):
+    assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
+    with pytest.raises(PermissionError, match="not registered"):
+        s4.check_technology_run()
+    with pytest.raises(PermissionError, match="not registered"):
+        s4.register(tmp_path, s4.REGISTERED_AT, s4.REGISTERED_CODE_SHA)
+    assert not (tmp_path / s4.REGISTRY_ANCHORS).exists()
+
+
 def test_a_later_technology_registration_requires_a_new_sectors_registration(monkeypatch):
     v7 = types.SimpleNamespace(VERSION="vs1-v7", SUPERSEDED_BY=None, PREREG_BODY_SHA256="7" * 64,
                                REGISTERED_RECORD_SHA256=("a" * 64, "b" * 64),
@@ -68,10 +91,7 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
         s4.check_technology_run()
 
 
-def test_a_broken_technology_chain_refuses(monkeypatch):
-    historical = s4._technology_modules()[:-1]
-    monkeypatch.setattr(s4, "_technology_modules", lambda: historical)
-    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
+def test_a_broken_technology_chain_refuses(monkeypatch, historical_v6_terminal):
     monkeypatch.setattr(v5, "SUPERSEDED_BY", None)
     with pytest.raises(PermissionError, match="no single terminal member"):
         s4.technology_terminal()
@@ -144,8 +164,7 @@ def test_the_census_knows_sectors_v4_on_a_git_vault(tmp_path):
         s4.check_census(census)  # at this registration v6 has not opened: sectors v4 cannot open
 
 
-def test_v6_refuses_to_open_while_sectors_v4_is_opened(tmp_path, monkeypatch):
-    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)  # isolate the historical census guard
+def test_v6_refuses_to_open_while_sectors_v4_is_opened(tmp_path, historical_v6_terminal):
     vault = _real_vault(tmp_path, SECTOR_LINE + b'{"head_sha256":"' + b"e" * 64
                         + b'","prev_anchor_sha256":"x","records":4,"run_at":"2026-10-01T00:00:00+00:00"}\n')
     _register(tmp_path / "reg", v6)
@@ -171,10 +190,7 @@ def test_v1_and_sectors_v3_point_at_sectors_v4():
         s3.check_open()
 
 
-def test_the_sectors_v4_registration_is_pinned(tmp_path, monkeypatch):
-    historical = s4._technology_modules()[:-1]
-    monkeypatch.setattr(s4, "_technology_modules", lambda: historical)
-    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
+def test_the_sectors_v4_registration_is_pinned(tmp_path, historical_v6_terminal):
     records = s4.register(tmp_path, s4.REGISTERED_AT, s4.REGISTERED_CODE_SHA)
     assert tuple(v1.chained_sha256(records)) == s4.REGISTERED_RECORD_SHA256
     assert (tmp_path / s4.REGISTRY_ANCHORS).read_bytes() == s4.REGISTERED_ANCHOR_LINE + b"\n"
