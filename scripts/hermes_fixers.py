@@ -1105,6 +1105,19 @@ def _execute_hermes_repair_command(
                     "stopped_by_budget": True,
                     "pull_result": pull_result,
                 }
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source, success=True)
+                return {"cmd": raw_cmd, "status": "no_new_data", "pull_result": pull_result}
+            not_fresh = retry_not_fresh_reason(pull_result)
+            if not_fresh:
+                state.cooldowns.record_attempt(source, success=False, error=not_fresh)
+                log.warning("REPULL:{s} did not recover: {r}", s=source, r=not_fresh)
+                return {
+                    "cmd": raw_cmd,
+                    "status": "failed",
+                    "reason": not_fresh,
+                    "pull_result": pull_result,
+                }
             state.cooldowns.record_attempt(source, success=True)
             return {"cmd": raw_cmd, "status": "ok", "pull_result": pull_result}
         log.info("Hermes wants REPULL:{s} but source in cooldown", s=source)
@@ -1449,6 +1462,28 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
     return puller, method, kwargs
 
 
+# Outcomes (ingestion.smart_scheduler._classify_outcome) for which a repair
+# pull must not advance source_catalog.last_pull_at nor count as recovered.
+_NOT_FRESH_OUTCOMES = frozenset({"SKIPPED", "FAILED", "PARTIAL", "NO_NEW_DATA"})
+
+
+def retry_not_fresh_reason(pull_result: dict[str, Any]) -> str | None:
+    """Why a completed ``_retry_source`` result is NOT a recovered pull, or None.
+
+    ``_retry_source`` returns normally for a run the puller itself reported
+    as skipped or failed (see its 2026-09-29 note). Callers that used to
+    treat "returned without raising" as success must check this first and
+    record a failed cooldown attempt instead of a recovery.
+    """
+    if not isinstance(pull_result, dict):
+        return None
+    outcome = pull_result.get("outcome")
+    if outcome not in _NOT_FRESH_OUTCOMES:
+        return None
+    note = pull_result.get("outcome_note") or pull_result.get("error")
+    return f"puller reported {outcome}" + (f": {note}" if note else "")
+
+
 def _retry_source(
     source_name: str,
     engine: Any,
@@ -1601,8 +1636,28 @@ def _retry_source(
 
             kwargs["should_continue"] = _combined_should_continue
 
-        result = pull_fn(**kwargs)
-        result = result if isinstance(result, dict) else {"status": "ok"}
+        raw_result = pull_fn(**kwargs)
+        # Fake-success fix (2026-09-29, follow-up to PR #727 review): a
+        # non-dict return used to become {"status": "ok"} unconditionally,
+        # and a dict's own SKIPPED/FAILED status was never read -- so a
+        # list whose every item was skipped (OptionsPuller outside an
+        # equity session) or failed, a {"status": "FAILED"} dict, or a
+        # lock-skipped {"status": "SKIPPED"} still advanced last_pull_at
+        # below and was recorded as a recovered pull by every caller.
+        # Classify with the SmartScheduler's own rules; see
+        # retry_not_fresh_reason() for what callers do with it.
+        from ingestion.smart_scheduler import _classify_outcome, _puller_owns_catalog
+
+        outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
+        result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        result.update(outcome=outcome, rows_inserted=outcome_rows)
+        not_fresh = outcome in _NOT_FRESH_OUTCOMES
+        if not_fresh:
+            # Every return carries a normalized outcome/count; nonfresh
+            # results also preserve the explanation for recovery callers.
+            result = {**result, "outcome": outcome}
+            if outcome_note:
+                result["outcome_note"] = outcome_note
 
         stopped_by_budget = bool(result.get("stopped_by_budget"))
 
@@ -1647,7 +1702,8 @@ def _retry_source(
             )
             summary_line = (
                 f"{source_name} repair: checked {total_checked} tickers "
-                f"(window {window_days}d): {counts.get('inserted', 0)} inserted rows, "
+                f"(window {window_days}d): {outcome_rows} written rows, "
+                f"{counts.get('inserted', 0)} inserted tickers, "
                 f"{counts.get('duplicate_only', 0)} duplicate-only, "
                 f"{counts.get('no_data', 0)} no_data, {counts.get('error', 0)} error, "
                 f"{counts.get('unattempted', 0)} unattempted"
@@ -1693,12 +1749,10 @@ def _retry_source(
             else:
                 state.repair_backlog.pop(source_key, None)
 
-        # Update last_pull_at in source_catalog only when the pull actually
-        # ran to completion over its (bounded) window — a budget-stopped
-        # attempt did not finish and should not be marked fresh. Semantics:
-        # this records that the source was CHECKED at this time, never that
-        # every symbol of this source is current (Check 1a).
-        if not stopped_by_budget:
+        # Only complete positive-write runs advance source freshness.
+        # NO_NEW_DATA is a completed check; callers keep its cadence without
+        # reporting recovery, refreshing a stale source, or claiming filled gaps.
+        if not stopped_by_budget and outcome == "SUCCESS" and not _puller_owns_catalog(source_name, puller):
             try:
                 from sqlalchemy import text
                 with engine.begin() as conn:
@@ -1921,6 +1975,16 @@ def diagnose_and_fix_pulls(
                 result["retried"] += 1
                 log.info("Repair for {s} stopped by budget; backlog persisted", s=source_name)
                 continue
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source_name, success=True)
+                result["retried"] += 1
+                continue
+            not_fresh = retry_not_fresh_reason(pull_result)
+            if not_fresh:
+                state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
+                result["retried"] += 1
+                log.warning("Repair for {s} did not recover: {r}", s=source_name, r=not_fresh)
+                continue
 
             result["retried"] += 1
             result["fixed"] += 1
@@ -2080,7 +2144,15 @@ def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> 
                     "Gap-filling {s} — {n} features, {d} days back",
                     s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
-                _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
+                pull_result = _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
+                if pull_result.get("outcome") == "NO_NEW_DATA":
+                    state.cooldowns.record_attempt(source_name, success=True)
+                    continue
+                not_fresh = retry_not_fresh_reason(pull_result)
+                if not_fresh:
+                    log.warning("Gap-fill for {s} did not fill: {r}", s=source_name, r=not_fresh)
+                    state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
+                    continue
                 result["gaps_filled"] += len(info["features"])
                 result["sources_repulled"].append(source_name)
                 state.cooldowns.record_attempt(source_name, success=True)
