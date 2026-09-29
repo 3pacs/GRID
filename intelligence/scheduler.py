@@ -936,7 +936,12 @@ def run_intelligence_loop() -> None:
     #   LME warehouse → daily 09:00 UTC (LME publishes ~08:00 London)
     #   Iron ore ports → Fri 10:00 UTC (Mysteel weekly Thursday release)
     #   Taiwan Strait → daily 23:30 UTC (MND publishes Taiwan morning)
-    _sched.every().day.at("09:00").do(_lme_warehouse_daily)
+    # Held off by default (2026-09-29): both LME URLs return a Cloudflare
+    # managed challenge (HTTP 403) to non-browser clients, so every run
+    # fetched nothing. Registered only when GRID_ENABLE_LME_WAREHOUSE_JOB
+    # is set -- see config.GRID_ENABLE_LME_WAREHOUSE_JOB.
+    if getattr(_s, "GRID_ENABLE_LME_WAREHOUSE_JOB", False):
+        _sched.every().day.at("09:00").do(_lme_warehouse_daily)
     _sched.every().friday.at("10:00").do(_iron_ore_ports_daily)
     # Held off by default (owner decision 2026-09-29): the MND source URLs
     # 404 and the job used to write placeholder rows as SUCCESS. Not
