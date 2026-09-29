@@ -1,0 +1,187 @@
+"""Tests for ingestion/altdata/rocaf_pla_activity.py.
+
+Fixtures in tests/fixtures/rocaf/ are the real air.mnd.gov.tw "Air
+activities" list page and the 2026-09-29 report, recorded from grid-svr on
+2026-09-29. No network is used.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+import requests
+
+import ingestion.altdata.rocaf_pla_activity as mod
+from ingestion.altdata.rocaf_pla_activity import (
+    AF_LIST_URL,
+    SERIES_ADIZ,
+    SERIES_AIRCRAFT,
+    SERIES_OFFICIAL_SHIPS,
+    SERIES_PLAN_SHIPS,
+    ROCAFPLAActivityPuller,
+    parse_list,
+    parse_report,
+)
+
+FIX = Path(__file__).parent / "fixtures" / "rocaf"
+LIST_HTML = (FIX / "air_activities_list_20260929.html").read_text(encoding="utf-8")
+REPORT_HTML = (FIX / "air_activity_59269_20260929.html").read_text(encoding="utf-8")
+URL_0929 = "https://air.mnd.gov.tw/EN/News/News_Detail.aspx?CID=214&ID=59269"
+URL_0928 = "https://air.mnd.gov.tw/EN/News/News_Detail.aspx?CID=214&ID=59267"
+
+
+def test_parse_list() -> None:
+    items = parse_list(LIST_HTML)
+    assert len(items) == 12
+    assert items[0].url == URL_0929
+    assert items[0].published == date(2026, 9, 29)
+    assert items[1].url == URL_0928
+    assert all("PLA activities" in i.title for i in items)
+
+
+def test_parse_list_layout_change_is_empty() -> None:
+    assert parse_list("<html><body>maintenance</body></html>") == []
+
+
+def test_parse_report_real_fixture() -> None:
+    rep = parse_report(REPORT_HTML, url=URL_0929)
+    assert rep is not None
+    assert rep.report_date == date(2026, 9, 29)
+    assert rep.aircraft_sorties == 3
+    assert rep.plan_ships == 6
+    assert rep.official_ships == 4
+    assert rep.adiz_entries == 1
+    assert rep.adiz_sentence_present is True
+
+
+def test_parse_report_median_line_wording_and_no_official_ships() -> None:
+    html = (
+        "<div>2026/08/01</div><p>2.PLA activities: 27 sorties of PLA aircraft and 9 PLAN "
+        "ships operating around Taiwan were detected as of 6 a.m. (UTC+8) today. "
+        "18 out of 27 sorties crossed the median line and entered Taiwan's northern, "
+        "central and southwestern ADIZ.</p>"
+    )
+    rep = parse_report(html)
+    assert rep is not None
+    assert (rep.aircraft_sorties, rep.plan_ships, rep.adiz_entries) == (27, 9, 18)
+    assert rep.official_ships is None  # not stated -> not stored
+
+
+def test_parse_report_without_adiz_sentence_marks_it() -> None:
+    html = (
+        "<div>2026/08/02</div><p>2.PLA activities: 5 sorties of PLA aircraft, 7 PLAN ships "
+        "and 1 official ship operating around Taiwan were detected as of 6 a.m. today.</p>"
+    )
+    rep = parse_report(html)
+    assert rep is not None
+    assert rep.adiz_entries == 0
+    assert rep.adiz_sentence_present is False
+
+
+def test_parse_report_without_sortie_count_is_skipped() -> None:
+    assert parse_report("<p>2026/08/03 Press conference on budget.</p>") is None
+
+
+# ---------------------------------------------------------------------------
+# Puller
+# ---------------------------------------------------------------------------
+
+
+class _Resp:
+    def __init__(self, text: str, status: int = 200) -> None:
+        self.text = text
+        self.status_code = status
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"HTTP {self.status_code}")
+
+
+class _Session:
+    def __init__(self, pages: dict[str, _Resp]) -> None:
+        self.pages = pages
+        self.headers: dict[str, str] = {}
+        self.calls: list[str] = []
+
+    def get(self, url: str, timeout: int = 0) -> _Resp:  # noqa: ARG002
+        self.calls.append(url)
+        return self.pages.get(url, _Resp("nf", 404))
+
+
+def _engine(latest: date | None) -> MagicMock:
+    engine = MagicMock()
+    cconn = MagicMock()
+
+    def _cexec(stmt, params=None):  # noqa: ANN001, ARG001
+        res = MagicMock()
+        res.fetchone.return_value = (latest,) if "MAX(obs_date)" in str(stmt) else (99,)
+        return res
+
+    cconn.execute.side_effect = _cexec
+    engine.connect.return_value.__enter__ = MagicMock(return_value=cconn)
+    engine.connect.return_value.__exit__ = MagicMock(return_value=False)
+    bconn = MagicMock()
+    bconn.execute.return_value.fetchall.return_value = []
+    bconn.execute.return_value.fetchone.return_value = None
+    engine.begin.return_value.__enter__ = MagicMock(return_value=bconn)
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+    engine._bconn = bconn
+    return engine
+
+
+def _inserts(engine: MagicMock) -> list[dict]:
+    return [c.args[1] for c in engine._bconn.execute.call_args_list
+            if "INSERT INTO raw_series" in str(c.args[0])]
+
+
+@pytest.fixture(autouse=True)
+def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
+
+
+def test_incremental_run_fetches_only_new_report() -> None:
+    engine = _engine(latest=date(2026, 9, 28))
+    session = _Session({AF_LIST_URL: _Resp(LIST_HTML), URL_0929: _Resp(REPORT_HTML)})
+    result = ROCAFPLAActivityPuller(engine, session=session).pull()
+    assert session.calls == [AF_LIST_URL, URL_0929]
+    assert result["status"] == "SUCCESS"
+    rows = {r["sid"]: r for r in _inserts(engine)}
+    assert {k: v["val"] for k, v in rows.items()} == {
+        SERIES_AIRCRAFT: 3.0, SERIES_PLAN_SHIPS: 6.0, SERIES_OFFICIAL_SHIPS: 4.0, SERIES_ADIZ: 1.0,
+    }
+    for r in rows.values():
+        assert r["od"] == date(2026, 9, 29)
+        assert r["status"] == "SUCCESS"
+        assert r["src"] == 99
+        assert "pull_timestamp" not in r  # column default = fetch time
+
+
+def test_list_blocked_is_failed_and_writes_nothing() -> None:
+    engine = _engine(latest=None)
+    result = ROCAFPLAActivityPuller(engine, session=_Session({AF_LIST_URL: _Resp("x", 403)})).pull()
+    assert result["status"] == "FAILED"
+    assert _inserts(engine) == []
+
+
+def test_all_details_failing_is_failed() -> None:
+    engine = _engine(latest=date(2026, 9, 27))
+    result = ROCAFPLAActivityPuller(engine, session=_Session({AF_LIST_URL: _Resp(LIST_HTML)})).pull()
+    assert result["status"] == "FAILED"
+    assert _inserts(engine) == []
+
+
+def test_first_run_is_bounded() -> None:
+    engine = _engine(latest=None)
+    session = _Session({AF_LIST_URL: _Resp(LIST_HTML), URL_0929: _Resp(REPORT_HTML)})
+    result = ROCAFPLAActivityPuller(engine, session=session).pull()
+    # list + at most INITIAL_MAX_DETAILS detail pages
+    assert len(session.calls) == 1 + mod.INITIAL_MAX_DETAILS
+    assert result["status"] == "PARTIAL"  # the other 9 fake URLs 404 here
+
+
+def test_own_source_identity() -> None:
+    assert ROCAFPLAActivityPuller.SOURCE_NAME == "rocaf_pla_activity"
+    assert SERIES_AIRCRAFT.startswith("pla_activity:")
