@@ -823,8 +823,12 @@ def _classify_outcome(out: Any) -> tuple[str, int | None, str | None]:
             return OUTCOME_SKIPPED, rows, note or "puller reported SKIPPED"
         if status in {"FAILED", "ERROR", "TIMEOUT"}:
             return OUTCOME_FAILED, rows, note or f"puller reported {status}"
+        # An explicit PARTIAL can truthfully report unknown committed rows.
+        # Keep NULL and its retry semantics; invalid counts and unknown
+        # SUCCESS still fail closed before any freshness decision.
         invalid = any(
-            k in out and (not isinstance(out[k], int) or isinstance(out[k], bool) or out[k] < 0)
+            k in out and not (status == "PARTIAL" and out[k] is None)
+            and (not isinstance(out[k], int) or isinstance(out[k], bool) or out[k] < 0)
             for k in _ROW_COUNT_KEYS
         )
         if invalid:
