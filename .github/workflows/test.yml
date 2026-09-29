@@ -429,6 +429,31 @@ jobs:
             exit 1
           fi
 
+      # Cadence-aware stale-sources signal (GRID-STALE-SOURCES-AUDIT-20260929.md
+      # / fix/cadence-aware-source-staleness): proves check_db_health's
+      # LATERAL top-1-per-source freshness read (index-backed by
+      # idx_raw_series_status_source_pull, never a raw_series scan) and the
+      # alerts.cadence classification actually work against real Postgres --
+      # weekly-within-cadence, writer-never-bumps-catalog read from
+      # raw_series, a genuinely broken source still flagged, never-pulled,
+      # inactive exclusion, and the update_frequency opportunistic-read
+      # fallback (via to_regclass, so it's correct inside this step's
+      # throwaway schema too, not just the public schema).
+      - name: Cadence-aware stale sources PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_hermes_health_stale_sources_pg.py -q -rA | tee /tmp/grid-stale-sources-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-stale-sources-pg.txt; then
+            echo "::error::Cadence-aware stale sources PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # security_master (migrations/versions/security_master_20260927.py, GD1):
       # runs the real upgrade/downgrade in a throwaway schema -- proves all
       # three tables (security_master, security_identifiers,
