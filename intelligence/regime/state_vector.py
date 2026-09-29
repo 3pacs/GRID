@@ -126,7 +126,7 @@ class StateVector:
     as_of_date: date
     values: tuple[float | None, ...]    # one per dimension, None = missing
     completeness: float                 # fraction of non-null dims
-    stale_dimensions: tuple[str, ...]   # dims with data >30d old
+    stale_dimensions: tuple[str, ...]   # usable non-derived dims beyond their cadence threshold
     # Which SPY price series fed the momentum/RSI dimensions: "spy_full"
     # (the resolved, post re-resolve feature) or the raw "YF:SPY:close"
     # fallback, or None when neither was available (see _fetch_spy_prices).
@@ -454,28 +454,18 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
 
     for dim in STATE_DIMENSIONS:
         try:
-            val = _compute_dimension(engine, dim, as_of, norm_stats, spy_prices)
+            # Reuse the accepted, bounded compute input for stale age. A
+            # shorter second read can miss old data that still produces a
+            # value, and a later read need not observe the same source rows.
+            series = None
+            if not dim.series_id.startswith('DERIVED:'):
+                series = _fetch_series(engine, dim.series_id, as_of)
+            val = _compute_dimension(engine, dim, as_of, norm_stats, spy_prices, series=series)
+            if val is not None and series is not None and not series.empty:
+                days_stale = (as_of - series.index[-1]).days
+                if days_stale > _stale_threshold_days(dim.series_id):
+                    stale.append(dim.name)
             values.append(val)
-
-            # Check staleness for non-derived series. The lookback here must
-            # reach back at least as far as this series' own stale
-            # threshold (70d monthly / 160d quarterly can both exceed a
-            # fixed 60d window) -- otherwise a series stale by MORE than the
-            # lookback silently returns an empty read here and is never
-            # flagged at all, regardless of the threshold comparison below.
-            # +60 is a buffer past the threshold itself so a series that's
-            # freshly crossed into "stale" is still found, not just one
-            # sitting exactly at the edge.
-            stale_lookback_days = max(60, _stale_threshold_days(dim.series_id) + 60)
-            if not dim.series_id.startswith('DERIVED:') and val is not None:
-                series = _fetch_series(engine, dim.series_id, as_of, lookback_days=stale_lookback_days)
-                if len(series) > 0:
-                    latest_date = series.index[-1]
-                    if hasattr(latest_date, 'date'):
-                        latest_date = latest_date
-                    days_stale = (as_of - latest_date).days if isinstance(latest_date, date) else 30
-                    if days_stale > _stale_threshold_days(dim.series_id):
-                        stale.append(dim.name)
         except Exception as exc:
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))
             values.append(None)
@@ -499,8 +489,10 @@ def _compute_dimension(
     as_of: date,
     norm_stats: dict[str, tuple[float, float]],
     spy_prices: pd.Series,
+    *,
+    series: pd.Series | None = None,
 ) -> float | None:
-    """Compute a single dimension value."""
+    """Compute a dimension, reusing its accepted input when supplied."""
 
     # ── Derived dimensions (computed from other series) ──
     if dim.series_id == 'DERIVED:T5YIE':
@@ -532,7 +524,8 @@ def _compute_dimension(
         return _get_insider_sentiment(engine, as_of)
 
     # ── Standard series dimensions ──
-    series = _fetch_series(engine, dim.series_id, as_of)
+    if series is None:
+        series = _fetch_series(engine, dim.series_id, as_of)
     if series.empty or len(series) < dim.min_history:
         return None
 

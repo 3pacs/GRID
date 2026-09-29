@@ -647,3 +647,150 @@ class TestComputeStateVectorMonthlyStaleness:
         sv = sv_mod.compute_state_vector(engine, as_of)
 
         assert "initial_claims" in sv.stale_dimensions
+
+
+def _seed_staleness_series(engine, sid, age, *, count=120, status="SUCCESS", value=1.0):
+    """Synthetic daily observations for real bounded-reader regression tests."""
+    latest = AS_OF - timedelta(days=age)
+    rows = [
+        {
+            "sid": sid, "src": FRED_SRC, "dt": latest - timedelta(days=i),
+            "ts": T0, "value": value + i * 0.01, "status": status,
+        }
+        for i in range(count)
+    ]
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, "
+            "pull_timestamp, value, pull_status) "
+            "VALUES (:sid, :src, :dt, :ts, :value, :status)"
+        ), rows)
+
+
+@pytest.mark.parametrize("sid,name,threshold", [
+    ("UNRATE", "unemployment_level", 70),
+    ("ICSA", "initial_claims", 30),
+    ("ICSA_QUARTERLY", "initial_claims", 160),
+])
+@pytest.mark.parametrize("offset", [-1, 0, 1, 59, 60, 61, 180])
+def test_stale_flag_remains_monotonic_for_usable_values(
+    engine, monkeypatch, sid, name, threshold, offset,
+):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    if sid == "ICSA_QUARTERLY":
+        sid = "ICSA"
+        monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({sid}))
+    age = threshold + offset
+    _seed_staleness_series(engine, sid, age)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES)
+    # Normalization and SQL both run: this is a retained usable value,
+    # including ages beyond the former threshold+60 stale-read cutoff.
+    assert result.values[sv_mod.DIM_NAMES.index(name)] == pytest.approx(-1.7105047343638058)
+    assert (name in result.stale_dimensions) == (age > threshold)
+
+
+@pytest.mark.parametrize("mode", [
+    "absent", "failed_only", "insufficient_history", "beyond_value_window", "future_only",
+])
+def test_unavailable_inputs_are_none_without_a_stale_flag(engine, monkeypatch, mode):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    if mode == "failed_only":
+        _seed_staleness_series(engine, "UNRATE", 0, status="FAILED")
+    elif mode == "insufficient_history":
+        _seed_staleness_series(engine, "UNRATE", 131, count=5)
+    elif mode == "beyond_value_window":
+        _seed_staleness_series(engine, "UNRATE", 2600)
+    elif mode == "future_only":
+        _seed_staleness_series(engine, "UNRATE", -130, count=30)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is None
+    assert "unemployment_level" not in result.stale_dimensions
+
+
+@pytest.mark.parametrize("age,usable", [(2491, True), (2492, False)])
+def test_staleness_respects_inclusive_compute_window_and_min_history(
+    engine, monkeypatch, age, usable,
+):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    # UNRATE requires 30 observations. At age 2491 exactly 30 daily
+    # observations fit in the inclusive 2520-day compute window; at 2492
+    # only 29 fit, even though the longer normalization read sees them all.
+    _seed_staleness_series(engine, "UNRATE", age)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert (result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None) == usable
+    assert ("unemployment_level" in result.stale_dimensions) == usable
+
+
+def test_failed_marker_cannot_hide_retained_stale_value(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    _seed_staleness_series(engine, "UNRATE", 131)
+    _seed_staleness_series(engine, "UNRATE", 0, count=1, status="FAILED", value=0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None
+    assert "unemployment_level" in result.stale_dimensions
+
+
+def test_retained_numeric_zero_is_usable_and_stale(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_get_normalization_stats", lambda _e: {})
+    _seed_staleness_series(engine, "UNRATE", 131, value=0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] == 0
+    assert "unemployment_level" in result.stale_dimensions
+
+
+def test_mixed_source_compute_input_remains_unavailable_without_stale_flag(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    _seed_staleness_series(engine, "UNRATE", 131)
+    _insert(engine, "UNRATE", AS_OF - timedelta(days=130), 4.0, source_id=YF_SRC)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES)
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is None
+    assert "unemployment_level" not in result.stale_dimensions
+
+
+def test_retained_stale_value_in_vector_above_cache_completeness_floor(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+    monkeypatch.setattr(sv_mod, "_get_crossref_score", lambda _e, _d: None)
+    _seed_staleness_series(engine, "UNRATE", 131)
+    for sid in [
+        "VIXCLS", "T10Y2Y", "DFF", "BAMLH0A0HYM2", "BAMLC0A0CM", "TCU",
+        "INDPRO", "M2SL", "UMCSENT", "ICSA", "COMPUTED:fed_net_liquidity",
+        "COMPUTED:fed_net_liquidity_change_1m",
+    ]:
+        _seed_staleness_series(engine, sid, 0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES) == 24
+    assert result.completeness == 0.75
+    assert result.completeness >= sv_mod.MIN_CACHE_COMPLETENESS
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None
+    assert "unemployment_level" in result.stale_dimensions
+    assert "unemployment_dir" in result.stale_dimensions
