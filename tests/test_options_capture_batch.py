@@ -16,6 +16,7 @@ SESSION_NOW = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
 class _Result:
     def __init__(self, row: tuple) -> None:
         self.row = row
+        self.rowcount = 1
 
     def fetchone(self) -> tuple:
         return self.row
@@ -129,7 +130,7 @@ class _Yahoo:
 def puller(monkeypatch: pytest.MonkeyPatch) -> options.OptionsPuller:
     obj = options.OptionsPuller.__new__(options.OptionsPuller)
     obj.engine = _DB()
-    monkeypatch.setattr(obj, "_push_to_resolved", lambda *_args: None)
+    monkeypatch.setattr(obj, "_push_to_resolved", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(options.time, "sleep", lambda _seconds: None)
     monkeypatch.setattr(options, "_utc_now", lambda: SESSION_NOW)
     monkeypatch.setattr(options, "compute_max_pain", lambda *_args: 100.0)
@@ -157,6 +158,8 @@ def test_completed_batch_time_follows_final_provider_response(
     assert result["status"] == "SUCCESS"
     assert yahoo.calls == 2
     assert len(db.rows) == 4
+    assert result["snapshots_inserted"] == 4
+    assert result["rows_inserted"] == 5  # four snapshot writes + one signal upsert
     assert len({row["batch_id"] for row in db.rows}) == 1
     assert len({row["ordinal"] for row in db.rows}) == 1
     assert len({row["started_at"] for row in db.rows}) == 1
@@ -171,6 +174,43 @@ def test_completed_batch_time_follows_final_provider_response(
     assert next(i for i, s in enumerate(sql) if "pg_advisory_xact_lock" in s) < next(
         i for i, s in enumerate(sql) if "DELETE FROM options_snapshots" in s
     ) < next(i for i, s in enumerate(sql) if "INSERT INTO options_snapshots" in s)
+
+
+def test_cancel_before_publish_does_not_write_or_advance_freshness(puller):
+    expirations = [int((SESSION_NOW + timedelta(days=10)).timestamp())]
+    puller._yahoo = _Yahoo(expirations, [100.0])
+    checks = iter([True, True, False])
+    result = puller._pull_ticker("SPY", SESSION_NOW.date().isoformat(), should_continue=lambda: next(checks))
+    assert result["status"] == "DEFERRED"
+    assert result["rows_inserted"] == 0
+    assert not puller.engine.rows
+    assert not any("DELETE FROM options_snapshots" in sql for sql, _ in puller.engine.calls)
+
+
+def test_cancel_during_publish_rolls_back_ticker(puller):
+    expirations = [int((SESSION_NOW + timedelta(days=10)).timestamp())]
+    puller._yahoo = _Yahoo(expirations, [100.0, 105.0])
+    checks = iter([True] * 5 + [False])
+    result = puller._pull_ticker("SPY", SESSION_NOW.date().isoformat(), should_continue=lambda: next(checks))
+    assert result["status"] == "DEFERRED"
+    assert result["rows_inserted"] == 0
+    assert not puller.engine.rows
+
+
+def test_conflicted_snapshot_inserts_count_actual_rows(puller, monkeypatch):
+    execute = puller.engine.execute
+
+    def with_conflict(statement, params=None):
+        result = execute(statement, params)
+        if "INSERT INTO options_snapshots" in str(statement):
+            result.rowcount = 0
+        return result
+
+    monkeypatch.setattr(puller.engine, "execute", with_conflict)
+    result, _ = _run(puller, [100.0])
+    assert result["snapshots"] == 4
+    assert result["snapshots_inserted"] == 0
+    assert result["rows_inserted"] == 1  # only the signal upsert affected a row
 
 
 def test_explicit_six_expiry_cap_preserves_legacy_gem_scope(
@@ -334,7 +374,7 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
     puller.engine = db
     newer = options.OptionsPuller.__new__(options.OptionsPuller)
     newer.engine = db
-    newer._push_to_resolved = lambda *_args: None
+    newer._push_to_resolved = lambda *_args, **_kwargs: 0
     now = SESSION_NOW
     expirations = [int((now + timedelta(days=days)).timestamp()) for days in (10, 20)]
     old_yahoo = _Yahoo(expirations, [100.0])

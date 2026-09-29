@@ -22,6 +22,15 @@ from __future__ import annotations
 from scripts import hermes_operator as ho
 
 
+def test_smart_ingestion_encloses_last_started_options_puller_and_cleanup() -> None:
+    """The scheduling cutoff is not a deadline for the last in-flight job."""
+    from ingestion.smart_scheduler import PULLER_REGISTRY, TICK_TIME_BUDGET_S
+
+    options = next(p for p in PULLER_REGISTRY if p["name"] == "options")
+    assert TICK_TIME_BUDGET_S + options["timeout_s"] + 60 <= ho.SMART_INGESTION_TIMEOUT_SECONDS
+    assert ho.SMART_INGESTION_TIMEOUT_SECONDS < ho.CYCLE_TIMEOUT_SECONDS
+
+
 def test_active_hypo_scorer_fits_inside_intelligence_step_with_daily_batch() -> None:
     """Scorer budget + the daily-intel per-cycle budget (+ headroom) must
     fit inside the step budget.

@@ -47,7 +47,7 @@ def _puller(engine, yahoo):
     puller = options.OptionsPuller.__new__(options.OptionsPuller)
     puller.engine = engine
     puller._yahoo = yahoo
-    puller._push_to_resolved = lambda *_args: None
+    puller._push_to_resolved = lambda *_args, **_kwargs: 0
     return puller
 
 
