@@ -26,6 +26,9 @@ LABELS = {
     "stockholders_equity": "Reported equity",
     "long_term_debt": "Reported long term debt",
 }
+DURATION_FIELDS = {
+    "revenue", "revenue_contracts", "net_income", "eps_basic", "eps_diluted",
+}
 UNSUPPORTED_FIELDS = (
     "price", "market_cap", "pe_ratio", "forward_pe", "eps_ttm", "eps_next_5y",
     "roe", "debt_equity", "profit_margin", "operating_margin", "beta",
@@ -71,19 +74,25 @@ def read_sec_profile(engine: Any, ticker: str, *, refresh: bool = False) -> dict
                 payload = json.loads(payload)
             filed = date.fromisoformat(payload["filed"])
             end = date.fromisoformat(payload["period_end"])
+            start = date.fromisoformat(payload["period_start"]) if field in DURATION_FIELDS else None
+            companyfacts = re.fullmatch(
+                r"https://data\.sec\.gov/api/xbrl/companyfacts/CIK([0-9]{10})\.json",
+                str(payload.get("source_url", "")),
+            )
+            cik = str(payload.get("cik", ""))
             expected_unit = "USD/shares" if field.startswith("eps_") else "USD"
             number = float(value)
             if (
                 isinstance(value, bool) or not math.isfinite(number)
                 or filed > today or end > filed or str(obs) != end.isoformat()
+                or (start is not None and start > end)
                 or payload.get("unit") != expected_unit
                 or payload.get("ticker") != ticker
                 or payload.get("form") not in {"10-K", "10-K/A", "10-Q", "10-Q/A"}
                 or not re.fullmatch(r"\d{10}-\d{2}-\d{6}", str(payload.get("accession", "")))
-                or not re.fullmatch(
-                    r"https://data\.sec\.gov/api/xbrl/companyfacts/CIK\d{10}\.json",
-                    str(payload.get("source_url", "")),
-                )
+                or companyfacts is None
+                or not re.fullmatch(r"[0-9]{1,10}", cik) or int(cik) <= 0
+                or companyfacts.group(1) != cik.zfill(10)
             ):
                 continue
         except (TypeError, ValueError, KeyError, AttributeError):
