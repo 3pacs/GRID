@@ -50,7 +50,7 @@ def test_should_continue_is_auto_wired_for_methods_that_accept_it() -> None:
         def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
             captured["should_continue"] = should_continue
             captured["initial_value"] = should_continue() if should_continue else None
-            return ["ok"]
+            return [{"status": "SUCCESS", "rows_inserted": 1}]
 
     _install_fake_module("grid_test_fake_yf_mod_should_continue", _Puller)
     sched = _full_scheduler()
@@ -110,7 +110,7 @@ def test_callable_kwargs_are_resolved_at_call_time() -> None:
 
         def pull_all(self, start_date=None):
             captured["start_date"] = start_date
-            return "done"
+            return {"status": "SUCCESS", "rows_inserted": 1}
 
     _install_fake_module("grid_test_fake_yf_mod_callable_kwargs", _Puller)
     sched = _full_scheduler()

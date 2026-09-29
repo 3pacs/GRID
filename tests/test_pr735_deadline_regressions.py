@@ -62,8 +62,9 @@ def test_catalog_complete_transaction_commits_once_and_disposes(monkeypatch):
     assert updates[0].args[1] == {"sid": 185}
     assert engine.begin.return_value.__exit__.call_args.args == (None, None, None)
     engine.dispose.assert_called_once_with()
-    # Local deadline plus maximum in-flight statement/commit stays well inside
-    # the options runner's cleanup margin (900s hard / 840s cooperative).
+    # The cooperative local deadline and configured statement limit are sized
+    # below the options cleanup margin (900s hard / 840s cooperative). This
+    # configuration check does not bound an in-progress durable COMMIT/WAL wait.
     assert options.CATALOG_PUBLICATION_SECONDS + 5 < 60
 
 

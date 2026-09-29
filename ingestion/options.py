@@ -432,7 +432,9 @@ class OptionsPuller(BasePuller):
         Use a short-lived connection to avoid the shared pool's 30s checkout
         wait, with a 5s database connection timeout configured explicitly.
         PostgreSQL 14 has no transaction_timeout; check the local deadline at
-        each boundary and bound each statement (including commit) to 5s.
+        each boundary, configure 5s statement limits, and check immediately
+        before commit. An in-progress durable COMMIT/WAL wait is not bounded
+        by that cooperative check or an absolute 5s wall-clock guarantee.
         """
         publication_deadline = time.monotonic() + CATALOG_PUBLICATION_SECONDS
         catalog_engine = None
