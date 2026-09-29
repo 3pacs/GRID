@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
 
@@ -91,7 +92,7 @@ def test_fix_output_dirs_skill_creates_common_output_directories(tmp_path, monke
         "outputs/llm_insights",
     ):
         assert (tmp_path / rel_path).is_dir()
-        assert str(tmp_path / rel_path) in result["paths"][rel_path]
+        assert str(tmp_path / rel_path) in result["paths"][str(Path(rel_path))]
 
 
 def test_cooldown_source_skill_pauses_noisy_source() -> None:

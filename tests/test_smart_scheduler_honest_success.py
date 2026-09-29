@@ -240,7 +240,7 @@ def test_options_all_tickers_skipped_is_not_success_and_not_fresh(sched, monkeyp
 
     result = summary["results"][0]
     assert result["status"] == OUTCOME_SKIPPED
-    assert "all 3 items skipped" in result["reason"]
+    assert result["reason"] == "no ticker capture completed"
     assert (summary["succeeded"], summary["skipped"]) == (0, 1)
     assert _last_pull(sched.engine, "YFINANCE_OPTIONS") is None  # no freshness bump
     assert _pull_log(sched.engine) == []  # not an attempt -> no pull_log row
