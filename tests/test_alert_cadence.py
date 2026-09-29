@@ -9,7 +9,7 @@ Pure-function coverage — no database needed. Exercises:
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -77,6 +77,39 @@ class TestIsExcluded:
     def test_nothing_is_excluded_by_default(self):
         assert cadence.is_excluded("GDELT_BULK") is False
         assert cadence.is_excluded("any_source") is False
+
+
+class TestHfArchiveCadence:
+    @pytest.mark.parametrize("catalog_frequency", ["DAILY", "REALTIME", "MONTHLY"])
+    def test_archive_override_wins_over_catalog_metadata(self, catalog_frequency):
+        assert cadence.cadence_for_source(
+            " HF_Financial_News ",
+            update_frequency=catalog_frequency,
+            latency_class="REALTIME",
+        ) == cadence.WEEKLY
+
+    @pytest.mark.parametrize(
+        "elapsed,expected_stale",
+        [
+            (timedelta(hours=168), False),  # Next scheduled weekly check.
+            (timedelta(days=8, seconds=-1), False),
+            (timedelta(days=8), False),
+            (timedelta(days=8, seconds=1), True),
+        ],
+    )
+    def test_archive_alert_uses_eight_calendar_day_boundary(self, elapsed, expected_stale):
+        last_success = _dt(2026, 9, 20, 3)  # Sunday legacy weekly check.
+        archive_cadence = cadence.cadence_for_source("hf_financial_news")
+        assert cadence.is_stale(
+            last_success, last_success + elapsed, archive_cadence,
+        ) is expected_stale
+
+    def test_archive_still_flags_missing_or_long_overdue_success(self):
+        now = _dt(2026, 9, 29)
+        archive_cadence = cadence.cadence_for_source("hf_financial_news")
+        assert cadence.is_excluded("hf_financial_news") is False
+        assert cadence.is_stale(None, now, archive_cadence) is True
+        assert cadence.is_stale(now - timedelta(days=15), now, archive_cadence) is True
 
 
 # ── is_stale / age_hours ─────────────────────────────────────────────────

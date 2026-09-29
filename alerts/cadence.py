@@ -136,7 +136,8 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
     "open_meteo": DAILY,
     "tiingo_fundamentals": DAILY,
     "finviz_fundamentals": DAILY,
-    "hf_financial_news": DAILY,
+    # Owner-approved archive: weekly revision checks, not live news.
+    "hf_financial_news": WEEKLY,
     "yfinance_options": DAILY,
     "lme_warehouse": DAILY,
     "reddit_options_pulse": DAILY,
