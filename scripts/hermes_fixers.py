@@ -2145,6 +2145,13 @@ def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> 
                     s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
                 pull_result = _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
+                if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                    log.info("Skipping gap-fill for {s} — repair already in flight", s=source_name)
+                    continue
+                if pull_result.get("status") == "abandoned":
+                    # The owning attempt must decide the cooldown outcome.
+                    log.warning("Gap-fill for {s} abandoned — not recording a cooldown outcome", s=source_name)
+                    continue
                 if pull_result.get("outcome") == "NO_NEW_DATA":
                     state.cooldowns.record_attempt(source_name, success=True)
                     continue

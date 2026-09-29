@@ -3582,6 +3582,13 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             if state.cooldowns.can_retry(src):
                 try:
                     pull_result = _retry_source(src, engine, attempt=1, state=state)
+                    if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                        log.info("Skipping stale refresh for {s} — repair already in flight", s=src)
+                        continue
+                    if pull_result.get("status") == "abandoned":
+                        # The owning attempt must decide the cooldown outcome.
+                        log.warning("Stale refresh for {s} abandoned — not recording a cooldown outcome", s=src)
+                        continue
                     if pull_result.get("outcome") == "NO_NEW_DATA":
                         state.cooldowns.record_attempt(src, success=True)
                         log.info("Stale source {s} checked with no new writes; remains stale", s=src)
