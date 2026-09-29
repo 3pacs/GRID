@@ -205,6 +205,54 @@ def test_wave3_held_writer_job_flags_are_independent(monkeypatch, flag, job_name
     assert not (other_jobs & names)
 
 
+def _run_loop_with_settings(monkeypatch, settings_obj) -> _FakeSchedule:
+    fake_schedule = _FakeSchedule()
+    monkeypatch.setattr(config, "Settings", lambda: settings_obj)
+    monkeypatch.setattr(scheduler, "_sched", fake_schedule)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+    return fake_schedule
+
+
+def test_taiwan_strait_osint_job_default_off(monkeypatch):
+    """Owner decision 2026-09-29: the Taiwan Strait OSINT job (MND URLs
+    404; used to write placeholder rows as SUCCESS) is skipped — never
+    registered — unless GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB is set. Both a
+    bare settings double and the real default settings leave it off."""
+    for settings_obj in (object(), SimpleNamespace(), config.settings):
+        fake_schedule = _run_loop_with_settings(monkeypatch, settings_obj)
+        names = {job["func"] for job in fake_schedule.jobs}
+        assert "_taiwan_strait_osint_daily" not in names
+        # The rest of the loop still registers normally.
+        assert "_crucix_ingest" in names
+
+
+def test_taiwan_strait_osint_job_explicit_false_is_skipped(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=False)
+    )
+    names = {job["func"] for job in fake_schedule.jobs}
+    assert "_taiwan_strait_osint_daily" not in names
+
+
+def test_taiwan_strait_osint_job_can_be_enabled_via_flag(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=True)
+    )
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_taiwan_strait_osint_daily"]["unit"] == "day"
+    assert jobs_by_name["_taiwan_strait_osint_daily"]["at"] == "23:30"
+    # Enabling it does not resurrect the Wave 3 held jobs.
+    assert "_options_tracker" not in jobs_by_name
+    assert "_nightly_research" not in jobs_by_name
+    assert "_paper_trading_signals" not in jobs_by_name
+
+
 class _CapturingSchedule:
     """Minimal fake `schedule` module that captures the real job callables
     (by function name) instead of just recording their cadence, so a test

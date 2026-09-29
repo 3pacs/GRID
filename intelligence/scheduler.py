@@ -10,7 +10,9 @@ recommendations. Three jobs — nightly bulk hypothesis generation
 owner decision (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md §6) and are
 only registered with `schedule` when their respective
 ``GRID_ENABLE_*_JOB`` flag is set; see the "Schedule registration"
-section below.
+section below. The daily Taiwan Strait OSINT job
+(``_taiwan_strait_osint_daily``) is likewise held off by default behind
+``GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB`` (owner decision 2026-09-29).
 
 Extracted from api/main.py lifespan to keep the API entry point lean
 and make the scheduler independently testable.
@@ -928,7 +930,12 @@ def run_intelligence_loop() -> None:
     #   Taiwan Strait → daily 23:30 UTC (MND publishes Taiwan morning)
     _sched.every().day.at("09:00").do(_lme_warehouse_daily)
     _sched.every().friday.at("10:00").do(_iron_ore_ports_daily)
-    _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
+    # Held off by default (owner decision 2026-09-29): the MND source URLs
+    # 404 and the job used to write placeholder rows as SUCCESS. Not
+    # registered with `schedule` unless GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB
+    # is set — see config.GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB.
+    if getattr(_s, "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB", False):
+        _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
 
     def _credit_index_proxies_daily() -> None:
         """CAT-7 / CAT-13 / CAT-42: FRED ICE BofA cash-bond OAS proxies

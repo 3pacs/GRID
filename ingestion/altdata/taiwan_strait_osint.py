@@ -34,9 +34,11 @@ Secondary signal
 ----------------
 KNOWN_PLA_EXERCISES is a hard-coded calendar of announced PLA drills
 since 2022 (Pelosi visit, Tsai-McCarthy meeting, Joint Sword series).
-It is a known-gap seed used by the event-tension classifier when the
-MND scrape fails or produces no rows. Real-time exercise announcement
-tracking requires live MND press releases, which this puller scrapes.
+It is reference context for the event-tension classifier only. It is
+NEVER written to raw_series: when the MND scrape fails or parses to zero
+rows the puller writes nothing (see ``TaiwanStraitPuller.pull``).
+Real-time exercise announcement tracking requires live MND press
+releases, which this puller scrapes.
 
 Series stored (raw_series namespaces)
 -------------------------------------
@@ -378,9 +380,15 @@ class TaiwanStraitPuller(BasePuller):
 
     Scrapes Taiwan MND English press releases for the daily ADIZ
     incursion count, then upserts into raw_series under the
-    ``taiwan_strait:*`` namespaces. Falls back to a hard-coded PLA
-    exercise seed when the scrape fails so downstream consumers always
-    see a non-null row for "today".
+    ``taiwan_strait:*`` namespaces. When the scrape fails (e.g. both MND
+    URLs 404) or parses to zero snapshots it writes NOTHING: no
+    placeholder rows, and never a ``SUCCESS`` row that was not observed.
+
+    History: until 2026-09-29 a failed scrape fell back to a zero-count
+    "seed" snapshot built from ``KNOWN_PLA_EXERCISES`` and inserted it as
+    ``pull_status='SUCCESS'`` with ``raw_payload.source='taiwan_mnd'``. The
+    MND URLs 404, so every production row (09-27, 09-28) was such a
+    placeholder; they were quarantined (#671 mechanism) on 2026-09-29.
 
     OpenSky / AISHub real-time integration is out of scope — see the
     module docstring for the V1 data strategy.
@@ -427,10 +435,14 @@ class TaiwanStraitPuller(BasePuller):
         return resp.text
 
     def pull(self) -> dict[str, Any]:
-        """Fetch + parse MND. Falls back to seed snapshot on failure.
+        """Fetch + parse MND. Returns no snapshots on failure.
+
+        There is deliberately no fallback: a failed or empty scrape must
+        not produce rows, so downstream consumers see the gap instead of a
+        fabricated zero-count observation.
 
         Returns:
-            Dict with: snapshots (list), source ("mnd_html"|"seed"|"none"),
+            Dict with: snapshots (list), source ("mnd_html"|"none"),
             error (str|None).
         """
         # Try specific ADIZ URL first, then the general press releases page.
@@ -452,27 +464,19 @@ class TaiwanStraitPuller(BasePuller):
                     "source": "mnd_html",
                     "error": None,
                 }
-            log.info("MND parse returned 0 snapshots for {u} — trying fallback", u=url)
+            log.info("MND parse returned 0 snapshots for {u} — trying next URL", u=url)
 
-        # Final fallback: seed row from hard-coded exercise calendar.
-        seed = self._seed_snapshot(date.today())
+        # No fallback rows: an unobserved day is left empty, never filled
+        # with a placeholder written as SUCCESS.
+        log.warning(
+            "taiwan_strait_osint: MND scrape produced no parseable snapshots "
+            "from any URL — writing nothing"
+        )
         return {
-            "snapshots": [seed],
-            "source": "seed",
+            "snapshots": [],
+            "source": "none",
             "error": "MND scrape produced no parseable snapshots",
         }
-
-    def _seed_snapshot(self, as_of: date) -> TaiwanStraitSnapshot:
-        """Construct a zero-count snapshot anchored on the exercise calendar."""
-        active, name = is_exercise_active(as_of, KNOWN_PLA_EXERCISES)
-        return TaiwanStraitSnapshot(
-            date=as_of,
-            aircraft_count=0,
-            adiz_crossing_count=0,
-            vessel_count=0,
-            exercise_announced=active,
-            exercise_name=name,
-        )
 
     # ------------------------------------------------------------------ #
     # Persist
@@ -530,7 +534,7 @@ def run_taiwan_strait_puller(engine: Engine) -> dict[str, Any]:
 
     Returns:
         Dict with keys: fetched, inserted, source, latest_aircraft_count.
-        ``source`` is one of ``"mnd_html"``, ``"seed"``, or ``"none"``.
+        ``source`` is ``"mnd_html"`` or ``"none"`` (nothing written).
     """
     puller = TaiwanStraitPuller(engine)
 
