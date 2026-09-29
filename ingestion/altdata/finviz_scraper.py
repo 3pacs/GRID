@@ -1,19 +1,34 @@
 """
 GRID Finviz fundamentals scraper.
 
-Scrapes Finviz for P/E, EPS, Revenue, Market Cap, Sector (free, no API key).
-Source: https://finviz.com/quote.ashx?t={TICKER}
+Reads the Finviz quote-page snapshot table for P/E, EPS, Sales, Market Cap,
+ROE, Debt/Eq and Beta (free, no API key) for a fixed list of ~20 large caps.
+Source: https://finviz.com/stock?t={TICKER}
+
+2026-09-29 fix: from ~2026-04-07 every run inserted 0 rows but reported
+SUCCESS. Finviz moved the page (``/quote.ashx`` -> ``/quote`` -> ``/stock``,
+301s) and changed the snapshot markup: the label is now inside
+``<div class="snapshot-td-label">`` and the value inside
+``<div class="snapshot-td-content"><b>..</b>`` (sometimes wrapped in a
+colour ``<span>``), so the old regex matched nothing. The page is
+server-rendered, so a plain HTTP GET with an honest User-Agent is enough;
+Playwright/Chromium is no longer needed. robots.txt allows /stock.
+
+Failure contract: if no ticker parses, ``pull()`` raises, so the scheduler
+group records FAILED in pull_log and does not bump source_catalog. Text
+fields (Sector/Industry) are no longer stored as a fake 0.0 value.
 """
 
 from __future__ import annotations
 
+import html as html_lib
 import re
 import time
 from datetime import date
 from typing import Any
 
+import requests
 from loguru import logger as log
-from playwright.sync_api import sync_playwright, Browser, Page
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
@@ -23,23 +38,53 @@ DEFAULT_TICKERS: list[str] = [
     "XOM", "JPM", "JNJ", "V", "PG", "MA", "HD", "AVGO", "LLY", "MRK", "COST",
 ]
 
+# Numeric snapshot fields only. (Sector/Industry used to be stored as a
+# meaningless 0.0 value; they are no longer written.) "Dividend %" is kept
+# for older layouts; when a label is absent the field is simply skipped.
 FIELDS_OF_INTEREST: dict[str, str] = {
     "P/E": "pe_ratio",
     "EPS (ttm)": "eps_ttm",
     "Market Cap": "market_cap",
     "Sales": "revenue",
-    "Sector": "sector",
-    "Industry": "industry",
     "Dividend %": "dividend_pct",
     "ROE": "roe",
     "Debt/Eq": "debt_equity",
     "Beta": "beta",
 }
 
-_BASE_URL: str = "https://finviz.com/quote.ashx"
-_RATE_LIMIT_DELAY: float = 0.5
+_BASE_URL: str = "https://finviz.com/stock"
+_USER_AGENT: str = "GRID/4.0 (research; stepdadfinance@gmail.com)"
+_RATE_LIMIT_DELAY: float = 1.5
 _REQUEST_TIMEOUT: int = 30
 _SERIES_PREFIX: str = "finviz"
+
+# Current layout (2026-09): label div + content div in adjacent cells.
+_SNAPSHOT_RE = re.compile(
+    r'<div class="snapshot-td-label">(?P<label>[^<]+)</div>\s*</td>\s*'
+    r'<td[^>]*>\s*<div class="snapshot-td-content">(?P<value>.*?)</div>\s*</td>',
+    re.S,
+)
+# Pre-2026 layout, kept as a fallback.
+_LEGACY_SNAPSHOT_RE = re.compile(
+    r'class="snapshot-td2[^"]*cursor-pointer[^"]*"[^>]*>([^<]+)</td>'
+    r'<td[^>]*class="snapshot-td2[^"]*"[^>]*><b>([^<]*)</b>',
+)
+_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def parse_snapshot_table(html: str) -> dict[str, str]:
+    """Extract label -> raw value text from a Finviz quote page."""
+    pairs: dict[str, str] = {}
+    for m in _SNAPSHOT_RE.finditer(html):
+        label = html_lib.unescape(m.group("label")).strip()
+        value = html_lib.unescape(_TAG_RE.sub(" ", m.group("value"))).strip()
+        # Some cells hold "value <small>pct</small>"; keep the first token.
+        value = value.split()[0] if value else value
+        pairs.setdefault(label, value)
+    if not pairs:
+        for m in _LEGACY_SNAPSHOT_RE.finditer(html):
+            pairs.setdefault(m.group(1).strip(), m.group(2).strip())
+    return pairs
 
 
 def _parse_finviz_value(raw: str) -> float | str | None:
@@ -86,79 +131,31 @@ class FinvizScraperPuller(BasePuller):
         "priority_rank": 45,
     }
 
-    def __init__(self, db_engine: Engine) -> None:
+    def __init__(self, db_engine: Engine, session: requests.Session | None = None) -> None:
         super().__init__(db_engine)
-        self._playwright_ctx = None
-        self._browser: Browser | None = None
+        self._session = session or requests.Session()
+        self._session.headers.update({"User-Agent": _USER_AGENT})
         log.info(
             "FinvizScraperPuller initialised -- source_id={sid}",
             sid=self.source_id,
         )
 
-    def _ensure_browser(self) -> Browser:
-        """Launch Playwright Chromium browser if not already running."""
-        if self._browser is None or not self._browser.is_connected():
-            self._playwright_ctx = sync_playwright().start()
-            self._browser = self._playwright_ctx.chromium.launch(headless=True)
-            log.debug("Playwright Chromium launched for Finviz scraper")
-        return self._browser
-
-    def _close_browser(self) -> None:
-        """Shut down the Playwright browser and context."""
-        if self._browser is not None:
-            try:
-                self._browser.close()
-            except Exception:
-                pass
-            self._browser = None
-        if self._playwright_ctx is not None:
-            try:
-                self._playwright_ctx.stop()
-            except Exception:
-                pass
-            self._playwright_ctx = None
-
     @retry_on_failure(
         max_attempts=3,
         backoff=3.0,
-        retryable_exceptions=(
-            ConnectionError, TimeoutError, OSError, Exception,
-        ),
+        retryable_exceptions=(ConnectionError, TimeoutError, requests.RequestException),
     )
     def _fetch_page(self, ticker: str) -> str:
-        """Fetch the Finviz quote page HTML via headless Chromium."""
-        browser = self._ensure_browser()
-        page: Page = browser.new_page(
-            user_agent=(
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
+        """Fetch the Finviz quote page HTML."""
+        resp = self._session.get(
+            _BASE_URL, params={"t": ticker}, timeout=_REQUEST_TIMEOUT,
         )
-        try:
-            url = f"{_BASE_URL}?t={ticker}"
-            page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            html = page.content()
-        finally:
-            page.close()
-        return html
+        resp.raise_for_status()
+        return resp.text
 
     def _parse_snapshot_table(self, html: str) -> dict[str, str]:
         """Extract key-value pairs from the Finviz snapshot table."""
-        pairs: dict[str, str] = {}
-        # Match label-value pairs in the snapshot table
-        # Label td: class="snapshot-td2 cursor-pointer ..." with visible label text
-        # Value td: class="snapshot-td2 w-[8%] ..." with <b>VALUE</b>
-        pattern = re.compile(
-            r'class="snapshot-td2[^"]*cursor-pointer[^"]*"[^>]*>([^<]+)</td>'
-            r'<td[^>]*class="snapshot-td2[^"]*"[^>]*><b>([^<]*)</b>',
-        )
-        for match in pattern.finditer(html):
-            label = match.group(1).strip()
-            value = match.group(2).strip()
-            pairs[label] = value
-
-        return pairs
+        return parse_snapshot_table(html)
 
     def pull_ticker(self, ticker: str) -> dict[str, Any]:
         """Pull fundamentals for a single ticker."""
@@ -197,11 +194,13 @@ class FinvizScraperPuller(BasePuller):
                     continue
 
                 parsed = _parse_finviz_value(raw_val)
-                if parsed is None:
+                if not isinstance(parsed, (int, float)):
+                    # None, or text that did not parse as a number: never
+                    # store a placeholder value.
                     continue
 
                 sid = f"{_SERIES_PREFIX}.{ticker}.{field_name}"
-                numeric_val = parsed if isinstance(parsed, (int, float)) else 0.0
+                numeric_val = parsed
 
                 self._insert_raw(
                     conn=conn,
@@ -222,22 +221,14 @@ class FinvizScraperPuller(BasePuller):
         return {"status": "SUCCESS", "ticker": ticker, "rows_inserted": inserted}
 
     def pull_all(self, tickers: list[str] | None = None) -> list[dict[str, Any]]:
-        """Pull fundamentals for a list of tickers (defaults to top-20 SPY).
-
-        Launches a headless Chromium browser once for the entire batch and
-        closes it when done, even if an error occurs mid-run.
-        """
+        """Pull fundamentals for a list of tickers (defaults to top-20 SPY)."""
         tickers = tickers or DEFAULT_TICKERS
         results: list[dict[str, Any]] = []
 
-        try:
-            self._ensure_browser()
-            for ticker in tickers:
-                result = self.pull_ticker(ticker)
-                results.append(result)
+        for n, ticker in enumerate(tickers):
+            if n:
                 time.sleep(_RATE_LIMIT_DELAY)
-        finally:
-            self._close_browser()
+            results.append(self.pull_ticker(ticker))
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)
@@ -248,10 +239,24 @@ class FinvizScraperPuller(BasePuller):
         return results
 
     def pull(self) -> dict[str, Any]:
-        """Standard pull entry point for scheduler.
+        """Standard pull entry point for the scheduler group.
 
-        Browser lifecycle is handled by pull_all's try/finally.
+        Raises when no ticker could be fetched and parsed, so the group
+        runner (which only treats exceptions as failures) records FAILED
+        instead of a 0-row SUCCESS. Returns PARTIAL when some tickers failed.
         """
         results = self.pull_all()
+        ok = [r for r in results if r["status"] == "SUCCESS"]
         total = sum(r["rows_inserted"] for r in results)
-        return {"status": "SUCCESS", "rows_inserted": total}
+        if not ok:
+            errors = sorted({str(r.get("error", ""))[:80] for r in results})
+            raise RuntimeError(
+                f"Finviz: 0/{len(results)} tickers parsed ({'; '.join(errors)[:300]})"
+            )
+        status = "SUCCESS" if len(ok) == len(results) else "PARTIAL"
+        return {
+            "status": status,
+            "rows_inserted": total,
+            "tickers_ok": len(ok),
+            "tickers_total": len(results),
+        }
