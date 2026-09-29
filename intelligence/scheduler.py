@@ -823,8 +823,7 @@ def run_intelligence_loop() -> None:
     #   Credit card → Fri 18:00 UTC (FRED weekly update)
     #   Buyback execution → 21st 13:00 UTC (Z.1 Flow of Funds is quarterly)
     #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
-    #   ECB LTRO (ILM weekly) → Mon 09:00 UTC (ECB publishes the weekly
-    #     financial statement on Tuesdays; Monday picks up the prior week)
+    #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
     def _pboc_omo_daily() -> None:
         """CAT-3: PBoC 7-day reverse repo + MLF daily pull."""
         try:

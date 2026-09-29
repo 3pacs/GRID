@@ -74,8 +74,8 @@ EXPECTED_CADENCE_BY_PREFIX: dict[str, int] = {
     "credit_card:":         7,    # weekly credit card spend
     "buybacks:":            90,   # quarterly buyback announcements
     "semi:":                30,   # monthly semiconductor sales
-    "ecb_tltro:":           7,    # weekly ECB TLTRO drawdown
     "ecb_ilm:":             7,    # weekly Eurosystem LTRO outstanding (ECB ILM)
+    "ecb_tltro:":           7,    # weekly ECB TLTRO drawdown
     "pboc:":                1,    # daily PBOC OMO and balance sheet
     "taiwan:":              30,   # monthly Taiwan macro
     "freight:":             7,    # weekly freight rates (Drewry / Baltic)
