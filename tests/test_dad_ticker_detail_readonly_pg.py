@@ -46,7 +46,7 @@ def test_ticker_detail_stored_cold_error_and_stream_gets_have_no_writes():
                 VALUES (:series, 1, :obs, :pulled, :value, CAST(:payload AS JSONB), 'SUCCESS')"""), {
                 "series": f"sec_filed_fundamentals.{ticker}.total_assets", "obs": pulled.date(), "pulled": datetime.now(timezone.utc),
                 "value": price, "payload": json.dumps({
-                    "ticker": ticker, "period_end": pulled.date().isoformat(),
+                    "ticker": ticker, "cik": "0000320193", "period_end": pulled.date().isoformat(),
                     "filed": pulled.date().isoformat(), "form": "10-K", "unit": "USD",
                     "accession": "0000320193-26-000001",
                     "source_url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json",
