@@ -89,7 +89,7 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"0512baf5cbae66310130e7219d589e3d992c438dd2ea2ae612903b456da58f5f",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-28T05:56:47.616223+00:00"}'
 )
-SUPERSEDED_BY: dict | None = None
+SUPERSEDED_BY: dict | None = {"version": "vs1-sectors-v5"}
 
 
 def _technology_modules() -> list[ModuleType]:

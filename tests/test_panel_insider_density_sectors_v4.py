@@ -47,10 +47,12 @@ def test_the_witness_is_the_canonical_sectors_v4_path():
     assert v1.SECTORS_WITNESS.match(s4.WITNESS_PATH)
 
 
-def test_the_technology_run_is_v6_the_terminal_member_of_the_pinned_chain():
+def test_the_technology_run_remains_pinned_to_v6_and_refuses_v7():
     assert s4.TECHNOLOGY_RUN["version"] == "vs1-v6" and s4.TECHNOLOGY_RUN["registry_id"] == "vs1-v6"
-    assert s4.check_technology_run() == s4.TECHNOLOGY_RUN == s4.technology_terminal()
     assert s4.TECHNOLOGY_RUN["registry_head_sha256"] == v6.REGISTERED_RECORD_SHA256[1]
+    assert s4.SUPERSEDED_BY["version"] == "vs1-sectors-v5"
+    with pytest.raises(PermissionError):
+        s4.check_technology_run()
 
 
 def test_a_later_technology_registration_requires_a_new_sectors_registration(monkeypatch):
@@ -58,7 +60,7 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
                                REGISTERED_RECORD_SHA256=("a" * 64, "b" * 64),
                                WITNESS_PATH=v1.canonical_witness_path("vs1-v7"))
     pin7 = {"version": "vs1-v7", "prereg_sha256": "7" * 64, "registry_head_sha256": "b" * 64}
-    chain = s4._technology_modules()
+    chain = s4._technology_modules()[:-1]  # historical v1-v6 chain, before the real v7 scaffold
     fakes = [types.SimpleNamespace(**{**vars(m), "SUPERSEDED_BY": pin7}) for m in chain]
     monkeypatch.setattr(s4, "_technology_modules", lambda: [*fakes, v7])
     assert s4.technology_terminal()["version"] == "vs1-v7"
@@ -67,6 +69,9 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
 
 
 def test_a_broken_technology_chain_refuses(monkeypatch):
+    historical = s4._technology_modules()[:-1]
+    monkeypatch.setattr(s4, "_technology_modules", lambda: historical)
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
     monkeypatch.setattr(v5, "SUPERSEDED_BY", None)
     with pytest.raises(PermissionError, match="no single terminal member"):
         s4.technology_terminal()
@@ -139,7 +144,8 @@ def test_the_census_knows_sectors_v4_on_a_git_vault(tmp_path):
         s4.check_census(census)  # at this registration v6 has not opened: sectors v4 cannot open
 
 
-def test_v6_refuses_to_open_while_sectors_v4_is_opened(tmp_path):
+def test_v6_refuses_to_open_while_sectors_v4_is_opened(tmp_path, monkeypatch):
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)  # isolate the historical census guard
     vault = _real_vault(tmp_path, SECTOR_LINE + b'{"head_sha256":"' + b"e" * 64
                         + b'","prev_anchor_sha256":"x","records":4,"run_at":"2026-10-01T00:00:00+00:00"}\n')
     _register(tmp_path / "reg", v6)
@@ -165,7 +171,10 @@ def test_v1_and_sectors_v3_point_at_sectors_v4():
         s3.check_open()
 
 
-def test_the_sectors_v4_registration_is_pinned(tmp_path):
+def test_the_sectors_v4_registration_is_pinned(tmp_path, monkeypatch):
+    historical = s4._technology_modules()[:-1]
+    monkeypatch.setattr(s4, "_technology_modules", lambda: historical)
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
     records = s4.register(tmp_path, s4.REGISTERED_AT, s4.REGISTERED_CODE_SHA)
     assert tuple(v1.chained_sha256(records)) == s4.REGISTERED_RECORD_SHA256
     assert (tmp_path / s4.REGISTRY_ANCHORS).read_bytes() == s4.REGISTERED_ANCHOR_LINE + b"\n"
