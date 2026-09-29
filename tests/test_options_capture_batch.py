@@ -202,7 +202,7 @@ def test_non_session_never_initializes_provider_or_publishes(
     monkeypatch.setattr(options, "YahooOptionsClient",
                         lambda: pytest.fail("closed day must not contact provider"))
     result = puller.pull_all(tickers=["SPY"], max_expirations=6)
-    assert result == [{"ticker": "SPY", "status": "SKIPPED",
+    assert result == [{"ticker": "SPY", "status": "SKIPPED", "rows_inserted": 0,
                        "reason": "non-equity-session"}]
     assert puller.engine.rows == []
 

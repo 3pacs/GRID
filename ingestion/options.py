@@ -308,13 +308,17 @@ class OptionsPuller(BasePuller):
         today_str = today.isoformat()
         if not is_market_open(today) or now.astimezone(_EQUITY_TZ).date() != today:
             log.info("Options pull skipped: {day} is not a scheduled equity session", day=today_str)
-            return [{"ticker": ticker, "status": "SKIPPED",
+            # Every item carries rows_inserted: SmartScheduler reads the run's
+            # outcome from these (an all-SKIPPED list is SKIPPED, not a fresh
+            # YFINANCE_OPTIONS pull -- see smart_scheduler._classify_outcome).
+            return [{"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                      "reason": "non-equity-session"} for ticker in tickers]
 
         self._yahoo = YahooOptionsClient()
         if not self._yahoo.is_available:
             log.error("Yahoo options client unavailable — cannot pull options")
-            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
+            return [{"ticker": "N/A", "status": "FAILED", "rows_inserted": 0,
+                     "error": "Yahoo auth failed"}]
         results: list[dict[str, Any]] = []
 
         for ticker in tickers:
@@ -339,7 +343,7 @@ class OptionsPuller(BasePuller):
             now = _utc_now()
             if (session_day != now.date() or not is_market_open(session_day)
                     or now.astimezone(_EQUITY_TZ).date() != session_day):
-                return {"ticker": ticker, "status": "SKIPPED",
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "non-equity-session or UTC date mismatch"}
             capture_clock = time.monotonic()
             # Force a 64-bit PostgreSQL transaction ID for each capture. It is
@@ -352,19 +356,21 @@ class OptionsPuller(BasePuller):
                 ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
-                return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
+                return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
+                        "error": "no data from Yahoo"}
 
             quote = first.get("quote", {})
             spot_price = quote.get("regularMarketPrice")
             if (not isinstance(spot_price, (int, float)) or isinstance(spot_price, bool)
                     or not math.isfinite(spot_price) or spot_price <= 0):
-                return {"ticker": ticker, "status": "SKIPPED",
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "no dated regular-market price"}
 
             expirations = first.get("expirations", [])
             if not expirations:
                 log.warning("{t}: no options expirations", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "reason": "no expirations"}
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                        "reason": "no expirations"}
             selected_expirations = expirations[:max_expirations]
 
             total_call_oi = 0
@@ -493,7 +499,7 @@ class OptionsPuller(BasePuller):
                 ).fetchone()
                 if latest and latest[0] is not None and latest[0] > capture_ordinal:
                     log.info("{t}: older overlapping options capture skipped", t=ticker)
-                    return {"ticker": ticker, "status": "SKIPPED",
+                    return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                             "reason": "newer options capture already published"}
 
                 # A ticker/day is one full capture, not a growing union of four

@@ -100,23 +100,32 @@ class CoinGeckoPuller:
             cg_id = CRYPTO_MAP.get(ticker.upper())
             if not cg_id:
                 log.debug("No CoinGecko ID for {t}", t=ticker)
+                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                                "reason": "No CoinGecko ID"})
                 continue
 
             fname = f"{ticker.lower()}_usd_full"
             if fname in fresh:
                 log.debug("Skipping {t} — already fresh today", t=ticker)
+                results.append({"ticker": ticker, "status": "UNCHANGED", "rows_inserted": 0})
                 continue
 
             try:
                 data = self._fetch_price(cg_id)
                 if data:
                     data["ticker"] = ticker.upper()
+                    data["rows_inserted"] = self._save_to_db(ticker, data)
+                    data["status"] = "SUCCESS"
                     results.append(data)
-                    self._save_to_db(ticker, data)
                     log.info("CoinGecko {t}: ${p:,.2f}", t=ticker, p=data["price"])
+                else:
+                    results.append({"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
+                                    "error": "Provider response had no USD price"})
                 time.sleep(2.5)  # Rate limit: 30/min free tier
             except Exception as exc:
                 log.warning("CoinGecko {t} failed: {e}", t=ticker, e=str(exc))
+                results.append({"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
+                                "error": str(exc)})
 
         log.info("CoinGecko pull complete: {n}/{total} tickers",
                  n=len(results), total=len(targets))
@@ -154,7 +163,7 @@ class CoinGeckoPuller:
             "date": date.today().isoformat(),
         }
 
-    def _save_to_db(self, ticker: str, data: dict) -> None:
+    def _save_to_db(self, ticker: str, data: dict) -> int | None:
         """Save price to resolved_series, creating feature if needed."""
         tk = ticker.lower()
         fname = f"{tk}_usd_full"
@@ -185,13 +194,16 @@ class CoinGeckoPuller:
                 ).fetchone()
 
             if feat:
-                conn.execute(text(
+                written = conn.execute(text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, source_priority_used) "
                     "VALUES (:fid, :d, :d, :d, :v, 1) "
                     "ON CONFLICT (feature_id, obs_date, vintage_date) "
                     "DO UPDATE SET value = EXCLUDED.value"
                 ), {"fid": feat[0], "d": today, "v": data["price"]})
+                count = written.rowcount
+                return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+        raise RuntimeError("CoinGecko feature unavailable; price not stored")
 
     def pull_history(self, ticker: str, days: int = 90) -> int:
         """Pull historical daily prices for a single coin.
