@@ -37,12 +37,15 @@ def test_check_db_health_stale_sources_is_cadence_aware_and_index_backed() -> No
 
 def test_source_catalog_column_exists_uses_information_schema_not_a_query_error() -> None:
     """Schema-drift-safe: update_frequency isn't in schema.sql, so reading
-    it must be gated on an information_schema check, not a bare SELECT
-    that would throw on a DB where the column doesn't exist."""
+    it must be gated on an existence check, not a bare SELECT that would
+    throw on a DB where the column doesn't exist. Uses to_regclass rather
+    than a hardcoded 'public' schema so the check is also correct inside a
+    throwaway test schema (search_path-scoped), not just production."""
     source = inspect.getsource(hermes_health._source_catalog_column_exists)
 
-    assert "information_schema.columns" in source
+    assert "to_regclass(" in source
     assert "source_catalog" in source
+    assert "table_schema = 'public'" not in source
 
 
 def test_resolve_source_issues_marks_unresolved_severe_rows() -> None:

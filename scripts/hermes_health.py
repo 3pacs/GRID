@@ -726,20 +726,26 @@ class OperatorState:
 # ─── Health checks ───────────────────────────────────────────────────
 
 def _source_catalog_column_exists(conn: Any, column_name: str) -> bool:
-    """Schema-drift-safe optional-column check (mirrors the same helper in
-    scripts/hermes_fixers.py -- duplicated rather than imported, since that
-    module imports from this one and importing back would be circular).
-    Lets us read source_catalog.update_frequency when it's present on the
-    live DB without requiring it (it isn't in schema.sql)."""
+    """Schema-drift-safe optional-column check. Lets us read
+    source_catalog.update_frequency when it's present on the live DB
+    without requiring it (it isn't in schema.sql).
+
+    Resolves the table with to_regclass, which follows the connection's
+    current search_path, rather than a hardcoded 'public' schema (the
+    pattern scripts/hermes_fixers.py's sibling helper uses, via
+    information_schema.columns) -- production only ever runs with
+    search_path=public so that distinction is invisible there, but a
+    schema-drift-safe check should also give the right answer inside a
+    test's throwaway schema, which the hardcoded form can't."""
     from sqlalchemy import text as sa_text
 
     row = conn.execute(
         sa_text(
             "SELECT EXISTS ("
-            "  SELECT 1 FROM information_schema.columns "
-            "  WHERE table_schema = 'public' "
-            "    AND table_name = 'source_catalog' "
-            "    AND column_name = :column_name"
+            "  SELECT 1 FROM pg_attribute "
+            "  WHERE attrelid = to_regclass('source_catalog') "
+            "    AND attname = :column_name "
+            "    AND NOT attisdropped"
             ")"
         ),
         {"column_name": column_name},
