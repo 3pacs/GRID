@@ -433,6 +433,53 @@ def test_run_probe_end_to_end_on_sqlite(tmp_path):
     assert "twelvedata_unavailable" in rec["ZZZ"]["reasons"]
 
 
+@pytest.mark.parametrize("extra", [[], ["--statement-timeout-s", "300"]])
+def test_the_probe_passes_its_own_900_second_ceiling_and_defaults_to_60(tmp_path, monkeypatch, extra):
+    """Operational only: the timeout reaches the read-only engine; the probe's outputs do not depend on it."""
+    engine, series = _db()
+    _Vendors(series, tmp_path).write(TICKERS)
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    calls = []
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: calls.append((a, k)) or engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    out = tmp_path / "probe"
+    cli.main(["probe", "--tickers-file", _tickers_file(tmp_path), "--twelvedata-dir", str(tmp_path / "td"),
+              "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+              "--as-of-ts", SNAPSHOT.isoformat(), *extra])
+    (seconds, name), kwargs = calls[0]
+    assert seconds == (300 if extra else 60) and name == "vs1_v6_price_probe"
+    assert kwargs == {"max_statement_timeout_s": cli.PROBE_MAX_STATEMENT_TIMEOUT_S} and cli.PROBE_MAX_STATEMENT_TIMEOUT_S == 900
+    assert cli.PROBE_MAX_STATEMENT_TIMEOUT_S <= rps.ABSOLUTE_MAX_STATEMENT_TIMEOUT_S
+    assert (out / "price_manifest.json").exists()
+
+
+def _tickers_file(tmp_path):
+    path = tmp_path / "tickers.json"
+    path.write_text(json.dumps(list(TICKERS)))
+    return str(path)
+
+
+def test_the_probe_report_is_identical_whatever_the_timeout(tmp_path, monkeypatch):
+    engine, series = _db()
+    _Vendors(series, tmp_path).write(TICKERS)
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    outs = []
+    for seconds in ("60", "900"):
+        out = tmp_path / f"probe{seconds}"
+        cli.main(["probe", "--tickers-file", _tickers_file(tmp_path), "--twelvedata-dir", str(tmp_path / "td"),
+                  "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+                  "--as-of-ts", SNAPSHOT.isoformat(), "--statement-timeout-s", seconds])
+        outs.append(out)
+    for name in ("probe_report.json", "crosscheck_report.json", "tiingo_meta_report.json", "price_manifest.json"):
+        assert (outs[0] / name).read_bytes() == (outs[1] / name).read_bytes(), name
+
+
 def test_cli_writes_reports_and_a_manifest_the_v6_harness_accepts(tmp_path, monkeypatch):
     engine, series = _db()
     _Vendors(series, tmp_path).write(TICKERS)

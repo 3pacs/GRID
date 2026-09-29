@@ -25,7 +25,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 
 # CFTC's own publication clock (15:30 America/New_York) — used by the
@@ -465,7 +465,15 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "solar",             "mod": "ingestion.celestial.solar",           "cls": "SolarActivityPuller",      "method": "pull_all",      "freq_h": 24, "timeout_s": 30},
 
     # ── Paid APIs (MUST RUN — user is paying for these) ──
-    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_all",      "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
+    # tiingo: pull_incremental, not pull_all (stale-sources audit 2026-09-29).
+    # pull_all() with no start_date re-pulled every ticker from 2020 and never
+    # fit in 120s: every run TIMED OUT and left an orphan thread writing
+    # alongside grid-scheduler's own Tiingo run. pull_incremental skips
+    # tickers already holding the latest session (so most runs finish in
+    # seconds), stops cleanly on the auto-wired should_continue deadline
+    # (PARTIAL, retried next tick), and shares one advisory lock with
+    # grid-scheduler's daily Tiingo worker (SKIPPED while that holds it).
+    {"name": "tiingo",            "mod": "ingestion.tiingo_pull",              "cls": "TiingoPuller",             "method": "pull_incremental", "freq_h": 4,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_news",       "mod": "ingestion.tiingo_news_pull",         "cls": "TiingoNewsPuller",         "method": "pull_all",      "freq_h": 6,  "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
@@ -544,14 +552,12 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # why these are registered here and not via the two .patch files in
     # docs/handoffs/2026-09-18/ (which target the non-live scheduler.py).
     #
-    # Registry ``name`` MUST match the source_catalog name lower-cased --
-    # ``_load_state_from_db`` keys restart state by ``name.lower()`` and
-    # ``_update_last_pull`` writes back the same way. Confirmed against
-    # grid-svr (read-only, name-only): the existing "EIA" row lower()s to
-    # "eia"; "FINRA_SHORT_VOLUME" and "SEC_FTD" don't exist yet and will be
-    # auto-created (BasePuller._resolve_source_id) with exactly the puller
-    # classes' own SOURCE_NAME the first time each runs, which already
-    # lower()s to "finra_short_volume" / "sec_ftd". LME_Warehouse is
+    # Restart state is keyed by registry ``name`` and persisted in pull_log
+    # (see SmartScheduler._load_state_from_db); the source_catalog row each
+    # entry bumps comes from REGISTRY_CATALOG_NAMES below, falling back to
+    # the registry name itself. These three names already lower() to their
+    # puller classes' SOURCE_NAME ("EIA", "FINRA_SHORT_VOLUME", "SEC_FTD"),
+    # so they need no REGISTRY_CATALOG_NAMES entry. LME_Warehouse is
     # deliberately NOT registered here at all -- see
     # _LMEWarehouseSchedulerAdapter's docstring (both LME URLs 403 from
     # grid-svr).
@@ -559,6 +565,142 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "finra_short_volume", "mod": "ingestion.altdata.finra_short_volume", "cls": "FINRAShortVolumePuller", "method": "pull_recent", "freq_h": 24, "timeout_s": 60, "kwargs": {"anchor_date": _finra_short_volume_trade_date, "weekdays_back": 5}},
     {"name": "sec_ftd",            "mod": "ingestion.smart_scheduler",         "cls": "_SECFTDSchedulerAdapter", "method": "pull", "freq_h": 24, "timeout_s": 60},
 ]
+
+# ── Registry name → source_catalog name ─────────────────────────────────
+# Stale-sources audit 2026-09-29 (GRID-STALE-SOURCES-AUDIT-20260929 §3-C):
+# restart state used to be rebuilt ONLY from source_catalog.last_pull_at
+# keyed by ``name.lower()``, and ``_update_last_pull`` wrote back the same
+# way. 48 of the 92 registry names match no catalog row under that rule
+# (and "defillama" matched an inactive row its puller never writes),
+# so every Hermes restart (14 of them on 2026-09-28 alone -- each push to
+# main restarts grid-hermes) made those entries look "never run"
+# (overdue 9999h), they sorted ahead of every genuinely overdue source,
+# and with only MAX_PULLERS_PER_TICK slots per tick bls/eia/cboe/aaii/
+# finra_short_volume/sec_ftd/kosis/cftc_cot never got a turn that day.
+#
+# This map names, for every entry whose registry name does not already
+# lower() to it, the source_catalog row its puller class actually writes
+# under (the class's own ``SOURCE_NAME``, or the name its hand-rolled
+# catalog insert uses). tests/test_smart_scheduler_restart_state.py
+# checks every entry against the puller class source, so a renamed
+# SOURCE_NAME or a new registry entry can't silently drift again.
+#
+# It is used for exactly two things:
+#   1. ``_update_last_pull`` bumps THIS row on success (so a successful
+#      run is visible to the stale-sources alert), and
+#   2. a one-time bootstrap of restart state, before this entry has any
+#      pull_log history of its own -- see ``_load_state_from_db``.
+# Restart state itself comes from pull_log (one row per SmartScheduler
+# run, puller_name = SMART_PULL_LOG_PREFIX + registry name), because
+# several entries share one catalog row (FRED, yfinance, Kalshi,
+# polymarket) and a shared row cannot say when each job last ran.
+REGISTRY_CATALOG_NAMES: dict[str, str] = {
+    "options":                "YFINANCE_OPTIONS",
+    "insider_filings":        "SEC_INSIDER",
+    "congressional":          "CONGRESS_TRADING",
+    "prediction_odds":        "Polymarket",
+    "prediction_pmxt":        "pmxt",
+    "smart_money":            "Social_Smart_Money",
+    "fed_liquidity":          "FRED",
+    "etf_flows":              "INSTITUTIONAL_FLOWS",
+    "news_scraper":           "NewsScraperRSS",
+    "opportunity":            "OppInsights",
+    "ecb":                    "ECB_SDW",
+    "bcb":                    "BCB_BR",
+    "mas":                    "MAS_SG",
+    "oecd":                   "OECD_SDMX",
+    "imf":                    "IMF_IFS",
+    "dark_pool":              "DARKPOOL",
+    "gov_contracts":          "USASPENDING_GOV",
+    "campaign_finance":       "FEC_CAMPAIGN_FINANCE",
+    "lobbying":               "LOBBYING_DISCLOSURE",
+    "export_controls":        "BIS_EXPORT_CONTROLS",
+    "fara":                   "FARA_DOJ",
+    "uk_companies":           "UK_Companies_House",
+    "telegram_scanner":       "Telegram_Solana_Scanner",
+    "discord_scanner":        "Discord_Solana_Scanner",
+    "planetary":              "PLANETARY_EPHEMERIS",
+    "lunar":                  "LUNAR_EPHEMERIS",
+    "solar":                  "NOAA_SWPC",
+    "edgar":                  "SEC_EDGAR",
+    "world_news":             "WorldNewsAPI",
+    "social_sentiment":       "SocialSentiment",
+    "wiki_history":           "WikiHistory",
+    "kalshi_markets":         "KALSHI",
+    "fed_speeches":           "FedSpeeches",
+    "crucix_bridge":          "Crucix",
+    "dune":                   "Dune_Analytics",
+    "defillama":              "DeFi_Llama",  # the "defillama" row is inactive; the puller writes DeFi_Llama
+    "repo_market":            "FRED",
+    "legislation":            "CONGRESS_GOV",
+    "earnings_calendar":      "yfinance_earnings",
+    "social_attention":       "Wikipedia_Attention",
+    "yield_curve_full":       "FRED",
+    "fx_rates":               "yfinance",
+    "margin_debt":            "FINRA_MARGIN",
+    "ag_commodity_futures":   "YFINANCE_COMMODITY_FUTURES",
+    "alphavantage_sentiment": "alphavantage_news_sentiment",
+    "offshore_leaks":         "ICIJ_OFFSHORE",
+}
+
+# pull_log.puller_name prefix for SmartScheduler runs. The prefix keeps
+# these rows distinct from grid-scheduler's own pull_log names (it logs a
+# "nowcast" and an "SEC_EDGAR_Fundamentals" run of its own, for example).
+SMART_PULL_LOG_PREFIX = "smart:"
+
+# pull_log lookback used to rebuild a failure streak (and so the cooldown)
+# on restart. Longer than the 24h maximum cooldown in _record_result.
+RESTART_FAILURE_LOOKBACK_H = 48
+
+
+def catalog_name_for(registry_name: str) -> str:
+    """The source_catalog name a registry entry's puller writes under."""
+    return REGISTRY_CATALOG_NAMES.get(registry_name, registry_name)
+
+
+def _cooldown_minutes(consecutive_fails: int) -> int:
+    """Exponential backoff: 30min, 1h, 2h, 4h, 8h, 16h, max 24h."""
+    return min(30 * (2 ** (max(consecutive_fails, 1) - 1)), 1440)
+
+
+def _as_utc(value: Any) -> datetime | None:
+    """Coerce a DB timestamp (datetime, or ISO text on SQLite) to aware UTC."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _extract_rows(out: Any) -> int | None:
+    """Best-effort row count from a puller's return value (for pull_log)."""
+    if isinstance(out, bool) or out is None:
+        return None
+    if isinstance(out, int):
+        return max(out, 0)
+    if isinstance(out, dict):
+        for key in ("rows_inserted", "total_inserted", "inserted", "rows_written", "rows"):
+            val = out.get(key)
+            if isinstance(val, int) and not isinstance(val, bool):
+                return max(val, 0)
+        return None
+    if isinstance(out, list):
+        total = 0
+        found = False
+        for item in out:
+            if isinstance(item, dict) and isinstance(item.get("rows_inserted"), int):
+                total += max(item["rows_inserted"], 0)
+                found = True
+        return total if found else None
+    return None
+
 
 # How many pullers to run per tick (keeps cycles short)
 MAX_PULLERS_PER_TICK = 8
@@ -658,23 +800,123 @@ class SmartScheduler:
             )
 
     def _load_state_from_db(self) -> None:
-        """Bootstrap state from source_catalog.last_pull_at."""
+        """Rebuild restart state for every registry entry, keyed by registry name.
+
+        Source of truth, per entry:
+          1. pull_log rows this scheduler wrote itself
+             (``puller_name = SMART_PULL_LOG_PREFIX + name``, see
+             ``_log_run``): the latest SUCCESS ``completed_at`` is
+             ``last_success``, and the trailing FAILED/PARTIAL streak inside
+             RESTART_FAILURE_LOOKBACK_H rebuilds ``consecutive_fails`` and
+             the matching cooldown, so an entry that was backing off does
+             not get retried on every restart either.
+          2. Bootstrap, only while an entry has no SUCCESS in pull_log yet
+             (i.e. the first restart after this code ships): the mapped
+             source_catalog row's ``last_pull_at`` (``catalog_name_for``) --
+             but only when that row belongs to this entry alone, or the
+             entry's own name is that row's name. A shared row (FRED,
+             yfinance, Kalshi, polymarket) is bumped by other jobs on their
+             own cadence; bootstrapping e.g. the 168h ``repo_market`` entry
+             from FRED's 12h bumps would re-defer it on every restart and
+             starve it for good. Those few entries run once, then have
+             pull_log history like everything else.
+        An entry with neither is genuinely never-run and stays absent from
+        ``_state`` (``_is_due`` treats that as due).
+        """
+        names = [p["name"] for p in PULLER_REGISTRY]
+        self._catalog_ids: dict[str, int] = {}
+        catalog_last: dict[str, datetime | None] = {}
         try:
             with self.engine.connect() as conn:
                 rows = conn.execute(text(
-                    "SELECT name, last_pull_at FROM source_catalog "
-                    "WHERE last_pull_at IS NOT NULL"
+                    "SELECT id, name, last_pull_at FROM source_catalog"
                 )).fetchall()
-                for r in rows:
-                    self._state[r[0].lower()] = {
-                        "last_success": r[1],
-                        "last_attempt": r[1],
-                        "consecutive_fails": 0,
-                        "cooldown_until": None,
-                    }
-            log.debug("SmartScheduler loaded {n} source states from DB", n=len(self._state))
+            for r in rows:
+                lname = str(r[1]).lower()
+                self._catalog_ids[lname] = int(r[0])
+                catalog_last[lname] = _as_utc(r[2])
         except Exception as exc:
-            log.warning("SmartScheduler DB state load failed: {e}", e=str(exc))
+            log.warning("SmartScheduler source_catalog state load failed: {e}", e=str(exc))
+
+        log_names = [SMART_PULL_LOG_PREFIX + n for n in names]
+        last_success: dict[str, datetime | None] = {}
+        recent: list[Any] = []
+        try:
+            since = datetime.now(timezone.utc) - timedelta(hours=RESTART_FAILURE_LOOKBACK_H)
+            with self.engine.connect() as conn:
+                for r in conn.execute(
+                    text(
+                        "SELECT puller_name, MAX(completed_at) FROM pull_log "
+                        "WHERE status = 'SUCCESS' AND puller_name IN :names "
+                        "GROUP BY puller_name"
+                    ).bindparams(bindparam("names", expanding=True)),
+                    {"names": log_names},
+                ).fetchall():
+                    last_success[str(r[0])[len(SMART_PULL_LOG_PREFIX):]] = _as_utc(r[1])
+                recent = conn.execute(
+                    text(
+                        "SELECT puller_name, status, started_at, completed_at FROM pull_log "
+                        "WHERE puller_name IN :names AND started_at >= :since "
+                        "ORDER BY started_at DESC"
+                    ).bindparams(bindparam("names", expanding=True)),
+                    {"names": log_names, "since": since},
+                ).fetchall()
+        except Exception as exc:
+            log.warning("SmartScheduler pull_log state load failed: {e}", e=str(exc))
+
+        # Trailing failure streak per entry (rows are newest first).
+        streaks: dict[str, tuple[int, datetime | None]] = {}
+        closed: set[str] = set()
+        for r in recent:
+            name = str(r[0])[len(SMART_PULL_LOG_PREFIX):]
+            if name in closed:
+                continue
+            status = str(r[1])
+            if status == "SUCCESS":
+                closed.add(name)
+                continue
+            if status in ("FAILED", "PARTIAL"):
+                fails, last_fail = streaks.get(name, (0, None))
+                if last_fail is None:
+                    last_fail = _as_utc(r[3]) or _as_utc(r[2])
+                streaks[name] = (fails + 1, last_fail)
+
+        owners: dict[str, int] = {}
+        for n in names:
+            key = catalog_name_for(n).lower()
+            owners[key] = owners.get(key, 0) + 1
+
+        from_log = from_catalog = 0
+        for n in names:
+            success = last_success.get(n)
+            source = "pull_log" if success is not None else None
+            if success is None:
+                key = catalog_name_for(n).lower()
+                if owners.get(key, 0) == 1 or key == n.lower():
+                    success = catalog_last.get(key)
+                    source = "source_catalog" if success is not None else None
+            fails, last_fail = streaks.get(n, (0, None))
+            if success is None and fails == 0:
+                continue
+            cooldown_until = None
+            if fails and last_fail is not None:
+                cooldown_until = last_fail + timedelta(minutes=_cooldown_minutes(fails))
+            self._state[n] = {
+                "last_success": success,
+                "last_attempt": last_fail or success,
+                "consecutive_fails": fails,
+                "cooldown_until": cooldown_until,
+                "state_source": source,
+            }
+            if source == "pull_log":
+                from_log += 1
+            elif source == "source_catalog":
+                from_catalog += 1
+        log.info(
+            "SmartScheduler restart state: {a} from pull_log, {b} bootstrapped "
+            "from source_catalog, {c} with no history (of {t} registered)",
+            a=from_log, b=from_catalog, c=len(names) - len(self._state), t=len(names),
+        )
 
     def _is_due(self, puller: dict) -> bool:
         """Check if a puller needs to run based on its frequency."""
@@ -906,6 +1148,7 @@ class SmartScheduler:
                     and "error" in out
                 )
             )
+            result["rows_inserted"] = _extract_rows(out)
             if self_reported_failure:
                 result["status"] = reported_status or "FAILED"
                 result["error"] = str(
@@ -959,15 +1202,66 @@ class SmartScheduler:
         raise ValueError(f"Unknown api_key_mode for {puller['name']}: {mode}")
 
     def _update_last_pull(self, name: str) -> None:
-        """Update source_catalog.last_pull_at for a source."""
+        """Advance source_catalog.last_pull_at for the row this entry writes.
+
+        ``name`` is the registry name; the catalog row is
+        ``catalog_name_for(name)`` (see REGISTRY_CATALOG_NAMES) -- before
+        the 2026-09-29 fix this matched ``name.lower()`` directly and was a
+        silent no-op for 48 of the 92 entries.
+        """
         try:
             with self.engine.begin() as conn:
                 conn.execute(text(
                     "UPDATE source_catalog SET last_pull_at = NOW() "
                     "WHERE LOWER(name) = :n"
-                ), {"n": name.lower()})
+                ), {"n": catalog_name_for(name).lower()})
         except Exception:
             pass  # best effort
+
+    def _log_run(self, name: str, started_at: datetime, result: dict[str, Any]) -> None:
+        """Persist one pull_log row per real run -- the restart-state record.
+
+        SKIPPED runs (thread limit, missing API key, a puller's own
+        single-flight skip) are not attempts and are not logged. TIMEOUT
+        and every other non-success is logged as FAILED (pull_log's CHECK
+        constraint allows RUNNING/SUCCESS/PARTIAL/FAILED only), with the
+        original status kept in error_message. One INSERT at the end of the
+        run, never a RUNNING row that a restart could orphan.
+        """
+        status = result.get("status")
+        if status == "SKIPPED":
+            return
+        log_status = status if status in ("SUCCESS", "PARTIAL") else "FAILED"
+        error = result.get("error")
+        if log_status == "FAILED" and status not in (None, "FAILED"):
+            error = f"{status}: {error}" if error else str(status)
+        try:
+            import socket
+
+            source_id = getattr(self, "_catalog_ids", {}).get(catalog_name_for(name).lower())
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text(
+                        "INSERT INTO pull_log (puller_name, source_id, started_at, "
+                        "completed_at, status, rows_inserted, error_message, node_name) "
+                        "VALUES (:name, :sid, :started, :completed, :status, :rows, "
+                        ":error, :node)"
+                    ),
+                    {
+                        "name": SMART_PULL_LOG_PREFIX + name,
+                        "sid": source_id,
+                        "started": started_at,
+                        "completed": datetime.now(timezone.utc),
+                        "status": log_status,
+                        "rows": result.get("rows_inserted") or 0,
+                        "error": (str(error)[:500] if error else None),
+                        "node": socket.gethostname(),
+                    },
+                )
+        except Exception as exc:
+            log.warning(
+                "SmartScheduler: pull_log write failed for {n}: {e}", n=name, e=str(exc)
+            )
 
     def _record_result(self, name: str, success: bool, error: str | None = None) -> None:
         """Record puller result and manage cooldowns."""
@@ -982,7 +1276,7 @@ class SmartScheduler:
             fails = state.get("consecutive_fails", 0) + 1
             state["consecutive_fails"] = fails
             # Exponential backoff: 30min, 1h, 2h, 4h, 8h, max 24h
-            cooldown_min = min(30 * (2 ** (fails - 1)), 1440)
+            cooldown_min = _cooldown_minutes(fails)
             state["cooldown_until"] = (
                 datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
             )
@@ -1030,9 +1324,11 @@ class SmartScheduler:
             name = puller["name"]
             log.info("SmartScheduler: running {n} (overdue {h:.0f}h)", n=name, h=puller.get("_overdue_h", 0))
 
+            run_started = datetime.now(timezone.utc)
             result = self._run_puller(puller)
             success = result["status"] == "SUCCESS"
             self._record_result(name, success, result.get("error"))
+            self._log_run(name, run_started, result)
 
             summary["results"].append(result)
             summary["ran"] += 1
