@@ -175,16 +175,16 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
         <article className="tl-panel">
             <div className="tl-section-head">
                 <div>
-                    <span>Finviz in Postgres</span>
+                    <span>{finviz?.source || 'SEC EDGAR/XBRL'}</span>
                     <h2>{finviz?.status || 'unavailable'}</h2>
                 </div>
                 <button
                     type="button"
                     className="tl-icon-button"
                     onClick={onRefresh}
-                    disabled={refreshing}
-                    title="Refresh Finviz"
-                    aria-label="Refresh Finviz"
+                    disabled={refreshing || !finviz?.refresh_available}
+                    title="SEC facts update through the scheduled source"
+                    aria-label="SEC reported fundamentals"
                 >
                     {refreshing ? <RefreshCw size={18} className="tl-spin" /> : <Database size={18} />}
                 </button>
@@ -192,15 +192,19 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
             <div className="tl-finviz-meta">
                 <span>{finviz?.field_count || 0} fields</span>
                 <span>{finviz?.freshness?.label || 'missing'}</span>
-                <span>{finviz?.latest_obs_date || 'no date'}</span>
+                <span>Fiscal period end: {finviz?.latest_obs_date || 'unavailable'}</span>
             </div>
+            <p className="tl-muted">{finviz?.provenance || 'Reported facts, not live valuation or forecasts.'}</p>
+            <p className="tl-muted">Current P/E, market cap, float, forecasts and short interest are unavailable from this source.</p>
             <div className="tl-finviz-grid">
                 {stats.length ? stats.slice(0, 12).map(stat => (
                     <div key={stat.id}>
                         <span>{stat.label}</span>
-                        <strong>{stat.raw_value ?? '-'}</strong>
+                        <strong>{stat.raw_value ?? 'unavailable'}</strong>
+                        <span>Period {stat.period_start || 'instant'} to {stat.period_end || 'unknown'}</span>
+                        <span>Filed {stat.filed || 'unknown'} · {stat.form || 'unknown'}</span>
                     </div>
-                )) : <p className="tl-muted">No Finviz snapshot rows found for this ticker yet.</p>}
+                )) : <p className="tl-muted">No provenance-complete SEC reported facts stored for this ticker.</p>}
             </div>
         </article>
     );
