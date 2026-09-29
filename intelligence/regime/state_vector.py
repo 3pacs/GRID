@@ -81,6 +81,43 @@ DIM_NAMES = [d.name for d in STATE_DIMENSIONS]
 DIM_WEIGHTS = np.array([d.weight for d in STATE_DIMENSIONS], dtype=np.float64)
 
 
+# ── Cadence-aware staleness (GRID-STALE-SOURCES-AUDIT-20260929.md §4) ────
+#
+# The old rule flagged a dimension stale when its latest obs was >30 days
+# old, for every dimension regardless of publication cadence. FRED's
+# monthly macro series carry obs_date = the 1st of the reference month but
+# are published 4-8 weeks later, so a monthly dimension is *always* >30
+# days old, even the same day GRID picks up its newest release (the audit
+# measured a 4-minute-to-~51-hour GRID pickup lag across all five monthly
+# series it checked -- the flag was 100% a false positive, never a real
+# gap). These are the only monthly series among STATE_DIMENSIONS today;
+# QUARTERLY_FRED_SERIES starts empty and is ready for one, same pattern.
+MONTHLY_FRED_SERIES: frozenset[str] = frozenset({
+    "UNRATE", "INDPRO", "TCU", "M2SL", "UMCSENT",
+})
+QUARTERLY_FRED_SERIES: frozenset[str] = frozenset()
+
+DEFAULT_STALE_DAYS = 30
+# ~70 days safely covers a monthly series' worst-case release lag (4-8
+# weeks) plus GRID's own pickup delay, while still catching a release
+# that's genuinely been missed (the next one is always <45 days away) --
+# this is the audit's own suggested fix (§4: "monthly = stale only if obs
+# is more than ~70 days old").
+MONTHLY_STALE_DAYS = 70
+# Same logic one tier out: a quarterly series can be published 1-3 months
+# after quarter-end, so give it a proportionally larger window.
+QUARTERLY_STALE_DAYS = 160
+
+
+def _stale_threshold_days(series_id: str) -> int:
+    """Cadence-aware staleness threshold, in days, for one series_id."""
+    if series_id in MONTHLY_FRED_SERIES:
+        return MONTHLY_STALE_DAYS
+    if series_id in QUARTERLY_FRED_SERIES:
+        return QUARTERLY_STALE_DAYS
+    return DEFAULT_STALE_DAYS
+
+
 # ── State Vector ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -428,7 +465,7 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
                     if hasattr(latest_date, 'date'):
                         latest_date = latest_date
                     days_stale = (as_of - latest_date).days if isinstance(latest_date, date) else 30
-                    if days_stale > 30:
+                    if days_stale > _stale_threshold_days(dim.series_id):
                         stale.append(dim.name)
         except Exception as exc:
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))

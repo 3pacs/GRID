@@ -15,6 +15,8 @@ from typing import Any
 
 from loguru import logger as log
 
+from alerts.cadence import cadence_for_source, is_excluded, is_stale
+
 
 # Import constants from the main module
 CYCLE_INTERVAL_SECONDS = 300
@@ -723,6 +725,28 @@ class OperatorState:
 
 # ─── Health checks ───────────────────────────────────────────────────
 
+def _source_catalog_column_exists(conn: Any, column_name: str) -> bool:
+    """Schema-drift-safe optional-column check (mirrors the same helper in
+    scripts/hermes_fixers.py -- duplicated rather than imported, since that
+    module imports from this one and importing back would be circular).
+    Lets us read source_catalog.update_frequency when it's present on the
+    live DB without requiring it (it isn't in schema.sql)."""
+    from sqlalchemy import text as sa_text
+
+    row = conn.execute(
+        sa_text(
+            "SELECT EXISTS ("
+            "  SELECT 1 FROM information_schema.columns "
+            "  WHERE table_schema = 'public' "
+            "    AND table_name = 'source_catalog' "
+            "    AND column_name = :column_name"
+            ")"
+        ),
+        {"column_name": column_name},
+    ).scalar()
+    return bool(row)
+
+
 def check_db_health(engine: Any) -> dict[str, Any]:
     """Check database connectivity and basic stats."""
     from sqlalchemy import text
@@ -773,25 +797,63 @@ def check_db_health(engine: Any) -> dict[str, Any]:
             ).fetchone()
             result["failed_pulls_1h"] = row[0] if row else 0
 
-            # Source freshness from source_catalog only. The old fallback
-            # joined every active source to raw_series and did an aggregate
-            # over the entire table, which made Hermes dry-runs exceed 90s.
+            # Source freshness, cadence-aware (GRID-STALE-SOURCES-AUDIT-
+            # 20260929.md). Two fixes over the old flat-26h rule:
+            #
+            # 1. Freshness uses the newer of source_catalog.last_pull_at and
+            #    the latest raw_series SUCCESS pull for that source, via a
+            #    LATERAL "top-1 ORDER BY ... LIMIT 1" per active source. That
+            #    is index-backed by idx_raw_series_status_source_pull
+            #    (pull_status, source_id, pull_timestamp DESC) -- an equality
+            #    seek on (pull_status, source_id) followed by LIMIT 1, not a
+            #    scan of raw_series (1.9B+ rows). The audit found 14 sources
+            #    whose writers never bump last_pull_at even though fresh rows
+            #    are landing; this reads their real freshness instead.
+            # 2. Staleness is judged against each source's own cadence
+            #    (alerts.cadence), not one 26h window for every source.
+            #
+            # update_frequency is read opportunistically if the column
+            # exists on this DB (it's not in schema.sql, but the audit found
+            # it present -- and unreliable -- on the live catalog) and only
+            # used as a fallback signal; see alerts.cadence's precedence.
+            has_update_frequency = _source_catalog_column_exists(conn, "update_frequency")
+            update_frequency_expr = "sc.update_frequency" if has_update_frequency else "NULL"
             rows = conn.execute(
                 text(
-                    "SELECT name, last_pull_at "
-                    "FROM source_catalog "
-                    "WHERE active = TRUE "
-                    "ORDER BY last_pull_at ASC NULLS FIRST"
+                    f"SELECT sc.name, sc.last_pull_at, sc.latency_class, "
+                    f"       {update_frequency_expr} AS update_frequency, "
+                    "        latest.latest_success "
+                    "FROM source_catalog sc "
+                    "LEFT JOIN LATERAL ("
+                    "    SELECT rs.pull_timestamp AS latest_success "
+                    "    FROM raw_series rs "
+                    "    WHERE rs.source_id = sc.id AND rs.pull_status = 'SUCCESS' "
+                    "    ORDER BY rs.pull_timestamp DESC "
+                    "    LIMIT 1"
+                    ") latest ON TRUE "
+                    "WHERE sc.active = TRUE"
                 )
             ).fetchall()
+            now = datetime.now(timezone.utc)
             stale: list[dict[str, Any]] = []
-            cutoff = datetime.now(timezone.utc) - timedelta(hours=DATA_FRESHNESS_THRESHOLD_HOURS)
-            for r in rows:
-                if r[1] is None or r[1] < cutoff:
+            for name, last_pull_at, latency_class, update_frequency, latest_success in rows:
+                if is_excluded(name):
+                    continue
+                effective = last_pull_at
+                if latest_success is not None and (effective is None or latest_success > effective):
+                    effective = latest_success
+                cadence = cadence_for_source(
+                    name, update_frequency=update_frequency, latency_class=latency_class,
+                )
+                if is_stale(effective, now, cadence):
+                    age = (now - effective).total_seconds() / 3600.0 if effective else None
                     stale.append({
-                        "source": r[0],
-                        "last_pull": r[1].isoformat() if r[1] else "never",
+                        "source": name,
+                        "last_pull": effective.isoformat() if effective else "never",
+                        "cadence": cadence.kind,
+                        "age_hours": round(age, 1) if age is not None else None,
                     })
+            stale.sort(key=lambda s: (s["age_hours"] is None, -(s["age_hours"] or 0)))
             result["stale_sources"] = stale
 
             # QUARANTINED rows (migrations/versions/raw_series_quarantined_20260926.py)

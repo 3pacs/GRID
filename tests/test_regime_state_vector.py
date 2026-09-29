@@ -502,3 +502,99 @@ def test_cache_round_trip_preserves_price_basis(engine, monkeypatch):
     served = sv_mod.get_or_compute_state_vector(engine, AS_OF, persist=False)
     assert served.price_basis == "spy_full"
     assert served.cached is True
+
+
+# ── Cadence-aware staleness (GRID-STALE-SOURCES-AUDIT-20260929.md §4) ────
+
+
+class TestStaleThresholdDays:
+    """Pure unit coverage of the per-series threshold table itself."""
+
+    def test_monthly_fred_series_get_70_days(self):
+        from intelligence.regime.state_vector import _stale_threshold_days
+
+        for sid in ("UNRATE", "INDPRO", "TCU", "M2SL", "UMCSENT"):
+            assert _stale_threshold_days(sid) == 70
+
+    def test_unclassified_series_keeps_old_30_day_rule(self):
+        from intelligence.regime.state_vector import _stale_threshold_days
+
+        assert _stale_threshold_days("T10Y2Y") == 30
+        assert _stale_threshold_days("VIXCLS") == 30
+        assert _stale_threshold_days("DERIVED:SPY_MA_RATIO") == 30
+
+    def test_quarterly_series_get_a_wider_window_than_monthly(self):
+        from intelligence.regime.state_vector import (
+            QUARTERLY_FRED_SERIES,
+            _stale_threshold_days,
+        )
+
+        # No quarterly series in STATE_DIMENSIONS today, but the tier must
+        # already behave correctly for the day one is added.
+        assert QUARTERLY_FRED_SERIES == frozenset()
+        assert _stale_threshold_days("SOME_QUARTERLY_SERIES") == 30  # unmapped -> default
+        from intelligence.regime import state_vector as sv_mod
+
+        try:
+            sv_mod.QUARTERLY_FRED_SERIES = frozenset({"SOME_QUARTERLY_SERIES"})
+            assert _stale_threshold_days("SOME_QUARTERLY_SERIES") == 160
+        finally:
+            sv_mod.QUARTERLY_FRED_SERIES = frozenset()
+
+
+class TestComputeStateVectorMonthlyStaleness:
+    """End-to-end: a monthly FRED series ~50 days old (always-stale under
+    the old flat 30-day rule) must not appear in stale_dimensions, while a
+    non-monthly series at the same age still would. Mirrors the audit's
+    UNRATE finding — GRID had the September release within minutes, but
+    the old rule called it stale every single day of the month.
+    """
+
+    def test_unrate_at_50_days_is_not_flagged_but_would_have_been_under_old_rule(
+        self, engine, monkeypatch,
+    ):
+        from intelligence.regime import state_vector as sv_mod
+
+        # _get_normalization_stats caches globally by design (module-level
+        # _NORM_CACHE) — reset around this test so an earlier/later test's
+        # engine never leaks in, and so this test's data doesn't leak out.
+        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=50)  # >30d (old rule) but <70d (new rule)
+        first_obs = latest_obs - timedelta(days=34)
+        d = first_obs
+        value = 4.0
+        while d <= latest_obs:
+            _insert(engine, "UNRATE", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.01  # tiny drift so std != 0
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "unemployment_level" not in sv.stale_dimensions
+        assert "unemployment_dir" not in sv.stale_dimensions
+        # Sanity: the old unconditional rule (30 days) would have caught
+        # this — confirms the fix is doing real work, not a no-op.
+        assert (as_of - latest_obs).days > 30
+
+    def test_non_monthly_series_at_the_same_age_is_still_flagged(
+        self, engine, monkeypatch,
+    ):
+        from intelligence.regime import state_vector as sv_mod
+
+        monkeypatch.setattr(sv_mod, "_NORM_CACHE", None)
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=50)
+        first_obs = latest_obs - timedelta(days=104)  # ICSA needs 100 rows (default min_history)
+        d = first_obs
+        value = 200.0
+        while d <= latest_obs:
+            _insert(engine, "ICSA", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.5
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "initial_claims" in sv.stale_dimensions
