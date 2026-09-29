@@ -797,20 +797,28 @@ def run_intelligence_loop() -> None:
             log.warning("SEMI book-to-bill monthly failed: {e}", e=str(exc))
 
     def _ecb_tltro_weekly() -> None:
-        """CAT-12: ECB TLTRO-III outstanding balance + repayment calendar."""
+        """CAT-12: Eurosystem LTRO outstanding (ECB Data Portal, ILM weekly).
+
+        2026-09-29: ingestion.altdata.ecb_tltro never wrote a row (its ECB
+        key 404s, its FRED path was skipped, and TLTRO-III fully matured in
+        Dec 2024). This job now runs ecb_ltro, which stores the official
+        weekly "Longer-term refinancing operations" line under its own
+        source_catalog row ``ecb_ilm_ltro``.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.ecb_tltro import run_ecb_tltro_puller
-            result = run_ecb_tltro_puller(_ge())
+            from ingestion.altdata.ecb_ltro import run_ecb_ltro_puller
+            result = run_ecb_ltro_puller(_ge())
             log.info(
-                "ECB TLTRO: outstanding={o} EUR bn, next={n}, {f} fetched, {i} new",
-                o=result.get("outstanding_eur_bn"),
-                n=result.get("next_repayment"),
+                "ECB LTRO: status={s}, latest={d} = {o} EUR bn, {f} fetched, {i} new",
+                s=result.get("status"),
+                d=result.get("latest_obs_date"),
+                o=result.get("ltro_outstanding_eur_bn"),
                 f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
+                i=result.get("rows_inserted", 0),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("ECB TLTRO weekly failed: {e}", e=str(exc))
+            log.warning("ECB LTRO weekly failed: {e}", e=str(exc))
 
     # Cadence:
     #   Refinery cracks → Thu 16:00 UTC (EIA Wed 10:30 ET release)
