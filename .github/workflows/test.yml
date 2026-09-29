@@ -556,6 +556,19 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
 
+      # Stale-sources audit 2026-09-29: ingestion/tiingo_pull.py's set-based
+      # insert must keep the per-row statement's dedupe contract on real
+      # PostgreSQL (unnest/array casts), and pull_incremental must skip
+      # while another connection holds the Tiingo prices advisory lock.
+      - name: Tiingo prices set-based insert and advisory lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_TIINGO_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_tiingo_prices_pg.py -q -rA
+
       # PR #688 review (2026-09-27): resolved_series' real unique index is
       # (feature_id, obs_date, vintage_date), so rows sharing
       # (feature_id, obs_date) are always distinct vintages that
