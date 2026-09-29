@@ -7,12 +7,14 @@ activities" list page and the 2026-09-29 report, recorded from grid-svr on
 
 from __future__ import annotations
 
+import json
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 import requests
+from sqlalchemy import create_engine, text
 
 import ingestion.altdata.rocaf_pla_activity as mod
 from ingestion.altdata.rocaf_pla_activity import (
@@ -118,6 +120,21 @@ def test_parse_report_mnd_adiz_variants(aircraft: int, sentence: str, entries: i
 ])
 def test_parse_report_unparsed_or_zero_adiz_is_skipped(sentence: str) -> None:
     assert parse_report(_report_html(3, sentence)) is None
+
+
+@pytest.mark.parametrize("sentence", [
+    "All 12 sorties remained outside Taiwan's ADIZ; none entered Taiwan's ADIZ.",
+    "22 of the 32 sorties remained outside Taiwan's ADIZ; none entered Taiwan's ADIZ.",
+    "All 12 sorties of PLA aircraft never entered Taiwan's southwestern ADIZ.",
+    "22 of the 32 sorties did not enter Taiwan's southwestern ADIZ.",
+    "All 12 sorties were monitored, while 6 PLAN ships entered the ADIZ.",
+    "Not all 12 sorties entered Taiwan's southwestern ADIZ.",
+    "If all 12 sorties entered Taiwan's southwestern ADIZ, monitoring would increase.",
+    "All 12 sorties entered Taiwan's southwestern ADIZ. ADIZ counts remain unconfirmed.",
+    "All 12 sorties entered the ADIZ. 2 of 12 sorties entered the ADIZ.",
+])
+def test_adiz_count_must_belong_to_one_affirmative_statement(sentence: str) -> None:
+    assert parse_report(_report_html(32, sentence)) is None
 
 
 # ---------------------------------------------------------------------------
@@ -246,3 +263,75 @@ def test_first_run_is_bounded() -> None:
 def test_own_source_identity() -> None:
     assert ROCAFPLAActivityPuller.SOURCE_NAME == "rocaf_pla_activity"
     assert SERIES_AIRCRAFT.startswith("pla_activity:")
+
+
+@pytest.mark.parametrize(("aircraft", "sentence", "entries"), [
+    (12, "All 12 sorties remained outside Taiwan's ADIZ; none entered Taiwan's ADIZ.", None),
+    (12, "All 12 sorties of PLA aircraft never entered Taiwan's southwestern ADIZ.", None),
+    (32, "22 of the 32 sorties were monitored, while 6 PLAN ships entered the ADIZ.", None),
+    (12, "All 12 sorties entered the ADIZ. ADIZ counts remain unconfirmed.", None),
+    (12, "All 12 sorties of PLA aircraft entered Taiwan's southwestern ADIZ.", 12),
+    (32, "22 of the 32 sorties entered Taiwan's northern and southwestern ADIZ.", 22),
+    (128, "103 out of 128 sorties crossed the median line and entered Taiwan's southwestern ADIZ.", 103),
+    (12, "ROC Armed Forces monitored the situation.", 0),
+])
+def test_affirmative_count_contract_through_real_sqlite_writer(
+    monkeypatch: pytest.MonkeyPatch, aircraft: int, sentence: str, entries: int | None,
+) -> None:
+    """Exercise the actual wrapper/save/BasePuller SQL, including honest zero."""
+    engine = create_engine("sqlite:///:memory:")
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE source_catalog (id INTEGER PRIMARY KEY, name TEXT, "
+            "last_pull_timestamp TEXT, row_count INTEGER)"
+        ))
+        conn.execute(text(
+            "CREATE TABLE raw_series (id INTEGER PRIMARY KEY, series_id TEXT, "
+            "source_id INTEGER, obs_date TEXT, value REAL, raw_payload TEXT, "
+            "pull_status TEXT, pull_timestamp TEXT DEFAULT CURRENT_TIMESTAMP)"
+        ))
+        conn.execute(text(
+            "INSERT INTO source_catalog VALUES "
+            "(7,'taiwan_strait_osint','2020-01-01',123),"
+            "(99,'rocaf_pla_activity','2020-01-02',456)"
+        ))
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id,source_id,obs_date,value,pull_status) "
+            "VALUES ('taiwan_strait:aircraft_count',7,'2026-09-28',88,'QUARANTINED')"
+        ))
+
+    def snapshot() -> tuple[list[tuple], list[tuple]]:
+        with engine.connect() as conn:
+            return (
+                [tuple(r) for r in conn.execute(text("SELECT * FROM source_catalog ORDER BY id"))],
+                [tuple(r) for r in conn.execute(text("SELECT * FROM raw_series ORDER BY id"))],
+            )
+
+    before = snapshot()
+    listing = (
+        '<a href="/EN/News/News_Detail.aspx?CID=214&amp;ID=59269">'
+        '<span class="Title">PLA activities in the waters</span>'
+        '<span class="Time">2026/09/29</span></a>'
+    )
+    session = _Session({
+        AF_LIST_URL: _Resp(listing),
+        URL_0929: _Resp(_report_html(aircraft, sentence)),
+    })
+    monkeypatch.setattr(mod.requests, "Session", lambda: session)
+    result = mod.run_rocaf_pla_activity_puller(engine)
+    after = snapshot()
+    assert after[0] == before[0]
+    if entries is None:
+        assert (result["status"], result["rows_inserted"]) == ("FAILED", 0)
+        assert after == before
+    else:
+        assert (result["status"], result["rows_inserted"]) == ("SUCCESS", 4)
+        assert after[1][0] == before[1][0]
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT value,raw_payload,pull_status FROM raw_series "
+                "WHERE source_id=99 AND series_id=:sid"
+            ), {"sid": SERIES_ADIZ}).one()
+        assert (row.value, row.pull_status) == (float(entries), "SUCCESS")
+        assert json.loads(row.raw_payload)["adiz_sentence_present"] is (entries > 0)
+    engine.dispose()

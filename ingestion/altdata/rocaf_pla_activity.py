@@ -91,13 +91,19 @@ _AIRCRAFT_RE = re.compile(r"(\d+)\s+sorties?\s+of\s+PLA\s+aircraft", re.I)
 _AIRCRAFT_ALT_RE = re.compile(r"(\d+)\s+PLA\s+aircraft", re.I)
 _PLAN_RE = re.compile(r"(\d+)\s+PLAN\s+(?:ships?|vessels?)", re.I)
 _OFFICIAL_RE = re.compile(r"(\d+)\s+official\s+(?:ships?|vessels?)", re.I)
-_ADIZ_RE = re.compile(
-    r"(\d+)\s+(?:out\s+of|of)\s+(?:the\s+)?(\d+)\s+sorties?\s+"
-    r"[^.]{0,120}?\bentered\b[^.]{0,80}?\bADIZ",
-    re.I,
+_ADIZ_DIRECTION = (
+    r"(?:northern|southern|eastern|western|central|northeastern|"
+    r"northwestern|southeastern|southwestern)"
 )
-_ADIZ_ALL_RE = re.compile(
-    r"\bAll\s+(\d+)\s+sorties?\s+[^.]{0,120}?\bentered\b[^.]{0,80}?\bADIZ",
+# Only the printed affirmative subject/predicate is supported. Arbitrary
+# spans can borrow a total from another clause or match "never entered".
+_ADIZ_RE = re.compile(
+    r"(?:All\s+(?P<all>\d+)|(?P<part>\d+)\s+(?:out\s+of|of)\s+"
+    r"(?:the\s+)?\d+)\s+sorties?(?:\s+of\s+PLA\s+aircraft)?\s+"
+    r"(?:crossed\s+the\s+median\s+line\s+and\s+)?entered\s+"
+    r"(?:(?:Taiwan['’]s|the)\s+)?"
+    rf"(?:{_ADIZ_DIRECTION}(?:\s*,\s*{_ADIZ_DIRECTION})*"
+    rf"(?:\s*,?\s+and\s+{_ADIZ_DIRECTION})?\s+)?ADIZ",
     re.I,
 )
 _DATE_RE = re.compile(r"\b(20\d{2})/(\d{2})/(\d{2})\b")
@@ -174,12 +180,21 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
 
     m_plan = _PLAN_RE.search(body)
     m_off = _OFFICIAL_RE.search(body)
-    m_adiz = _ADIZ_RE.search(body) or _ADIZ_ALL_RE.search(body)
-    adiz_entries = int(m_adiz.group(1)) if m_adiz else 0
-    # Check all visible text: a mention beyond the bounded parsing window
-    # must not be mistaken for MND omitting the ADIZ sentence entirely.
-    if "adiz" in text.lower() and (m_adiz is None or adiz_entries == 0):
-        return None
+    adiz_entries = 0
+    adiz_present = "adiz" in text.lower()
+    if adiz_present:
+        # A second/unsupported mention makes the report ambiguous, even if
+        # one other clause has a parseable count. Check all visible text so
+        # an out-of-window mention cannot silently become an omitted zero.
+        clauses = [c.strip() for c in re.split(r"[.;!?]", body) if "adiz" in c.lower()]
+        if text.lower().count("adiz") != 1 or len(clauses) != 1:
+            return None
+        m_adiz = _ADIZ_RE.fullmatch(clauses[0])
+        if m_adiz is None:
+            return None
+        adiz_entries = int(m_adiz.group("all") or m_adiz.group("part"))
+        if adiz_entries == 0:
+            return None
     return PLAActivityReport(
         url=url,
         report_date=report_date,
@@ -187,7 +202,7 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
         plan_ships=int(m_plan.group(1)) if m_plan else None,
         official_ships=int(m_off.group(1)) if m_off else None,
         adiz_entries=adiz_entries,
-        adiz_sentence_present=bool(m_adiz),
+        adiz_sentence_present=adiz_present,
         text=body[:600],
     )
 
