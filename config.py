@@ -84,6 +84,12 @@ class Settings(BaseSettings):
     # SECFTDPuller fails closed with a clear error if this is unset rather
     # than silently sending an unidentified request.
     SEC_USER_AGENT: str = ""
+    # Reddit Data API, application-only OAuth (free tier). Owner registers a
+    # "script" app at reddit.com/prefs/apps; see ingestion/altdata/reddit_oauth.py.
+    # Empty = Reddit pullers report FAILED "not configured" and send nothing.
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
@@ -465,6 +471,15 @@ class Settings(BaseSettings):
     # working MND endpoint and this flag is set in a reviewed change.
     GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB: bool = False
 
+    # LME warehouse job (2026-09-29, GRID-DEAD-FEEDS-FIX-20260929.md). Both
+    # LME URLs answer HTTP 403 with a Cloudflare managed challenge
+    # ("cf-mitigated: challenge") to any non-browser client; there is no
+    # free programmatic LME endpoint and GRID does not bypass bot checks.
+    # The daily 09:00 `_lme_warehouse_daily` job therefore stays
+    # unregistered until a legitimate endpoint exists and this flag is set
+    # in a reviewed change.
+    GRID_ENABLE_LME_WAREHOUSE_JOB: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -480,6 +495,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
         "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
+        "GRID_ENABLE_LME_WAREHOUSE_JOB",
         mode="before",
     )
     @classmethod

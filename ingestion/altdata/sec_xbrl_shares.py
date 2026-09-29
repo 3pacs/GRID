@@ -178,7 +178,24 @@ _ADR_RATIOS: dict[str, float] = {
     "FMX": 10,     # 1 ADR = 10 shares
     "KOF": 10,
     "CCEP": 1,
+    # TM: each ADS represents ten shares of common stock (20-F FY2026
+    # cover). It was two shares per ADS until Toyota's 5-for-1 split
+    # effective 2021-10-01 (20-F filed 2021-06-24 cover: "each American
+    # Depositary Share representing two shares"); the ADS count did not
+    # change, so the ratio went 2 -> 10. See _ADR_RATIO_HISTORY.
     "TM": 10,
+    # GSK: "American Depositary Shares, each representing 2 Ordinary
+    # Shares" (GSK plc 20-F FY2025 and FY2022 covers; JPMorgan depositary).
+    # Was missing (defaulted to 1), which overstated market cap 2x.
+    "GSK": 2,
+    # SHEL: "American Depositary Shares representing two ordinary shares"
+    # (Shell plc 20-F FY2025 and FY2021 covers). Was missing (defaulted
+    # to 1), which overstated market cap 2x.
+    "SHEL": 2,
+    # SONY: "Each American Depositary Share represents one share of Common
+    # Stock" (Sony Group 20-F FY2025 cover; F-6EF 2024-09-13). Explicit so
+    # it is not mistaken for a missing entry.
+    "SONY": 1,
     # SNY: each ADS represents one-half of one Sanofi ordinary share
     # (JPMorgan depositary; Sanofi 20-F FY2025 exhibit 2.2). Unchanged
     # since the NYSE listing on 2002-07-01. Was wrongly 2 (inverted),
@@ -204,6 +221,15 @@ _ADR_RATIO_HISTORY: dict[str, tuple[tuple[date, float], ...]] = {
         # 6-K 2026-01-20: ADS listing on Nasdaq ceases 2026-01-30;
         # ordinary shares trade on the NYSE from Monday 2026-02-02.
         (date(2026, 2, 2), 1.0),
+    ),
+    "TM": (
+        # 1 ADS = 2 shares of common stock before the split.
+        (date.min, 2.0),
+        # 5-for-1 split of Toyota common stock effective 2021-10-01
+        # (record date 2021-09-30); ADSs were not split, so from then on
+        # 1 ADS = 10 shares. YF:TM:close is continuous across the date
+        # (177.75 on 09-30, 177.62 on 10-01).
+        (date(2021, 10, 1), 10.0),
     ),
 }
 
@@ -243,8 +269,17 @@ def _extract_shares_entries(
     deduplicates by ``filed`` date (keeping the highest-priority tag for
     each date), and returns newest-last so callers can walk in
     chronological order for forward-fill.
+
+    One filing usually reports the same tag for several period ends
+    (a 20-F shows this year-end and prior year-ends; a 10-Q shows the
+    quarter end and the prior fiscal year end). Within the winning tag,
+    the fact with the LATEST period ``end`` is the filing's current
+    count. Taking the first-listed fact instead (Company Facts lists
+    oldest period first) returned a stale count, e.g. SONY's 20-F filed
+    2025-06-20 yielded the pre-split 2022-03-31 count 1,261,081,781
+    instead of the 2025-03-31 count 6,149,810,645.
     """
-    by_filed: dict[date, tuple[int, int]] = {}
+    by_filed: dict[date, tuple[int, int, date]] = {}
     for priority, (taxonomy, tag) in enumerate(_SHARES_TAG_SPECS):
         try:
             entries = (
@@ -273,12 +308,21 @@ def _extract_shares_entries(
                 filed = date.fromisoformat(filed_str)
             except ValueError:
                 continue
+            try:
+                end = date.fromisoformat(str(entry.get("end") or ""))
+            except ValueError:
+                end = date.min
             existing = by_filed.get(filed)
-            # Lower priority number wins (us-gaap over dei).
-            if existing is None or priority < existing[1]:
-                by_filed[filed] = (shares, priority)
+            # Lower priority number wins (us-gaap over dei); within the
+            # same tag, the latest period end wins (ties keep the first).
+            if (
+                existing is None
+                or priority < existing[1]
+                or (priority == existing[1] and end > existing[2])
+            ):
+                by_filed[filed] = (shares, priority, end)
 
-    pairs = [(filed, shares) for filed, (shares, _p) in by_filed.items()]
+    pairs = [(filed, shares) for filed, (shares, _p, _e) in by_filed.items()]
     pairs.sort(key=lambda p: p[0])
     return pairs
 

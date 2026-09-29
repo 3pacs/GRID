@@ -546,7 +546,8 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     # requires a class. Those need their own scheduler path or class wrappers.
     {"name": "cboe",                  "mod": "ingestion.altdata.cboe_indices",       "cls": "CBOEIndicesPuller",          "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
     {"name": "googletrends",          "mod": "ingestion.altdata.google_trends",      "cls": "GoogleTrendsPuller",         "method": "pull_all",  "freq_h": 24,  "timeout_s": 180, "kwargs": {"days_back": 30}},
-    {"name": "hf_financial_news",     "mod": "ingestion.altdata.hf_financial_news",  "cls": "HFFinancialNewsPuller",      "method": "pull_all",  "freq_h": 24,  "timeout_s": 300},
+    # Static HF corpora: weekly revision check only (see the module's "Revision gate").
+    {"name": "hf_financial_news",     "mod": "ingestion.altdata.hf_financial_news",  "cls": "HFFinancialNewsPuller",      "method": "pull_all",  "freq_h": 168, "timeout_s": 300},
     {"name": "ny_fed",                "mod": "ingestion.altdata.nyfed",              "cls": "NYFedPuller",                "method": "pull_all",  "freq_h": 24,  "timeout_s": 120},
     {"name": "nyfed_gscpi",           "mod": "ingestion.altdata.nyfed_gscpi",        "cls": "NYFedGSCPIPuller",           "method": "pull_all",  "freq_h": 24,  "timeout_s": 60},
     {"name": "stocktwits",            "mod": "ingestion.altdata.stocktwits",         "cls": "StockTwitsPuller",           "method": "pull_all",  "freq_h": 12,  "timeout_s": 60},

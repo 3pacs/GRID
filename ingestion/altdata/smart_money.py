@@ -46,8 +46,11 @@ TARGET_SUBREDDITS: list[str] = [
     "thetagang",
 ]
 
-# Reddit JSON API (public, no auth required — append .json to any URL)
-_REDDIT_BASE: str = "https://www.reddit.com"
+# Reddit is read through the official Data API with an owner-registered
+# OAuth app (ingestion/altdata/reddit_oauth.py). The old unauthenticated
+# www.reddit.com/<sub>/hot.json path returns "403 Blocked" from grid-svr
+# and is disallowed by robots.txt, so it is no longer used.
+_REDDIT_BASE: str = "https://oauth.reddit.com"
 
 # Minimum trust score to track a user (0-1 scale)
 _MIN_TRUST_SCORE: float = 0.3
@@ -323,22 +326,14 @@ class SmartMoneyPuller(BasePuller):
         Raises:
             requests.RequestException: On HTTP errors after retries.
         """
-        headers = {
-            "User-Agent": "GRID-DataPuller/1.0 (financial research)",
-            "Accept": "application/json",
-        }
+        from ingestion.altdata.reddit_oauth import RedditAppClient
 
-        url = f"{_REDDIT_BASE}/r/{subreddit}/{sort}.json"
-        params = {"limit": min(limit, 100), "raw_json": 1}
-
-        resp = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=_REQUEST_TIMEOUT,
+        if getattr(self, "_reddit_client", None) is None:
+            # Raises RedditNotConfigured when the credential names are unset.
+            self._reddit_client = RedditAppClient()
+        data = self._reddit_client.get_json(
+            f"/r/{subreddit}/{sort}", params={"limit": min(limit, 100)},
         )
-        resp.raise_for_status()
-        data = resp.json()
 
         posts = []
         children = data.get("data", {}).get("children", [])
@@ -790,6 +785,9 @@ class SmartMoneyPuller(BasePuller):
         self._load_trust_scores()
 
         all_signals: list[dict[str, Any]] = []
+        failed_subs: list[str] = []
+
+        from ingestion.altdata.reddit_oauth import RedditNotConfigured
 
         for sub in subreddits:
             try:
@@ -804,7 +802,17 @@ class SmartMoneyPuller(BasePuller):
                     signals = self._parse_reddit_post(post, sub)
                     all_signals.extend(signals)
 
+            except RedditNotConfigured as exc:
+                log.warning("SmartMoney: Reddit skipped: {e}", e=str(exc))
+                return {
+                    "source": "reddit",
+                    "status": "FAILED",
+                    "error": "reddit not configured",
+                    "signals_found": 0,
+                    "rows_inserted": 0,
+                }
             except Exception as exc:
+                failed_subs.append(sub)
                 log.warning(
                     "SmartMoney: Reddit pull failed for r/{s}: {e}",
                     s=sub,
@@ -812,6 +820,16 @@ class SmartMoneyPuller(BasePuller):
                 )
 
             time.sleep(_RATE_LIMIT_DELAY)
+
+        if subreddits and len(failed_subs) == len(subreddits):
+            # Every subreddit failed: not a "0 signals" success.
+            return {
+                "source": "reddit",
+                "status": "FAILED",
+                "error": f"all {len(failed_subs)} subreddit fetches failed",
+                "signals_found": 0,
+                "rows_inserted": 0,
+            }
 
         if not all_signals:
             log.info("SmartMoney: no Reddit signals found")
