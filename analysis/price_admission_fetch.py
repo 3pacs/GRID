@@ -435,9 +435,18 @@ def _json_or_none(body: bytes) -> Any:
 # --- reading the saved files back (the probe) ---------------------------------------------------------
 
 
-def _closes(out_dir: Path, entry: Mapping[str, Any]) -> tuple[dict[str, float], int]:
+def _validate_td_symbol(doc: Any, ticker: str) -> None:
+    """Bind a successful cached response to the actual requested ticker, not its receipt."""
+    meta = doc.get("meta") if isinstance(doc, dict) else None
+    if (not isinstance(meta, dict) or not isinstance(meta.get("symbol"), str)
+            or meta["symbol"] != td_symbol(ticker)):
+        raise FetchStopped(f"TwelveData cached body symbol does not match requested {td_symbol(ticker)}")
+
+
+def _closes(out_dir: Path, entry: Mapping[str, Any], ticker: str) -> tuple[dict[str, float], int]:
     """Window closes of one saved body, and the number of rows dated on or after 2020-01-01 (never returned)."""
     doc = json.loads(read_gz(Path(out_dir) / entry["file"]))
+    _validate_td_symbol(doc, ticker)
     closes, holdout = {}, 0
     for v in doc.get("values") or []:
         d = str(v.get("datetime", ""))[:10]
@@ -467,20 +476,25 @@ def load_td_closes(out_dir: Path, ticker: str, done: Mapping[str, dict] | None =
     the dates the window file lacks are added). Fail closed: a mode whose files carry any row
     dated on or after 2020-01-01, whose supplement is missing, or whose supplement disagrees on
     an overlapping date is dropped, and ``state`` names why.
+    Every successful body, including an optional supplement, must identify the requested
+    ticker using TwelveData's exact canonical symbol; a mismatch stops the reader.
     """
     done = FetchLog(Path(out_dir) / "fetch_log.jsonl").final() if done is None else done
     out: dict[str, Any] = {"receipts": {}, "holdout_rows": 0, "supplemented": [], "problems": []}
     unavailable = 0
     for adjust in TD_ADJUST_MODES:
         entry = done.get(f"{ticker}|{adjust}")
+        supp = done.get(f"{ticker}|{adjust}|supplement")
+        if supp is not None and supp["outcome"] == "ok" and not needs_supplement(entry):
+            # Optional rows remain ignored, but their successful body must belong to this ticker.
+            _validate_td_symbol(json.loads(read_gz(Path(out_dir) / supp["file"])), ticker)
         if entry is None:
             continue
         out["receipts"][adjust] = {k: entry.get(k) for k in _RECEIPT_KEYS}
         if entry["outcome"] != "ok":
             unavailable += 1
             continue
-        closes, holdout = _closes(out_dir, entry)
-        supp = done.get(f"{ticker}|{adjust}|supplement")
+        closes, holdout = _closes(out_dir, entry, ticker)
         if supp is not None:
             out["receipts"][f"{adjust}_supplement"] = {k: supp.get(k) for k in _RECEIPT_KEYS}
         if needs_supplement(entry):
@@ -488,7 +502,7 @@ def load_td_closes(out_dir: Path, ticker: str, done: Mapping[str, dict] | None =
                 out["problems"].append(f"{adjust}:supplement_missing")
                 continue
             if supp["outcome"] == "ok":
-                extra, extra_holdout = _closes(out_dir, supp)
+                extra, extra_holdout = _closes(out_dir, supp, ticker)
                 holdout += extra_holdout
                 if any(d in closes and extra[d] != closes[d] for d in extra):
                     out["problems"].append(f"{adjust}:supplement_mismatch")

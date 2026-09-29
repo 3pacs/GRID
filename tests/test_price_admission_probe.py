@@ -568,3 +568,101 @@ def test_event_coverage_is_issuer_level():
     cov = gd4.event_coverage(issuers, ["AAA", "CCC", "XLK"])
     assert (cov.issuers, cov.issuers_price_admitted, cov.events, cov.events_price_admitted) == (3, 2, 8, 5)
     assert cov.event_fraction == pytest.approx(5 / 8) and cov.not_admitted == ["BBB"]
+
+
+# --- the explicit other-source list (source_id IN (...)) returns exactly what source_id <> :src returned ----
+
+_LEGACY_OTHER_ROWS_SQL = (
+    "SELECT sc.name, r.pull_status, COUNT(*) FROM raw_series r JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE r.series_id = :sid AND r.source_id <> :src AND r.obs_date >= :lo AND r.obs_date <= :hi "
+    "AND r.pull_timestamp <= :ts GROUP BY sc.name, r.pull_status"
+)
+
+
+def _legacy_read_other_source_rows(conn, sid, source_id, lo, hi, as_of_ts, other_source_ids=None):
+    """The query as merged in #705 (``source_id <> :src``), kept verbatim as the reference."""
+    from sqlalchemy import text
+
+    gd4.check_window(lo, hi)
+    out: dict[str, dict[str, int]] = {}
+    for name, status, n in conn.execute(text(_LEGACY_OTHER_ROWS_SQL), {"sid": sid, "src": source_id, "lo": lo,
+                                                                       "hi": hi, "ts": as_of_ts}).fetchall():
+        out.setdefault(str(name), {})[str(status)] = int(n)
+    return out
+
+
+def _db_with_edge_rows():
+    """The fixture DB plus rows the two queries must treat alike: an uncatalogued source, a NULL source,
+    another source's post-snapshot and out-of-window rows, and a QUARANTINED other-source row."""
+    from sqlalchemy import text
+
+    engine, series = _db()
+    days = list(series["AAA"][0])
+    extra = [
+        ("YF:AAA:adj_close", 9999, days[3], PULL, "SUCCESS"),              # source_id not in source_catalog
+        ("YF:AAA:close", None, days[4], PULL, "SUCCESS"),                  # NULL source_id
+        ("YF:DDD:close", YFINANCE, days[5], datetime(2026, 9, 20, 9, 0), "SUCCESS"),  # pulled after the snapshot
+        ("YF:DDD:adj_close", YFINANCE, date(2011, 1, 3), PULL, "SUCCESS"),  # before the read window
+        ("YF:DDD:adj_close", KAGGLE, days[6], PULL, "QUARANTINED"),
+        ("YF:BBB:close", TD_SPLITS, days[7], PULL, "FAILED"),
+    ]
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                       "pull_status) VALUES (:sid, :src, :d, :ts, 1.0, '{}', :st)"),
+                  [{"sid": s, "src": src, "d": d, "ts": ts, "st": st} for s, src, d, ts, st in extra])
+    return engine, series
+
+
+def test_the_explicit_list_counts_exactly_what_the_inequality_counted():
+    engine, _ = _db_with_edge_rows()
+    lo, hi = gd4.DEFAULT_WINDOW
+    with engine.connect() as conn:
+        others = gd4.read_other_sources(conn, TIINGO)
+        assert others == ((YFINANCE, "yfinance"), (KAGGLE, "KAGGLE_BULK"), (TD_SPLITS, "TWELVEDATA_SPLITS"))
+        ids = [i for i, _ in others]
+        seen_any = False
+        for t in ("XLK", "AAA", "BBB", "CCC", "DDD", "EEE", "ZZZ"):
+            for fld in ("close", "adj_close"):
+                sid = f"YF:{t}:{fld}"
+                legacy = _legacy_read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT)
+                assert gd4.read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT, ids) == legacy, sid
+                assert gd4.read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT) == legacy, sid
+                seen_any = seen_any or bool(legacy)
+        assert seen_any
+        assert gd4.read_other_source_rows(conn, "YF:DDD:adj_close", TIINGO, lo, hi, SNAPSHOT, ids) == {
+            "KAGGLE_BULK": {"QUARANTINED": 1}}
+        assert gd4.read_other_source_rows(conn, "YF:AAA:adj_close", TIINGO, lo, hi, SNAPSHOT, []) == {}
+        with pytest.raises(gd4.ProbeRefused, match="admitted source"):
+            gd4.read_other_source_rows(conn, "YF:AAA:close", TIINGO, lo, hi, SNAPSHOT, [TIINGO, YFINANCE])
+
+
+def _probe_cli(tmp_path, engine, monkeypatch, name):
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    tickers = tmp_path / "tickers.json"
+    if not tickers.exists():
+        tickers.write_text(json.dumps(TICKERS))
+    out = tmp_path / name
+    cli.main(["probe", "--tickers-file", str(tickers), "--twelvedata-dir", str(tmp_path / "td"),
+              "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+              "--as-of-ts", SNAPSHOT.isoformat()])
+    return out
+
+
+def test_reports_and_manifest_are_byte_identical_under_the_old_and_new_query(tmp_path, monkeypatch):
+    engine, series = _db_with_edge_rows()
+    _Vendors(series, tmp_path).write(TICKERS)
+    new = _probe_cli(tmp_path, engine, monkeypatch, "new")
+    monkeypatch.setattr(gd4, "read_other_source_rows", _legacy_read_other_source_rows)
+    old = _probe_cli(tmp_path, engine, monkeypatch, "old")
+    for name in ("probe_report.json", "crosscheck_report.json", "tiingo_meta_report.json", "price_manifest.json",
+                 "sha256s.txt"):
+        assert (new / name).read_bytes() == (old / name).read_bytes(), name
+    report = json.loads((new / "probe_report.json").read_text())
+    audit = report["source_filtering_query"]
+    assert audit["other_source_ids"] == [YFINANCE, KAGGLE, TD_SPLITS] and TIINGO not in audit["other_source_ids"]
+    assert audit["other_sources"][0] == {"id": YFINANCE, "name": "yfinance"}
+    assert report["summary"]["source_filtering"]["other_source_rows_by_source"]["KAGGLE_BULK"] == 41
