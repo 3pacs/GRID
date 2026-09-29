@@ -60,4 +60,28 @@ describe('TickerLookup route ticker', () => {
         await waitFor(() => expect(api.getDadTickerGold).toHaveBeenLastCalledWith('MSFT', { refreshFinviz: false }));
         expect(screen.getByRole('heading', { name: 'MSFT' })).toBeInTheDocument();
     });
+
+    it('shows dated SEC facts and unavailable valuation without a live refresh', async () => {
+        api.getDadTickerGold.mockResolvedValue({
+            ticker: 'AAPL', grid_data: {}, signals: {},
+            finviz: {
+                source: 'SEC EDGAR/XBRL', status: 'ready', field_count: 1,
+                refresh_available: false, latest_obs_date: '2025-12-31',
+                provenance: 'Reported fiscal-period facts; not TTM or live valuation.',
+                stats: [{ id: 'revenue', label: 'Reported revenue', raw_value: '0 USD',
+                    period_start: '2025-01-01', period_end: '2025-12-31',
+                    filed: '2026-02-01', form: '10-K' }],
+            },
+        });
+        window.location.hash = '#/ticker-lookup?ticker=AAPL';
+        render(<TickerLookup />);
+        await waitFor(() => expect(screen.getByText('SEC EDGAR/XBRL')).toBeInTheDocument());
+        expect(screen.getByText('0 USD')).toBeInTheDocument();
+        expect(screen.getByText('Filed 2026-02-01 · 10-K')).toBeInTheDocument();
+        expect(screen.getByText(/Current P\/E, market cap, float, forecasts and short interest are unavailable/)).toBeInTheDocument();
+        fireEvent.click(screen.getByRole('button', { name: 'SEC reported fundamentals' }));
+        expect(screen.getByRole('button', { name: 'SEC reported fundamentals' })).toBeDisabled();
+        expect(api.getDadTickerGold).toHaveBeenCalledTimes(1);
+        expect(screen.queryByText('Finviz in Postgres')).not.toBeInTheDocument();
+    });
 });

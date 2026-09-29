@@ -86,7 +86,6 @@ _SOURCE_NAME_ALIASES: dict[str, tuple[str, ...]] = {
     "Export_Controls": ("BIS_EXPORT_CONTROLS",),
     "FEC_Campaign_Finance": ("FEC_CAMPAIGN_FINANCE",),
     "FINRA_Margin": ("FINRA_MARGIN",),
-    "Finviz_Fundamentals": ("finviz_fundamentals",),
     "FMP_Earnings": ("fmp",),
     "Gov_Contracts": ("USASPENDING_GOV",),
     "Google_Trends_Daily": ("Google_Trends",),
@@ -723,7 +722,7 @@ def _get_pullers_for_group(
             pullers.append(("Prediction_Odds", PredictionOddsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Prediction Odds puller init failed: {err}", err=str(exc))
-        # Social smart money — Reddit + Finviz insider tracking (daily)
+        # Social smart money — Reddit (SEC Form-4 insider tracking is separate)
         try:
             from ingestion.altdata.smart_money import SmartMoneyPuller
             pullers.append(("Smart_Money", SmartMoneyPuller(db_engine), "pull_all", {}))
@@ -886,12 +885,7 @@ def _get_pullers_for_group(
             pullers.append(("StockTwits", StockTwitsPuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("StockTwits puller init failed: {err}", err=str(exc))
-        # Finviz fundamentals via Playwright (daily)
-        try:
-            from ingestion.altdata.finviz_scraper import FinvizScraperPuller
-            pullers.append(("Finviz_Fundamentals", FinvizScraperPuller(db_engine), "pull", {}))
-        except Exception as exc:
-            log.warning("Finviz scraper init failed: {err}", err=str(exc))
+        # SEC EDGAR replaces retired Finviz fundamentals; register it once below.
         # SEC EDGAR XBRL fundamentals (daily)
         try:
             from ingestion.altdata.sec_edgar_company import SECEdgarCompanyPuller
@@ -996,11 +990,6 @@ def _get_pullers_for_group(
             pullers.append(("nowcast", NowcastPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("Nowcast puller init failed: {err}", err=str(exc))
-        try:
-            from ingestion.altdata.sec_edgar_company import SECEdgarCompanyPuller
-            pullers.append(("SEC_EDGAR_Fundamentals", SECEdgarCompanyPuller(db_engine), "pull_all", {}))
-        except Exception as exc:
-            log.warning("SEC EDGAR puller init failed: {err}", err=str(exc))
         try:
             from ingestion.altdata.cloudflare_radar_puller import CloudflareRadarPuller
             pullers.append(("Cloudflare_Radar", CloudflareRadarPuller(db_engine), "pull", {}))

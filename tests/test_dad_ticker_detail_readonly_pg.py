@@ -39,15 +39,17 @@ def test_ticker_detail_stored_cold_error_and_stream_gets_have_no_writes():
             value DOUBLE PRECISION, raw_payload JSONB, pull_status TEXT NOT NULL)"""))
         conn.execute(text("INSERT INTO source_catalog (id, name) VALUES (1, :name)"),
                      {"name": dad.FINVIZ_SOURCE_NAME})
-        for ticker, age_days, price in (("FRESH", 0, 11.0), ("STALE", 3, 22.0), ("ERR", 3, 33.0)):
+        for ticker, age_days, price in (("FRESH", 0, 11.0), ("STALE", 200, 22.0), ("ERR", 200, 33.0)):
             pulled = datetime.now(timezone.utc) - timedelta(days=age_days)
             conn.execute(text("""INSERT INTO raw_series
                 (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status)
                 VALUES (:series, 1, :obs, :pulled, :value, CAST(:payload AS JSONB), 'SUCCESS')"""), {
-                "series": f"finviz.{ticker}.price", "obs": pulled.date(), "pulled": pulled,
+                "series": f"sec_filed_fundamentals.{ticker}.total_assets", "obs": pulled.date(), "pulled": datetime.now(timezone.utc),
                 "value": price, "payload": json.dumps({
-                    "field": "price", "label": "Price", "group": "market",
-                    "raw_value": str(price), "parsed": price,
+                    "ticker": ticker, "period_end": pulled.date().isoformat(),
+                    "filed": pulled.date().isoformat(), "form": "10-K", "unit": "USD",
+                    "accession": "0000320193-26-000001",
+                    "source_url": "https://data.sec.gov/api/xbrl/companyfacts/CIK0000320193.json",
                 }),
             })
 
@@ -71,11 +73,7 @@ def test_ticker_detail_stored_cold_error_and_stream_gets_have_no_writes():
 
     def fetch(ticker):
         fetched.append(ticker)
-        if ticker == "ERR":
-            raise RuntimeError("synthetic provider failure")
-        if ticker == "ERRCOLD":
-            raise RuntimeError("synthetic cold provider failure")
-        return {"Price": "123.45"}
+        raise AssertionError("retired Finviz provider must never be called")
 
     dad._GOLD_MEMORY_CACHE.clear()
     dad._FINVIZ_MEMORY_CACHE.clear()
@@ -86,47 +84,33 @@ def test_ticker_detail_stored_cold_error_and_stream_gets_have_no_writes():
             with TestClient(app) as client:
                 fresh = client.get("/api/v1/dad/ticker/FRESH/finviz?refresh_finviz=true")
                 assert fresh.status_code == 200
-                assert fresh.json()["finviz"]["fields"]["price"]["parsed"] == 11.0
-                assert fresh.json()["finviz"]["source"] == "postgres"
-                assert "FRESH" not in fetched  # stored row remains fresh
+                assert fresh.json()["finviz"]["fields"]["total_assets"]["parsed"] == 11.0
+                assert fresh.json()["finviz"]["source"] == "SEC EDGAR/XBRL"
+                assert fresh.json()["finviz"]["refresh_available"] is False
 
-                cold = client.get("/api/v1/dad/ticker/COLD/finviz?refresh_finviz=true")
-                assert cold.status_code == 200
-                assert cold.json()["finviz"]["fields"]["price"]["parsed"] == 123.45
-                assert cold.json()["finviz"]["source"] == "live-readonly"
-                assert cold.json()["finviz"]["rows_inserted"] == 0
-                remembered = client.get("/api/v1/dad/ticker/COLD/finviz")
-                assert remembered.json()["finviz"]["source"] == "live-memory"
-                assert remembered.json()["finviz"]["fields"]["price"]["parsed"] == 123.45
-
-                stale = client.get("/api/v1/dad/ticker/STALE/finviz")
-                assert stale.status_code == 200
-                assert stale.json()["finviz"]["status"] == "stale"
-                assert stale.json()["finviz"]["fields"]["price"]["parsed"] == 22.0
-
-                failed = client.get("/api/v1/dad/ticker/ERR/finviz?refresh_finviz=true")
-                assert failed.status_code == 200
-                assert failed.json()["finviz"]["fields"]["price"]["parsed"] == 33.0
-                assert failed.json()["finviz"]["status"] == "stale"
-                assert "synthetic provider failure" in failed.json()["finviz"]["error"]
-
-                cold_error = client.get("/api/v1/dad/ticker/ERRCOLD/finviz?refresh_finviz=true")
-                assert cold_error.status_code == 200
-                assert cold_error.json()["finviz"]["status"] == "unavailable"
-                assert cold_error.json()["finviz"]["field_count"] == 0
-                assert "synthetic cold provider failure" in cold_error.json()["finviz"]["error"]
+                for ticker in ("COLD", "ERRCOLD"):
+                    cold = client.get(f"/api/v1/dad/ticker/{ticker}/finviz?refresh_finviz=true")
+                    assert cold.status_code == 200
+                    assert cold.json()["finviz"]["status"] == "unavailable"
+                    assert cold.json()["finviz"]["fields"] == {}
+                    assert cold.json()["finviz"]["rows_inserted"] == 0
+                for ticker, value in (("STALE", 22.0), ("ERR", 33.0)):
+                    stale = client.get(f"/api/v1/dad/ticker/{ticker}/finviz?refresh_finviz=true")
+                    assert stale.status_code == 200
+                    assert stale.json()["finviz"]["status"] == "stale"
+                    assert stale.json()["finviz"]["fields"]["total_assets"]["parsed"] == value
 
                 # The PWA's normal stream and its four direct fallback GETs all
                 # traverse the same read-only contract, including refresh.
                 stream = client.get("/api/v1/dad/ticker/COLD/gold/stream?refresh_finviz=true")
                 assert stream.status_code == 200
                 assert "event: finviz" in stream.text
-                assert '"source": "live-memory"' in stream.text
+                assert '"source": "SEC EDGAR/XBRL"' in stream.text
                 for path in ("evidence", "chart", "finviz", "options"):
                     response = client.get(f"/api/v1/dad/ticker/COLD/{path}")
                     assert response.status_code == 200, path
 
-        assert fetched.count("COLD") == 1  # stream reuses live memory, no duplicate provider fetch
+        assert fetched == []  # All stored reads, including refresh and stream.
         assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE", "DROP"))
                        for sql in statements)
         with engine.connect() as conn:
