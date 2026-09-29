@@ -41,7 +41,7 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
         def __init__(self, db_engine):
             # The opt-in fixture owns only options tables, not source_catalog.
             self.engine = db_engine
-            self._push_to_resolved = lambda *_args: None
+            self._push_to_resolved = lambda *_args, **_kwargs: 0
 
     monkeypatch.setattr(options, "OptionsPuller", BoundPuller)
     calls = defaultdict(list)

@@ -13,7 +13,7 @@ from __future__ import annotations
 import math
 import time
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
 from uuid import uuid4
 from zoneinfo import ZoneInfo
 
@@ -43,6 +43,62 @@ EQUITY_TICKERS: list[str] = [
 MAX_EXPIRATIONS = 12
 MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
 _EQUITY_TZ = ZoneInfo("America/New_York")
+
+
+class _OptionsBudgetExpired(Exception):
+    """Stop a capture without publishing an incomplete chain."""
+
+
+def _check_budget(should_continue: Callable[[], bool] | None) -> None:
+    if should_continue is not None and not should_continue():
+        raise _OptionsBudgetExpired
+
+
+def _affected_rows(result: Any) -> int | None:
+    count = getattr(result, "rowcount", None)
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+
+
+class OptionsPullResults(list[dict[str, Any]]):
+    """Per-ticker list, with the source-wide outcome available to wrappers.
+
+    GEM can still iterate/serialize this as a list. Wrappers must classify
+    ``summary`` rather than infer source freshness from one successful item.
+    Explicit ticker lists, reduced expiry caps and omitted catalyst tickers
+    are subsets even if every requested ticker succeeded.
+    """
+
+    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
+        super().__init__(items)
+        self.full_universe = full_universe
+
+    @property
+    def summary(self) -> dict[str, Any]:
+        statuses = [r.get("status") for r in self]
+        counts = [r.get("rows_inserted") for r in self]
+        known_rows = all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts)
+        rows = sum(counts) if known_rows else None
+        ok = statuses.count("SUCCESS")
+        deferred = statuses.count("DEFERRED")
+        if not self or all(s == "SKIPPED" for s in statuses):
+            status, note = "SKIPPED", "no ticker capture completed"
+        elif not ok and not deferred:
+            status, note = "FAILED", "no ticker succeeded"
+        elif not self.full_universe or ok != len(self) or not known_rows:
+            status, note = "PARTIAL", "source coverage incomplete or row count unknown"
+        elif not rows:
+            status, note = "NO_NEW_DATA", "run completed, 0 rows written"
+        else:
+            status, note = "SUCCESS", "full default universe captured"
+        return {
+            "status": status, "rows_inserted": rows,
+            "scope": "full_universe" if self.full_universe else "subset",
+            "tickers_total": len(self), "tickers_ok": ok,
+            "tickers_deferred": deferred,
+            "snapshots": sum(r.get("snapshots", 0) for r in self),
+            "error": note if status in ("PARTIAL", "FAILED") else None,
+            "reason": note,
+        }
 
 
 def _utc_now() -> datetime:
@@ -101,12 +157,14 @@ def catalyst_options_universe(
     *,
     horizon_days: int = CATALYST_UNIVERSE_HORIZON_DAYS,
     max_tickers: int = CATALYST_UNIVERSE_MAX_TICKERS,
+    require_complete: bool = False,
 ) -> list[str]:
     """Tickers with a dated catalyst inside ``horizon_days``.
 
     Bounded on both sides and capped, because this list drives an outbound
-    fetch loop. Never raises — a missing ``catalyst_calendar`` just means no
-    extra coverage this cycle.
+    fetch loop. Routine callers retain the empty-list fallback. A source-wide
+    capture sets require_complete so lookup failure cannot masquerade as a
+    complete run of the smaller hand-listed universe.
     """
     try:
         with engine.connect() as conn:
@@ -114,8 +172,10 @@ def catalyst_options_universe(
                 _CATALYST_UNIVERSE_SQL,
                 {"horizon_days": int(horizon_days), "max_tickers": int(max_tickers)},
             ).fetchall()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("options: catalyst universe unavailable: {e}", e=str(exc))
+    except Exception:  # noqa: BLE001
+        log.warning("options: catalyst universe unavailable")
+        if require_complete:
+            raise RuntimeError("options catalyst universe unavailable") from None
         return []
     return [str(r[0]).strip().upper() for r in rows if r[0] and str(r[0]).strip()]
 
@@ -271,7 +331,8 @@ class OptionsPuller(BasePuller):
         *,
         include_catalyst_universe: bool = True,
         max_expirations: int = MAX_EXPIRATIONS,
-    ) -> list[dict[str, Any]]:
+        should_continue: Callable[[], bool] | None = None,
+    ) -> OptionsPullResults:
         """Pull options chains for all tickers and compute signals.
 
         Parameters:
@@ -285,18 +346,24 @@ class OptionsPuller(BasePuller):
             max_expirations: Limit the nearest complete expiries per ticker.
                 The default preserves the scheduler's existing 12-expiry cap;
                 the legacy GEM timer used six.
+            should_continue: Deadline check between tickers, expirations and
+                publication statements. Cancellation rolls back the current
+                ticker and reports it and the remaining tickers as DEFERRED.
 
         Returns:
-            list[dict]: Per-ticker results with status and row counts.
+            OptionsPullResults: List-compatible results with a source-wide
+                summary. Only a complete default-universe SUCCESS bumps the
+                catalog; explicit scopes such as GEM never do.
         """
         if (not isinstance(max_expirations, int) or isinstance(max_expirations, bool)
                 or not 1 <= max_expirations <= MAX_EXPIRATIONS):
             raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
+        full_universe = tickers is None and include_catalyst_universe and max_expirations == MAX_EXPIRATIONS
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
-                extra = [t for t in catalyst_options_universe(self.engine) if t not in set(tickers)]
+                extra = [t for t in catalyst_options_universe(self.engine, require_complete=True) if t not in set(tickers)]
                 if extra:
                     log.info(
                         "options: +{n} catalyst-universe tickers beyond the {b} hand-listed",
@@ -308,18 +375,36 @@ class OptionsPuller(BasePuller):
         today_str = today.isoformat()
         if not is_market_open(today) or now.astimezone(_EQUITY_TZ).date() != today:
             log.info("Options pull skipped: {day} is not a scheduled equity session", day=today_str)
-            return [{"ticker": ticker, "status": "SKIPPED",
-                     "reason": "non-equity-session"} for ticker in tickers]
+            return OptionsPullResults([
+                {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                 "reason": "non-equity-session"} for ticker in tickers
+            ], full_universe=full_universe)
 
         self._yahoo = YahooOptionsClient()
         if not self._yahoo.is_available:
             log.error("Yahoo options client unavailable — cannot pull options")
-            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
+            return OptionsPullResults([
+                {"ticker": "N/A", "status": "FAILED", "rows_inserted": 0, "error": "Yahoo auth failed"}
+            ], full_universe=full_universe)
         results: list[dict[str, Any]] = []
 
-        for ticker in tickers:
-            result = self._pull_ticker(ticker, today_str, max_expirations=max_expirations)
+        for idx, ticker in enumerate(tickers):
+            if should_continue is not None and not should_continue():
+                results.extend(
+                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
+                    for t in tickers[idx:]
+                )
+                break
+            result = self._pull_ticker(
+                ticker, today_str, max_expirations=max_expirations, should_continue=should_continue,
+            )
             results.append(result)
+            if result["status"] == "DEFERRED":
+                results.extend(
+                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
+                    for t in tickers[idx + 1:]
+                )
+                break
             time.sleep(0.3)  # rate limit
 
         total_snaps = sum(r.get("snapshots", 0) for r in results)
@@ -328,18 +413,34 @@ class OptionsPuller(BasePuller):
             "Options pull complete — {ok}/{total} tickers, {snaps} snapshots",
             ok=succeeded, total=len(tickers), snaps=total_snaps,
         )
-        return results
+        outcome = OptionsPullResults(results, full_universe=full_universe)
+        if outcome.summary["status"] == "SUCCESS":
+            self._mark_catalog_pulled()
+        return outcome
+
+    def _mark_catalog_pulled(self) -> None:
+        """Advance freshness only after a complete default-universe capture."""
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                    {"sid": self.source_id},
+                )
+        except Exception:  # best effort; never emit connection/credential text
+            log.warning("options: source_catalog freshness update failed")
 
     def _pull_ticker(
         self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,
+        should_continue: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
+            _check_budget(should_continue)
             session_day = date.fromisoformat(today_str)
             now = _utc_now()
             if (session_day != now.date() or not is_market_open(session_day)
                     or now.astimezone(_EQUITY_TZ).date() != session_day):
-                return {"ticker": ticker, "status": "SKIPPED",
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "non-equity-session or UTC date mismatch"}
             capture_clock = time.monotonic()
             # Force a 64-bit PostgreSQL transaction ID for each capture. It is
@@ -352,19 +453,19 @@ class OptionsPuller(BasePuller):
                 ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
-                return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
+                return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from Yahoo"}
 
             quote = first.get("quote", {})
             spot_price = quote.get("regularMarketPrice")
             if (not isinstance(spot_price, (int, float)) or isinstance(spot_price, bool)
                     or not math.isfinite(spot_price) or spot_price <= 0):
-                return {"ticker": ticker, "status": "SKIPPED",
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "no dated regular-market price"}
 
             expirations = first.get("expirations", [])
             if not expirations:
                 log.warning("{t}: no options expirations", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "reason": "no expirations"}
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": "no expirations"}
             selected_expirations = expirations[:max_expirations]
 
             total_call_oi = 0
@@ -386,6 +487,7 @@ class OptionsPuller(BasePuller):
             near_puts_df = pd.DataFrame()
 
             for i, exp_ts in enumerate(selected_expirations):
+                _check_budget(should_continue)
                 if time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
                     complete = False
                     break
@@ -466,6 +568,7 @@ class OptionsPuller(BasePuller):
                 if atm_ivs:
                     expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
 
+            _check_budget(should_continue)
             if not complete or not snap_count or time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
                 raise ValueError("incomplete options chain response")
 
@@ -493,19 +596,23 @@ class OptionsPuller(BasePuller):
                 ).fetchone()
                 if latest and latest[0] is not None and latest[0] > capture_ordinal:
                     log.info("{t}: older overlapping options capture skipped", t=ticker)
-                    return {"ticker": ticker, "status": "SKIPPED",
+                    return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                             "reason": "newer options capture already published"}
 
                 # A ticker/day is one full capture, not a growing union of four
                 # scheduled pulls. Remove old/legacy rows and publish the new
                 # batch in the same transaction. A concurrent legacy insert
                 # after commit remains mixed and is rejected by the reader.
+                _check_budget(should_continue)
                 conn.execute(
                     text("DELETE FROM options_snapshots WHERE ticker = :ticker AND snap_date = :snap_date"),
                     {"ticker": ticker, "snap_date": today_str},
                 )
+                snapshots_inserted = 0
+                rows_known = True
                 for row in snapshot_rows:
-                    conn.execute(
+                    _check_budget(should_continue)
+                    written = conn.execute(
                         text(
                             "INSERT INTO options_snapshots "
                             "(ticker, snap_date, expiry, opt_type, strike, "
@@ -522,6 +629,9 @@ class OptionsPuller(BasePuller):
                         {**row, "ordinal": capture_ordinal,
                          "started_at": capture_started_at, "completed_at": completed_at},
                     )
+                    count = _affected_rows(written)
+                    rows_known = rows_known and count is not None
+                    snapshots_inserted += count or 0
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
@@ -569,7 +679,8 @@ class OptionsPuller(BasePuller):
                 oi_conc = _compute_oi_concentration(near_calls_df, near_puts_df, total_oi)
 
                 # Insert daily signals
-                conn.execute(
+                _check_budget(should_continue)
+                signal_write = conn.execute(
                     text(
                         "INSERT INTO options_daily_signals "
                         "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
@@ -603,7 +714,7 @@ class OptionsPuller(BasePuller):
                 )
 
                 # Push to resolved_series for PIT access
-                self._push_to_resolved(conn, ticker, today_str, {
+                resolved_inserted = self._push_to_resolved(conn, ticker, today_str, {
                     "pcr": ("sentiment", f"{ticker} Put/Call Ratio", put_call_ratio),
                     "max_pain": ("sentiment", f"{ticker} Max Pain Strike", max_pain),
                     "iv_skew": ("vol", f"{ticker} IV Skew (OTM/ATM)", iv_skew),
@@ -614,7 +725,13 @@ class OptionsPuller(BasePuller):
                     "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                })
+                }, should_continue=should_continue)
+                _check_budget(should_continue)
+                signals_written = _affected_rows(signal_write)
+                rows_inserted = (
+                    snapshots_inserted + signals_written + resolved_inserted
+                    if rows_known and signals_written is not None and resolved_inserted is not None else None
+                )
 
             log.info(
                 "{t}: {n} snaps, capture={capture:.1f}s, publish={publish:.1f}s, "
@@ -629,7 +746,8 @@ class OptionsPuller(BasePuller):
             )
             return {
                 "ticker": ticker, "status": "SUCCESS",
-                "snapshots": snap_count, "rows_inserted": snap_count,
+                "snapshots": snap_count, "snapshots_inserted": snapshots_inserted if rows_known else None,
+                "rows_inserted": rows_inserted,
                 "signals": {
                     "put_call_ratio": put_call_ratio,
                     "max_pain": max_pain,
@@ -639,6 +757,8 @@ class OptionsPuller(BasePuller):
                 },
             }
 
+        except _OptionsBudgetExpired:
+            return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
         except Exception as e:
             log.error("{t}: {e}", t=ticker, e=e)
             return {"ticker": ticker, "status": "FAILED", "error": str(e), "rows_inserted": 0}
@@ -649,10 +769,15 @@ class OptionsPuller(BasePuller):
         ticker: str,
         today_str: str,
         signals: dict[str, tuple[str, str, Any]],
-    ) -> None:
+        *,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> int | None:
         """Push computed signals to feature_registry + resolved_series."""
         prefix = ticker.lower().replace("-", "_")
+        inserted = 0
+        known = True
         for suffix, (family, desc, val) in signals.items():
+            _check_budget(should_continue)
             if val is None:
                 continue
             feat_name = f"{prefix}_{suffix}"
@@ -688,7 +813,8 @@ class OptionsPuller(BasePuller):
                     continue
                 fid = fid_row[0]
 
-            conn.execute(
+            _check_budget(should_continue)
+            written = conn.execute(
                 text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, "
@@ -701,6 +827,10 @@ class OptionsPuller(BasePuller):
                     "vd": today_str, "val": float(val), "src": self.source_id,
                 },
             )
+            count = _affected_rows(written)
+            known = known and count is not None
+            inserted += count or 0
+        return inserted if known else None
 
 
 # ---------------------------------------------------------------------------

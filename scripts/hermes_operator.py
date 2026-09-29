@@ -132,7 +132,12 @@ DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step �
 # tests/test_hermes_repair_bounded.py.
 DIAGNOSTICS_TIMEOUT_SECONDS = 300
 RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.resolve_pending. Outer guard only — RESOLUTION_SCAN_BUDGET_SECONDS is what bounds the step. Must hold that budget (180) + one slice of overshoot capped at MIN_SCAN_SLICE_TIMEOUT_S (60) + the worst resolve phase observed live on 2026-09-14 (77.5s, cycle 6014) = 317.5s. Was 240, which the 371-411s cold scan of ops-exec run 292 did not fit inside. tests/test_hermes_resolution_watermark.py pins the invariant.
-SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
+# tick() stops STARTING jobs after 300s; a final options call can still take
+# 900s. Include that overshoot plus 60s for result persistence/cleanup so
+# the enclosing step does not abandon a cooperating options capture.
+# This scopes the fix to options; existing 1800s registry jobs still need
+# separate budget review. The 4500s whole-cycle watchdog is unchanged.
+SMART_INGESTION_TIMEOUT_SECONDS = 1260
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 ASTROGRID_CELESTIAL_TIMEOUT_SECONDS = 240      # oracle.astrogrid_cycle.run_celestial_cycle: deterministic sky build is sub-second; the budget is almost entirely the one local-LLM interpretation call (num_predict=1200). Degrades to a deterministic fallback if the model is offline, so a timeout here means the model was slow, not absent.
 DAILY_INTEL_BATCH_OBSERVED_S = 360            # HISTORICAL — observed run length of the OLD monolithic 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08. Superseded by DAILY_INTEL_CYCLE_BUDGET_SECONDS below for the timeout-budget pin (fable-daily-intel-resumable, 2026-09-20) — kept only because it is a documented historical measurement other notes reference; nothing computes with it anymore.

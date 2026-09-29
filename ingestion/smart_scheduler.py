@@ -4,7 +4,7 @@ GRID Smart Scheduler — runs only due/stale pullers per cycle.
 Replaces the old pattern of running ALL 50+ pullers every pipeline cycle.
 Each puller has an expected frequency. On each tick, we check which pullers
 are overdue and run only those, capped at MAX_PULLERS_PER_TICK to keep
-cycles short (< 5 minutes).
+cycles short (a 5-minute scheduling cutoff; the final puller may exceed it).
 
 Pullers that fail or timeout get exponential backoff cooldowns. The old
 full pipeline (run_full_pipeline.py) is still available for manual runs.
@@ -12,7 +12,7 @@ full pipeline (run_full_pipeline.py) is still available for manual runs.
 Usage from Hermes:
     from ingestion.smart_scheduler import SmartScheduler
     sched = SmartScheduler(engine)
-    result = sched.tick()  # runs 3-5 due pullers, returns in < 5 min
+    result = sched.tick()  # options may occupy up to 15 minutes
 """
 
 from __future__ import annotations
@@ -223,6 +223,27 @@ class _LMEWarehouseSchedulerAdapter:
         }
 
 
+class _OptionsSchedulerAdapter:
+    """Full-universe options runner with cooperative, bounded cancellation.
+
+    The measured ~10 minute universe needs more than the old 180 second
+    ceiling. This call may occupy one Hermes tick for up to 15 minutes;
+    TICK_TIME_BUDGET_S stops scheduling subsequent jobs after it returns.
+    Subset and incomplete runs retain committed rows but never claim the
+    entire source fresh. The puller also uses this summary for daily runs.
+    """
+
+    SOURCE_NAME = "YFINANCE_OPTIONS"
+
+    def __init__(self, db_engine: Engine) -> None:
+        from ingestion.options import OptionsPuller
+
+        self._puller = OptionsPuller(db_engine=db_engine)
+
+    def pull(self, should_continue: Any = None) -> dict[str, Any]:
+        return self._puller.pull_all(should_continue=should_continue).summary
+
+
 class _SECFTDSchedulerAdapter:
     """Config-gated, half-month-catch-up shim for SECFTDPuller.
 
@@ -385,7 +406,7 @@ def _cftc_cot_is_due(last_success: datetime | None, now: datetime) -> bool:
 PULLER_REGISTRY: list[dict[str, Any]] = [
     # ── Fast domestic (run frequently) ──
     {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 240, "kwargs": {"start_date": _yfinance_incremental_start}},
-    {"name": "options",           "mod": "ingestion.options",             "cls": "OptionsPuller",            "method": "pull_all",  "freq_h": 6,  "timeout_s": 180},
+    {"name": "options",           "mod": "ingestion.smart_scheduler",     "cls": "_OptionsSchedulerAdapter", "method": "pull",      "freq_h": 6, "timeout_s": 900, "stop_margin_s": 60},
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
     {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 120, "api_key": "FRED_API_KEY"},
 
@@ -900,7 +921,9 @@ class SmartScheduler:
                 continue
             cooldown_until = None
             if fails and last_fail is not None:
-                cooldown_until = last_fail + timedelta(minutes=_cooldown_minutes(fails))
+                latest_status = next((str(r[1]) for r in recent if str(r[0]) == SMART_PULL_LOG_PREFIX + n), None)
+                retry_minutes = 30 if n == "options" and latest_status == "PARTIAL" else _cooldown_minutes(fails)
+                cooldown_until = last_fail + timedelta(minutes=retry_minutes)
             self._state[n] = {
                 "last_success": success,
                 "last_attempt": last_fail or success,
@@ -1066,7 +1089,7 @@ class SmartScheduler:
                 except (TypeError, ValueError):
                     accepts_should_continue = False
                 if accepts_should_continue:
-                    margin = min(15, max(timeout_s // 8, 1))
+                    margin = puller.get("stop_margin_s", min(15, max(timeout_s // 8, 1)))
                     deadline = time.monotonic() + max(timeout_s - margin, 1)
                     method_kwargs["should_continue"] = (
                         lambda _deadline=deadline: time.monotonic() < _deadline
@@ -1112,9 +1135,10 @@ class SmartScheduler:
             # SKIPPED outcome — e.g. YFinancePuller.pull_all's single-flight
             # lock finding a previous run still active. That is NOT a
             # successful check and must not advance last_pull_at.
-            if isinstance(out, dict) and out.get("status") == "SKIPPED":
+            if isinstance(out, dict) and out.get("status") in ("SKIPPED", "NO_NEW_DATA", "UNCHANGED"):
                 result["status"] = "SKIPPED"
-                result["reason"] = out.get("skipped_reason", "puller reported SKIPPED")
+                result["reason"] = out.get("skipped_reason") or out.get("reason") or "puller reported no new data"
+                result["rows_inserted"] = _extract_rows(out)
                 result["detail"] = str(out)[:200]
                 return result
 
@@ -1263,7 +1287,9 @@ class SmartScheduler:
                 "SmartScheduler: pull_log write failed for {n}: {e}", n=name, e=str(exc)
             )
 
-    def _record_result(self, name: str, success: bool, error: str | None = None) -> None:
+    def _record_result(
+        self, name: str, success: bool, error: str | None = None, *, partial: bool = False,
+    ) -> None:
         """Record puller result and manage cooldowns."""
         state = self._state.get(name, {"consecutive_fails": 0})
         state["last_attempt"] = datetime.now(timezone.utc)
@@ -1276,7 +1302,10 @@ class SmartScheduler:
             fails = state.get("consecutive_fails", 0) + 1
             state["consecutive_fails"] = fails
             # Exponential backoff: 30min, 1h, 2h, 4h, 8h, max 24h
-            cooldown_min = _cooldown_minutes(fails)
+            # Incomplete options coverage is common (including tickers with
+            # no chain). Preserve PARTIAL truth without a 24h retry lockout.
+            # True FAILED/TIMEOUT outcomes retain normal failure backoff.
+            cooldown_min = 30 if name == "options" and partial else _cooldown_minutes(fails)
             state["cooldown_until"] = (
                 datetime.now(timezone.utc) + timedelta(minutes=cooldown_min)
             )
@@ -1327,7 +1356,7 @@ class SmartScheduler:
             run_started = datetime.now(timezone.utc)
             result = self._run_puller(puller)
             success = result["status"] == "SUCCESS"
-            self._record_result(name, success, result.get("error"))
+            self._record_result(name, success, result.get("error"), partial=result["status"] == "PARTIAL")
             self._log_run(name, run_started, result)
 
             summary["results"].append(result)
