@@ -334,6 +334,21 @@ retention="$root/.runtime-retention"
 printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s\n' \
   "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
 cp "$retention" "$box/good-retention"
+# Binary suffixes must not disappear inside Bash mapfile. Each refusal is
+# before any candidate build or swap, against the real scheduler Git identity.
+printf 'rollback=%s\nrollback_sha=%s\0HIDDEN_SHA\nrollback_tree=%s\n' \
+  "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
+fail_without_swap "$root/rm-failure" nul-retention-sha
+printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s\0HIDDEN_TREE\n' \
+  "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
+fail_without_swap "$root/rm-failure" nul-retention-tree
+printf 'rollback=%s\0HIDDEN_PATH\nrollback_sha=%s\nrollback_tree=%s\n' \
+  "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
+fail_without_swap "$root/rm-failure" nul-retention-path
+printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s' \
+  "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
+fail_without_swap "$root/rm-failure" unterminated-retention
+cp "$box/good-retention" "$retention"
 printf 'extra=bad\n' >> "$retention"
 fail_without_swap "$root/rm-failure" bad-retention-shape
 cp "$box/good-retention" "$retention"

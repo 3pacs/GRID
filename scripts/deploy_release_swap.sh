@@ -293,6 +293,13 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
     retained_release_dir="${retention_lines[0]#rollback=}"
     retained_release_sha="${retention_lines[1]#rollback_sha=}"
     retained_release_tree="${retention_lines[2]#rollback_tree=}"
+    # Bash mapfile loses NUL bytes (and their suffixes). Trust parsed fields
+    # only when their canonical reconstruction matches every original byte.
+    if ! cmp -s "$RETENTION_FILE" <(printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s\n' \
+        "$retained_release_dir" "$retained_release_sha" "$retained_release_tree"); then
+      echo "invalid runtime retention record: noncanonical bytes" >&2
+      exit 5
+    fi
     if [ ! -d "$retained_release_dir" ] || [ -L "$retained_release_dir" ] ||
        [ "$(realpath -e -- "$retained_release_dir")" != "$retained_release_dir" ] ||
        [ "$(dirname -- "$retained_release_dir")" != "$releases_root" ]; then
