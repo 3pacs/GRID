@@ -3,7 +3,28 @@ State vector construction for the regime-matched analog engine.
 
 Each state vector captures the macro environment at a point in time across
 24 dimensions — VIX, rates, spreads, employment, liquidity, momentum, and
-cross-reference divergence scores. All queries are PIT-correct (no look-ahead).
+cross-reference divergence scores.
+
+Point-in-time contract (``as_of`` = known by the end of that UTC day)
+--------------------------------------------------------------------
+* **Macro inputs** are read with ``store.observations.read_window_known_at``:
+  an observation is visible at ``as_of`` only if it was pulled by then, or —
+  for history backfilled long after the fact (every FRED row on griddb was
+  pulled on or after 2026-03-24) — if its declared, conservative
+  :data:`PUBLICATION_LAGS` entry says it was published by then. The
+  observation date alone never makes a value visible, so a monthly series
+  dated the 1st is not seen weeks before its release.
+  ``store.pit.PITStore`` cannot serve these reads: ``resolved_series``'s
+  ``release_date`` for them is (almost always) the backfill pull date, so
+  it returns little or no history before 2026-03.
+* **Normalisation** (z-scores of the ``raw`` dims) uses mean/std over the
+  same PIT-visible series in a rolling :data:`NORM_LOOKBACK_DAYS` window
+  ending at ``as_of`` — the 10,000-day window the original design used,
+  anchored at ``as_of`` instead of the run date. No process-level cache: a
+  vector depends only on ``as_of`` and data known by then, not on when or in
+  which process it was computed.
+* **SPY** momentum/RSI keep their existing basis handling (``spy_full`` via
+  ``store.pit`` where PIT-visible, else raw ``YF:SPY:close``).
 
 State vectors are cached in the `regime_state_vectors` table.
 """
@@ -21,7 +42,12 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.observations import MixedSourceError, read_window
+from store.observations import (
+    MixedSourceError,
+    PublicationLag,
+    read_window,
+    read_window_known_at,
+)
 
 
 # ── Dimension specification ──────────────────────────────────────────────
@@ -81,6 +107,71 @@ DIM_NAMES = [d.name for d in STATE_DIMENSIONS]
 DIM_WEIGHTS = np.array([d.weight for d in STATE_DIMENSIONS], dtype=np.float64)
 
 
+# ── Publication lags (modeled availability) ──────────────────────────────
+#
+# Used only where GRID has no pull evidence for an observation (backfilled
+# history); a value pulled by ``as_of`` is visible from its pull date. Each
+# lag is deliberately late — at or beyond the latest normal release date —
+# because an early lag is look-ahead and a late one only costs freshness.
+# "First pull" figures are the observed obs->first-pull lags for the dates
+# GRID ingested live (griddb, read-only, 2026-09-29).
+#
+# Known gap: releases delayed by a government shutdown (e.g. the Oct 2013 and
+# Oct-Nov 2025 BLS/BEA delays) exceed these lags; a backfilled vector for
+# those few weeks can still see a value slightly early.
+_NEXT_BUSINESS_DAY = PublicationLag(
+    1, "business",
+    "next business day; same lag as analysis.research_real_panel.PUBLICATIONS "
+    "(FRB_H15 / FRED_H15_SPREAD / ICE_BOFA / CBOE_VIX, reviewer-verified)",
+)
+
+PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
+    # Daily market/rates series, posted to FRED the next business day
+    'VIXCLS': _NEXT_BUSINESS_DAY,
+    'T10Y2Y': _NEXT_BUSINESS_DAY,
+    'T5YIE': _NEXT_BUSINESS_DAY,
+    'DFF': _NEXT_BUSINESS_DAY,
+    'BAMLH0A0HYM2': _NEXT_BUSINESS_DAY,
+    'BAMLC0A0CM': _NEXT_BUSINESS_DAY,
+    # Monthly, dated the 1st of the reference month
+    'UNRATE': PublicationLag(
+        40, "calendar",
+        "BLS Employment Situation, first Friday of the next month (latest ~day 10); "
+        "first pull 31-35d",
+    ),
+    'INDPRO': PublicationLag(
+        50, "calendar",
+        "Fed G.17 industrial production, ~15th-18th of the next month; first pull 44-46d",
+    ),
+    'TCU': PublicationLag(
+        50, "calendar",
+        "Fed G.17 capacity utilisation, ~15th-18th of the next month; first pull 44-46d",
+    ),
+    'M2SL': PublicationLag(
+        60, "calendar",
+        "Fed H.6 money stock, ~4th Tuesday of the next month; first pull 51-55d",
+    ),
+    'UMCSENT': PublicationLag(
+        60, "calendar",
+        "UMich sentiment as posted to FRED (delayed vs the survey's own release); "
+        "first pull 52-57d",
+    ),
+    # Weekly, dated the Saturday week-end
+    'ICSA': PublicationLag(
+        6, "calendar",
+        "DOL weekly claims, following Thursday (Friday after a holiday); first pull 5d",
+    ),
+    # Computed by GRID itself: known when GRID computed it, never earlier
+    'COMPUTED:fed_net_liquidity': None,
+    'COMPUTED:fed_net_liquidity_change_1m': None,
+}
+
+# Rolling window for the z-score mean/std, ending at as_of (see module doc).
+NORM_LOOKBACK_DAYS = 10000
+# Window the dimension transforms read (unchanged).
+VALUE_LOOKBACK_DAYS = 2520
+
+
 # ── State Vector ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -122,22 +213,27 @@ class StateVector:
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def _fetch_series(engine: Engine, series_id: str, as_of: date, lookback_days: int = 2520) -> pd.Series:
-    """Fetch series values up to as_of date (PIT-correct).
+def _fetch_series(
+    engine: Engine, series_id: str, as_of: date, lookback_days: int = VALUE_LOOKBACK_DAYS,
+) -> pd.Series:
+    """Macro series values known by the end of ``as_of`` (point-in-time).
 
-    Goes through ``store.observations.read_window``: SUCCESS-only, one row
-    per ``obs_date`` (latest vintage wins), bounded by ``as_of`` — replacing
-    the direct, un-collapsed ``raw_series`` read this module used to do (a
-    revision day or a FAILED zero marker could otherwise leak in). A
-    series_id whose rows span more than one source (see
-    ``store.observations.MixedSourceError``) degrades to an empty series
-    rather than silently mixing sources; the caller already treats a short
-    or empty series as "dimension unavailable".
+    Goes through ``store.observations.read_window_known_at``: SUCCESS-only,
+    one value per ``obs_date``, and an observation is included only if it was
+    pulled by ``as_of`` (latest such vintage) or, for backfilled history, its
+    :data:`PUBLICATION_LAGS` entry puts its release on or before ``as_of``
+    (earliest pulled vintage). A series not in :data:`PUBLICATION_LAGS` gets
+    no modeled path (pull evidence only). A series_id whose selected rows
+    span more than one source (``store.observations.MixedSourceError``)
+    degrades to an empty series rather than silently mixing sources; the
+    caller already treats a short or empty series as "dimension unavailable".
     """
     cutoff = as_of - timedelta(days=lookback_days)
     try:
         with engine.connect() as conn:
-            obs = read_window(conn, series_id, start=cutoff, as_of=as_of)
+            obs = read_window_known_at(
+                conn, series_id, as_of=as_of, lag=PUBLICATION_LAGS.get(series_id), start=cutoff,
+            )
     except MixedSourceError as exc:
         log.warning("state_vector: {sid} is mixed-source, skipping: {e}", sid=series_id, e=str(exc))
         return pd.Series(dtype=float)
@@ -147,6 +243,37 @@ def _fetch_series(engine: Engine, series_id: str, as_of: date, lookback_days: in
         {o.obs_date: o.value for o in obs},
         dtype=float,
     ).sort_index()
+
+
+class _AsOfReader:
+    """Per-``compute_state_vector`` memo: each macro series is read once.
+
+    Reads the full :data:`NORM_LOOKBACK_DAYS` PIT window (needed for the
+    normalisation stats) and serves the shorter
+    :data:`VALUE_LOOKBACK_DAYS` window to the transforms by slicing it. The
+    known-at rule is decided per observation date, so the slice equals a
+    direct read of the shorter window. Lives for one ``as_of`` only; nothing
+    is shared across dates or calls.
+    """
+
+    def __init__(self, engine: Engine, as_of: date) -> None:
+        self.engine = engine
+        self.as_of = as_of
+        self._full: dict[str, pd.Series] = {}
+
+    def full(self, series_id: str) -> pd.Series:
+        if series_id not in self._full:
+            self._full[series_id] = _fetch_series(
+                self.engine, series_id, self.as_of, lookback_days=NORM_LOOKBACK_DAYS,
+            )
+        return self._full[series_id]
+
+    def window(self, series_id: str) -> pd.Series:
+        series = self.full(series_id)
+        if series.empty:
+            return series
+        cutoff = self.as_of - timedelta(days=VALUE_LOOKBACK_DAYS)
+        return series[[d >= cutoff for d in series.index]]
 
 
 def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
@@ -366,29 +493,30 @@ def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
 
 # ── Normalization stats ──────────────────────────────────────────────────
 
-_NORM_CACHE: dict[str, tuple[float, float]] | None = None
+def _get_normalization_stats(
+    engine: Engine, as_of: date, reader: _AsOfReader | None = None,
+) -> dict[str, tuple[float, float]]:
+    """Mean and std for each series z-scored in the state vector, as of ``as_of``.
 
-
-def _get_normalization_stats(engine: Engine) -> dict[str, tuple[float, float]]:
-    """Compute mean and std for each series used in state vectors.
-
-    Used to z-score normalize dimensions so they're comparable.
-    Cached after first computation.
+    Point-in-time: computed only from observations known by the end of
+    ``as_of`` (the same known-at read as the dimension values), over a
+    rolling :data:`NORM_LOOKBACK_DAYS` window ending at ``as_of``. This keeps
+    the original design's 10,000-day window but anchors it at ``as_of``
+    instead of the run date (``date.today()``), so a historical row's
+    z-scores no longer depend on data after ``as_of`` or on when the job
+    ran. Rolling rather than expanding because that is what the original
+    lookback was; for any as_of before ~2017 it spans all GRID history
+    (from 1990) anyway.
     """
-    global _NORM_CACHE
-    if _NORM_CACHE is not None:
-        return _NORM_CACHE
-
+    reader = reader or _AsOfReader(engine, as_of)
     stats: dict[str, tuple[float, float]] = {}
     for dim in STATE_DIMENSIONS:
-        if dim.series_id.startswith('DERIVED:'):
+        if dim.series_id.startswith('DERIVED:') or dim.series_id in stats:
             continue
-        series = _fetch_series(engine, dim.series_id, date.today(), lookback_days=10000)
+        series = reader.full(dim.series_id)
         if len(series) < 20:
             continue
         stats[dim.series_id] = (float(series.mean()), float(series.std()))
-
-    _NORM_CACHE = stats
     return stats
 
 
@@ -404,32 +532,36 @@ def _zscore_normalize(value: float | None, mean: float, std: float) -> float | N
 def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVector:
     """Compute the macro state vector at a specific date (PIT-correct).
 
-    Each dimension is fetched from the database, transformed, and z-score
-    normalized against its full history.
+    Each macro dimension is read point-in-time (only observations known by
+    the end of ``as_of``, see :func:`_fetch_series`), transformed, and the
+    ``raw`` ones z-scored against PIT stats as of ``as_of``
+    (:func:`_get_normalization_stats`). The result depends only on ``as_of``
+    and the data known by then — the nightly job
+    (``get_or_compute_state_vector``) and ``compute_state_vector_series``
+    both call this and get the same vector for the same ``as_of``.
     """
     if as_of is None:
         as_of = date.today()
 
-    norm_stats = _get_normalization_stats(engine)
+    reader = _AsOfReader(engine, as_of)
+    norm_stats = _get_normalization_stats(engine, as_of, reader)
     spy_prices, price_basis = _fetch_spy_prices(engine, as_of)
     values: list[float | None] = []
     stale: list[str] = []
 
     for dim in STATE_DIMENSIONS:
         try:
-            val = _compute_dimension(engine, dim, as_of, norm_stats, spy_prices)
+            val = _compute_dimension(reader, dim, as_of, norm_stats, spy_prices)
             values.append(val)
 
-            # Check staleness for non-derived series
+            # Staleness for non-derived series: age of the newest observation
+            # known at as_of (the one the value came from). Before the PIT
+            # fix this looked only at a 60-day window, so a series with
+            # nothing in the last 60 days read as *not* stale.
             if not dim.series_id.startswith('DERIVED:') and val is not None:
-                series = _fetch_series(engine, dim.series_id, as_of, lookback_days=60)
-                if len(series) > 0:
-                    latest_date = series.index[-1]
-                    if hasattr(latest_date, 'date'):
-                        latest_date = latest_date
-                    days_stale = (as_of - latest_date).days if isinstance(latest_date, date) else 30
-                    if days_stale > 30:
-                        stale.append(dim.name)
+                series = reader.window(dim.series_id)
+                if len(series) > 0 and (as_of - series.index[-1]).days > 30:
+                    stale.append(dim.name)
         except Exception as exc:
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))
             values.append(None)
@@ -448,17 +580,18 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
 
 
 def _compute_dimension(
-    engine: Engine,
+    reader: _AsOfReader,
     dim: DimensionSpec,
     as_of: date,
     norm_stats: dict[str, tuple[float, float]],
     spy_prices: pd.Series,
 ) -> float | None:
-    """Compute a single dimension value."""
+    """Compute a single dimension value (macro reads via the PIT ``reader``)."""
+    engine = reader.engine
 
     # ── Derived dimensions (computed from other series) ──
     if dim.series_id == 'DERIVED:T5YIE':
-        series = _fetch_series(engine, 'T5YIE', as_of)
+        series = reader.window('T5YIE')
         if series.empty:
             return None
         val = float(series.iloc[-1])
@@ -473,8 +606,8 @@ def _compute_dimension(
         return (rsi_val - 50.0) / 25.0 if rsi_val is not None else None  # normalize to ~[-2, 2]
 
     if dim.series_id == 'DERIVED:REAL_FF':
-        dff = _fetch_series(engine, 'DFF', as_of)
-        t5yie = _fetch_series(engine, 'T5YIE', as_of)
+        dff = reader.window('DFF')
+        t5yie = reader.window('T5YIE')
         if dff.empty or t5yie.empty:
             return None
         return float(dff.iloc[-1] - t5yie.iloc[-1])
@@ -486,7 +619,7 @@ def _compute_dimension(
         return _get_insider_sentiment(engine, as_of)
 
     # ── Standard series dimensions ──
-    series = _fetch_series(engine, dim.series_id, as_of)
+    series = reader.window(dim.series_id)
     if series.empty or len(series) < dim.min_history:
         return None
 

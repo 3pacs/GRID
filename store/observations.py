@@ -54,6 +54,10 @@ Every function here:
   the same ``series_id`` raises :class:`MixedSourceError` instead of silently
   picking whichever source's row happens to sort first — see "Multi-source
   series_id" below;
+* :func:`read_window_known_at` is the point-in-time variant: it returns an
+  observation only if it was known by the end of ``as_of`` (pulled by then,
+  or published by then per a caller-declared :class:`PublicationLag` for
+  backfilled history), never merely because ``obs_date <= as_of``;
 * returns :class:`Observation` records that carry their own provenance
   (``series_id``, ``obs_date``, ``pull_timestamp``, ``source``), so a caller
   can report freshness and origin instead of stamping ``now()`` or assuming
@@ -80,7 +84,7 @@ This module reads only; it never writes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from sqlalchemy import text
@@ -113,6 +117,11 @@ class Observation:
     value: float
     pull_timestamp: datetime | None = None
     source: str | None = None
+    # Set only by read_window_known_at: the UTC date the value is taken to
+    # have been known by, and whether that came from a pull ("pulled") or a
+    # declared publication lag ("modeled_lag").
+    known_at: date | None = None
+    known_at_basis: str | None = None
 
     @property
     def age_days(self) -> int:
@@ -304,3 +313,156 @@ def read_latest_n(
 
 def values(observations: Iterable[Observation]) -> list[float]:
     return [o.value for o in observations]
+
+
+# ── Known-at (publication-time) reads ────────────────────────────────────────
+#
+# ``read_window(as_of=...)`` bounds by *observation* date only: a monthly
+# series dated the 1st (UNRATE, INDPRO, ...) is returned at an ``as_of`` weeks
+# before it was published, and a vintage pulled after ``as_of`` still replaces
+# the value a past read saw. ``store/pit.py`` fixes both for ``resolved_series``
+# via ``release_date <= as_of``, but ``raw_series`` has no release column, and
+# ``resolved_series.release_date`` is the resolver's pull date — on griddb every
+# FRED macro row was (back)filled on or after 2026-03-24, so a ``PITStore``
+# read of 1990-2025 history returns little or nothing. ``read_window_known_at``
+# applies the same "known by the end of ``as_of`` (UTC day)" contract to
+# ``raw_series`` with two upper bounds on when a value became known:
+#
+# * the pull itself (proven: GRID had the row by then), and
+# * ``obs_date + PublicationLag`` (modeled, conservative, declared per series by
+#   the caller) for history that was backfilled long after publication.
+
+
+@dataclass(frozen=True)
+class PublicationLag:
+    """An observation dated ``d`` is taken as public by the end of ``d + days``.
+
+    ``unit`` is ``"calendar"`` or ``"business"`` (US federal holiday calendar;
+    a weekend/holiday-dated observation rolls back to the prior business day
+    first, the same convention as
+    ``analysis.research_real_panel.publication_times``). ``basis`` documents
+    where the number comes from. This is a *modeled* availability, used only
+    where no pull evidence exists; make it conservative (late), never early.
+    """
+
+    days: int
+    unit: str = "calendar"
+    basis: str = ""
+
+    def known_dates(self, obs_dates: list[date]) -> list[date]:
+        """Modeled known-at date for each of ``obs_dates`` (same order)."""
+        if not obs_dates:
+            return []
+        if self.unit == "calendar":
+            return [d + timedelta(days=self.days) for d in obs_dates]
+        if self.unit == "business":
+            import numpy as np
+
+            days = np.asarray(obs_dates, dtype="datetime64[D]")
+            out = np.busday_offset(days, self.days, roll="backward", holidays=_us_holidays())
+            return [d.astype(object) for d in out]
+        raise ValueError(f"unknown PublicationLag unit {self.unit!r}")
+
+
+_US_HOLIDAYS: Any = None
+
+
+def _us_holidays() -> Any:
+    global _US_HOLIDAYS
+    if _US_HOLIDAYS is None:
+        from pandas.tseries.holiday import USFederalHolidayCalendar
+
+        _US_HOLIDAYS = (
+            USFederalHolidayCalendar()
+            .holidays("1980-01-01", "2045-12-31")
+            .to_numpy()
+            .astype("datetime64[D]")
+        )
+    return _US_HOLIDAYS
+
+
+def _utc_date(ts: datetime | None) -> date | None:
+    if ts is None:
+        return None
+    if ts.tzinfo is not None:
+        ts = ts.astimezone(timezone.utc)
+    return ts.date()  # naive timestamps are taken as UTC (griddb runs Etc/UTC)
+
+
+def read_window_known_at(
+    conn: Any,
+    series_id: str,
+    *,
+    as_of: date,
+    lag: PublicationLag | None,
+    source: str | None = None,
+    start: date | None = None,
+) -> list[Observation]:
+    """Accepted observations of ``series_id`` that were known by the end of ``as_of``.
+
+    Point-in-time counterpart of :func:`read_window` (same SUCCESS-only,
+    source and ``[start, as_of]`` observation bounds). An observation date is
+    returned only if it was known by the end of the UTC day ``as_of``:
+
+    * **pulled** — some accepted vintage of it has
+      ``pull_timestamp`` (UTC date) ``<= as_of``. The value is the latest
+      such vintage (``LATEST_AS_OF``, as in ``store/pit.py``); vintages pulled
+      after ``as_of`` are ignored.
+    * **modeled** — otherwise, when ``lag`` is given and
+      ``lag.known_dates([obs_date]) <= as_of``. The value is the *earliest*
+      pulled vintage (the closest available proxy for the first release,
+      ``FIRST_RELEASE``-like), so a revision appended later never changes it.
+      With ``lag=None`` there is no modeled path: pull evidence only.
+
+    Either way the result for a given ``as_of`` depends only on rows pulled
+    by ``as_of`` or on the earliest vintage of each date, so appending data
+    later (new dates, re-pulls, revisions) never changes a past read. The
+    mixed-source rule of :func:`read_window` is applied to the vintages known
+    at ``as_of`` (every vintage pulled by then, plus the earliest vintage of a
+    modeled date), so a second source appearing later cannot break a past
+    read.
+
+    Each returned :class:`Observation` has ``known_at`` set and
+    ``known_at_basis`` = ``"pulled"`` or ``"modeled_lag"``.
+    """
+    rows = conn.execute(
+        text(_WINDOW_SQL),
+        {
+            "sid": series_id, "ok": SUCCESS, "source": source,
+            "start": start, "as_of": as_of, "as_of_ts": None,
+        },
+    ).fetchall()
+
+    # Group vintages per obs_date. Rows arrive obs_date ASC, pull_timestamp
+    # DESC; values that are NULL are not observations.
+    groups: list[tuple[date, list[tuple[float, datetime | None, str | None]]]] = []
+    for obs_date, value, pull_ts, source_name in rows:
+        if value is None:
+            continue
+        d = _coerce_date(obs_date)
+        if groups and groups[-1][0] == d:
+            groups[-1][1].append((float(value), _coerce_ts(pull_ts), source_name))
+        else:
+            groups.append((d, [(float(value), _coerce_ts(pull_ts), source_name)]))
+
+    modeled = lag.known_dates([d for d, _ in groups]) if lag is not None else [None] * len(groups)
+
+    out: list[Observation] = []
+    known_sources: set[str] = set()
+    for (d, vintages), modeled_known in zip(groups, modeled):
+        pulled = [(v, ts, s, _utc_date(ts)) for v, ts, s in vintages]
+        proven = [p for p in pulled if p[3] is not None and p[3] <= as_of]
+        if proven:
+            v, ts, s, pull_day = proven[0]  # latest vintage pulled by as_of
+            known = pull_day if modeled_known is None else min(pull_day, modeled_known)
+            out.append(Observation(series_id, d, v, ts, s, max(d, known), "pulled"))
+            known_sources.update(p[2] for p in proven if p[2] is not None)
+        elif modeled_known is not None and modeled_known <= as_of:
+            v, ts, s, _ = pulled[-1]  # earliest pulled vintage
+            out.append(Observation(series_id, d, v, ts, s, modeled_known, "modeled_lag"))
+            if s is not None:
+                known_sources.add(s)
+
+    if source is None:
+        _raise_if_mixed(series_id, sorted(known_sources))
+    return out
