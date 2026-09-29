@@ -40,6 +40,8 @@ def test_v6_stop_requires_exact_witness_and_cannot_open_after_supersession(tmp_p
     assert stop["gate_passed"] is False
     assert stop["discovery_opened"] is False and stop["holdout_opened"] is False
     assert "v7_prereg_sha256" not in stop and "v7_registry_head_sha256" not in stop
+    with pytest.raises(PermissionError, match="missing or extra fields"):
+        v6._check_stop_record({**stop, "unregistered_field": "forbidden"})
     with pytest.raises(PermissionError, match="off-host anchor log"):
         v6.verify_terminal_stop(log_dir, prior)
 

@@ -174,6 +174,9 @@ def _check_stop_record(record: Mapping[str, Any]) -> None:
     }
     if any(record.get(key) != value for key, value in required.items()):
         raise PermissionError("v6 terminal record is not the exact STOP status")
+    allowed = set(required) | {"run_at", "power_receipt_sha256", "owner_decision_ref", "prev_sha256"}
+    if set(record) != allowed:
+        raise PermissionError("v6 terminal STOP record has missing or extra fields")
     if not v1._is_hex64(record.get("power_receipt_sha256")) or not record.get("owner_decision_ref"):
         raise PermissionError("v6 STOP needs the immutable power receipt and owner decision reference")
     if "v7_prereg_sha256" in record or "v7_registry_head_sha256" in record:
