@@ -65,7 +65,7 @@ def test_the_v3_registry_and_witness_are_their_own():
     assert record["supersedes"][1]["registry_head_sha256"] == v2.REGISTERED_RECORD_SHA256[1]
 
 
-def test_v1_v2_and_v3_are_pinned_as_superseded_by_the_registered_v4():
+def test_v1_through_v5_point_to_v6_and_v6_has_the_v7_stop_pin():
     from analysis import panel_insider_density_v4 as v4
     from analysis import panel_insider_density_v5 as v5
     from analysis import panel_insider_density_v6 as v6
@@ -73,13 +73,13 @@ def test_v1_v2_and_v3_are_pinned_as_superseded_by_the_registered_v4():
     for pin in (v1.SUPERSEDED_BY, v2.SUPERSEDED_BY, v3.SUPERSEDED_BY, v4.SUPERSEDED_BY, v5.SUPERSEDED_BY):
         assert pin == {"version": "vs1-v6", "prereg_sha256": v6.PREREG_BODY_SHA256,
                        "registry_head_sha256": v6.REGISTERED_RECORD_SHA256[1]}
-    assert v6.SUPERSEDED_BY is None
+    assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
 
 
 @pytest.fixture(autouse=True)
 def _v3_not_superseded(request, monkeypatch):
     """v3 is superseded by v4 (pinned); the machinery tests exercise v3 as if it were current."""
-    if request.node.name != "test_v1_v2_and_v3_are_pinned_as_superseded_by_the_registered_v4":
+    if request.node.name != "test_v1_through_v5_point_to_v6_and_v6_has_the_v7_stop_pin":
         monkeypatch.setattr(v3, "SUPERSEDED_BY", None)
 
 

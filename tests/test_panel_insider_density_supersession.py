@@ -264,9 +264,10 @@ def test_every_harness_module_pins_every_lower_version_as_earlier():
                           module.REGISTERED_ANCHOR_LINE)
         found.append(number)
     assert found == list(range(2, max(found) + 1)) and max(found) >= 3
-    # only the newest version is unsuperseded; every older one names a later registered version
+    # v6 is the latest registered harness; its v7 stop pin is version-only
+    # until v7 registration is witnessed.
     newest = importlib.import_module(f"analysis.panel_insider_density_v{max(found)}")
-    assert newest.SUPERSEDED_BY is None
+    assert newest.VERSION == "vs1-v6" and newest.SUPERSEDED_BY == {"version": "vs1-v7"}
     for number in [1, *found[:-1]]:
         module = v1 if number == 1 else importlib.import_module(f"analysis.panel_insider_density_v{number}")
         assert module.SUPERSEDED_BY and module.SUPERSEDED_BY["registry_head_sha256"] == newest.REGISTERED_RECORD_SHA256[1]
