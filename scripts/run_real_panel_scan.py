@@ -47,6 +47,10 @@ from analysis.research_real_panel import (
 
 REPO = Path(__file__).resolve().parent.parent
 MAX_STATEMENT_TIMEOUT_S = 60
+#: Hard ceiling for callers that opt into a longer per-statement bound (``max_statement_timeout_s``).
+#: Operational only: the VS1 price-admission probe's per-ticker basis queries can exceed 60 s on a cold
+#: cache under concurrent ingest (2026-09-29: YF:XLK:adj_close other-source count 154 s cold, 0.8 s warm).
+ABSOLUTE_MAX_STATEMENT_TIMEOUT_S = 900
 
 WEEKLY = {"stale_sessions": 10}
 
@@ -102,10 +106,18 @@ def file_sha256(relative: str) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def read_only_engine(statement_timeout_s: int, application_name: str = "s09_real_panel_scan"):
-    """NullPool engine: read-only sessions, bounded statements, autocommit."""
-    if not 0 < statement_timeout_s <= MAX_STATEMENT_TIMEOUT_S:
-        raise ValueError(f"statement timeout must be 1..{MAX_STATEMENT_TIMEOUT_S} s")
+def read_only_engine(statement_timeout_s: int, application_name: str = "s09_real_panel_scan", *,
+                     max_statement_timeout_s: int = MAX_STATEMENT_TIMEOUT_S):
+    """NullPool engine: read-only sessions, bounded statements, autocommit.
+
+    ``statement_timeout_s`` must lie in 1..``max_statement_timeout_s`` (default 60 s, unchanged for
+    every existing caller). A caller may raise its own ceiling up to
+    :data:`ABSOLUTE_MAX_STATEMENT_TIMEOUT_S` (900 s), never beyond.
+    """
+    if not 0 < max_statement_timeout_s <= ABSOLUTE_MAX_STATEMENT_TIMEOUT_S:
+        raise ValueError(f"statement timeout ceiling must be 1..{ABSOLUTE_MAX_STATEMENT_TIMEOUT_S} s")
+    if not 0 < statement_timeout_s <= max_statement_timeout_s:
+        raise ValueError(f"statement timeout must be 1..{max_statement_timeout_s} s")
     if not application_name.replace("_", "").isalnum():
         raise ValueError("application_name must be alphanumeric/underscore")
     from sqlalchemy import create_engine
