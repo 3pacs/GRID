@@ -671,14 +671,20 @@ def _as_utc(value: Any) -> datetime | None:
     return value.astimezone(timezone.utc)
 
 
+_ROW_COUNT_KEYS = ("rows_inserted", "total_inserted", "inserted", "rows_written", "rows")
+
+
 def _extract_rows(out: Any) -> int | None:
-    """Best-effort row count from a puller's return value (for pull_log)."""
+    """Best-effort row count from a puller's return value (for pull_log).
+
+    ``None`` means "the puller did not say" -- never "zero rows".
+    """
     if isinstance(out, bool) or out is None:
         return None
     if isinstance(out, int):
         return max(out, 0)
     if isinstance(out, dict):
-        for key in ("rows_inserted", "total_inserted", "inserted", "rows_written", "rows"):
+        for key in _ROW_COUNT_KEYS:
             val = out.get(key)
             if isinstance(val, int) and not isinstance(val, bool):
                 return max(val, 0)
@@ -687,15 +693,135 @@ def _extract_rows(out: Any) -> int | None:
         total = 0
         found = False
         for item in out:
-            if isinstance(item, dict) and isinstance(item.get("rows_inserted"), int):
-                total += max(item["rows_inserted"], 0)
+            item_rows = _extract_rows(item) if isinstance(item, dict) else None
+            if item_rows is not None:
+                total += item_rows
                 found = True
         return total if found else None
     return None
 
 
+# Outcome vocabulary for one SmartScheduler run (see _classify_outcome).
+# Only SUCCESS advances source_catalog.last_pull_at -- the freshness layer.
+# NO_NEW_DATA keeps the job's cadence (it is not re-run every tick, and not
+# backed off like a failure) but does NOT make the source look fresh.
+OUTCOME_SUCCESS = "SUCCESS"
+OUTCOME_NO_NEW_DATA = "NO_NEW_DATA"
+OUTCOME_SKIPPED = "SKIPPED"
+OUTCOME_FAILED = "FAILED"
+OUTCOME_PARTIAL = "PARTIAL"
+
+# Per-item statuses a list-returning puller uses (options, tiingo, ...).
+_ITEM_OK = frozenset({"SUCCESS", "OK"})
+_ITEM_SKIP = frozenset({"SKIPPED", "SKIP"})
+_ITEM_FAIL = frozenset({"FAILED", "ERROR", "PARTIAL"})
+
+
+def _first_item_note(items: list[dict], statuses: frozenset[str], *keys: str) -> str | None:
+    for item in items:
+        if str(item.get("status") or "").upper() in statuses:
+            for key in keys:
+                if item.get(key):
+                    return str(item[key])
+    return None
+
+
+def _classify_outcome(out: Any) -> tuple[str, int | None, str | None]:
+    """Map a puller's return value to ``(outcome, rows, note)`` honestly.
+
+    Fake-success fix (2026-09-29, follow-up to PR #727 review): every
+    return value that was not an explicit SKIPPED/FAILED/PARTIAL dict used
+    to be recorded as SUCCESS -- including a *list* in which every item was
+    skipped or failed. OptionsPuller.pull_all returns one
+    ``{"status": "SKIPPED"}`` per ticker outside an equity session (#653),
+    so Hermes bumped YFINANCE_OPTIONS.last_pull_at on runs that wrote
+    nothing. The rules now are:
+
+    * rows written > 0                        -> SUCCESS (with the count);
+      a list with some failed items but rows > 0 is still SUCCESS -- the
+      note carries the failed-item count.
+    * the puller says "nothing to do" (a SKIPPED dict, or a list whose
+      every item is SKIPPED, or an empty list)  -> SKIPPED.
+    * every attempted item failed / a FAILED dict / a status-less dict
+      with ``rows_inserted == 0`` and an ``error``           -> FAILED.
+    * an explicit PARTIAL dict                 -> PARTIAL (unchanged
+      semantics, see _run_puller's mitigation 3).
+    * the run completed cleanly but reported 0 rows written -> NO_NEW_DATA.
+    * the puller reports no row count at all (``None``, a bare string, a
+      list of non-dicts, a dict with no count key) -> SUCCESS, as before;
+      its outcome can only be as honest as its return value. The puller
+      audit in the PR description lists which pullers are in that class.
+    """
+    rows = _extract_rows(out)
+
+    if isinstance(out, dict):
+        status = out.get("status")
+        if status == "SKIPPED":
+            reason = out.get("skipped_reason") or out.get("reason") or "puller reported SKIPPED"
+            return OUTCOME_SKIPPED, rows, str(reason)
+        if status in (OUTCOME_FAILED, OUTCOME_PARTIAL):
+            return status, rows, str(out.get("error", f"puller reported {status}"))
+        if status is None and out.get("rows_inserted") == 0 and "error" in out:
+            return OUTCOME_FAILED, 0, str(out.get("error"))
+        if rows is None:
+            return OUTCOME_SUCCESS, None, None
+        if rows > 0:
+            return OUTCOME_SUCCESS, rows, None
+        return OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written"
+
+    if isinstance(out, list):
+        if not out:
+            return OUTCOME_SKIPPED, 0, "puller returned no per-item results"
+        items = [i for i in out if isinstance(i, dict)]
+        if not items:
+            return OUTCOME_SUCCESS, rows, None  # opaque list: no status to read
+        statuses = [str(i.get("status") or "").upper() for i in items]
+        n_ok = sum(s in _ITEM_OK for s in statuses)
+        n_skip = sum(s in _ITEM_SKIP for s in statuses)
+        n_fail = sum(s in _ITEM_FAIL for s in statuses)
+        total = len(items)
+        if rows is not None and rows > 0:
+            note = f"{n_fail} of {total} items failed" if n_fail else None
+            return OUTCOME_SUCCESS, rows, note
+        if n_skip == total:
+            reason = _first_item_note(items, _ITEM_SKIP, "reason", "skipped_reason")
+            return OUTCOME_SKIPPED, 0, f"all {total} items skipped" + (f": {reason}" if reason else "")
+        if n_ok == 0 and n_fail > 0:
+            err = _first_item_note(items, _ITEM_FAIL, "error", "reason")
+            return (
+                OUTCOME_FAILED,
+                0,
+                f"{n_fail} of {total} items failed, {n_skip} skipped, 0 rows written"
+                + (f": {err}" if err else ""),
+            )
+        if rows is None and (n_ok > 0 or n_ok + n_skip + n_fail < total):
+            # Items succeeded (or carry no recognised status) but none
+            # reports a row count: nothing to contradict success with.
+            return OUTCOME_SUCCESS, None, None
+        return (
+            OUTCOME_NO_NEW_DATA,
+            0,
+            f"run completed, 0 rows written ({n_ok} ok, {n_skip} skipped, {n_fail} failed)",
+        )
+
+    if isinstance(out, bool):
+        if out:
+            return OUTCOME_SUCCESS, None, None
+        return OUTCOME_FAILED, None, "puller returned False"
+
+    if isinstance(out, int):
+        if out > 0:
+            return OUTCOME_SUCCESS, out, None
+        return OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written"
+
+    return OUTCOME_SUCCESS, rows, None
+
+
 # How many pullers to run per tick (keeps cycles short)
 MAX_PULLERS_PER_TICK = 8
+
+# Flat retry delay after a SKIPPED run (not a failure -- no backoff).
+SKIP_RETRY_MINUTES = 30
 
 # Per-tick time budget (seconds) — stop scheduling more if we're over this
 TICK_TIME_BUDGET_S = 300  # 5 minutes
@@ -1100,14 +1226,19 @@ class SmartScheduler:
                 raise err_box[0]
 
             out = out_box[0]
+            outcome, rows, note = _classify_outcome(out)
+            result["rows_inserted"] = rows
+            result["detail"] = str(out)[:200] if out else ""
+
             # Mitigation 2 (see docstring): a puller can report its own
             # SKIPPED outcome — e.g. YFinancePuller.pull_all's single-flight
-            # lock finding a previous run still active. That is NOT a
-            # successful check and must not advance last_pull_at.
-            if isinstance(out, dict) and out.get("status") == "SKIPPED":
-                result["status"] = "SKIPPED"
-                result["reason"] = out.get("skipped_reason", "puller reported SKIPPED")
-                result["detail"] = str(out)[:200]
+            # lock finding a previous run still active, or (2026-09-29) a
+            # list whose every item is SKIPPED, like OptionsPuller.pull_all
+            # outside an equity session. That is NOT a successful check and
+            # must not advance last_pull_at.
+            if outcome == OUTCOME_SKIPPED:
+                result["status"] = OUTCOME_SKIPPED
+                result["reason"] = note or "puller reported SKIPPED"
                 return result
 
             # Mitigation 3 (2026-09-27 review of PR #685): a puller's own
@@ -1130,29 +1261,27 @@ class SmartScheduler:
             # cooldown-gated tick" reports PARTIAL and gets that FAILED-like
             # treatment (no last_pull_at advance, cooldown applies) even
             # though the rows it DID insert are already committed.
-            reported_status = out.get("status") if isinstance(out, dict) else None
-            self_reported_failure = (
-                reported_status in ("FAILED", "PARTIAL")
-                or (
-                    isinstance(out, dict)
-                    and reported_status is None
-                    and out.get("rows_inserted") == 0
-                    and "error" in out
-                )
-            )
-            result["rows_inserted"] = _extract_rows(out)
-            if self_reported_failure:
-                result["status"] = reported_status or "FAILED"
-                result["error"] = str(
-                    out.get("error", f"puller reported {result['status']}")
-                )[:200]
-                result["detail"] = str(out)[:200]
+            # 2026-09-29: a list in which every attempted item failed and
+            # nothing was written is FAILED too (see _classify_outcome).
+            if outcome in (OUTCOME_FAILED, OUTCOME_PARTIAL):
+                result["status"] = outcome
+                result["error"] = (note or f"puller reported {outcome}")[:200]
                 # Deliberately NOT calling self._update_last_pull(name) --
                 # this source did not have a clean, complete run.
                 return result
 
-            result["status"] = "SUCCESS"
-            result["detail"] = str(out)[:200] if out else ""
+            # 2026-09-29: a clean run that wrote nothing is not a fresh
+            # source. NO_NEW_DATA keeps the job's cadence (tick() treats it
+            # as a completed check, so it is neither re-run every tick nor
+            # backed off like a failure) but never bumps last_pull_at.
+            if outcome == OUTCOME_NO_NEW_DATA:
+                result["status"] = OUTCOME_NO_NEW_DATA
+                result["reason"] = note or "run completed, 0 rows written"
+                return result
+
+            result["status"] = OUTCOME_SUCCESS
+            if note:
+                result["note"] = note
             self._update_last_pull(name)
 
         except Exception as exc:
@@ -1214,19 +1343,32 @@ class SmartScheduler:
         """Persist one pull_log row per real run -- the restart-state record.
 
         SKIPPED runs (thread limit, missing API key, a puller's own
-        single-flight skip) are not attempts and are not logged. TIMEOUT
+        single-flight skip, an all-items-skipped list) are not attempts and
+        are not logged. NO_NEW_DATA is logged as SUCCESS with 0 rows. TIMEOUT
         and every other non-success is logged as FAILED (pull_log's CHECK
         constraint allows RUNNING/SUCCESS/PARTIAL/FAILED only), with the
         original status kept in error_message. One INSERT at the end of the
         run, never a RUNNING row that a restart could orphan.
         """
         status = result.get("status")
-        if status == "SKIPPED":
+        if status == OUTCOME_SKIPPED:
             return
-        log_status = status if status in ("SUCCESS", "PARTIAL") else "FAILED"
         error = result.get("error")
-        if log_status == "FAILED" and status not in (None, "FAILED"):
-            error = f"{status}: {error}" if error else str(status)
+        if status == OUTCOME_NO_NEW_DATA:
+            # A completed check that wrote nothing. pull_log's CHECK
+            # constraint has no such status, so it is stored as SUCCESS
+            # with rows_inserted = 0 and the NO_NEW_DATA marker in
+            # error_message -- restart state needs it to keep the job's
+            # cadence. The freshness layer (source_catalog.last_pull_at)
+            # was NOT bumped for it; see _run_puller.
+            log_status = OUTCOME_SUCCESS
+            error = f"{OUTCOME_NO_NEW_DATA}: {result.get('reason') or 'run completed, 0 rows written'}"
+        else:
+            log_status = status if status in (OUTCOME_SUCCESS, OUTCOME_PARTIAL) else OUTCOME_FAILED
+            if log_status == OUTCOME_FAILED and status not in (None, OUTCOME_FAILED):
+                error = f"{status}: {error}" if error else str(status)
+            if log_status == OUTCOME_SUCCESS and result.get("note"):
+                error = str(result["note"])
         try:
             import socket
 
@@ -1255,12 +1397,36 @@ class SmartScheduler:
                 "SmartScheduler: pull_log write failed for {n}: {e}", n=name, e=str(exc)
             )
 
-    def _record_result(self, name: str, success: bool, error: str | None = None) -> None:
-        """Record puller result and manage cooldowns."""
+    def _record_result(
+        self,
+        name: str,
+        success: bool,
+        error: str | None = None,
+        *,
+        skipped: bool = False,
+    ) -> None:
+        """Record puller result and manage cooldowns.
+
+        ``success`` means "a completed check" (SUCCESS or NO_NEW_DATA): it
+        anchors the job's cadence. ``skipped`` (2026-09-29) is neither a
+        success nor a failure: the job is retried after a flat
+        SKIP_RETRY_MINUTES, its failure streak and last success untouched.
+        Before, a SKIPPED run fed the exponential failure backoff -- so an
+        options job skipping every run from Friday's close would sit in a
+        16-24h cooldown by Monday's open.
+        """
         state = self._state.get(name, {"consecutive_fails": 0})
         state["last_attempt"] = datetime.now(timezone.utc)
 
-        if success:
+        if skipped:
+            state["cooldown_until"] = (
+                datetime.now(timezone.utc) + timedelta(minutes=SKIP_RETRY_MINUTES)
+            )
+            log.info(
+                "SmartScheduler: {n} skipped ({r}), retry in {c}min",
+                n=name, r=error or "no reason given", c=SKIP_RETRY_MINUTES,
+            )
+        elif success:
             state["last_success"] = datetime.now(timezone.utc)
             state["consecutive_fails"] = 0
             state["cooldown_until"] = None
@@ -1293,6 +1459,7 @@ class SmartScheduler:
             "succeeded": 0,
             "failed": 0,
             "skipped": 0,
+            "no_new_data": 0,
             "results": [],
             "still_due": [],
         }
@@ -1318,15 +1485,23 @@ class SmartScheduler:
 
             run_started = datetime.now(timezone.utc)
             result = self._run_puller(puller)
-            success = result["status"] == "SUCCESS"
-            self._record_result(name, success, result.get("error"))
+            status = result["status"]
+            skipped = status == OUTCOME_SKIPPED
+            self._record_result(
+                name,
+                status in (OUTCOME_SUCCESS, OUTCOME_NO_NEW_DATA),
+                result.get("error") or result.get("reason"),
+                skipped=skipped,
+            )
             self._log_run(name, run_started, result)
 
             summary["results"].append(result)
             summary["ran"] += 1
-            if success:
+            if status == OUTCOME_SUCCESS:
                 summary["succeeded"] += 1
-            elif result["status"] == "SKIPPED":
+            elif status == OUTCOME_NO_NEW_DATA:
+                summary["no_new_data"] += 1
+            elif skipped:
                 summary["skipped"] += 1
             else:
                 summary["failed"] += 1
@@ -1337,8 +1512,10 @@ class SmartScheduler:
         elapsed = time.monotonic() - tick_start
         log.info(
             "SmartScheduler tick complete in {e:.1f}s — "
-            "{ok}/{ran} succeeded, {f} failed, {d} still due",
+            "{ok}/{ran} succeeded, {nd} no new data, {sk} skipped, "
+            "{f} failed, {d} still due",
             e=elapsed, ok=summary["succeeded"], ran=summary["ran"],
+            nd=summary["no_new_data"], sk=summary["skipped"],
             f=summary["failed"], d=len(summary["still_due"]),
         )
         return summary

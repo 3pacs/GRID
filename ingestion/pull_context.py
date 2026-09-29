@@ -52,11 +52,21 @@ class PullContext:
         self._rows_inserted: int = 0
         self._rows_expected: int | None = None
         self._features_affected: list[int] = []
+        self._note: str | None = None
         self._started_at = datetime.now(timezone.utc)
 
     def record_rows(self, count: int) -> None:
         """Record number of rows inserted during this pull."""
         self._rows_inserted += count
+
+    def set_note(self, note: str) -> None:
+        """Annotate a run that ends SUCCESS without being a fresh pull.
+
+        pull_log's CHECK constraint has no SKIPPED / NO_NEW_DATA status, so
+        such a run is stored as SUCCESS with its honest row count and this
+        note in error_message (e.g. ``"SKIPPED: all 40 items skipped"``).
+        """
+        self._note = note
 
     def set_expected(self, count: int) -> None:
         """Set expected row count for partial detection."""
@@ -129,7 +139,7 @@ class PullContext:
             )
         else:
             status = "SUCCESS"
-            error_msg = None
+            error_msg = self._note
             if not self._require_persisted_log:
                 log.info(
                     "Pull SUCCESS: {p} — {r} rows",

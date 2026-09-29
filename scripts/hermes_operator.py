@@ -754,6 +754,7 @@ from scripts.hermes_health import (  # noqa: E402, F401
 from scripts.hermes_fixers import (  # noqa: E402, F401
     _resolve_puller,
     _retry_source,
+    retry_not_fresh_reason,
     diagnose_and_fix_pulls,
     maybe_run_pipeline,
     fill_data_gaps,
@@ -3574,7 +3575,14 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
                 try:
-                    _retry_source(src, engine, attempt=1, state=state)
+                    pull_result = _retry_source(src, engine, attempt=1, state=state)
+                    not_fresh = retry_not_fresh_reason(pull_result)
+                    if not_fresh:
+                        # Skipped / every item failed: not a refresh, and
+                        # _retry_source left last_pull_at alone (2026-09-29).
+                        state.cooldowns.record_attempt(src, success=False, error=not_fresh)
+                        log.info("Stale refresh for {s} did not refresh: {r}", s=src, r=not_fresh)
+                        continue
                     state.cooldowns.record_attempt(src, success=True)
                     stale_repulled += 1
                     log.info("Proactively refreshed stale source: {s}", s=src)

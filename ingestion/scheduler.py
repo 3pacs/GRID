@@ -242,8 +242,23 @@ def _extract_rows_inserted(result: Any) -> int:
                 return len(value)
         return 0
     if isinstance(result, (list, tuple, set)):
+        # A list of per-item result dicts (Tiingo, options, ...) is NOT a
+        # list of rows: before 2026-09-29 this returned len(result), so
+        # Tiingo_Prices logged rows_inserted=1328 (its ticker count) on
+        # every run, whatever it wrote. Sum the items' own counts instead.
+        if any(
+            isinstance(item, dict) and ("status" in item or "rows_inserted" in item)
+            for item in result
+        ):
+            from ingestion.smart_scheduler import _extract_rows
+
+            return _extract_rows(list(result)) or 0
         return len(result)
     return 0
+
+
+class PullerReportedFailure(RuntimeError):
+    """A puller returned normally but reported that nothing succeeded."""
 
 
 def _get_incremental_start(db_engine: Engine, source_name: str, overlap_days: int = 30) -> str:
@@ -309,6 +324,7 @@ def run_pull_group(
         "success_count": 0,
         "failure_count": 0,
         "skipped_count": 0,
+        "no_new_data_count": 0,
     }
 
     try:
@@ -380,7 +396,39 @@ def run_pull_group(
                 require_persisted_log=(group_name == "crypto"),
             ) as ctx:
                 result = method(**resolved_kwargs)
+                # Fake-success fix (2026-09-29, follow-up to PR #727
+                # review): any normal return used to be a SUCCESS that
+                # advanced source_catalog.last_pull_at -- including a list
+                # whose every item was skipped or failed. Same rules as
+                # SmartScheduler (smart_scheduler._classify_outcome):
+                #   FAILED       -> raised here, so pull_log says FAILED;
+                #   SKIPPED / NO_NEW_DATA -> pull_log SUCCESS with the
+                #                   honest row count (0) and the outcome in
+                #                   error_message; last_pull_at untouched;
+                #   SUCCESS      -> as before.
+                from ingestion.smart_scheduler import _classify_outcome
+
+                outcome, _rows, note = _classify_outcome(result)
+                if outcome == "FAILED":
+                    raise PullerReportedFailure(note or "puller reported FAILED")
                 ctx.record_rows(_extract_rows_inserted(result))
+                if outcome in ("SKIPPED", "NO_NEW_DATA"):
+                    ctx.set_note(f"{outcome}: {note}" if note else outcome)
+
+            if outcome in ("SKIPPED", "NO_NEW_DATA"):
+                summary["results"].append({
+                    "puller": puller_name, "status": outcome,
+                    "reason": note, "result": result,
+                })
+                if outcome == "SKIPPED":
+                    summary["skipped_count"] += 1
+                else:
+                    summary["no_new_data_count"] += 1
+                log.info(
+                    "{p} complete — {o}, source not marked fresh ({n})",
+                    p=puller_name, o=outcome, n=note,
+                )
+                continue
 
             _touch_source_catalog_last_pull(
                 db_engine,
@@ -402,9 +450,11 @@ def run_pull_group(
             summary["failure_count"] += 1
 
     log.info(
-        "Pull group {g} complete — {ok} succeeded, {fail} failed, {skip} skipped",
+        "Pull group {g} complete — {ok} succeeded, {nd} no new data, "
+        "{fail} failed, {skip} skipped",
         g=group_name,
         ok=summary["success_count"],
+        nd=summary.get("no_new_data_count", 0),
         fail=summary["failure_count"],
         skip=summary["skipped_count"],
     )

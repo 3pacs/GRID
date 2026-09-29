@@ -202,3 +202,72 @@ def test_incremental_start_uses_canonical_source_alias(monkeypatch):
     assert puller.kwargs["start_date"] == "2026-04-20"
     assert engine.incremental_source_names == ["TIINGO"]
     assert engine.touched_source_ids == [524]
+
+
+# ── Honest outcomes (2026-09-29, PR #727 review follow-up) ───────────────
+
+
+def _run_list_result(monkeypatch, result):
+    import ingestion.scheduler as sched
+
+    engine = _FakeEngine({"TIINGO": 524})
+    monkeypatch.setattr(
+        sched,
+        "_get_pullers_for_group",
+        lambda group, db_engine, config: [("Tiingo_Prices", _SuccessfulPuller(result), "pull", {})],
+    )
+    return engine, sched.run_pull_group("daily", engine, config={})
+
+
+def test_list_row_count_is_the_items_rows_not_the_list_length(monkeypatch):
+    import ingestion.scheduler as sched
+
+    items = [
+        {"ticker": "SPY", "status": "SUCCESS", "rows_inserted": 6},
+        {"ticker": "QQQ", "status": "SUCCESS", "rows_inserted": 0},
+        {"ticker": "ZZZ", "status": "PARTIAL", "rows_inserted": 0, "errors": ["404"]},
+    ]
+    assert sched._extract_rows_inserted(items) == 6  # was len(items) == 3
+    assert sched._extract_rows_inserted(["a", "b"]) == 2  # opaque list: unchanged
+
+    engine, summary = _run_list_result(monkeypatch, items)
+    assert summary["success_count"] == 1
+    assert engine.pull_logs[1]["status"] == "SUCCESS"
+    assert engine.pull_logs[1]["rows_inserted"] == 6
+    assert engine.touched_source_ids == [524]
+
+
+def test_all_items_skipped_is_not_fresh(monkeypatch):
+    items = [{"ticker": t, "status": "SKIPPED", "reason": "non-equity-session"} for t in ("SPY", "QQQ")]
+    engine, summary = _run_list_result(monkeypatch, items)
+
+    assert summary["success_count"] == 0
+    assert summary["skipped_count"] == 1
+    assert summary["results"][0]["status"] == "SKIPPED"
+    log_row = engine.pull_logs[1]
+    assert (log_row["status"], log_row["rows_inserted"]) == ("SUCCESS", 0)
+    assert log_row["error_message"].startswith("SKIPPED: all 2 items skipped")
+    assert engine.touched_source_ids == []
+
+
+def test_all_items_failed_is_failed(monkeypatch):
+    items = [{"ticker": "SPY", "status": "FAILED", "rows_inserted": 0, "errors": ["HTTP 503"]}]
+    engine, summary = _run_list_result(monkeypatch, items)
+
+    assert summary["failure_count"] == 1
+    assert summary["success_count"] == 0
+    assert engine.pull_logs[1]["status"] == "FAILED"
+    assert "PullerReportedFailure" in engine.pull_logs[1]["error_message"]
+    assert engine.touched_source_ids == []
+
+
+def test_clean_zero_row_run_is_logged_but_not_fresh(monkeypatch):
+    items = [{"ticker": "SPY", "status": "SUCCESS", "rows_inserted": 0}]
+    engine, summary = _run_list_result(monkeypatch, items)
+
+    assert summary["success_count"] == 0
+    assert summary["no_new_data_count"] == 1
+    log_row = engine.pull_logs[1]
+    assert (log_row["status"], log_row["rows_inserted"]) == ("SUCCESS", 0)
+    assert log_row["error_message"].startswith("NO_NEW_DATA:")
+    assert engine.touched_source_ids == []

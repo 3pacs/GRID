@@ -251,6 +251,28 @@ jobs:
           TESTING: "true"
         run: python -m pytest tests/test_binance_forward_cadence.py tests/test_spy_completed_close_schedule.py tests/test_scheduler_pull_logging.py -q -rA
 
+      # SmartScheduler honest outcomes (2026-09-29, PR #727 review follow-up):
+      # proves the pull_log rows (under production's pull_log_status_check,
+      # which has no SKIPPED/NO_NEW_DATA status) and the
+      # source_catalog.last_pull_at bumps SmartScheduler writes for skipped,
+      # partial, all-failed, zero-row and raising runs. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: SmartScheduler honest pull_log PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_smart_scheduler_honest_success_pg.py -q -rA | tee /tmp/grid-smart-honest-pg.txt
+          # Anchored to pytest's -rA skip-summary line: the scheduler's own
+          # log output legitimately contains the word SKIPPED.
+          if grep -qE "^SKIPPED \[" /tmp/grid-smart-honest-pg.txt; then
+            echo "::error::SmartScheduler honest pull_log PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Portfolio GET PostgreSQL read contract
         env:
           GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
