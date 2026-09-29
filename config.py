@@ -455,6 +455,16 @@ class Settings(BaseSettings):
     GRID_ENABLE_BULK_HYPOTHESIS_JOB: bool = False
     GRID_ENABLE_LEGACY_PAPER_TRADING_JOB: bool = False
 
+    # Taiwan Strait OSINT job (owner decision 2026-09-29, GRID-STALE-SOURCES-
+    # AUDIT-20260929.md §2D / §5 row 5). `intelligence/scheduler.py`'s daily
+    # 23:30 `_taiwan_strait_osint_daily` -> `run_taiwan_strait_puller` job
+    # scrapes Taiwan MND pages that now 404; until 2026-09-29 it then wrote
+    # zero-count placeholder "seed" rows into raw_series as SUCCESS. The
+    # puller no longer writes placeholders, and the job stays unregistered
+    # (same semantics as the Wave 3 flags above) until the scraper has a
+    # working MND endpoint and this flag is set in a reviewed change.
+    GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -469,6 +479,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_SCANNER_WEIGHTS_JOB",
         "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
         "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
+        "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         mode="before",
     )
     @classmethod
