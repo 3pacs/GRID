@@ -328,4 +328,55 @@ test -d "$root/failing-prune" && test -d "$root/unused-sentinel"
 test "$(readlink -f "$live")" = "$root/rm-failure"
 grep -q 'pruning stopped (status 42)' "$box/rm-failure.log"
 grep -q 'label=rm-failure ' "$root/.activation-in-progress"
-echo 'PASS: retained runtimes/descendants/oneshots, pre-swap refusal, post-swap churn/find/rm failure containment, invalid identities and stale activation record'
+# Preserve an explicitly retired scheduler independently of existing recovery.
+# With current-main's old prune predicate this directory is deleted after repin.
+retention="$root/.runtime-retention"
+printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s\n' \
+  "$root/scheduler-old" "$scheduler_sha" "$scheduler_tree" > "$retention"
+cp "$retention" "$box/good-retention"
+printf 'extra=bad\n' >> "$retention"
+fail_without_swap "$root/rm-failure" bad-retention-shape
+cp "$box/good-retention" "$retention"
+sed -i 's/^rollback_sha=.*/rollback_sha=0000000000000000000000000000000000000000/' "$retention"
+fail_without_swap "$root/rm-failure" bad-retention-sha
+cp "$box/good-retention" "$retention"
+sed -i "s|^rollback=.*|rollback=$box/outside|" "$retention"
+fail_without_swap "$root/rm-failure" outside-retention
+cp "$box/good-retention" "$retention"
+mv "$retention" "$box/retention-source"
+ln -s "$box/retention-source" "$retention"
+fail_without_swap "$root/rm-failure" linked-retention
+rm "$retention"
+cp "$box/good-retention" "$retention"
+printf 'dirty\n' > "$root/scheduler-old/marker.txt"
+fail_without_swap "$root/rm-failure" dirty-retention
+git -C "$root/scheduler-old" restore marker.txt
+
+# Now model the verified activation then postrestart record rewrite. Only the
+# three scheduler fields change; all three recovery lines remain byte-identical.
+git -C "$root/next-4" init -q
+git -C "$root/next-4" add marker.txt
+git -C "$root/next-4" -c user.name=Test -c user.email=test@example.invalid commit -qm activated
+grep '^recovery' "$record" > "$box/recovery-before"
+sed -i "s|^scheduler=.*|scheduler=$root/next-4|" "$record"
+sed -i "s|^scheduler_sha=.*|scheduler_sha=$(git -C "$root/next-4" rev-parse HEAD)|" "$record"
+sed -i "s|^scheduler_tree=.*|scheduler_tree=$(git -C "$root/next-4" rev-parse 'HEAD^{tree}')|" "$record"
+kill "$scheduler_pid"
+wait "$scheduler_pid" 2>/dev/null || true
+scheduler_pid=
+export TEST_SCHEDULER_PID="$activated_pid" TEST_SCHEDULER_WORKDIR="$root/next-4"
+mkdir -p "$box/proc/$activated_pid"
+printf '0::/scheduler\n' > "$box/proc/$activated_pid/cgroup"
+printf '%s\n' "$activated_pid" > "$box/cgroup/scheduler/cgroup.procs"
+touch -d '2010-01-01 UTC' "$root/scheduler-old"
+bash "$swap" "$live" retained-after-repin "$box/build" retained > "$box/retained.log" 2>&1
+test -d "$root/scheduler-old" && test -d "$root/recovery-old"
+grep '^recovery' "$record" > "$box/recovery-after"
+cmp "$box/recovery-before" "$box/recovery-after"
+set +e
+bash "$swap" "$live" scheduler-old "$box/build" overwrite > "$box/retention-collision.log" 2>&1
+collision_rc=$?
+set -e
+test "$collision_rc" -eq 5
+test "$(cat "$root/scheduler-old/marker.txt")" = scheduler-old
+echo 'PASS: runtime/preservation gates, same-label no-op, stale activation refusal, retired scheduler rollback retention and collision/shape/path/SHA/dirt refusal'
