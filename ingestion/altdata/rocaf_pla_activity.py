@@ -99,7 +99,7 @@ _ADIZ_DIRECTION = (
 # spans can borrow a total from another clause or match "never entered".
 _ADIZ_RE = re.compile(
     r"(?:All\s+(?P<all>\d+)|(?P<part>\d+)\s+(?:out\s+of|of)\s+"
-    r"(?:the\s+)?\d+)\s+sorties?(?:\s+of\s+PLA\s+aircraft)?\s+"
+    r"(?:the\s+)?(?P<total>\d+))\s+sorties?(?:\s+of\s+PLA\s+aircraft)?\s+"
     r"(?:crossed\s+the\s+median\s+line\s+and\s+)?entered\s+"
     r"(?:(?:Taiwan['’]s|the)\s+)?"
     rf"(?:{_ADIZ_DIRECTION}(?:\s*,\s*{_ADIZ_DIRECTION})*"
@@ -167,6 +167,7 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
     m_air = _AIRCRAFT_RE.search(body) or _AIRCRAFT_ALT_RE.search(body)
     if not m_air:
         return None
+    aircraft_sorties = int(m_air.group(1))
 
     report_date = fallback_date
     m_date = _DATE_RE.search(text[max(0, start - 200):start + 50]) or _DATE_RE.search(text)
@@ -207,12 +208,15 @@ def parse_report(html: str, url: str = "", fallback_date: date | None = None) ->
         if m_adiz is None:
             return None
         adiz_entries = int(m_adiz.group("all") or m_adiz.group("part"))
-        if adiz_entries == 0:
+        stated_total = int(m_adiz.group("all") or m_adiz.group("total"))
+        # The count belongs to the same printed aircraft total. Refuse
+        # contradictions instead of choosing one of the reported numbers.
+        if not 0 < adiz_entries <= aircraft_sorties or stated_total != aircraft_sorties:
             return None
     return PLAActivityReport(
         url=url,
         report_date=report_date,
-        aircraft_sorties=int(m_air.group(1)),
+        aircraft_sorties=aircraft_sorties,
         plan_ships=int(m_plan.group(1)) if m_plan else None,
         official_ships=int(m_off.group(1)) if m_off else None,
         adiz_entries=adiz_entries,
