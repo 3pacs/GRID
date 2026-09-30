@@ -4,7 +4,7 @@ Pass/fail gates that block any change making GRID's research or ingestion
 less honest. They are cheap (seconds, synthetic fixtures, no network, no
 production access) so they run on every PR:
 
-* ``test_lookahead_canary.py`` / ``test_lookahead_canary_pg.py`` -- a small
+* ``test_lookahead_canary.py`` / ``test_gates_pg.py`` (PostgreSQL) -- a small
   synthetic world with vintages, pull timestamps, revisions and data
   published after ``as_of``. The main point-in-time consumers
   (``store.observations.read_window_known_at`` / ``read_window`` /
@@ -35,6 +35,10 @@ in this directory (LF-normalised) and ``test_manifest_guard.py`` fails when
 any file changes without the manifest. Regenerate deliberately with
 ``python -m evals.e1.manifest --write`` -- an eval change is a reviewed,
 versioned event, never a side effect.
+
+The PostgreSQL gates use only ``GRID_TEST_DB_URL`` (no default) and refuse
+production database names (``pg_safety.py``, ``test_pg_safety.py``): scratch
+schemas never touch a production cluster database.
 
 CI: ``.github/workflows/test.yml`` step "E1 integrity gates" runs
 ``python -m pytest evals/e1`` against the job's PostgreSQL with

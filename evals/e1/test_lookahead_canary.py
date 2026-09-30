@@ -1,4 +1,4 @@
-"""E1 gate 1: look-ahead canary (SQLite part; the PostgreSQL part is ``test_lookahead_canary_pg.py``).
+"""E1 gate 1: look-ahead canary (SQLite part; the PostgreSQL part is ``test_gates_pg.py``).
 
 Two invariants, checked on the main point-in-time consumers:
 
