@@ -340,11 +340,12 @@ def test_live_preopen_keeps_latest_and_replay_uses_earlier_batch(
 
 
 def test_capture_after_ny_session_date_is_refused_before_any_write(scratch, monkeypatch) -> None:
-    """#653 kept: 00:15 UTC Saturday is still Friday in New York -> refused."""
+    """#653 kept: 00:15 UTC Friday is still Thursday 20:15 in New York; both
+    days are sessions, so only the UTC/New York date mismatch refuses it."""
     engine, _ = scratch
     _run(engine, "upgrade")
     monkeypatch.setattr(options, "_utc_now",
-                        lambda: datetime(2026, 9, 26, 0, 15, tzinfo=timezone.utc))
+                        lambda: datetime(2026, 9, 25, 0, 15, tzinfo=timezone.utc))
     monkeypatch.setattr(options, "YahooOptionsClient",
                         lambda: pytest.fail("non-session capture must not contact provider"))
     puller = options.OptionsPuller.__new__(options.OptionsPuller)
@@ -374,4 +375,62 @@ def test_downgrade_restores_table_when_one_batch_per_day(scratch) -> None:
         assert conn.execute(text(
             "SELECT relkind FROM pg_class WHERE oid = to_regclass('options_snapshots')")).scalar() == "r"
         assert conn.execute(text("SELECT COUNT(*) FROM options_snapshots")).scalar() == 5
+        assert conn.execute(text("SELECT to_regclass('options_capture_batches')")).scalar() is None
+
+
+def test_same_day_legacy_rows_are_kept_but_hidden_once_a_batch_lands(scratch, monkeypatch) -> None:
+    engine, _ = scratch
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO options_snapshots (ticker, snap_date, expiry, opt_type, strike, "
+            "open_interest, implied_vol) VALUES ('SPY', :d, '2026-10-16', 'call', 999.0, 5, 0.2)"
+        ), {"d": SNAP_DAY})
+    _run(engine, "upgrade")
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT strike FROM options_snapshots")).scalars().all() == [999.0]
+    result = _capture(engine, monkeypatch, GEM_START, _EARLY_OI)
+    assert result["status"] == "SUCCESS"
+    with engine.connect() as conn:
+        visible = conn.execute(text("SELECT DISTINCT capture_batch_id FROM options_snapshots")).scalars().all()
+        assert visible == [result["capture_batch_id"]]
+        assert conn.execute(text(
+            "SELECT COUNT(*) FROM options_snapshots_all WHERE capture_batch_id IS NULL")).scalar() == 1
+
+
+def _schema_sql_options_block() -> str:
+    source = (Path(__file__).resolve().parents[1] / "schema.sql").read_text(encoding="utf-8")
+    start = source.index("DO $options_store$")
+    end = source.index("$options_store$;", start) + len("$options_store$;")
+    return source[start:end]
+
+
+def test_schema_sql_fresh_install_matches_migration_guards(pg_engine) -> None:
+    schema = f"opts_schema_sql_{uuid4().hex[:12]}"
+    with pg_engine.begin() as conn:
+        conn.execute(text(f'CREATE SCHEMA "{schema}"'))
+    engine = create_engine(pg_engine.url.update_query_dict({"options": f"-csearch_path={schema}"}))
+    try:
+        with engine.begin() as conn:
+            conn.exec_driver_sql(_schema_sql_options_block())
+            conn.exec_driver_sql(_schema_sql_options_block())  # idempotent no-op
+        with engine.connect() as conn:
+            assert conn.execute(text(
+                "SELECT relkind FROM pg_class WHERE oid = to_regclass('options_snapshots')")).scalar() == "v"
+        with pytest.raises(DBAPIError, match="options_snapshots_all_batch_required"):
+            with engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "INSERT INTO options_snapshots_all (ticker, snap_date, expiry, opt_type, strike) "
+                    "VALUES ('SPY', '2026-09-25', '2026-10-16', 'call', 1.0)")
+    finally:
+        engine.dispose()
+        with pg_engine.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE'))
+
+
+def test_schema_sql_block_is_a_no_op_on_a_pre_migration_database(scratch) -> None:
+    engine, _ = scratch
+    with engine.begin() as conn:
+        conn.exec_driver_sql(_schema_sql_options_block())
+        assert conn.execute(text(
+            "SELECT relkind FROM pg_class WHERE oid = to_regclass('options_snapshots')")).scalar() == "r"
         assert conn.execute(text("SELECT to_regclass('options_capture_batches')")).scalar() is None

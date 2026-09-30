@@ -42,7 +42,17 @@ def upgrade() -> None:
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute("SET LOCAL statement_timeout = '15min'")
 
-    op.execute("ALTER TABLE options_snapshots RENAME TO options_snapshots_all")
+    # Lock order (review note): everything that scans the 2 GB table runs
+    # BEFORE the rename, under locks that only block writers (SHARE for the
+    # index build, ACCESS SHARE for the backfill scan). The ACCESS EXCLUSIVE
+    # rename comes last, so readers are blocked only for the catalog-only
+    # statements that follow it.
+    # Many batches per ticker/day: uniqueness is per batch, not per day.
+    op.execute("""
+        CREATE UNIQUE INDEX options_snapshots_all_batch_contract_key
+            ON options_snapshots (capture_batch_id, expiry, opt_type, strike)
+            WHERE capture_batch_id IS NOT NULL
+    """)
 
     op.execute("""
         CREATE TABLE options_capture_batches (
@@ -59,23 +69,11 @@ def upgrade() -> None:
             registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             CHECK (capture_started_at <= capture_completed_at),
             CONSTRAINT options_capture_batches_identity_key
-                UNIQUE (capture_batch_id, capture_ordinal, ticker, snap_date)
+                UNIQUE (capture_batch_id, capture_ordinal, ticker, snap_date),
+            -- One ordinal per ticker/day, so "latest batch" is never a tie.
+            CONSTRAINT options_capture_batches_day_ordinal_key
+                UNIQUE (ticker, snap_date, capture_ordinal)
         )
-    """)
-    op.execute("""
-        CREATE INDEX options_capture_batches_ticker_day_idx
-            ON options_capture_batches (ticker, snap_date, capture_ordinal)
-    """)
-
-    # Many batches per ticker/day: uniqueness is per batch, not per day.
-    op.execute("""
-        ALTER TABLE options_snapshots_all
-            DROP CONSTRAINT options_snapshots_ticker_snap_date_expiry_opt_type_strike_key
-    """)
-    op.execute("""
-        CREATE UNIQUE INDEX options_snapshots_all_batch_contract_key
-            ON options_snapshots_all (capture_batch_id, expiry, opt_type, strike)
-            WHERE capture_batch_id IS NOT NULL
     """)
 
     # Register existing batches only when their rows are internally
@@ -90,7 +88,7 @@ def upgrade() -> None:
         SELECT capture_batch_id, MIN(ticker), MIN(snap_date), MIN(capture_ordinal),
                MIN(capture_started_at), MIN(capture_completed_at), COUNT(*),
                NULL, 'pre_append_only', true
-        FROM options_snapshots_all
+        FROM options_snapshots
         WHERE capture_batch_id IS NOT NULL
         GROUP BY capture_batch_id
         HAVING COUNT(DISTINCT ticker) = 1
@@ -102,6 +100,12 @@ def upgrade() -> None:
                         AND capture_started_at IS NOT NULL
                         AND capture_completed_at IS NOT NULL)
            AND MIN(capture_started_at) <= MIN(capture_completed_at)
+    """)
+
+    op.execute("ALTER TABLE options_snapshots RENAME TO options_snapshots_all")
+    op.execute("""
+        ALTER TABLE options_snapshots_all
+            DROP CONSTRAINT options_snapshots_ticker_snap_date_expiry_opt_type_strike_key
     """)
 
     # New rows must be full batch members of a registered batch. NOT VALID:

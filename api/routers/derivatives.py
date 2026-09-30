@@ -132,6 +132,8 @@ async def get_gex(
     try:
         engine_gex = _get_gex_engine()
         result = engine_gex.compute_gex_profile(ticker.upper(), **args)
+        if capture_batch_id is not None and isinstance(result, dict):
+            result = {**result, "replayed_batch": True}
         return result
     except Exception as exc:
         log.warning("GEX computation failed for {t}: {e}", t=ticker, e=str(exc))
@@ -256,6 +258,7 @@ async def get_walls(
         result = engine_gex.compute_gex_profile(ticker.upper(), **args)
         return {
             "ticker": ticker.upper(),
+            "replayed_batch": capture_batch_id is not None,
             "chain_snap_date": result.get("chain_snap_date"),
             "chain_batch_id": result.get("chain_batch_id"),
             "chain_capture_ordinal": result.get("chain_capture_ordinal"),

@@ -212,13 +212,17 @@ def _append_only_schema_ok(engine) -> bool:
               to_regclass('options_snapshots_all') IS NOT NULL,
               to_regclass('options_capture_batches') IS NOT NULL,
               (SELECT COUNT(*) FROM pg_trigger
-                WHERE NOT tgisinternal AND tgname IN (
+                WHERE NOT tgisinternal
+                  AND tgrelid IN (to_regclass('options_snapshots_all'),
+                                  to_regclass('options_capture_batches'))
+                  AND tgname IN (
                   'options_snapshots_all_no_row_mutation',
                   'options_snapshots_all_no_truncate',
                   'options_capture_batches_no_row_mutation',
                   'options_capture_batches_no_truncate')) = 4,
               (SELECT COUNT(*) FROM pg_constraint
-                WHERE conname IN ('options_snapshots_all_batch_fk',
+                WHERE conrelid = to_regclass('options_snapshots_all')
+                  AND conname IN ('options_snapshots_all_batch_fk',
                                   'options_snapshots_all_batch_required')) = 2
         """)).one()
     return all(value is True for value in row)

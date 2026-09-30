@@ -36,6 +36,9 @@ def test_explicit_batch_replay_passes_day_and_batch(monkeypatch) -> None:
     walls = asyncio.run(derivatives.get_walls("spy", snap_date=day, capture_batch_id="b-1"))
     assert engine.calls == [("SPY", {"snap_date": day, "capture_batch_id": "b-1"})]
     assert walls["chain_batch_id"] == "b-1" and walls["put_wall"] == 95.0
+    assert walls["replayed_batch"] is True
+    gex = asyncio.run(derivatives.get_gex("spy", snap_date=day, capture_batch_id="b-1"))
+    assert gex["replayed_batch"] is True
 
 
 def test_batch_without_day_is_refused_before_engine(monkeypatch) -> None:
