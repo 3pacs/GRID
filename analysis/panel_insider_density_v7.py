@@ -238,10 +238,26 @@ class V7Harness(v2.Harness):
                     for r in records]
         return contamination([*censuses, key.census])
 
+    def _refuse_if_stopped(self, log_dir: Path) -> None:
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+        if v1._kind(records, "status"):
+            raise PermissionError("v7 carries a terminal STOP status record: no freeze or opening")
+
     def freeze_inputs(self, log_dir: Path, now: datetime, inputs: Mapping[str, Any]) -> dict:
         if inputs.get("accept_underpowered") is not False:
             raise PermissionError("v7 must STOP below the raw 0.50 post-admission power gate")
+        self._refuse_if_stopped(log_dir)
         return super().freeze_inputs(log_dir, now, inputs)
+
+    def open_discovery(self, log_dir: Path, now: datetime, observed: Mapping[str, Any], witness) -> dict:
+        self._refuse_if_stopped(log_dir)
+        return super().open_discovery(log_dir, now, observed, witness)
+
+    def open_holdout(self, frozen: dict, *, log_dir: Path, **kwargs) -> dict:
+        self._refuse_if_stopped(log_dir)
+        return super().open_holdout(frozen, log_dir=log_dir, **kwargs)
 
 
 V6_EARLIER = v2.EarlierVersion(
@@ -283,6 +299,115 @@ seal_discovery = V7.seal_discovery
 open_holdout = V7.open_holdout
 resume_holdout = V7.resume_holdout
 seal_holdout = V7.seal_holdout
+
+
+# --- terminal STOP below the power gate (mirrors v6's witnessed STOP) ---------------------------
+#
+# Section 4 step 3 of the v7 body: a raw post-admission A90|fwd5 power below 0.50 at planted IC
+# 0.01 appends and witnesses a STOP, with no freeze and no opening. The status is bound to the
+# sealed power receipt itself (file bytes and verified content), not to a typed number.
+
+STOP_STATUS = "STOP_UNDERPOWERED_UNOPENED"
+STOP_SUCCESSOR = "vs1-v8"
+STOP_RECORDS = 3
+_STOP_REQUIRED: Mapping[str, Any] = {
+    "kind": "status", "version": VERSION, "status": STOP_STATUS,
+    "gate_passed": False, "inputs_frozen": False, "discovery_opened": False, "holdout_opened": False,
+    "superseded_by": STOP_SUCCESSOR, "prereg_sha256": PREREG_BODY_SHA256,
+    "primary_trial": PRIMARY_TRIAL,
+    "power_gate": {"target_ic": v1.POWER_GATE_IC, "threshold": v1.POWER_GATE},
+    "promotion_allowed": False,
+}
+_STOP_FIELDS = frozenset(_STOP_REQUIRED) | {
+    "run_at", "raw_primary_power_ic_0_01", "usable_dates", "power_receipt_sha256",
+    "power_inputs", "decision_ref", "prev_sha256",
+}
+
+
+def raw_primary_power(power: Mapping[str, Any]) -> dict:
+    """The primary row of a verified v7 post-admission Stage-0 receipt (no outcome is involved)."""
+    verify_power(power)
+    inputs = power.get("inputs") or {}
+    if inputs.get("prereg_sha256") != PREREG_BODY_SHA256 or not v1._is_hex64(inputs.get("price_manifest_sha256")):
+        raise PermissionError("power receipt is not a v7 post-admission Stage-0 on a price manifest")
+    row = next(r for r in power["table"][PRIMARY_TRIAL] if r["target_ic"] == v1.POWER_GATE_IC)
+    return {"power": float(row["power"]), "usable_dates": row.get("usable_dates"),
+            "gate_passed": bool(power["gate_passed"]), "inputs": dict(inputs)}
+
+
+def _check_stop_record(record: Mapping[str, Any]) -> None:
+    if any(record.get(key) != value for key, value in _STOP_REQUIRED.items()):
+        raise PermissionError("v7 terminal record is not the exact STOP status")
+    if set(record) != _STOP_FIELDS:
+        raise PermissionError("v7 terminal STOP record has missing or extra fields")
+    raw = record.get("raw_primary_power_ic_0_01")
+    if not isinstance(raw, float) or not 0.0 <= raw < v1.POWER_GATE:
+        raise PermissionError("v7 STOP needs a raw primary power below the 0.50 gate")
+    if not v1._is_hex64(record.get("power_receipt_sha256")) or not str(record.get("decision_ref") or "").strip():
+        raise PermissionError("v7 STOP needs the sealed power receipt hash and a decision reference")
+    inputs = record.get("power_inputs")
+    if not isinstance(inputs, Mapping) or inputs.get("prereg_sha256") != PREREG_BODY_SHA256 \
+            or not v1._is_hex64(inputs.get("price_manifest_sha256")):
+        raise PermissionError("v7 STOP must carry the v7 power receipt's input hashes")
+
+
+def append_stop_status(log_dir: Path, now: datetime, *, power_path: Path, decision_ref: str,
+                       expected_prev_sha256: str, witness, dry_run: bool = False) -> dict:
+    """Append v7's one STOP record after checking the exact two-record witnessed chain.
+
+    The raw primary power is read from the sealed ``power.json`` (verified at the
+    pre-registered settings and bound to the v7 body and a price manifest); a
+    receipt at or above the gate refuses. ``dry_run=True`` returns the exact
+    would-be record and head without writing. Execute once after a backup and a
+    dry run with the same ``now``; a second execution refuses. Publishing the
+    anchor is a separate step, followed by :func:`verify_terminal_stop`.
+    """
+    from datetime import timedelta
+
+    if now.tzinfo is None or now.utcoffset() != timedelta(0) or not str(decision_ref).strip() \
+            or expected_prev_sha256 != REGISTERED_RECORD_SHA256[1]:
+        raise ValueError("STOP needs a UTC time, a decision reference and the exact v7 registration head")
+    body = Path(power_path).read_bytes()
+    primary = raw_primary_power(json.loads(body))
+    if primary["gate_passed"] or primary["power"] >= v1.POWER_GATE:
+        raise PermissionError("v7 passed its power gate: a STOP is refused (freeze instead)")
+    V7.require_witness(log_dir, witness, 2)
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != 2:
+        raise PermissionError("v7's canonical witness is not at the two-record baseline")
+    log = V7.registry(log_dir)
+    with log.locked():
+        records = V7._chain(log)
+        if len(records) != 2:
+            raise PermissionError("v7 registry differs from its two-record baseline; reconcile before STOP")
+        if v1._record_sha256(records[-1]) != expected_prev_sha256:
+            raise PermissionError("v7 prior head differs from the expected head")
+        candidate = {
+            **_STOP_REQUIRED, "power_gate": dict(_STOP_REQUIRED["power_gate"]),
+            "run_at": now.isoformat(),
+            "raw_primary_power_ic_0_01": primary["power"], "usable_dates": primary["usable_dates"],
+            "power_receipt_sha256": hashlib.sha256(body).hexdigest(), "power_inputs": primary["inputs"],
+            "decision_ref": str(decision_ref).strip(), "prev_sha256": v1._record_sha256(records[-1]),
+        }
+        _check_stop_record(candidate)
+        if dry_run:
+            return {"dry_run": True, "would_append": candidate,
+                    "would_be_head_sha256": v1._record_sha256(candidate)}
+        return log.append_locked([candidate])[0]
+
+
+def verify_terminal_stop(log_dir: Path, witness) -> dict:
+    """Return the only acceptable v7 terminal head after exact off-host witnessing."""
+    log = V7.registry(log_dir)
+    proof = V7.require_witness(log_dir, witness, STOP_RECORDS)
+    records = V7._chain(log)
+    if len(records) != STOP_RECORDS or proof["witnessed_records"] != STOP_RECORDS:
+        raise PermissionError("v7 STOP witness must end at exactly three records")
+    _check_stop_record(records[-1])
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != STOP_RECORDS:
+        raise PermissionError("v7 census does not cover exactly the STOP record")
+    return {"records": STOP_RECORDS, "head_sha256": v1._record_sha256(records[-1]),
+            "raw_primary_power_ic_0_01": records[-1]["raw_primary_power_ic_0_01"],
+            "witness_path": WITNESS_PATH, "witness_tip": witness.tip}
 
 
 def run_spec(run_id: str | None = None):

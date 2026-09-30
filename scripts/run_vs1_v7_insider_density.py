@@ -3,6 +3,8 @@
 The v7 discovery start is scoped to this invocation; v1-v6 retain 2012-01-01.
 The power command needs the witnessed v7 registration and exact earlier-window
 non-outcome admission reports. No command here silently opens a holdout.
+``stop`` (dry run unless ``--execute``) and ``verify-stop`` record and check the
+terminal STOP when the sealed post-admission power is below the 0.50 gate.
 """
 
 from __future__ import annotations
@@ -87,6 +89,30 @@ def main(argv: list[str] | None = None) -> None:
                               v6_log_dir=v6_log_dir, v6_witness=witness)
         print(json.dumps({"appended": [r["kind"] for r in records],
                           "chain": v7.registry(log_dir).verify_chain()}, indent=2))
+        return
+    if command in {"stop", "verify-stop"}:
+        # stop --log-dir DIR --vault-repo CLONE --power POWER.json --decision-ref TEXT
+        #      --expected-prev-sha256 HEX --run-at ISO [--execute]   (dry run unless --execute)
+        from datetime import datetime, timezone
+        log_dir = Path(_option(args, "--log-dir"))
+        v7.check_prereg()
+        witness = v7.check_offhost(Path(_option(args, "--vault-repo")))
+        if command == "verify-stop":
+            print(json.dumps(v7.verify_terminal_stop(log_dir, witness), indent=2, sort_keys=True))
+            return
+        run_at = datetime.fromisoformat(_option(args, "--run-at"))
+        if run_at.utcoffset() is None or run_at > datetime.now(timezone.utc):
+            raise SystemExit("--run-at must be an explicit UTC instant that is not in the future")
+        out = v7.append_stop_status(
+            log_dir, run_at, power_path=Path(_option(args, "--power")),
+            decision_ref=_option(args, "--decision-ref"),
+            expected_prev_sha256=_option(args, "--expected-prev-sha256"),
+            witness=witness, dry_run="--execute" not in args)
+        if "--execute" in args:
+            out = {"appended": out, "head_sha256": v7.v1._record_sha256(out),
+                   "chain": v7.registry(log_dir).verify_chain(),
+                   "next": f"publish the anchor to {v7.WITNESS_PATH}, then run verify-stop"}
+        print(json.dumps(out, indent=2, sort_keys=True))
         return
     if command in {"power", "freeze-inputs", "open-discovery", "discover", "open-holdout", "holdout"}:
         if "--accept-underpowered" in args:
