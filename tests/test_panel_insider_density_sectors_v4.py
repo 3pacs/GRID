@@ -23,8 +23,11 @@ SECTOR_LINE = b'{"records":2}\n'
 
 @pytest.fixture
 def historical_v6_terminal(monkeypatch):
-    """Replay sectors-v4's registered v6-era checks before the v7 stop pin."""
+    """Replay the recorded sectors-v4 checks before v7 source was present."""
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
+    modules = s4._technology_modules()
+    assert modules[-1].VERSION == "vs1-v7"
+    monkeypatch.setattr(s4, "_technology_modules", lambda: modules[:-1])
     monkeypatch.setattr(v6, "SUPERSEDED_BY", None)
 
 
@@ -54,17 +57,23 @@ def test_the_witness_is_the_canonical_sectors_v4_path():
     assert v1.SECTORS_WITNESS.match(s4.WITNESS_PATH)
 
 
-def test_the_technology_run_is_v6_the_terminal_member_of_the_pinned_chain(historical_v6_terminal):
+def test_the_technology_run_remains_pinned_to_v6_and_refuses_v7():
     assert s4.TECHNOLOGY_RUN["version"] == "vs1-v6" and s4.TECHNOLOGY_RUN["registry_id"] == "vs1-v6"
-    assert s4.check_technology_run() == s4.TECHNOLOGY_RUN == s4.technology_terminal()
     assert s4.TECHNOLOGY_RUN["registry_head_sha256"] == v6.REGISTERED_RECORD_SHA256[1]
-
-
-def test_v7_stop_pin_blocks_sectors_v4_without_a_registered_terminal(tmp_path):
-    assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
-    with pytest.raises(PermissionError, match="no single terminal member"):
+    assert s4.SUPERSEDED_BY["version"] == "vs1-sectors-v5"
+    with pytest.raises(PermissionError):
         s4.check_technology_run()
-    with pytest.raises(PermissionError, match="no single terminal member"):
+
+
+def test_the_historical_technology_run_was_v6(historical_v6_terminal):
+    assert s4.check_technology_run() == s4.TECHNOLOGY_RUN == s4.technology_terminal()
+
+
+def test_v7_unregistered_blocks_sectors_v4_without_an_anchor(tmp_path):
+    assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
+    with pytest.raises(PermissionError, match="not registered"):
+        s4.check_technology_run()
+    with pytest.raises(PermissionError, match="not registered"):
         s4.register(tmp_path, s4.REGISTERED_AT, s4.REGISTERED_CODE_SHA)
     assert not (tmp_path / s4.REGISTRY_ANCHORS).exists()
 
@@ -74,7 +83,7 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
                                REGISTERED_RECORD_SHA256=("a" * 64, "b" * 64),
                                WITNESS_PATH=v1.canonical_witness_path("vs1-v7"))
     pin7 = {"version": "vs1-v7", "prereg_sha256": "7" * 64, "registry_head_sha256": "b" * 64}
-    chain = s4._technology_modules()
+    chain = s4._technology_modules()[:-1]  # historical v1-v6 chain, before the real v7 scaffold
     fakes = [types.SimpleNamespace(**{**vars(m), "SUPERSEDED_BY": pin7}) for m in chain]
     monkeypatch.setattr(s4, "_technology_modules", lambda: [*fakes, v7])
     assert s4.technology_terminal()["version"] == "vs1-v7"

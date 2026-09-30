@@ -42,6 +42,8 @@ import dataclasses
 import hashlib
 import json
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from fractions import Fraction
@@ -69,6 +71,32 @@ SERIES_TEMPLATE = v6.SERIES_TEMPLATE
 BASIS = v6.BASIS
 BENCHMARK = v6.BENCHMARK
 CROSSCHECK = v6.CROSSCHECK
+_probe_context: ContextVar[tuple[str, str, str] | None] = ContextVar("vs1_probe_context", default=None)
+
+
+@contextmanager
+def preregistered_window(start: str, study: str, body_sha256: str):
+    """Scope a later version's read window and prereg pin; v6 stays default."""
+    if not v1._is_hex64(body_sha256):
+        raise ValueError("probe preregistration body hash is not pinned")
+    if date.fromisoformat(start) >= HOLDOUT_START:
+        raise ValueError("probe start must precede holdout")
+    token = _probe_context.set((start, study, body_sha256))
+    try:
+        yield
+    finally:
+        _probe_context.reset(token)
+
+
+def probe_rule():
+    context = _probe_context.get()
+    return (dataclasses.replace(CROSSCHECK, discovery_window=(context[0], CROSSCHECK.discovery_window[1]))
+            if context else CROSSCHECK)
+
+
+def probe_identity() -> tuple[str, str]:
+    context = _probe_context.get()
+    return (context[1], context[2]) if context else (STUDY, PREREG_BODY_SHA256)
 SPLICE_TOL = v6.SPLICE_TOL
 
 #: The first holdout instant. Nothing on or after it is ever read (v6 §3, §8).
@@ -380,7 +408,7 @@ def assess_ticker(
         reasons.append("splice_failed")
 
     # TwelveData return cross-check (v4)
-    cross = v6.crosscheck_statistics(sessions, adj_iso, close_iso, td_all or {}, td_none or {})
+    cross = v6.crosscheck_statistics(sessions, adj_iso, close_iso, td_all or {}, td_none or {}, probe_rule())
     if td_state != "ok":
         reasons.append(f"twelvedata_{td_state}")
     if not cross["passed"]:
@@ -706,7 +734,8 @@ def _count(items: Iterable[str]) -> dict[str, int]:
 
 
 def _common(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime) -> dict:
-    return {"prereg": {"study": STUDY, "body_sha256": PREREG_BODY_SHA256, "rules": "v6 §2.2 rules 3-4, §2.3"},
+    study, body = probe_identity()
+    return {"prereg": {"study": study, "body_sha256": body, "rules": "v6 §2.2 rules 3-4, §2.3"},
             "code_sha": code_sha, "snapshot_as_of_ts": snapshot_as_of_ts.astimezone(timezone.utc).isoformat(),
             "window": "discovery", "read_window": {"start": lo.isoformat(), "end": hi.isoformat()},
             "source": dict(probe["source"]), "promotion_allowed": False}
@@ -714,6 +743,7 @@ def _common(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of
 
 def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                             twelvedata_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     recs = probe["records"]
     tickers = {}
     for t, r in sorted(recs.items()):
@@ -726,16 +756,16 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
                             and r["twelvedata"]["state"] == "ok" and not r["twelvedata"].get("has_window_end"))
     holdout_rows = sum(int(r["twelvedata"].get("holdout_rows", 0)) for r in tickers.values())
     return {
-        "report": "vs1-v6-twelvedata-crosscheck",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
-        "rule": dataclasses.asdict(CROSSCHECK),
+        "report": f"{common['prereg']['study']}-twelvedata-crosscheck",
+        **common,
+        "rule": dataclasses.asdict(probe_rule()),
         "request": {"url": fetch.TD_URL, "params": {**fetch.td_params("{ticker}", "all"), "adjust": ["all", "none"]},
                     "supplement_params": {**fetch.td_params("{ticker}", "all", start=fetch.TD_SUPPLEMENT_START),
                                           "adjust": ["all", "none"]},
                     "fetch_log_sha256": twelvedata_fetch_log_sha256},
         "window_implementation": {
             "note": fetch.TD_WINDOW_NOTE,
-            "registered_window": [fetch.TD_START, fetch.TD_WINDOW_END],
+            "registered_window": [fetch.td_start(), fetch.TD_WINDOW_END],
             "end_date_exclusive_bound": fetch.TD_END_EXCLUSIVE,
             "assertion": "no TwelveData row dated on or after 2020-01-01",
             "rows_dated_2020_or_later": holdout_rows,
@@ -751,7 +781,7 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
             "twelvedata_state": _count(r["twelvedata"]["state"] for r in tickers.values()),
             "twelvedata_unavailable": sorted(t for t, r in tickers.items() if r["twelvedata"]["state"] == "unavailable"),
             "twelvedata_not_fetched": sorted(t for t, r in tickers.items() if r["twelvedata"]["state"] == "not_fetched"),
-            "below_n_pairs": sorted(t for t, r in tickers.items() if r["pairs"] < CROSSCHECK.min_pairs),
+            "below_n_pairs": sorted(t for t, r in tickers.items() if r["pairs"] < probe_rule().min_pairs),
             "excluded_adjustment_pairs_total": sum(r["excluded_adjustment_pairs"] for r in tickers.values()),
             "dropped_nonconsecutive_total": sum(r["dropped_nonconsecutive"] for r in tickers.values()),
             "twelvedata_missing_window_end": td_end_missing,
@@ -764,6 +794,7 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
 
 def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                              tiingo_meta_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     tickers = {}
     for t, r in sorted(probe["records"].items()):
         if "tiingo_meta" not in r:
@@ -774,8 +805,8 @@ def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: st
                       "sec_name": r["entity"]["sec_name"], "entity_check": r["entity"]["check"],
                       "listed_from": r["listed_from"]}
     return {
-        "report": "vs1-v6-tiingo-metadata",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
+        "report": f"{common['prereg']['study']}-tiingo-metadata",
+        **common,
         "request": {"url": fetch.TIINGO_META_URL, "fetch_log_sha256": tiingo_meta_fetch_log_sha256},
         "name_match": {"jaccard_min": v6.NAME_JACCARD_MIN, "stop_tokens": sorted(v6.NAME_STOP_TOKENS),
                        "or": "one joined token string prefixes the other"},
@@ -836,8 +867,8 @@ def build_report(probe: Mapping, *, tickers: Sequence[str], benchmark: str, lo: 
         "probe_version": PROBE_VERSION,
         **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
         "read_window": {"start": lo.isoformat(), "end": hi.isoformat(),
-                        "why": "discovery 2012-01-01..2019-12-31 plus the harness's 60-day warm-up; nothing on or "
-                               "after 2020-01-01 is read"},
+                        "why": f"discovery {v1.discovery_start()[:10]}..2019-12-31 plus the harness's "
+                               "60-day warm-up; nothing on or after 2020-01-01 is read"},
         "refused_sources": sorted(REFUSED_SOURCES) + [f"{p}*" for p in REFUSED_PREFIXES] + ["every source but TIINGO"],
         **({"source_filtering_query": {
             "other_sources": list(probe["other_sources"]),
@@ -855,7 +886,7 @@ def build_report(probe: Mapping, *, tickers: Sequence[str], benchmark: str, lo: 
                        "max_split_term": MAX_SPLIT_TERM, "max_whole_split": MAX_WHOLE_SPLIT,
                        "min_split_move": MIN_SPLIT_MOVE, "max_distribution_drop": MAX_DISTRIBUTION_DROP,
                        "td_match_days": TD_MATCH_DAYS, "splice_tol": SPLICE_TOL,
-                       "crosscheck": dataclasses.asdict(CROSSCHECK), "low_price_usd": LOW_PRICE_USD},
+                       "crosscheck": dataclasses.asdict(probe_rule()), "low_price_usd": LOW_PRICE_USD},
         "interpretation": list(INTERPRETATION),
         "crosscheck_report_sha256": crosscheck_report_sha256,
         "tiingo_meta_report_sha256": tiingo_meta_report_sha256,
