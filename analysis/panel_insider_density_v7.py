@@ -41,8 +41,14 @@ REGISTRY_LOG = "granular_panel_prereg_v7.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v7.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v7.lock"
 WITNESS_PATH = v1.canonical_witness_path(REGISTRY_ID)
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
-REGISTERED_ANCHOR_LINE: bytes | None = None
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "a04654d988f4705fb0620b2474684197bf1a170957f93c8dfcae32315aff7e48",  # header
+    "4b42f649ce2a69191de5b73d14aebdd7bbe470b8ae65cb98a099201484c40e53",  # preregistration
+)
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"4b42f649ce2a69191de5b73d14aebdd7bbe470b8ae65cb98a099201484c40e53",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-30T01:43:00+00:00"}'
+)
 SUPERSEDED_BY: Mapping[str, Any] | None = None
 
 FROZEN_REGISTRIES = (

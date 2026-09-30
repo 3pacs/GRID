@@ -260,16 +260,8 @@ def test_every_harness_module_pins_every_lower_version_as_earlier():
         assert sorted(e.number for e in harness.pins.earlier) == list(range(1, number))
         for e in harness.pins.earlier:
             assert (e.prereg_sha256, e.registry_head_sha256, e.witness_path, e.anchor_line) == pinned[e.number]
-        if number == 7:
-            # v7 is preregistered in code, but its first two registry records
-            # cannot be pinned until the witnessed registration has happened.
-            assert module.REGISTERED_RECORD_SHA256 is None
-            assert module.REGISTERED_ANCHOR_LINE is None
-            assert harness.pins.registered_record_sha256 is None
-            assert harness.pins.registered_anchor_line is None
-        else:
-            pinned[number] = (module.PREREG_BODY_SHA256, module.REGISTERED_RECORD_SHA256[1], module.WITNESS_PATH,
-                              module.REGISTERED_ANCHOR_LINE)
+        pinned[number] = (module.PREREG_BODY_SHA256, module.REGISTERED_RECORD_SHA256[1], module.WITNESS_PATH,
+                          module.REGISTERED_ANCHOR_LINE)
         found.append(number)
     assert found == list(range(2, max(found) + 1)) and max(found) >= 3
     # Historical supersession pins still point to v6's two-record head.
