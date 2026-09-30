@@ -323,7 +323,8 @@ def test_live_preopen_keeps_latest_and_replay_uses_earlier_batch(
 
     assert live["excluded"] is False, live
     assert live["kind"] == "preopen"
-    assert live["chain"]["created_at"] == LATE_START + timedelta(minutes=2)
+    # The appended record comes back JSON-serialized by the v1 store.
+    assert live["chain"]["created_at"] == (LATE_START + timedelta(minutes=2)).isoformat()
     assert (live["levels"]["real"]["put_wall"], live["levels"]["real"]["call_wall"]) == (97.0, 103.0)
 
     assert replayed["excluded"] is False, replayed
