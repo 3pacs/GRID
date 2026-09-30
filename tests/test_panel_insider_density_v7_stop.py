@@ -26,6 +26,10 @@ V6_STOP_ANCHOR = (
 )
 
 
+def _scorecard():
+    return v7.v2.REPO / "docs/paper_log/vs1-v7-stop-e0-scorecard.json"
+
+
 def _registered(log_dir):
     """The exact witnessed v7 registration, re-materialised from its pinned inputs."""
     log = v7.registry(log_dir)
@@ -44,47 +48,46 @@ def _vault(root, monkeypatch):
     return vault
 
 
-def _power(tmp_path, primary_power, name="power.json", **overrides):
-    table = {trial: [{"target_ic": ic, "power": primary_power if (trial, ic) == (v7.PRIMARY_TRIAL, 0.01) else 0.9,
-                      "sims": v1.POWER_SIMS, "usable_dates": 414} for ic in v1.POWER_TARGET_ICS]
-             for trial in v1.trial_names()}
-    doc = {"version": v7.VERSION, "primary_trial": v7.PRIMARY_TRIAL, "settings": v1.power_settings(),
-           "table": table, "gate_passed": primary_power >= v1.POWER_GATE,
-           "inputs": {"prereg_sha256": v7.PREREG_BODY_SHA256, "price_manifest_sha256": "a" * 64,
-                      "form4_receipt_sha256": "b" * 64},
-           **overrides}
-    path = tmp_path / name
-    path.write_text(json.dumps(doc, sort_keys=True), encoding="utf-8")
-    return path
+def test_pinned_e0_evidence_is_below_the_gate_under_realistic_models():
+    data = _scorecard().read_bytes()
+    assert hashlib.sha256(data).hexdigest() == v7.E0_SCORECARD_SHA256
+    powers = v7.e0_v7_power(data)
+    assert powers == {"gaussian_idio": 0.496, "factor_t_garch": 0.446, "factor_t_garch_exposed": 0.414}
+    with pytest.raises(PermissionError, match="pinned evidence"):
+        v7.e0_v7_power(data.replace(b'"e0_power_raw_threshold": 0.414', b'"e0_power_raw_threshold": 0.514'))
 
 
-def test_v7_stop_requires_exact_witness_and_sealed_underpowered_receipt(tmp_path, monkeypatch):
+def test_v7_stop_requires_exact_witness_and_pinned_e0_evidence(tmp_path, monkeypatch):
     vault = _vault(tmp_path / "vault", monkeypatch)
     log_dir = tmp_path / "registry"
     _registered(log_dir)
     vault.publish(log_dir)
     prior = vault.witness()
-    power = _power(tmp_path, 0.455)
     head = v7.REGISTERED_RECORD_SHA256[1]
+    v7.V7._refuse_if_stopped(log_dir)  # silent before a STOP
+    with pytest.raises(PermissionError, match="superseded by vs1-v8"):
+        v1.refuse_superseded(7, v7.SUPERSEDED_BY)
 
-    preview = v7.append_stop_status(log_dir, RUN_AT, power_path=power, decision_ref="owner-standing-auth",
-                                    expected_prev_sha256=head, witness=prior, dry_run=True)
+    kw = {"e0_scorecard": _scorecard(), "decision_ref": "owner-standing-auth", "expected_prev_sha256": head,
+          "witness": prior}
+    preview = v7.append_stop_status(log_dir, RUN_AT, dry_run=True, **kw)
     assert preview["dry_run"] is True
     assert v7.registry(log_dir).verify_chain()["records"] == 2
-
-    stop = v7.append_stop_status(log_dir, RUN_AT, power_path=power, decision_ref="owner-standing-auth",
-                                 expected_prev_sha256=head, witness=prior)
+    stop = v7.append_stop_status(log_dir, RUN_AT, **kw)
     assert stop == preview["would_append"]
     assert v1._record_sha256(stop) == preview["would_be_head_sha256"]
     assert stop["prev_sha256"] == head
     assert stop["status"] == v7.STOP_STATUS and stop["superseded_by"] == "vs1-v8"
-    assert stop["raw_primary_power_ic_0_01"] == 0.455 and stop["usable_dates"] == 414
-    assert stop["power_receipt_sha256"] == hashlib.sha256(power.read_bytes()).hexdigest()
-    assert stop["gate_passed"] is False and stop["inputs_frozen"] is False
+    assert stop["e0_scorecard_sha256"] == v7.E0_SCORECARD_SHA256
+    assert stop["e0_v7_power_ic_0_01"]["factor_t_garch_exposed"] == 0.414
+    assert stop["stage0_run"] is False and stop["inputs_frozen"] is False
     assert stop["discovery_opened"] is False and stop["holdout_opened"] is False
     assert not any(k.startswith("v8_") for k in stop)
     with pytest.raises(PermissionError, match="missing or extra fields"):
         v7._check_stop_record({**stop, "v8_prereg_sha256": "c" * 64})
+    passing = {**stop["e0_v7_power_ic_0_01"], "factor_t_garch_exposed": 0.5}
+    with pytest.raises(PermissionError, match="below the gate"):
+        v7._check_stop_record({**stop, "e0_v7_power_ic_0_01": passing})
     with pytest.raises(PermissionError, match="off-host anchor log"):
         v7.verify_terminal_stop(log_dir, prior)
 
@@ -93,35 +96,38 @@ def test_v7_stop_requires_exact_witness_and_sealed_underpowered_receipt(tmp_path
         v7.freeze_inputs(log_dir, RUN_AT, {"accept_underpowered": False})
     with pytest.raises(PermissionError, match="terminal STOP"):
         v7.open_discovery(log_dir, RUN_AT, {}, prior)
+    with pytest.raises(PermissionError, match="terminal STOP"):
+        v7.open_holdout({}, allow_holdout=True, prereg_sha256=v7.PREREG_BODY_SHA256, log_dir=log_dir,
+                        now=RUN_AT, observed={}, witness=prior)
 
     vault.publish(log_dir)
     proof = v7.verify_terminal_stop(log_dir, vault.witness())
     assert proof["records"] == 3 and proof["head_sha256"] == v1._record_sha256(stop)
     with pytest.raises(PermissionError, match="two-record baseline"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=power, decision_ref="owner-standing-auth",
-                              expected_prev_sha256=head, witness=prior)
+        v7.append_stop_status(log_dir, RUN_AT, **kw)
 
 
-def test_v7_stop_refuses_a_passing_or_foreign_power_receipt(tmp_path, monkeypatch):
+def test_v7_stop_refuses_bad_evidence_time_head_or_a_grown_chain(tmp_path, monkeypatch):
     vault = _vault(tmp_path / "vault", monkeypatch)
     log_dir = tmp_path / "registry"
-    _registered(log_dir)
+    log = _registered(log_dir)
     vault.publish(log_dir)
     prior = vault.witness()
     head = v7.REGISTERED_RECORD_SHA256[1]
-    kw = dict(decision_ref="owner-standing-auth", expected_prev_sha256=head, witness=prior, dry_run=True)
+    kw = {"decision_ref": "owner-standing-auth", "expected_prev_sha256": head, "witness": prior, "dry_run": True}
 
-    with pytest.raises(PermissionError, match="passed its power gate"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=_power(tmp_path, 0.5, "pass.json"), **kw)
-    with pytest.raises(ValueError, match="gate_passed disagrees"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=_power(tmp_path, 0.45, "lie.json", gate_passed=True), **kw)
-    with pytest.raises(ValueError, match="harness"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=_power(tmp_path, 0.45, "v6.json", version=v6.VERSION),
-                              **kw)
-    foreign = {"prereg_sha256": v6.PREREG_BODY_SHA256, "price_manifest_sha256": "a" * 64}
-    with pytest.raises(PermissionError, match="not a v7 post-admission"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=_power(tmp_path, 0.45, "f.json", inputs=foreign), **kw)
+    other = tmp_path / "other.json"
+    other.write_bytes(_scorecard().read_bytes() + b" ")
+    with pytest.raises(PermissionError, match="pinned evidence"):
+        v7.append_stop_status(log_dir, RUN_AT, e0_scorecard=other, **kw)
+    with pytest.raises(ValueError, match="UTC time"):
+        v7.append_stop_status(log_dir, RUN_AT.replace(tzinfo=None), e0_scorecard=_scorecard(), **kw)
     with pytest.raises(ValueError, match="registration head"):
-        v7.append_stop_status(log_dir, RUN_AT, power_path=_power(tmp_path, 0.45, "ok.json"),
-                              decision_ref="x", expected_prev_sha256="d" * 64, witness=prior)
-    assert v7.registry(log_dir).verify_chain()["records"] == 2
+        v7.append_stop_status(log_dir, RUN_AT, e0_scorecard=_scorecard(), decision_ref="x",
+                              expected_prev_sha256="d" * 64, witness=prior)
+    # A chain that already carries a later record (e.g. a freeze) cannot be stopped this way.
+    log.append([{"kind": "inputs_frozen", "prereg_sha256": v7.PREREG_BODY_SHA256,
+                 "run_at": RUN_AT.isoformat()}])
+    with pytest.raises(PermissionError):
+        v7.append_stop_status(log_dir, RUN_AT, e0_scorecard=_scorecard(), **kw)
+    assert json.loads(_scorecard().read_bytes())["version"] == "e0-v1"

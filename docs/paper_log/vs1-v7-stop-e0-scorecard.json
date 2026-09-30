@@ -1,0 +1,1139 @@
+{
+  "benchmark": "E0 machinery calibration: power, empirical FDR and null p-value calibration of the VS1 panel path",
+  "checks": {
+    "factor_t_garch": {
+      "fdr_bh_controlled": true,
+      "fwer_holm_controlled": true,
+      "null_p_uniform_ks": true
+    },
+    "factor_t_garch_exposed": {
+      "fdr_bh_controlled": true,
+      "fwer_holm_controlled": true,
+      "null_p_uniform_ks": true
+    },
+    "gaussian_idio": {
+      "fdr_bh_controlled": true,
+      "fwer_holm_controlled": true,
+      "null_p_uniform_ks": true
+    }
+  },
+  "headline": {
+    "declared_fdr": 0.1,
+    "declared_fwer": 0.05,
+    "empirical_fdr_bh_all": 0.06375,
+    "empirical_fdr_bh_global_null": 0.082,
+    "fwer_holm_global_null": 0.034,
+    "null_p_ks_p": 0.0971045235165,
+    "null_p_ks_stat": 0.0275,
+    "null_size_at_0.05": 0.0535,
+    "power_ic_0.01_bh": 0.51,
+    "power_ic_0.01_holm": 0.414,
+    "power_ic_0.01_raw_threshold": 0.414,
+    "power_ic_0.02_bh": 0.994,
+    "power_ic_0.02_holm": 0.972,
+    "power_ic_0.02_raw_threshold": 0.972,
+    "scenario": "factor_t_garch_exposed"
+  },
+  "machinery_sha256": {
+    "analysis/offline_research_proof.py": "002af8464ad31af43a425ab8c5c904ac9546b70f1f17a9894a262f2ff635ac71",
+    "analysis/panel_insider_density.py": "b52b223ddc6f6912df8532ffdb44f065ce631557c8b2bd2f3556f203fe3d781f"
+  },
+  "manifest": {
+    "files": 20,
+    "manifest_sha256": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
+    "version": "e0-v1"
+  },
+  "planted_scale_calibration": {
+    "factor_t_garch": {
+      "A90|fwd5": {
+        "pilot_increment_at_pilot_scale": 0.0862434256016,
+        "pilot_increment_before_last_step": {
+          "0.005": 0.00499933201752,
+          "0.01": 0.00999996961749,
+          "0.02": 0.0199997810366,
+          "0.03": 0.0300000230348,
+          "0.05": 0.0499999339522
+        },
+        "pilot_null_mean_ic": 0.00149346965212,
+        "pilot_scale": 0.1,
+        "pilot_sims": 24,
+        "scales": {
+          "0.005": 0.00572453221515,
+          "0.01": 0.0114445843789,
+          "0.02": 0.022962455098,
+          "0.03": 0.0344671518389,
+          "0.05": 0.0575444816387
+        }
+      }
+    },
+    "factor_t_garch_exposed": {
+      "A90|fwd5": {
+        "pilot_increment_at_pilot_scale": 0.0855685426026,
+        "pilot_increment_before_last_step": {
+          "0.005": 0.00500014885513,
+          "0.01": 0.0100000699705,
+          "0.02": 0.0200000496383,
+          "0.03": 0.0299996582119,
+          "0.05": 0.0500002827186
+        },
+        "pilot_null_mean_ic": 0.00165807916308,
+        "pilot_scale": 0.1,
+        "pilot_sims": 24,
+        "scales": {
+          "0.005": 0.00578462487203,
+          "0.01": 0.0115848270101,
+          "0.02": 0.0231624872749,
+          "0.03": 0.0347778760227,
+          "0.05": 0.0580267603756
+        }
+      }
+    },
+    "gaussian_idio": {
+      "A90|fwd5": {
+        "pilot_increment_at_pilot_scale": 0.0966046797714,
+        "pilot_increment_before_last_step": {
+          "0.005": 0.00499999226856,
+          "0.01": 0.0100001180264,
+          "0.02": 0.0199997394506,
+          "0.03": 0.0300010820536,
+          "0.05": 0.0500004879747
+        },
+        "pilot_null_mean_ic": 0.000929523738022,
+        "pilot_scale": 0.1,
+        "pilot_sims": 24,
+        "scales": {
+          "0.005": 0.00513785133996,
+          "0.01": 0.0102588201534,
+          "0.02": 0.0205014428231,
+          "0.03": 0.0307767420377,
+          "0.05": 0.0514029793009
+        }
+      }
+    }
+  },
+  "profile": {
+    "ic_grid": [
+      0.0,
+      0.005,
+      0.01,
+      0.02,
+      0.03,
+      0.05
+    ],
+    "name": "full",
+    "null_sims": 500,
+    "perms": 999,
+    "scenarios": [
+      "gaussian_idio",
+      "factor_t_garch",
+      "factor_t_garch_exposed"
+    ],
+    "sims": 500
+  },
+  "replication": {
+    "declared": 3,
+    "guards": {
+      "cutoff_exclusive": "2011-01-01",
+      "denylist_size": 908,
+      "vs1_universe_touched": false,
+      "vs1_windows_touched": false
+    },
+    "hits": 2,
+    "perms": 999,
+    "survivorship": "today's non-Technology sector-map companies with pre-2011 TIINGO history: survivor-biased",
+    "trials": {
+      "MOM12_1|fwd20": {
+        "bh_adjusted_p": 0.158,
+        "bh_selected": false,
+        "block": 1,
+        "decision_range": [
+          "1995-01-06",
+          "2010-11-23"
+        ],
+        "expected_sign": 1,
+        "hit": false,
+        "holm_adjusted_p": 0.158,
+        "mean_ic": 0.0161882653004,
+        "median_entities": 563,
+        "n_dates": 201,
+        "p": 0.158,
+        "prior": "12-1 momentum (Jegadeesh and Titman 1993)",
+        "sign_matches_prior": true
+      },
+      "REV20|fwd20": {
+        "bh_adjusted_p": 0.0015,
+        "bh_selected": true,
+        "block": 1,
+        "decision_range": [
+          "1995-01-06",
+          "2010-11-23"
+        ],
+        "expected_sign": -1,
+        "hit": true,
+        "holm_adjusted_p": 0.003,
+        "mean_ic": -0.0323005982559,
+        "median_entities": 578,
+        "n_dates": 201,
+        "p": 0.001,
+        "prior": "one-month reversal (Jegadeesh 1990)",
+        "sign_matches_prior": true
+      },
+      "REV5|fwd5": {
+        "bh_adjusted_p": 0.0015,
+        "bh_selected": true,
+        "block": 1,
+        "decision_range": [
+          "1995-01-06",
+          "2010-12-22"
+        ],
+        "expected_sign": -1,
+        "hit": true,
+        "holm_adjusted_p": 0.003,
+        "mean_ic": -0.0431419945521,
+        "median_entities": 579,
+        "n_dates": 805,
+        "p": 0.001,
+        "prior": "weekly reversal (Lehmann 1990; Lo and MacKinlay 1990)",
+        "sign_matches_prior": true
+      }
+    },
+    "universe": {
+      "first_date": "1993-06-01",
+      "grid_dates": 887,
+      "last_date": "2010-12-30",
+      "tickers": 710
+    }
+  },
+  "scenarios": {
+    "factor_t_garch": {
+      "fdr": {
+        "all_simulations": {
+          "fdr_bh": {
+            "n": 3000,
+            "rate": 0.0695555555556,
+            "se": 0.00387023955782
+          },
+          "fdr_holm_run_alpha": {
+            "n": 3000,
+            "rate": 0.0296388888889,
+            "se": 0.00270582740984
+          },
+          "sims": 3000
+        },
+        "global_null": {
+          "fdr_bh": {
+            "n": 500,
+            "rate": 0.08,
+            "se": 0.0121447515405
+          },
+          "fdr_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.04,
+            "se": 0.00877233764829
+          },
+          "fwer_bh": {
+            "n": 500,
+            "rate": 0.08,
+            "se": 0.0121447515405
+          },
+          "fwer_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.04,
+            "se": 0.00877233764829
+          },
+          "sims": 500
+        }
+      },
+      "note": "market + 3 industry/style factors, GARCH(1,1) volatility clustering, Student-t(4) tails, dispersed idiosyncratic vol, loadings independent of the feature",
+      "null_calibration": {
+        "per_trial": {
+          "A30|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.75909783842,
+            "ks_stat": 0.03,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00784458025501,
+            "null_mean_ic": -2.60478957635e-06,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.012,
+              "se": 0.00487437370726
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.046,
+              "se": 0.00937784025112
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.09,
+              "se": 0.0128112550717
+            }
+          },
+          "A30|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.68523140292,
+            "ks_stat": 0.032,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00411057221756,
+            "null_mean_ic": 2.06206780918e-05,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.012,
+              "se": 0.00487437370726
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.06,
+              "se": 0.01063137113
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.122,
+              "se": 0.014651324945
+            }
+          },
+          "A90|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.82795686146,
+            "ks_stat": 0.028,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00777935048608,
+            "null_mean_ic": -3.46641159177e-05,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.008,
+              "se": 0.00398795782516
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.048,
+              "se": 0.00956949059776
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.094,
+              "se": 0.013064047561
+            }
+          },
+          "A90|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.647557287771,
+            "ks_stat": 0.033,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00391123654723,
+            "null_mean_ic": -0.000115940889127,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.006,
+              "se": 0.00345715255776
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.05,
+              "se": 0.00975655578375
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.084,
+              "se": 0.0124175840156
+            }
+          }
+        },
+        "pooled": {
+          "critical_5pct": 0.0303658031344,
+          "ks_p": 0.859294341748,
+          "ks_stat": 0.0135,
+          "n": 2000,
+          "size_at_0.01": {
+            "n": 2000,
+            "rate": 0.0095,
+            "se": 0.00216961485391
+          },
+          "size_at_0.05": {
+            "n": 2000,
+            "rate": 0.051,
+            "se": 0.00492052901657
+          },
+          "size_at_0.10": {
+            "n": 2000,
+            "rate": 0.0975,
+            "se": 0.0066346728964
+          }
+        }
+      },
+      "power_curve": [
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.00572453221515,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.15,
+            "se": 0.0159847121352
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.096,
+            "se": 0.0131877151798
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.094,
+            "se": 0.013064047561
+          },
+          "realized_ic_sd_across_sims": 0.00391165283371,
+          "realized_mean_ic": 0.00481954252811,
+          "sims": 500,
+          "target_ic": 0.005
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0114445843789,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.568,
+            "se": 0.0221751092656
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.446,
+            "se": 0.0222521530786
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.446,
+            "se": 0.0222521530786
+          },
+          "realized_ic_sd_across_sims": 0.00391657129728,
+          "realized_mean_ic": 0.00975245393098,
+          "sims": 500,
+          "target_ic": 0.01
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.022962455098,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.998,
+            "se": 0.002
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.998,
+            "se": 0.002
+          },
+          "realized_ic_sd_across_sims": 0.00392922052392,
+          "realized_mean_ic": 0.0196843070152,
+          "sims": 500,
+          "target_ic": 0.02
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0344671518389,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.0039681362372,
+          "realized_mean_ic": 0.0295923171148,
+          "sims": 500,
+          "target_ic": 0.03
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0575444816387,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.00408101429577,
+          "realized_mean_ic": 0.0493972758825,
+          "sims": 500,
+          "target_ic": 0.05
+        }
+      ]
+    },
+    "factor_t_garch_exposed": {
+      "fdr": {
+        "all_simulations": {
+          "fdr_bh": {
+            "n": 3000,
+            "rate": 0.06375,
+            "se": 0.00382241166348
+          },
+          "fdr_holm_run_alpha": {
+            "n": 3000,
+            "rate": 0.0229166666667,
+            "se": 0.00242871727696
+          },
+          "sims": 3000
+        },
+        "global_null": {
+          "fdr_bh": {
+            "n": 500,
+            "rate": 0.082,
+            "se": 0.0122822517241
+          },
+          "fdr_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.034,
+            "se": 0.00811293037555
+          },
+          "fwer_bh": {
+            "n": 500,
+            "rate": 0.082,
+            "se": 0.0122822517241
+          },
+          "fwer_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.034,
+            "se": 0.00811293037555
+          },
+          "sims": 500
+        }
+      },
+      "note": "factor_t_garch plus a style exposure: entity loading on factor 1 correlated 0.3 with the entity's insider-buy propensity (insider buying clusters in small/value/beaten-down names)",
+      "null_calibration": {
+        "per_trial": {
+          "A30|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.954058146875,
+            "ks_stat": 0.023,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00805617386138,
+            "null_mean_ic": -0.000698122123649,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.006,
+              "se": 0.00345715255776
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.05,
+              "se": 0.00975655578375
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.092,
+              "se": 0.012938578501
+            }
+          },
+          "A30|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.572654807024,
+            "ks_stat": 0.035,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00391386023086,
+            "null_mean_ic": -0.000374031691012,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.008,
+              "se": 0.00398795782516
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.036,
+              "se": 0.00833949004366
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.09,
+              "se": 0.0128112550717
+            }
+          },
+          "A90|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.0484188049275,
+            "ks_stat": 0.061,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00878796711203,
+            "null_mean_ic": -0.000401664696479,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.008,
+              "se": 0.00398795782516
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.062,
+              "se": 0.0107956051327
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.102,
+              "se": 0.0135483991023
+            }
+          },
+          "A90|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.0971045235165,
+            "ks_stat": 0.055,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00447013763513,
+            "null_mean_ic": -0.000360231869622,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.018,
+              "se": 0.00595170947639
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.066,
+              "se": 0.0111146331537
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.126,
+              "se": 0.0148556177508
+            }
+          }
+        },
+        "pooled": {
+          "critical_5pct": 0.0303658031344,
+          "ks_p": 0.0971045235165,
+          "ks_stat": 0.0275,
+          "n": 2000,
+          "size_at_0.01": {
+            "n": 2000,
+            "rate": 0.01,
+            "se": 0.00222541596968
+          },
+          "size_at_0.05": {
+            "n": 2000,
+            "rate": 0.0535,
+            "se": 0.00503304488062
+          },
+          "size_at_0.10": {
+            "n": 2000,
+            "rate": 0.1025,
+            "se": 0.00678379576214
+          }
+        }
+      },
+      "power_curve": [
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.00578462487203,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.152,
+            "se": 0.0160719823679
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.092,
+            "se": 0.012938578501
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.092,
+            "se": 0.012938578501
+          },
+          "realized_ic_sd_across_sims": 0.00447232011983,
+          "realized_mean_ic": 0.00462473485832,
+          "sims": 500,
+          "target_ic": 0.005
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0115848270101,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.51,
+            "se": 0.0223785969892
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.414,
+            "se": 0.0220494979698
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.414,
+            "se": 0.0220494979698
+          },
+          "realized_ic_sd_across_sims": 0.00447098133375,
+          "realized_mean_ic": 0.00962698983057,
+          "sims": 500,
+          "target_ic": 0.01
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0231624872749,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.994,
+            "se": 0.00345715255776
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.972,
+            "se": 0.00738519344123
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.972,
+            "se": 0.00738519344123
+          },
+          "realized_ic_sd_across_sims": 0.00448047190862,
+          "realized_mean_ic": 0.0196066678436,
+          "sims": 500,
+          "target_ic": 0.02
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0347778760227,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.00450673203899,
+          "realized_mean_ic": 0.0296059463083,
+          "sims": 500,
+          "target_ic": 0.03
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0580267603756,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.00459894944535,
+          "realized_mean_ic": 0.0495439882154,
+          "sims": 500,
+          "target_ic": 0.05
+        }
+      ]
+    },
+    "gaussian_idio": {
+      "fdr": {
+        "all_simulations": {
+          "fdr_bh": {
+            "n": 3000,
+            "rate": 0.0792777777778,
+            "se": 0.00418334207782
+          },
+          "fdr_holm_run_alpha": {
+            "n": 3000,
+            "rate": 0.0361111111111,
+            "se": 0.00297059649545
+          },
+          "sims": 3000
+        },
+        "global_null": {
+          "fdr_bh": {
+            "n": 500,
+            "rate": 0.104,
+            "se": 0.0136653387432
+          },
+          "fdr_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.056,
+            "se": 0.0102927100299
+          },
+          "fwer_bh": {
+            "n": 500,
+            "rate": 0.104,
+            "se": 0.0136653387432
+          },
+          "fwer_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.056,
+            "se": 0.0102927100299
+          },
+          "sims": 500
+        }
+      },
+      "note": "v1 Stage-0 equivalent: constant-variance Gaussian idiosyncratic noise, no factors",
+      "null_calibration": {
+        "per_trial": {
+          "A30|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.287693218142,
+            "ks_stat": 0.044,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00823320485642,
+            "null_mean_ic": 0.000502583033907,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.01,
+              "se": 0.00445417549707
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.046,
+              "se": 0.00937784025112
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.116,
+              "se": 0.0143352362379
+            }
+          },
+          "A30|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.794394419557,
+            "ks_stat": 0.029,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00405659573156,
+            "null_mean_ic": 0.000157790434321,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.012,
+              "se": 0.00487437370726
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.052,
+              "se": 0.00993929470125
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.116,
+              "se": 0.0143352362379
+            }
+          },
+          "A90|fwd20": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.968870172878,
+            "ks_stat": 0.022,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00836925742331,
+            "null_mean_ic": 0.000344316260882,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.02,
+              "se": 0.0062672607345
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.064,
+              "se": 0.010956646211
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.104,
+              "se": 0.0136653387432
+            }
+          },
+          "A90|fwd5": {
+            "critical_5pct": 0.0607316062689,
+            "ks_p": 0.340991932397,
+            "ks_stat": 0.042,
+            "median_block": 1.0,
+            "n": 500,
+            "null_ic_sd_across_sims": 0.00410926568481,
+            "null_mean_ic": 0.000100109506333,
+            "size_at_0.01": {
+              "n": 500,
+              "rate": 0.018,
+              "se": 0.00595170947639
+            },
+            "size_at_0.05": {
+              "n": 500,
+              "rate": 0.066,
+              "se": 0.0111146331537
+            },
+            "size_at_0.10": {
+              "n": 500,
+              "rate": 0.102,
+              "se": 0.0135483991023
+            }
+          }
+        },
+        "pooled": {
+          "critical_5pct": 0.0303658031344,
+          "ks_p": 0.400471036208,
+          "ks_stat": 0.02,
+          "n": 2000,
+          "size_at_0.01": {
+            "n": 2000,
+            "rate": 0.015,
+            "se": 0.0027186753388
+          },
+          "size_at_0.05": {
+            "n": 2000,
+            "rate": 0.057,
+            "se": 0.00518545508825
+          },
+          "size_at_0.10": {
+            "n": 2000,
+            "rate": 0.1095,
+            "se": 0.00698421539132
+          }
+        }
+      },
+      "power_curve": [
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.00513785133996,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.162,
+            "se": 0.0164941235664
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.106,
+            "se": 0.0137807044679
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.106,
+            "se": 0.0137807044679
+          },
+          "realized_ic_sd_across_sims": 0.0040961377875,
+          "realized_mean_ic": 0.00512346020565,
+          "sims": 500,
+          "target_ic": 0.005
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0102588201534,
+          "power_bh": {
+            "n": 500,
+            "rate": 0.638,
+            "se": 0.0215136625276
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.496,
+            "se": 0.022382357782
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.496,
+            "se": 0.022382357782
+          },
+          "realized_ic_sd_across_sims": 0.00409293329879,
+          "realized_mean_ic": 0.0101264529064,
+          "sims": 500,
+          "target_ic": 0.01
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0205014428231,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 0.988,
+            "se": 0.00487437370726
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 0.986,
+            "se": 0.00525959377265
+          },
+          "realized_ic_sd_across_sims": 0.00408339331539,
+          "realized_mean_ic": 0.0201296723003,
+          "sims": 500,
+          "target_ic": 0.02
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0307767420377,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.00406911689708,
+          "realized_mean_ic": 0.0301646840764,
+          "sims": 500,
+          "target_ic": 0.03
+        },
+        {
+          "median_block": 1.0,
+          "median_usable_dates": 414.0,
+          "planted_scale": 0.0514029793009,
+          "power_bh": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_holm_run_alpha": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "power_raw_threshold": {
+            "n": 500,
+            "rate": 1.0,
+            "se": 0.0
+          },
+          "realized_ic_sd_across_sims": 0.00404597488728,
+          "realized_mean_ic": 0.0502209992471,
+          "sims": 500,
+          "target_ic": 0.05
+        }
+      ]
+    }
+  },
+  "selection": {
+    "bh_q": 0.1,
+    "direction": 1,
+    "holm_run_alpha": 0.05,
+    "raw_threshold": 0.0125
+  },
+  "statement": "Synthetic outcomes except the pre-2011 non-Technology replication; nothing here is a trading signal.",
+  "structure": {
+    "entities": 202,
+    "name": "vs1_v7_technology_structure",
+    "primary_trial": "A90|fwd5",
+    "sessions": 2068,
+    "trials": {
+      "A30|fwd20": {
+        "decisions": 104,
+        "horizon": 20
+      },
+      "A30|fwd5": {
+        "decisions": 414,
+        "horizon": 5
+      },
+      "A90|fwd20": {
+        "decisions": 104,
+        "horizon": 20
+      },
+      "A90|fwd5": {
+        "decisions": 414,
+        "horizon": 5
+      }
+    }
+  },
+  "v7_crosscheck": {
+    "by_scenario": {
+      "factor_t_garch": {
+        "difference_vs_registered": -0.089,
+        "disagrees_2se": true,
+        "e0_power_bh": 0.568,
+        "e0_power_holm_run_alpha": 0.446,
+        "e0_power_raw_threshold": 0.446,
+        "e0_se": 0.0222521530786,
+        "passes_v7_gate": false,
+        "sims": 500,
+        "z_difference": -2.13420461883
+      },
+      "factor_t_garch_exposed": {
+        "difference_vs_registered": -0.121,
+        "disagrees_2se": true,
+        "e0_power_bh": 0.51,
+        "e0_power_holm_run_alpha": 0.414,
+        "e0_power_raw_threshold": 0.414,
+        "e0_se": 0.0220494979698,
+        "passes_v7_gate": false,
+        "sims": 500,
+        "z_difference": -2.90907802737
+      },
+      "gaussian_idio": {
+        "difference_vs_registered": -0.039,
+        "disagrees_2se": false,
+        "e0_power_bh": 0.638,
+        "e0_power_holm_run_alpha": 0.496,
+        "e0_power_raw_threshold": 0.496,
+        "e0_se": 0.022382357782,
+        "passes_v7_gate": false,
+        "sims": 500,
+        "z_difference": -0.933654485206
+      }
+    },
+    "design": "VS1 v7 registration: A90|fwd5, 414 usable dates, 202 issuers, 200 sims, 999 sign flips, seed 20260927, Holm threshold 0.0125",
+    "flag": "DISAGREES: under the headline (realistic) outcome model E0 power at IC 0.01 is 0.414 vs the registered design estimate 0.535",
+    "gate": 0.5,
+    "headline_scenario": "factor_t_garch_exposed",
+    "registered_design_power": 0.535,
+    "registered_design_se": 0.0352686121077,
+    "synthetic_outcomes_only": true,
+    "target_ic": 0.01,
+    "threshold": 0.0125
+  },
+  "version": "e0-v1"
+}

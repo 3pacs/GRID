@@ -4,7 +4,7 @@ The v7 discovery start is scoped to this invocation; v1-v6 retain 2012-01-01.
 The power command needs the witnessed v7 registration and exact earlier-window
 non-outcome admission reports. No command here silently opens a holdout.
 ``stop`` (dry run unless ``--execute``) and ``verify-stop`` record and check the
-terminal STOP when the sealed post-admission power is below the 0.50 gate.
+terminal STOP that supersedes v7 unopened before its Stage-0 (pinned E0 evidence).
 """
 
 from __future__ import annotations
@@ -91,8 +91,9 @@ def main(argv: list[str] | None = None) -> None:
                           "chain": v7.registry(log_dir).verify_chain()}, indent=2))
         return
     if command in {"stop", "verify-stop"}:
-        # stop --log-dir DIR --vault-repo CLONE --power POWER.json --decision-ref TEXT
-        #      --expected-prev-sha256 HEX --run-at ISO [--execute]   (dry run unless --execute)
+        # stop --log-dir DIR --vault-repo CLONE --e0-scorecard SCORECARD.json --decision-ref TEXT
+        #      --expected-prev-sha256 HEX --run-at 2026-10-01T03:00:00+00:00
+        #      [--execute --expected-stop-head HEX]   (dry run unless --execute; the head is the dry run's)
         from datetime import datetime, timezone
         log_dir = Path(_option(args, "--log-dir"))
         v7.check_prereg()
@@ -103,12 +104,14 @@ def main(argv: list[str] | None = None) -> None:
         run_at = datetime.fromisoformat(_option(args, "--run-at"))
         if run_at.utcoffset() is None or run_at > datetime.now(timezone.utc):
             raise SystemExit("--run-at must be an explicit UTC instant that is not in the future")
-        out = v7.append_stop_status(
-            log_dir, run_at, power_path=Path(_option(args, "--power")),
-            decision_ref=_option(args, "--decision-ref"),
-            expected_prev_sha256=_option(args, "--expected-prev-sha256"),
-            witness=witness, dry_run="--execute" not in args)
+        stop_kwargs = {"e0_scorecard": Path(_option(args, "--e0-scorecard")),
+                       "decision_ref": _option(args, "--decision-ref"),
+                       "expected_prev_sha256": _option(args, "--expected-prev-sha256"), "witness": witness}
+        out = v7.append_stop_status(log_dir, run_at, dry_run=True, **stop_kwargs)
         if "--execute" in args:
+            if out["would_be_head_sha256"] != _option(args, "--expected-stop-head"):
+                raise SystemExit("--expected-stop-head differs from this STOP's dry-run head: nothing appended")
+            out = v7.append_stop_status(log_dir, run_at, **stop_kwargs)
             out = {"appended": out, "head_sha256": v7.v1._record_sha256(out),
                    "chain": v7.registry(log_dir).verify_chain(),
                    "next": f"publish the anchor to {v7.WITNESS_PATH}, then run verify-stop"}
