@@ -1,0 +1,18 @@
+# /etc/systemd/system/grid-options-puller.service.d/50-grid652-immutable-pin.conf
+# GEM daily capture, immutable pin @PIN_SHA@ (rendered by
+# scripts/render_gem_daily_units.py; do not hand-edit the SHA).
+# The pinned checkout is a clean Git clone at
+# /data/grid_v4/grid-options-puller-pins/@PIN_SHA@ ; the runner refuses a
+# dirty or mismatched checkout (activation identity gate).
+[Service]
+WorkingDirectory=/data/grid_v4/grid-options-puller-pins/@PIN_SHA@
+Environment=GEM_DAILY_PIN_SHA=@PIN_SHA@
+ExecStart=
+ExecStart=/data/grid_v4/venv/bin/python3 /data/grid_v4/grid-options-puller-pins/@PIN_SHA@/scripts/gem_daily_capture.py
+# CONTAIN: always record the terminal result against the same-day claim.
+ExecStopPost=-/data/grid_v4/venv/bin/python3 /data/grid_v4/grid-options-puller-pins/@PIN_SHA@/scripts/gem_daily_contain.py
+TimeoutStartSec=15min
+TimeoutStopSec=40s
+KillMode=control-group
+SendSIGKILL=yes
+NoNewPrivileges=yes
