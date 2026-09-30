@@ -211,6 +211,30 @@ def test_incremental_run_fetches_only_new_report() -> None:
         assert "pull_timestamp" not in r  # column default = fetch time
 
 
+def test_no_new_report_is_failed_without_writes() -> None:
+    engine = _engine(latest=date(2026, 9, 29))
+    session = _Session({AF_LIST_URL: _Resp(LIST_HTML)})
+    result = ROCAFPLAActivityPuller(engine, session=session).pull()
+    assert result["status"] == "FAILED"
+    assert result["rows_inserted"] == 0
+    assert "no new" in result["error"]
+    assert session.calls == [AF_LIST_URL]
+    assert _inserts(engine) == []
+    engine.begin.assert_not_called()
+
+
+def test_new_report_with_no_inserted_rows_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = _engine(latest=date(2026, 9, 28))
+    session = _Session({AF_LIST_URL: _Resp(LIST_HTML), URL_0929: _Resp(REPORT_HTML)})
+    puller = ROCAFPLAActivityPuller(engine, session=session)
+    monkeypatch.setattr(puller, "_get_existing_dates", lambda *args, **kwargs: {date(2026, 9, 29)})
+    result = puller.pull()
+    assert result["status"] == "FAILED"
+    assert result["rows_inserted"] == 0
+    assert result["reports"] == 1
+    assert _inserts(engine) == []
+
+
 def test_list_blocked_is_failed_and_writes_nothing() -> None:
     engine = _engine(latest=None)
     result = ROCAFPLAActivityPuller(engine, session=_Session({AF_LIST_URL: _Resp("x", 403)})).pull()
