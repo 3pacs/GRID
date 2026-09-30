@@ -177,6 +177,43 @@ def test_state_vector_on_postgres_ignores_future_macro_rows_and_checks(pg_scratc
     assert vector() == before
 
 
+def _insert_filed_pg(engine, rows: list[dict], filed: list[date]) -> None:
+    """INSIDER rows with a JSONB ``raw_payload.filing_date``, as the Form 4 puller writes them."""
+    with engine.begin() as c:
+        c.execute(
+            text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                 "pull_status) VALUES (:sid, :src, :d, :ts, :v, CAST(:payload AS JSONB), :st)"),
+            [{**r, "payload": json.dumps({"filing_date": f.isoformat()})} for r, f in zip(_tz_rows(rows), filed)],
+        )
+
+
+def test_state_vector_on_postgres_ignores_late_spy_closes_and_form4s(pg_scratch):
+    """E1-V1/V2 on the real types: JSONB ``filing_date``, TIMESTAMPTZ pulls."""
+    from intelligence.regime.state_vector import DIM_NAMES, compute_state_vector
+
+    engine = pg_scratch
+    as_of = AS_OF_LIVE
+    W.insert(engine, _tz_rows(W.macro_rows() + W.live_rows()))
+    # Backfilled Form 4s: pulled long after as_of, filed the day after each trade.
+    ins = W.insider_rows(as_of - timedelta(days=60), as_of - timedelta(days=3), ts_of=lambda d: W.LATE_TS)
+    _insert_filed_pg(engine, ins, [r["d"] + timedelta(days=1) for r in ins])
+
+    def vector():
+        sv = compute_state_vector(engine, as_of)
+        return json.dumps([list(sv.values), list(sv.stale_dimensions), sv.completeness, sv.price_basis])
+
+    before = vector()
+    got = json.loads(before)
+    assert got[0][DIM_NAMES.index("insider_sentiment")] is not None  # visible through the JSONB filing date
+    assert got[0][DIM_NAMES.index("spy_rsi")] is not None and got[3] == "YF:SPY:close"
+    spy = W.spy_path(W.HIST_START, W.LIVE_END)
+    days = list(W.bdays(as_of - timedelta(days=12), as_of))
+    W.insert(engine, _tz_rows([W.row("YF:SPY:close", d, spy[d] * 1.25, W.LATE_TS, W.YF_SRC) for d in days]))
+    late = [W.row(f"INSIDER:LATE:n{i}:SELL", d, 9e7, W.LATE_TS, W.SEC_SRC) for i, d in enumerate(days)]
+    _insert_filed_pg(engine, late, [as_of + timedelta(days=i % 3) for i in range(len(late))])
+    assert vector() == before
+
+
 # ── provenance fixture: the shared raw_series writer on the real DDL ──
 
 

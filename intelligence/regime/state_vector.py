@@ -25,8 +25,20 @@ Availability contract (``as_of`` = end of that UTC day)
   anchored at ``as_of`` instead of the run date. No process-level cache: a
   vector no longer uses run-date normalization. Later insertion of previously
   absent historical observations can still change modeled historical vectors.
-* **SPY** momentum/RSI keep their existing basis handling (``spy_full`` via
-  ``store.pit`` where PIT-visible, else raw ``YF:SPY:close``).
+* **SPY** momentum/RSI keep their basis order (``spy_full`` via ``store.pit``
+  where PIT-visible, i.e. ``release_date <= as_of``, else raw
+  ``YF:SPY:close``). The raw fallback is read with the same
+  ``read_window_known_at`` rule as the macro inputs (E1-V1): a close is
+  visible if it was pulled by ``as_of`` (latest such vintage) or, for
+  backfilled history, by :data:`SPY_CLOSE_LAG` — the close of session ``d``
+  is public once ``d``'s session ends, i.e. by the end of UTC day ``d``
+  (earliest pulled vintage). A re-pull or restatement after ``as_of`` never
+  changes a past vector.
+* **Insider sentiment** counts a Form 4 row only if it was known by the end
+  of ``as_of`` (E1-V2): pulled by then, or filed by then under VS1's
+  convention (``analysis.panel_insider_density.filing_known_at``: filing date
+  22:00 America/New_York). ``INSIDER:*`` rows are dated by *transaction*
+  date, so ``obs_date <= as_of`` alone admits filings made after ``as_of``.
 
 State vectors are cached in the `regime_state_vectors` table.
 """
@@ -34,9 +46,11 @@ State vectors are cached in the `regime_state_vectors` table.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -47,7 +61,6 @@ from sqlalchemy.engine import Engine
 from store.observations import (
     MixedSourceError,
     PublicationLag,
-    read_window,
     read_window_known_at,
 )
 
@@ -180,6 +193,18 @@ PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
     'COMPUTED:fed_net_liquidity': None,
     'COMPUTED:fed_net_liquidity_change_1m': None,
 }
+
+# Raw ``YF:SPY:close`` fallback (E1-V1). A daily close is public when its
+# session ends (16:00 America/New_York = 20:00/21:00 UTC), so the close dated
+# ``d`` is known by the end of UTC day ``d``: lag 0 business days. Used only
+# where GRID has no pull by ``as_of`` (every close before 2026-04-09 on griddb
+# was backfilled then); the value is the earliest pulled vintage, as for the
+# macro inputs above.
+SPY_CLOSE_LAG = PublicationLag(
+    0, "business",
+    "US equity close: public at the end of its own session (16:00 ET), i.e. by "
+    "the end of that UTC day; earliest pulled vintage for backfilled history",
+)
 
 # Rolling window for the z-score mean/std, ending at as_of (see module doc).
 NORM_LOOKBACK_DAYS = 10000
@@ -355,13 +380,18 @@ def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> 
     """SPY close series for momentum/RSI computation, PIT-correct.
 
     Prefers the resolved ``spy_full`` feature (the post re-resolve price
-    basis, with retractions honoured) so momentum/RSI agree with the rest
-    of the platform. Falls back to the raw ``YF:SPY:close`` observation
-    series (SUCCESS-only, vintage-collapsed, ``source="yfinance"`` per
-    ``store.observations``'s mixed-source rule) when the resolved feature
-    isn't available yet. Returns ``(empty series, None)`` — an honest
-    "unavailable", not a crash or a silent stale read — when neither path
-    has data.
+    basis, with retractions honoured, ``release_date <= as_of``) so
+    momentum/RSI agree with the rest of the platform. Falls back to the raw
+    ``YF:SPY:close`` observation series when the resolved feature isn't
+    available at ``as_of``: SUCCESS-only, ``source="yfinance"`` per
+    ``store.observations``'s mixed-source rule, and point-in-time through
+    ``read_window_known_at`` with :data:`SPY_CLOSE_LAG` — a close pulled by
+    ``as_of`` (latest such vintage), or a backfilled close whose session
+    ended by ``as_of`` (earliest pulled vintage). A vintage pulled after
+    ``as_of`` (a re-pull, a basis change, a repaired contamination) never
+    replaces what a past read saw (E1-V1). Returns ``(empty series, None)``
+    — an honest "unavailable", not a crash or a silent stale read — when
+    neither path has data.
 
     Returns ``(prices, price_basis)`` where ``price_basis`` is
     ``"spy_full"``, ``"YF:SPY:close"``, or ``None``.
@@ -374,7 +404,9 @@ def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> 
 
     try:
         with engine.connect() as conn:
-            obs = read_window(conn, "YF:SPY:close", source="yfinance", start=cutoff, as_of=as_of)
+            obs = read_window_known_at(
+                conn, "YF:SPY:close", as_of=as_of, lag=SPY_CLOSE_LAG, source="yfinance", start=cutoff,
+            )
     except Exception as exc:
         log.debug("state_vector: raw SPY:close fallback failed: {e}", e=str(exc))
         return pd.Series(dtype=float), None
@@ -469,72 +501,169 @@ def _get_crossref_score(engine: Engine, as_of: date) -> float | None:
     return float(row[0]) if row[0] is not None else None
 
 
-# One batched, vintage-collapsed read of every INSIDER:* series in the
-# window, replacing a per-series_id loop over store.observations.read_window
-# (PR #713 review: ~1,548 distinct INSIDER:* series active in a 30-day
-# window meant ~1,500 round trips per uncached GET). Semantics preserved
-# exactly: pull_status='SUCCESS' only, bounded by [cutoff, as_of], one row
-# per (series_id, obs_date) — the latest pull_timestamp wins via
-# ROW_NUMBER() (portable to SQLite and Postgres, unlike DISTINCT ON) — and
-# a series_id whose accepted rows span more than one source_id is excluded
-# entirely (the same fail-closed rule store.observations.MixedSourceError
-# enforces one series at a time), not silently mixed into the sum.
-_INSIDER_SENTIMENT_SQL = text(
-    "WITH candidates AS ("
-    "  SELECT series_id, obs_date, value, pull_timestamp, source_id"
+# ── Insider sentiment (Form 4), point-in-time ────────────────────────────
+#
+# ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` rows are dated by the
+# *transaction* date (ingestion/altdata/insider_filings.py); the filing date
+# rides in ``raw_payload.filing_date``. A Form 4 is due two business days
+# after the trade and late filers take weeks or years, so ``obs_date <=
+# as_of`` alone counts filings nobody could see at ``as_of`` (E1-V2; on
+# griddb every pre-2026 INSIDER row was filed and pulled in 2026).
+#
+# A row is known by the end of ``as_of`` (UTC) if it was pulled by then, or
+# if it was filed by then under VS1's convention
+# (``analysis.panel_insider_density.filing_known_at``: filing date 22:00
+# America/New_York, the Reg S-T 13(a)(4) dissemination cutoff). The
+# convention is restated here rather than imported so the API path does not
+# import the research harness; ``tests/test_regime_insider_known_at.py``
+# pins the two to each other.
+_FORM4_KNOWN_AT_LOCAL = time(22, 0)
+_NEW_YORK = ZoneInfo("America/New_York")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_SEC_DATE = re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4}$")
+
+# One round trip per call (PR #713 review: ~1,548 distinct INSIDER:* series
+# are active in a 30-day window; the per-series loop this replaced made one
+# query each). SUCCESS-only and bounded to [cutoff, as_of] by transaction
+# date; availability, vintage choice and the mixed-source rule are applied
+# in Python by ``_insider_known_rows`` so they stay portable and testable.
+# The filing date is read from the JSON payload with each dialect's own
+# accessor (``raw_payload`` is JSONB on Postgres, JSON text on SQLite).
+_INSIDER_ROWS_SQL_PG = text(
+    "SELECT series_id, obs_date, value, pull_timestamp, source_id,"
+    "       raw_payload->>'filing_date' AS filing_date"
     "  FROM raw_series"
-    "  WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
-    "    AND obs_date >= :cutoff AND obs_date <= :as_of"
-    "),"
-    "mixed_source AS ("
-    "  SELECT series_id FROM candidates"
-    "  GROUP BY series_id HAVING COUNT(DISTINCT source_id) > 1"
-    "),"
-    "ranked AS ("
-    "  SELECT series_id, value,"
-    "         ROW_NUMBER() OVER ("
-    "             PARTITION BY series_id, obs_date ORDER BY pull_timestamp DESC"
-    "         ) AS rn"
-    "  FROM candidates"
-    "  WHERE series_id NOT IN (SELECT series_id FROM mixed_source)"
-    ")"
-    "SELECT"
-    "  SUM(CASE WHEN series_id LIKE :buy_pat THEN value ELSE 0 END),"
-    "  SUM(CASE WHEN series_id LIKE :sell_pat THEN value ELSE 0 END)"
-    "FROM ranked WHERE rn = 1"
+    " WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
+    "   AND obs_date >= :cutoff AND obs_date <= :as_of"
 )
+_INSIDER_ROWS_SQL_SQLITE = text(
+    "SELECT series_id, obs_date, value, pull_timestamp, source_id,"
+    "       json_extract(raw_payload, '$.filing_date') AS filing_date"
+    "  FROM raw_series"
+    " WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
+    "   AND obs_date >= :cutoff AND obs_date <= :as_of"
+)
+
+
+def _form4_known_at(filing_date: Any) -> datetime | None:
+    """UTC instant a Form 4 filed on ``filing_date`` is public (VS1 convention).
+
+    Accepts a ``date``/``datetime`` or the ISO (``YYYY-MM-DD[...]``) and SEC
+    data-set (``DD-MON-YYYY``) strings VS1's ``parse_dates`` accepts.
+    ``None`` when there is no usable filing date: such a row is visible only
+    through its pull.
+    """
+    if filing_date is None:
+        return None
+    if isinstance(filing_date, datetime):
+        d = filing_date.date()
+    elif isinstance(filing_date, date):
+        d = filing_date
+    else:
+        s = str(filing_date).strip()
+        try:
+            if _ISO_DATE.match(s):
+                d = date.fromisoformat(s[:10])
+            elif _SEC_DATE.match(s):
+                d = datetime.strptime(s.upper(), "%d-%b-%Y").date()
+            else:
+                return None
+        except ValueError:
+            return None
+    local = datetime.combine(d, _FORM4_KNOWN_AT_LOCAL, tzinfo=_NEW_YORK)
+    return local.astimezone(timezone.utc)
+
+
+def _pulled_at_utc(pull_ts: Any) -> datetime | None:
+    """``pull_timestamp`` as an aware UTC datetime (naive = UTC, as griddb runs Etc/UTC)."""
+    if pull_ts is None:
+        return None
+    if not isinstance(pull_ts, datetime):
+        try:
+            pull_ts = datetime.fromisoformat(str(pull_ts))
+        except ValueError:
+            return None
+    if pull_ts.tzinfo is None:
+        return pull_ts.replace(tzinfo=timezone.utc)
+    return pull_ts.astimezone(timezone.utc)
+
+
+def _insider_known_rows(rows: list[tuple], as_of: date) -> list[tuple[str, float]]:
+    """``(series_id, value)`` per ``(series_id, obs_date)`` known by the end of ``as_of``.
+
+    ``rows`` are ``(series_id, obs_date, value, pull_timestamp, source_id,
+    filing_date)``. A vintage is visible if it was pulled, or filed
+    (:func:`_form4_known_at`), before 00:00 UTC of ``as_of + 1``. Per
+    ``(series_id, obs_date)``: the latest vintage pulled by then; otherwise
+    the earliest-pulled vintage visible through its filing date (the same
+    pulled-else-earliest rule as ``store.observations.read_window_known_at``).
+    A series_id whose visible vintages span more than one source is dropped
+    entirely (fail closed, as ``MixedSourceError``); a source first pulled
+    after ``as_of`` without a visible filing cannot drop a series from a past
+    read.
+    """
+    end = datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc)
+    never = datetime.max.replace(tzinfo=timezone.utc)
+    # (series_id, obs_date) -> [(pulled_by_end, pulled_at, value, source_id)]
+    groups: dict[tuple[str, str], list[tuple[bool, datetime, float, Any]]] = {}
+    sources: dict[str, set] = {}
+    filed: dict[Any, datetime | None] = {}  # a few hundred distinct filing dates per window
+    for series_id, obs_date, value, pull_ts, source_id, filing_date in rows:
+        if value is None:
+            continue
+        pulled_at = _pulled_at_utc(pull_ts)
+        pulled = pulled_at is not None and pulled_at < end
+        if filing_date not in filed:
+            filed[filing_date] = _form4_known_at(filing_date)
+        filed_at = filed[filing_date]
+        if not pulled and not (filed_at is not None and filed_at < end):
+            continue  # not public at as_of
+        key = (str(series_id), str(obs_date)[:10])
+        groups.setdefault(key, []).append((pulled, pulled_at or never, float(value), source_id))
+        sources.setdefault(key[0], set()).add(source_id)
+
+    out: list[tuple[str, float]] = []
+    for (series_id, _obs), vintages in sorted(groups.items()):
+        if len(sources[series_id]) > 1:
+            continue
+        proven = [v for v in vintages if v[0]]
+        if proven:
+            chosen = max(proven, key=lambda v: (v[1], v[2]))  # latest pulled by as_of
+        else:
+            chosen = min(vintages, key=lambda v: (v[1], v[2]))  # earliest vintage filed by as_of
+        out.append((series_id, chosen[2]))
+    return out
 
 
 def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
     """Net insider sentiment from SEC Form 4 filings (30d window), PIT.
 
-    A single query (``_INSIDER_SENTIMENT_SQL``) reads every
-    ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` series in the window at
-    once: SUCCESS-only, one row per ``(series_id, obs_date)`` (latest
-    ``pull_timestamp`` wins), a mixed-source series_id excluded rather than
-    mixed in, then summed by the ``:BUY``/``:SELL`` suffix. This is the
-    batched equivalent of calling ``store.observations.read_window`` once
-    per series_id and summing the results — same filters, same vintage
-    rule, one round trip instead of one per series.
+    One query reads every ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}``
+    row with a transaction date in ``[as_of - 30d, as_of]`` (SUCCESS-only);
+    :func:`_insider_known_rows` keeps only filings known by the end of
+    ``as_of`` (pulled or filed by then, see the section comment), collapses
+    vintages and drops mixed-source series; the result is summed by the
+    ``:BUY``/``:SELL`` suffix. A filing made or pulled after ``as_of`` never
+    changes a past value (E1-V2).
     """
     cutoff = as_of - timedelta(days=30)
     try:
         with engine.connect() as conn:
-            row = conn.execute(
-                _INSIDER_SENTIMENT_SQL,
-                {
-                    "insider_pat": "INSIDER:%", "buy_pat": "%:BUY", "sell_pat": "%:SELL",
-                    "cutoff": cutoff, "as_of": as_of,
-                },
-            ).fetchone()
+            sql = _INSIDER_ROWS_SQL_PG if conn.dialect.name == "postgresql" else _INSIDER_ROWS_SQL_SQLITE
+            rows = conn.execute(
+                sql, {"insider_pat": "INSIDER:%", "cutoff": cutoff, "as_of": as_of},
+            ).fetchall()
     except Exception as exc:
         log.debug("insider sentiment: batched read failed: {e}", e=str(exc))
         return None
 
-    if row is None:
-        return None
-    buy_vol = float(row[0] or 0)
-    sell_vol = float(row[1] or 0)
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for series_id, value in _insider_known_rows([tuple(r) for r in rows], as_of):
+        if series_id.endswith(":BUY"):
+            buy_vol += value
+        elif series_id.endswith(":SELL"):
+            sell_vol += value
     total = buy_vol + sell_vol
     if total == 0:
         return None

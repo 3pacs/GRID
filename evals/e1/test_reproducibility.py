@@ -7,7 +7,9 @@
 * The S09 real-panel scan (``scripts/run_real_panel_scan.scan``) run twice on
   a frozen SQLite ``raw_series`` fixture, every artifact compared byte for
   byte. The second run is timed on a "slower host" (a different wall clock):
-  identical inputs and code must still give identical bytes.
+  identical inputs and code must still give identical bytes. The one file
+  exempt is the scan's declared ops log ``TIMING_FILE`` (wall-clock seconds
+  only, asserted below), which sits outside the artifacts (E1-V5, fixed).
 """
 
 from __future__ import annotations
@@ -23,7 +25,6 @@ import pandas as pd
 import pytest
 
 from evals.e1 import vs1_world, world as W
-from evals.e1.known_violations import known_violation
 
 
 def _tree_digest(root: Path) -> dict[str, str]:
@@ -114,14 +115,29 @@ def _scan(out: Path, *, seconds_per_tick: float) -> None:
             scan_script.scan(conn, out, args)
 
 
+def _timing_file() -> str:
+    from scripts import run_real_panel_scan as scan_script
+
+    return scan_script.TIMING_FILE
+
+
 @pytest.fixture(scope="module")
-def scans(tmp_path_factory) -> dict[str, dict[str, str]]:
+def scan_root(tmp_path_factory) -> Path:
     """Three runs, same inputs and code: two on one host, one on a slower host."""
     root = tmp_path_factory.mktemp("e1-scan")
-    runs = {"a": 0.0, "b": 0.0, "slow": 7.3}
-    for name, tick in runs.items():
+    for name, tick in {"a": 0.0, "b": 0.0, "slow": 7.3}.items():
         _scan(root / name, seconds_per_tick=tick)
-    return {name: _tree_digest(root / name) for name in runs}
+    return root
+
+
+@pytest.fixture(scope="module")
+def scans(scan_root) -> dict[str, dict[str, str]]:
+    """Digest of every deterministic artifact per run (the ops timing log excluded)."""
+    timing = _timing_file()
+    return {
+        name: {k: v for k, v in _tree_digest(scan_root / name).items() if k != timing}
+        for name in ("a", "b", "slow")
+    }
 
 
 def test_real_panel_scan_artifacts_are_byte_identical_across_runs(scans):
@@ -135,6 +151,20 @@ def test_real_panel_scan_ledger_does_not_depend_on_host_speed(scans):
     assert {k: scans["a"][k] for k in ledgers} == {k: scans["slow"][k] for k in ledgers}
 
 
-@known_violation("E1-V5")
 def test_real_panel_scan_report_does_not_depend_on_host_speed(scans):
     assert scans["a"]["summary.json"] == scans["slow"]["summary.json"]
+    assert scans["a"] == scans["slow"]
+
+
+def test_real_panel_scan_timing_log_holds_only_wall_clock_seconds(scan_root):
+    """The exempt file is the ops timing log and nothing else: it cannot carry results."""
+    import json
+
+    timing = _timing_file()
+    fast = json.loads((scan_root / "a" / timing).read_text(encoding="utf-8"))
+    slow = json.loads((scan_root / "slow" / timing).read_text(encoding="utf-8"))
+    assert set(fast) == set(slow) == {"read_seconds", "total_seconds"}
+    assert all(isinstance(v, (int, float)) for v in (*fast.values(), *slow.values()))
+    assert slow["total_seconds"] > fast["total_seconds"]  # it really is the host clock
+    summary = (scan_root / "slow" / "summary.json").read_text(encoding="utf-8")
+    assert "read_seconds" not in summary and "total_seconds" not in summary

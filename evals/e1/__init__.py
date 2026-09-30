@@ -45,4 +45,4 @@ CI: ``.github/workflows/test.yml`` step "E1 integrity gates" runs
 ``E1_REQUIRE_PG=1``; a skipped PostgreSQL gate fails the step.
 """
 
-SUITE_VERSION = "e1-v1"
+SUITE_VERSION = "e1-v1.1"  # v1.1: E1-V1, V2, V5 fixed; their xfails removed
