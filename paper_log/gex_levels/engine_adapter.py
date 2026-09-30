@@ -111,7 +111,9 @@ class LevelsEngine(Protocol):
     """What :class:`DealerGammaAdapter` needs from an engine — satisfied by
     ``physics.dealer_gamma.DealerGammaEngine`` and by any test double."""
 
-    def compute_gex_profile(self, ticker: str, snap_date: date | None = None) -> dict[str, Any]: ...
+    def compute_gex_profile(self, ticker: str, snap_date: date | None = None,
+                            *, capture_batch_id: str | None = None,
+                            capture_ordinal: int | None = None) -> dict[str, Any]: ...
 
 
 # Default label for a *successful* result: the engine's success-path dict
@@ -144,8 +146,16 @@ class DealerGammaAdapter:
         else:
             raise ValueError("must pass engine= or db_engine=")
 
-    def get_levels(self, ticker: str, snap_date: date) -> LevelsResult:
-        raw = self._engine.compute_gex_profile(ticker, snap_date)
+    def get_levels(self, ticker: str, snap_date: date, *,
+                   capture_batch_id: str | None = None,
+                   capture_ordinal: int | None = None) -> LevelsResult:
+        if capture_batch_id is None and capture_ordinal is None:
+            raw = self._engine.compute_gex_profile(ticker, snap_date)
+        else:
+            raw = self._engine.compute_gex_profile(
+                ticker, snap_date, capture_batch_id=capture_batch_id,
+                capture_ordinal=capture_ordinal,
+            )
         return self._translate(raw)
 
     @staticmethod

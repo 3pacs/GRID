@@ -65,8 +65,10 @@ class _FakeAdapter:
         self.result = result
         self.calls: list[tuple[str, date]] = []
 
-    def get_levels(self, ticker: str, snap_date: date) -> LevelsResult:
-        self.calls.append((ticker, snap_date))
+    def get_levels(self, ticker: str, snap_date: date, *,
+                   capture_batch_id: str | None = None,
+                   capture_ordinal: int | None = None) -> LevelsResult:
+        self.calls.append((ticker, snap_date, capture_batch_id, capture_ordinal))
         return self.result
 
 
@@ -81,9 +83,9 @@ def _fake_fetch_previous_close(spy_price: float | None = 500.0, vix_price: float
 
 
 def _fake_compute_tested_walls(walls: WallSelection = DEFAULT_TESTED_WALLS, *, calls: list | None = None):
-    def _fn(db_engine, ticker, snap_date, spot, p0):
+    def _fn(db_engine, ticker, snap_date, spot, p0, **kwargs):
         if calls is not None:
-            calls.append((ticker, snap_date, spot, p0))
+            calls.append((ticker, snap_date, spot, p0, kwargs))
         return walls
     return _fn
 
@@ -97,6 +99,7 @@ def _patch_success_path(
         lambda engine, ticker, run_at: ChainSelection(
             snap_date=chain_snap_date,
             created_at=datetime.combine(chain_snap_date, datetime.min.time(), tzinfo=timezone.utc),
+            capture_batch_id="gem-batch", capture_ordinal=1,
         ),
     )
     monkeypatch.setattr(preopen_mod, "fetch_previous_close", _fake_fetch_previous_close(spy_price, vix_price))
@@ -300,6 +303,8 @@ def test_successful_preopen_builds_real_levels_and_placebos(tmp_path: Path, monk
     assert record["session_date"] == "2026-09-24"
     assert record["code_sha"] == "deadbeef"
     assert record["chain"]["snap_date"] == "2026-09-23"
+    assert record["chain"]["capture_batch_id"] == "gem-batch"
+    assert record["chain"]["capture_ordinal"] == 1
 
     # Engine's own (untested) walls, recorded separately.
     assert record["engine"]["engine_put_wall"] == 489.0
@@ -341,11 +346,12 @@ def test_tested_walls_receives_engine_spot_and_p0(tmp_path: Path, monkeypatch: p
     _run(log_dir=tmp_path, compute_tested_walls=_fake_compute_tested_walls(DEFAULT_TESTED_WALLS, calls=calls))
 
     assert len(calls) == 1
-    ticker, snap_date, spot, p0 = calls[0]
+    ticker, snap_date, spot, p0, capture = calls[0]
     assert ticker == "SPY"
     assert snap_date == date(2026, 9, 23)
     assert spot == 500.5  # levels.spot (the engine's own spot)
     assert p0 == 500.0    # P0, not spot
+    assert capture == {"capture_batch_id": "gem-batch", "capture_ordinal": 1}
 
 
 def test_missing_tested_wall_is_recorded_not_excluded(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -369,7 +375,7 @@ def test_successful_preopen_uses_the_selected_snap_date_against_the_adapter(
     _patch_success_path(monkeypatch, chain_snap_date=date(2026, 9, 23))
     adapter = _FakeAdapter(FULL_LEVELS)
     _run(log_dir=tmp_path, adapter=adapter, ticker="SPY")
-    assert adapter.calls == [("SPY", date(2026, 9, 23))]
+    assert adapter.calls == [("SPY", date(2026, 9, 23), "gem-batch", 1)]
 
 
 def test_two_preopen_runs_chain_correctly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

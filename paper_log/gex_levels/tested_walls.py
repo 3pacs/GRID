@@ -73,7 +73,10 @@ _CHAIN_QUERY = text(
         SELECT capture_batch_id FROM options_snapshots
         WHERE ticker = :ticker AND snap_date = :snap_date
           AND capture_batch_id IS NOT NULL
+          AND (:capture_batch_id IS NULL OR capture_batch_id = :capture_batch_id)
+          AND (:capture_ordinal IS NULL OR capture_ordinal = :capture_ordinal)
         ORDER BY capture_ordinal DESC LIMIT 1)
+    AND (:capture_ordinal IS NULL OR capture_ordinal = :capture_ordinal)
     AND open_interest > 0 AND implied_vol > 0
     AND expiry > :snap_date
     """
@@ -86,9 +89,15 @@ class WallSelection:
     call_wall: float | None
 
 
-def _load_full_chain_rows(db_engine: Engine, ticker: str, snap_date: date) -> list:
+def _load_full_chain_rows(db_engine: Engine, ticker: str, snap_date: date, *,
+                          capture_batch_id: str | None = None,
+                          capture_ordinal: int | None = None) -> list:
+    if (capture_batch_id is None) != (capture_ordinal is None):
+        return []
     with db_engine.connect() as conn:
-        return conn.execute(_CHAIN_QUERY, {"ticker": ticker, "snap_date": snap_date}).fetchall()
+        return conn.execute(_CHAIN_QUERY, {"ticker": ticker, "snap_date": snap_date,
+                                          "capture_batch_id": capture_batch_id,
+                                          "capture_ordinal": capture_ordinal}).fetchall()
 
 
 def aggregate_per_strike_gex(
@@ -176,11 +185,15 @@ def compute_tested_walls_from_db(
     *,
     min_distance_pct: float,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    capture_batch_id: str | None = None,
+    capture_ordinal: int | None = None,
 ) -> WallSelection:
     """End-to-end: load the full chain for `snap_date`, aggregate per-strike
     GEX at `spot` (the engine's own spot — so these numbers agree with what
     the engine's own per-strike output would show, uncapped), then select
     tested walls using `p0` per Amendment 1's rule."""
-    rows = _load_full_chain_rows(db_engine, ticker, snap_date)
+    rows = _load_full_chain_rows(db_engine, ticker, snap_date,
+                                 capture_batch_id=capture_batch_id,
+                                 capture_ordinal=capture_ordinal)
     per_strike = aggregate_per_strike_gex(rows, spot, snap_date, risk_free_rate=risk_free_rate)
     return select_tested_walls(per_strike, p0, min_distance_pct=min_distance_pct)

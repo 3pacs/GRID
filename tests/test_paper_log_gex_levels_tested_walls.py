@@ -228,6 +228,12 @@ def test_tested_walls_use_only_latest_same_day_capture(sqlite_engine) -> None:
     )
     assert walls.put_wall == 730.0
     assert walls.call_wall == 800.0
+    earlier = compute_tested_walls_from_db(
+        sqlite_engine, "SPY", snap_date, spot=764.9, p0=764.9,
+        min_distance_pct=MIN_DIST, capture_batch_id="test-batch", capture_ordinal=1,
+    )
+    assert earlier.put_wall == 740.0
+    assert earlier.call_wall == 790.0
 
 
 def test_compute_tested_walls_from_db_filters_zero_oi_and_iv(sqlite_engine) -> None:

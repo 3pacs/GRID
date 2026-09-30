@@ -114,6 +114,18 @@ def test_chain_preserves_actual_capture_and_requested_date() -> None:
     assert chain.attrs["provider_regular_market_at_min"] == SOURCE_TIME
 
 
+def test_earlier_batch_can_be_replayed_after_later_capture() -> None:
+    later = "22222222-2222-4222-8222-222222222222"
+    db = _DB([_option_row(batch=BATCH, ordinal=1),
+              _option_row(batch=later, ordinal=2)])
+    engine = DealerGammaEngine(db)
+    assert engine._load_chain("SPY", AS_OF).attrs["batch_id"] == later
+    earlier = engine._load_chain("SPY", AS_OF, capture_batch_id=BATCH,
+                                 capture_ordinal=1)
+    assert earlier.attrs["batch_id"] == BATCH
+    assert earlier.attrs["capture_ordinal"] == 1
+
+
 def test_publication_created_at_after_provider_completion_is_valid() -> None:
     inserted = COMPLETE + timedelta(minutes=1)
     chain = DealerGammaEngine(_DB([_option_row(inserted)]))._load_chain("SPY", AS_OF)

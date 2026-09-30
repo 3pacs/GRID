@@ -89,7 +89,7 @@ def run_preopen(
     code_sha: str,
     now_fn: Callable[[], Any] = now_utc,
     adapter: DealerGammaAdapter | None = None,
-    compute_tested_walls: Callable[[Engine, str, date, float, float], WallSelection] | None = None,
+    compute_tested_walls: Callable[..., WallSelection] | None = None,
     ticker: str = TICKER,
 ) -> dict[str, Any]:
     """Run one pre-open cycle and append exactly one record. Returns it."""
@@ -141,7 +141,9 @@ def run_preopen(
     chain = select_chain_snapshot(db_engine, ticker, run_at)
     if chain is None:
         return _finish(excluded=True, reason=EXCL_NO_CHAIN)
-    fields["chain"] = {"snap_date": chain.snap_date, "created_at": chain.created_at}
+    fields["chain"] = {"snap_date": chain.snap_date, "created_at": chain.created_at,
+                       "capture_batch_id": chain.capture_batch_id,
+                       "capture_ordinal": chain.capture_ordinal}
 
     prior_trading_day = last_trading_day(session_date - timedelta(days=1))
     if chain.snap_date < prior_trading_day:
@@ -149,7 +151,9 @@ def run_preopen(
 
     if adapter is None:
         adapter = DealerGammaAdapter(db_engine=db_engine)
-    levels = adapter.get_levels(ticker, chain.snap_date)
+    levels = adapter.get_levels(ticker, chain.snap_date,
+                                capture_batch_id=chain.capture_batch_id,
+                                capture_ordinal=chain.capture_ordinal)
     fields["engine"] = levels_result_to_dict(levels)
 
     if not levels.available:
@@ -180,9 +184,15 @@ def run_preopen(
         tested = compute_tested_walls_from_db(
             db_engine, ticker, chain.snap_date, levels.spot, p0.price,
             min_distance_pct=TESTED_WALL_MIN_DISTANCE_PCT,
+            capture_batch_id=chain.capture_batch_id,
+            capture_ordinal=chain.capture_ordinal,
         )
     else:
-        tested = compute_tested_walls(db_engine, ticker, chain.snap_date, levels.spot, p0.price)
+        tested = compute_tested_walls(
+            db_engine, ticker, chain.snap_date, levels.spot, p0.price,
+            capture_batch_id=chain.capture_batch_id,
+            capture_ordinal=chain.capture_ordinal,
+        )
 
     tested_present: dict[str, float] = {}
     if levels.gamma_flip is not None:

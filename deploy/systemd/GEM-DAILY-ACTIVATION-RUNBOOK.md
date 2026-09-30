@@ -41,10 +41,11 @@ provider. There is no retry or backfill path.
    private staging directory. Never print environment values. `systemd-analyze
    verify` the rendered service/timer. Run a no-provider dry-run of the date,
    journal, lock, schema, code-SHA and GEX prerequisites.
-3. Verify exact one post-13:29 `market_open=True` scheduler daily-pull start
-   and one subsequent `Options daily pull complete` for the intended day. If
+3. Verify exact one post-09:29 New York `market_open=True` scheduler daily-pull start
+   and one subsequent `Options daily pull complete` with positive succeeded
+   tickers and snapshots for the intended day. If
    missing, duplicate, failed or late, skip that day. The timer itself fires
-   at 14:05 UTC on weekdays, with `Persistent=false`; NYSE holiday and NY
+   at 10:05 America/New_York on weekdays, with `Persistent=false`; NYSE holiday and NY
    market-hour checks run before any provider call.
 4. Only after all prerequisites, install service/timer and create the reviewed
    `ACTIVATED` marker under `/data/grid_v4/gem_daily`. Then enable/start the
@@ -56,7 +57,7 @@ provider. There is no retry or backfill path.
    exact `capture_batch_id` and `capture_ordinal`, row count, calls/puts,
    quote/session times. The service hard timeout is 15 minutes; systemd kills
    its control group and `ExecStopPost` records containment. An absolute
-   14:20 UTC alarm also interrupts a delayed start. Review the journal and attempt receipt after every
+   10:20 America/New_York alarm also interrupts a delayed start. Review the journal and attempt receipt after every
    session; a failed ticker is unavailable, never a zero SUCCESS. A service
    exit 0 with `GEM_SKIP` is a skipped capture, not a successful capture.
 6. After ten actual NYSE sessions, write an outcomes/reliability note to

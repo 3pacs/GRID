@@ -299,7 +299,11 @@ def test_tiingo_has_its_own_weekday_utc_slot(monkeypatch) -> None:
     assert len(daily_groups) == 5
     domestic = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls]
     assert len(domestic) == 28
-    assert {j.job_func.keywords["slot"] for j in domestic} == {"13:30", "16:00", "20:00", "22:00"}
+    assert {j.job_func.keywords["slot"] for j in domestic} == {
+        "09:30 America/New_York", "16:00", "20:00", "22:00"}
+    open_jobs = [j for j in domestic if j.job_func.keywords["slot"] == "09:30 America/New_York"]
+    assert len(open_jobs) == 7
+    assert all(j.at_time_zone.zone == "America/New_York" for j in open_jobs)
 
 
 def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) -> None:
@@ -307,7 +311,7 @@ def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) 
     jobs = _registered_jobs(monkeypatch)
     tiingo_job = next(j for j in jobs.jobs if j.job_func.func is sched.start_tiingo_prices_worker)
     options_job = next(j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls
-                       and j.job_func.keywords["slot"] == "13:30")
+                       and j.job_func.keywords["slot"] == "09:30 America/New_York")
     group_job = next(j for j in jobs.jobs if j.job_func.func is sched.run_pull_group
                      and j.job_func.args[0] == "daily")
     release = threading.Event()
@@ -336,7 +340,7 @@ def test_slow_tiingo_does_not_block_the_options_slot_or_other_jobs(monkeypatch) 
     assert started.wait(2)                       # and Tiingo really is running
     sched.run_daily_pulls(**options_job.job_func.keywords)
     sched.run_pull_group("daily", group_job.job_func.args[1])
-    assert ran == ["domestic@13:30", "group:daily"]
+    assert ran == ["domestic@09:30 America/New_York", "group:daily"]
     assert sched._tiingo_worker.is_alive()       # still mid-pull while they ran
     # A second slot while the first worker is alive starts nothing.
     assert sched.start_tiingo_prices_worker(tiingo_job.job_func.args[0]) is False
@@ -403,6 +407,13 @@ def test_run_tiingo_prices_records_outcome(out, log_status, bumped) -> None:
 
 
 def test_slot_lateness() -> None:
+    from datetime import timezone
+    assert sched._slot_lateness(
+        "09:30 America/New_York", datetime(2026, 10, 1, 13, 45, tzinfo=timezone.utc)
+    ) == timedelta(minutes=15)
+    assert sched._slot_lateness(
+        "09:30 America/New_York", datetime(2026, 11, 2, 14, 45, tzinfo=timezone.utc)
+    ) == timedelta(minutes=15)
     assert sched._slot_lateness("13:30", datetime(2026, 9, 29, 13, 45)) == timedelta(minutes=15)
     # A 22:00 slot released at 07:30 the next morning is 9.5h late.
     assert sched._slot_lateness("22:00", datetime(2026, 9, 30, 7, 30)) == timedelta(hours=9, minutes=30)

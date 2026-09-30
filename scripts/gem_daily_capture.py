@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -37,11 +38,15 @@ def _utc_now() -> datetime:
 
 
 def _hard_stop(_signum, _frame) -> None:
-    raise TimeoutError("GEM absolute 14:20 UTC containment")
+    raise TimeoutError("GEM absolute 10:20 New York containment")
+
+
+def _session_deadline(day: date) -> datetime:
+    return datetime.combine(day, time(10, 20), _NY).astimezone(timezone.utc)
 
 
 def _scheduler_gate(lines: list[str], day: date) -> bool:
-    """Require one post-13:29 market-open daily start and one later completion."""
+    """Require one NYSE-open daily start and a positive options completion."""
     start = []
     complete = []
     failed = []
@@ -58,22 +63,32 @@ def _scheduler_gate(lines: list[str], day: date) -> bool:
         if previous is not None and stamp < previous:
             return False
         previous = stamp
-        if stamp.date() != day or stamp.time() < time(13, 29):
+        local = stamp.astimezone(_NY)
+        if local.date() != day or local.time() < time(9, 29):
             continue
         if "Starting daily pulls" in message:
             start.append((stamp, "market_open=True" in message))
-        if "Options daily pull complete" in message:
-            complete.append(stamp)
+        match = re.fullmatch(
+            r"Options daily pull complete — (\d+)/(\d+) tickers, (\d+) snapshots",
+            message,
+        )
+        if match:
+            ok, total, snapshots = map(int, match.groups())
+            complete.append((stamp, 0 < ok <= total and snapshots > 0))
+        elif "Options daily pull complete" in message:
+            return False
         if "Options daily pull failed" in message or "Options pull skipped" in message:
             failed.append(stamp)
     return (len(start) == len(complete) == 1 and start[0][1]
-            and complete[0] > start[0][0] and not failed)
+            and complete[0][1] and complete[0][0] > start[0][0]
+            and complete[0][0] <= _session_deadline(day) and not failed)
 
 
 def _read_scheduler_journal(day: date, now: datetime) -> list[str]:
     result = subprocess.run(
         ["journalctl", "-u", "grid-scheduler.service", "--since",
-         f"{day.isoformat()} 13:29:00 UTC", "--until",
+         (datetime.combine(day, time(9, 29), _NY).astimezone(timezone.utc)
+          .strftime("%Y-%m-%d %H:%M:%S UTC")), "--until",
          now.strftime("%Y-%m-%d %H:%M:%S UTC"), "-o", "json", "--no-pager"],
         text=True, capture_output=True, timeout=15, check=True,
     )
@@ -112,7 +127,18 @@ def _activation_identity_ok() -> bool:
         )
     except (OSError, subprocess.SubprocessError):
         return False
-    return head == pin and ancestor.returncode == 0
+    return head == pin and ancestor.returncode == 0 and _checkout_clean(root)
+
+
+def _checkout_clean(root: Path) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(root), "status", "--porcelain=v1", "--untracked-files=all"],
+            capture_output=True, text=True, check=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return not result.stdout
 
 
 def _append_only_schema_ok(engine) -> bool:
@@ -175,7 +201,7 @@ def main() -> int:
         print("GEM_SKIP same-day attempt already recorded", flush=True)
         return 0
     if (day < _FIRST_DAY or day.weekday() >= 5 or not is_market_open(day)
-            or now.time() >= time(14, 20)
+            or now >= _session_deadline(day)
             or now.astimezone(_NY).date() != day
             or not time(9, 30) <= now.astimezone(_NY).time() <= time(16, 0)):
         print("GEM_SKIP date/session/time gate", flush=True)
@@ -193,10 +219,9 @@ def main() -> int:
 
     try:
         # The systemd 15-minute timeout is a second safety net. This one is
-        # absolute, so a delayed 14:05 timer start cannot run past 14:20.
+        # absolute, so a delayed 10:05 NY timer start cannot run past 10:20 NY.
         if sys.platform == "linux":
-            remaining = (datetime.combine(day, time(14, 20), timezone.utc)
-                         - _utc_now()).total_seconds()
+            remaining = (_session_deadline(day) - _utc_now()).total_seconds()
             if remaining <= 0:
                 print("GEM_SKIP absolute deadline", flush=True)
                 return 0
@@ -209,7 +234,7 @@ def main() -> int:
         results = OptionsPuller(db_engine=engine).pull_all(
             tickers=list(GEM_TICKERS), include_catalyst_universe=False,
             max_expirations=GEM_MAX_EXPIRATIONS,
-            should_continue=lambda: _utc_now().time() < time(14, 20),
+            should_continue=lambda: _utc_now() < _session_deadline(day),
         )
         if (len(results) == 1 and results[0].get("status") == "SKIPPED"
                 and results[0].get("reason") == "another options writer active"):

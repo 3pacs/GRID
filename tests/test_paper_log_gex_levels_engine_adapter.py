@@ -15,8 +15,9 @@ class _FakeEngine:
         self._result = result
         self.calls: list[tuple[str, date | None]] = []
 
-    def compute_gex_profile(self, ticker: str, snap_date: date | None = None) -> dict:
-        self.calls.append((ticker, snap_date))
+    def compute_gex_profile(self, ticker: str, snap_date: date | None = None,
+                            **kwargs) -> dict:
+        self.calls.append((ticker, snap_date, kwargs))
         return self._result
 
 
@@ -31,7 +32,15 @@ def test_get_levels_passes_ticker_and_snap_date_through() -> None:
     engine = _FakeEngine(FULL_RESULT)
     adapter = DealerGammaAdapter(engine=engine)
     adapter.get_levels("SPY", date(2026, 9, 24))
-    assert engine.calls == [("SPY", date(2026, 9, 24))]
+    assert engine.calls == [("SPY", date(2026, 9, 24), {})]
+
+
+def test_get_levels_forwards_exact_capture_batch() -> None:
+    engine = _FakeEngine(FULL_RESULT)
+    DealerGammaAdapter(engine=engine).get_levels(
+        "SPY", date(2026, 9, 24), capture_batch_id="gem", capture_ordinal=1)
+    assert engine.calls == [("SPY", date(2026, 9, 24),
+                             {"capture_batch_id": "gem", "capture_ordinal": 1})]
 
 
 def test_available_result_translates_all_fields() -> None:

@@ -413,6 +413,17 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     ``now`` defaults to the host-local naive clock -- the same clock
     ``schedule.every().<day>.at("HH:MM")`` (no tz argument) fires on.
     """
+    if slot_hhmm == "09:30 America/New_York":
+        from zoneinfo import ZoneInfo
+        eastern = ZoneInfo("America/New_York")
+        current = now or datetime.now(timezone.utc)
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=timezone.utc)
+        local = current.astimezone(eastern)
+        slot = local.replace(hour=9, minute=30, second=0, microsecond=0)
+        if slot > local:
+            slot -= timedelta(days=1)
+        return local - slot
     now = now or datetime.now()
     hh, mm = (int(x) for x in slot_hhmm.split(":"))
     slot = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
@@ -1970,13 +1981,15 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
-    # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
+    # The open slot follows New York civil time across EDT and EST.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
                 "saturday", "sunday"]:
-        for utc_time in ["13:30", "16:00", "20:00", "22:00"]:
+        getattr(schedule.every(), day).at("09:30", "America/New_York").do(
+            run_daily_pulls, start_date=ongoing_start, slot="09:30 America/New_York"
+        )
+        for utc_time in ["16:00", "20:00", "22:00"]:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )

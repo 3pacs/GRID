@@ -158,6 +158,9 @@ class DealerGammaEngine:
         snap_date: date | None = None,
         spot_range_pct: float = 0.15,
         n_points: int = 50,
+        *,
+        capture_batch_id: str | None = None,
+        capture_ordinal: int | None = None,
     ) -> dict[str, Any]:
         """Compute the full GEX profile for a ticker.
 
@@ -193,7 +196,11 @@ class DealerGammaEngine:
         if snap_date is None:
             snap_date = datetime.now(timezone.utc).date()
 
-        chain = self._load_chain(ticker, snap_date)
+        if capture_batch_id is None and capture_ordinal is None:
+            chain = self._load_chain(ticker, snap_date)
+        else:
+            chain = self._load_chain(ticker, snap_date, capture_batch_id=capture_batch_id,
+                                     capture_ordinal=capture_ordinal)
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
@@ -543,7 +550,9 @@ class DealerGammaEngine:
             for p, g in zip(prices, gex_values)
         ]
 
-    def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
+    def _load_chain(self, ticker: str, snap_date: date, *,
+                    capture_batch_id: str | None = None,
+                    capture_ordinal: int | None = None) -> pd.DataFrame:
         """Load only the requested day's chain; reject mixed or late captures.
 
         The latest ordinal's single complete batch is eligible. Earlier
@@ -551,6 +560,8 @@ class DealerGammaEngine:
         the selected chain.
         """
         if not is_market_open(snap_date):
+            return pd.DataFrame()
+        if (capture_batch_id is None) != (capture_ordinal is None):
             return pd.DataFrame()
         try:
             with self.engine.connect() as conn:
@@ -561,8 +572,12 @@ class DealerGammaEngine:
                        capture_started_at, capture_completed_at, provider_regular_market_at
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
+                  AND (:capture_batch_id IS NULL OR capture_batch_id = :capture_batch_id)
+                  AND (:capture_ordinal IS NULL OR capture_ordinal = :capture_ordinal)
                 ORDER BY expiry, strike, opt_type
-                """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
+                """), {"ticker": ticker, "snap_date": snap_date,
+                        "capture_batch_id": capture_batch_id,
+                        "capture_ordinal": capture_ordinal}).fetchall()
         except SQLAlchemyError:
             # Until the additive migration exists, no old batch earns a
             # guessed source market date.
@@ -574,8 +589,13 @@ class DealerGammaEngine:
         ordinals_present = [row[8] for row in rows if isinstance(row[8], int)]
         if not ordinals_present:
             return pd.DataFrame()
-        latest_ordinal = max(ordinals_present)
-        rows = [row for row in rows if row[8] == latest_ordinal]
+        selected_ordinal = capture_ordinal if capture_ordinal is not None else max(ordinals_present)
+        selected_ids = {row[7] for row in rows if row[8] == selected_ordinal}
+        if any(row[7] in selected_ids and row[8] != selected_ordinal for row in rows):
+            return pd.DataFrame()
+        rows = [row for row in rows if row[8] == selected_ordinal]
+        if not rows or (capture_batch_id is not None and any(row[7] != capture_batch_id for row in rows)):
+            return pd.DataFrame()
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}
