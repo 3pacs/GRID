@@ -81,3 +81,34 @@ def test_storage_curator_write_report_uses_output_dir(tmp_path: Path, monkeypatc
     assert result["markdown_path"]
     assert Path(result["markdown_path"]).exists()
     assert Path("outputs/storage_maintenance/storage_maintenance_latest.md").exists()
+
+
+def test_immutable_release_reports_use_data_root(tmp_path: Path, monkeypatch) -> None:
+    data_root = tmp_path / "data" / "grid_v4"
+    release_file = (
+        data_root / "grid_release.releases" / "abc123" / "scripts" / "storage_curator.py"
+    )
+    report_dir = data_root / "storage_maintenance"
+    monkeypatch.setattr(storage_curator, "RUNTIME_GRID_ROOT", data_root)
+    monkeypatch.setattr(storage_curator, "__file__", str(release_file))
+    monkeypatch.chdir(tmp_path)
+
+    assert storage_curator.storage_report_dir() == report_dir
+    assert storage_curator.storage_report_dir(
+        source_file=tmp_path / "dev" / "scripts" / "storage_curator.py",
+        data_root=data_root,
+    ) == Path("outputs/storage_maintenance")
+
+    active = tmp_path / "active"
+    active.mkdir()
+    report = storage_curator.build_storage_maintenance_report(
+        engine=None,
+        target_id="test-node",
+        active_roots=(active,),
+        cold_root=tmp_path / "mirror",
+    )
+    storage_curator.write_storage_maintenance_report(report)
+    assert (report_dir / "storage_maintenance_latest.json").exists()
+    assert (report_dir / "storage_maintenance_latest.md").exists()
+    assert Path(report.json_path).parent == report_dir
+    assert not (tmp_path / "outputs" / "storage_maintenance").exists()
