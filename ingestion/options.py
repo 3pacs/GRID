@@ -384,10 +384,14 @@ class OptionsPuller(BasePuller):
                     for t in tickers[idx:]
                 )
                 break
-            result = self._pull_ticker(
-                ticker, today_str, max_expirations=max_expirations, should_continue=should_continue,
-                capture_source=capture_source,
-            )
+            ticker_kwargs: dict[str, Any] = {
+                "max_expirations": max_expirations, "should_continue": should_continue,
+            }
+            if capture_source != DEFAULT_CAPTURE_SOURCE:
+                # Only non-default writers pass a label; the default call
+                # shape stays what existing wrappers and doubles expect.
+                ticker_kwargs["capture_source"] = capture_source
+            result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
             if result["status"] == "DEFERRED":
                 results.extend(
