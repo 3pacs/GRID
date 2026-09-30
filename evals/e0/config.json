@@ -1,0 +1,108 @@
+{
+  "version": "e0-v1",
+  "benchmark": "E0 machinery calibration: power, empirical FDR and null p-value calibration of the VS1 panel path",
+  "structure": {
+    "name": "vs1_v7_technology_structure",
+    "file": "data/vs1_v7_technology_structure.npz",
+    "trials": ["A90|fwd5", "A30|fwd5", "A90|fwd20", "A30|fwd20"],
+    "primary_trial": "A90|fwd5",
+    "propensity_trial": "A90|fwd5"
+  },
+  "selection": {
+    "ledger_q": 0.10,
+    "run_k": 1,
+    "bh_q": 0.10,
+    "direction": 1,
+    "raw_threshold_note": "v1 Stage-0 power counts raw two-sided p <= run_alpha / trials (the smallest Holm threshold)"
+  },
+  "machinery": {
+    "perms": 999,
+    "seed": "analysis.panel_insider_density.SEED",
+    "min_n": "analysis.panel_insider_density.MIN_N",
+    "min_entities": "analysis.panel_insider_density.MIN_ENTITIES"
+  },
+  "scenarios": {
+    "gaussian_idio": {
+      "note": "v1 Stage-0 equivalent: constant-variance Gaussian idiosyncratic noise, no factors",
+      "market": false,
+      "n_factors": 0,
+      "tail_df": null,
+      "garch": null,
+      "factor_ar1": 0.0,
+      "exposure": 0.0,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.0,
+      "label_missing_rate": 0.0
+    },
+    "factor_t_garch": {
+      "note": "market + 3 industry/style factors, GARCH(1,1) volatility clustering, Student-t(4) tails, dispersed idiosyncratic vol, loadings independent of the feature",
+      "market": true,
+      "market_vol": 0.010,
+      "beta_mean": 1.0,
+      "beta_sd": 0.3,
+      "n_factors": 3,
+      "factor_vol": 0.006,
+      "factor_ar1": 0.05,
+      "tail_df": 4,
+      "garch": {"alpha": 0.08, "beta": 0.90},
+      "exposure": 0.0,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    },
+    "factor_t_garch_exposed": {
+      "note": "factor_t_garch plus a style exposure: entity loading on factor 1 correlated 0.3 with the entity's insider-buy propensity (insider buying clusters in small/value/beaten-down names)",
+      "market": true,
+      "market_vol": 0.010,
+      "beta_mean": 1.0,
+      "beta_sd": 0.3,
+      "n_factors": 3,
+      "factor_vol": 0.006,
+      "factor_ar1": 0.05,
+      "tail_df": 4,
+      "garch": {"alpha": 0.08, "beta": 0.90},
+      "exposure": 0.3,
+      "idio_vol": 0.02,
+      "idio_vol_dispersion": 0.4,
+      "label_missing_rate": 0.002
+    }
+  },
+  "headline_scenario": "factor_t_garch_exposed",
+  "planted": {
+    "ic_grid": [0.0, 0.005, 0.01, 0.02, 0.03, 0.05],
+    "planted_trials": ["A90|fwd5"],
+    "pilot_sims": 24,
+    "pilot_scale": 0.1
+  },
+  "profiles": {
+    "full": {"sims": 500, "perms": 999, "scenarios": ["gaussian_idio", "factor_t_garch", "factor_t_garch_exposed"]},
+    "ci": {"sims": 24, "null_sims": 48, "perms": 199, "pilot_sims": 12, "ic_grid": [0.0, 0.05], "scenarios": ["factor_t_garch_exposed"]},
+    "smoke": {"sims": 3, "perms": 99, "pilot_sims": 3, "ic_grid": [0.0, 0.05], "scenarios": ["factor_t_garch"]}
+  },
+  "seeds": {"base": 20260930, "pilot": 20260931},
+  "v7_crosscheck": {
+    "registered_design_power": 0.535,
+    "registered_design_sims": 200,
+    "target_ic": 0.01,
+    "threshold": 0.0125,
+    "gate": 0.50,
+    "source": "VS1 v7 registration: A90|fwd5, 414 usable dates, 202 issuers, 200 sims, 999 sign flips, seed 20260927, Holm threshold 0.0125"
+  },
+  "replication": {
+    "file": "data/replication_pre2011_nontech_grid5.npz",
+    "denylist": "data/vs1_technology_denylist.json",
+    "cutoff_exclusive": "2011-01-01",
+    "decision_start": "1995-01-01",
+    "grid_sessions": 5,
+    "perms": 999,
+    "bh_q": 0.10,
+    "trials": {
+      "REV5|fwd5": {"lookback_steps": 1, "skip_steps": 0, "horizon_steps": 1, "expected_sign": -1,
+                     "prior": "weekly reversal (Lehmann 1990; Lo and MacKinlay 1990)"},
+      "REV20|fwd20": {"lookback_steps": 4, "skip_steps": 0, "horizon_steps": 4, "expected_sign": -1,
+                       "prior": "one-month reversal (Jegadeesh 1990)"},
+      "MOM12_1|fwd20": {"lookback_steps": 52, "skip_steps": 4, "horizon_steps": 4, "expected_sign": 1,
+                         "prior": "12-1 momentum (Jegadeesh and Titman 1993)"}
+    }
+  }
+}
