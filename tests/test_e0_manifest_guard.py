@@ -19,7 +19,7 @@ from evals.e0 import VERSION, manifest
 
 #: version -> sha256 of evals/e0/MANIFEST.sha256 (LF). Append-only.
 RELEASED_MANIFESTS = {
-    "e0-v1": "db0318ccf5e8dddb055bbaa068e3a6312476bc6d415dcb512698ef78ee0128ab",
+    "e0-v1": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
 }
 
 

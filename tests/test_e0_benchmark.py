@@ -141,3 +141,10 @@ def test_v7_crosscheck_flags_disagreement(config):
     disagree = benchmark.crosscheck_v7({"s": card(0.35)}, config, "s")
     assert disagree["flag"].startswith("DISAGREES")
     assert disagree["by_scenario"]["s"]["passes_v7_gate"] is False
+
+
+def test_committed_replication_panel_is_outside_vs1(config):
+    panel = replication.load_prices(config)  # raises on any VS1 window date or Technology ticker
+    assert panel.dates[-1] < date(2011, 1, 1)
+    assert not set(panel.tickers) & replication.load_denylist(config)
+    assert len(panel.tickers) >= 300
