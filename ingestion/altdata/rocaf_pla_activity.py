@@ -42,8 +42,9 @@ zero is stored only when ADIZ is absent. ``obs_date`` is the report date
 (counts as of 06:00 UTC+8 that day); ``raw_series.pull_timestamp`` keeps
 its default = GRID's fetch time.
 
-Failure contract: list fetch/parse failure, or every new detail failing,
--> ``status="FAILED"`` and nothing written.
+Failure contract: list fetch/parse failure, every new detail failing, or no
+new rows after the incremental filter/deduplication -> ``status="FAILED"``.
+Never report a zero-row pull as SUCCESS.
 """
 
 from __future__ import annotations
@@ -324,11 +325,20 @@ class ROCAFPLAActivityPuller(BasePuller):
             return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)[:300]}
         if errors and not reports:
             return {"status": "FAILED", "rows_inserted": 0, "error": "; ".join(errors)[:300]}
+        if not reports:
+            return {"status": "FAILED", "rows_inserted": 0, "error": "no new ROCAF activity reports"}
         try:
             inserted = self.save(reports)
         except Exception as exc:  # noqa: BLE001
             log.warning("rocaf_pla_activity: save failed: {e}", e=str(exc))
             return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)[:300]}
+        if inserted == 0:
+            return {
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "reports": len(reports),
+                "error": "ROCAF activity reports produced no new rows",
+            }
         latest_rep = max(reports, key=lambda r: r.report_date) if reports else None
         return {
             "status": "PARTIAL" if errors else "SUCCESS",
