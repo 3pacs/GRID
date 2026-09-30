@@ -1,0 +1,56 @@
+{
+  "contents": "feature geometry only: proxy sessions, decision positions, decisions x anonymised-entity insider-buy density (NaN = not admitted)",
+  "discovery_window": [
+    "2011-10-01",
+    "2020-01-01"
+  ],
+  "input_sha256": {
+    "form4": "df71899f77c7f49af691224afad1fac629d0133eeb45419ff6f498543e6cc6de",
+    "issuer_map": "016ae8ffe06c0f8f8bed5aff9af1bb69ae12b197a3441851c712f88a5d7f64f1",
+    "probe_metadata": "a10bac82c81fc41fa6f49cbd6c6f7ea8af53098d2bed3491ba9957fe7d257be7",
+    "sic_map": "4200acd05c9fbf563dd681acfedefd8ccd3a3ff46330fe742edf7159dd883f08",
+    "submissions": "c2177cf3ffc911110c40af92dd34c4002594fd236532de3ee74bb4e81a2926e7"
+  },
+  "issuers": 202,
+  "never_read": [
+    "prices",
+    "returns",
+    "rank IC",
+    "discovery or holdout artefacts"
+  ],
+  "proxy_sessions": 2068,
+  "rebuilt_with": "analysis.panel_insider_density_v6.load_inputs + feature_panel (v7 Stage-0 path)",
+  "structure": "vs1_v7_technology_structure",
+  "summary": {
+    "A30|fwd20": {
+      "decisions": 104,
+      "entities": 202,
+      "finite_share": 0.7813690022848438,
+      "nonzero_share_of_finite": 0.04447151995126409
+    },
+    "A30|fwd5": {
+      "decisions": 414,
+      "entities": 202,
+      "finite_share": 0.7815205433586837,
+      "nonzero_share_of_finite": 0.04417277414814021
+    },
+    "A90|fwd20": {
+      "decisions": 104,
+      "entities": 202,
+      "finite_share": 0.7813690022848438,
+      "nonzero_share_of_finite": 0.10910752360645751
+    },
+    "A90|fwd5": {
+      "decisions": 414,
+      "entities": 202,
+      "finite_share": 0.7815205433586837,
+      "nonzero_share_of_finite": 0.10840460853466347
+    }
+  },
+  "trials": [
+    "A90|fwd5",
+    "A30|fwd5",
+    "A90|fwd20",
+    "A30|fwd20"
+  ]
+}
