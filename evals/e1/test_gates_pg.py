@@ -79,8 +79,10 @@ def test_pit_store_ignores_vintages_released_after_as_of(pg_scratch):
     # Everything released after as_of: late revisions of old dates, newer dates,
     # and a retraction made after as_of (it may only hide the row from later reads).
     _resolved(engine, [r for r in rows if r["r"] > PIT_AS_OF])
-    _resolved(engine, [{"f": a, "d": d, "r": PIT_AS_OF + timedelta(days=3), "v": PIT_AS_OF + timedelta(days=3),
-                        "x": -1e6} for d in W.bdays(date(2024, 8, 1), PIT_AS_OF)])
+    taken = {(r["f"], r["d"], r["v"]) for r in rows}  # resolved_series' unique key
+    late = PIT_AS_OF + timedelta(days=3)
+    _resolved(engine, [{"f": a, "d": d, "r": late, "v": late, "x": -1e6}
+                       for d in W.bdays(date(2024, 8, 1), PIT_AS_OF) if (a, d, late) not in taken])
     with engine.begin() as c:
         c.execute(text("INSERT INTO resolved_series_retractions VALUES (:f, :d, :v, :t)"),
                   {"f": b, "d": date(2024, 9, 3), "v": _bday(date(2024, 9, 3), 1),
@@ -144,7 +146,9 @@ def test_read_window_known_at_on_timestamptz_ignores_future_rows(pg_scratch):
     W.insert(engine, _tz_rows(future_macro_rows(AS_OF_LIVE, base)))
     W.insert(engine, [W.row("VIXCLS", AS_OF_LIVE, 55.0, evening)])
     assert snapshot(AS_OF_LIVE) == before[AS_OF_LIVE]
-    W.insert(engine, _tz_rows(future_macro_rows(AS_OF_MODELED, base)))
+    live_keys = {(r["sid"], r["src"], r["d"], r["ts"]) for r in future_macro_rows(AS_OF_LIVE, base)}
+    W.insert(engine, _tz_rows([r for r in future_macro_rows(AS_OF_MODELED, base)
+                               if (r["sid"], r["src"], r["d"], r["ts"]) not in live_keys]))
     assert snapshot(AS_OF_MODELED) == before[AS_OF_MODELED]
 
 
