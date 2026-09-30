@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -34,6 +35,16 @@ def test_vendor_window_and_probe_rule_are_scoped():
         assert fetch.td_params("XLK", "all")["start_date"] == "2011-08-02"
         assert gd4.probe_rule().discovery_window == ("2011-08-02", "2019-12-31")
         assert gd4.probe_identity() == (v7.VERSION, v7.PREREG_BODY_SHA256)
+        probe = {"source": {"name": "TIINGO"}, "records": {}}
+        kwargs = {"lo": date(2011, 8, 2), "hi": date(2019, 12, 31),
+                  "code_sha": "a" * 40, "snapshot_as_of_ts": datetime(2026, 9, 29, tzinfo=timezone.utc)}
+        cross = gd4.build_crosscheck_report(probe, twelvedata_fetch_log_sha256=None, **kwargs)
+        meta = gd4.build_tiingo_meta_report(probe, tiingo_meta_fetch_log_sha256=None, **kwargs)
+        assert cross["report"] == "vs1-v7-twelvedata-crosscheck"
+        assert meta["report"] == "vs1-v7-tiingo-metadata"
+        assert cross["request"]["params"]["start_date"] == "2011-08-02"
+        assert cross["window_implementation"]["registered_window"] == ["2011-08-02", "2019-12-31"]
+        assert cross["request"]["supplement_params"]["start_date"] == "2019-12-20"
     assert fetch.td_params("XLK", "all")["start_date"] == old
     assert gd4.probe_rule() == gd4.CROSSCHECK
 

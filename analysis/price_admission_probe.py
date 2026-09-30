@@ -743,6 +743,7 @@ def _common(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of
 
 def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                             twelvedata_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     recs = probe["records"]
     tickers = {}
     for t, r in sorted(recs.items()):
@@ -755,8 +756,8 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
                             and r["twelvedata"]["state"] == "ok" and not r["twelvedata"].get("has_window_end"))
     holdout_rows = sum(int(r["twelvedata"].get("holdout_rows", 0)) for r in tickers.values())
     return {
-        "report": "vs1-v6-twelvedata-crosscheck",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
+        "report": f"{common['prereg']['study']}-twelvedata-crosscheck",
+        **common,
         "rule": dataclasses.asdict(probe_rule()),
         "request": {"url": fetch.TD_URL, "params": {**fetch.td_params("{ticker}", "all"), "adjust": ["all", "none"]},
                     "supplement_params": {**fetch.td_params("{ticker}", "all", start=fetch.TD_SUPPLEMENT_START),
@@ -793,6 +794,7 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
 
 def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                              tiingo_meta_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     tickers = {}
     for t, r in sorted(probe["records"].items()):
         if "tiingo_meta" not in r:
@@ -803,8 +805,8 @@ def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: st
                       "sec_name": r["entity"]["sec_name"], "entity_check": r["entity"]["check"],
                       "listed_from": r["listed_from"]}
     return {
-        "report": "vs1-v6-tiingo-metadata",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
+        "report": f"{common['prereg']['study']}-tiingo-metadata",
+        **common,
         "request": {"url": fetch.TIINGO_META_URL, "fetch_log_sha256": tiingo_meta_fetch_log_sha256},
         "name_match": {"jaccard_min": v6.NAME_JACCARD_MIN, "stop_tokens": sorted(v6.NAME_STOP_TOKENS),
                        "or": "one joined token string prefixes the other"},
