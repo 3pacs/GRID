@@ -741,11 +741,18 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     capture_ordinal BIGINT,
     capture_started_at TIMESTAMPTZ,
     capture_completed_at TIMESTAMPTZ,
-    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
+    UNIQUE (ticker, snap_date, capture_batch_id, expiry, opt_type, strike)
 );
 
 CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
     ON options_snapshots (ticker, snap_date);
+
+CREATE UNIQUE INDEX IF NOT EXISTS options_snapshots_legacy_strike_key
+    ON options_snapshots (ticker, snap_date, expiry, opt_type, strike)
+    WHERE capture_batch_id IS NULL;
+
+CREATE INDEX IF NOT EXISTS options_snapshots_latest_batch_idx
+    ON options_snapshots (ticker, snap_date, capture_ordinal DESC, capture_batch_id);
 
 -- ============================================================
 -- TABLE: options_daily_signals

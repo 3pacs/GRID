@@ -546,9 +546,9 @@ class DealerGammaEngine:
     def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
         """Load only the requested day's chain; reject mixed or late captures.
 
-        Only one fully completed capture is eligible. A legacy or partially
-        published chain without ordinal, start, batch, and completion provenance fails
-        closed, as do rows mixed with an older writer.
+        The latest ordinal's single complete batch is eligible. Earlier
+        same-day captures are retained for audit and must never be mixed into
+        the selected chain.
         """
         if not is_market_open(snap_date):
             return pd.DataFrame()
@@ -570,6 +570,12 @@ class DealerGammaEngine:
 
         if not rows:
             return pd.DataFrame()
+
+        ordinals_present = [row[8] for row in rows if isinstance(row[8], int)]
+        if not ordinals_present:
+            return pd.DataFrame()
+        latest_ordinal = max(ordinals_present)
+        rows = [row for row in rows if row[8] == latest_ordinal]
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}

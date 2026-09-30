@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread, current_thread
 from typing import Any, Self
@@ -62,11 +63,7 @@ class _DB:
             ordinals = [row["ordinal"] for row in self.rows if row["ticker"] == values["ticker"]
                         and row["snap_date"] == values["snap_date"] and row.get("ordinal")]
             return _Result((max(ordinals) if ordinals else None,))
-        if "DELETE FROM options_snapshots" in sql:
-            self.rows = [row for row in self.rows if not (
-                row["ticker"] == values["ticker"] and row["snap_date"] == values["snap_date"]
-            )]
-        elif "INSERT INTO options_snapshots" in sql:
+        if "INSERT INTO options_snapshots" in sql:
             self.rows.append(values.copy())
             self._insert_count += 1
             if self._insert_count == self.fail_after_inserts:
@@ -172,8 +169,20 @@ def test_completed_batch_time_follows_final_provider_response(
     assert "txid_current()" in sql[0]
     assert not any("nextval(" in statement for statement in sql)
     assert next(i for i, s in enumerate(sql) if "pg_advisory_xact_lock" in s) < next(
-        i for i, s in enumerate(sql) if "DELETE FROM options_snapshots" in s
-    ) < next(i for i, s in enumerate(sql) if "INSERT INTO options_snapshots" in s)
+        i for i, s in enumerate(sql) if "INSERT INTO options_snapshots" in s)
+    assert not any("DELETE FROM options_snapshots" in s for s in sql)
+
+
+def test_busy_writer_lease_skips_before_provider_or_database(puller, monkeypatch) -> None:
+    @contextmanager
+    def busy():
+        yield False
+
+    monkeypatch.setattr(options, "_options_writer_lease", busy)
+    result = puller.pull_all(tickers=["SPY"], include_catalyst_universe=False)
+    assert result.summary["status"] == "SKIPPED"
+    assert result[0]["reason"] == "another options writer active"
+    assert puller.engine.calls == []
 
 
 def test_cancel_before_publish_does_not_write_or_advance_freshness(puller):
@@ -197,7 +206,7 @@ def test_cancel_during_publish_rolls_back_ticker(puller):
     assert not puller.engine.rows
 
 
-def test_conflicted_snapshot_inserts_count_actual_rows(puller, monkeypatch):
+def test_conflicted_snapshot_inserts_fail_closed_without_partial_batch(puller, monkeypatch):
     execute = puller.engine.execute
 
     def with_conflict(statement, params=None):
@@ -208,9 +217,9 @@ def test_conflicted_snapshot_inserts_count_actual_rows(puller, monkeypatch):
 
     monkeypatch.setattr(puller.engine, "execute", with_conflict)
     result, _ = _run(puller, [100.0])
-    assert result["snapshots"] == 4
-    assert result["snapshots_inserted"] == 0
-    assert result["rows_inserted"] == 1  # only the signal upsert affected a row
+    assert result["status"] == "FAILED"
+    assert result["rows_inserted"] == 0
+    assert puller.engine.rows == []
 
 
 def test_explicit_six_expiry_cap_preserves_legacy_gem_scope(
@@ -322,19 +331,21 @@ def test_invalid_expiry_cap_fails_before_client_or_provider(
         puller.pull_all(tickers=["OPCH"], max_expirations=cap)
 
 
-def test_second_complete_pull_replaces_added_and_removed_strikes(
+def test_gem_then_scheduler_same_day_preserves_both_batches(
     puller: options.OptionsPuller,
 ) -> None:
     assert _run(puller, [100.0, 110.0])[0]["status"] == "SUCCESS"
     first_batch = {row["batch_id"] for row in puller.engine.rows}
     assert _run(puller, [100.0, 120.0])[0]["status"] == "SUCCESS"
     rows = puller.engine.rows
-    assert len(rows) == 8  # two expiries, calls and puts, two strikes
-    assert {row["strike"] for row in rows} == {100.0, 120.0}
-    assert len({row["batch_id"] for row in rows}) == 1
-    assert {row["batch_id"] for row in rows} != first_batch
-    assert {row["ordinal"] for row in rows} == {2}
-    assert len({row["completed_at"] for row in rows}) == 1
+    assert len(rows) == 16  # two four-contract chains, each with two expiries
+    assert {row["strike"] for row in rows} == {100.0, 110.0, 120.0}
+    assert len(first_batch) == 1
+    assert len({row["batch_id"] for row in rows}) == 2
+    assert first_batch <= {row["batch_id"] for row in rows}
+    assert {row["ordinal"] for row in rows} == {1, 2}
+    assert all(len([row for row in rows if row["batch_id"] == batch]) == 8
+               for batch in {row["batch_id"] for row in rows})
 
 
 def test_failed_second_pull_preserves_first_complete_batch(
@@ -356,7 +367,7 @@ def test_capture_deadline_fails_closed_after_short_xid_checkout(
     assert puller.engine.rows == []
 
 
-def test_insert_failure_rolls_back_delete_and_partial_new_batch(
+def test_insert_failure_rolls_back_partial_new_batch(
     puller: options.OptionsPuller,
 ) -> None:
     assert _run(puller, [100.0])[0]["status"] == "SUCCESS"
@@ -421,7 +432,7 @@ def test_older_overlapping_worker_cannot_replace_newer_capture(
     assert len({row["batch_id"] for row in db.rows}) == 1
 
 
-def test_complete_pull_replaces_preexisting_legacy_rows(puller: options.OptionsPuller) -> None:
+def test_complete_pull_keeps_preexisting_legacy_rows(puller: options.OptionsPuller) -> None:
     puller.engine.rows = [{
         "ticker": "SPY", "snap_date": SESSION_NOW.date().isoformat(),
         "strike": 999.0, "batch_id": None, "ordinal": None,
@@ -430,6 +441,7 @@ def test_complete_pull_replaces_preexisting_legacy_rows(puller: options.OptionsP
     assert _run(puller, [100.0], fail_second=True)[0]["status"] == "FAILED"
     assert puller.engine.rows[0]["batch_id"] is None  # still reader-unavailable
     assert _run(puller, [100.0])[0]["status"] == "SUCCESS"
-    assert {row["strike"] for row in puller.engine.rows} == {100.0}
-    assert all(row["batch_id"] and row["ordinal"] and row["started_at"] and row["completed_at"]
-               for row in puller.engine.rows)
+    assert {row["strike"] for row in puller.engine.rows} == {100.0, 999.0}
+    assert len([row for row in puller.engine.rows if row["batch_id"] is None]) == 1
+    assert all(row["ordinal"] and row["started_at"] and row["completed_at"]
+               for row in puller.engine.rows if row["batch_id"])

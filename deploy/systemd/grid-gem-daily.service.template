@@ -1,0 +1,24 @@
+[Unit]
+Description=GRID GEM eight-ticker gated daily options capture
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/data/grid_v4/gem_daily/ACTIVATED
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+WorkingDirectory=/data/grid_v4/grid-options-puller-pins/@PIN_SHA@
+EnvironmentFile=@DB_ENV_FILE@
+Environment=GEM_DAILY_PIN_SHA=@PIN_SHA@
+ExecStart=/data/grid_v4/venv/bin/python3 scripts/gem_daily_capture.py
+ExecStopPost=/data/grid_v4/venv/bin/python3 scripts/gem_daily_contain.py
+TimeoutStartSec=15min
+TimeoutStopSec=40s
+KillMode=control-group
+SendSIGKILL=yes
+RefuseManualStart=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

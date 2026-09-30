@@ -19,6 +19,7 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import URL, make_url
 
 from ingestion import options
+from migrations.versions import options_append_only_batches_20260930 as append_migration
 from migrations.versions import options_capture_batch_20260924 as migration
 from migrations.versions import options_quote_time_20260925 as source_migration
 from physics.dealer_gamma import DealerGammaEngine
@@ -230,6 +231,8 @@ def scratch_pg14(monkeypatch):
             migration.upgrade()
             monkeypatch.setattr(source_migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
             source_migration.upgrade()
+            monkeypatch.setattr(append_migration, "op", SimpleNamespace(execute=conn.exec_driver_sql))
+            append_migration.upgrade()
         yield engine
     finally:
         engine.dispose()
@@ -284,7 +287,7 @@ def test_pg14_real_clock_non_session_refuses_before_provider(scratch_pg14) -> No
         assert conn.execute(text("SELECT COUNT(*) FROM options_snapshots")).scalar_one() == 0
 
 
-def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14, monkeypatch):
+def test_pg14_same_day_batches_append_rollback_and_overlap(synthetic_session_pg14, monkeypatch):
     engine, now = synthetic_session_pg14
     day = now.date()
     expirations = [int((now + timedelta(days=n)).timestamp()) for n in (10, 20)]
@@ -324,11 +327,14 @@ def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14,
                    capture_completed_at, created_at FROM options_snapshots
             WHERE ticker = 'SPY' AND snap_date = :day
         """), {"day": day}).fetchall()
-    assert len(rows) == 8
-    assert {row[0] for row in rows} == {100.0, 120.0}
-    assert len({row[1] for row in rows}) == 1
-    assert len({row[2] for row in rows}) == 1 and rows[0][2] > 0
-    assert all(row[3] <= row[4] for row in rows)
+    assert len(rows) == 9  # legacy row plus both four-row captures
+    assert {row[0] for row in rows} == {999.0, 100.0, 110.0, 120.0}
+    batches = {row[1] for row in rows if row[1] is not None}
+    ordinals = {row[2] for row in rows if row[2] is not None}
+    assert len(batches) == len(ordinals) == 2
+    assert all(row[2] is None or row[2] > 0 for row in rows)
+    assert all(row[3] is None or row[3] <= row[4] for row in rows)
+    before_failed = {(row[0], row[1], row[2]) for row in rows}
     assert not DealerGammaEngine(engine)._load_chain("SPY", day).empty
 
     with engine.begin() as conn:
@@ -350,7 +356,13 @@ def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14,
         strikes = {row[0] for row in conn.execute(text(
             "SELECT strike FROM options_snapshots WHERE ticker = 'SPY' AND snap_date = :day"
         ), {"day": day})}
-    assert strikes == {100.0, 120.0}
+    assert strikes == {999.0, 100.0, 110.0, 120.0}
+    with engine.connect() as conn:
+        after_failed = {(row[0], row[1], row[2]) for row in conn.execute(text(
+            "SELECT strike, capture_batch_id, capture_ordinal FROM options_snapshots "
+            "WHERE ticker = 'SPY' AND snap_date = :day"
+        ), {"day": day})}
+    assert after_failed == before_failed
     with engine.begin() as conn:
         conn.exec_driver_sql("DROP TRIGGER reject_130 ON options_snapshots")
         conn.exec_driver_sql("DROP FUNCTION reject_130()")
@@ -392,4 +404,14 @@ def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14,
         strikes = {row[0] for row in conn.execute(text(
             "SELECT strike FROM options_snapshots WHERE ticker = 'SPY' AND snap_date = :day"
         ), {"day": day})}
-    assert strikes == {140.0}
+    assert strikes == {999.0, 100.0, 110.0, 120.0, 140.0}
+    with engine.connect() as conn:
+        captured = conn.execute(text("""
+            SELECT capture_batch_id, capture_ordinal, COUNT(*)
+            FROM options_snapshots WHERE ticker = 'SPY' AND snap_date = :day
+              AND capture_batch_id IS NOT NULL
+            GROUP BY capture_batch_id, capture_ordinal
+        """), {"day": day}).fetchall()
+    assert len(captured) == 3
+    assert {row[2] for row in captured} == {4}
+    assert len({row[1] for row in captured}) == 3

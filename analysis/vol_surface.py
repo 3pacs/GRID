@@ -938,6 +938,11 @@ class VolSurfaceEngine:
                            last_price, bid, ask, volume
                     FROM options_snapshots
                     WHERE ticker = :ticker AND snap_date = :snap_date
+                    AND capture_batch_id = (
+                        SELECT capture_batch_id FROM options_snapshots
+                        WHERE ticker = :ticker AND snap_date = :snap_date
+                          AND capture_batch_id IS NOT NULL
+                        ORDER BY capture_ordinal DESC LIMIT 1)
                     AND open_interest > 0 AND implied_vol > 0
                     AND expiry > :snap_date
                     ORDER BY expiry, strike
@@ -1017,6 +1022,11 @@ class VolSurfaceEngine:
                 text("""
                     SELECT strike FROM options_snapshots
                     WHERE ticker = :t AND snap_date = :d AND opt_type = 'call'
+                      AND capture_batch_id = (
+                        SELECT capture_batch_id FROM options_snapshots
+                        WHERE ticker = :t AND snap_date = :d
+                          AND capture_batch_id IS NOT NULL
+                        ORDER BY capture_ordinal DESC LIMIT 1)
                     ORDER BY open_interest DESC LIMIT 1
                 """),
                 {"t": ticker, "d": as_of_date},

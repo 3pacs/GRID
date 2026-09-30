@@ -29,7 +29,7 @@ def _fast_calculations(monkeypatch):
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
 
 
-def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
+def test_gem_wrapper_real_batch_writer_eight_tickers_six_expiries(
     synthetic_session_pg14, monkeypatch,
 ):
     """Use the real wrapper and writer, but a local deterministic provider."""

@@ -1022,7 +1022,12 @@ class OptionsRecommender:
                   AND strike = :strike
                   AND expiry = :expiry
                   AND opt_type = :opt_type
+                  AND capture_batch_id = (
+                      SELECT capture_batch_id FROM options_snapshots
+                      WHERE ticker = :ticker AND capture_batch_id IS NOT NULL
+                      ORDER BY snap_date DESC, capture_ordinal DESC LIMIT 1)
                 ORDER BY snap_date DESC
+                       , capture_ordinal DESC
                 LIMIT 1
             """), {
                 "ticker": ticker,
@@ -1261,7 +1266,12 @@ class OptionsRecommender:
                 WHERE ticker = :ticker
                   AND strike = :strike
                   AND opt_type = :opt_type
+                  AND capture_batch_id = (
+                      SELECT capture_batch_id FROM options_snapshots
+                      WHERE ticker = :ticker AND capture_batch_id IS NOT NULL
+                      ORDER BY snap_date DESC, capture_ordinal DESC LIMIT 1)
                 ORDER BY snap_date DESC
+                       , capture_ordinal DESC
                 LIMIT 1
             """), {
                 "ticker": rec.ticker,
@@ -1596,6 +1606,12 @@ Respond with ONLY the JSON object."""
                   AND snap_date = (
                       SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :ticker
                   )
+                  AND capture_batch_id = (
+                      SELECT capture_batch_id FROM options_snapshots
+                      WHERE ticker = :ticker AND snap_date = (
+                          SELECT MAX(snap_date) FROM options_snapshots WHERE ticker = :ticker)
+                        AND capture_batch_id IS NOT NULL
+                      ORDER BY capture_ordinal DESC LIMIT 1)
                   AND open_interest > 0
                   AND expiry > CURRENT_DATE
                 ORDER BY expiry, strike

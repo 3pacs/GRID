@@ -11,7 +11,10 @@ Falls back to yfinance if the direct API fails.
 from __future__ import annotations
 
 import math
+import os
+import sys
 import time
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 from uuid import uuid4
@@ -47,6 +50,32 @@ MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
 # limits and a local transaction deadline fit inside the scheduler's 60s margin.
 CATALOG_PUBLICATION_SECONDS = 15
 _EQUITY_TZ = ZoneInfo("America/New_York")
+_OPTIONS_WRITER_LOCK = "/run/lock/grid-options-pull.lock"
+
+
+@contextmanager
+def _options_writer_lease():
+    """Serialize all server options writers across scheduler, Hermes and GEM.
+
+    The lock remains held for the entire pull, including provider requests.
+    Hermes timeout threads retain it until their actual work stops. Windows
+    offline tests have no flock; production Linux fails closed on lock errors.
+    """
+    if sys.platform != "linux":
+        yield True
+        return
+    import fcntl
+
+    fd = os.open(_OPTIONS_WRITER_LOCK, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC, 0o640)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            yield False
+            return
+        yield True
+    finally:
+        os.close(fd)
 
 
 class _OptionsBudgetExpired(Exception):
@@ -297,12 +326,21 @@ class OptionsPuller(BasePuller):
                     capture_started_at TIMESTAMPTZ,
                     capture_completed_at TIMESTAMPTZ,
                     provider_regular_market_at TIMESTAMPTZ,
-                    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
+                    UNIQUE (ticker, snap_date, capture_batch_id, expiry, opt_type, strike)
                 )
             """))
             conn.execute(text("""
                 CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
                 ON options_snapshots (ticker, snap_date)
+            """))
+            conn.execute(text("""
+                CREATE UNIQUE INDEX IF NOT EXISTS options_snapshots_legacy_strike_key
+                ON options_snapshots (ticker, snap_date, expiry, opt_type, strike)
+                WHERE capture_batch_id IS NULL
+            """))
+            conn.execute(text("""
+                CREATE INDEX IF NOT EXISTS options_snapshots_latest_batch_idx
+                ON options_snapshots (ticker, snap_date, capture_ordinal DESC, capture_batch_id)
             """))
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS options_daily_signals (
@@ -331,6 +369,26 @@ class OptionsPuller(BasePuller):
             """))
 
     def pull_all(
+        self,
+        tickers: list[str] | None = None,
+        *,
+        include_catalyst_universe: bool = True,
+        max_expirations: int = MAX_EXPIRATIONS,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> OptionsPullResults:
+        """One nonblocking lease prevents overlapping options writers."""
+        with _options_writer_lease() as acquired:
+            if not acquired:
+                return OptionsPullResults([{
+                    "ticker": "N/A", "status": "SKIPPED", "rows_inserted": 0,
+                    "reason": "another options writer active",
+                }], full_universe=False)
+            return self._pull_all_under_lease(
+                tickers, include_catalyst_universe=include_catalyst_universe,
+                max_expirations=max_expirations, should_continue=should_continue,
+            )
+
+    def _pull_all_under_lease(
         self,
         tickers: list[str] | None = None,
         *,
@@ -652,15 +710,9 @@ class OptionsPuller(BasePuller):
                     return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                             "reason": "newer options capture already published"}
 
-                # A ticker/day is one full capture, not a growing union of four
-                # scheduled pulls. Remove old/legacy rows and publish the new
-                # batch in the same transaction. A concurrent legacy insert
-                # after commit remains mixed and is rejected by the reader.
+                # Each completed capture is immutable. A later scheduler pull
+                # must retain an earlier GEM batch and its provenance.
                 _check_budget(should_continue)
-                conn.execute(
-                    text("DELETE FROM options_snapshots WHERE ticker = :ticker AND snap_date = :snap_date"),
-                    {"ticker": ticker, "snap_date": today_str},
-                )
                 snapshots_inserted = 0
                 rows_known = True
                 for row in snapshot_rows:
@@ -677,7 +729,8 @@ class OptionsPuller(BasePuller):
                             ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
                             ":batch_id, :ordinal, :started_at, :completed_at, "
                             ":provider_regular_market_at) "
-                            "ON CONFLICT DO NOTHING"
+                            "ON CONFLICT (ticker, snap_date, capture_batch_id, expiry, opt_type, strike) "
+                            "DO NOTHING"
                         ),
                         {**row, "ordinal": capture_ordinal,
                          "started_at": capture_started_at, "completed_at": completed_at},
@@ -685,6 +738,8 @@ class OptionsPuller(BasePuller):
                     count = _affected_rows(written)
                     rows_known = rows_known and count is not None
                     snapshots_inserted += count or 0
+                if not rows_known or snapshots_inserted != len(snapshot_rows):
+                    raise ValueError("options capture batch was not fully inserted")
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
@@ -800,6 +855,7 @@ class OptionsPuller(BasePuller):
             return {
                 "ticker": ticker, "status": "SUCCESS",
                 "snapshots": snap_count, "snapshots_inserted": snapshots_inserted if rows_known else None,
+                "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
                 "rows_inserted": rows_inserted,
                 "signals": {
                     "put_call_ratio": put_call_ratio,

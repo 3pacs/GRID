@@ -69,6 +69,11 @@ _CHAIN_QUERY = text(
     SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility, expiry
     FROM options_snapshots
     WHERE ticker = :ticker AND snap_date = :snap_date
+    AND capture_batch_id = (
+        SELECT capture_batch_id FROM options_snapshots
+        WHERE ticker = :ticker AND snap_date = :snap_date
+          AND capture_batch_id IS NOT NULL
+        ORDER BY capture_ordinal DESC LIMIT 1)
     AND open_interest > 0 AND implied_vol > 0
     AND expiry > :snap_date
     """

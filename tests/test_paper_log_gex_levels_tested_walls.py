@@ -165,6 +165,8 @@ def sqlite_engine():
         sa.Column("opt_type", sa.Text),
         sa.Column("open_interest", sa.Integer),
         sa.Column("implied_vol", sa.Float),
+        sa.Column("capture_batch_id", sa.Text),
+        sa.Column("capture_ordinal", sa.Integer),
     )
     meta.create_all(engine)
     try:
@@ -176,9 +178,10 @@ def sqlite_engine():
 def _insert(engine, rows: list[dict]) -> None:
     with engine.begin() as conn:
         conn.execute(sa.text(
-            "INSERT INTO options_snapshots (ticker, snap_date, expiry, strike, opt_type, open_interest, implied_vol) "
-            "VALUES (:ticker, :snap_date, :expiry, :strike, :opt_type, :open_interest, :implied_vol)"
-        ), rows)
+            "INSERT INTO options_snapshots (ticker, snap_date, expiry, strike, opt_type, open_interest, implied_vol, capture_batch_id, capture_ordinal) "
+            "VALUES (:ticker, :snap_date, :expiry, :strike, :opt_type, :open_interest, :implied_vol, :batch_id, :ordinal)"
+        ), [{**row, "batch_id": row.get("batch_id", "test-batch"),
+             "ordinal": row.get("ordinal", 1)} for row in rows])
 
 
 def test_compute_tested_walls_from_db_end_to_end(sqlite_engine) -> None:
@@ -203,6 +206,28 @@ def test_compute_tested_walls_from_db_end_to_end(sqlite_engine) -> None:
     )
     assert walls.put_wall == 740.0
     assert walls.call_wall == 790.0
+
+
+def test_tested_walls_use_only_latest_same_day_capture(sqlite_engine) -> None:
+    snap_date = date(2026, 9, 24)
+    expiry = snap_date + timedelta(days=30)
+    _insert(sqlite_engine, [
+        {"ticker": "SPY", "snap_date": snap_date, "expiry": expiry, "strike": 740.0,
+         "opt_type": "put", "open_interest": 50000, "implied_vol": 0.2},
+        {"ticker": "SPY", "snap_date": snap_date, "expiry": expiry, "strike": 790.0,
+         "opt_type": "call", "open_interest": 50000, "implied_vol": 0.2},
+        {"ticker": "SPY", "snap_date": snap_date, "expiry": expiry, "strike": 730.0,
+         "opt_type": "put", "open_interest": 10000, "implied_vol": 0.2,
+         "batch_id": "later", "ordinal": 2},
+        {"ticker": "SPY", "snap_date": snap_date, "expiry": expiry, "strike": 800.0,
+         "opt_type": "call", "open_interest": 10000, "implied_vol": 0.2,
+         "batch_id": "later", "ordinal": 2},
+    ])
+    walls = compute_tested_walls_from_db(
+        sqlite_engine, "SPY", snap_date, spot=764.9, p0=764.9, min_distance_pct=MIN_DIST,
+    )
+    assert walls.put_wall == 730.0
+    assert walls.call_wall == 800.0
 
 
 def test_compute_tested_walls_from_db_filters_zero_oi_and_iv(sqlite_engine) -> None:

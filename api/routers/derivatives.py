@@ -307,10 +307,13 @@ def get_vol_surface(ticker: str) -> dict[str, Any]:
 
             rows = conn.execute(text(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, open_interest, volume, opt_type "
+                "implied_vol AS implied_volatility, open_interest, volume, opt_type "
                 "FROM options_snapshots "
                 "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND open_interest > 0 "
+                "AND capture_batch_id = (SELECT capture_batch_id FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date = :sd AND capture_batch_id IS NOT NULL "
+                "ORDER BY capture_ordinal DESC LIMIT 1) "
+                "AND implied_vol > 0 AND open_interest > 0 "
                 "AND expiry > :sd "
                 "ORDER BY expiry, strike"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
@@ -361,10 +364,13 @@ def get_skew(ticker: str) -> dict[str, Any]:
 
             rows = conn.execute(text(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, opt_type "
+                "implied_vol AS implied_volatility, opt_type "
                 "FROM options_snapshots "
                 "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND expiry > :sd "
+                "AND capture_batch_id = (SELECT capture_batch_id FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date = :sd AND capture_batch_id IS NOT NULL "
+                "ORDER BY capture_ordinal DESC LIMIT 1) "
+                "AND implied_vol > 0 AND expiry > :sd "
                 "ORDER BY expiry, strike"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
@@ -429,6 +435,9 @@ def get_term_structure(ticker: str) -> dict[str, Any]:
             spot_row = conn.execute(text(
                 "SELECT strike FROM options_snapshots "
                 "WHERE ticker = :t AND snap_date = :sd AND opt_type = 'call' "
+                "AND capture_batch_id = (SELECT capture_batch_id FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date = :sd AND capture_batch_id IS NOT NULL "
+                "ORDER BY capture_ordinal DESC LIMIT 1) "
                 "ORDER BY open_interest DESC LIMIT 1"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchone()
 
@@ -436,10 +445,13 @@ def get_term_structure(ticker: str) -> dict[str, Any]:
 
             rows = conn.execute(text(
                 "SELECT strike, expiry, (expiry - :sd) AS dte, "
-                "implied_volatility, opt_type, open_interest "
+                "implied_vol AS implied_volatility, opt_type, open_interest "
                 "FROM options_snapshots "
                 "WHERE ticker = :t AND snap_date = :sd "
-                "AND implied_volatility > 0 AND expiry > :sd "
+                "AND capture_batch_id = (SELECT capture_batch_id FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date = :sd AND capture_batch_id IS NOT NULL "
+                "ORDER BY capture_ordinal DESC LIMIT 1) "
+                "AND implied_vol > 0 AND expiry > :sd "
                 "ORDER BY expiry, strike"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()
 
@@ -532,6 +544,9 @@ def get_oi_heatmap(ticker: str) -> dict[str, Any]:
                 "COALESCE(volume, 0) AS volume "
                 "FROM options_snapshots "
                 "WHERE ticker = :t AND snap_date = :sd "
+                "AND capture_batch_id = (SELECT capture_batch_id FROM options_snapshots "
+                "WHERE ticker = :t AND snap_date = :sd AND capture_batch_id IS NOT NULL "
+                "ORDER BY capture_ordinal DESC LIMIT 1) "
                 "AND open_interest > 0 AND expiry > :sd "
                 "ORDER BY expiry, strike"
             ), {"t": ticker.upper(), "sd": snap_date}).fetchall()

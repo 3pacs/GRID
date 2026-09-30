@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compatibility entrypoint for the nine-ticker GEM options timer.
+"""Compatibility entrypoint for the eight-ticker GEM options timer.
 
 The separately installed legacy script writes options_snapshots directly,
 without capture metadata. Retire or repoint that timer before activating this
@@ -17,7 +17,7 @@ from loguru import logger as log
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 GEM_TICKERS = (
-    "OPCH", "SPGI", "FLUT", "GEHC", "GLND", "BHRB",
+    "OPCH", "SPGI", "FLUT", "GEHC", "GLND",
     "SPY", "QQQ", "IWM",
 )
 GEM_MAX_EXPIRATIONS = 6
