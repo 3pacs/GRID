@@ -84,10 +84,27 @@ checks, not economic evidence. The script uses strict finite JSON serialization.
 
 Focused run: **119 passed**, including 45 new calendar/horizon/leakage/missing
 bar/basis/cost/extreme-value tests. Ruff check passes after formatting.
-A broader yfinance-basis run: **119 passed, 11 failed**, all 11 failures from
-missing local `yfinance`. Alembic single-head collection was **unrun** due to
-missing `alembic`. Full suite, live TimesFM and real-bar integration unrun.
-No dependencies were installed and no paid provider calls were made.
+Initial broader verification was blocked by missing `yfinance` and `alembic`.
+The approved follow-up installed repository-declared dependencies from PyPI
+into `.venv-verification`, with its cache under `/tmp/grid-72h-uv-cache`.
+Final combined verification: **134 passed, 0 failed, 0 skipped** across the
+six files listed below. This includes all 12 yfinance-basis checks and all
+three offline Alembic history/logging checks. No production database was
+used; disposable PostgreSQL was initialized under `.verification/postgres`,
+with host connections rejected and only a task-local Unix socket enabled.
+Database identity was `grid_72h_test|grid_test` with null `inet_server_addr()`.
+Test configuration explicitly set DB_HOST/PORT/NAME/USER and GRID_TEST_DB_URL
+to that instance. Alembic tests inspect scripts/logging without applying
+migrations. The server was stopped after verification. Full-suite migration
+upgrade/integration, live TimesFM and real-bar integration remain unrun.
+No paid provider or data collection calls were made.
+
+Final test files: `test_continuous_forecasts.py`, `test_signal_outcomes.py`,
+`test_evaluation_prices.py`, `test_evaluate_signals_cli.py`,
+`test_yfinance_auto_adjust_explicit.py`, `test_alembic_single_head.py`.
+Exact resolved versions are captured in
+`docs/examples/continuous_72h_verification_requirements.txt`; this is the
+bounded verification environment, not a replacement runtime dependency lock.
 
 ## Bounded real-data availability probe (2026-09-30)
 
