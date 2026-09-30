@@ -930,7 +930,8 @@ def run_intelligence_loop() -> None:
             from db import get_engine as _ge
             from ingestion.altdata.rocaf_pla_activity import run_rocaf_pla_activity_puller
             result = run_rocaf_pla_activity_puller(_ge())
-            log.info(
+            log_fn = log.warning if result.get("status") == "FAILED" else log.info
+            log_fn(
                 "PLA activity (ROCAF/MND): status={st}, {n} reports, {i} rows, "
                 "latest={d} sorties={a}",
                 st=result.get("status"),

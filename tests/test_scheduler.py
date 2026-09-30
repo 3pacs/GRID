@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import config
@@ -22,6 +22,7 @@ class _StopScheduler(Exception):
 class _FakeSchedule:
     def __init__(self) -> None:
         self.jobs: list[dict[str, object]] = []
+        self.callbacks: dict[str, object] = {}
         self.run_pending_calls = 0
 
     def every(self, interval: int = 1) -> "_FakeJob":
@@ -64,6 +65,7 @@ class _FakeJob:
         return self
 
     def do(self, func):
+        self._schedule.callbacks[func.__name__] = func
         self._schedule.jobs.append(
             {
                 "interval": self._interval,
@@ -251,6 +253,26 @@ def test_taiwan_strait_osint_job_can_be_enabled_via_flag(monkeypatch):
     assert "_options_tracker" not in jobs_by_name
     assert "_nightly_research" not in jobs_by_name
     assert "_paper_trading_signals" not in jobs_by_name
+
+
+def test_taiwan_daily_logs_zero_row_pull_as_failure(monkeypatch):
+    import db
+    from ingestion.altdata import rocaf_pla_activity as rocaf
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=True)
+    )
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "_get_latest_date", lambda self, sid: date(2026, 9, 29))
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "fetch", lambda self, since: ([], []))
+    warnings = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+    fake_schedule.callbacks["_taiwan_strait_osint_daily"]()
+    assert len(warnings) == 1
+    assert "status=FAILED" in warnings[0]
+    assert "0 rows" in warnings[0]
 
 
 def test_lme_warehouse_job_default_off(monkeypatch):
