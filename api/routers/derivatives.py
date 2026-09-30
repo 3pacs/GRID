@@ -101,21 +101,78 @@ def get_overview() -> dict[str, Any]:
 
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
+def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[str, Any] | None:
+    """Default: latest complete batch today. Replay needs an explicit day+batch."""
+    if capture_batch_id is None:
+        return {"snap_date": snap_date} if snap_date is not None else {}
+    if snap_date is None:
+        return None
+    return {"snap_date": snap_date, "capture_batch_id": capture_batch_id}
+
+
 @router.get("/gex/{ticker}")
-async def get_gex(ticker: str) -> dict[str, Any]:
+async def get_gex(
+    ticker: str,
+    snap_date: date | None = Query(None, description="Chain day (default: today UTC)"),
+    capture_batch_id: str | None = Query(
+        None, min_length=1, max_length=64,
+        description="Replay this registered capture batch instead of the day's latest",
+    ),
+) -> dict[str, Any]:
     """Full GEX profile for a single ticker.
 
     Returns gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall,
     dealer_delta, vanna_exposure, charm_exposure, regime, profile curve,
-    and per_strike breakdown.
+    and per_strike breakdown. By default the latest complete capture batch is
+    used; ``snap_date`` + ``capture_batch_id`` replay an earlier batch.
     """
+    args = _replay_args(snap_date, capture_batch_id)
+    if args is None:
+        return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper())
+        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
         return result
     except Exception as exc:
         log.warning("GEX computation failed for {t}: {e}", t=ticker, e=str(exc))
         return {"error": str(exc), "ticker": ticker.upper()}
+
+
+# ── GET /options-batches/{ticker} ─────────────────────────────────────
+
+@router.get("/options-batches/{ticker}")
+async def get_options_batches(
+    ticker: str,
+    snap_date: date = Query(..., description="Chain day to list capture batches for"),
+) -> dict[str, Any]:
+    """Every registered complete capture batch for a ticker/day, oldest first.
+
+    ``latest`` marks the batch the default readers use; any other listed
+    batch can be replayed via ``/gex`` or ``/walls`` with ``capture_batch_id``.
+    """
+    try:
+        with get_db_engine().connect() as conn:
+            rows = conn.execute(text(
+                "SELECT capture_batch_id, capture_ordinal, capture_started_at, "
+                "capture_completed_at, row_count, capture_source, backfilled "
+                "FROM options_capture_batches "
+                "WHERE ticker = :ticker AND snap_date = :snap_date "
+                "ORDER BY capture_ordinal"
+            ), {"ticker": ticker.upper(), "snap_date": snap_date}).fetchall()
+    except Exception as exc:
+        log.warning("Options batch listing failed for {t}: {e}", t=ticker, e=type(exc).__name__)
+        return {"error": "options batch listing unavailable", "ticker": ticker.upper()}
+    batches = [
+        {
+            "capture_batch_id": r[0], "capture_ordinal": int(r[1]),
+            "capture_started_at": r[2].isoformat() if r[2] else None,
+            "capture_completed_at": r[3].isoformat() if r[3] else None,
+            "row_count": int(r[4]), "capture_source": r[5], "backfilled": bool(r[6]),
+            "latest": i == len(rows) - 1,
+        }
+        for i, r in enumerate(rows)
+    ]
+    return {"ticker": ticker.upper(), "snap_date": snap_date.isoformat(), "batches": batches}
 
 
 # ── GET /regime ──────────────────────────────────────────────────────
@@ -177,17 +234,31 @@ async def get_regime() -> dict[str, Any]:
 # ── GET /walls/{ticker} ─────────────────────────────────────────────
 
 @router.get("/walls/{ticker}")
-async def get_walls(ticker: str) -> dict[str, Any]:
+async def get_walls(
+    ticker: str,
+    snap_date: date | None = Query(None, description="Chain day (default: today UTC)"),
+    capture_batch_id: str | None = Query(
+        None, min_length=1, max_length=64,
+        description="Replay this registered capture batch instead of the day's latest",
+    ),
+) -> dict[str, Any]:
     """Support/resistance levels derived from gamma walls.
 
     Returns put_wall (support), call_wall (resistance), gamma_flip,
-    and current spot price.
+    and current spot price, from the latest complete capture batch unless
+    ``snap_date`` + ``capture_batch_id`` name an earlier one to replay.
     """
+    args = _replay_args(snap_date, capture_batch_id)
+    if args is None:
+        return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper())
+        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
         return {
             "ticker": ticker.upper(),
+            "chain_snap_date": result.get("chain_snap_date"),
+            "chain_batch_id": result.get("chain_batch_id"),
+            "chain_capture_ordinal": result.get("chain_capture_ordinal"),
             "put_wall": result.get("put_wall"),
             "call_wall": result.get("call_wall"),
             "gamma_wall": result.get("gamma_wall"),

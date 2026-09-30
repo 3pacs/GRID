@@ -719,10 +719,13 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
     ON agent_runs (decision_journal_id);
 
 -- ============================================================
--- TABLE: options_snapshots
--- Raw options chain snapshots per ticker/expiry/strike.
+-- TABLE: options_snapshots_all  (append-only; migration options_append_only_20260930)
+-- Every options chain capture batch, one row per contract per batch.
+-- Rows are immutable. options_capture_batches registers each complete
+-- batch; the options_snapshots VIEW below shows the latest complete batch
+-- per ticker/day (what the old delete-then-insert table held).
 -- ============================================================
-CREATE TABLE IF NOT EXISTS options_snapshots (
+CREATE TABLE IF NOT EXISTS options_snapshots_all (
     id              BIGSERIAL PRIMARY KEY,
     ticker          TEXT NOT NULL,
     snap_date       DATE NOT NULL,
@@ -741,11 +744,55 @@ CREATE TABLE IF NOT EXISTS options_snapshots (
     capture_ordinal BIGINT,
     capture_started_at TIMESTAMPTZ,
     capture_completed_at TIMESTAMPTZ,
-    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
+    provider_regular_market_at TIMESTAMPTZ
 );
 
 CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
-    ON options_snapshots (ticker, snap_date);
+    ON options_snapshots_all (ticker, snap_date);
+
+CREATE UNIQUE INDEX IF NOT EXISTS options_snapshots_all_batch_contract_key
+    ON options_snapshots_all (capture_batch_id, expiry, opt_type, strike)
+    WHERE capture_batch_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS options_capture_batches (
+    capture_batch_id     TEXT PRIMARY KEY,
+    ticker               TEXT NOT NULL,
+    snap_date            DATE NOT NULL,
+    capture_ordinal      BIGINT NOT NULL CHECK (capture_ordinal > 0),
+    capture_started_at   TIMESTAMPTZ NOT NULL,
+    capture_completed_at TIMESTAMPTZ NOT NULL,
+    row_count            INTEGER NOT NULL CHECK (row_count > 0),
+    spot_price           DOUBLE PRECISION,
+    capture_source       TEXT NOT NULL,
+    backfilled           BOOLEAN NOT NULL DEFAULT false,
+    registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    CHECK (capture_started_at <= capture_completed_at),
+    CONSTRAINT options_capture_batches_identity_key
+        UNIQUE (capture_batch_id, capture_ordinal, ticker, snap_date)
+);
+
+CREATE INDEX IF NOT EXISTS options_capture_batches_ticker_day_idx
+    ON options_capture_batches (ticker, snap_date, capture_ordinal);
+
+-- Constraints, append-only triggers and the view are created by the
+-- migration (options_append_only_20260930), which is the source of truth:
+--   options_snapshots_all_batch_required CHECK ... NOT VALID
+--   options_snapshots_all_batch_fk FOREIGN KEY -> options_capture_batches
+--   *_no_row_mutation / *_no_truncate triggers (UPDATE/DELETE/TRUNCATE raise)
+CREATE OR REPLACE VIEW options_snapshots AS
+SELECT s.id, s.ticker, s.snap_date, s.expiry, s.opt_type, s.strike,
+       s.last_price, s.bid, s.ask, s.volume, s.open_interest,
+       s.implied_vol, s.in_the_money, s.created_at,
+       s.capture_batch_id, s.capture_ordinal, s.capture_started_at,
+       s.capture_completed_at, s.provider_regular_market_at
+FROM options_snapshots_all s
+WHERE NOT EXISTS (
+    SELECT 1 FROM options_capture_batches b
+    WHERE b.ticker = s.ticker
+      AND b.snap_date = s.snap_date
+      AND b.capture_batch_id IS DISTINCT FROM s.capture_batch_id
+      AND b.capture_ordinal >= COALESCE(s.capture_ordinal, 0)
+);
 
 -- ============================================================
 -- TABLE: options_daily_signals

@@ -56,7 +56,7 @@ def test_failed_catalyst_lookup_cannot_claim_full_universe(monkeypatch):
     obj._mark_catalog_pulled.assert_not_called()
 
 
-def test_nine_gem_tickers_are_list_compatible_and_never_fresh(monkeypatch):
+def test_eight_gem_tickers_are_list_compatible_and_never_fresh(monkeypatch):
     from scripts.pull_options_gem_tickers import GEM_TICKERS
 
     obj = _puller(monkeypatch, dict.fromkeys(GEM_TICKERS, "SUCCESS"))
@@ -65,7 +65,7 @@ def test_nine_gem_tickers_are_list_compatible_and_never_fresh(monkeypatch):
     assert all(r["status"] == "SUCCESS" for r in result)
     assert result.summary["status"] == "PARTIAL"
     assert result.summary["scope"] == "subset"
-    assert result.summary["rows_inserted"] == 9 * 12
+    assert result.summary["rows_inserted"] == len(GEM_TICKERS) * 12 == 8 * 12
     obj._mark_catalog_pulled.assert_not_called()
 
 
