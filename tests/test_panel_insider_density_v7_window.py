@@ -3,18 +3,55 @@
 from __future__ import annotations
 
 import json
+import shutil
 from datetime import date, datetime, timezone
-from pathlib import Path
 
 import pandas as pd
 import pytest
 
 from analysis import panel_insider_density as v1
-from analysis import panel_insider_density_v7 as v7
 from analysis import panel_insider_density_sectors_v5 as s5
+from analysis import panel_insider_density_v2 as v2
+from analysis import panel_insider_density_v6 as v6
+from analysis import panel_insider_density_v7 as v7
 from analysis import price_admission_fetch as fetch
 from analysis import price_admission_probe as gd4
+from scripts import run_vs1_v2_insider_density as runner
 from scripts.run_vs1_v7_insider_density import check_early_probe
+
+
+def test_v7_freeze_digest_covers_new_code_and_refuses_mutation(tmp_path, monkeypatch):
+    """Changing a v7 run dependency invalidates frozen inputs, with v1-v6 unchanged."""
+    assert set(runner._code_files(v6)) == set(runner.CODE_FILES)
+    original = runner._code_files(v7)
+    assert set(original) == set(runner.V7_CODE_FILES)
+    assert set(runner.V7_CODE_FILES) - set(runner.CODE_FILES) == {
+        "analysis/panel_insider_density_v7.py",
+        "analysis/price_admission_fetch.py",
+        "analysis/price_admission_probe.py",
+        "scripts/run_price_admission_probe.py",
+        "scripts/run_real_panel_scan.py",
+        "scripts/run_vs1_v7_insider_density.py",
+        "scripts/run_vs1_v7_price_admission_probe.py",
+    }
+    for name in runner.V7_CODE_FILES:
+        copy = tmp_path / name
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(runner.REPO / name, copy)
+    monkeypatch.setattr(runner, "REPO", tmp_path)
+    changed_source = tmp_path / "scripts/run_vs1_v7_insider_density.py"
+    changed_source.write_bytes(changed_source.read_bytes() + b"\n# synthetic mutation\n")
+    changed = runner._code_files(v7)
+    assert changed["scripts/run_vs1_v7_insider_density.py"] != original[
+        "scripts/run_vs1_v7_insider_density.py"
+    ]
+    assert all(changed[name] == value for name, value in original.items()
+               if name != "scripts/run_vs1_v7_insider_density.py")
+    frozen = {key: None for key in v2.OBSERVED_INPUT_KEYS}
+    frozen["code_file_sha256"] = original
+    observed = {**frozen, "code_file_sha256": changed}
+    with pytest.raises(PermissionError, match="code_file_sha256"):
+        v2._check_observed(frozen, observed)
 
 
 def test_v7_window_is_scoped_and_holdout_fixed():
