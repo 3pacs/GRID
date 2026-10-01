@@ -338,6 +338,8 @@ def test_nonfinite_result_fields_reject_before_any_artifact(tmp_path, monkeypatc
 
 
 def test_existing_run_directory_is_preserved_untouched(tmp_path):
+    # Preserved behavior (the pre-fix CLI also refused): guards the reorder
+    # that now checks the directory before any work.
     out = tmp_path / "run"
     out.mkdir()
     (out / "keep.txt").write_bytes(b"prior")

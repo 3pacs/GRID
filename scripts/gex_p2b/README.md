@@ -47,9 +47,13 @@ licensing is unverified; keep raw bytes and run output outside Git.
 
 1. **Native behavior first.** GRID `DealerGammaEngine.compute_gex_profile` runs with only
    its two DB loaders replaced by packet adapters (r=.05, q=0, integer DTE, prior close).
-   Gamma Watch `broker.py:curves` runs from its own source with only the wall clock frozen
-   at valuation. Its gates, rounding, IV pairing, 20:00Z expiry and r/q are untouched.
-   Native results are `NOT_COMPARABLE` across engines.
+   Gamma Watch `broker.py:curves` runs from its own source with three disclosed
+   substitutions: the wall clock is frozen at valuation, `CONTRACTS` and the feed are built
+   from packet rows, and the RTD coverage gates are set to 1.0 (every packet row has direct
+   IV). Its gates, rounding, IV pairing, 20:00Z expiry and r/q are untouched; `build_feed`'s
+   missing-IV recovery is measured as an attribution factor instead. Native results are
+   `NOT_COMPARABLE` across engines; nonfinite native fields are recorded by path, and each
+   engine's native universe omissions are ledgered with OI.
 2. **Per contract at the packet spot**, against the P2-A 80/110-digit Decimal reference:
    GRID's shared primitive and the P2-A Gamma Watch kernel. The protocol tolerance is
    primary; the P2-A propagated bound is reported alongside. Expiry subtotal, strike
@@ -74,7 +78,13 @@ licensing is unverified; keep raw bytes and run output outside Git.
    `NOT_COMPARABLE`. Paid vendors stay off (owner ask).
 
 Collector source drift (pinned AST fingerprints, Python-version stable) makes the affected
-engine `NOT_SUPPORTED`, and the class-1 status can then not be a full PASS.
+engine `NOT_SUPPORTED`, and the class-1 status can then not be a full PASS. Statuses:
+`INPUT_REJECTED` only when `normalize()` rejects the packet; an engine fault or nonfinite
+engine output on valid input is that engine's `FAIL_NUMERICAL` (other engines keep their
+results); a harness fault on valid input is `INDETERMINATE` with the error recorded. GRID
+primitive rows below its `T_MIN` clip are `NOT_SUPPORTED`. Timing is `INDETERMINATE` even with
+a grid-svr receipt (server clock health is not evidenced), and Cboe's document timestamp is
+cross-checked against the receipt with any zone conflict recorded.
 
 ## Output (create-only)
 

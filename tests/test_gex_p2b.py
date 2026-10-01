@@ -78,7 +78,13 @@ def test_normalize_ledger_identity_and_calendar():
     }
     assert summary["EXPIRED"]["oi"] == 100.0
     # Invalid OI is unknown mass, not its raw value or zero.
-    assert summary["OI_INVALID"] == {"rows": 1, "oi": 0.0, "oi_unknown": 1}
+    assert summary["OI_INVALID"] == {
+        "rows": 1,
+        "oi_known": 0.0,
+        "oi_unknown_rows": 1,
+        "oi": None,
+    }
+    assert summary["IV_MISSING_OR_NONPOSITIVE"]["oi"] == 1200.0
     nov = [r for r in p["rows"] if r["expiry_date"] == "2026-11-27"]
     assert nov and all(r["early_close_candidate"] for r in nov)
     # 16:00 EST is 21:00Z after the DST change; flagged, never shifted to 13:00.
@@ -293,3 +299,193 @@ def test_harness_never_imports_frozen_paper_log_or_writers():
             imported.add(node.module or "")
     assert not any(m.startswith(("paper_log", "ingestion", "store", "db", "requests", "urllib")) for m in imported)
     assert not any(m.startswith("collectors") for m in imported)
+
+
+# ── root and wall definitions (protocol fixture matrix) ──────────────────
+
+GRID = [100.0, 101.0, 102.0, 103.0, 104.0]
+
+
+def linear(points):
+    """Piecewise-linear evaluator through (GRID, points) for refine()."""
+
+    def f(x):
+        for (x0, y0), (x1, y1) in zip(zip(GRID, points), zip(GRID[1:], points[1:])):
+            if x0 <= x <= x1:
+                return y0 + (y1 - y0) * (x - x0) / (x1 - x0)
+        raise ValueError(x)
+
+    return f
+
+
+@pytest.mark.parametrize(
+    "values,roots,uncertain",
+    [
+        ([1, 2, 3, 2, 1], [], 0),  # no root
+        ([1, -1, 1, -1, 1], [100.5, 101.5, 102.5, 103.5], 0),  # multiple roots
+        ([1, 0, -1, -2, -3], [], 2),  # exact zero: never an asserted flip
+        ([1, 0, 0, 1, 2], [], 3),  # flat zero interval
+        ([0, 1, 2, 3, 4], [], 1),  # boundary zero
+    ],
+)
+def test_brackets_and_refine(values, roots, uncertain):
+    found, unsure = h.root_set(linear(values), values, GRID)
+    assert [round(x["root"], 3) for x in found] == roots
+    assert all(x["bracket"][1] - x["bracket"][0] <= h.ROOT_BRACKET for x in found)
+    assert len(unsure) == uncertain
+
+
+def test_tangency_and_near_cancellation_are_indeterminate():
+    ref = [1.0, 0.004, 1.0, 2.0, 3.0]  # touches zero within tolerance, no crossing
+    engine = [1.0, -0.004, 1.0, 2.0, 3.0]  # crosses twice
+    tol = [0.01] * 5
+    ref_roots, unsure = h.root_set(linear(ref), ref, GRID, tol)
+    eng_roots, eng_unsure = h.root_set(linear(engine), engine, GRID)
+    near = [x for x, v, t in zip(GRID, ref, tol) if abs(v) <= t]
+    assert ref_roots == [] and len(eng_roots) == 2
+    assert h.match_roots(eng_roots, ref_roots, unsure, eng_unsure, near) == "INDETERMINATE"
+    # Without the indeterminate point the count mismatch is a failure.
+    assert h.match_roots(eng_roots, ref_roots, [], [], []) == "FAIL_NUMERICAL"
+    # An exact zero on the engine side is indeterminate, not silently dropped.
+    zero = [1.0, 0.0, 1.0, 2.0, 3.0]
+    z_roots, z_unsure = h.root_set(linear(zero), zero, GRID)
+    assert h.match_roots(z_roots, [], [], z_unsure, []) == "INDETERMINATE"
+
+
+def test_root_match_separation():
+    a = [{"root": 101.0}]
+    assert h.match_roots([{"root": 101.009}], a, [], [], []) == "PASS_NUMERICAL"
+    assert h.match_roots([{"root": 101.02}], a, [], [], []) == "FAIL_NUMERICAL"
+
+
+def test_walls_keep_ties_within_tolerance_as_sets():
+    per = {
+        760.0: {"call": 100.0, "put": -50.0},
+        765.0: {"call": 100.005, "put": -80.0},
+        770.0: {"call": 20.0, "put": -79.999},
+        775.0: {"call": 0.0, "put": 0.0},
+    }
+    w = h.walls(per, 0.01)
+    assert w["call_wall_max_positive_call"] == [760.0, 765.0]
+    assert w["put_wall_most_negative_put"] == [765.0, 770.0]
+    # |net|: 760 -> 50, 765 -> 20.005, 770 -> 59.999, 775 -> 0
+    assert w["net_wall_max_abs_net"] == [770.0]
+    assert h.walls({}, 0.01) == {
+        "call_wall_max_positive_call": [],
+        "put_wall_most_negative_put": [],
+        "net_wall_max_abs_net": [],
+    }
+
+
+# ── failure handling: engine faults never become INPUT_REJECTED ──────────
+
+
+def test_watch_kernel_drift_still_writes_every_artifact(monkeypatch):
+    def drifted():
+        raise ValueError("collector kernel structure changed; review adapter")
+
+    monkeypatch.setattr(h.p2a, "watch_kernel", drifted)
+    files = h.build(RAW.read_bytes(), RECEIPT.read_bytes())
+    r = results(files)
+    assert r["per_contract"]["engines"]["gamma_watch_kernel"]["status"] == "NOT_SUPPORTED"
+    assert r["per_contract"]["engines"]["grid_primitive"]["status"] == "PASS_NUMERICAL"
+    assert r["class_1_status"] == "NOT_SUPPORTED"
+    assert "gamma_watch_kernel | NOT_SUPPORTED" in files["REPORT.md"].decode()
+
+
+def test_engine_fault_is_engine_level_and_keeps_other_results(monkeypatch):
+    from physics.dealer_gamma import DealerGammaEngine
+
+    def broken(self, chain, spot):
+        raise KeyError("engine bug")
+
+    monkeypatch.setattr(DealerGammaEngine, "_compute_per_strike", broken)
+    r = results(h.build(RAW.read_bytes(), RECEIPT.read_bytes()))
+    wall = r["walls"]["engines"]["grid_per_strike"]
+    assert wall["status"] == "FAIL_NUMERICAL" and "engine bug" in wall["engine_error"]
+    assert r["curves"]["engines"]["grid_engine_vectorized"]["status"] == "PASS_NUMERICAL"
+    assert r["per_contract"]["engines"]["gamma_watch_kernel"]["status"] == "PASS_NUMERICAL"
+    assert r["class_1_status"] == "FAIL_NUMERICAL"
+    assert "engine_error" in r["native"]["grid"]  # native also uses the per-strike path
+
+
+def test_nonfinite_engine_curve_is_fail_numerical_not_rejection(monkeypatch):
+    import numpy as np
+    from physics.dealer_gamma import DealerGammaEngine
+
+    real = DealerGammaEngine._gex_at_spots_vectorized
+
+    def nan_curve(self, *a):
+        out = real(self, *a)
+        out[0] = np.nan
+        return out
+
+    monkeypatch.setattr(DealerGammaEngine, "_gex_at_spots_vectorized", nan_curve)
+    r = results(h.build(RAW.read_bytes(), RECEIPT.read_bytes()))
+    grid = r["curves"]["engines"]["grid_engine_vectorized"]
+    assert grid["status"] == "FAIL_NUMERICAL" and "nonfinite" in grid["reason"]
+    assert r["curves"]["engines"]["gamma_watch_aggregation"]["status"] == "PASS_NUMERICAL"
+    assert r["class_1_status"] == "FAIL_NUMERICAL"
+    # The native profile saw the same NaN: recorded by path, never a crash.
+    assert r["native"]["grid"]["nonfinite_fields"]
+
+
+def test_harness_fault_on_valid_input_is_indeterminate_with_artifacts(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("harness bug")
+
+    monkeypatch.setattr(h, "attribution", boom)
+    files = h.build(RAW.read_bytes(), RECEIPT.read_bytes())
+    r = results(files)
+    assert r["class_1_status"] == "INDETERMINATE" and "harness bug" in r["harness_error"]
+    assert json.loads(files["manifest.json"])["class_1"]["eligible_packets"] == 1
+    assert "Harness fault" in files["REPORT.md"].decode()
+
+
+def test_grid_t_floor_rows_are_not_supported_not_failures():
+    p = h.normalize(RAW.read_bytes(), RECEIPT.read_bytes())
+    p["rows"][0]["T"] = 1e-7  # below the GRID primitive's T_MIN clip
+    primitive, _ = h.p2a.load_primitive()
+    watch, _ = h.p2a.watch_kernel()
+    out = h.per_contract(p, primitive, watch)
+    grid = out["engines"]["grid_primitive"]
+    assert grid["counts"].get("NOT_SUPPORTED") == 1
+    assert "FAIL_NUMERICAL" not in grid["counts"]
+    assert grid["status"] == "NOT_SUPPORTED"
+    assert out["engines"]["gamma_watch_kernel"]["status"] == "PASS_NUMERICAL"
+
+
+def test_native_units_and_strike_rows_are_stored(built):
+    r = results(built)
+    for e in r["curves"]["engines"].values():
+        assert len(e["native_values"]) == len(r["curves"]["grid"])
+    grid_curve = r["curves"]["engines"]["grid_engine_vectorized"]
+    s0 = r["curves"]["grid"][0]
+    assert grid_curve["values"][0] == pytest.approx(grid_curve["native_values"][0] * s0 * 0.01)
+    watch = r["curves"]["engines"]["gamma_watch_aggregation"]
+    assert watch["values"][0] == pytest.approx(watch["native_values"][0] * 1e9)
+    walls = r["walls"]
+    assert walls["reference_per_strike"] and walls["engines"]["grid_per_strike"]["native_rows"]
+
+
+def test_iv_recovery_and_universe_factors_are_separated(built):
+    at = results(built)["attribution"]
+    rec = at["factors"]["universe_watch_iv_recovery"]
+    assert at["iv_recovery_rows"] == 1 and rec["contracts"] == at["baseline"]["contracts"] + 1
+    assert rec["delta_G"] != 0
+    t = at["factors"]["T_grid_integer_calendar_dte"]
+    assert t["delta_from"] == "universe_grid_drop_calendar_dte0"
+    assert at["expiry_scope"]["status"] == "NOT_SUPPORTED"
+    assert "native_universe_omissions" in results(built)["native"]["grid"]
+
+
+def test_provider_timestamp_zone_conflict_is_recorded(built):
+    check = results(built)["timing_validation"]["provider_timestamp_check"]
+    assert check["status"] == "INDETERMINATE"
+    assert check["utc_reading_possible"] and not check["new_york_reading_possible"]
+
+
+def test_grid_svr_receipt_timing_is_still_indeterminate():
+    raw = RAW.read_bytes()
+    r = results(h.build(raw, receipt_for(raw, clock="grid_svr_pull_receipt")))
+    assert r["timing_validation"]["status"] == "INDETERMINATE"

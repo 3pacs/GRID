@@ -241,7 +241,18 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
         if reason:
             # Invalid OI is unknown mass, never its raw (or zero) value.
             mass = None if reason == "OI_INVALID" else oi_raw
-            exclusions.append({"contract": symbol, "reason": reason, "oi": mass})
+            entry = {"contract": symbol, "reason": reason, "oi": mass}
+            if reason == "IV_MISSING_OR_NONPOSITIVE":
+                # Kept so Gamma Watch's paired-OTM IV recovery can be measured.
+                seconds = (expiry_instant(expiry_day) - valuation).total_seconds()
+                entry.update(
+                    expiry_date=expiry_day.isoformat(),
+                    strike=strike,
+                    side=side,
+                    T=seconds / YEAR_SECONDS,
+                    calendar_dte=(expiry_day - session).days,
+                )
+            exclusions.append(entry)
             continue
         seconds = (expiry_instant(expiry_day) - valuation).total_seconds()
         rows.append(
@@ -294,8 +305,55 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
         "rows": rows,
         "exclusions": exclusions,
     }
+    normalized["provider_timestamp_check"] = provider_timestamp_check(
+        doc.get("timestamp"), started, received
+    )
     normalized["packet_id"] = str(uuid.UUID(hex=digest(raw)[:32]))
     return normalized
+
+
+def provider_timestamp_check(raw_ts, started: datetime, received: datetime) -> dict:
+    """Cross-check Cboe's naive document timestamp against the pull receipt.
+
+    The valuation instant uses the underlying last_trade_time read as
+    America/New_York. The document timestamp's zone is undisclosed; a reading
+    that would place it after the receipt completed is impossible and is
+    recorded as a conflict, never silently resolved.
+    """
+    out = {"raw": raw_ts, "as_new_york": None, "as_utc": None}
+    try:
+        naive = datetime.fromisoformat(raw_ts) if isinstance(raw_ts, str) else None
+    except ValueError:
+        naive = None
+    if naive is None or naive.tzinfo is not None:
+        out["status"] = "INDETERMINATE"
+        out["note"] = "provider timestamp missing, malformed or offset-bearing"
+        return out
+    as_ny = naive.replace(tzinfo=ET).astimezone(timezone.utc)
+    as_utc = naive.replace(tzinfo=timezone.utc)
+    out.update(
+        as_new_york=as_ny.isoformat(),
+        as_utc=as_utc.isoformat(),
+        new_york_reading_possible=as_ny <= received,
+        utc_reading_possible=as_utc <= received,
+    )
+    if out["new_york_reading_possible"] and out["utc_reading_possible"]:
+        out["status"] = "INDETERMINATE"
+        out["note"] = "both zone readings precede the receipt; zone unknown"
+    elif out["utc_reading_possible"]:
+        out["status"] = "INDETERMINATE"
+        out["note"] = (
+            "document timestamp is only possible as UTC, while valuation reads "
+            "last_trade_time as New York: provider zones differ or are unknown"
+        )
+    elif out["new_york_reading_possible"]:
+        out["status"] = "INDETERMINATE"
+        out["note"] = "document timestamp is only possible as New York time"
+    else:
+        out["status"] = "INDETERMINATE"
+        out["conflict"] = True
+        out["note"] = "document timestamp follows the receipt under every reading"
+    return out
 
 
 def packet_hash(p: dict) -> str:
@@ -368,15 +426,17 @@ def grid_curve(rows, spots, r):
     """GRID engine-level aggregation (_gex_at_spots_vectorized), normalized.
 
     Adapter: dte column = T * 365 so the engine's T = dte / 365 reproduces the
-    packet T (within one ulp; mismatches are counted). Native GRID units are
-    gamma*OI*100*S; multiplying by S*0.01 at every point gives $/1% move.
+    packet T within one ulp (inexact round trips are counted in the result as
+    grid_adapter_T_roundtrip_mismatches). Native GRID units are gamma*OI*100*S;
+    multiplying by S*0.01 at every point gives $/1% move. Returns
+    (normalized, native).
     """
     engine = grid_engine(r)
     chain = grid_chain(rows, [row["T"] * 365.0 for row in rows])
     prepared = engine._prepare_chain_arrays(chain)
     spots = np.asarray(spots, dtype=np.float64)
     native = engine._gex_at_spots_vectorized(*prepared, spots)
-    return native * spots * 0.01
+    return native * spots * 0.01, native
 
 
 def _collector_tree():
@@ -456,7 +516,7 @@ def watch_aggregation():
             "np": np,
         }
         exec(compiled, {"__builtins__": {}}, env)
-        return env["net"] * 1e9  # native billions -> $/1% move
+        return env["net"] * 1e9, env["net"]  # (normalized $/1%, native $bn)
 
     return evaluate, digest(path.read_bytes()), fingerprint
 
@@ -515,94 +575,107 @@ def contract_status(actual: float, ref: Decimal) -> tuple[str, Decimal]:
     return ("PASS_NUMERICAL" if error <= tol else "FAIL_NUMERICAL"), error
 
 
+def engine_error(exc: BaseException) -> dict:
+    """An engine/adapter fault on valid input: FAIL_NUMERICAL, never INPUT_REJECTED."""
+    return {
+        "status": "FAIL_NUMERICAL",
+        "engine_error": f"{type(exc).__name__}: {exc}",
+    }
+
+
 def per_contract(p, primitive, watch):
     """Protocol step 3 at the packet spot: contract gamma, signed contribution,
     expiry subtotal, strike subtotal and total, for GRID's shared primitive
     (per-strike path) and Gamma Watch's extracted kernel, vs the Decimal
-    reference. The P2-A propagated error bound is reported alongside."""
+    reference. The P2-A propagated error bound is reported alongside. Each
+    engine is evaluated in isolation: one engine's fault never discards another
+    engine's comparison."""
     s, r, q = p["spot"], p["r"], p["q"]
-    engines = {
-        "grid_primitive": {"counts": {}, "bound_counts": {}, "max_rel_error": 0.0},
-        "gamma_watch_kernel": {"counts": {}, "bound_counts": {}, "max_rel_error": 0.0},
-    }
-    contributions = {name: [] for name in engines}
-    reference, certify = [], 0.0
+    reference, converged_refs, factors, certify = [], [], [], 0.0
     with localcontext() as ctx:
         ctx.prec = 80
         for row in p["rows"]:
             args = (s, row["strike"], row["T"], r, q, row["iv"])
             ref = decimal_gamma(*args, precision=80)
-            converged = decimal_gamma(*args, precision=110)
+            converged_refs.append(decimal_gamma(*args, precision=110))
             factor = Decimal.from_float(row["oi"] * row["multiplier"] * s * s * 0.01)
-            factor *= row["sign"]
-            reference.append(ref * factor)
+            factors.append(factor * row["sign"])
+            reference.append(ref)
             fl = float(reference_gamma_vec(s, row["strike"], row["T"], r, q, row["iv"]))
             if ref != 0:
                 certify = max(certify, float(abs(Decimal.from_float(fl) - ref) / ref))
-            outputs = {
-                "grid_primitive": (
-                    float(primitive.gamma(s, row["strike"], row["T"], r, row["iv"], q=q)),
-                    lambda: reference_bound(*args),
-                ),
-            }
-            if watch is not None:
-                outputs["gamma_watch_kernel"] = (
-                    float(watch(*args)),
-                    lambda: watch(*args, bounded=True),
-                )
-            for name, (actual, ball) in outputs.items():
+    ref_terms = [g * f for g, f in zip(reference, factors)]
+    gross = float(sum(abs(x) for x in ref_terms))
+    tol = agg_tolerance(gross)
+
+    def evaluate(name, gamma_of, bound_of, unsupported):
+        e = {"counts": {}, "bound_counts": {}, "max_rel_error": 0.0}
+        terms, skipped = [], 0
+        with localcontext() as ctx:
+            ctx.prec = 80
+            for row, ref, conv, factor in zip(p["rows"], reference, converged_refs, factors):
+                args = (s, row["strike"], row["T"], r, q, row["iv"])
+                if unsupported(row):
+                    e["counts"]["NOT_SUPPORTED"] = e["counts"].get("NOT_SUPPORTED", 0) + 1
+                    terms.append(None)
+                    skipped += 1
+                    continue
+                actual = float(gamma_of(args))
                 if not math.isfinite(actual):
-                    raise InputRejected("nonfinite engine gamma")
-                status, error = contract_status(actual, ref)
-                e = engines[name]
+                    status, error = "FAIL_NUMERICAL", None
+                else:
+                    status, error = contract_status(actual, ref)
                 e["counts"][status] = e["counts"].get(status, 0) + 1
+                if error is None:
+                    terms.append(math.nan)
+                    continue
                 if ref != 0:
                     e["max_rel_error"] = max(e["max_rel_error"], float(error / abs(ref)))
-                bound = ball().e + abs(ref - converged)
+                bound = bound_of(args).e + abs(ref - conv)
                 bstatus = "PASS_NUMERICAL" if error <= bound else "FAIL_NUMERICAL"
                 e["bound_counts"][bstatus] = e["bound_counts"].get(bstatus, 0) + 1
-                term = actual * row["oi"] * row["multiplier"] * s * s * 0.01 * row["sign"]
-                if not math.isfinite(term):
-                    raise InputRejected("nonfinite exposure contribution")
-                contributions[name].append(term)
-    gross = float(sum(abs(x) for x in reference))
-    tol = agg_tolerance(gross)
-    if watch is None:
-        engines["gamma_watch_kernel"] = {
-            "status": "NOT_SUPPORTED",
-            "reason": "collector d1/gamma fingerprint drift (P2-A pin); review adapter",
-        }
-    for name, e in engines.items():
-        if name not in contributions or (watch is None and name == "gamma_watch_kernel"):
-            continue
-        terms = contributions[name]
-        e["contract_status"] = (
-            "FAIL_NUMERICAL" if e["counts"].get("FAIL_NUMERICAL") else "PASS_NUMERICAL"
-        )
+                terms.append(actual * row["oi"] * row["multiplier"] * s * s * 0.01 * row["sign"])
+        e["contract_status"] = worst_status(e["counts"])
+        if skipped:
+            e["not_supported_reason"] = "GRID primitive T floor (T < T_MIN) differs from exact T"
         e["subtotals"] = {}
         for label, key in (("expiry", "expiry_date"), ("strike", "strike")):
             groups_ref, groups = {}, {}
-            for row, ref_term, term in zip(p["rows"], reference, terms):
+            for row, ref_term, term in zip(p["rows"], ref_terms, terms):
                 groups_ref[row[key]] = groups_ref.get(row[key], Decimal(0)) + ref_term
                 groups.setdefault(row[key], []).append(term)
-            worst = max(
-                abs(math.fsum(groups[k]) - float(v)) for k, v in groups_ref.items()
-            )
+            errors = [
+                None
+                if any(t is None for t in groups[k])
+                else abs(math.fsum(groups[k]) - float(v))
+                for k, v in groups_ref.items()
+            ]
+            finite = [x for x in errors if x is not None and math.isfinite(x)]
+            if any(x is None for x in errors):
+                status = "NOT_SUPPORTED"
+            elif len(finite) != len(errors) or max(finite) > tol:
+                status = "FAIL_NUMERICAL"
+            else:
+                status = "PASS_NUMERICAL"
             e["subtotals"][label] = {
                 "groups": len(groups_ref),
-                "max_abs_error": worst,
+                "max_abs_error": max(finite) if finite else None,
                 "tolerance": tol,
-                "status": "PASS_NUMERICAL" if worst <= tol else "FAIL_NUMERICAL",
+                "status": status,
             }
-        total, ref_total = math.fsum(terms), float(sum(reference, Decimal(0)))
+        ref_total = float(sum(ref_terms, Decimal(0)))
+        if any(t is None for t in terms):
+            total, err, tstatus = None, None, "NOT_SUPPORTED"
+        else:
+            total = math.fsum(terms)
+            err = abs(total - ref_total) if math.isfinite(total) else None
+            tstatus = "PASS_NUMERICAL" if err is not None and err <= tol else "FAIL_NUMERICAL"
         e["total"] = {
-            "value": total,
+            "value": total if total is not None and math.isfinite(total) else None,
             "reference": ref_total,
-            "abs_error": abs(total - ref_total),
+            "abs_error": err,
             "tolerance": tol,
-            "status": "PASS_NUMERICAL"
-            if abs(total - ref_total) <= tol
-            else "FAIL_NUMERICAL",
+            "status": tstatus,
             "sign": "INDETERMINATE"
             if abs(ref_total) <= tol
             else ("POSITIVE" if ref_total > 0 else "NEGATIVE"),
@@ -610,6 +683,33 @@ def per_contract(p, primitive, watch):
         parts = [e["contract_status"], e["total"]["status"]]
         parts += [x["status"] for x in e["subtotals"].values()]
         e["status"] = worst_status(parts)
+        return e
+
+    engines = {}
+    try:
+        engines["grid_primitive"] = evaluate(
+            "grid_primitive",
+            lambda a: primitive.gamma(a[0], a[1], a[2], a[3], a[5], q=a[4]),
+            lambda a: reference_bound(*a),
+            lambda row: row["T"] < primitive.T_MIN,
+        )
+    except Exception as exc:  # engine fault on valid input
+        engines["grid_primitive"] = engine_error(exc)
+    if watch is None:
+        engines["gamma_watch_kernel"] = {
+            "status": "NOT_SUPPORTED",
+            "reason": "collector d1/gamma fingerprint drift (P2-A pin); review adapter",
+        }
+    else:
+        try:
+            engines["gamma_watch_kernel"] = evaluate(
+                "gamma_watch_kernel",
+                lambda a: watch(*a),
+                lambda a: watch(*a, bounded=True),
+                lambda row: False,
+            )
+        except Exception as exc:
+            engines["gamma_watch_kernel"] = engine_error(exc)
     return {
         "spot": s,
         "contracts": len(p["rows"]),
@@ -641,8 +741,14 @@ def common_grid(spot: float):
     return [lo + i * step for i in range(count)]
 
 
-def brackets(values, spots, tol):
-    """Strict sign-change brackets; |value|<=tol at an endpoint -> indeterminate."""
+def brackets(values, spots, tol=None):
+    """Strict sign-change brackets on the grid.
+
+    Returns (found, uncertain). An exact zero or a flat zero interval is never
+    an asserted crossing: the bracket goes to ``uncertain``. With ``tol`` (the
+    per-point aggregate tolerance), a sign change whose endpoint is within
+    tolerance of zero is also uncertain (indeterminate sign near cancellation).
+    """
     found, uncertain = [], []
     for i in range(len(spots) - 1):
         a, b = values[i], values[i + 1]
@@ -656,6 +762,7 @@ def brackets(values, spots, tol):
 
 
 def refine(evaluate, lo, hi):
+    """Bisect a strict sign-change bracket to ROOT_BRACKET width."""
     f_lo = evaluate(lo)
     for _ in range(200):
         if hi - lo <= ROOT_BRACKET:
@@ -680,8 +787,16 @@ def root_set(evaluate, values, spots, tol=None):
     return roots, uncertain
 
 
-def match_roots(engine, reference, uncertain):
-    if uncertain:
+def match_roots(engine, reference, uncertain, engine_uncertain=(), indeterminate_points=()):
+    """Protocol root-set match.
+
+    INDETERMINATE when the reference has a sign-indeterminate point (|G| within
+    tolerance: tangency or near-cancellation) or an uncertain bracket, or when
+    the engine curve has an exact zero: a flip there cannot be asserted either
+    way. Otherwise equal counts and one-to-one separation <= ROOT_MATCH (sorted
+    order) pass.
+    """
+    if uncertain or engine_uncertain or indeterminate_points:
         return "INDETERMINATE"
     if len(engine) != len(reference):
         return "FAIL_NUMERICAL"
@@ -723,19 +838,27 @@ def reference_per_strike(a, rows, s, r, q):
 
 
 def grid_per_strike(rows, s, r):
+    """GRID _compute_per_strike rows: (normalized $/1% dict, native rows)."""
     engine = grid_engine(r)
     chain = grid_chain(rows, [row["T"] * 365.0 for row in rows])
     scale = s * 0.01
-    return {
+    native = engine._compute_per_strike(chain, s)
+    normalized = {
         x["strike"]: {"call": x["call_gex"] * scale, "put": x["put_gex"] * scale}
-        for x in engine._compute_per_strike(chain, s)
+        for x in native
     }
+    return normalized, native
+
+
+def strike_rows(per_strike: dict) -> list:
+    return [[k, v["call"], v["put"]] for k, v in sorted(per_strike.items())]
 
 
 def engine_curves(p, a, spots, watch_eval):
     r, q = p["r"], p["q"]
     ref_values, ref_gross = reference_curve(a, spots, r, q)
     tol = [agg_tolerance(g) for g in ref_gross]
+    t_mismatch = sum(1 for row in p["rows"] if (row["T"] * 365.0) / 365.0 != row["T"])
     out = {
         "grid": spots,
         "reference": {
@@ -743,6 +866,7 @@ def engine_curves(p, a, spots, watch_eval):
             "gross": ref_gross.tolist(),
             "implementation": "independent float64 + math.fsum, Decimal-certified",
         },
+        "grid_adapter_T_roundtrip_mismatches": t_mismatch,
         "engines": {},
     }
 
@@ -750,22 +874,23 @@ def engine_curves(p, a, spots, watch_eval):
         return reference_curve(a, [x], r, q)[0][0]
 
     ref_roots, uncertain = root_set(ref_eval, ref_values, spots, tol)
+    indeterminate = [x for x, v, t in zip(spots, ref_values, tol) if abs(v) <= t]
     out["reference"]["roots"] = ref_roots
     out["reference"]["indeterminate_brackets"] = uncertain
-    out["reference"]["sign_indeterminate_points"] = [
-        x for x, v, t in zip(spots, ref_values, tol) if abs(v) <= t
-    ]
+    out["reference"]["sign_indeterminate_points"] = indeterminate
     evaluators = {
         "grid_engine_vectorized": (
             (lambda xs: grid_curve(p["rows"], xs, r)) if q == 0 else None,
             "physics/dealer_gamma.py DealerGammaEngine._gex_at_spots_vectorized",
+            "gamma*OI*100*S (native) x S*0.01",
         ),
         "gamma_watch_aggregation": (
             (lambda xs: watch_eval(a, xs, r, q)) if watch_eval else None,
             "collectors/gamma_watch/broker.py curves() iv/d1/gamma/net statements",
+            "$bn per 1% move (native) x 1e9",
         ),
     }
-    for name, (fn, source) in evaluators.items():
+    for name, (fn, source, unit) in evaluators.items():
         if fn is None:
             out["engines"][name] = {
                 "source": source,
@@ -775,25 +900,42 @@ def engine_curves(p, a, spots, watch_eval):
                 else "collector source fingerprint drift; review adapter",
             }
             continue
-        values = np.asarray(fn(spots), dtype=np.float64)
-        if not np.all(np.isfinite(values)):
-            raise InputRejected(f"nonfinite {name} curve")
-        errors = np.abs(values - ref_values)
-        point_ok = errors <= np.array(tol)
-        roots, _ = root_set(lambda x: float(fn([x])[0]), values.tolist(), spots)
-        root_status = match_roots(roots, ref_roots, uncertain)
-        curve_status = "PASS_NUMERICAL" if bool(point_ok.all()) else "FAIL_NUMERICAL"
-        out["engines"][name] = {
-            "source": source,
-            "values": values.tolist(),
-            "max_abs_error": float(errors.max()),
-            "max_error_over_gross": float(np.max(errors / np.maximum(ref_gross, 1e-300))),
-            "points_failed": int((~point_ok).sum()),
-            "curve_status": curve_status,
-            "roots": roots,
-            "root_status": root_status,
-            "status": worst_status([curve_status, root_status]),
-        }
+        try:
+            values, native = fn(spots)
+            values = np.asarray(values, dtype=np.float64)
+            entry = {"source": source, "unit_conversion": unit}
+            if not np.all(np.isfinite(values)):
+                entry.update(
+                    status="FAIL_NUMERICAL",
+                    curve_status="FAIL_NUMERICAL",
+                    reason="nonfinite engine output where the reference is finite",
+                )
+                out["engines"][name] = entry
+                continue
+            entry["native_values"] = np.asarray(native, dtype=np.float64).tolist()
+            errors = np.abs(values - ref_values)
+            point_ok = errors <= np.array(tol)
+            roots, engine_uncertain = root_set(
+                lambda x: float(fn([x])[0][0]), values.tolist(), spots
+            )
+            root_status = match_roots(
+                roots, ref_roots, uncertain, engine_uncertain, indeterminate
+            )
+            curve_status = "PASS_NUMERICAL" if bool(point_ok.all()) else "FAIL_NUMERICAL"
+            entry.update(
+                values=values.tolist(),
+                max_abs_error=float(errors.max()),
+                max_error_over_gross=float(np.max(errors / np.maximum(ref_gross, 1e-300))),
+                points_failed=int((~point_ok).sum()),
+                curve_status=curve_status,
+                roots=roots,
+                engine_uncertain_brackets=engine_uncertain,
+                root_status=root_status,
+                status=worst_status([curve_status, root_status]),
+            )
+            out["engines"][name] = entry
+        except Exception as exc:  # engine fault on valid input
+            out["engines"][name] = {"source": source, **engine_error(exc)}
     return out, ref_eval
 
 
@@ -803,41 +945,96 @@ def wall_comparison(p, a):
     gross = math.fsum(abs(v["call"]) + abs(v["put"]) for v in ref.values())
     tol = agg_tolerance(gross)
     ref_walls = walls(ref, tol)
-    out = {"spot": s, "tolerance": tol, "reference": ref_walls, "engines": {}}
+    out = {
+        "spot": s,
+        "tolerance": tol,
+        "reference": ref_walls,
+        "per_strike_columns": ["strike", "call_usd_per_1pct", "put_usd_per_1pct"],
+        "reference_per_strike": strike_rows(ref),
+        "engines": {},
+    }
     if q != 0:
         out["engines"]["grid_per_strike"] = {
             "status": "NOT_SUPPORTED",
             "reason": "GRID per-strike path has no dividend yield",
         }
     else:
-        grid = grid_per_strike(p["rows"], s, r)
-        same_keys = set(grid) == set(ref)
-        worst = max(
-            max(abs(grid[k]["call"] - v["call"]), abs(grid[k]["put"] - v["put"]))
-            for k, v in ref.items()
-            if k in grid
-        )
-        grid_walls = walls(grid, tol)
-        strike_status = (
-            "PASS_NUMERICAL" if same_keys and worst <= tol else "FAIL_NUMERICAL"
-        )
-        wall_status = "PASS_NUMERICAL" if grid_walls == ref_walls else "FAIL_NUMERICAL"
-        out["engines"]["grid_per_strike"] = {
-            "source": "physics/dealer_gamma.py DealerGammaEngine._compute_per_strike",
-            "walls": grid_walls,
-            "strike_max_abs_error": worst,
-            "strike_status": strike_status,
-            "wall_status": wall_status,
-            "status": worst_status([strike_status, wall_status]),
-        }
+        try:
+            grid, native = grid_per_strike(p["rows"], s, r)
+            same_keys = set(grid) == set(ref)
+            diffs = [
+                max(abs(grid[k]["call"] - v["call"]), abs(grid[k]["put"] - v["put"]))
+                for k, v in ref.items()
+                if k in grid
+            ]
+            worst = max(diffs) if diffs else None
+            finite = worst is not None and math.isfinite(worst)
+            grid_walls = walls(grid, tol) if finite else None
+            strike_status = (
+                "PASS_NUMERICAL"
+                if same_keys and finite and worst <= tol
+                else "FAIL_NUMERICAL"
+            )
+            wall_status = "PASS_NUMERICAL" if grid_walls == ref_walls else "FAIL_NUMERICAL"
+            out["engines"]["grid_per_strike"] = {
+                "source": "physics/dealer_gamma.py DealerGammaEngine._compute_per_strike",
+                "walls": grid_walls,
+                "per_strike": strike_rows(grid) if finite else None,
+                "native_rows": [
+                    [x["strike"], x["call_gex"], x["put_gex"]] for x in native
+                ]
+                if finite
+                else None,
+                "native_columns": ["strike", "call_gex", "put_gex"],
+                "strike_max_abs_error": worst if finite else None,
+                "strike_status": strike_status,
+                "wall_status": wall_status,
+                "status": worst_status([strike_status, wall_status]),
+            }
+        except Exception as exc:  # engine fault on valid input
+            out["engines"]["grid_per_strike"] = engine_error(exc)
     out["engines"]["gamma_watch"] = {
         "status": "NOT_SUPPORTED",
+        "structural_not_applicable": True,
         "reason": "broker.py:curves computes no strike walls; its walls are ZeroGEX vendor output (class 3)",
     }
     return out
 
 
 # ── native behavior (protocol step 1) ────────────────────────────────────
+
+
+def json_safe(value, path="", found=None):
+    """Native engine output with every nonfinite float replaced by None.
+
+    Native outputs are preserved as produced, except that NaN/inf cannot be
+    serialized; their JSON paths are recorded instead of crashing the run.
+    """
+    if found is None:
+        found = []
+    if isinstance(value, float) and not math.isfinite(value):
+        found.append(path or "$")
+        return None, found
+    if isinstance(value, dict):
+        return {k: json_safe(v, f"{path}.{k}", found)[0] for k, v in value.items()}, found
+    if isinstance(value, (list, tuple)):
+        return [json_safe(v, f"{path}[{i}]", found)[0] for i, v in enumerate(value)], found
+    if isinstance(value, np.generic):
+        return json_safe(value.item(), path, found)
+    return value, found
+
+
+def native_record(out: dict) -> dict:
+    safe, nonfinite = json_safe(out)
+    if nonfinite:
+        safe["nonfinite_fields"] = nonfinite
+    return safe
+
+
+def omissions(rows, drop) -> dict:
+    """Rows an engine's native universe drops, with their OI mass."""
+    dropped = [r for r in rows if drop(r)]
+    return {"rows": len(dropped), "oi": math.fsum(r["oi"] for r in dropped)}
 
 
 def grid_native(p):
@@ -874,12 +1071,19 @@ def grid_native(p):
     }
     engine._load_chain = lambda ticker, snap_date, capture_batch_id=None: chain
     engine._get_spot_receipt = lambda ticker, completed: receipt
-    out = engine.compute_gex_profile("SPY", session)
+    try:
+        out = engine.compute_gex_profile("SPY", session)
+    except Exception as exc:  # engine fault on valid input
+        return {"status": "NOT_COMPARABLE", **engine_error(exc)}
+    out["status"] = "NOT_COMPARABLE"
+    out["native_universe_omissions"] = {
+        "calendar_dte_le_0": omissions(p["rows"], lambda r: r["calendar_dte"] <= 0)
+    }
     out["adapter"] = (
         "DB loaders replaced by packet chain/receipt; receipt is provider-derived "
         "(current_price - price_change), not GRID's spy_close_receipt"
     )
-    return out
+    return native_record(out)
 
 
 def watch_native_run(p):
@@ -905,40 +1109,89 @@ def watch_native_run(p):
         "expiries": sorted({r["expiry"] for r in rows}),
     }
     try:
-        path, tree = _collector_tree()
-        fingerprint = native_fingerprint(
-            [_function(tree, "dt"), _function(tree, "curves")]
-        )
+        _, tree = _collector_tree()
+        fingerprint = native_fingerprint([_function(tree, "dt"), _function(tree, "curves")])
     except (StopIteration, SyntaxError, OSError):
         fingerprint = None
-    if fingerprint == WATCH_NATIVE_FINGERPRINT:
-        try:
-            out, fingerprint = watch_native(feed, rows, valuation)
-        except ValueError as exc:
-            # The collector's own gates (coverage, spot window) withheld it.
-            return {"status": "NOT_SUPPORTED", "reason": f"native gate: {exc}"}
     if fingerprint != WATCH_NATIVE_FINGERPRINT:
         return {
             "status": "NOT_SUPPORTED",
             "reason": "collector curves()/dt() fingerprint drift; review adapter",
             "fingerprint": fingerprint,
         }
+    try:
+        out, _ = watch_native(feed, rows, valuation)
+    except ValueError as exc:
+        # The collector's own gates (coverage, spot window) withheld it.
+        return {"status": "NOT_SUPPORTED", "reason": f"native gate: {exc}"}
+    except Exception as exc:  # engine fault on valid input
+        return {"status": "NOT_COMPARABLE", **engine_error(exc)}
+    fixed20 = {
+        r["contract"]: (
+            datetime.combine(date.fromisoformat(r["expiry_date"]), time(20, 0), timezone.utc)
+            <= valuation
+        )
+        for r in p["rows"]
+    }
+    out["status"] = "NOT_COMPARABLE"
+    out["native_universe_omissions"] = {
+        "fixed_20Z_expiry_not_after_valuation": omissions(
+            p["rows"], lambda r: fixed20[r["contract"]]
+        )
+    }
     out["adapter"] = (
-        "clock frozen at packet valuation; CONTRACTS/feed built from packet rows; "
-        "RTD coverage gates set to 1.0 because every packet row has direct IV"
+        "substitutions: wall clock frozen at packet valuation; CONTRACTS and the "
+        "feed built from packet rows; RTD coverage gates set to 1.0 because every "
+        "packet row has direct IV. build_feed (RTD parsing and paired-OTM recovery "
+        "of missing-IV rows) is not exercised; its effect is the "
+        "universe_watch_iv_recovery attribution factor."
     )
-    return out
+    return native_record(out)
 
 
 # ── one-factor attribution (protocol step 4) ─────────────────────────────
 
 
 def paired_otm_iv(rows, spot):
+    """curves() 'paired OTM IV': pairs only among rows that reach curves()
+    (Watch drops zero-OI and missing-IV rows before pairing, as here)."""
     by_key = {(r["expiry_date"], r["strike"], r["side"]): r["iv"] for r in rows}
     out = []
     for r in rows:
         side = "put" if r["strike"] < spot else "call"
         out.append(by_key.get((r["expiry_date"], r["strike"], side), r["iv"]))
+    return out
+
+
+def recovered_rows(p):
+    """build_feed's paired-OTM recovery: an excluded missing-IV row whose OTM
+    mate (same expiry/strike, other side) survived takes the mate's IV."""
+    spot = p["spot"]
+    by_key = {(r["expiry_date"], r["strike"], r["side"]): r for r in p["rows"]}
+    out = []
+    for e in p["exclusions"]:
+        if e["reason"] != "IV_MISSING_OR_NONPOSITIVE" or not e.get("oi"):
+            continue
+        otm = "put" if e["strike"] < spot else "call"
+        if e["side"] == otm:
+            continue  # Watch recovers only ITM rows from their OTM mate
+        mate = by_key.get((e["expiry_date"], e["strike"], otm))
+        if mate is None:
+            continue
+        out.append(
+            {
+                "contract": e["contract"],
+                "expiry_date": e["expiry_date"],
+                "strike": e["strike"],
+                "side": e["side"],
+                "sign": 1 if e["side"] == "call" else -1,
+                "iv": mate["iv"],
+                "oi": e["oi"],
+                "multiplier": 100.0,
+                "T": e["T"],
+                "calendar_dte": e["calendar_dte"],
+            }
+        )
     return out
 
 
@@ -955,24 +1208,31 @@ def attribution(p, spots):
         for r in rows
     ]
     window = [WATCH_GRID[0] <= r["strike"] <= WATCH_GRID[1] for r in rows]
+    dte_pos = [r["calendar_dte"] > 0 for r in rows]
+    fixed_pos = [t > 0 for t in t_fixed20]
+    recovered = recovered_rows(p)
 
-    def run(*, r=BASELINE["r"], q=BASELINE["q"], T=None, iv=None, keep=None, at=spot):
-        use = [i for i, row in enumerate(rows) if (keep is None or keep[i])]
+    def run(*, r=BASELINE["r"], q=BASELINE["q"], T=None, iv=None, keep=None, at=spot, extra=()):
+        use = [i for i in range(len(rows)) if keep is None or keep[i]]
         pick = lambda xs: None if xs is None else [xs[i] for i in use]  # noqa: E731
         T_use = pick(T)
         if T_use is not None and any(t <= 0 for t in T_use):
-            use = [i for i, t in zip(use, T_use) if t > 0]
-            T_use = [x for x in T_use if x > 0]
-        a = arrays([rows[i] for i in use], T=T_use, iv=pick(iv))
+            raise ValueError("a T factor must be paired with its own universe drop")
+        chosen = [rows[i] for i in use] + list(extra)
+        a = arrays(
+            chosen,
+            T=None if T_use is None else T_use + [x["T"] for x in extra],
+            iv=None if iv is None else pick(iv) + [x["iv"] for x in extra],
+        )
         at_value = math.fsum(reference_terms(a, at, r, q).tolist())
-        values, gross = reference_curve(a, spots, r, q)
+        values, _ = reference_curve(a, spots, r, q)
         roots, _ = root_set(
             lambda x: reference_curve(a, [x], r, q)[0][0], values.tolist(), spots
         )
         return {
             "G_at_eval_spot": at_value,
             "eval_spot": at,
-            "contracts": len(use),
+            "contracts": len(chosen),
             "roots": [round(x["root"], 3) for x in roots],
         }
 
@@ -980,60 +1240,92 @@ def attribution(p, spots):
     factors = {
         "r_grid_native_0.05": run(r=GRID_NATIVE["r"]),
         "q_watch_native_0.012": run(q=WATCH_NATIVE["q"]),
-        "T_grid_integer_calendar_dte": run(T=t_integer),
-        "T_watch_fixed_20Z_expiry": run(T=t_fixed20),
+        "universe_grid_drop_calendar_dte0": run(keep=dte_pos),
+        "universe_watch_drop_fixed20Z_expired": run(keep=fixed_pos),
         "spot_prior_close_derived": run(at=p["prior_close_derived"]),
         "iv_watch_paired_otm": run(iv=paired_otm_iv(rows, spot)),
         "universe_watch_strike_window_735_790": run(keep=window),
+        "universe_watch_iv_recovery": run(extra=recovered),
     }
-    zero_dte = sum(1 for r in rows if r["calendar_dte"] == 0)
+    # T conventions are measured on the universe each convention can represent,
+    # against that universe's own exact-T value, so a universe drop is never
+    # reported as a time-convention effect.
+    t_factors = {
+        "T_grid_integer_calendar_dte": (
+            run(keep=dte_pos, T=t_integer),
+            "universe_grid_drop_calendar_dte0",
+        ),
+        "T_watch_fixed_20Z_expiry": (
+            run(keep=fixed_pos, T=t_fixed20),
+            "universe_watch_drop_fixed20Z_expired",
+        ),
+    }
+    for item in factors.values():
+        item["delta_G"] = item["G_at_eval_spot"] - base["G_at_eval_spot"]
+        item["delta_from"] = "baseline"
+    for name, (item, parent) in t_factors.items():
+        item["delta_G"] = item["G_at_eval_spot"] - factors[parent]["G_at_eval_spot"]
+        item["delta_from"] = parent
+        factors[name] = item
     combined = {
         "grid_native_combined": run(
-            r=GRID_NATIVE["r"], T=t_integer, at=p["prior_close_derived"]
+            r=GRID_NATIVE["r"], keep=dte_pos, T=t_integer, at=p["prior_close_derived"]
         ),
         "watch_native_combined": run(
             r=WATCH_NATIVE["r"],
             q=WATCH_NATIVE["q"],
+            keep=[f and w for f, w in zip(fixed_pos, window)],
             T=t_fixed20,
             iv=paired_otm_iv(rows, spot),
-            keep=window,
         ),
     }
-    for item in list(factors.values()) + list(combined.values()):
-        item["delta_G"] = item["G_at_eval_spot"] - base["G_at_eval_spot"]
     members = {
         "grid_native_combined": (
             "r_grid_native_0.05",
+            "universe_grid_drop_calendar_dte0",
             "T_grid_integer_calendar_dte",
             "spot_prior_close_derived",
         ),
         "watch_native_combined": (
             "q_watch_native_0.012",
+            "universe_watch_drop_fixed20Z_expired",
             "T_watch_fixed_20Z_expiry",
             "iv_watch_paired_otm",
             "universe_watch_strike_window_735_790",
         ),
     }
     for name, parts in members.items():
-        combined[name]["interaction_residual"] = combined[name]["delta_G"] - sum(
+        item = combined[name]
+        item["delta_G"] = item["G_at_eval_spot"] - base["G_at_eval_spot"]
+        item["delta_from"] = "baseline"
+        item["members"] = list(parts)
+        item["interaction_residual"] = item["delta_G"] - sum(
             factors[x]["delta_G"] for x in parts
         )
+    zero_dte = omissions(rows, lambda r: r["calendar_dte"] == 0)
     return {
         "evaluator": "certified independent reference (float64 + fsum)",
         "baseline": base,
         "factors": factors,
         "combined": combined,
         "zero_dte": {
-            "rows": zero_dte,
-            "status": "NOT_SUPPORTED" if zero_dte else "NOT_COMPARABLE",
-            "note": "GRID native loader excludes calendar DTE 0; none present at this valuation"
-            if not zero_dte
-            else "GRID native equivalence NOT_SUPPORTED for 0DTE rows",
+            **zero_dte,
+            "status": "NOT_SUPPORTED" if zero_dte["rows"] else "NOT_COMPARABLE",
+            "note": "GRID native loader excludes calendar DTE 0"
+            + ("" if zero_dte["rows"] else "; none present at this valuation"),
+        },
+        "expiry_scope": {
+            "status": "NOT_SUPPORTED",
+            "note": (
+                "Gamma Watch's expiry scope is a static RTD subscription list "
+                "(contracts.json), not reconstructible for this packet; not inferred"
+            ),
         },
         "oi_vintage": {
             "status": "NOT_SUPPORTED",
             "note": "single OI vintage; Cboe supplies no OI as-of date",
         },
+        "iv_recovery_rows": len(recovered),
         "note": "Interacting factors are not additive; residuals are reported, not apportioned.",
     }
 
@@ -1117,17 +1409,21 @@ def code_hashes():
 
 
 def environment():
+    import pandas as pd
+
     return {
         "python": sys.version,
         "numpy": np.__version__,
+        "pandas": pd.__version__,
         "platform": sys.platform,
         "float_mantissa_bits": sys.float_info.mant_dig,
     }
 
 
-def reconcile(raw: bytes, receipt_raw: bytes) -> tuple[dict, dict]:
+def reconcile(raw: bytes, receipt_raw: bytes, p: dict | None = None) -> tuple[dict, dict]:
     """Pure: bytes in, (complete result, normalized packet) out."""
-    p = normalize(raw, receipt_raw)
+    if p is None:
+        p = normalize(raw, receipt_raw)
     phash = packet_hash(p)
     primitive, _ = p2a.load_primitive()
     try:
@@ -1151,14 +1447,16 @@ def reconcile(raw: bytes, receipt_raw: bytes) -> tuple[dict, dict]:
     wall = wall_comparison(p, a)
     class1 = [e["status"] for e in contract["engines"].values()]
     class1 += [e["status"] for e in curves["engines"].values()]
+    # Only a structurally absent capability (Gamma Watch computes no walls) is
+    # left out; any other NOT_SUPPORTED engine keeps class 1 from a full PASS.
     class1 += [
-        e["status"] for e in wall["engines"].values() if e["status"] != "NOT_SUPPORTED"
+        e["status"]
+        for e in wall["engines"].values()
+        if not e.get("structural_not_applicable")
     ]
-    timing = (
-        "INDETERMINATE"
-        if p["availability_basis"] == "untrusted_workstation"
-        else "NOT_SUPPORTED"
-    )
+    # Unknown unless server clock health is evidenced, which this harness
+    # cannot do: a grid-svr receipt is still INDETERMINATE timing.
+    timing = "INDETERMINATE"
     return {
         "schema": RESULT_SCHEMA,
         "packet_id": p["packet_id"],
@@ -1169,7 +1467,9 @@ def reconcile(raw: bytes, receipt_raw: bytes) -> tuple[dict, dict]:
         "timing_validation": {
             "status": timing,
             "basis": p["availability_basis"],
-            "note": "pull receipt proves when bytes were held, not exchange freshness or OI age",
+            "note": "pull receipt proves when bytes were held, not exchange freshness "
+            "or OI age; server clock health is not evidenced here",
+            "provider_timestamp_check": p["provider_timestamp_check"],
         },
         "parameters": {"r": p["r"], "q": p["q"], "spot": p["spot"], "grid": spots},
         "tolerances": TOLERANCES,
@@ -1193,12 +1493,17 @@ def reconcile(raw: bytes, receipt_raw: bytes) -> tuple[dict, dict]:
 def exclusion_summary(p):
     out = {}
     for e in p["exclusions"]:
-        bucket = out.setdefault(e["reason"], {"rows": 0, "oi": 0.0, "oi_unknown": 0})
+        bucket = out.setdefault(
+            e["reason"], {"rows": 0, "oi_known": 0.0, "oi_unknown_rows": 0}
+        )
         bucket["rows"] += 1
         if e["oi"] is None:
-            bucket["oi_unknown"] += 1
+            bucket["oi_unknown_rows"] += 1
         else:
-            bucket["oi"] += e["oi"]
+            bucket["oi_known"] += e["oi"]
+    for bucket in out.values():
+        # Total mass is unknown (null) whenever any row's OI is unknown, never 0.
+        bucket["oi"] = None if bucket["oi_unknown_rows"] else bucket["oi_known"]
     flagged = [r["contract"] for r in p["rows"] if r["early_close_candidate"]]
     return {
         "by_reason": out,
@@ -1211,19 +1516,37 @@ def exclusion_summary(p):
     }
 
 
+def _fmt(value, spec: str) -> str:
+    """Format a number, or show '-' for an absent value (never crash a report)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+        return format(value, spec)
+    return "-"
+
+
+def _engine_note(e: dict) -> str:
+    return str(e.get("engine_error") or e.get("reason") or e.get("not_supported_reason") or "")
+
+
 def report(result: dict, packet: dict | None) -> str:
+    """Human report. Every engine shape (comparison, NOT_SUPPORTED, engine
+    fault) renders; a report can never be the reason a run writes nothing."""
+    status = result["class_1_status"]
     lines = [
         "# GEX P2-B matched real-input packet report",
         "",
-        f"Status (class 1 exact-input arithmetic): **{result['class_1_status']}**",
+        f"Status (class 1 exact-input arithmetic): **{status}**",
         "",
         "Evidence boundary: identical-input arithmetic only. Not vendor validation, "
         "observed dealer positioning, or a trading edge. No canonical-engine choice.",
         "",
     ]
-    if result["class_1_status"] == "INPUT_REJECTED":
-        lines += [f"Rejected: {result.get('reason')}", ""]
+    if result.get("reason"):
+        lines += [f"Rejected: {result['reason']}", ""]
+    if result.get("harness_error"):
+        lines += [f"Harness fault on valid input (not an input rejection): {result['harness_error']}", ""]
     if packet:
+        timing = result["timing_validation"]
+        check = timing.get("provider_timestamp_check", {})
         lines += [
             "## Packet",
             "",
@@ -1231,7 +1554,9 @@ def report(result: dict, packet: dict | None) -> str:
             f"- raw sha256 `{result['raw_sha256']}`; receipt sha256 `{result['receipt_sha256']}`",
             f"- valuation_at {packet['valuation_at']} ({packet['valuation_basis']})",
             f"- available_at {packet['available_at']} ({packet['availability_basis']}); "
-            f"timing validation {result['timing_validation']['status']}",
+            f"timing validation {timing['status']}",
+            f"- provider document timestamp {check.get('raw')}: {check.get('status')} "
+            f"({check.get('note')})",
             f"- spot {packet['spot']} (Cboe current_price); prior close derived "
             f"{packet['prior_close_derived']}; prev_day_close field {packet['prior_close_field']}",
             f"- calendar {packet['calendar_version']}",
@@ -1241,13 +1566,14 @@ def report(result: dict, packet: dict | None) -> str:
         ex = result["exclusion_summary"]
         lines += ["## Exclusion ledger (no post-hoc exclusion of failures)", ""]
         lines += [
-            f"- {k}: {v['rows']} rows, OI {v['oi']:.0f} (+{v['oi_unknown']} unknown)"
+            f"- {k}: {v['rows']} rows, OI {_fmt(v['oi'], '.0f')} "
+            f"(known {_fmt(v['oi_known'], '.0f')}, unknown-OI rows {v['oi_unknown_rows']})"
             for k, v in sorted(ex["by_reason"].items())
         ]
         lines += [
-            f"- included: {ex['included_rows']} rows, OI {ex['included_oi']:.0f}; "
+            f"- included: {ex['included_rows']} rows, OI {_fmt(ex['included_oi'], '.0f')}; "
             f"early-close candidates flagged (not modeled): {ex['early_close_candidate_rows']} "
-            f"rows, OI {ex['early_close_candidate_oi']:.0f}",
+            f"rows, OI {_fmt(ex['early_close_candidate_oi'], '.0f')}",
             "",
         ]
         pc = result["per_contract"]
@@ -1255,18 +1581,21 @@ def report(result: dict, packet: dict | None) -> str:
             "## Class 1: per contract and subtotals at the packet spot",
             "",
             f"Reference: 80/110-digit Decimal (P2-A). Float reference max relative "
-            f"error {pc['reference_float_max_rel_error']:.2e} (certified "
+            f"error {_fmt(pc['reference_float_max_rel_error'], '.2e')} (certified "
             f"{pc['reference_float_certified']}).",
             "",
-            "| engine | contracts | contract gamma | protocol tol | P2-A bound | expiry subtotal | strike subtotal | total | sign |",
-            "|---|---|---|---|---|---|---|---|---|",
+            "| engine | status | contract gamma (protocol tol) | P2-A bound | max rel err | expiry subtotal | strike subtotal | total | sign | note |",
+            "|---|---|---|---|---|---|---|---|---|---|",
         ]
         for name, e in pc["engines"].items():
+            sub = e.get("subtotals", {})
+            total = e.get("total", {})
             lines.append(
-                f"| {name} | {pc['contracts']} | max rel err {e['max_rel_error']:.2e} | "
-                f"{e['contract_status']} {e['counts']} | {e['bound_counts']} | "
-                f"{e['subtotals']['expiry']['status']} | {e['subtotals']['strike']['status']} | "
-                f"{e['total']['status']} (err ${e['total']['abs_error']:.4f}) | {e['total']['sign']} |"
+                f"| {name} | {e['status']} | {e.get('counts', '-')} | {e.get('bound_counts', '-')} | "
+                f"{_fmt(e.get('max_rel_error'), '.2e')} | "
+                f"{sub.get('expiry', {}).get('status', '-')} | {sub.get('strike', {}).get('status', '-')} | "
+                f"{total.get('status', '-')} (err ${_fmt(total.get('abs_error'), '.4f')}) | "
+                f"{total.get('sign', '-')} | {_engine_note(e)} |"
             )
         cv = result["curves"]
         lines += [
@@ -1275,64 +1604,75 @@ def report(result: dict, packet: dict | None) -> str:
             f"{cv['grid'][0]}..{cv['grid'][-1]})",
             "",
             f"Reference roots: {[round(x['root'], 3) for x in cv['reference']['roots']]}; "
-            f"sign-indeterminate points: {len(cv['reference']['sign_indeterminate_points'])}",
+            f"sign-indeterminate points: {len(cv['reference']['sign_indeterminate_points'])}; "
+            f"GRID adapter T round-trip mismatches: {cv['grid_adapter_T_roundtrip_mismatches']}",
             "",
-            "| engine | curve | max abs err | max err/gross | roots | root set |",
-            "|---|---|---|---|---|---|",
+            "| engine | status | curve | max abs err | max err/gross | roots | root set | note |",
+            "|---|---|---|---|---|---|---|---|",
         ]
         for name, e in cv["engines"].items():
-            if "values" not in e:
-                lines.append(f"| {name} | {e['status']} | | | | {e.get('reason')} |")
-                continue
+            roots = [round(x["root"], 3) for x in e.get("roots", [])]
             lines.append(
-                f"| {name} | {e['curve_status']} | ${e['max_abs_error']:.4f} | "
-                f"{e['max_error_over_gross']:.2e} | "
-                f"{[round(x['root'], 3) for x in e['roots']]} | {e['root_status']} |"
+                f"| {name} | {e['status']} | {e.get('curve_status', '-')} | "
+                f"${_fmt(e.get('max_abs_error'), '.4f')} | {_fmt(e.get('max_error_over_gross'), '.2e')} | "
+                f"{roots if 'roots' in e else '-'} | {e.get('root_status', '-')} | {_engine_note(e)} |"
             )
         w = result["walls"]
         lines += ["", "## Class 1: walls at the packet spot", ""]
         lines.append(f"- reference: {w['reference']}")
         for name, e in w["engines"].items():
-            lines.append(f"- {name}: {e['status']} {e.get('walls', e.get('reason'))}")
+            lines.append(f"- {name}: {e['status']} {e.get('walls') or _engine_note(e)}")
         nat = result["native"]
         g = nat["grid"]
         lines += [
             "",
             "## Native behavior (own parameters; NOT_COMPARABLE across engines)",
             "",
-            f"- GRID compute_gex_profile (r=.05, q=0, integer DTE, prior close {g.get('spot')}): "
-            f"gex_aggregate {g.get('gex_aggregate')}, gamma_flip {g.get('gamma_flip')} "
-            f"({g.get('gamma_flip_crossings')} crossings), call/put/gamma wall "
-            f"{g.get('call_wall')}/{g.get('put_wall')}/{g.get('gamma_wall')}, regime {g.get('regime')}",
         ]
+        if g.get("engine_error"):
+            lines.append(f"- GRID compute_gex_profile: engine fault {g['engine_error']}")
+        else:
+            lines.append(
+                f"- GRID compute_gex_profile (r=.05, q=0, integer DTE, prior close {g.get('spot')}): "
+                f"gex_aggregate {g.get('gex_aggregate')}, gamma_flip {g.get('gamma_flip')} "
+                f"({g.get('gamma_flip_crossings')} crossings), call/put/gamma wall "
+                f"{g.get('call_wall')}/{g.get('put_wall')}/{g.get('gamma_wall')}, regime {g.get('regime')}; "
+                f"native omissions {g.get('native_universe_omissions')}"
+            )
         gw = nat["gamma_watch"]
         if "variants" in gw:
             for v in gw["variants"]:
                 lines.append(
                     f"- Gamma Watch curves ({v['name']}, IV shock {v['iv_shock']}): roots {v['roots']}, used {v['used']}"
                 )
+            lines.append(f"- Gamma Watch native omissions {gw.get('native_universe_omissions')}")
         else:
-            lines.append(f"- Gamma Watch curves: {gw['status']} ({gw['reason']})")
+            lines.append(f"- Gamma Watch curves: {gw['status']} ({_engine_note(gw)})")
         at = result["attribution"]
         lines += [
             "",
-            "## One-factor attribution from the common baseline (reference evaluator)",
+            "## One-factor attribution (reference evaluator)",
             "",
-            f"Baseline G(spot) ${at['baseline']['G_at_eval_spot']:,.0f}; roots {at['baseline']['roots']}",
+            f"Baseline G(spot) ${_fmt(at['baseline']['G_at_eval_spot'], ',.0f')}; roots {at['baseline']['roots']}",
             "",
-            "| factor | delta G | roots |",
-            "|---|---|---|",
+            "| factor | delta G | from | contracts | roots |",
+            "|---|---|---|---|---|",
         ]
         for k, v in list(at["factors"].items()) + list(at["combined"].items()):
             extra = (
-                f" (interaction residual ${v['interaction_residual']:,.0f})"
+                f" (interaction residual ${_fmt(v['interaction_residual'], ',.0f')})"
                 if "interaction_residual" in v
                 else ""
             )
-            lines.append(f"| {k} | ${v['delta_G']:,.0f}{extra} | {v['roots']} |")
+            lines.append(
+                f"| {k} | ${_fmt(v['delta_G'], ',.0f')}{extra} | {v['delta_from']} | "
+                f"{v['contracts']} | {v['roots']} |"
+            )
         lines += [
-            f"| zero_dte | {at['zero_dte']['status']} | {at['zero_dte']['note']} |",
-            f"| oi_vintage | {at['oi_vintage']['status']} | {at['oi_vintage']['note']} |",
+            f"| zero_dte | {at['zero_dte']['status']} | rows {at['zero_dte']['rows']}, OI "
+            f"{_fmt(at['zero_dte']['oi'], '.0f')} | | {at['zero_dte']['note']} |",
+            f"| expiry_scope | {at['expiry_scope']['status']} | | | {at['expiry_scope']['note']} |",
+            f"| oi_vintage | {at['oi_vintage']['status']} | | | {at['oi_vintage']['note']} |",
             "",
             at["note"],
         ]
@@ -1352,34 +1692,38 @@ def report(result: dict, packet: dict | None) -> str:
             if row.get("contracts_with_provider_gamma"):
                 lines.append(
                     f"  - diagnostic only: {row['contracts_with_provider_gamma']} contracts, "
-                    f"rel diff median {row['rel_diff_median']:.2e}, p95 {row['rel_diff_p95']:.2e}"
+                    f"rel diff median {_fmt(row['rel_diff_median'], '.2e')}, "
+                    f"p95 {_fmt(row['rel_diff_p95'], '.2e')}"
                 )
     lines += ["", "No engine edit, consumer rewire, activation or canonical choice follows from this report.", ""]
     return "\n".join(lines)
+
+
+def failure(raw: bytes, receipt_raw: bytes, status: str, exc: BaseException) -> dict:
+    key = "reason" if status == "INPUT_REJECTED" else "harness_error"
+    return {
+        "schema": RESULT_SCHEMA,
+        "class_1_status": status,
+        key: f"{type(exc).__name__}: {exc}",
+        "raw_sha256": digest(raw),
+        "receipt_sha256": digest(receipt_raw),
+        "vendor": {"class_2_eligible_packets": 0, "class_2_status": "NOT_SUPPORTED"},
+    }
 
 
 def build(raw: bytes, receipt_raw: bytes) -> dict[str, bytes]:
     """Every artifact, fully serialized, before anything touches the disk."""
     packet = None
     try:
-        result, packet = reconcile(raw, receipt_raw)
-    except (
-        InputRejected,
-        ValueError,
-        KeyError,
-        TypeError,
-        AttributeError,
-        IndexError,
-        ArithmeticError,
-    ) as exc:
-        result = {
-            "schema": RESULT_SCHEMA,
-            "class_1_status": "INPUT_REJECTED",
-            "reason": f"{type(exc).__name__}: {exc}",
-            "raw_sha256": digest(raw),
-            "receipt_sha256": digest(receipt_raw),
-            "vendor": {"class_2_eligible_packets": 0, "class_2_status": "NOT_SUPPORTED"},
-        }
+        normalized = normalize(raw, receipt_raw)
+    except (InputRejected, ValueError, KeyError, TypeError, AttributeError, IndexError) as exc:
+        result = failure(raw, receipt_raw, "INPUT_REJECTED", exc)
+    else:
+        try:
+            result, packet = reconcile(raw, receipt_raw, normalized)
+            canonical(result)  # nonfinite anywhere fails here, before any write
+        except Exception as exc:  # a harness fault on valid input is never INPUT_REJECTED
+            result, packet = failure(raw, receipt_raw, "INDETERMINATE", exc), None
     files = {
         "input/cboe_raw.json": raw,
         "input/receipt.json": receipt_raw,
@@ -1393,7 +1737,7 @@ def build(raw: bytes, receipt_raw: bytes) -> dict[str, bytes]:
         "protocol": "docs/GAMMA-WATCH-P2-RECONCILIATION.md",
         "status_vocabulary": list(STATUSES),
         "class_1": {
-            "eligible_packets": 1 if packet else 0,
+            "eligible_packets": 0 if result["class_1_status"] == "INPUT_REJECTED" else 1,
             "status": result["class_1_status"],
         },
         "class_2": {
