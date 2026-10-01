@@ -85,14 +85,21 @@ def test_v7_stop_requires_exact_witness_and_pinned_e0_evidence(tmp_path, monkeyp
     assert not any(k.startswith("v8_") for k in stop)
     with pytest.raises(PermissionError, match="missing or extra fields"):
         v7._check_stop_record({**stop, "v8_prereg_sha256": "c" * 64})
-    passing = {**stop["e0_v7_power_ic_0_01"], "factor_t_garch_exposed": 0.5}
-    with pytest.raises(PermissionError, match="below the gate"):
-        v7._check_stop_record({**stop, "e0_v7_power_ic_0_01": passing})
+    assert stop["prereg_gate_evaluated"] is False and "never evaluated" in stop["basis"]
+    for changed in ({**stop["e0_v7_power_ic_0_01"], "factor_t_garch_exposed": 0.5},
+                    {**stop["e0_v7_power_ic_0_01"], "factor_t_garch_exposed": 0.3}):
+        with pytest.raises(PermissionError, match="below the gate"):
+            v7._check_stop_record({**stop, "e0_v7_power_ic_0_01": changed})
     with pytest.raises(PermissionError, match="off-host anchor log"):
         v7.verify_terminal_stop(log_dir, prior)
 
+    # The supersession pin alone refuses a freeze on a stale two-record copy.
+    stale = tmp_path / "stale"
+    _registered(stale)
+    with pytest.raises(PermissionError, match="superseded by vs1-v8"):
+        v7.freeze_inputs(stale, RUN_AT, {"accept_underpowered": False})
     # No freeze or opening after a STOP, even with otherwise valid arguments.
-    with pytest.raises(PermissionError, match="terminal STOP"):
+    with pytest.raises(PermissionError, match="superseded by vs1-v8|terminal STOP"):
         v7.freeze_inputs(log_dir, RUN_AT, {"accept_underpowered": False})
     with pytest.raises(PermissionError, match="terminal STOP"):
         v7.open_discovery(log_dir, RUN_AT, {}, prior)

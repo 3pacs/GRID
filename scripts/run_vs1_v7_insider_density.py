@@ -101,9 +101,14 @@ def main(argv: list[str] | None = None) -> None:
         if command == "verify-stop":
             print(json.dumps(v7.verify_terminal_stop(log_dir, witness), indent=2, sort_keys=True))
             return
-        run_at = datetime.fromisoformat(_option(args, "--run-at"))
-        if run_at.utcoffset() is None or run_at > datetime.now(timezone.utc):
-            raise SystemExit("--run-at must be an explicit UTC instant that is not in the future")
+        raw = _option(args, "--run-at")
+        try:
+            run_at = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+        except ValueError as exc:
+            raise SystemExit("--run-at must be an ISO instant such as 2026-10-01T03:00:00+00:00") from exc
+        registered = datetime.fromisoformat(v7.registry(log_dir).read_all()[-1]["run_at"])
+        if run_at.utcoffset() is None or not registered <= run_at <= datetime.now(timezone.utc):
+            raise SystemExit("--run-at must be a UTC instant after the last record and not in the future")
         stop_kwargs = {"e0_scorecard": Path(_option(args, "--e0-scorecard")),
                        "decision_ref": _option(args, "--decision-ref"),
                        "expected_prev_sha256": _option(args, "--expected-prev-sha256"), "witness": witness}
@@ -118,6 +123,7 @@ def main(argv: list[str] | None = None) -> None:
         print(json.dumps(out, indent=2, sort_keys=True))
         return
     if command in {"power", "freeze-inputs", "open-discovery", "discover", "open-holdout", "holdout"}:
+        v1.refuse_superseded(7, v7.SUPERSEDED_BY)  # v7 is stopped: no Stage-0, freeze or opening
         if "--accept-underpowered" in args:
             raise PermissionError("v7 has no underpowered override")
         check_early_probe(Path(_option(args, "--probe-report")),

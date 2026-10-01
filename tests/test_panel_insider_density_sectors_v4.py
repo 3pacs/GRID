@@ -69,7 +69,7 @@ def test_the_historical_technology_run_was_v6(historical_v6_terminal):
     assert s4.check_technology_run() == s4.TECHNOLOGY_RUN == s4.technology_terminal()
 
 
-def test_v7_registered_with_stale_supersession_blocks_sectors_v4_without_an_anchor(tmp_path):
+def test_v7_stopped_or_superseded_blocks_sectors_v4_without_an_anchor(tmp_path):
     assert v6.SUPERSEDED_BY == {"version": "vs1-v7"}
     # v7 is itself superseded (terminal STOP) until its successor's module exists: still refused.
     refused = "supersession pin does not name the terminal|no single terminal member"
