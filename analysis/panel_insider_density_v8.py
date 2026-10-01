@@ -80,8 +80,18 @@ REGISTRY_LOG = "granular_panel_prereg_v8.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_v8.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_v8.lock"
 WITNESS_PATH = v1.canonical_witness_path(REGISTRY_ID)
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: The one witnessed v8 registration: registered once on grid-svr at 2026-10-01T15:05:27Z against
+#: merged main 1f7c6b19 (#769) in /data/sec/vs8/registry_v8, anchor file SHA-256 ff356e69...,
+#: witnessed on vault main d83c8594 and verified off-host.
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "c29c80fcc2fbb5cd89a3a695ac55b91c62d22552b7080204f45664aca5f65d49",  # header
+    "69a7d3276da1fffc10f0ea023151ff283dd0e154b9ee3509495c670ddff42bb5",  # preregistration (head at 2)
+)
+#: The first line every committed version of the v8 witness file starts with.
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"69a7d3276da1fffc10f0ea023151ff283dd0e154b9ee3509495c670ddff42bb5",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-10-01T15:05:27+00:00"}'
+)
 SUPERSEDED_BY: Mapping[str, Any] | None = None
 
 FROZEN_REGISTRIES = v7.FROZEN_REGISTRIES
