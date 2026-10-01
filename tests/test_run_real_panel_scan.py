@@ -273,6 +273,10 @@ def test_scan_end_to_end_writes_a_new_ledger_artifact(engine, tmp_path, monkeypa
                  "run/discovery-frozen.json", "run/holdout-result.json"):
         assert (tmp_path / name).exists()
     assert json.loads((tmp_path / "summary.json").read_text())["trials"] == 12
+    # Wall-clock timings live only in the unhashed ops log, never in summary.json (E1-V5).
+    assert "read_seconds" not in summary and "total_seconds" not in summary
+    timing = json.loads((tmp_path / scan_script.TIMING_FILE).read_text())
+    assert set(timing) == {"read_seconds", "total_seconds"}
     assert "self_lag_p" in (tmp_path / "trial-ledger.csv").read_text().splitlines()[0]
     with engine.connect() as conn, pytest.raises(FileExistsError):
         scan_script.scan(conn, tmp_path, args)

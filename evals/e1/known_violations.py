@@ -28,31 +28,6 @@ class Violation:
 
 
 KNOWN: dict[str, Violation] = {
-    "E1-V1": Violation(
-        gate="look-ahead canary",
-        title="state vector SPY fallback reads prices pulled after as_of",
-        location="intelligence/regime/state_vector.py::_fetch_spy_prices (raw YF:SPY:close fallback)",
-        detail=(
-            "The raw fallback calls store.observations.read_window(..., as_of=as_of) with no "
-            "as_of_ts, so the latest vintage wins even when it was pulled after as_of. A later "
-            "re-pull that restates closes (a basis change, a repaired contamination) silently "
-            "rewrites spy_momentum / spy_rsi of every historical vector, and a planted restatement "
-            "equal to the next-period return shows up in spy_rsi at the decision date. Applies "
-            "whenever the resolved spy_full feature is unavailable (always, before the re-resolve)."
-        ),
-    ),
-    "E1-V2": Violation(
-        gate="look-ahead canary",
-        title="state vector insider sentiment counts Form 4s filed after as_of",
-        location="intelligence/regime/state_vector.py::_get_insider_sentiment (_INSIDER_SENTIMENT_SQL)",
-        detail=(
-            "INSIDER:* rows are dated by transaction date (ingestion/altdata/insider_filings.py) "
-            "and the batched read bounds only obs_date to [as_of - 30d, as_of]; nothing bounds "
-            "pull_timestamp or the filing date. Form 4s are filed up to two business days (late "
-            "filers: weeks) after the trade, so a historical vector (the regime history rebuild) "
-            "counts filings that were not public at as_of, and appending late filings changes it."
-        ),
-    ),
     "E1-V3": Violation(
         gate="honest success (registry completeness)",
         title="registered pullers with no callable pull method (bls, wiki_history, pumpfun)",
@@ -78,18 +53,6 @@ KNOWN: dict[str, Violation] = {
             "have; watchlist_helpers and full_universe_pull use ON CONFLICT ... DO UPDATE SET value "
             "(watchlist_helpers also pull_timestamp = NOW()), i.e. they would rewrite a stored vintage "
             "in place instead of appending one."
-        ),
-    ),
-    "E1-V5": Violation(
-        gate="reproducibility",
-        title="real-panel scan summary.json embeds wall-clock timings",
-        location="scripts/run_real_panel_scan.py::scan (summary keys read_seconds, total_seconds)",
-        detail=(
-            "The scan's report is not a pure function of inputs and code: summary.json carries the "
-            "host's elapsed read/total seconds, so the same data, code SHA and seed give different "
-            "bytes on a slower or loaded host. The ledger artifacts (trial-ledger.csv, "
-            "discovery-frozen.json, holdout-result.json, frozen-candidates.json) are byte-identical; "
-            "timings belong in a separate, unhashed run log."
         ),
     ),
     "E1-V6": Violation(

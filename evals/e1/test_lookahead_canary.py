@@ -22,7 +22,6 @@ import pandas as pd
 import pytest
 
 from evals.e1 import vs1_world, world as W
-from evals.e1.known_violations import known_violation
 from store import observations as obs
 
 AS_OF_MODELED = date(2025, 6, 10)  # every row backfilled later: modeled-lag path only
@@ -195,7 +194,6 @@ def test_state_vector_macro_dims_ignore_future_rows(as_of):
     assert _vector(engine, as_of) == before
 
 
-@known_violation("E1-V1")
 @pytest.mark.parametrize("as_of", [AS_OF_MODELED, AS_OF_LIVE], ids=["modeled", "pulled"])
 def test_state_vector_spy_dims_ignore_prices_pulled_after_as_of(as_of):
     engine = W.sqlite_engine()
@@ -208,7 +206,6 @@ def test_state_vector_spy_dims_ignore_prices_pulled_after_as_of(as_of):
     assert _vector(engine, as_of) == before
 
 
-@known_violation("E1-V2")
 def test_state_vector_insider_dim_ignores_filings_pulled_after_as_of():
     as_of = AS_OF_MODELED
     engine = W.sqlite_engine()
@@ -220,6 +217,45 @@ def test_state_vector_insider_dim_ignores_filings_pulled_after_as_of():
     W.insert(engine, [W.row(f"INSIDER:BBB:late{i}:BUY", d, 9e5, W.LATE_TS, W.SEC_SRC)
                       for i, d in enumerate(W.bdays(as_of - timedelta(days=10), as_of))])
     assert _vector(engine, as_of) == before
+
+
+def _insert_filed(engine, rows: list[dict], filed: list[date]) -> None:
+    """INSIDER rows carrying ``raw_payload.filing_date`` (as ingestion/altdata/insider_filings.py writes it)."""
+    from sqlalchemy import text
+
+    with engine.begin() as c:
+        c.execute(
+            text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                 "pull_status) VALUES (:sid, :src, :d, :ts, :v, :payload, :st)"),
+            [{**r, "payload": json.dumps({"filing_date": f.isoformat()})} for r, f in zip(rows, filed)],
+        )
+
+
+def test_state_vector_insider_dim_ignores_form4s_filed_on_or_after_as_of():
+    # A Form 4 filed on as_of is public at 22:00 New York = the next UTC day (VS1 convention).
+    as_of = AS_OF_MODELED
+    engine = W.sqlite_engine()
+    W.insert(engine, W.macro_rows())
+    W.insert(engine, W.insider_rows(as_of - timedelta(days=90), as_of - timedelta(days=3)))
+    before = _vector(engine, as_of)
+    days = list(W.bdays(as_of - timedelta(days=10), as_of))
+    rows = [W.row(f"INSIDER:CCC:late{i}:SELL", d, 9e5, W.LATE_TS, W.SEC_SRC) for i, d in enumerate(days)]
+    _insert_filed(engine, rows, [as_of + timedelta(days=i % 3) for i in range(len(rows))])
+    assert _vector(engine, as_of) == before
+
+
+def test_insider_canary_self_test_counts_a_form4_filed_before_as_of_but_pulled_later():
+    # The filing-date path is live (the canary above is not vacuous): filed the day before
+    # as_of, pulled weeks later, it was public at as_of and must move the dimension.
+    as_of = AS_OF_MODELED
+    engine = W.sqlite_engine()
+    W.insert(engine, W.macro_rows())
+    W.insert(engine, W.insider_rows(as_of - timedelta(days=90), as_of - timedelta(days=3)))
+    before = json.loads(_vector(engine, as_of))["values"][-1]
+    _insert_filed(engine, [W.row("INSIDER:DDD:ontime:SELL", as_of - timedelta(days=3), 9e7, W.LATE_TS, W.SEC_SRC)],
+                  [as_of - timedelta(days=1)])
+    after = json.loads(_vector(engine, as_of))["values"][-1]
+    assert after is not None and after < before
 
 
 def _vector_leak(engine, decisions, dim):
@@ -268,11 +304,27 @@ def test_state_vector_leak_self_test_trips_on_a_latest_vintage_reader(monkeypatc
     assert _corr(_vector_leak(engine, decisions, "vix_level"), z) > 0.9
 
 
-@known_violation("E1-V1")
 def test_state_vector_spy_dim_does_not_see_a_planted_future_leak():
     engine, decisions, z = _state_vector_leak_world("SPY")
     r = _corr(_vector_leak(engine, decisions, "spy_rsi"), z)
     assert abs(r) < LEAK_THRESHOLD, f"spy_rsi corr with the next-period outcome {r:.2f}"
+
+
+def test_state_vector_spy_leak_self_test_trips_on_a_latest_vintage_reader(monkeypatch):
+    # The pre-fix raw fallback (latest vintage, bounded by obs_date only) must trip the canary.
+    from intelligence.regime import state_vector as sv_mod
+
+    def leaky(engine, as_of, lookback_days=504):
+        with engine.connect() as conn:
+            got = obs.read_window(conn, "YF:SPY:close", source="yfinance",
+                                  start=as_of - timedelta(days=lookback_days), as_of=as_of)
+        return pd.Series({o.obs_date: o.value for o in got}, dtype=float).sort_index(), "YF:SPY:close"
+
+    monkeypatch.setattr(sv_mod, "_fetch_spy_prices", leaky)
+    engine, decisions, z = _state_vector_leak_world("SPY")
+    # RSI-14 dilutes one restated close (seeded world: leaky corr 0.75), so the bar is the
+    # canary's own threshold: the leaky reader must fail the gate above.
+    assert _corr(_vector_leak(engine, decisions, "spy_rsi"), z) > LEAK_THRESHOLD
 
 
 # ── VS1 panel feature builders (analysis/panel_insider_density*) ────────
