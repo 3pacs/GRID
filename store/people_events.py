@@ -47,7 +47,10 @@ CHANNELS = (
     "gov_contract_qq_aggregate",
     "lobbying",
     "news",
+    "fara",  # people_events_v2_20261001
 )
+
+CONFIDENCES = ("high", "medium", "low")
 
 KNOWN_AT_BASES = (
     "filing",
@@ -91,7 +94,9 @@ class PeopleEvent:
     co_actor_ids: tuple[str, ...] = ()
     entity_ticker: str | None = None
     entity_cik: str | None = None
-    security_id: int | None = None
+    # GD1 security_master.entity_id (TEXT, e.g. "sm_0000320193") since
+    # people_events_v2_20261001; it was an unused BIGINT before.
+    security_id: str | None = None
     direction: str | None = None
     transaction_code: str | None = None
     size_usd: float | None = None
@@ -100,6 +105,13 @@ class PeopleEvent:
     n_sources: int = 1
     echo_of: int | None = None
     provenance: dict[str, Any] = field(default_factory=dict)
+    # people_events_v2_20261001 columns.
+    loose_key: str | None = None
+    confidence: str | None = None
+    content_hash: str | None = None
+    materializer_version: str | None = None
+    run_id: str | None = None
+    n_source_rows: int = 1
 
     def __post_init__(self) -> None:
         if self.channel not in CHANNELS:
@@ -116,6 +128,10 @@ class PeopleEvent:
             raise ValueError(f"unknown direction {self.direction!r}; expected one of {DIRECTIONS} or None")
         if self.size_usd is not None and self.size_usd < 0:
             raise ValueError(f"size_usd must be >= 0, got {self.size_usd!r}")
+        if self.confidence is not None and self.confidence not in CONFIDENCES:
+            raise ValueError(f"unknown confidence {self.confidence!r}; expected one of {CONFIDENCES} or None")
+        if self.n_source_rows < 1:
+            raise ValueError(f"n_source_rows must be >= 1, got {self.n_source_rows!r}")
         if self.n_sources < 1:
             raise ValueError(f"n_sources must be >= 1, got {self.n_sources!r}")
         if not self.dedup_key:
@@ -130,15 +146,21 @@ _INSERT_SQL = text("""
         actor_id, actor_id_basis, actor_type, co_actor_ids,
         entity_ticker, entity_cik, security_id, direction, transaction_code,
         size_usd, source, source_record_id, source_refs, n_sources, echo_of,
-        provenance
+        provenance, loose_key, confidence, content_hash, materializer_version, run_id,
+        n_source_rows
     ) VALUES (
         :channel, :dedup_key, :event_time, :known_at, :known_at_basis,
         :actor_id, :actor_id_basis, :actor_type, :co_actor_ids,
         :entity_ticker, :entity_cik, :security_id, :direction, :transaction_code,
         :size_usd, :source, :source_record_id, CAST(:source_refs AS jsonb),
-        :n_sources, :echo_of, CAST(:provenance AS jsonb)
+        :n_sources, :echo_of, CAST(:provenance AS jsonb), :loose_key, :confidence,
+        :content_hash, :materializer_version, :run_id, :n_source_rows
     )
-    ON CONFLICT (channel, dedup_key) DO UPDATE SET
+    -- people_events_v2_20261001: uniqueness covers the *current* version only
+    -- (superseded/retracted rows stay in the table), so the conflict target
+    -- names the partial index's predicate.
+    ON CONFLICT (channel, dedup_key) WHERE superseded_at IS NULL AND retracted_at IS NULL
+    DO UPDATE SET
         -- The act itself never changes on a re-materialize; actor/entity
         -- fields are intentionally left untouched so a second source cannot
         -- silently rewrite the first source's identification of who/what.
@@ -169,7 +191,15 @@ _INSERT_SQL = text("""
                 people_events.source_refs || EXCLUDED.source_refs
             ) AS elem
         ),
+        -- n_sources counts distinct source *systems* (an original filing and
+        -- its amendment are one source); n_source_rows counts every row.
         n_sources = (
+            SELECT count(DISTINCT COALESCE(elem->>'source', elem->>'source_type', elem::text))
+            FROM jsonb_array_elements(
+                people_events.source_refs || EXCLUDED.source_refs
+            ) AS elem
+        ),
+        n_source_rows = (
             SELECT count(DISTINCT elem)
             FROM jsonb_array_elements(
                 people_events.source_refs || EXCLUDED.source_refs
@@ -212,6 +242,12 @@ def upsert_event(engine: Engine, event: PeopleEvent) -> int:
                 "n_sources": event.n_sources,
                 "echo_of": event.echo_of,
                 "provenance": json.dumps(event.provenance),
+                "loose_key": event.loose_key,
+                "confidence": event.confidence,
+                "content_hash": event.content_hash,
+                "materializer_version": event.materializer_version,
+                "run_id": event.run_id,
+                "n_source_rows": event.n_source_rows,
             },
         ).fetchone()
     return int(row[0])
@@ -226,6 +262,10 @@ _READ_SQL_TEMPLATE = """
         provenance
     FROM people_events
     WHERE known_at <= :as_of
+      -- the version a reader at as_of may use: not yet superseded or
+      -- retracted at as_of (people_events_v2_20261001)
+      AND (superseded_at IS NULL OR superseded_at > :as_of)
+      AND (retracted_at IS NULL OR retracted_at > :as_of)
     {extra_filters}
     ORDER BY known_at DESC
 """
