@@ -165,6 +165,33 @@ describe('Dashboard watchlist loading', () => {
         expect(screen.queryByRole('button', { name: /play briefing/i })).not.toBeInTheDocument();
     });
 
+    it('labels an older saved recording as previous when the new briefing has no audio', async () => {
+        api.listFlowBriefings.mockResolvedValue({
+            briefings: [{ filename: 'briefing_2026-04-07_20260407_060040.mp3', briefing_date: '2026-04-07' }],
+        });
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning.',
+                audio_path: null,
+                audio_status: 'unavailable',
+                audio_note: 'Local TTS unavailable: Kokoro TTS is unreachable (ConnectionError).',
+                provider: 'local',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        await screen.findByRole('button', { name: 'Load and play briefing' });
+        expect(screen.queryByTestId('previous-recording')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByTestId('previous-recording')).toHaveTextContent(/Previous recording \(2026-04-07\)/);
+        });
+    });
+
     it('shows the not-configured note inside a text-only briefing', async () => {
         api.generateFlowBriefing.mockResolvedValue({
             status: 'SUCCESS',

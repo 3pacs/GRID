@@ -162,7 +162,26 @@ def test_kokoro_failure_is_text_only_and_never_paid(
     assert result.script_text == "Good morning. GRID briefing."
     assert result.audio_note.startswith("Local TTS unavailable:")
     assert expect in result.audio_note
+    # The user-facing note never leaks the internal host or a response body.
+    assert "kokoro.test" not in result.audio_note
+    assert "Voice not found" not in result.audio_note
     assert not kokoro_on.exists() or not any(kokoro_on.iterdir())
+
+
+def test_unwritable_output_dir_keeps_script_and_says_so(monkeypatch, kokoro_on, no_paid):
+    _stub_pipeline(monkeypatch)
+    monkeypatch.setattr(requests, "post", lambda *a, **kw: _Resp())
+
+    def _readonly():
+        raise PermissionError(13, "Permission denied")
+    monkeypatch.setattr(audio_briefing, "_ensure_output_dir", _readonly)
+
+    result = audio_briefing.generate_briefing_audio(MagicMock())
+
+    assert result.audio_path is None
+    assert result.audio_status == "unavailable"
+    assert result.script_text == "Good morning. GRID briefing."
+    assert "could not be saved" in result.audio_note
 
 
 def test_not_configured_is_text_only_without_any_request(monkeypatch, briefing_dir, no_paid):
@@ -241,6 +260,44 @@ def test_kokoro_settings_bind_from_env_and_blank_timeout_keeps_default(monkeypat
     monkeypatch.setenv("GRID_KOKORO_TIMEOUT_SECONDS", "  ")
     fresh = config.Settings(_env_file=None)
     assert fresh.GRID_KOKORO_URL == "http://gridz4:8880"
-    assert fresh.GRID_KOKORO_TIMEOUT_SECONDS == 120.0
+    assert fresh.GRID_KOKORO_TIMEOUT_SECONDS == 60.0
     # Default: not configured (owner sets GRID_KOKORO_URL to activate).
     assert config.Settings.model_fields["GRID_KOKORO_URL"].default == ""
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [("45", 45.0), ("0", 60.0), ("-5", 60.0), ("inf", 60.0), ("nan", 60.0), ("9999", 60.0)],
+)
+def test_kokoro_timeout_out_of_range_keeps_default(monkeypatch, raw, expected):
+    monkeypatch.setenv("ENVIRONMENT", "development")
+    monkeypatch.setenv("GRID_KOKORO_TIMEOUT_SECONDS", raw)
+    assert config.Settings(_env_file=None).GRID_KOKORO_TIMEOUT_SECONDS == expected
+
+
+def test_briefing_route_runs_generation_off_the_event_loop(monkeypatch):
+    """grid-api is one uvicorn process: the blocking LLM + Kokoro call must
+    run in a worker thread, not on the event loop."""
+    import asyncio
+    import threading
+
+    from api.routers import flows
+
+    loop_thread: list[int] = []
+    gen_thread: list[int] = []
+
+    def fake_generate(engine):
+        gen_thread.append(threading.get_ident())
+        return audio_briefing.BriefingResult(script_text="s", audio_status="not_configured")
+
+    monkeypatch.setattr(audio_briefing, "generate_briefing_audio", fake_generate)
+    monkeypatch.setattr(flows, "get_db_engine", lambda: MagicMock())
+
+    async def _run():
+        loop_thread.append(threading.get_ident())
+        return await flows.generate_briefing(audio=True, _token="t")
+
+    out = asyncio.run(_run())
+    assert out["status"] == "SUCCESS"
+    assert out["briefing"]["audio_status"] == "not_configured"
+    assert gen_thread and gen_thread[0] != loop_thread[0]

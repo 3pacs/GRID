@@ -753,7 +753,7 @@ def _generate_audio_file_kokoro(script_text: str, briefing_date: str) -> str:
     if not base:
         raise LocalTTSUnavailable("GRID_KOKORO_URL is not set")
     voice = str(getattr(settings, "GRID_KOKORO_VOICE", "") or "af_heart").strip()
-    read_timeout = float(getattr(settings, "GRID_KOKORO_TIMEOUT_SECONDS", 120.0) or 120.0)
+    read_timeout = float(getattr(settings, "GRID_KOKORO_TIMEOUT_SECONDS", 60.0) or 60.0)
 
     log.info("Generating audio (kokoro): voice={v} server={s}", v=voice, s=base)
     t0 = time.monotonic()
@@ -770,26 +770,31 @@ def _generate_audio_file_kokoro(script_text: str, briefing_date: str) -> str:
             },
             timeout=(KOKORO_CONNECT_TIMEOUT_SECONDS, read_timeout),
         )
+    # User-facing reasons stay host-free; the server URL and any response
+    # body go to the log only.
     except requests.Timeout as exc:
+        log.warning("Kokoro TTS timeout at {s}: {e}", s=base, e=str(exc))
         raise LocalTTSUnavailable(
-            f"Kokoro at {base} timed out ({type(exc).__name__}, "
+            f"Kokoro TTS timed out ({type(exc).__name__}, "
             f"read timeout {read_timeout:.0f}s)"
         ) from exc
     except requests.RequestException as exc:
+        log.warning("Kokoro TTS unreachable at {s}: {e}", s=base, e=str(exc))
         raise LocalTTSUnavailable(
-            f"Kokoro at {base} is unreachable ({type(exc).__name__})"
+            f"Kokoro TTS is unreachable ({type(exc).__name__})"
         ) from exc
 
     if resp.status_code != 200:
-        detail = (resp.text or "")[:200].replace("\n", " ")
-        raise LocalTTSUnavailable(
-            f"Kokoro at {base} returned HTTP {resp.status_code}: {detail}"
+        log.warning(
+            "Kokoro TTS at {s} returned HTTP {c}: {d}",
+            s=base, c=resp.status_code, d=(resp.text or "")[:300],
         )
+        raise LocalTTSUnavailable(f"Kokoro TTS returned HTTP {resp.status_code}")
     content_type = (resp.headers.get("Content-Type") or "").lower()
     audio = resp.content or b""
     if not content_type.startswith("audio/") or not _looks_like_mp3(audio):
         raise LocalTTSUnavailable(
-            f"Kokoro at {base} returned no MP3 audio "
+            f"Kokoro TTS returned no MP3 audio "
             f"(content-type {content_type or 'missing'}, {len(audio)} bytes)"
         )
 
@@ -1027,6 +1032,19 @@ def generate_briefing_audio(engine) -> BriefingResult:
                 "was made and no paid TTS was tried."
             )
             log.warning("Briefing audio skipped: {e}", e=str(exc))
+        except OSError as exc:
+            # Synthesis may have worked but the MP3 could not be stored
+            # (e.g. GRID_BRIEFING_DIR unwritable). Keep the script; say so.
+            audio_status = "unavailable"
+            tts_provider = "kokoro" if _kokoro_url() else "openai"
+            audio_note = (
+                "Audio could not be saved (the briefing output directory is "
+                "not writable). Text-only briefing; no audio was kept."
+            )
+            log.warning(
+                "Briefing audio could not be written to {d}: {e}",
+                d=briefing_output_dir(), e=str(exc),
+            )
     else:
         audio_status = "not_configured"
         audio_note = (

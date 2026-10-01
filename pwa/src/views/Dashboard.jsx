@@ -121,6 +121,9 @@ function AudioBriefingPlayer({ onNavigate }) {
     // (audio_status "not_configured") or did not answer ("unavailable").
     // See audio_briefing.py's audio_note — never a paid fallback.
     const [textBriefing, setTextBriefing] = useState(null);
+    // True when the latest request produced no audio: any player still shown
+    // is an OLDER recording and must be labelled as such.
+    const [playerIsPrevious, setPlayerIsPrevious] = useState(false);
     const audioRef = React.useRef(null);
     const audioUrlRef = React.useRef(null);
 
@@ -174,6 +177,7 @@ function AudioBriefingPlayer({ onNavigate }) {
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
                 const filename = r.briefing.audio_path.split('/').pop();
                 replaceAudioUrl(null);
+                setPlayerIsPrevious(false);
                 setAudioFile(filename);
                 setBriefingMeta({
                     briefing_date: r.briefing.briefing_date, size_bytes: 0,
@@ -185,6 +189,7 @@ function AudioBriefingPlayer({ onNavigate }) {
                 // Never invent audio that wasn't made; when local TTS failed,
                 // say so as an error rather than a quiet note.
                 setTextBriefing(r.briefing);
+                setPlayerIsPrevious(true);
                 if (r.briefing.audio_status === 'unavailable') {
                     setBriefingError(r.briefing.audio_note || 'Local TTS unavailable — text-only briefing.');
                 }
@@ -235,7 +240,8 @@ function AudioBriefingPlayer({ onNavigate }) {
             </div>
             <div style={{ fontFamily: SANS, fontSize: '11px', color: colors.textDim, marginBottom: '8px' }}>
                 {'On-demand only — no schedule behind this button. Script text comes from a ' +
-                    'local LLM and audio from local Kokoro TTS. No paid providers.'}
+                    'local LLM and audio from local Kokoro TTS. Paid providers stay off ' +
+                    'unless GRID_ALLOW_PAID_LLM is set.'}
             </div>
             {briefingError && (
                 <div style={{
@@ -274,6 +280,12 @@ function AudioBriefingPlayer({ onNavigate }) {
                         whiteSpace: 'pre-wrap' }}>
                         {textBriefing.script_text}
                     </div>
+                </div>
+            )}
+            {audioFile && playerIsPrevious && (
+                <div data-testid="previous-recording" style={{ fontFamily: MONO, fontSize: '10px',
+                    color: colors.textDim, marginBottom: '4px' }}>
+                    {`Previous recording${briefingMeta?.briefing_date ? ` (${briefingMeta.briefing_date})` : ''} — not the briefing above`}
                 </div>
             )}
             {audioFile ? (
