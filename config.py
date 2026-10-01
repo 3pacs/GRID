@@ -9,12 +9,13 @@ non-development environments.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
 from dotenv import load_dotenv
 from loguru import logger as log
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 
 # Load .env from the project root (same directory as this file)
@@ -274,12 +275,45 @@ class Settings(BaseSettings):
     OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
 
-    # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
-    # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
-    # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
-    KOKORO_TTS_BASE_URL: str = "http://koala:8091"
-    KOKORO_TTS_ENABLED: bool = True
-    KOKORO_TTS_VOICE: str = "af_sarah"
+    # Local Kokoro TTS for the on-demand audio briefing
+    # (intelligence/audio_briefing.py). Kokoro-FastAPI, OpenAI-compatible
+    # ``POST /v1/audio/speech`` returning MP3. Verified 2026-10-01Z: gridz4
+    # (HP Z4 G4) runs it as the docker container ``kokoro-tts-cpu``
+    # (ghcr.io/remsky/kokoro-fastapi-cpu) on :8880 with 67 voices; grid-svr
+    # reaches it at http://gridz4:8880. The old koala:8091 server has been
+    # offline since ~2026-07-25. Empty URL = not configured: the briefing is
+    # text-only and says so. Paid TTS is never a fallback for a local failure.
+    GRID_KOKORO_URL: str = ""
+    GRID_KOKORO_VOICE: str = "af_heart"
+    # Read timeout for one synthesis. ~24s measured for a 234-word script on
+    # gridz4 CPU; 60s leaves headroom while staying well inside the ~100s
+    # Cloudflare origin limit once LLM script time is added.
+    GRID_KOKORO_TIMEOUT_SECONDS: float = Field(60.0, gt=0, le=600)
+    # Writable directory for briefing MP3 + JSON sidecars. Empty = automatic:
+    # /data/grid_v4/briefings when running from an immutable release
+    # (grid_release.releases/<sha>), else <checkout>/outputs/briefings.
+    GRID_BRIEFING_DIR: str = ""
+
+    @field_validator("GRID_KOKORO_TIMEOUT_SECONDS", mode="before")
+    @classmethod
+    def _coerce_blank_kokoro_timeout(cls, v: object) -> object:
+        """Blank, non-finite or out-of-range (<=0, >600) values keep the 60s
+        default instead of crashing grid-api startup over an optional
+        feature; non-numeric garbage still raises so a real typo is seen."""
+        if isinstance(v, str):
+            if not v.strip():
+                return 60.0
+            try:
+                num = float(v)
+            except ValueError:
+                return v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            num = float(v)
+        else:
+            return v
+        if not math.isfinite(num) or num <= 0 or num > 600:
+            return 60.0
+        return num
 
     # koala card 1 — whisper.cpp Vulkan transcription server (port 8092).
     # whisper-large-v3-turbo model, runs on GTX TITAN X via Vulkan backend.
