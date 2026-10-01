@@ -190,7 +190,10 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
     by_key = {(e["channel"], e["dedup_key"]): e for e in events.to_dict("records")}
     counts = {op: 0 for op in ("insert", "add_sources", "tighten_known_at", "enrich_identity", "supersede",
                                "retract", "actor_conflict", "unchanged")}
-    lock_conn = engine.connect()
+    # Autocommit: the lock session must not sit "idle in transaction" for the
+    # whole run (idle_in_transaction_session_timeout would kill it and silently
+    # drop the lock). The engine needs a pool of at least 2 connections.
+    lock_conn = engine.connect().execution_options(isolation_level="AUTOCOMMIT")
     if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}).scalar():
         lock_conn.close()
         raise RuntimeError("another people_events writer holds the lock")
