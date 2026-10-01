@@ -1,0 +1,191 @@
+{
+ "timestamp": "2026-10-01 03:57:05",
+ "symbol": "SPY",
+ "data": {
+  "symbol": "SPY",
+  "current_price": 762.5,
+  "price_change": -1.5,
+  "prev_day_close": 762.5,
+  "close": 762.5,
+  "last_trade_time": "2026-09-30T16:00:00",
+  "options": [
+   {
+    "option": "SPY260930C00762000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.2,
+    "open_interest": 100.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.05,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261002C00760000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.18,
+    "open_interest": 1000.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.06,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261002P00760000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.2,
+    "open_interest": 1500.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.06,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261002C00765000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.17,
+    "open_interest": 800.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.05,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261002P00765000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.19,
+    "open_interest": 600.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.05,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261002C00775000",
+    "bid": 0.4,
+    "ask": 0.45,
+    "iv": 0.15,
+    "open_interest": 9000.0,
+    "volume": 10.0,
+    "delta": 0.2,
+    "gamma": 0.03,
+    "theo": 0.42
+   },
+   {
+    "option": "SPY261016C00770000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.16,
+    "open_interest": 2000.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.02,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261016P00750000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.22,
+    "open_interest": 2500.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.02,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261016P00770000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.18,
+    "open_interest": 900.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": null,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261127C00765000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.18,
+    "open_interest": 300.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.01,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261127P00760000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.2,
+    "open_interest": 400.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.01,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261120P00740000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.25,
+    "open_interest": 0.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.0,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261016C00775000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.0,
+    "open_interest": 700.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.0,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY1261016C00770000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.16,
+    "open_interest": 50.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.02,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261016C00780000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 0.15,
+    "open_interest": 1.5,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.01,
+    "theo": 1.05
+   },
+   {
+    "option": "SPY261016C00785000",
+    "bid": 1.0,
+    "ask": 1.1,
+    "iv": 25.0,
+    "open_interest": 10.0,
+    "volume": 10.0,
+    "delta": 0.5,
+    "gamma": 0.01,
+    "theo": 1.05
+   }
+  ]
+ },
+ "_fixture": "synthetic-not-market-data"
+}

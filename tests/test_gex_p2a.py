@@ -289,3 +289,59 @@ def test_cli_capture_create_only_and_rejection(tmp_path):
         json.loads((tmp_path / "rejected/result.json").read_bytes())["status"]
         == "INPUT_REJECTED"
     )
+
+
+@pytest.mark.parametrize(
+    "value", [None, 1727622000, True, "not-a-time", "2026-09-28T15:00:00"]
+)
+def test_invalid_available_at_is_a_complete_rejection_receipt(tmp_path, value):
+    p = sample()
+    p["available_at"] = value
+    raw = h.canonical(p)
+    src = tmp_path / "packet.json"
+    src.write_bytes(raw)
+    out = tmp_path / "run"
+    assert h.main([str(src), "--output", str(out)]) == 1
+    assert (out / "input.json").read_bytes() == raw  # exact bytes preserved
+    result = json.loads((out / "result.json").read_bytes())
+    assert result["status"] == "INPUT_REJECTED"
+    assert result["raw_sha256"] == h.digest(raw)
+    assert "AttributeError" not in result["reason"]
+
+
+def test_extreme_finite_inputs_never_leave_input_without_result(tmp_path):
+    p = sample()
+    p["spots"] = [1e150]
+    p["rows"] = p["rows"][2:3]
+    p["rows"][0].update(strike=1e150, oi=1e300)
+    raw = h.canonical(p)
+    src = tmp_path / "packet.json"
+    src.write_bytes(raw)
+    out = tmp_path / "run"
+    assert h.main([str(src), "--output", str(out)]) == 1
+    result = json.loads((out / "result.json").read_bytes())  # strict JSON, no inf
+    assert result["status"] == "INPUT_REJECTED"
+    assert "nonfinite" in result["reason"]
+    assert sorted(x.name for x in out.iterdir()) == ["input.json", "result.json"]
+
+
+def test_nonfinite_result_fields_reject_before_any_artifact(tmp_path, monkeypatch):
+    real = h.reconcile
+    monkeypatch.setattr(
+        h, "reconcile", lambda raw: {**real(raw), "injected": float("inf")}
+    )
+    out = tmp_path / "run"
+    assert h.main([str(FIXTURE), "--output", str(out)]) == 1
+    result = json.loads((out / "result.json").read_bytes())
+    assert result["status"] == "INPUT_REJECTED"
+    assert (out / "input.json").read_bytes() == FIXTURE.read_bytes()
+
+
+def test_existing_run_directory_is_preserved_untouched(tmp_path):
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "keep.txt").write_bytes(b"prior")
+    with pytest.raises(FileExistsError):
+        h.main([str(FIXTURE), "--output", str(out)])
+    assert sorted(x.name for x in out.iterdir()) == ["keep.txt"]
+    assert (out / "keep.txt").read_bytes() == b"prior"
