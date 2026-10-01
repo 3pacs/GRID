@@ -30,7 +30,7 @@ from analysis.research_forward_log import canonical
 VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
-PREREG_BODY_SHA256 = "506c11657f033c252473ce52d3e67cfc09f500544c4ff68f11955477d0f88c14"
+PREREG_BODY_SHA256 = "636b8c7eddbbc0e040ef05fa09751216f036228926c5a0e123c8c2c62916e7cb"
 #: The witnessed v7 terminal STOP head (3 records; vault main 4456453d, anchor file SHA-256 bd018b11...).
 V7_STOP_HEAD_SHA256: str | None = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
 #: The exact second line of the witnessed v7 anchor file.
@@ -95,24 +95,34 @@ ALLOWED_REGISTRIES = frozenset((*BASELINE_REGISTRIES, REGISTRY_ID, SECTORS_V6))
 
 
 def _sectors_v6_anchor_at_tip(repo: Path, tip: str) -> None:
-    """Once sectors-v6's registration is pinned in its own code, its witness must be exactly that anchor.
+    """The sectors-v6 witness must be exactly one canonical two-record registration anchor.
 
-    Before that pin exists the census rule (canonical path, exactly two records) is the whole check;
+    Once sectors-v6 pins its own REGISTERED_ANCHOR_LINE, the witness must be exactly that line;
     sectors-v6's own registration verifies that its header names the witnessed v8 head.
     """
+    content = v1._git(repo, "show", f"{tip}:{v1.canonical_witness_path(SECTORS_V6)}", binary=True)
+    lines = content.split(b"\n")
+    try:
+        anchor = json.loads(lines[0]) if len(lines) == 2 and lines[1] == b"" else None
+    except ValueError:
+        anchor = None
+    if not isinstance(anchor, dict) or lines[0] != canonical(anchor) or anchor.get("records") != SECTORS_V6_RECORDS \
+            or anchor.get("prev_anchor_sha256") is not None or not v1._is_hex64(anchor.get("head_sha256")):
+        raise PermissionError("sectors-v6 witness is not exactly one canonical two-record registration anchor")
+    s6 = _load_sectors_v6()
+    line = getattr(s6, "REGISTERED_ANCHOR_LINE", None) if s6 is not None else None
+    if line is not None and content != line + b"\n":
+        raise PermissionError("sectors-v6 witness is not exactly its pinned two-record registration anchor")
+
+
+def _load_sectors_v6():
+    """The sectors-v6 module when present (lazy: it imports v8), else None."""
+    import importlib
     import importlib.util
 
     if importlib.util.find_spec("analysis.panel_insider_density_sectors_v6") is None:
-        return
-    import importlib
-
-    s6 = importlib.import_module("analysis.panel_insider_density_sectors_v6")
-    line = getattr(s6, "REGISTERED_ANCHOR_LINE", None)
-    if line is None:
-        return
-    content = v1._git(repo, "show", f"{tip}:{v1.canonical_witness_path(SECTORS_V6)}", binary=True)
-    if content != line + b"\n":
-        raise PermissionError("sectors-v6 witness is not exactly its pinned two-record registration anchor")
+        return None
+    return importlib.import_module("analysis.panel_insider_density_sectors_v6")
 
 
 def _bound() -> tuple[str, str]:
@@ -184,6 +194,7 @@ def contamination(censuses: list[Mapping[str, Any] | None]) -> dict:
     """The known v6/v7 STOPs are clean; every other non-v8 growth or unknown is not."""
     found: dict[str, Any] = {}
     unknown: set[str] = set()
+    absent_earlier = False  # censuses are chronological: v8 openings, then the current one
     for census in censuses:
         if not census:
             continue
@@ -194,6 +205,9 @@ def contamination(censuses: list[Mapping[str, Any] | None]) -> dict:
                 found[key] = counts.get(key)
         if SECTORS_V6 in counts and counts[SECTORS_V6] != SECTORS_V6_RECORDS:
             found[SECTORS_V6] = counts[SECTORS_V6]
+        if SECTORS_V6 in counts and absent_earlier:
+            found["sectors-v6 (appeared after a v8 opening)"] = counts[SECTORS_V6]
+        absent_earlier = absent_earlier or SECTORS_V6 not in counts
         for key in set(counts) - ALLOWED_REGISTRIES:
             found[key] = counts[key]
     return {"contaminated": bool(found or unknown),
@@ -395,6 +409,20 @@ class V8Harness(v2.Harness):
                     for r in records]
         return contamination([*censuses, key.census])
 
+    def open_holdout(self, frozen: dict, *, log_dir: Path, **kwargs) -> dict:
+        """A sectors-v6 witness absent at discovery_opened may not appear before the holdout opens."""
+        self._refuse_if_stopped(log_dir)
+        witness = kwargs.get("witness")
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+        opened = [r for r in records if r.get("kind") == "discovery_opened"]
+        at_discovery = ((opened[-1].get("supersession") or {}).get("vs1_witness_census") or {}) if opened else {}
+        now_present = SECTORS_V6 in ((getattr(witness, "census", None) or {}).get("records") or {})
+        if now_present and SECTORS_V6 not in (at_discovery.get("records") or {}):
+            raise PermissionError("sectors-v6 first appeared after v8 discovery_opened: invalid, holdout refused")
+        return v2.Harness.open_holdout(self, frozen, log_dir=log_dir, **kwargs)
+
     def _refuse_if_stopped(self, log_dir: Path) -> None:
         log = self.registry(log_dir)
         with log.locked():
@@ -412,9 +440,6 @@ class V8Harness(v2.Harness):
         self._refuse_if_stopped(log_dir)
         return super().open_discovery(log_dir, now, observed, witness)
 
-    def open_holdout(self, frozen: dict, *, log_dir: Path, **kwargs) -> dict:
-        self._refuse_if_stopped(log_dir)
-        return super().open_holdout(frozen, log_dir=log_dir, **kwargs)
 
     # -- Stage-0 --
     def stage0_power(self, features: Mapping[str, np.ndarray]) -> dict:

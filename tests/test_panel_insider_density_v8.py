@@ -314,17 +314,47 @@ def test_v8_opening_census_tolerates_only_a_two_record_sectors_v6(monkeypatch, t
         v8.check_census(base, stop_head_sha256=head, witness_repo=tmp_path)
 
 
-def test_sectors_v6_pinned_anchor_must_match_exactly(monkeypatch, tmp_path):
+def _s6_line(head="a"):
+    return canonical({"head_sha256": head * 64, "prev_anchor_sha256": None, "records": 2,
+                      "run_at": "2026-10-02T00:00:00+00:00"})
+
+
+def test_sectors_v6_witness_shape_and_pinned_anchor(monkeypatch, tmp_path):
     import types
 
-    line = b'{"head_sha256":"' + b"a" * 64 + b'","prev_anchor_sha256":null,"records":2,"run_at":"x"}'
+    nl, cr = b"\n", b"\r"
+    line = _s6_line()
+    git = {"content": line + nl}
+    monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: git["content"])
+    assert v8._load_sectors_v6() is None  # real path: no sectors-v6 module in this tree
+    v8._sectors_v6_anchor_at_tip(tmp_path, "t")  # unpinned: the canonical shape is enough
+    bads = (line + nl + line + nl, line, line + cr + nl, line.replace(b'"records":2', b'"records":3') + nl,
+            line.replace(b'"prev_anchor_sha256":null', b'"prev_anchor_sha256":"x"') + nl, b"{}" + nl)
+    for bad in bads:
+        git["content"] = bad
+        with pytest.raises(PermissionError, match="sectors-v6 witness"):
+            v8._sectors_v6_anchor_at_tip(tmp_path, "t")
     fake = types.SimpleNamespace(REGISTERED_ANCHOR_LINE=line)
-    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
-    monkeypatch.setattr("importlib.import_module", lambda name: fake)
-    monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: line + b"\n")
+    monkeypatch.setattr(v8, "_load_sectors_v6", lambda: fake)
+    git["content"] = line + nl
     v8._sectors_v6_anchor_at_tip(tmp_path, "t")
-    monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: line.replace(b"a" * 64, b"b" * 64) + b"\n")
+    git["content"] = _s6_line("b") + nl
     with pytest.raises(PermissionError, match="pinned two-record"):
         v8._sectors_v6_anchor_at_tip(tmp_path, "t")
-    fake.REGISTERED_ANCHOR_LINE = None
-    v8._sectors_v6_anchor_at_tip(tmp_path, "t")  # unpinned: the census count rule is the whole check
+
+
+def test_a_sectors_v6_appearing_after_discovery_is_contamination_and_refuses_holdout(monkeypatch, tmp_path):
+    import types
+
+    counts = {key: 2 for key in v8.FROZEN_REGISTRIES} | {v6.VERSION: 3, v7.VERSION: 3, "vs1-v8": 4}
+    without = {"tip": "t", "records": counts, "unknown": []}
+    with_s6 = {"tip": "t2", "records": {**counts, "sectors-v6": 2}, "unknown": []}
+    assert not v8.contamination([with_s6, with_s6])["contaminated"]  # present from the first opening
+    late = v8.contamination([without, with_s6])
+    assert late["contaminated"] and "sectors-v6 (appeared after a v8 opening)" in str(late["detail"])
+    opened = {"kind": "discovery_opened", "supersession": {"vs1_witness_census": without}}
+    monkeypatch.setattr(v8.V8, "_chain", lambda log: [{"kind": "header"}, {"kind": "preregistration"}, opened])
+    witness = types.SimpleNamespace(census=with_s6)
+    with pytest.raises(PermissionError, match="first appeared after v8 discovery_opened"):
+        v8.open_holdout({}, allow_holdout=True, prereg_sha256=v8.PREREG_BODY_SHA256, log_dir=tmp_path,
+                        now=NOW, observed={}, witness=witness)
