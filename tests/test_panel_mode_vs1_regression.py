@@ -1,13 +1,14 @@
 """Old path vs new path: panel mode reproduces the VS1 statistic byte for byte (synthetic fixtures).
 
-VS1 v6/v7/v8 all measure through ``analysis.panel_insider_density`` (v1
-``measure_trial`` / ``discover_panel`` / ``evaluate_panel_holdout``, with
-``relative_labels`` for labels). Panel mode imports those primitives without
-editing them; these tests run the VS1 functions and the panel-mode functions on
-the same seeded fixtures and require identical records (every VS1 key, JSON
-bytes equal). The E0 machinery fingerprint test in
-``test_panel_mode_e0_parity.py`` proves the VS1 files themselves are untouched.
-No real price, label or IC is read.
+VS1 v1 measures through ``analysis.panel_insider_density`` (``measure_trial`` /
+``discover_panel`` / ``evaluate_panel_holdout``, ``relative_labels``); VS1 v2-v8
+measure through ``analysis.panel_insider_density_v2.measure_trial``, which is
+v1's record plus the negative one-sided p from the same draws (and reported-only
+extras). Panel mode imports those primitives without editing them; these tests
+run the VS1 functions and the panel-mode functions on the same seeded fixtures
+and require identical records (every VS1 key, JSON bytes equal). The E0
+machinery fingerprint test in ``test_panel_mode_e0_parity.py`` proves the VS1
+machinery files themselves are untouched. No real price, label or IC is read.
 """
 
 from __future__ import annotations
@@ -17,9 +18,16 @@ import pandas as pd
 import pytest
 
 from analysis import panel_insider_density as v1
+from analysis import panel_insider_density_v2 as v2
 from analysis import panel_mode as pm
 from analysis import panel_prices as pp
-from tests.panel_mode_support import construct, dumps, run_spec, synthetic_panel, v8_terminal_witness
+from tests.panel_mode_support import (
+    construct,
+    dumps,
+    run_spec,
+    synthetic_panel,
+    v8_terminal_witness,
+)
 
 VS1_DISCOVERY = {"A90|fwd5": (70, 1), "A90|fwd20": (40, 2), "A30|fwd5": (70, 3), "A30|fwd20": (40, 4)}
 
@@ -44,6 +52,19 @@ def test_measure_trial_byte_identical(sensitivity, frozen_block):
                                      magnitude="positive_vs_zero")
         _same_vs1_keys(old, new)
         assert new["p_one_sided"] == old["p_one_sided_positive"]
+
+
+def test_v2_measure_trial_byte_identical_both_directions():
+    """VS1 v2-v8's measurement: v1's keys equal, and v2's negative one-sided p is panel mode's direction=-1 p."""
+    for trial, panel in _vs1_panels("discovery", "2012-01-03", {"A90|fwd5": -0.4}).items():
+        old = v2.measure_trial(panel, perms=2000, sensitivity=False)
+        pos = pm.measure_panel_trial(panel, direction=1, perms=2000, sensitivity=False)
+        neg = pm.measure_panel_trial(panel, direction=-1, perms=2000, sensitivity=False)
+        for k in old:
+            if k == "p_one_sided_negative":
+                assert dumps(old[k]) == dumps(neg["p_one_sided"]), trial
+            else:
+                assert dumps(old[k]) == dumps(pos[k]) == dumps(neg[k]), (trial, k)
 
 
 def test_insufficient_data_byte_identical():

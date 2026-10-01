@@ -8,7 +8,12 @@ import pytest
 
 from analysis import panel_mode as pm
 from tests.panel_mode_support import (
-    Vault, anchor_line, construct, run_spec, synthetic_panel, v8_terminal_witness,
+    Vault,
+    anchor_line,
+    construct,
+    run_spec,
+    synthetic_panel,
+    v8_terminal_witness,
 )
 
 IN = (date(2015, 1, 1), date(2015, 3, 1))
@@ -154,3 +159,44 @@ def test_registry_and_witness_paths_never_touch_vs1():
                  "05-GRID/Paper-Log/other/gd8.anchors.jsonl"):
         with pytest.raises(PermissionError):
             pm.check_witness_path(path)
+
+
+@pytest.mark.parametrize("c", [
+    construct("ib90", 90, scorer="gd5:ib90", channels=("sec_form4",), event_filter="buy"),
+    construct("density_x", 30, scorer="gd5:A30", channels=("other",)),
+    construct("anything", 45, insider_buy_density=True),
+    construct("f4_open_market", 90, channels=("Form 4",), event_filter="open-market purchase"),
+])
+def test_renamed_insider_buy_density_is_still_the_sectors_v6_family(c):
+    assert pm.is_sectors_v6_family(c)
+    with pytest.raises(PermissionError, match="sectors-v6"):
+        pm.OutcomeWindowGuard.check_trial(c, "Financials", 20)
+
+
+def test_sell_density_and_multichannel_are_not_the_sectors_v6_family():
+    assert not pm.is_sectors_v6_family(construct("s90", 90, scorer="gd5:s90", channels=("form4",), event_filter="S"))
+    assert not pm.is_sectors_v6_family(construct("mc1", 90, scorer="gd5:mc1", channels=("form4", "congress")))
+
+
+def test_denylist_cannot_be_shrunk_and_tickers_are_normalised():
+    guard = pm.OutcomeWindowGuard(extra_technology_tickers=["ZZTECH"])
+    assert {"AAPL", "ZZTECH"} <= guard.denylist
+    with pytest.raises(PermissionError, match="R2"):
+        guard.check("Energy", ["XOM", "aapl"], "XLE", IN)
+    assert pm.normalise_ticker("BRK.B") == pm.normalise_ticker("BRK-B") == "BRKB"
+    with pytest.raises(TypeError):
+        pm.OutcomeWindowGuard(denylist=())
+
+
+def test_run_sectors_are_the_eleven_with_their_benchmark():
+    with pytest.raises(ValueError, match="11 equity sectors"):
+        run_spec(sectors=("Tech",), benchmarks=(("Tech", "SPY"),)).validate()
+    with pytest.raises(ValueError, match="11 equity sectors"):
+        run_spec(sectors=("Energy",), benchmarks=(("Energy", "SPY"),)).validate()
+    run_spec(sectors=("Energy", "Utilities")).validate()
+
+
+def test_registry_files_never_share_a_vs1_stem(tmp_path):
+    log = pm.PanelRegistry(tmp_path, "panel_prereg_sectors_v6", "ab" * 32).log()
+    names = {log.path.name, log.anchor_path.name, log.lock_path.name}
+    assert all(not n.lstrip(".").startswith("granular_panel_prereg") for n in names)

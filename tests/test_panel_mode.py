@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import dataclasses
 from datetime import date, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -17,7 +16,14 @@ from analysis import panel_prices as pp
 from analysis.offline_research_proof import digest
 from analysis.research_forward_log import scientific_identity
 from tests.panel_mode_support import (
-    FLOW_SECTOR, FLOW_TICKERS, NOW, anchor_line, construct, flow_features, flow_setup, run_spec,
+    FLOW_SECTOR,
+    FLOW_TICKERS,
+    NOW,
+    anchor_line,
+    construct,
+    flow_features,
+    flow_setup,
+    run_spec,
 )
 
 
@@ -36,17 +42,28 @@ def _discovery_key(f):
 
 
 def _panels(f, key, guard, start: date, as_of: date):
-    prices = pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS, start=start, as_of=as_of, key=key, guard=guard)
-    feats = flow_features(prices.closes())
+    out = {}
     c = f["construct"]
-    return {FLOW_SECTOR: {f"{c.name}|fwd{h}": pp.build_label_panel(prices, f["run"], c, feats, FLOW_TICKERS, h)
-                          for h in c.horizons}}
+    for sector, manifest in f["manifests"].items():
+        prices = pp.load_panel_prices(None, manifest, start=start, as_of=as_of, key=key, guard=guard)
+        feats = flow_features(prices.closes(), pm.universe(manifest))
+        out[sector] = {f"{c.name}|fwd{h}": pp.build_label_panel(prices, f["run"], c, feats, h) for h in c.horizons}
+    return out
 
 
-def _discover(f, key, guard):
+def _discover(f, key, guard, **over):
     panels = _panels(f, key, guard, date(2026, 7, 1), date(2028, 6, 30))
-    inputs = {"inputs_frozen_sha256": key.inputs_frozen_sha256, **f["inputs"].as_record()}
-    return pm.discover_panel(f["construct"], f["run"], panels, inputs=inputs, guard=guard)
+    return pm.discover_panel(over.get("constructs", f["construct"]), over.get("run", f["run"]), panels,
+                             inputs=pm.discovery_inputs(key), guard=guard)
+
+
+def _holdout_key(f, frozen):
+    pm.open_holdout(f["reg"], frozen, allow_holdout=True, prereg_sha256=f["prereg"], now=NOW,
+                    observed=f["inputs"], repo_root=f["repo_root"])
+    f["vault"].publish(f["reg"])
+    return pm.resume_holdout(f["reg"], frozen, allow_holdout=True, prereg_sha256=f["prereg"],
+                             observed=f["inputs"], witness=f["vault"].witness(f["reg"].registry_id),
+                             repo_root=f["repo_root"])
 
 
 def test_full_one_shot_flow_and_every_second_opening_refused(tmp_path, monkeypatch):
@@ -55,13 +72,13 @@ def test_full_one_shot_flow_and_every_second_opening_refused(tmp_path, monkeypat
     key = _discovery_key(f)
     frozen = _discover(f, key, guard)
     assert frozen["payload"]["promotion_allowed"] is False
-    pm.seal_discovery(key, NOW, frozen)
+    pm.seal_discovery(key, NOW, frozen, f["manifests"])
     with pytest.raises(PermissionError, match="one shot"):
         pm.open_discovery(f["reg"], NOW, f["inputs"], repo_root=f["repo_root"])
     with pytest.raises(PermissionError, match="already frozen"):
         pm.resume_discovery(f["reg"], f["inputs"], f["vault"].witness(f["reg"].registry_id), repo_root=f["repo_root"])
     with pytest.raises(PermissionError, match="already frozen"):
-        pm.seal_discovery(key, NOW, frozen)
+        pm.seal_discovery(key, NOW, frozen, f["manifests"])
 
     # holdout: explicit flag + the frozen hash, then the off-host witness
     kw = dict(prereg_sha256=f["prereg"], now=NOW, observed=f["inputs"], repo_root=f["repo_root"])
@@ -97,7 +114,7 @@ def test_no_price_without_a_discovery_key(tmp_path, monkeypatch):
     _register(f)
     pm.freeze_inputs(f["reg"], NOW, f["inputs"])
     with pytest.raises(PermissionError, match="no inputs_frozen|PanelDiscoveryKey"):
-        pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS, start=date(2026, 7, 1), as_of=date(2027, 1, 1),
+        pp.load_panel_prices(None, f["manifest"], start=date(2026, 7, 1), as_of=date(2027, 1, 1),
                              key=object(), guard=pm.OutcomeWindowGuard())
     with pytest.raises(TypeError):
         pm.PanelDiscoveryKey(object(), registry=f["reg"], inputs_frozen_sha256="0" * 64,
@@ -124,7 +141,7 @@ def test_split_first_no_discovery_read_at_or_after_the_split(tmp_path, monkeypat
     key = _discovery_key(f)
     guard = pm.OutcomeWindowGuard()
     with pytest.raises(PermissionError, match="split first"):
-        pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS, start=date(2026, 7, 1), as_of=date(2028, 7, 1),
+        pp.load_panel_prices(None, f["manifest"], start=date(2026, 7, 1), as_of=date(2028, 7, 1),
                              key=key, guard=guard)
     _discover(f, key, guard)
     split = date(2028, 7, 1)
@@ -228,13 +245,8 @@ def test_entity_split_second_holdout(tmp_path, monkeypatch):
     key = _discovery_key(f)
     frozen = _discover(f, key, guard)
     assert frozen["payload"]["spec"]["entity_split_salt"] == "gd6-split"
-    pm.seal_discovery(key, NOW, frozen)
-    pm.open_holdout(f["reg"], frozen, allow_holdout=True, prereg_sha256=f["prereg"], now=NOW,
-                    observed=f["inputs"], repo_root=f["repo_root"])
-    f["vault"].publish(f["reg"])
-    hkey = pm.resume_holdout(f["reg"], frozen, allow_holdout=True, prereg_sha256=f["prereg"],
-                             observed=f["inputs"], witness=f["vault"].witness(f["reg"].registry_id),
-                             repo_root=f["repo_root"])
+    pm.seal_discovery(key, NOW, frozen, f["manifests"])
+    hkey = _holdout_key(f, frozen)
     result = pm.evaluate_panel_holdout(frozen, _panels(f, hkey, guard, date(2028, 7, 1), date(2030, 6, 28)), hkey,
                                        guard=guard)
     assert all("entity_split" in c for c in result["holdout_checks"])
@@ -262,3 +274,62 @@ def test_ledger_options_both_implemented():
         run_spec(option="shared", k=2).validate()
     with pytest.raises(ValueError, match="ledger_option"):
         dataclasses.replace(sep, ledger_option="nope").validate()
+
+
+def test_two_sector_run_with_one_manifest_per_sector(tmp_path, monkeypatch):
+    """One Holm over both sectors' trials; per-sector manifests and per-manifest price receipts."""
+    f = flow_setup(tmp_path, monkeypatch, sectors=("Energy", "Utilities"))
+    guard = pm.OutcomeWindowGuard()
+    key = _discovery_key(f)
+    frozen = _discover(f, key, guard)
+    ledger = frozen["payload"]["ledger"]
+    assert {t["sector"] for t in ledger} == {"Energy", "Utilities"} and len(ledger) == 4
+    assert frozen["payload"]["entities"]["Utilities"] == pm.universe(f["manifests"]["Utilities"])
+    pm.seal_discovery(key, NOW, frozen, f["manifests"])
+    hkey = _holdout_key(f, frozen)
+    result = pm.evaluate_panel_holdout(frozen, _panels(f, hkey, guard, date(2028, 7, 1), date(2030, 6, 28)), hkey,
+                                       guard=guard)
+    assert {c["sector"] for c in result["holdout_checks"]} == {"Energy", "Utilities"}
+
+
+def test_freeze_needs_one_manifest_per_declared_sector(tmp_path, monkeypatch):
+    f = flow_setup(tmp_path, monkeypatch, sectors=("Energy", "Utilities"))
+    _register(f)
+    partial = dataclasses.replace(f["inputs"], price_manifest_sha256s=f["inputs"].price_manifest_sha256s[:1])
+    with pytest.raises(ValueError, match="per declared sector"):
+        pm.freeze_inputs(f["reg"], NOW, partial)
+
+
+def test_seal_refuses_a_discovery_other_than_the_registered_design(tmp_path, monkeypatch):
+    """After a witnessed price read, a re-run with another seed / direction / subset cannot be sealed."""
+    f = flow_setup(tmp_path, monkeypatch)
+    guard = pm.OutcomeWindowGuard()
+    key = _discovery_key(f)
+    reseeded = _discover(f, key, guard, run=dataclasses.replace(f["run"], seed=1))
+    with pytest.raises(PermissionError, match="registered constructs and run spec"):
+        pm.seal_discovery(key, NOW, reseeded, f["manifests"])
+    flipped = _discover(f, key, guard, constructs=dataclasses.replace(f["construct"], direction=-1))
+    with pytest.raises(PermissionError, match="registered constructs and run spec"):
+        pm.seal_discovery(key, NOW, flipped, f["manifests"])
+    honest = _discover(f, key, guard)
+    subset = {**honest["payload"], "entities": {FLOW_SECTOR: FLOW_TICKERS[:10]}}
+    with pytest.raises(PermissionError, match="full frozen admitted universe"):
+        pm.seal_discovery(key, NOW, {"payload": subset, "sha256": digest(subset)}, f["manifests"])
+    foreign = {**honest["payload"], "inputs": {**honest["payload"]["inputs"], "as_of_ts": "2026-09-01T00:00:00+00:00"}}
+    with pytest.raises(PermissionError, match="inputs_frozen record"):
+        pm.seal_discovery(key, NOW, {"payload": foreign, "sha256": digest(foreign)}, f["manifests"])
+    pm.seal_discovery(key, NOW, honest, f["manifests"])
+
+
+def test_reproducible_holdout(tmp_path, monkeypatch):
+    f = flow_setup(tmp_path, monkeypatch)
+    guard = pm.OutcomeWindowGuard()
+    key = _discovery_key(f)
+    frozen = _discover(f, key, guard)
+    pm.seal_discovery(key, NOW, frozen, f["manifests"])
+    hkey = _holdout_key(f, frozen)
+    one = pm.evaluate_panel_holdout(frozen, _panels(f, hkey, guard, date(2028, 7, 1), date(2030, 6, 28)), hkey,
+                                    guard=guard)
+    two = pm.evaluate_panel_holdout(frozen, _panels(f, hkey, guard, date(2028, 7, 1), date(2030, 6, 28)), hkey,
+                                    guard=guard)
+    assert digest(one) == digest(two)

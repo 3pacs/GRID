@@ -12,7 +12,7 @@ import pytest
 
 from analysis import panel_mode as pm
 from analysis import panel_prices as pp
-from tests.panel_mode_support import FLOW_TICKERS, NOW, flow_setup
+from tests.panel_mode_support import NOW, flow_setup
 
 
 def _key(f):
@@ -40,18 +40,14 @@ def test_refusals_happen_before_any_read(tmp_path, monkeypatch):
     f = flow_setup(tmp_path, monkeypatch)
     key = _key(f)
     guard = pm.OutcomeWindowGuard()
-    with pytest.raises(PermissionError, match="admitted"):
-        pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS + ["AAPL"], start=date(2026, 7, 1),
-                             as_of=date(2027, 1, 1), key=key, guard=guard)
     with pytest.raises(PermissionError, match="R3"):  # a read reaching back into the quarantine window
-        pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS, start=date(2026, 6, 1), as_of=date(2027, 1, 1),
+        pp.load_panel_prices(None, f["manifest"], start=date(2026, 6, 1), as_of=date(2027, 1, 1),
                              key=key, guard=guard)
     other = dataclasses.replace(f["manifest"], probe_report_sha256="ee" * 32)
     with pytest.raises(PermissionError, match="inputs_frozen"):
-        pp.load_panel_prices(None, other, FLOW_TICKERS, start=date(2026, 7, 1), as_of=date(2027, 1, 1),
-                             key=key, guard=guard)
+        pp.load_panel_prices(None, other, start=date(2026, 7, 1), as_of=date(2027, 1, 1), key=key, guard=guard)
     with pytest.raises(PermissionError, match="itself"):
-        pp.load_panel_prices(None, f["manifest"], FLOW_TICKERS, start=date(2026, 7, 1), as_of=date(2027, 1, 1),
+        pp.load_panel_prices(None, f["manifest"], start=date(2026, 7, 1), as_of=date(2027, 1, 1),
                              key=key, guard=object())
     assert f["reader"].calls == []
 

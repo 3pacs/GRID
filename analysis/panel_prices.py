@@ -26,14 +26,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from datetime import date, timedelta
-from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
 from analysis import panel_insider_density as v1
 from analysis import panel_mode as pm
-from analysis.offline_research_proof import digest, stamp
+from analysis.offline_research_proof import digest
 from store import observations
 
 PRICE_SOURCE = "TIINGO"  # source_catalog id 524
@@ -130,14 +129,17 @@ class PanelPrices:
 def load_panel_prices(
     conn,
     manifest: PanelPriceManifest,
-    tickers: Iterable[str],
     *,
     start: date,
     as_of: date,
     key: pm.PanelDiscoveryKey | pm.PanelHoldoutKey,
     guard: pm.OutcomeWindowGuard,
 ) -> PanelPrices:
-    """Read admitted closes under a key, after the outcome-window guard; discovery stops before the split."""
+    """Read the sector's whole admitted universe under a key, after the outcome-window guard.
+
+    Discovery stops before the split. The universe is the manifest's (admitted
+    minus benchmark and calendar), so a run cannot measure a hand-picked subset.
+    """
     manifest.validate()
     pm.require_guard(guard)
     if isinstance(key, pm.PanelDiscoveryKey):
@@ -154,14 +156,10 @@ def load_panel_prices(
         raise ValueError("start must not be after as_of")
     if manifest.sector not in run.sectors or run.benchmark(manifest.sector) != manifest.benchmark:
         raise PermissionError("the manifest's sector / benchmark are not the run's")
-    if manifest.digest() != key.inputs.get("price_manifest_sha256"):
-        raise PermissionError("price manifest differs from the one in inputs_frozen")
-    if manifest.probe_report_sha256 != key.inputs.get("probe_report_sha256"):
-        raise PermissionError("price manifest's probe report differs from the one in inputs_frozen")
-    wanted = sorted(set(tickers) | {manifest.benchmark, manifest.calendar})
-    refused = [t for t in wanted if t not in manifest.admitted]
-    if refused:
-        raise PermissionError(f"tickers not in the admitted-price manifest: {refused[:10]}")
+    pinned = dict(key.inputs.get("price_manifest_sha256s") or [])
+    if manifest.digest() != pinned.get(manifest.sector):
+        raise PermissionError("price manifest differs from the one inputs_frozen pinned for this sector")
+    wanted = sorted(set(manifest.admitted))
     guard.check(manifest.sector, wanted, manifest.benchmark, (start, as_of + timedelta(days=1)))
     data = {}
     for ticker in wanted:
@@ -173,7 +171,7 @@ def load_panel_prices(
         raise ValueError("no calendar closes in the read window")
     prices = PanelPrices(_LOADER, manifest=manifest, start=start, as_of=as_of, as_of_ts=key.as_of_ts,
                          window=window, data=data)
-    pm.record_prices_read(key, prices.receipt_sha)
+    pm.record_prices_read(key, prices.receipt_sha, manifest.digest())
     return prices
 
 
@@ -239,19 +237,19 @@ def build_label_panel(
     run: pm.PanelRunSpec,
     construct: pm.ConstructSpec,
     features: pd.DataFrame,
-    tickers: list[str],
     horizon: int,
 ) -> pm.TrialPanel:
     """One (sector, horizon) trial panel from verified prices and a frozen feature frame.
 
     ``features`` is decision-instant (UTC) x ticker, as read from a frozen
     artifact; a decision with no feature row abstains. The feature also
-    abstains where the issuer has no close at the decision.
+    abstains where the issuer has no close at the decision. The entities are
+    the manifest's whole universe (:func:`analysis.panel_mode.universe`).
     """
     prices.verify()
     closes = prices.closes()
     manifest = prices.manifest
-    tickers = [t for t in tickers if t in closes.columns and t != manifest.benchmark]
+    tickers = pm.universe(manifest)
     lo, hi = run.window_bounds(prices.window)
     first = date.fromisoformat(manifest.benchmark_first_close) if manifest.benchmark_first_close else None
     positions, labels, momentum = relative_labels(closes, manifest.benchmark, tickers, horizon, lo, hi,

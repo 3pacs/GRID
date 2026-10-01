@@ -7,16 +7,18 @@ defines the receipt contract against a fixture and adopts GD5's receipt once
 it lands (the field names below follow the GD5 brief, section 2).
 
 Refused: an unknown hash (the file's sha256 must equal the hash the caller
-froze), a receipt that does not name that hash, an artifact kind outside the
+froze; likewise the receipt file's sha256), a receipt that does not name that hash, an artifact kind outside the
 allowed list, a missing receipt field, a column set or order other than the
 receipt's, a naive or non-UTC timestamp (column values or the receipt's
-``as_of``), and any event ``known_at`` later than ``as_of``. Returns the frame
-and the receipt for the run manifest.
+``as_of``), a missing ``known_at``, and any ``known_at`` later than ``as_of``
+or than its row's ``decision_at``. The frame is parsed from the very bytes
+that were hashed. Returns the frame and the receipt for the run manifest.
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 from datetime import datetime, timezone
 from pathlib import Path
@@ -64,12 +66,13 @@ def read_frozen_artifact(
     artifact: Path,
     *,
     expected_sha256: str,
+    expected_receipt_sha256: str,
     allowed_kinds: Iterable[str],
 ) -> tuple[pd.DataFrame, dict]:
     """The frozen frame and its receipt, after every check above (nothing is read on refusal)."""
     artifact = Path(artifact)
-    if not _hex64(expected_sha256):
-        raise PermissionError("the expected artifact sha256 must be a frozen sha256 hex digest")
+    if not _hex64(expected_sha256) or not _hex64(expected_receipt_sha256):
+        raise PermissionError("the expected artifact and receipt sha256 must be frozen sha256 hex digests")
     allowed = frozenset(allowed_kinds)
     if not allowed:
         raise PermissionError("declare the artifact kinds this construct may read")
@@ -78,9 +81,15 @@ def read_frozen_artifact(
     if actual != expected_sha256:
         raise PermissionError(f"artifact hashes to {actual[:12]}, frozen {expected_sha256[:12]}: unknown artifact")
     try:
-        receipt = json.loads(receipt_path(artifact).read_text(encoding="utf-8"))
+        receipt_bytes = receipt_path(artifact).read_bytes()
     except FileNotFoundError as exc:
         raise PermissionError("the artifact has no receipt") from exc
+    if hashlib.sha256(receipt_bytes).hexdigest() != expected_receipt_sha256:
+        raise PermissionError("the receipt is not the frozen one (its sha256 differs)")
+    try:
+        receipt = json.loads(receipt_bytes.decode("utf-8"))
+    except ValueError as exc:
+        raise PermissionError("the receipt is not JSON") from exc
     if not isinstance(receipt, dict):
         raise PermissionError("the receipt is not a JSON object")
     missing = [k for k in RECEIPT_KEYS if k not in receipt]
@@ -97,7 +106,7 @@ def read_frozen_artifact(
     if not isinstance(specs, dict) or not specs or any(not _hex64(v) for v in specs.values()):
         raise PermissionError("receipt spec_sha256s must map spec names to sha256 digests")
     as_of = _utc(receipt["as_of"], "receipt as_of")
-    frame = pd.read_parquet(artifact)
+    frame = pd.read_parquet(io.BytesIO(data))
     if list(frame.columns) != list(receipt["columns"]):
         raise PermissionError(f"artifact columns {list(frame.columns)} differ from the receipt's {receipt['columns']}")
     if len(frame) != receipt["row_count"]:
@@ -119,8 +128,12 @@ def read_frozen_artifact(
     if "known_at" in frame.columns:
         if "known_at" not in stamps:
             raise PermissionError("known_at must be a declared UTC timestamp column")
+        if frame["known_at"].isna().any():
+            raise PermissionError("a row has no known_at")
         if (frame["known_at"] > pd.Timestamp(as_of)).any():
             raise PermissionError("an event's known_at is later than the artifact's as_of (look-ahead)")
+        if "decision_at" in frame.columns and (frame["known_at"] > frame["decision_at"]).any():
+            raise PermissionError("a row's known_at is later than its decision_at (look-ahead)")
     return frame, {**receipt, "receipt_sha256": digest(receipt)}
 
 

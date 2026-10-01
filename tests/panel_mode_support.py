@@ -137,7 +137,8 @@ def dumps(value) -> str:
 
 FLOW_SECTOR = "Energy"
 FLOW_BENCH = "XLE"
-FLOW_TICKERS = [f"E{j:02d}" for j in range(25)]
+SECTOR_TICKERS = {"Energy": [f"E{j:02d}" for j in range(25)], "Utilities": [f"U{j:02d}" for j in range(25)]}
+FLOW_TICKERS = SECTOR_TICKERS[FLOW_SECTOR]
 FLOW_WINDOWS = {"discovery_start": "2026-07-01T00:00:00+00:00", "split": "2028-07-01T00:00:00+00:00",
                 "end": "2030-07-01T00:00:00+00:00"}
 
@@ -153,7 +154,7 @@ def write_prereg(repo_root: Path, body: str = "GD6 test pre-registration body\n"
 def synthetic_closes(seed: int = 11) -> pd.DataFrame:
     days = pd.bdate_range("2026-06-01", "2030-06-28")
     rng = np.random.default_rng(seed)
-    cols = FLOW_TICKERS + [FLOW_BENCH]
+    cols = [t for s in SECTOR_TICKERS for t in SECTOR_TICKERS[s]] + [v1.EQUITY_SECTORS[s] for s in SECTOR_TICKERS]
     return pd.DataFrame(np.exp(np.cumsum(0.01 * rng.standard_normal((len(days), len(cols))), axis=0)) * 40,
                         index=days, columns=cols)
 
@@ -181,33 +182,38 @@ def flow_construct() -> pm.ConstructSpec:
                      event_filter="P")
 
 
-def flow_setup(tmp_path: Path, monkeypatch, *, registry_id="gd6-flow", supersedes=(), entity_split_salt=None):
+def sector_manifest(sector: str):
     from analysis import panel_prices as pp
 
+    bench = v1.EQUITY_SECTORS[sector]
+    return pp.PanelPriceManifest(sector=sector, source=pp.PRICE_SOURCE, series_template=pp.SERIES_TEMPLATE,
+                                 basis="split+dividend adjusted", benchmark=bench, calendar=bench,
+                                 admitted=tuple(sorted(SECTOR_TICKERS[sector] + [bench])),
+                                 probe_report_sha256="cd" * 32)
+
+
+def flow_setup(tmp_path: Path, monkeypatch, *, registry_id="gd6-flow", supersedes=(), entity_split_salt=None,
+               sectors=(FLOW_SECTOR,)):
     monkeypatch.setattr(pm, "OWNER_LEDGER_DECISION", "separate")
     repo_root = tmp_path / "repo"
     rel, prereg = write_prereg(repo_root)
-    run = run_spec(sectors=(FLOW_SECTOR,), registry_id=registry_id, prereg=prereg, perms=999,
+    run = run_spec(sectors=tuple(sectors), registry_id=registry_id, prereg=prereg, perms=999,
                    supersedes=tuple(supersedes), entity_split_salt=entity_split_salt, **FLOW_WINDOWS)
     reg = pm.PanelRegistry(tmp_path / f"registry-{registry_id}", registry_id, prereg)
-    manifest = pp.PanelPriceManifest(sector=FLOW_SECTOR, source=pp.PRICE_SOURCE, series_template=pp.SERIES_TEMPLATE,
-                                     basis="split+dividend adjusted", benchmark=FLOW_BENCH, calendar=FLOW_BENCH,
-                                     admitted=tuple(sorted(FLOW_TICKERS + [FLOW_BENCH])),
-                                     probe_report_sha256="cd" * 32)
-    inputs = pm.PanelInputs(artifact_sha256s=("ef" * 32,), price_manifest_sha256=manifest.digest(),
-                            probe_report_sha256=manifest.probe_report_sha256,
+    manifests = {s: sector_manifest(s) for s in sectors}
+    inputs = pm.PanelInputs(artifacts=(("ef" * 32, "fe" * 32),),
+                            price_manifest_sha256s=tuple((s, m.digest()) for s, m in manifests.items()),
                             as_of_ts="2026-09-30T00:00:00+00:00")
     reader = FakeReader(synthetic_closes())
     monkeypatch.setattr("store.observations.read_window", reader)
     return {"repo_root": repo_root, "prereg_path": rel, "prereg": prereg, "run": run, "reg": reg,
-            "construct": flow_construct(), "manifest": manifest, "inputs": inputs, "reader": reader,
-            "vault": Vault(tmp_path / f"vault-{registry_id}")}
+            "construct": flow_construct(), "manifests": manifests, "manifest": manifests[sectors[0]],
+            "inputs": inputs, "reader": reader, "vault": Vault(tmp_path / f"vault-{registry_id}")}
 
 
-def flow_features(closes: pd.DataFrame, seed: int = 3, plant_from: pd.DataFrame | None = None) -> pd.DataFrame:
-    """Decision-instant x ticker features (sparse counts); optionally tilted toward future returns."""
+def flow_features(closes: pd.DataFrame, tickers, seed: int = 3) -> pd.DataFrame:
+    """Decision-instant x ticker features (sparse counts), as a frozen artifact would carry them."""
     rng = np.random.default_rng(seed)
     instants = v1.decision_instants([d.date() for d in closes.index])
-    feats = pd.DataFrame(rng.poisson(0.5, size=(len(instants), len(FLOW_TICKERS))).astype(float),
-                         index=instants, columns=FLOW_TICKERS)
-    return feats
+    return pd.DataFrame(rng.poisson(0.5, size=(len(instants), len(tickers))).astype(float),
+                        index=instants, columns=list(tickers))

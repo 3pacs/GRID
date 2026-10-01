@@ -58,7 +58,7 @@ import hashlib
 import json
 import re
 import tempfile
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
@@ -129,6 +129,9 @@ class ConstructSpec:
     every other horizon is exploratory. ``contains_price`` marks constructs
     computed from prices (GD9 PX variants): their feature window is guarded as
     an outcome window too (``price_lookback_days`` before each decision).
+    ``insider_buy_density`` declares a Form 4 insider-buy density construct (the
+    sectors-v6 confirmatory family is refused whatever the construct is called;
+    see :meth:`OutcomeWindowGuard.check_trial`).
     """
 
     name: str
@@ -144,6 +147,7 @@ class ConstructSpec:
     price_lookback_days: int = 0
     artifact_kinds: tuple[str, ...] = ()
     magnitude: str = "none"
+    insider_buy_density: bool = False
 
     def validate(self) -> None:
         if not _NAME.fullmatch(self.name) or not _NAME.fullmatch(self.feature_class) or not self.scorer:
@@ -234,6 +238,10 @@ class PanelRunSpec:
         bench = dict(self.benchmarks)
         if len(bench) != len(self.benchmarks) or set(bench) != set(self.sectors):
             raise ValueError("every sector has exactly one benchmark")
+        for sector, etf in bench.items():
+            if v1.EQUITY_SECTORS.get(sector) != etf:
+                raise ValueError(f"{sector!r} is not one of the 11 equity sectors with its benchmark ETF "
+                                 f"({etf!r}); see analysis.panel_insider_density.EQUITY_SECTORS")
         option = LEDGER_OPTIONS.get(self.ledger_option)
         if option is None:
             raise ValueError(f"ledger_option must be one of {sorted(LEDGER_OPTIONS)}")
@@ -324,13 +332,18 @@ SECTORS_V6_PIN: Mapping[str, Any] | None = None
 _GUARD_WITNESS_TOKEN = object()
 
 
+def normalise_ticker(ticker: str) -> str:
+    """Upper case, separators dropped (``BRK.B``, ``BRK-B`` and ``BRK/B`` are one ticker)."""
+    return re.sub(r"[^A-Z0-9]", "", str(ticker).upper())
+
+
 def load_technology_denylist(path: Path = DENYLIST_PATH) -> frozenset[str]:
-    """E0's VS1 Technology denylist (the 782-candidate v2 universe, sector-map Technology, XLK)."""
+    """E0's VS1 Technology denylist (the 782-candidate v2 universe, sector-map Technology, XLK), normalised."""
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     tickers = raw.get("tickers") if isinstance(raw, dict) else None
-    if not isinstance(tickers, list) or not tickers:
-        raise ValueError("the Technology denylist has no tickers")
-    return frozenset(str(t).upper() for t in tickers) | {TECHNOLOGY_BENCHMARK}
+    if not isinstance(tickers, list) or len(tickers) < 782:
+        raise ValueError("the Technology denylist is missing or truncated")
+    return frozenset(normalise_ticker(t) for t in tickers) | {TECHNOLOGY_BENCHMARK}
 
 
 class _GuardWitness:
@@ -382,6 +395,27 @@ def _tokens(name: str) -> set[str]:
     return {t for t in re.split(r"[^A-Z0-9]+", str(name).upper()) if t}
 
 
+_SELL_TOKENS = frozenset({"S", "SELL", "SELLS", "SALE", "SALES", "D", "DISPOSITION", "DISPOSE"})
+
+
+def is_sectors_v6_family(construct: ConstructSpec) -> bool:
+    """Form 4 insider-buy density at W30 / W90, however it is named (conservative).
+
+    True when declared (``insider_buy_density``), when the name or scorer carries an
+    ``A30`` / ``A90`` token, or when every channel is Form 4, the window is 30 or 90
+    days and the event filter is not explicitly a sell / disposition filter.
+    """
+    if construct.insider_buy_density:
+        return True
+    tokens = _tokens(construct.name) | _tokens(construct.scorer)
+    if tokens & SECTORS_V6_CONSTRUCTS:
+        return True
+    channels = [re.sub(r"[^a-z0-9]", "", c.lower()) for c in construct.channels]
+    form4_only = bool(channels) and all("form4" in c or c in ("f4", "sec4") for c in channels)
+    sell = bool(_tokens(construct.event_filter) & _SELL_TOKENS)
+    return form4_only and construct.window_days in SECTORS_V6_WINDOWS and not sell
+
+
 class OutcomeWindowGuard:
     """Refuses outcome windows that standing rules R2/R3 quarantine.
 
@@ -392,14 +426,14 @@ class OutcomeWindowGuard:
 
     def __init__(self, *, v8_terminal: V8TerminalWitness | None = None,
                  sectors_v6: SectorsV6Witness | None = None,
-                 denylist: Iterable[str] | None = None) -> None:
+                 extra_technology_tickers: Iterable[str] = ()) -> None:
         if v8_terminal is not None and type(v8_terminal) is not V8TerminalWitness:
             raise PermissionError("unknown witness: R2 lifts only on a V8TerminalWitness")
         if sectors_v6 is not None and type(sectors_v6) is not SectorsV6Witness:
             raise PermissionError("unknown witness: R3 lifts only on a SectorsV6Witness")
         self.v8_terminal, self.sectors_v6 = v8_terminal, sectors_v6
-        self.denylist = frozenset(t.upper() for t in denylist) if denylist is not None else load_technology_denylist()
-        self.denylist = self.denylist | {TECHNOLOGY_BENCHMARK}
+        # The E0 denylist is always in force; callers can only add to it.
+        self.denylist = load_technology_denylist() | {normalise_ticker(t) for t in extra_technology_tickers}
 
     @staticmethod
     def in_quarantine(window: tuple[Any, Any]) -> bool:
@@ -410,9 +444,9 @@ class OutcomeWindowGuard:
 
     def check(self, sector: str, tickers: Iterable[str], benchmark: str, window: tuple[Any, Any]) -> dict:
         inside = self.in_quarantine(window)
-        tickers = [str(t).upper() for t in tickers]
+        tickers = [normalise_ticker(t) for t in tickers]
         hits = sorted({t for t in tickers if t in self.denylist})
-        xlk = TECHNOLOGY_BENCHMARK in _tokens(benchmark)
+        xlk = TECHNOLOGY_BENCHMARK in _tokens(benchmark) or normalise_ticker(benchmark) in self.denylist
         technology_sector = str(sector).strip().lower() in TECHNOLOGY_SECTORS
         technology = technology_sector or xlk or bool(hits)
         if inside and technology and self.v8_terminal is None:
@@ -436,12 +470,7 @@ class OutcomeWindowGuard:
     @staticmethod
     def check_trial(construct: ConstructSpec, sector: str, horizon: int) -> None:
         """The sectors-v6 confirmatory trials run only in the sectors-v6 harness (always refused)."""
-        insider_buy = construct.name.upper() in SECTORS_V6_CONSTRUCTS or (
-            tuple(c.lower() for c in construct.channels) == ("form4",)
-            and construct.event_filter.strip().upper() in ("P", "INSIDER_BUY", "PURCHASE")
-            and construct.window_days in SECTORS_V6_WINDOWS
-        )
-        if insider_buy and str(sector).strip().lower() not in TECHNOLOGY_SECTORS and horizon in SECTORS_V6_HORIZONS:
+        if is_sectors_v6_family(construct) and str(sector).strip().lower() not in TECHNOLOGY_SECTORS                 and horizon in SECTORS_V6_HORIZONS:
             raise PermissionError(
                 f"R3: {construct.name}|fwd{horizon} in {sector} is a sectors-v6 confirmatory trial "
                 "(Form 4 A30/A90 insider-buy density, non-Technology, fwd5/fwd20); only the sectors-v6 "
@@ -623,6 +652,8 @@ def e0_measure(feature: np.ndarray, label: np.ndarray, horizon: int, trial: str,
 def validate_panel(panel: TrialPanel, run: PanelRunSpec) -> None:
     """VS1's ``validate_panel`` against the run's own windows."""
     lo, hi = run.window_bounds(panel.window)
+    if len(panel.decision_at) != len(panel.label_end):
+        raise ValueError("decisions and label ends differ in length")
     previous_end = None
     for decided, ended in zip(panel.decision_at, panel.label_end):
         d, e = stamp(decided), stamp(ended)
@@ -631,8 +662,6 @@ def validate_panel(panel: TrialPanel, run: PanelRunSpec) -> None:
         if previous_end is not None and d < previous_end:
             raise ValueError("overlapping outcome windows")
         previous_end = e
-    if len(panel.decision_at) != len(panel.label_end):
-        raise ValueError("decisions and label ends differ in length")
     shape = (len(panel.decision_at), len(panel.entities))
     for matrix in (panel.feature, panel.label):
         if matrix.shape != shape or np.isinf(matrix).any():
@@ -704,12 +733,14 @@ def discover_panel(
     require_guard(guard)
     trials = declared_trials(constructs, run)
     _check_panels(panels, trials)
-    guarded, ledger, measured = [], [], {}
+    guarded, ledger, measured, entities = [], [], {}, {}
     for sector, trial in trials:
         construct = construct_of(constructs, trial)
         panel = panels[sector][trial]
         if panel.window != "discovery" or panel.trial != trial or panel.horizon != trial_horizon(trial):
             raise ValueError("discovery received a non-discovery or mislabelled panel")
+        if entities.setdefault(sector, list(panel.entities)) != list(panel.entities):
+            raise ValueError(f"every {sector} panel must cover the same entities")
         validate_panel(panel, run)
         guarded.append(guard.check_panel(construct, sector, run.benchmark(sector), panel))
         if run.entity_split_salt is not None:
@@ -742,6 +773,7 @@ def discover_panel(
                 f"(autocorrelation_block, >= {MIN_BLOCKS} blocks)",
         "inputs": inputs,
         "guard": guarded,
+        "entities": entities,
         "discovery_sha256": digest({f"{s}::{t}": panel_digest(measured[(s, t)]) for s, t in trials}),
         "ledger": ledger,
         "calibration": calibration(ledger),
@@ -771,6 +803,21 @@ def calibration(ledger: list[dict]) -> dict:
             "confirmatory_trials": [f"{t['sector']}::{t['trial']}" for t in ledger if t["confirmatory"]]}
 
 
+def _holdout_measure(panel: TrialPanel, entry: dict, construct: ConstructSpec, run: PanelRunSpec,
+                     n_selected: int) -> tuple[dict, float | None, bool]:
+    """VS1's holdout step for one panel: frozen block (MIN_BLOCKS cap), Bonferroni, same sign."""
+    ic, _ = v1.rank_ic_series(panel.feature, panel.label)
+    n = int(np.isfinite(ic).sum())
+    block = max(1, min(entry["block"] or 1, max(1, n // MIN_BLOCKS)))
+    result = measure_panel_trial(panel, direction=construct.direction, block=block, perms=run.perms,
+                                 seed=run.seed, min_n=run.min_n, sensitivity=True, magnitude=construct.magnitude)
+    is_selected = entry["selected"]
+    adjusted = corrected_p(result["p"], n_selected) if is_selected else None
+    survives = bool(is_selected and result["status"] == "tested" and adjusted <= HOLDOUT_ALPHA
+                    and result["mean_ic"] * entry["mean_ic"] > 0)
+    return result, adjusted, survives
+
+
 def evaluate_panel_holdout(
     frozen: dict,
     panels: Mapping[str, Mapping[str, TrialPanel]],
@@ -797,27 +844,17 @@ def evaluate_panel_holdout(
         panel = (panels.get(sector) or {}).get(trial)
         if panel is None:
             raise ValueError(f"the holdout lacks the panel {sector}::{trial}")
-        if panel.window != "holdout" or panel.trial != trial:
+        if panel.window != "holdout" or panel.trial != trial or panel.horizon != trial_horizon(trial):
             raise ValueError("holdout received a non-holdout or mislabelled panel")
+        if list(panel.entities) != payload["entities"][sector]:
+            raise ValueError(f"the {sector} holdout panel is not on the discovery's entities")
         validate_panel(panel, run)
         guarded.append(guard.check_panel(construct, sector, run.benchmark(sector), panel))
         records[f"{sector}::{trial}"] = panel_digest(panel)
         entry = ledger[(sector, trial)]
         is_selected = entry["selected"]
 
-        def measured(p: TrialPanel) -> tuple[dict, float | None, bool]:
-            ic, _ = v1.rank_ic_series(p.feature, p.label)
-            n = int(np.isfinite(ic).sum())
-            block = max(1, min(entry["block"] or 1, max(1, n // MIN_BLOCKS)))
-            result = measure_panel_trial(p, direction=construct.direction, block=block, perms=run.perms,
-                                         seed=run.seed, min_n=run.min_n, sensitivity=True,
-                                         magnitude=construct.magnitude)
-            adjusted = corrected_p(result["p"], len(selected)) if is_selected else None
-            survives = bool(is_selected and result["status"] == "tested" and adjusted <= HOLDOUT_ALPHA
-                            and result["mean_ic"] * entry["mean_ic"] > 0)
-            return result, adjusted, survives
-
-        result, adjusted, survives = measured(panel)
+        result, adjusted, survives = _holdout_measure(panel, entry, construct, run, len(selected))
         check = {
             "trial_id": entry["trial_id"], "trial": trial, "sector": sector,
             "family_key": entry["family_key"], "selected_in_discovery": is_selected,
@@ -826,7 +863,8 @@ def evaluate_panel_holdout(
             "confirmatory_one_sided_p": result["p_one_sided"] if entry["confirmatory"] else None,
         }
         if salt is not None:
-            split_result, split_adjusted, split_survives = measured(restrict_entities(panel, salt, 1))
+            split_result, split_adjusted, split_survives = _holdout_measure(
+                restrict_entities(panel, salt, 1), entry, construct, run, len(selected))
             check["entity_split"] = {**split_result, "bonferroni_p": split_adjusted,
                                      "retrospective_survivor": split_survives}
         checks.append(check)
@@ -898,7 +936,7 @@ WITNESS_BRANCH = "main"
 WITNESS_REF = "refs/granular-witness/main"
 _REGISTRY_ID = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 _WITNESS_FILE = re.compile(r"^05-GRID/Paper-Log/granular/([a-z0-9][a-z0-9._-]{2,63})\.anchors\.jsonl$")
-FROZEN_INPUT_KEYS: tuple[str, ...] = ("artifact_sha256s", "price_manifest_sha256", "probe_report_sha256",
+FROZEN_INPUT_KEYS: tuple[str, ...] = ("artifacts", "price_manifest_sha256s",
                                       "as_of_ts")
 OBSERVED_INPUT_KEYS: tuple[str, ...] = tuple(k for k in FROZEN_INPUT_KEYS if k != "as_of_ts")
 _KEY_TOKEN = object()
@@ -930,23 +968,35 @@ def check_witness_path(path: str) -> str:
 
 @dataclass(frozen=True)
 class PanelInputs:
-    """The hashes ``inputs_frozen`` pins (re-freezable only while no discovery is open)."""
+    """The hashes ``inputs_frozen`` pins (re-freezable only while no discovery is open).
 
-    artifact_sha256s: tuple[str, ...]
-    price_manifest_sha256: str
-    probe_report_sha256: str
+    ``artifacts``: (artifact sha256, receipt sha256) pairs of the frozen feature
+    artifacts. ``price_manifest_sha256s``: (sector, admitted-price manifest
+    digest) pairs, one per declared sector (the manifest digest covers its
+    probe report and admitted universe).
+    """
+
+    artifacts: tuple[tuple[str, str], ...]
+    price_manifest_sha256s: tuple[tuple[str, str], ...]
     as_of_ts: str
 
-    def validate(self) -> None:
-        if not self.artifact_sha256s or any(not v1._is_hex64(s) for s in self.artifact_sha256s):
-            raise ValueError("artifact_sha256s must be sha256 hex digests")
-        for k in ("price_manifest_sha256", "probe_report_sha256"):
-            if not v1._is_hex64(getattr(self, k)):
-                raise ValueError(f"{k} must be a sha256 hex digest")
+    def validate(self, run: "PanelRunSpec | None" = None) -> None:
+        if not self.artifacts or any(len(a) != 2 or not all(v1._is_hex64(x) for x in a) for a in self.artifacts):
+            raise ValueError("artifacts are (artifact sha256, receipt sha256) pairs")
+        sectors = [pair[0] for pair in self.price_manifest_sha256s]
+        if not sectors or len(set(sectors)) != len(sectors)                 or any(len(pair) != 2 or not v1._is_hex64(pair[1]) for pair in self.price_manifest_sha256s):
+            raise ValueError("price_manifest_sha256s are distinct (sector, sha256) pairs")
+        if run is not None and set(sectors) != set(run.sectors):
+            raise ValueError("one admitted-price manifest per declared sector")
         stamp(self.as_of_ts)
 
+    def manifest_sha256(self, sector: str) -> str | None:
+        return dict(self.price_manifest_sha256s).get(sector)
+
     def as_record(self) -> dict:
-        return {**asdict(self), "artifact_sha256s": sorted(self.artifact_sha256s)}
+        return {"artifacts": sorted([list(a) for a in self.artifacts]),
+                "price_manifest_sha256s": sorted([list(p) for p in self.price_manifest_sha256s]),
+                "as_of_ts": self.as_of_ts}
 
     def observed(self) -> dict:
         record = self.as_record()
@@ -971,7 +1021,7 @@ class PanelRegistry:
         return witness_path(self.registry_id)
 
     def log(self) -> ForwardLog:
-        stem = f"granular_{self.registry_id}"
+        stem = f"gd_panel_mode_{self.registry_id}"
         return ForwardLog(Path(self.log_dir), log_filename=f"{stem}.jsonl",
                           anchor_filename=f"{stem}.anchors.jsonl", lock_filename=f".{stem}.lock",
                           prereg_sha256=self.prereg_sha256)
@@ -1260,14 +1310,23 @@ def export_anchors(reg: PanelRegistry, vault_worktree: Path) -> list[str]:
     new = local[len(existing):]
     if new:
         path.parent.mkdir(parents=True, exist_ok=True)
+        tail = path.read_bytes() if path.exists() else b""
         with open(path, "ab") as stream:
+            if tail and not tail.endswith(b"\n"):
+                stream.write(b"\n")
             for line in new:
                 stream.write(line + b"\n")
     return [line.decode("utf-8") for line in new]
 
 
 class PanelDiscoveryKey:
-    """``discovery_opened`` is in this registry's chain and witnessed off-host (from :func:`resume_discovery`)."""
+    """``discovery_opened`` is in this registry's chain and witnessed off-host (from :func:`resume_discovery`).
+
+    As in VS1, the issuing token is a module-private object: forging a key is
+    prevented by convention and review (any caller could import the token), not
+    by the type system. The registry chain and the off-host witness are the
+    actual record of what was opened.
+    """
 
     window = "discovery"
 
@@ -1307,7 +1366,8 @@ def freeze_inputs(reg: PanelRegistry, now: datetime, inputs: PanelInputs) -> dic
     """Append ``inputs_frozen`` before any price read; refused once a discovery was opened."""
     if now.tzinfo is None:
         raise ValueError("now must carry a timezone")
-    inputs.validate()
+    _, run, _ = registered(reg)
+    inputs.validate(run)
     if stamp(inputs.as_of_ts) > now:
         raise ValueError("as_of_ts cannot be later than the freeze")
     log = reg.log()
@@ -1369,49 +1429,81 @@ def resume_discovery(reg: PanelRegistry, observed: PanelInputs, witness: Granula
                              inputs=matching[0]["inputs"], witness_tip=witness.tip)
 
 
-def record_prices_read(key: PanelDiscoveryKey | PanelHoldoutKey, price_receipt_sha256: str,
-                       now: datetime | None = None) -> dict:
-    """Append ``prices_read``; a resumed run's re-read must reproduce the first receipt."""
-    if not isinstance(key, (PanelDiscoveryKey, PanelHoldoutKey)):
-        raise PermissionError("recording a price read needs its key")
-    reg = key.registry
+def record_prices_read(grant: PanelDiscoveryKey | PanelHoldoutKey, price_receipt_sha256: str,
+                       manifest_sha256: str, now: datetime | None = None) -> dict:
+    """Append ``prices_read`` for one sector's manifest; a resumed re-read must reproduce the first receipt."""
+    if not isinstance(grant, (PanelDiscoveryKey, PanelHoldoutKey)):
+        raise PermissionError("recording a price read needs its grant")
+    if manifest_sha256 not in {sha for _, sha in grant.inputs.get("price_manifest_sha256s", [])}:
+        raise PermissionError("the price manifest is not one inputs_frozen pinned")
+    reg = grant.registry
     log = reg.log()
     with log.locked():
         records = _chain(reg)
-        earlier = [r for r in _kind(records, "prices_read") if r["window"] == key.window]
+        earlier = [r for r in _kind(records, "prices_read")
+                   if r["window"] == grant.window and r["manifest_sha256"] == manifest_sha256]
         if any(r["price_receipt_sha256"] != price_receipt_sha256 for r in earlier):
-            raise PermissionError(f"{key.window} prices differ from the first read under this registry: refused")
+            raise PermissionError(f"{grant.window} prices differ from the first read of this manifest under this "
+                                  "registry: refused")
         return log.append_locked([{
             "kind": "prices_read", "run_at": (now or datetime.now(timezone.utc)).isoformat(),
-            "prereg_sha256": reg.prereg_sha256, "window": key.window,
-            "price_receipt_sha256": price_receipt_sha256, "witness_tip": key.witness_tip,
+            "prereg_sha256": reg.prereg_sha256, "window": grant.window, "manifest_sha256": manifest_sha256,
+            "price_receipt_sha256": price_receipt_sha256, "witness_tip": grant.witness_tip,
             "promotion_allowed": False,
         }])[0]
 
 
-def seal_discovery(key: PanelDiscoveryKey, now: datetime, frozen: dict) -> dict:
-    """Append ``discovery_frozen`` with the frozen manifest's sha256."""
-    if not isinstance(key, PanelDiscoveryKey):
+def discovery_inputs(grant: PanelDiscoveryKey) -> dict:
+    """The ``inputs`` a sealable discovery manifest carries: the grant's inputs_frozen record and hash."""
+    if not isinstance(grant, PanelDiscoveryKey):
+        raise PermissionError("discovery inputs come from a PanelDiscoveryKey")
+    return {"inputs_frozen_sha256": grant.inputs_frozen_sha256, **grant.inputs}
+
+
+def universe(manifest: Any) -> list[str]:
+    """A sector manifest's issuer universe: admitted tickers minus its benchmark and calendar tickers."""
+    return sorted(set(manifest.admitted) - {manifest.benchmark, manifest.calendar})
+
+
+def seal_discovery(grant: PanelDiscoveryKey, now: datetime, frozen: dict, manifests: Mapping[str, Any]) -> dict:
+    """Append ``discovery_frozen`` with the frozen manifest's sha256 -- only for the registered design.
+
+    The discovery must have run exactly the registered constructs and run spec
+    (same trials, directions, seed, perms, ledger k), on exactly this grant's
+    frozen inputs, and every sector's panels on that sector's full admitted
+    universe (``manifests``: sector -> the frozen admitted-price manifest).
+    """
+    if not isinstance(grant, PanelDiscoveryKey):
         raise PermissionError("sealing a discovery needs its PanelDiscoveryKey")
     payload = frozen.get("payload") or {}
     if digest(payload) != frozen.get("sha256"):
         raise ValueError("frozen discovery manifest does not hash to its sha256")
-    if (payload.get("inputs") or {}).get("inputs_frozen_sha256") != key.inputs_frozen_sha256:
-        raise PermissionError("the discovery manifest does not carry this key's inputs_frozen hash")
-    reg = key.registry
+    if payload.get("inputs") != discovery_inputs(grant):
+        raise PermissionError("the discovery manifest does not carry this grant's inputs_frozen record")
+    reg = grant.registry
     if payload.get("prereg_sha256") != reg.prereg_sha256 or payload.get("spec", {}).get("registry_id") != reg.registry_id:
         raise PermissionError("the discovery manifest belongs to another registry")
+    with reg.log().locked():
+        prereg = _chain(reg)[1]
+    if payload.get("constructs_sha256") != prereg["constructs_sha256"] or payload.get("spec_sha256") != prereg["run_sha256"]:
+        raise PermissionError("the discovery did not run the registered constructs and run spec")
+    pinned = dict(grant.inputs["price_manifest_sha256s"])
+    if set(manifests) != set(pinned) or any(manifests[sec].digest() != pinned[sec] for sec in pinned):
+        raise PermissionError("the price manifests are not the ones inputs_frozen pinned")
+    entities = payload.get("entities") or {}
+    if set(entities) != set(pinned) or any(entities[sec] != universe(manifests[sec]) for sec in pinned):
+        raise PermissionError("a sector's panels are not its full frozen admitted universe")
     log = reg.log()
     with log.locked():
         records = _chain(reg)
         opened = _kind(records, "discovery_opened")
-        if len(opened) != 1 or opened[0]["inputs_frozen_sha256"] != key.inputs_frozen_sha256:
-            raise PermissionError("no discovery_opened record for this key")
+        if len(opened) != 1 or opened[0]["inputs_frozen_sha256"] != grant.inputs_frozen_sha256:
+            raise PermissionError("no discovery_opened record for this grant")
         if _kind(records, "discovery_frozen"):
             raise PermissionError("a discovery is already frozen (one shot)")
         return log.append_locked([{
             "kind": "discovery_frozen", "run_at": now.isoformat(), "prereg_sha256": reg.prereg_sha256,
-            "inputs_frozen_sha256": key.inputs_frozen_sha256, "discovery_sha256": frozen["sha256"],
+            "inputs_frozen_sha256": grant.inputs_frozen_sha256, "discovery_sha256": frozen["sha256"],
             "calibration": payload["calibration"]["state"],
             "selected": [f"{t['sector']}::{t['trial']}" for t in payload["ledger"] if t["selected"]],
             "promotion_allowed": False,
@@ -1485,21 +1577,21 @@ def resume_holdout(reg: PanelRegistry, frozen: dict, *, allow_holdout: bool, pre
                            witness_tip=witness.tip)
 
 
-def seal_holdout(key: PanelHoldoutKey, now: datetime, result: dict) -> dict:
+def seal_holdout(grant: PanelHoldoutKey, now: datetime, result: dict) -> dict:
     """Append ``holdout_result`` (the result's sha256 and verdict state)."""
-    if not isinstance(key, PanelHoldoutKey) or result.get("discovery_manifest") != key.frozen_sha256:
-        raise PermissionError("the holdout result does not belong to this key")
-    reg = key.registry
+    if not isinstance(grant, PanelHoldoutKey) or result.get("discovery_manifest") != grant.frozen_sha256:
+        raise PermissionError("the holdout result does not belong to this grant")
+    reg = grant.registry
     log = reg.log()
     with log.locked():
         records = _chain(reg)
-        if not any(r.get("discovery_sha256") == key.frozen_sha256 for r in _kind(records, "holdout_opened")):
+        if not any(r.get("discovery_sha256") == grant.frozen_sha256 for r in _kind(records, "holdout_opened")):
             raise PermissionError("no holdout_opened record for this discovery")
         if _kind(records, "holdout_result"):
             raise PermissionError("a holdout result is already recorded")
         return log.append_locked([{
             "kind": "holdout_result", "run_at": now.isoformat(), "prereg_sha256": reg.prereg_sha256,
-            "discovery_sha256": key.frozen_sha256, "result_sha256": digest(result),
+            "discovery_sha256": grant.frozen_sha256, "result_sha256": digest(result),
             "verdict": result["verdict"]["state"], "promotion_allowed": False,
         }])[0]
 
