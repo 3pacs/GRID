@@ -70,8 +70,7 @@ Activation is operator-authorized and needs a verified scheduler restart onto th
 
 ```bash
 sudo -u grid install -d -m 0750 /data/grid_v4/gem_daily /data/grid_v4/gem_daily/attempts
-printf 'pin=%s utc=%s
-' "$PIN" "$(date -u +%FT%TZ)" | sudo install -m 0644 -o root -g root /dev/stdin /data/grid_v4/gem_daily/ACTIVATED
+printf 'pin=%s utc=%s\n' "$PIN" "$(date -u +%FT%TZ)" | sudo install -m 0644 -o root -g root /dev/stdin /data/grid_v4/gem_daily/ACTIVATED
 sudo systemctl enable --now grid-options-puller.timer
 systemctl list-timers grid-options-puller.timer
 ```
