@@ -1,6 +1,6 @@
 # GEM daily options capture: pin, timer, activation
 
-This runs the eight GEM tickers (OPCH, SPGI, FLUT, GEHC, GLND, SPY, QQQ, IWM) once per NYSE weekday session at 10:05 New York, after the scheduler's own 13:30 UTC options pull. Every GEM capture is its own immutable batch (`options_append_only_20260930`, `capture_source='gem'`). A later same-day scheduler capture never removes it; it stays replayable by `capture_batch_id`.
+This runs the eight GEM tickers (OPCH, SPGI, FLUT, GEHC, GLND, SPY, QQQ, IWM) once per NYSE weekday session, started by the scheduler's own 13:30 UTC options pull completing (event-triggered, see below). Every GEM capture is its own immutable batch (`options_append_only_20260930`, `capture_source='gem'`). A later same-day scheduler capture never removes it; it stays replayable by `capture_batch_id`.
 
 It reuses the existing `grid-options-puller.service` / `.timer` units. Their legacy hourly config stays on disk; these drop-ins override it.
 
@@ -26,12 +26,16 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
    - the provider quote time is on the session day;
    - the capture falls inside the New York session.
 7. **CONTAIN.**
-   - `Type=oneshot` with `TimeoutStartSec=15min`, so the timeout bounds the whole run, plus `KillMode=control-group`. The runner's own SIGALRM stops at 10:20 New York.
+   - `Type=oneshot` with `TimeoutStartSec=55min` (09:31 arm to the 10:20 deadline is 49 min), so the timeout bounds the whole run, plus `KillMode=control-group`. The runner's own SIGALRM stops at 10:20 New York.
    - `ExecStopPost=-…/gem_daily_contain.py` appends `CONTAINED result=… status=…` to the day's claim receipt, whatever the outcome.
    - The timer uses `Persistent=false`, so there are no catch-up runs.
    - The quarantine drop-in keeps `RefuseManualStart=yes`.
 
-**Timing margin.** In EDT, 10:05 New York is 14:05Z. On 2026-09-30 the scheduler's 13:30Z options pull completed at 13:57Z, so the margin is about 8 minutes. If the scheduler pull is still running at 14:05Z, the gate skips. The day's single claim is then used up and that day has no GEM batch. This fails closed. In EST the timer fires at 15:05Z, which leaves an hour.
+**Event-triggered start (GEM-EV).** The timer only arms the runner at 09:31 New York. The runner then follows `journalctl -u grid-scheduler -f` and starts the capture within about two seconds of the scheduler's `Options daily pull complete` line. That line must come from the same invocation and PID as the `Starting daily pulls` line before it. Before the capture starts, a strict whole-window check repeats the original gate. A `GEM_TRIGGER scheduler_options_complete=… lag_s=…` line goes to the log and to the day's claim receipt.
+
+- If the line has not appeared by **10:05 New York** (the latest start), the day is recorded as `GEM_SKIP scheduler options not complete by latest start`.
+- A failure or skip line, a restart between the start and completion lines, or a second pull records `GEM_SKIP scheduler options journal gate`.
+- In EDT the capture now starts about 13:57Z instead of 14:05Z. In EST the scheduler finishes before the open, so the capture starts at 09:31 New York: captures must lie inside the session.
 
 **Quarantine marker change.** Installing `99-grid652-quarantine.conf` deliberately replaces the GRID-652 forensics `activation-held` condition with the GEM daily marker. That marker is created **root-owned** (below). Its directory belongs to `grid`, so the service account could still delete the marker, which is fail-safe because it deactivates. Activation also needs the timer enabled, which only root can do.
 
@@ -61,7 +65,7 @@ sudo install -d -m 0755 /etc/systemd/system/grid-options-puller.timer.d
 sudo install -m 0644 -o root -g root $OUT/grid-options-puller.timer.d/50-gem-daily.conf /etc/systemd/system/grid-options-puller.timer.d/
 sudo systemctl daemon-reload
 systemctl cat grid-options-puller.service grid-options-puller.timer
-systemd-analyze calendar --iterations=3 'Mon..Fri *-*-* 10:05:00 America/New_York'
+systemd-analyze calendar --iterations=3 'Mon..Fri *-*-* 09:31:00 America/New_York'
 ```
 
 ## Activation
@@ -78,7 +82,7 @@ systemctl list-timers grid-options-puller.timer
 ## First-run check
 
 - Check `/var/log/grid-options-puller.log` for eight `GEM_VALIDATE … PASS` lines and one `GEM_CONTAIN result=success`.
-- Check `/data/grid_v4/gem_daily/attempts/<day>`: it should hold one `STARTED` line and one `CONTAINED` line.
+- Check `/data/grid_v4/gem_daily/attempts/<day>`. It should hold `STARTED`, then `GEM_TRIGGER … lag_s=…` (or a `GEM_SKIP` with its reason), the `GEM_VALIDATE` lines, and finally `CONTAINED`.
 - Call `GET /api/v1/derivatives/options-batches/SPY?snap_date=<day>`. It should list the scheduler batch and the `gem` batch.
 
 ## Kill switch
