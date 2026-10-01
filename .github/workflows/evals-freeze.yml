@@ -44,4 +44,4 @@ jobs:
             echo "bootstrap: no base guard"
             exit 0
           fi
-          python3 -I base/evals/released.py check --base-dir base --head-dir head
+          python3 -I base/evals/released.py check --base-dir base --head-dir head --fresh-checkout

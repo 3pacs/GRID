@@ -18,7 +18,7 @@ the thing it guards in the same change.
 | Keep an old version live next to a new one | Yes | Release the new version as a sibling package (e0-v2 at `evals/e0v2/`). Each path stays pinned to its own latest entry, so e0-v1 at `evals/e0` keeps hash `75489d50…`, which VS1 v8 verifies at run time. |
 | Add a new suite (`evals/<x>/` with a `MANIFEST.sha256`) | Yes | Append its first `suite` entry in the same PR. |
 | Delete a released suite path | **Never** | Retire it in docs; the files stay. |
-| Change a guard file (the latest `guards` entry's `files`) | Only with a **new `guards` entry** | Append `guards-vN+1` with the new hashes. Owner approval. |
+| Change a guard file (the latest `guards` entry's `files`) | Only with a **new `guards` entry** | Append `guards-vN+1` with the new hashes. Owner approval. A guards entry may add or re-hash files but never drop one, and `evals/released.py` plus the workflow are always pinned; retiring a guard file needs an owner override. |
 
 Owner approval is a merge decision made by the repository owner. The guard
 makes every such change visible as one appended entry; it cannot judge whether
@@ -63,10 +63,10 @@ intended: the second one rebases and takes the next `seq`.
 | R1 | `released entry <seq> changed/deleted` | An existing entry was edited, removed or reordered. Restore it byte-for-byte; append instead. |
 | R2 | `schema must be 1`, `seq must be contiguous`, `fields must be exactly …` | The registry is malformed. Fix the JSON shape. |
 | R3 | `<suite> manifest is not a released version` | The suite's `MANIFEST.sha256` differs from the latest entry for that path. Append a new released entry, or revert the change. |
-| R4 | `changed:` / `missing:` / `unpinned:` | A file under a suite path does not match its manifest line. Re-pin and release, or revert. Symlinks and non-regular files are refused. |
-| R5 | `guard file <path> changed without a new guards entry` | A guard file changed. Append a `guards` entry, or revert. |
+| R4 | `changed:` / `missing:` / `unpinned:` / `committed bytecode not allowed` | A file under a suite path does not match its manifest line. Re-pin and release, or revert. Symlinks, non-regular files and (in CI's fresh checkout) committed `__pycache__`/`*.pyc` are refused, because a committed unchecked-hash `.pyc` can be imported instead of the pinned source. |
+| R5 | `guard file <path> changed without a new guards entry`, `unpins guard file` | A guard file changed: append a `guards` entry, or revert. A new guards entry must keep every previously pinned file. |
 | R6 | `duplicate release <suite> <version>` | A `(suite, version)` pair is registered twice, or one path is given to two suites. Use a new version name. |
-| R7 | `unreleased suite evals/<x>` | A directory has a `MANIFEST.sha256` but no entry. Append its first entry. |
+| R7 | `unreleased suite evals/<x>`, `symlink not allowed`, `would shadow the guard module` | A directory has a `MANIFEST.sha256` but no entry (append its first entry), or `evals/` holds a symlink or a `released*` name that would shadow `released.py`. |
 | R8 | `N new entries for <path> in one change` | Release one version per path per PR. |
 | R9 | `released suite <x> is missing from the head tree` | A released suite path was deleted. Restore it. |
 
@@ -82,3 +82,12 @@ intended: the second one rebases and takes the next `seq`.
   Backend Tests job meanwhile.
 - `RELEASED.json` itself is not pinned in `guards`: R1 protects its released
   entries, and appending is the only legitimate change.
+- `pull_request_target` checks the PR head against the base **at event time**
+  and does not re-run when `main` moves. Two appends to `RELEASED.json`
+  conflict textually, but other combinations may not, so the owner should
+  enable "require branches to be up to date" on the ruleset. The `push` run on
+  `main` reports anything that slips through after merge.
+- Content is checked as checked out. A head `.gitattributes` could make the
+  working tree differ from the committed blob, but every checkout (CI and
+  deploy) applies the same attributes, so the deployed bytes are the checked
+  bytes.

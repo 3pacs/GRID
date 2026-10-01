@@ -46,8 +46,11 @@ SUITE_FIELDS = ("seq", "kind", "suite", "version", "path", "manifest_sha256",
 GUARDS_FIELDS = ("seq", "kind", "version", "files")
 GUARDS_KEY = "<guards>"
 
-_HEX64 = re.compile(r"^[0-9a-f]{64}$")
-_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_HEX64 = re.compile(r"[0-9a-f]{64}\Z")
+_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+_SUITE_PATH = re.compile(r"evals/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
+# Guard files every guards entry must pin, whatever else it lists.
+ALWAYS_GUARDED = ("evals/released.py", ".github/workflows/evals-freeze.yml")
 
 # Manifest formats, matched to each suite's own manifest.py:
 #  * "versioned" (evals/e0/manifest.py): has a "# version:" header; files whose
@@ -201,6 +204,15 @@ def canonical(entry: dict) -> str:
     return json.dumps(entry, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def _no_duplicate_keys(pairs: list) -> dict:
+    out = {}
+    for key, value in pairs:
+        if key in out:
+            raise ValueError(f"duplicate key {key!r}")
+        out[key] = value
+    return out
+
+
 def load_registry(root: Path, *, missing_ok: bool = False) -> list[dict]:
     data = _read_file(Path(root), REGISTRY)
     if data is None:
@@ -208,7 +220,7 @@ def load_registry(root: Path, *, missing_ok: bool = False) -> list[dict]:
             return []
         raise GuardError(f"{REGISTRY} is missing")
     try:
-        doc = json.loads(data.decode("utf-8"))
+        doc = json.loads(data.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
     except (UnicodeDecodeError, ValueError) as exc:
         raise GuardError(f"{REGISTRY} is not valid JSON: {exc}") from None
     if not isinstance(doc, dict) or doc.get("schema") != SCHEMA:
@@ -247,9 +259,7 @@ def _validate_entry(entry: dict) -> list[str]:
         if isinstance(entry["suite"], str) and not _NAME.match(entry["suite"]):
             problems.append(f"R2: entry {seq}: bad suite name {entry['suite']!r}")
         path = entry["path"]
-        if (not isinstance(path, str) or not path.startswith(EVALS_DIR + "/")
-                or any(p in ("", ".", "..") for p in path.split("/"))
-                or "\\" in path or path.endswith("/")):
+        if not isinstance(path, str) or not _SUITE_PATH.match(path):
             problems.append(f"R2: entry {seq}: bad path {path!r} (must be evals/<dir>)")
         if not isinstance(entry["manifest_sha256"], str) or not _HEX64.match(entry["manifest_sha256"]):
             problems.append(f"R2: entry {seq}: manifest_sha256 must be 64 lowercase hex")
@@ -276,8 +286,35 @@ def latest_by_key(entries: list[dict]) -> dict[str, dict]:
 
 # --------------------------------------------------------------------------- the guard
 
-def check(base_dir: Path, head_dir: Path) -> list[str]:
-    """Every rule violation of HEAD against BASE (empty list = pass)."""
+def _bytecode_under(root: Path, rel_dir: str) -> list[str]:
+    """Committed ``__pycache__`` dirs / ``*.pyc`` files under ``root/rel_dir``.
+
+    The manifest walkers skip bytecode because a working copy regenerates it,
+    but a COMMITTED unchecked-hash ``.pyc`` (or a sourceless ``.pyc``) can be
+    imported instead of the pinned source. A fresh CI checkout has none, so
+    ``--fresh-checkout`` refuses any.
+    """
+    found = []
+    base = Path(root) / rel_dir
+    if not base.is_dir() or os.path.islink(base):
+        return found
+    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
+        here = Path(dirpath)
+        for name in dirnames:
+            if name == "__pycache__":
+                found.append((here / name).relative_to(root).as_posix() + "/")
+        for name in filenames:
+            if name.endswith(".pyc"):
+                found.append((here / name).relative_to(root).as_posix())
+    return sorted(set(found))
+
+
+def check(base_dir: Path, head_dir: Path, *, fresh_checkout: bool = False) -> list[str]:
+    """Every rule violation of HEAD against BASE (empty list = pass).
+
+    ``fresh_checkout`` (set by CI) additionally refuses committed bytecode
+    under ``evals/`` and next to every guard file (R4/R5).
+    """
     base_dir, head_dir = Path(base_dir), Path(head_dir)
     failures: list[str] = []
     try:
@@ -298,7 +335,7 @@ def check(base_dir: Path, head_dir: Path) -> list[str]:
 
     # R2: schema (checked on load), contiguous seq from 0, well-formed entries.
     for i, entry in enumerate(head_entries):
-        if entry.get("seq") != i or isinstance(entry.get("seq"), bool):
+        if type(entry.get("seq")) is not int or entry.get("seq") != i:
             failures.append(f"R2: entries[{i}] has seq {entry.get('seq')!r}; seq must be contiguous from 0")
         failures.extend(_validate_entry(entry))
     if any(f.startswith("R2:") for f in failures):
@@ -361,8 +398,17 @@ def check(base_dir: Path, head_dir: Path) -> list[str]:
         except (GuardError, UnicodeDecodeError, OSError) as exc:
             failures.append(f"R4: {label}: {exc}")
 
-    # R5: every file pinned by the latest guards entry matches at head.
+    # R5: every file pinned by the latest guards entry matches at head, and a
+    # new guards entry can add or re-hash files but never unpin one.
     guards = latest.get(GUARDS_KEY)
+    base_guards = latest_by_key(base_entries).get(GUARDS_KEY)
+    if guards is not None:
+        required = set(ALWAYS_GUARDED)
+        if base_guards is not None and isinstance(base_guards.get("files"), dict):
+            required |= set(base_guards["files"])
+        for rel in sorted(required - set(guards["files"])):
+            failures.append(f"R5: {guards['version']} unpins guard file {rel}; a guards entry may "
+                            "add or re-hash files but never drop one")
     if guards is None:
         failures.append("R5: no guards entry is registered")
     else:
@@ -378,12 +424,30 @@ def check(base_dir: Path, head_dir: Path) -> list[str]:
                 failures.append(f"R5: guard file {rel} changed without a new guards entry "
                                 f"(pinned by {guards['version']})")
 
+    if fresh_checkout:
+        found = _bytecode_under(head_dir, EVALS_DIR)
+        guard_dirs = {Path(rel).parent for rel in (guards or {}).get("files", {})}
+        for parent in sorted(guard_dirs):
+            if os.path.lexists(head_dir / parent / "__pycache__"):
+                found.append((parent / "__pycache__").as_posix() + "/")
+        for item in sorted(set(found)):
+            failures.append(f"R4: committed bytecode not allowed: {item}")
+
     # R7: every MANIFEST.sha256 under evals/ belongs to a registered suite path.
     try:
         evals_root = _check_no_symlink(head_dir, EVALS_DIR)
         if evals_root.is_dir():
+            for name in sorted(os.listdir(evals_root)):
+                stem = name.split(".", 1)[0].lower()
+                if stem == "released" and name not in ("released.py", "RELEASED.json"):
+                    failures.append(f"R7: evals/{name} would shadow the guard module or registry")
             for dirpath, dirnames, filenames in os.walk(evals_root, followlinks=False):
-                dirnames[:] = sorted(d for d in dirnames if d not in PLAIN_SKIP_DIRS)
+                for name in dirnames + filenames:
+                    if os.path.islink(Path(dirpath) / name):
+                        rel = (Path(dirpath) / name).relative_to(head_dir).as_posix()
+                        failures.append(f"R7: symlink not allowed under evals/: {rel}")
+                dirnames[:] = sorted(d for d in dirnames if d not in PLAIN_SKIP_DIRS
+                                     and not os.path.islink(Path(dirpath) / d))
                 if MANIFEST_NAME not in filenames:
                     continue
                 rel_dir = Path(dirpath).relative_to(head_dir).as_posix()
@@ -428,6 +492,8 @@ def main(argv: list[str] | None = None) -> int:
     p_check = sub.add_parser("check", help="enforce R1-R9 of HEAD against BASE")
     p_check.add_argument("--base-dir", required=True, type=Path)
     p_check.add_argument("--head-dir", required=True, type=Path)
+    p_check.add_argument("--fresh-checkout", action="store_true",
+                         help="HEAD is a fresh git checkout: refuse any committed bytecode")
     p_hash = sub.add_parser("lf-sha256", help="print the CRLF->LF sha256 of files")
     p_hash.add_argument("paths", nargs="+", type=Path)
     args = parser.parse_args(argv)
@@ -438,7 +504,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     try:
-        failures = check(args.base_dir, args.head_dir)
+        failures = check(args.base_dir, args.head_dir, fresh_checkout=args.fresh_checkout)
     except GuardError as exc:
         failures = [f"guard error: {exc}"]
     if failures:

@@ -219,6 +219,25 @@ def test_f_editing_a_guard_file_needs_a_guards_entry(trees):
     _passes(base, head)
 
 
+def test_f_a_guards_entry_cannot_unpin_a_guard_file(trees):
+    base, head = trees
+    files = dict(released.latest_by_key(released.entries(head))[released.GUARDS_KEY]["files"])
+    del files["tests/test_e0_benchmark.py"]
+    _append(head, kind="guards", version="guards-v99", files=files)
+    _fails(base, head, "guards-v99 unpins guard file tests/test_e0_benchmark.py")
+
+
+def test_f_the_guard_and_workflow_are_always_pinned(trees):
+    base, head = trees
+    (base / "evals" / "RELEASED.json").unlink()  # even with no base guards entry
+    files = dict(released.latest_by_key(released.entries(head))[released.GUARDS_KEY]["files"])
+    del files["evals/released.py"]
+    doc = _doc(head)
+    doc["entries"][1]["files"] = files
+    _save(head, doc)
+    _fails(base, head, "unpins guard file evals/released.py")
+
+
 def test_f_deleting_a_guard_file_fails(trees):
     base, head = trees
     (head / "evals" / "released.py").unlink()
@@ -251,7 +270,9 @@ def test_j_guard_runs_stdlib_only_in_isolated_mode(trees, tmp_path):
     _, head = trees
     env = {k: v for k, v in os.environ.items() if not k.startswith("PYTHON")}
     env["PYTHONPATH"] = ""
-    cmd = [sys.executable, "-I", "base/evals/released.py", "check", "--base-dir", "base",
+    # -I ignores PYTHON* env vars and the script dir; -S drops site-packages,
+    # so only the standard library is importable.
+    cmd = [sys.executable, "-I", "-S", "base/evals/released.py", "check", "--base-dir", "base",
            "--head-dir", "head"]
     ok = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120,
                         check=False)
@@ -343,6 +364,62 @@ def test_r2_unknown_fields_and_kinds(trees):
     _fails(base, head, "unknown kind 'hotfix'")
 
 
+def test_r2_duplicate_json_keys_fail(trees):
+    base, head = trees
+    path = head / "evals" / "RELEASED.json"
+    text = path.read_text(encoding="utf-8")
+    sha = '"manifest_sha256": "' + E0_V1_SHA + '"'
+    path.write_text(text.replace(sha, sha + ', "manifest_sha256": "' + "0" * 64 + '"', 1),
+                    encoding="utf-8")
+    _fails(base, head, "duplicate key 'manifest_sha256'")
+
+
+def test_r2_seq_must_be_a_plain_int(trees):
+    base, head = trees
+    sha = _make_plain_suite(head, "evals/e9")
+    entry = _append(head, **_suite_entry("e9", "e9-v1", "evals/e9", sha))
+    doc = _doc(head)
+    doc["entries"][entry["seq"]]["seq"] = float(entry["seq"])
+    _save(head, doc)
+    _fails(base, head, "seq must be contiguous from 0")
+
+
+def test_r2_suite_path_is_one_level_under_evals(trees):
+    base, head = trees
+    _append(head, **_suite_entry("e9", "e9-v1", "evals/e0/data", "1" * 64))
+    _fails(base, head, "bad path 'evals/e0/data'")
+
+
+def test_committed_bytecode_fails_in_a_fresh_checkout(trees):
+    base, head = trees
+    pyc = head / "evals" / "e0" / "__pycache__" / "scorer.cpython-310.pyc"
+    pyc.parent.mkdir()
+    pyc.write_bytes(b"not really bytecode")
+    _passes(base, head)  # a developer working copy regenerates bytecode
+    failures = released.check(base, head, fresh_checkout=True)
+    assert any("committed bytecode not allowed: evals/e0/__pycache__/" in f for f in failures), failures
+    shutil.rmtree(pyc.parent)
+    (head / "tests" / "__pycache__").mkdir()
+    failures = released.check(base, head, fresh_checkout=True)
+    assert any("committed bytecode not allowed: tests/__pycache__/" in f for f in failures), failures
+    shutil.rmtree(head / "tests" / "__pycache__")
+    assert released.check(base, head, fresh_checkout=True) == []
+
+
+def test_trailing_newline_in_a_version_is_rejected(trees):
+    base, head = trees
+    sha = _make_plain_suite(head, "evals/e9")
+    _append(head, **_suite_entry("e9", "e9-v1\n", "evals/e9", sha))
+    _fails(base, head, "bad version")
+
+
+def test_shadowing_the_guard_module_fails(trees):
+    base, head = trees
+    (head / "evals" / "released").mkdir()
+    (head / "evals" / "released" / "__init__.py").write_text("", encoding="utf-8")
+    _fails(base, head, "evals/released would shadow the guard module")
+
+
 def test_header_version_must_match_the_entry(trees):
     base, head = trees
     sha = _make_e0_sibling(head, "evals/e0v2", "e0-v2")
@@ -410,8 +487,9 @@ def test_workflow_shape():
     assert job["name"] == "evals-freeze-guard"
     assert "permissions" not in job or job["permissions"] == {"contents": "read"}
 
+    assert len(job["steps"]) == 3
     checkouts = [s for s in job["steps"] if str(s.get("uses", "")).startswith("actions/checkout@")]
-    assert len(checkouts) == 2
+    assert len(checkouts) == 2 and job["steps"][:2] == checkouts
     for step in checkouts:
         assert step["with"]["persist-credentials"] is False
     base, head = checkouts
@@ -427,6 +505,7 @@ def test_workflow_shape():
     assert scripts and all(t.startswith("base/") for t in scripts), scripts
     assert "--head-dir" in tokens and tokens[tokens.index("--head-dir") + 1] == "head"
     assert "--base-dir" in tokens and tokens[tokens.index("--base-dir") + 1] == "base"
+    assert "--fresh-checkout" in tokens
     assert "bootstrap: no base guard" in runs[0]
 
     lowered = text.lower()
