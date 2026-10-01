@@ -143,8 +143,9 @@ def test_one_current_version_per_key(v2):
     with pytest.raises(DBAPIError):
         _insert(v2)
     with v2.begin() as conn:
-        conn.execute(text("UPDATE people_events SET superseded_at = NOW() WHERE id = :i"), {"i": eid})
-    _insert(v2)  # a new current version of the same key
+        conn.execute(text("UPDATE people_events SET superseded_at = '2026-05-01T00:00:00Z' WHERE id = :i"),
+                     {"i": eid})
+    _insert(v2, known="2026-05-01T00:00:00Z")  # a new current version, visible from the supersession on
     _raises(v2, "UPDATE people_events SET superseded_at = NULL WHERE id = :i", {"i": eid})
 
 
