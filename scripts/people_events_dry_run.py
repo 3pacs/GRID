@@ -65,17 +65,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db-url-env", help="env var holding the database URL (default: config.settings.DB_URL)")
     ap.add_argument("--since", default="2025-01-01", help="signal_date floor for signal_sources reads")
     ap.add_argument("--limit-per-source", type=int, default=250_000)
-    ap.add_argument("--observed-at", help="ISO timestamp to use as this run's observation time (default: now)")
+    ap.add_argument("--observed-at", help="ISO timestamp for this run's observation time (default: the moment "
+                    "the inputs finished loading); must not precede that moment unless --allow-past-observed-at")
+    ap.add_argument("--allow-past-observed-at", action="store_true",
+                    help="fixtures/tests only: accept an --observed-at earlier than the read")
     ap.add_argument("--out", type=Path, required=True, help="JSON report path (must not exist)")
     args = ap.parse_args(argv)
 
     if args.out.exists():
         print(f"refusing to overwrite {args.out}", file=sys.stderr)
         return 2
-    observed_at = (datetime.fromisoformat(args.observed_at) if args.observed_at else datetime.now(timezone.utc))
-    if observed_at.tzinfo is None:
-        observed_at = observed_at.replace(tzinfo=timezone.utc)
-
     t0 = time.perf_counter()
     form345 = None
     if args.form345:
@@ -103,6 +102,21 @@ def main(argv: list[str] | None = None) -> int:
             "people_events_counts": got["people_events_counts"], "since": args.since,
             "limit_per_source": args.limit_per_source,
         }
+
+    # The observation time is taken AFTER every input was read: a row ingested
+    # while the parquet/DB load was running must never get a first_seen bound
+    # earlier than the moment this run could actually have seen it.
+    read_done = datetime.now(timezone.utc)
+    if args.observed_at:
+        observed_at = datetime.fromisoformat(args.observed_at.replace("Z", "+00:00"))
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        if observed_at < read_done and not args.allow_past_observed_at:
+            print("refusing --observed-at earlier than the input read (first_seen would be too early)",
+                  file=sys.stderr)
+            return 2
+    else:
+        observed_at = read_done
 
     report = D.run_dry_run(
         form345=form345,

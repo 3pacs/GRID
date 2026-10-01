@@ -90,7 +90,11 @@ def next_session_open_after_series(dates: pd.Series) -> pd.Series:
 
 
 def to_utc(value: Any) -> datetime | None:
-    """Parse a timestamp-like value to an aware UTC datetime; naive input is taken as UTC."""
+    """Parse a timestamp-like value to an aware UTC datetime; naive input is taken as UTC.
+
+    Only for database ``timestamptz`` values (``created_at``), which are always
+    aware. Third-party timestamps go through :func:`vendor_time_bound`.
+    """
     if value is None or (isinstance(value, float) and pd.isna(value)) or value == "":
         return None
     try:
@@ -102,6 +106,34 @@ def to_utc(value: Any) -> datetime | None:
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     return ts.tz_convert("UTC").to_pydatetime()
+
+
+_HAS_TIME = re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{1,2}:\d{2}")
+_HAS_OFFSET = re.compile(r"(Z|[+-]\d{2}:?\d{2})$")
+
+
+def vendor_time_bound(value: Any) -> datetime | None:
+    """A third-party timestamp as a known_at upper bound, never earlier than the instant it names.
+
+    * Explicit offset (``...Z`` / ``...+00:00``): taken exactly.
+    * Date only, or a naive date-time (time zone unknown): the next session
+      open after that calendar date. A naive "18:00" could be Eastern or
+      Pacific; reading it as UTC would put the bound hours *before* the real
+      posting, which is a look-ahead leak at the 16:00 ET decision. The next
+      session open after the date is later than any instant of that date in
+      any US time zone.
+    """
+    if value is None or value == "" or (isinstance(value, float) and pd.isna(value)):
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            return value.astimezone(timezone.utc)
+        return next_session_open_after(value.date())
+    text = str(value).strip()
+    if _HAS_TIME.match(text) and _HAS_OFFSET.search(text):
+        return to_utc(text)
+    d = parse_date(text)
+    return next_session_open_after(d) if d is not None else None
 
 
 def parse_date(value: Any) -> date | None:

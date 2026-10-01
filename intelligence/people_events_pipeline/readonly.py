@@ -32,7 +32,9 @@ LOCK_TIMEOUT_MS = 2_000
 
 _FORBIDDEN_TABLES = frozenset({"raw_series"}) | NEVER_A_CHANNEL
 _WRITE_WORDS = re.compile(
-    r"\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|TRUNCATE|GRANT|REVOKE|COPY|VACUUM|ANALYZE|REFRESH|CALL|DO|LOCK)\b",
+    r"\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|TRUNCATE|GRANT|REVOKE|COPY|VACUUM|ANALYZE|REFRESH|CALL|DO|LOCK"
+    r"|INTO|SET_CONFIG|NEXTVAL|SETVAL|DBLINK|LO_IMPORT|LO_EXPORT|PG_TERMINATE_BACKEND|PG_CANCEL_BACKEND"
+    r"|PG_ADVISORY_LOCK|PG_RELOAD_CONF|PG_READ_FILE|PG_WRITE_FILE)\b",
     re.IGNORECASE,
 )
 
@@ -75,6 +77,7 @@ def readonly_engine(url: str) -> Engine:
 
 
 def _query(conn: Connection, sql: str, params: dict[str, Any]) -> pd.DataFrame:
+    assert_db_window_open()  # re-checked per statement: a long run must not drift into the window
     result = conn.execute(text(guard_sql(sql)), params)
     return pd.DataFrame(result.fetchall(), columns=list(result.keys()))
 
@@ -113,12 +116,25 @@ _PEOPLE_EVENTS_COUNT_SQL = """
     SELECT channel, count(*) AS n, count(security_id) AS with_security_id
     FROM people_events GROUP BY channel ORDER BY channel
 """
-_PEOPLE_EVENTS_ROWS_SQL = """
-    SELECT channel, dedup_key, known_at, known_at_basis, source_refs
+_PEOPLE_EVENTS_HAS_V2_SQL = """
+    SELECT count(*) AS n FROM information_schema.columns
+    WHERE table_schema = current_schema() AND table_name = 'people_events' AND column_name = 'superseded_at'
+"""
+_PEOPLE_EVENTS_TOTAL_SQL = "SELECT count(*) AS n FROM people_events"
+# Every version (current, superseded, retracted): the plan needs them all to
+# compute each key's version floor.
+_PEOPLE_EVENTS_ROWS_V2_SQL = """
+    SELECT channel, dedup_key, known_at, known_at_basis, source_refs, content_hash, actor_id, actor_id_basis,
+           entity_cik, superseded_at, retracted_at
     FROM people_events
     ORDER BY id
-    LIMIT :limit
 """
+_PEOPLE_EVENTS_ROWS_V1_SQL = """
+    SELECT channel, dedup_key, known_at, known_at_basis, source_refs, actor_id, actor_id_basis, entity_cik
+    FROM people_events
+    ORDER BY id
+"""
+STORED_ROWS_CAP = 2_000_000
 
 
 def read_inputs(url: str, *, since: Any, limit_per_source: int, source_types: list[str] | None = None,
@@ -144,7 +160,16 @@ def read_inputs(url: str, *, since: Any, limit_per_source: int, source_types: li
             out["frames"]["security_identifiers"] = _query(conn, _IDENTIFIERS_SQL, {})
             out["security_master"] = _query(conn, _MASTER_COUNT_SQL, {}).iloc[0].to_dict()
             out["people_events_counts"] = _query(conn, _PEOPLE_EVENTS_COUNT_SQL, {}).to_dict("records")
-            out["frames"]["people_events"] = _query(conn, _PEOPLE_EVENTS_ROWS_SQL, {"limit": 500_000})
+            total = int(_query(conn, _PEOPLE_EVENTS_TOTAL_SQL, {}).iloc[0]["n"])
+            if total > STORED_ROWS_CAP:
+                # A partial view of stored rows would make every "would write"
+                # count wrong; refuse instead of reporting a misleading plan.
+                raise RuntimeError(f"people_events holds {total} rows (> {STORED_ROWS_CAP}); "
+                                   "the dry run needs a per-channel stored-row reader first")
+            v2 = int(_query(conn, _PEOPLE_EVENTS_HAS_V2_SQL, {}).iloc[0]["n"]) > 0
+            out["frames"]["people_events"] = _query(
+                conn, _PEOPLE_EVENTS_ROWS_V2_SQL if v2 else _PEOPLE_EVENTS_ROWS_V1_SQL, {})
+            out["people_events_schema"] = "v2" if v2 else "v1"
     finally:
         engine.dispose()
     return out

@@ -7,8 +7,13 @@ Rules (design doc section 2.3):
   minimum is too, and it is the tightest one available. ``known_at_basis``
   follows the candidate that supplied it (ties: the stronger basis).
 * Descriptive fields (actor, entity, direction, size, event date) come from
-  the most authoritative source (``adapters.PRECEDENCE``), ties broken by
-  ``source_record_id`` so the result never depends on input order.
+  an original filing before any amendment (``/A``), then the most
+  authoritative source (``adapters.PRECEDENCE``), ties broken by
+  ``source_record_id`` so the result never depends on input order. An
+  amendment's content is never shown at the original's known_at: an
+  amendment that repeats the line only adds a source; one that changes it
+  lands under a different key (flagged near-duplicate; supersession by
+  amendment is owner decision D6).
 * ``n_sources`` counts distinct source *systems* (``sec_form345``,
   ``edgar_native``, ``quiverquant`` ...), not rows: an original Form 4 and its
   amendment repeating the same line are one source. ``n_source_rows`` keeps
@@ -43,8 +48,14 @@ EVENT_COLUMNS = [
     "accession", "document_type", "near_duplicate", "content_hash", "attrs",
 ]
 
-CONTENT_FIELDS = ("channel", "dedup_key", "event_date", "actor_id", "entity_ticker", "entity_cik",
-                  "direction", "transaction_code", "size_usd")
+# What a correction must change to be a new version. Identity fields
+# (actor_id, entity_cik) are excluded: a better source naming the same person
+# by CIK instead of by name is an identity enrichment of the same act, not a
+# correction. Size is part of the act only where the key does not already pin
+# it (13F position changes, contract awards); for Form 4 the key carries the
+# share count and sources legitimately differ on price precision.
+CONTENT_FIELDS = ("channel", "dedup_key", "event_date", "entity_ticker", "direction", "transaction_code")
+SIZE_IN_CONTENT = frozenset({"thirteen_f", "gov_contract"})
 
 
 @dataclass
@@ -58,13 +69,13 @@ def _ref(frame: pd.DataFrame) -> pd.Series:
 
 
 def content_hash_series(events: pd.DataFrame) -> pd.Series:
-    """sha256 over the act's descriptive content. A change means a new version, not an edit."""
+    """sha256 over the act's content (``CONTENT_FIELDS``). A change means a new version, not an edit."""
     size = events["size_usd"].map(lambda v: "" if v is None or pd.isna(v) else f"{float(v):.2f}")
-    cik = events["entity_cik"].map(lambda v: "" if v is None or pd.isna(v) else str(int(v)))
+    size = size.where(events["channel"].isin(SIZE_IN_CONTENT), "")
     parts = [
         events["channel"].astype(str), events["dedup_key"].astype(str), events["event_date"].astype(str),
-        events["actor_id"].astype(str), events["entity_ticker"].fillna("").astype(str), cik,
-        events["direction"].fillna("").astype(str), events["transaction_code"].fillna("").astype(str), size,
+        events["entity_ticker"].fillna("").astype(str), events["direction"].fillna("").astype(str),
+        events["transaction_code"].fillna("").astype(str), size,
     ]
     joined = parts[0]
     for p in parts[1:]:
@@ -79,6 +90,7 @@ def merge_candidates(candidates: pd.DataFrame) -> MergeResult:
     c = candidates[CANDIDATE_COLUMNS].copy()
     c["_ref"] = _ref(c)
     c["_basis_rank"] = c["known_at_basis"].map(R.BASIS_RANK).fillna(9)
+    c["_amend"] = c["document_type"].fillna("").astype(str).str.endswith("/A").astype(int)
     keys = ["channel", "dedup_key"]
 
     # known_at: earliest valid bound, then stronger basis, then a stable tiebreak.
@@ -86,7 +98,7 @@ def merge_candidates(candidates: pd.DataFrame) -> MergeResult:
     known = by_known.drop_duplicates(keys)[keys + ["known_at", "known_at_basis"]]
 
     # Descriptive fields: most authoritative source first.
-    by_prec = c.sort_values(keys + ["precedence", "_ref"], kind="mergesort")
+    by_prec = c.sort_values(keys + ["_amend", "precedence", "_ref"], kind="mergesort")
     rep = by_prec.drop_duplicates(keys).drop(columns=["known_at", "known_at_basis"])
 
     counts = c.groupby(keys, sort=False).agg(n_source_rows=("_ref", "size"), n_sources=("source", "nunique"))
