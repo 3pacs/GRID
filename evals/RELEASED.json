@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "seq": 0,
+      "kind": "suite",
+      "suite": "e0",
+      "version": "e0-v1",
+      "path": "evals/e0",
+      "manifest_sha256": "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822",
+      "released_in": "#763 (merge 0f708789)",
+      "approved_by": "3pacs (owner; merged #763)",
+      "note": "E0 machinery-calibration benchmark v1. VS1 v8 (#769) verifies this manifest hash at run time; evals/e0 must stay at e0-v1 (E0 v2 ships as a sibling package)."
+    },
+    {
+      "seq": 1,
+      "kind": "guards",
+      "version": "guards-v1",
+      "files": {
+        "tests/test_e0_manifest_guard.py": "901e38094b0603fc7421c7142d76ccbb1a0b072ab072dfa9f7a0dd09c418d9b4",
+        "tests/test_e0_benchmark.py": "4a4cb6d97e64b68fdbdcfabb8da00316704898514c781e8a16fa8d5c4b5f1454",
+        "tests/test_e2_manifest_guard.py": "00059ed848c778078ca2e0e828a49c273fae8980b86d9d8a76300255b5936187",
+        "tests/test_evals_released.py": "d279ce484fa809a3f2e0bfc4cc26619aa83ba940f89817f92c6adb1bae334d10",
+        "evals/released.py": "0ce91b25c1d0c11a820e2696b8dc8e3349f185ffb25d5e6d798d560edc4c8917",
+        "evals/README.md": "f471345f2790521307990ee40f9c95f825a0070e02e541de6d9ba25b8fd3f122",
+        "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
+        ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7"
+      }
+    },
+    {
+      "seq": 2,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1",
+      "path": "evals/e1",
+      "manifest_sha256": "6f3708b70a4328e11783b089658c4903e5593c210a4a863422b406cc61e0619b",
+      "released_in": "#762 (merge 8054a508)",
+      "approved_by": "3pacs (owner; merged #762)",
+      "note": "E1 integrity gates v1 (look-ahead canary, honest success, provenance, reproducibility). Historical: superseded at evals/e1 by e1-v1.1."
+    },
+    {
+      "seq": 3,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.1",
+      "path": "evals/e1",
+      "manifest_sha256": "7ab47d0ae46ffac19f2f281af9b6fd8d82be48cbc1cc348dab8bc6c32eb83d56",
+      "released_in": "#767 (merge 97567cf9)",
+      "approved_by": "3pacs (owner; merged #767)",
+      "note": "E1 v1.1: E1-V1, V2, V5 fixed and their xfails removed (evals.e1.SUITE_VERSION e1-v1.1)."
+    },
+    {
+      "seq": 4,
+      "kind": "suite",
+      "suite": "e2",
+      "version": "e2-v1",
+      "path": "evals/e2",
+      "manifest_sha256": "7bc9a6cd54a4f1081dfac635d7df00ea16b95e19c20b77ea17517ea0e289987f",
+      "released_in": "#771 (merge 55357d8b)",
+      "approved_by": "3pacs (owner; merged #771)",
+      "note": "E2 forward scoreboard v1 (M2 single objective); hash was RELEASED_MANIFESTS['e2-v1'] in tests/test_e2_manifest_guard.py."
+    }
+  ]
+}
