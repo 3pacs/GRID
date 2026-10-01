@@ -663,7 +663,26 @@ def gov_contract_from_usaspending(frame: pd.DataFrame, spec: SourceSpec, observe
     return _finish(rows), skips
 
 
-_QUARTER_END = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+# The quarter-end date GD-FIX's writer (quiverquant._gov_contract_period_date)
+# stores as signal_date. It reads (Year, Qtr) as a CALENDAR quarter; used here
+# only to recognise rows written under that post-fix key.
+_WRITER_QUARTER_END = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+
+
+def federal_fiscal_quarter(year: int, qtr: int) -> tuple[date, date]:
+    """(start, end) of US federal fiscal quarter ``qtr`` of fiscal ``year``.
+
+    QuiverQuant's gov-contract (Year, Qtr) is the federal fiscal quarter: the
+    E1 PIT canary found 2,947 aggregates "known" before the calendar quarter
+    they were mapped to had begun (e.g. 2026 Q4 seen 2026-09-11), which only
+    the fiscal reading explains (FY2026 Q4 = 2026-07-01..2026-09-30). FY Y
+    starts 1 October of Y-1.
+    """
+    if qtr == 1:
+        return date(year - 1, 10, 1), date(year - 1, 12, 31)
+    start = date(year, 3 * qtr - 5, 1)
+    end = {2: date(year, 3, 31), 3: date(year, 6, 30), 4: date(year, 9, 30)}[qtr]
+    return start, end
 
 
 def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at: datetime | None
@@ -686,7 +705,10 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
         try:
             year = int(R.first_present(p, ("Year", "year")))
             qtr = int(R.first_present(p, ("Qtr", "qtr", "Quarter", "quarter")))
-            end = date(year, *_QUARTER_END[qtr])
+            if qtr not in (1, 2, 3, 4):
+                raise ValueError(qtr)
+            start, end = federal_fiscal_quarter(year, qtr)
+            writer_end = date(year, *_WRITER_QUARTER_END[qtr])
         except (TypeError, ValueError, KeyError):
             skips[f"{spec.source_type}:missing_year_or_quarter"] += 1
             continue
@@ -697,7 +719,7 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
         stored = R.parse_date(rec.get("signal_date"))
         created = R.to_utc(rec.get("created_at"))
         snapshot_bound = None
-        if stored is not None and stored != end and created is not None:
+        if stored is not None and stored != writer_end and created is not None:
             snapshot_bound = R.next_session_open_after(created.date())  # pre-fix daily snapshot
         bound = _min_bound([(snapshot_bound, "first_seen"), _observed(spec, observed_at)])
         if bound is None:
@@ -712,14 +734,14 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
             # The aggregate covers a whole quarter and QuiverQuant publishes it
             # while the quarter is still running, so the act's date is the
             # period start (period end goes to attrs).
-            "event_date": date(year, 3 * qtr - 2, 1), "known_at": bound[0], "known_at_basis": bound[1],
+            "event_date": start, "known_at": bound[0], "known_at_basis": bound[1],
             "actor_id": "USG", "actor_id_basis": "agency_code", "actor_type": "agency_aggregate",
             "actor_name": "US federal government (aggregate)", "co_actor_ids": "",
             "entity_ticker": ticker, "entity_cik": None, "entity_kind": "issuer",
             "direction": "award", "transaction_code": None, "size_usd": abs(amount),
             "source": spec.source, "source_type": spec.source_type, "source_record_id": f"{spec.source_type}:{rec['id']}",
             "precedence": PRECEDENCE[spec.source], "accession": None, "document_type": None, "amended": None,
-            "attrs": {"year": year, "qtr": qtr, "period_end": end.isoformat()},
+            "attrs": {"fiscal_year": year, "fiscal_qtr": qtr, "period_end": end.isoformat()},
         })
     return _finish(rows), skips
 
