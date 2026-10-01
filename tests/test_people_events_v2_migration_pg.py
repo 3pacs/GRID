@@ -381,6 +381,8 @@ def test_read_event_versions_omits_current_only_counts_and_rejects_naive_time(v2
 
     _insert(v2)
     rows = read_event_versions(v2, datetime(2026, 9, 30, tzinfo=UTC))
-    assert rows and not ({"n_sources", "n_source_rows", "source_refs", "confidence"} & set(rows[0]))
+    assert rows and not ({"n_sources", "n_source_rows", "source_refs", "confidence", "source", "provenance"}
+                         & set(rows[0]))
+    assert "attrs" in rows[0]
     with pytest.raises(ValueError):
         read_event_versions(v2, datetime(2026, 9, 30))

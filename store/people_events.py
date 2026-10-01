@@ -359,7 +359,11 @@ _HISTORY_SQL_TEMPLATE = """
     SELECT
         id, channel, dedup_key, loose_key, event_time, known_at, known_at_basis,
         actor_id, actor_id_basis, actor_type, entity_ticker, entity_cik, security_id,
-        direction, transaction_code, size_usd, source, echo_of, content_hash, provenance,
+        direction, transaction_code, size_usd, echo_of, content_hash,
+        -- Only the act's own attributes: provenance also lists every source
+        -- that reported the act (later ones included) and a hindsight
+        -- near-duplicate flag, which would leak after known_by.
+        provenance -> 'attrs' AS attrs,
         -- An end time after known_by is not knowable at known_by: masked to NULL,
         -- so the result itself carries no information from after known_by.
         CASE WHEN superseded_at <= :known_by THEN superseded_at END AS superseded_at,
@@ -405,12 +409,16 @@ def read_event_versions(
     are never merged or deduplicated here.
 
     Deliberately NOT returned: ``n_sources``, ``n_source_rows``,
-    ``source_refs`` and ``confidence``. They are current values that grow
-    when a source reports the act later (and confidence follows them), so
-    they would carry information from after ``known_by``. Every returned
-    column is immutable after insert, except the masked end times and the
-    set-once identity enrichment (``actor_id``/``entity_cik``/``security_id``,
-    which identify the same act more precisely, never change what or when).
+    ``source_refs``, ``confidence``, ``source`` and the full ``provenance``.
+    They are current values: sources that report the act later grow them,
+    ``source`` is the most authoritative reporter (possibly a later one), and
+    provenance lists every reporter plus a hindsight near-duplicate flag --
+    all information from after ``known_by``. Only ``provenance->'attrs'``
+    (the act's own attributes, e.g. ``is_10b5_1``) is returned. Every
+    returned column is immutable after insert, except the masked end times
+    and the set-once identity enrichment (``actor_id``/``entity_cik``/
+    ``security_id``, which identify the same act more precisely, never
+    change what or when).
     ``known_by`` must be timezone-aware.
     """
     if known_by.tzinfo is None:
