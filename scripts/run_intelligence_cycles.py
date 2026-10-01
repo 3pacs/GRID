@@ -18,8 +18,9 @@ sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 from sqlalchemy import create_engine
 
-ENGINE_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
-engine = create_engine(ENGINE_URL)
+from config import settings
+
+engine = create_engine(settings.DB_URL)
 
 SEPARATOR = "=" * 70
 
@@ -100,7 +101,13 @@ def step_patterns():
 
 if __name__ == "__main__":
     log.info("GRID Intelligence Cycle Runner")
-    log.info("Database: {}", ENGINE_URL.replace('gridmaster2026', '***'))
+    log.info(
+        "Database: {}@{}:{}/{}",
+        settings.DB_USER,
+        settings.DB_HOST,
+        settings.DB_PORT,
+        settings.DB_NAME,
+    )
 
     run_step("1. THESIS SCORING — run_thesis_cycle()", step_thesis)
     run_step("2. TRUST SCORER — run_trust_cycle()", step_trust)
