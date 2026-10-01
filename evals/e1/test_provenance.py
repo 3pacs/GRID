@@ -178,14 +178,10 @@ def _all_sites() -> dict[str, list[InsertSite]]:
 
 _SITES = _all_sites()
 
-# Writer files on main that violate the rules above (see known_violations.py).
-_KNOWN_BAD_WRITERS = {
-    "api/routers/watchlist_helpers.py": "E1-V4",
-    "ingestion/altdata/offshore_leaks.py": "E1-V4",
-    "ingestion/social_sentiment.py": "E1-V4",
-    "ingestion/wiki_history.py": "E1-V4",
-    "scripts/full_universe_pull.py": "E1-V4",
-}
+# Writer files on main that violate the rules above, as path -> known_violations
+# ID. Empty since e1-v1.2 (the five former writers are fixed; the watchlist
+# price cache no longer writes raw_series at all).
+_KNOWN_BAD_WRITERS: dict[str, str] = {}
 
 
 def _writer_params():

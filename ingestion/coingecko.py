@@ -1,24 +1,40 @@
 """
-CoinGecko crypto price puller — free tier, no API key required.
+CoinGecko crypto spot-price puller — free tier, no API key required.
 
-Pulls current prices + 7d history for tracked crypto assets.
-With API key (COINGECKO_API_KEY): higher rate limits via Pro endpoint.
-Without: 30 requests/minute on the free endpoint.
+One ``/simple/price`` request per run returns the USD spot quote and its
+``last_updated_at`` time for every tracked coin. Each quote is stored in
+``raw_series`` under the ``coingecko`` source as ``CG:<coingecko id>:usd``:
 
-Checks freshness before pulling — skips tickers already fresh today.
+* ``obs_date`` is the UTC date of the quote's own ``last_updated_at``, never
+  the date of the pull (a stale quote keeps its real date);
+* ``pull_timestamp`` is the schema's ``DEFAULT NOW()``, i.e. when GRID
+  actually learned the value;
+* ``pull_status`` is ``SUCCESS``;
+* raw_series is append-only: a series that already has a SUCCESS row for that
+  ``obs_date`` is left alone (the first quote of the UTC day is kept).
+
+Values reach ``resolved_series`` only through the normal resolver
+(``normalization.entity_map`` maps ``CG:<id>:usd`` to ``<ticker>_usd_full``,
+except BTC and ETH, whose ``*_usd_full`` features carry the yfinance daily
+close). Before E1-V6 this module wrote ``resolved_series`` directly
+(``source_priority_used = 1``, ``release_date = vintage_date = obs_date``,
+``ON CONFLICT ... DO UPDATE``); those rows are left in place pending an
+owner decision.
+
+With API key (COINGECKO_API_KEY): demo or pro endpoint headers.
 """
 
 from __future__ import annotations
 
 import os
-import time
-from datetime import date, datetime
+from datetime import datetime, timezone
+from typing import Any
 
 import requests
 from loguru import logger as log
-from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.base import BasePuller
 
 # CoinGecko IDs for our tracked crypto
 CRYPTO_MAP = {
@@ -46,11 +62,27 @@ CRYPTO_MAP = {
 }
 
 
-class CoinGeckoPuller:
-    """Pull crypto prices from CoinGecko free API."""
+def spot_series_id(cg_id: str) -> str:
+    """raw_series id for a CoinGecko USD spot quote."""
+    return f"CG:{cg_id}:usd"
+
+
+class CoinGeckoPuller(BasePuller):
+    """Pull crypto USD spot quotes from CoinGecko into ``raw_series``."""
+
+    SOURCE_NAME = "coingecko"
+    # Same catalog payload scripts/bulk_historical_pull.py registers.
+    SOURCE_CONFIG = {
+        "base_url": "https://api.coingecko.com",
+        "cost_tier": "FREE",
+        "latency_class": "EOD",
+        "pit_available": False,
+        "revision_behavior": "NEVER",
+        "trust_score": "MED",
+        "priority_rank": 25,
+    }
 
     def __init__(self, db_engine: Engine) -> None:
-        self.engine = db_engine
         self.api_key = os.getenv("COINGECKO_API_KEY", "")
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "GRID/4.0"})
@@ -67,202 +99,93 @@ class CoinGeckoPuller:
             self._session.headers["x-cg-demo-api-key"] = self.api_key
         else:
             self.base_url = "https://api.coingecko.com/api/v3"
+        super().__init__(db_engine)
 
-    def _get_fresh_tickers(self) -> set[str]:
-        """Return set of crypto feature names already fresh today."""
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(text(
-                    "SELECT fr.name FROM feature_registry fr "
-                    "JOIN resolved_series rs ON rs.feature_id = fr.id "
-                    "WHERE fr.family = 'crypto' AND rs.obs_date >= CURRENT_DATE "
-                    "GROUP BY fr.name"
-                )).fetchall()
-                return {r[0] for r in rows}
-        except Exception:
-            return set()
+    def _fetch_quotes(self, cg_ids: list[str]) -> dict[str, dict[str, Any]]:
+        """One ``/simple/price`` call for every coin: {cg_id: quote}."""
+        resp = self._session.get(
+            f"{self.base_url}/simple/price",
+            params={
+                "ids": ",".join(cg_ids),
+                "vs_currencies": "usd",
+                "include_market_cap": "true",
+                "include_24hr_vol": "true",
+                "include_last_updated_at": "true",
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("CoinGecko simple/price returned a non-object payload")
+        return data
 
-    def pull_all(self, tickers: list[str] | None = None) -> list[dict]:
-        """Pull prices for all tracked crypto, skipping fresh ones.
-
-        Parameters:
-            tickers: Optional list of ticker symbols (e.g., ['BTC', 'ETH']).
-                     Defaults to all CRYPTO_MAP keys.
+    def pull_all(self, tickers: list[str] | None = None) -> dict[str, Any]:
+        """Store one spot quote per tracked coin (append-only, deduped per UTC day).
 
         Returns:
-            List of result dicts with keys: ticker, price, date, market_cap, volume_24h.
+            ``{"status", "rows_inserted", "succeeded", "total", ...}``.
+            SUCCESS only when every coin had a dated USD quote; a provider
+            error or no usable quote at all is FAILED; some missing is PARTIAL.
         """
-        targets = tickers or list(CRYPTO_MAP.keys())
-        fresh = self._get_fresh_tickers()
-        results = []
+        wanted = [t.upper() for t in (tickers or list(CRYPTO_MAP))]
+        targets = [(t, CRYPTO_MAP[t]) for t in wanted if t in CRYPTO_MAP]
+        missing = [t for t in wanted if t not in CRYPTO_MAP]
+        total = len(wanted)
+        if not targets:
+            return {"status": "FAILED", "rows_inserted": 0, "succeeded": 0, "total": total,
+                    "error": f"no CoinGecko id for {missing}"}
 
-        for ticker in targets:
-            cg_id = CRYPTO_MAP.get(ticker.upper())
-            if not cg_id:
-                log.debug("No CoinGecko ID for {t}", t=ticker)
-                results.append({"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
-                                "reason": "No CoinGecko ID"})
-                continue
+        try:
+            quotes = self._fetch_quotes([cg_id for _, cg_id in targets])
+        except Exception as exc:
+            log.warning("CoinGecko simple/price failed: {e}", e=str(exc))
+            return {"status": "FAILED", "rows_inserted": 0, "succeeded": 0, "total": total,
+                    "error": str(exc)}
 
-            fname = f"{ticker.lower()}_usd_full"
-            if fname in fresh:
-                log.debug("Skipping {t} — already fresh today", t=ticker)
-                results.append({"ticker": ticker, "status": "UNCHANGED", "rows_inserted": 0})
-                continue
-
-            try:
-                data = self._fetch_price(cg_id)
-                if data:
-                    data["ticker"] = ticker.upper()
-                    data["rows_inserted"] = self._save_to_db(ticker, data)
-                    data["status"] = "SUCCESS"
-                    results.append(data)
-                    log.info("CoinGecko {t}: ${p:,.2f}", t=ticker, p=data["price"])
-                else:
-                    results.append({"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
-                                    "error": "Provider response had no USD price"})
-                time.sleep(2.5)  # Rate limit: 30/min free tier
-            except Exception as exc:
-                log.warning("CoinGecko {t} failed: {e}", t=ticker, e=str(exc))
-                results.append({"ticker": ticker, "status": "FAILED", "rows_inserted": 0,
-                                "error": str(exc)})
-
-        log.info("CoinGecko pull complete: {n}/{total} tickers",
-                 n=len(results), total=len(targets))
-        return results
-
-    def _fetch_price(self, cg_id: str) -> dict | None:
-        """Fetch current price + metadata for a single coin."""
-        url = f"{self.base_url}/coins/{cg_id}"
-        params = {
-            "localization": "false",
-            "tickers": "false",
-            "market_data": "true",
-            "community_data": "false",
-            "developer_data": "false",
-            "sparkline": "false",
-        }
-        resp = self._session.get(url, params=params, timeout=15)
-        resp.raise_for_status()
-        data = resp.json()
-
-        md = data.get("market_data", {})
-        price = md.get("current_price", {}).get("usd")
-        if price is None:
-            return None
-
-        return {
-            "price": float(price),
-            "market_cap": md.get("market_cap", {}).get("usd"),
-            "volume_24h": md.get("total_volume", {}).get("usd"),
-            "price_change_24h_pct": md.get("price_change_percentage_24h"),
-            "price_change_7d_pct": md.get("price_change_percentage_7d"),
-            "price_change_30d_pct": md.get("price_change_percentage_30d"),
-            "ath": md.get("ath", {}).get("usd"),
-            "ath_change_pct": md.get("ath_change_percentage", {}).get("usd"),
-            "date": date.today().isoformat(),
-        }
-
-    def _save_to_db(self, ticker: str, data: dict) -> int | None:
-        """Save price to resolved_series, creating feature if needed."""
-        tk = ticker.lower()
-        fname = f"{tk}_usd_full"
-        today = date.today()
-
+        inserted = 0
+        unchanged = 0
         with self.engine.begin() as conn:
-            feat = conn.execute(
-                text("SELECT id FROM feature_registry WHERE name = :n"),
-                {"n": fname},
-            ).fetchone()
+            for ticker, cg_id in targets:
+                quote = quotes.get(cg_id)
+                price = quote.get("usd") if isinstance(quote, dict) else None
+                updated = quote.get("last_updated_at") if isinstance(quote, dict) else None
+                if (
+                    isinstance(price, bool) or not isinstance(price, (int, float))
+                    or isinstance(updated, bool) or not isinstance(updated, (int, float))
+                ):
+                    missing.append(ticker)
+                    continue
+                obs_date = datetime.fromtimestamp(updated, tz=timezone.utc).date()
+                series_id = spot_series_id(cg_id)
+                if obs_date in self._get_existing_dates(series_id, conn, obs_date, obs_date):
+                    unchanged += 1
+                    continue
+                self._insert_raw(
+                    conn, series_id, obs_date, float(price),
+                    raw_payload={
+                        "kind": "spot",
+                        "endpoint": "simple/price",
+                        "ticker": ticker,
+                        "last_updated_at": int(updated),
+                        "market_cap_usd": quote.get("usd_market_cap"),
+                        "volume_24h_usd": quote.get("usd_24h_vol"),
+                    },
+                )
+                inserted += 1
 
-            if not feat:
-                conn.execute(text(
-                    "INSERT INTO feature_registry "
-                    "(name, family, description, transformation, normalization, "
-                    "missing_data_policy, model_eligible, eligible_from_date) "
-                    "VALUES (:name, 'crypto', :desc, 'RAW', 'ZSCORE', "
-                    "'FORWARD_FILL', TRUE, :efd) "
-                    "ON CONFLICT (name) DO NOTHING"
-                ), {
-                    "name": fname,
-                    "desc": f"CoinGecko {ticker.upper()}/USD daily close",
-                    "efd": date(2020, 1, 1),
-                })
-                feat = conn.execute(
-                    text("SELECT id FROM feature_registry WHERE name = :n"),
-                    {"n": fname},
-                ).fetchone()
-
-            if feat:
-                written = conn.execute(text(
-                    "INSERT INTO resolved_series "
-                    "(feature_id, obs_date, release_date, vintage_date, value, source_priority_used) "
-                    "VALUES (:fid, :d, :d, :d, :v, 1) "
-                    "ON CONFLICT (feature_id, obs_date, vintage_date) "
-                    "DO UPDATE SET value = EXCLUDED.value"
-                ), {"fid": feat[0], "d": today, "v": data["price"]})
-                count = written.rowcount
-                return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
-        raise RuntimeError("CoinGecko feature unavailable; price not stored")
-
-    def pull_history(self, ticker: str, days: int = 90) -> int:
-        """Pull historical daily prices for a single coin.
-
-        Returns number of rows saved.
-        """
-        cg_id = CRYPTO_MAP.get(ticker.upper())
-        if not cg_id:
-            return 0
-
-        url = f"{self.base_url}/coins/{cg_id}/market_chart"
-        params = {"vs_currency": "usd", "days": days, "interval": "daily"}
-        resp = self._session.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-
-        prices = data.get("prices", [])
-        if not prices:
-            return 0
-
-        tk = ticker.lower()
-        fname = f"{tk}_usd_full"
-        saved = 0
-
-        with self.engine.begin() as conn:
-            feat = conn.execute(
-                text("SELECT id FROM feature_registry WHERE name = :n"),
-                {"n": fname},
-            ).fetchone()
-
-            if not feat:
-                conn.execute(text(
-                    "INSERT INTO feature_registry "
-                    "(name, family, description, transformation, normalization, "
-                    "missing_data_policy, model_eligible, eligible_from_date) "
-                    "VALUES (:name, 'crypto', :desc, 'RAW', 'ZSCORE', "
-                    "'FORWARD_FILL', TRUE, :efd) "
-                    "ON CONFLICT (name) DO NOTHING"
-                ), {
-                    "name": fname,
-                    "desc": f"CoinGecko {ticker.upper()}/USD daily close",
-                    "efd": date(2020, 1, 1),
-                })
-                feat = conn.execute(
-                    text("SELECT id FROM feature_registry WHERE name = :n"),
-                    {"n": fname},
-                ).fetchone()
-
-            if feat:
-                for ts_ms, price in prices:
-                    d = datetime.utcfromtimestamp(ts_ms / 1000).date()
-                    conn.execute(text(
-                        "INSERT INTO resolved_series "
-                        "(feature_id, obs_date, release_date, vintage_date, value, source_priority_used) "
-                        "VALUES (:fid, :d, :d, :d, :v, 1) "
-                        "ON CONFLICT (feature_id, obs_date, vintage_date) "
-                        "DO UPDATE SET value = EXCLUDED.value"
-                    ), {"fid": feat[0], "d": d, "v": float(price)})
-                    saved += 1
-
-        log.info("CoinGecko history {t}: {n} days saved", t=ticker, n=saved)
-        return saved
+        succeeded = total - len(missing)
+        result: dict[str, Any] = {
+            "status": "SUCCESS" if not missing else ("PARTIAL" if succeeded else "FAILED"),
+            "rows_inserted": inserted,
+            "succeeded": succeeded,
+            "total": total,
+            "unchanged": unchanged,
+        }
+        if missing:
+            result["error"] = f"no dated USD quote for {sorted(missing)}"
+        log.info(
+            "CoinGecko spot: {n} rows, {u} already stored, {m} missing",
+            n=inserted, u=unchanged, m=len(missing),
+        )
+        return result

@@ -74,6 +74,17 @@
         "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
         ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7"
       }
+    },
+    {
+      "seq": 6,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.2",
+      "path": "evals/e1",
+      "manifest_sha256": "16a6d066900e4c88de407cf7908e31186cedeae0300d68edf779c25b4a45bbd9",
+      "released_in": "#768",
+      "approved_by": "3pacs (owner; merges #768)",
+      "note": "E1 v1.2: E1-V3, V4, V6 fixed and their xfails removed (evals.e1.SUITE_VERSION e1-v1.2)."
     }
   ]
 }
