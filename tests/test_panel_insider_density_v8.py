@@ -82,9 +82,36 @@ def test_v8_freeze_digest_covers_v8_and_e0_code(tmp_path, monkeypatch):
         v2._check_observed(frozen, {**frozen, "code_file_sha256": changed})
 
 
+def test_v8_registration_pins_match_the_witnessed_anchor():
+    assert v8.REGISTERED_RECORD_SHA256 == (
+        "c29c80fcc2fbb5cd89a3a695ac55b91c62d22552b7080204f45664aca5f65d49",
+        "69a7d3276da1fffc10f0ea023151ff283dd0e154b9ee3509495c670ddff42bb5",
+    )
+    assert v8.V8.pins.registered_record_sha256 == v8.REGISTERED_RECORD_SHA256
+    assert v8.V8.pins.registered_anchor_line == v8.REGISTERED_ANCHOR_LINE
+    assert hashlib.sha256(v8.REGISTERED_ANCHOR_LINE + b"\n").hexdigest() == (
+        "ff356e69e0333800826321c7a33b4390ff0e4b7c98fd9a9727fc5ba0a0dd5d90")
+    assert json.loads(v8.REGISTERED_ANCHOR_LINE) == {
+        "head_sha256": v8.REGISTERED_RECORD_SHA256[1], "prev_anchor_sha256": None, "records": 2,
+        "run_at": "2026-10-01T15:05:27+00:00"}
+    # The pinned chain is exactly the registration records at that time and the merged #769 code.
+    records = v8.registration_records(datetime(2026, 10, 1, 15, 5, 27, tzinfo=timezone.utc),
+                                      "1f7c6b19efa467b1bcc3af6c8772a8e75e251965")
+    assert tuple(v1.chained_sha256(records)) == v8.REGISTERED_RECORD_SHA256
+
+
+def test_v8_changed_local_registration_head_is_refused(tmp_path):
+    log = v8.registry(tmp_path / "wrong")
+    log.append(v8.registration_records(NOW, "a" * 40))
+    with pytest.raises(PermissionError, match="not the pinned vs1-v8 registration"):
+        v8.V8._chain(log)
+
+
 def test_v8_binds_the_witnessed_v7_stop_and_is_fail_closed_until_registered(tmp_path, monkeypatch):
     head = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
-    assert v8.V7_STOP_HEAD_SHA256 == head and v8.REGISTERED_RECORD_SHA256 is None
+    assert v8.V7_STOP_HEAD_SHA256 == head
+    monkeypatch.setattr(v8, "REGISTERED_RECORD_SHA256", None)
+    monkeypatch.setattr(v8, "REGISTERED_ANCHOR_LINE", None)
     line = json.loads(v8.V7_STOP_ANCHOR_LINE)
     assert line["head_sha256"] == head and line["records"] == 3
     assert line["prev_anchor_sha256"] == hashlib.sha256(v7.REGISTERED_ANCHOR_LINE).hexdigest()
