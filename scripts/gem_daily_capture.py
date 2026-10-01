@@ -40,7 +40,7 @@ import select
 import signal
 import subprocess
 import sys
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
@@ -103,69 +103,91 @@ def _message(record: dict[str, Any]) -> str | None:
     return None
 
 
-def _scheduler_state(lines: Iterable[str], day: date) -> tuple[str, datetime | None]:
-    """Classify the scheduler journal since 13:29 UTC: pass, pending or fail.
+class _SchedulerTracker:
+    """Incremental classifier of the scheduler journal since 13:29 UTC.
 
-    ``pass``: exactly one ``Starting daily pulls ... market_open=True`` and
-    exactly one positive ``Options daily pull complete`` after it, both with
-    the same non-empty ``_SYSTEMD_INVOCATION_ID`` and ``_PID``, completed by
-    the absolute deadline; returns the completion time. ``pending``: nothing
-    yet, or one valid start still waiting for its completion. ``fail``:
-    anything else -- a restart between start and completion, a missing
-    identity, a second pull, a failure/skip line, a zero-row or malformed
-    completion, out-of-order or unparseable journal output.
+    ``feed`` one JSON line at a time (O(1) each); ``state`` returns pass,
+    pending or fail. ``pass``: exactly one ``Starting daily pulls ...
+    market_open=True`` and exactly one positive ``Options daily pull
+    complete`` after it, both with the same non-empty
+    ``_SYSTEMD_INVOCATION_ID`` and ``_PID``, completed by the absolute
+    deadline. ``pending``: nothing yet, or one valid start still waiting for
+    its completion. ``fail`` (sticky): anything else -- a restart between
+    start and completion, a missing identity, a second pull, a failure/skip
+    line, a zero-row or malformed completion, out-of-order or unparseable
+    journal output.
     """
-    window = _scheduler_window_start(day)
-    starts: list[tuple[datetime, bool, str, str]] = []
-    completes: list[tuple[datetime, bool, str, str]] = []
-    previous = None
-    for line in lines:
+
+    def __init__(self, day: date) -> None:
+        self.day = day
+        self.window = _scheduler_window_start(day)
+        self.starts: list[tuple[datetime, bool, str, str]] = []
+        self.completes: list[tuple[datetime, bool, str, str]] = []
+        self.previous: datetime | None = None
+        self.failed = False
+
+    def feed(self, line: str) -> None:
+        if self.failed:
+            return
         try:
             record = json.loads(line)
             stamp = datetime.fromtimestamp(
                 int(record["__REALTIME_TIMESTAMP"]) / 1_000_000, timezone.utc)
         except (ValueError, KeyError, TypeError, OverflowError):
-            return "fail", None
-        if not isinstance(record, dict):
-            return "fail", None
-        if previous is not None and stamp < previous:
-            return "fail", None
-        previous = stamp
-        if stamp < window or stamp.date() != day:
-            continue
+            self.failed = True
+            return
+        if not isinstance(record, dict) or (self.previous is not None and stamp < self.previous):
+            self.failed = True
+            return
+        self.previous = stamp
+        if stamp < self.window or stamp.date() != self.day:
+            return
         message = _message(record)
         if message is None:
-            return "fail", None
+            self.failed = True
+            return
         invocation = record.get("_SYSTEMD_INVOCATION_ID")
         pid = record.get("_PID")
         invocation = invocation if isinstance(invocation, str) else ""
         pid = pid if isinstance(pid, str) else ""
         if any(marker in message for marker in _FAILURE_MARKERS):
-            return "fail", None
+            self.failed = True
+            return
         start = _START_RE.search(message)
         if start:
-            starts.append((stamp, start.group(1) == "True", invocation, pid))
-            continue
+            self.starts.append((stamp, start.group(1) == "True", invocation, pid))
+            return
         complete = _COMPLETE_RE.search(message)
         if complete:
             ok, total, snapshots = map(int, complete.groups())
-            completes.append((stamp, 0 < ok <= total and snapshots > 0, invocation, pid))
+            self.completes.append((stamp, 0 < ok <= total and snapshots > 0, invocation, pid))
         elif "Options daily pull complete" in message:
+            self.failed = True
+
+    def state(self) -> tuple[str, datetime | None]:
+        starts, completes = self.starts, self.completes
+        if self.failed or len(starts) > 1 or len(completes) > 1 or (completes and not starts):
             return "fail", None
-    if len(starts) > 1 or len(completes) > 1 or (completes and not starts):
+        if not starts:
+            return "pending", None
+        s_at, market_open, s_inv, s_pid = starts[0]
+        if not market_open or not s_inv or not s_pid:
+            return "fail", None
+        if not completes:
+            return "pending", None
+        c_at, positive, c_inv, c_pid = completes[0]
+        if (positive and c_at > s_at and c_at <= _session_deadline(self.day)
+                and s_inv == c_inv and s_pid == c_pid):
+            return "pass", c_at
         return "fail", None
-    if not starts:
-        return "pending", None
-    s_at, market_open, s_inv, s_pid = starts[0]
-    if not market_open or not s_inv or not s_pid:
-        return "fail", None
-    if not completes:
-        return "pending", None
-    c_at, positive, c_inv, c_pid = completes[0]
-    if (positive and c_at > s_at and c_at <= _session_deadline(day)
-            and s_inv == c_inv and s_pid == c_pid):
-        return "pass", c_at
-    return "fail", None
+
+
+def _scheduler_state(lines: Iterable[str], day: date) -> tuple[str, datetime | None]:
+    """Classify a whole journal window (see :class:`_SchedulerTracker`)."""
+    tracker = _SchedulerTracker(day)
+    for line in lines:
+        tracker.feed(line)
+    return tracker.state()
 
 
 def _scheduler_gate(lines: list[str], day: date) -> bool:
@@ -184,7 +206,7 @@ def _follow_scheduler_journal(day: date, poll_seconds: float = 2.0) -> Iterator[
     proc = subprocess.Popen(
         ["journalctl", "-u", "grid-scheduler.service",
          "--since", _scheduler_window_start(day).strftime("%Y-%m-%d %H:%M:%S UTC"),
-         "-f", "-o", "json", "--no-pager"],
+         "-f", "--no-tail", "-o", "json", "--no-pager"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
     if proc.stdout is None:
@@ -203,6 +225,8 @@ def _follow_scheduler_journal(day: date, poll_seconds: float = 2.0) -> Iterator[
             if not chunk:
                 raise OSError("journalctl follow stream ended")
             pending += chunk
+            if len(pending) > _JOURNAL_LIMIT_BYTES:
+                raise OSError("journalctl follow line too long")
             *complete_lines, pending = pending.split(b"\n")
             for raw in complete_lines:
                 if raw:
@@ -220,22 +244,28 @@ def _await_scheduler(
 ) -> tuple[str, datetime | None]:
     """Wait for the scheduler's options completion; return as soon as known.
 
-    ``pass`` (with the completion time) or ``fail`` the moment the journal
-    decides it; ``timeout`` once the latest start passes while still
-    pending; ``fail`` if the stream ends or exceeds the size limit.
+    ``pass`` (with the completion time) the moment the journal shows it --
+    but only if both the completion and the decision are before the latest
+    start; ``fail`` the moment the journal fails the gate; ``timeout`` once
+    the latest start passes while still pending (or a pass arrives after
+    it); ``fail`` if the stream ends or exceeds the size limit.
     """
     cutoff = _latest_start(day)
-    collected: list[str] = []
+    tracker = _SchedulerTracker(day)
     size = 0
     for line in stream:
         if line is not None:
             size += len(line)
             if size > _JOURNAL_LIMIT_BYTES:
                 return "fail", None
-            collected.append(line)
-            state, completed_at = _scheduler_state(collected, day)
-            if state != "pending":
+            tracker.feed(line)
+            state, completed_at = tracker.state()
+            if state == "pass":
+                if completed_at is None or completed_at >= cutoff or now_fn() >= cutoff:
+                    return "timeout", None
                 return state, completed_at
+            if state == "fail":
+                return state, None
         if now_fn() >= cutoff:
             return "timeout", None
     return "fail", None
@@ -245,7 +275,11 @@ def _read_scheduler_journal(day: date, now: datetime) -> list[str]:
     result = subprocess.run(
         ["journalctl", "-u", "grid-scheduler.service",
          "--since", _scheduler_window_start(day).strftime("%Y-%m-%d %H:%M:%S UTC"),
-         "--until", now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+         # Round up: journalctl --until has whole-second resolution and
+         # drops entries after it, e.g. a 13:57:20.300 completion when
+         # now is 13:57:20.800.
+         "--until", (now.replace(microsecond=0) + timedelta(seconds=1))
+         .strftime("%Y-%m-%d %H:%M:%S UTC"),
          "-o", "json", "--no-pager"],
         text=True, capture_output=True, timeout=15, check=True,
     )
@@ -429,7 +463,14 @@ def main() -> int:
         if not _scheduler_gate(_read_scheduler_journal(day, triggered), day):
             _record(day, "GEM_SKIP scheduler options journal gate (confirmation)")
             return 0
-    except (OSError, subprocess.SubprocessError, ValueError, TimeoutError):
+        if completed_at >= _latest_start(day) or _utc_now() >= _latest_start(day):
+            _record(day, "GEM_SKIP scheduler options not complete by latest start 10:05 New York")
+            return 0
+    except TimeoutError:
+        _disarm_deadline()
+        _record(day, "GEM_SKIP absolute deadline reached while waiting")
+        return 0
+    except (OSError, subprocess.SubprocessError, ValueError):
         _disarm_deadline()
         _record(day, "GEM_SKIP scheduler journal unavailable")
         return 0

@@ -177,3 +177,118 @@ def test_main_refuses_to_arm_before_the_open(armed) -> None:
     armed.clock.now = _at(13, 29)  # 09:29 New York
     assert daily.main() == 0
     assert "GEM_SKIP date/session/time gate" in _receipt(armed)
+
+
+# --- review round 1 (B1, B2, S1-S3) -----------------------------------------
+
+def test_confirmation_until_includes_a_same_second_completion(monkeypatch) -> None:
+    """B1: --until is whole-second; it must be rounded up, not down."""
+    seen = {}
+
+    def fake_run(argv, **_kwargs):
+        seen["argv"] = argv
+        return SimpleNamespace(stdout="")
+
+    monkeypatch.setattr(daily.subprocess, "run", fake_run)
+    daily._read_scheduler_journal(DAY, datetime(2026, 10, 1, 13, 57, 20, 800000, tzinfo=timezone.utc))
+    until = seen["argv"][seen["argv"].index("--until") + 1]
+    assert until == "2026-10-01 13:57:21 UTC"  # a 13:57:20.300 completion stays inside
+
+
+def test_pass_after_latest_start_without_an_idle_tick_is_a_timeout() -> None:
+    """B2: a completion processed at/after 10:05 NY never starts a capture."""
+    clock = _Clock(_at(13, 31))
+    items = [_event(_at(13, 30), START_MSG), _event(_at(14, 4, 59), DONE_MSG)]
+
+    def late(stream):
+        for item in stream:
+            if item is not None and "Options daily pull complete" in item:
+                clock.now = _at(14, 5, 1)  # decision lands after the latest start
+            yield item
+
+    assert daily._await_scheduler(DAY, late(iter(items)), clock)[0] == "timeout"
+    clock = _Clock(_at(13, 31))
+    items = [_event(_at(13, 30), START_MSG), _event(_at(14, 5, 0), DONE_MSG)]
+    assert daily._await_scheduler(DAY, _stream(clock, items), clock)[0] == "timeout"
+
+
+def test_main_rechecks_latest_start_after_confirmation(armed, monkeypatch) -> None:
+    armed.items = [_event(_at(13, 30), START_MSG), _event(_at(14, 4, 50), DONE_MSG)]
+    real_read = daily._read_scheduler_journal
+
+    def slow_confirmation(day, now):
+        armed.clock.now = _at(14, 5, 2)  # the confirmation read straddled 10:05 NY
+        return real_read(day, now)
+
+    monkeypatch.setattr(daily, "_read_scheduler_journal", slow_confirmation)
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(
+        get_engine=lambda: pytest.fail("no capture after the latest start")))
+    assert daily.main() == 0
+    assert "GEM_SKIP scheduler options not complete by latest start" in _receipt(armed)
+
+
+def test_alarm_during_wait_is_labelled_as_deadline(armed) -> None:
+    def alarm(_day):
+        raise TimeoutError("GEM absolute 10:20 New York containment")
+        yield  # pragma: no cover
+
+    daily_follow = daily._follow_scheduler_journal
+    try:
+        daily._follow_scheduler_journal = alarm
+        assert daily.main() == 0
+    finally:
+        daily._follow_scheduler_journal = daily_follow
+    assert "GEM_SKIP absolute deadline reached while waiting" in _receipt(armed)
+
+
+def test_tracker_is_incremental_and_matches_whole_window() -> None:
+    lines = [_event(_at(13, 30), START_MSG)] + [
+        _event(_at(13, 31) + timedelta(milliseconds=i), OTHER_MSG) for i in range(3000)
+    ] + [_event(_at(14, 2), DONE_MSG)]
+    tracker = daily._SchedulerTracker(DAY)
+    for line in lines:
+        tracker.feed(line)
+    assert tracker.state() == daily._scheduler_state(lines, DAY) == ("pass", _at(14, 2))
+
+
+_FAKE_JOURNALCTL = r"""
+import sys, time
+out = sys.stdout.buffer
+out.write(b'{"a": 1}\n{"b"'); out.flush(); time.sleep(0.3)
+out.write(b': 2}\n'); out.flush()
+if sys.argv[1] == "eof":
+    sys.exit(0)
+time.sleep(60)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="select() on pipes needs POSIX")
+@pytest.mark.parametrize("mode", ["eof", "hang"])
+def test_follow_splits_partial_lines_and_cleans_up_the_child(monkeypatch, mode) -> None:
+    import subprocess as sp
+
+    real_popen = sp.Popen
+    procs = []
+
+    def fake_popen(argv, **kwargs):
+        assert argv[:3] == ["journalctl", "-u", "grid-scheduler.service"]
+        assert "-f" in argv and "--no-tail" in argv and "--since" in argv
+        proc = real_popen([sys.executable, "-c", _FAKE_JOURNALCTL, mode], **kwargs)
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(daily.subprocess, "Popen", fake_popen)
+    stream = daily._follow_scheduler_journal(DAY, poll_seconds=0.1)
+    got = [item for item in (next(stream) for _ in range(8)) if item is not None][:2] \
+        if mode == "hang" else None
+    if mode == "eof":
+        lines = []
+        with pytest.raises(OSError):
+            for item in stream:
+                if item is not None:
+                    lines.append(item)
+        assert lines == ['{"a": 1}', '{"b": 2}']
+    else:
+        assert got == ['{"a": 1}', '{"b": 2}']
+        stream.close()
+        assert procs[0].poll() is not None  # journalctl child terminated on close
