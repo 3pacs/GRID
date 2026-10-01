@@ -411,8 +411,8 @@ def test_schema_sql_fresh_install_matches_migration_guards(pg_engine) -> None:
     engine = create_engine(pg_engine.url.update_query_dict({"options": f"-csearch_path={schema}"}))
     try:
         with engine.begin() as conn:
-            conn.exec_driver_sql(_schema_sql_options_block())
-            conn.exec_driver_sql(_schema_sql_options_block())  # idempotent no-op
+            conn.execute(text(_schema_sql_options_block()))
+            conn.execute(text(_schema_sql_options_block()))  # idempotent no-op
         with engine.connect() as conn:
             assert conn.execute(text(
                 "SELECT relkind FROM pg_class WHERE oid = to_regclass('options_snapshots')")).scalar() == "v"
@@ -430,7 +430,7 @@ def test_schema_sql_fresh_install_matches_migration_guards(pg_engine) -> None:
 def test_schema_sql_block_is_a_no_op_on_a_pre_migration_database(scratch) -> None:
     engine, _ = scratch
     with engine.begin() as conn:
-        conn.exec_driver_sql(_schema_sql_options_block())
+        conn.execute(text(_schema_sql_options_block()))
         assert conn.execute(text(
             "SELECT relkind FROM pg_class WHERE oid = to_regclass('options_snapshots')")).scalar() == "r"
         assert conn.execute(text("SELECT to_regclass('options_capture_batches')")).scalar() is None
