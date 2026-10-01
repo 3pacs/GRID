@@ -247,9 +247,10 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
   condition and with vendor walls.
 - **Session separation.** MG1, MG2, SC1, SC2 and DW1 stay `BLOCKED` until the v1 closure artifact
   below is proven on vault `origin/main` (section 10). The proof date is the America/New_York
-  calendar date of that section 10 proof; the first session on which any of the five may decide is
-  the next NYSE session strictly after it. Any report of these five cites v1's matching hypothesis, and their
-  false-pass bounds add to v1's.
+  calendar date of the later of the two section 10 observations (the verifier's fetch time and
+  GitHub's push-event time). The first session on which any of the five may decide is the next NYSE
+  session strictly after the proof date. Any report of these five cites v1's matching hypothesis,
+  and their false-pass bounds add to v1's.
 - **v1 closure artifact.** v1 itself writes no terminal record: `evaluate` prints to stdout and
   `status` only prints a stop advisory. Its closure is therefore defined here as one owner-committed
   file, `05-GRID/Paper-Log/gex_levels_v1/CLOSURE.json`, on vault `main`. It contains:
@@ -258,18 +259,23 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
     `/data/grid/paper_log/gex_levels_v1/gex_levels_v1.jsonl` at closure;
   - for `evaluation`: the exact stdout of `python -m paper_log.gex_levels evaluate --log-dir
     /data/grid/paper_log/gex_levels_v1` run without `--interim`, and it must be neither refused nor
-    INTERIM;
-  - for `stop`: the owner's stop decision quoting the exact `status` advisory line it relies on.
+    INTERIM. Because that output depends on the numerical stack (numpy's random stream, scipy and
+    statsmodels), the artifact also records the Python interpreter version, the numpy, scipy and
+    statsmodels versions, and the SHA-256 of the grid-svr environment's lock or `pip freeze` output;
+  - for `stop`: the owner's stop decision quoting the exact `ADVISORY:` line printed by `status`.
 
   Verification, all of which must hold:
   - line number `log_records` of the v1 log hashes to `log_head_sha256`, using v1's own convention
     (`paper_log/gex_levels/storage.py`: SHA-256 of the exact canonical JSON line, the value each
     next record carries as `prev_sha256`), and the chain of lines 1..`log_records` verifies;
-  - the verifier copies the first `log_records` lines to a scratch directory, re-runs `evaluate`
-    (for `evaluation`) or `status` (for `stop`) on that copy with v1's pinned code, and requires
-    output byte-identical to the quoted stdout or advisory line;
-  - the proof of when the file reached `origin/main` follows section 10. **Absent this artifact, the five stay `BLOCKED`
-  permanently; no other route unblocks them.**
+  - the verifier copies the first `log_records` lines to a scratch directory and re-runs v1's pinned
+    code on that copy. For `evaluation` it runs `evaluate` in an environment matching the recorded
+    interpreter, package versions and lock hash, and requires stdout byte-identical to the quoted
+    stdout. For `stop` it runs `status` (pure counting) and requires its `ADVISORY:` line to be
+    byte-identical to the quoted advisory line;
+  - the proof of when the file reached `origin/main` follows section 10.
+
+  **Absent this artifact, the five stay `BLOCKED` permanently; no other route unblocks them.**
 - v1 H2 (wall hold against mirror placebos on 5-minute bars) is not re-tested. DW uses vendor or
   recomputed delayed walls and auction prices only.
 - S10: no candidate scientific pair is shared.
@@ -668,8 +674,9 @@ or p-value. A look taken early is a defect and invalidates the hypothesis.
   - the E2 releases for `e2.auction_oc.v1`, `e2.abs_move.v1` and `e2.paired_oc.v1`, and the E2
     `rules.json` stream registration of `gex_intraday_v1`;
   - the ten trial entries in the E3 trial ledger.
-- The frozen GEX-levels v1 log and its pinned code are not read, imported or written by any of this.
-  The section 7 rule reads only the v1 closure artifact and the v1 log's head hash and count.
+- This PR's code does not import or write the frozen GEX-levels v1 log or its pinned code. The
+  section 7 verification reads the v1 log read-only, and runs v1's pinned code only on a scratch
+  copy of the log's first `log_records` lines. Nothing in this family ever writes to v1.
 
 <!-- PREREG-BODY-END -->
 

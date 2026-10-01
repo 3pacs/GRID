@@ -33,7 +33,7 @@ from analysis.research_forward_log import ForwardLog, _lines, canonical
 REPO = Path(__file__).resolve().parents[1]
 VERSION = "gex_intraday_v1"
 PREREG_PATH = Path("docs/paper_log/gex-intraday-v1-preregistration.md")
-PREREG_BODY_SHA256 = "f051fb7b89c788e93d279e0c1b8b2492e181878cf59aa4513f99bb7936245df2"
+PREREG_BODY_SHA256 = "9a5dc301920df7a783b127ed06af766a8667db37497ef63b5748a75182df644c"
 BODY_START = "<!-- PREREG-BODY-START -->"
 BODY_END = "<!-- PREREG-BODY-END -->"
 

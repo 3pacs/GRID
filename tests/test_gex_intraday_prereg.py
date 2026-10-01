@@ -320,7 +320,18 @@ def test_final_cleanup_wording_is_binding():
     assert "It is never P0, and it is an input (PO2, RB1) only through receipts created" in body
     assert "used as an outcome only" not in body
     assert "line number `log_records` of the v1 log hashes to `log_head_sha256`" in body
-    assert "byte-identical to the quoted stdout or advisory line" in body
-    assert "next NYSE session strictly after it" in body
+    assert "requires stdout byte-identical to the quoted\n    stdout" in body
+    assert "session strictly after the proof date" in body
     assert "batch completing between 13:30Z and D0 can see the S-1 close" in body
     assert "ex-dates in the month on or before M-3" in body
+
+
+def test_v1_access_statement_matches_the_closure_verification():
+    body = g.read_body()
+    assert "not read, imported or written" not in body
+    assert "reads only the v1 closure artifact" not in body
+    assert "reads the v1 log read-only, and runs v1's pinned code only on a scratch" in body
+    assert "Nothing in this family ever writes to v1." in body
+    assert "statsmodels versions, and the SHA-256 of the grid-svr environment's lock" in body
+    assert "requires its `ADVISORY:` line to be\n    byte-identical" in body
+    assert "the later of the two section 10 observations" in body
