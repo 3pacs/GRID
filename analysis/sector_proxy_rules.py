@@ -26,7 +26,9 @@ Feature series grammar (version ``gd7a-v1``)
 -------------------------------------------
 A feature is ``{series}|{suffix}`` (the S11 convention; the suffix is a
 transform or a window such as ``chg20`` or ``W30``). The series is
-``NS``, ``NS:SUBJECT`` or ``NS:SUBJECT:FIELD``:
+``NS``, ``NS:SUBJECT`` or ``NS:SUBJECT:FIELD``. Matching is case-normalized
+(namespaces and subjects upper-case, fields lower-case), so no spelling of a
+declared table or ticker escapes the rules.
 
 * price namespaces :data:`PRICE_NAMESPACES` (``PX``, ``RET``, ``MOM``,
   ``TIINGO``, ``TWELVEDATA``, ``REL``): past closes, returns or momentum of the
@@ -35,16 +37,21 @@ transform or a window such as ``chg20`` or ``W30``). The series is
   panel mode (each issuer's own past return).
 * ``ETF_FLOWS:{ETF}``: the ``etf_flows`` table, a dollar-volume proxy (price x
   volume), not creation/redemption data.
-* ``OPTIONS:{TICKER}:{field}``: options features; ``max_pain`` and
-  ``spot_price`` embed spot.
-* ``FUNDAMENTAL_DIVERGENCE:{TICKER}:price_score`` and
-  ``TICKER_METRICS_DAILY:{TICKER}:market_cap_usd``: price-derived columns.
+* ``OPTIONS:{TICKER}:{field}``: options features; spot levels (``max_pain``,
+  ``spot_price``, ``gamma_flip``, ``call_wall``, ``put_wall``) embed spot.
+* ``FUNDAMENTAL_DIVERGENCE:{TICKER}[:{field}]`` and
+  ``TICKER_METRICS_DAILY:{TICKER}[:{field}]``: every column of these tables is
+  treated as price-derived (``price_score``, ``divergence``, ``close_price``,
+  ``market_cap_usd`` ...).
 * ``SECTOR_HEALTH_SNAPSHOTS[:...]``: a composite of the same inputs.
 * people-density features: GD5 spec names (``A_insider_buy``,
   ``S_insider``, ``A_insider_buy@edgar``, ``D_peer_congress``, ``A_multi`` ...)
-  as the panel-mode construct, or ``SECTOR_DENSITY:{sector}:{spec}:W{w}`` for
-  Route A's weekly sector aggregates. These are the features under test and are
-  never proxies.
+  as the panel-mode construct, or exactly ``SECTOR_DENSITY:{sector}:{spec}:W{w}``
+  for Route A's weekly sector aggregates. These are the features under test
+  and are never proxies.
+* refused outright: R6 never-a-channel tables (any case; the only
+  ``sector_density`` spelling allowed is GD5's exact aggregate form above) and
+  yfinance ids (``YF``/``YF_ADJ``, unverified price basis).
 
 Rules (:data:`PROXY_TABLES`; each carries the reason the ledger records)
 -----------------------------------------------------------------------
@@ -52,8 +59,8 @@ For every declared target, a feature is a PROXY (forced ``SELF_LAG``) when it
 is: the ETF's or a constituent's own past return/momentum; SPY's past return;
 ``etf_flows`` of any ETF and ``sector_health_snapshots`` (both also R6:
 they may appear only as PROXY members, never as features under test); an
-options spot field, ``fundamental_divergence.price_score`` or
-``ticker_metrics_daily.market_cap_usd`` of a target leg or constituent.
+options spot level or any ``fundamental_divergence`` / ``ticker_metrics_daily``
+column of a target leg, a constituent or SPY.
 A pair subject (``REL:XLE-SPY``) is a proxy when either leg is: a series that
 shares a leg with the target is a near-copy (``research_real_panel`` rule (b)),
 so every ``*-SPY`` relative return is a proxy of every sector-relative target.
@@ -62,11 +69,12 @@ a possible constituent of every sector (fail-closed).
 
 ``contains_price`` (plan section 2.3, GD9 PX flywheels)
 ------------------------------------------------------
-Any other price-derived construct (another sector's momentum, a flywheel with a
-PX stage, ...) is ``contains_price``. It is not forced to SELF_LAG, but it may
-be selected only through :func:`momentum_gate`: the same run must have tested
-the target's momentum family, and the construct must beat it (rule
-:data:`MOMENTUM_GATE_RULE`). Otherwise it is refused.
+Fail-closed: every feature that is not a people-density channel carries price
+unless its construct is explicitly declared ``nonprice``. Such a feature is not
+forced to SELF_LAG, but it may be selected only through :func:`momentum_gate`:
+the same run must have tested the target's momentum family, the feature must
+beat it, and its incremental (momentum-residualized) p must be below 0.05
+(rule :data:`MOMENTUM_GATE_RULE`). Otherwise it is refused.
 
 A channel family is one vote
 ----------------------------
@@ -74,7 +82,7 @@ A channel family is one vote
 EDGAR sources, ``A`` and ``S`` and the ``D_self``/``D_peer`` normalizations) to
 one feature class ``people_density_{channel}``, so the S11 allocator, whose arms
 are ``{feature_class}::{family}``, sees one arm per channel and family and
-cannot farm one channel as several arms.
+cannot farm one channel as several arms. A declared class cannot be overridden.
 """
 
 from __future__ import annotations
@@ -86,6 +94,8 @@ import re
 from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass
 from datetime import date
+
+import numpy as np
 
 from analysis.ledger_steered_exploration import SELF_LAG_CLASS, Catalog
 
@@ -121,9 +131,14 @@ PRE_INCEPTION_RULE = (
 )
 
 PRICE_NAMESPACES: tuple[str, ...] = ("PX", "RET", "MOM", "TIINGO", "TWELVEDATA", "REL")
-MOMENTUM_NAMESPACES: tuple[str, ...] = ("MOM", "RET")
-SPOT_OPTION_FIELDS: tuple[str, ...] = ("max_pain", "spot_price")
-#: R6 never-a-channel tables (GD-INDEX): refused as features outright.
+#: Option fields that are spot levels (embed spot); fields are matched lower-case.
+SPOT_OPTION_FIELDS: tuple[str, ...] = ("max_pain", "spot_price", "gamma_flip", "call_wall", "put_wall")
+#: Tables whose every column is price-derived or price-relative (close_price,
+#: market_cap_usd, price_score, divergence = fundamental_score - price_score, ...).
+PRICE_TABLE_NAMESPACES: tuple[str, ...] = ("TICKER_METRICS_DAILY", "FUNDAMENTAL_DIVERGENCE")
+#: yfinance ids: price basis not verified single-valued per date (S07/#642); refused.
+UNVERIFIED_PRICE_NAMESPACES: tuple[str, ...] = ("YF", "YF_ADJ")
+#: R6 never-a-channel tables (GD-INDEX): refused as features outright (any case).
 R6_REFUSED_NAMESPACES: tuple[str, ...] = (
     "signal_data",
     "insider_trades",
@@ -136,6 +151,7 @@ R6_REFUSED_NAMESPACES: tuple[str, ...] = (
     "sector_density",
 )
 R6_REFUSED_TOKENS: tuple[str, ...] = ("is_cluster_buy",)
+MOMENTUM_GATE_ALPHA = 0.05
 
 # --- people channels (one vote each) -------------------------------------------------
 
@@ -156,7 +172,7 @@ SOURCE_VARIANTS: tuple[str, ...] = ("quiverquant", "quiver", "qq", "edgar", "sec
 
 @dataclass(frozen=True)
 class ProxyRule:
-    """One declared PROXY rule; ``scope`` is ``own``, ``market`` or ``any``."""
+    """One declared PROXY rule; ``scope`` is ``own``, ``market``, ``own+market`` or ``any``."""
 
     rule_id: str
     namespaces: tuple[str, ...]
@@ -194,21 +210,24 @@ PROXY_TABLES: tuple[ProxyRule, ...] = (
         ("OPTIONS",),
         SPOT_OPTION_FIELDS,
         "own+market",
-        "options features that embed spot (max_pain, spot_price)",
+        "options features that are spot levels (max_pain, spot_price, gamma_flip, "
+        "call_wall, put_wall)",
     ),
     ProxyRule(
-        "fundamental_divergence_price_score",
+        "fundamental_divergence",
         ("FUNDAMENTAL_DIVERGENCE",),
-        ("price_score",),
+        None,
         "own+market",
-        "fundamental_divergence.price_score is price-derived",
+        "fundamental_divergence is price-relative in every column (price_score; "
+        "divergence = fundamental_score - price_score; its classification)",
     ),
     ProxyRule(
-        "ticker_metrics_market_cap",
+        "ticker_metrics_daily",
         ("TICKER_METRICS_DAILY",),
-        ("market_cap_usd",),
+        None,
         "own+market",
-        "ticker_metrics_daily.market_cap_usd is price x shares",
+        "ticker_metrics_daily carries close_price and market_cap_usd (price x shares); "
+        "every column is treated as price-derived",
     ),
     ProxyRule(
         "sector_health_snapshots",
@@ -219,24 +238,27 @@ PROXY_TABLES: tuple[ProxyRule, ...] = (
         "ever a PROXY member, never a feature under test",
     ),
 )
-#: Namespaces whose features carry price even when they are not a PROXY member of a
-#: given target (another sector's momentum, an options greek, ...).
-CONTAINS_PRICE_NAMESPACES: tuple[str, ...] = (
+#: Every namespace this module knows; a construct named by a ``classes`` override
+#: may not use one (nor a subject), so an override cannot smuggle a table in.
+KNOWN_NAMESPACES: tuple[str, ...] = (
     *PRICE_NAMESPACES,
     "ETF_FLOWS",
     "OPTIONS",
     "SECTOR_HEALTH_SNAPSHOTS",
+    *PRICE_TABLE_NAMESPACES,
+    *UNVERIFIED_PRICE_NAMESPACES,
 )
-CONTAINS_PRICE_FIELDS: dict[str, tuple[str, ...]] = {
-    "FUNDAMENTAL_DIVERGENCE": ("price_score",),
-    "TICKER_METRICS_DAILY": ("market_cap_usd",),
-}
 MOMENTUM_GATE_RULE = (
-    "a contains_price feature of family F may be selected in a run only if the same run "
-    "tested F's momentum family (MOM/RET features of F's own legs or constituents, "
-    "measured as SELF_LAG) with at least one finite statistic, and the feature beats "
-    "every such momentum trial: p <= the smallest momentum p AND |statistic| > the "
-    "largest finite |momentum statistic|; otherwise it is refused"
+    "contains_price is fail-closed: every feature that is not a people-density channel "
+    "(and not declared nonprice by its construct) carries price. Such a feature of "
+    "family F may be selected in a run only if (a) every stat comes from that one run "
+    "(run_id), (b) the run tested F's momentum family (every own-leg/constituent/SPY "
+    "price-namespace feature, measured as SELF_LAG) with at least one finite statistic, "
+    "(c) it beats every momentum trial: p <= the smallest momentum p AND |statistic| > "
+    "the largest finite |momentum statistic|, and (d) its incremental p (the block-"
+    "permutation p of its correlation with the label after both are residualized on the "
+    "momentum family, incremental_pvalue) is below MOMENTUM_GATE_ALPHA = 0.05; "
+    "otherwise it is refused"
 )
 
 # --- parsing -------------------------------------------------------------------------
@@ -299,17 +321,17 @@ def parse_target(target_id: str, members: Mapping[str, str] | None = None) -> Ta
 
 
 def split_series(series: str) -> tuple[str, str | None, str | None]:
-    """``NS[:SUBJECT[:FIELD]]`` -> (namespace, subject, field)."""
+    """``NS[:SUBJECT[:FIELD]]`` -> (NAMESPACE, SUBJECT, field), case-normalized."""
     if not series:
         raise ValueError("empty feature series")
-    if series.startswith("REL:"):
-        return "REL", series[len("REL:") :] or None, None
+    if series[:4].upper() == "REL:":
+        return "REL", series[4:].upper() or None, None
     parts = series.split(":")
     if len(parts) > 3 or not _NAMESPACE.match(parts[0]) or any(p == "" for p in parts):
         raise ValueError(f"{series!r}: refused: not a gd7a-v1 feature series")
-    namespace = parts[0]
-    subject = parts[1] if len(parts) > 1 else None
-    field = parts[2] if len(parts) > 2 else None
+    namespace = parts[0].upper()
+    subject = parts[1].upper() if len(parts) > 1 else None
+    field = parts[2].lower() if len(parts) > 2 else None
     return namespace, subject, field
 
 
@@ -318,12 +340,32 @@ def series_of(feature: str) -> str:
     return feature.rsplit("|", 1)[0] if "|" in feature else feature
 
 
+def _gd5_aggregate(series: str) -> bool:
+    """Exactly GD5's ``SECTOR_DENSITY:{sector}:{spec}:W{w}`` (upper-case, four parts)."""
+    parts = series.split(":")
+    return (
+        len(parts) == 4
+        and parts[0] == "SECTOR_DENSITY"
+        and parts[1] in SECTOR_BENCHMARKS
+        and bool(parts[2])
+        and re.match(r"^W\d+$", parts[3]) is not None
+    )
+
+
 def r6_refusal(feature: str) -> str | None:
-    """Why ``feature`` is an R6 never-a-channel input, or ``None``."""
+    """Why ``feature`` is refused outright (R6 never-a-channel, unverified price), or ``None``.
+
+    Matched case-insensitively. The only ``sector_density`` spelling allowed is
+    GD5's exact Route A aggregate ``SECTOR_DENSITY:{sector}:{spec}:W{w}``.
+    """
     series = series_of(feature)
     namespace = series.split(":", 1)[0]
-    if namespace in R6_REFUSED_NAMESPACES or any(t in feature.lower() for t in R6_REFUSED_TOKENS):
+    if any(t in feature.lower() for t in R6_REFUSED_TOKENS) or (
+        namespace.lower() in R6_REFUSED_NAMESPACES and not _gd5_aggregate(series)
+    ):
         return f"{feature}: refused: R6 never-a-channel input"
+    if namespace.upper() in UNVERIFIED_PRICE_NAMESPACES:
+        return f"{feature}: refused: yfinance price basis not verified single-valued per date"
     return None
 
 
@@ -357,6 +399,9 @@ def proxy_rule(
     """The first :data:`PROXY_TABLES` rule that makes ``feature`` a proxy of the target."""
     target = parse_target(target_id, members)
     members = members or {}
+    refusal = r6_refusal(feature)
+    if refusal:
+        raise ValueError(refusal)
     if people_channel(feature) is not None:
         return None  # people densities are the features under test, never proxies
     namespace, subject, field = split_series(series_of(feature))
@@ -459,35 +504,32 @@ def self_lag_reasons(
 # --- contains_price and the momentum gate --------------------------------------------
 
 
-def contains_price(feature: str, flagged: Iterable[str] = ()) -> bool:
-    """Whether a feature carries price: a price/proxy namespace or a flagged construct.
+def contains_price(feature: str, nonprice: Iterable[str] = ()) -> bool:
+    """Fail-closed: every non-people feature carries price unless declared ``nonprice``.
 
-    ``flagged`` names constructs whose GD6 ``ConstructSpec.contains_price`` is
-    true (GD9 PX flywheels); a construct is matched by its series name.
+    ``nonprice`` names constructs whose GD6 ``ConstructSpec.contains_price`` is
+    explicitly false (matched by series name); the declaration is the caller's
+    and is recorded in its prereg. People-density channels never carry price.
     """
-    series = series_of(feature)
-    if series in set(flagged):
-        return True
     if people_channel(feature) is not None:
         return False
-    namespace, _subject, field = split_series(series)
-    if namespace in CONTAINS_PRICE_NAMESPACES:
-        return True
-    return field in CONTAINS_PRICE_FIELDS.get(namespace, ())
+    return series_of(feature) not in set(nonprice)
 
 
 def momentum_features(
     family: str, features: Iterable[str], members: Mapping[str, str] | None = None
 ) -> tuple[str, ...]:
-    """The family's momentum family: MOM/RET features of its own legs or constituents."""
-    target = parse_target(family_target(family), members)
-    members = members or {}
+    """The family's momentum family: every price-namespace feature that is SELF_LAG for it.
+
+    That is the past price/return/momentum of the target's own legs, its
+    constituents (or unmapped tickers) and SPY, in any price namespace
+    (``MOM``, ``RET``, ``PX``, ``TIINGO``, ``TWELVEDATA``, ``REL`` pairs).
+    """
+    target = family_target(family)
     out = []
     for f in features:
-        if people_channel(f) is not None:
-            continue
-        namespace, subject, _field = split_series(series_of(f))
-        if namespace in MOMENTUM_NAMESPACES and _own(target, _tickers(subject), members):
+        rule = proxy_rule(target, f, members)
+        if rule is not None and rule.rule_id in ("own_price", "market_price"):
             out.append(f)
     return tuple(out)
 
@@ -499,28 +541,64 @@ def _finite(value) -> bool:
         return False
 
 
+def incremental_pvalue(
+    feature,
+    momentum,
+    label,
+    *,
+    block: int,
+    perms: int,
+    seed: int,
+) -> tuple[float, float]:
+    """Partial correlation of a feature with the label given the momentum family, and its p.
+
+    Both the feature and the label are residualized (OLS with an intercept) on
+    the momentum columns; the p is ``offline_research_proof``'s two-sided
+    block-permutation p of the residuals' correlation. The run's harness calls
+    this on the discovery rows and passes the p to :func:`momentum_gate` as
+    ``incremental_p``.
+    """
+    from analysis.offline_research_proof import block_permutation_pvalue
+
+    x = np.asarray(feature, dtype=float)
+    y = np.asarray(label, dtype=float)
+    m = np.asarray(momentum, dtype=float).reshape(len(x), -1)
+    design = np.column_stack([np.ones(len(x)), m])
+    rx = x - design @ np.linalg.lstsq(design, x, rcond=None)[0]
+    ry = y - design @ np.linalg.lstsq(design, y, rcond=None)[0]
+    if float(rx @ rx) <= 1e-12 * max(1.0, float(x @ x)):
+        return 0.0, 1.0  # the feature is (a linear copy of) momentum
+    return block_permutation_pvalue(rx, ry, block, perms, seed)
+
+
 def momentum_gate(
     family: str,
     stats: Mapping[str, Mapping[str, float]],
     *,
-    flagged: Iterable[str] = (),
+    run_id: str,
+    nonprice: Iterable[str] = (),
     members: Mapping[str, str] | None = None,
 ) -> dict[str, str | None]:
     """Admissibility of every selectable ``contains_price`` trial of one run's family.
 
-    ``stats`` maps each feature the run tested for ``family`` to its discovery
-    ``p`` and signed ``statistic``. Returns ``{feature: None}`` for an admissible
-    trial and ``{feature: reason}`` for a refused one, for every feature that is
-    ``contains_price`` and not already a forced SELF_LAG (those are never
-    selectable). Rule: :data:`MOMENTUM_GATE_RULE`.
+    ``stats`` maps each feature the run tested for ``family`` to its ``run_id``,
+    discovery ``p`` and signed ``statistic``; a ``contains_price`` trial also
+    carries ``incremental_p`` (:func:`incremental_pvalue`). Returns
+    ``{feature: None}`` for an admissible trial and ``{feature: reason}`` for a
+    refused one, for every ``contains_price`` feature that is not already a
+    forced SELF_LAG (those are never selectable). Rule: :data:`MOMENTUM_GATE_RULE`.
     """
-    flagged = frozenset(flagged)
+    nonprice = frozenset(nonprice)
     target = family_target(family)
+    foreign = sorted(f for f, s in stats.items() if not run_id or s.get("run_id") != run_id)
     momentum = momentum_features(family, stats, members)
     finite = [m for m in momentum if _finite(stats[m].get("statistic")) and _finite(stats[m].get("p"))]
     out: dict[str, str | None] = {}
     for feature, s in sorted(stats.items()):
-        if proxy_rule(target, feature, members) is not None or not contains_price(feature, flagged):
+        if proxy_rule(target, feature, members) is not None or not contains_price(feature, nonprice):
+            continue
+        if foreign:
+            out[feature] = f"refused: stats are not all from run {run_id!r}: {foreign}"
             continue
         if not momentum:
             out[feature] = "refused: contains_price and the run did not test the momentum family"
@@ -528,17 +606,20 @@ def momentum_gate(
         if not finite:
             out[feature] = "refused: contains_price and the momentum family was untestable"
             continue
-        if not (_finite(s.get("p")) and _finite(s.get("statistic"))):
-            out[feature] = "refused: contains_price trial has no finite statistic"
+        if not (_finite(s.get("p")) and _finite(s.get("statistic")) and _finite(s.get("incremental_p"))):
+            out[feature] = "refused: contains_price trial lacks a finite p, statistic or incremental_p"
             continue
         best_p = min(float(stats[m]["p"]) for m in finite)
         best_stat = max(abs(float(stats[m]["statistic"])) for m in finite)
-        if float(s["p"]) <= best_p and abs(float(s["statistic"])) > best_stat:
+        beats = float(s["p"]) <= best_p and abs(float(s["statistic"])) > best_stat
+        incremental = float(s["incremental_p"]) < MOMENTUM_GATE_ALPHA
+        if beats and incremental:
             out[feature] = None
         else:
             out[feature] = (
                 f"refused: contains_price does not beat momentum (p={float(s['p']):.6g} vs "
-                f"{best_p:.6g}, |stat|={abs(float(s['statistic'])):.6g} vs {best_stat:.6g})"
+                f"{best_p:.6g}, |stat|={abs(float(s['statistic'])):.6g} vs {best_stat:.6g}, "
+                f"incremental_p={float(s['incremental_p']):.6g} vs {MOMENTUM_GATE_ALPHA})"
             )
     return out
 
@@ -548,7 +629,8 @@ def gate_selections(
     selected: Iterable[str],
     stats: Mapping[str, Mapping[str, float]],
     *,
-    flagged: Iterable[str] = (),
+    run_id: str,
+    nonprice: Iterable[str] = (),
     members: Mapping[str, str] | None = None,
 ) -> tuple[tuple[str, ...], dict[str, str]]:
     """Split one family's discovery selections into (kept, {refused: reason}).
@@ -557,13 +639,13 @@ def gate_selections(
     is kept only if :func:`momentum_gate` admits it.
     """
     target = family_target(family)
-    gate = momentum_gate(family, stats, flagged=flagged, members=members)
+    gate = momentum_gate(family, stats, run_id=run_id, nonprice=nonprice, members=members)
     kept, refused = [], {}
     for feature in selected:
         rule = proxy_rule(target, feature, members)
         if rule is not None:
             refused[feature] = f"refused: SELF_LAG ({rule.rule_id})"
-        elif contains_price(feature, flagged):
+        elif contains_price(feature, nonprice):
             reason = gate.get(feature, "refused: contains_price trial missing from the run stats")
             if reason is None:
                 kept.append(feature)
@@ -579,13 +661,12 @@ def gate_selections(
 
 def _construct(series: str) -> str:
     """The GD5 spec / construct name inside a feature series."""
-    if series.startswith("SECTOR_DENSITY:"):
-        parts = series.split(":")
-        if len(parts) != 4 or parts[1] not in SECTOR_BENCHMARKS or not re.match(r"^W\d+$", parts[3]):
+    if series.upper().startswith("SECTOR_DENSITY:"):
+        if not _gd5_aggregate(series):
             raise ValueError(
                 f"{series!r}: refused: Route A aggregates are SECTOR_DENSITY:{{sector}}:{{spec}}:W{{w}}"
             )
-        return parts[2]
+        return series.split(":")[2]
     return series
 
 
@@ -594,6 +675,8 @@ def people_channel(feature: str) -> str | None:
     series = series_of(feature)
     construct = _construct(series).split("@", 1)
     name, source = construct[0], construct[1] if len(construct) > 1 else None
+    if ":" in name:
+        return None  # a table series, never a people construct
     tokens = name.lower().split("_")
     if not tokens or tokens[0].upper() not in MEASURES:
         return None
@@ -609,6 +692,10 @@ def people_channel(feature: str) -> str | None:
     if len(hits) > 1:
         raise ValueError(f"{feature!r}: refused: names several channels {sorted(hits)}; use multi")
     return hits.pop() if hits else None
+
+
+class Unclassified(ValueError):
+    """A well-formed feature with no declared class (a construct needing a ``classes`` entry)."""
 
 
 def vote_class(feature: str) -> str:
@@ -631,7 +718,7 @@ def vote_class(feature: str) -> str:
     }
     if namespace in fixed:
         return fixed[namespace]
-    raise ValueError(f"{feature!r}: refused: no declared feature class")
+    raise Unclassified(f"{feature!r}: refused: no declared feature class")
 
 
 def rel_catalog(
@@ -643,9 +730,13 @@ def rel_catalog(
 ) -> Catalog:
     """An S11 :class:`Catalog` over sector-relative families with GD7a classes and SELF_LAG.
 
-    ``classes`` names the class of a feature :func:`vote_class` cannot classify
-    (e.g. a GD9 flywheel construct). It may not re-class a people channel: that
-    would let one channel farm several arms.
+    ``classes`` names the class of a construct :func:`vote_class` cannot
+    classify (e.g. a GD9 flywheel). It is refused for any feature
+    :func:`vote_class` can classify (no re-classing, so one channel or one
+    price table cannot farm several arms), for a refused input, for a
+    construct with a subject or a known namespace, and for a
+    ``people_density_*`` class on a non-people feature. Such constructs are
+    ``contains_price`` (fail-closed) unless declared nonprice.
     """
     families = tuple(families)
     features = tuple(features)
@@ -657,16 +748,24 @@ def rel_catalog(
             raise ValueError(refusal)
         try:
             cls = vote_class(f)
-        except ValueError:
+        except Unclassified:
             if f not in classes:
                 raise
+            series = series_of(f)
             cls = classes[f]
-        else:
-            if f in classes and classes[f] != cls and people_channel(f) is not None:
+            if ":" in series or series.upper() in KNOWN_NAMESPACES:
                 raise ValueError(
-                    f"{f!r}: refused: a people channel is one vote ({cls}), not {classes[f]!r}"
+                    f"{f!r}: refused: a class override names a construct, not a table or a ticker"
+                ) from None
+            if not cls or cls.startswith("people_density_"):
+                raise ValueError(
+                    f"{f!r}: refused: {cls!r} is reserved for people-density channels"
+                ) from None
+        else:
+            if f in classes and classes[f] != cls:
+                raise ValueError(
+                    f"{f!r}: refused: its class is declared ({cls}); one vote, not {classes[f]!r}"
                 )
-            cls = classes.get(f, cls)
         if cls == SELF_LAG_CLASS:
             raise ValueError("feature classes may not be SELF_LAG")
         mapping.append((f, cls))
@@ -701,11 +800,14 @@ def rules_manifest() -> dict:
         "late_etf_start": dict(LATE_ETF_START),
         "pre_inception_rule": PRE_INCEPTION_RULE,
         "price_namespaces": list(PRICE_NAMESPACES),
-        "momentum_namespaces": list(MOMENTUM_NAMESPACES),
+        "price_table_namespaces": list(PRICE_TABLE_NAMESPACES),
+        "unverified_price_namespaces": list(UNVERIFIED_PRICE_NAMESPACES),
+        "spot_option_fields": list(SPOT_OPTION_FIELDS),
         "proxy_tables": [asdict(rule) for rule in PROXY_TABLES],
-        "contains_price_namespaces": list(CONTAINS_PRICE_NAMESPACES),
-        "contains_price_fields": {k: list(v) for k, v in CONTAINS_PRICE_FIELDS.items()},
+        "matching": "namespaces and subjects upper-cased, fields lower-cased",
+        "contains_price": "fail-closed: every non-people feature unless declared nonprice",
         "momentum_gate_rule": MOMENTUM_GATE_RULE,
+        "momentum_gate_alpha": MOMENTUM_GATE_ALPHA,
         "channel_tokens": {k: list(v) for k, v in CHANNEL_TOKENS.items()},
         "source_variants": list(SOURCE_VARIANTS),
         "r6_refused_namespaces": list(R6_REFUSED_NAMESPACES),

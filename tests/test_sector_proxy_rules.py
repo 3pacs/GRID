@@ -67,8 +67,12 @@ def expected_proxies(target: str) -> set[str]:
             f"TIINGO:{t}:adj_close|chg20",
             f"OPTIONS:{t}:max_pain|z60",
             f"OPTIONS:{t}:spot_price|z60",
+            f"OPTIONS:{t}:gamma_flip|z60",
             f"FUNDAMENTAL_DIVERGENCE:{t}:price_score|z60",
+            f"FUNDAMENTAL_DIVERGENCE:{t}:value_score|z60",
+            f"FUNDAMENTAL_DIVERGENCE:{t}:divergence|z60",
             f"TICKER_METRICS_DAILY:{t}:market_cap_usd|z60",
+            f"TICKER_METRICS_DAILY:{t}:close_price|chg20",
         }
     # entity-own (no subject), any ETF's flows, sector health: always
     out |= {"MOM|k20", "PX|k5"}
@@ -90,9 +94,12 @@ def universe() -> list[str]:
             f"OPTIONS:{t}:max_pain|z60",
             f"OPTIONS:{t}:spot_price|z60",
             f"OPTIONS:{t}:put_call_ratio|z60",
+            f"OPTIONS:{t}:gamma_flip|z60",
             f"FUNDAMENTAL_DIVERGENCE:{t}:price_score|z60",
             f"FUNDAMENTAL_DIVERGENCE:{t}:value_score|z60",
+            f"FUNDAMENTAL_DIVERGENCE:{t}:divergence|z60",
             f"TICKER_METRICS_DAILY:{t}:market_cap_usd|z60",
+            f"TICKER_METRICS_DAILY:{t}:close_price|chg20",
             f"ETF_FLOWS:{t}|chg5" if t in spr.ETF_SECTOR or t == "SPY" else None,
         ]
     feats += [f"REL:{e}-SPY|chg20" for e in spr.ETF_SECTOR]
@@ -137,7 +144,7 @@ def test_benchmarks_pinned_to_vs1_and_sector_map():
 
     assert spr.SECTOR_BENCHMARKS == v1.EQUITY_SECTORS
     assert spr.LATE_ETF_START == s2.LATE_ETF_START
-    assert spr.LATE_ETF_START == getattr(s4, "LATE_ETF_START", s2.LATE_ETF_START)
+    assert spr.LATE_ETF_START == s4.LATE_ETF_START
     with open(spr.__file__.replace("sector_proxy_rules.py", "sector_map_data.yaml"), encoding="utf-8") as fh:
         sector_map = yaml.safe_load(fh)["SECTOR_MAP"]
     for sector, etf in spr.SECTOR_BENCHMARKS.items():
@@ -328,18 +335,23 @@ def test_allocator_counts_one_arm_per_channel():
 
 # --- 4.3: contains_price must beat momentum in the same run ------------------------
 
-
-def _stats(features: dict, y, perms=1999, seed=7):
-    out = {}
-    for name, x in features.items():
-        r, p = block_permutation_pvalue(x, y, 1, perms, seed)
-        out[name] = {"statistic": r, "p": p}
-    return out
-
-
+RUN = "run-1"
 FAMILY = "REL:XLE-SPY|return|fwd5"
 MOMENTUM = "MOM:XLE-SPY|chg20"
 FLY = "FW_A|W30"
+
+
+def _stats(features: dict, y, momentum_names, perms=999, seed=7, run_id=RUN):
+    """What a run's harness records per trial: run id, p, statistic, incremental p."""
+    mom = np.column_stack([features[m] for m in momentum_names]) if momentum_names else None
+    out = {}
+    for name, x in features.items():
+        r, p = block_permutation_pvalue(x, y, 1, perms, seed)
+        entry = {"run_id": run_id, "statistic": r, "p": p}
+        if mom is not None and name not in momentum_names:
+            entry["incremental_p"] = spr.incremental_pvalue(x, mom, y, block=1, perms=perms, seed=seed)[1]
+        out[name] = entry
+    return out
 
 
 def test_flywheel_refused_where_only_momentum_is_real():
@@ -349,37 +361,80 @@ def test_flywheel_refused_where_only_momentum_is_real():
     y = 0.35 * m + rng.standard_normal(n)
     flywheel = m + 0.8 * rng.standard_normal(n)  # a PX-stage construct: a noisy copy of momentum
     noise = rng.standard_normal(n)
-    stats = _stats({MOMENTUM: m, FLY: flywheel, "A_insider_buy@edgar|W30": noise}, y)
+    stats = _stats({MOMENTUM: m, FLY: flywheel, "A_insider_buy@edgar|W30": noise}, y, [MOMENTUM])
     assert spr.proxy_rule("REL:XLE-SPY", MOMENTUM) is not None  # momentum itself is SELF_LAG
     assert spr.momentum_features(FAMILY, stats) == (MOMENTUM,)
     assert stats[FLY]["p"] < 0.01  # without the gate it would be "discovered"
-    gate = spr.momentum_gate(FAMILY, stats, flagged={"FW_A"})
-    assert set(gate) == {FLY}
+    gate = spr.momentum_gate(FAMILY, stats, run_id=RUN)
+    assert set(gate) == {FLY}  # fail-closed contains_price, no flag needed
     assert gate[FLY] and gate[FLY].startswith("refused: contains_price does not beat momentum")
-    kept, refused = spr.gate_selections(FAMILY, [FLY, MOMENTUM, "A_insider_buy@edgar|W30"], stats, flagged={"FW_A"})
+    kept, refused = spr.gate_selections(FAMILY, [FLY, MOMENTUM, "A_insider_buy@edgar|W30"], stats, run_id=RUN)
     assert kept == ("A_insider_buy@edgar|W30",)
     assert set(refused) == {FLY, MOMENTUM}
     assert refused[MOMENTUM].startswith("refused: SELF_LAG")
 
 
-def test_flywheel_refused_when_momentum_not_tested_or_untestable():
+def test_near_copies_of_momentum_are_refused_across_seeds():
+    """A near-copy (m + 0.1 noise) can edge past momentum on raw strength; the incremental test stops it."""
+    admitted_raw = admitted = 0
+    for seed in range(40):
+        rng = np.random.default_rng([7, seed])
+        n = 400
+        m = rng.standard_normal(n)
+        y = 0.35 * m + rng.standard_normal(n)
+        near = m + 0.1 * rng.standard_normal(n)
+        stats = _stats({MOMENTUM: m, FLY: near}, y, [MOMENTUM], perms=499)
+        s, mo = stats[FLY], stats[MOMENTUM]
+        admitted_raw += s["p"] <= mo["p"] and abs(s["statistic"]) > abs(mo["statistic"])
+        admitted += spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY] is None
+    assert admitted_raw >= 4  # the raw-strength rule alone is weak
+    assert admitted <= 2  # ~ raw rate x 5%
+
+
+def test_momentum_family_includes_relative_and_close_series():
+    rng = np.random.default_rng(5)
+    n = 600
+    rel = rng.standard_normal(n)
+    y = 0.4 * rel + rng.standard_normal(n)
+    weak_mom = rng.standard_normal(n)
+    fly = 0.4 * rel + rng.standard_normal(n)  # weaker than the target's own relative momentum
+    names = ["REL:XLE-SPY|chg20", "MOM:XLE|chg20", "TIINGO:XLE:adj_close|chg20", "MOM:SPY|chg5"]
+    feats = {names[0]: rel, names[1]: weak_mom, names[2]: weak_mom + rng.standard_normal(n),
+             names[3]: rng.standard_normal(n), FLY: fly}
+    stats = _stats(feats, y, names)
+    assert set(spr.momentum_features(FAMILY, stats)) == set(names)
+    assert stats[FLY]["p"] < 0.01 and stats[FLY]["p"] <= stats["MOM:XLE|chg20"]["p"]
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY].startswith("refused: contains_price does not beat")
+
+
+def test_flywheel_refused_when_momentum_not_tested_or_untestable_or_other_run():
     rng = np.random.default_rng(3)
     n = 400
     g = rng.standard_normal(n)
     y = 0.5 * g + rng.standard_normal(n)
-    stats = _stats({FLY: g}, y)
-    assert spr.momentum_gate(FAMILY, stats, flagged={"FW_A"})[FLY] == (
+    stats = _stats({FLY: g}, y, [])
+    stats[FLY]["incremental_p"] = 0.001
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY] == (
         "refused: contains_price and the run did not test the momentum family"
     )
-    stats[MOMENTUM] = {"statistic": float("nan"), "p": 1.0}
-    assert spr.momentum_gate(FAMILY, stats, flagged={"FW_A"})[FLY] == (
+    stats[MOMENTUM] = {"run_id": RUN, "statistic": float("nan"), "p": 1.0}
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY] == (
         "refused: contains_price and the momentum family was untestable"
     )
     # another sector's momentum is contains_price, not momentum for this family
-    stats = _stats({FLY: g, "MOM:XLF|chg20": g + rng.standard_normal(n)}, y)
-    gate = spr.momentum_gate(FAMILY, stats, flagged={"FW_A"})
+    stats = _stats({FLY: g, "MOM:XLF|chg20": g + rng.standard_normal(n)}, y, [])
+    gate = spr.momentum_gate(FAMILY, stats, run_id=RUN)
     assert gate[FLY].endswith("did not test the momentum family")
     assert gate["MOM:XLF|chg20"].endswith("did not test the momentum family")
+    # momentum from another run does not count
+    m = rng.standard_normal(n)
+    stats = _stats({MOMENTUM: m, FLY: g}, y, [MOMENTUM])
+    stats[MOMENTUM]["run_id"] = "run-0"
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY].startswith("refused: stats are not all from run")
+    # a missing incremental p is refused
+    stats = _stats({MOMENTUM: m, FLY: g}, y, [MOMENTUM])
+    del stats[FLY]["incremental_p"]
+    assert "incremental_p" in spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY]
 
 
 def test_flywheel_with_incremental_signal_is_admitted():
@@ -389,16 +444,78 @@ def test_flywheel_with_incremental_signal_is_admitted():
     g = rng.standard_normal(n)
     y = 0.1 * m + 0.5 * g + rng.standard_normal(n)
     flywheel = g + 0.3 * m
-    stats = _stats({MOMENTUM: m, FLY: flywheel}, y)
-    assert spr.momentum_gate(FAMILY, stats, flagged={"FW_A"}) == {FLY: None}
-    kept, refused = spr.gate_selections(FAMILY, [FLY], stats, flagged={"FW_A"})
+    stats = _stats({MOMENTUM: m, FLY: flywheel}, y, [MOMENTUM])
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN) == {FLY: None}
+    kept, refused = spr.gate_selections(FAMILY, [FLY], stats, run_id=RUN)
     assert kept == (FLY,) and not refused
 
 
-def test_people_density_is_not_gated():
-    stats = {MOMENTUM: {"statistic": 0.5, "p": 0.001}, "A_congress|W90": {"statistic": 0.01, "p": 0.6}}
-    assert spr.momentum_gate(FAMILY, stats) == {}
+def test_contains_price_is_fail_closed():
+    stats = {MOMENTUM: {"run_id": RUN, "statistic": 0.5, "p": 0.001},
+             "A_congress|W90": {"run_id": RUN, "statistic": 0.01, "p": 0.6}}
+    assert spr.momentum_gate(FAMILY, stats, run_id=RUN) == {}
     assert not spr.contains_price("A_congress|W90")
-    assert spr.contains_price("OPTIONS:XLF:delta|z60")
-    assert spr.contains_price("TICKER_METRICS_DAILY:JPM:market_cap_usd|z60")
-    assert not spr.contains_price("TICKER_METRICS_DAILY:JPM:employees|z60")
+    assert not spr.contains_price("SECTOR_DENSITY:Energy:A_insider_buy:W30|chg4")
+    for f in ["OPTIONS:XLF:delta|z60", "TICKER_METRICS_DAILY:JPM:employees|z60", "FW_A|W30", "XYZ|k5"]:
+        assert spr.contains_price(f), f
+    assert not spr.contains_price("FW_B|W30", nonprice={"FW_B"})
+
+
+# --- review regressions: spellings, whole price tables, class overrides ---------------
+
+
+@pytest.mark.parametrize(
+    "feature,rule",
+    [
+        ("TICKER_METRICS_DAILY:XLE:close_price|chg20", "ticker_metrics_daily"),
+        ("TICKER_METRICS_DAILY:XLE|z60", "ticker_metrics_daily"),
+        ("FUNDAMENTAL_DIVERGENCE:XOM:divergence|z60", "fundamental_divergence"),
+        ("FUNDAMENTAL_DIVERGENCE:XOM:classification|z60", "fundamental_divergence"),
+        ("fundamental_divergence:xom:PRICE_SCORE|z60", "fundamental_divergence"),
+        ("TICKER_METRICS_DAILY:XOM:market_cap|z60", "ticker_metrics_daily"),
+        ("OPTIONS:XLE:MAX_PAIN|z60", "options_spot"),
+        ("OPTIONS:XLE:gamma_flip|z60", "options_spot"),
+        ("OPTIONS:SPY:call_wall|z60", "options_spot"),
+        ("mom:XLE|chg20", "own_price"),
+        ("Mom:xle|chg20", "own_price"),
+        ("rel:xle-spy|chg20", "own_price"),
+        ("tiingo:spy:adj_close|chg20", "market_price"),
+        ("etf_flows:XLK|chg5", "etf_flows"),
+        ("Sector_Health_Snapshots|z60", "sector_health_snapshots"),
+    ],
+)
+def test_spellings_and_price_tables_are_proxies(feature, rule):
+    assert spr.proxy_rule("REL:XLE-SPY", feature, MEMBERS).rule_id == rule
+    cat = spr.rel_catalog(["REL:XLE-SPY|return|fwd5"], [feature, "A_congress|W90"], members=MEMBERS)
+    assert cat.feature_class("REL:XLE-SPY|return|fwd5", feature) == lse.SELF_LAG_CLASS
+
+
+@pytest.mark.parametrize(
+    "feature",
+    ["Insider_Trades:XOM|z60", "SIGNAL_DATA:XOM|z60", "Sector_Density:Energy|z60",
+     "sector_density:Energy:A_insider_buy:W30|chg4", "YF:XLE:close|chg20", "yf_adj:XLE|chg20"],
+)
+def test_refused_inputs_in_any_case(feature):
+    with pytest.raises(ValueError, match="refused"):
+        spr.rel_catalog(["REL:XLE-SPY|return|fwd5"], [feature, "A_congress|W90"],
+                        classes={feature: "flywheel"})
+    with pytest.raises(ValueError, match="refused"):
+        spr.proxy_rule("REL:XLE-SPY", feature, MEMBERS)
+
+
+@pytest.mark.parametrize(
+    "feature,cls",
+    [
+        ("mom:XLE|chg20", "flywheel"),  # classifiable: price
+        ("MOM:XLB|chg20", "people_density_congress"),
+        ("MOM:XLF|chg20", "fresh_arm"),
+        ("etf_flows:XLE|chg5", "flow"),
+        ("FW_A:XLE|W30", "flywheel"),  # a construct with a subject
+        ("TIINGO|k5", "flywheel"),  # classifiable namespace
+        ("FW_A|W30", "people_density_insider"),  # people class on a non-people construct
+        ("A_congress|W90", "people_density_congress_2"),
+    ],
+)
+def test_class_overrides_cannot_smuggle_or_split(feature, cls):
+    with pytest.raises(ValueError, match="refused"):
+        spr.rel_catalog(["REL:XLE-SPY|return|fwd5"], [feature], members=MEMBERS, classes={feature: cls})
