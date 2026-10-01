@@ -19,7 +19,6 @@ from evals.e2 import board, scoring
 from evals.e2.adapters.gex_levels import GexLevelsAdapter
 from evals.e2.adapters.s10 import S10Adapter
 from evals.e2.chain import Ledger
-from evals.e2.records import LookAheadError
 from tests import e2_support as S
 
 FIXTURE = Path(__file__).parent / "fixtures" / "e2" / "gex_levels_v1.jsonl"
@@ -151,8 +150,10 @@ def test_gex_postclose_fetched_before_the_close_is_look_ahead(tmp_path):
         _preopen("2026-10-01", "2026-10-01T12:45:00+00:00"),
         _postclose("2026-10-01", "2026-10-01T20:30:00+00:00", fetched="2026-10-01T19:59:00+00:00"),
     ])
-    with pytest.raises(LookAheadError, match="precedes the session close"):
-        _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 2))
+    snap = _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 2))["snapshot"]
+    assert snap["streams"]["gex_levels_v1"]["ok"] is False
+    assert "precedes the session close" in snap["streams"]["gex_levels_v1"]["error"]
+    assert snap["counts"]["predictions"] == 0 and snap["counts"]["integrity_alerts"] == 1
 
 
 def test_gex_postclose_not_yet_written_stays_pending_then_voids_after_grace(tmp_path):
@@ -271,8 +272,10 @@ def test_s10_scores_are_sealed_until_the_verdict_then_match_it(tmp_path):
 def test_s10_outcome_read_before_publication_is_look_ahead(tmp_path):
     logs = tmp_path / "s10"
     _s10_log(logs, _s10_events(verdict=False, bad_outcome=True))
-    with pytest.raises(LookAheadError, match="before its label was published"):
-        _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 13, 12))
+    snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 13, 12))["snapshot"]
+    assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is False
+    assert "before its label was published" in snap["streams"]["s10_hypothesis_forward_v1"]["error"]
+    assert snap["counts"]["resolutions"] == 0 and snap["counts"]["integrity_alerts"] == 1
 
 
 def test_real_s10_log_copy_header_only(tmp_path):

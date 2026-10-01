@@ -16,7 +16,7 @@ import pytest
 
 from evals.e2 import board, scoring
 from evals.e2.chain import ChainError, Ledger, raw_lines
-from evals.e2.records import LookAheadError
+from evals.e2.adapters.e2_stream import E2StreamAdapter
 from evals.e2.resolve import PriceObs
 from tests import e2_support as S
 
@@ -160,15 +160,38 @@ class _Hostile:
         return PriceObs(instrument, obs_date, value, self.available_at, "hostile", "X", "v")
 
 
-def test_price_offered_before_the_close_is_refused_and_nothing_is_written(tmp_path):
-    with pytest.raises(LookAheadError, match="before the session closed"):
-        _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 1, 12)))
-    assert not (tmp_path / "board" / "e2_scoreboard_e2-v1.jsonl").exists()
+def _assert_lookahead_refused(tmp_path, snap, match):
+    stream = snap["streams"][S.STREAM]
+    assert stream["ok"] is False and stream["error"].startswith("LookAheadError") and match in stream["error"]
+    ledger = Ledger(tmp_path / "board", "e2-v1").read_all()
+    assert [r["kind"] for r in ledger] == ["header", "integrity_alert", "snapshot"]  # nothing from the stream
+    assert ledger[1]["stream"] == S.STREAM and "look-ahead refused" in ledger[1]["detail"]
+
+
+def test_price_offered_before_the_close_is_refused_and_nothing_is_recorded(tmp_path):
+    snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 1, 12)))["snapshot"]
+    _assert_lookahead_refused(tmp_path, snap, "before the session closed")
 
 
 def test_price_offered_from_the_future_is_refused(tmp_path):
-    with pytest.raises(LookAheadError, match="not observable until"):
-        _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 3, 12)))
+    snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 3, 12)))["snapshot"]
+    _assert_lookahead_refused(tmp_path, snap, "not observable until")
+
+
+def test_one_streams_look_ahead_does_not_block_the_others(tmp_path):
+    good, bad = tmp_path / "good.jsonl", tmp_path / "bad.jsonl"
+    S.write_chain(good, S.stream_records())
+    S.write_chain(bad, [{**r, "stream": "other_v1"} if r["kind"] == "header" else
+                        {**r, "prediction_id": r["prediction_id"].replace(S.STREAM, "other_v1")}
+                        for r in S.stream_records()])
+    rules = S.rules()
+    rules["streams"]["other_v1"] = {**rules["streams"][S.STREAM]}
+    adapters = [S.stream_adapter(good, rules, S.prices()),
+                E2StreamAdapter(bad, "other_v1", rules["streams"]["other_v1"], rules, _Hostile(S.utc(2026, 10, 1, 12)))]
+    snap = board.run(tmp_path / "board", adapters, AFTER, rules=rules, cost_model=S.cost_model(),
+                     manifest_info=S.MANIFEST_INFO, code_sha=S.CODE_SHA)["snapshot"]
+    assert snap["streams"][S.STREAM]["ok"] is True and snap["streams"]["other_v1"]["ok"] is False
+    assert snap["counts"]["scores"] == 6 and snap["counts"]["integrity_alerts"] == 1
 
 
 def test_prediction_whose_entry_close_precedes_it_is_never_ingested(tmp_path):

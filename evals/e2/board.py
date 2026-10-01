@@ -28,7 +28,7 @@ from typing import Iterable
 
 from evals.e2 import scoring
 from evals.e2.chain import ChainError, Ledger, digest
-from evals.e2.records import RecordError, iso, parse_ts, prediction_sha256, session_close_utc, validate_prediction
+from evals.e2.records import LookAheadError, RecordError, iso, parse_ts, prediction_sha256, session_close_utc, validate_prediction
 
 PER_PREDICTION_RULES = frozenset({"e2.direction.v1", "e2.probability.v1", "gex.level_hold.v1", "gex.h3_net_pnl.v1"})
 METRIC_KIND = {"hit": "binary", "net_return": "sum", "brier": "mean", "log_loss": "mean",
@@ -154,6 +154,64 @@ def _check_resolution(pred: dict, res: dict, now: datetime) -> None:
         raise RecordError(f"{pred['prediction_id']}: outcome observable before outcome_not_before")
 
 
+def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules: dict, cost_model: dict) -> dict:
+    """Ingest, resolve and score one stream; appends to ``new`` and mutates ``state``."""
+    alert = _source_prefix_alert(adapter.stream, view, state, now)
+    if alert is not None and (adapter.stream, alert["observed_sha256"]) not in state["alerts"]:
+        new.append(alert)
+        state["alerts"].add((adapter.stream, alert["observed_sha256"]))
+    ingested = 0
+    for pred in adapter.predictions(view):
+        validate_prediction(pred, rules)
+        pid, sha = pred["prediction_id"], prediction_sha256(pred)
+        known = state["prediction_sha"].get(pid)
+        if known is not None:
+            if known != sha and (pid, sha) not in state["alerts"]:
+                alert = {"kind": "integrity_alert", "run_at": iso(now), "prediction_id": pid,
+                         "ledger_sha256": known, "observed_sha256": sha,
+                         "detail": "the stream now shows different content under an ingested id; "
+                                   "the ledger keeps the first version"}
+                new.append(alert)
+                state["alerts"].add((pid, sha))
+            continue
+        timing = "before_outcome" if now < parse_ts(pred["outcome_not_before"]) else "after_outcome"
+        new.append({"kind": "prediction", "run_at": iso(now), "prediction": pred,
+                    "prediction_sha256": sha, "ingest_timing": timing})
+        state["predictions"][pid], state["prediction_sha"][pid] = pred, sha
+        ingested += 1
+    resolved_now = 0
+    for pid in sorted(state["predictions"]):
+        pred = state["predictions"][pid]
+        if pred["stream"] != adapter.stream or pid in state["resolutions"]:
+            continue
+        res = adapter.resolve(view, pred, now)
+        if res is None:
+            continue
+        _check_resolution(pred, res, now)
+        record = {"kind": "resolution", "run_at": iso(now), "prediction_id": pid, **res}
+        new.append(record)
+        state["resolutions"][pid] = record
+        resolved_now += 1
+        if res["status"] == "resolved" and pred["rule_id"] in PER_PREDICTION_RULES:
+            score = _score_record(now, pred, res, compute_metrics(pred, res, cost_model, rules), rules)
+            new.append(score)
+            state["scores"].append(score)
+            state["unit_scored"].add(score["unit"])
+    for score in adapter.unit_scores(view, state, now) + _rank_ic_units(adapter.stream, state, now, rules):
+        registered = parse_ts(rules["registered_at"])
+        score = {"prediction_ids": [], "role": "candidate", **score, "kind": "score", "run_at": iso(now),
+                 "official": parse_ts(score["available_at"]) > registered}
+        new.append(score)
+        state["scores"].append(score)
+        state["unit_scored"].add(score["unit"])
+    return {
+        "ok": True, "source_log": view.path.name, "source_records_total": view.total_records,
+        "source_records_seen": len(view.records), "source_head_sha256": view.head_sha256,
+        "ingested_this_run": ingested, "resolved_this_run": resolved_now,
+        "activity": adapter.activity(view),
+    }
+
+
 def run(board_dir: Path, adapters: list, now: datetime, *, rules: dict, cost_model: dict, manifest_info: dict,
         code_sha: str, write_views: bool = True) -> dict:
     """One scoreboard run. Returns ``{"appended": n, "snapshot": <snapshot record>}``."""
@@ -183,60 +241,22 @@ def run(board_dir: Path, adapters: list, now: datetime, *, rules: dict, cost_mod
             except (ChainError, OSError, ValueError, KeyError) as exc:
                 streams[adapter.stream] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 continue
-            alert = _source_prefix_alert(adapter.stream, view, state, now)
-            if alert is not None and (adapter.stream, alert["observed_sha256"]) not in state["alerts"]:
-                new.append(alert)
-                state["alerts"].add((adapter.stream, alert["observed_sha256"]))
-            ingested = 0
-            for pred in adapter.predictions(view):
-                validate_prediction(pred, rules)
-                pid, sha = pred["prediction_id"], prediction_sha256(pred)
-                known = state["prediction_sha"].get(pid)
-                if known is not None:
-                    if known != sha and (pid, sha) not in state["alerts"]:
-                        alert = {"kind": "integrity_alert", "run_at": iso(now), "prediction_id": pid,
-                                 "ledger_sha256": known, "observed_sha256": sha,
-                                 "detail": "the stream now shows different content under an ingested id; "
-                                           "the ledger keeps the first version"}
-                        new.append(alert)
-                        state["alerts"].add((pid, sha))
-                    continue
-                timing = "before_outcome" if now < parse_ts(pred["outcome_not_before"]) else "after_outcome"
-                new.append({"kind": "prediction", "run_at": iso(now), "prediction": pred,
-                            "prediction_sha256": sha, "ingest_timing": timing})
-                state["predictions"][pid], state["prediction_sha"][pid] = pred, sha
-                ingested += 1
-            resolved_now = 0
-            for pid in sorted(state["predictions"]):
-                pred = state["predictions"][pid]
-                if pred["stream"] != adapter.stream or pid in state["resolutions"]:
-                    continue
-                res = adapter.resolve(view, pred, now)
-                if res is None:
-                    continue
-                _check_resolution(pred, res, now)
-                record = {"kind": "resolution", "run_at": iso(now), "prediction_id": pid, **res}
-                new.append(record)
-                state["resolutions"][pid] = record
-                resolved_now += 1
-                if res["status"] == "resolved" and pred["rule_id"] in PER_PREDICTION_RULES:
-                    score = _score_record(now, pred, res, compute_metrics(pred, res, cost_model, rules), rules)
-                    new.append(score)
-                    state["scores"].append(score)
-                    state["unit_scored"].add(score["unit"])
-            for score in adapter.unit_scores(view, state, now) + _rank_ic_units(adapter.stream, state, now, rules):
-                registered = parse_ts(rules["registered_at"])
-                score = {"prediction_ids": [], "role": "candidate", **score, "kind": "score", "run_at": iso(now),
-                         "official": parse_ts(score["available_at"]) > registered}
-                new.append(score)
-                state["scores"].append(score)
-                state["unit_scored"].add(score["unit"])
-            streams[adapter.stream] = {
-                "ok": True, "source_log": view.path.name, "source_records_total": view.total_records,
-                "source_records_seen": len(view.records), "source_head_sha256": view.head_sha256,
-                "ingested_this_run": ingested, "resolved_this_run": resolved_now,
-                "activity": adapter.activity(view),
-            }
+            mark = len(new)
+            try:
+                streams[adapter.stream] = _process_stream(adapter, view, state, new, now, rules, cost_model)
+            except (LookAheadError, RecordError, KeyError, TypeError, ValueError) as exc:
+                # Everything this stream produced this run is discarded; other streams proceed.
+                del new[mark:]
+                state = ledger_state(records + new)
+                error = f"{type(exc).__name__}: {exc}"
+                streams[adapter.stream] = {"ok": False, "error": error}
+                if isinstance(exc, LookAheadError):
+                    observed = "lookahead:" + digest(error)
+                    if (adapter.stream, observed) not in state["alerts"]:
+                        new.append({"kind": "integrity_alert", "run_at": iso(now), "stream": adapter.stream,
+                                    "ledger_sha256": None, "observed_sha256": observed,
+                                    "detail": f"look-ahead refused, nothing from this stream was recorded: {error}"})
+                        state["alerts"].add((adapter.stream, observed))
         snapshot = build_snapshot(state, streams, now, rules, cost_model)
         new.append(snapshot)
         ledger.append_locked(new, manifest_sha256=manifest_sha)
