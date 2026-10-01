@@ -68,9 +68,9 @@
         "tests/test_e0_manifest_guard.py": "901e38094b0603fc7421c7142d76ccbb1a0b072ab072dfa9f7a0dd09c418d9b4",
         "tests/test_e0_benchmark.py": "4a4cb6d97e64b68fdbdcfabb8da00316704898514c781e8a16fa8d5c4b5f1454",
         "tests/test_e2_manifest_guard.py": "00059ed848c778078ca2e0e828a49c273fae8980b86d9d8a76300255b5936187",
-        "tests/test_evals_released.py": "a82e6cf8452e8cab77dea32c731a002b4221449b62f5796675f5392a2f37b330",
+        "tests/test_evals_released.py": "9e6342538aa8e9fd874c99bd584c120a2cecca3a86e76ab9190547ffce23f53d",
         "evals/released.py": "0ce91b25c1d0c11a820e2696b8dc8e3349f185ffb25d5e6d798d560edc4c8917",
-        "evals/README.md": "f471345f2790521307990ee40f9c95f825a0070e02e541de6d9ba25b8fd3f122",
+        "evals/README.md": "43e791937008e73d7313e17393c05c447b6efcb99d20dc3b4c7b8e4b61ab0f6c",
         "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
         ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7"
       }

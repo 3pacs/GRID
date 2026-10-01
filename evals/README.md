@@ -40,8 +40,8 @@ the change is a good idea.
 3. Append **one** entry to `entries` with the next `seq`:
 
    ```json
-   {"seq": 5, "kind": "suite", "suite": "e1", "version": "e1-v1.2", "path": "evals/e1",
-    "manifest_sha256": "<64 hex>", "released_in": "#768",
+   {"seq": <next seq>, "kind": "suite", "suite": "e1", "version": "<new e1 version>", "path": "evals/e1",
+    "manifest_sha256": "<64 hex>", "released_in": "#<PR>",
     "approved_by": "<owner>", "note": "why this version exists"}
    ```
 
@@ -49,7 +49,7 @@ the change is a good idea.
    header (E0, E2), `version` must equal the header. Never edit an existing
    entry, including the previous version for the same path.
 4. To change a guard file, append a `guards` entry instead:
-   `{"seq": N, "kind": "guards", "version": "guards-v2", "files": {"<path>": "<lf sha256>", ...}}`.
+   `{"seq": N, "kind": "guards", "version": "guards-vN", "files": {"<path>": "<lf sha256>", ...}}`.
    List every file that should stay pinned, not just the changed one.
    `python evals/released.py lf-sha256 <paths>` prints the hashes.
 5. Run the guard locally against a clean export of `origin/main`:

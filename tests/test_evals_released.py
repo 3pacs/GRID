@@ -474,7 +474,7 @@ def test_bootstrap_base_without_registry(trees):
 
 
 def test_e1_style_repin_appends_a_new_entry(trees):
-    """What #768 does: re-pin evals/e1 and append e1-v1.2; editing e1-v1.1 instead fails."""
+    """What an e1 release does (#768): re-pin evals/e1 and append the next e1 version; editing the released entry instead fails."""
     base, head = trees
     suite = head / "evals" / "e1"
     init = suite / "__init__.py"
