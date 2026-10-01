@@ -262,8 +262,17 @@ class SocialSentimentPuller:
         }
 
     def save_to_db(self, result: dict) -> bool:
-        """Save sentiment data to raw_series."""
+        """Append the day's sentiment scan to raw_series (one SUCCESS row per day).
+
+        Nothing is written when the scan collected nothing at all (every
+        source failed): that is not an observation of "0 tickers mentioned".
+        A day that already has a SUCCESS row is left alone -- raw_series is
+        append-only, never rewritten. True when the day's row is stored (now
+        or earlier).
+        """
         if not self.engine:
+            return False
+        if not (result.get("ticker_sentiment") or result.get("reddit") or result.get("bluesky")):
             return False
         try:
             from sqlalchemy import text
@@ -287,18 +296,26 @@ class SocialSentimentPuller:
                 src = conn.execute(text(
                     "SELECT id FROM source_catalog WHERE name = 'SocialSentiment'"
                 )).fetchone()
-                if src:
-                    conn.execute(text(
-                        "INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload) "
-                        "VALUES (:sid, :src, :d, NOW(), :v, :payload) "
-                        "ON CONFLICT DO NOTHING"
-                    ), {
-                        "sid": f"social_sentiment_{result['date']}",
-                        "src": src[0],
-                        "d": result["date"],
-                        "v": len(result.get("ticker_sentiment", {})),
-                        "payload": json.dumps(result, default=str),
-                    })
+                if not src:
+                    return False
+                series_id = f"social_sentiment_{result['date']}"
+                exists = conn.execute(text(
+                    "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
+                    "AND obs_date = :d AND pull_status = 'SUCCESS' LIMIT 1"
+                ), {"sid": series_id, "src": src[0], "d": result["date"]}).fetchone()
+                if exists:
+                    return True
+                # pull_timestamp: schema DEFAULT NOW().
+                conn.execute(text(
+                    "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                    "VALUES (:sid, :src, :d, :v, :payload, 'SUCCESS')"
+                ), {
+                    "sid": series_id,
+                    "src": src[0],
+                    "d": result["date"],
+                    "v": len(result.get("ticker_sentiment", {})),
+                    "payload": json.dumps(result, default=str),
+                })
             return True
         except Exception as exc:
             log.warning("Failed to save social sentiment: {e}", e=str(exc))

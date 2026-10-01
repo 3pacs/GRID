@@ -59,6 +59,17 @@
       "released_in": "#771 (merge 55357d8b)",
       "approved_by": "3pacs (owner; merged #771)",
       "note": "E2 forward scoreboard v1 (M2 single objective); hash was RELEASED_MANIFESTS['e2-v1'] in tests/test_e2_manifest_guard.py."
+    },
+    {
+      "seq": 5,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.2",
+      "path": "evals/e1",
+      "manifest_sha256": "16a6d066900e4c88de407cf7908e31186cedeae0300d68edf779c25b4a45bbd9",
+      "released_in": "#768",
+      "approved_by": "3pacs (owner; merges #768)",
+      "note": "E1 v1.2: E1-V3, V4, V6 fixed and their xfails removed (evals.e1.SUITE_VERSION e1-v1.2)."
     }
   ]
 }

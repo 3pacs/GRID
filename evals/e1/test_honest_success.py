@@ -119,12 +119,11 @@ def test_registry_entry_reports_success_only_when_rows_were_committed(entry, sch
 
 # ── registry completeness ──────────────────────────────────────────────
 
-# Registered entries on main that are not real pullable sources (see
-# known_violations.py): no callable pull method (bls and wiki_history are held
-# and report SKIPPED; pumpfun is not held and raises every run), or a puller
-# that never writes the source_catalog row the scheduler marks fresh
-# (coingecko writes resolved_series directly).
-_KNOWN_INCOMPLETE = {"bls": "E1-V3", "wiki_history": "E1-V3", "pumpfun": "E1-V3", "coingecko": "E1-V6"}
+# Registered entries that are not real pullable sources, as registry name ->
+# known_violations ID. Empty since e1-v1.2: bls and wiki_history gained real
+# pull_all entry points, pumpfun (dead upstream) left the registry, and
+# coingecko writes its own source_catalog row via raw_series.
+_KNOWN_INCOMPLETE: dict[str, str] = {}
 
 
 def _params():

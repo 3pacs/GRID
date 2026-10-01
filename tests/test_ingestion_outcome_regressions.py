@@ -174,12 +174,11 @@ def test_coingecko_attempted_provider_outage_is_failure(monkeypatch):
     from ingestion import coingecko
 
     puller = coingecko.CoinGeckoPuller.__new__(coingecko.CoinGeckoPuller)
-    monkeypatch.setattr(puller, "_get_fresh_tickers", lambda: set())
 
-    def unavailable(_coin):
+    def unavailable(_ids):
         raise RuntimeError("mock provider outage")
 
-    monkeypatch.setattr(puller, "_fetch_price", unavailable)
+    monkeypatch.setattr(puller, "_fetch_quotes", unavailable)
     out = puller.pull_all(tickers=["BTC"])
     assert ss._classify_outcome(out)[0] == "FAILED"
 

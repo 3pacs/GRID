@@ -723,6 +723,25 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CG:bittensor:close": "tao_chain_market_cap",
     "CG:bittensor:volume": "tao_chain_total_volume",
 
+    # CoinGecko live USD spot quotes (ingestion/coingecko.py writes
+    # CG:<coingecko id>:usd to raw_series; E1-V6). These are the *_usd_full
+    # features the puller used to write into resolved_series directly, now
+    # reached through the resolver. BTC and ETH are deliberately NOT mapped:
+    # btc_usd_full / eth_usd_full carry the yfinance daily close
+    # (YF:BTC-USD:close, YF:ETH-USD:close above), and a first-of-day spot quote
+    # from a second series would race it for the same (feature, obs_date,
+    # vintage_date) key. CG:bitcoin:usd stays in raw_series (thesis_scorer
+    # reads it directly).
+    **{f"CG:{cg_id}:usd": f"{ticker}_usd_full" for ticker, cg_id in (
+        ("sol", "solana"), ("bnb", "binancecoin"), ("xrp", "ripple"),
+        ("tao", "bittensor"), ("doge", "dogecoin"), ("ada", "cardano"),
+        ("avax", "avalanche-2"), ("link", "chainlink"), ("dot", "polkadot"),
+        ("matic", "matic-network"), ("uni", "uniswap"), ("aave", "aave"),
+        ("mkr", "maker"), ("snx", "havven"), ("crv", "curve-dao-token"),
+        ("shib", "shiba-inu"), ("ltc", "litecoin"), ("atom", "cosmos"),
+        ("near", "near"),
+    )},
+
     # DeFi (DeFiLlama + DexScreener)
     "DEFILLAMA:solana_dex_volume": "dex_sol_volume_24h",
     "DEFILLAMA:solana_tvl": "dex_sol_liquidity",
