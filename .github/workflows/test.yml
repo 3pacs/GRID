@@ -662,6 +662,32 @@ jobs:
             exit 1
           fi
 
+      # E1 integrity gates (evals/e1, GRID-EVALS-SELF-IMPROVING-ENGINE-PLAN
+      # milestone M1): look-ahead canary (append-future determinism + planted
+      # future-leak on store.observations, store.pit, the regime state vector
+      # and the VS1 panel builders), honest success over every SmartScheduler
+      # registry entry, raw_series provenance / one meaning per source, and
+      # byte-identical reruns of the VS1 ledger and the real-panel scan. The
+      # suite is hash-pinned (evals/e1/MANIFEST.sha256, checked first); known
+      # violations on main are strict, named xfails (evals/e1/known_violations.py).
+      # Not under tests/, so the general run above never collects it. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E1 integrity gates
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m evals.e1.manifest --check
+          python -m pytest evals/e1 -q -rA --durations=10 | tee /tmp/grid-e1-gates.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-e1-gates.txt; then
+            echo "::error::E1 integrity gates: a gate was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
