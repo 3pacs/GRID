@@ -30,7 +30,7 @@ from analysis.research_forward_log import canonical
 VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
-PREREG_BODY_SHA256 = "65518ccc61f13d78e784da79b4f7e58d3cd5aaa690452228d65b88b0f1bbd250"
+PREREG_BODY_SHA256 = "247f0349773febea1dacc9ed615410361d867f35acc7ce9531131762340f720f"
 #: The witnessed v7 terminal STOP head (3 records; vault main 4456453d, anchor file SHA-256 bd018b11...).
 V7_STOP_HEAD_SHA256: str | None = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
 #: The exact second line of the witnessed v7 anchor file.
