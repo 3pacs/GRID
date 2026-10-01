@@ -293,6 +293,10 @@ def read_events(
     This is the only supported read path onto `people_events`; it never
     filters on `event_time`, so a caller cannot accidentally build a
     look-ahead feature by forgetting to bound the query on `known_at`.
+
+    ``n_sources``/``source_refs`` on the returned events are CURRENT values
+    (sources that reported the act after ``as_of`` are counted). Never use
+    them as point-in-time features; use ``read_event_versions`` for history.
     """
     filters = []
     params: dict[str, Any] = {"as_of": as_of}
@@ -355,8 +359,7 @@ _HISTORY_SQL_TEMPLATE = """
     SELECT
         id, channel, dedup_key, loose_key, event_time, known_at, known_at_basis,
         actor_id, actor_id_basis, actor_type, entity_ticker, entity_cik, security_id,
-        direction, transaction_code, size_usd, source, n_sources, confidence, echo_of,
-        content_hash,
+        direction, transaction_code, size_usd, source, echo_of, content_hash, provenance,
         -- An end time after known_by is not knowable at known_by: masked to NULL,
         -- so the result itself carries no information from after known_by.
         CASE WHEN superseded_at <= :known_by THEN superseded_at END AS superseded_at,
@@ -400,7 +403,18 @@ def read_event_versions(
     a DataFrame of these rows.) With ``known_by`` >= every decision, the
     per-decision result equals ``read_events(as_of=t)`` exactly; versions
     are never merged or deduplicated here.
+
+    Deliberately NOT returned: ``n_sources``, ``n_source_rows``,
+    ``source_refs`` and ``confidence``. They are current values that grow
+    when a source reports the act later (and confidence follows them), so
+    they would carry information from after ``known_by``. Every returned
+    column is immutable after insert, except the masked end times and the
+    set-once identity enrichment (``actor_id``/``entity_cik``/``security_id``,
+    which identify the same act more precisely, never change what or when).
+    ``known_by`` must be timezone-aware.
     """
+    if known_by.tzinfo is None:
+        raise ValueError("known_by must be timezone-aware (a naive value would be read in the server's zone)")
     params: dict[str, Any] = {"known_by": known_by}
     filters = []
     for name, value in (("channel", channel), ("entity_ticker", entity_ticker),

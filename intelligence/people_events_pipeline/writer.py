@@ -110,6 +110,17 @@ def _refs_json(refs: list[str]) -> str:
     return json.dumps(out)
 
 
+def _none(value: Any) -> Any:
+    """pandas missing values (NaN, NaT, pd.NA) -> None. psycopg2 would send NaN as 'NaN'::float,
+    which a TEXT column silently stores as the string 'NaN' and a CHECK rejects."""
+    if value is None or isinstance(value, (list, tuple, dict)):
+        return value
+    try:
+        return None if pd.isna(value) else value
+    except (TypeError, ValueError):
+        return value
+
+
 def _known(value: Any) -> datetime:
     return pd.Timestamp(value).to_pydatetime()
 
@@ -134,7 +145,7 @@ def event_row(ev: dict[str, Any], *, run_id: str, known_at: Any = None, basis: s
     if known_at is not None:
         provenance["act_known_at"] = pd.Timestamp(ev["known_at"]).isoformat()
     size = ev.get("size_usd")
-    return {
+    row = {
         "channel": ev["channel"], "dedup_key": ev["dedup_key"], "loose_key": ev.get("loose_key"),
         "event_time": datetime.combine(ev["event_date"], time.min, tzinfo=timezone.utc),
         "known_at": _known(known), "known_at_basis": known_basis,
@@ -152,6 +163,7 @@ def event_row(ev: dict[str, Any], *, run_id: str, known_at: Any = None, basis: s
         "content_hash": ev["content_hash"], "materializer_version": PIPELINE_VERSION, "run_id": run_id,
         "provenance": json.dumps(provenance, default=str),
     }
+    return {k: _none(v) for k, v in row.items()}
 
 
 def _one(conn: Connection, stmt, params: dict[str, Any], what: str) -> None:
@@ -168,7 +180,7 @@ def _start_run(conn: Connection, run_id: str, mode: str, inputs: dict[str, Any])
 
 
 def _finish_run(conn: Connection, run_id: str, counts: dict[str, int], error: str | None = None) -> str:
-    written = sum(v for k, v in counts.items() if k not in ("unchanged", "actor_conflict"))
+    written = sum(v for k, v in counts.items() if k not in ("unchanged", "actor_conflict", "report_only"))
     status = "FAILED" if error else ("SUCCESS" if written > 0 else "NO_NEW_ROWS")
     conn.execute(text(
         "UPDATE people_events_runs SET finished_at = clock_timestamp(), status = :status, "
@@ -189,7 +201,7 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
         raise ValueError("observed_at must be timezone-aware and not in the future")
     by_key = {(e["channel"], e["dedup_key"]): e for e in events.to_dict("records")}
     counts = {op: 0 for op in ("insert", "add_sources", "tighten_known_at", "enrich_identity", "supersede",
-                               "retract", "actor_conflict", "unchanged")}
+                               "retract", "actor_conflict", "report_only", "unchanged")}
     # Autocommit: the lock session must not sit "idle in transaction" for the
     # whole run (idle_in_transaction_session_timeout would kill it and silently
     # drop the lock). The engine needs a pool of at least 2 connections.
@@ -221,7 +233,7 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
                     key = (p["channel"], p["dedup_key"])
                     op = p["op"]
                     params = {"channel": key[0], "dedup_key": key[1]}
-                    if op in ("unchanged", "actor_conflict"):
+                    if op in ("unchanged", "actor_conflict", "report_only"):
                         pending[op] += 1
                     elif op == "insert":
                         known = p.get("known_at")
@@ -239,7 +251,8 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
                         pending[op] += 1
                     elif op == "enrich_identity":
                         cik = p.get("entity_cik")
-                        _one(conn, _ENRICH, {**params, "actor_id": p["actor_id"], "actor_id_basis": p["actor_id_basis"],
+                        _one(conn, _ENRICH, {**params, "actor_id": _none(p["actor_id"]),
+                                             "actor_id_basis": _none(p["actor_id_basis"]),
                                              "entity_cik": None if cik is None or pd.isna(cik) else R.cik_text(int(cik))},
                              op)
                         pending[op] += 1

@@ -358,3 +358,29 @@ def test_read_event_versions_serves_every_decision_time_like_read_events(v2):
     # Known by a date before the supersession: the later end is masked, not leaked.
     early = pd.DataFrame(read_event_versions(v2, datetime(2026, 9, 3, tzinfo=UTC), channel="thirteen_f"))
     assert len(early) == 1 and pd.isna(early.iloc[0]["superseded_at"])
+
+
+def test_writer_stores_null_not_nan_for_unmapped_codes_and_missing_tickers(v2):
+    from intelligence.people_events_pipeline.writer import apply_write_plan
+
+    t0 = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    rows = [_sec(transaction_code="M", acquired_disposed_code="A"),
+            _sec(accession_number="acc-2", nonderiv_trans_sk="2", issuer_ticker="NONE", transaction_code="S",
+                 shares=10.0)]
+    ev, plan = _plan(v2, t0, form345=rows)
+    out = apply_write_plan(v2, ev, plan, run_id="nan1", mode="backfill", observed_at=t0)
+    assert out["status"] == "SUCCESS" and out["counts"]["insert"] == 2
+    with v2.connect() as conn:
+        got = conn.execute(text("SELECT transaction_code, direction, entity_ticker FROM people_events "
+                                "ORDER BY transaction_code")).fetchall()
+    assert [tuple(r) for r in got] == [("M", None, "AAPL"), ("S", "sell", None)]
+
+
+def test_read_event_versions_omits_current_only_counts_and_rejects_naive_time(v2):
+    from store.people_events import read_event_versions
+
+    _insert(v2)
+    rows = read_event_versions(v2, datetime(2026, 9, 30, tzinfo=UTC))
+    assert rows and not ({"n_sources", "n_source_rows", "source_refs", "confidence"} & set(rows[0]))
+    with pytest.raises(ValueError):
+        read_event_versions(v2, datetime(2026, 9, 30))
