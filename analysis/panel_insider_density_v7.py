@@ -49,7 +49,9 @@ REGISTERED_ANCHOR_LINE: bytes | None = (
     b'{"head_sha256":"4b42f649ce2a69191de5b73d14aebdd7bbe470b8ae65cb98a099201484c40e53",'
     b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-09-30T01:43:00+00:00"}'
 )
-SUPERSEDED_BY: Mapping[str, Any] | None = None
+# Set by the terminal STOP change (v7 superseded unopened before Stage-0, see below): v7 can
+# never open a discovery or holdout; the witnessed STOP record names the successor.
+SUPERSEDED_BY: Mapping[str, Any] | None = {"version": "vs1-v8"}
 
 FROZEN_REGISTRIES = (
     "vs1-v1", "vs1-v2", "vs1-v3", "vs1-v4", "vs1-v5",
@@ -238,10 +240,29 @@ class V7Harness(v2.Harness):
                     for r in records]
         return contamination([*censuses, key.census])
 
+    def _refuse_if_stopped(self, log_dir: Path) -> None:
+        # Checked before the base method re-takes the lock. The pinned SUPERSEDED_BY refuses every
+        # opening and (below) every freeze, so even a stale two-record copy cannot freeze.
+        log = self.registry(log_dir)
+        with log.locked():
+            records = self._chain(log)
+        if v1._kind(records, "status"):
+            raise PermissionError("v7 carries a terminal STOP status record: no freeze or opening")
+
     def freeze_inputs(self, log_dir: Path, now: datetime, inputs: Mapping[str, Any]) -> dict:
         if inputs.get("accept_underpowered") is not False:
             raise PermissionError("v7 must STOP below the raw 0.50 post-admission power gate")
+        v1.refuse_superseded(7, self.superseded_by)
+        self._refuse_if_stopped(log_dir)
         return super().freeze_inputs(log_dir, now, inputs)
+
+    def open_discovery(self, log_dir: Path, now: datetime, observed: Mapping[str, Any], witness) -> dict:
+        self._refuse_if_stopped(log_dir)
+        return super().open_discovery(log_dir, now, observed, witness)
+
+    def open_holdout(self, frozen: dict, *, log_dir: Path, **kwargs) -> dict:
+        self._refuse_if_stopped(log_dir)
+        return super().open_holdout(frozen, log_dir=log_dir, **kwargs)
 
 
 V6_EARLIER = v2.EarlierVersion(
@@ -283,6 +304,131 @@ seal_discovery = V7.seal_discovery
 open_holdout = V7.open_holdout
 resume_holdout = V7.resume_holdout
 seal_holdout = V7.seal_holdout
+
+
+# --- terminal STOP: superseded unopened before its Stage-0 (mirrors v6's witnessed STOP) --------
+#
+# The owner's standing authorization (2026-09-30) is to finish VS1 at a solid design without
+# opening outcomes. The E0 machinery-calibration benchmark (synthetic outcomes on the v7
+# feature geometry) gives 0.496 under its Gaussian model (statistically consistent with v7's
+# registered 0.535, z -0.93, but on the failing side) and 0.446 / 0.414 under its realistic
+# factor + GARCH + t-tail (+ style tilt) models, below the 0.50 gate. v7 is therefore stopped,
+# by a discretionary decision before its post-admission Stage-0 (this is not the body section 4
+# step-3 gate), and superseded by a better-powered v8. No v7 Stage-0, freeze, discovery or
+# holdout record exists; the STOP is bound to the exact E0 scorecard bytes and the v7 cross-check
+# powers pinned below. (The scorecard also carries E0's pre-2011 non-Technology real-price
+# replication block; the STOP reads only its synthetic ``v7_crosscheck``.)
+
+STOP_STATUS = "STOP_SUPERSEDED_BY_V8_UNOPENED"
+STOP_SUCCESSOR = "vs1-v8"
+STOP_RECORDS = 3
+#: SHA-256 of the E0 v1 full-profile scorecard (PR #763 head c724ce53, manifest 75489d50...).
+E0_SCORECARD_SHA256 = "4b47f918433524d4ab36b93e6472ee557e6617bbfe7567e5c182d4834a7cd62a"
+E0_MANIFEST_SHA256 = "75489d5091d82af64312f4523c41bdb52b0951a11e017644a022baa08a172822"
+E0_CODE_REF = "3pacs/GRID PR #763 evals/e0 at c724ce536a0580117e8281286c7a7b3bfd80216e"
+#: The scorecard's v7 cross-check powers (raw threshold 0.0125, IC 0.01, 500 synthetic worlds each).
+E0_V7_POWERS: Mapping[str, float] = {"gaussian_idio": 0.496, "factor_t_garch": 0.446,
+                                     "factor_t_garch_exposed": 0.414}
+STOP_REASON = ("E0 synthetic-outcome power for the registered v7 design (A90|fwd5, IC 0.01, "
+               "threshold 0.0125) is below the 0.50 gate under the realistic outcome models; "
+               "discretionary supersession before Stage-0, no VS1 outcome read")
+STOP_BASIS = ("discretionary pre-Stage-0 supersession on synthetic E0 evidence under the owner's standing "
+              "authorization; the body section 4 step-3 Stage-0 gate was never evaluated")
+_STOP_REQUIRED: Mapping[str, Any] = {
+    "kind": "status", "version": VERSION, "status": STOP_STATUS,
+    "stage0_run": False, "prereg_gate_evaluated": False, "basis": STOP_BASIS,
+    "inputs_frozen": False, "discovery_opened": False, "holdout_opened": False,
+    "superseded_by": STOP_SUCCESSOR, "prereg_sha256": PREREG_BODY_SHA256,
+    "reason": STOP_REASON, "e0_scorecard_sha256": E0_SCORECARD_SHA256,
+    "e0_manifest_sha256": E0_MANIFEST_SHA256, "e0_code_ref": E0_CODE_REF,
+    "power_gate": {"target_ic": v1.POWER_GATE_IC, "threshold": v1.POWER_GATE},
+    "promotion_allowed": False,
+}
+_STOP_FIELDS = frozenset(_STOP_REQUIRED) | {"run_at", "e0_v7_power_ic_0_01", "decision_ref", "prev_sha256"}
+_E0_SCENARIOS = ("gaussian_idio", "factor_t_garch", "factor_t_garch_exposed")
+
+
+def e0_v7_power(scorecard_bytes: bytes) -> dict[str, float]:
+    """The pinned E0 scorecard's v7 cross-check powers (synthetic outcomes only)."""
+    if hashlib.sha256(scorecard_bytes).hexdigest() != E0_SCORECARD_SHA256:
+        raise PermissionError("E0 scorecard differs from the pinned evidence")
+    card = json.loads(scorecard_bytes)
+    cross = card.get("v7_crosscheck") or {}
+    if card.get("version") != "e0-v1" or cross.get("synthetic_outcomes_only") is not True \
+            or cross.get("target_ic") != v1.POWER_GATE_IC or cross.get("gate") != v1.POWER_GATE:
+        raise PermissionError("E0 scorecard is not the v1 synthetic v7 cross-check")
+    rows = cross.get("by_scenario") or {}
+    return {name: float(rows[name]["e0_power_raw_threshold"]) for name in _E0_SCENARIOS}
+
+
+def _check_stop_record(record: Mapping[str, Any]) -> None:
+    if any(record.get(key) != value for key, value in _STOP_REQUIRED.items()):
+        raise PermissionError("v7 terminal record is not the exact STOP status")
+    if set(record) != _STOP_FIELDS:
+        raise PermissionError("v7 terminal STOP record has missing or extra fields")
+    powers = record.get("e0_v7_power_ic_0_01")
+    if not isinstance(powers, Mapping) or set(powers) != set(_E0_SCENARIOS) \
+            or not all(isinstance(p, float) and 0.0 <= p <= 1.0 for p in powers.values()) \
+            or dict(powers) != dict(E0_V7_POWERS) or not powers["factor_t_garch_exposed"] < v1.POWER_GATE:
+        raise PermissionError("v7 STOP needs the E0 realistic-model power below the gate")
+    if not str(record.get("decision_ref") or "").strip():
+        raise PermissionError("v7 STOP needs a decision reference")
+
+
+def append_stop_status(log_dir: Path, now: datetime, *, e0_scorecard: Path, decision_ref: str,
+                       expected_prev_sha256: str, witness, dry_run: bool = False) -> dict:
+    """Append v7's one STOP record after checking the exact two-record witnessed chain.
+
+    Refuses unless the local and off-host chains are exactly the two registration
+    records (so no freeze or opening was ever recorded; a probe or Stage-0 writes no
+    registry record, so their absence rests on the operator log) and the E0
+    scorecard hashes to the pinned evidence with the pinned cross-check powers. ``dry_run=True`` returns the
+    exact would-be record and head. Execute once after a backup and a dry run with
+    the same ``now``; a second execution refuses. Publishing the anchor is a
+    separate step, followed by :func:`verify_terminal_stop`.
+    """
+    from datetime import timedelta
+
+    if now.tzinfo is None or now.utcoffset() != timedelta(0) or not str(decision_ref).strip() \
+            or expected_prev_sha256 != REGISTERED_RECORD_SHA256[1]:
+        raise ValueError("STOP needs a UTC time, a decision reference and the exact v7 registration head")
+    powers = e0_v7_power(Path(e0_scorecard).read_bytes())
+    if powers != dict(E0_V7_POWERS):
+        raise PermissionError("E0 scorecard cross-check differs from the pinned powers")
+    V7.require_witness(log_dir, witness, 2)
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != 2:
+        raise PermissionError("v7's canonical witness is not at the two-record baseline")
+    log = V7.registry(log_dir)
+    with log.locked():
+        records = V7._chain(log)
+        if len(records) != 2:
+            raise PermissionError("v7 registry differs from its two-record baseline; reconcile before STOP")
+        if v1._record_sha256(records[-1]) != expected_prev_sha256:
+            raise PermissionError("v7 prior head differs from the expected head")
+        candidate = {
+            **_STOP_REQUIRED, "power_gate": dict(_STOP_REQUIRED["power_gate"]),
+            "run_at": now.isoformat(), "e0_v7_power_ic_0_01": powers,
+            "decision_ref": str(decision_ref).strip(), "prev_sha256": v1._record_sha256(records[-1]),
+        }
+        _check_stop_record(candidate)
+        if dry_run:
+            return {"dry_run": True, "would_append": candidate,
+                    "would_be_head_sha256": v1._record_sha256(candidate)}
+        return log.append_locked([candidate])[0]
+
+
+def verify_terminal_stop(log_dir: Path, witness) -> dict:
+    """Return the only acceptable v7 terminal head after exact off-host witnessing."""
+    log = V7.registry(log_dir)
+    proof = V7.require_witness(log_dir, witness, STOP_RECORDS)
+    records = V7._chain(log)
+    if len(records) != STOP_RECORDS or proof["witnessed_records"] != STOP_RECORDS:
+        raise PermissionError("v7 STOP witness must end at exactly three records")
+    _check_stop_record(records[-1])
+    if (witness.census.get("records") or {}).get(REGISTRY_ID) != STOP_RECORDS:
+        raise PermissionError("v7 census does not cover exactly the STOP record")
+    return {"records": STOP_RECORDS, "head_sha256": v1._record_sha256(records[-1]),
+            "witness_path": WITNESS_PATH, "witness_tip": witness.tip}
 
 
 def run_spec(run_id: str | None = None):
