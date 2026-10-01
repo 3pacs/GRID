@@ -350,6 +350,7 @@ def _stats(features: dict, y, momentum_names, perms=999, seed=7, run_id=RUN):
         entry = {"run_id": run_id, "statistic": r, "p": p}
         if mom is not None and name not in momentum_names:
             entry["incremental_p"] = spr.incremental_pvalue(x, mom, y, block=1, perms=perms, seed=seed)[1]
+            entry["incremental_on"] = sorted(momentum_names)
         out[name] = entry
     return out
 
@@ -435,6 +436,9 @@ def test_flywheel_refused_when_momentum_not_tested_or_untestable_or_other_run():
     stats = _stats({MOMENTUM: m, FLY: g}, y, [MOMENTUM])
     del stats[FLY]["incremental_p"]
     assert "incremental_p" in spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY]
+    # an incremental p residualized on a different momentum set is refused
+    stats = _stats({MOMENTUM: m, FLY: g, "MOM:XLE|chg5": m + rng.standard_normal(n)}, y, [MOMENTUM])
+    assert "not residualized on this run's momentum family" in spr.momentum_gate(FAMILY, stats, run_id=RUN)[FLY]
 
 
 def test_flywheel_with_incremental_signal_is_admitted():
@@ -514,8 +518,25 @@ def test_refused_inputs_in_any_case(feature):
         ("TIINGO|k5", "flywheel"),  # classifiable namespace
         ("FW_A|W30", "people_density_insider"),  # people class on a non-people construct
         ("A_congress|W90", "people_density_congress_2"),
+        ("XLE|chg20", "flywheel"),  # bare tickers: own price as a "construct"
+        ("SPY|chg5", "flywheel"),
+        ("XOM|chg20", "flywheel"),
+        ("AAPL|z60", "flywheel"),  # any ticker-shaped name, mapped or not
+        ("FW-A|W30", "flywheel"),  # construct names need an underscore
     ],
 )
 def test_class_overrides_cannot_smuggle_or_split(feature, cls):
     with pytest.raises(ValueError, match="refused"):
         spr.rel_catalog(["REL:XLE-SPY|return|fwd5"], [feature], members=MEMBERS, classes={feature: cls})
+
+
+def test_people_grammar_is_strict():
+    assert spr.people_channel("A_insider_px_flywheel|W30") is None
+    assert spr.contains_price("A_insider_px_flywheel|W30")
+    with pytest.raises(spr.Unclassified):
+        spr.vote_class("A_insider_px_flywheel|W30")
+    assert spr.people_channel("D_mean_insider|W30") is None
+    for f, ch in [("A_insider_buy@edgar|W30", "insider"), ("S_insider_sell|W30", "insider"),
+                  ("D_self_form4|W90", "insider"), ("A_thirteen_f|W90", "inst"),
+                  ("C_form4_congress|W90", "multi")]:
+        assert spr.people_channel(f) == ch, f

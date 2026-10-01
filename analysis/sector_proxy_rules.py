@@ -166,6 +166,9 @@ CHANNEL_TOKENS: dict[str, tuple[str, ...]] = {
 }
 MULTI_TOKEN = "multi"
 MEASURES: tuple[str, ...] = ("A", "C", "S", "D")
+#: Strict GD5 spec grammar: {A,C,S}_{channel...}[_buy|_sell], D_{self,peer}_{channel...};
+#: any other token makes the name a construct (contains_price, needs a class).
+SPEC_QUALIFIERS: tuple[str, ...] = ("buy", "sell", "f")
 #: Source variants of one channel; a construct may name one after ``@``.
 SOURCE_VARIANTS: tuple[str, ...] = ("quiverquant", "quiver", "qq", "edgar", "sec")
 
@@ -257,8 +260,10 @@ MOMENTUM_GATE_RULE = (
     "(c) it beats every momentum trial: p <= the smallest momentum p AND |statistic| > "
     "the largest finite |momentum statistic|, and (d) its incremental p (the block-"
     "permutation p of its correlation with the label after both are residualized on the "
-    "momentum family, incremental_pvalue) is below MOMENTUM_GATE_ALPHA = 0.05; "
-    "otherwise it is refused"
+    "momentum family, incremental_pvalue, recorded with incremental_on = the sorted "
+    "momentum feature list, which must equal this run's momentum family) is below "
+    "MOMENTUM_GATE_ALPHA = 0.05; otherwise it is refused. The gate only filters: an "
+    "admitted feature still has to survive the run's Holm/BH over all declared trials"
 )
 
 # --- parsing -------------------------------------------------------------------------
@@ -609,6 +614,12 @@ def momentum_gate(
         if not (_finite(s.get("p")) and _finite(s.get("statistic")) and _finite(s.get("incremental_p"))):
             out[feature] = "refused: contains_price trial lacks a finite p, statistic or incremental_p"
             continue
+        if sorted(s.get("incremental_on") or []) != sorted(momentum):
+            out[feature] = (
+                "refused: incremental_p was not residualized on this run's momentum family "
+                f"{sorted(momentum)}"
+            )
+            continue
         best_p = min(float(stats[m]["p"]) for m in finite)
         best_stat = max(abs(float(stats[m]["statistic"])) for m in finite)
         beats = float(s["p"]) <= best_p and abs(float(s["statistic"])) > best_stat
@@ -682,6 +693,12 @@ def people_channel(feature: str) -> str | None:
         return None
     if source is not None and source.lower() not in SOURCE_VARIANTS:
         raise ValueError(f"{feature!r}: refused: unknown source variant {source!r}")
+    rest = tokens[2:] if tokens[0] == "d" else tokens[1:]
+    if tokens[0] == "d" and tokens[1:2] not in (["self"], ["peer"]):
+        return None
+    allowed = {w for words in CHANNEL_TOKENS.values() for w in words} | {MULTI_TOKEN, *SPEC_QUALIFIERS}
+    if any(t not in allowed for t in rest):
+        return None  # strict GD5 grammar: anything else is a construct, not a people channel
     if tokens[0] == "c" or MULTI_TOKEN in tokens:
         return MULTI_TOKEN
     hits = {
@@ -753,7 +770,14 @@ def rel_catalog(
                 raise
             series = series_of(f)
             cls = classes[f]
-            if ":" in series or series.upper() in KNOWN_NAMESPACES:
+            if (
+                ":" in series
+                or "_" not in series  # construct names carry an underscore (FW_A); tickers do not
+                or series.upper() in KNOWN_NAMESPACES
+                or series.upper() in ETF_SECTOR
+                or series.upper() == MARKET
+                or series.upper() in {k.upper() for k in (members or {})}
+            ):
                 raise ValueError(
                     f"{f!r}: refused: a class override names a construct, not a table or a ticker"
                 ) from None
