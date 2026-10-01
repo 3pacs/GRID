@@ -212,6 +212,13 @@ _INSERT_SQL = text("""
 def upsert_event(engine: Engine, event: PeopleEvent) -> int:
     """Insert a `PeopleEvent`, or merge it into the existing row for its dedup key.
 
+    Legacy single-row path (only the superseded GD2 materializer calls it).
+    Since people_events_v2_20261001 the version-floor trigger fires BEFORE
+    INSERT, i.e. before ON CONFLICT resolves: re-upserting an act that has a
+    superseded or retracted earlier version with a known_at before that
+    version ended raises. Use intelligence.people_events_pipeline (plan +
+    writer), which clamps to the floor.
+
     A second source describing the same act (same `channel` + `dedup_key`)
     merges into `source_refs`/`n_sources` rather than creating a duplicate
     row or overwriting the first source's `known_at` -- see the ON CONFLICT

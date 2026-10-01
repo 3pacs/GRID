@@ -22,8 +22,10 @@ logged into ``people_event_revisions`` by trigger, and the table's guard and
 version-floor triggers refuse anything else (deletes, content edits, a later
 known_at, a version visible before its predecessor ended). Work is committed
 in chunks so a crash leaves a prefix; a re-run recomputes the plan against
-what was stored and continues (idempotent). A transaction-level advisory lock
-keeps two runs from interleaving. Each run is recorded in
+what was stored and continues (idempotent). A session-level advisory lock,
+held on a dedicated connection for the whole run, keeps two runs from
+interleaving (the unique index and the one-row UPDATE checks would make a
+second run fail safe anyway). Each run is recorded in
 ``people_events_runs``; counts are rows actually written, and a run that
 wrote nothing is ``NO_NEW_ROWS``, never ``SUCCESS``.
 """
@@ -188,6 +190,20 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
     by_key = {(e["channel"], e["dedup_key"]): e for e in events.to_dict("records")}
     counts = {op: 0 for op in ("insert", "add_sources", "tighten_known_at", "enrich_identity", "supersede",
                                "retract", "actor_conflict", "unchanged")}
+    lock_conn = engine.connect()
+    if not lock_conn.execute(text("SELECT pg_try_advisory_lock(:k)"), {"k": ADVISORY_LOCK_KEY}).scalar():
+        lock_conn.close()
+        raise RuntimeError("another people_events writer holds the lock")
+    try:
+        return _apply_locked(engine, by_key, counts, plan, run_id=run_id, mode=mode, observed_at=observed_at,
+                             inputs=inputs)
+    finally:
+        lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
+        lock_conn.close()
+
+
+def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd.DataFrame, *, run_id: str,
+                  mode: str, observed_at: datetime, inputs: dict[str, Any] | None) -> dict[str, Any]:
     with engine.begin() as conn:
         _start_run(conn, run_id, mode, inputs or {})
     ops = plan.to_dict("records")
@@ -197,8 +213,6 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
             chunk = ops[start:start + CHUNK_ROWS]
             pending = dict(counts)
             with engine.begin() as conn:
-                if not conn.execute(text("SELECT pg_try_advisory_xact_lock(:k)"), {"k": ADVISORY_LOCK_KEY}).scalar():
-                    raise RuntimeError("another people_events writer holds the lock")
                 inserts = []
                 for p in chunk:
                     key = (p["channel"], p["dedup_key"])
