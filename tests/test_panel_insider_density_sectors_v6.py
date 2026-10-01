@@ -126,6 +126,10 @@ def test_registration_binds_v8_and_only_while_v8_is_at_two_records(monkeypatch, 
                                  "run_at": NOW.isoformat()}])
     with pytest.raises(PermissionError, match="differs from its witness"):
         s6.verify_v8_registration(v8_reg, witness.repo, witness.tip)
+    with pytest.raises(PermissionError):
+        s6.register(tmp_path / "s6reg2", NOW, "c" * 40, v8_log_dir=v8_reg, witness=witness)
+    with pytest.raises(PermissionError):
+        s6.register(tmp_path / "s6reg3", NOW, "c" * 40, v8_log_dir=tmp_path / "empty-v8", witness=witness)
 
 
 def test_registration_refuses_wrong_v8_head_or_changed_body(monkeypatch, tmp_path):

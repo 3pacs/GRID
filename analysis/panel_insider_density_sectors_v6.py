@@ -153,10 +153,12 @@ def register(log_dir: Path, now: datetime, code_sha: str, *, v8_log_dir: Path, w
     """
     if not isinstance(witness, v2.OffhostWitness) or witness.path != v8.WITNESS_PATH:
         raise PermissionError("sectors-v6 registration needs a fresh v8 off-host witness (v8.check_offhost)")
-    registered_at = datetime.fromisoformat(v8.registry(v8_log_dir).read_all()[-1]["run_at"])
+    check_registration_census(witness.census, v8_log_dir=v8_log_dir, witness_repo=witness.repo)
+    log8 = v8.registry(v8_log_dir)
+    with log8.locked():
+        registered_at = datetime.fromisoformat(log8.read_all()[1]["run_at"])  # verified two-record chain
     if now.tzinfo is None or now < registered_at:
         raise ValueError("sectors-v6 registration time must follow v8's registration")
-    check_registration_census(witness.census, v8_log_dir=v8_log_dir, witness_repo=witness.repo)
     records = registration_records(now, code_sha)
     heads = v1.chained_sha256(records)
     if REGISTERED_RECORD_SHA256 is not None and tuple(heads) != REGISTERED_RECORD_SHA256:
