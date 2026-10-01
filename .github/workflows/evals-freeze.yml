@@ -1,0 +1,47 @@
+name: Evals Freeze Guard
+
+# Enforces evals/RELEASED.json (append-only released-suite registry) and the
+# pinned evals/ trees against the BASE revision. See evals/README.md.
+#
+# pull_request_target runs THIS file as it exists on the base branch, so a PR
+# cannot edit or delete the guard it is checked by. That is safe only because
+# the head checkout is read as data: the guard script comes from the base
+# checkout, nothing from the head is installed, imported or executed, no
+# secrets are used and the token is read-only and not persisted.
+
+on:
+  pull_request_target:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  evals-freeze-guard:
+    name: evals-freeze-guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Trusted checkout (base revision)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.event.before }}
+          path: base
+          persist-credentials: false
+
+      - name: Data checkout (head revision, read only)
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          path: head
+          persist-credentials: false
+
+      - name: Run the base revision's guard against the head tree
+        run: |
+          if [ ! -f base/evals/released.py ]; then
+            echo "bootstrap: no base guard"
+            exit 0
+          fi
+          python3 -I base/evals/released.py check --base-dir base --head-dir head
