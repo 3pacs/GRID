@@ -40,10 +40,13 @@ Records
                        references, no free payload.
 ``stage_entered``      ``stage`` in :data:`STAGES`, strictly in order, once.
                        ``screen`` records the label window and the S11 head it
-                       was checked against; ``holdout`` the S11 allocation.
+                       was checked against; ``holdout`` S11's *open* allocation
+                       (which must declare the candidate's identities and may
+                       pay for each identity's look only once) and its alpha.
 ``stage_result``       ``result`` in :data:`RESULTS`, ``p_values``,
-                       ``alpha_spent``, ``s11_allocation_sha256`` (holdout) and
-                       the ``receipt_sha256`` of the stage artifact.
+                       ``alpha_spent`` (0 except holdout, which spends exactly
+                       its allocation's alpha), ``s11_allocation_sha256``
+                       (holdout) and the ``receipt_sha256`` of the stage artifact.
 ``abandoned``          any time before a terminal record; counts as a failure.
                        After an S11 allocation it stores the sha of the S11
                        record that closed that allocation (``abandoned``, or
@@ -68,9 +71,15 @@ Who may write what
 ``withdraw`` for that proposer's own candidates (abandon only before any S11
 allocation). Appends carry a module-private capability (the VS1
 ``_WITNESS_TOKEN`` pattern) and the proposer capability is refused every
-judge record kind. In-process Python is not a security boundary: the binding
-boundary is the OS-level separation in EVAL-E4A (proposers run as a separate
-user without write access to the ledger and anchor directories).
+judge record kind. In-process Python is not a security boundary. In v1 the
+client writes the files itself, so it only runs where the ledger is writable;
+EVAL-E4A must put proposers behind an OS boundary (a separate user without
+write access to the ledger and anchor directories) and route their records
+through a judge-owned writer (spool or IPC) that exposes this same client API.
+The judge accepts only the S11 file ledger with its anchor, never one in memory.
+
+Every append and read re-verifies and replays the whole file under the lock:
+O(n) per call, fine at hill-climb volumes; E3B/E4 may cache a verified head.
 """
 
 from __future__ import annotations
@@ -132,7 +141,7 @@ FIELDS: dict[str, frozenset] = {
     },
     "stage_entered": _BASE | {
         "candidate_id", "stage", "window", "s11_ledger_id", "s11_head_sha256",
-        "s11_allocation_sha256",
+        "s11_allocation_sha256", "s11_alpha",
     },
     "stage_result": _BASE | {
         "candidate_id", "stage", "result", "p_values", "alpha_spent",
@@ -228,6 +237,7 @@ class Candidate:
     entered_seq: dict[str, int] = field(default_factory=dict)
     results: dict[str, dict] = field(default_factory=dict)
     allocation: str | None = None
+    alpha: float | None = None
     terminal: str | None = None
     promoted: bool = False
     suspended: bool = False
@@ -256,6 +266,8 @@ class Candidate:
 class State:
     genesis: dict
     candidates: dict[str, Candidate]
+    #: S11 allocation sha -> identities whose holdout look it already paid for
+    allocation_identities: dict[str, set] = field(default_factory=dict)
 
 
 def _fail(seq: int | None, message: str) -> ValueError:
@@ -348,10 +360,18 @@ def _apply(state: State | None, record: dict) -> State:
 
     if kind == "stage_entered":
         _check_stage_entered(candidate, record, seq)
+        if record["stage"] == "holdout":
+            allocation = record["s11_allocation_sha256"]
+            paid = state.allocation_identities.setdefault(allocation, set())
+            identities = set(candidate.proposed["identity_sha256"])
+            if paid & identities:
+                raise _fail(seq, "this S11 allocation already paid for a holdout look at one of "
+                                 "these identities: a re-test needs a new allocation")
+            paid |= identities
+            candidate.allocation = allocation
+            candidate.alpha = record["s11_alpha"]
         candidate.entered.append(record["stage"])
         candidate.entered_seq[record["stage"]] = seq
-        if record["stage"] == "holdout":
-            candidate.allocation = record["s11_allocation_sha256"]
     elif kind == "stage_result":
         _check_stage_result(candidate, record, seq)
         candidate.results[record["stage"]] = record
@@ -489,11 +509,18 @@ def _check_stage_entered(candidate: Candidate, record: dict, seq: int) -> None:
             raise _fail(seq, "screen records the S11 ledger it was checked against")
     elif window is not None:
         raise _fail(seq, "only screen declares a window")
+    s11_alpha = record["s11_alpha"]
     if stage == "holdout":
         if not _name(s11_id) or not _hex(s11_head) or not _hex(allocation):
             raise _fail(seq, "holdout spends alpha through an S11 allocation")
-    elif allocation is not None:
-        raise _fail(seq, "only holdout names an S11 allocation")
+        if (
+            isinstance(s11_alpha, bool)
+            or not isinstance(s11_alpha, (int, float))
+            or not 0 < s11_alpha <= 1
+        ):
+            raise _fail(seq, "holdout records the S11 allocation's alpha in (0, 1]")
+    elif allocation is not None or s11_alpha is not None:
+        raise _fail(seq, "only holdout names an S11 allocation and its alpha")
     if stage not in ("screen", "holdout") and (s11_id is not None or s11_head is not None):
         raise _fail(seq, f"stage {stage} does not consult S11")
 
@@ -507,13 +534,12 @@ def _check_stage_result(candidate: Candidate, record: dict, seq: int) -> None:
     if not _hex(record["receipt_sha256"]):
         raise _fail(seq, "receipt_sha256 must be a sha256")
     alpha = record["alpha_spent"]
-    if (
-        isinstance(alpha, bool)
-        or not isinstance(alpha, (int, float))
-        or not math.isfinite(alpha)
-        or not 0 <= alpha <= 1
-    ):
-        raise _fail(seq, "alpha_spent must be in [0, 1]")
+    if isinstance(alpha, bool) or not isinstance(alpha, (int, float)) or not math.isfinite(alpha):
+        raise _fail(seq, "alpha_spent must be a number")
+    expected_alpha = candidate.alpha if stage == "holdout" else 0
+    if alpha != expected_alpha:
+        raise _fail(seq, f"alpha_spent must be {expected_alpha}: only the holdout spends alpha, "
+                         "and it spends exactly its S11 allocation's alpha")
     p_values = record["p_values"]
     if p_values is not None:
         if not isinstance(p_values, list) or len(p_values) != candidate.proposed["declared_trials"]:
@@ -610,6 +636,8 @@ def _write(
 def _check_s11(s11: Ledger, genesis: dict) -> None:
     if not isinstance(s11, Ledger):
         raise TypeError("pass the S11 ledger (analysis.ledger_steered_exploration.Ledger)")
+    if s11.path is None:
+        raise ValueError("the bound S11 ledger must be the file ledger with its anchor, not in memory")
     s11.verify()
     if s11.genesis["ledger_id"] != genesis["s11_ledger_id"]:
         raise ValueError(
@@ -623,13 +651,6 @@ def _candidate(state: State, candidate_id: str) -> Candidate:
     if candidate is None:
         raise ValueError(f"candidate {str(candidate_id)[:12]} was never proposed")
     return candidate
-
-
-def _s11_allocation(s11: Ledger, allocation_sha: str) -> dict:
-    for allocation in s11.allocations():
-        if s11.line_sha(allocation["seq"]) == allocation_sha:
-            return allocation
-    raise ValueError("s11_allocation_sha256 is not an allocation in the bound S11 ledger")
 
 
 class CandidateLedger:
@@ -741,8 +762,10 @@ class CandidateLedger:
             "failed": failed,
             "failures": abandoned + failed,
             "holdout_looks": sum("holdout" in c.entered for c in members),
+            # once per distinct S11 allocation the family's holdout looks spent,
+            # recorded at holdout entry (so abandoned looks still count)
             "alpha_spent": float(
-                sum(r["alpha_spent"] for c in members for r in c.results.values())
+                sum({c.allocation: c.alpha for c in members if c.allocation}.values())
             ),
             "forward_admitted": sum("forward" in c.entered for c in members),
             "promoted": sum(c.promoted for c in members),
@@ -784,11 +807,18 @@ class CandidateLedger:
                                 f"identity {sha[:12]} already touched an overlapping window "
                                 f"in S11 ({used['source']}): refused at screen"
                             )
+            s11_alpha = None
             if stage == "holdout":
-                allocation = _s11_allocation(s11, s11_allocation_sha256)
+                open_allocation = s11.open_allocation()
+                if open_allocation is None or open_allocation[1] != s11_allocation_sha256:
+                    raise ValueError(
+                        "holdout must name S11's open allocation (not a closed or unknown one)"
+                    )
+                allocation = open_allocation[0]
                 covered = {t["identity_sha256"] for t in allocation["trials"]}
                 if not set(candidate.proposed["identity_sha256"]) <= covered:
                     raise ValueError("the S11 allocation does not declare this candidate's trials")
+                s11_alpha = allocation["alpha"]
             return {
                 "kind": "stage_entered",
                 "actor": JUDGE,
@@ -798,6 +828,7 @@ class CandidateLedger:
                 "s11_ledger_id": s11_id,
                 "s11_head_sha256": s11_head,
                 "s11_allocation_sha256": s11_allocation_sha256,
+                "s11_alpha": s11_alpha,
             }
 
         return _write(self.paths, _JUDGE_CAP, build, recorded_at)
@@ -809,7 +840,7 @@ class CandidateLedger:
         result: str,
         *,
         receipt_sha256: str,
-        alpha_spent: float = 0.0,
+        alpha_spent: float | None = None,
         p_values: list | None = None,
         recorded_at: str | None = None,
     ) -> dict:
@@ -822,7 +853,11 @@ class CandidateLedger:
                 "stage": stage,
                 "result": result,
                 "p_values": None if p_values is None else list(p_values),
-                "alpha_spent": alpha_spent,
+                "alpha_spent": (
+                    alpha_spent
+                    if alpha_spent is not None
+                    else candidate.alpha if stage == "holdout" else 0.0
+                ),
                 "s11_allocation_sha256": candidate.allocation if stage == "holdout" else None,
                 "receipt_sha256": receipt_sha256,
             }

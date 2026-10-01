@@ -47,8 +47,8 @@ A crash between the ledger write and the anchor write leaves one unanchored line
 |---|---|---|
 | `genesis` | owner/judge | `ledger_id`, `e3_version`, `created_at`, and `s11_ledger_id`, the S11 ledger whose alpha the holdout spends |
 | `proposed` | proposer | `candidate_id` (the sha256 of the canonical proposal core), `family`, `candidate_kind` (feature, parameter, machinery-change or generator-change), `identity` (S11 `scientific_identity` per declared trial) and `identity_sha256`, `declared_trials`, `proposer`, `engine_version`, `spec_sha256`, `expected_sign` (-1, 0 or 1), `rationale_sha256`, `retest_of`, `proposed_at`. The spec and the rationale are stored as **hashes only**, so no data references and no free payload enter the ledger. |
-| `stage_entered` | judge | Stages run in order: `screen` → `gates` → `holdout` → `forward` → `promotion`. Each is entered once, and only after the previous stage passed. `screen` records its label window and the S11 head it was checked against. `holdout` records the S11 allocation, which must declare the candidate's identities. |
-| `stage_result` | judge | `result` is `pass`, `fail`, `untestable` or `inconclusive`. Also `p_values` (one per declared trial, or null), `alpha_spent`, `s11_allocation_sha256` (holdout only) and `receipt_sha256` of the stage artifact. |
+| `stage_entered` | judge | Stages run in order: `screen` → `gates` → `holdout` → `forward` → `promotion`. Each is entered once, and only after the previous stage passed. `screen` records its label window and the S11 head it was checked against. `holdout` must name S11's **open** allocation, which must declare the candidate's identities. One allocation pays for each identity's holdout look only once. The record stores the allocation's alpha. |
+| `stage_result` | judge | `result` is `pass`, `fail`, `untestable` or `inconclusive`. Also `p_values` (one per declared trial, or null), `alpha_spent` (0 for every stage except holdout, which spends exactly its allocation's alpha), `s11_allocation_sha256` (holdout only) and `receipt_sha256` of the stage artifact. |
 | `abandoned` | judge, or the proposer for its own candidate before any allocation | Allowed at any point before a terminal record. It **counts as a failure.** After an S11 allocation, the allocation must first be closed in S11 (`abandon()`, so alpha stays spent), and the ledger stores that S11 record's sha. If the S11 run was already recorded, it stores the `run_result` sha instead. |
 | `withdrawn_pre_data` | judge, or the proposer for its own candidate | Only before any `stage_entered`. Still counted in `proposed`. No alpha spent. |
 | `promoted_research`, `suspended`, `retired` | judge (E3B/E3C) | Promotion needs a passed `promotion` stage. Suspension and retirement need forward admission. |
@@ -64,7 +64,7 @@ At `screen`, an identity is refused if S11's window registry (`touched_windows`)
 - `proposed` and `declared_trials`;
 - `withdrawn`, `screened`, `abandoned`;
 - `failed` (closed by a non-pass result) and `failures` (`abandoned` + `failed`);
-- `holdout_looks`, `alpha_spent`;
+- `holdout_looks`, and `alpha_spent` (summed once per distinct S11 allocation that the family's holdout looks used, counted at holdout entry, so an abandoned look still counts);
 - `forward_admitted`, `promoted`, `suspended`, `retired`.
 
 E3B and E3C use these as the honest denominator, and E4B uses them for yield per trial.
@@ -79,7 +79,13 @@ E3B and E3C use these as the honest denominator, and E4B uses them for yield per
 - Judge methods don't exist on the client, so calling one raises `AttributeError`.
 - Appends carry a module-private capability (the VS1 `_WITNESS_TOKEN` pattern). The proposer capability is refused every judge record kind, and every record's `actor` is replayed on open.
 
-**Limit.** In-process Python is not a security boundary. A proposer that runs in the judge's process could reach module internals. The binding boundary is EVAL-E4A: proposers run as a separate OS user with no write access to `GRID_E3_LEDGER_DIR` or `GRID_E3_ANCHOR_DIR`, and they never see holdout data.
+**Limit.** In-process Python is not a security boundary. A proposer that runs in the judge's process could reach module internals. In v1 the client writes the ledger, anchor and lock files itself, so it only works where those directories are writable. EVAL-E4A must provide the binding boundary:
+- proposers run as a separate OS user, with no write access to `GRID_E3_LEDGER_DIR` or `GRID_E3_ANCHOR_DIR` and no view of holdout data;
+- their records reach the ledger through a judge-owned writer (a spool directory or IPC) that exposes this same client API.
+
+The judge only accepts the S11 **file** ledger with its anchor, never an in-memory one.
+
+**Scale.** Every append and every read re-verifies and replays the whole file under the lock. That is O(n) per call, which is fine at hill-climb volumes. E3B or E4 may cache a verified head if volumes grow.
 
 ## Usage
 

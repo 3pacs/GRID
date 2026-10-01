@@ -37,7 +37,8 @@ def file_sha256(path: Path) -> str:
 
 def pinned_files(root: Path = PACKAGE) -> list[str]:
     out = []
-    for path in sorted(Path(root).rglob("*")):
+    # sort by the POSIX relative path: Path ordering is case-insensitive on Windows only
+    for path in sorted(Path(root).rglob("*"), key=lambda p: p.relative_to(root).as_posix()):
         if not path.is_file() or path.name == MANIFEST_NAME or path.suffix == ".pyc":
             continue
         if any(part in EXCLUDED_DIRS for part in path.relative_to(root).parts):

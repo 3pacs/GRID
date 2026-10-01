@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -59,10 +60,30 @@ def propose(c: e3.ProposerClient, n: int, *, family: str = FAMILY, trials=(TRIAL
     )
 
 
-def s11_ledger(ledger_id: str = S11_ID) -> lse.Ledger:
+def s11_ledger(tmp_path: Path, ledger_id: str = S11_ID) -> lse.Ledger:
+    """A file-backed S11 fixture ledger (the judge refuses in-memory ones)."""
+    root = tmp_path / f"s11-{ledger_id}"
+    (root / "ledger").mkdir(parents=True)
+    (root / "anchor").mkdir()
     return lse.Ledger.create(
-        None, catalog=lse.synthetic_catalog(), ledger_id=ledger_id, recorded_at=FIXED
+        root / "ledger" / "ledger.jsonl", anchor=root / "anchor" / "ledger.anchor.jsonl",
+        catalog=lse.synthetic_catalog(), ledger_id=ledger_id, recorded_at=FIXED,
     )
+
+
+WINDOW_2001 = {"start": "2001-01-01T00:00:00+00:00", "split": "2001-07-01T00:00:00+00:00",
+               "end": "2002-01-01T00:00:00+00:00"}
+
+
+def allocate(s11: lse.Ledger, run_id: str = "r1", windows: dict = WINDOW_2001) -> dict:
+    return lse.allocate(s11, lse.synthetic_catalog(), lse.Policy(budget=7), run_id=run_id,
+                        windows=windows, recorded_at=FIXED)
+
+
+def to_holdout(judge: e3.CandidateLedger, cid: str, s11: lse.Ledger) -> None:
+    screen_pass(judge, cid, s11)
+    judge.stage_entered(cid, "gates")
+    judge.stage_result(cid, "gates", "pass", receipt_sha256=RECEIPT)
 
 
 def screen_pass(judge: e3.CandidateLedger, cid: str, s11: lse.Ledger, window=W_2000) -> None:
@@ -91,7 +112,7 @@ def rechain(records: list[dict]) -> list[bytes]:
 
 
 def test_stage_before_proposed_and_out_of_order_are_refused(tmp_path):
-    judge, s11 = new_e3(tmp_path), s11_ledger()
+    judge, s11 = new_e3(tmp_path), s11_ledger(tmp_path)
     with pytest.raises(ValueError, match="never proposed"):
         judge.stage_entered("f" * 64, "screen", s11=s11, window=W_2000)
     cid = propose(client(tmp_path), 0)
@@ -116,7 +137,7 @@ def test_stage_before_proposed_and_out_of_order_are_refused(tmp_path):
 
 
 def test_withdrawn_pre_data_only_before_any_stage(tmp_path):
-    judge, s11, c = new_e3(tmp_path), s11_ledger(), client(tmp_path)
+    judge, s11, c = new_e3(tmp_path), s11_ledger(tmp_path), client(tmp_path)
     early, late = propose(c, 0), propose(c, 1)
     c.withdraw(early, "duplicate of another idea")
     with pytest.raises(ValueError, match="already withdrawn_pre_data"):
@@ -185,7 +206,7 @@ def test_open_replays_every_invariant_even_for_a_well_chained_record(tmp_path):
     storage._append({  # chained and anchored, but for a candidate never proposed
         "kind": "stage_entered", "actor": "judge", "candidate_id": "c" * 64, "stage": "screen",
         "window": W_2000, "s11_ledger_id": S11_ID, "s11_head_sha256": "d" * 64,
-        "s11_allocation_sha256": None, "recorded_at": FIXED,
+        "s11_allocation_sha256": None, "s11_alpha": None, "recorded_at": FIXED,
     })
     with pytest.raises(ValueError, match="never proposed"):
         e3.CandidateLedger.open(ledger_dir, anchor_dir)
@@ -195,7 +216,7 @@ def test_open_replays_every_invariant_even_for_a_well_chained_record(tmp_path):
 
 
 def test_every_candidate_counts_including_abandoned_and_withdrawn(tmp_path):
-    judge, s11, c = new_e3(tmp_path), s11_ledger(), client(tmp_path)
+    judge, s11, c = new_e3(tmp_path), s11_ledger(tmp_path), client(tmp_path)
     ids = [propose(c, n) for n in range(10)]
     c.withdraw(ids[0], "superseded before any data")
     judge.withdrawn_pre_data(ids[1], "judge: out of scope")
@@ -224,22 +245,16 @@ def test_every_candidate_counts_including_abandoned_and_withdrawn(tmp_path):
 
 def test_abandon_after_allocation_needs_the_s11_abandon_and_alpha_stays_spent(tmp_path):
     judge, c = new_e3(tmp_path), client(tmp_path)
-    catalog = lse.synthetic_catalog()
-    s11 = s11_ledger()
-    window = {"start": "2001-01-01T00:00:00+00:00", "split": "2001-07-01T00:00:00+00:00",
-              "end": "2002-01-01T00:00:00+00:00"}
-    allocation = lse.allocate(s11, catalog, lse.Policy(budget=7), run_id="r1", windows=window,
-                              recorded_at=FIXED)
+    s11 = s11_ledger(tmp_path)
+    allocation = allocate(s11)
     trial = allocation["record"]["trials"][0]
     cid = propose(c, 0, trials=((trial["family"], trial["feature"]),))
     outside = propose(c, 1, trials=(("T1|change|fwd1", lse.SYNTHETIC_OWN),))  # never allocated
     for candidate in (cid, outside):
-        screen_pass(judge, candidate, s11)
-        judge.stage_entered(candidate, "gates")
-        judge.stage_result(candidate, "gates", "pass", receipt_sha256=RECEIPT)
+        to_holdout(judge, candidate, s11)
     with pytest.raises(ValueError, match="does not declare this candidate's trials"):
         judge.stage_entered(outside, "holdout", s11=s11, s11_allocation_sha256=allocation["sha256"])
-    with pytest.raises(ValueError, match="not an allocation"):
+    with pytest.raises(ValueError, match="open allocation"):
         judge.stage_entered(cid, "holdout", s11=s11, s11_allocation_sha256="e" * 64)
     judge.stage_entered(cid, "holdout", s11=s11, s11_allocation_sha256=allocation["sha256"])
 
@@ -262,38 +277,42 @@ def test_abandon_after_allocation_needs_the_s11_abandon_and_alpha_stays_spent(tm
     assert summary["alpha_spent"] == pytest.approx(allocation["record"]["alpha"])
     counts = judge.family_counts(FAMILY)
     assert counts["holdout_looks"] == 1 and counts["abandoned"] == 1 and counts["failures"] == 1
+    # the abandoned look's alpha is counted in E3 too, from the holdout entry
+    assert counts["alpha_spent"] == pytest.approx(summary["alpha_spent"])
 
 
 def test_s11_binding_is_checked(tmp_path):
     judge, c = new_e3(tmp_path), client(tmp_path)
     cid = propose(c, 0)
     with pytest.raises(ValueError, match="binds S11 ledger"):
-        judge.stage_entered(cid, "screen", s11=s11_ledger("another-ledger"), window=W_2000)
+        judge.stage_entered(cid, "screen", s11=s11_ledger(tmp_path, "another-ledger"), window=W_2000)
     with pytest.raises(ValueError, match="checked against the bound S11 ledger"):
         judge.stage_entered(cid, "screen", window=W_2000)
 
 
 def test_full_funnel_to_promotion_suspension_and_retirement(tmp_path):
     judge, c = new_e3(tmp_path), client(tmp_path)
-    catalog, s11 = lse.synthetic_catalog(), s11_ledger()
-    window = {"start": "2001-01-01T00:00:00+00:00", "split": "2001-07-01T00:00:00+00:00",
-              "end": "2002-01-01T00:00:00+00:00"}
-    allocation = lse.allocate(s11, catalog, lse.Policy(budget=7), run_id="r1", windows=window,
-                              recorded_at=FIXED)
+    s11 = s11_ledger(tmp_path)
+    allocation = allocate(s11)
     trial = allocation["record"]["trials"][0]
     cid = propose(c, 0, trials=((trial["family"], trial["feature"]),))
-    screen_pass(judge, cid, s11)
-    judge.stage_entered(cid, "gates")
-    judge.stage_result(cid, "gates", "pass", receipt_sha256=RECEIPT)
-    judge.stage_entered(cid, "holdout", s11=s11, s11_allocation_sha256=allocation["sha256"])
-    result = judge.stage_result(cid, "holdout", "pass", receipt_sha256=RECEIPT,
-                                alpha_spent=allocation["record"]["alpha"], p_values=[0.001])
+    to_holdout(judge, cid, s11)
+    entered = judge.stage_entered(cid, "holdout", s11=s11,
+                                  s11_allocation_sha256=allocation["sha256"])["record"]
+    assert entered["s11_alpha"] == allocation["record"]["alpha"]
+    with pytest.raises(ValueError, match="alpha_spent must be"):
+        judge.stage_result(cid, "holdout", "pass", receipt_sha256=RECEIPT, alpha_spent=0.5)
+    result = judge.stage_result(cid, "holdout", "pass", receipt_sha256=RECEIPT, p_values=[0.001])
+    assert result["record"]["alpha_spent"] == allocation["record"]["alpha"]
     assert result["record"]["s11_allocation_sha256"] == allocation["sha256"]
     with pytest.raises(ValueError, match="needs a passed promotion"):
         judge.promoted_research(cid, receipt_sha256=RECEIPT)
-    for stage in ("forward", "promotion"):
-        judge.stage_entered(cid, stage)
-        judge.stage_result(cid, stage, "pass", receipt_sha256=RECEIPT)
+    judge.stage_entered(cid, "forward")
+    with pytest.raises(ValueError, match="only the holdout spends alpha"):
+        judge.stage_result(cid, "forward", "pass", receipt_sha256=RECEIPT, alpha_spent=0.01)
+    judge.stage_result(cid, "forward", "pass", receipt_sha256=RECEIPT)
+    judge.stage_entered(cid, "promotion")
+    judge.stage_result(cid, "promotion", "pass", receipt_sha256=RECEIPT)
     judge.promoted_research(cid, receipt_sha256=RECEIPT)
     judge.suspended(cid, "edge decaying")
     judge.retired(cid, "decayed below the retirement rule", receipt_sha256=RECEIPT)
@@ -310,7 +329,7 @@ def test_full_funnel_to_promotion_suspension_and_retirement(tmp_path):
 
 
 def _populated(tmp_path: Path) -> tuple[Path, Path, Path]:
-    judge, s11, c = new_e3(tmp_path), s11_ledger(), client(tmp_path)
+    judge, s11, c = new_e3(tmp_path), s11_ledger(tmp_path), client(tmp_path)
     ids = [propose(c, n) for n in range(3)]
     screen_pass(judge, ids[0], s11)
     c.abandon(ids[1], "dropped")
@@ -450,7 +469,7 @@ def test_a_proposer_abandons_only_its_own_candidates_and_it_counts(tmp_path):
 def test_an_identity_whose_s11_window_was_touched_is_refused_at_screen(tmp_path):
     judge, c = new_e3(tmp_path), client(tmp_path)
     catalog = lse.synthetic_catalog()
-    s11 = s11_ledger()
+    s11 = s11_ledger(tmp_path)
     epoch = lse.synthetic_epoch(catalog, 1)
     step = lse.run_synthetic_step(
         s11, catalog, lse.Policy(budget=7), epoch, tmp_path / "s11-run1", run_id="r1",
@@ -480,31 +499,76 @@ def test_an_identity_whose_s11_window_was_touched_is_refused_at_screen(tmp_path)
     assert entered[-1]["s11_ledger_id"] == S11_ID
 
 
+def test_holdout_needs_the_open_allocation_and_pays_once_per_identity(tmp_path):
+    judge, c = new_e3(tmp_path), client(tmp_path)
+    s11 = s11_ledger(tmp_path)
+    first = allocate(s11, "r1")
+    trial = first["record"]["trials"][0]
+    pair = (trial["family"], trial["feature"])
+    a = propose(c, 0, trials=(pair,))
+    b = propose(c, 1, trials=(pair,), retest_of=a)  # same identity, new candidate
+    for cid in (a, b):
+        to_holdout(judge, cid, s11)
+    judge.stage_entered(a, "holdout", s11=s11, s11_allocation_sha256=first["sha256"])
+    with pytest.raises(ValueError, match="already paid for a holdout look"):
+        judge.stage_entered(b, "holdout", s11=s11, s11_allocation_sha256=first["sha256"])
+    lse.abandon(s11, "closed", recorded_at=FIXED)
+    with pytest.raises(ValueError, match="open allocation"):  # closed: no reuse
+        judge.stage_entered(b, "holdout", s11=s11, s11_allocation_sha256=first["sha256"])
+    assert judge.family_counts(FAMILY)["alpha_spent"] == pytest.approx(first["record"]["alpha"])
+
+
+def test_an_in_memory_s11_ledger_is_refused(tmp_path):
+    judge, c = new_e3(tmp_path), client(tmp_path)
+    cid = propose(c, 0)
+    memory = lse.Ledger.create(None, catalog=lse.synthetic_catalog(), ledger_id=S11_ID,
+                               recorded_at=FIXED)
+    with pytest.raises(ValueError, match="not in memory"):
+        judge.stage_entered(cid, "screen", s11=memory, window=W_2000)
+
+
 # --- 6. concurrency -----------------------------------------------------------------
 
 _WORKER = """
 import sys
 from evals.e3.ledger import client_for_proposer
-proposer, ledger_dir, anchor_dir, n = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
+import pathlib, random, time
+proposer, ledger_dir, anchor_dir, n, barrier = sys.argv[1:6]
 c = client_for_proposer(proposer, ledger_dir, anchor_dir)
-for i in range(n):
+barrier = pathlib.Path(barrier)
+(barrier / (proposer + ".ready")).touch()
+while not (barrier / "go").exists():  # start appending together, after the slow imports
+    time.sleep(0.01)
+rng = random.Random(proposer)
+for i in range(int(n)):
     c.propose(family="fam-c", candidate_kind="feature", trials=[("T1|change|fwd1", "alpha1|x")],
               spec={"proposer": proposer, "i": i}, rationale="r", engine_version="e4b-test")
+    time.sleep(rng.uniform(0.0, 0.03))
 """
 
 
 def test_two_processes_appending_concurrently_keep_one_valid_chain(tmp_path):
     judge = new_e3(tmp_path)
     ledger_dir, anchor_dir = dirs(tmp_path)
-    n = 12
+    n = 30
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
     env = {**os.environ, "PYTHONPATH": str(REPO) + os.pathsep + os.environ.get("PYTHONPATH", "")}
+    names = ("agent-p", "agent-q")
     workers = [
         subprocess.Popen(
-            [sys.executable, "-c", _WORKER, name, str(ledger_dir), str(anchor_dir), str(n)],
+            [sys.executable, "-c", _WORKER, name, str(ledger_dir), str(anchor_dir), str(n),
+             str(barrier)],
             cwd=REPO, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        for name in ("agent-p", "agent-q")
+        for name in names
     ]
+    deadline = time.monotonic() + 900
+    while not all((barrier / f"{name}.ready").exists() for name in names):
+        assert all(w.poll() is None for w in workers), "a worker died before the barrier"
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    (barrier / "go").touch()
     for worker in workers:
         _, err = worker.communicate(timeout=900)
         assert worker.returncode == 0, err.decode("utf-8", "replace")[-2000:]
@@ -512,9 +576,12 @@ def test_two_processes_appending_concurrently_keep_one_valid_chain(tmp_path):
     assert len(records) == 1 + 2 * n
     proposed = [r for r in records if r["kind"] == "proposed"]
     assert len({r["candidate_id"] for r in proposed}) == 2 * n
-    for name in ("agent-p", "agent-q"):
+    for name in names:
         mine = [r for r in proposed if r["proposer"] == name]
         assert len(mine) == n
+    order = [r["proposer"] for r in proposed]
+    switches = sum(a != b for a, b in zip(order, order[1:]))
+    assert switches >= 2, f"appends did not interleave: {order}"  # they really raced
     assert judge.verify()["records"] == 1 + 2 * n
     assert len(lines(ledger_dir / e3.LEDGER_FILENAME)) == len(lines(anchor_dir / e3.ANCHOR_FILENAME))
     assert judge.family_counts("fam-c")["proposed"] == 2 * n
