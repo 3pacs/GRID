@@ -126,6 +126,7 @@ def recovery():
     return R, fitted
 
 
+@pytest.mark.timeout(900)  # a full indirect-inference fit: ~4 min on ubuntu-latest (setup included)
 def test_parameter_recovery(recovery):
     R, fitted = recovery
     got = fitted["best"]["params"]
