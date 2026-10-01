@@ -41,6 +41,7 @@ package this module or its lazy imports could reach: ``config.py`` and an
 
 from __future__ import annotations
 
+import ast
 import importlib
 import re
 import sys
@@ -199,56 +200,105 @@ def test_every_lazy_first_party_module_resolves_under_the_real_repo(
         )
 
 
+def _is_first_party(module_name: str, repo_root) -> bool:
+    """True if `module_name`'s top-level package/module exists directly
+    under the repo root -- i.e. it is one of THIS repo's own packages
+    (``config``, ``intelligence``, ...), not a stdlib or installed
+    third-party module (``sys``, ``sqlalchemy``, ``loguru``, ...). Derived
+    from the filesystem rather than a hardcoded name list, so a new
+    first-party import added anywhere in the file is caught automatically."""
+    top = module_name.split(".")[0]
+    if (repo_root / f"{top}.py").is_file():
+        return True
+    pkg_dir = repo_root / top
+    return pkg_dir.is_dir() and (pkg_dir / "__init__.py").is_file()
+
+
 def test_guard_precedes_every_first_party_import_in_source():
-    """Ordering regression, checked statically rather than by executing the
-    module as __main__ (this script has no --help-style short-circuit --
-    running it for real would attempt its actual, DB-touching cycle logic).
+    """Ordering regression, checked statically via the ``ast`` module rather
+    than by executing the module as __main__ (this script has no
+    --help-style short-circuit -- running it for real would attempt its
+    actual, DB-touching cycle logic) and rather than a plain text/regex
+    search (unsound here: this file's own guard comment literally contains
+    the substring "from config import settings", so a naive search could be
+    fooled by a comment or docstring mention rather than the real import
+    statement).
 
     A guard placed AFTER ``from config import settings`` can never fire: if
     config were not already importable, that import would already have
     raised before the guard was reached, so the fallback could never
-    actually rescue it. This asserts the guard's `sys.path.insert(...)`
-    line appears, in source order, before every top-level first-party
-    import statement in the file.
+    actually rescue it. This parses the real source and asserts:
+
+    1. The guarded ``if ...: sys.path.insert(0, "/data/grid_v4/grid_repo")``
+       block exists at module level, and its condition actually references
+       both ``__name__`` and ``find_spec`` (ordering alone doesn't prove the
+       guard's *condition* survived a future edit).
+    2. Every MODULE-LEVEL (``tree.body``, which excludes anything nested
+       inside a function -- i.e. the lazy ``intelligence.*`` imports inside
+       step_thesis/step_trust/step_forensics/step_patterns are correctly
+       excluded, since they run long after the guard anyway) first-party
+       import -- determined by filesystem lookup under the repo root, not a
+       hardcoded module list -- appears strictly after that guard.
     """
-    path = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "run_intelligence_cycles.py"
-    )
+    repo_root = Path(__file__).resolve().parents[1]
+    path = repo_root / "scripts" / "run_intelligence_cycles.py"
     source = path.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(path))
 
-    insert_match = re.search(
-        r'sys\.path\.insert\(0,\s*["\']' + re.escape(_LEGACY_CHECKOUT_PATH) + r'["\']\)',
-        source,
-    )
-    assert insert_match is not None, (
-        "Expected the legacy-checkout sys.path.insert fallback to still be "
-        "present (guarded) in run_intelligence_cycles.py; if it was removed "
-        "entirely, this test (and its guard-ordering concern) no longer "
-        "applies and should be deleted instead."
-    )
-    insert_pos = insert_match.start()
-
-    # Every top-level (module-scope) first-party import in this file.
-    first_party_import_pattern = re.compile(
-        r'^from config import|^from intelligence\.\w+ import', re.MULTILINE,
-    )
-    first_party_imports = list(first_party_import_pattern.finditer(source))
-
-    # This module only imports `config` at module scope; the intelligence.*
-    # imports are all lazy (inside step_* functions, i.e. indented -- the
-    # `^` anchor with MULTILINE only matches column 0, so indented lazy
-    # imports inside functions are correctly excluded here).
-    assert first_party_imports, "Expected at least a top-level `from config import ...`"
-
-    for m in first_party_imports:
-        assert insert_pos < m.start(), (
-            f"The sys.path fallback at offset {insert_pos} must appear "
-            f"BEFORE the first-party import {m.group(0)!r} at offset "
-            f"{m.start()} -- a guard placed after a first-party import can "
-            "never fire, since that import would already have raised."
+    def _is_sys_path_insert_call(node: ast.AST) -> bool:
+        return (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "insert"
+            and isinstance(node.func.value, ast.Attribute)
+            and node.func.value.attr == "path"
+            and isinstance(node.func.value.value, ast.Name)
+            and node.func.value.value.id == "sys"
+            and len(node.args) == 2
+            and isinstance(node.args[1], ast.Constant)
+            and node.args[1].value == _LEGACY_CHECKOUT_PATH
         )
+
+    guard_if = None
+    for node in tree.body:
+        if isinstance(node, ast.If) and any(
+            _is_sys_path_insert_call(n) for n in ast.walk(node)
+        ):
+            guard_if = node
+            break
+
+    assert guard_if is not None, (
+        "Expected a module-level `if ...: sys.path.insert(0, "
+        f'"{_LEGACY_CHECKOUT_PATH}")` guard in run_intelligence_cycles.py; '
+        "if it was removed entirely, this test (and its guard-ordering "
+        "concern) no longer applies and should be deleted instead."
+    )
+
+    condition_src = ast.unparse(guard_if.test)
+    assert "__name__" in condition_src, (
+        f"Guard condition must check __name__, got: {condition_src!r}"
+    )
+    assert "find_spec" in condition_src, (
+        "Guard condition must check "
+        f"importlib.util.find_spec(...), got: {condition_src!r}"
+    )
+
+    violations = []
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if _is_first_party(node.module, repo_root) and node.lineno <= guard_if.lineno:
+                violations.append((node.lineno, ast.unparse(node)))
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if _is_first_party(alias.name, repo_root) and node.lineno <= guard_if.lineno:
+                    violations.append((node.lineno, ast.unparse(node)))
+
+    assert violations == [], (
+        f"First-party import(s) at/before the sys.path guard "
+        f"(guard at line {guard_if.lineno}): {violations} -- a guard placed "
+        "after a first-party import can never fire, since that import "
+        "would already have raised."
+    )
 
 
 def test_running_as_main_skips_the_fallback_when_repo_already_importable(
