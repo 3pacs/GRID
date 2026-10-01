@@ -114,11 +114,9 @@ jobs:
           # order. See the block comment in tests/conftest.py for why.
           # --durations=25 surfaces the slowest tests so the next round of
           # tuning has numbers instead of guesses.
-          # -m "not e0_slow": the E0 benchmark tests that take minutes each run
-          # in the "E0 IC 0.01 recovery" step below, with their own timeout.
           set +e
           python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
-            -n auto --dist loadgroup --durations=25 -m "not e0_slow" \
+            -n auto --dist loadgroup --durations=25 \
             > /tmp/grid-pytest-output.txt 2>&1
           pytest_status=$?
           set -e
@@ -130,13 +128,6 @@ jobs:
           tail -300 /tmp/grid-pytest-output.txt
           echo "::endgroup::"
           exit "$pytest_status"
-
-      # EVAL-E0C1: E0 v1 at the decision-relevant planted IC 0.01 (realised-IC
-      # recovery on fresh worlds, a deterministic power pin, consistency with
-      # the released e0-v1 scorecard, null size). Synthetic outcomes, no DB.
-      # Several minutes, so the main run above deselects it.
-      - name: E0 IC 0.01 recovery
-        run: python -m pytest tests/test_e0_ic01_recovery.py -m e0_slow -q -rA --timeout=900 --durations=10
 
       - name: Pipeline health PostgreSQL contract
         env:

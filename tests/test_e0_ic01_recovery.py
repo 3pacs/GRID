@@ -19,11 +19,10 @@ Per scenario (the headline ``factor_t_garch_exposed`` and ``gaussian_idio``):
    scorecard (500 sims, 999 flips);
 4. at IC 0 the primary trial's Holm rejection rate is at most 0.05 + 3 SE.
 
-Runtime is several minutes (each world runs the full four-trial VS1
-statistic), so the module is marked ``e0_slow``: the main CI run deselects it
-and a dedicated CI step runs it with a longer per-test timeout. Synthetic
-outcomes only: the structure is SEC feature geometry; no price, return or IC
-of any VS1 window is read, and there is no DB access.
+The whole file takes ~14 s on ubuntu-latest (the two per-scenario setups are
+computed once and shared). Synthetic outcomes only: the structure is SEC
+feature geometry; no price, return or IC of any VS1 window is read, and there
+is no DB access.
 """
 
 from __future__ import annotations
@@ -38,8 +37,6 @@ import pytest
 
 from evals.e0 import benchmark, runners, scorer
 from evals.e0.structure import load_structure
-
-pytestmark = pytest.mark.e0_slow
 
 REPO = Path(__file__).resolve().parents[1]
 #: The committed e0-v1 full-profile scorecard (also GRID-E0-BENCHMARK-V1-20260930.scorecard.json,
