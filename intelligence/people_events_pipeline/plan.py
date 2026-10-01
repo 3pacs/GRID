@@ -194,7 +194,10 @@ def build_write_plan(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd
         for op in ops:
             plan.append({
                 "op": op, "channel": key[0], "dedup_key": key[1], "known_at": target,
-                "known_at_basis": ev["known_at_basis"] if op == "tighten_known_at" else old["known_at_basis"],
+                # A floor-clamped tighten is the floor instant, not the source's own
+                # bound, so it is labelled first_seen, never the source's basis.
+                "known_at_basis": (ev["known_at_basis"] if target == ev_known else "first_seen")
+                if op == "tighten_known_at" else old["known_at_basis"],
                 "content_hash": ev["content_hash"], "source_refs": sorted(new_refs | old_refs),
                 "prev_known_at": old_known, "actor_id": ev.get("actor_id"),
                 "actor_id_basis": ev.get("actor_id_basis"), "entity_cik": ev.get("entity_cik"),
