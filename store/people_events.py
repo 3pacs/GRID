@@ -345,3 +345,70 @@ def read_events(
             )
         )
     return events
+
+
+# ---------------------------------------------------------------------------
+# Version history for multi-decision (panel) readers
+# ---------------------------------------------------------------------------
+
+_HISTORY_SQL_TEMPLATE = """
+    SELECT
+        id, channel, dedup_key, loose_key, event_time, known_at, known_at_basis,
+        actor_id, actor_id_basis, actor_type, entity_ticker, entity_cik, security_id,
+        direction, transaction_code, size_usd, source, n_sources, confidence, echo_of,
+        content_hash,
+        -- An end time after known_by is not knowable at known_by: masked to NULL,
+        -- so the result itself carries no information from after known_by.
+        CASE WHEN superseded_at <= :known_by THEN superseded_at END AS superseded_at,
+        CASE WHEN retracted_at <= :known_by THEN retracted_at END AS retracted_at
+    FROM people_events
+    WHERE known_at <= :known_by
+    {extra_filters}
+    ORDER BY known_at, id
+"""
+
+HISTORY_FILTERS = {
+    "channel": "AND channel = :channel",
+    "entity_ticker": "AND entity_ticker = :entity_ticker",
+    "security_id": "AND security_id = :security_id",
+    "actor_id": "AND actor_id = :actor_id",
+}
+
+
+def read_event_versions(
+    engine: Engine,
+    known_by: datetime,
+    *,
+    channel: str | None = None,
+    entity_ticker: str | None = None,
+    security_id: str | None = None,
+    actor_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Every version of every act known by ``known_by`` -- current, superseded and retracted.
+
+    The access path for readers that evaluate many decision times in one
+    pass (panel density features, GD5/GD6). ``read_events(as_of=t)`` returns
+    the single version visible at one ``t``; calling it per decision is
+    correct but slow. This returns all versions once, each with its
+    ``known_at`` and its ``superseded_at``/``retracted_at`` (NULL when that
+    end lies after ``known_by``), and the caller applies, per decision ``t``:
+
+        known_at <= t AND (superseded_at IS NULL OR superseded_at > t)
+                      AND (retracted_at IS NULL OR retracted_at > t)
+
+    (``intelligence.people_events_pipeline.plan.visible_at`` implements it on
+    a DataFrame of these rows.) With ``known_by`` >= every decision, the
+    per-decision result equals ``read_events(as_of=t)`` exactly; versions
+    are never merged or deduplicated here.
+    """
+    params: dict[str, Any] = {"known_by": known_by}
+    filters = []
+    for name, value in (("channel", channel), ("entity_ticker", entity_ticker),
+                        ("security_id", security_id), ("actor_id", actor_id)):
+        if value is not None:
+            filters.append(HISTORY_FILTERS[name])
+            params[name] = value
+    sql = text(_HISTORY_SQL_TEMPLATE.format(extra_filters="\n".join(filters)))
+    with engine.connect() as conn:
+        result = conn.execute(sql, params)
+        return [dict(zip(result.keys(), row)) for row in result.fetchall()]

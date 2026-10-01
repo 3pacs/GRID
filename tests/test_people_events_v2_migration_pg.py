@@ -332,3 +332,29 @@ def test_writer_enriches_a_live_feed_row_when_sec_arrives(v2):
     with v2.connect() as conn:
         row = conn.execute(text("SELECT actor_id, actor_id_basis, entity_cik, n_sources FROM people_events")).one()
     assert row == ("0001214156", "owner_cik", "0000320193", 2)
+
+
+def test_read_event_versions_serves_every_decision_time_like_read_events(v2):
+    from intelligence.people_events_pipeline import plan as P
+    from intelligence.people_events_pipeline.writer import apply_write_plan
+    from store.people_events import read_event_versions, read_events
+
+    t0 = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t0, holdings=_holdings(150))
+    apply_write_plan(v2, ev, plan, run_id="h1", mode="backfill", observed_at=t0)
+    t1 = datetime(2026, 9, 6, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t1, holdings=_holdings(175))
+    apply_write_plan(v2, ev, plan, run_id="h2", mode="incremental", observed_at=t1)
+
+    known_by = datetime(2026, 9, 30, tzinfo=UTC)
+    versions = pd.DataFrame(read_event_versions(v2, known_by, channel="thirteen_f"))
+    assert len(versions) == 2  # the superseded version is returned, not hidden
+    for t in pd.date_range("2026-05-01", "2026-09-29", freq="1D", tz="UTC"):
+        got = P.visible_at(versions, t)
+        want = read_events(v2, as_of=t.to_pydatetime(), channel="thirteen_f")
+        assert len(got) == len(want) <= 1
+        if want:
+            assert got.iloc[0]["size_usd"] == want[0].size_usd
+    # Known by a date before the supersession: the later end is masked, not leaked.
+    early = pd.DataFrame(read_event_versions(v2, datetime(2026, 9, 3, tzinfo=UTC), channel="thirteen_f"))
+    assert len(early) == 1 and pd.isna(early.iloc[0]["superseded_at"])
