@@ -8,17 +8,40 @@ Targets:
   4. Pattern detection (event_patterns has 0 rows)
 """
 
+import importlib.util
 import sys
 import json
 import traceback
 from loguru import logger as log
 
-# Ensure project root is on the path
-sys.path.insert(0, "/data/grid_v4/grid_repo")
-
+# Every first-party (repo-root) import this module needs must be resolvable
+# BEFORE the sys.path fallback further down ever has a chance to run -- see
+# that fallback's own comment, and
+# tests/test_score_oracle_trades_stale_repo_shadow.py (the regression this
+# mirrors: a stale grid_repo checkout on disk must never shadow this repo's
+# real first-party packages just because this module was imported).
 from sqlalchemy import create_engine
 
 from config import settings
+
+# Fallback for direct execution (``python scripts/run_intelligence_cycles.py``)
+# on a host where this repo's root does not already make `config` (and the
+# rest of the first-party tree) importable. Two guards, both required:
+#
+# * `__name__ == "__main__"` -- never run when the module is merely
+#   imported (e.g. by a test, or by anything that re-exports its helpers).
+#   The imports above already prove the repo resolves correctly for every
+#   first-party module this file needs when that's true.
+# * `importlib.util.find_spec("config") is None` -- even under direct
+#   execution, prefer whatever already makes the repo importable (e.g. via
+#   PYTHONPATH or CWD) over this hardcoded, potentially-stale path.
+#
+# Unconditionally inserting a hardcoded checkout path here previously meant
+# every mere import of this module -- on any host where that directory
+# exists, including a stale legacy checkout -- mutated process-global
+# sys.path for the rest of the process's lifetime.
+if __name__ == "__main__" and importlib.util.find_spec("config") is None:
+    sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 engine = create_engine(settings.DB_URL)
 
