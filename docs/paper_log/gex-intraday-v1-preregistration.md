@@ -3,296 +3,351 @@
 Written 2026-10-01, before any outcome for any hypothesis below exists or was examined. No forward
 record has been written. The UTF-8 LF body strictly between the markers is immutable once this file
 is merged; its SHA-256 is pinned in `analysis/gex_intraday_prereg.py`. Any change to the body is a
-new version (v2) with a new registry, a new witness file and a new start. Promotion is prohibited:
+new version (v2) with a new registry, new witness files and a new start. Promotion is prohibited:
 nothing here may change a weight, a signal, a briefing or an order.
 
 Author: Claude (Opus 5.5), slice GEX-P3 (design part). Owner: Anik. Status: DESIGN REGISTERED IN GIT,
-NOT ACTIVATED. Activation and the off-host witness are owner gates (section 9).
+NOT ACTIVATED. Registry write, witnesses and activation are owner gates (section 10).
 
 <!-- PREREG-BODY-START -->
 
 ## 0. Scope, custody and what this is not
 
-This family is new and separate. It is not GEX-levels v1 (`docs/paper_log/gex-levels-v1-preregistration.md`,
+This family is new and separate from GEX-levels v1 (`docs/paper_log/gex-levels-v1-preregistration.md`,
 registered 2026-09-24, code pinned at 07e1fc16, log under `/data/grid/paper_log/gex_levels_v1/`).
-Nothing in this family reads, writes, re-scores, amends or replaces that log, its inputs, its code
-or its 60-session evaluation. Section 6 lists the overlaps with v1 and how they are counted.
+Nothing here reads, writes, re-scores, amends or replaces that log, its inputs, its code or its
+60-session evaluation. Section 7 states every overlap with v1 and how it is handled.
 
-No historical outcome is used anywhere. Every hypothesis is forward only. Its first decision falls
-strictly after all of: this body's registry header is witnessed off-host on vault `main`; the
-owner activates the logger; and the hypothesis's own inputs and price contract are admitted
-(section 4). A hypothesis whose inputs are not admitted stays `BLOCKED` and makes no prediction.
+No historical outcome is used. Every hypothesis is forward only. Its first decision falls strictly
+after all of: the registry header is witnessed on vault `main` (section 10); the owner activates the
+logger; the hypothesis's inputs and price contract are admitted (section 4); its Stage-0 power gate
+passed and was witnessed (section 2); and, for MG1, MG2 and SC1, the session-separation rule of
+section 7. A hypothesis whose inputs are not admitted is `BLOCKED` and makes no prediction.
 
-Evidence boundary: a supported verdict here is a request for independent review, not an edge,
-not a promotion and not evidence of actual dealer positioning. Numerical agreement between GEX
-engines (GEX-P2B) says nothing about any hypothesis in this family.
+Evidence boundary: a supported verdict is a request for independent review, not an edge, not a
+promotion and not evidence of actual dealer positioning. Numerical agreement between GEX engines
+(GEX-P2B) validates arithmetic only and says nothing about any hypothesis here.
 
 ## 1. Sub-families and error control
 
-Five sub-families, each its own multiple-testing family. They are never pooled into one test.
-In particular, the price-only baseline (PO) is never tested together with a gamma-model hypothesis.
+Five sub-families, each its own multiple-testing family. They are never pooled into one test; the
+price-only baseline (PO) is never tested together with a gamma-model hypothesis.
 
-| Sub-family | Code | What it isolates | Family alpha (holdout) |
-|---|---|---|---:|
-| Price-only baseline | PO | What price alone already explains (the comparator) | 0.05 |
-| Delayed-wall response | DW | Price response at published or recomputed delayed walls | 0.05 |
-| Modeled-gamma volatility/continuation | MG | GRID's own dealer-gamma model at a pinned engine | 0.05 |
-| Structural confirmation | SC | Breadth/tick confirmation of a gamma-conditioned move | 0.05 |
-| Rebalancing sensitivity | RB | Hypothetical month-end allocation pressure | 0.05 |
+| Sub-family | Code | Registered hypotheses k | Holdout alpha per hypothesis |
+|---|---|---:|---:|
+| Price-only baseline | PO | 2 | 0.05 / 2 = 0.025 |
+| Delayed-wall response | DW | 2 | 0.05 / 2 = 0.025 |
+| Modeled-gamma volatility/continuation | MG | 3 | 0.05 / 3 = 0.0167 |
+| Structural confirmation | SC | 2 | 0.05 / 2 = 0.025 |
+| Rebalancing sensitivity | RB | 1 | 0.05 / 1 = 0.05 |
 
-Two-stage, forward, disjoint split per hypothesis (the forward analogue of VS1's discovery/holdout):
+Two stages per hypothesis, forward and disjoint (the forward analogue of VS1's discovery/holdout):
 
-1. **Discovery window.** The first `n_discovery` valid observations after the hypothesis's first
-   decision. One look, at exactly `n_discovery`. Selected if the statistic has the registered
-   sign and one-sided p <= 0.10.
-2. **Holdout window.** The next `n_holdout` valid observations, all with decisions strictly after
-   the discovery verdict record. Disjoint from discovery. One look, at exactly `n_holdout`.
-3. **Holdout alpha.** Frozen-selection Bonferroni within the sub-family: 0.05 divided by the number
-   of hypotheses of that sub-family selected in discovery. Same sign required. Hypotheses never
-   selected keep p = 1 in the family's count. Unselected, blocked or stopped hypotheses close.
-4. **Across sub-families.** Nothing is pooled. By the union bound, the chance of any false holdout
-   pass anywhere in this family is at most 5 x 0.05 = 0.25; every report states this bound next to
-   any pass. A pass in one sub-family never lends alpha to another.
-5. **Global trial count.** Exactly the ten hypotheses in section 7, registered once in the E3 trial
-   ledger as ten trials. No hypothesis may be added to v1. A new hypothesis is a new version.
+1. **Discovery.** The first `n_discovery` valid observations after the hypothesis's first decision.
+   One look, at exactly `n_discovery`. Selected if the statistic has the registered sign and
+   one-sided p <= 0.10. Not selected closes the hypothesis.
+2. **Gap.** Observations whose decision falls after the last discovery observation and at or before
+   the discovery verdict record are dropped from both stages and logged as `between_stages`.
+3. **Holdout.** The next `n_holdout` valid observations, all decided strictly after the discovery
+   verdict record. One look, at exactly `n_holdout`. Pass if the registered sign holds and one-sided
+   p <= the fixed per-hypothesis alpha in the table above.
+4. **Fixed k.** The divisor is the registered count k of the sub-family, fixed now. It does not
+   depend on how many hypotheses are selected, blocked or stopped, or on when their verdicts arrive.
+5. **Across sub-families.** Nothing is pooled. By the union bound the chance of any false holdout
+   pass in this family is at most 5 x 0.05 = 0.25; every report states this bound next to any pass.
+   Overlapping v1 claims (section 7) add their own bounds.
+6. **Global trial count.** Exactly the ten hypotheses in section 8, registered once in the E3 trial
+   ledger as ten trials. No hypothesis may be added to v1.
 
 ## 2. Stage-0 power gate (before any first decision)
 
-Before a hypothesis's first decision, a Stage-0 synthetic power computation is run and witnessed.
-It uses only the registered statistic, the registered windows and the planted effect in section 7,
-with synthetic outcomes drawn from the registered noise parameter. It reads no real outcome.
+Before a hypothesis's first decision a Stage-0 synthetic power computation is run and witnessed. It
+uses only the registered statistic, windows, alpha and the `planted_effect` of section 8, with
+synthetic outcomes. It reads no real outcome.
 
-- Gate: synthetic power at the registered holdout alpha (assuming every hypothesis in its
-  sub-family is selected, the most conservative case) must be at least 0.50 for the registered
-  `n_holdout`. Seed 20261001, 2,000 simulations.
-- If the gate fails at the registered `n_holdout`, the next larger value in the hypothesis's
-  `n_holdout_ladder` is tried, in order. The first rung that passes becomes binding and is
-  witnessed. If no rung passes, the hypothesis is `STOP_UNDERPOWERED`: it is logged as activity
-  only and can never yield a verdict. No override exists.
-- Back-of-envelope (normal approximation, not binding): a daily SPY trade with a planted net edge
-  of 10 bp and 80 bp noise needs about 290 trades for power 0.50 at alpha 0.0167. Trade hypotheses
-  therefore carry ladders measured in years. This is stated so that nobody mistakes a short
-  window for evidence.
+- **Simulation.** Seed 20261001, 2,000 simulations, independent observations (optimistic: real
+  returns are autocorrelated and heavy-tailed; the Newey-West statistic is still used).
+  - `trade`: per-trade net return ~ Normal(`net_bps`, `noise_bps`).
+  - `forecast_continuous`: standardized regressor z ~ N(0, 1); the PO2 control c ~ N(0, 1) with
+    corr(z, c) = `control_corr`; outcome y = `slope_per_sd` * z + 0.3 * c + e, e ~ N(0, `noise_log_sd`).
+  - `forecast_binary`: x ~ Bernoulli(`base_rate`), correlated with c through a latent Gaussian with
+    correlation `control_corr`; y = `diff` * x + 0.3 * c + e.
+  - `paired_trade`: per-session paired difference ~ Normal(`net_bps`, `noise_bps`).
+- **Gate.** The joint power, P(selected in discovery AND pass in holdout), must be at least 0.50 at the
+  registered `n_discovery` and `n_holdout`. If not, the next `n_holdout_ladder` rung is tried in order.
+  The first passing rung becomes binding and is witnessed. If no rung passes, the hypothesis is
+  `STOP_UNDERPOWERED`: activity is logged and no verdict can ever be issued. No override exists.
+  The holdout-only power at the binding rung is reported alongside.
+- **Standardization (no outcome use).** A continuous regressor x is standardized as
+  z = (x - m) / s, with m and s the mean and standard deviation of x over the discovery window's
+  valid observations (inputs only). m and s are frozen in the discovery verdict record and reused
+  unchanged in the holdout.
+- **Scale.** A daily SPY trade with a 10 bp net edge and 80 bp noise needs on the order of a
+  thousand trades for joint power 0.5 at alpha 0.025. The ladders are therefore measured in years.
+  This is stated so that nobody mistakes a short window for evidence.
 
 ## 3. Decision instants, inputs and the engine pin
 
 All times are America/New_York on NYSE regular sessions (`ingestion.market_calendar`). Early-close
 sessions and the session after an unscheduled closure are excluded (`early_close`, `market_closed`).
 
-- **Pre-open decision (D0).** 09:10 for session S. The decision record must be appended to the
-  family log, and its anchor must be committed to the off-host witness file on vault `main` before
-  09:28. Otherwise the session is excluded `late_decision`. The entry auction is 09:30.
-- **Chain.** SPY in `options_snapshots_all`, one explicit `capture_batch_id` registered in
-  `options_capture_batches`: the latest complete batch for SPY with `capture_completed_at` before
-  D0 and `snap_date` equal to the previous NYSE session S-1. Replayed through
-  `DealerGammaEngine.compute_gex_profile("SPY", S-1, capture_batch_id=...)`. Never the latest-batch
-  view, never a batch first registered after D0. A batch that is missing, incomplete or not
-  registered before D0 excludes the session (`no_batch`). A later replacement batch never changes
-  a logged decision.
-- **Engine pin (MG and SC).** GRID `physics/dealer_gamma.py` and `physics/greeks/black_scholes.py`
-  with SHA-256 `a74a4df9c9a966e38a471d05bef7a6871107d841704481780dca95fe31e5095b` and
-  `7affd538a299c9ac9683d798b39df6ee1accb990e2a882457ad5155c53df317d` (content of main
-  `cdf1b7f7f5a3cf2f37030a9c8164203405a23ecb`; last engine change `dafc9c06`). Native parameters:
-  r = 0.05, q = 0, integer calendar DTE, DTE 0 excluded, OI > 0 and IV > 0, prior completed close
-  spot from `spy_close_receipt`, engine regime thresholds (`gex_normalized` > 0.5 LONG_GAMMA,
-  < -0.5 SHORT_GAMMA). The logger runs an immutable archive of exactly these files and refuses if
-  their hashes differ. A later engine fix, including any GEX-P2C canonical-engine decision, does not
-  change this family. It can only start a new version. The GEX-P2B arithmetic evidence for this engine
-  is recorded by reference only and validates arithmetic, not any hypothesis.
-- **P0.** SPY's official close of S-1 from the PIT close receipt (section 4), used for every
-  distance and side. The engine's own spot is recorded but never used for P0.
-- **Delayed-wall and structural inputs (DW, SC).** Each needs an append-only capture with a grid-svr
-  pull receipt (`available_at` = completed grid-svr pull, never the ANIK workstation clock), held
-  in GRID before D0. None exists on 2026-10-01. These hypotheses are `BLOCKED` until one is
-  separately built, reviewed, owner-activated and has collected its first receipt. Missing history
-  stays missing; it is never backfilled.
+- **Pre-open decision D0 = 09:10 on session S.** The decision record is appended to the decision log,
+  its anchor line is appended to the decision witness file (section 10), and that commit must be on
+  vault `origin/main` before 09:28, proven as in section 10. Otherwise the session is excluded
+  `late_decision`. Market-on-open orders are due before the 09:30 opening auction.
+- **Receipt rule for every input.** An input counts only if its GRID receipt (`created_at`, the row's
+  insertion time, never the provider's or the pull's `available_at`) is at or before D0. Otherwise
+  the session is excluded `input_unavailable`.
+- **Chain.** SPY rows in `options_snapshots_all` for exactly one batch in `options_capture_batches`:
+  ticker `SPY`, `snap_date` = S-1, `backfilled = false`, `registered_at <= D0`, the highest
+  `capture_ordinal` among those, with `row_count` equal to the stored rows. It is replayed through
+  `DealerGammaEngine.compute_gex_profile("SPY", S-1, capture_batch_id=...)`. The latest-batch view is
+  never used. A missing or incomplete batch excludes the session (`no_batch`). A later batch never
+  changes a logged decision.
+- **Engine spot.** The pinned engine prices gamma at its own verified prior close: the latest
+  `spy_close_receipt` available before the batch completed, which is the S-2 close. This is disclosed
+  and kept as the engine's native behavior. Every distance and side in this family uses P0 instead.
+- **P0 and PM.** P0 = SPY's official close of S-1. PM = a SPY pre-market indication (last trade or
+  quote midpoint) stamped between 08:30 and 09:10. Both must come from one pre-open capture with a
+  grid-svr receipt at or before D0. GRID's `spy_close_v1` receipts arrive from 13:30Z on S, which is
+  after D0, so they cannot serve as P0. No pre-open capture exists on 2026-10-01, so every
+  hypothesis that uses P0 or PM is `BLOCKED_INPUT`. Admission requires an independently reviewed
+  check over at least 20 sessions: the captured S-1 close equals the later `spy_close_v1` receipt
+  for S-1, and the PM timestamp falls in the window.
+- **Gap.** g = ln(PM / P0), known at D0.
+- **Engine pin (MG and SC).** GRID `physics/dealer_gamma.py` and `physics/greeks/black_scholes.py`,
+  pinned by the SHA-256 of their LF git content at main `cdf1b7f7f5a3cf2f37030a9c8164203405a23ecb`:
+  `8db7ab0ac311d6564fa44a664d4685c23ff40669c845769fc842c93e63037111` and
+  `50d5dfd9f26d1e797ccfc913a8e127040e3908de0cfb3a8a5f6bc230c5764b99`. Native parameters: r = 0.05,
+  q = 0, integer calendar DTE, DTE 0 excluded, OI > 0 and IV > 0, engine regime thresholds
+  (`gex_normalized` > 0.5 LONG_GAMMA, < -0.5 SHORT_GAMMA). The logger runs an immutable archive of
+  exactly this content and refuses on any hash difference (LF-normalized). A later engine change,
+  including any GEX-P2C canonical-engine decision, cannot change this family; it can only start a
+  new version.
+- **Delayed walls (DW).** Two inputs are named here: (a) ZeroGEX `get_gamma_levels("SPY")` call-wall
+  and put-wall values; (b) a Cboe delayed SPY chain. Each needs an append-only capture with a
+  grid-svr receipt at or before D0. Neither capture exists; both are `BLOCKED_INPUT`. ZeroGEX's
+  methodology is not published to GRID and was not obtained at registration. DW1 therefore treats
+  its levels as opaque vendor numbers. The admission record must quote the vendor's field names and
+  any published definition. A later change in the vendor's fields stops DW1 (`STOP_INPUT_CHANGED`).
+- **Recomputed walls (DW2), written here in full.** From the Cboe capture: standard `SPY` roots only;
+  OI > 0; 0 < IV <= 5; expiry at 16:00 America/New_York; T = seconds from the capture's
+  last_trade_time (read as America/New_York) to expiry / (365 x 86400), T > 0; Black-Scholes gamma
+  with r = 0.04, q = 0 and the Cboe IV; exposure per contract = gamma(P0) x OI x 100 x P0^2 x 0.01,
+  sign +1 for calls and -1 for puts. Summed by strike: call wall = the strike with the largest
+  positive call exposure; put wall = the strike with the most negative put exposure. Ties go to the
+  strike nearer P0, then the lower strike.
+- **Breadth (SC).** NYSE ADVN and DECN at the S-1 close, captured with a grid-svr receipt at or before
+  D0. There is no capture, so `BLOCKED_INPUT`.
 
-## 4. Executable price contracts (copied from the SPY outcome-selection rule)
+## 4. Executable price contracts
 
-Every price is the price of an order that could have been sent at the decision instant. No mid,
-no theoretical fill, no intraday bar print.
+Every price is the price of an order that could have been sent at the decision instant. No mid, no
+theoretical fill, no intraday bar print.
 
-- **PC-OC (open auction to close auction, session S).** Entry: SPY official opening auction price
-  of S (a market-on-open order submitted after D0). Exit: SPY official closing auction price of S
-  (market-on-close). Return = side * (close / open - 1) minus costs.
-- **PC-CC (close auction to close auction).** Entry: official closing auction price of the entry
-  session. Exit: the official closing auction price of the exit session.
-- **Receipt rule.** The outcome for session S uses only a price receipt for S whose `created_at`
-  is at or before D = (S + 6 calendar days) 00:00Z. Use `created_at`, not `available_at`: the receipt
-  row is written later than the raw pull, the trap already documented for `spy_close_v1`. If no
-  eligible receipt exists at D + 1 hour, the observation is terminally `price_unavailable`. There is
-  no fallback to another session, another source or a later receipt.
-- **Admitted sources.** Close: `astrogrid.price_close_receipt` (`spy_close_v1` receipts, unadjusted,
-  verified). Open: none is admitted on 2026-10-01. Before any PC-OC hypothesis can start, an opening
-  auction source must pass an independently reviewed admission check: at least 20 sessions in which
-  the candidate open equals the NYSE Arca official opening auction print, unadjusted, with a
-  grid-svr receipt. Until then every PC-OC hypothesis is `BLOCKED_PRICE_CONTRACT`.
-- **Costs.** E2 cost model `e2-costs-v1`, class `us_equity_etf_large`: 3 bp per side, 6 bp round
-  trip, primary. A 1 bp-per-side sensitivity (the GEX-levels v1 cost) is reported, never tested.
-- **Measured quantities for forecast hypotheses.** Open-to-close absolute log return
-  |ln(C_S / O_S)| uses the same PC-OC prices and receipts. A forecast hypothesis has no fill and is
-  not a P&L claim.
+- **PC-OC (opening auction to closing auction, session S).** Entry: SPY's official opening auction
+  price O_S (a market-on-open order submitted after D0 and before 09:28). Exit: the official closing
+  auction price C_S (market-on-close). Return = side x (C_S / O_S - 1) - costs.
+- **PC-CC (closing auction to closing auction).** Entry: the official closing auction price of the
+  entry session (market-on-close submitted before that session's MOC cutoff, 15:50). Exit: the
+  official closing auction price of the exit session.
+- **Outcome receipts (copied from the SPY outcome-selection rule).** Each price session E used as an
+  outcome counts only through a receipt for E whose `created_at` is at or before
+  D(E) = (E + 6 calendar days) 00:00Z; `created_at`, not `available_at`, because the receipt row is
+  written after the raw pull. If no eligible receipt exists at D(E) + 1 hour, the observation is
+  terminally `price_unavailable`. There is no fallback to another session, source or later receipt.
+- **Admitted sources.** Closes: `astrogrid.price_close_receipt` (`spy_close_v1` receipts,
+  unadjusted, verified), as outcomes only. Opens: none admitted on 2026-10-01. Admitting an
+  opening-auction source requires an independently reviewed check over at least 20 sessions: the
+  candidate equals the NYSE Arca official opening auction print, unadjusted, with a grid-svr receipt.
+  Until then every PC-OC hypothesis is `BLOCKED_PRICE_CONTRACT`.
+- **Costs.** E2 cost model `e2-costs-v1`, class `us_equity_etf_large`: 3 bp per side, 6 bp round trip.
+  This is the primary cost. A 1 bp-per-side sensitivity (GEX-levels v1's cost) is reported but never
+  tested.
+- **Move size for forecasts.** m_S = |ln(C_S / O_S)| from the same PC-OC prices and receipts. The
+  forecast outcome is y_S = ln(max(m_S, 0.00005)); the 0.5 bp floor keeps C = O finite. A forecast
+  has no fill and is not a P&L claim.
 
 ## 5. Forward logger and E2 feed (design decision)
 
 S10's `grid-hypothesis-forward-log.timer` does not fit. S10 admits only frozen candidates from
-`scripts/run_real_panel_scan.py` scans, reads features through the latest-vintage observations
-adapter and labels target series. It has no capture-batch identity, engine pin, pre-open witness
-deadline or auction price contract. Bolting those on would change S10's registered behavior.
+`scripts/run_real_panel_scan.py` scans, reads features through the latest-vintage observations adapter
+and labels target series. It has no capture-batch identity, engine pin, pre-open witness deadline or
+auction price contract. Adding them would change S10's registered behavior.
 
-Decision: a reviewed sibling logger, `gex_intraday_v1`. Its family log is written in E2's admission
-format `e2-stream-v1` (header `format`, `stream = "gex_intraday_v1"`, `prereg_sha256` = this body's
-SHA-256), using the S10 chain convention (`analysis.research_forward_log.ForwardLog`: canonical JSON
-lines, `prev_sha256`, chained anchor file). It adds these fields to each prediction:
-`hypothesis_id`, `sub_family`, `capture_batch_id`, `engine_pin`, `decision_at`, `p0_receipt_id`
-and `price_contract`.
+Decision: a reviewed sibling logger, `gex_intraday_v1`. Its decision log is written in E2's admission
+format `e2-stream-v1`. The header carries `format`, `stream = "gex_intraday_v1"` and `prereg_sha256` =
+this body's SHA-256. It uses the S10 chain convention (`analysis.research_forward_log.ForwardLog`:
+canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds `hypothesis_id`,
+`sub_family`, `capture_batch_id`, `engine_pin`, `decision_at`, `input_receipts` and `price_contract`.
 
 - PC-CC direction hypotheses map onto the existing E2 rule `e2.direction.v1`.
 - PC-OC trades need an E2 rule for auction-to-auction intraday entry and exit, proposed as
-  `e2.auction_oc.v1`. Forecast hypotheses need a forecast rule, proposed as `e2.abs_move.v1`. Both
-  are E2 releases owned by the E2 lane (EVAL-E2F4). Until they exist, E2 reports those hypotheses
-  as activity only, and the family's own one-look tests in section 7 decide them.
+  `e2.auction_oc.v1`. Forecasts need `e2.abs_move.v1` and paired tests need `e2.paired_oc.v1`. These
+  are E2 releases owned by the E2 lane (EVAL-E2F4). Until they exist, E2 reports those hypotheses as
+  activity only, and this family's own one-look tests decide them.
 - E2 never promotes. This family never writes a weight, signal, briefing or order.
 
-## 6. Overlap with GEX-levels v1 and with S10
+## 6. Incremental claims (gamma and breadth are never credited by default)
 
-- v1 H1 (pre-open regime label -> ln range, VIX control): overlaps MG1 in spirit (gamma -> volatility).
-  MG1 differs in regressor (continuous `gex_normalized`), outcome (auction open-to-close absolute
-  return, not the bar range) and control (price-only persistence PO2). Both are counted. Any report
-  of either cites the other, and their pass bounds add.
-- v1 H2/H3 (wall hold and wall-break trade on GRID engine walls, 5-minute bars): no P3 hypothesis
-  re-tests them. DW uses vendor or Cboe-recomputed delayed walls and auction prices only.
+- MG2's registered statistic is paired. On every session where PO1 triggers, take
+  d = net(MG2) - net(PO1); net(MG2) = 0 on a session where MG2 does not trade. Only this tests
+  whether the gamma regime adds anything to fading the gap.
+- SC1's registered statistic is paired the same way: d = net(SC1) - net(MG2) on every session where
+  MG2 trades.
+- A standalone mean for MG2 or SC1 may be reported. It may never be described as evidence for gamma
+  or breadth.
+- MG1, MG3, DW2 and SC2 enter PO2's regressor as a control, so their coefficients are incremental
+  to price-only persistence.
+
+## 7. Overlap with GEX-levels v1 and with S10
+
+- MG1 restates v1 H1 in spirit: gamma conditions move size. MG2 and SC1 restate v1 H3's regime claim
+  (fade under LONG_GAMMA, follow under SHORT_GAMMA) with a gap trigger instead of a wall.
+- **Session separation.** MG1, MG2 and SC1 make no decision on any session up to and including the
+  later of (a) v1's 60th valid session and (b) v1's evaluation or stop record. They stay `BLOCKED` until
+  then. Any report of these three cites v1's matching hypothesis, and their false-pass bounds add to
+  v1's.
+- v1 H2 (wall hold against mirror placebos on 5-minute bars) is not re-tested. DW uses vendor or
+  recomputed delayed walls and auction prices only.
 - S10: no candidate scientific pair is shared.
 
-## 7. The ten hypotheses (machine-readable, binding)
+## 8. The ten hypotheses (machine-readable, binding)
 
-The JSON block below is the binding list. Prose elsewhere explains it; if they disagree, the block
-governs and the discrepancy is a defect to be fixed in v2.
+The JSON block below is the binding list. The prose explains it; if the two disagree, the block
+governs and the discrepancy is a defect, fixed only in v2.
 
 ```json
 {
   "family": "gex_intraday_v1",
   "registered_on": "2026-10-01",
-  "first_decision_rule": "first NYSE session strictly after witnessed registry header, owner activation and hypothesis admission",
-  "stage0": {"seed": 20261001, "simulations": 2000, "min_power": 0.5},
+  "first_decision_rule": "first NYSE session strictly after witnessed registry header, owner activation, admitted inputs and price contract, witnessed Stage-0 pass, and for MG1/MG2/SC1 the GEX-levels v1 separation rule",
+  "stage0": {"seed": 20261001, "simulations": 2000, "min_joint_power": 0.5, "control_loading": 0.3},
   "discovery": {"select_one_sided_p": 0.10},
-  "holdout": {"family_alpha": 0.05, "correction": "frozen_selection_bonferroni_within_sub_family", "same_sign": true},
+  "holdout": {
+    "family_alpha": 0.05,
+    "correction": "fixed_k_bonferroni_within_sub_family",
+    "k": {"PO": 2, "DW": 2, "MG": 3, "SC": 2, "RB": 1},
+    "same_sign": true
+  },
   "sub_families": ["PO", "DW", "MG", "SC", "RB"],
   "engine_pin": {
-    "physics/dealer_gamma.py": "a74a4df9c9a966e38a471d05bef7a6871107d841704481780dca95fe31e5095b",
-    "physics/greeks/black_scholes.py": "7affd538a299c9ac9683d798b39df6ee1accb990e2a882457ad5155c53df317d",
+    "physics/dealer_gamma.py": "8db7ab0ac311d6564fa44a664d4685c23ff40669c845769fc842c93e63037111",
+    "physics/greeks/black_scholes.py": "50d5dfd9f26d1e797ccfc913a8e127040e3908de0cfb3a8a5f6bc230c5764b99",
+    "hash_basis": "sha256 of LF git content",
     "reference_commit": "cdf1b7f7f5a3cf2f37030a9c8164203405a23ecb"
   },
   "cost": {"model": "e2-costs-v1", "class": "us_equity_etf_large", "bps_per_side": 3.0, "sensitivity_bps_per_side": 1.0},
+  "forecast_outcome": {"y": "ln(max(abs(ln(C_S/O_S)), 0.00005))"},
   "hypotheses": [
     {
       "id": "PO1", "sub_family": "PO", "kind": "trade", "uses_gamma": false,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.auction_oc.v1",
-      "input": "P0 and SPY official open of S",
-      "rule": "if |ln(O_S/P0)| >= 0.003, side = -sign(ln(O_S/P0)) (fade the overnight gap); else no trade",
+      "input": "P0 and PM from one admitted pre-open capture",
+      "rule": "g = ln(PM/P0); if abs(g) >= 0.003, side = -sign(g) (fade the pre-open gap); else no trade",
       "statistic": "mean net PC-OC return per trade; one-sided t, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"net_bps": 10, "noise_bps": 80},
-      "n_discovery": 120, "n_holdout": 290, "n_holdout_ladder": [290, 580, 1160],
-      "input_status": "BLOCKED_PRICE_CONTRACT"
+      "planted_effect": {"model": "trade", "net_bps": 10, "noise_bps": 80},
+      "n_discovery": 250, "n_holdout": 580, "n_holdout_ladder": [580, 1160, 2320],
+      "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "PO2", "sub_family": "PO", "kind": "forecast", "uses_gamma": false,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.abs_move.v1",
-      "input": "|ln(C/O)| of sessions S-1..S-20 from admitted receipts",
-      "rule": "forecast x = ln(mean |ln(C/O)| over S-1..S-5) - ln(median |ln(C/O)| over S-1..S-20)",
-      "statistic": "OLS slope of ln|ln(C_S/O_S)| on x; one-sided, Newey-West 5 lags",
+      "input": "m for sessions S-2..S-21 from outcome receipts created at or before D0",
+      "rule": "x = ln(mean m over S-2..S-6) - ln(median m over S-2..S-21)",
+      "statistic": "OLS slope of y_S on z(x); one-sided, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"slope": 0.15, "noise_log_sd": 1.0},
-      "n_discovery": 60, "n_holdout": 120, "n_holdout_ladder": [120, 250, 500],
+      "planted_effect": {"model": "forecast_continuous", "slope_per_sd": 0.15, "noise_log_sd": 1.0, "control_corr": 0.0},
+      "n_discovery": 120, "n_holdout": 250, "n_holdout_ladder": [250, 500, 1000, 2000],
       "input_status": "BLOCKED_PRICE_CONTRACT"
     },
     {
       "id": "DW1", "sub_family": "DW", "kind": "trade", "uses_gamma": true,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.auction_oc.v1",
-      "input": "ZeroGEX delayed SPY call wall and put wall captured with a grid-svr receipt before D0",
-      "rule": "if O_S is within 0.25% below the vendor call wall, side = -1; if within 0.25% above the vendor put wall, side = +1; both or neither: no trade",
+      "input": "ZeroGEX call wall and put wall captured at or before D0; PM",
+      "rule": "if PM is within 0.25% below the vendor call wall, side = -1; if within 0.25% above the vendor put wall, side = +1; both or neither: no trade",
       "statistic": "mean net PC-OC return per trade; one-sided t, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"net_bps": 10, "noise_bps": 80},
-      "n_discovery": 60, "n_holdout": 290, "n_holdout_ladder": [290, 580, 1160],
+      "planted_effect": {"model": "trade", "net_bps": 10, "noise_bps": 80},
+      "n_discovery": 120, "n_holdout": 580, "n_holdout_ladder": [580, 1160, 2320],
       "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "DW2", "sub_family": "DW", "kind": "forecast", "uses_gamma": true,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.abs_move.v1",
-      "input": "Cboe delayed SPY chain captured with a grid-svr receipt before D0; walls by the GEX-P2B reference wall definitions",
-      "rule": "x = min distance from P0 to the reference call wall or put wall, in percent of P0",
-      "statistic": "OLS slope of ln|ln(C_S/O_S)| on ln(x), controlling for PO2's x; one-sided, Newey-West 5 lags",
+      "input": "Cboe delayed SPY chain captured at or before D0; walls by the section 3 formula; P0",
+      "rule": "x = ln(min distance from P0 to the recomputed call wall or put wall, in percent of P0, floored at 0.01)",
+      "statistic": "OLS slope of y_S on z(x) and PO2's z; one-sided, Newey-West 5 lags",
       "direction": "negative",
-      "planted_effect": {"slope": -0.15, "noise_log_sd": 1.0},
-      "n_discovery": 60, "n_holdout": 120, "n_holdout_ladder": [120, 250, 500],
+      "planted_effect": {"model": "forecast_continuous", "slope_per_sd": -0.15, "noise_log_sd": 1.0, "control_corr": 0.3},
+      "n_discovery": 120, "n_holdout": 250, "n_holdout_ladder": [250, 500, 1000, 2000],
       "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "MG1", "sub_family": "MG", "kind": "forecast", "uses_gamma": true,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.abs_move.v1",
-      "input": "pinned engine gex_normalized from the D0 capture batch",
+      "input": "pinned engine gex_normalized from the section 3 batch",
       "rule": "x = gex_normalized (continuous)",
-      "statistic": "OLS slope of ln|ln(C_S/O_S)| on x, controlling for PO2's x; one-sided, Newey-West 5 lags",
+      "statistic": "OLS slope of y_S on z(x) and PO2's z; one-sided, Newey-West 5 lags",
       "direction": "negative",
-      "planted_effect": {"slope": -0.10, "noise_log_sd": 1.0},
-      "n_discovery": 60, "n_holdout": 120, "n_holdout_ladder": [120, 250, 500],
+      "planted_effect": {"model": "forecast_continuous", "slope_per_sd": -0.15, "noise_log_sd": 1.0, "control_corr": 0.3},
+      "n_discovery": 120, "n_holdout": 250, "n_holdout_ladder": [250, 500, 1000, 2000],
       "input_status": "BLOCKED_PRICE_CONTRACT"
     },
     {
-      "id": "MG2", "sub_family": "MG", "kind": "trade", "uses_gamma": true,
-      "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.auction_oc.v1",
-      "input": "pinned engine regime from the D0 capture batch; P0; O_S",
-      "rule": "gap g = ln(O_S/P0), |g| >= 0.003: SHORT_GAMMA side = sign(g) (continue); LONG_GAMMA side = -sign(g) (fade); NEUTRAL or |g| < 0.003: no trade",
-      "statistic": "mean net PC-OC return per trade; one-sided t, Newey-West 5 lags; PO1 on the same sessions reported alongside, never pooled",
+      "id": "MG2", "sub_family": "MG", "kind": "paired_trade", "uses_gamma": true,
+      "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.paired_oc.v1",
+      "input": "pinned engine regime from the section 3 batch; P0 and PM",
+      "rule": "on abs(g) >= 0.003: SHORT_GAMMA side = sign(g) (continue); LONG_GAMMA side = -sign(g) (fade); NEUTRAL: no trade",
+      "statistic": "mean of d = net(MG2) - net(PO1) over sessions where PO1 trades; one-sided t, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"net_bps": 10, "noise_bps": 80},
-      "n_discovery": 120, "n_holdout": 290, "n_holdout_ladder": [290, 580, 1160],
-      "input_status": "BLOCKED_PRICE_CONTRACT"
+      "planted_effect": {"model": "paired_trade", "net_bps": 10, "noise_bps": 80},
+      "n_discovery": 250, "n_holdout": 580, "n_holdout_ladder": [580, 1160, 2320],
+      "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "MG3", "sub_family": "MG", "kind": "forecast", "uses_gamma": true,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.abs_move.v1",
-      "input": "pinned engine gamma_flip and gamma_flip_crossings from the D0 capture batch; P0",
-      "rule": "x = 1 if gamma_flip_crossings >= 1 and |gamma_flip - P0| / P0 <= 0.0025, else 0",
-      "statistic": "difference in mean ln|ln(C_S/O_S)| (x=1 minus x=0), controlling for PO2's x by OLS; one-sided, Newey-West 5 lags",
+      "input": "pinned engine gamma_flip and gamma_flip_crossings from the section 3 batch; P0",
+      "rule": "x = 1 if gamma_flip_crossings >= 1 and abs(gamma_flip - P0) / P0 <= 0.0025, else 0",
+      "statistic": "OLS coefficient of x in y_S on x and PO2's z; one-sided, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"slope": 0.20, "noise_log_sd": 1.0},
-      "n_discovery": 60, "n_holdout": 120, "n_holdout_ladder": [120, 250, 500],
-      "input_status": "BLOCKED_PRICE_CONTRACT"
+      "planted_effect": {"model": "forecast_binary", "diff": 0.30, "base_rate": 0.15, "noise_log_sd": 1.0, "control_corr": 0.2},
+      "n_discovery": 120, "n_holdout": 250, "n_holdout_ladder": [250, 500, 1000, 2000],
+      "input_status": "BLOCKED_INPUT"
     },
     {
-      "id": "SC1", "sub_family": "SC", "kind": "trade", "uses_gamma": true,
-      "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.auction_oc.v1",
-      "input": "MG2 trigger plus NYSE ADVN-DECN at the prior session close captured with a grid-svr receipt",
-      "rule": "MG2's trade only when sign(ADVN-DECN at S-1 close) equals the MG2 side; else no trade",
-      "statistic": "mean net PC-OC return per trade; one-sided t, Newey-West 5 lags",
+      "id": "SC1", "sub_family": "SC", "kind": "paired_trade", "uses_gamma": true,
+      "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.paired_oc.v1",
+      "input": "MG2 trigger plus NYSE ADVN minus DECN at the S-1 close, captured at or before D0",
+      "rule": "MG2's trade only when sign(ADVN - DECN) equals the MG2 side; else no trade",
+      "statistic": "mean of d = net(SC1) - net(MG2) over sessions where MG2 trades; one-sided t, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"net_bps": 10, "noise_bps": 80},
-      "n_discovery": 60, "n_holdout": 290, "n_holdout_ladder": [290, 580, 1160],
+      "planted_effect": {"model": "paired_trade", "net_bps": 10, "noise_bps": 80},
+      "n_discovery": 120, "n_holdout": 580, "n_holdout_ladder": [580, 1160, 2320],
       "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "SC2", "sub_family": "SC", "kind": "forecast", "uses_gamma": true,
       "price_contract": "PC-OC", "decision": "D0", "e2_rule": "e2.abs_move.v1",
-      "input": "pinned engine regime; NYSE ADVN-DECN at the prior session close with a grid-svr receipt",
-      "rule": "x = 1 if regime is SHORT_GAMMA and |ADVN-DECN| at S-1 close is in its top third over S-1..S-60, else 0",
-      "statistic": "difference in mean ln|ln(C_S/O_S)| (x=1 minus x=0), controlling for PO2's x by OLS; one-sided, Newey-West 5 lags",
+      "input": "pinned engine regime; NYSE ADVN minus DECN at the S-1 close and the prior 59 closes, captured at or before D0",
+      "rule": "x = 1 if regime is SHORT_GAMMA and abs(ADVN - DECN) at the S-1 close is in its top third over the S-1..S-60 closes, else 0",
+      "statistic": "OLS coefficient of x in y_S on x and PO2's z; one-sided, Newey-West 5 lags",
       "direction": "positive",
-      "planted_effect": {"slope": 0.20, "noise_log_sd": 1.0},
-      "n_discovery": 60, "n_holdout": 120, "n_holdout_ladder": [120, 250, 500],
+      "planted_effect": {"model": "forecast_binary", "diff": 0.30, "base_rate": 0.10, "noise_log_sd": 1.0, "control_corr": 0.2},
+      "n_discovery": 120, "n_holdout": 250, "n_holdout_ladder": [250, 500, 1000, 2000],
       "input_status": "BLOCKED_INPUT"
     },
     {
       "id": "RB1", "sub_family": "RB", "kind": "trade", "uses_gamma": false,
-      "price_contract": "PC-CC", "decision": "close of the third-to-last NYSE session of each month (M-3)", "e2_rule": "e2.direction.v1",
-      "input": "month-to-date total returns of SPY and AGG through M-3 from admitted unadjusted closes and declared dividends",
-      "rule": "if SPY MTD minus AGG MTD >= +0.03, side = -1 from close of M-2 to close of M (rebalancing sale); if <= -0.03, side = +1; else no trade",
+      "price_contract": "PC-CC", "decision": "D_RB: 15:00 on M-2, the second-to-last NYSE session of each month", "e2_rule": "e2.direction.v1",
+      "input": "month-to-date total returns of SPY and AGG through the M-3 close, from unadjusted close receipts and declared dividends with ex-dates in the month, every receipt created at or before D_RB",
+      "rule": "if SPY MTD minus AGG MTD >= +0.03, side = -1 from the M-2 close to the M close (rebalancing sale); if <= -0.03, side = +1; else no trade",
       "statistic": "mean net PC-CC return per trade; one-sided t",
       "direction": "positive",
-      "planted_effect": {"net_bps": 40, "noise_bps": 150},
-      "n_discovery": 12, "n_holdout": 36, "n_holdout_ladder": [36, 72],
+      "planted_effect": {"model": "trade", "net_bps": 40, "noise_bps": 150},
+      "n_discovery": 12, "n_holdout": 36, "n_holdout_ladder": [36, 72, 144],
       "input_status": "BLOCKED_INPUT"
     }
   ]
@@ -301,37 +356,57 @@ governs and the discrepancy is a defect to be fixed in v2.
 
 Notes binding the block:
 
-- `n_discovery` and `n_holdout` count valid observations: trades for `trade`, sessions for
-  `forecast`, month-ends for RB1. A session with no trigger is not a trade and not an exclusion.
-- "Controlling for PO2's x" means PO2's forecast variable is computed for the same session and
-  entered as a regressor. It never means PO2's verdict.
-- RB1 counts month-end events. Its AGG input has no admitted source on 2026-10-01 (`BLOCKED_INPUT`).
+- `n_discovery` and `n_holdout` count valid observations: trades for `trade`; paired sessions for
+  `paired_trade`; sessions for `forecast`; month-end events for RB1. A session with no trigger is
+  neither a trade nor an exclusion.
+- z(x) is the standardization of section 2. "PO2's z" means PO2's regressor for the same session,
+  entered as a control. It never means PO2's verdict.
+- RB1's decision record and its anchor must be on vault `origin/main` before 15:45 on M-2, proven as
+  in section 10. Otherwise `late_decision`. Its entry is the M-2 market-on-close order. Each of its
+  price sessions follows the section 4 receipt rule separately. Its AGG prices and dividend source
+  are not admitted (`BLOCKED_INPUT`).
 
-## 8. Exclusions (reason codes, never silent)
+## 9. Exclusions (reason codes, never silent)
 
 `market_closed`, `early_close`, `late_decision`, `no_batch`, `engine_unavailable` (no measured spot
-or no regime), `input_blocked`, `input_unavailable` (an admitted input has no receipt before D0),
-`price_unavailable` (section 4 receipt rule) and `halted` (an SPY trading halt during S). If more
-than 10% of a hypothesis's sessions are excluded (not counting `market_closed`, `early_close` or
-`input_blocked`) by its 30th session, that hypothesis stops (`STOP_DATA_QUALITY`). Any fix is v2.
+or no regime), `input_blocked`, `input_unavailable` (no receipt at or before the decision),
+`between_stages`, `price_unavailable` (section 4) and `halted` (a SPY trading halt during S). A
+hypothesis stops (`STOP_DATA_QUALITY`) if more than 10% of its sessions are excluded by its 30th
+session. `market_closed`, `early_close`, `input_blocked` and `between_stages` do not count toward
+the 10%. Any fix is v2.
 
-Until a hypothesis's look, status reports activity only: decisions, trades, exclusions by reason,
-and valid observations against `n_discovery` or `n_holdout`. It never reports a return, hit rate,
-slope or p-value. A look taken early is a defect and invalidates the hypothesis.
+Until a hypothesis's look, status reports activity only: decisions, trades, exclusions by reason, and
+valid observations against `n_discovery` or `n_holdout`. It never reports a return, hit rate, slope
+or p-value. A look taken early is a defect and invalidates the hypothesis.
 
-## 9. Integrity and owner gates
+## 10. Integrity, witnesses and owner gates
 
-- Registry: `analysis/gex_intraday_prereg.py`, an append-only hash-chained JSONL using
-  `ForwardLog`. It holds a header (this body's SHA-256), one `preregistration` record (this block's
-  canonical SHA-256 and the ten trial ids), then, per hypothesis, `stage0_power`,
-  `admitted`/`blocked`, `discovery_verdict`, `holdout_verdict` or a `stop` record.
-- Witness: the anchor lines go to `05-GRID/Paper-Log/gex_intraday_v1/gex_intraday_v1_prereg.anchors.jsonl`
-  on vault `main`, from a worktree off `origin/main`, LF only. This is an owner gate.
-- Owner gates, none of which this PR performs: writing the registry on grid-svr; the vault witness
-  commit; the Stage-0 power run; admitting an opening-auction source, a delayed-wall capture,
-  breadth capture or AGG source; installing or enabling any logger timer (`GRID_ENABLE_*_JOB`,
-  with backup, dry-run and GO); and the E2 releases for `e2.auction_oc.v1` and `e2.abs_move.v1`.
+- **Registry.** `analysis/gex_intraday_prereg.py`: an append-only hash-chained JSONL (`ForwardLog`). It
+  starts with a header carrying this body's SHA-256 and `promotion_allowed = false`, then one
+  `preregistration` record carrying this block's canonical SHA-256 and the ten trial ids. After
+  that, per hypothesis: `admitted` or `blocked`, `stage0_power`, `discovery_verdict` (with the frozen
+  m and s), `holdout_verdict`, or `stop`. After the real registration, the two record hashes are
+  pinned in code. A different registration is a fork and is refused.
+- **Registry witness.** Anchor lines go to
+  `05-GRID/Paper-Log/gex_intraday_v1/gex_intraday_v1_prereg.anchors.jsonl` on vault `main`, from a
+  worktree off `origin/main`, LF only.
+- **Decision witness and time proof.** Every decision's anchor line is appended to
+  `05-GRID/Paper-Log/gex_intraday_v1/gex_intraday_v1_decisions.anchors.jsonl` and pushed to vault
+  `origin/main`. A commit's own timestamp is self-reported and proves nothing. The time proof is a
+  remote observation: a separate verifier fetches `origin/main` and records its fetch time together
+  with the containing commit. GitHub's server-recorded push event time is also kept. Both must be at
+  or before the deadline (09:28 for D0, 15:45 for RB1). Missing either means `late_decision`.
+- **Owner gates.** None of these is performed by this PR:
+  - writing the registry on grid-svr;
+  - the registry witness commit;
+  - the Stage-0 power runs and their witnesses;
+  - admitting the pre-open capture, opening-auction, ZeroGEX, Cboe-chain, breadth, AGG and dividend
+    sources;
+  - installing or enabling the logger timer and the daily decision-witness push automation
+    (`GRID_ENABLE_*_JOB`, with backup, dry-run and GO);
+  - the E2 releases for `e2.auction_oc.v1`, `e2.abs_move.v1` and `e2.paired_oc.v1`.
 - The frozen GEX-levels v1 log and its pinned code are not read, imported or written by any of this.
+  The section 7 rule reads only v1's verified status (session count and evaluation or stop record).
 
 <!-- PREREG-BODY-END -->
 

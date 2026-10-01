@@ -1,11 +1,13 @@
 """GEX P3 intraday family v1: pre-registration body pin, family rules, registry design.
 
-Offline: no database, network or subprocess; no outcome or price is read.
+Offline: no database or network; no outcome or price is read. One test may run
+`git show` to prove the engine pin against the reference commit's LF content.
 """
 
 import ast
 import copy
 from datetime import datetime, timezone
+import hashlib
 import json
 from pathlib import Path
 import socket
@@ -18,6 +20,7 @@ from analysis import gex_intraday_prereg as g
 
 NOW = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
 CODE = "cdf1b7f7f5a3cf2f37030a9c8164203405a23ecb"
+IDX = {h: i for i, h in enumerate(["PO1", "PO2", "DW1", "DW2", "MG1", "MG2", "MG3", "SC1", "SC2", "RB1"])}
 
 
 @pytest.fixture(autouse=True)
@@ -51,60 +54,104 @@ def test_any_body_edit_is_refused(tmp_path):
         g.check_prereg(tmp_path)
 
 
-def test_sub_families_are_separate_and_never_pooled(checked):
+def test_sub_families_are_separate_with_fixed_k(checked):
     family = checked["family"]
     assert tuple(family["sub_families"]) == g.SUB_FAMILIES
-    assert family["holdout"]["correction"] == "frozen_selection_bonferroni_within_sub_family"
-    assert sorted(sum(checked["sub_families"].values(), [])) == sorted(
-        h["id"] for h in family["hypotheses"]
-    )
+    assert family["holdout"]["correction"] == "fixed_k_bonferroni_within_sub_family"
+    assert family["holdout"]["k"] == g.FIXED_K == {k: len(v) for k, v in checked["sub_families"].items()}
     for h in family["hypotheses"]:
-        if h["sub_family"] == "PO":
-            assert h["uses_gamma"] is False
-        elif h["sub_family"] in ("DW", "MG", "SC"):
-            assert h["uses_gamma"] is True
+        assert h["uses_gamma"] is (h["sub_family"] in ("DW", "MG", "SC"))
+
+
+def test_gamma_and_breadth_trade_claims_are_paired(checked):
+    by_id = {h["id"]: h for h in checked["family"]["hypotheses"]}
+    assert by_id["MG2"]["kind"] == "paired_trade" and "net(PO1)" in by_id["MG2"]["statistic"]
+    assert by_id["SC1"]["kind"] == "paired_trade" and "net(MG2)" in by_id["SC1"]["statistic"]
+    for hid in ("DW2", "MG1", "MG3", "SC2"):
+        assert "PO2's z" in by_id[hid]["statistic"]
+
+
+def test_no_side_or_distance_uses_a_post_decision_price(checked):
+    for h in checked["family"]["hypotheses"]:
+        if h["decision"] == "D0":
+            # O_S (the opening auction) is unknown at D0; sides use PM and P0.
+            assert "O_S" not in h["rule"] and "O_S" not in h["input"], h["id"]
+    body = g.read_body()
+    assert "`spy_close_v1` receipts arrive from 13:30Z on S" in body
+    assert "registered_at <= D0" in body and "backfilled = false" in body
 
 
 def test_every_hypothesis_has_an_executable_price_contract(checked):
     body = g.read_body()
     for h in checked["family"]["hypotheses"]:
         assert h["price_contract"] in ("PC-OC", "PC-CC")
-        assert h["price_contract"] in body
-    # The receipt rule copies spy_close_v2: created_at, fixed deadline, no fallback.
-    assert "`created_at`" in body and "(S + 6 calendar days) 00:00Z" in body
+        assert h["e2_rule"] == g.E2_RULE[(h["price_contract"], h["kind"])]
+    # Receipt rule from the SPY outcome-selection design: created_at, fixed
+    # per-session deadline, no fallback.
+    assert "`created_at`" in body and "(E + 6 calendar days) 00:00Z" in body
     assert "no fallback" in body
+    assert "ln(max(abs(ln(C_S/O_S)), 0.00005))" in body
 
 
 def test_nothing_is_ready_without_admitted_inputs(checked):
-    statuses = {h["id"]: h["input_status"] for h in checked["family"]["hypotheses"]}
-    assert "READY" not in statuses.values()
-    assert all(
-        statuses[h["id"]] == "BLOCKED_PRICE_CONTRACT" or statuses[h["id"]] == "BLOCKED_INPUT"
-        for h in checked["family"]["hypotheses"]
-    )
+    assert {h["input_status"] for h in checked["family"]["hypotheses"]} <= {
+        "BLOCKED_INPUT",
+        "BLOCKED_PRICE_CONTRACT",
+    }
 
 
-def test_engine_pin_names_the_engine_by_content(checked):
+def test_engine_pin_is_lf_content_of_the_reference_commit(checked, monkeypatch, tmp_path):
     pin = checked["family"]["engine_pin"]
-    assert set(pin) == {"physics/dealer_gamma.py", "physics/greeks/black_scholes.py", "reference_commit"}
-    # Report-only: a later engine change must run the pinned archive, never relabel.
-    assert set(g.engine_matches_pin(checked["family"])) == set(g.ENGINE_FILES)
+    assert pin["hash_basis"] == "sha256 of LF git content"
+    # CRLF copies of the pinned content still match (grid-svr is LF, Windows is CRLF).
+    matches = g.engine_matches_pin(checked["family"])
+    monkeypatch.undo()  # this test alone may run git
+    verified_by_git = False
+    for f in g.ENGINE_FILES:
+        shown = subprocess.run(
+            ["git", "-C", str(g.REPO), "show", f"{pin['reference_commit']}:{f}"],
+            capture_output=True,
+        )
+        if shown.returncode == 0:
+            verified_by_git = True
+            assert hashlib.sha256(shown.stdout).hexdigest() == pin[f]
+            crlf = tmp_path / f
+            crlf.parent.mkdir(parents=True, exist_ok=True)
+            crlf.write_bytes(shown.stdout.replace(b"\n", b"\r\n"))
+    if verified_by_git:
+        assert all(g.engine_matches_pin(checked["family"], tmp_path).values())
+    elif not all(matches.values()):
+        pytest.skip("reference commit not fetched and engine changed since; pin unverifiable here")
+    assert verified_by_git or all(matches.values())
 
 
 @pytest.mark.parametrize(
     "mutate,match",
     [
-        (lambda f: f["hypotheses"][0].update(uses_gamma=True), "must not mix"),
-        (lambda f: f["hypotheses"][4].update(uses_gamma=False), "must not mix"),
-        (lambda f: f["hypotheses"][0].update(sub_family="MG"), "sub-family"),
-        (lambda f: f["hypotheses"][4].update(input_status="READY"), "opening-auction"),
-        (lambda f: f["hypotheses"][4].update(rule="x since 2026-10-15"), "dates"),
-        (lambda f: f["hypotheses"][4].update(direction="two-sided"), "one-sided"),
-        (lambda f: f["hypotheses"][4].update(n_holdout_ladder=[500, 120]), "ladder"),
+        (lambda f: f["hypotheses"][IDX["PO1"]].update(uses_gamma=True), "must not mix"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(uses_gamma=False), "must not mix"),
+        (lambda f: f["hypotheses"][IDX["RB1"]].update(uses_gamma=True), "must not mix"),
+        (lambda f: f["hypotheses"][IDX["PO1"]].update(sub_family="MG"), "sub-family"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(input_status="READY"), "opening-auction"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x since 2026-10-15"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x after the 2027 rebalance"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x in October only"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(direction="two-sided"), "one-sided"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(n_holdout_ladder=[500, 250]), "ladder"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(n_holdout=250.0), "integer"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(e2_rule="e2.direction.v1"), "e2 rule"),
+        (lambda f: f["hypotheses"][IDX["MG2"]].update(statistic="mean net return"), "paired"),
+        (lambda f: f["hypotheses"][IDX["MG3"]]["planted_effect"].pop("base_rate"), "Stage-0"),
+        (lambda f: f["hypotheses"][IDX["MG3"]]["planted_effect"].update(base_rate=1.5), "base rate"),
         (lambda f: f["hypotheses"].append(copy.deepcopy(f["hypotheses"][0])), "ten"),
         (lambda f: f["holdout"].update(correction="pooled_bonferroni"), "never pooled"),
+        (lambda f: f["holdout"]["k"].update(MG=2), "never pooled"),
         (lambda f: f.update(sub_families=["PO", "MG"]), "sub-families"),
         (lambda f: f["engine_pin"].update({"physics/dealer_gamma.py": "x"}), "engine pin"),
+        (lambda f: f["engine_pin"].update(reference_commit="cdf1b7f7"), "engine pin"),
+        (lambda f: f["stage0"].update(min_joint_power=0.3), "stage0"),
+        (lambda f: f.update(discovery={"select_one_sided_p": 0.2}), "discovery"),
+        (lambda f: f["cost"].update(bps_per_side=1.0), "cost"),
     ],
 )
 def test_family_rules_are_enforced(checked, mutate, match):
@@ -118,8 +165,9 @@ def test_registration_is_deterministic_and_write_once(tmp_path, checked):
     records = g.register(tmp_path, NOW, CODE, dry_run=True)
     assert [r["kind"] for r in records] == ["header", "preregistration"]
     assert records[0]["prereg_sha256"] == g.PREREG_BODY_SHA256
-    assert records[1]["promotion_allowed"] is False
+    assert all(r["promotion_allowed"] is False for r in records)
     assert records[1]["trials"] == [h["id"] for h in checked["family"]["hypotheses"]]
+    assert records[1]["fixed_k"] == g.FIXED_K
     assert not list(tmp_path.iterdir())  # dry run writes nothing
     written = g.register(tmp_path, NOW, CODE)
     assert written[1]["prev_sha256"] is not None
@@ -128,10 +176,25 @@ def test_registration_is_deterministic_and_write_once(tmp_path, checked):
         g.register(tmp_path, NOW, CODE)
 
 
+def test_pinned_registration_refuses_a_fork(tmp_path):
+    written = g.register(tmp_path / "real", NOW, CODE)
+    pins = tuple(hashlib.sha256(g.canonical(r)).hexdigest() for r in written)
+    assert g.verify(tmp_path / "real", registered=pins)["ok"]
+    g.register(tmp_path / "fork", datetime(2026, 10, 2, tzinfo=timezone.utc), CODE)
+    result = g.verify(tmp_path / "fork", registered=pins)
+    assert not result["ok"] and "fork" in result["detail"]
+
+
 @pytest.mark.parametrize("now,code", [(datetime(2026, 10, 1, 12), CODE), (NOW, "abc")])
 def test_registration_inputs_validated(tmp_path, now, code):
     with pytest.raises(g.PreregError):
         g.register(tmp_path, now, code, dry_run=True)
+
+
+def test_now_accepts_z_suffix_on_python_310():
+    assert g.parse_now("2026-10-01T12:00:00Z") == NOW
+    with pytest.raises(g.PreregError):
+        g.parse_now("2026-10-01T12:00:00")
 
 
 def test_tampered_registry_and_foreign_witness_refused(tmp_path):
@@ -152,6 +215,13 @@ def test_tampered_registry_and_foreign_witness_refused(tmp_path):
     g.register(other, datetime(2026, 10, 2, tzinfo=timezone.utc), CODE)
     with pytest.raises(PermissionError, match="another registry"):
         g.export_anchors(other, vault)
+
+
+def test_witness_paths_are_distinct_vault_files():
+    assert g.WITNESS_PATH != g.DECISION_WITNESS_PATH
+    body = g.read_body()
+    assert g.WITNESS_PATH.as_posix() in body and g.DECISION_WITNESS_PATH.as_posix() in body
+    assert "self-reported" in body and "push event time" in body
 
 
 def test_registry_module_reads_no_outcomes_or_frozen_v1():

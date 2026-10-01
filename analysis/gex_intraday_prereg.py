@@ -2,10 +2,12 @@
 
 The body of ``docs/paper_log/gex-intraday-v1-preregistration.md`` (LF bytes
 strictly between the VS1 body markers) is pinned in :data:`PREREG_BODY_SHA256`.
-Its machine-readable hypothesis block is validated here: five sub-families with
-separate error budgets, the price-only baseline never pooled with gamma-model
-hypotheses, every hypothesis bound to an executable price contract and, where it
-uses gamma, to the pinned engine.
+Its machine-readable hypothesis block is validated here against every
+structural rule the body states: five sub-families with fixed Bonferroni k, the
+price-only baseline never mixed with gamma-model hypotheses, paired incremental
+statistics for the gamma/breadth trade claims, each hypothesis bound to an
+executable price contract and the matching E2 rule, a complete Stage-0 power
+specification, the cost model, and an engine pinned by LF content hash.
 
 The registry reuses the S10/VS1 chain (``analysis.research_forward_log.ForwardLog``):
 canonical JSON lines, ``prev_sha256``, a chained anchor file, and an off-host
@@ -31,7 +33,7 @@ from analysis.research_forward_log import ForwardLog, _lines, canonical
 REPO = Path(__file__).resolve().parents[1]
 VERSION = "gex_intraday_v1"
 PREREG_PATH = Path("docs/paper_log/gex-intraday-v1-preregistration.md")
-PREREG_BODY_SHA256 = "3ccc664a306747d70a1d4c832de5db65418cd28fe8245f2d4a90caedee264cbf"
+PREREG_BODY_SHA256 = "13ade76299a45bb8f1526531b638c0ad93ca114a98b0bc26b0e10a8c442998f8"
 BODY_START = "<!-- PREREG-BODY-START -->"
 BODY_END = "<!-- PREREG-BODY-END -->"
 
@@ -39,14 +41,40 @@ REGISTRY_LOG = "gex_intraday_v1_prereg.jsonl"
 REGISTRY_ANCHORS = "gex_intraday_v1_prereg.anchors.jsonl"
 REGISTRY_LOCK = ".gex_intraday_v1_prereg.lock"
 WITNESS_PATH = Path("05-GRID/Paper-Log/gex_intraday_v1/gex_intraday_v1_prereg.anchors.jsonl")
+DECISION_WITNESS_PATH = Path(
+    "05-GRID/Paper-Log/gex_intraday_v1/gex_intraday_v1_decisions.anchors.jsonl"
+)
+#: Pinned after the real (owner-gated) registration, as VS1 does with its
+#: REGISTERED_RECORD_SHA256. While None, no registration has been witnessed.
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
 
 SUB_FAMILIES = ("PO", "DW", "MG", "SC", "RB")
+FIXED_K = {"PO": 2, "DW": 2, "MG": 3, "SC": 2, "RB": 1}
 PRICE_CONTRACTS = ("PC-OC", "PC-CC")
 INPUT_STATUSES = ("READY", "BLOCKED_INPUT", "BLOCKED_PRICE_CONTRACT")
-KINDS = ("trade", "forecast")
+E2_RULE = {
+    ("PC-OC", "trade"): "e2.auction_oc.v1",
+    ("PC-OC", "forecast"): "e2.abs_move.v1",
+    ("PC-OC", "paired_trade"): "e2.paired_oc.v1",
+    ("PC-CC", "trade"): "e2.direction.v1",
+}
+PLANTED_MODELS = {
+    "trade": {"trade": ("net_bps", "noise_bps")},
+    "paired_trade": {"paired_trade": ("net_bps", "noise_bps")},
+    "forecast": {
+        "forecast_continuous": ("slope_per_sd", "noise_log_sd", "control_corr"),
+        "forecast_binary": ("diff", "base_rate", "noise_log_sd", "control_corr"),
+    },
+}
 ENGINE_FILES = ("physics/dealer_gamma.py", "physics/greeks/black_scholes.py")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
-ISO_DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+# Written before outcomes: hypotheses may not reference a calendar date, a year
+# or a named month (a pattern that could postdate registration).
+DATE_LIKE = re.compile(
+    r"\b\d{4}-\d{2}-\d{2}\b|\b(?:19|20)\d{2}\b|\b(?:January|February|March|April|June|"
+    r"July|August|September|October|November|December)\b"
+)
 REQUIRED = (
     "id",
     "sub_family",
@@ -69,6 +97,10 @@ REQUIRED = (
 
 class PreregError(ValueError):
     """The pre-registration or its family block violates a registered rule."""
+
+
+def lf_sha256(data: bytes) -> str:
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def prereg_body(text: str) -> str:
@@ -105,59 +137,105 @@ def family_block(body: str) -> dict:
     return json.loads(blocks[0], object_pairs_hook=unique)
 
 
+def _int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _number(value: Any) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def validate_family(family: dict) -> dict:
-    """Every registered structural rule of section 1/3/4/7, checked mechanically."""
+    """Every structural rule the body registers, checked mechanically."""
     if family.get("family") != VERSION:
         raise PreregError("family name mismatch")
     if tuple(family.get("sub_families", ())) != SUB_FAMILIES:
         raise PreregError("sub-families must be exactly PO, DW, MG, SC, RB")
-    hold = family.get("holdout", {})
-    if hold.get("family_alpha") != 0.05 or not hold.get("same_sign"):
-        raise PreregError("holdout family alpha must be 0.05 with same sign")
-    if hold.get("correction") != "frozen_selection_bonferroni_within_sub_family":
-        raise PreregError("holdout correction must be within sub-family, never pooled")
-    pin = family.get("engine_pin", {})
-    if set(pin) != set(ENGINE_FILES) | {"reference_commit"} or not all(
-        HEX64.fullmatch(str(pin[f])) for f in ENGINE_FILES
+    stage0 = family.get("stage0", {})
+    if not (
+        _int(stage0.get("seed"))
+        and _int(stage0.get("simulations"))
+        and stage0.get("simulations", 0) >= 1000
+        and stage0.get("min_joint_power") == 0.5
+        and _number(stage0.get("control_loading"))
     ):
-        raise PreregError("engine pin must name both engine files by sha256")
+        raise PreregError("stage0 must fix seed, simulations, joint power 0.5 and control loading")
+    if family.get("discovery") != {"select_one_sided_p": 0.10}:
+        raise PreregError("discovery selection must be one-sided p <= 0.10")
+    hold = family.get("holdout", {})
+    if (
+        hold.get("family_alpha") != 0.05
+        or hold.get("same_sign") is not True
+        or hold.get("correction") != "fixed_k_bonferroni_within_sub_family"
+        or hold.get("k") != FIXED_K
+    ):
+        raise PreregError("holdout must be fixed-k Bonferroni within sub-family, never pooled")
+    cost = family.get("cost", {})
+    if cost.get("model") != "e2-costs-v1" or cost.get("bps_per_side") != 3.0:
+        raise PreregError("cost must be e2-costs-v1 at 3 bp per side")
+    pin = family.get("engine_pin", {})
+    if (
+        set(pin) != set(ENGINE_FILES) | {"hash_basis", "reference_commit"}
+        or not all(HEX64.fullmatch(str(pin[f])) for f in ENGINE_FILES)
+        or pin.get("hash_basis") != "sha256 of LF git content"
+        or not HEX40.fullmatch(str(pin.get("reference_commit")))
+    ):
+        raise PreregError("engine pin must name both engine files by LF sha256 and a full commit")
     hypotheses = family.get("hypotheses", [])
     ids = [h.get("id") for h in hypotheses]
-    if len(ids) != len(set(ids)) or len(ids) != 10:
+    if len(ids) != len(set(ids)) or len(ids) != sum(FIXED_K.values()):
         raise PreregError("exactly ten uniquely named hypotheses")
     by_family: dict[str, list[str]] = {k: [] for k in SUB_FAMILIES}
     for h in hypotheses:
         missing = [k for k in REQUIRED if k not in h]
         if missing:
             raise PreregError(f"{h.get('id')}: missing {missing}")
-        if h["sub_family"] not in SUB_FAMILIES or not h["id"].startswith(h["sub_family"]):
-            raise PreregError(f"{h['id']}: sub-family mismatch")
-        # The price-only baseline is never a gamma-model test, and vice versa.
-        if (h["sub_family"] == "PO") == bool(h["uses_gamma"]) and h["sub_family"] != "RB":
-            raise PreregError(f"{h['id']}: price-only and gamma hypotheses must not mix")
-        if h["kind"] not in KINDS or h["price_contract"] not in PRICE_CONTRACTS:
-            raise PreregError(f"{h['id']}: unknown kind or price contract")
+        hid = h["id"]
+        if h["sub_family"] not in SUB_FAMILIES or not hid.startswith(h["sub_family"]):
+            raise PreregError(f"{hid}: sub-family mismatch")
+        # The price-only baseline and rebalancing never use gamma; DW/MG/SC always do.
+        if bool(h["uses_gamma"]) != (h["sub_family"] in ("DW", "MG", "SC")):
+            raise PreregError(f"{hid}: price-only and gamma hypotheses must not mix")
+        if (h["price_contract"], h["kind"]) not in E2_RULE:
+            raise PreregError(f"{hid}: unknown kind or price contract")
+        if h["e2_rule"] != E2_RULE[(h["price_contract"], h["kind"])]:
+            raise PreregError(f"{hid}: e2 rule does not match the price contract and kind")
         if h["input_status"] not in INPUT_STATUSES:
-            raise PreregError(f"{h['id']}: unknown input status")
+            raise PreregError(f"{hid}: unknown input status")
         if h["price_contract"] == "PC-OC" and h["input_status"] == "READY":
-            raise PreregError(f"{h['id']}: no opening-auction source is admitted yet")
+            raise PreregError(f"{hid}: no opening-auction source is admitted yet")
         if h["direction"] not in ("positive", "negative"):
-            raise PreregError(f"{h['id']}: direction must be one-sided")
+            raise PreregError(f"{hid}: direction must be one-sided")
+        if h["kind"] == "paired_trade" and "d = net(" not in h["statistic"]:
+            raise PreregError(f"{hid}: a paired hypothesis must test the paired difference")
+        planted = h["planted_effect"]
+        models = PLANTED_MODELS[h["kind"]]
+        fields = models.get(planted.get("model"))
+        if fields is None or set(planted) != {"model", *fields} or not all(
+            _number(planted[f]) for f in fields
+        ):
+            raise PreregError(f"{hid}: planted effect does not match its Stage-0 model")
+        if "base_rate" in planted and not 0 < planted["base_rate"] < 1:
+            raise PreregError(f"{hid}: base rate must lie in (0, 1)")
         ladder = h["n_holdout_ladder"]
         if (
-            not ladder
+            not _int(h["n_discovery"])
+            or not _int(h["n_holdout"])
+            or not isinstance(ladder, list)
+            or not all(_int(x) for x in ladder)
+            or not ladder
             or ladder[0] != h["n_holdout"]
             or ladder != sorted(set(ladder))
             or h["n_discovery"] <= 0
         ):
-            raise PreregError(f"{h['id']}: holdout ladder must start at n_holdout and grow")
-        # Written before outcomes: no hypothesis may reference a calendar date.
-        text = json.dumps({k: v for k, v in h.items() if k != "id"})
-        if ISO_DATE.search(text):
-            raise PreregError(f"{h['id']}: hypotheses may not reference specific dates")
-        by_family[h["sub_family"]].append(h["id"])
-    if any(not v for v in by_family.values()):
-        raise PreregError("every sub-family needs at least one hypothesis")
+            raise PreregError(f"{hid}: integer windows; ladder must start at n_holdout and grow")
+        # Only the prose fields: integer windows such as 2000 are not years.
+        text = " ".join(v for k, v in h.items() if isinstance(v, str) and k != "id")
+        if DATE_LIKE.search(text):
+            raise PreregError(f"{hid}: hypotheses may not reference specific dates")
+        by_family[h["sub_family"]].append(hid)
+    if {k: len(v) for k, v in by_family.items()} != FIXED_K:
+        raise PreregError("sub-family sizes must equal the registered fixed k")
     return by_family
 
 
@@ -177,15 +255,14 @@ def check_prereg(repo_root: Path = REPO, pinned: str | None = None) -> dict:
 
 
 def engine_matches_pin(family: dict, repo_root: Path = REPO) -> dict[str, bool]:
-    """Whether the checkout's engine files still equal the pinned engine.
+    """Whether the checkout's engine files (LF-normalized) equal the pinned engine.
 
     A mismatch is not an error here (the engine may legitimately move on); it
     means the forward logger must run the immutable pinned archive instead.
     """
     pin = family["engine_pin"]
     return {
-        f: hashlib.sha256((Path(repo_root) / f).read_bytes()).hexdigest() == pin[f]
-        for f in ENGINE_FILES
+        f: lf_sha256((Path(repo_root) / f).read_bytes()) == pin[f] for f in ENGINE_FILES
     }
 
 
@@ -202,7 +279,7 @@ def registry(log_dir: Path, prereg_sha256: str = PREREG_BODY_SHA256) -> ForwardL
 def registration_records(now: datetime, code_sha: str, checked: dict) -> list[dict]:
     if now.tzinfo is None:
         raise PreregError("now must carry a timezone")
-    if not re.fullmatch(r"[0-9a-f]{40}", code_sha):
+    if not HEX40.fullmatch(code_sha):
         raise PreregError("code_sha must be a full 40-hex git commit")
     family = checked["family"]
     return [
@@ -213,6 +290,7 @@ def registration_records(now: datetime, code_sha: str, checked: dict) -> list[di
             "code_sha": code_sha,
             "prereg_path": PREREG_PATH.as_posix(),
             "prereg_sha256": checked["body_sha256"],
+            "promotion_allowed": False,
         },
         {
             "kind": "preregistration",
@@ -221,6 +299,7 @@ def registration_records(now: datetime, code_sha: str, checked: dict) -> list[di
             "family_sha256": checked["family_sha256"],
             "trials": [h["id"] for h in family["hypotheses"]],
             "sub_families": checked["sub_families"],
+            "fixed_k": family["holdout"]["k"],
             "input_status": {h["id"]: h["input_status"] for h in family["hypotheses"]},
             "engine_pin": family["engine_pin"],
             "promotion_allowed": False,
@@ -252,7 +331,9 @@ def register(
         return log.append_locked(records)
 
 
-def export_anchors(log_dir: Path, vault_worktree: Path, prereg_sha256: str = PREREG_BODY_SHA256) -> list[str]:
+def export_anchors(
+    log_dir: Path, vault_worktree: Path, prereg_sha256: str = PREREG_BODY_SHA256
+) -> list[str]:
     """Append missing anchor lines to the witness file in a vault WORKTREE only.
 
     Refuses when the witness file is not a prefix of this registry's anchors.
@@ -280,14 +361,39 @@ def export_anchors(log_dir: Path, vault_worktree: Path, prereg_sha256: str = PRE
     return [line.decode("utf-8") for line in new]
 
 
-def verify(log_dir: Path, external_anchors: Path | None = None, prereg_sha256: str = PREREG_BODY_SHA256) -> dict[str, Any]:
-    result = registry(log_dir, prereg_sha256).verify_chain(external_anchors)
-    if result["ok"]:
-        records = registry(log_dir, prereg_sha256).read_all()
-        kinds = [r.get("kind") for r in records[:2]]
-        if kinds != ["header", "preregistration"]:
-            return {**result, "ok": False, "detail": "registry does not start with header + preregistration"}
+def verify(
+    log_dir: Path,
+    external_anchors: Path | None = None,
+    prereg_sha256: str = PREREG_BODY_SHA256,
+    registered: tuple[str, str] | None = None,
+) -> dict[str, Any]:
+    """Chain + anchors; the first two records must be header + preregistration
+    with promotion_allowed false, and, once the real registration is pinned,
+    exactly the pinned record hashes (anything else is a fork)."""
+    log = registry(log_dir, prereg_sha256)
+    result = log.verify_chain(external_anchors)
+    if not result["ok"]:
+        return result
+    records = log.read_all()
+    head = records[:2]
+    if [r.get("kind") for r in head] != ["header", "preregistration"] or any(
+        r.get("promotion_allowed") is not False for r in head
+    ):
+        return {**result, "ok": False, "detail": "registry does not start with the pinned registration"}
+    pinned = REGISTERED_RECORD_SHA256 if registered is None else registered
+    if pinned is not None:
+        hashes = tuple(hashlib.sha256(canonical(r)).hexdigest() for r in head)
+        if hashes != tuple(pinned):
+            return {**result, "ok": False, "detail": "registration differs from the pinned one (fork)"}
     return result
+
+
+def parse_now(text: str) -> datetime:
+    """ISO-8601 with an offset; a trailing 'Z' is accepted on Python 3.10."""
+    value = datetime.fromisoformat(text[:-1] + "+00:00" if text.endswith("Z") else text)
+    if value.tzinfo is None:
+        raise PreregError("--now must carry an offset")
+    return value
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -297,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     reg = sub.add_parser("register", help="OWNER GATE: write header + preregistration")
     reg.add_argument("--log-dir", type=Path, required=True)
     reg.add_argument("--code-sha", required=True)
-    reg.add_argument("--now", required=True, help="ISO-8601 with offset")
+    reg.add_argument("--now", required=True, help="ISO-8601 with offset or Z")
     reg.add_argument("--dry-run", action="store_true")
     exp = sub.add_parser("export-anchors", help="append anchor lines into a vault worktree")
     exp.add_argument("--log-dir", type=Path, required=True)
@@ -311,9 +417,7 @@ def main(argv: list[str] | None = None) -> int:
         out = {k: v for k, v in checked.items() if k != "family"}
         out["engine_matches_pin"] = engine_matches_pin(checked["family"])
     elif args.command == "register":
-        out = register(
-            args.log_dir, datetime.fromisoformat(args.now), args.code_sha, dry_run=args.dry_run
-        )
+        out = register(args.log_dir, parse_now(args.now), args.code_sha, dry_run=args.dry_run)
     elif args.command == "export-anchors":
         out = export_anchors(args.log_dir, args.vault_worktree)
     else:
