@@ -27,6 +27,7 @@ instant the outcome became observable. E2 never accepts an outcome whose
 
 from __future__ import annotations
 
+import math
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
@@ -104,7 +105,38 @@ def validate_prediction(p: dict, rules: dict) -> dict:
     for key in ("log", "line_index", "line_sha256", "prev_sha256"):
         if key not in receipt:
             raise RecordError(f"{p['prediction_id']}: log_receipt lacks {key}")
+    _check_call(p)
+    digest(p)  # every value must be finite JSON (canonical, allow_nan=False) or the record is set aside
     return p
+
+
+def _finite(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+
+
+def _check_call(p: dict) -> None:
+    """Per-rule call payload: what the pre-registered scoring rule needs, finite and in range."""
+    call, rule, pid = p["call"], p["rule_id"], p["prediction_id"]
+    expected = {"e2.direction.v1": "direction", "e2.probability.v1": "probability", "e2.rank_ic.v1": "rank_score",
+                "gex.level_hold.v1": "conditional_binary", "gex.h3_net_pnl.v1": "rule_trade",
+                "s10.ts_ic.v1": "signal"}.get(rule)
+    if expected is not None and call.get("kind") != expected:
+        raise RecordError(f"{pid}: rule {rule} needs a {expected} call, got {call.get('kind')!r}")
+    if rule == "e2.direction.v1" and (call.get("side") not in (1, -1) or isinstance(call.get("side"), bool)):
+        raise RecordError(f"{pid}: direction side must be +1 or -1")
+    if rule == "e2.probability.v1" and not (_finite(call.get("p")) and 0.0 <= call["p"] <= 1.0):
+        raise RecordError(f"{pid}: probability must be a finite number in [0, 1]")
+    if rule == "e2.rank_ic.v1" and not _finite(call.get("score")):
+        raise RecordError(f"{pid}: rank score must be a finite number")
+    if rule == "gex.level_hold.v1" and not _finite(call.get("level")):
+        raise RecordError(f"{pid}: level must be a finite number")
+    if rule == "s10.ts_ic.v1":
+        if call.get("value") is not None and not _finite(call.get("value")):
+            raise RecordError(f"{pid}: signal value must be null or a finite number")
+        if call.get("direction") not in (1, -1):
+            raise RecordError(f"{pid}: signal direction must be +1 or -1")
+    if "instrument_class" in (p.get("target") or {}) and not isinstance(p["target"]["instrument_class"], str):
+        raise RecordError(f"{pid}: instrument_class must be a string")
 
 
 def prediction_sha256(p: dict) -> str:

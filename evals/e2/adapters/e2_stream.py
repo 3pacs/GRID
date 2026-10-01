@@ -22,6 +22,10 @@ was logged (no hindsight entries); the outcome is the close-to-close return
 to ``exit_date``, resolved point-in-time by ``evals.e2.resolve``. A stream is
 scored only if it is registered in ``rules.json`` (adding one is a new E2
 version).
+
+A prediction id is read once: the FIRST record carrying it is the prediction,
+even if that record is malformed and quarantined; a later record re-using the
+id is ignored (a stream cannot replace a call after the fact).
 """
 
 from __future__ import annotations

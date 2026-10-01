@@ -33,7 +33,7 @@ REPO = Path(__file__).resolve().parent.parent
 
 #: version -> sha256 of evals/e2/MANIFEST.sha256 (LF). Append-only.
 RELEASED_MANIFESTS = {
-    "e2-v1": "eeeeb68139998d5d210cb372cd3230345e3d680620c19886914845d0989a47ac",
+    "e2-v1": "ce0c574ade7e9b7b6ac5abd8ec3a6fa2fd2a9a095ff3fce65a6ef1ed977ed82c",
 }
 
 

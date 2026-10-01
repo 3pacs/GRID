@@ -307,3 +307,14 @@ def test_s10_malformed_admission_plan_is_quarantined_not_fatal(tmp_path):
     assert snap["counts"]["scores"] == 0 and snap["counts"]["integrity_alerts"] == 1
     again = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 15, 12))["snapshot"]
     assert again["counts"]["integrity_alerts"] == 1  # not repeated
+
+
+def test_s10_prediction_with_a_malformed_label_end_is_quarantined(tmp_path):
+    logs = tmp_path / "s10"
+    events = _s10_events(verdict=False)
+    first = next(i for i, e in enumerate(events) if e["kind"] == "prediction")
+    events[first] = {**events[first], "label_end": "not-a-date"}
+    _s10_log(logs, events)
+    snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 13, 12))["snapshot"]
+    assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is True
+    assert snap["counts"]["predictions"] == 3 and snap["counts"]["integrity_alerts"] == 1

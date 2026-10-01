@@ -34,13 +34,13 @@ def cost_model() -> dict:
     return scoring.load_json("cost_model.json")
 
 
-def write_chain(path: Path, records: list[dict]) -> None:
+def write_chain(path: Path, records: list[dict], *, allow_nan: bool = False) -> None:
     """Write records with the S10/E2 chain convention (canonical lines, prev_sha256)."""
     previous = None
     with open(path, "wb") as stream:
         for record in records:
             line = json.dumps({**record, "prev_sha256": previous}, sort_keys=True, separators=(",", ":"),
-                              allow_nan=False).encode("utf-8")
+                              allow_nan=allow_nan).encode("utf-8")
             stream.write(line + b"\n")
             previous = hashlib.sha256(line).hexdigest()
 

@@ -223,23 +223,33 @@ def _with(records, index, **changes):
     return out
 
 
-@pytest.mark.parametrize("broken", ["missing_family", "exit_before_issue", "bad_date"])
+# (line index in the stream log, changes) -- each breaks exactly one record
+MALFORMED = {
+    "missing_family": (2, {"family": None}),
+    "exit_before_issue": (2, {"horizon": {"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-09-30"}}),
+    "bad_date": (2, {"horizon": {"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-13-45"}}),
+    "side_2": (1, {"call": {"kind": "direction", "side": 2}}),
+    "side_true": (1, {"call": {"kind": "direction", "side": True}}),
+    "p_1.5": (4, {"call": {"kind": "probability", "event": "up", "p": 1.5}}),
+    "p_nan": (4, {"call": {"kind": "probability", "event": "up", "p": float("nan")}}),
+    "score_abc": (6, {"call": {"kind": "rank_score", "score": "abc"}}),
+    "score_inf": (6, {"call": {"kind": "rank_score", "score": float("inf")}}),
+}
+
+
+@pytest.mark.parametrize("broken", sorted(MALFORMED))
 def test_a_malformed_record_is_quarantined_not_fatal(tmp_path, broken):
-    records = S.stream_records()
-    if broken == "missing_family":
-        records = _with(records, 2, family=None)
-    elif broken == "exit_before_issue":
-        records = _with(records, 2, horizon={"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-09-30"})
-    else:
-        records = _with(records, 2, horizon={"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-13-45"})
+    index, changes = MALFORMED[broken]
+    records = _with(S.stream_records(), index, **changes)
     log = tmp_path / "stream.jsonl"
-    S.write_chain(log, records)
-    snap = _run(tmp_path, AFTER, log=log)["snapshot"]
+    S.write_chain(log, records, allow_nan=True)
+    snap = _run(tmp_path, S.utc(2026, 10, 9), log=log)["snapshot"]  # well past every horizon
     assert snap["streams"][S.STREAM]["ok"] is True
     assert snap["counts"]["predictions"] == 9 and snap["counts"]["pending"] == 0
     alerts = [r for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"]
-    assert len(alerts) == 1 and alerts[0]["observed_sha256"] == "quarantine" and "line 2" in alerts[0]["detail"]
-    _run(tmp_path, S.utc(2026, 10, 3, 23), log=log)
+    assert len(alerts) == 1 and alerts[0]["observed_sha256"] == "quarantine"
+    assert f"line {index}" in alerts[0]["detail"]
+    _run(tmp_path, S.utc(2026, 10, 10), log=log)
     assert len([r for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"]) == 1
 
 

@@ -101,7 +101,7 @@ def role_of(pred: dict) -> str:
     return "control" if pred["call"].get("arm") == "placebo" else "candidate"
 
 
-def _rank_ic_units(stream: str, state: dict, now: datetime, rules: dict) -> list[dict]:
+def _rank_ic_units(stream: str, state: dict, new: list, now: datetime, rules: dict) -> list[dict]:
     """Score every closed rank-IC unit (all members resolved, past every member's exit close)."""
     units: dict[str, list[dict]] = {}
     for p in state["predictions"].values():
@@ -111,26 +111,38 @@ def _rank_ic_units(stream: str, state: dict, now: datetime, rules: dict) -> list
     min_names = int(rules["rules"]["e2.rank_ic.v1"]["min_names"])
     registered = parse_ts(rules["registered_at"])
     for unit, members in sorted(units.items()):
-        closes = [session_close_utc(date.fromisoformat(p["horizon"]["exit_date"])) for p in members]
-        if now < max(closes) or any(p["prediction_id"] not in state["resolutions"] for p in members):
+        try:
+            score = _rank_ic_unit(unit, members, stream, state, now, min_names, registered)
+        except DATA_ERRORS as exc:  # backstop: one unscorable unit is skipped, never the run
+            _alert(new, state, now, key=unit, kind="malformed_unit", stream=stream,
+                   detail=f"rank-IC unit {unit} could not be scored this run: {exc}")
             continue
-        members = sorted(members, key=lambda p: p["prediction_id"])
-        resolved = [(p, state["resolutions"][p["prediction_id"]]) for p in members]
-        resolved = [(p, r) for p, r in resolved if r["status"] == "resolved"]
-        scores = [float(p["call"]["score"]) for p, _ in resolved]
-        rets = [float(r["outcome"]["return"]) for _, r in resolved]
-        ic = scoring.spearman(scores, rets) if len(resolved) >= min_names else None
-        available = max((parse_ts(r["available_at"]) for _, r in resolved), default=now)
-        first = members[0]
-        out.append({
-            "kind": "score", "run_at": iso(now), "unit": unit, "prediction_ids": [p["prediction_id"] for p in members],
-            "rule_id": "e2.rank_ic.v1", "stream": stream, "family": first["family"], "sector": first["sector"],
-            "horizon": first["horizon"]["label"], "issued_at": min(p["issued_at"] for p in members),
-            "available_at": iso(available), "official": available > registered,
-            "metrics": {} if ic is None else {"rank_ic": ic},
-            "detail": {"names": len(members), "resolved_names": len(resolved), "min_names": min_names},
-        })
+        if score is not None:
+            out.append(score)
     return out
+
+
+def _rank_ic_unit(unit: str, members: list[dict], stream: str, state: dict, now: datetime, min_names: int,
+                  registered: datetime) -> dict | None:
+    closes = [session_close_utc(date.fromisoformat(p["horizon"]["exit_date"])) for p in members]
+    if now < max(closes) or any(p["prediction_id"] not in state["resolutions"] for p in members):
+        return None
+    members = sorted(members, key=lambda p: p["prediction_id"])
+    resolved = [(p, state["resolutions"][p["prediction_id"]]) for p in members]
+    resolved = [(p, r) for p, r in resolved if r["status"] == "resolved"]
+    scores = [float(p["call"]["score"]) for p, _ in resolved]
+    rets = [float(r["outcome"]["return"]) for _, r in resolved]
+    ic = scoring.spearman(scores, rets) if len(resolved) >= min_names else None
+    available = max((parse_ts(r["available_at"]) for _, r in resolved), default=now)
+    first = members[0]
+    return {
+        "kind": "score", "run_at": iso(now), "unit": unit, "prediction_ids": [p["prediction_id"] for p in members],
+        "rule_id": "e2.rank_ic.v1", "stream": stream, "family": first["family"], "sector": first["sector"],
+        "horizon": first["horizon"]["label"], "issued_at": min(p["issued_at"] for p in members),
+        "available_at": iso(available), "official": available > registered,
+        "metrics": {} if ic is None else {"rank_ic": ic},
+        "detail": {"names": len(members), "resolved_names": len(resolved), "min_names": min_names},
+    }
 
 
 def _alert(new: list, state: dict, now: datetime, *, key: str, kind: str, stream: str, detail: str,
@@ -184,8 +196,8 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
     for pred in preds:
         try:
             validate_prediction(pred, rules)
-            valid.append(pred)
-        except (RecordError, KeyError, TypeError) as exc:  # breaks the E2 record contract: quarantined
+            valid.append((pred, prediction_sha256(pred)))
+        except DATA_ERRORS as exc:  # breaks the E2 record contract (or is not finite JSON): quarantined
             receipt = pred.get("log_receipt") or {}
             quarantined.append({"line_index": receipt.get("line_index"), "line_sha256": receipt.get("line_sha256"),
                                 "error": f"{type(exc).__name__}: {exc}"[:500]})
@@ -193,8 +205,8 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
         _alert(new, state, now, key=q["line_sha256"] or f"{adapter.stream}:{q['line_index']}", kind="quarantine",
                stream=adapter.stream, detail=f"malformed record at {view.path.name} line {q['line_index']} set "
                f"aside (never ingested): {q['error']}")
-    for pred in valid:
-        pid, sha = pred["prediction_id"], prediction_sha256(pred)
+    for pred, sha in valid:
+        pid = pred["prediction_id"]
         known = state["prediction_sha"].get(pid)
         if known is not None:
             if known != sha and (pid, sha) not in state["alerts"]:
@@ -237,13 +249,26 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
             res = _void("malformed_outcome_record", now, f"{type(exc).__name__}: {exc}"[:500])
         if res is None:
             continue
+        try:
+            digest(res)  # an outcome that is not finite JSON cannot enter the ledger
+        except DATA_ERRORS as exc:
+            _alert(new, state, now, key=pid, kind="malformed_outcome", stream=adapter.stream, prediction_id=pid,
+                   detail=f"the outcome is not finite JSON; the prediction is void: {exc}")
+            res = _void("malformed_outcome_record", now, f"{type(exc).__name__}: {exc}"[:500])
         _check_resolution(pred, res, now)
         record = {"kind": "resolution", "run_at": iso(now), "prediction_id": pid, **res}
         new.append(record)
         state["resolutions"][pid] = record
         resolved_now += 1
         if res["status"] == "resolved" and pred["rule_id"] in PER_PREDICTION_RULES:
-            score = _score_record(now, pred, res, compute_metrics(pred, res, cost_model, rules), rules)
+            try:
+                metrics = compute_metrics(pred, res, cost_model, rules)
+                digest(metrics)
+            except DATA_ERRORS as exc:  # backstop: a call or outcome the rule cannot score
+                _alert(new, state, now, key=pid, kind="malformed_call", stream=adapter.stream, prediction_id=pid,
+                       detail=f"the rule could not score this prediction; it stays unscored: {exc}")
+                continue
+            score = _score_record(now, pred, res, metrics, rules)
             new.append(score)
             state["scores"].append(score)
             state["unit_scored"].add(score["unit"])
@@ -253,7 +278,7 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
         unit_scores = []
         _alert(new, state, now, key=f"{adapter.stream}:unit_scores:{type(exc).__name__}:{exc}"[:300],
                kind="malformed_unit", stream=adapter.stream, detail=f"unit scoring skipped this run: {exc}")
-    for score in unit_scores + _rank_ic_units(adapter.stream, state, now, rules):
+    for score in unit_scores + _rank_ic_units(adapter.stream, state, new, now, rules):
         registered = parse_ts(rules["registered_at"])
         score = {"prediction_ids": [], "role": "candidate", **score, "kind": "score", "run_at": iso(now),
                  "official": parse_ts(score["available_at"]) > registered}
