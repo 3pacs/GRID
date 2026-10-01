@@ -581,3 +581,60 @@ def _push_to_resolved(conn, today_str, fid, val):
     assert got["ingestion/options.py"] == []
     assert got["x.py"] == ["backdate", "backdate"]
     assert ("ingestion/options.py", "_push_to_resolved") in vintage_scan.REVIEWED_SAME_DAY
+
+
+# Review round 2 (DFa): unbalanced wrappers, look-alike "now" helpers, aliases,
+# coalesce fallbacks, and the reviewed same-day exemption's callers.
+def test_vintage_scanner_self_test_round_two_residuals():
+    lookalike_now = '''
+def backfill(cur, fid, prices):
+    for i in range(100):
+        d = my_now(i)
+        cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value) "
+                    "VALUES (%s,%s,%s,%s,%s)", (fid, d, d, d, prices[i]))
+'''
+    alias = '''
+def backfill(cur, fid, hist):
+    for d, v in hist.items():
+        rel = d
+        cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value) "
+                    "VALUES (%s,%s,%s,%s,%s)", (fid, d, rel, rel, v))
+'''
+    coalesce_sql = ("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                    "SELECT 1, t.d, t.pulled::date, coalesce(t.as_of, t.d), t.v FROM t;")
+    unbalanced = ("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                  "SELECT 1, date(t.a) + date(t.b), t.pulled::date, t.pulled::date, t.v FROM t;")
+    got = _problems({"a.py": lookalike_now, "b.py": alias, "c.sql": coalesce_sql, "d.sql": unbalanced})
+    assert got["a.py"] == ["backdate", "backdate"]
+    assert got["b.py"] == ["backdate", "backdate"]
+    assert got["c.sql"] == [vintage_scan.UNVERIFIABLE]
+    assert got["d.sql"] == []  # wrapper not stripped: compared as written, and it differs
+
+
+def test_reviewed_same_day_exemption_callers_are_pinned():
+    """options.py::_push_to_resolved is exempt only while its date provably comes from
+    pull_all's own clock: called only by _pull_ticker, which is called only by pull_all,
+    where today_str is derived from _utc_now()."""
+    import ast as _ast
+
+    def callers(attr: str) -> set[tuple[str, str]]:
+        found = set()
+        for rel, text in vintage_scan.sources().items():
+            if not rel.endswith(".py") or attr not in text:
+                continue
+            module = vintage_scan._Module(rel, text)
+            for node in _ast.walk(module.tree):
+                if isinstance(node, _ast.Call) and isinstance(node.func, _ast.Attribute) and node.func.attr == attr:
+                    found.add((rel, getattr(module.function_of(node), "name", "<module>")))
+        return found
+
+    assert callers("_push_to_resolved") == {("ingestion/options.py", "_pull_ticker")}
+    # other pullers have their own _pull_ticker; only options.py's matters here
+    assert {c for c in callers("_pull_ticker") if c[0] == "ingestion/options.py"} == {
+        ("ingestion/options.py", "pull_all")}
+    module = vintage_scan._Module("ingestion/options.py", vintage_scan.sources()["ingestion/options.py"])
+    call = next(n for n in _ast.walk(module.tree) if isinstance(n, _ast.Call)
+                and isinstance(n.func, _ast.Attribute) and n.func.attr == "_pull_ticker")
+    date_arg = call.args[1]
+    assert isinstance(date_arg, _ast.Name) and date_arg.id == "today_str"
+    assert module.is_today(date_arg)

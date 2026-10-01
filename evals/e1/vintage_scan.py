@@ -53,7 +53,11 @@ _INSERT = re.compile(
 _REWRITE = re.compile(r"on\s+conflict[^;]*?do\s+update", re.I | re.S)
 _POSITIONAL = re.compile(r"%s|\?")
 _NAMED = re.compile(r"^(?::(?P<a>[A-Za-z_]\w*)|%\((?P<b>[A-Za-z_]\w*)\)s)$")
-_TODAY_CALL = re.compile(r"(^|_)(today|now|utcnow)$")
+#: Callables that return the current date/time: methods (date.today(),
+#: datetime.now(tz), datetime.utcnow(), pd.Timestamp.now()) and the module-
+#: local helper names GRID uses for "now in UTC". Nothing else counts.
+_TODAY_METHODS = frozenset({"today", "now", "utcnow"})
+_TODAY_FUNCTIONS = frozenset({"_utc_now", "utc_now", "utcnow"})
 _SQL_TODAY = re.compile(r"\b(current_date|current_timestamp|localtimestamp)\b|\bnow\(\)", re.I)
 _DATE_COLS = ("release_date", "vintage_date")
 EXECUTE_ATTRS = frozenset({"execute", "executemany", "exec_driver_sql"})
@@ -302,6 +306,15 @@ class _Module:
                 return None
         return values
 
+    def canonical(self, expr: ast.AST, depth: int = 0) -> str:
+        """``ast.dump`` of ``expr`` after following single-assignment name aliases
+        (``rel = d`` then ``rel`` is ``d``), so an alias cannot hide a backdate."""
+        if depth < 5 and isinstance(expr, ast.Name):
+            values = self._bindings_of(expr.id, self.function_of(expr))
+            if values is not None and len(values) == 1 and isinstance(values[0], ast.Name):
+                return self.canonical(values[0], depth + 1)
+        return ast.dump(expr)
+
     def is_today(self, expr: ast.AST, depth: int = 0) -> bool:
         """True only when ``expr`` is provably the run's own date (a same-day snapshot).
 
@@ -317,13 +330,13 @@ class _Module:
         if isinstance(expr, ast.Call):
             fn = expr.func
             if isinstance(fn, ast.Attribute):
-                if _TODAY_CALL.search(fn.attr):
+                if fn.attr in _TODAY_METHODS:
                     return True
                 if fn.attr in ("date", "isoformat", "strftime"):
                     return self.is_today(fn.value, depth + 1)
                 return False
             if isinstance(fn, ast.Name):
-                if _TODAY_CALL.search(fn.id):
+                if fn.id in _TODAY_FUNCTIONS:
                     return True
                 if fn.id == "str" and len(expr.args) == 1:
                     return self.is_today(expr.args[0], depth + 1)
@@ -348,7 +361,7 @@ def _strip_casts(expr: str) -> str:
         before = e
         e = _CAST_SUFFIX.sub("", e).strip()
         m = _CAST_CALL.match(e) or _DATE_CALL.match(e)
-        if m:
+        if m and _balanced(e, e.index("(")) == len(e):
             e = m.group("x").strip()
         if e.startswith("(") and _balanced(e, 0) == len(e):
             e = e[1:-1].strip()
@@ -425,6 +438,9 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
         return None
     if obs[0] == "sql" and other[0] == "sql":
         if obs[1] != other[1]:
+            # coalesce(t.as_of, t.obs) falls back to the obs date: not provably different
+            if re.search(rf"(?<![\w.]){re.escape(str(obs[1]))}(?!\w)", str(other[1])):
+                return None
             return False
         return not _SQL_TODAY.search(obs[1])
     if other[0] == "sql":
@@ -449,7 +465,7 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
         values, from_fallback = _named_values(module, calls, {obs[1], other[1]})
         if not values:
             return None
-        verdicts = {ast.dump(v[obs[1]]) == ast.dump(v[other[1]]) and not module.is_today(v[obs[1]])
+        verdicts = {module.canonical(v[obs[1]]) == module.canonical(v[other[1]]) and not module.is_today(v[obs[1]])
                     for v in values}
         if from_fallback and len(verdicts) > 1:
             return None  # module dicts with these keys disagree: which one is bound is unknown
@@ -465,7 +481,7 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
             if max(obs[1], other[1]) >= len(params.elts):
                 return None
             a, b = params.elts[obs[1]], params.elts[other[1]]
-            verdicts.append(ast.dump(a) == ast.dump(b) and not module.is_today(a))
+            verdicts.append(module.canonical(a) == module.canonical(b) and not module.is_today(a))
         return any(verdicts)
     return None
 
