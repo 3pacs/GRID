@@ -111,8 +111,9 @@ N_FACTORS = 3
 MIN_SECTOR_N = 40
 DF_GRID = (2.5, 3.0, 3.5, 4.0, 5.0, 6.0, 8.0, 12.0, 30.0)
 EXPOSURE_GRID = (0.0, 0.15, 0.30, 0.45)
-# A priori (from the brief): daily GARCH alpha vs beta, tail_df and the factor AR(1) are poorly
-# identified after 5-day aggregation. Their CI corners are power-checked; the rest are point fits.
+# A priori (from the brief): daily GARCH alpha vs beta and tail_df are poorly identified after 5-day
+# aggregation; their CI corners are power-checked. The factor AR(1) is also weak but enters E0 power
+# only through the exposure stress, so it stays at its point estimate (its CI is reported).
 WEAK = ("tail_df", "garch_persistence", "garch_alpha_share")
 
 MOMENT_NAMES = (
@@ -634,11 +635,14 @@ def jacobian(sim: SimPanel, theta: np.ndarray, tail_df: float, h: float = 0.05) 
 # --------------------------------------------------------------------------------------------
 
 
-def e0_power(params: Mapping, *, exposure: float, sims: int, label_missing_rate: float) -> dict:
+def e0_power(params: Mapping, *, exposure: float, sims: int, label_missing_rate: float,
+             pilot_sims: int | None = None) -> dict:
     """E0 v1 power at IC 0.01 for one parameter set: v7 Technology SEC feature geometry, E0 seeds.
 
-    Every run uses the e0-v1 scenario name ``factor_t_garch`` for seeding, so all parameter sets
-    share common random numbers (and the e0-v1 values reproduce E0's own first ``sims`` worlds).
+    Runs seed with the e0-v1 scenario name of their exposure (``factor_t_garch`` at 0,
+    ``factor_t_garch_exposed`` otherwise), so parameter sets at one exposure share common random
+    numbers, and the e0-v1 values with label_missing_rate 0.002 replay E0's own first ``sims``
+    worlds of that scenario.
     """
     from evals.e0 import runners, scorer  # lazy: pulls in the analysis machinery
     from evals.e0.structure import load_structure
@@ -650,9 +654,9 @@ def e0_power(params: Mapping, *, exposure: float, sims: int, label_missing_rate:
                                   direction=sel["direction"])
     planted = config["planted"]["planted_trials"]
     scenario = scenario_from(params, exposure=exposure, label_missing_rate=label_missing_rate)
-    seed_name = "factor_t_garch"
+    seed_name = "factor_t_garch" if exposure == 0 else "factor_t_garch_exposed"
     scales = runners.calibrate_scales(structure, seed_name, scenario, [0.01], planted,
-                                      pilot_sims=config["planted"]["pilot_sims"],
+                                      pilot_sims=pilot_sims or config["planted"]["pilot_sims"],
                                       pilot_scale=config["planted"]["pilot_scale"],
                                       pilot_seed=config["seeds"]["pilot"])
     rows = runners.run_scenario(structure, seed_name, scenario, ic_grid=[0.01], sims=sims, null_sims=0,
@@ -675,8 +679,8 @@ def e0_power(params: Mapping, *, exposure: float, sims: int, label_missing_rate:
 
 
 def _power_job(args: tuple) -> tuple[str, dict]:
-    key, params, exposure, sims, lmr = args
-    return key, e0_power(params, exposure=exposure, sims=sims, label_missing_rate=lmr)
+    key, params, exposure, sims, lmr, pilot_sims = args
+    return key, e0_power(params, exposure=exposure, sims=sims, label_missing_rate=lmr, pilot_sims=pilot_sims)
 
 
 # --------------------------------------------------------------------------------------------
@@ -734,7 +738,13 @@ class RunSettings:
     sectors: bool = True
     power_sims: int = 100
     ridge: bool = True
+    aux_maxfev: int | None = None  # ridge-profile and corner refits (default max(maxfev // 3, 60))
+    power_pilot_sims: int | None = None  # plant-scale pilot worlds per power run (default: E0's 24)
     extra: dict = field(default_factory=dict)
+
+    @property
+    def aux(self) -> int:
+        return self.aux_maxfev if self.aux_maxfev is not None else max(self.maxfev // 3, 60)
 
 
 def _round(value):
@@ -761,6 +771,7 @@ def _df_job(args: tuple) -> dict:
     fit = fit_at_df(sim, target, df, start, settings)
     fit["jacobian"] = jacobian(sim, fit["theta"], df)
     fit["evaluations"] = sim.evaluations
+    print(f"[e0c2]   tail_df {df:g}: J={fit['J']:.2f} after {sim.evaluations} evaluations", flush=True)
     return fit
 
 
@@ -786,7 +797,7 @@ def fit_panel(R: np.ndarray, *, seed: int, bootstrap: int, reps: int, maxfev: in
     fits = _pmap(_df_job, [(np.isfinite(R), target, df, start, settings, seed) for df in df_grid], jobs)
     best = min(fits, key=lambda f: f["J"])
     log(f"[e0c2] best tail_df {best['tail_df']} J={best['J']:.2f}")
-    return {"real": real, "boot": boot, "target": target, "fits": fits, "best": best, "start": start}
+    return {"real": real, "boot": boot, "target": target, "fits": fits, "best": best, "start": start, "reps": reps}
 
 
 def linearized_bootstrap(fitted: dict) -> dict:
@@ -797,6 +808,8 @@ def linearized_bootstrap(fitted: dict) -> dict:
     boot = fitted["boot"] - fitted["boot"].mean(axis=0, keepdims=True) + target.moments[None, :]
     W = target.weights
     sqw = np.sqrt(W)
+    # Simulated-moment noise (R replications at fixed common random numbers): the usual SMM factor.
+    inflate = math.sqrt(1.0 + 1.0 / fitted["reps"])
     per_df = []
     for f in fits:
         G = f["jacobian"]
@@ -808,7 +821,7 @@ def linearized_bootstrap(fitted: dict) -> dict:
         steps = steps.T  # B x P
         pred = boot - f["sim_moments"][None, :] - steps @ G.T
         J = (W[None, :] * pred * pred).sum(axis=1)
-        per_df.append((f, steps, J))
+        per_df.append((f, steps * inflate, J))
     Jmat = np.column_stack([J for _, _, J in per_df])
     choice = Jmat.argmin(axis=1)
     draws = []
@@ -819,8 +832,14 @@ def linearized_bootstrap(fitted: dict) -> dict:
     G = best["jacobian"]
     info = G.T @ (W[:, None] * G)
     evals, evecs = np.linalg.eigh(info)
+    best_steps = next(st for f, st, _ in per_df if f is best)
+    # How much J a resample's optimum moves away from the point fit: a data-driven admissibility
+    # threshold for CI corners (a corner whose excess J is larger is rejected by the data jointly).
+    excess = ((best_steps @ G.T) ** 2 * W[None, :]).sum(axis=1)
     return {
         "draws": draws,
+        "inflation": inflate,
+        "excess_J_q90": float(np.percentile(excess, 90)),
         "df_choice_freq": {f"{fits[k]['tail_df']:g}": float(np.mean(choice == k)) for k in range(len(fits))},
         "information_eigenvalues": evals.tolist(),
         "weakest_direction": dict(zip(FREE, evecs[:, 0].tolist())),
@@ -895,7 +914,9 @@ def calibrate(settings: RunSettings, *, panel_path: Path | None = None, log=prin
         "settings": {"seed": settings.seed, "bootstrap": settings.bootstrap, "reps": settings.reps,
                      "maxfev": settings.maxfev, "df_grid": list(settings.df_grid), "block_steps": BLOCK_STEPS,
                      "winsor_z": WINSOR_Z, "n_factors": N_FACTORS, "grid_sessions": GRID_SESSIONS,
-                     "power_sims": settings.power_sims, "sectors": settings.sectors, "ridge": settings.ridge},
+                     "power_sims": settings.power_sims, "sectors": settings.sectors, "ridge": settings.ridge,
+                     "aux_maxfev": settings.aux,
+                     "power_pilot_sims": settings.power_pilot_sims or e0_config()["planted"]["pilot_sims"]},
         "moments": {"names": list(MOMENT_NAMES), "real": fitted["real"], "bootstrap_sd": sd,
                     "m14_interior_missing_rate": lmr},
         "df_profile": [{"tail_df": f["tail_df"], "J": f["J"], "delta_J": f["J"] - best["J"], "params": f["params"]}
@@ -910,11 +931,16 @@ def calibrate(settings: RunSettings, *, panel_path: Path | None = None, log=prin
         "uncertainty": {
             "method": ("circular moving-block bootstrap of the real moments (blocks of 52 grid steps, resamples "
                        "recentred on the real moments), each resample mapped to parameters by one Gauss-Newton "
-                       "step at every grid df's optimum with df re-selected per resample; simulated moments at "
-                       "fixed common random numbers (simulation noise not included)"),
+                       "step at every grid df's optimum with df re-selected per resample; steps inflated by "
+                       "sqrt(1 + 1/reps) for simulated-moment noise. market_vol and factor_vol scale single "
+                       "time series: their CIs include the real path's sampling noise, and the simulated "
+                       "paths' realised scales are recorded below"),
             "resamples": settings.bootstrap,
             "ci90": ci,
             "tail_df_choice_freq": unc["df_choice_freq"],
+            "simulation_noise_inflation": unc["inflation"],
+            "corner_admissibility_excess_J_q90": unc["excess_J_q90"],
+            "simulated_market_scale_by_rep": sim_market_scales(R, best["params"], settings),
             "information_eigenvalues": unc["information_eigenvalues"],
             "information_condition": unc["information_condition"],
             "weakest_direction": unc["weakest_direction"],
@@ -931,7 +957,7 @@ def calibrate(settings: RunSettings, *, panel_path: Path | None = None, log=prin
     if settings.ridge:
         log("[e0c2] GARCH ridge profile")
         receipt["ridge_profile"] = ridge_profile(R, target, best["params"], best["J"], settings.seed, settings.reps,
-                                                 max(settings.maxfev // 3, 60), settings.jobs)
+                                                 settings.aux, settings.jobs)
     sectors = {}
     if settings.sectors:
         smap = sector_of(used)
@@ -957,7 +983,7 @@ def calibrate(settings: RunSettings, *, panel_path: Path | None = None, log=prin
         }
     if settings.power_sims > 0:
         receipt["conservative_pick"], receipt["power"] = conservative_pick(
-            R, target, best["params"], best["J"], ci, sectors, lmr, settings, log)
+            R, target, best["params"], best["J"], ci, sectors, lmr, settings, log, unc["excess_J_q90"])
     else:
         receipt["conservative_pick"] = {"status": "not_run (power_sims=0)", "params": best["params"]}
     return _round(receipt)
@@ -973,9 +999,26 @@ def e0_v1_params() -> dict:
                 "exposure"]}
 
 
-def conservative_pick(R, target, best, best_J, ci, sectors, lmr, settings, log) -> tuple[dict, dict]:
-    """Power at the weak-parameter CI corners (strong parameters refit), pick the lowest-power one."""
-    corners = {}
+def sim_market_scales(R: np.ndarray, params: Mapping, settings: RunSettings) -> list[float]:
+    """Realised / population scale of each simulated replication's market path at the fitted shape."""
+    sim = SimPanel(np.isfinite(R), seed=settings.seed, reps=settings.reps)
+    garch = {"alpha": params["garch_alpha"], "beta": params["garch_beta"]}
+    return [sim.market_scale(params["tail_df"], garch, r) for r in range(settings.reps)]
+
+
+EXPOSURES_CHECKED = (0.0, 0.3)
+
+
+def conservative_pick(R, target, best, best_J, ci, sectors, lmr, settings, log,
+                      excess_q90: float) -> tuple[dict, dict]:
+    """Power at the admissible weak-parameter CI corners (strong parameters refit); pick the lowest.
+
+    Corners are the box of marginal 90% CIs of tail_df (snapped to the grid), GARCH persistence and
+    alpha share. A corner is admissible only if its excess J over the point fit is within the 90th
+    percentile of the excess J that bootstrap resamples' own optima produce (the box can leave the
+    joint region along the alpha/beta ridge). The pick minimises the mean Holm power over exposure
+    0 and 0.3 among the point fit and the admissible corners.
+    """
     df_lo, df_hi = ci["tail_df"]
     p_lo, p_hi = ci["garch_persistence"]
     pers = best["garch_alpha"] + best["garch_beta"]
@@ -987,44 +1030,53 @@ def conservative_pick(R, target, best, best_J, ci, sectors, lmr, settings, log) 
     jobs = []
     for d in df_choices:
         for p in sorted({min(p_lo, 0.998), min(p_hi, 0.998)}):
-            for s in sorted({share_lo, share_hi}):
-                key = f"df{d:g}_p{p:.4f}_a{p * s:.4f}"
-                shape = {"tail_df": d, "garch_alpha": p * s, "garch_beta": p * (1 - s)}
-                jobs.append((key, np.isfinite(R), target, shape, best, settings.seed, settings.reps,
-                             max(settings.maxfev // 2, 60)))
+            for sh in sorted({share_lo, share_hi}):
+                key = f"df{d:g}_p{p:.4f}_a{p * sh:.4f}"
+                shape = {"tail_df": d, "garch_alpha": p * sh, "garch_beta": p * (1 - sh)}
+                jobs.append((key, np.isfinite(R), target, shape, best, settings.seed, settings.reps, settings.aux))
     log(f"[e0c2] refitting {len(jobs)} weak-parameter corners")
-    for key, fit in _pmap(_corner_job, jobs, settings.jobs):
-        corners[key] = fit
-    sets = {"fitted": best, **{f"corner:{k}": v["params"] for k, v in corners.items()},
+    corners = dict(_pmap(_corner_job, jobs, settings.jobs))
+    admissible = {k: v for k, v in corners.items() if v["J"] - best_J <= excess_q90}
+    sets = {"fitted": best, **{f"corner:{k}": v["params"] for k, v in admissible.items()},
             "e0_v1": {k: v for k, v in e0_v1_params().items() if k in best}}
-    worst_sector = None
-    for name, s in sectors.items():
-        sets[f"sector:{name}"] = s["params"]
+    for name, sec in sectors.items():
+        sets[f"sector:{name}"] = sec["params"]
     # Survivor panel: delisting-like missingness is unobservable here (lmr is a lower bound), so the
     # power runs keep e0-v1's 0.002 as a floor; the same rate for every set keeps the comparison CRN.
     lmr_power = max(lmr, float(e0_v1_params()["label_missing_rate"]))
-    power_jobs = [(k, p, 0.0, settings.power_sims, lmr_power) for k, p in sets.items()]
-    power_jobs += [(f"{k}@exposure0.3", p, 0.3, settings.power_sims, lmr_power) for k, p in sets.items()
-                   if k in ("fitted", "e0_v1")]
+    power_jobs = []
+    for k, p in sets.items():
+        for x in EXPOSURES_CHECKED:
+            if k.startswith("sector:") and x != 0.0:
+                continue  # sectors: exposure 0 to rank them; the worst one also gets 0.3 below
+            power_jobs.append((f"{k}@exposure{x:g}", p, x, settings.power_sims, lmr_power,
+                               settings.power_pilot_sims))
     log(f"[e0c2] E0 power: {len(power_jobs)} runs x {settings.power_sims} sims")
     power = dict(_pmap(_power_job, power_jobs, settings.jobs))
-    candidates = ["fitted"] + [f"corner:{k}" for k in corners]
-    pick_key = min(candidates, key=lambda k: (power[k]["power_holm_run_alpha"], k))
+    worst_sector = None
     if sectors:
-        worst_sector = min((k for k in sets if k.startswith("sector:")), key=lambda k: power[k]["power_holm_run_alpha"])
-    pick_params = dict(sets[pick_key])
-    if pick_key != "fitted":
-        pick_jobs = [(f"{pick_key}@exposure0.3", pick_params, 0.3, settings.power_sims, lmr_power)]
-        power.update(dict(_pmap(_power_job, pick_jobs, 1)))
+        worst_sector = min((k for k in sets if k.startswith("sector:")),
+                           key=lambda k: (power[f"{k}@exposure0"]["power_holm_run_alpha"], k))
+        power.update(dict(_pmap(_power_job, [(f"{worst_sector}@exposure0.3", sets[worst_sector], 0.3,
+                                              settings.power_sims, lmr_power, settings.power_pilot_sims)], 1)))
+
+    def mean_power(k: str) -> float:
+        return float(np.mean([power[f"{k}@exposure{x:g}"]["power_holm_run_alpha"] for x in EXPOSURES_CHECKED]))
+
+    candidates = ["fitted"] + [f"corner:{k}" for k in admissible]
+    pick_key = min(candidates, key=lambda k: (mean_power(k), k))
     pick = {
-        "rule": ("among the fitted point and the 90%-CI corners of the weakly identified parameters "
-                 f"{list(WEAK)} (tail_df snapped to the grid; strong parameters refit at each corner), the set "
-                 "with the lowest synthetic E0 Holm power at planted IC 0.01, exposure 0"),
+        "rule": ("among the fitted point and the admissible 90%-CI corners of the weakly identified parameters "
+                 f"{list(WEAK)} (tail_df snapped to the grid; strong parameters refit at each corner; admissible "
+                 "= excess J within the bootstrap q90), the set with the lowest mean synthetic E0 Holm power "
+                 "at planted IC 0.01 over exposure 0 and 0.3"),
         "picked": pick_key,
-        "params": {**pick_params, "label_missing_rate": lmr_power},
+        "params": {**sets[pick_key], "label_missing_rate": lmr_power},
         "label_missing_rate_rule": "max(interior missing rate of the survivor panel, e0-v1 0.002)",
-        "corner_fits": {k: {"J": v["J"], "delta_J": v["J"] - best_J, "params": v["params"]}
-                        for k, v in corners.items()},
+        "mean_power_by_candidate": {k: mean_power(k) for k in candidates},
+        "admissibility_excess_J_q90": excess_q90,
+        "corner_fits": {k: {"J": v["J"], "delta_J": v["J"] - best_J, "admissible": k in admissible,
+                            "params": v["params"]} for k, v in corners.items()},
         "worst_power_sector": worst_sector,
         "a_share_at_fit": a_share,
         "persistence_at_fit": pers,
@@ -1060,10 +1112,12 @@ def write_receipt(receipt: Mapping, out_dir: Path) -> Path:
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "calibration_receipt.json"
-    if path.exists():
-        raise FileExistsError(f"{path} exists: calibration receipts are write-once")
-    path.write_text(json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8",
-                    newline="\n")
+    body = json.dumps(receipt, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    try:
+        with open(path, "x", encoding="utf-8", newline="\n") as fh:  # exclusive create: write-once
+            fh.write(body)
+    except FileExistsError:
+        raise FileExistsError(f"{path} exists: calibration receipts are write-once") from None
     return path
 
 
@@ -1078,16 +1132,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--power-sims", type=int, default=100, help="E0 sims per power check (0 = skip the pick)")
     ap.add_argument("--no-sectors", action="store_true")
     ap.add_argument("--no-ridge", action="store_true")
+    ap.add_argument("--aux-maxfev", type=int, default=None, help="evaluations per ridge point / corner refit")
     ap.add_argument("--df-grid", type=float, nargs="+", default=list(DF_GRID))
-    ap.add_argument("--panel", type=Path, default=None, help="a pre-cutoff panel npz (default: the pinned E0 panel)")
     a = ap.parse_args(argv)
     out = Path(a.out) / "calibration_receipt.json"
     if out.exists():
         ap.error(f"{out} exists: calibration receipts are write-once")
     settings = RunSettings(seed=a.seed, bootstrap=a.bootstrap, reps=a.reps, maxfev=a.maxfev,
                            df_grid=tuple(a.df_grid), jobs=a.jobs, sectors=not a.no_sectors,
-                           power_sims=a.power_sims, ridge=not a.no_ridge)
-    receipt = calibrate(settings, panel_path=a.panel)
+                           power_sims=a.power_sims, ridge=not a.no_ridge, aux_maxfev=a.aux_maxfev)
+    receipt = calibrate(settings)  # the pinned panel only (external panels are a test-only path)
     path = write_receipt(receipt, a.out)
     print(f"[e0c2] wrote {path} sha256 {sha256_file(path)}")
     return 0

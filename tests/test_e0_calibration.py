@@ -13,7 +13,7 @@ price, return or IC.
 from __future__ import annotations
 
 import builtins
-import importlib.util
+import importlib
 import json
 import sys
 from datetime import date, timedelta
@@ -29,14 +29,11 @@ SCRIPT = REPO / "scripts" / "e0_calibrate_outcome_model.py"
 
 
 def _load_script():
-    name = "e0_calibrate_outcome_model"
-    if name in sys.modules:
-        return sys.modules[name]
-    spec = importlib.util.spec_from_file_location(name, SCRIPT)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
+    # A plain import from scripts/ (on sys.path), so --jobs process-pool workers (spawned with the
+    # parent's sys.path) can unpickle the script's job functions.
+    if str(SCRIPT.parent) not in sys.path:
+        sys.path.insert(0, str(SCRIPT.parent))
+    return importlib.import_module(SCRIPT.stem)
 
 
 cal = _load_script()
@@ -131,11 +128,14 @@ def test_parameter_recovery(recovery):
     R, fitted = recovery
     got = fitted["best"]["params"]
     sim = cal.SimPanel(np.isfinite(R), seed=99, reps=2)
-    # market_vol scales ONE time series (the market shock). Under t(4) + GARCH(0.98) its in-sample
-    # scale over 700 grid steps has ~15% sampling sd across seeds (0.77-1.68 x population over 40
-    # seeds), so no estimator can promise +/-15% of the population value from one panel. The
-    # recovery target is therefore the truth panel's realised market scale; every cross-sectional
-    # parameter is checked against its known population value.
+    # market_vol scales ONE time series (the market shock). Under t(4) + GARCH(0.08, 0.90) its
+    # in-sample scale over 700 grid steps varies a lot across seeds (measured: sd 0.15 over 40 seeds,
+    # range 0.77-1.68; an independent check found sd 0.21, 5-95% 0.78-1.25 over 400 paths; this
+    # seed's truth path is 0.83), so no estimator can promise +/-15% of the population value from one
+    # panel. The +/-15% target is the truth panel's realised market scale (plus a loose +/-35% on the
+    # population value); every cross-sectional parameter is checked against its known population
+    # value. tail_df is held at its true value (df_grid=[4.0]): this recovers the other parameters
+    # given df; df itself is profiled on a grid in the real calibration.
     truth = cal.SimPanel(np.isfinite(R), seed=424242, reps=2)  # rep 1 == the truth panel's draws
     realised_market = TRUE["market_vol"] * truth.market_scale(
         TRUE["tail_df"], {"alpha": TRUE["garch_alpha"], "beta": TRUE["garch_beta"]}, 1)
@@ -143,6 +143,8 @@ def test_parameter_recovery(recovery):
                "idio_vol_dispersion": TRUE["idio_vol_dispersion"], "beta_sd": TRUE["beta_sd"]}
     problems = [f"{k}: got {got[k]:.5g}, want {v:.5g} +/-15%" for k, v in targets.items()
                 if abs(got[k] / v - 1) > 0.15]
+    if abs(got["market_vol"] / TRUE["market_vol"] - 1) > 0.35:
+        problems.append(f"market_vol {got['market_vol']:.5g} vs population 0.010 +/-35%")
     persistence = got["garch_alpha"] + got["garch_beta"]
     if abs(persistence - (TRUE["garch_alpha"] + TRUE["garch_beta"])) > 0.05:
         problems.append(f"persistence {persistence:.4f} vs 0.98 +/-0.05")
@@ -154,10 +156,15 @@ def test_parameter_recovery(recovery):
     assert not problems, f"{problems}; fitted {got}"
 
 
+@pytest.mark.timeout(600)  # two tiny calibrations, one through a spawned process pool
 def test_deterministic_and_write_once(tmp_path):
     path = _write_panel(tmp_path / "p.npz", [f"ZZ{i:02d}" for i in range(25)])
-    a = cal.write_receipt(cal.calibrate(_tiny_settings(), panel_path=path, log=lambda _m: None), tmp_path / "a")
-    b = cal.write_receipt(cal.calibrate(_tiny_settings(), panel_path=path, log=lambda _m: None), tmp_path / "b")
+    two_df = {"df_grid": (4.0, 6.0)}
+    a = cal.write_receipt(cal.calibrate(_tiny_settings(**two_df), panel_path=path, log=lambda _m: None),
+                          tmp_path / "a")
+    # the same seed through the process pool (jobs=2) gives the same bytes
+    b = cal.write_receipt(cal.calibrate(_tiny_settings(**two_df, jobs=2), panel_path=path, log=lambda _m: None),
+                          tmp_path / "b")
     assert a.read_bytes() == b.read_bytes()
     receipt = json.loads(a.read_text(encoding="utf-8"))
     assert receipt["input"]["cutoff_exclusive"] == "2007-11-01"
@@ -166,8 +173,13 @@ def test_deterministic_and_write_once(tmp_path):
         cal.write_receipt(receipt, tmp_path / "a")
 
 
+@pytest.mark.timeout(900)  # the full pipeline (fit, ridge, sectors, corners, E0 power) at a tiny budget
 def test_no_db(monkeypatch, tmp_path):
-    """The calibration on the cached panel runs with every DB import and connection refused."""
+    """The FULL calibration on the cached panel runs with every DB import and connection refused.
+
+    Every stage runs (df fit, bootstrap, GARCH ridge, sector fits, corner refits, synthetic E0 power
+    and the conservative pick), at a tiny optimisation budget.
+    """
     blocked = ("psycopg2", "psycopg", "sqlalchemy", "asyncpg")
 
     def refuse(*_a, **_k):
@@ -188,6 +200,10 @@ def test_no_db(monkeypatch, tmp_path):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", guarded)
-    receipt = cal.calibrate(_tiny_settings(bootstrap=3), log=lambda _m: None)
+    settings = _tiny_settings(bootstrap=3, maxfev=4, aux_maxfev=2, sectors=True, ridge=True, power_sims=1,
+                              power_pilot_sims=2)
+    receipt = cal.calibrate(settings, log=lambda _m: None)
     assert receipt["input"]["pinned"] is True and receipt["input"]["last_date"] < "2007-11-01"
     assert receipt["input"]["tickers_used"] >= 300
+    assert receipt["ridge_profile"] and receipt["sectors"]["fits"]
+    assert receipt["conservative_pick"]["picked"] and receipt["power"]["e0_v1@exposure0.3"]["sims"] == 1
