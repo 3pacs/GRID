@@ -39,8 +39,16 @@ REGISTRY_LOG = "granular_panel_prereg_sectors_v6.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_sectors_v6.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_sectors_v6.lock"
 WITNESS_PATH = v1.canonical_witness_path(REGISTRY_ID)
-REGISTERED_RECORD_SHA256: tuple[str, str] | None = None
-REGISTERED_ANCHOR_LINE: bytes | None = None
+#: Registered once on grid-svr 2026-10-01T16:09:28Z (merged main 4dfc25c9, v8 at exactly two records);
+#: witnessed on vault main 3ec4ffb7 at WITNESS_PATH (anchor file SHA-256 98369529...).
+REGISTERED_RECORD_SHA256: tuple[str, str] | None = (
+    "507fe8a8f659b9b8c847ccd6389a1a2672a4da1b4951955ac4d4c7b59f3c9416",
+    "55c05e31b10621043a09f468fb2a6cf9a1fb8dafb75cbf15904db1e6ef7efa67",
+)
+REGISTERED_ANCHOR_LINE: bytes | None = (
+    b'{"head_sha256":"55c05e31b10621043a09f468fb2a6cf9a1fb8dafb75cbf15904db1e6ef7efa67",'
+    b'"prev_anchor_sha256":null,"records":2,"run_at":"2026-10-01T16:09:28+00:00"}'
+)
 
 DISCOVERY = {"start": v8.DISCOVERY_START, "end": v1.SPLIT}
 HOLDOUT = {"start": v1.SPLIT, "end": v1.END}

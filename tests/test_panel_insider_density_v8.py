@@ -353,8 +353,9 @@ def test_sectors_v6_witness_shape_and_pinned_anchor(monkeypatch, tmp_path):
     line = _s6_line()
     git = {"content": line + nl}
     monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: git["content"])
-    s6 = v8._load_sectors_v6()  # real path: absent, or present but not yet pinned
-    assert s6 is None or s6.REGISTERED_ANCHOR_LINE is None
+    s6 = v8._load_sectors_v6()  # real path: present and pinned; exercise the unpinned shape check
+    assert s6 is not None and s6.REGISTERED_ANCHOR_LINE is not None
+    monkeypatch.setattr(s6, "REGISTERED_ANCHOR_LINE", None)
     v8._sectors_v6_anchor_at_tip(tmp_path, "t")  # unpinned: the canonical shape is enough
     bads = (line + nl + line + nl, line, line + cr + nl, line.replace(b'"records":2', b'"records":3') + nl,
             line.replace(b'"prev_anchor_sha256":null', b'"prev_anchor_sha256":"x"') + nl, b"{}" + nl)
