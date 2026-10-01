@@ -139,7 +139,8 @@ def _check_types(p: dict) -> None:
         for key in ("entry_date", "exit_date"):
             if not _text(horizon.get(key)):
                 raise RecordError(f"horizon.{key} must be an ISO date string")
-            date.fromisoformat(horizon[key])
+        if not date.fromisoformat(horizon["exit_date"]) > date.fromisoformat(horizon["entry_date"]):
+            raise RecordError("horizon.exit_date must be after horizon.entry_date")
 
 
 def _finite(value) -> bool:

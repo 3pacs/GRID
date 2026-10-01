@@ -16,6 +16,7 @@ from pathlib import Path
 import pytest
 
 from evals.e2 import board, scoring
+from evals.e2.adapters.e2_stream import E2StreamAdapter
 from evals.e2.chain import ChainError, Ledger, raw_lines
 from evals.e2.resolve import PriceObs
 from tests import e2_support as S
@@ -239,7 +240,36 @@ MALFORMED = {
     "sector_object": (1, {"sector": {"a": 1}}),
     "label_list": (1, {"horizon": {"label": [1], "entry_date": "2026-10-01", "exit_date": "2026-10-02"}}),
     "instrument_list": (1, {"target": {"instrument": ["AAA"], "instrument_class": "us_equity_large_cap"}}),
+    "exit_not_after_entry": (1, {"horizon": {"label": "1d", "entry_date": "2026-10-02", "exit_date": "2026-10-01"}}),
 }
+
+
+@pytest.mark.parametrize("tail", [b"[1,2]", b"null", b"5"])
+def test_a_non_object_log_line_fails_only_that_stream(tmp_path, tail):
+    good, bad = tmp_path / "good.jsonl", tmp_path / "bad.jsonl"
+    S.write_chain(good, S.stream_records())
+    S.write_chain(bad, [{**r, "stream": "other_v1"} if r["kind"] == "header" else
+                        {**r, "prediction_id": r["prediction_id"].replace(S.STREAM, "other_v1")}
+                        for r in S.stream_records()])
+    bad.write_bytes(bad.read_bytes() + tail + b"\n")
+    rules = S.rules()
+    rules["streams"]["other_v1"] = {**rules["streams"][S.STREAM]}
+    adapters = [E2StreamAdapter(bad, "other_v1", rules["streams"]["other_v1"], rules, S.prices()),
+                S.stream_adapter(good, rules, S.prices())]
+    snap = board.run(tmp_path / "board", adapters, AFTER, rules=rules, cost_model=S.cost_model(),
+                     manifest_info=S.MANIFEST_INFO, code_sha=S.CODE_SHA)["snapshot"]
+    assert snap["streams"]["other_v1"]["ok"] is False and "not a JSON object" in snap["streams"]["other_v1"]["error"]
+    assert snap["streams"][S.STREAM]["ok"] is True and snap["counts"]["scores"] == 6
+
+
+def test_a_non_object_ledger_line_reports_chain_broken(tmp_path):
+    from evals.e2.report import load_board
+
+    _run(tmp_path, AFTER)
+    path = tmp_path / "board" / "e2_scoreboard_e2-v1.jsonl"
+    path.write_bytes(path.read_bytes() + b"[1,2]\n")
+    board_view = load_board(tmp_path / "board", "e2-v1")
+    assert board_view["status"] == "chain_broken" and "not a JSON object" in board_view["chain"]["detail"]
 
 
 @pytest.mark.parametrize("broken", sorted(MALFORMED))

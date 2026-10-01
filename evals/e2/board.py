@@ -333,7 +333,7 @@ def run(board_dir: Path, adapters: list, now: datetime, *, rules: dict, cost_mod
         for adapter in adapters:
             try:
                 view = adapter.load(now)
-            except (ChainError, OSError, ValueError, KeyError) as exc:
+            except (ChainError, OSError, *DATA_ERRORS) as exc:  # this stream is not read; the others proceed
                 streams[adapter.stream] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 continue
             alert = _source_prefix_alert(adapter.stream, view, state, now)

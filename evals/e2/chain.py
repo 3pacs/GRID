@@ -74,6 +74,8 @@ def verify_source_chain(path: Path, *, prereg_sha256: str | None = None,
             record = json.loads(line)
         except ValueError as exc:
             raise ChainError(f"{Path(path).name} line {i}: not JSON ({exc})") from None
+        if not isinstance(record, dict):
+            raise ChainError(f"{Path(path).name} line {i}: not a JSON object")
         if require_canonical and line != json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8"):
             raise ChainError(f"{Path(path).name} line {i}: not canonical JSON")
         if record.get("prev_sha256") != previous:
@@ -114,6 +116,8 @@ class Ledger:
                 record = json.loads(line)
             except ValueError:
                 return _broken(len(lines), i, "line is not JSON")
+            if not isinstance(record, dict):
+                return _broken(len(lines), i, "line is not a JSON object")
             if line != canonical(record):
                 return _broken(len(lines), i, "line is not canonical JSON")
             if record.get("prev_sha256") != previous:
@@ -218,6 +222,8 @@ def check_anchors(path: Path, heads: list[str]) -> tuple[str | None, int]:
             anchor = json.loads(line)
         except ValueError:
             return f"anchor {i} is not JSON", count
+        if not isinstance(anchor, dict):
+            return f"anchor {i} is not a JSON object", count
         if line != canonical(anchor) or anchor.get("prev_anchor_sha256") != previous:
             return f"anchor {i} breaks the anchor chain", count
         records = anchor.get("records")
