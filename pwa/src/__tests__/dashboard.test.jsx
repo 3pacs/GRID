@@ -137,6 +137,52 @@ describe('Dashboard watchlist loading', () => {
         });
         const textBriefing = screen.getByTestId('text-briefing');
         expect(within(textBriefing).getByText(/GRID Intelligence briefing for today/)).toBeInTheDocument();
-        expect(within(textBriefing).getByText(/local/)).toBeInTheDocument();
+        expect(within(textBriefing).getByText(/\(local\)/)).toBeInTheDocument();
+    });
+
+    it('says the local TTS is unavailable when Kokoro did not answer (never a fake success)', async () => {
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning. GRID Intelligence briefing for today.',
+                audio_path: null,
+                audio_status: 'unavailable',
+                audio_note: 'Local TTS unavailable: Kokoro at http://gridz4:8880 is unreachable (ConnectionError). Text-only briefing; no audio was made and no paid TTS was tried.',
+                provider: 'local',
+                briefing_date: '2026-10-01',
+                generated_at: '2026-10-01T12:00:00Z',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByText(/Local TTS unavailable: Kokoro/)).toBeInTheDocument();
+        });
+        expect(screen.getByTestId('text-briefing')).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /play briefing/i })).not.toBeInTheDocument();
+    });
+
+    it('shows the not-configured note inside a text-only briefing', async () => {
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning.',
+                audio_path: null,
+                audio_status: 'not_configured',
+                audio_note: 'Text-only briefing: local TTS is not configured (set GRID_KOKORO_URL to a Kokoro server). Paid TTS stays off.',
+                provider: 'local',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByTestId('text-briefing-note')).toHaveTextContent(/GRID_KOKORO_URL/);
+        });
     });
 });

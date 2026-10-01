@@ -117,8 +117,9 @@ function AudioBriefingPlayer({ onNavigate }) {
     const [playing, setPlaying] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [briefingError, setBriefingError] = useState(null);
-    // Text-only result (no audio_path) — GRID_ALLOW_PAID_LLM is not set, so
-    // there is no paid TTS provider. See audio_briefing.py's audio_note.
+    // Text-only result (no audio_path): local Kokoro TTS is not configured
+    // (audio_status "not_configured") or did not answer ("unavailable").
+    // See audio_briefing.py's audio_note — never a paid fallback.
     const [textBriefing, setTextBriefing] = useState(null);
     const audioRef = React.useRef(null);
     const audioUrlRef = React.useRef(null);
@@ -179,11 +180,14 @@ function AudioBriefingPlayer({ onNavigate }) {
                     generated_at: r.briefing.generated_at, provider: r.briefing.provider,
                 });
             } else if (r?.status === 'SUCCESS' && r.briefing?.script_text) {
-                // On-demand, text-only: no paid TTS provider is enabled
-                // (GRID_ALLOW_PAID_LLM unset), so the local-LLM script is the
-                // whole result. See audio_briefing.py's "text-only via local
-                // LLM" fix (Wave 3 #5) — never invent audio that wasn't made.
+                // On-demand, text-only: local Kokoro TTS is not configured or
+                // did not answer, so the local-LLM script is the whole result.
+                // Never invent audio that wasn't made; when local TTS failed,
+                // say so as an error rather than a quiet note.
                 setTextBriefing(r.briefing);
+                if (r.briefing.audio_status === 'unavailable') {
+                    setBriefingError(r.briefing.audio_note || 'Local TTS unavailable — text-only briefing.');
+                }
             } else {
                 // Backend returns {error, status:'FAILED'} on failure (e.g. paid
                 // generation disabled) — prefer that honest message over the
@@ -231,7 +235,7 @@ function AudioBriefingPlayer({ onNavigate }) {
             </div>
             <div style={{ fontFamily: SANS, fontSize: '11px', color: colors.textDim, marginBottom: '8px' }}>
                 {'On-demand only — no schedule behind this button. Script text comes from a ' +
-                    'local LLM; audio needs a paid TTS provider (off by default).'}
+                    'local LLM and audio from local Kokoro TTS. No paid providers.'}
             </div>
             {briefingError && (
                 <div style={{
@@ -260,6 +264,12 @@ function AudioBriefingPlayer({ onNavigate }) {
                     <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim, marginBottom: '6px' }}>
                         {`Generated on request (${textBriefing.provider || 'local'}) \u2014 text only, no audio`}
                     </div>
+                    {textBriefing.audio_note && textBriefing.audio_status !== 'unavailable' && (
+                        <div data-testid="text-briefing-note" style={{ fontFamily: SANS, fontSize: '11px',
+                            color: colors.textDim, marginBottom: '6px' }}>
+                            {textBriefing.audio_note}
+                        </div>
+                    )}
                     <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.text, lineHeight: 1.6,
                         whiteSpace: 'pre-wrap' }}>
                         {textBriefing.script_text}
