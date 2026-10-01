@@ -688,6 +688,26 @@ jobs:
             exit 1
           fi
 
+      # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
+      # point-in-time against real SQL (no close before its pull or its
+      # session close, no revision pulled after the run instant, one named
+      # source), a full board run resolves only once the exit close is
+      # observable, and the price session is server-enforced read-only.
+      # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E2 forward scoreboard price resolution PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_price_resolver_pg.py -q -rA | tee /tmp/grid-e2-prices-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-prices-pg.txt; then
+            echo "::error::E2 forward scoreboard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
