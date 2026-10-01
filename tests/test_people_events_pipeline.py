@@ -387,6 +387,28 @@ class TestReviewFixes:
         sec, _ = A.form4_from_form345(frame([sec_row()]))
         assert sec.loc[0, "attrs"]["is_10b5_1"] is None
 
+    def test_10b5_1_flag_survives_a_merge_with_a_flagless_source(self):
+        native = sig(7, "insider", "AAPL", "2026-04-01",
+                     {"transaction_code": "P", "shares": 1000, "price": 200, "filing_date": "2026-04-03",
+                      "is_10b5_1": True}, source_id="COOK TIMOTHY D")
+        ev = run(form345=[sec_row()], signal_sources=[native]).events
+        assert len(ev) == 1 and ev.loc[0, "n_sources"] == 2
+        assert ev.loc[0, "source"] == "sec_form345" and ev.loc[0, "attrs"]["is_10b5_1"] is True
+
+    def test_unmapped_form4_codes_have_none_direction_not_nan(self):
+        cands, _ = A.form4_from_form345(frame([sec_row(transaction_code="M")]))
+        assert cands.loc[0, "direction"] is None
+
+    def test_qq_aggregate_snapshots_are_report_only(self):
+        rows = [sig(i, "quiverquant:gov_contracts", "LMT", d, {"Year": 2026, "Qtr": 3, "Amount": amt},
+                    created_at=f"{d}T09:00:00Z", signal_type="gov_contracts")
+                for i, (d, amt) in enumerate([("2026-05-02", 1e6), ("2026-06-15", 2.5e6)], start=1)]
+        ev = _resolved(signal_sources=rows)
+        assert len(ev) == 2  # two growing snapshots: never both written as acts
+        plan = P.build_write_plan(ev, pd.DataFrame(), OBSERVED)
+        assert set(plan["op"]) == {"report_only"}
+        assert P.apply_in_memory(pd.DataFrame(), plan, OBSERVED).empty
+
     def test_amendment_content_is_never_shown_at_the_original_known_at(self):
         rows = [sec_row(), sec_row(accession_number="0001214156-26-000009", document_type="4/A", amended=True,
                                    filing_date="2026-05-20", nonderiv_trans_sk="9", price_per_share=300.0)]
