@@ -27,6 +27,7 @@ WORKFLOW = REPO / ".github" / "workflows" / "evals-freeze.yml"
 REQUIRED_GUARD_FILES = {
     "tests/test_e0_manifest_guard.py",
     "tests/test_e0_benchmark.py",
+    "tests/test_e2_manifest_guard.py",
     "tests/test_evals_released.py",
     "evals/released.py",
     "evals/README.md",
@@ -137,6 +138,20 @@ def test_e0_v1_is_entry_zero_with_its_released_hash():
     assert first["manifest_sha256"] == E0_V1_SHA
     assert released.latest_entry("e0", path="evals/e0")["manifest_sha256"] == E0_V1_SHA
     assert e0_manifest.manifest_sha256() == E0_V1_SHA
+
+
+def test_every_suite_on_main_is_enrolled_at_its_package_version():
+    from evals import e1, e2
+    from evals.e0 import VERSION as E0_VERSION
+
+    assert released.latest_entry("e0", path="evals/e0")["version"] == E0_VERSION
+    # E1's manifest has no version header, so its version is checked here.
+    e1_entry = released.latest_entry("e1", path="evals/e1")
+    assert e1_entry["version"] == e1.SUITE_VERSION, (
+        "evals.e1.SUITE_VERSION and the latest released e1 entry differ: a re-pin of "
+        "evals/e1/MANIFEST.sha256 appends a NEW e1 entry with the new version")
+    assert e1_entry["manifest_sha256"] == _lf(REPO / "evals" / "e1" / "MANIFEST.sha256")
+    assert released.latest_entry("e2", path="evals/e2")["version"] == e2.VERSION
 
 
 def test_guards_entry_pins_the_guard_files():
@@ -451,8 +466,32 @@ def test_symlinks_are_refused(trees):
 
 
 def test_bootstrap_base_without_registry(trees):
+    """The PR that creates the registry records history (several entries per path)."""
     base, head = trees
     (base / "evals" / "RELEASED.json").unlink()
+    _passes(base, head)
+
+
+def test_e1_style_repin_appends_a_new_entry(trees):
+    """What #768 does: re-pin evals/e1 and append e1-v1.2; editing e1-v1.1 instead fails."""
+    base, head = trees
+    suite = head / "evals" / "e1"
+    init = suite / "__init__.py"
+    init.write_bytes(init.read_bytes() + b"\n# v1.2\n")
+    _fails(base, head, "changed: evals/e1/__init__.py")
+    lines = [f"{_lf(suite / rel)}  {rel}\n"
+             for rel in released.walk_suite(head, "evals/e1", released.PLAIN_SKIP_DIRS)]
+    (suite / "MANIFEST.sha256").write_bytes("".join(lines).encode())
+    _fails(base, head, "e1 manifest is not a released version")
+    new_sha = _lf(suite / "MANIFEST.sha256")
+    doc = _doc(head)
+    latest = max(i for i, e in enumerate(doc["entries"]) if e.get("path") == "evals/e1")
+    doc["entries"][latest]["manifest_sha256"] = new_sha  # editing the released entry
+    _save(head, doc)
+    _fails(base, head, f"released entry {latest} changed")
+    doc["entries"][latest]["manifest_sha256"] = _doc(base)["entries"][latest]["manifest_sha256"]
+    _save(head, doc)
+    _append(head, **_suite_entry("e1", "e1-v1.2", "evals/e1", new_sha))
     _passes(base, head)
 
 

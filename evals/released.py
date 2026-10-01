@@ -53,14 +53,18 @@ _SUITE_PATH = re.compile(r"evals/[A-Za-z0-9][A-Za-z0-9._-]*\Z")
 ALWAYS_GUARDED = ("evals/released.py", ".github/workflows/evals-freeze.yml")
 
 # Manifest formats, matched to each suite's own manifest.py:
-#  * "versioned" (evals/e0/manifest.py): has a "# version:" header; files whose
-#    suffix is in BINARY_SUFFIXES are hashed raw, every other file CRLF->LF;
-#    skips __pycache__ dirs and *.pyc.
-#  * "plain" (evals/e1/manifest.py): no header; every file CRLF->LF; skips
-#    __pycache__ and .pytest_cache dirs and *.pyc.
+#  * "versioned" (evals/e0, evals/e2 manifest.py): a "# version:" header; files
+#    whose suffix is in VERSIONED_BINARY_SUFFIXES are hashed raw (E0's .npz
+#    caches), every other file CRLF->LF. E2 has no such files today; if a
+#    versioned suite ever LF-hashes one, the guard fails closed until a
+#    guards-vN release teaches it otherwise.
+#  * "plain" (evals/e1/manifest.py): no header; every file CRLF->LF.
+# Both skip __pycache__ and .pytest_cache dirs and *.pyc, as the suites' own
+# walkers do (a fresh CI checkout refuses committed ones, see check()).
 VERSIONED_BINARY_SUFFIXES = frozenset({".npz", ".gz", ".parquet"})
-VERSIONED_SKIP_DIRS = frozenset({"__pycache__"})
-PLAIN_SKIP_DIRS = frozenset({"__pycache__", ".pytest_cache"})
+SKIP_DIRS = frozenset({"__pycache__", ".pytest_cache"})
+VERSIONED_SKIP_DIRS = SKIP_DIRS
+PLAIN_SKIP_DIRS = SKIP_DIRS
 
 
 class GuardError(Exception):
@@ -301,7 +305,7 @@ def _bytecode_under(root: Path, rel_dir: str) -> list[str]:
     for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
         here = Path(dirpath)
         for name in dirnames:
-            if name == "__pycache__":
+            if name in SKIP_DIRS:
                 found.append((here / name).relative_to(root).as_posix() + "/")
         for name in filenames:
             if name.endswith(".pyc"):
@@ -357,7 +361,9 @@ def check(base_dir: Path, head_dir: Path, *, fresh_checkout: bool = False) -> li
                 failures.append(f"R6: entry {entry['seq']}: path {entry['path']} already holds suite {prior}")
 
     # R8: at most one new entry per suite path (and one new guards entry) per change.
-    new_entries = head_entries[len(base_entries):] if len(head_entries) > len(base_entries) else []
+    # The change that creates the registry records existing history and is exempt.
+    base_has_registry = os.path.lexists(base_dir / REGISTRY)
+    new_entries = head_entries[len(base_entries):] if base_has_registry else []
     counts: dict[str, int] = {}
     for entry in new_entries:
         counts[entry_key(entry)] = counts.get(entry_key(entry), 0) + 1

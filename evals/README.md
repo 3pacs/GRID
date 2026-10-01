@@ -30,18 +30,24 @@ the change is a good idea.
    - E0: bump `evals.e0.VERSION` and `config.json`, then
      `python -m evals.e0 manifest --write --version e0-vN` (in a sibling
      package if the old version must stay live).
-   - E1: `python -m evals.e1.manifest --write`.
+   - E1: bump `evals.e1.SUITE_VERSION` (e.g. `e1-v1.1` -> `e1-v1.2`), then
+     `python -m evals.e1.manifest --write`. E1's manifest has no version
+     header, so `tests/test_evals_released.py` checks that `SUITE_VERSION`
+     equals the latest `e1` entry's `version`.
+   - E2: bump `evals.e2.VERSION` and `rules.json`, then
+     `python -m evals.e2 manifest --write --version e2-vN`.
 2. Hash the new manifest: `python evals/released.py lf-sha256 evals/<dir>/MANIFEST.sha256`.
 3. Append **one** entry to `entries` with the next `seq`:
 
    ```json
-   {"seq": 3, "kind": "suite", "suite": "e1", "version": "e1-v1.1", "path": "evals/e1",
-    "manifest_sha256": "<64 hex>", "released_in": "#767",
+   {"seq": 5, "kind": "suite", "suite": "e1", "version": "e1-v1.2", "path": "evals/e1",
+    "manifest_sha256": "<64 hex>", "released_in": "#768",
     "approved_by": "<owner>", "note": "why this version exists"}
    ```
 
    `version` must be new for that suite. For a manifest with a `# version:`
-   header (E0), `version` must equal the header.
+   header (E0, E2), `version` must equal the header. Never edit an existing
+   entry, including the previous version for the same path.
 4. To change a guard file, append a `guards` entry instead:
    `{"seq": N, "kind": "guards", "version": "guards-v2", "files": {"<path>": "<lf sha256>", ...}}`.
    List every file that should stay pinned, not just the changed one.
@@ -52,6 +58,9 @@ the change is a good idea.
    git worktree add /tmp/evals-base origin/main
    python -I evals/released.py check --base-dir /tmp/evals-base --head-dir .
    ```
+
+Released today (see `RELEASED.json`): e0-v1 at `evals/e0`, e1-v1 then e1-v1.1
+at `evals/e1`, e2-v1 at `evals/e2`.
 
 Two PRs that each append an entry will conflict on `RELEASED.json`. That is
 intended: the second one rebases and takes the next `seq`.

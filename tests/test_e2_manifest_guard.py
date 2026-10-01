@@ -13,9 +13,11 @@
   (``tests/test_systemd_template_invariants.py`` checks it with the others).
 
 Changing E2 is an owner-approved version bump: bump ``evals.e2.VERSION`` and
-``rules.json``, run ``python -m evals.e2 manifest --write --version e2-vN`` and ADD
-the new manifest's sha256 below (never edit a released entry). The new version
-writes its own ledger file; old ledgers are never rescored in place.
+``rules.json``, run ``python -m evals.e2 manifest --write --version e2-vN`` and
+APPEND a new released entry to ``evals/RELEASED.json`` (never edit a released
+entry; the ``evals-freeze-guard`` workflow enforces that against the base
+revision, see evals/README.md). The new version writes its own ledger file;
+old ledgers are never rescored in place.
 """
 
 from __future__ import annotations
@@ -27,14 +29,11 @@ from pathlib import Path
 
 import pytest
 
+from evals import released
 from evals.e2 import VERSION, manifest
 
 REPO = Path(__file__).resolve().parent.parent
-
-#: version -> sha256 of evals/e2/MANIFEST.sha256 (LF). Append-only.
-RELEASED_MANIFESTS = {
-    "e2-v1": "7bc9a6cd54a4f1081dfac635d7df00ea16b95e19c20b77ea17517ea0e289987f",
-}
+E2_PATH = "evals/e2"
 
 
 def test_every_pinned_file_matches_the_manifest():
@@ -44,8 +43,12 @@ def test_every_pinned_file_matches_the_manifest():
 def test_manifest_is_the_released_one_for_its_version():
     version, _ = manifest.parse(manifest.MANIFEST.read_text(encoding="utf-8"))
     assert version == VERSION, "evals.e2.VERSION and the manifest header differ"
-    assert version in RELEASED_MANIFESTS, f"{version} is not a released E2 version (RELEASED_MANIFESTS)"
-    assert manifest.manifest_sha256() == RELEASED_MANIFESTS[version], (
+    entry = released.latest_entry("e2", path=E2_PATH)
+    assert entry["version"] == version, (
+        f"{version} is not the latest released E2 version at {E2_PATH} ({entry['version']}): "
+        "append a released entry to evals/RELEASED.json"
+    )
+    assert manifest.manifest_sha256() == entry["manifest_sha256"], (
         f"MANIFEST.sha256 changed without a version bump: {version} was released with a different manifest"
     )
 
