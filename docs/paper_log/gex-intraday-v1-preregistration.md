@@ -113,8 +113,10 @@ sessions and the session after an unscheduled closure are excluded (`early_close
   never used. A missing or incomplete batch excludes the session (`no_batch`). A later batch never
   changes a logged decision.
 - **Engine spot.** The pinned engine prices gamma at its own verified prior close: the latest
-  `spy_close_receipt` available before the batch completed, which is the S-2 close. This is disclosed
-  and kept as the engine's native behavior. Every distance and side in this family uses P0 instead.
+  `spy_close_receipt` available before the batch completed and at most four calendar days old. This
+  is normally the S-2 close, and an earlier close across holidays or missing receipts. It is
+  disclosed and kept as the engine's native behavior. Every distance and side in this family uses P0
+  instead.
 - **P0 and PM.** P0 = SPY's official close of S-1. PM = a SPY pre-market indication (last trade or
   quote midpoint) stamped between 08:30 and 09:10. Both must come from one pre-open capture with a
   grid-svr receipt at or before D0. GRID's earliest scheduled equity pull for the S-1 close is
@@ -152,7 +154,11 @@ sessions and the session after an unscheduled closure are excluded (`early_close
   with r = 0.04, q = 0 and the Cboe IV; exposure per contract = gamma(P0) x OI x 100 x P0^2 x 0.01,
   sign +1 for calls and -1 for puts. Summed by strike: call wall = the strike with the largest
   positive call exposure; put wall = the strike with the most negative put exposure. Ties go to the
-  strike nearer P0, then the lower strike.
+  strike nearer P0, then the lower strike. If neither wall exists, the session is `no_wall`.
+- **DW2 direction.** The registered sign is the pinning reading: a large gamma concentration near the
+  price dampens the move. Sessions whose nearest wall is farther away should then move more, so the
+  slope of y on ln(distance) is positive. The opposite (acceleration) reading is not tested; this is
+  one-sided.
 - **Breadth (SC).** NYSE ADVN and DECN at the S-1 close, captured with a grid-svr receipt at or before
   D0. There is no capture, so `BLOCKED_INPUT`.
 
@@ -175,11 +181,16 @@ theoretical fill, no intraday bar print.
   This is the only outcome-side exclusion: a missing official auction print (for any reason,
   including a halt) is `price_unavailable`; no rule may inspect intraday price behavior to exclude
   a session.
-- **Admitted sources.** Closes: `astrogrid.price_close_receipt` (`spy_close_v1` receipts,
-  unadjusted, verified), as outcomes only. Opens: none admitted on 2026-10-01. Admitting an
-  opening-auction source requires an independently reviewed check over at least 20 sessions: the
-  candidate equals the NYSE Arca official opening auction print, unadjusted, with a grid-svr receipt.
-  Until then every PC-OC hypothesis is `BLOCKED_PRICE_CONTRACT`.
+- **Admitted sources.** C_S, and every close in this family, is the value of the
+  `astrogrid.price_close_receipt` receipt for that session (`spy_close_v1`, unadjusted, verified),
+  used as an outcome only. That receipt is the provider's daily close; it is not certified to be
+  the closing auction print. Opens: none admitted on 2026-10-01. Before any hypothesis can start,
+  one independently reviewed check over the same 20 or more sessions must show both that the
+  candidate open equals the NYSE Arca official opening auction print and that the `spy_close_v1`
+  close equals the official closing auction print. Both must be unadjusted and carry grid-svr
+  receipts. Until that check passes, every PC-OC and PC-CC hypothesis is `BLOCKED_PRICE_CONTRACT`
+  or `BLOCKED_INPUT`. If the close check fails, `spy_close_v1` is not admitted and the family
+  waits for a close source that passes it.
 - **Costs.** E2 cost model `e2-costs-v1`, class `us_equity_etf_large`: 3 bp per side, 6 bp round trip.
   This is the primary cost. A 1 bp-per-side sensitivity (GEX-levels v1's cost) is reported but never
   tested.
@@ -214,6 +225,12 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
   whether the gamma regime adds anything to fading the gap.
 - SC1's registered statistic is paired the same way: d = net(SC1) - net(MG2) on every session where
   MG2 trades.
+- **Partners are counterfactuals.** PO1's rule is evaluated on every session MG2 evaluates, and
+  MG2's rule on every session SC1 evaluates. This continues whether or not the partner was selected,
+  passed, closed or stopped; a partner's verdict or stop never removes it from a pair. If the
+  partner's net return is unavailable on a session while the paired hypothesis's own is available
+  (for example, a partner-only input is missing), that paired observation is excluded as
+  `partner_unavailable`. It is never filled with zero.
 - A standalone mean for MG2 or SC1 may be reported. It may never be described as evidence for gamma
   or breadth.
 - MG1, MG3, DW2 and SC2 enter PO2's regressor as a control, so their coefficients are incremental
@@ -226,9 +243,23 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
   of a wall. DW1 resembles H3's LONG_GAMMA leg (fade at a call or put wall) without a regime
   condition and with vendor walls.
 - **Session separation.** MG1, MG2, SC1, SC2 and DW1 make no decision on any session up to and
-  including the one on which v1's terminal evaluation record or terminal stop record is written.
-  They stay `BLOCKED` until that record exists and is verified. Any report of these five cites v1's
-  matching hypothesis, and their false-pass bounds add to v1's.
+  including the session on which the v1 closure artifact below is proven on vault `origin/main`.
+  They stay `BLOCKED` until then. Any report of these five cites v1's matching hypothesis, and their
+  false-pass bounds add to v1's.
+- **v1 closure artifact.** v1 itself writes no terminal record: `evaluate` prints to stdout and
+  `status` only prints a stop advisory. Its closure is therefore defined here as one owner-committed
+  file, `05-GRID/Paper-Log/gex_levels_v1/CLOSURE.json`, on vault `main`. It contains:
+  - `kind`: `evaluation` or `stop`;
+  - `log_records` and `log_head_sha256`: the record count and the SHA-256 of the last line of
+    `/data/grid/paper_log/gex_levels_v1/gex_levels_v1.jsonl` at closure;
+  - for `evaluation`: the exact stdout of `python -m paper_log.gex_levels evaluate --log-dir
+    /data/grid/paper_log/gex_levels_v1` run without `--interim`, and it must be neither refused nor
+    INTERIM;
+  - for `stop`: the owner's stop decision quoting the exact `status` advisory line it relies on.
+
+  It is verified by checking the head hash and count against the v1 log on grid-svr. The proof of
+  when it reached `origin/main` follows section 10. **Absent this artifact, the five stay `BLOCKED`
+  permanently; no other route unblocks them.**
 - v1 H2 (wall hold against mirror placebos on 5-minute bars) is not re-tested. DW uses vendor or
   recomputed delayed walls and auction prices only.
 - S10: no candidate scientific pair is shared.
@@ -381,12 +412,12 @@ governs and the discrepancy is a defect, fixed only in v2.
       "decision": "D0",
       "e2_rule": "e2.abs_move.v1",
       "input": "Cboe delayed SPY chain captured at or before D0; walls by the section 3 formula; P0",
-      "rule": "x = ln(min distance from P0 to the recomputed call wall or put wall, in percent of P0, floored at 0.01)",
+      "rule": "x = ln(min distance from P0 to the recomputed call wall or put wall, in percent of P0, floored at 0.01); neither wall: no_wall",
       "statistic": "OLS (with intercept) slope of y_S on z(x) and PO2's x; one-sided, Newey-West 5 lags",
-      "direction": "negative",
+      "direction": "positive",
       "planted_effect": {
         "model": "forecast_continuous",
-        "slope_per_sd": -0.15,
+        "slope_per_sd": 0.15,
         "noise_log_sd": 1.0,
         "control_corr": 0.3
       },
@@ -542,7 +573,7 @@ governs and the discrepancy is a defect, fixed only in v2.
       "kind": "trade",
       "uses_gamma": false,
       "price_contract": "PC-CC",
-      "decision": "D_RB: 15:00 on M-2, the second-to-last NYSE session of each month",
+      "decision": "D_RB: 15:00 on M-2, the third-to-last NYSE session of the calendar month (M = the last NYSE session of the calendar month)",
       "e2_rule": "e2.direction.v1",
       "input": "month-to-date total returns of SPY and AGG through the M-3 close, from unadjusted close receipts and declared dividends with ex-dates in the month, every receipt created at or before D_RB",
       "rule": "if SPY MTD minus AGG MTD >= +0.03, side = -1 from the M-2 close to the M close (rebalancing sale); if <= -0.03, side = +1; else no trade",
@@ -568,14 +599,18 @@ governs and the discrepancy is a defect, fixed only in v2.
 Notes binding the block:
 
 - `n_discovery` and `n_holdout` count valid observations: trades for `trade`; paired sessions for
-  `paired_trade`; sessions for `forecast`; month-end events for RB1. A session with no trigger is
-  neither a trade nor an exclusion.
+  `paired_trade`; sessions for `forecast`; triggered month-end trades for RB1. A session or month
+  with no trigger is neither a trade nor an exclusion.
+- RB1 horizon: if about half of months trigger, 64 discovery trades take about 11 years and 72 holdout
+  trades about 12 more. This is stated so that nobody mistakes a short window for evidence.
 - z(x) is the standardization of section 2. "PO2's x" means PO2's raw regressor for the same
   session, entered as a control. It never means PO2's verdict.
 - PO2's window is exactly the NYSE sessions S-2..S-21. If any of them lacks both outcome receipts
   created at or before D0, PO2's x is unavailable and every hypothesis using it excludes the session
   (`input_unavailable`). The window is never shortened or shifted.
 - Every OLS includes an intercept (section 2).
+- RB1 calendar: M = the last NYSE session of the calendar month; M-1 = the second-to-last; M-2 = the
+  third-to-last; M-3 = the fourth-to-last.
 - RB1's decision record and its anchor must be on vault `origin/main` before 15:45 on M-2, proven as
   in section 10. Otherwise `late_decision`. Its entry is the M-2 market-on-close order. Each of its
   price sessions follows the section 4 receipt rule separately. Its AGG prices and dividend source
@@ -585,10 +620,11 @@ Notes binding the block:
 
 `market_closed`, `early_close`, `late_decision`, `no_batch`, `engine_unavailable` (no measured spot
 or no regime), `input_blocked`, `input_unavailable` (no receipt at or before the decision),
+`no_wall` (DW2: neither recomputed wall exists), `partner_unavailable` (section 6),
 `between_stages` and `price_unavailable` (section 4; the only outcome-side code). A
 hypothesis stops (`STOP_DATA_QUALITY`) if more than 10% of its sessions are excluded by its 30th
-session. `market_closed`, `early_close`, `input_blocked` and `between_stages` do not count toward
-the 10%. Any fix is v2.
+session. `market_closed`, `early_close`, `input_blocked`, `no_wall` and `between_stages` do not
+count toward the 10%. Any fix is v2.
 
 Until a hypothesis's look, status reports activity only: decisions, trades, exclusions by reason, and
 valid observations against `n_discovery` or `n_holdout`. It never reports a return, hit rate, slope
@@ -623,7 +659,7 @@ or p-value. A look taken early is a defect and invalidates the hypothesis.
     `rules.json` stream registration of `gex_intraday_v1`;
   - the ten trial entries in the E3 trial ledger.
 - The frozen GEX-levels v1 log and its pinned code are not read, imported or written by any of this.
-  The section 7 rule reads only whether v1's terminal evaluation or stop record exists and verifies.
+  The section 7 rule reads only the v1 closure artifact and the v1 log's head hash and count.
 
 <!-- PREREG-BODY-END -->
 

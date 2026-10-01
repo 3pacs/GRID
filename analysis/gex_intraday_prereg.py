@@ -33,7 +33,7 @@ from analysis.research_forward_log import ForwardLog, _lines, canonical
 REPO = Path(__file__).resolve().parents[1]
 VERSION = "gex_intraday_v1"
 PREREG_PATH = Path("docs/paper_log/gex-intraday-v1-preregistration.md")
-PREREG_BODY_SHA256 = "f5a568d9231f97624f8df0099510796c99fd9f2817e86ee768dad61ef02a740b"
+PREREG_BODY_SHA256 = "384b71afe27d4a218b8e6de69d83e412f0c168daa13defc388b6b0560df44120"
 BODY_START = "<!-- PREREG-BODY-START -->"
 BODY_END = "<!-- PREREG-BODY-END -->"
 
@@ -82,7 +82,8 @@ HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # or a named month (a pattern that could postdate registration).
 DATE_LIKE = re.compile(
     r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\b(?:19|20)\d{2}\b"
-    r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?(?=\s|$|[,.;:)])"
+    r"|\b(?:January|February|March|April|May|June|July|August|September|October|November"
+    r"|December|Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)\b"
 )
 REQUIRED = (
     "id",

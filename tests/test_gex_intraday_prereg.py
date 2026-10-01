@@ -102,7 +102,7 @@ def test_no_outcome_dependent_exclusion_and_v1_separation():
     assert "halted" not in body  # a halt is only a missing auction print
     assert "the only outcome-side code" in body
     assert "MG1, MG2, SC1, SC2 and DW1 make no decision" in body
-    assert "terminal evaluation record or terminal stop record" in body
+    assert "v1 closure artifact below is proven" in body
     for gate in ("`rules.json` stream registration", "E3 trial ledger"):
         assert gate in body
 
@@ -272,3 +272,40 @@ def test_registry_module_reads_no_outcomes_or_frozen_v1():
         m.startswith(("paper_log", "store", "db", "ingestion", "sqlalchemy", "physics", "evals"))
         for m in imported
     )
+
+
+def test_v1_closure_artifact_is_concrete_and_otherwise_blocks_forever():
+    body = g.read_body()
+    assert "05-GRID/Paper-Log/gex_levels_v1/CLOSURE.json" in body
+    assert "log_head_sha256" in body and "without `--interim`" in body
+    assert "Absent this artifact, the five stay `BLOCKED`" in body
+    assert "terminal evaluation record or terminal stop record" not in body
+
+
+def test_rb1_calendar_is_defined_and_consistent(checked):
+    body = g.read_body()
+    assert "M = the last NYSE session of the calendar month" in body
+    assert "M-2 = the\n  third-to-last" in body
+    rb1 = next(h for h in checked["family"]["hypotheses"] if h["id"] == "RB1")
+    assert "third-to-last" in rb1["decision"] and "second-to-last" not in rb1["decision"]
+    assert "triggered month-end trades" in body
+
+
+def test_partners_are_counterfactuals_and_dw2_sign_is_registered(checked):
+    body = g.read_body()
+    assert "Partners are counterfactuals" in body and "`partner_unavailable`" in body
+    assert "never filled with zero" in body
+    dw2 = next(h for h in checked["family"]["hypotheses"] if h["id"] == "DW2")
+    assert dw2["direction"] == "positive" and dw2["planted_effect"]["slope_per_sd"] > 0
+    assert "no_wall" in dw2["rule"]
+
+
+def test_close_contract_requires_auction_check():
+    body = g.read_body()
+    assert "not certified to be\n  the closing auction print" in body
+    assert "`spy_close_v1`\n  close equals the official closing auction print" in body
+
+
+@pytest.mark.parametrize("word", ["Market", "Decision", "Separate", "Maybe", "Octane", "Junction"])
+def test_date_pattern_ignores_ordinary_capitalized_words(word):
+    assert not g.DATE_LIKE.search(f"{word} rule on the session")
