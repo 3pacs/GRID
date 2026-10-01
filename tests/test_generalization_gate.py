@@ -35,14 +35,15 @@ EXP = gg.spec_sha256(FAST)
 
 
 def seal(r):
-    SEALED.add((r.terminal_record_sha256, gg.content_sha256(r)))
+    """A registry seals the terminal content, and (later, separately) the forward content."""
+    SEALED.add(("terminal", r.terminal_record_sha256, gg.terminal_content_sha256(r)))
     if r.forward_record_sha256:
-        SEALED.add((r.forward_record_sha256, gg.content_sha256(r)))
+        SEALED.add(("forward", r.forward_record_sha256, gg.forward_content_sha256(r)))
     return r
 
 
-def witnessed(sha, result) -> bool:
-    return (sha, gg.content_sha256(result)) in SEALED
+def witnessed(kind, sha, content) -> bool:
+    return (kind, sha, content) in SEALED
 
 
 def gate(res, spec=FAST, check=witnessed, expected=None):
@@ -322,15 +323,15 @@ def _refused(res, check=witnessed, spec=FAST, expected=None):
 
 def test_unwitnessed_inputs_are_refused():
     res = world()
-    assert "not witnessed" in _refused(res, check=lambda sha, r: sha != TERMINAL["Energy"])
-    assert "not witnessed" in _refused(res, check=lambda sha, r: False)
+    assert "not witnessed" in _refused(res, check=lambda kind, sha, c: sha != TERMINAL["Energy"])
+    assert "not witnessed" in _refused(res, check=lambda kind, sha, c: False)
 
-    def boom(sha, r):
+    def boom(kind, sha, c):
         raise OSError("vault unreachable")
 
     assert "witness_check raised OSError" in _refused(res, check=boom)
-    assert "not witnessed" in _refused(res, check=lambda sha, r: "yes")  # only True passes
-    assert "not witnessed" in _refused(res, check=lambda sha, r: np.bool_(True))
+    assert "not witnessed" in _refused(res, check=lambda kind, sha, c: "yes")  # only True passes
+    assert "not witnessed" in _refused(res, check=lambda kind, sha, c: np.bool_(True))
     bad = list(res)
     bad[3] = replace(bad[3], terminal_record_sha256="")
     assert "terminal record sha256 missing" in _refused(bad)
@@ -376,6 +377,8 @@ def test_incomplete_or_inconsistent_inputs_are_refused():
     bad_dates = list(res)
     bad_dates[2] = seal(replace(res[2], ic_series=tuple((f"x{d}", v) for d, v in res[2].ic_series)))
     assert "ISO date" in _refused(bad_dates)
+    bad_dates[2] = seal(replace(res[2], ic_series=tuple((f"{d}junk", v) for d, v in res[2].ic_series)))
+    assert "ISO date" in _refused(bad_dates)
 
 
 def test_altered_content_under_a_witnessed_record_is_refused():
@@ -389,8 +392,25 @@ def test_altered_content_under_a_witnessed_record_is_refused():
                                  terminal_kind="stage0_untestable", prereg_sha256=PREREG, direction=1)
     assert "not witnessed with this content" in _refused(relabel)
     v = gate(res)
-    assert [i["content_sha256"] for i in v.payload["inputs"]] == [
-        gg.content_sha256(r) for r in sorted(res, key=lambda r: r.sector)]
+    ordered = sorted(res, key=lambda r: r.sector)
+    assert [i["terminal_content_sha256"] for i in v.payload["inputs"]] == [
+        gg.terminal_content_sha256(r) for r in ordered]
+    assert [i["forward_content_sha256"] is not None for i in v.payload["inputs"]] == [
+        r.forward_verdict is not None for r in ordered]
+
+
+def test_forward_verdict_added_after_the_terminal_record_still_verifies():
+    """The terminal record is sealed before any forward verdict exists; adding one later
+    must not invalidate it, and a forged forward verdict is refused."""
+    sealed_before = world(forward=0)
+    res = [replace(r, forward_verdict=gg.SUPPORTED, forward_record_sha256=FORWARD[r.sector]) if i < 2 else r
+           for i, r in enumerate(sealed_before)]
+    for r in res[:2]:
+        SEALED.add(("forward", r.forward_record_sha256, gg.forward_content_sha256(r)))
+    assert gate(res).verdict == "GENERAL_REVIEW_REQUIRED"
+    forged = list(res)
+    forged[2] = replace(res[2], forward_verdict=gg.SUPPORTED, forward_record_sha256="d" * 64)  # never sealed
+    assert "forward record dddddddddddd is not witnessed" in _refused(forged)
 
 
 def test_spec_must_match_the_prereg():

@@ -45,14 +45,19 @@ holdout one-sided p, permutation block, the sealed per-date holdout IC series,
 per-entity IC contributions (summing to the IC sum), the coverage-stable IC
 series, and the forward verdict with its own record sha256.
 
-The caller injects `witness_check(record_sha256, result)`. It must return the
-plain `True` only when the record is witnessed on the vault **and** `result`'s
-sealed fields are the ones recorded under it (`content_sha256(result)`); the
-verdict lists every input's `content_sha256`, so a swapped IC series or a
-sector relabelled as untestable under a witnessed sha is refused. The caller
+The caller injects `witness_check(kind, record_sha256, content_sha256)`. It
+must return the plain `True` only when that record is witnessed on the vault
+**and** seals exactly that content. `kind="terminal"` carries
+`terminal_content_sha256(result)` (kind, p, IC series, contributions,
+coverage series; sealed at the holdout, before any forward verdict exists);
+`kind="forward"` carries `forward_content_sha256(result)` (sector, prereg,
+terminal record, forward verdict). The verdict lists both hashes per input, so
+a swapped IC series, a sector relabelled as untestable, or a forged forward
+verdict under a witnessed sha is refused. The caller
 also passes `expected_spec_sha256` from the construct's prereg; any other spec
 (even a "v1" with different perms or seed) is refused. The verdict embeds the
-sha256 of the gate module's source (`implementation_sha256`).
+sha256 of the gate module's source (`implementation_sha256`; read at import,
+so a deploy without the `.py` source fails closed).
 
 The gate refuses (`REFUSED`) when: any terminal or forward record sha is
 missing, malformed or fails `witness_check` for that content; the spec is not

@@ -9,11 +9,14 @@ What it consumes, and what it never does
 ----------------------------------------
 * Inputs are :class:`SectorResult` objects copied from **witnessed terminal**
   registry records: each carries the sha256 of its terminal record. The
-  injected ``witness_check(record_sha256, result)`` (tests stay offline) must
-  confirm both that the record is witnessed and that ``result``'s sealed
-  fields (kind, p, IC series, contributions, forward verdict; see
-  :func:`content_sha256`) are the ones recorded under it, and must return the
-  plain ``True``. The verdict carries every input's ``content_sha256``. An
+  injected ``witness_check(kind, record_sha256, content_sha256)`` (tests stay
+  offline) must confirm both that the record is witnessed and that it seals
+  exactly that content, and must return the plain ``True``. ``kind`` is
+  ``"terminal"`` (content :func:`terminal_content_sha256`: kind, p, IC series,
+  contributions, coverage series; sealed at the holdout, before any forward
+  verdict exists) or ``"forward"`` (content :func:`forward_content_sha256`:
+  sector, prereg, terminal record, forward verdict). The verdict carries both
+  content hashes of every input. An
   unwitnessed or altered input, a missing sector, or a mixed prereg/direction
   set is ``REFUSED``.
 * The caller passes ``expected_spec_sha256`` from the construct's prereg; a
@@ -110,7 +113,8 @@ from scipy.stats import t as student_t
 from analysis.offline_research_proof import MIN_BLOCKS
 from analysis.panel_insider_density import block_signs, signflip_pvalues
 
-#: sha256 of this module's source (LF-normalized), embedded in every verdict.
+#: sha256 of this module's source (LF-normalized), embedded in every verdict. Read at
+#: import, so a .pyc-only deploy fails closed (ImportError) rather than mislabelling.
 IMPLEMENTATION_SHA256 = hashlib.sha256(
     Path(__file__).read_bytes().replace(b"\r\n", b"\n")
 ).hexdigest()
@@ -248,9 +252,24 @@ class SectorResult:
         return self.terminal_kind == "holdout_result"
 
 
-def content_sha256(result: SectorResult) -> str:
-    """sha256 of every sealed field of a result; what ``witness_check`` binds to its record."""
-    return hashlib.sha256(canonical(asdict(result))).hexdigest()
+FORWARD_FIELDS = ("forward_verdict", "forward_record_sha256")
+
+
+def terminal_content_sha256(result: SectorResult) -> str:
+    """sha256 of the fields the terminal (holdout / Stage-0 / STOP) record seals."""
+    fields = {k: v for k, v in asdict(result).items() if k not in FORWARD_FIELDS}
+    return hashlib.sha256(canonical(fields)).hexdigest()
+
+
+def forward_content_sha256(result: SectorResult) -> str:
+    """sha256 of what the forward-log record seals: which sector, prereg and verdict."""
+    fields = {
+        "sector": result.sector,
+        "prereg_sha256": result.prereg_sha256,
+        "terminal_record_sha256": result.terminal_record_sha256,
+        "forward_verdict": result.forward_verdict,
+    }
+    return hashlib.sha256(canonical(fields)).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -470,7 +489,8 @@ def _iso_dates_ok(series) -> bool:
         for d, _v in series:
             if not isinstance(d, str):
                 return False
-            date.fromisoformat(d[:10])
+            if date.fromisoformat(d).isoformat() != d:
+                return False
     except (TypeError, ValueError):
         return False
     return True
@@ -479,7 +499,7 @@ def _iso_dates_ok(series) -> bool:
 def _check_inputs(
     results: Sequence[SectorResult],
     spec: GateSpec,
-    witness_check: Callable[[str, SectorResult], bool],
+    witness_check: Callable[[str, str, str], bool],
 ) -> list[str]:
     reasons = []
     if any(not isinstance(r, SectorResult) or not isinstance(r.sector, str) for r in results):
@@ -502,7 +522,7 @@ def _check_inputs(
     for r in results:
         tag = r.sector
         try:
-            content_sha256(r)
+            contents = {"terminal": terminal_content_sha256(r), "forward": forward_content_sha256(r)}
         except (TypeError, ValueError):
             reasons.append(f"{tag}: sealed fields are not canonical JSON (non-finite or wrong type)")
             continue
@@ -519,7 +539,7 @@ def _check_inputs(
                 reasons.append(f"{tag}: {kind} record sha256 missing or malformed")
                 continue
             try:
-                ok = witness_check(sha, r) is True
+                ok = witness_check(kind, sha, contents[kind]) is True
             except Exception as exc:  # noqa: BLE001 - a failing witness is a refusal, never a pass
                 ok = False
                 reasons.append(f"{tag}: witness_check raised {type(exc).__name__}")
@@ -577,24 +597,24 @@ def evaluate_gate(
     results: Sequence[SectorResult],
     spec: GateSpec = GATE_SPEC_V1,
     *,
-    witness_check: Callable[[str, SectorResult], bool],
+    witness_check: Callable[[str, str, str], bool],
     expected_spec_sha256: str,
 ) -> GateVerdict:
     """The generalization verdict over every declared sector's terminal result.
 
-    ``witness_check(record_sha256, result)`` must return the plain ``True`` only
-    when the record is witnessed and ``result``'s sealed content is the one
-    recorded under it. ``expected_spec_sha256`` comes from the construct's
-    prereg; any other spec is refused.
+    ``witness_check(kind, record_sha256, content_sha256)`` must return the
+    plain ``True`` only when that record is witnessed and seals that content
+    (``kind`` is ``"terminal"`` or ``"forward"``). ``expected_spec_sha256``
+    comes from the construct's prereg; any other spec is refused.
     """
     spec.validate()
     results = sorted(results, key=lambda r: str(getattr(r, "sector", "")))
     sha = spec_sha256(spec)
 
-    def _content(r) -> str | None:
+    def _content(r, fn) -> str | None:
         try:
-            return content_sha256(r)
-        except (TypeError, ValueError):
+            return fn(r)
+        except (TypeError, ValueError, AttributeError):
             return None
 
     payload: dict = {
@@ -611,7 +631,12 @@ def evaluate_gate(
                 "terminal_record_sha256": getattr(r, "terminal_record_sha256", None),
                 "forward_record_sha256": getattr(r, "forward_record_sha256", None),
                 "prereg_sha256": getattr(r, "prereg_sha256", None),
-                "content_sha256": _content(r),
+                "terminal_content_sha256": _content(r, terminal_content_sha256),
+                "forward_content_sha256": (
+                    _content(r, forward_content_sha256)
+                    if getattr(r, "forward_verdict", None) is not None
+                    else None
+                ),
             }
             for r in results
         ],
