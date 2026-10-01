@@ -1038,8 +1038,8 @@ def generate_briefing_audio(engine) -> BriefingResult:
             audio_status = "unavailable"
             tts_provider = "kokoro" if _kokoro_url() else "openai"
             audio_note = (
-                "Audio could not be saved (the briefing output directory is "
-                "not writable). Text-only briefing; no audio was kept."
+                f"Audio could not be saved ({type(exc).__name__}). "
+                "Text-only briefing; no audio was kept."
             )
             log.warning(
                 "Briefing audio could not be written to {d}: {e}",

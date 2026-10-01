@@ -172,6 +172,7 @@ function AudioBriefingPlayer({ onNavigate }) {
         setGenerating(true);
         setBriefingError(null);
         setTextBriefing(null);
+        setPlayerIsPrevious(false);
         try {
             const r = await api.generateFlowBriefing(true);
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {

@@ -181,7 +181,7 @@ def test_unwritable_output_dir_keeps_script_and_says_so(monkeypatch, kokoro_on, 
     assert result.audio_path is None
     assert result.audio_status == "unavailable"
     assert result.script_text == "Good morning. GRID briefing."
-    assert "could not be saved" in result.audio_note
+    assert "could not be saved (PermissionError)" in result.audio_note
 
 
 def test_not_configured_is_text_only_without_any_request(monkeypatch, briefing_dir, no_paid):
