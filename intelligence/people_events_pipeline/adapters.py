@@ -297,7 +297,8 @@ def form4_from_form345(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
     size = (base["shares"] * base["price"]).abs().where(base["price"] > 0)
     attrs = pd.Series(
         [
-            {"is_director": _b(d), "is_officer": _b(o), "is_ten_pct_owner": _b(t)}
+            # The derived Form 3/4/5 file has no AFF10B5ONE column: unknown (D5).
+            {"is_director": _b(d), "is_officer": _b(o), "is_ten_pct_owner": _b(t), "is_10b5_1": None}
             for d, o, t in zip(base["is_director"], base["is_officer"], base["is_ten_pct_owner"])
         ] if "is_director" in base.columns else [{}] * len(base),
         index=base.index,
@@ -330,6 +331,20 @@ def form4_from_form345(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
         "attrs": attrs,
     })
     return out[CANDIDATE_COLUMNS].reset_index(drop=True), skips
+
+
+def _flag(v: Any) -> bool | None:
+    """A source boolean that may be absent: missing/blank/unparseable -> None (unknown), never False."""
+    if v is None or v == "" or (isinstance(v, float) and pd.isna(v)):
+        return None
+    if isinstance(v, bool):
+        return v
+    text = str(v).strip().lower()
+    if text in ("true", "t", "1", "y", "yes"):
+        return True
+    if text in ("false", "f", "0", "n", "no"):
+        return False
+    return None
 
 
 def _b(v: Any) -> bool | None:
@@ -413,7 +428,10 @@ def form4_from_qq_insider(frame: pd.DataFrame, spec: SourceSpec, observed_at: da
             "transaction_code": code, "size_usd": _size(shares, price),
             "source": spec.source, "source_type": spec.source_type, "source_record_id": sid,
             "precedence": PRECEDENCE[spec.source], "accession": None, "document_type": None, "amended": None,
-            "attrs": {},
+            # QuiverQuant's insider payload carries no Rule 10b5-1 flag: unknown,
+            # never "not planned" (a density feature must not count planned
+            # sales as discretionary because the field was absent).
+            "attrs": {"is_10b5_1": None},
         })
     return _finish(rows), skips
 
@@ -475,7 +493,7 @@ def form4_from_edgar_native(frame: pd.DataFrame, spec: SourceSpec, observed_at: 
             "source": spec.source, "source_type": spec.source_type,
             "source_record_id": f"{spec.source_type}:{rec['id']}",
             "precedence": PRECEDENCE[spec.source], "accession": accession, "document_type": None, "amended": None,
-            "attrs": {"is_10b5_1": bool(p.get("is_10b5_1", False))},
+            "attrs": {"is_10b5_1": _flag(p.get("is_10b5_1"))},
         })
     return _finish(rows), skips
 

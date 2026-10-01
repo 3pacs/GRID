@@ -363,6 +363,19 @@ class TestReviewFixes:
         cands, _ = A.thirteen_f_changes(frame(rows))
         assert cands.loc[0, "known_at"] == pd.Timestamp(R.next_session_open_after(date(2026, 6, 1)))
 
+    def test_missing_10b5_1_flag_is_unknown_not_false(self):
+        base = {"transaction_code": "S", "shares": 10, "price": 5, "filing_date": "2026-04-03"}
+        rows = [sig(1, "insider", "AAPL", "2026-04-01", base, source_id="A PERSON"),
+                sig(2, "insider", "AAPL", "2026-04-01", {**base, "shares": 11, "is_10b5_1": True}, source_id="A PERSON"),
+                sig(3, "insider", "AAPL", "2026-04-01", {**base, "shares": 12, "is_10b5_1": False}, source_id="A PERSON")]
+        cands, _ = A.from_signal_sources(frame(rows), OBSERVED)
+        flags = dict(zip(cands["source_record_id"], cands["attrs"].map(lambda a: a["is_10b5_1"])))
+        assert flags == {"insider:1": None, "insider:2": True, "insider:3": False}
+        qq, _ = A.from_signal_sources(frame([qq_insider()]), OBSERVED)
+        assert qq.loc[0, "attrs"]["is_10b5_1"] is None
+        sec, _ = A.form4_from_form345(frame([sec_row()]))
+        assert sec.loc[0, "attrs"]["is_10b5_1"] is None
+
     def test_amendment_content_is_never_shown_at_the_original_known_at(self):
         rows = [sec_row(), sec_row(accession_number="0001214156-26-000009", document_type="4/A", amended=True,
                                    filing_date="2026-05-20", nonderiv_trans_sk="9", price_per_share=300.0)]
