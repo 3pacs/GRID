@@ -508,3 +508,76 @@ def w(conn, params):
                                           "y.sql": "COPY resolved_series FROM STDIN;",
                                           "z.sql": "COPY resolved_series_retractions TO STDOUT;"})
     assert hidden == ["x.py", "y.sql"]
+
+
+# Review round 1 (DFa): casts, the timedelta backfill loop, loop targets named
+# "today", disagreeing module dicts, now(), shell heredocs.
+_BAD_CAST_POSITIONAL = '''
+def ins(cur, fid, d, v):
+    cur.execute("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                "VALUES (%s, %s, %s::date, %s::date, %s)", (fid, d, d, d, v))
+'''
+_BAD_CAST_NAMED = '''
+def ins(conn, fid, d, v):
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:fid, :d, CAST(:d AS date), (:d)::date, :v)"), {"fid": fid, "d": d, "v": v})
+'''
+_BAD_CAST_SQL = """INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
+SELECT fr.id, t.obs_date, t.obs_date::date, date(t.obs_date), t.close, 7 FROM t JOIN fr ON true;"""
+_BAD_TIMEDELTA_LOOP = '''
+def backfill(cur, fid, prices):
+    for i in range(1300):
+        d = date.today() - timedelta(days=i)
+        cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value) "
+                    "VALUES (%s,%s,%s,%s,%s)", (fid, d, d, d, prices[i]))
+'''
+_BAD_TODAY_LOOP_NAME = '''
+def backfill(cur, fid, hist):
+    for today_row, v in hist.items():
+        cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value) "
+                    "VALUES (%s,%s,%s,%s,%s)", (fid, today_row, today_row, today_row, v))
+'''
+_BAD_SHELL = """#!/bin/sh
+psql -d griddb <<'SQL'
+INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
+SELECT 1, obs_date, obs_date, obs_date, value, 2 FROM staging;
+SQL
+"""
+
+
+def test_vintage_scanner_self_test_sees_through_casts_loops_and_names():
+    got = _problems({"a.py": _BAD_CAST_POSITIONAL, "b.py": _BAD_CAST_NAMED, "c.sql": _BAD_CAST_SQL,
+                     "d.py": _BAD_TIMEDELTA_LOOP, "e.py": _BAD_TODAY_LOOP_NAME, "f.sh": _BAD_SHELL})
+    for rel in ("a.py", "b.py", "c.sql", "d.py", "e.py", "f.sh"):
+        assert got[rel] == ["backdate", "backdate"], (rel, got[rel])
+
+
+def test_vintage_scanner_self_test_unverifiable_when_module_dicts_disagree():
+    disagree = '''
+def run(conn, days, run_date):
+    batch = [{"fid": 1, "od": d, "vd": d} for d in days]
+    other = [{"fid": 1, "od": d, "vd": run_date} for d in days]
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:fid, :od, CURRENT_DATE, :vd, 1.0)"), batch + other)
+'''
+    assert _problems({"a.py": disagree}) == {"a.py": [vintage_scan.UNVERIFIABLE]}
+
+
+def test_vintage_scanner_self_test_same_day_sql_and_reviewed_exemption():
+    same_day_sql = '''
+def push(conn, fid, v):
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:fid, now()::date, now()::date, CURRENT_DATE, :v)"), {"fid": fid, "v": v})
+'''
+    param_today = '''
+def _push_to_resolved(conn, today_str, fid, val):
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:fid, :od, :rd, :vd, :val)"),
+                 {"fid": fid, "od": today_str, "rd": today_str, "vd": today_str, "val": val})
+'''
+    got = _problems({"a.py": same_day_sql, "ingestion/options.py": param_today, "x.py": param_today})
+    assert got["a.py"] == []
+    # a parameter is not provably today: only the reviewed (file, function) entry passes
+    assert got["ingestion/options.py"] == []
+    assert got["x.py"] == ["backdate", "backdate"]
+    assert ("ingestion/options.py", "_push_to_resolved") in vintage_scan.REVIEWED_SAME_DAY

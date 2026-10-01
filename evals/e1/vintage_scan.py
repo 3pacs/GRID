@@ -41,8 +41,10 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 RESOLVER = "normalization/resolver.py"
+# Unlike the raw_series scan, migrations/ is scanned: a data migration that
+# backfills resolved_series is exactly the kind of writer this gate is for.
 _SKIP_TOP = frozenset({"tests", "evals", "pwa", "notebooks", "data", "outputs", "output", "docs",
-                       "migrations", "node_modules", ".git", ".github", ".claude", "server_log"})
+                       "node_modules", ".git", ".github", ".claude", "server_log"})
 _INSERT = re.compile(
     r"insert\s+into\s+(?:public\.)?resolved_series\b\s*(\((?P<cols>[^)]*)\))?"
     r"(?P<rest>.*?)(?=insert\s+into|\Z)",
@@ -52,10 +54,26 @@ _REWRITE = re.compile(r"on\s+conflict[^;]*?do\s+update", re.I | re.S)
 _POSITIONAL = re.compile(r"%s|\?")
 _NAMED = re.compile(r"^(?::(?P<a>[A-Za-z_]\w*)|%\((?P<b>[A-Za-z_]\w*)\)s)$")
 _TODAY_CALL = re.compile(r"(^|_)(today|now|utcnow)$")
-_SQL_TODAY = re.compile(r"\b(current_date|current_timestamp|now\(\)|localtimestamp)\b", re.I)
+_SQL_TODAY = re.compile(r"\b(current_date|current_timestamp|localtimestamp)\b|\bnow\(\)", re.I)
 _DATE_COLS = ("release_date", "vintage_date")
 EXECUTE_ATTRS = frozenset({"execute", "executemany", "exec_driver_sql"})
 UNVERIFIABLE = "unverifiable"
+# Wrappers that do not change which date a value is: x::date, CAST(x AS date),
+# date(x) / date_trunc('day', x) of the same thing. Stripped before comparing.
+_CAST_SUFFIX = re.compile(r"::\s*[a-z_]+(?:\s+(?:with|without)\s+time\s+zone)?(?:\s*\(\s*\d+\s*\))?\s*$", re.I)
+_CAST_CALL = re.compile(r"^cast\s*\((?P<x>.*)\s+as\s+[a-z_ ]+(?:\(\s*\d+\s*\))?\s*\)$", re.I | re.S)
+_DATE_CALL = re.compile(r"^(?:date\s*\(|date_trunc\s*\(\s*'day'\s*,)\s*(?P<x>.*)\)\s*$", re.I | re.S)
+
+#: Writers whose same-value obs/release/vintage binding was reviewed and is a
+#: same-day snapshot the scan cannot prove statically (the date arrives as a
+#: parameter). Keyed by (file, function); a backdate finding inside that
+#: function is not reported. Adding an entry is a reviewed E1 change.
+REVIEWED_SAME_DAY: dict[tuple[str, str], str] = {
+    ("ingestion/options.py", "_push_to_resolved"): (
+        "today_str is the run's own session date (OptionsPuller.pull_all: now = _utc_now(); "
+        "today_str = now.date().isoformat(), and the pull is skipped outside that equity session); "
+        "obs = release = vintage = the day the chain was captured"),
+}
 
 
 @dataclass(frozen=True)
@@ -252,30 +270,67 @@ class _Module:
                     out.append(node)
         return out
 
+    def _bindings_of(self, name: str, scope: ast.AST) -> list[ast.AST] | None:
+        """Values assigned to ``name`` in ``scope``; None if it is bound any other way
+        (a parameter, a loop or comprehension target, a with target, unpacking, a walrus)."""
+        values: list[ast.AST] = []
+        if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            args = scope.args
+            params = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+            params += [a for a in (args.vararg, args.kwarg) if a is not None]
+            if any(a.arg == name for a in params):
+                return None
+        for node in ast.walk(scope):
+            if isinstance(node, ast.Assign):
+                for t in node.targets:
+                    if isinstance(t, ast.Name) and t.id == name:
+                        values.append(node.value)
+                    elif any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(t)):
+                        return None  # tuple unpacking: value unknown
+            elif isinstance(node, (ast.AnnAssign, ast.AugAssign)):
+                if isinstance(node.target, ast.Name) and node.target.id == name:
+                    if isinstance(node, ast.AugAssign) or node.value is None:
+                        return None
+                    values.append(node.value)
+            elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+                if any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node.target)):
+                    return None
+            elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+                if any(isinstance(n, ast.Name) and n.id == name for n in ast.walk(node.optional_vars)):
+                    return None
+            elif isinstance(node, ast.NamedExpr) and node.target.id == name:
+                return None
+        return values
+
     def is_today(self, expr: ast.AST, depth: int = 0) -> bool:
-        """True when ``expr`` is the run's own date (a same-day snapshot), not a historical date."""
-        if depth > 4:
+        """True only when ``expr`` is provably the run's own date (a same-day snapshot).
+
+        Accepted: a direct ``today()`` / ``now()`` / ``utcnow()`` call (any
+        receiver: ``date.today()``, ``datetime.now(tz)``, ``_utc_now()``),
+        ``.date()`` / ``.isoformat()`` / ``.strftime(...)`` / ``str()`` of one,
+        or a local name every assignment of which is one of those. Arithmetic
+        (``date.today() - timedelta(days=i)``), parameters and loop targets
+        are not the run's date.
+        """
+        if depth > 6:
             return False
-        for node in ast.walk(expr):
-            if isinstance(node, ast.Call):
-                fn = node.func
-                name = fn.attr if isinstance(fn, ast.Attribute) else fn.id if isinstance(fn, ast.Name) else ""
-                if _TODAY_CALL.search(name):
+        if isinstance(expr, ast.Call):
+            fn = expr.func
+            if isinstance(fn, ast.Attribute):
+                if _TODAY_CALL.search(fn.attr):
                     return True
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and _SQL_TODAY.search(node.value):
-                return True
-        if isinstance(expr, ast.Attribute):
-            return self.is_today(expr.value, depth + 1)
-        if isinstance(expr, ast.Call) and isinstance(expr.func, ast.Attribute):
-            return self.is_today(expr.func.value, depth + 1)
+                if fn.attr in ("date", "isoformat", "strftime"):
+                    return self.is_today(fn.value, depth + 1)
+                return False
+            if isinstance(fn, ast.Name):
+                if _TODAY_CALL.search(fn.id):
+                    return True
+                if fn.id == "str" and len(expr.args) == 1:
+                    return self.is_today(expr.args[0], depth + 1)
+            return False
         if isinstance(expr, ast.Name):
-            if "today" in expr.id.lower():
-                return True
-            scope = self.function_of(expr)
-            for node in ast.walk(scope):
-                if isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == expr.id for t in node.targets):
-                    if self.is_today(node.value, depth + 1):
-                        return True
+            values = self._bindings_of(expr.id, self.function_of(expr))
+            return bool(values) and all(self.is_today(v, depth + 1) for v in values)
         return False
 
 
@@ -286,9 +341,31 @@ def _value_for(d: ast.Dict, key: str) -> ast.AST | None:
     return None
 
 
-def _binding(expr: str, base: int) -> tuple[str, object]:
-    """('named', name) | ('pos', index) | ('sql', normalised text) | ('dynamic', expr)."""
+def _strip_casts(expr: str) -> str:
+    """``x::date``, ``CAST(x AS date)``, ``date(x)``, ``(x)`` -> ``x`` (repeatedly)."""
     e = expr.strip()
+    while True:
+        before = e
+        e = _CAST_SUFFIX.sub("", e).strip()
+        m = _CAST_CALL.match(e) or _DATE_CALL.match(e)
+        if m:
+            e = m.group("x").strip()
+        if e.startswith("(") and _balanced(e, 0) == len(e):
+            e = e[1:-1].strip()
+        if e == before:
+            return e
+
+
+def _binding(expr: str, base: int) -> tuple[str, object]:
+    """('named', name) | ('pos', index) | ('sql', normalised text) | ('dynamic', expr).
+
+    Casts are stripped first, so ``%s::date`` binds like ``%s`` and
+    ``t.obs_date::date`` compares equal to ``t.obs_date``. A SQL expression
+    that still holds a placeholder (``COALESCE(%s, x)``) is 'dynamic':
+    unverifiable, never passed. ``base`` is the index of the first
+    positional placeholder in ``expr``.
+    """
+    e = _strip_casts(expr)
     if "{dynamic}" in e:
         return ("dynamic", e)
     m = _NAMED.match(e)
@@ -296,6 +373,8 @@ def _binding(expr: str, base: int) -> tuple[str, object]:
         return ("named", m.group("a") or m.group("b"))
     if _POSITIONAL.fullmatch(e):
         return ("pos", base)
+    if _POSITIONAL.search(e) or re.search(r"(?<![:\w]):[A-Za-z_]\w*|%\(\w+\)s", e):
+        return ("dynamic", e)
     return ("sql", _norm(e))
 
 
@@ -329,6 +408,10 @@ def site_problems(site: _Site, module: _Module | None, string_node: ast.AST | No
             continue
         b = bind(col)
         verdict = _same_binding(obs, b, site, module, string_node)
+        if verdict and module is not None and string_node is not None:
+            fn = module.function_of(string_node)
+            if (site.path, getattr(fn, "name", "")) in REVIEWED_SAME_DAY:
+                continue
         if verdict is None:
             problems.append(Problem(where, UNVERIFIABLE, f"cannot verify where {col} comes from"))
         elif verdict:
@@ -345,9 +428,12 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
             return False
         return not _SQL_TODAY.search(obs[1])
     if other[0] == "sql":
-        # A SQL expression for the vintage (CURRENT_DATE, a filing date column)
-        # against a bound obs_date: a backdate only if it reads the obs date.
-        return None if re.search(r"obs_date", str(other[1])) else False
+        # A placeholder-free SQL expression for the vintage (CURRENT_DATE, a
+        # filing-date or pull-timestamp column) against a bound obs_date. It
+        # cannot be the bound value unless it names an obs date column.
+        if _SQL_TODAY.search(str(other[1])):
+            return False
+        return None if re.search(r"obs", str(other[1])) else False
     if obs[0] == "sql":
         return None  # a bound vintage against a SQL obs_date: not resolvable statically
     if module is None or string_node is None:
@@ -356,14 +442,18 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
     if obs[0] == "named" and other[0] == "named":
         if obs[1] == other[1]:
             # Same placeholder name: same value, unless that value is today's date.
-            values = _named_values(module, calls, {obs[1]})
+            values, _ = _named_values(module, calls, {obs[1]})
             if values and all(module.is_today(v[obs[1]]) for v in values):
                 return False
             return True
-        values = _named_values(module, calls, {obs[1], other[1]})
+        values, from_fallback = _named_values(module, calls, {obs[1], other[1]})
         if not values:
             return None
-        return any(ast.dump(v[obs[1]]) == ast.dump(v[other[1]]) and not module.is_today(v[obs[1]]) for v in values)
+        verdicts = {ast.dump(v[obs[1]]) == ast.dump(v[other[1]]) and not module.is_today(v[obs[1]])
+                    for v in values}
+        if from_fallback and len(verdicts) > 1:
+            return None  # module dicts with these keys disagree: which one is bound is unknown
+        return True in verdicts
     if obs[0] == "pos" and other[0] == "pos":
         if not calls:
             return None
@@ -380,8 +470,14 @@ def _same_binding(obs, other, site: _Site, module: _Module | None, string_node) 
     return None
 
 
-def _named_values(module: _Module, calls: list[ast.Call], keys: set[str]) -> list[dict[str, ast.AST]]:
-    """Values bound to ``keys``: from a literal dict at the call, else from module dict literals."""
+def _named_values(module: _Module, calls: list[ast.Call],
+                  keys: set[str]) -> tuple[list[dict[str, ast.AST]], bool]:
+    """(values bound to ``keys``, whether they came from the module-wide fallback).
+
+    A literal dict at the ``execute`` call wins. Otherwise every dict literal
+    in the module carrying all the keys is a candidate (a batch built
+    elsewhere); the caller treats disagreeing candidates as unverifiable.
+    """
     found: list[dict[str, ast.AST]] = []
     for call in calls:
         params = module.params_of(call)
@@ -390,10 +486,10 @@ def _named_values(module: _Module, calls: list[ast.Call], keys: set[str]) -> lis
             if all(v is not None for v in vals.values()):
                 found.append(vals)
     if found:
-        return found
+        return found, False
     for d in module.dict_literals_with(keys):
         found.append({k: _value_for(d, k) for k in keys})
-    return found
+    return found, True
 
 
 # ── repository walk ─────────────────────────────────────────────────────
@@ -447,7 +543,7 @@ def all_writers(files: dict[str, str] | None = None) -> dict[str, list[Problem]]
             continue
         if rel.endswith(".py"):
             problems = scan_python(rel, text)
-        elif rel.endswith(".sql"):
+        elif rel.endswith((".sql", ".sh")):
             problems = scan_sql_file(rel, text)
         else:
             continue
@@ -457,8 +553,9 @@ def all_writers(files: dict[str, str] | None = None) -> dict[str, list[Problem]]
 
 
 _HIDDEN = re.compile(
-    r"""to_sql\(\s*['"]resolved_series['"]|Table\(\s*['"]resolved_series['"]|"""
-    r"""__tablename__\s*=\s*['"]resolved_series['"]|\bcopy\s+(?:public\.)?resolved_series\b""",
+    r"""to_sql\(\s*(?:name\s*=\s*)?['"]resolved_series['"]|Table\(\s*['"]resolved_series['"]|"""
+    r"""__tablename__\s*=\s*['"]resolved_series['"]|\bcopy\s+(?:public\.)?resolved_series\b|"""
+    r"""copy_(?:from|records_to_table)\([^)]*['"](?:public\.)?resolved_series['"]""",
     re.I,
 )
 

@@ -10,9 +10,16 @@ series. Per feature this script reports, with bounded queries:
   ``vintage_date = obs_date`` too;
 * ``first_raw_pull``: the earliest SUCCESS ``raw_series.pull_timestamp`` over the
   feature's mapped series ids (``normalization.entity_map`` seeds, plus
-  ``YF:<TICKER>:close`` for ``<ticker>_full``, plus ``--series`` overrides);
+  ``YF:<TICKER>:close`` for ``<ticker>_full``, plus ``--series`` overrides).
+  Every source is counted: Tiingo also writes ``YF:<TICKER>:close`` (under its
+  own source id), so its pulls are included;
 * ``backdated_before_first_pull``: backdated rows whose ``obs_date`` precedes
-  that first pull -- values that cannot have been known on the day they claim.
+  that first pull -- values that cannot have been known on the day they claim;
+* ``already_retracted``: how many of the backdated rows already have a
+  ``resolved_series_retractions`` row (0 when that table does not exist).
+
+The exit status is non-zero when any feature reports an ``error`` (a timeout
+must not read as a clean audit) or the run stopped at the DB window.
 
 Safety (GRID-DFa, R7):
 
@@ -22,7 +29,9 @@ Safety (GRID-DFa, R7):
   ``raw_series`` by ``series_id`` only (never a raw_series full scan; the
   ``min()`` is written so the planner cannot walk the pull_timestamp index);
 * it refuses to run between 03:30 and 10:30 UTC (the nightly backup and DB
-  window) unless ``--allow-db-window`` is passed for a non-production test DB.
+  window) unless ``--allow-db-window`` is passed for a non-production test DB;
+  the window is re-checked before every feature, and a run that reaches it
+  stops with a partial report.
 
 Usage::
 
@@ -91,6 +100,7 @@ class FeatureAudit:
     backdated_before_first_pull: int | None = None
     backdated_obs_min: str | None = None
     backdated_obs_max: str | None = None
+    already_retracted: int | None = None
     by_source: list[dict[str, Any]] = field(default_factory=list)
     error: str | None = None
 
@@ -122,6 +132,14 @@ _COUNTS_SQL = text("""
     WHERE rs.feature_id = :fid AND rs.release_date = rs.obs_date
     GROUP BY rs.source_priority_used, sc.name
     ORDER BY count(*) DESC
+""")
+
+
+_RETRACTED_SQL = text("""
+    SELECT count(*) FROM resolved_series rs
+    JOIN resolved_series_retractions r
+      ON r.feature_id = rs.feature_id AND r.obs_date = rs.obs_date AND r.vintage_date = rs.vintage_date
+    WHERE rs.feature_id = :fid AND rs.release_date = rs.obs_date
 """)
 
 
@@ -162,6 +180,10 @@ def audit_feature(engine: Engine, feature: str, *, overrides: dict[str, list[str
             out.backdated_before_first_pull = before if first_day is not None else None
             out.backdated_obs_min = obs_lo.isoformat() if obs_lo else None
             out.backdated_obs_max = obs_hi.isoformat() if obs_hi else None
+            has_retractions = conn.execute(
+                text("SELECT to_regclass('resolved_series_retractions') IS NOT NULL")).scalar()
+            out.already_retracted = int(conn.execute(_RETRACTED_SQL, {"fid": out.feature_id}).scalar()) \
+                if has_retractions else 0
     except Exception as exc:  # one feature's timeout must not hide the others
         out.error = f"{type(exc).__name__}: {str(exc).splitlines()[0][:200]}"
     return out
@@ -179,9 +201,18 @@ def run(engine: Engine, features: list[str], *, overrides: dict[str, list[str]] 
         clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> dict[str, Any]:
     started = clock()
     check_window(started, allow_db_window)
-    audits = [asdict(audit_feature(engine, f, overrides=overrides, timeout_ms=timeout_ms)) for f in features]
+    audits: list[dict[str, Any]] = []
+    stopped = None
+    for f in features:
+        try:
+            check_window(clock(), allow_db_window)
+        except DbWindowRefused as exc:
+            stopped = f"db_window: {exc}"
+            break
+        audits.append(asdict(audit_feature(engine, f, overrides=overrides, timeout_ms=timeout_ms)))
     return {"generated_at": started.astimezone(timezone.utc).isoformat(), "statement_timeout_ms": timeout_ms,
-            "read_only": True, "features": audits}
+            "read_only": True, "features": audits, "stopped": stopped,
+            "complete": stopped is None and len(audits) == len(features)}
 
 
 def _parse_overrides(values: list[str]) -> dict[str, list[str]]:
@@ -228,6 +259,10 @@ def main(argv: list[str] | None = None) -> int:
                  timeout_ms=args.statement_timeout_ms, allow_db_window=args.allow_db_window)
     json.dump(report, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
+    failed = [a["feature"] for a in report["features"] if a["error"]]
+    if failed or not report["complete"]:
+        print(f"incomplete audit: errors in {failed}; stopped={report['stopped']}", file=sys.stderr)
+        return 1
     return 0
 
 

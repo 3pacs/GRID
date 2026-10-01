@@ -37,6 +37,13 @@ _DDL = (
            source_priority_used INTEGER NOT NULL REFERENCES source_catalog(id),
            conflict_flag BOOLEAN NOT NULL DEFAULT FALSE)""",
     """CREATE UNIQUE INDEX uq_resolved_series_composite ON resolved_series (feature_id, obs_date, vintage_date)""",
+    """CREATE TABLE resolved_series_retractions (
+           id BIGSERIAL PRIMARY KEY, feature_id INTEGER NOT NULL, obs_date DATE NOT NULL,
+           vintage_date DATE NOT NULL, retracted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+           reason TEXT NOT NULL, run_tag TEXT NOT NULL,
+           UNIQUE (feature_id, obs_date, vintage_date),
+           FOREIGN KEY (feature_id, obs_date, vintage_date)
+               REFERENCES resolved_series (feature_id, obs_date, vintage_date))""",
 )
 
 YF, TIINGO, FILL = 2, 524, 7
@@ -113,6 +120,10 @@ def _seed(engine) -> None:
             conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, "
                               "value, source_priority_used) VALUES (:f, :od, :rd, :vd, 1.0, :src)"),
                          {"f": fid, "od": od, "rd": rd, "vd": vd, "src": src})
+        # one backdated fill row is already retracted; one honest row too (not counted)
+        for od, vd in ((date(2021, 3, 29), date(2021, 3, 29)), (date(2021, 3, 26), date(2026, 3, 26))):
+            conn.execute(text("INSERT INTO resolved_series_retractions (feature_id, obs_date, vintage_date, "
+                              "reason, run_tag) VALUES (2791, :od, :vd, 'test', 'test')"), {"od": od, "vd": vd})
 
 
 _OK_CLOCK = lambda: datetime(2026, 10, 1, 11, 0, tzinfo=timezone.utc)  # noqa: E731
@@ -134,8 +145,10 @@ def test_counts_are_exact(pg_engine):
     by = {r["source_name"]: r for r in spy["by_source"]}
     assert by["fill"]["rows"] == 4 and by["fill"]["before_first_pull"] == 4 and by["fill"]["vintage_also_obs"] == 3
     assert by["TIINGO"]["rows"] == 1 and by["TIINGO"]["before_first_pull"] == 0
+    assert spy["already_retracted"] == 1
     assert spy["error"] is None
     assert missing["error"] == "feature not in feature_registry"
+    assert report["complete"] is True and report["stopped"] is None
 
 
 def test_feature_without_raw_mapping_reports_no_first_pull(pg_engine):
@@ -144,6 +157,15 @@ def test_feature_without_raw_mapping_reports_no_first_pull(pg_engine):
     assert other["series"] == ["YF:OTHER:close"]
     assert other["first_raw_pull"] is None
     assert other["backdated_rows"] == 1 and other["backdated_before_first_pull"] is None
+    assert other["already_retracted"] == 0
+
+
+def test_missing_retractions_table_reads_as_zero(pg_engine):
+    _seed(pg_engine)
+    with pg_engine.begin() as conn:
+        conn.execute(text("DROP TABLE resolved_series_retractions"))
+    spy = audit.run(pg_engine, ["spy_full"], clock=_OK_CLOCK)["features"][0]
+    assert spy["error"] is None and spy["already_retracted"] == 0 and spy["backdated_rows"] == 5
 
 
 def test_audit_transactions_are_read_only(pg_engine):
@@ -156,13 +178,24 @@ def test_audit_transactions_are_read_only(pg_engine):
             conn.execute(text("INSERT INTO source_catalog VALUES (1, 'x')"))
 
 
-def test_a_statement_timeout_is_reported_per_feature_not_raised(pg_engine):
+def test_a_statement_timeout_is_reported_per_feature_not_raised(pg_engine, monkeypatch):
     _seed(pg_engine)
-    report = audit.run(pg_engine, ["spy_full"], timeout_ms=1, clock=_OK_CLOCK,
-                       overrides={"spy_full": [f"YF:PAD{i}:close" for i in range(200)]})
-    feature = report["features"][0]
-    # 1 ms is enough on a fast box, so accept either outcome but never an exception.
-    assert feature["error"] is None or "cancel" in feature["error"].lower() or "timeout" in feature["error"].lower()
+    # Force a statement that outlives the timeout; the next feature still runs.
+    monkeypatch.setattr(audit, "_FIRST_PULL_SQL", text("SELECT pg_sleep(2), :sid"))
+    report = audit.run(pg_engine, ["spy_full", "missing_feature"], timeout_ms=200, clock=_OK_CLOCK)
+    slow, nxt = report["features"]
+    assert slow["error"] is not None and "statement timeout" in slow["error"].lower(), slow["error"]
+    assert nxt["error"] == "feature not in feature_registry"
+
+
+def test_run_stops_when_it_reaches_the_db_window(pg_engine):
+    _seed(pg_engine)
+    ticks = iter([datetime(2026, 10, 1, 3, 29, tzinfo=timezone.utc),   # start: outside
+                  datetime(2026, 10, 1, 3, 29, tzinfo=timezone.utc),   # feature 1: outside
+                  datetime(2026, 10, 1, 3, 30, tzinfo=timezone.utc)])  # feature 2: inside
+    report = audit.run(pg_engine, ["spy_full", "other_full"], clock=lambda: next(ticks))
+    assert [f["feature"] for f in report["features"]] == ["spy_full"]
+    assert report["complete"] is False and report["stopped"].startswith("db_window")
 
 
 # ── no database needed ──────────────────────────────────────────────────
