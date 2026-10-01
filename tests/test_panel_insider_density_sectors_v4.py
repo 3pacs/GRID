@@ -85,7 +85,7 @@ def test_a_later_technology_registration_requires_a_new_sectors_registration(mon
                                REGISTERED_RECORD_SHA256=("a" * 64, "b" * 64),
                                WITNESS_PATH=v1.canonical_witness_path("vs1-v7"))
     pin7 = {"version": "vs1-v7", "prereg_sha256": "7" * 64, "registry_head_sha256": "b" * 64}
-    chain = s4._technology_modules()[:-1]  # historical v1-v6 chain, before the real v7 scaffold
+    chain = s4._technology_modules()[:6]  # historical v1-v6 chain, before the real v7/v8 modules
     fakes = [types.SimpleNamespace(**{**vars(m), "SUPERSEDED_BY": pin7}) for m in chain]
     monkeypatch.setattr(s4, "_technology_modules", lambda: [*fakes, v7])
     assert s4.technology_terminal()["version"] == "vs1-v7"
