@@ -34,6 +34,9 @@ V6_STOP_LINE = (
 
 
 def test_fail_closed_until_bound(tmp_path):
+    assert s6.GATE_SPEC_SHA256 == "fa2fa2bd1b1ef5cb81168f393135795824991e08829b60f66a109decdf401174"
+    body = (s4.REPO / s6.PREREG_PATH).read_text(encoding="utf-8")
+    assert s6.GATE_SPEC_SHA256 in v1.prereg_body(body) and "@@GATE_SPEC@@" not in body
     assert s6.PREREG_BODY_SHA256 is None and s6.V8_REGISTRATION_HEAD_SHA256 is None
     assert s6.REGISTERED_RECORD_SHA256 is None and s6.REGISTERED_ANCHOR_LINE is None
     assert s6.REGISTRY_ID == "sectors-v6" and s6.WITNESS_PATH == v1.canonical_witness_path("sectors-v6")
@@ -44,7 +47,7 @@ def test_fail_closed_until_bound(tmp_path):
         s6.check_open()
 
 
-GATE_SPEC = "9" * 64
+GATE_SPEC = s6.GATE_SPEC_SHA256
 V8_AT = datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)
 
 
@@ -66,7 +69,6 @@ def _bind_v8(monkeypatch, tmp_path):
                        .encode("utf-8"))
     monkeypatch.setattr(s6, "PREREG_PATH", filled)
     monkeypatch.setattr(s6, "V8_REGISTRATION_HEAD_SHA256", heads[1])
-    monkeypatch.setattr(s6, "GATE_SPEC_SHA256", GATE_SPEC)
     monkeypatch.setattr(s6, "PREREG_BODY_SHA256", v1.prereg_body_sha256(filled))
     return v8_reg, heads
 

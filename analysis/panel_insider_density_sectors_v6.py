@@ -32,8 +32,9 @@ PREREG_PATH = Path("docs/paper_log/vs1-sectors-v6-preregistration.md")
 PREREG_BODY_SHA256: str | None = None  # pinned at review, after the GateSpec v1 hash is cited
 #: The exact witnessed two-record v8 registration head; bound only after v8 is registered and witnessed.
 V8_REGISTRATION_HEAD_SHA256: str | None = None
-#: sha256 of GD10b GateSpec v1 (analysis.generalization_gate.GATE_SPEC_V1_SHA256); bound once GD10b merges.
-GATE_SPEC_SHA256: str | None = None
+#: sha256 of GD10b GateSpec v1 (analysis.generalization_gate.GATE_SPEC_V1_SHA256, PR #784 head 05c7a89a).
+#: A runtime equality check against the merged module is added once #784 is on main.
+GATE_SPEC_SHA256: str | None = "fa2fa2bd1b1ef5cb81168f393135795824991e08829b60f66a109decdf401174"
 REGISTRY_LOG = "granular_panel_prereg_sectors_v6.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_sectors_v6.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_sectors_v6.lock"
