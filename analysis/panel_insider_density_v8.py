@@ -30,7 +30,7 @@ from analysis.research_forward_log import canonical
 VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
-PREREG_BODY_SHA256 = "2000396c5f517ea1ecefffbcaa3963f2b67f5ad3d6d6752b9cc6a21392d10125"
+PREREG_BODY_SHA256 = "65518ccc61f13d78e784da79b4f7e58d3cd5aaa690452228d65b88b0f1bbd250"
 #: The witnessed v7 terminal STOP head: bound only after the STOP is appended and witnessed.
 V7_STOP_HEAD_SHA256: str | None = None
 V7_STOP_RECORDS = v7.STOP_RECORDS
@@ -393,7 +393,7 @@ class V8Harness(v2.Harness):
                          f"power(IC {v1.POWER_GATE_IC}) >= {v1.POWER_GATE} under gaussian_v1 AND "
                          f"e0:{E0_GATED_SCENARIO}"),
                 "v8_stage0": {"settings": json.loads(json.dumps(STAGE0_SETTINGS)), "models": gate,
-                              "n_sessions": n_sessions,
+                              "discovery_start": v1.discovery_start(), "n_sessions": n_sessions,
                               "design_target_met": bool(
                                   gate[f"e0:{E0_GATED_SCENARIO}"]["power"] >= DESIGN_TARGET_POWER)},
                 "gate_passed": passed}
@@ -406,21 +406,35 @@ class V8Harness(v2.Harness):
         table = power.get("table") or {}
         if set(table) != set(v1.trial_names()):
             raise ValueError("power file must cover exactly the declared trials")
+        for trial, rows in table.items():
+            if [r.get("target_ic") for r in rows] != list(v1.POWER_TARGET_ICS) \
+                    or any(r.get("sims") not in (v1.POWER_SIMS, 0) for r in rows):
+                raise ValueError(f"{trial}: continuity table rows are not at the pre-registered settings")
         stage0 = power.get("v8_stage0") or {}
         if stage0.get("settings") != json.loads(json.dumps(STAGE0_SETTINGS)):
             raise ValueError("power file was not computed at the pre-registered v8 Stage-0 settings")
+        start = DISCOVERY_START[:10]
+        sessions = len(v1.proxy_sessions(datetime.fromisoformat(start).date(),
+                                         datetime.fromisoformat(v1.SPLIT[:10]).date()))
+        if stage0.get("discovery_start") != DISCOVERY_START or stage0.get("n_sessions") != sessions:
+            raise ValueError("power file was not computed on the v8 discovery window")
         models = stage0.get("models") or {}
         expected = {"gaussian_v1", f"e0:{E0_GATED_SCENARIO}", *(f"e0:{s}" for s in E0_REPORTED_SCENARIOS)}
         if set(models) != expected:
             raise ValueError("power file must carry exactly the v8 Stage-0 models")
         g = models["gaussian_v1"]
-        if (g.get("sims"), g.get("perms"), g.get("seed"), g.get("alpha_one_sided"), g.get("target_ic")) != (
-                GAUSSIAN_SIMS, v1.POWER_PERMS, v1.SEED, CONFIRMATORY_ALPHA_ONE_SIDED, v1.POWER_GATE_IC):
+        degenerate = g.get("sims") == 0 and g.get("power") == 0.0  # too few usable dates: power 0
+        if g.get("model") != "gaussian_v1" or (g.get("alpha_one_sided"), g.get("target_ic")) != (
+                CONFIRMATORY_ALPHA_ONE_SIDED, v1.POWER_GATE_IC) or not degenerate and (
+                (g.get("sims"), g.get("perms"), g.get("seed")) != (GAUSSIAN_SIMS, v1.POWER_PERMS, v1.SEED)):
             raise ValueError("gaussian_v1 Stage-0 row is not at the pre-registered settings")
+        seeds = {"base": 20260930, "pilot": 20260931}  # E0 v1 config.json seeds (manifest-pinned)
         for name, row in models.items():
-            if name.startswith("e0:") and ((row.get("sims"), row.get("perms"), row.get("alpha_one_sided"),
-                                            row.get("target_ic"), row.get("e0_manifest_sha256")) != (
-                    E0_SIMS, v1.POWER_PERMS, CONFIRMATORY_ALPHA_ONE_SIDED, v1.POWER_GATE_IC, E0_MANIFEST_SHA256)):
+            if name.startswith("e0:") and (row.get("model") != name or (
+                    row.get("sims"), row.get("perms"), row.get("alpha_one_sided"), row.get("target_ic"),
+                    row.get("e0_manifest_sha256"), row.get("e0_seeds")) != (
+                    E0_SIMS, v1.POWER_PERMS, CONFIRMATORY_ALPHA_ONE_SIDED, v1.POWER_GATE_IC, E0_MANIFEST_SHA256,
+                    seeds)):
                 raise ValueError(f"{name} Stage-0 row is not at the pre-registered settings")
         if power.get("gate_passed") is not _gate_passed(models):
             raise ValueError("power file's gate_passed disagrees with its gated models")
@@ -502,7 +516,9 @@ POWER_INPUT_KEYS = frozenset({
 
 
 def _check_power_inputs(inputs: Any) -> None:
-    if not isinstance(inputs, Mapping) or set(inputs) != POWER_INPUT_KEYS             or inputs.get("prereg_sha256") != PREREG_BODY_SHA256             or not all(v1._is_hex64(inputs[k]) for k in POWER_INPUT_KEYS):
+    if not isinstance(inputs, Mapping) or set(inputs) != POWER_INPUT_KEYS \
+            or inputs.get("prereg_sha256") != PREREG_BODY_SHA256 \
+            or not all(v1._is_hex64(inputs[k]) for k in POWER_INPUT_KEYS):
         raise PermissionError("power receipt is not a v8 post-admission Stage-0 on a price manifest")
 
 

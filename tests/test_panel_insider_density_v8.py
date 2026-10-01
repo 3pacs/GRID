@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from datetime import date, datetime, timezone
@@ -12,11 +13,15 @@ import pytest
 
 from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_v2 as v2
+from analysis import panel_insider_density_v3 as v3
+from analysis import panel_insider_density_v4 as v4
+from analysis import panel_insider_density_v5 as v5
 from analysis import panel_insider_density_v6 as v6
 from analysis import panel_insider_density_v7 as v7
 from analysis import panel_insider_density_v8 as v8
 from analysis import price_admission_fetch as fetch
 from analysis import price_admission_probe as gd4
+from analysis.research_forward_log import canonical
 from scripts import run_vs1_v2_insider_density as runner
 from scripts.run_vs1_v8_insider_density import check_early_probe
 
@@ -158,19 +163,33 @@ def test_stage0_models_run_on_synthetic_geometry_and_gate_needs_both():
     assert v8._gate_passed(gate) is False
 
 
-def test_v8_power_verifier_refuses_inconsistent_gate():
+def _power_doc(exposed=0.45, gaussian=0.7):
     table = {t: [{"target_ic": ic, "power": 0.5, "sims": v1.POWER_SIMS} for ic in v1.POWER_TARGET_ICS]
              for t in v1.trial_names()}
     e0row = {"sims": v8.E0_SIMS, "perms": v1.POWER_PERMS, "alpha_one_sided": 0.05, "target_ic": 0.01,
-             "e0_manifest_sha256": v8.E0_MANIFEST_SHA256}
-    models = {"gaussian_v1": {"power": 0.7, "sims": v8.GAUSSIAN_SIMS, "perms": v1.POWER_PERMS, "seed": v1.SEED,
-                              "alpha_one_sided": 0.05, "target_ic": 0.01},
-              "e0:factor_t_garch_exposed": {**e0row, "power": 0.45},
-              "e0:factor_t_garch": {**e0row, "power": 0.6}}
-    power = {"version": v8.VERSION, "primary_trial": v8.PRIMARY_TRIAL, "settings": v1.power_settings(),
-             "table": table, "gate_passed": False,
-             "v8_stage0": {"settings": json.loads(json.dumps(v8.STAGE0_SETTINGS)), "models": models}}
+             "e0_manifest_sha256": v8.E0_MANIFEST_SHA256, "e0_seeds": {"base": 20260930, "pilot": 20260931}}
+    models = {"gaussian_v1": {"model": "gaussian_v1", "power": gaussian, "sims": v8.GAUSSIAN_SIMS,
+                              "perms": v1.POWER_PERMS, "seed": v1.SEED, "alpha_one_sided": 0.05, "target_ic": 0.01},
+              "e0:factor_t_garch_exposed": {**e0row, "model": "e0:factor_t_garch_exposed", "power": exposed},
+              "e0:factor_t_garch": {**e0row, "model": "e0:factor_t_garch", "power": 0.6}}
+    sessions = len(v1.proxy_sessions(date(2008, 1, 1), date(2020, 1, 1)))
+    return {"version": v8.VERSION, "primary_trial": v8.PRIMARY_TRIAL, "settings": v1.power_settings(),
+            "table": table, "gate_passed": v8._gate_passed(models),
+            "inputs": {"prereg_sha256": v8.PREREG_BODY_SHA256, "price_manifest_sha256": "a" * 64,
+                       "form4_receipt_sha256": "b" * 64, "admission_receipt_sha256": "c" * 64,
+                       "universe_sha256": "d" * 64},
+            "v8_stage0": {"settings": json.loads(json.dumps(v8.STAGE0_SETTINGS)), "models": models,
+                          "discovery_start": v8.DISCOVERY_START, "n_sessions": sessions}}
+
+
+def test_v8_power_verifier_refuses_inconsistent_gate():
+    power = _power_doc()
     v8.verify_power(power)
+    for key, value in (("discovery_start", "2012-01-01T00:00:00+00:00"), ("n_sessions", 100)):
+        moved = json.loads(json.dumps(power))
+        moved["v8_stage0"][key] = value
+        with pytest.raises(ValueError, match="discovery window"):
+            v8.verify_power(moved)
     with pytest.raises(ValueError, match="disagrees"):
         v8.verify_power({**power, "gate_passed": True})
     bad = json.loads(json.dumps(power))
@@ -191,3 +210,65 @@ def test_v8_records_link_the_v7_stop(monkeypatch):
     assert prereg["confirmatory"]["alpha_one_sided"] == 0.05 and prereg["promotion_allowed"] is False
     assert [p["version"] for p in prereg["prior_registrations"]] == [f"vs1-v{n}" for n in range(1, 7)]
     assert date.fromisoformat(prereg["probe_window"][0]) == date(2007, 11, 2)
+
+
+def test_v8_stop_happy_path_on_an_underpowered_sealed_receipt(tmp_path, monkeypatch):
+    from tests.test_panel_insider_density_v2 import _Vault
+
+    monkeypatch.setattr(v8, "V7_STOP_HEAD_SHA256", "e" * 64)
+    log = v8.registry(tmp_path / "reg")
+    log.append(v8.registration_records(NOW, "a" * 40))
+    heads = tuple(v1._line_sha256(log))
+    monkeypatch.setattr(v8, "REGISTERED_RECORD_SHA256", heads)
+    monkeypatch.setattr(v8, "REGISTERED_ANCHOR_LINE",
+                        (tmp_path / "reg" / v8.REGISTRY_ANCHORS).read_bytes().splitlines()[0])
+    monkeypatch.setattr(v8, "check_census", lambda *a, **k: None)
+    vault = _Vault(tmp_path / "vault", h=v8, seeds=("vs1-v1", "vs1-v2"))
+    nl = b"\n"
+    for m in (v3, v4, v5):
+        vault.add_file(m.WITNESS_PATH, m.REGISTERED_ANCHOR_LINE + nl)
+    for m, head in ((v6, v7.V6_STOP_HEAD_SHA256), (v7, "e" * 64)):
+        stop_line = canonical({"head_sha256": head, "prev_anchor_sha256": hashlib.sha256(
+            m.REGISTERED_ANCHOR_LINE).hexdigest(), "records": 3, "run_at": "2026-10-01T00:00:00+00:00"})
+        vault.add_file(m.WITNESS_PATH, m.REGISTERED_ANCHOR_LINE + nl + stop_line + nl)
+    vault.publish(tmp_path / "reg")
+    prior = vault.witness()
+    power = tmp_path / "power.json"
+    power.write_text(json.dumps(_power_doc(exposed=0.45)))
+    kw = {"power_path": power, "decision_ref": "stage0-below-gate", "expected_prev_sha256": heads[1],
+          "witness": prior}
+    preview = v8.append_stop_status(tmp_path / "reg", NOW, dry_run=True, **kw)
+    stop = v8.append_stop_status(tmp_path / "reg", NOW, **kw)
+    assert stop == preview["would_append"] and stop["status"] == v8.STOP_STATUS
+    assert stop["stage0_power_ic_0_01"] == {"gaussian_v1": 0.7, "e0:factor_t_garch_exposed": 0.45}
+    with pytest.raises(PermissionError, match="terminal STOP"):
+        v8.freeze_inputs(tmp_path / "reg", NOW, {"accept_underpowered": False})
+    vault.publish(tmp_path / "reg")
+    assert v8.verify_terminal_stop(tmp_path / "reg", vault.witness())["records"] == 3
+    passing = tmp_path / "pass.json"
+    passing.write_text(json.dumps(_power_doc(exposed=0.6)))
+    with pytest.raises(PermissionError):
+        v8.append_stop_status(tmp_path / "reg", NOW, **{**kw, "power_path": passing})
+
+
+def test_e0_power_matches_the_e0_runner_on_its_own_structure():
+    from evals.e0 import runners
+    from evals.e0.benchmark import load_config
+    from evals.e0.structure import load_structure
+
+    config = load_config()
+    structure = load_structure(config)
+    features = {t: structure.trials[t].feature for t in v8.E0_TRIAL_ORDER}
+    ours = v8.e0_power(features, structure.n_sessions, "factor_t_garch", sims=2, perms=99)
+    scenario = config["scenarios"]["factor_t_garch"]
+    scales = runners.calibrate_scales(structure, "factor_t_garch", scenario, [0.01], [v8.PRIMARY_TRIAL],
+                                      pilot_sims=config["planted"]["pilot_sims"],
+                                      pilot_scale=config["planted"]["pilot_scale"],
+                                      pilot_seed=config["seeds"]["pilot"])
+    rows = runners.run_scenario(structure, "factor_t_garch", scenario, ic_grid=[0.01], sims=2, null_sims=0,
+                                perms=99, selection=runners.Selection(0.10, 1, 0.10, 1),
+                                planted_trials=[v8.PRIMARY_TRIAL], scales=scales,
+                                base_seed=config["seeds"]["base"])
+    assert ours["plant_scale"] == scales[v8.PRIMARY_TRIAL]["scales"]["0.01"]
+    theirs = [r["trials"][v8.PRIMARY_TRIAL]["mean_ic"] for r in rows["0.01"]]
+    assert ours["realized_mean_ic"] == pytest.approx(float(np.mean(theirs)), abs=1e-12)

@@ -59,8 +59,14 @@ def _registered(log_dir: Path, vault_repo: Path) -> None:
 def _run_at(args: list[str]):
     from datetime import datetime, timezone
 
-    run_at = datetime.fromisoformat(_option(args, "--run-at"))
-    if run_at.utcoffset() is None or run_at > datetime.now(timezone.utc):
+    from datetime import timedelta
+
+    raw = _option(args, "--run-at")
+    try:
+        run_at = datetime.fromisoformat(raw[:-1] + "+00:00" if raw.endswith("Z") else raw)
+    except ValueError as exc:
+        raise SystemExit("--run-at must be an ISO instant such as 2026-10-02T03:00:00+00:00") from exc
+    if run_at.utcoffset() != timedelta(0) or run_at > datetime.now(timezone.utc):
         raise SystemExit("--run-at must be an explicit UTC instant (+00:00) that is not in the future")
     return run_at
 
