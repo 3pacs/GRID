@@ -151,9 +151,11 @@ def test_gex_postclose_fetched_before_the_close_is_look_ahead(tmp_path):
         _postclose("2026-10-01", "2026-10-01T20:30:00+00:00", fetched="2026-10-01T19:59:00+00:00"),
     ])
     snap = _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 2))["snapshot"]
-    assert snap["streams"]["gex_levels_v1"]["ok"] is False
-    assert "precedes the session close" in snap["streams"]["gex_levels_v1"]["error"]
-    assert snap["counts"]["predictions"] == 0 and snap["counts"]["integrity_alerts"] == 1
+    assert snap["streams"]["gex_levels_v1"]["ok"] is True
+    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 7}
+    assert snap["counts"]["scores"] == 0 and snap["counts"]["integrity_alerts"] == 7
+    refusal = next(iter(_resolutions(tmp_path / "board").values()))["receipt"]["refusal"]
+    assert "precedes the session close" in refusal
 
 
 def test_gex_postclose_not_yet_written_stays_pending_then_voids_after_grace(tmp_path):
@@ -273,9 +275,12 @@ def test_s10_outcome_read_before_publication_is_look_ahead(tmp_path):
     logs = tmp_path / "s10"
     _s10_log(logs, _s10_events(verdict=False, bad_outcome=True))
     snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 13, 12))["snapshot"]
-    assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is False
-    assert "before its label was published" in snap["streams"]["s10_hypothesis_forward_v1"]["error"]
-    assert snap["counts"]["resolutions"] == 0 and snap["counts"]["integrity_alerts"] == 1
+    assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is True
+    res = _resolutions(tmp_path / "board")
+    bad = res["s10_hypothesis_forward_v1:cand1:k0"]
+    assert bad["reason"] == "lookahead_refused" and "before its label was published" in bad["receipt"]["refusal"]
+    assert sum(r["status"] == "resolved" for r in res.values()) == 3   # k=1,3,4 still resolve
+    assert snap["counts"]["integrity_alerts"] == 1
 
 
 def test_real_s10_log_copy_header_only(tmp_path):

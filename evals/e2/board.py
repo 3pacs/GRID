@@ -156,10 +156,6 @@ def _check_resolution(pred: dict, res: dict, now: datetime) -> None:
 
 def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules: dict, cost_model: dict) -> dict:
     """Ingest, resolve and score one stream; appends to ``new`` and mutates ``state``."""
-    alert = _source_prefix_alert(adapter.stream, view, state, now)
-    if alert is not None and (adapter.stream, alert["observed_sha256"]) not in state["alerts"]:
-        new.append(alert)
-        state["alerts"].add((adapter.stream, alert["observed_sha256"]))
     ingested = 0
     for pred in adapter.predictions(view):
         validate_prediction(pred, rules)
@@ -184,7 +180,20 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
         pred = state["predictions"][pid]
         if pred["stream"] != adapter.stream or pid in state["resolutions"]:
             continue
-        res = adapter.resolve(view, pred, now)
+        try:
+            res = adapter.resolve(view, pred, now)
+        except LookAheadError as exc:
+            # Contained to this prediction: it is voided for good (its outcome source offered
+            # data that was not observable), one alert is recorded, the stream carries on.
+            error = f"LookAheadError: {exc}"
+            res = {"status": "void", "reason": "lookahead_refused", "available_at": iso(now),
+                   "receipt": {"refusal": error}, "outcome": None}
+            if (pid, "lookahead") not in state["alerts"]:
+                new.append({"kind": "integrity_alert", "run_at": iso(now), "prediction_id": pid,
+                            "stream": adapter.stream, "ledger_sha256": state["prediction_sha"][pid],
+                            "observed_sha256": "lookahead",
+                            "detail": f"look-ahead refused; the prediction is void and never scored: {error}"})
+                state["alerts"].add((pid, "lookahead"))
         if res is None:
             continue
         _check_resolution(pred, res, now)
@@ -241,22 +250,20 @@ def run(board_dir: Path, adapters: list, now: datetime, *, rules: dict, cost_mod
             except (ChainError, OSError, ValueError, KeyError) as exc:
                 streams[adapter.stream] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
                 continue
+            alert = _source_prefix_alert(adapter.stream, view, state, now)
+            if alert is not None and (adapter.stream, alert["observed_sha256"]) not in state["alerts"]:
+                new.append(alert)  # recorded before any stream work, so a later refusal cannot drop it
+                state["alerts"].add((adapter.stream, alert["observed_sha256"]))
             mark = len(new)
             try:
                 streams[adapter.stream] = _process_stream(adapter, view, state, new, now, rules, cost_model)
-            except (LookAheadError, RecordError, KeyError, TypeError, ValueError) as exc:
-                # Everything this stream produced this run is discarded; other streams proceed.
+            except RecordError as exc:
+                # A stream emitting a record that breaks the E2 contract: everything it produced this
+                # run is discarded, the stream is reported not ok, the other streams proceed.
+                # Unexpected exceptions (E2 bugs) still abort the whole run.
                 del new[mark:]
                 state = ledger_state(records + new)
-                error = f"{type(exc).__name__}: {exc}"
-                streams[adapter.stream] = {"ok": False, "error": error}
-                if isinstance(exc, LookAheadError):
-                    observed = "lookahead:" + digest(error)
-                    if (adapter.stream, observed) not in state["alerts"]:
-                        new.append({"kind": "integrity_alert", "run_at": iso(now), "stream": adapter.stream,
-                                    "ledger_sha256": None, "observed_sha256": observed,
-                                    "detail": f"look-ahead refused, nothing from this stream was recorded: {error}"})
-                        state["alerts"].add((adapter.stream, observed))
+                streams[adapter.stream] = {"ok": False, "error": f"RecordError: {exc}"}
         snapshot = build_snapshot(state, streams, now, rules, cost_model)
         new.append(snapshot)
         ledger.append_locked(new, manifest_sha256=manifest_sha)
@@ -309,6 +316,7 @@ def build_snapshot(state: dict, streams: dict, now: datetime, rules: dict, cost_
                 seed_parts=(rule_id, metric, json.dumps(group), window, bucket), aggregation=agg)
             rows.append({"bucket": bucket, "rule_id": rule_id, "metric": metric, "group": dict(group),
                          "window": window, "interim": interim.get(stream, False),
+                         "stream_ok_this_run": bool((streams.get(stream) or {}).get("ok")),
                          "first_issued_at": subset[0]["issued_at"] if subset else None,
                          "last_issued_at": subset[-1]["issued_at"] if subset else None, **summary})
     counts = {"predictions": len(state["predictions"]), "resolutions": len(state["resolutions"]),

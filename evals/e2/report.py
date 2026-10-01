@@ -77,11 +77,13 @@ def render_markdown(snapshot: dict | None) -> str:
         if not rows:
             lines += ["None yet.", ""]
             continue
-        lines += ["| group | rule | metric | n | mean | 95% CI | interim |", "|---|---|---|---|---|---|---|"]
+        lines += ["| group | rule | metric | n | mean | 95% CI | flags |", "|---|---|---|---|---|---|---|"]
         for r in rows:
             group = "/".join(str(v) for v in r["group"].values())
+            flags = [f for f, on in (("INTERIM", r["interim"]),
+                                     ("STREAM NOT READ THIS RUN", not r.get("stream_ok_this_run", True))) if on]
             lines.append(f"| {group} | {r['rule_id']} | {r['metric']} | {r['n']} | {_fmt(r['mean'])} | {_ci(r)} | "
-                         f"{'INTERIM' if r['interim'] else ''} |")
+                         f"{', '.join(flags)} |")
         lines.append("")
     lines.append(f"aggregates sha256 `{snapshot['aggregates_sha256']}`")
     return "\n".join(lines) + "\n"

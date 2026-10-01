@@ -11,12 +11,12 @@ from __future__ import annotations
 import json
 import math
 from datetime import date
+from pathlib import Path
 
 import pytest
 
 from evals.e2 import board, scoring
 from evals.e2.chain import ChainError, Ledger, raw_lines
-from evals.e2.adapters.e2_stream import E2StreamAdapter
 from evals.e2.resolve import PriceObs
 from tests import e2_support as S
 
@@ -160,38 +160,93 @@ class _Hostile:
         return PriceObs(instrument, obs_date, value, self.available_at, "hostile", "X", "v")
 
 
-def _assert_lookahead_refused(tmp_path, snap, match):
-    stream = snap["streams"][S.STREAM]
-    assert stream["ok"] is False and stream["error"].startswith("LookAheadError") and match in stream["error"]
-    ledger = Ledger(tmp_path / "board", "e2-v1").read_all()
-    assert [r["kind"] for r in ledger] == ["header", "integrity_alert", "snapshot"]  # nothing from the stream
-    assert ledger[1]["stream"] == S.STREAM and "look-ahead refused" in ledger[1]["detail"]
+def _ledger(tmp_path):
+    return Ledger(tmp_path / "board", "e2-v1").read_all()
 
 
-def test_price_offered_before_the_close_is_refused_and_nothing_is_recorded(tmp_path):
+def test_price_offered_before_the_close_voids_only_those_predictions(tmp_path):
     snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 1, 12)))["snapshot"]
-    _assert_lookahead_refused(tmp_path, snap, "before the session closed")
+    assert snap["streams"][S.STREAM]["ok"] is True
+    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 10}
+    assert snap["counts"]["integrity_alerts"] == 10
+    assert all(not r["metrics"] for r in _ledger(tmp_path) if r["kind"] == "score")  # nothing was scored
+    refusal = [r for r in _ledger(tmp_path) if r["kind"] == "resolution"][0]["receipt"]["refusal"]
+    assert "before the session closed" in refusal
+    again = _run(tmp_path, S.utc(2026, 10, 3, 23), price_source=_Hostile(S.utc(2026, 10, 1, 12)))["snapshot"]
+    assert again["counts"]["integrity_alerts"] == 10 and again["counts"]["resolutions"] == 10  # no repeats
 
 
 def test_price_offered_from_the_future_is_refused(tmp_path):
     snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 3, 12)))["snapshot"]
-    _assert_lookahead_refused(tmp_path, snap, "not observable until")
+    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 10}
+    assert "not observable until" in [r for r in _ledger(tmp_path) if r["kind"] == "resolution"][0]["receipt"]["refusal"]
 
 
-def test_one_streams_look_ahead_does_not_block_the_others(tmp_path):
-    good, bad = tmp_path / "good.jsonl", tmp_path / "bad.jsonl"
-    S.write_chain(good, S.stream_records())
-    S.write_chain(bad, [{**r, "stream": "other_v1"} if r["kind"] == "header" else
-                        {**r, "prediction_id": r["prediction_id"].replace(S.STREAM, "other_v1")}
-                        for r in S.stream_records()])
+class _HostileFor:
+    """Honest closes, except one instrument's exit close is offered before its session closed."""
+
+    name = "partly_hostile"
+
+    def __init__(self, bad):
+        self.bad, self.honest = bad, S.prices()
+
+    def close(self, instrument, obs_date, now):
+        obs = self.honest.close(instrument, obs_date, now)
+        if obs is not None and instrument == self.bad and obs_date == date(2026, 10, 2):
+            return PriceObs(instrument, obs_date, obs.value, S.utc(2026, 10, 2, 12), "x", "X", "v")
+        return obs
+
+
+def test_one_look_ahead_does_not_block_the_rest_of_the_stream(tmp_path):
+    snap = _run(tmp_path, AFTER, price_source=_HostileFor("AAA"))["snapshot"]
+    assert snap["streams"][S.STREAM]["ok"] is True
+    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 3}  # d1, p1 and r_AAA
+    scores = _scores(tmp_path / "board")
+    assert scores[f"{S.STREAM}:d2"]["metrics"]["hit"] == 0 and scores[f"{S.STREAM}:p2"]["metrics"]["brier"] == 0.09
+    assert scores[f"{S.STREAM}:rank:1d:2026-10-01"]["metrics"] == {}  # 4 resolved names < min_names
+    assert snap["counts"]["integrity_alerts"] == 3
+    again = _run(tmp_path, S.utc(2026, 10, 3, 23), price_source=_HostileFor("AAA"))["snapshot"]
+    assert again["counts"]["integrity_alerts"] == 3
+
+
+class _BrokenAdapter:
+    """A stream adapter whose records break the E2 contract (an unregistered rule)."""
+
+    stream = "broken_v1"
+
+    def load(self, now):
+        from evals.e2.adapters import SourceView
+
+        return SourceView("broken_v1", Path("broken.jsonl"), [], [], [], 0, None)
+
+    def predictions(self, view):
+        return [{"stream": "broken_v1", "prediction_id": "broken_v1:x", "rule_id": "nope.v1"}]
+
+    def resolve(self, view, pred, now):
+        return None
+
+    def unit_scores(self, view, state, now):
+        return []
+
+    def activity(self, view):
+        return {}
+
+
+@pytest.mark.parametrize("broken_first", [True, False])
+def test_a_stream_breaking_the_record_contract_is_isolated(tmp_path, broken_first):
+    log = tmp_path / "stream.jsonl"
+    S.write_chain(log, S.stream_records())
     rules = S.rules()
-    rules["streams"]["other_v1"] = {**rules["streams"][S.STREAM]}
-    adapters = [S.stream_adapter(good, rules, S.prices()),
-                E2StreamAdapter(bad, "other_v1", rules["streams"]["other_v1"], rules, _Hostile(S.utc(2026, 10, 1, 12)))]
+    adapters = [S.stream_adapter(log, rules, S.prices()), _BrokenAdapter()]
+    if broken_first:
+        adapters.reverse()
     snap = board.run(tmp_path / "board", adapters, AFTER, rules=rules, cost_model=S.cost_model(),
                      manifest_info=S.MANIFEST_INFO, code_sha=S.CODE_SHA)["snapshot"]
-    assert snap["streams"][S.STREAM]["ok"] is True and snap["streams"]["other_v1"]["ok"] is False
-    assert snap["counts"]["scores"] == 6 and snap["counts"]["integrity_alerts"] == 1
+    assert snap["streams"]["broken_v1"]["ok"] is False
+    assert snap["streams"]["broken_v1"]["error"].startswith("RecordError")
+    assert snap["streams"][S.STREAM]["ok"] is True
+    assert (snap["counts"]["predictions"], snap["counts"]["pending"], snap["counts"]["scores"]) == (10, 0, 6)
+    assert not [r for r in _ledger(tmp_path) if "broken_v1" in json.dumps(r.get("prediction") or {})]
 
 
 def test_prediction_whose_entry_close_precedes_it_is_never_ingested(tmp_path):
