@@ -15,7 +15,7 @@ from pathlib import Path
 
 _ATTEMPTS = Path("/data/grid_v4/gem_daily/attempts")
 _ALLOWED = {"success", "exit-code", "timeout", "signal", "core-dump", "watchdog",
-            "resources", "protocol", "start-limit-hit"}
+            "resources", "protocol", "start-limit-hit", "oom-kill", "exec-condition"}
 
 
 def main() -> int:

@@ -30,6 +30,9 @@ def test_rendered_pin_drop_in_is_immutable_and_contained(tmp_path) -> None:
     starts = [line for line in lines if line.startswith("ExecStart=")]
     assert starts == ["ExecStart=",
                       f"ExecStart=/data/grid_v4/venv/bin/python3 {root}/scripts/gem_daily_capture.py"]
+    stop_posts = [line for line in lines if line.startswith("ExecStopPost=")]
+    assert stop_posts[0] == "ExecStopPost=" and len(stop_posts) == 2
+    assert "Type=oneshot" in lines  # TimeoutStartSec then bounds the whole run
     assert (f"ExecStopPost=-/data/grid_v4/venv/bin/python3 {root}/scripts/gem_daily_contain.py"
             in lines)
     for setting in ("TimeoutStartSec=15min", "KillMode=control-group", "SendSIGKILL=yes",
@@ -59,6 +62,10 @@ def test_timer_fires_once_per_weekday_after_scheduler_pull_and_before_deadline(t
         fire = datetime.combine(day, time(10, 5), ny).astimezone(timezone.utc)
         assert fire.time() >= time(13, 29)
         assert fire < daily._session_deadline(day)
+
+
+def test_contain_and_runner_share_the_attempts_directory() -> None:
+    assert contain._ATTEMPTS == daily._ATTEMPTS
 
 
 def test_contain_appends_terminal_record_and_never_fails(tmp_path, monkeypatch, capsys) -> None:
