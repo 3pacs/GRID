@@ -167,6 +167,8 @@ class ConstructSpec:
             raise ValueError("a construct that contains prices declares its price lookback")
         if not self.artifact_kinds:
             raise ValueError("declare the frozen artifact kinds the construct is read from")
+        if not self.channels or any(not str(c).strip() for c in self.channels):
+            raise ValueError("declare the construct's event channels")
 
     @property
     def feature(self) -> str:
@@ -395,6 +397,10 @@ def _tokens(name: str) -> set[str]:
     return {t for t in re.split(r"[^A-Z0-9]+", str(name).upper()) if t}
 
 
+def _is_form4(name: str) -> bool:
+    return "form4" in name or "form345" in name or name in ("f4", "sec4")
+
+
 _SELL_TOKENS = frozenset({"S", "SELL", "SELLS", "SALE", "SALES", "D", "DISPOSITION", "DISPOSE"})
 
 
@@ -403,7 +409,8 @@ def is_sectors_v6_family(construct: ConstructSpec) -> bool:
 
     True when declared (``insider_buy_density``), when the name or scorer carries an
     ``A30`` / ``A90`` token, or when every channel is Form 4, the window is 30 or 90
-    days and the event filter is not explicitly a sell / disposition filter.
+    days and the event filter is not explicitly a sell / disposition filter
+    (Form 4 = a channel or feature class naming form4 / form345 / f4 / sec4).
     """
     if construct.insider_buy_density:
         return True
@@ -411,7 +418,8 @@ def is_sectors_v6_family(construct: ConstructSpec) -> bool:
     if tokens & SECTORS_V6_CONSTRUCTS:
         return True
     channels = [re.sub(r"[^a-z0-9]", "", c.lower()) for c in construct.channels]
-    form4_only = bool(channels) and all("form4" in c or c in ("f4", "sec4") for c in channels)
+    form4_only = (bool(channels) and all(_is_form4(c) for c in channels)) or \
+        _is_form4(re.sub(r"[^a-z0-9]", "", construct.feature_class.lower()))
     sell = bool(_tokens(construct.event_filter) & _SELL_TOKENS)
     return form4_only and construct.window_days in SECTORS_V6_WINDOWS and not sell
 
@@ -470,7 +478,8 @@ class OutcomeWindowGuard:
     @staticmethod
     def check_trial(construct: ConstructSpec, sector: str, horizon: int) -> None:
         """The sectors-v6 confirmatory trials run only in the sectors-v6 harness (always refused)."""
-        if is_sectors_v6_family(construct) and str(sector).strip().lower() not in TECHNOLOGY_SECTORS                 and horizon in SECTORS_V6_HORIZONS:
+        if (is_sectors_v6_family(construct) and str(sector).strip().lower() not in TECHNOLOGY_SECTORS
+                and horizon in SECTORS_V6_HORIZONS):
             raise PermissionError(
                 f"R3: {construct.name}|fwd{horizon} in {sector} is a sectors-v6 confirmatory trial "
                 "(Form 4 A30/A90 insider-buy density, non-Technology, fwd5/fwd20); only the sectors-v6 "
@@ -984,7 +993,8 @@ class PanelInputs:
         if not self.artifacts or any(len(a) != 2 or not all(v1._is_hex64(x) for x in a) for a in self.artifacts):
             raise ValueError("artifacts are (artifact sha256, receipt sha256) pairs")
         sectors = [pair[0] for pair in self.price_manifest_sha256s]
-        if not sectors or len(set(sectors)) != len(sectors)                 or any(len(pair) != 2 or not v1._is_hex64(pair[1]) for pair in self.price_manifest_sha256s):
+        if (not sectors or len(set(sectors)) != len(sectors)
+                or any(len(pair) != 2 or not v1._is_hex64(pair[1]) for pair in self.price_manifest_sha256s)):
             raise ValueError("price_manifest_sha256s are distinct (sector, sha256) pairs")
         if run is not None and set(sectors) != set(run.sectors):
             raise ValueError("one admitted-price manifest per declared sector")
@@ -1485,8 +1495,16 @@ def seal_discovery(grant: PanelDiscoveryKey, now: datetime, frozen: dict, manife
         raise PermissionError("the discovery manifest belongs to another registry")
     with reg.log().locked():
         prereg = _chain(reg)[1]
-    if payload.get("constructs_sha256") != prereg["constructs_sha256"] or payload.get("spec_sha256") != prereg["run_sha256"]:
+    try:
+        constructs = tuple(construct_from_record(c) for c in payload["constructs"])
+        recomputed = (constructs_digest(constructs), run_from_record(payload["spec"]).digest())
+    except (KeyError, TypeError, ValueError) as exc:
+        raise PermissionError("the discovery manifest's constructs / spec are malformed") from exc
+    if {payload.get("constructs_sha256"), recomputed[0]} != {prereg["constructs_sha256"]} \
+            or {payload.get("spec_sha256"), recomputed[1]} != {prereg["run_sha256"]}:
         raise PermissionError("the discovery did not run the registered constructs and run spec")
+    if any(t.get("direction") != construct_of(constructs, t["trial"]).direction for t in payload.get("ledger", [])):
+        raise PermissionError("a ledger entry's direction differs from its registered construct")
     pinned = dict(grant.inputs["price_manifest_sha256s"])
     if set(manifests) != set(pinned) or any(manifests[sec].digest() != pinned[sec] for sec in pinned):
         raise PermissionError("the price manifests are not the ones inputs_frozen pinned")

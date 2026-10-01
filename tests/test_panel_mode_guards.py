@@ -166,6 +166,9 @@ def test_registry_and_witness_paths_never_touch_vs1():
     construct("density_x", 30, scorer="gd5:A30", channels=("other",)),
     construct("anything", 45, insider_buy_density=True),
     construct("f4_open_market", 90, channels=("Form 4",), event_filter="open-market purchase"),
+    construct("ib90b", 90, scorer="gd5:ib90b", channels=("sec_form345",), event_filter="P"),
+    construct("ib90c", 90, scorer="gd5:ib90c", channels=("insider",), feature_class="people_density_form4",
+              event_filter="P"),
 ])
 def test_renamed_insider_buy_density_is_still_the_sectors_v6_family(c):
     assert pm.is_sectors_v6_family(c)
@@ -175,7 +178,8 @@ def test_renamed_insider_buy_density_is_still_the_sectors_v6_family(c):
 
 def test_sell_density_and_multichannel_are_not_the_sectors_v6_family():
     assert not pm.is_sectors_v6_family(construct("s90", 90, scorer="gd5:s90", channels=("form4",), event_filter="S"))
-    assert not pm.is_sectors_v6_family(construct("mc1", 90, scorer="gd5:mc1", channels=("form4", "congress")))
+    assert not pm.is_sectors_v6_family(construct("mc1", 90, scorer="gd5:mc1", channels=("form4", "congress"),
+                                                 feature_class="people_density_multi"))
 
 
 def test_denylist_cannot_be_shrunk_and_tickers_are_normalised():
@@ -200,3 +204,8 @@ def test_registry_files_never_share_a_vs1_stem(tmp_path):
     log = pm.PanelRegistry(tmp_path, "panel_prereg_sectors_v6", "ab" * 32).log()
     names = {log.path.name, log.anchor_path.name, log.lock_path.name}
     assert all(not n.lstrip(".").startswith("granular_panel_prereg") for n in names)
+
+
+def test_a_construct_must_declare_its_channels():
+    with pytest.raises(ValueError, match="channels"):
+        construct("ib90", 90, scorer="gd5:ib90", channels=(), event_filter="P").validate()

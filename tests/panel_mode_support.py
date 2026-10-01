@@ -95,7 +95,8 @@ def construct(name="A90", window=90, horizons=(5, 20), direction=1, confirmatory
     return pm.ConstructSpec(name=name, feature_class=kw.pop("feature_class", "people_density_form4"),
                             scorer=kw.pop("scorer", f"gd5:{name}"), window_days=window, horizons=tuple(horizons),
                             direction=direction, confirmatory_horizons=tuple(confirmatory),
-                            artifact_kinds=kw.pop("artifact_kinds", ("people_density",)), magnitude=magnitude, **kw)
+                            artifact_kinds=kw.pop("artifact_kinds", ("people_density",)), magnitude=magnitude,
+                            channels=kw.pop("channels", ("synthetic",)), **kw)
 
 
 def run_spec(sectors=("Technology",), benchmarks=None, *, discovery_start=v1.DISCOVERY_START, split=v1.SPLIT,
