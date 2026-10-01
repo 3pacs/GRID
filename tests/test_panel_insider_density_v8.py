@@ -283,3 +283,48 @@ def test_e0_power_matches_the_e0_runner_on_its_own_structure():
     assert ours["plant_scale"] == scales[v8.PRIMARY_TRIAL]["scales"]["0.01"]
     theirs = [r["trials"][v8.PRIMARY_TRIAL]["mean_ic"] for r in rows["0.01"]]
     assert ours["realized_mean_ic"] == pytest.approx(float(np.mean(theirs)), abs=1e-12)
+
+
+def test_v8_opening_census_tolerates_only_a_two_record_sectors_v6(monkeypatch, tmp_path):
+    head = v8.V7_STOP_HEAD_SHA256
+    monkeypatch.setattr(v7, "_v6_anchor_at_tip", lambda repo, tip, h: None)
+    monkeypatch.setattr(v8, "_v7_anchor_at_tip", lambda repo, tip, h: None)
+    pinned_checks = []
+    monkeypatch.setattr(v8, "_sectors_v6_anchor_at_tip", lambda repo, tip: pinned_checks.append(tip))
+    counts = {key: 2 for key in v8.FROZEN_REGISTRIES} | {v6.VERSION: 3, v7.VERSION: 3, "vs1-v8": 2}
+    files = {k: v1.canonical_witness_path(k) for k in counts}
+    opened = {"tip": "t", "files": files, "records": counts, "unknown": []}
+    v8.check_census(opened, stop_head_sha256=head, witness_repo=tmp_path, opening=True)  # absent: fine
+    s6 = {**opened, "files": {**files, "sectors-v6": v1.canonical_witness_path("sectors-v6")},
+          "records": {**counts, "sectors-v6": 2}}
+    v8.check_census(s6, stop_head_sha256=head, witness_repo=tmp_path, opening=True)
+    assert pinned_checks == ["t"] and not v8.contamination([s6])["contaminated"]
+    for grown in (1, 3, 4, None):
+        bad = {**s6, "records": {**s6["records"], "sectors-v6": grown}}
+        with pytest.raises(PermissionError, match="sectors-v6"):
+            v8.check_census(bad, stop_head_sha256=head, witness_repo=tmp_path, opening=True)
+        assert v8.contamination([bad])["contaminated"]
+    wrong_path = {**s6, "files": {**s6["files"], "sectors-v6": "05-GRID/Paper-Log/vs1/other.anchors.jsonl"}}
+    with pytest.raises(PermissionError, match="canonical"):
+        v8.check_census(wrong_path, stop_head_sha256=head, witness_repo=tmp_path, opening=True)
+    # At v8 registration (not an opening) a sectors-v6 witness cannot already exist.
+    base = {**s6, "files": {k: p for k, p in s6["files"].items() if k != "vs1-v8"},
+            "records": {k: c for k, c in s6["records"].items() if k != "vs1-v8"}}
+    with pytest.raises(PermissionError, match="missing or extra"):
+        v8.check_census(base, stop_head_sha256=head, witness_repo=tmp_path)
+
+
+def test_sectors_v6_pinned_anchor_must_match_exactly(monkeypatch, tmp_path):
+    import types
+
+    line = b'{"head_sha256":"' + b"a" * 64 + b'","prev_anchor_sha256":null,"records":2,"run_at":"x"}'
+    fake = types.SimpleNamespace(REGISTERED_ANCHOR_LINE=line)
+    monkeypatch.setattr("importlib.util.find_spec", lambda name: object())
+    monkeypatch.setattr("importlib.import_module", lambda name: fake)
+    monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: line + b"\n")
+    v8._sectors_v6_anchor_at_tip(tmp_path, "t")
+    monkeypatch.setattr(v1, "_git", lambda repo, *a, binary=False: line.replace(b"a" * 64, b"b" * 64) + b"\n")
+    with pytest.raises(PermissionError, match="pinned two-record"):
+        v8._sectors_v6_anchor_at_tip(tmp_path, "t")
+    fake.REGISTERED_ANCHOR_LINE = None
+    v8._sectors_v6_anchor_at_tip(tmp_path, "t")  # unpinned: the census count rule is the whole check

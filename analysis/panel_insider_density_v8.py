@@ -30,7 +30,7 @@ from analysis.research_forward_log import canonical
 VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
-PREREG_BODY_SHA256 = "f7965da2f09365cf671eb8611760403196612efb6c8042edc5e6f58af51446d3"
+PREREG_BODY_SHA256 = "506c11657f033c252473ce52d3e67cfc09f500544c4ff68f11955477d0f88c14"
 #: The witnessed v7 terminal STOP head (3 records; vault main 4456453d, anchor file SHA-256 bd018b11...).
 V7_STOP_HEAD_SHA256: str | None = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
 #: The exact second line of the witnessed v7 anchor file.
@@ -87,7 +87,32 @@ SUPERSEDED_BY: Mapping[str, Any] | None = None
 FROZEN_REGISTRIES = v7.FROZEN_REGISTRIES
 TERMINAL_REGISTRIES = {v6.VERSION: v7.V6_STOP_RECORDS, v7.VERSION: V7_STOP_RECORDS}
 BASELINE_REGISTRIES = frozenset((*FROZEN_REGISTRIES, *TERMINAL_REGISTRIES))
-ALLOWED_REGISTRIES = frozenset((*BASELINE_REGISTRIES, REGISTRY_ID))
+#: The ten-sector generalization registration bound to v8 (body section 0). Optional: absent, or at
+#: exactly its two registration records; it may not open before v8 is terminal.
+SECTORS_V6 = "sectors-v6"
+SECTORS_V6_RECORDS = 2
+ALLOWED_REGISTRIES = frozenset((*BASELINE_REGISTRIES, REGISTRY_ID, SECTORS_V6))
+
+
+def _sectors_v6_anchor_at_tip(repo: Path, tip: str) -> None:
+    """Once sectors-v6's registration is pinned in its own code, its witness must be exactly that anchor.
+
+    Before that pin exists the census rule (canonical path, exactly two records) is the whole check;
+    sectors-v6's own registration verifies that its header names the witnessed v8 head.
+    """
+    import importlib.util
+
+    if importlib.util.find_spec("analysis.panel_insider_density_sectors_v6") is None:
+        return
+    import importlib
+
+    s6 = importlib.import_module("analysis.panel_insider_density_sectors_v6")
+    line = getattr(s6, "REGISTERED_ANCHOR_LINE", None)
+    if line is None:
+        return
+    content = v1._git(repo, "show", f"{tip}:{v1.canonical_witness_path(SECTORS_V6)}", binary=True)
+    if content != line + b"\n":
+        raise PermissionError("sectors-v6 witness is not exactly its pinned two-record registration anchor")
 
 
 def _bound() -> tuple[str, str]:
@@ -133,6 +158,8 @@ def check_census(census: Mapping[str, Any], *, stop_head_sha256: str | None = No
         raise PermissionError(f"unknown VS1 witnesses: {census['unknown']}")
     files, counts = census.get("files") or {}, census.get("records") or {}
     expected = BASELINE_REGISTRIES | ({REGISTRY_ID} if opening else set())
+    if opening and (SECTORS_V6 in files or SECTORS_V6 in counts):
+        expected = expected | {SECTORS_V6}  # optional; a sectors-v6 cannot precede v8's registration
     if set(files) != expected or set(counts) != expected:
         raise PermissionError("v8 witness census has missing or extra registries")
     for key, path in files.items():
@@ -145,6 +172,10 @@ def check_census(census: Mapping[str, Any], *, stop_head_sha256: str | None = No
             raise PermissionError(f"{key} witness must cover exactly its terminal STOP")
     if opening and (not isinstance(counts[REGISTRY_ID], int) or counts[REGISTRY_ID] < 2):
         raise PermissionError("v8 witness does not cover its registration")
+    if SECTORS_V6 in counts:
+        if counts[SECTORS_V6] != SECTORS_V6_RECORDS:
+            raise PermissionError("sectors-v6 witness must cover exactly its two registration records")
+        _sectors_v6_anchor_at_tip(Path(witness_repo), census["tip"])
     v7._v6_anchor_at_tip(Path(witness_repo), census["tip"], v7.V6_STOP_HEAD_SHA256)
     _v7_anchor_at_tip(Path(witness_repo), census["tip"], pinned_stop_head)
 
@@ -161,6 +192,8 @@ def contamination(censuses: list[Mapping[str, Any] | None]) -> dict:
         for key in BASELINE_REGISTRIES:
             if counts.get(key) != TERMINAL_REGISTRIES.get(key, 2):
                 found[key] = counts.get(key)
+        if SECTORS_V6 in counts and counts[SECTORS_V6] != SECTORS_V6_RECORDS:
+            found[SECTORS_V6] = counts[SECTORS_V6]
         for key in set(counts) - ALLOWED_REGISTRIES:
             found[key] = counts[key]
     return {"contaminated": bool(found or unknown),
