@@ -1,6 +1,13 @@
 #!/usr/bin/env python3
 """One gated GEM options capture per NYSE session; run only by its timer.
 
+Event-triggered start (GEM-EV): the timer only *arms* the runner at 09:31
+New York. The runner then follows the grid-scheduler journal and starts the
+capture within seconds of the scheduler's own ``Options daily pull
+complete`` line (same invocation as its start), instead of at a fixed clock
+time. If that line has not appeared by the latest start (10:05 New York), or
+the scheduler's options step fails/skips, the day is recorded as a SKIP.
+
 This program never installs, enables or starts a timer. Every gate fails
 closed and prints one ``GEM_SKIP``/``GEM_FAILED``/``GEM_VALIDATE`` line:
 
@@ -29,12 +36,13 @@ from __future__ import annotations
 import json
 import os
 import re
+import select
 import signal
 import subprocess
 import sys
 from datetime import date, datetime, time, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterable, Iterator
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import text
@@ -54,6 +62,9 @@ _SCHEDULER_WINDOW_UTC = time(13, 29)
 _ATTEMPTS = Path("/data/grid_v4/gem_daily/attempts")
 _ACTIVATED = Path("/data/grid_v4/gem_daily/ACTIVATED")
 _PIN_ROOT = Path("/data/grid_v4/grid-options-puller-pins")
+_EARLIEST_START_NY = time(9, 30)   # captures must lie inside the NY session
+_LATEST_START_NY = time(10, 5)     # the old fixed start becomes the latest start
+_JOURNAL_LIMIT_BYTES = 5_000_000
 _SESSION_GUARD_COMMIT = "01b19194"  # #653: fail closed on non-session captures
 
 _START_RE = re.compile(
@@ -75,6 +86,10 @@ def _session_deadline(day: date) -> datetime:
     return datetime.combine(day, time(10, 20), _NY).astimezone(timezone.utc)
 
 
+def _latest_start(day: date) -> datetime:
+    return datetime.combine(day, _LATEST_START_NY, _NY).astimezone(timezone.utc)
+
+
 def _scheduler_window_start(day: date) -> datetime:
     return datetime.combine(day, _SCHEDULER_WINDOW_UTC, timezone.utc)
 
@@ -88,14 +103,17 @@ def _message(record: dict[str, Any]) -> str | None:
     return None
 
 
-def _scheduler_gate(lines: list[str], day: date) -> bool:
-    """Exactly one scheduler options pull since 13:29 UTC, one invocation.
+def _scheduler_state(lines: Iterable[str], day: date) -> tuple[str, datetime | None]:
+    """Classify the scheduler journal since 13:29 UTC: pass, pending or fail.
 
-    The start and its positive completion must carry the same non-empty
-    ``_SYSTEMD_INVOCATION_ID`` and ``_PID``; a restart between them, a
-    missing identity, a second pull, a failure/skip line, a zero-row or
-    malformed completion, or out-of-order/unparseable journal output all
-    fail closed.
+    ``pass``: exactly one ``Starting daily pulls ... market_open=True`` and
+    exactly one positive ``Options daily pull complete`` after it, both with
+    the same non-empty ``_SYSTEMD_INVOCATION_ID`` and ``_PID``, completed by
+    the absolute deadline; returns the completion time. ``pending``: nothing
+    yet, or one valid start still waiting for its completion. ``fail``:
+    anything else -- a restart between start and completion, a missing
+    identity, a second pull, a failure/skip line, a zero-row or malformed
+    completion, out-of-order or unparseable journal output.
     """
     window = _scheduler_window_start(day)
     starts: list[tuple[datetime, bool, str, str]] = []
@@ -107,23 +125,23 @@ def _scheduler_gate(lines: list[str], day: date) -> bool:
             stamp = datetime.fromtimestamp(
                 int(record["__REALTIME_TIMESTAMP"]) / 1_000_000, timezone.utc)
         except (ValueError, KeyError, TypeError, OverflowError):
-            return False
+            return "fail", None
         if not isinstance(record, dict):
-            return False
+            return "fail", None
         if previous is not None and stamp < previous:
-            return False
+            return "fail", None
         previous = stamp
         if stamp < window or stamp.date() != day:
             continue
         message = _message(record)
         if message is None:
-            return False
+            return "fail", None
         invocation = record.get("_SYSTEMD_INVOCATION_ID")
         pid = record.get("_PID")
         invocation = invocation if isinstance(invocation, str) else ""
         pid = pid if isinstance(pid, str) else ""
         if any(marker in message for marker in _FAILURE_MARKERS):
-            return False
+            return "fail", None
         start = _START_RE.search(message)
         if start:
             starts.append((stamp, start.group(1) == "True", invocation, pid))
@@ -133,15 +151,94 @@ def _scheduler_gate(lines: list[str], day: date) -> bool:
             ok, total, snapshots = map(int, complete.groups())
             completes.append((stamp, 0 < ok <= total and snapshots > 0, invocation, pid))
         elif "Options daily pull complete" in message:
-            return False
-    if len(starts) != 1 or len(completes) != 1:
-        return False
+            return "fail", None
+    if len(starts) > 1 or len(completes) > 1 or (completes and not starts):
+        return "fail", None
+    if not starts:
+        return "pending", None
     s_at, market_open, s_inv, s_pid = starts[0]
+    if not market_open or not s_inv or not s_pid:
+        return "fail", None
+    if not completes:
+        return "pending", None
     c_at, positive, c_inv, c_pid = completes[0]
-    return (market_open and positive and c_at > s_at
-            and c_at <= _session_deadline(day)
-            and bool(s_inv) and s_inv == c_inv
-            and bool(s_pid) and s_pid == c_pid)
+    if (positive and c_at > s_at and c_at <= _session_deadline(day)
+            and s_inv == c_inv and s_pid == c_pid):
+        return "pass", c_at
+    return "fail", None
+
+
+def _scheduler_gate(lines: list[str], day: date) -> bool:
+    """Strict whole-window check: exactly one scheduler options pull passed."""
+    return _scheduler_state(lines, day)[0] == "pass"
+
+
+def _follow_scheduler_journal(day: date, poll_seconds: float = 2.0) -> Iterator[str | None]:
+    """Stream grid-scheduler journal lines since 13:29 UTC as they arrive.
+
+    Yields each JSON line (history first, then live lines from
+    ``journalctl -f``), and ``None`` whenever ``poll_seconds`` pass with no
+    output so the caller can re-check its latest-start cutoff. Raw fd reads
+    keep the latency to the select wake-up (no hidden Python buffering).
+    """
+    proc = subprocess.Popen(
+        ["journalctl", "-u", "grid-scheduler.service",
+         "--since", _scheduler_window_start(day).strftime("%Y-%m-%d %H:%M:%S UTC"),
+         "-f", "-o", "json", "--no-pager"],
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+    )
+    if proc.stdout is None:
+        raise OSError("journalctl follow has no stdout")
+    fd = proc.stdout.fileno()
+    pending = b""
+    try:
+        while True:
+            ready, _, _ = select.select([fd], [], [], poll_seconds)
+            if not ready:
+                if proc.poll() is not None:
+                    raise OSError("journalctl follow exited")
+                yield None
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                raise OSError("journalctl follow stream ended")
+            pending += chunk
+            *complete_lines, pending = pending.split(b"\n")
+            for raw in complete_lines:
+                if raw:
+                    yield raw.decode("utf-8", errors="replace")
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+
+def _await_scheduler(
+    day: date, stream: Iterable[str | None], now_fn: Callable[[], datetime],
+) -> tuple[str, datetime | None]:
+    """Wait for the scheduler's options completion; return as soon as known.
+
+    ``pass`` (with the completion time) or ``fail`` the moment the journal
+    decides it; ``timeout`` once the latest start passes while still
+    pending; ``fail`` if the stream ends or exceeds the size limit.
+    """
+    cutoff = _latest_start(day)
+    collected: list[str] = []
+    size = 0
+    for line in stream:
+        if line is not None:
+            size += len(line)
+            if size > _JOURNAL_LIMIT_BYTES:
+                return "fail", None
+            collected.append(line)
+            state, completed_at = _scheduler_state(collected, day)
+            if state != "pending":
+                return state, completed_at
+        if now_fn() >= cutoff:
+            return "timeout", None
+    return "fail", None
 
 
 def _read_scheduler_journal(day: date, now: datetime) -> list[str]:
@@ -153,7 +250,7 @@ def _read_scheduler_journal(day: date, now: datetime) -> list[str]:
         text=True, capture_output=True, timeout=15, check=True,
     )
     # A bounded day window should be small. Refuse truncated or unusual output.
-    if len(result.stdout) > 5_000_000:
+    if len(result.stdout) > _JOURNAL_LIMIT_BYTES:
         raise ValueError("scheduler journal window too large")
     return result.stdout.splitlines()
 
@@ -167,6 +264,29 @@ def _claim_day(day: date) -> bool:
     with os.fdopen(fd, "w", encoding="ascii") as receipt:
         receipt.write(f"{_utc_now().isoformat()} STARTED\n")
     return True
+
+
+def _arm_deadline(day: date, now: datetime) -> None:
+    """SIGALRM at the absolute 10:20 New York deadline (Linux only)."""
+    if sys.platform == "linux":
+        signal.signal(signal.SIGALRM, _hard_stop)
+        signal.setitimer(signal.ITIMER_REAL,
+                         max((_session_deadline(day) - now).total_seconds(), 0.001))
+
+
+def _disarm_deadline() -> None:
+    if sys.platform == "linux":
+        signal.setitimer(signal.ITIMER_REAL, 0)
+
+
+def _record(day: date, line: str) -> None:
+    """Print one outcome line and append it to the day's claim receipt."""
+    print(line, flush=True)
+    try:
+        with (_ATTEMPTS / day.isoformat()).open("a", encoding="ascii", errors="replace") as receipt:
+            receipt.write(f"{_utc_now().isoformat()} {line}\n")
+    except OSError:
+        pass
 
 
 def _activation_identity_ok() -> bool:
@@ -284,35 +404,47 @@ def main() -> int:
         print("GEM_SKIP same-day attempt already recorded", flush=True)
         return 0
     if (day < _FIRST_DAY or day.weekday() >= 5 or not is_market_open(day)
-            or now >= _session_deadline(day)
+            or now >= _latest_start(day)
             or now.astimezone(_NY).date() != day
-            or not time(9, 30) <= now.astimezone(_NY).time() <= time(16, 0)):
-        print("GEM_SKIP date/session/time gate", flush=True)
+            or not _EARLIEST_START_NY <= now.astimezone(_NY).time() <= time(16, 0)):
+        _record(day, "GEM_SKIP date/session/time gate")
         return 0
+    # Absolute containment for the whole run, including the wait.
+    _arm_deadline(day, now)
     try:
-        if not _scheduler_gate(_read_scheduler_journal(day, now), day):
-            print("GEM_SKIP scheduler options journal gate", flush=True)
+        stream = _follow_scheduler_journal(day)
+        try:
+            state, completed_at = _await_scheduler(day, stream, _utc_now)
+        finally:
+            stream.close()  # stop journalctl -f before capturing
+        if state == "timeout":
+            _record(day, "GEM_SKIP scheduler options not complete by latest start 10:05 New York")
             return 0
-    except (OSError, subprocess.SubprocessError, ValueError):
-        print("GEM_SKIP scheduler journal unavailable", flush=True)
+        if state != "pass" or completed_at is None:
+            _record(day, "GEM_SKIP scheduler options journal gate")
+            return 0
+        # Strict confirmation over the whole window up to now: still exactly
+        # one pull, same invocation (no second start or failure since).
+        triggered = _utc_now()
+        if not _scheduler_gate(_read_scheduler_journal(day, triggered), day):
+            _record(day, "GEM_SKIP scheduler options journal gate (confirmation)")
+            return 0
+    except (OSError, subprocess.SubprocessError, ValueError, TimeoutError):
+        _disarm_deadline()
+        _record(day, "GEM_SKIP scheduler journal unavailable")
         return 0
+    _record(day, f"GEM_TRIGGER scheduler_options_complete={completed_at.isoformat()} "
+                 f"lag_s={(triggered - completed_at).total_seconds():.1f}")
 
     from db import get_engine
     from ingestion.options import OptionsPuller
 
     try:
-        # The systemd timeout is a second safety net. This one is absolute,
-        # so a delayed 10:05 New York start cannot run past 10:20 New York.
-        if sys.platform == "linux":
-            remaining = (_session_deadline(day) - _utc_now()).total_seconds()
-            if remaining <= 0:
-                print("GEM_SKIP absolute deadline", flush=True)
-                return 0
-            signal.signal(signal.SIGALRM, _hard_stop)
-            signal.setitimer(signal.ITIMER_REAL, remaining)
+        # SIGALRM (armed before the wait) stops the run at 10:20 New York;
+        # the systemd timeout is a second safety net.
         engine = get_engine()
         if not _append_only_schema_ok(engine):
-            print("GEM_SKIP append-only schema gate", flush=True)
+            _record(day, "GEM_SKIP append-only schema gate")
             return 0
         results = OptionsPuller(db_engine=engine).pull_all(
             tickers=list(GEM_TICKERS), include_catalyst_universe=False,
@@ -321,7 +453,7 @@ def main() -> int:
             capture_source=GEM_CAPTURE_SOURCE,
         )
         if len(results) != len(GEM_TICKERS) or [r.get("ticker") for r in results] != list(GEM_TICKERS):
-            print("GEM_FAILED incomplete result set", flush=True)
+            _record(day, "GEM_FAILED incomplete result set")
             return 1
         passed = []
         with engine.connect() as conn:
@@ -331,16 +463,15 @@ def main() -> int:
                 good = (result.get("status") == "SUCCESS"
                         and _validate_batch(conn, ticker, day, result))
                 passed.append(good)
-                print(f"GEM_VALIDATE {ticker} {'PASS' if good else 'FAIL'} "
-                      f"batch={result.get('capture_batch_id')} "
-                      f"ordinal={result.get('capture_ordinal')}", flush=True)
+                _record(day, f"GEM_VALIDATE {ticker} {'PASS' if good else 'FAIL'} "
+                             f"batch={result.get('capture_batch_id')} "
+                             f"ordinal={result.get('capture_ordinal')}")
         return 0 if all(passed) else 1
     except Exception as exc:  # noqa: BLE001 - process boundary; no secret-bearing text
-        print(f"GEM_FAILED {type(exc).__name__}", flush=True)
+        _record(day, f"GEM_FAILED {type(exc).__name__}")
         return 1
     finally:
-        if sys.platform == "linux":
-            signal.setitimer(signal.ITIMER_REAL, 0)
+        _disarm_deadline()
 
 
 if __name__ == "__main__":

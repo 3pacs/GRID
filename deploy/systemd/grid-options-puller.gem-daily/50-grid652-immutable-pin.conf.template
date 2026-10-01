@@ -15,7 +15,8 @@ ExecStart=/data/grid_v4/venv/bin/python3 /data/grid_v4/grid-options-puller-pins/
 # CONTAIN: always record the terminal result against the same-day claim.
 ExecStopPost=
 ExecStopPost=-/data/grid_v4/venv/bin/python3 /data/grid_v4/grid-options-puller-pins/@PIN_SHA@/scripts/gem_daily_contain.py
-TimeoutStartSec=15min
+# 09:31 arm -> at most 10:20 New York (SIGALRM) = 49 min; 55 min backstop.
+TimeoutStartSec=55min
 TimeoutStopSec=40s
 KillMode=control-group
 SendSIGKILL=yes

@@ -35,7 +35,7 @@ def test_rendered_pin_drop_in_is_immutable_and_contained(tmp_path) -> None:
     assert "Type=oneshot" in lines  # TimeoutStartSec then bounds the whole run
     assert (f"ExecStopPost=-/data/grid_v4/venv/bin/python3 {root}/scripts/gem_daily_contain.py"
             in lines)
-    for setting in ("TimeoutStartSec=15min", "KillMode=control-group", "SendSIGKILL=yes",
+    for setting in ("TimeoutStartSec=55min", "KillMode=control-group", "SendSIGKILL=yes",
                     "NoNewPrivileges=yes"):
         assert setting in lines
     assert "@" not in pin
@@ -50,18 +50,21 @@ def test_quarantine_keeps_manual_start_refused_and_marker_gated(tmp_path) -> Non
                      f"ConditionPathExists={daily._ACTIVATED.as_posix()}"]
 
 
-def test_timer_fires_once_per_weekday_after_scheduler_pull_and_before_deadline(tmp_path) -> None:
+def test_timer_arms_once_per_weekday_inside_session_before_latest_start(tmp_path) -> None:
     render.render(PIN, tmp_path)
     text = (tmp_path / "grid-options-puller.timer.d" / "50-gem-daily.conf").read_text()
     lines = [line for line in text.splitlines() if line and not line.startswith("#")]
     assert lines == ["[Timer]", "OnCalendar=",
-                     "OnCalendar=Mon..Fri *-*-* 10:05:00 America/New_York",
+                     "OnCalendar=Mon..Fri *-*-* 09:31:00 America/New_York",
                      "Persistent=false", "RandomizedDelaySec=0", "AccuracySec=1s"]
     ny = ZoneInfo("America/New_York")
     for day in (date(2026, 10, 1), date(2026, 11, 2)):  # EDT and EST
-        fire = datetime.combine(day, time(10, 5), ny).astimezone(timezone.utc)
-        assert fire.time() >= time(13, 29)
-        assert fire < daily._session_deadline(day)
+        arm = datetime.combine(day, time(9, 31), ny).astimezone(timezone.utc)
+        assert arm.time() >= time(13, 29)  # the scheduler journal window has opened
+        assert arm.astimezone(ny).time() >= daily._EARLIEST_START_NY
+        assert arm < daily._latest_start(day) < daily._session_deadline(day)
+        # The 55 min unit timeout covers the arm-to-deadline span.
+        assert (daily._session_deadline(day) - arm).total_seconds() <= 55 * 60
 
 
 def test_contain_and_runner_share_the_attempts_directory() -> None:
