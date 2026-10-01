@@ -14,34 +14,38 @@ import json
 import traceback
 from loguru import logger as log
 
-# Every first-party (repo-root) import this module needs must be resolvable
-# BEFORE the sys.path fallback further down ever has a chance to run -- see
-# that fallback's own comment, and
-# tests/test_score_oracle_trades_stale_repo_shadow.py (the regression this
-# mirrors: a stale grid_repo checkout on disk must never shadow this repo's
-# real first-party packages just because this module was imported).
+# Fallback for direct execution (``python scripts/run_intelligence_cycles.py``)
+# on a host where this repo's root is not already on sys.path, so the
+# first-party imports just below (``config``, and later the lazily-imported
+# ``intelligence.*`` modules) would otherwise fail. Two guards, both
+# required, and this MUST run before any first-party import is attempted --
+# a guard placed after ``from config import settings`` can never fire: if
+# config were not already importable, that import would already have raised
+# before reaching the guard.
+#
+# * ``find_spec("config") is None`` -- checked without importing anything,
+#   so it reflects whether the repo root is on sys.path *before* we commit
+#   to the hardcoded, potentially-stale fallback path. If it's already
+#   importable (the normal case -- every current invocation already has the
+#   repo root on sys.path), this is false and sys.path is left untouched.
+# * ``__name__ == "__main__"`` -- never mutate sys.path just because this
+#   module was merely imported (e.g. by a test, or by anything re-exporting
+#   its helpers). Combined with the check above, importing this module can
+#   never mutate process-global sys.path, regardless of host.
+#
+# See tests/test_run_intelligence_cycles_stale_repo_shadow.py (mirrors
+# tests/test_score_oracle_trades_stale_repo_shadow.py, written for the
+# identical defect in scripts/score_oracle_trades.py) for the regression
+# proof: unconditionally inserting a hardcoded checkout path here used to
+# mean every mere import of this module, on any host where that directory
+# exists -- including a stale legacy checkout -- mutated sys.path for the
+# rest of the process's lifetime.
+if __name__ == "__main__" and importlib.util.find_spec("config") is None:
+    sys.path.insert(0, "/data/grid_v4/grid_repo")
+
 from sqlalchemy import create_engine
 
 from config import settings
-
-# Fallback for direct execution (``python scripts/run_intelligence_cycles.py``)
-# on a host where this repo's root does not already make `config` (and the
-# rest of the first-party tree) importable. Two guards, both required:
-#
-# * `__name__ == "__main__"` -- never run when the module is merely
-#   imported (e.g. by a test, or by anything that re-exports its helpers).
-#   The imports above already prove the repo resolves correctly for every
-#   first-party module this file needs when that's true.
-# * `importlib.util.find_spec("config") is None` -- even under direct
-#   execution, prefer whatever already makes the repo importable (e.g. via
-#   PYTHONPATH or CWD) over this hardcoded, potentially-stale path.
-#
-# Unconditionally inserting a hardcoded checkout path here previously meant
-# every mere import of this module -- on any host where that directory
-# exists, including a stale legacy checkout -- mutated process-global
-# sys.path for the rest of the process's lifetime.
-if __name__ == "__main__" and importlib.util.find_spec("config") is None:
-    sys.path.insert(0, "/data/grid_v4/grid_repo")
 
 engine = create_engine(settings.DB_URL)
 
