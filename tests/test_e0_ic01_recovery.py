@@ -20,7 +20,8 @@ Per scenario (the headline ``factor_t_garch_exposed`` and ``gaussian_idio``):
 4. at IC 0 the primary trial's Holm rejection rate is at most 0.05 + 3 SE.
 
 The whole file takes ~14 s on ubuntu-latest (the two per-scenario setups are
-computed once and shared). Synthetic outcomes only: the structure is SEC
+computed once and shared); on a contended host with multi-threaded BLAS it can
+take minutes, so set OPENBLAS_NUM_THREADS=1 when running it locally. Synthetic outcomes only: the structure is SEC
 feature geometry; no price, return or IC of any VS1 window is read, and there
 is no DB access.
 """
@@ -55,10 +56,12 @@ MACHINERY_CHANGE = "a machinery change: re-run E0 and get owner sign-off; do not
 #: numpy 2.5.2 / scipy 1.18.1, Python 3.13, and checked on CI's Python 3.11). "holm" / "bh": the
 #: planted primary trial A90|fwd5 selected with the planted sign at IC 0.01 (Holm at the run alpha,
 #: BH at bh_q, over all four declared trials). "null_holm_primary": the primary trial selected by
-#: Holm (any sign) on the IC 0 worlds.
+#: Holm (any sign) on the IC 0 worlds. "p_fingerprint": sum over both IC rows, every world and every
+#: declared trial of p * (PERMS + 1) -- an integer (permutation p-values sit on that grid) that moves
+#: when any p-value moves, even one that crosses no Holm/BH threshold.
 PINNED_HITS = {
-    "factor_t_garch_exposed": {"holm": 16, "bh": 25, "null_holm_primary": 1},
-    "gaussian_idio": {"holm": 36, "bh": 45, "null_holm_primary": 2},
+    "factor_t_garch_exposed": {"holm": 16, "bh": 25, "null_holm_primary": 1, "p_fingerprint": 42296},
+    "gaussian_idio": {"holm": 36, "bh": 45, "null_holm_primary": 2, "p_fingerprint": 41324},
 }
 
 
@@ -101,14 +104,14 @@ def _run(name: str) -> dict:
     return {"scales": scales, "rows": rows, "scored": scored}
 
 
-def _published(name: str) -> dict:
+def _published() -> dict:
     card = json.loads(SCORECARD.read_text(encoding="utf-8"))
     assert card["version"] == "e0-v1" and card["profile"]["name"] == "full"
     return card
 
 
 def _published_row(name: str) -> dict:
-    card = _published(name)
+    card = _published()
     return next(r for r in card["scenarios"][name]["power_curve"] if abs(r["target_ic"] - TARGET_IC) < 1e-12)
 
 
@@ -124,6 +127,9 @@ def _hits(name: str) -> dict:
         return rec["mean_ic"] is not None and np.sign(rec["mean_ic"]) == direction
 
     return {
+        "p_fingerprint": sum(round(rec["p"] * (PERMS + 1))
+                             for key in ("0", f"{TARGET_IC:g}") for sim in run["rows"][key]
+                             for rec in sim["trials"].values()),
         "holm": sum(bool(r["holm"] and right_sign(r)) for r in planted),
         "bh": sum(bool(r["bh"] and right_sign(r)) for r in planted),
         "null_holm_primary": sum(bool(r["holm"]) for r in null),
@@ -142,7 +148,7 @@ def test_realised_ic_recovers_target_on_fresh_worlds(name):
     run = _run(name)
     primary = _structure().primary_trial
     # The calibration is the released one: same pilot worlds, same scale as the e0-v1 scorecard.
-    released = _published(name)["planted_scale_calibration"][name][primary]["scales"][f"{TARGET_IC:g}"]
+    released = _published()["planted_scale_calibration"][name][primary]["scales"][f"{TARGET_IC:g}"]
     assert run["scales"][primary]["scales"][f"{TARGET_IC:g}"] == pytest.approx(released, rel=1e-9), MACHINERY_CHANGE
     row = next(r for r in run["scored"]["power_curve"] if r["target_ic"] == TARGET_IC)
     assert row["sims"] == SIMS
@@ -156,6 +162,10 @@ def test_realised_ic_recovers_target_on_fresh_worlds(name):
 def test_ic01_power_is_pinned(name):
     hits = _hits(name)
     assert hits["planted_sims"] == SIMS and hits["null_sims"] == SIMS
+    # the hand-counted hits are exactly what scorer.score_scenario reports (no drift from the scorer)
+    row = next(r for r in _run(name)["scored"]["power_curve"] if r["target_ic"] == TARGET_IC)
+    assert hits["holm"] == round(row["power_holm_run_alpha"]["rate"] * SIMS)
+    assert hits["bh"] == round(row["power_bh"]["rate"] * SIMS)
     observed = {k: hits[k] for k in PINNED_HITS[name]}
     assert observed == PINNED_HITS[name], (
         f"{name}: E0 hit counts at IC {TARGET_IC} ({SIMS} sims, {PERMS} flips) moved from "
@@ -169,14 +179,15 @@ def test_ic01_power_consistent_with_released_scorecard(name):
     published = _published_row(name)
     p_pub = published["power_holm_run_alpha"]["rate"]
     se_pub = published["power_holm_run_alpha"]["se"]
-    assert published["sims"] == 500 and se_pub == pytest.approx(0.022, abs=0.001)
+    assert published["sims"] == 500 and se_pub == pytest.approx(0.022, abs=0.001)  # the brief's 0.022
     expected = {"factor_t_garch_exposed": 0.414, "gaussian_idio": 0.496}[name]
     assert p_pub == pytest.approx(expected, abs=1e-12)
     rate = _hits(name)["holm"] / SIMS
-    bound = 3 * math.sqrt(p_pub * (1 - p_pub) / SIMS) + 3 * se_pub
+    bound = 3 * math.sqrt(p_pub * (1 - p_pub) / SIMS) + 3 * 0.022
+    # A loose sanity bound: 199 flips (p-grid 0.005) is a little less powerful than the scorecard's 999.
     assert abs(rate - p_pub) <= bound, (
-        f"{name}: Holm power at IC {TARGET_IC} is {rate:.3f} over {SIMS} sims vs the released {p_pub:.3f} "
-        f"(bound {bound:.3f}): E0 v1 no longer reproduces its own scorecard"
+        f"{name}: Holm power at IC {TARGET_IC} is {rate:.3f} over {SIMS} sims at {PERMS} flips vs the released "
+        f"{p_pub:.3f} at 999 flips (bound {bound:.3f}): outside Monte Carlo error of the e0-v1 scorecard"
     )
 
 
