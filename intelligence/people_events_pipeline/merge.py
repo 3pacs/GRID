@@ -199,11 +199,15 @@ def pit_violations(events: pd.DataFrame, observed_at: pd.Timestamp | None = None
     * ``missing_known_at``: should be impossible (adapters drop such rows).
     """
     if events.empty:
-        return {"known_before_event": 0, "known_after_observation": 0, "missing_known_at": 0}
+        return {"known_before_event": 0, "known_before_event_by_channel": {}, "known_after_observation": 0,
+                "missing_known_at": 0}
     start = pd.to_datetime(events["event_date"]).dt.tz_localize("UTC")
     known = pd.to_datetime(events["known_at"], utc=True)
+    early = known < start
     out = {
-        "known_before_event": int((known < start).sum()),
+        "known_before_event": int(early.sum()),
+        "known_before_event_by_channel": {str(k): int(v) for k, v in
+                                          events.loc[early.to_numpy(), "channel"].value_counts().items()},
         "missing_known_at": int(known.isna().sum()),
         "known_after_observation": 0,
     }

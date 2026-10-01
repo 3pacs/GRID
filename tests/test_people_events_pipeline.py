@@ -264,7 +264,18 @@ class TestSignalSourceAdapters:
         assert by_id["quiverquant:gov_contracts:1"] == pd.Timestamp(R.next_session_open_after(date(2026, 5, 2)))
         assert by_id["quiverquant:gov_contracts:2"] == pd.Timestamp(OBSERVED)  # post-fix rows are rewritten
         ev = M.merge_candidates(cands).events
-        assert len(ev) == 1 and ev.loc[0, "event_date"] == date(2026, 4, 1)
+        # Federal fiscal 2026 Q2 = calendar 2026-01-01..2026-03-31.
+        assert len(ev) == 1 and ev.loc[0, "event_date"] == date(2026, 1, 1)
+
+    def test_qq_gov_quarters_are_federal_fiscal(self):
+        assert A.federal_fiscal_quarter(2026, 1) == (date(2025, 10, 1), date(2025, 12, 31))
+        assert A.federal_fiscal_quarter(2026, 4) == (date(2026, 7, 1), date(2026, 9, 30))
+        # The production case the PIT canary caught: FY2026 Q4 first seen 2026-09-11.
+        rec = sig(1, "quiverquant:gov_contracts", "AAPL", "2026-12-31", {"Year": 2026, "Qtr": 4, "Amount": 5e5},
+                  created_at="2026-09-11T05:00:00Z", signal_type="gov_contracts")
+        seen = datetime(2026, 9, 11, 13, 30, tzinfo=UTC)
+        ev = M.merge_candidates(A.from_signal_sources(frame([rec]), seen)[0]).events
+        assert M.pit_violations(ev, pd.Timestamp(seen))["known_before_event"] == 0
 
     def test_fara_is_not_an_issuer_event(self):
         rec = sig(1, "foreign_lobbying", "XLE", "2026-04-01", {"principal_name": "X", "activity_type": "a"},
@@ -557,7 +568,8 @@ class TestLookAheadGates:
     def test_planted_leak_trips_the_pit_invariant(self):
         good = run(form345=[sec_row()]).events
         assert M.pit_violations(good, pd.Timestamp(OBSERVED)) == {
-            "known_before_event": 0, "known_after_observation": 0, "missing_known_at": 0}
+            "known_before_event": 0, "known_before_event_by_channel": {}, "known_after_observation": 0,
+            "missing_known_at": 0}
         leaky = good.copy()
         leaky["known_at"] = pd.to_datetime(leaky["event_date"]).dt.tz_localize("UTC") - pd.Timedelta(seconds=1)
         assert M.pit_violations(leaky)["known_before_event"] == 1
