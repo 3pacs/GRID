@@ -234,7 +234,9 @@ def test_writer_idempotent_and_supersedes(v2):
                                  "FROM people_events ORDER BY id")).fetchall()
         statuses = [r[0] for r in conn.execute(text("SELECT status FROM people_events_runs ORDER BY started_at"))]
     assert len(rows) == 2 and rows[0][2] == rows[1][0] and rows[1][1] == "sm_0000320193"
-    assert rows[1][5] == "high"
+    # The original (filing basis, owner CIK, resolved issuer) is high confidence;
+    # the correction is only first_seen by this run, so it is low.
+    assert rows[0][5] == "high" and rows[1][5] == "low"
     assert statuses == ["SUCCESS", "NO_NEW_ROWS", "SUCCESS"]
     before = read_events(v2, as_of=datetime(2026, 10, 2, tzinfo=UTC))
     after = read_events(v2, as_of=datetime(2026, 10, 7, tzinfo=UTC))
