@@ -101,8 +101,8 @@ def test_no_outcome_dependent_exclusion_and_v1_separation():
     body = g.read_body()
     assert "halted" not in body  # a halt is only a missing auction print
     assert "the only outcome-side code" in body
-    assert "MG1, MG2, SC1, SC2 and DW1 make no decision" in body
-    assert "v1 closure artifact below is proven" in body
+    assert "MG1, MG2, SC1, SC2 and DW1 stay `BLOCKED` until the v1 closure artifact" in body
+    assert "proven on vault `origin/main` (section 10)" in body
     for gate in ("`rules.json` stream registration", "E3 trial ledger"):
         assert gate in body
 
@@ -188,6 +188,9 @@ def test_engine_pin_is_lf_content_of_the_reference_commit(checked, monkeypatch, 
         (lambda f: f["stage0"].update(min_joint_power=0.3), "stage0"),
         (lambda f: f.update(discovery={"select_one_sided_p": 0.2}), "discovery"),
         (lambda f: f["cost"].update(bps_per_side=1.0), "cost"),
+        (lambda f: f["hypotheses"][IDX["MG1"]]["planted_effect"].update(slope_per_sd=0.15), "sign"),
+        (lambda f: f["hypotheses"][IDX["PO1"]].update(direction="negative"), "sign"),
+        (lambda f: f["hypotheses"][IDX["MG3"]]["planted_effect"].update(diff=0.0), "sign"),
     ],
 )
 def test_family_rules_are_enforced(checked, mutate, match):
@@ -309,3 +312,15 @@ def test_close_contract_requires_auction_check():
 @pytest.mark.parametrize("word", ["Market", "Decision", "Separate", "Maybe", "Octane", "Junction"])
 def test_date_pattern_ignores_ordinary_capitalized_words(word):
     assert not g.DATE_LIKE.search(f"{word} rule on the session")
+
+
+def test_final_cleanup_wording_is_binding():
+    body = g.read_body()
+    assert "stays `BLOCKED_PRICE_CONTRACT`; any replacement close source is a new version" in body
+    assert "It is never P0, and it is an input (PO2, RB1) only through receipts created" in body
+    assert "used as an outcome only" not in body
+    assert "line number `log_records` of the v1 log hashes to `log_head_sha256`" in body
+    assert "byte-identical to the quoted stdout or advisory line" in body
+    assert "next NYSE session strictly after it" in body
+    assert "batch completing between 13:30Z and D0 can see the S-1 close" in body
+    assert "ex-dates in the month on or before M-3" in body

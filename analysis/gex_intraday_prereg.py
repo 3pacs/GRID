@@ -33,7 +33,7 @@ from analysis.research_forward_log import ForwardLog, _lines, canonical
 REPO = Path(__file__).resolve().parents[1]
 VERSION = "gex_intraday_v1"
 PREREG_PATH = Path("docs/paper_log/gex-intraday-v1-preregistration.md")
-PREREG_BODY_SHA256 = "384b71afe27d4a218b8e6de69d83e412f0c168daa13defc388b6b0560df44120"
+PREREG_BODY_SHA256 = "f051fb7b89c788e93d279e0c1b8b2492e181878cf59aa4513f99bb7936245df2"
 BODY_START = "<!-- PREREG-BODY-START -->"
 BODY_END = "<!-- PREREG-BODY-END -->"
 
@@ -230,6 +230,9 @@ def validate_family(family: dict) -> dict:
             raise PreregError(f"{hid}: planted effect does not match its Stage-0 model")
         if "base_rate" in planted and not 0 < planted["base_rate"] < 1:
             raise PreregError(f"{hid}: base rate must lie in (0, 1)")
+        effect = next(planted[k] for k in ("net_bps", "slope_per_sd", "diff") if k in planted)
+        if effect == 0 or (effect > 0) != (h["direction"] == "positive"):
+            raise PreregError(f"{hid}: planted effect sign must agree with the registered direction")
         ladder = h["n_holdout_ladder"]
         if (
             not _int(h["n_discovery"])

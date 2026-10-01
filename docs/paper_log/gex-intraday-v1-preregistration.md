@@ -114,7 +114,8 @@ sessions and the session after an unscheduled closure are excluded (`early_close
   changes a logged decision.
 - **Engine spot.** The pinned engine prices gamma at its own verified prior close: the latest
   `spy_close_receipt` available before the batch completed and at most four calendar days old. This
-  is normally the S-2 close, and an earlier close across holidays or missing receipts. It is
+  is normally the S-2 close, and an earlier close across holidays or missing receipts. In winter, a
+  batch completing between 13:30Z and D0 can see the S-1 close receipt and use it instead. It is
   disclosed and kept as the engine's native behavior. Every distance and side in this family uses P0
   instead.
 - **P0 and PM.** P0 = SPY's official close of S-1. PM = a SPY pre-market indication (last trade or
@@ -182,15 +183,17 @@ theoretical fill, no intraday bar print.
   including a halt) is `price_unavailable`; no rule may inspect intraday price behavior to exclude
   a session.
 - **Admitted sources.** C_S, and every close in this family, is the value of the
-  `astrogrid.price_close_receipt` receipt for that session (`spy_close_v1`, unadjusted, verified),
-  used as an outcome only. That receipt is the provider's daily close; it is not certified to be
+  `astrogrid.price_close_receipt` receipt for that session (`spy_close_v1`, unadjusted, verified).
+  It is never P0, and it is an input (PO2, RB1) only through receipts created at or before the
+  decision. That receipt is the provider's daily close; it is not certified to be
   the closing auction print. Opens: none admitted on 2026-10-01. Before any hypothesis can start,
   one independently reviewed check over the same 20 or more sessions must show both that the
   candidate open equals the NYSE Arca official opening auction print and that the `spy_close_v1`
   close equals the official closing auction print. Both must be unadjusted and carry grid-svr
   receipts. Until that check passes, every PC-OC and PC-CC hypothesis is `BLOCKED_PRICE_CONTRACT`
-  or `BLOCKED_INPUT`. If the close check fails, `spy_close_v1` is not admitted and the family
-  waits for a close source that passes it.
+  or `BLOCKED_INPUT`. If the close check fails, `spy_close_v1` is not admitted and the whole family
+  stays `BLOCKED_PRICE_CONTRACT`; any replacement close source is a new version (v2), never a
+  substitution inside v1.
 - **Costs.** E2 cost model `e2-costs-v1`, class `us_equity_etf_large`: 3 bp per side, 6 bp round trip.
   This is the primary cost. A 1 bp-per-side sensitivity (GEX-levels v1's cost) is reported but never
   tested.
@@ -242,9 +245,10 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
   v1 H3's regime claim (fade under LONG_GAMMA, follow under SHORT_GAMMA) with a gap trigger instead
   of a wall. DW1 resembles H3's LONG_GAMMA leg (fade at a call or put wall) without a regime
   condition and with vendor walls.
-- **Session separation.** MG1, MG2, SC1, SC2 and DW1 make no decision on any session up to and
-  including the session on which the v1 closure artifact below is proven on vault `origin/main`.
-  They stay `BLOCKED` until then. Any report of these five cites v1's matching hypothesis, and their
+- **Session separation.** MG1, MG2, SC1, SC2 and DW1 stay `BLOCKED` until the v1 closure artifact
+  below is proven on vault `origin/main` (section 10). The proof date is the America/New_York
+  calendar date of that section 10 proof; the first session on which any of the five may decide is
+  the next NYSE session strictly after it. Any report of these five cites v1's matching hypothesis, and their
   false-pass bounds add to v1's.
 - **v1 closure artifact.** v1 itself writes no terminal record: `evaluate` prints to stdout and
   `status` only prints a stop advisory. Its closure is therefore defined here as one owner-committed
@@ -257,8 +261,14 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
     INTERIM;
   - for `stop`: the owner's stop decision quoting the exact `status` advisory line it relies on.
 
-  It is verified by checking the head hash and count against the v1 log on grid-svr. The proof of
-  when it reached `origin/main` follows section 10. **Absent this artifact, the five stay `BLOCKED`
+  Verification, all of which must hold:
+  - line number `log_records` of the v1 log hashes to `log_head_sha256`, using v1's own convention
+    (`paper_log/gex_levels/storage.py`: SHA-256 of the exact canonical JSON line, the value each
+    next record carries as `prev_sha256`), and the chain of lines 1..`log_records` verifies;
+  - the verifier copies the first `log_records` lines to a scratch directory, re-runs `evaluate`
+    (for `evaluation`) or `status` (for `stop`) on that copy with v1's pinned code, and requires
+    output byte-identical to the quoted stdout or advisory line;
+  - the proof of when the file reached `origin/main` follows section 10. **Absent this artifact, the five stay `BLOCKED`
   permanently; no other route unblocks them.**
 - v1 H2 (wall hold against mirror placebos on 5-minute bars) is not re-tested. DW uses vendor or
   recomputed delayed walls and auction prices only.
@@ -575,7 +585,7 @@ governs and the discrepancy is a defect, fixed only in v2.
       "price_contract": "PC-CC",
       "decision": "D_RB: 15:00 on M-2, the third-to-last NYSE session of the calendar month (M = the last NYSE session of the calendar month)",
       "e2_rule": "e2.direction.v1",
-      "input": "month-to-date total returns of SPY and AGG through the M-3 close, from unadjusted close receipts and declared dividends with ex-dates in the month, every receipt created at or before D_RB",
+      "input": "month-to-date total returns of SPY and AGG through the M-3 close, from unadjusted close receipts and declared dividends with ex-dates in the month on or before M-3, every receipt created at or before D_RB",
       "rule": "if SPY MTD minus AGG MTD >= +0.03, side = -1 from the M-2 close to the M close (rebalancing sale); if <= -0.03, side = +1; else no trade",
       "statistic": "mean net PC-CC return per trade; one-sided t",
       "direction": "positive",
