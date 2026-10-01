@@ -199,7 +199,8 @@ PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
 # ``d`` is known by the end of UTC day ``d``: lag 0 business days. Used only
 # where GRID has no pull by ``as_of`` (every close before 2026-04-09 on griddb
 # was backfilled then); the value is the earliest pulled vintage, as for the
-# macro inputs above.
+# macro inputs above. A wrong early vintage (e.g. a mis-adjusted close, #642)
+# is therefore not repaired by re-pulling: mark it QUARANTINED.
 SPY_CLOSE_LAG = PublicationLag(
     0, "business",
     "US equity close: public at the end of its own session (16:00 ET), i.e. by "
@@ -597,10 +598,11 @@ def _insider_known_rows(rows: list[tuple], as_of: date) -> list[tuple[str, float
     ``(series_id, obs_date)``: the latest vintage pulled by then; otherwise
     the earliest-pulled vintage visible through its filing date (the same
     pulled-else-earliest rule as ``store.observations.read_window_known_at``).
-    A series_id whose visible vintages span more than one source is dropped
-    entirely (fail closed, as ``MixedSourceError``); a source first pulled
-    after ``as_of`` without a visible filing cannot drop a series from a past
-    read.
+    A series_id whose known vintages (every vintage pulled by ``as_of``, or
+    the earliest-pulled ones of a filing-visible date) span more than one
+    source is dropped entirely (fail closed, as ``MixedSourceError``); a
+    second source re-pulling a filing after ``as_of`` cannot drop a series
+    from a past read.
     """
     end = datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc)
     never = datetime.max.replace(tzinfo=timezone.utc)
@@ -620,19 +622,23 @@ def _insider_known_rows(rows: list[tuple], as_of: date) -> list[tuple[str, float
             continue  # not public at as_of
         key = (str(series_id), str(obs_date)[:10])
         groups.setdefault(key, []).append((pulled, pulled_at or never, float(value), source_id))
-        sources.setdefault(key[0], set()).add(source_id)
 
-    out: list[tuple[str, float]] = []
-    for (series_id, _obs), vintages in sorted(groups.items()):
-        if len(sources[series_id]) > 1:
-            continue
+    chosen: dict[tuple[str, str], float] = {}
+    for key, vintages in groups.items():
         proven = [v for v in vintages if v[0]]
         if proven:
-            chosen = max(proven, key=lambda v: (v[1], v[2]))  # latest pulled by as_of
+            pick = max(proven, key=lambda v: (v[1], v[2]))  # latest pulled by as_of
+            known = proven  # every vintage pulled by as_of
         else:
-            chosen = min(vintages, key=lambda v: (v[1], v[2]))  # earliest vintage filed by as_of
-        out.append((series_id, chosen[2]))
-    return out
+            pick = min(vintages, key=lambda v: (v[1], v[2]))  # earliest vintage filed by as_of
+            known = [v for v in vintages if v[1] == pick[1]]  # sources tied at that pull
+        chosen[key] = pick[2]
+        # As in read_window_known_at: only the vintages a past read actually
+        # rests on take part in the mixed-source check, so a second source
+        # re-pulling an already-public filing after as_of cannot drop the series.
+        sources.setdefault(key[0], set()).update(v[3] for v in known)
+
+    return [(sid, value) for (sid, _obs), value in sorted(chosen.items()) if len(sources[sid]) <= 1]
 
 
 def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:

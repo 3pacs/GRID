@@ -200,6 +200,27 @@ def test_mixed_source_is_judged_on_what_was_known_at_as_of(engine):
     assert _sentiment(engine, AS_OF + timedelta(days=5)) == pytest.approx(-1.0)
 
 
+def test_a_second_source_repulling_a_public_filing_later_cannot_drop_the_series(engine):
+    d = AS_OF - timedelta(days=4)
+    filed = AS_OF - timedelta(days=3)
+    _insert(engine, "INSIDER:MIX:x:BUY", d, 100.0, datetime(2025, 6, 7, 6, 0), filed=filed)
+    _insert(engine, "INSIDER:CLEAN:y:SELL", d, 100.0, datetime(2025, 6, 7, 6, 0), filed=filed)
+    before = _sentiment(engine)
+    # The same, already-public filing re-pulled by another source long after as_of.
+    _insert(engine, "INSIDER:MIX:x:BUY", d, 100.0, LATE, filed=filed, src=OTHER_SRC)
+    assert before == pytest.approx(0.0)
+    assert _sentiment(engine) == before
+
+
+def test_backfilled_filing_with_two_sources_tied_at_the_first_pull_fails_closed(engine):
+    d = AS_OF - timedelta(days=4)
+    filed = AS_OF - timedelta(days=3)
+    _insert(engine, "INSIDER:MIX:x:BUY", d, 100.0, LATE, filed=filed)
+    _insert(engine, "INSIDER:MIX:x:BUY", d, 100.0, LATE, filed=filed, src=OTHER_SRC)
+    _insert(engine, "INSIDER:CLEAN:y:SELL", d, 100.0, LATE, filed=filed)
+    assert _sentiment(engine) == pytest.approx(-1.0)
+
+
 def test_a_visible_second_source_excludes_the_series(engine):
     d = AS_OF - timedelta(days=4)
     _insert(engine, "INSIDER:MIX:x:BUY", d, 100.0, datetime(2025, 6, 7, 6, 0))
