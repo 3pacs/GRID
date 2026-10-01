@@ -31,8 +31,14 @@ VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
 PREREG_BODY_SHA256 = "65518ccc61f13d78e784da79b4f7e58d3cd5aaa690452228d65b88b0f1bbd250"
-#: The witnessed v7 terminal STOP head: bound only after the STOP is appended and witnessed.
-V7_STOP_HEAD_SHA256: str | None = None
+#: The witnessed v7 terminal STOP head (3 records; vault main 4456453d, anchor file SHA-256 bd018b11...).
+V7_STOP_HEAD_SHA256: str | None = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
+#: The exact second line of the witnessed v7 anchor file.
+V7_STOP_ANCHOR_LINE = (
+    b'{"head_sha256":"5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4",'
+    b'"prev_anchor_sha256":"1648bfbeebd263d1489a11bf667c9f4656043806bebfe35c17f3084f131dd5a1",'
+    b'"records":3,"run_at":"2026-10-01T00:38:30+00:00"}'
+)
 V7_STOP_RECORDS = v7.STOP_RECORDS
 DISCOVERY_START = "2008-01-01T00:00:00+00:00"
 PROBE_START = "2007-11-02"
@@ -111,7 +117,7 @@ def _v7_anchor_at_tip(repo: Path, tip: str, expected_head: str) -> None:
         last = json.loads(lines[1])
     except ValueError as exc:
         raise PermissionError("v7 STOP anchor is not JSON") from exc
-    if lines[1] != canonical(last) or last.get("records") != V7_STOP_RECORDS \
+    if lines[1] != V7_STOP_ANCHOR_LINE or lines[1] != canonical(last) or last.get("records") != V7_STOP_RECORDS \
             or last.get("head_sha256") != expected_head \
             or last.get("prev_anchor_sha256") != hashlib.sha256(lines[0]).hexdigest():
         raise PermissionError("v7 STOP anchor differs from the verified terminal head")

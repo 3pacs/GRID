@@ -82,12 +82,23 @@ def test_v8_freeze_digest_covers_v8_and_e0_code(tmp_path, monkeypatch):
         v2._check_observed(frozen, {**frozen, "code_file_sha256": changed})
 
 
-def test_v8_is_fail_closed_until_the_v7_stop_head_is_bound(tmp_path):
-    assert v8.V7_STOP_HEAD_SHA256 is None and v8.REGISTERED_RECORD_SHA256 is None
+def test_v8_binds_the_witnessed_v7_stop_and_is_fail_closed_until_registered(tmp_path, monkeypatch):
+    head = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
+    assert v8.V7_STOP_HEAD_SHA256 == head and v8.REGISTERED_RECORD_SHA256 is None
+    line = json.loads(v8.V7_STOP_ANCHOR_LINE)
+    assert line["head_sha256"] == head and line["records"] == 3
+    assert line["prev_anchor_sha256"] == hashlib.sha256(v7.REGISTERED_ANCHOR_LINE).hexdigest()
+    nl = b"\n"
+    assert hashlib.sha256(v7.REGISTERED_ANCHOR_LINE + nl + v8.V7_STOP_ANCHOR_LINE + nl).hexdigest() == (
+        "bd018b11830c0a913c94a29efd9e8fc87dd56d69a3c131ea7b0477dc98f000ec")
+    assert v8.registration_records(NOW, "a" * 40)[1]["parent_terminal_head_sha256"] == head
+    with pytest.raises(PermissionError, match="verified v7 STOP head"):
+        v8.check_census({"tip": "t"}, stop_head_sha256="b" * 64, witness_repo=tmp_path)
+    with pytest.raises(PermissionError, match="not registered"):
+        v8.check_offhost(tmp_path)
+    monkeypatch.setattr(v8, "V7_STOP_HEAD_SHA256", None)
     with pytest.raises(PermissionError, match="not bound"):
         v8.registration_records(NOW, "a" * 40)
-    with pytest.raises(PermissionError, match="not bound"):
-        v8.check_census({"tip": "t"}, stop_head_sha256="b" * 64, witness_repo=tmp_path)
     with pytest.raises(PermissionError, match="not registered"):
         v8.append_stop_status(tmp_path, NOW, power_path=tmp_path / "p.json", decision_ref="x",
                               expected_prev_sha256="c" * 64, witness=None)
