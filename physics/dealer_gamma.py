@@ -158,8 +158,17 @@ class DealerGammaEngine:
         snap_date: date | None = None,
         spot_range_pct: float = 0.15,
         n_points: int = 50,
+        capture_batch_id: str | None = None,
     ) -> dict[str, Any]:
         """Compute the full GEX profile for a ticker.
+
+        By default the chain is the latest complete capture batch for
+        ``ticker``/``snap_date`` (the ``options_snapshots`` view). Passing
+        ``capture_batch_id`` replays that specific registered batch from
+        ``options_snapshots_all`` instead -- e.g. GEM's 10:05 NY batch after a
+        later same-day scheduler capture -- and fails closed (no-data result)
+        unless the batch is registered for exactly that ticker/day and all of
+        its rows are present.
 
         Returns:
             Dictionary with:
@@ -193,7 +202,10 @@ class DealerGammaEngine:
         if snap_date is None:
             snap_date = datetime.now(timezone.utc).date()
 
-        chain = self._load_chain(ticker, snap_date)
+        if capture_batch_id is None:
+            chain = self._load_chain(ticker, snap_date)
+        else:
+            chain = self._load_chain(ticker, snap_date, capture_batch_id=capture_batch_id)
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
@@ -543,26 +555,58 @@ class DealerGammaEngine:
             for p, g in zip(prices, gex_values)
         ]
 
-    def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
+    def _load_chain(
+        self, ticker: str, snap_date: date, *, capture_batch_id: str | None = None,
+    ) -> pd.DataFrame:
         """Load only the requested day's chain; reject mixed or late captures.
 
         Only one fully completed capture is eligible. A legacy or partially
         published chain without ordinal, start, batch, and completion provenance fails
         closed, as do rows mixed with an older writer.
+
+        Default: the ``options_snapshots`` view, i.e. the latest complete
+        registered batch for the ticker/day. ``capture_batch_id``: that exact
+        registered batch from ``options_snapshots_all``; its registered
+        ticker, day, ordinal and row count must all match or nothing loads.
         """
         if not is_market_open(snap_date):
             return pd.DataFrame()
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(text("""
+        params = {"ticker": ticker, "snap_date": snap_date}
+        if capture_batch_id is None:
+            query = text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
                        capture_batch_id, capture_ordinal,
-                       capture_started_at, capture_completed_at, provider_regular_market_at
+                       capture_started_at, capture_completed_at, provider_regular_market_at,
+                       NULL AS registered_row_count
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
-                """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
+                """)
+        else:
+            if not isinstance(capture_batch_id, str) or not capture_batch_id:
+                return pd.DataFrame()
+            params["batch"] = capture_batch_id
+            query = text("""
+                SELECT s.strike, s.opt_type, s.open_interest, s.implied_vol AS implied_volatility,
+                       s.expiry, (s.expiry - :snap_date) AS dte, s.created_at,
+                       s.capture_batch_id, s.capture_ordinal,
+                       s.capture_started_at, s.capture_completed_at,
+                       s.provider_regular_market_at, b.row_count AS registered_row_count
+                FROM options_snapshots_all s
+                JOIN options_capture_batches b
+                  ON b.capture_batch_id = s.capture_batch_id
+                 AND b.capture_ordinal = s.capture_ordinal
+                 AND b.ticker = s.ticker AND b.snap_date = s.snap_date
+                 AND b.capture_started_at = s.capture_started_at
+                 AND b.capture_completed_at = s.capture_completed_at
+                WHERE s.ticker = :ticker AND s.snap_date = :snap_date
+                  AND s.capture_batch_id = :batch
+                ORDER BY s.expiry, s.strike, s.opt_type
+                """)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(query, params).fetchall()
         except SQLAlchemyError:
             # Until the additive migration exists, no old batch earns a
             # guessed source market date.
@@ -570,6 +614,10 @@ class DealerGammaEngine:
 
         if not rows:
             return pd.DataFrame()
+        if capture_batch_id is not None and {row[12] for row in rows} != {len(rows)}:
+            # Replay of an incompletely stored batch never loads.
+            return pd.DataFrame()
+        rows = [tuple(row[:12]) for row in rows]
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}

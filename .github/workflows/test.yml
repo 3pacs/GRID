@@ -161,6 +161,27 @@ jobs:
             exit 1
           fi
 
+      # GEM append-only options capture (options_append_only_20260930):
+      # proves on real PostgreSQL that two same-day capture batches both
+      # survive, the options_snapshots view (every default reader, including
+      # the frozen GEX-levels v1 paper log) shows only the latest complete
+      # batch, UPDATE/DELETE/TRUNCATE are refused, an earlier batch replays
+      # end to end, and downgrade refuses to collapse batches. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: Options append-only capture PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_options_append_only_pg.py -q -rA | tee /tmp/grid-options-append-only-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-options-append-only-pg.txt; then
+            echo "::error::Options append-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # fix/cap-future-dated-reads-20260927: the general "Run tests" step
       # above leaves GRID_TEST_DB_URL unset, so tests/test_future_dated_reads_guard.py
       # would silently skip there. REQUIRE_FUTURE_DATED_READS_PG makes a
