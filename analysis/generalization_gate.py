@@ -8,9 +8,18 @@ route a construct takes to get here is in ``docs/research/generalization-gate-v1
 What it consumes, and what it never does
 ----------------------------------------
 * Inputs are :class:`SectorResult` objects copied from **witnessed terminal**
-  registry records: each carries the sha256 of its terminal record, checked by
-  the injected ``witness_check`` callable (tests stay offline). An unwitnessed
-  input, a missing sector, or a mixed prereg/direction set is ``REFUSED``.
+  registry records: each carries the sha256 of its terminal record. The
+  injected ``witness_check(record_sha256, result)`` (tests stay offline) must
+  confirm both that the record is witnessed and that ``result``'s sealed
+  fields (kind, p, IC series, contributions, forward verdict; see
+  :func:`content_sha256`) are the ones recorded under it, and must return the
+  plain ``True``. The verdict carries every input's ``content_sha256``. An
+  unwitnessed or altered input, a missing sector, or a mixed prereg/direction
+  set is ``REFUSED``.
+* The caller passes ``expected_spec_sha256`` from the construct's prereg; a
+  spec that does not hash to it is ``REFUSED``, so a favourable variant spec
+  cannot be picked after the fact. The verdict also carries the sha256 of this
+  module's source, so an algorithm change cannot hide behind an unchanged spec.
 * Every declared sector must be present and terminal. The gate never runs on a
   subset, so it cannot be used to look at some sectors' outcomes before the
   others are terminal.
@@ -46,18 +55,23 @@ The five conditions (spec :data:`GATE_SPEC_V1`)
 
    Why not "shift each sector's IC series by a random circular offset" (the
    plan's first sketch): a circular shift leaves every sector's mean IC, hence
-   its survival, unchanged, and shifting sectors independently *breaks* the
-   cross-sector alignment, which yields the independence (binomial) null that
-   the correlated worlds show to be anti-conservative. The joint sign-flip is
-   the null that preserves both kinds of dependence; tests 4.1 prove the
-   difference.
+   its survival, unchanged, so that "null" count is degenerate (it always
+   equals the observed count) and calibrates nothing. The joint sign-flip is a
+   null that keeps both within-sector autocorrelation and cross-sector
+   dependence; tests 4.1 show it controls the false-breadth rate where the
+   binomial threshold does not. The null needs at least ``MIN_BLOCKS`` (8)
+   sign blocks on the common grid, else the gate refuses.
 2. **No dominance.**
    * Leave-one-sector-out: for every testable sector j, the equal-weight pooled
      IC of the other testable sectors keeps the pre-registered sign with
      two-sided p < ``loso_alpha`` (0.05). Method ``cluster_t`` (v1): per-date
      pooled ICs (which absorbs same-date cross-sector correlation), with a
-     cluster-robust (CR1) t over blocks of consecutive dates, df = clusters - 1.
-     Method ``sector_bootstrap``: a bootstrap that resamples whole sectors.
+     cluster-robust (CR1) t over blocks of consecutive dates, df = clusters - 1
+     (the clusters are date blocks; pooling per date is what makes it robust to
+     sector co-movement). Method ``sector_bootstrap`` (not used by v1): a
+     percentile bootstrap over whole sectors; with about 10 clusters and no
+     time dependence it is anti-conservative, so a later spec should not pick
+     it without a calibration.
    * Within each surviving sector, the top entity's contribution in the
      pre-registered sign is below ``top_entity_max_share`` (25%) of the
      sector's IC sum. Contributions must add up to the sealed IC sum.
@@ -67,7 +81,8 @@ The five conditions (spec :data:`GATE_SPEC_V1`)
 4. **Coverage honesty.** On the sealed coverage-stable IC series (entity-dates
    with a stable channel-coverage set, GD5 guard), at least the required number
    of surviving sectors still survive (block sign-flip, same sign, p below
-   ``holdout_alpha``).
+   ``holdout_alpha``). That p uses the spec's seed and perms, not the sector's
+   sealed ones, so a sector near p = 0.10 can differ by Monte Carlo noise.
 
 Verdict precedence: ``REFUSED`` > ``INSUFFICIENT_SECTORS`` (breadth or coverage)
 > ``SECTOR_SPECIFIC`` (dominance) > ``FORWARD_PENDING`` >
@@ -85,12 +100,20 @@ import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import asdict, dataclass, field
+from datetime import date
+from pathlib import Path
 
 import numpy as np
 from scipy.stats import binom
 from scipy.stats import t as student_t
 
+from analysis.offline_research_proof import MIN_BLOCKS
 from analysis.panel_insider_density import block_signs, signflip_pvalues
+
+#: sha256 of this module's source (LF-normalized), embedded in every verdict.
+IMPLEMENTATION_SHA256 = hashlib.sha256(
+    Path(__file__).read_bytes().replace(b"\r\n", b"\n")
+).hexdigest()
 
 GATE_VERSION = "generalization-gate-v1"
 SUPPORTED = "FORWARD_SUPPORTED_REVIEW_REQUIRED"  # analysis.research_forward_log.SUPPORTED
@@ -223,6 +246,11 @@ class SectorResult:
     @property
     def testable(self) -> bool:
         return self.terminal_kind == "holdout_result"
+
+
+def content_sha256(result: SectorResult) -> str:
+    """sha256 of every sealed field of a result; what ``witness_check`` binds to its record."""
+    return hashlib.sha256(canonical(asdict(result))).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -433,10 +461,29 @@ def coverage_honesty(results: Sequence[SectorResult], *, alpha: float, perms: in
 # --- input validation ---------------------------------------------------------------
 
 
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _iso_dates_ok(series) -> bool:
+    try:
+        for d, _v in series:
+            if not isinstance(d, str):
+                return False
+            date.fromisoformat(d[:10])
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _check_inputs(
-    results: Sequence[SectorResult], spec: GateSpec, witness_check: Callable[[str], bool]
+    results: Sequence[SectorResult],
+    spec: GateSpec,
+    witness_check: Callable[[str, SectorResult], bool],
 ) -> list[str]:
     reasons = []
+    if any(not isinstance(r, SectorResult) or not isinstance(r.sector, str) for r in results):
+        return ["every input must be a SectorResult with a sector name"]
     sectors = [r.sector for r in results]
     if len(set(sectors)) != len(sectors):
         reasons.append("duplicate sector results")
@@ -448,10 +495,17 @@ def _check_inputs(
         reasons.append(f"undeclared sectors {extra}")
     if len({r.prereg_sha256 for r in results}) > 1:
         reasons.append("results come from different preregistrations")
-    if len({r.direction for r in results}) > 1 or any(r.direction not in (-1, 1) for r in results):
+    if len({r.direction for r in results}) > 1 or any(
+        not _is_int(r.direction) or r.direction not in (-1, 1) for r in results
+    ):
         reasons.append("pre-registered direction must be one sign, +1 or -1, for every sector")
     for r in results:
         tag = r.sector
+        try:
+            content_sha256(r)
+        except (TypeError, ValueError):
+            reasons.append(f"{tag}: sealed fields are not canonical JSON (non-finite or wrong type)")
+            continue
         if r.terminal_kind not in TERMINAL_KINDS:
             reasons.append(f"{tag}: unknown terminal kind {r.terminal_kind!r}")
         if r.terminal_kind == "stop" and r.sector != spec.stop_sector:
@@ -465,13 +519,18 @@ def _check_inputs(
                 reasons.append(f"{tag}: {kind} record sha256 missing or malformed")
                 continue
             try:
-                ok = witness_check(sha) is True
+                ok = witness_check(sha, r) is True
             except Exception as exc:  # noqa: BLE001 - a failing witness is a refusal, never a pass
                 ok = False
                 reasons.append(f"{tag}: witness_check raised {type(exc).__name__}")
             if not ok:
-                reasons.append(f"{tag}: {kind} record {sha[:12]} is not witnessed")
+                reasons.append(
+                    f"{tag}: {kind} record {sha[:12]} is not witnessed with this content"
+                )
         if r.testable:
+            if not _iso_dates_ok(r.ic_series) or not _iso_dates_ok(r.coverage_stable_ic_series):
+                reasons.append(f"{tag}: IC dates must be ISO date strings")
+                continue
             ic = _values(r.ic_series)
             dates = [d for d, _v in r.ic_series]
             if not len(ic) or not np.all(np.isfinite(ic)):
@@ -484,7 +543,7 @@ def _check_inputs(
             p = r.holdout_p_one_sided
             if p is None or not (0 < p <= 1):
                 reasons.append(f"{tag}: holdout one-sided p missing or outside (0, 1]")
-            if not isinstance(r.block, int) or r.block < 1:
+            if not _is_int(r.block) or r.block < 1:
                 reasons.append(f"{tag}: block must be a positive int")
             c = np.asarray([v for _e, v in r.entity_contributions], dtype=float)
             if not len(c) or not np.all(np.isfinite(c)):
@@ -496,11 +555,17 @@ def _check_inputs(
         if r.forward_verdict is not None and r.forward_record_sha256 is None:
             reasons.append(f"{tag}: forward verdict without a forward record sha256")
     if not reasons:
-        _grid_dates, alignment = _grid(results)
+        grid, alignment = _grid(results)
         if alignment < spec.min_grid_alignment:
             reasons.append(
                 f"sector IC series share {alignment:.2f} of their decision dates (< "
                 f"{spec.min_grid_alignment}): the joint null needs a common grid"
+            )
+        blocks = [r.block for r in results if r.testable]
+        if blocks and len(grid) // max(blocks) < MIN_BLOCKS:
+            reasons.append(
+                f"{len(grid)} decision dates in blocks of {max(blocks)} give fewer than "
+                f"{MIN_BLOCKS} sign blocks: the joint null would be degenerate"
             )
     return reasons
 
@@ -512,28 +577,51 @@ def evaluate_gate(
     results: Sequence[SectorResult],
     spec: GateSpec = GATE_SPEC_V1,
     *,
-    witness_check: Callable[[str], bool],
+    witness_check: Callable[[str, SectorResult], bool],
+    expected_spec_sha256: str,
 ) -> GateVerdict:
-    """The generalization verdict over every declared sector's terminal result."""
+    """The generalization verdict over every declared sector's terminal result.
+
+    ``witness_check(record_sha256, result)`` must return the plain ``True`` only
+    when the record is witnessed and ``result``'s sealed content is the one
+    recorded under it. ``expected_spec_sha256`` comes from the construct's
+    prereg; any other spec is refused.
+    """
     spec.validate()
-    results = sorted(results, key=lambda r: r.sector)
+    results = sorted(results, key=lambda r: str(getattr(r, "sector", "")))
+    sha = spec_sha256(spec)
+
+    def _content(r) -> str | None:
+        try:
+            return content_sha256(r)
+        except (TypeError, ValueError):
+            return None
+
     payload: dict = {
         "gate_version": GATE_VERSION,
+        "implementation_sha256": IMPLEMENTATION_SHA256,
         "spec": asdict(spec),
-        "spec_sha256": spec_sha256(spec),
+        "spec_sha256": sha,
+        "expected_spec_sha256": expected_spec_sha256,
         "promotion_allowed": False,
         "inputs": [
             {
-                "sector": r.sector,
-                "terminal_kind": r.terminal_kind,
-                "terminal_record_sha256": r.terminal_record_sha256,
-                "forward_record_sha256": r.forward_record_sha256,
-                "prereg_sha256": r.prereg_sha256,
+                "sector": getattr(r, "sector", None),
+                "terminal_kind": getattr(r, "terminal_kind", None),
+                "terminal_record_sha256": getattr(r, "terminal_record_sha256", None),
+                "forward_record_sha256": getattr(r, "forward_record_sha256", None),
+                "prereg_sha256": getattr(r, "prereg_sha256", None),
+                "content_sha256": _content(r),
             }
             for r in results
         ],
     }
-    refusals = _check_inputs(results, spec, witness_check)
+    refusals = []
+    if expected_spec_sha256 != sha:
+        refusals.append(
+            f"spec sha256 {sha[:12]} is not the prereg's {str(expected_spec_sha256)[:12]}"
+        )
+    refusals += _check_inputs(results, spec, witness_check)
     if refusals:
         payload.update(verdict="REFUSED", reasons=refusals)
         return GateVerdict("REFUSED", tuple(refusals), payload)
@@ -546,7 +634,7 @@ def evaluate_gate(
     k_perm, rates = permutation_threshold(counts, n, spec.breadth_alpha)
     required = max(k_binomial, k_perm)
     survivors = sorted(r.sector for r in counted if survives(r, spec.holdout_alpha))
-    observed = len(survivors)
+    observed = breadth_count(counted, spec.holdout_alpha)
     _grid_dates, alignment = _grid(counted)
     breadth = {
         "branch": "10-sector (v8 STOP)" if stop else "11-sector",

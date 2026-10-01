@@ -29,11 +29,25 @@ DATES = tuple((date(2020, 1, 3) + timedelta(days=28 * i)).isoformat() for i in r
 PREREG = "b" * 64
 TERMINAL = {s: f"{i + 1:064x}" for i, s in enumerate(gg.EQUITY_SECTORS)}
 FORWARD = {s: f"f{i + 1:063x}" for i, s in enumerate(gg.EQUITY_SECTORS)}
-WITNESSED = frozenset(TERMINAL.values()) | frozenset(FORWARD.values())
+#: (record sha, content sha) pairs a registry has sealed; ``witnessed`` binds content to record.
+SEALED: set = set()
+EXP = gg.spec_sha256(FAST)
 
 
-def witnessed(sha: str) -> bool:
-    return sha in WITNESSED
+def seal(r):
+    SEALED.add((r.terminal_record_sha256, gg.content_sha256(r)))
+    if r.forward_record_sha256:
+        SEALED.add((r.forward_record_sha256, gg.content_sha256(r)))
+    return r
+
+
+def witnessed(sha, result) -> bool:
+    return (sha, gg.content_sha256(result)) in SEALED
+
+
+def gate(res, spec=FAST, check=witnessed, expected=None):
+    return gg.evaluate_gate(res, spec, witness_check=check,
+                            expected_spec_sha256=gg.spec_sha256(spec) if expected is None else expected)
 
 
 def exact_series(mean: float, seed: int, sd: float = 0.05) -> np.ndarray:
@@ -45,13 +59,13 @@ def exact_series(mean: float, seed: int, sd: float = 0.05) -> np.ndarray:
 
 def result(sector, ic, *, direction=1, forward=None, contributions=None, coverage=None, kind="holdout_result"):
     if kind != "holdout_result":
-        return gg.SectorResult(sector=sector, terminal_record_sha256=TERMINAL[sector], terminal_kind=kind,
-                               prereg_sha256=PREREG, direction=direction)
+        return seal(gg.SectorResult(sector=sector, terminal_record_sha256=TERMINAL[sector], terminal_kind=kind,
+                                    prereg_sha256=PREREG, direction=direction))
     ic = np.asarray(ic, dtype=float)
     _mean, _two, one = signflip_pvalues(ic, 1, 999, 7, direction)  # the per-sector harness's p
     if contributions is None:
         contributions = [ic.sum() / 20] * 20  # 20 entities, 5% each
-    return gg.SectorResult(
+    return seal(gg.SectorResult(
         sector=sector,
         terminal_record_sha256=TERMINAL[sector],
         terminal_kind=kind,
@@ -64,7 +78,7 @@ def result(sector, ic, *, direction=1, forward=None, contributions=None, coverag
         coverage_stable_ic_series=tuple(zip(DATES, (ic if coverage is None else coverage).tolist())),
         forward_verdict=forward,
         forward_record_sha256=FORWARD[sector] if forward else None,
-    )
+    ))
 
 
 def world(strong=6, mean=0.03, forward=2, **overrides):
@@ -170,14 +184,31 @@ def test_independent_null_worlds_match_the_binomial_chance():
 
 @pytest.mark.parametrize("rho", [0.3, 0.6])
 def test_correlated_null_worlds_permutation_controls_binomial_does_not(rho):
-    binomial, permutation = false_breadth_rates(rho, 700, 2026)
-    assert permutation <= 0.05, (rho, permutation)
-    assert binomial > 0.05, (rho, binomial)
-    assert binomial > permutation
+    worlds = 1200
+    binomial, permutation = false_breadth_rates(rho, worlds, 2026)
+    se = (0.05 * 0.95 / worlds) ** 0.5
+    assert permutation <= 0.05 + 2 * se, (rho, permutation)  # controlled at 0.05 up to MC error
+    assert binomial > 0.05 + 2 * se, (rho, binomial)  # the binomial rule is not
+    assert binomial - permutation > 0.02
+
+
+def test_independent_null_worlds_gate_rule_is_the_binomial_rule():
+    rng = np.random.default_rng(99)
+    ks, hits = [], 0
+    for _ in range(300):
+        ic = null_world(rng, 0.0)
+        p, obs = harness_p(ic)
+        counts = gg.sector_block_permutation_null(null_results(ic, p), 999, FAST.seed, alpha=0.10)
+        k, _ = gg.permutation_threshold(counts, 11, 0.05)
+        ks.append(k)
+        hits += int(((p < 0.10) & (obs > 0)).sum()) >= max(4, k)
+    assert np.mean(np.asarray(ks) <= 4) > 0.9  # no correlation: the permutation threshold is ~4
+    assert hits / 300 <= 0.05
 
 
 def test_independent_circular_shifts_cannot_calibrate_the_count():
-    """Why the plan's circular-offset sketch is not the null: it leaves every mean IC unchanged."""
+    """Documentation: the plan's circular-offset sketch leaves every mean IC (so every survival)
+    unchanged, so its "null" count is degenerate."""
     ic = null_world(np.random.default_rng(1), 0.6)
     rng = np.random.default_rng(2)
     shifted = np.stack([np.roll(row, rng.integers(N)) for row in ic])
@@ -188,17 +219,18 @@ def test_untestable_sectors_never_survive_in_the_null():
     ic = null_world(np.random.default_rng(3), 0.0)
     p, _ = harness_p(ic)
     res = null_results(ic, p)
-    res[1] = gg.SectorResult(sector=res[1].sector, terminal_record_sha256=TERMINAL[res[1].sector],
-                             terminal_kind="stage0_untestable", prereg_sha256=PREREG, direction=1)
+    for i in range(2, 11):  # only two sectors testable
+        res[i] = gg.SectorResult(sector=res[i].sector, terminal_record_sha256=TERMINAL[res[i].sector],
+                                 terminal_kind="stage0_untestable", prereg_sha256=PREREG, direction=1)
     counts = gg.sector_block_permutation_null(res, 999, 5, alpha=0.10)
-    assert counts.max() <= 10
+    assert counts.max() <= 2 and counts.max() >= 1
 
 
 # --- the verdicts --------------------------------------------------------------------
 
 
 def test_general_review_required_when_everything_passes():
-    v = gg.evaluate_gate(world(), FAST, witness_check=witnessed)
+    v = gate(world())
     assert v.verdict == "GENERAL_REVIEW_REQUIRED", v.reasons
     assert v.payload["promotion_allowed"] is False
     assert v.payload["breadth"]["count"] == 6
@@ -209,9 +241,10 @@ def test_general_review_required_when_everything_passes():
 def test_one_sector_driving_everything_fails_loso():
     over = {"Technology": {"ic": exact_series(0.30, 1)}}
     res = world(strong=6, mean=0.02, **over)
-    # the other five non-survivors are exactly as negative as the weak ones are positive
+    # LOSO only fails if the rest pool to ~0: the five non-survivors are exactly as negative
+    # as the five weak survivors are positive, so leaving Technology out leaves a zero mean
     res = [r if i < 6 else result(r.sector, exact_series(-0.02, 200 + i)) for i, r in enumerate(res)]
-    v = gg.evaluate_gate(res, FAST, witness_check=witnessed)
+    v = gate(res)
     assert v.payload["breadth"]["passed"], v.payload["breadth"]
     assert v.verdict == "SECTOR_SPECIFIC", v.reasons
     assert v.payload["dominance"]["loso"]["failed_when_leaving_out"] == ["Technology"]
@@ -224,7 +257,7 @@ def test_one_entity_with_40pct_of_a_sector_fails_top_entity():
     total = ic.sum()
     contributions = [0.40 * total] + [0.60 * total / 19] * 19
     res = world(Technology={"ic": ic, "contributions": contributions})
-    v = gg.evaluate_gate(res, FAST, witness_check=witnessed)
+    v = gate(res)
     assert v.verdict == "SECTOR_SPECIFIC", v.reasons
     assert v.payload["dominance"]["loso"]["passed"]
     assert v.payload["dominance"]["top_entity_share"]["Technology"] == pytest.approx(0.40)
@@ -232,18 +265,18 @@ def test_one_entity_with_40pct_of_a_sector_fails_top_entity():
 
 
 def test_forward_one_is_pending_two_pass():
-    assert gg.evaluate_gate(world(forward=1), FAST, witness_check=witnessed).verdict == "FORWARD_PENDING"
-    assert gg.evaluate_gate(world(forward=0), FAST, witness_check=witnessed).verdict == "FORWARD_PENDING"
-    assert gg.evaluate_gate(world(forward=2), FAST, witness_check=witnessed).verdict == "GENERAL_REVIEW_REQUIRED"
+    assert gate(world(forward=1)).verdict == "FORWARD_PENDING"
+    assert gate(world(forward=0)).verdict == "FORWARD_PENDING"
+    assert gate(world(forward=2)).verdict == "GENERAL_REVIEW_REQUIRED"
     # a SUPPORTED verdict on a non-survivor does not count
     res = world(forward=1)
     res[8] = result(res[8].sector, exact_series(0.0, 108), forward=gg.SUPPORTED)
-    v = gg.evaluate_gate(res, FAST, witness_check=witnessed)
+    v = gate(res)
     assert v.verdict == "FORWARD_PENDING" and v.payload["forward"]["supported"] == [gg.EQUITY_SECTORS[0]]
 
 
 def test_too_few_survivors_is_insufficient():
-    v = gg.evaluate_gate(world(strong=3), FAST, witness_check=witnessed)
+    v = gate(world(strong=3))
     assert v.verdict == "INSUFFICIENT_SECTORS"
     assert v.payload["breadth"]["count"] == 3
 
@@ -251,7 +284,7 @@ def test_too_few_survivors_is_insufficient():
 def test_coverage_artifact_is_insufficient():
     over = {s: {"ic": exact_series(0.03, 100 + i), "coverage": exact_series(0.0, 300 + i)}
             for i, s in enumerate(gg.EQUITY_SECTORS[:6])}
-    v = gg.evaluate_gate(world(**over), FAST, witness_check=witnessed)
+    v = gate(world(**over))
     assert v.verdict == "INSUFFICIENT_SECTORS", v.reasons
     assert v.payload["breadth"]["passed"] and not v.payload["coverage"]["passed"]
 
@@ -259,7 +292,7 @@ def test_coverage_artifact_is_insufficient():
 def test_ten_sector_branch_uses_the_predeclared_values():
     res = world(strong=6, forward=3)
     res[0] = result("Technology", None, kind="stop")  # v8 ended in STOP: 10 counted sectors
-    v = gg.evaluate_gate(res, FAST, witness_check=witnessed)
+    v = gate(res)
     b = v.payload["breadth"]
     assert b["branch"] == "10-sector (v8 STOP)" and b["n_sectors"] == 10
     assert b["required_binomial"] == gg.GATE_SPEC_V1.branch_10_min_survivors == 4
@@ -271,7 +304,7 @@ def test_ten_sector_branch_uses_the_predeclared_values():
 def test_stage0_untestable_sector_is_a_non_survivor():
     res = world(strong=4)
     res[2] = result(res[2].sector, None, kind="stage0_untestable")
-    v = gg.evaluate_gate(res, FAST, witness_check=witnessed)
+    v = gate(res)
     assert v.payload["breadth"]["untestable"] == [gg.EQUITY_SECTORS[2]]
     assert v.payload["breadth"]["n_sectors"] == 11 and v.payload["breadth"]["count"] == 3
     assert v.verdict == "INSUFFICIENT_SECTORS"
@@ -280,8 +313,8 @@ def test_stage0_untestable_sector_is_a_non_survivor():
 # --- 4.4 witness and other refusals ---------------------------------------------------
 
 
-def _refused(res, check=witnessed, spec=FAST):
-    v = gg.evaluate_gate(res, spec, witness_check=check)
+def _refused(res, check=witnessed, spec=FAST, expected=None):
+    v = gate(res, spec, check, expected)
     assert v.verdict == "REFUSED"
     assert v.payload["promotion_allowed"] is False
     return " | ".join(v.reasons)
@@ -289,14 +322,15 @@ def _refused(res, check=witnessed, spec=FAST):
 
 def test_unwitnessed_inputs_are_refused():
     res = world()
-    assert "not witnessed" in _refused(res, check=lambda sha: sha != TERMINAL["Energy"])
-    assert "not witnessed" in _refused(res, check=lambda sha: False)
+    assert "not witnessed" in _refused(res, check=lambda sha, r: sha != TERMINAL["Energy"])
+    assert "not witnessed" in _refused(res, check=lambda sha, r: False)
 
-    def boom(sha):
+    def boom(sha, r):
         raise OSError("vault unreachable")
 
     assert "witness_check raised OSError" in _refused(res, check=boom)
-    assert "not witnessed" in _refused(res, check=lambda sha: "yes")  # only True passes
+    assert "not witnessed" in _refused(res, check=lambda sha, r: "yes")  # only True passes
+    assert "not witnessed" in _refused(res, check=lambda sha, r: np.bool_(True))
     bad = list(res)
     bad[3] = replace(bad[3], terminal_record_sha256="")
     assert "terminal record sha256 missing" in _refused(bad)
@@ -332,24 +366,55 @@ def test_incomplete_or_inconsistent_inputs_are_refused():
     assert "cannot carry holdout statistics" in _refused(held)
     shifted = list(res)
     for i in range(6, 11):
-        shifted[i] = replace(res[i], ic_series=tuple((f"{int(d[:4]) + 20}{d[4:]}", v) for d, v in res[i].ic_series))
+        shifted[i] = seal(replace(res[i], ic_series=tuple((f"{int(d[:4]) + 20}{d[4:]}", v)
+                                                          for d, v in res[i].ic_series)))
     assert "common grid" in _refused(shifted)
+    coarse = [seal(replace(r, block=40)) if r.testable else r for r in res]
+    assert "degenerate" in _refused(coarse)
+    assert "SectorResult with a sector name" in _refused([replace(res[0], sector=None)] + res[1:])
+    assert "direction" in _refused([seal(replace(r, direction=True)) for r in res])
+    bad_dates = list(res)
+    bad_dates[2] = seal(replace(res[2], ic_series=tuple((f"x{d}", v) for d, v in res[2].ic_series)))
+    assert "ISO date" in _refused(bad_dates)
+
+
+def test_altered_content_under_a_witnessed_record_is_refused():
+    res = world()
+    swapped = list(res)
+    swapped[3] = replace(res[3], ic_series=tuple(zip(DATES, exact_series(0.0, 999).tolist())))
+    assert f"{res[3].sector}: terminal record" in _refused(swapped)
+    # relabelling a sector as untestable to drop it from LOSO / the null is refused too
+    relabel = list(res)
+    relabel[8] = gg.SectorResult(sector=res[8].sector, terminal_record_sha256=res[8].terminal_record_sha256,
+                                 terminal_kind="stage0_untestable", prereg_sha256=PREREG, direction=1)
+    assert "not witnessed with this content" in _refused(relabel)
+    v = gate(res)
+    assert [i["content_sha256"] for i in v.payload["inputs"]] == [
+        gg.content_sha256(r) for r in sorted(res, key=lambda r: r.sector)]
+
+
+def test_spec_must_match_the_prereg():
+    res = world()
+    assert "is not the prereg's" in _refused(res, expected=gg.GATE_SPEC_V1_SHA256)  # FAST is not v1
+    variant = replace(gg.GATE_SPEC_V1, seed=1)
+    assert "is not the prereg's" in _refused(res, spec=variant, expected=gg.GATE_SPEC_V1_SHA256)
 
 
 # --- 4.5 determinism ------------------------------------------------------------------
 
 
 def test_verdict_json_is_deterministic_and_carries_the_spec_hash():
-    a = gg.evaluate_gate(world(), FAST, witness_check=witnessed)
-    b = gg.evaluate_gate(list(reversed(world())), FAST, witness_check=witnessed)
+    a = gate(world())
+    b = gate(list(reversed(world())))
     assert a.to_json() == b.to_json()
     assert a.sha256() == b.sha256()
     assert a.payload["spec_sha256"] == gg.spec_sha256(FAST)
     assert b'"spec_sha256":"' + gg.spec_sha256(FAST).encode() + b'"' in a.to_json()
     assert b"NaN" not in a.to_json()
+    assert a.payload["implementation_sha256"] == gg.IMPLEMENTATION_SHA256
 
 
 def test_v1_spec_runs_end_to_end():
-    v = gg.evaluate_gate(world(), witness_check=witnessed)
+    v = gg.evaluate_gate(world(), witness_check=witnessed, expected_spec_sha256=gg.GATE_SPEC_V1_SHA256)
     assert v.payload["spec_sha256"] == gg.GATE_SPEC_V1_SHA256
     assert v.verdict == "GENERAL_REVIEW_REQUIRED", v.reasons
