@@ -18,6 +18,9 @@ Rules (design doc section 2.3):
   ``edgar_native``, ``quiverquant`` ...), not rows: an original Form 4 and its
   amendment repeating the same line are one source. ``n_source_rows`` keeps
   the row count and ``source_refs`` every contributing row.
+* ``near_duplicate`` is a batch-level audit flag computed with hindsight
+  (siblings known later count); it must never be used as a point-in-time
+  filter.
 * Near-duplicates -- events sharing a ``loose_key`` (the dedup key minus its
   size component; stored as the act group) but not a dedup key, and coming
   from more than one filing or record -- are flagged and counted, never
@@ -118,6 +121,19 @@ def merge_candidates(candidates: pd.DataFrame) -> MergeResult:
         events.loc[has, "source_refs"] = pd.Series(refs.reindex(idx[has]).to_list(), index=events.index[has])
         events.loc[has, "sources"] = pd.Series(srcs.reindex(idx[has]).to_list(), index=events.index[has])
         events.loc[has, "co_actor_ids"] = co.reindex(idx[has]).to_numpy()
+        # A flag one source knows and another lacks (the SEC data set carries no
+        # 10b5-1 column) must not be lost to the representative's None: take the
+        # first known value, preferring the most authoritative source.
+        flags = (m.sort_values(keys + ["precedence", "_ref"], kind="mergesort")
+                 .assign(_f=lambda d: d["attrs"].map(lambda a: a.get("is_10b5_1") if isinstance(a, dict) else None))
+                 .dropna(subset=["_f"]).drop_duplicates(keys).set_index(keys)["_f"])
+        if not flags.empty:
+            for pos in [i for i, k in enumerate(idx) if k in flags.index]:
+                row = events.index[pos]
+                attrs = dict(events.at[row, "attrs"] or {})
+                if attrs.get("is_10b5_1") is None:
+                    attrs["is_10b5_1"] = bool(flags.loc[idx[pos]])
+                    events.at[row, "attrs"] = attrs
         conflicts = m.groupby(keys).agg(d=("direction", lambda s: s.dropna().nunique()),
                                         e=("event_date", "nunique"))
     else:

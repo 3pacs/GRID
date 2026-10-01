@@ -53,7 +53,14 @@ import pandas as pd
 from intelligence.people_events_pipeline.rules import STRONG_ACTOR_BASES
 
 OPS = ("insert", "add_sources", "tighten_known_at", "enrich_identity", "supersede", "retract", "actor_conflict",
-       "unchanged")
+       "report_only", "unchanged")
+
+# Channels the dry run reports but no run writes. QuiverQuant's quarterly
+# contract totals are published while the quarter runs and grow: keyed with the
+# amount, every snapshot would stay current and a sum would double count;
+# keyed without it, a later amount would show at an earlier known_at. They
+# stay out of the write path until amounts are versioned (owner decision D13).
+REPORT_ONLY_CHANNELS = frozenset({"gov_contract_qq_aggregate"})
 
 STORED_COLUMNS = ["channel", "dedup_key", "known_at", "known_at_basis", "source_refs", "content_hash",
                   "actor_id", "actor_id_basis", "entity_cik", "superseded_at", "retracted_at"]
@@ -126,8 +133,25 @@ def build_write_plan(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd
     ``stored`` may lack ``content_hash`` (today's schema has none); such rows
     are treated as content-equal so a first run never supersedes legacy rows
     on a hash it cannot compute.
+
+    ``complete_channels`` asserts that ``events`` holds the FULL source scope
+    of those channels (no ``--since`` window, no row limit, no skipped
+    quarter); only then is an absent key a retraction. Never pass it from a
+    windowed or limited read.
     """
     observed_at = _ts(observed_at)
+    report_only = events["channel"].isin(REPORT_ONLY_CHANNELS) if not events.empty else None
+    held = pd.DataFrame()
+    if report_only is not None and report_only.any():
+        held = pd.DataFrame({"op": "report_only", "channel": events.loc[report_only, "channel"].to_numpy(),
+                             "dedup_key": events.loc[report_only, "dedup_key"].to_numpy()})
+        events = events[~report_only.to_numpy()]
+    out = _build(events, stored, observed_at, complete_channels)
+    return pd.concat([out, held], ignore_index=True) if not held.empty else out
+
+
+def _build(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd.Timestamp,
+           complete_channels: Iterable[str]) -> pd.DataFrame:
     if stored.empty:
         # Fast path (a first load, e.g. the GD3 backfill): every event is an insert.
         if events.empty:
@@ -250,7 +274,7 @@ def apply_in_memory(stored: pd.DataFrame, plan: pd.DataFrame, observed_at: pd.Ti
 
     for p in plan.to_dict("records"):
         op = p["op"]
-        if op in ("unchanged", "actor_conflict"):
+        if op in ("unchanged", "actor_conflict", "report_only"):
             continue
         if op == "insert":
             if current(p["channel"], p["dedup_key"]) is not None:

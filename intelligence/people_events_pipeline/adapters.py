@@ -293,7 +293,8 @@ def form4_from_form345(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
 
     owner_text = base["owner_cik"].map(lambda v: R.cik_text(int(v)) if pd.notna(v) else None)
     has_cik = owner_text.notna()
-    direction = base["code"].map(R.FORM4_CODE_DIRECTIONS)
+    direction = base["code"].map(R.FORM4_CODE_DIRECTIONS).astype(object)
+    direction = direction.where(direction.notna(), None)  # M/F/G/J...: no direction, as None not NaN
     size = (base["shares"] * base["price"]).abs().where(base["price"] > 0)
     attrs = pd.Series(
         [
