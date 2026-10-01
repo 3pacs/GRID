@@ -336,6 +336,42 @@ class TestMerge:
         assert echo.tolist() == [None, "f", None]
 
 
+class TestReviewFixes:
+    def test_vendor_time_bound(self):
+        assert R.vendor_time_bound("2026-04-03T21:00:00Z") == datetime(2026, 4, 3, 21, 0, tzinfo=UTC)
+        nso = R.next_session_open_after(date(2026, 4, 3))
+        assert R.vendor_time_bound("2026-04-03 18:00:00") == nso  # naive: zone unknown
+        assert R.vendor_time_bound("2026-04-03") == nso
+        assert R.vendor_time_bound(None) is None
+
+    def test_naive_qq_uploaded_never_precedes_its_day(self):
+        rec = qq_insider(fileDate=None, uploaded="2026-04-02 18:00:00")
+        cands, _ = A.from_signal_sources(frame([rec]), OBSERVED)
+        assert cands.loc[0, "known_at"] == pd.Timestamp(R.next_session_open_after(date(2026, 4, 2)))
+
+    def test_pre_gdfix_native_congress_disclosure_is_not_used(self):
+        rec = sig(1, "congressional", "MSFT", "2026-04-01",
+                  {"disclosure_date": "2026-04-01", "amount_range": "$1,001 - $15,000"},
+                  created_at="2026-05-20T10:00:00Z", source_id="Nancy Pelosi")
+        cands, skips = A.from_signal_sources(frame([rec]), OBSERVED)
+        assert cands.loc[0, "known_at"] == pd.Timestamp("2026-05-20 10:00", tz="UTC")
+        assert skips["congressional:pre_gdfix_disclosure_date_not_used"] == 1
+
+    def test_13f_change_waits_for_the_later_of_both_filings(self):
+        rows = [holding(1, "1001", "X", 100, "2025-12-31", "2026-06-01"),  # Q4 filed late, after Q1
+                holding(2, "1001", "X", 150, "2026-03-31", "2026-05-12")]
+        cands, _ = A.thirteen_f_changes(frame(rows))
+        assert cands.loc[0, "known_at"] == pd.Timestamp(R.next_session_open_after(date(2026, 6, 1)))
+
+    def test_amendment_content_is_never_shown_at_the_original_known_at(self):
+        rows = [sec_row(), sec_row(accession_number="0001214156-26-000009", document_type="4/A", amended=True,
+                                   filing_date="2026-05-20", nonderiv_trans_sk="9", price_per_share=300.0)]
+        ev = run(form345=rows).events
+        assert len(ev) == 1
+        assert ev.loc[0, "document_type"] == "4" and ev.loc[0, "size_usd"] == 200_000.0
+        assert ev.loc[0, "known_at"] == pd.Timestamp("2026-04-04 02:00", tz="UTC")
+
+
 class TestSecurity:
     IDS = pd.DataFrame([
         {"entity_id": "sm_0000320193", "id_scheme": "cik", "id_value": "320193", "valid_from": "2026-09-27",
@@ -385,19 +421,74 @@ class TestWritePlan:
         assert len(after) == 1 and len(after.loc[0, "source_refs"]) == 2
         assert after.loc[0, "known_at"] == pd.Timestamp("2026-04-03 23:00", tz="UTC")
 
+    def _holdings(self, q1_shares):
+        return [holding(1, "1001", "037833100", 100, "2025-12-31", "2026-02-10"),
+                holding(2, "1001", "037833100", q1_shares, "2026-03-31", "2026-05-12")]
+
     def test_content_change_supersedes_with_one_visible_version_at_every_instant(self):
-        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(form345=[sec_row()]),
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(holdings=self._holdings(150)),
                                                                        pd.DataFrame(), OBSERVED), OBSERVED)
         later = OBSERVED + timedelta(days=5)
-        ev = _resolved(form345=[sec_row(price_per_share=250.0)])  # same key, new size_usd
+        ev = _resolved(holdings=self._holdings(175))  # a 13F amendment: same key, new position change
         plan = P.build_write_plan(ev, stored, later)
         assert list(plan["op"]) == ["supersede"]
         after = P.apply_in_memory(stored, plan, later)
         assert len(after) == 2
-        for t in pd.date_range("2026-04-04 03:00", "2026-10-10", freq="12h", tz="UTC"):
-            assert len(P.visible_at(after, t)) == 1
+        grid = pd.date_range("2026-05-13", "2026-10-10", freq="12h", tz="UTC")
+        assert P.max_visible_versions(after, grid) == 1
         assert P.visible_at(after, OBSERVED).iloc[0]["content_hash"] == stored.loc[0, "content_hash"]
         assert P.visible_at(after, later).iloc[0]["content_hash"] == ev.loc[0, "content_hash"]
+        # A fourth pass (same inputs) must not pull the correction back in time.
+        again = P.build_write_plan(ev, after, later + timedelta(days=1))
+        assert set(again["op"]) == {"unchanged"}
+        assert P.max_visible_versions(P.apply_in_memory(after, again, later), grid) == 1
+
+    def test_superseding_version_is_never_tightened_below_its_predecessor(self):
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(holdings=self._holdings(150)),
+                                                                       pd.DataFrame(), OBSERVED), OBSERVED)
+        later = OBSERVED + timedelta(days=5)
+        ev = _resolved(holdings=self._holdings(175))
+        after = P.apply_in_memory(stored, P.build_write_plan(ev, stored, later), later)
+        # Same content, now with an extra source carrying the act's original (early) known_at.
+        extra = ev.copy()
+        extra.at[0, "source_refs"] = list(extra.at[0, "source_refs"]) + ["sec_13f|institutional_holdings:99"]
+        plan = P.build_write_plan(extra, after, later + timedelta(days=1))
+        assert "tighten_known_at" not in set(plan["op"])
+        final = P.apply_in_memory(after, plan, later)
+        assert P.max_visible_versions(final, pd.date_range("2026-05-13", "2026-10-10", freq="6h", tz="UTC")) == 1
+
+    def test_live_feed_first_then_sec_enriches_identity_without_superseding(self):
+        qq = _resolved(signal_sources=[qq_insider(uploaded="2026-04-03T23:00:00Z")])
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(qq, pd.DataFrame(), OBSERVED), OBSERVED)
+        assert stored.loc[0, "actor_id_basis"] == "normalized_name"
+        both = _resolved(form345=[sec_row()], signal_sources=[qq_insider(uploaded="2026-04-03T23:00:00Z")])
+        plan = P.build_write_plan(both, stored, OBSERVED + timedelta(days=90))
+        assert sorted(plan["op"]) == ["add_sources", "enrich_identity"]
+        after = P.apply_in_memory(stored, plan, OBSERVED)
+        assert len(after) == 1 and after.loc[0, "actor_id"] == "0001214156"
+        assert after.loc[0, "known_at"] == pd.Timestamp("2026-04-03 23:00", tz="UTC")
+
+    def test_two_different_owner_ciks_on_one_key_are_a_conflict_not_a_merge(self):
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(form345=[sec_row()]),
+                                                                       pd.DataFrame(), OBSERVED), OBSERVED)
+        other = _resolved(form345=[sec_row(owner_cik="0000000555")])  # same name tokens, another CIK
+        plan = P.build_write_plan(other, stored, OBSERVED)
+        assert list(plan["op"]) == ["actor_conflict"]
+
+    def test_retracted_act_that_reappears_starts_at_the_retraction(self):
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(form345=[sec_row()]),
+                                                                       pd.DataFrame(), OBSERVED), OBSERVED)
+        gone = _resolved(form345=[sec_row(owner_cik="9", owner_name="OTHER PERSON")])
+        retracted = P.apply_in_memory(stored, P.build_write_plan(gone, stored, OBSERVED,
+                                                                 complete_channels=["form4"]), OBSERVED)
+        later = OBSERVED + timedelta(days=3)
+        plan = P.build_write_plan(_resolved(form345=[sec_row()]), retracted, later)
+        key = stored.loc[0, "dedup_key"]
+        row = plan[(plan["op"] == "insert") & (plan["dedup_key"] == key)].iloc[0]
+        assert row["known_at"] == pd.Timestamp(OBSERVED) and row["known_at_basis"] == "first_seen"
+        final = P.apply_in_memory(retracted, plan, later)
+        grid = pd.date_range("2026-04-04 03:00", "2026-10-10", freq="12h", tz="UTC")
+        assert P.max_visible_versions(final, grid) == 1
 
     def test_retract_only_for_complete_scope(self):
         stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(form345=[sec_row()]),
@@ -507,7 +598,8 @@ def test_cli_writes_report_and_refuses_overwrite(tmp_path):
     frame([dict(sec_row(), quarter="2026q2"), dict(sec_row(nonderiv_trans_sk="2", shares=5.0), quarter="2026q2")]) \
         .to_parquet(pq_path)
     out = tmp_path / "report.json"
-    assert cli.main(["--form345", str(pq_path), "--out", str(out), "--observed-at", "2026-10-01T12:00:00+00:00"]) == 0
+    assert cli.main(["--form345", str(pq_path), "--out", str(out), "--observed-at", "2026-10-01T12:00:00Z",
+                     "--allow-past-observed-at"]) == 0
     report = json.loads(out.read_text())
     assert report["mode"] == "dry_run_no_writes"
     assert report["channels"]["form4"]["events"] == 2

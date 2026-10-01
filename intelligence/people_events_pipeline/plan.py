@@ -1,30 +1,41 @@
 """Canonical events vs. rows already stored -> an append-only write plan.
 
-Storage model (design doc section 4; schema in the ``people_events_v2``
-migration): ``people_events`` is append-only. A stored row's descriptive
-content is never edited in place. What a run may do:
+Storage model (design doc section 5; schema in the ``people_events_v2``
+migration): ``people_events`` is append-only. A stored row's content is never
+edited in place. What a run may do:
 
-``insert``            a new act (new ``(channel, dedup_key)``).
+``insert``            a new act (no current row for ``(channel, dedup_key)``).
 ``add_sources``       another source row describing an act already stored:
                       ``source_refs``/``n_sources`` grow. Content unchanged.
 ``tighten_known_at``  a new source gives an *earlier* valid upper bound for an
-                      act already stored. known_at only ever moves earlier
-                      (the minimum of valid bounds is a valid bound); the old
-                      value goes to the revision log.
+                      act already stored. known_at only ever moves earlier.
+``enrich_identity``   a stronger identity for the same act (a name-keyed actor
+                      now known by CIK, an issuer CIK now known). Content and
+                      known_at unchanged.
 ``supersede``         the same key now describes different content (a source
                       corrected the act). The stored row gets
                       ``superseded_at = observed_at`` and a new version row is
                       inserted with ``known_at = observed_at`` (basis
-                      ``first_seen``): the corrected content was not knowable
-                      to GRID before this run, and exactly one version is
-                      visible at any ``as_of``.
+                      ``first_seen``).
 ``retract``           the act vanished from a source scope that was scanned
                       in full (``complete_channels``). ``retracted_at =
                       observed_at``; the row stays.
+``actor_conflict``    the same key now names a *different* strongly-identified
+                      actor (two owner CIKs). Nothing is written; counted for
+                      review.
 ``unchanged``         nothing to do -- the idempotency case.
 
-Running the same plan twice gives only ``unchanged`` the second time
-(``tests/test_people_events_pipeline.py`` proves it with ``apply_in_memory``).
+The version floor (the one-visible-version invariant)
+------------------------------------------------------
+For a key with earlier versions (superseded or retracted), no current row may
+become visible before the last of those ended:
+``floor = max(superseded_at, retracted_at)`` over the key's non-current rows.
+``insert`` (a re-appearing act) and ``tighten_known_at`` (a superseding
+version later matched by an earlier source) are clamped to the floor, so at
+every ``as_of`` at most one version of an act is visible. The database
+enforces the same rule by trigger (``people_events_v2``).
+
+Running the same plan twice gives only ``unchanged`` the second time.
 
 A materializer *rule* change that alters content is not a supersession: it
 bumps ``rules.KEY_VERSION`` (a new key namespace) and is rebuilt side by side,
@@ -33,23 +44,25 @@ so history built under the old rules stays reproducible.
 
 from __future__ import annotations
 
+import json
 from collections import Counter
 from typing import Any, Iterable
 
 import pandas as pd
 
-OPS = ("insert", "add_sources", "tighten_known_at", "supersede", "retract", "unchanged")
+from intelligence.people_events_pipeline.rules import STRONG_ACTOR_BASES
+
+OPS = ("insert", "add_sources", "tighten_known_at", "enrich_identity", "supersede", "retract", "actor_conflict",
+       "unchanged")
 
 STORED_COLUMNS = ["channel", "dedup_key", "known_at", "known_at_basis", "source_refs", "content_hash",
-                  "superseded_at", "retracted_at"]
+                  "actor_id", "actor_id_basis", "entity_cik", "superseded_at", "retracted_at"]
 
 
 def _refs(value: Any) -> frozenset[str]:
     if value is None or (isinstance(value, float) and pd.isna(value)):
         return frozenset()
     if isinstance(value, str):
-        import json
-
         try:
             value = json.loads(value)
         except ValueError:
@@ -63,15 +76,47 @@ def _refs(value: Any) -> frozenset[str]:
     return frozenset(out)
 
 
+def _ts(value: Any) -> pd.Timestamp | None:
+    if value is None or (not isinstance(value, (list, tuple)) and pd.isna(value)):
+        return None
+    t = pd.Timestamp(value)
+    return t.tz_localize("UTC") if t.tzinfo is None else t.tz_convert("UTC")
+
+
+def _normalize(stored: pd.DataFrame) -> pd.DataFrame:
+    s = stored.copy()
+    for col in STORED_COLUMNS:
+        if col not in s.columns:
+            s[col] = None
+    return s
+
+
 def current_rows(stored: pd.DataFrame) -> pd.DataFrame:
-    """The visible version of every key: not superseded, not retracted."""
+    """The current version of every key: not superseded, not retracted."""
     if stored.empty:
         return stored
-    s = stored
-    for col in ("superseded_at", "retracted_at"):
-        if col not in s.columns:
-            s = s.assign(**{col: pd.NaT})
+    s = _normalize(stored)
     return s[s["superseded_at"].isna() & s["retracted_at"].isna()]
+
+
+def version_floors(stored: pd.DataFrame) -> dict[tuple[str, str], pd.Timestamp]:
+    """Per key, the instant its last non-current version stopped being visible."""
+    if stored.empty:
+        return {}
+    s = _normalize(stored)
+    floors: dict[tuple[str, str], pd.Timestamp] = {}
+    for r in s.to_dict("records"):
+        ends = [t for t in (_ts(r["superseded_at"]), _ts(r["retracted_at"])) if t is not None]
+        if not ends:
+            continue
+        key = (r["channel"], r["dedup_key"])
+        end = max(ends)
+        floors[key] = max(floors.get(key, end), end)
+    return floors
+
+
+def _strong(basis: Any) -> bool:
+    return isinstance(basis, str) and basis in STRONG_ACTOR_BASES
 
 
 def build_write_plan(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd.Timestamp,
@@ -82,7 +127,7 @@ def build_write_plan(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd
     are treated as content-equal so a first run never supersedes legacy rows
     on a hash it cannot compute.
     """
-    observed_at = pd.Timestamp(observed_at)
+    observed_at = _ts(observed_at)
     if stored.empty:
         # Fast path (a first load, e.g. the GD3 backfill): every event is an insert.
         if events.empty:
@@ -92,45 +137,67 @@ def build_write_plan(events: pd.DataFrame, stored: pd.DataFrame, observed_at: pd
             "known_at": events["known_at"].to_numpy(), "known_at_basis": events["known_at_basis"].to_numpy(),
             "content_hash": events["content_hash"].to_numpy(),
             "source_refs": [sorted(set(r)) for r in events["source_refs"]], "prev_known_at": None,
+            "actor_id": events["actor_id"].to_numpy(), "actor_id_basis": events["actor_id_basis"].to_numpy(),
+            "entity_cik": events["entity_cik"].to_numpy(),
         })
-    cur = current_rows(stored)
-    cur_by_key = {(r["channel"], r["dedup_key"]): r for r in cur.to_dict("records")}
+    cur_by_key = {(r["channel"], r["dedup_key"]): r for r in current_rows(stored).to_dict("records")}
+    floors = version_floors(stored)
     plan: list[dict[str, Any]] = []
     seen: set[tuple[str, str]] = set()
     for ev in events.to_dict("records"):
         key = (ev["channel"], ev["dedup_key"])
         seen.add(key)
         new_refs = frozenset(ev["source_refs"])
+        ev_known = _ts(ev["known_at"])
+        floor = floors.get(key)
         old = cur_by_key.get(key)
         if old is None:
-            plan.append({"op": "insert", "channel": key[0], "dedup_key": key[1], "known_at": ev["known_at"],
-                         "known_at_basis": ev["known_at_basis"], "content_hash": ev["content_hash"],
-                         "source_refs": sorted(new_refs), "prev_known_at": None})
+            known, basis = ev_known, ev["known_at_basis"]
+            if floor is not None and known < floor:
+                known, basis = floor, "first_seen"  # a re-appearing act is new to readers from the floor on
+            plan.append({"op": "insert", "channel": key[0], "dedup_key": key[1], "known_at": known,
+                         "known_at_basis": basis, "content_hash": ev["content_hash"],
+                         "source_refs": sorted(new_refs), "prev_known_at": None,
+                         "act_known_at": ev_known if known != ev_known else None,
+                         "actor_id": ev.get("actor_id"), "actor_id_basis": ev.get("actor_id_basis"),
+                         "entity_cik": ev.get("entity_cik")})
+            continue
+        if _strong(old.get("actor_id_basis")) and _strong(ev.get("actor_id_basis")) \
+                and str(old.get("actor_id")) != str(ev.get("actor_id")):
+            plan.append({"op": "actor_conflict", "channel": key[0], "dedup_key": key[1],
+                         "stored_actor_id": old.get("actor_id"), "new_actor_id": ev.get("actor_id")})
             continue
         old_hash = old.get("content_hash")
         if isinstance(old_hash, str) and old_hash and old_hash != ev["content_hash"]:
             plan.append({"op": "supersede", "channel": key[0], "dedup_key": key[1], "known_at": observed_at,
                          "known_at_basis": "first_seen", "content_hash": ev["content_hash"],
                          "source_refs": sorted(new_refs | _refs(old.get("source_refs"))),
-                         "prev_known_at": old["known_at"], "act_known_at": ev["known_at"]})
+                         "prev_known_at": old["known_at"], "act_known_at": ev_known,
+                         "actor_id": ev.get("actor_id"), "actor_id_basis": ev.get("actor_id_basis"),
+                         "entity_cik": ev.get("entity_cik")})
             continue
         old_refs = _refs(old.get("source_refs"))
-        old_known = pd.Timestamp(old["known_at"])
+        old_known = _ts(old["known_at"])
+        target = min(ev_known, old_known)
+        if floor is not None:
+            target = max(target, floor)
         ops = []
-        if pd.Timestamp(ev["known_at"]) < old_known:
+        if target < old_known:
             ops.append("tighten_known_at")
         if not new_refs <= old_refs:
             ops.append("add_sources")
+        if not _strong(old.get("actor_id_basis")) and _strong(ev.get("actor_id_basis")):
+            ops.append("enrich_identity")
         if not ops:
             plan.append({"op": "unchanged", "channel": key[0], "dedup_key": key[1]})
             continue
         for op in ops:
             plan.append({
-                "op": op, "channel": key[0], "dedup_key": key[1],
-                "known_at": min(pd.Timestamp(ev["known_at"]), old_known),
+                "op": op, "channel": key[0], "dedup_key": key[1], "known_at": target,
                 "known_at_basis": ev["known_at_basis"] if op == "tighten_known_at" else old["known_at_basis"],
                 "content_hash": ev["content_hash"], "source_refs": sorted(new_refs | old_refs),
-                "prev_known_at": old_known,
+                "prev_known_at": old_known, "actor_id": ev.get("actor_id"),
+                "actor_id_basis": ev.get("actor_id_basis"), "entity_cik": ev.get("entity_cik"),
             })
     complete = set(complete_channels)
     for key, old in sorted(cur_by_key.items()):
@@ -159,42 +226,52 @@ def apply_in_memory(stored: pd.DataFrame, plan: pd.DataFrame, observed_at: pd.Ti
     and mirrored statement-for-statement by the writer that ships with the
     migration.
     """
-    observed_at = pd.Timestamp(observed_at)
-    rows = [] if stored.empty else stored.to_dict("records")
-    for r in rows:
-        r.setdefault("superseded_at", pd.NaT)
-        r.setdefault("retracted_at", pd.NaT)
+    observed_at = _ts(observed_at)
+    rows = [] if stored.empty else _normalize(stored).to_dict("records")
 
     def current(channel: str, key: str) -> dict[str, Any] | None:
         for r in rows:
-            if r["channel"] == channel and r["dedup_key"] == key and pd.isna(r["superseded_at"]) \
-                    and pd.isna(r["retracted_at"]):
+            if r["channel"] == channel and r["dedup_key"] == key and _ts(r["superseded_at"]) is None \
+                    and _ts(r["retracted_at"]) is None:
                 return r
         return None
 
+    def new_row(p: dict[str, Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
+        row = {"channel": p["channel"], "dedup_key": p["dedup_key"], "known_at": p["known_at"],
+               "known_at_basis": p["known_at_basis"], "source_refs": list(p["source_refs"]),
+               "content_hash": p["content_hash"], "actor_id": p.get("actor_id"),
+               "actor_id_basis": p.get("actor_id_basis"), "entity_cik": p.get("entity_cik"),
+               "superseded_at": None, "retracted_at": None}
+        row.update(extra or {})
+        return row
+
     for p in plan.to_dict("records"):
         op = p["op"]
-        if op == "unchanged":
+        if op in ("unchanged", "actor_conflict"):
             continue
         if op == "insert":
-            rows.append({"channel": p["channel"], "dedup_key": p["dedup_key"], "known_at": p["known_at"],
-                         "known_at_basis": p["known_at_basis"], "source_refs": list(p["source_refs"]),
-                         "content_hash": p["content_hash"], "superseded_at": pd.NaT, "retracted_at": pd.NaT})
+            if current(p["channel"], p["dedup_key"]) is not None:
+                raise ValueError("insert for a key that already has a current row")
+            rows.append(new_row(p))
             continue
         cur = current(p["channel"], p["dedup_key"])
         if cur is None:
             raise ValueError(f"plan op {op} for a key with no current row: {p['channel']} {p['dedup_key']}")
         if op == "supersede":
             cur["superseded_at"] = observed_at
-            rows.append({"channel": p["channel"], "dedup_key": p["dedup_key"], "known_at": p["known_at"],
-                         "known_at_basis": p["known_at_basis"], "source_refs": list(p["source_refs"]),
-                         "content_hash": p["content_hash"], "superseded_at": pd.NaT, "retracted_at": pd.NaT})
+            rows.append(new_row(p))
         elif op == "tighten_known_at":
-            if pd.Timestamp(p["known_at"]) > pd.Timestamp(cur["known_at"]):
+            if _ts(p["known_at"]) > _ts(cur["known_at"]):
                 raise ValueError("known_at may only move earlier")
             cur["known_at"], cur["known_at_basis"] = p["known_at"], p["known_at_basis"]
         elif op == "add_sources":
             cur["source_refs"] = sorted(set(cur["source_refs"]) | set(p["source_refs"]))
+        elif op == "enrich_identity":
+            if _strong(cur.get("actor_id_basis")):
+                raise ValueError("identity is already strong")
+            cur["actor_id"], cur["actor_id_basis"] = p["actor_id"], p["actor_id_basis"]
+            if cur.get("entity_cik") is None or pd.isna(cur.get("entity_cik")):
+                cur["entity_cik"] = p.get("entity_cik")
         elif op == "retract":
             cur["retracted_at"] = observed_at
     return pd.DataFrame(rows)
@@ -209,9 +286,20 @@ def visible_at(stored: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
     """
     if stored.empty:
         return stored
-    as_of = pd.Timestamp(as_of)
-    known = pd.to_datetime(stored["known_at"], utc=True)
-    sup = pd.to_datetime(stored.get("superseded_at"), utc=True)
-    ret = pd.to_datetime(stored.get("retracted_at"), utc=True)
+    s = _normalize(stored)
+    as_of = _ts(as_of)
+    known = pd.to_datetime(s["known_at"], utc=True)
+    sup = pd.to_datetime(s["superseded_at"], utc=True)
+    ret = pd.to_datetime(s["retracted_at"], utc=True)
     mask = (known <= as_of) & (sup.isna() | (sup > as_of)) & (ret.isna() | (ret > as_of))
     return stored[mask.to_numpy()]
+
+
+def max_visible_versions(stored: pd.DataFrame, instants: Iterable[pd.Timestamp]) -> int:
+    """The largest number of versions of any one act visible at any of ``instants`` (must be <= 1)."""
+    worst = 0
+    for t in instants:
+        v = visible_at(stored, t)
+        if not v.empty:
+            worst = max(worst, int(v.groupby(["channel", "dedup_key"]).size().max()))
+    return worst

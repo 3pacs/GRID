@@ -389,7 +389,7 @@ def form4_from_qq_insider(frame: pd.DataFrame, spec: SourceSpec, observed_at: da
             continue
         bound = _min_bound([
             (R.section16_filing_known_at(filed) if filed else None, "filing"),
-            (R.to_utc(R.first_present(p, _QQ_UPLOADED)), "first_seen"),
+            (R.vendor_time_bound(R.first_present(p, _QQ_UPLOADED)), "first_seen"),
             _observed(spec, observed_at),
         ])
         if bound is None:
@@ -516,9 +516,9 @@ def congress_from_qq(frame: pd.DataFrame, spec: SourceSpec, observed_at: datetim
         if disclosed is not None and disclosed < traded:
             disclosed = None
             skips[f"{spec.source_type}:disclosure_before_trade_ignored"] += 1
-        modified = R.to_utc(R.first_present(p, _QQ_LAST_MODIFIED))
-        if modified is not None and modified.date() < traded:
-            modified = None
+        raw_modified = R.first_present(p, _QQ_LAST_MODIFIED)
+        modified_day = R.parse_date(raw_modified)
+        modified = R.vendor_time_bound(raw_modified) if modified_day is not None and modified_day >= traded else None
         bound = _min_bound([
             (R.next_session_open_after(disclosed) if disclosed else None, "filing"),
             (modified, "qq_last_modified"),
@@ -554,10 +554,17 @@ def congress_from_native(frame: pd.DataFrame, spec: SourceSpec, observed_at: dat
         if traded is None or ticker is None or not member:
             skips[f"{spec.source_type}:missing_date_ticker_or_member"] += 1
             continue
-        disclosed = R.parse_date(p.get("disclosure_date")) if p.get("disclosure_basis", "reported") == "reported" else None
-        if p.get("disclosure_basis") == "statutory_bound":
+        # Only an explicit ``reported`` basis is a disclosure date. Rows written
+        # before GD-FIX (#694) carry no basis and stored the *transaction*
+        # date as the disclosure date ("lag 0 is not real"), so a missing
+        # basis means "no disclosure date", not "reported".
+        basis = p.get("disclosure_basis")
+        disclosed = R.parse_date(p.get("disclosure_date")) if basis == "reported" else None
+        if basis == "statutory_bound":
             skips[f"{spec.source_type}:statutory_bound_not_used"] += 1
-        if disclosed is not None and disclosed < traded:
+        elif basis is None and p.get("disclosure_date"):
+            skips[f"{spec.source_type}:pre_gdfix_disclosure_date_not_used"] += 1
+        if disclosed is not None and disclosed <= traded:
             disclosed = None
         bound = _min_bound([
             (R.next_session_open_after(disclosed) if disclosed else None, "filing"),
@@ -850,7 +857,9 @@ def thirteen_f_changes(holdings: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
             if (q - prev_q).days > MAX_QUARTER_GAP_DAYS:
                 skips[f"{src}:non_consecutive_quarter"] += int(len(cur))
                 continue
-            known = R.next_session_open_after(filed_by_q[q])
+            # A change compares two filings; it is knowable only once BOTH are
+            # public (the earlier one can be late, or amended in place).
+            known = R.next_session_open_after(max(filed_by_q[q], filed_by_q[prev_q]))
             for security in sorted(set(cur.index) | set(prev.index)):
                 now_sh = float(cur.loc[security, "shares"]) if security in cur.index else 0.0
                 was_sh = float(prev.loc[security, "shares"]) if security in prev.index else 0.0
