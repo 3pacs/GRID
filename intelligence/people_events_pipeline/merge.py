@@ -124,7 +124,7 @@ def merge_candidates(candidates: pd.DataFrame) -> MergeResult:
         # A flag one source knows and another lacks (the SEC data set carries no
         # 10b5-1 column) must not be lost to the representative's None: take the
         # first known value, preferring the most authoritative source.
-        flags = (m.sort_values(keys + ["precedence", "_ref"], kind="mergesort")
+        flags = (m.sort_values(keys + ["_amend", "precedence", "_ref"], kind="mergesort")
                  .assign(_f=lambda d: d["attrs"].map(lambda a: a.get("is_10b5_1") if isinstance(a, dict) else None))
                  .dropna(subset=["_f"]).drop_duplicates(keys).set_index(keys)["_f"])
         if not flags.empty:
