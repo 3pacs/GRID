@@ -33,7 +33,7 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
 
 **Timing margin.** In EDT, 10:05 New York is 14:05Z. On 2026-09-30 the scheduler's 13:30Z options pull completed at 13:57Z, so the margin is about 8 minutes. If the scheduler pull is still running at 14:05Z, the gate skips. The day's single claim is then used up and that day has no GEM batch. This fails closed. In EST the timer fires at 15:05Z, which leaves an hour.
 
-**Quarantine marker change.** Installing `99-grid652-quarantine.conf` deliberately replaces the GRID-652 forensics `activation-held` condition with the GEM daily marker. That marker is created **root-owned** (below), so the `grid` service account cannot activate itself.
+**Quarantine marker change.** Installing `99-grid652-quarantine.conf` deliberately replaces the GRID-652 forensics `activation-held` condition with the GEM daily marker. That marker is created **root-owned** (below). Its directory belongs to `grid`, so the service account could still delete the marker, which is fail-safe because it deactivates. Activation also needs the timer enabled, which only root can do.
 
 ## Pin (after the append-only code is merged and deployed)
 
