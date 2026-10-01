@@ -26,29 +26,36 @@ The runner is `scripts/gem_daily_capture.py`. Every gate fails closed.
    - the provider quote time is on the session day;
    - the capture falls inside the New York session.
 7. **CONTAIN.**
-   - `TimeoutStartSec=15min` and `KillMode=control-group`.
+   - `Type=oneshot` with `TimeoutStartSec=15min`, so the timeout bounds the whole run, plus `KillMode=control-group`. The runner's own SIGALRM stops at 10:20 New York.
    - `ExecStopPost=-…/gem_daily_contain.py` appends `CONTAINED result=… status=…` to the day's claim receipt, whatever the outcome.
    - The timer uses `Persistent=false`, so there are no catch-up runs.
    - The quarantine drop-in keeps `RefuseManualStart=yes`.
+
+**Timing margin.** In EDT, 10:05 New York is 14:05Z. On 2026-09-30 the scheduler's 13:30Z options pull completed at 13:57Z, so the margin is about 8 minutes. If the scheduler pull is still running at 14:05Z, the gate skips. The day's single claim is then used up and that day has no GEM batch. This fails closed. In EST the timer fires at 15:05Z, which leaves an hour.
+
+**Quarantine marker change.** Installing `99-grid652-quarantine.conf` deliberately replaces the GRID-652 forensics `activation-held` condition with the GEM daily marker. That marker is created **root-owned** (below), so the `grid` service account cannot activate itself.
 
 ## Pin (after the append-only code is merged and deployed)
 
 ```bash
 PIN=<40-hex main SHA containing this directory>
-sudo -u grid git clone --quiet /data/grid_v4/grid_release.releases/$PIN /data/grid_v4/grid-options-puller-pins/$PIN
-sudo -u grid git -C /data/grid_v4/grid-options-puller-pins/$PIN checkout --quiet --detach $PIN
-test "$(git -C /data/grid_v4/grid-options-puller-pins/$PIN rev-parse HEAD)" = "$PIN"
-test -z "$(git -C /data/grid_v4/grid-options-puller-pins/$PIN status --porcelain --untracked-files=all)"
-git -C /data/grid_v4/grid-options-puller-pins/$PIN merge-base --is-ancestor 01b19194 $PIN
+P=/data/grid_v4/grid-options-puller-pins/$PIN
+sudo -u grid git clone --quiet /data/grid_v4/grid_release.releases/$PIN "$P"
+sudo -u grid git -C "$P" checkout --quiet --detach $PIN
+test "$(sudo -u grid git -C "$P" rev-parse HEAD)" = "$PIN"
+test -z "$(sudo -u grid git -C "$P" status --porcelain --untracked-files=all)"
+sudo -u grid git -C "$P" merge-base --is-ancestor 01b19194 $PIN
 ```
 
 ## Render and install (no activation yet)
 
 ```bash
-cd /data/grid_v4/grid-options-puller-pins/$PIN
-OUT=/data/grid_v4/grid-options-puller-pins/gem-daily-units-$PIN
-/data/grid_v4/venv/bin/python3 scripts/render_gem_daily_units.py $PIN $OUT
-# back up the current drop-ins first, then:
+OUT=/data/grid_v4/grid-options-puller-pins/gem-daily-units-$PIN   # sibling of the pin, never inside it
+sudo -u grid /data/grid_v4/venv/bin/python3 "$P/scripts/render_gem_daily_units.py" $PIN $OUT
+systemctl is-enabled grid-options-puller.timer; systemctl is-active grid-options-puller.timer   # expect disabled / inactive
+BK=/home/grid/backups/gem_daily_units_$(date -u +%Y%m%dT%H%M%SZ); sudo install -d -m 0700 "$BK"
+sudo cp -a /etc/systemd/system/grid-options-puller.service.d /etc/systemd/system/grid-options-puller.service /etc/systemd/system/grid-options-puller.timer "$BK"/
+sudo sh -c "cd $BK && find . -type f -exec sha256sum {} + > SHA256SUMS"
 sudo install -m 0644 -o root -g root $OUT/grid-options-puller.service.d/*.conf /etc/systemd/system/grid-options-puller.service.d/
 sudo install -d -m 0755 /etc/systemd/system/grid-options-puller.timer.d
 sudo install -m 0644 -o root -g root $OUT/grid-options-puller.timer.d/50-gem-daily.conf /etc/systemd/system/grid-options-puller.timer.d/
@@ -63,7 +70,8 @@ Activation is operator-authorized and needs a verified scheduler restart onto th
 
 ```bash
 sudo -u grid install -d -m 0750 /data/grid_v4/gem_daily /data/grid_v4/gem_daily/attempts
-sudo -u grid sh -c 'printf "pin=%s utc=%s\n" "$1" "$(date -u +%FT%TZ)" > /data/grid_v4/gem_daily/ACTIVATED' _ "$PIN"
+printf 'pin=%s utc=%s
+' "$PIN" "$(date -u +%FT%TZ)" | sudo install -m 0644 -o root -g root /dev/stdin /data/grid_v4/gem_daily/ACTIVATED
 sudo systemctl enable --now grid-options-puller.timer
 systemctl list-timers grid-options-puller.timer
 ```
@@ -76,4 +84,4 @@ systemctl list-timers grid-options-puller.timer
 
 ## Kill switch
 
-Use `sudo systemctl disable --now grid-options-puller.timer`, or remove `/data/grid_v4/gem_daily/ACTIVATED`. The unit will then not start.
+Use `sudo systemctl disable --now grid-options-puller.timer`, or `sudo rm /data/grid_v4/gem_daily/ACTIVATED`. The unit will then not start.
