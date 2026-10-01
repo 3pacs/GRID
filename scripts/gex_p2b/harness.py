@@ -156,6 +156,26 @@ def early_close_candidate(day: date) -> bool:
     return False
 
 
+WATCH_IV_RANGE = (0.02, 3.0)
+WATCH_IV_DONOR_BASIS = (
+    "standard SPY rows, any OI, IV in Watch's [0.02, 3] range, quotes "
+    "0 <= bid <= ask and ask > 0 (build_feed's mate checks)"
+)
+
+
+def watch_quotes_ok(bid, ask) -> bool:
+    return bid is not None and ask is not None and 0 <= bid <= ask and ask > 0
+
+
+def donor(donors, expiry_day, strike, side, iv, item) -> None:
+    """Record a contract Gamma Watch could use as an OTM IV donor."""
+    if iv is None or not WATCH_IV_RANGE[0] <= iv <= WATCH_IV_RANGE[1]:
+        return
+    if not watch_quotes_ok(number(item.get("bid")), number(item.get("ask"))):
+        return
+    donors.append([expiry_day.isoformat(), strike, side, iv])
+
+
 @lru_cache(maxsize=None)
 def _osi_date(text: str) -> date:
     return date(2000 + int(text[:2]), int(text[2:4]), int(text[4:6]))
@@ -189,6 +209,8 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
     change = number(data.get("price_change"))
     if spot is None or spot <= 0 or change is None:
         raise InputRejected("underlying current_price/price_change missing")
+    if spot - change <= 0:
+        raise InputRejected("derived prior close (current_price - price_change) is not positive")
     trade_time = data.get("last_trade_time")
     if not isinstance(trade_time, str):
         raise InputRejected("underlying last_trade_time missing")
@@ -208,7 +230,7 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
     if not isinstance(options, list) or not options:
         raise InputRejected("empty option chain")
 
-    rows, exclusions, seen = [], [], set()
+    rows, exclusions, seen, donors = [], [], set(), []
     for item in options:
         symbol = item.get("option") if isinstance(item, dict) else None
         oi_raw = number(item.get("open_interest")) if isinstance(item, dict) else None
@@ -242,7 +264,7 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
             # Invalid OI is unknown mass, never its raw (or zero) value.
             mass = None if reason == "OI_INVALID" else oi_raw
             entry = {"contract": symbol, "reason": reason, "oi": mass}
-            if reason == "IV_MISSING_OR_NONPOSITIVE":
+            if reason in ("IV_MISSING_OR_NONPOSITIVE", "IV_OUT_OF_RANGE_PERCENT_SUSPECT"):
                 # Kept so Gamma Watch's paired-OTM IV recovery can be measured.
                 seconds = (expiry_instant(expiry_day) - valuation).total_seconds()
                 entry.update(
@@ -251,9 +273,14 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
                     side=side,
                     T=seconds / YEAR_SECONDS,
                     calendar_dte=(expiry_day - session).days,
+                    bid=number(item.get("bid")),
+                    ask=number(item.get("ask")),
                 )
             exclusions.append(entry)
+            if reason in ("ZERO_OI_NO_EXPOSURE", "IV_OUT_OF_RANGE_PERCENT_SUSPECT"):
+                donor(donors, expiry_day, strike, side, iv, item)
             continue
+        donor(donors, expiry_day, strike, side, iv, item)
         seconds = (expiry_instant(expiry_day) - valuation).total_seconds()
         rows.append(
             {
@@ -304,6 +331,8 @@ def normalize(raw: bytes, receipt_raw: bytes) -> dict:
         "q": BASELINE["q"],
         "rows": rows,
         "exclusions": exclusions,
+        "iv_donors": sorted(donors),
+        "iv_donor_basis": WATCH_IV_DONOR_BASIS,
     }
     normalized["provider_timestamp_check"] = provider_timestamp_check(
         doc.get("timestamp"), started, received
@@ -651,10 +680,11 @@ def per_contract(p, primitive, watch):
                 for k, v in groups_ref.items()
             ]
             finite = [x for x in errors if x is not None and math.isfinite(x)]
-            if any(x is None for x in errors):
-                status = "NOT_SUPPORTED"
-            elif len(finite) != len(errors) or max(finite) > tol:
+            nonfinite = [x for x in errors if x is not None and not math.isfinite(x)]
+            if nonfinite or (finite and max(finite) > tol):
                 status = "FAIL_NUMERICAL"
+            elif any(x is None for x in errors):
+                status = "NOT_SUPPORTED"
             else:
                 status = "PASS_NUMERICAL"
             e["subtotals"][label] = {
@@ -664,7 +694,9 @@ def per_contract(p, primitive, watch):
                 "status": status,
             }
         ref_total = float(sum(ref_terms, Decimal(0)))
-        if any(t is None for t in terms):
+        if any(t is not None and not math.isfinite(t) for t in terms):
+            total, err, tstatus = None, None, "FAIL_NUMERICAL"
+        elif any(t is None for t in terms):
             total, err, tstatus = None, None, "NOT_SUPPORTED"
         else:
             total = math.fsum(terms)
@@ -756,8 +788,11 @@ def brackets(values, spots, tol=None):
             uncertain.append([spots[i], spots[i + 1]])
         elif (a > 0) != (b > 0):
             if tol is not None and (abs(a) <= tol[i] or abs(b) <= tol[i + 1]):
+                # Indeterminate crossings are reported only as uncertain,
+                # never mixed into the asserted root set.
                 uncertain.append([spots[i], spots[i + 1]])
-            found.append((spots[i], spots[i + 1]))
+            else:
+                found.append((spots[i], spots[i + 1]))
     return found, uncertain
 
 
@@ -823,6 +858,36 @@ def walls(per_strike: dict, tol: float) -> dict:
         "put_wall_most_negative_put": pick(puts, min),
         "net_wall_max_abs_net": pick(nets, max),
     }
+
+
+def wall_match(engine_walls, ref_walls, ref_per_strike, tol) -> str:
+    """Equal sets pass. Sets that differ only by strikes whose reference value
+    is within 2x tolerance of that wall's target are INDETERMINATE (a tie-edge
+    strike can enter or leave a set through an error that is itself within
+    tolerance). Anything else fails."""
+    if engine_walls is None:
+        return "FAIL_NUMERICAL"
+    if engine_walls == ref_walls:
+        return "PASS_NUMERICAL"
+    value = {
+        "call_wall_max_positive_call": lambda v: v["call"],
+        "put_wall_most_negative_put": lambda v: v["put"],
+        "net_wall_max_abs_net": lambda v: abs(v["call"] + v["put"]),
+    }
+    for kind, of in value.items():
+        a, b = set(engine_walls[kind]), set(ref_walls[kind])
+        if a == b:
+            continue
+        if not b:
+            return "FAIL_NUMERICAL"
+        target = of(ref_per_strike[next(iter(b))])
+        edge = all(
+            k in ref_per_strike and abs(of(ref_per_strike[k]) - target) <= 2 * tol
+            for k in a ^ b
+        )
+        if not edge:
+            return "FAIL_NUMERICAL"
+    return "INDETERMINATE"
 
 
 def reference_per_strike(a, rows, s, r, q):
@@ -953,10 +1018,16 @@ def wall_comparison(p, a):
         "reference_per_strike": strike_rows(ref),
         "engines": {},
     }
+    t_min = p2a.load_primitive()[0].T_MIN
     if q != 0:
         out["engines"]["grid_per_strike"] = {
             "status": "NOT_SUPPORTED",
             "reason": "GRID per-strike path has no dividend yield",
+        }
+    elif any(row["T"] < t_min for row in p["rows"]):
+        out["engines"]["grid_per_strike"] = {
+            "status": "NOT_SUPPORTED",
+            "reason": "GRID per-strike path clamps T below T_MIN; exact-T comparison unsupported",
         }
     else:
         try:
@@ -975,7 +1046,7 @@ def wall_comparison(p, a):
                 if same_keys and finite and worst <= tol
                 else "FAIL_NUMERICAL"
             )
-            wall_status = "PASS_NUMERICAL" if grid_walls == ref_walls else "FAIL_NUMERICAL"
+            wall_status = wall_match(grid_walls, ref_walls, ref, tol)
             out["engines"]["grid_per_strike"] = {
                 "source": "physics/dealer_gamma.py DealerGammaEngine._compute_per_strike",
                 "walls": grid_walls,
@@ -1074,7 +1145,7 @@ def grid_native(p):
     try:
         out = engine.compute_gex_profile("SPY", session)
     except Exception as exc:  # engine fault on valid input
-        return {"status": "NOT_COMPARABLE", **engine_error(exc)}
+        return engine_error(exc)
     out["status"] = "NOT_COMPARABLE"
     out["native_universe_omissions"] = {
         "calendar_dte_le_0": omissions(p["rows"], lambda r: r["calendar_dte"] <= 0)
@@ -1125,7 +1196,7 @@ def watch_native_run(p):
         # The collector's own gates (coverage, spot window) withheld it.
         return {"status": "NOT_SUPPORTED", "reason": f"native gate: {exc}"}
     except Exception as exc:  # engine fault on valid input
-        return {"status": "NOT_COMPARABLE", **engine_error(exc)}
+        return engine_error(exc)
     fixed20 = {
         r["contract"]: (
             datetime.combine(date.fromisoformat(r["expiry_date"]), time(20, 0), timezone.utc)
@@ -1167,16 +1238,21 @@ def recovered_rows(p):
     """build_feed's paired-OTM recovery: an excluded missing-IV row whose OTM
     mate (same expiry/strike, other side) survived takes the mate's IV."""
     spot = p["spot"]
-    by_key = {(r["expiry_date"], r["strike"], r["side"]): r for r in p["rows"]}
+    by_key = {(d[0], d[1], d[2]): d[3] for d in p["iv_donors"]}
     out = []
     for e in p["exclusions"]:
-        if e["reason"] != "IV_MISSING_OR_NONPOSITIVE" or not e.get("oi"):
+        if e["reason"] not in (
+            "IV_MISSING_OR_NONPOSITIVE",
+            "IV_OUT_OF_RANGE_PERCENT_SUSPECT",
+        ) or not e.get("oi"):
             continue
+        if not watch_quotes_ok(e.get("bid"), e.get("ask")):
+            continue  # build_feed drops a row without valid own quotes
         otm = "put" if e["strike"] < spot else "call"
         if e["side"] == otm:
             continue  # Watch recovers only ITM rows from their OTM mate
-        mate = by_key.get((e["expiry_date"], e["strike"], otm))
-        if mate is None:
+        mate_iv = by_key.get((e["expiry_date"], e["strike"], otm))
+        if mate_iv is None:
             continue
         out.append(
             {
@@ -1185,7 +1261,7 @@ def recovered_rows(p):
                 "strike": e["strike"],
                 "side": e["side"],
                 "sign": 1 if e["side"] == "call" else -1,
-                "iv": mate["iv"],
+                "iv": mate_iv,
                 "oi": e["oi"],
                 "multiplier": 100.0,
                 "T": e["T"],
@@ -1236,6 +1312,15 @@ def attribution(p, spots):
             "roots": [round(x["root"], 3) for x in roots],
         }
 
+    def fixed20_T(x):
+        expiry = datetime.combine(date.fromisoformat(x["expiry_date"]), time(20, 0), timezone.utc)
+        return (expiry - valuation).total_seconds() / YEAR_SECONDS
+
+    watch_recovered = [
+        {**x, "T": fixed20_T(x)}
+        for x in recovered
+        if fixed20_T(x) > 0 and WATCH_GRID[0] <= x["strike"] <= WATCH_GRID[1]
+    ]
     base = run()
     factors = {
         "r_grid_native_0.05": run(r=GRID_NATIVE["r"]),
@@ -1277,6 +1362,7 @@ def attribution(p, spots):
             keep=[f and w for f, w in zip(fixed_pos, window)],
             T=t_fixed20,
             iv=paired_otm_iv(rows, spot),
+            extra=watch_recovered,
         ),
     }
     members = {
@@ -1292,6 +1378,7 @@ def attribution(p, spots):
             "T_watch_fixed_20Z_expiry",
             "iv_watch_paired_otm",
             "universe_watch_strike_window_735_790",
+            "universe_watch_iv_recovery",
         ),
     }
     for name, parts in members.items():
@@ -1310,9 +1397,10 @@ def attribution(p, spots):
         "combined": combined,
         "zero_dte": {
             **zero_dte,
-            "status": "NOT_SUPPORTED" if zero_dte["rows"] else "NOT_COMPARABLE",
+            # GRID's native loader cannot represent 0DTE in any packet.
+            "status": "NOT_SUPPORTED",
             "note": "GRID native loader excludes calendar DTE 0"
-            + ("" if zero_dte["rows"] else "; none present at this valuation"),
+            + ("" if zero_dte["rows"] else "; no 0DTE rows in this packet"),
         },
         "expiry_scope": {
             "status": "NOT_SUPPORTED",
@@ -1440,11 +1528,16 @@ def reconcile(raw: bytes, receipt_raw: bytes, p: dict | None = None) -> tuple[di
         agg_eval = None
     contract = per_contract(p, primitive, watch)
     curves, _ = engine_curves(p, a, spots, agg_eval)
-    if not contract["reference_float_certified"]:
-        for e in curves["engines"].values():
-            e["status"] = "INDETERMINATE"
-            e["reason"] = "float reference not certified against Decimal reference"
     wall = wall_comparison(p, a)
+    if not contract["reference_float_certified"]:
+        # Only a PASS rests on the float reference being right; a fault or a
+        # NOT_SUPPORTED keeps its own status and reason.
+        for e in list(curves["engines"].values()) + list(wall["engines"].values()):
+            if e.get("status") == "PASS_NUMERICAL":
+                e["status"] = "INDETERMINATE"
+                e["uncertified_reference"] = (
+                    "float reference not certified against the Decimal reference"
+                )
     class1 = [e["status"] for e in contract["engines"].values()]
     class1 += [e["status"] for e in curves["engines"].values()]
     # Only a structurally absent capability (Gamma Watch computes no walls) is
@@ -1746,6 +1839,11 @@ def build(raw: bytes, receipt_raw: bytes) -> dict[str, bytes]:
             "reason": "no free matched vendor input exists",
         },
         "class_3": {"status": "NOT_COMPARABLE", "pooled_with_class_1": False},
+        "native": {
+            k: v.get("status")
+            for k, v in (result.get("native") or {}).items()
+            if isinstance(v, dict)
+        },
         "packet_id": result.get("packet_id"),
         "packet_sha256": result.get("packet_sha256"),
         "files": {name: digest(data) for name, data in sorted(files.items())},

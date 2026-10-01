@@ -337,9 +337,12 @@ def test_nonfinite_result_fields_reject_before_any_artifact(tmp_path, monkeypatc
     assert (out / "input.json").read_bytes() == FIXTURE.read_bytes()
 
 
-def test_existing_run_directory_is_preserved_untouched(tmp_path):
-    # Preserved behavior (the pre-fix CLI also refused): guards the reorder
-    # that now checks the directory before any work.
+def test_existing_run_directory_is_preserved_untouched(tmp_path, monkeypatch):
+    # The directory is checked before any work: reconcile is never called.
+    def never(raw):
+        raise AssertionError("reconcile ran before the existing-directory check")
+
+    monkeypatch.setattr(h, "reconcile", never)
     out = tmp_path / "run"
     out.mkdir()
     (out / "keep.txt").write_bytes(b"prior")

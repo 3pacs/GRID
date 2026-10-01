@@ -489,3 +489,88 @@ def test_grid_svr_receipt_timing_is_still_indeterminate():
     raw = RAW.read_bytes()
     r = results(h.build(raw, receipt_for(raw, clock="grid_svr_pull_receipt")))
     assert r["timing_validation"]["status"] == "INDETERMINATE"
+
+
+# ── second-review minors ─────────────────────────────────────────────────
+
+
+def test_not_supported_group_never_hides_a_failing_group(monkeypatch):
+    p = h.normalize(RAW.read_bytes(), RECEIPT.read_bytes())
+    p["rows"][0]["T"] = 1e-7  # one unsupported row in one expiry group
+    real, sha = h.p2a.load_primitive()
+    original = real.gamma
+    real.gamma = lambda *a, **k: original(*a, **k) * 1.001  # and a real failure
+    watch, _ = h.p2a.watch_kernel()
+    out = h.per_contract(p, real, watch)
+    grid = out["engines"]["grid_primitive"]
+    assert grid["subtotals"]["expiry"]["status"] == "FAIL_NUMERICAL"
+    assert grid["status"] == "FAIL_NUMERICAL"
+
+
+def test_wall_tie_edge_is_indeterminate_not_failure():
+    ref = {
+        760.0: {"call": 100.0, "put": -10.0},
+        765.0: {"call": 99.985, "put": -20.0},  # 1.5x tol below the target
+        770.0: {"call": 50.0, "put": -30.0},
+    }
+    tol = 0.01
+    ref_walls = h.walls(ref, tol)
+    assert ref_walls["call_wall_max_positive_call"] == [760.0]
+    engine = {**ref, 765.0: {"call": 99.995, "put": -20.0}}  # within tol of ref
+    assert h.wall_match(h.walls(engine, tol), ref_walls, ref, tol) == "INDETERMINATE"
+    far = {**ref, 770.0: {"call": 120.0, "put": -30.0}}
+    assert h.wall_match(h.walls(far, tol), ref_walls, ref, tol) == "FAIL_NUMERICAL"
+    assert h.wall_match(ref_walls, ref_walls, ref, tol) == "PASS_NUMERICAL"
+
+
+def test_uncertified_reference_only_lowers_passes(monkeypatch):
+    monkeypatch.setattr(h, "CERTIFY_REL", -1.0)  # force "not certified"
+    monkeypatch.setattr(h, "WATCH_AGGREGATION_FINGERPRINT", "drifted")
+    r = results(h.build(RAW.read_bytes(), RECEIPT.read_bytes()))
+    curves = r["curves"]["engines"]
+    assert curves["grid_engine_vectorized"]["status"] == "INDETERMINATE"
+    assert "uncertified_reference" in curves["grid_engine_vectorized"]
+    assert curves["gamma_watch_aggregation"]["status"] == "NOT_SUPPORTED"  # reason kept
+    assert r["walls"]["engines"]["grid_per_strike"]["status"] == "INDETERMINATE"
+
+
+def test_iv_recovery_uses_zero_oi_donors_and_watch_ranges():
+    d = doc()
+    # ITM put (strike above spot) with no IV; its OTM call mate has zero OI.
+    d["data"]["options"] += [
+        {"option": "SPY261016P00782000", "bid": 18.0, "ask": 18.4, "iv": 0.0,
+         "open_interest": 300.0},
+        {"option": "SPY261016C00782000", "bid": 0.5, "ask": 0.6, "iv": 0.17,
+         "open_interest": 0.0},
+        # An ITM put whose OTM mate is outside Watch's [0.02, 3] IV range.
+        {"option": "SPY261016P00792000", "bid": 28.0, "ask": 28.4, "iv": 0.0,
+         "open_interest": 300.0},
+        {"option": "SPY261016C00792000", "bid": 0.1, "ask": 0.2, "iv": 4.0,
+         "open_interest": 0.0},
+    ]
+    raw = encode(d)
+    p = h.normalize(raw, receipt_for(raw))
+    recovered = {x["contract"] for x in h.recovered_rows(p)}
+    assert "SPY261016P00782000" in recovered
+    assert "SPY261016P00792000" not in recovered
+    at = h.attribution(p, h.common_grid(p["spot"]))
+    assert "universe_watch_iv_recovery" in at["combined"]["watch_native_combined"]["members"]
+
+
+def test_nonpositive_derived_prior_close_is_rejected():
+    d = doc()
+    d["data"]["price_change"] = 800.0
+    raw = encode(d)
+    with pytest.raises(h.InputRejected, match="prior close"):
+        h.normalize(raw, receipt_for(raw))
+
+
+def test_indeterminate_crossings_are_not_asserted_roots():
+    values = [1.0, -0.004, -1.0, -2.0, -3.0]
+    roots, unsure = h.root_set(linear(values), values, GRID, [0.01] * 5)
+    assert roots == [] and len(unsure) == 1
+
+
+def test_manifest_reports_native_statuses(built):
+    manifest = json.loads(built["manifest.json"])
+    assert manifest["native"] == {"grid": "NOT_COMPARABLE", "gamma_watch": "NOT_COMPARABLE"}
