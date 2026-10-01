@@ -201,6 +201,17 @@ def test_cli_refusal_writes_nothing(tmp_path: Path) -> None:
     assert not dst.exists()
 
 
+def test_cli_refuses_crlf_input_and_keeps_bytes_exact(tmp_path: Path) -> None:
+    src = tmp_path / "before.txt"
+    src.write_bytes(LIVE.replace("\n", "\r\n").encode())
+    dst = tmp_path / "after.txt"
+    assert cutover.main(["--in", str(src), "--out", str(dst)]) == 2
+    assert not dst.exists()
+    # Without a trailing newline the output must not gain one either.
+    new, _ = _run(LIVE.rstrip("\n"))
+    assert not new.endswith("\n")
+
+
 # ── shell entry points ────────────────────────────────────────────────
 
 needs_posix_bash = pytest.mark.skipif(

@@ -203,7 +203,13 @@ def _is_active(line: str) -> bool:
 
 def transform(text: str, stamp: str) -> tuple[str, list[str]]:
     """Return (new crontab text, summary lines). Raises CutoverError on drift."""
-    lines = text.splitlines()
+    if "\r" in text:
+        raise CutoverError(
+            "crontab text contains CR bytes; expected crontab -l output (LF only)"
+        )
+    # split("\n"), not splitlines(): only LF separates crontab lines, and the
+    # join below must give back every untouched byte, trailing newline included.
+    lines = text.split("\n")
     summary: list[str] = []
     problems: list[str] = []
 
@@ -265,10 +271,7 @@ def transform(text: str, stamp: str) -> tuple[str, list[str]]:
         f"note     {env_readers} active line(s) still read {SHARED_ENV_FILE} (env file only, by design)"
     )
 
-    new_text = "\n".join(lines)
-    if text.endswith("\n"):
-        new_text += "\n"
-    return new_text, summary
+    return "\n".join(lines), summary
 
 
 def target_block() -> str:
@@ -315,7 +318,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(f"refusing to overwrite existing {args.dst}")
 
     try:
-        new_text, summary = transform(args.src.read_text(encoding="utf-8"), args.stamp)
+        with open(args.src, encoding="utf-8", newline="") as fh:  # keep bytes as-is
+            new_text, summary = transform(fh.read(), args.stamp)
     except CutoverError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 2
