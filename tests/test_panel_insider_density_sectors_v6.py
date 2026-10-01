@@ -6,6 +6,7 @@ No provider, price, outcome or production registry access.
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timezone
 
 import pytest
@@ -40,7 +41,7 @@ def test_fail_closed_until_bound(tmp_path):
     assert s6.V8_REGISTRATION_HEAD_SHA256 == v8.REGISTERED_RECORD_SHA256[1]
     assert s6.V8_REGISTRATION_HEAD_SHA256 in v1.prereg_body(body) and "@@" not in body
     assert s6.check_prereg() == s6.PREREG_BODY_SHA256  # the committed body is final and bound
-    assert s6.REGISTERED_RECORD_SHA256 is None and s6.REGISTERED_ANCHOR_LINE is None
+    assert s6.REGISTERED_RECORD_SHA256 is not None and s6.REGISTERED_ANCHOR_LINE is not None
     assert s6.REGISTRY_ID == "sectors-v6" and s6.WITNESS_PATH == v1.canonical_witness_path("sectors-v6")
 
 
@@ -84,6 +85,9 @@ def _bind_v8(monkeypatch, tmp_path):
     monkeypatch.setattr(s6, "PREREG_PATH", filled)
     monkeypatch.setattr(s6, "V8_REGISTRATION_HEAD_SHA256", heads[1])
     monkeypatch.setattr(s6, "PREREG_BODY_SHA256", v1.prereg_body_sha256(filled))
+    # A synthetic sectors-v6 chain is not the pinned one; exercise the pre-pin registration path.
+    monkeypatch.setattr(s6, "REGISTERED_RECORD_SHA256", None)
+    monkeypatch.setattr(s6, "REGISTERED_ANCHOR_LINE", None)
     return v8_reg, heads
 
 
@@ -146,6 +150,52 @@ def test_registration_binds_v8_and_only_while_v8_is_at_two_records(monkeypatch, 
         s6.register(tmp_path / "s6reg2", NOW, "c" * 40, v8_log_dir=v8_reg, witness=witness)
     with pytest.raises(PermissionError):
         s6.register(tmp_path / "s6reg3", NOW, "c" * 40, v8_log_dir=tmp_path / "empty-v8", witness=witness)
+
+
+REAL_S6_HEADS = (
+    "507fe8a8f659b9b8c847ccd6389a1a2672a4da1b4951955ac4d4c7b59f3c9416",
+    "55c05e31b10621043a09f468fb2a6cf9a1fb8dafb75cbf15904db1e6ef7efa67",
+)
+REAL_S6_LINE = s6.REGISTERED_ANCHOR_LINE
+
+
+def test_sectors_v6_registration_pins_match_the_witnessed_anchor():
+    assert s6.REGISTERED_RECORD_SHA256 == REAL_S6_HEADS
+    assert hashlib.sha256(s6.REGISTERED_ANCHOR_LINE + b"\n").hexdigest() == (
+        "98369529ce81e885ce4c9a43859c339440891911a883561823a0a5ebcdd2c33f")
+    assert json.loads(s6.REGISTERED_ANCHOR_LINE) == {
+        "head_sha256": REAL_S6_HEADS[1], "prev_anchor_sha256": None, "records": 2,
+        "run_at": "2026-10-01T16:09:28+00:00"}
+    assert canonical(json.loads(s6.REGISTERED_ANCHOR_LINE)) == s6.REGISTERED_ANCHOR_LINE
+    # The pinned chain is exactly the registration records at that time and the merged #786 code,
+    # bound to the real witnessed v8 head and GateSpec v1.
+    records = s6.registration_records(datetime(2026, 10, 1, 16, 9, 28, tzinfo=timezone.utc),
+                                      "4dfc25c9dd0eb1bd2f9f0c18e7ecb895f8e55c01")
+    assert tuple(v1.chained_sha256(records)) == s6.REGISTERED_RECORD_SHA256
+    assert records[1]["technology_run"]["registration_head_sha256"] == v8.REGISTERED_RECORD_SHA256[1]
+    assert records[1]["generalization_gate"]["spec_sha256"] == s6.GATE_SPEC_SHA256
+
+
+def test_pinned_sectors_v6_refuses_a_fork_and_v8_refuses_an_unpinned_witness(monkeypatch, tmp_path):
+    v8_reg, _ = _bind_v8(monkeypatch, tmp_path)
+    vault = _real_vault(tmp_path / "vault")
+    vault.publish(v8_reg)
+    witness = vault.witness()
+    monkeypatch.setattr(s6, "REGISTERED_RECORD_SHA256", REAL_S6_HEADS)
+    monkeypatch.setattr(s6, "REGISTERED_ANCHOR_LINE", REAL_S6_LINE)
+    kw = {"v8_log_dir": v8_reg, "witness": witness}
+    with pytest.raises(PermissionError, match="fork its pinned chain"):
+        s6.register(tmp_path / "s6reg", NOW, "c" * 40, **kw)
+    assert not (tmp_path / "s6reg" / s6.REGISTRY_LOG).exists()
+    # Any sectors-v6 witness other than the pinned anchor is refused by v8's opening census.
+    other = tmp_path / "other"
+    log = s6.registry(other)
+    with monkeypatch.context() as m:
+        m.setattr(s6, "REGISTERED_RECORD_SHA256", None)
+        log.append(s6.registration_records(NOW, "c" * 40))
+    vault.add_file(s6.WITNESS_PATH, (other / s6.REGISTRY_ANCHORS).read_bytes())
+    with pytest.raises(PermissionError, match="pinned two-record"):
+        vault.witness()
 
 
 def test_registration_refuses_wrong_v8_head_or_changed_body(monkeypatch, tmp_path):
