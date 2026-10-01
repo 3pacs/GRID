@@ -33,7 +33,7 @@ from analysis.research_forward_log import ForwardLog, _lines, canonical
 REPO = Path(__file__).resolve().parents[1]
 VERSION = "gex_intraday_v1"
 PREREG_PATH = Path("docs/paper_log/gex-intraday-v1-preregistration.md")
-PREREG_BODY_SHA256 = "13ade76299a45bb8f1526531b638c0ad93ca114a98b0bc26b0e10a8c442998f8"
+PREREG_BODY_SHA256 = "f5a568d9231f97624f8df0099510796c99fd9f2817e86ee768dad61ef02a740b"
 BODY_START = "<!-- PREREG-BODY-START -->"
 BODY_END = "<!-- PREREG-BODY-END -->"
 
@@ -66,14 +66,23 @@ PLANTED_MODELS = {
         "forecast_binary": ("diff", "base_rate", "noise_log_sd", "control_corr"),
     },
 }
-ENGINE_FILES = ("physics/dealer_gamma.py", "physics/greeks/black_scholes.py")
+#: The engine and its spot path (the logger imports them only from a git
+#: archive of ``reference_commit`` whose tree must equal ``reference_tree``).
+ENGINE_FILES = (
+    "physics/dealer_gamma.py",
+    "physics/greeks/black_scholes.py",
+    "store/astrogrid.py",
+    "store/availability.py",
+    "ingestion/market_calendar.py",
+    "price_close_contract.py",
+)
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 HEX40 = re.compile(r"^[0-9a-f]{40}$")
 # Written before outcomes: hypotheses may not reference a calendar date, a year
 # or a named month (a pattern that could postdate registration).
 DATE_LIKE = re.compile(
-    r"\b\d{4}-\d{2}-\d{2}\b|\b(?:19|20)\d{2}\b|\b(?:January|February|March|April|June|"
-    r"July|August|September|October|November|December)\b"
+    r"\b\d{4}-\d{2}-\d{2}\b|\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b|\b(?:19|20)\d{2}\b"
+    r"|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Sept|Oct|Nov|Dec)[a-z]*\.?(?=\s|$|[,.;:)])"
 )
 REQUIRED = (
     "id",
@@ -175,12 +184,15 @@ def validate_family(family: dict) -> dict:
         raise PreregError("cost must be e2-costs-v1 at 3 bp per side")
     pin = family.get("engine_pin", {})
     if (
-        set(pin) != set(ENGINE_FILES) | {"hash_basis", "reference_commit"}
+        set(pin) != set(ENGINE_FILES) | {"hash_basis", "reference_commit", "reference_tree"}
         or not all(HEX64.fullmatch(str(pin[f])) for f in ENGINE_FILES)
         or pin.get("hash_basis") != "sha256 of LF git content"
         or not HEX40.fullmatch(str(pin.get("reference_commit")))
+        or not HEX40.fullmatch(str(pin.get("reference_tree")))
     ):
-        raise PreregError("engine pin must name both engine files by LF sha256 and a full commit")
+        raise PreregError(
+            "engine pin must name the engine and spot-path files by LF sha256, a full commit and its tree"
+        )
     hypotheses = family.get("hypotheses", [])
     ids = [h.get("id") for h in hypotheses]
     if len(ids) != len(set(ids)) or len(ids) != sum(FIXED_K.values()):

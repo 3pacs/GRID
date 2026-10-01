@@ -68,7 +68,8 @@ def test_gamma_and_breadth_trade_claims_are_paired(checked):
     assert by_id["MG2"]["kind"] == "paired_trade" and "net(PO1)" in by_id["MG2"]["statistic"]
     assert by_id["SC1"]["kind"] == "paired_trade" and "net(MG2)" in by_id["SC1"]["statistic"]
     for hid in ("DW2", "MG1", "MG3", "SC2"):
-        assert "PO2's z" in by_id[hid]["statistic"]
+        assert "PO2's x" in by_id[hid]["statistic"]
+        assert "with intercept" in by_id[hid]["statistic"]
 
 
 def test_no_side_or_distance_uses_a_post_decision_price(checked):
@@ -77,7 +78,10 @@ def test_no_side_or_distance_uses_a_post_decision_price(checked):
             # O_S (the opening auction) is unknown at D0; sides use PM and P0.
             assert "O_S" not in h["rule"] and "O_S" not in h["input"], h["id"]
     body = g.read_body()
-    assert "`spy_close_v1` receipts arrive from 13:30Z on S" in body
+    # The S-1 close receipt can predate D0 only in winter and is never
+    # guaranteed, so it is not admitted as P0 in any season.
+    assert "09:30 EDT (after D0) in summer and 08:30 EST in winter" in body
+    assert "not admitted as P0 in any season" in body
     assert "registered_at <= D0" in body and "backfilled = false" in body
 
 
@@ -93,6 +97,26 @@ def test_every_hypothesis_has_an_executable_price_contract(checked):
     assert "ln(max(abs(ln(C_S/O_S)), 0.00005))" in body
 
 
+def test_no_outcome_dependent_exclusion_and_v1_separation():
+    body = g.read_body()
+    assert "halted" not in body  # a halt is only a missing auction print
+    assert "the only outcome-side code" in body
+    assert "MG1, MG2, SC1, SC2 and DW1 make no decision" in body
+    assert "terminal evaluation record or terminal stop record" in body
+    for gate in ("`rules.json` stream registration", "E3 trial ledger"):
+        assert gate in body
+
+
+def test_every_hypothesis_selects_with_high_probability_by_design(checked):
+    # Windows sized for P(select) ~ 0.8 at the planted effect: a fixed
+    # discovery window never caps joint power below the 0.5 gate.
+    nd = {h["id"]: h["n_discovery"] for h in checked["family"]["hypotheses"]}
+    assert nd == {
+        "PO1": 300, "PO2": 250, "DW1": 300, "DW2": 250, "MG1": 250,
+        "MG2": 300, "MG3": 450, "SC1": 300, "SC2": 650, "RB1": 64,
+    }
+
+
 def test_nothing_is_ready_without_admitted_inputs(checked):
     assert {h["input_status"] for h in checked["family"]["hypotheses"]} <= {
         "BLOCKED_INPUT",
@@ -103,6 +127,7 @@ def test_nothing_is_ready_without_admitted_inputs(checked):
 def test_engine_pin_is_lf_content_of_the_reference_commit(checked, monkeypatch, tmp_path):
     pin = checked["family"]["engine_pin"]
     assert pin["hash_basis"] == "sha256 of LF git content"
+    assert set(g.ENGINE_FILES) >= {"store/astrogrid.py", "ingestion/market_calendar.py"}
     # CRLF copies of the pinned content still match (grid-svr is LF, Windows is CRLF).
     matches = g.engine_matches_pin(checked["family"])
     monkeypatch.undo()  # this test alone may run git
@@ -120,6 +145,12 @@ def test_engine_pin_is_lf_content_of_the_reference_commit(checked, monkeypatch, 
             crlf.write_bytes(shown.stdout.replace(b"\n", b"\r\n"))
     if verified_by_git:
         assert all(g.engine_matches_pin(checked["family"], tmp_path).values())
+        tree = subprocess.run(
+            ["git", "-C", str(g.REPO), "rev-parse", f"{pin['reference_commit']}^{{tree}}"],
+            capture_output=True,
+            text=True,
+        )
+        assert tree.stdout.strip() == pin["reference_tree"]
     elif not all(matches.values()):
         pytest.skip("reference commit not fetched and engine changed since; pin unverifiable here")
     assert verified_by_git or all(matches.values())
@@ -136,6 +167,11 @@ def test_engine_pin_is_lf_content_of_the_reference_commit(checked, monkeypatch, 
         (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x since 2026-10-15"), "dates"),
         (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x after the 2027 rebalance"), "dates"),
         (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x in October only"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x after May"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x since Oct. close"), "dates"),
+        (lambda f: f["hypotheses"][IDX["MG1"]].update(rule="x after 10/15"), "dates"),
+        (lambda f: f["engine_pin"].pop("store/astrogrid.py"), "engine pin"),
+        (lambda f: f["engine_pin"].update(reference_tree="abc"), "engine pin"),
         (lambda f: f["hypotheses"][IDX["MG1"]].update(direction="two-sided"), "one-sided"),
         (lambda f: f["hypotheses"][IDX["MG1"]].update(n_holdout_ladder=[500, 250]), "ladder"),
         (lambda f: f["hypotheses"][IDX["MG1"]].update(n_holdout=250.0), "integer"),
