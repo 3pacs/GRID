@@ -19,8 +19,7 @@ Proves the append-only contract the design doc relies on:
 from __future__ import annotations
 
 import importlib
-import json
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from uuid import uuid4
 
 import pandas as pd
@@ -183,65 +182,152 @@ def test_downgrade_on_clean_table(v2):
     assert dtype == "bigint"
 
 
+def test_upgrade_refuses_a_non_empty_table(schema_engine):
+    _run(schema_engine, CHAIN[0])
+    _run(schema_engine, CHAIN[1])
+    with schema_engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO people_events (channel, dedup_key, event_time, known_at, known_at_basis, actor_id, "
+            "actor_id_basis, actor_type, source) VALUES ('form4', 'k', NOW(), NOW(), 'filing', "
+            "'X', 'normalized_name', 'insider', 's')"))
+    with pytest.raises(RuntimeError, match="pre-v2 rows"):
+        _run(schema_engine, CHAIN[2])
+
+
+def test_version_floor_is_enforced_by_the_database(v2):
+    eid = _insert(v2, known="2026-04-04T02:00:00Z")
+    with v2.begin() as conn:
+        conn.execute(text("UPDATE people_events SET retracted_at = '2026-06-01T00:00:00Z' WHERE id = :i"), {"i": eid})
+    # A re-appearing act may not be visible before the retraction ...
+    with pytest.raises(DBAPIError):
+        _insert(v2, known="2026-04-04T02:00:00Z")
+    # ... and is fine from the retraction on; it then cannot be tightened below it.
+    new_id = _insert(v2, known="2026-06-01T00:00:00Z")
+    _raises(v2, "UPDATE people_events SET known_at = '2026-05-01T00:00:00Z' WHERE id = :i", {"i": new_id})
+
+
+def test_identity_enrichment_only_from_name_to_stable_id(v2):
+    with v2.begin() as conn:
+        eid = conn.execute(text(
+            "INSERT INTO people_events (channel, dedup_key, event_time, known_at, known_at_basis, actor_id, "
+            "actor_id_basis, actor_type, source) VALUES ('form4', 'n', NOW(), NOW(), 'filing', 'COOK_TIMOTHY', "
+            "'normalized_name', 'insider', 'quiverquant') RETURNING id")).scalar()
+        conn.execute(text("UPDATE people_events SET actor_id = '0001214156', actor_id_basis = 'owner_cik', "
+                          "entity_cik = '0000320193' WHERE id = :i"), {"i": eid})
+        op = conn.execute(text("SELECT op FROM people_event_revisions WHERE event_id = :i"), {"i": eid}).scalar()
+    assert op == "enrich_identity"
+    _raises(v2, "UPDATE people_events SET actor_id = '0000000001' WHERE id = :i", {"i": eid})
+    _raises(v2, "UPDATE people_events SET entity_cik = '0000000002' WHERE id = :i", {"i": eid})
+
+
+def test_downgrade_refuses_when_revision_history_exists(v2):
+    eid = _insert(v2)
+    with v2.begin() as conn:
+        conn.execute(text("UPDATE people_events SET known_at = known_at - interval '1 hour', "
+                          "known_at_basis = 'first_seen' WHERE id = :i"), {"i": eid})
+    with pytest.raises(RuntimeError, match="history"):
+        _run(v2, CHAIN[2], "downgrade")
+
+
 # --- writer --------------------------------------------------------------------------------
 
 
 def _sec(**over):
-    row = dict(accession_number="acc-1", document_type="4", amended=False, filing_date="2026-04-03",
-               issuer_cik="0000320193", issuer_ticker="AAPL", owner_cik="0001214156", owner_name="COOK TIMOTHY D",
-               is_director=False, is_officer=True, is_ten_pct_owner=False, nonderiv_trans_sk="1",
-               transaction_date="2026-04-01", transaction_date_raw="01-APR-2026", transaction_code="P",
-               shares=1000.0, price_per_share=200.0, acquired_disposed_code="A")
+    row = {"accession_number": "acc-1", "document_type": "4", "amended": False, "filing_date": "2026-04-03",
+           "issuer_cik": "0000320193", "issuer_ticker": "AAPL", "owner_cik": "0001214156",
+           "owner_name": "COOK TIMOTHY D", "is_director": False, "is_officer": True, "is_ten_pct_owner": False,
+           "nonderiv_trans_sk": "1", "transaction_date": "2026-04-01", "transaction_date_raw": "01-APR-2026",
+           "transaction_code": "P", "shares": 1000.0, "price_per_share": 200.0, "acquired_disposed_code": "A"}
     row.update(over)
     return row
 
 
-def _plan(engine: Engine, rows: list[dict], observed: datetime):
+def _holdings(q1_shares):
+    base = {"cik": "1001", "holder_name": "Big Fund LLC", "ticker": "AAPL", "cusip": "037833100",
+            "source": "sec_13f_live", "created_at": "2026-05-01"}
+    return [{**base, "id": 1, "shares_held": 100, "value_usd": 20_000.0, "report_date": "2025-12-31",
+             "filed_date": "2026-02-10"},
+            {**base, "id": 2, "shares_held": q1_shares, "value_usd": q1_shares * 200.0, "report_date": "2026-03-31",
+             "filed_date": "2026-05-12"}]
+
+
+_IDS = pd.DataFrame([{"entity_id": "sm_0000320193", "id_scheme": "cik", "id_value": "320193",
+                      "valid_from": "2026-09-27", "valid_to": None, "is_primary": True, "conflict_flag": False}])
+
+
+def _plan(engine: Engine, observed: datetime, form345=None, holdings=None, signal_sources=None):
     from intelligence.people_events_pipeline import adapters as A
     from intelligence.people_events_pipeline import merge as M
     from intelligence.people_events_pipeline import plan as P
     from intelligence.people_events_pipeline import security as S
 
-    cands, _ = A.form4_from_form345(pd.DataFrame(rows))
-    ids = pd.DataFrame([{"entity_id": "sm_0000320193", "id_scheme": "cik", "id_value": "320193",
-                         "valid_from": "2026-09-27", "valid_to": None, "is_primary": True, "conflict_flag": False}])
-    events = S.resolve_securities(M.merge_candidates(cands).events, ids)
+    parts = []
+    if form345:
+        parts.append(A.form4_from_form345(pd.DataFrame(form345))[0])
+    if holdings:
+        parts.append(A.thirteen_f_changes(pd.DataFrame(holdings))[0])
+    if signal_sources:
+        parts.append(A.from_signal_sources(pd.DataFrame(signal_sources), observed)[0])
+    events = S.resolve_securities(M.merge_candidates(pd.concat(parts, ignore_index=True)).events, _IDS)
     with engine.connect() as conn:
         stored = pd.read_sql(text("SELECT channel, dedup_key, known_at, known_at_basis, source_refs, content_hash, "
-                                  "superseded_at, retracted_at FROM people_events"), conn)
+                                  "actor_id, actor_id_basis, entity_cik, superseded_at, retracted_at "
+                                  "FROM people_events"), conn)
     return events, P.build_write_plan(events, stored, pd.Timestamp(observed))
 
 
-def test_writer_idempotent_and_supersedes(v2):
+def test_writer_idempotent_supersedes_and_keeps_one_visible_version(v2):
     from intelligence.people_events_pipeline.writer import apply_write_plan
     from store.people_events import read_events
 
-    t0 = datetime(2026, 10, 1, 12, tzinfo=UTC)
-    ev, plan = _plan(v2, [_sec()], t0)
+    t0 = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t0, form345=[_sec()], holdings=_holdings(150))
     out = apply_write_plan(v2, ev, plan, run_id="r1", mode="backfill", observed_at=t0)
-    assert out["status"] == "SUCCESS" and out["counts"]["insert"] == 1
+    assert out["status"] == "SUCCESS" and out["counts"]["insert"] == 2
 
-    ev, plan = _plan(v2, [_sec()], t0)
+    ev, plan = _plan(v2, t0, form345=[_sec()], holdings=_holdings(150))
     out = apply_write_plan(v2, ev, plan, run_id="r2", mode="incremental", observed_at=t0)
-    assert out["status"] == "NO_NEW_ROWS" and out["counts"]["unchanged"] == 1
+    assert out["status"] == "NO_NEW_ROWS" and out["counts"]["unchanged"] == 2
 
-    t1 = datetime(2026, 10, 6, 12, tzinfo=UTC)
-    ev, plan = _plan(v2, [_sec(price_per_share=250.0)], t1)
+    t1 = datetime(2026, 9, 6, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t1, form345=[_sec()], holdings=_holdings(175))  # 13F amendment
     out = apply_write_plan(v2, ev, plan, run_id="r3", mode="incremental", observed_at=t1)
     assert out["counts"]["supersede"] == 1
+    # A fourth, identical run changes nothing and never pulls the correction back.
+    t2 = datetime(2026, 9, 7, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t2, form345=[_sec()], holdings=_holdings(175))
+    out = apply_write_plan(v2, ev, plan, run_id="r4", mode="incremental", observed_at=t2)
+    assert out["status"] == "NO_NEW_ROWS"
+
     with v2.connect() as conn:
-        rows = conn.execute(text("SELECT id, security_id, superseded_by, superseded_at, size_usd, confidence "
-                                 "FROM people_events ORDER BY id")).fetchall()
+        rows = conn.execute(text("SELECT id, superseded_by, known_at, confidence FROM people_events "
+                                 "WHERE channel = 'thirteen_f' ORDER BY id")).fetchall()
+        f4 = conn.execute(text("SELECT security_id, confidence FROM people_events WHERE channel = 'form4'")).one()
         statuses = [r[0] for r in conn.execute(text("SELECT status FROM people_events_runs ORDER BY started_at"))]
-    assert len(rows) == 2 and rows[0][2] == rows[1][0] and rows[1][1] == "sm_0000320193"
-    # The original (filing basis, owner CIK, resolved issuer) is high confidence;
-    # the correction is only first_seen by this run, so it is low.
-    assert rows[0][5] == "high" and rows[1][5] == "low"
-    assert statuses == ["SUCCESS", "NO_NEW_ROWS", "SUCCESS"]
-    before = read_events(v2, as_of=datetime(2026, 10, 2, tzinfo=UTC))
-    after = read_events(v2, as_of=datetime(2026, 10, 7, tzinfo=UTC))
-    assert len(before) == 1 and before[0].size_usd == 200_000.0
-    assert len(after) == 1 and after[0].size_usd == 250_000.0
-    assert json.loads(json.dumps(after[0].provenance))["act_known_at"].startswith("2026-04-04")
-    assert read_events(v2, as_of=datetime(2026, 4, 4, 1, 59, tzinfo=UTC)) == []
-    assert date(2026, 4, 1) == before[0].event_time.date()
+    assert len(rows) == 2 and rows[0][1] == rows[1][0] and rows[1][2] == t1 and rows[1][3] == "low"
+    assert f4 == ("sm_0000320193", "high")
+    assert statuses == ["SUCCESS", "NO_NEW_ROWS", "SUCCESS", "NO_NEW_ROWS"]
+    for as_of in (datetime(2026, 5, 14, tzinfo=UTC), datetime(2026, 9, 2, tzinfo=UTC),
+                  datetime(2026, 9, 6, 12, tzinfo=UTC), datetime(2026, 9, 30, tzinfo=UTC)):
+        assert len(read_events(v2, as_of=as_of, channel="thirteen_f")) == 1
+    assert read_events(v2, as_of=datetime(2026, 9, 30, tzinfo=UTC), channel="thirteen_f")[0].provenance[
+        "act_known_at"].startswith("2026-05-13")
+
+
+def test_writer_enriches_a_live_feed_row_when_sec_arrives(v2):
+    from intelligence.people_events_pipeline.writer import apply_write_plan
+
+    qq = {"id": 5, "source_type": "quiverquant:insider", "source_id": "qq_insider_trading", "ticker": "AAPL",
+          "signal_date": "2026-04-01", "signal_type": "insider_buy", "created_at": "2026-04-04T00:00:00Z",
+          "signal_value": {"Name": "Timothy D. Cook", "TransactionCode": "P", "Shares": 1000,
+                           "PricePerShare": 200, "fileDate": "2026-04-03"}}
+    t0 = datetime(2026, 4, 5, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t0, signal_sources=[qq])
+    apply_write_plan(v2, ev, plan, run_id="q1", mode="incremental", observed_at=t0)
+    t1 = datetime(2026, 7, 15, 12, tzinfo=UTC)
+    ev, plan = _plan(v2, t1, form345=[_sec()], signal_sources=[qq])
+    out = apply_write_plan(v2, ev, plan, run_id="s1", mode="backfill", observed_at=t1)
+    assert out["counts"]["enrich_identity"] == 1 and out["counts"]["supersede"] == 0
+    with v2.connect() as conn:
+        row = conn.execute(text("SELECT actor_id, actor_id_basis, entity_cik, n_sources FROM people_events")).one()
+    assert row == ("0001214156", "owner_cik", "0000320193", 2)

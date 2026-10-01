@@ -30,9 +30,16 @@ What it changes, all on ``people_events`` (GD2) and two new tables
    says so.
 7. Guards (triggers): ``people_events`` rows cannot be DELETEd or
    TRUNCATEd; an UPDATE may only move ``known_at`` earlier, grow
-   ``source_refs``, set ``superseded_*``/``retracted_*`` once, or set a
-   NULL ``security_id``; descriptive content is immutable. The revision
-   log cannot be updated or deleted at all.
+   ``source_refs``, set ``superseded_*``/``retracted_*``/``security_id``/
+   ``echo_of``/``entity_cik`` once, or enrich a name-keyed actor to a
+   stable id; descriptive content is immutable. A version floor trigger
+   refuses any row (INSERT or known_at UPDATE) that would be known before an
+   earlier version of the same act stopped being visible, so the database
+   itself guarantees one visible version per act at every ``as_of``. The
+   revision log cannot be updated or deleted at all.
+9. Preconditions: the table must be empty (the superseded GD2 materializer
+   was never activated; any pre-v2 row would carry an incompatible key and
+   known_at convention) and hold no BIGINT security_id.
 8. Grants to ``grid`` -- including on ``people_events`` itself, which the
    GD2 migration created without a grant footer.
 
@@ -54,11 +61,15 @@ depends_on: Union[str, Sequence[str], None] = None
 CHANNELS = ("form4", "congress", "thirteen_f", "gov_contract", "gov_contract_qq_aggregate", "lobbying", "news", "fara")
 
 _IMMUTABLE_COLUMNS = (
-    "channel", "dedup_key", "event_time", "actor_id", "actor_id_basis", "actor_type", "co_actor_ids",
-    "entity_ticker", "entity_cik", "direction", "transaction_code", "size_usd", "source",
-    "source_record_id", "echo_of", "loose_key", "content_hash", "materializer_version", "run_id",
+    "channel", "dedup_key", "event_time", "actor_type", "co_actor_ids",
+    "entity_ticker", "direction", "transaction_code", "size_usd", "source",
+    "source_record_id", "loose_key", "content_hash", "materializer_version", "run_id",
     "ingested_at", "provenance",
 )
+# actor_id/actor_id_basis/entity_cik may change only as an identity enrichment
+# (a name-keyed actor now known by a stable id; an issuer CIK now known);
+# echo_of and security_id may be set once. Everything else is immutable.
+_STRONG_ACTOR_BASES = ("owner_cik", "bioguide", "filer_cik", "registrant_id")
 
 
 def upgrade() -> None:
@@ -69,6 +80,14 @@ def upgrade() -> None:
         raise RuntimeError(
             f"people_events has {n} non-NULL security_id values; refusing to change the column type "
             "(they cannot be GD1 entity ids). Resolve them first."
+        )
+    rows = bind.execute(sa.text("SELECT count(*) FROM people_events")).scalar()
+    if rows:
+        # Rows written by the superseded GD2 materializer use another key format
+        # and a created_at-based known_at that is not a valid bound for
+        # QuiverQuant rows; they must not sit next to v2 rows unmarked.
+        raise RuntimeError(
+            f"people_events holds {rows} pre-v2 rows; retract or remove them (owner decision) before upgrading"
         )
 
     channel_list = ", ".join(f"'{c}'" for c in CHANNELS)
@@ -112,7 +131,7 @@ def upgrade() -> None:
         event_id           BIGINT NOT NULL REFERENCES people_events (id),
         op                 TEXT NOT NULL CHECK (op IN (
                                'tighten_known_at', 'add_sources', 'supersede', 'retract',
-                               'resolve_security', 'other')),
+                               'resolve_security', 'enrich_identity', 'set_echo', 'other')),
         old_known_at       TIMESTAMPTZ,
         new_known_at       TIMESTAMPTZ,
         old_known_at_basis TEXT,
@@ -143,6 +162,7 @@ def upgrade() -> None:
     """)
 
     immutable_checks = " OR ".join(f"NEW.{c} IS DISTINCT FROM OLD.{c}" for c in _IMMUTABLE_COLUMNS)
+    strong = ", ".join(f"'{b}'" for b in _STRONG_ACTOR_BASES)
     op.execute(f"""
     CREATE OR REPLACE FUNCTION people_events_guard() RETURNS trigger LANGUAGE plpgsql AS $$
     BEGIN
@@ -170,6 +190,16 @@ def upgrade() -> None:
         IF OLD.security_id IS NOT NULL AND NEW.security_id IS DISTINCT FROM OLD.security_id THEN
             RAISE EXCEPTION 'people_events: security_id is set once (supersede to change it)';
         END IF;
+        IF OLD.echo_of IS NOT NULL AND NEW.echo_of IS DISTINCT FROM OLD.echo_of THEN
+            RAISE EXCEPTION 'people_events: echo_of is set once';
+        END IF;
+        IF (NEW.actor_id IS DISTINCT FROM OLD.actor_id OR NEW.actor_id_basis IS DISTINCT FROM OLD.actor_id_basis)
+           AND NOT (OLD.actor_id_basis = 'normalized_name' AND NEW.actor_id_basis IN ({strong})) THEN
+            RAISE EXCEPTION 'people_events: actor identity may only be enriched from a name to a stable id';
+        END IF;
+        IF OLD.entity_cik IS NOT NULL AND NEW.entity_cik IS DISTINCT FROM OLD.entity_cik THEN
+            RAISE EXCEPTION 'people_events: entity_cik is set once';
+        END IF;
         IF NOT (NEW.source_refs @> OLD.source_refs) THEN
             RAISE EXCEPTION 'people_events: source_refs may only grow';
         END IF;
@@ -191,16 +221,40 @@ def upgrade() -> None:
             v_op := 'tighten_known_at';
         ELSIF NEW.source_refs IS DISTINCT FROM OLD.source_refs THEN
             v_op := 'add_sources';
+        ELSIF NEW.actor_id IS DISTINCT FROM OLD.actor_id OR NEW.entity_cik IS DISTINCT FROM OLD.entity_cik THEN
+            v_op := 'enrich_identity';
         ELSIF NEW.security_id IS DISTINCT FROM OLD.security_id THEN
             v_op := 'resolve_security';
+        ELSIF NEW.echo_of IS DISTINCT FROM OLD.echo_of THEN
+            v_op := 'set_echo';
         END IF;
         INSERT INTO people_event_revisions (event_id, op, old_known_at, new_known_at, old_known_at_basis,
             new_known_at_basis, old_n_sources, new_n_sources, old_source_refs, detail)
         VALUES (OLD.id, v_op, OLD.known_at, NEW.known_at, OLD.known_at_basis, NEW.known_at_basis,
             OLD.n_sources, NEW.n_sources, OLD.source_refs,
             jsonb_build_object('superseded_by', NEW.superseded_by, 'retraction_reason', NEW.retraction_reason,
-                               'security_id', NEW.security_id));
+                               'security_id', NEW.security_id, 'old_actor_id', OLD.actor_id,
+                               'new_actor_id', NEW.actor_id, 'echo_of', NEW.echo_of));
         RETURN NULL;
+    END $$;
+
+    -- One visible version per act, enforced by the database: no row of a key
+    -- may become known before an earlier version of that key stopped being
+    -- visible (superseded or retracted). Covers INSERT (a re-appearing act,
+    -- a store upsert of a retracted key) and an UPDATE that moves known_at.
+    CREATE OR REPLACE FUNCTION people_events_version_floor() RETURNS trigger LANGUAGE plpgsql AS $$
+    DECLARE
+        v_floor TIMESTAMPTZ;
+    BEGIN
+        SELECT max(GREATEST(superseded_at, retracted_at)) INTO v_floor
+        FROM people_events
+        WHERE channel = NEW.channel AND dedup_key = NEW.dedup_key AND id <> NEW.id
+          AND (superseded_at IS NOT NULL OR retracted_at IS NOT NULL);
+        IF v_floor IS NOT NULL AND NEW.known_at < v_floor THEN
+            RAISE EXCEPTION 'people_events: known_at % precedes the end (%) of an earlier version of this act',
+                NEW.known_at, v_floor;
+        END IF;
+        RETURN NEW;
     END $$;
 
     CREATE OR REPLACE FUNCTION people_events_refuse() RETURNS trigger LANGUAGE plpgsql AS $$
@@ -214,6 +268,9 @@ def upgrade() -> None:
     DROP TRIGGER IF EXISTS people_events_truncate_trg ON people_events;
     CREATE TRIGGER people_events_truncate_trg BEFORE TRUNCATE ON people_events
         FOR EACH STATEMENT EXECUTE FUNCTION people_events_refuse();
+    DROP TRIGGER IF EXISTS people_events_version_floor_trg ON people_events;
+    CREATE TRIGGER people_events_version_floor_trg BEFORE INSERT OR UPDATE OF known_at ON people_events
+        FOR EACH ROW EXECUTE FUNCTION people_events_version_floor();
     DROP TRIGGER IF EXISTS people_events_revision_trg ON people_events;
     CREATE TRIGGER people_events_revision_trg AFTER UPDATE ON people_events
         FOR EACH ROW EXECUTE FUNCTION people_events_log_revision();
@@ -255,6 +312,9 @@ def downgrade() -> None:
     keyed = bind.execute(sa.text("SELECT count(*) FROM people_events WHERE security_id IS NOT NULL")).scalar()
     if keyed:
         raise RuntimeError(f"people_events has {keyed} security_id values; refusing to drop them")
+    revisions = bind.execute(sa.text("SELECT count(*) FROM people_event_revisions")).scalar()
+    if revisions:
+        raise RuntimeError(f"people_event_revisions holds {revisions} rows of history; refusing to drop it")
     fara = bind.execute(sa.text("SELECT count(*) FROM people_events WHERE channel = 'fara'")).scalar()
     if fara:
         raise RuntimeError(f"people_events has {fara} fara rows; refusing to narrow the channel CHECK")
@@ -262,10 +322,12 @@ def downgrade() -> None:
     DROP TRIGGER IF EXISTS people_event_revisions_truncate_trg ON people_event_revisions;
     DROP TRIGGER IF EXISTS people_event_revisions_guard_trg ON people_event_revisions;
     DROP TRIGGER IF EXISTS people_events_revision_trg ON people_events;
+    DROP TRIGGER IF EXISTS people_events_version_floor_trg ON people_events;
     DROP TRIGGER IF EXISTS people_events_truncate_trg ON people_events;
     DROP TRIGGER IF EXISTS people_events_guard_trg ON people_events;
     DROP FUNCTION IF EXISTS people_events_refuse();
     DROP FUNCTION IF EXISTS people_events_log_revision();
+    DROP FUNCTION IF EXISTS people_events_version_floor();
     DROP FUNCTION IF EXISTS people_events_guard();
     DROP TABLE IF EXISTS people_events_runs;
     DROP TABLE IF EXISTS people_event_revisions;
