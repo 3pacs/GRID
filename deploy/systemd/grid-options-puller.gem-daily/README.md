@@ -83,4 +83,4 @@ systemctl list-timers grid-options-puller.timer
 
 ## Kill switch
 
-Use `sudo systemctl disable --now grid-options-puller.timer`, or `sudo rm /data/grid_v4/gem_daily/ACTIVATED`. The unit will then not start.
+The primary kill switch is `sudo systemctl disable --now grid-options-puller.timer`, since only root can re-enable it. A secondary one is `sudo rm /data/grid_v4/gem_daily/ACTIVATED`, after which the unit does not start. Note that `grid` owns that directory and could re-create the marker. Both base units live in `/etc/systemd/system` (checked 2026-09-30). After the backup step, confirm that `SHA256SUMS` lists every copied file.
