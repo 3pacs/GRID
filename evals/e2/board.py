@@ -255,7 +255,12 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
             _alert(new, state, now, key=pid, kind="malformed_outcome", stream=adapter.stream, prediction_id=pid,
                    detail=f"the outcome is not finite JSON; the prediction is void: {exc}")
             res = _void("malformed_outcome_record", now, f"{type(exc).__name__}: {exc}"[:500])
-        _check_resolution(pred, res, now)
+        try:
+            _check_resolution(pred, res, now)
+        except DATA_ERRORS as exc:  # upstream timestamps that contradict the run or the prediction
+            _alert(new, state, now, key=pid, kind="invalid_resolution", stream=adapter.stream, prediction_id=pid,
+                   detail=f"the outcome's timing is inconsistent; the prediction is void: {exc}")
+            res = _void("invalid_resolution", now, f"{type(exc).__name__}: {exc}"[:500])
         record = {"kind": "resolution", "run_at": iso(now), "prediction_id": pid, **res}
         new.append(record)
         state["resolutions"][pid] = record
@@ -289,8 +294,17 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
         "ok": True, "source_log": view.path.name, "source_records_total": view.total_records,
         "source_records_seen": len(view.records), "source_head_sha256": view.head_sha256,
         "ingested_this_run": ingested, "resolved_this_run": resolved_now,
-        "activity": adapter.activity(view),
+        "activity": _activity(adapter, view),
     }
+
+
+def _activity(adapter, view) -> dict:
+    try:
+        activity = adapter.activity(view)
+        digest(activity)
+        return activity
+    except DATA_ERRORS as exc:  # activity is a view of upstream data; it must never abort the run
+        return {"error": f"{type(exc).__name__}: {exc}"[:500]}
 
 
 def run(board_dir: Path, adapters: list, now: datetime, *, rules: dict, cost_model: dict, manifest_info: dict,
@@ -354,6 +368,11 @@ def _write_atomic(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
+def _group_value(value):
+    """Group keys are text or null; anything else (never admitted, but never trusted) is made text."""
+    return value if value is None or isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+
+
 def _window(rows: list[dict], window: str) -> list[dict]:
     rows = sorted(rows, key=lambda s: (s["issued_at"], s["unit"]))
     if window == "all":
@@ -372,7 +391,7 @@ def build_snapshot(state: dict, streams: dict, now: datetime, rules: dict, cost_
     for score in state["scores"]:
         bucket = "official" if score["official"] else "pre_registration"
         for keys in agg["group_keys"]:
-            group = tuple((k, score.get(k)) for k in keys)
+            group = tuple((k, _group_value(score.get(k))) for k in keys)
             for metric in score["metrics"]:
                 groups.setdefault((bucket, score["rule_id"], metric, group), []).append(score)
     rows = []

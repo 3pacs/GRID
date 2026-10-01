@@ -197,11 +197,11 @@ class S10Adapter:
         for i in view.extra["predictions"].values():
             record = view.records[i]
             if record.get("excluded"):
-                reason = record.get("exclusion_reason") or "excluded"
+                reason = str(record.get("exclusion_reason") or "excluded")
                 excluded[reason] = excluded.get(reason, 0) + 1
         states: dict[str, int] = {}
         for i in view.extra["verdicts"].values():
-            state = view.records[i].get("state") or "?"
+            state = str(view.records[i].get("state") or "?")
             states[state] = states.get(state, 0) + 1
         return {
             "candidates": len(view.extra["admissions"]),

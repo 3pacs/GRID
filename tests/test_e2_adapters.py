@@ -318,3 +318,29 @@ def test_s10_prediction_with_a_malformed_label_end_is_quarantined(tmp_path):
     snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 13, 12))["snapshot"]
     assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is True
     assert snap["counts"]["predictions"] == 3 and snap["counts"]["integrity_alerts"] == 1
+
+
+def test_gex_postclose_fetched_after_the_run_voids_not_refuses_the_stream(tmp_path):
+    logs = tmp_path / "gex"
+    _gex_log(logs, [
+        _preopen("2026-10-01", "2026-10-01T12:45:00+00:00"),
+        _postclose("2026-10-01", "2026-10-01T20:30:00+00:00", fetched="2027-01-01T00:00:00+00:00"),
+    ])
+    snap = _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 2))["snapshot"]
+    assert snap["streams"]["gex_levels_v1"]["ok"] is True
+    assert snap["counts"]["void_by_reason"] == {"invalid_resolution": 7}
+    again = _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 3))["snapshot"]
+    assert again["counts"]["integrity_alerts"] == snap["counts"]["integrity_alerts"]
+
+
+def test_s10_odd_upstream_values_do_not_abort_activity(tmp_path):
+    logs = tmp_path / "s10"
+    events = _s10_events(verdict=True)
+    pred = next(i for i, e in enumerate(events) if e["kind"] == "prediction" and e["excluded"])
+    events[pred] = {**events[pred], "exclusion_reason": 7}
+    verdict = next(i for i, e in enumerate(events) if e["kind"] == "verdict")
+    events[verdict] = {**events[verdict], "state": ["odd"]}
+    _s10_log(logs, events)
+    snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 14, 12))["snapshot"]
+    activity = snap["streams"]["s10_hypothesis_forward_v1"]["activity"]
+    assert activity["prediction_exclusions"] == {"7": 1} and activity["verdicts"] == {"['odd']": 1}

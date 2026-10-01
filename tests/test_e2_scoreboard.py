@@ -234,6 +234,11 @@ MALFORMED = {
     "p_nan": (4, {"call": {"kind": "probability", "event": "up", "p": float("nan")}}),
     "score_abc": (6, {"call": {"kind": "rank_score", "score": "abc"}}),
     "score_inf": (6, {"call": {"kind": "rank_score", "score": float("inf")}}),
+    "family_list": (1, {"family": ["x"]}),
+    "family_number": (1, {"family": 7}),
+    "sector_object": (1, {"sector": {"a": 1}}),
+    "label_list": (1, {"horizon": {"label": [1], "entry_date": "2026-10-01", "exit_date": "2026-10-02"}}),
+    "instrument_list": (1, {"target": {"instrument": ["AAA"], "instrument_class": "us_equity_large_cap"}}),
 }
 
 
@@ -243,6 +248,7 @@ def test_a_malformed_record_is_quarantined_not_fatal(tmp_path, broken):
     records = _with(S.stream_records(), index, **changes)
     log = tmp_path / "stream.jsonl"
     S.write_chain(log, records, allow_nan=True)
+    _run(tmp_path, S.utc(2026, 10, 1, 15), log=log)  # before the horizon: ingestion only
     snap = _run(tmp_path, S.utc(2026, 10, 9), log=log)["snapshot"]  # well past every horizon
     assert snap["streams"][S.STREAM]["ok"] is True
     assert snap["counts"]["predictions"] == 9 and snap["counts"]["pending"] == 0

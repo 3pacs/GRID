@@ -90,6 +90,7 @@ def validate_prediction(p: dict, rules: dict) -> dict:
     missing = [k for k in REQUIRED if k not in p]
     if missing:
         raise RecordError(f"prediction lacks {missing}")
+    _check_types(p)
     if not isinstance(p["prediction_id"], str) or not p["prediction_id"].startswith(f"{p['stream']}:"):
         raise RecordError(f"prediction_id must start with '{p['stream']}:'")
     if p["call"].get("kind") not in CALL_KINDS:
@@ -108,6 +109,37 @@ def validate_prediction(p: dict, rules: dict) -> dict:
     _check_call(p)
     digest(p)  # every value must be finite JSON (canonical, allow_nan=False) or the record is set aside
     return p
+
+
+def _text(value) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _check_types(p: dict) -> None:
+    """Every field the board groups, keys or formats on must be plain text (or null where allowed)."""
+    for key in ("stream", "prediction_id", "family", "rule_id"):
+        if not _text(p.get(key)):
+            raise RecordError(f"{key} must be a non-empty string")
+    if p.get("sector") is not None and not _text(p["sector"]):
+        raise RecordError("sector must be a non-empty string or null")
+    if p.get("unit") is not None and not _text(p["unit"]):
+        raise RecordError("unit must be a non-empty string or null")
+    for key in ("issued_at", "outcome_not_before"):
+        if not _text(p.get(key)):
+            raise RecordError(f"{key} must be an ISO timestamp string")
+    for key in ("call", "target", "horizon", "log_receipt"):
+        if not isinstance(p.get(key), dict):
+            raise RecordError(f"{key} must be an object")
+    horizon = p["horizon"]
+    if not _text(horizon.get("label")) or not _text(horizon.get("ends_at")):
+        raise RecordError("horizon.label and horizon.ends_at must be non-empty strings")
+    if p["rule_id"].startswith("e2."):
+        if not _text(p["target"].get("instrument")) or not _text(p["target"].get("instrument_class")):
+            raise RecordError("target.instrument and target.instrument_class must be non-empty strings")
+        for key in ("entry_date", "exit_date"):
+            if not _text(horizon.get(key)):
+                raise RecordError(f"horizon.{key} must be an ISO date string")
+            date.fromisoformat(horizon[key])
 
 
 def _finite(value) -> bool:
