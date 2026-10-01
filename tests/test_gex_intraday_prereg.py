@@ -333,5 +333,9 @@ def test_v1_access_statement_matches_the_closure_verification():
     assert "reads the v1 log read-only, and runs v1's pinned code only on a scratch" in body
     assert "Nothing in this family ever writes to v1." in body
     assert "statsmodels versions, and the SHA-256 of the grid-svr environment's lock" in body
-    assert "requires its `ADVISORY:` line to be\n    byte-identical" in body
+    assert "after stripping leading whitespace (status prints it indented)" in body
+    assert "requires that\n    stripped line to be byte-identical to the quoted advisory line" in body
+    # No statement anywhere contradicts the section 7 read-only verification.
+    assert "Nothing here reads, writes" not in body
+    assert "Section 7's closure verification alone reads the log read-only" in body
     assert "the later of the two section 10 observations" in body

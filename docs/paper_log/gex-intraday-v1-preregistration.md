@@ -15,8 +15,10 @@ NOT ACTIVATED. Registry write, witnesses and activation are owner gates (section
 
 This family is new and separate from GEX-levels v1 (`docs/paper_log/gex-levels-v1-preregistration.md`,
 registered 2026-09-24, code pinned at 07e1fc16, log under `/data/grid/paper_log/gex_levels_v1/`).
-Nothing here reads, writes, re-scores, amends or replaces that log, its inputs, its code or its
-60-session evaluation. Section 7 states every overlap with v1 and how it is handled.
+Nothing here writes, amends or replaces that log, its inputs or its code, or re-scores its 60-session
+evaluation. Section 7's closure verification alone reads the log read-only and re-runs v1's pinned
+code on a scratch copy only to reproduce its quoted output byte for byte. Section 7 states every
+overlap with v1 and how it is handled.
 
 No historical outcome is used. Every hypothesis is forward only. Its first decision falls strictly
 after all of: the registry header is witnessed on vault `main` (section 10); the owner activates the
@@ -262,7 +264,8 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
     INTERIM. Because that output depends on the numerical stack (numpy's random stream, scipy and
     statsmodels), the artifact also records the Python interpreter version, the numpy, scipy and
     statsmodels versions, and the SHA-256 of the grid-svr environment's lock or `pip freeze` output;
-  - for `stop`: the owner's stop decision quoting the exact `ADVISORY:` line printed by `status`.
+  - for `stop`: the owner's stop decision quoting the exact `ADVISORY:` line printed by `status`,
+    with its leading whitespace stripped.
 
   Verification, all of which must hold:
   - line number `log_records` of the v1 log hashes to `log_head_sha256`, using v1's own convention
@@ -271,8 +274,9 @@ canonical JSON lines, `prev_sha256`, chained anchor file). Each prediction adds 
   - the verifier copies the first `log_records` lines to a scratch directory and re-runs v1's pinned
     code on that copy. For `evaluation` it runs `evaluate` in an environment matching the recorded
     interpreter, package versions and lock hash, and requires stdout byte-identical to the quoted
-    stdout. For `stop` it runs `status` (pure counting) and requires its `ADVISORY:` line to be
-    byte-identical to the quoted advisory line;
+    stdout. For `stop` it runs `status` (pure counting), takes the line that starts with
+    `ADVISORY:` after stripping leading whitespace (status prints it indented), and requires that
+    stripped line to be byte-identical to the quoted advisory line, which is quoted stripped;
   - the proof of when the file reached `origin/main` follows section 10.
 
   **Absent this artifact, the five stay `BLOCKED` permanently; no other route unblocks them.**
