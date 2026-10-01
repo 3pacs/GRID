@@ -49,7 +49,7 @@ PRODUCTION_DB_NAMES = frozenset({"grid", "griddb", "grid_obsidian", "grid_v4", "
 
 
 def check_scratch_target(url: str) -> str:
-    """Same rule as evals/e1/pg_safety.py: only *_test databases, never a production name."""
+    """Same rule as evals/e1/pg_safety.py: a *_test name is fine; a production name or any other grid* name is refused."""
     name = (make_url(url).database or "").strip().lower()
     if not name:
         raise RuntimeError("GRID_TEST_DB_URL names no database")
@@ -211,6 +211,7 @@ def test_load_events_is_pit_and_features_ignore_rows_known_after_as_of(pe_scratc
 
     before_frame = P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)
     assert len(before_frame) == len(base) + 1
+    assert before_frame.attrs["versioned_store_gap"] is False  # v1 table: no versioning columns
     assert (before_frame["known_at"] <= pd.Timestamp(AS_OF)).all()
     assert not before_frame["dedup_key"].str.startswith("echo").any()
     before = _features(before_frame)

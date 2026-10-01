@@ -57,7 +57,9 @@ GRID-PEOPLE-EVENTS-PIPELINE-DESIGN-20261001 sections 2-4 (PRs #779/#780):
 * C1 actor key: ``actor_id`` for every channel -- owner CIK (10-digit) or
   normalized name for Form 4, bioguide or name for congress, filer CIK for
   13F, awarding agency for contracts, registrant for lobbying -- prefixed
-  with ``actor_id_basis`` so two id spaces never merge by accident.
+  with ``actor_id_basis`` so two id spaces never merge by accident. Known
+  limit: an insider keyed by CIK in SEC history and by name in live
+  QuiverQuant rows counts as two actors if both fall in one window.
 * C2 10b5-1: read from ``provenance["attrs"]["is_10b5_1"]`` (the v2 writer's
   attrs), else a top-level ``is_10b5_1``. Absent means *undetermined*
   (None), never False.
@@ -89,6 +91,8 @@ import numpy as np
 import pandas as pd
 from scipy.stats import rankdata
 
+from sqlalchemy import text
+
 from intelligence.security_master import entity_id_for_cik
 from store.people_events import CHANNELS, KNOWN_AT_BASES, PeopleEvent, read_events
 
@@ -105,6 +109,12 @@ D_SELF_EPSILON = 0.1
 MIN_PEER_COUNT = 5
 #: Sector aggregate threshold ("count of entities with D_peer > 0.9").
 D_PEER_HIGH = 0.9
+#: known_at bases a declared spec admits, spelled out (not the store's
+#: vocabulary) so a vocabulary change never re-hashes a frozen spec.
+#: ``statutory_bound`` is never a valid bound (PE design F2: late PTRs) and
+#: ``qq_last_modified`` is out under GD-INDEX R6 (Senate QQ last_modified);
+#: a spec that wants either is a new name.
+DECLARED_KNOWN_AT_BASES = ("filing", "first_seen", "publish")
 
 POSITIVE_DIRECTIONS = frozenset({"buy", "award", "positive"})
 NEGATIVE_DIRECTIONS = frozenset({"sell", "negative"})
@@ -113,10 +123,11 @@ EVENT_COLUMNS = (
     "channel", "dedup_key", "event_time", "known_at", "known_at_basis",
     "actor_id", "actor_id_basis", "actor_type", "entity_id", "entity_cik",
     "entity_ticker", "direction", "transaction_code", "size_usd", "plan_10b5_1",
+    "visible_until",
 )
 
 AGGREGATE_COLUMNS = (
-    "decision_at", "sector", "spec", "sum_A", "n_dpeer_gt_0p9", "n_covered", "n_members",
+    "decision_at", "sector", "spec", "sum_A", "n_dpeer_gt_0p9", "n_covered", "n_undefined", "n_members",
 )
 
 
@@ -196,7 +207,7 @@ class DensitySpec:
     window_days: int
     tau_days: float
     signed: bool = False
-    allowed_known_at_bases: tuple[str, ...] = KNOWN_AT_BASES
+    allowed_known_at_bases: tuple[str, ...] = ("filing", "first_seen", "publish")
 
     def __post_init__(self) -> None:
         if self.window_days <= 0 or self.tau_days <= 0:
@@ -239,7 +250,8 @@ def _declare() -> dict[str, DensitySpec]:
     for base, (rules, signed) in families.items():
         for window in (30, 90):
             name = f"{base}_w{window}"
-            specs[name] = DensitySpec(name, rules, window, window / 2.0, signed=signed)
+            specs[name] = DensitySpec(name, rules, window, window / 2.0, signed=signed,
+                                      allowed_known_at_bases=DECLARED_KNOWN_AT_BASES)
     return specs
 
 
@@ -249,6 +261,9 @@ DECLARED_SPECS: dict[str, DensitySpec] = _declare()
 
 
 # --- events -----------------------------------------------------------------------------
+
+
+_EXTRA_COLUMNS = ("echo_of", "security_id", "superseded_at", "retracted_at")
 
 
 def _to_utc(values: pd.Series, name: str) -> pd.Series:
@@ -305,7 +320,9 @@ def events_frame(
     ``echo_of IS NOT NULL`` rows, normalises ``known_at`` / ``event_time`` to
     tz-aware UTC (naive timestamps are refused) and keys every row on a
     security_master ``entity_id`` (contract C5). Unresolvable rows are dropped
-    and counted in ``frame.attrs["dropped"]``.
+    and counted in ``frame.attrs["dropped"]``. ``visible_until`` is the
+    earliest of ``visible_until`` / ``superseded_at`` / ``retracted_at`` when
+    present (people_events v2 versioning); NaT means visible for ever.
     """
     if isinstance(events, pd.DataFrame):
         raw = events.copy()
@@ -320,11 +337,13 @@ def events_frame(
             row = {c: getattr(ev, c, None) for c in EVENT_COLUMNS if c not in ("entity_id", "plan_10b5_1")}
             row["echo_of"] = ev.echo_of
             row["security_id"] = getattr(ev, "security_id", None)
+            row["superseded_at"] = getattr(ev, "superseded_at", None)  # v2 versioning, when the store exposes it
+            row["retracted_at"] = getattr(ev, "retracted_at", None)
             row["plan_10b5_1"] = contract.plan_flag(ev.provenance)
             rows.append(row)
-        raw = pd.DataFrame(rows, columns=[c for c in EVENT_COLUMNS if c != "entity_id"] + ["echo_of", "security_id"])
+        raw = pd.DataFrame(rows, columns=[c for c in EVENT_COLUMNS if c != "entity_id"] + list(_EXTRA_COLUMNS))
 
-    for col in EVENT_COLUMNS + ("echo_of", "security_id"):
+    for col in EVENT_COLUMNS + _EXTRA_COLUMNS:
         if col not in raw.columns:
             raw[col] = None
     n_in = len(raw)
@@ -357,6 +376,9 @@ def events_frame(
     out["transaction_code"] = _clean_text(raw["transaction_code"], upper=True)
     out["size_usd"] = pd.to_numeric(raw["size_usd"], errors="coerce").astype(float)
     out["plan_10b5_1"] = pd.array(list(raw["plan_10b5_1"]), dtype="boolean")
+    # A version is visible from known_at until it is superseded or retracted.
+    ends = [_to_utc(raw[c], c) for c in ("visible_until", "superseded_at", "retracted_at")]
+    out["visible_until"] = pd.concat(ends, axis=1).min(axis=1)
 
     entity = _clean_text(raw["entity_id"])
     # v2 security_id is the TEXT entity_id; a v1 BIGINT carries no identity.
@@ -398,6 +420,18 @@ def load_events(
     ``read_events`` filters on ``known_at <= as_of`` (never ``event_time``).
     Ticker-only rows are resolved through ``security_master.resolve_entity``
     as of the event's ``known_at`` New York date.
+
+    Versioned store (people_events v2, PR #780): ``read_events`` returns the
+    versions visible *at* ``as_of`` and hides one superseded or retracted
+    before it, so a grid of decisions earlier than ``as_of`` would lose that
+    version for ``[known_at, superseded_at)``. Until the store can return
+    superseded/retracted versions with their timestamps (which the features
+    already honour through ``visible_until``), call this with ``as_of`` equal
+    to the grid's last decision and treat earlier decisions as subject to that
+    caveat; on the v1 store (no versioning) there is none. The frame says so:
+    ``attrs["versioned_store_gap"]`` is True when the store is versioned but
+    the rows carry no visibility timestamps, and :func:`build_receipt`
+    records it.
     """
     if as_of.tzinfo is None:
         raise ValueError("as_of must be tz-aware")
@@ -419,7 +453,22 @@ def load_events(
     frame = events_frame(rows, ticker_resolver=resolver, contract=contract)
     if (frame["known_at"] > pd.Timestamp(as_of).tz_convert("UTC")).any():  # defence in depth over read_events
         raise AssertionError("load_events returned an event with known_at > as_of")
+    frame.attrs["versioned_store_gap"] = _store_is_versioned(engine) and not frame["visible_until"].notna().any()
+    frame.attrs["as_of"] = pd.Timestamp(as_of).tz_convert("UTC").isoformat()
     return frame
+
+
+_VERSIONED_COLUMNS_SQL = text(
+    "SELECT count(*) FROM information_schema.columns "
+    "WHERE table_schema = current_schema() AND table_name = 'people_events' "
+    "AND column_name IN ('superseded_at', 'retracted_at')"
+)
+
+
+def _store_is_versioned(engine: Any) -> bool:
+    """True when people_events has v2 versioning columns (PR #780)."""
+    with engine.connect() as conn:
+        return int(conn.execute(_VERSIONED_COLUMNS_SQL).scalar() or 0) > 0
 
 
 # --- coverage ---------------------------------------------------------------------------
@@ -521,14 +570,21 @@ def _live_start(coverage: Sequence[CoverageSpan], channel: str) -> pd.Timestamp 
 def _select(
     events: pd.DataFrame,
     spec: DensitySpec,
+    entities: Sequence[str],
     decisions: pd.DatetimeIndex,
     coverage: Sequence[CoverageSpan] | None,
     *,
     need_sign: bool = False,
 ) -> pd.DataFrame:
-    """Qualifying events of ``spec`` known by the last decision, with actor key and sign."""
+    """Qualifying events of ``spec`` on ``entities`` known by the last decision.
+
+    Adds ``actor_key`` and, with ``need_sign``, ``sign`` (+1 / -1) and
+    ``undetermined`` (a Form 4 sell with no 10b5-1 determination). Planned
+    (10b5-1) Form 4 sells are dropped; rules with ``exclude_planned`` also
+    drop planned purchases (as VS1's event build does).
+    """
     t_max = decisions[-1] if len(decisions) else pd.Timestamp.min.tz_localize("UTC")
-    frame = events.loc[events["known_at"] <= t_max]
+    frame = events.loc[(events["known_at"] <= t_max) & events["entity_id"].isin(entities)]
     frame = frame.loc[frame["known_at_basis"].isin(spec.allowed_known_at_bases)]
     parts = []
     for rule in spec.rules:
@@ -546,8 +602,7 @@ def _select(
             key = part["actor_id_basis"].fillna("?").astype(str) + ":" + part["actor_id"].astype(str)
         else:
             key = part[rule.actor_field].astype(str)
-        part = part.assign(actor_key=key)
-        parts.append((rule, part))
+        parts.append((rule, part.assign(actor_key=key)))
 
     if coverage is not None:
         for rule, part in parts:
@@ -560,29 +615,26 @@ def _select(
             if (seen < live).any():
                 raise ImpossibleEvent(f"{rule.channel}: a first_seen event is known before the live start {live}")
 
+    signs = {**{d: 1.0 for d in POSITIVE_DIRECTIONS}, **{d: -1.0 for d in NEGATIVE_DIRECTIONS}}
     out = []
     for rule, part in parts:
         planned = part["plan_10b5_1"].fillna(False).astype(bool)
         if need_sign:
-            signs = {**{d: 1.0 for d in POSITIVE_DIRECTIONS}, **{d: -1.0 for d in NEGATIVE_DIRECTIONS}}
             sign = part["direction"].map(signs).fillna(0.0).astype(float)
+            undetermined = pd.Series(False, index=part.index)
             if rule.channel == "form4":
                 sells = sign < 0
                 undetermined = sells & part["plan_10b5_1"].isna()
-                if undetermined.any():
-                    raise UndefinedFeature(
-                        f"{spec.name}: {int(undetermined.sum())} Form 4 sell(s) carry no 10b5-1 determination"
-                    )
-                planned_sell = sells & planned
-                part, sign = part.loc[~planned_sell], sign.loc[~planned_sell]
-                planned = planned.loc[~planned_sell]
-            part = part.assign(sign=sign)
-            part = part.loc[part["sign"] != 0]
-            planned = planned.loc[part.index]
+                keep = ~(sells & planned)
+                part, sign, planned, undetermined = part.loc[keep], sign.loc[keep], planned.loc[keep], undetermined.loc[keep]
+            part = part.assign(sign=sign, undetermined=undetermined.astype(bool))
+            keep = (part["sign"] != 0).to_numpy()
+            part, planned = part.loc[keep], planned.loc[keep]
         if rule.exclude_planned:
-            part = part.loc[~planned]
+            part = part.loc[~planned.to_numpy()]
         out.append(part)
-    cols = ["entity_id", "channel", "actor_key", "known_at"] + (["sign"] if need_sign else [])
+    cols = ["entity_id", "channel", "actor_key", "known_at", "visible_until"]
+    cols += ["sign", "undetermined"] if need_sign else []
     if not out:
         return pd.DataFrame(columns=cols)
     return pd.concat([p[cols] for p in out], ignore_index=True)
@@ -591,28 +643,24 @@ def _select(
 # --- features ---------------------------------------------------------------------------
 
 
-def _inside_pairs(
-    groups: np.ndarray, known_f: np.ndarray, t_f: np.ndarray, window_ns: float
+def _visible_pairs(
+    known_f: np.ndarray, until_f: np.ndarray, t_f: np.ndarray, window_ns: float
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """(event, decision, age) for every decision at which the event is its group's latest in-window event.
+    """(event, decision, age) for every decision at which an event is visible and in the window.
 
-    ``groups`` / ``known_f`` must be sorted by (group, known_at). An event is
-    its group's latest known event for decisions ``t`` with
-    ``known_at <= t < next known_at`` of the same group, and counts while
-    ``0 <= t - known_at < W`` -- the same float64 arithmetic as
-    ``analysis.panel_insider_density.density`` (``age = t - known``), so the
-    latest-event weight is bit-identical to its per-actor maximum.
+    Visible at ``t``: ``known_at <= t < visible_until`` (superseded or
+    retracted versions stop at that instant; ``+inf`` when never). In the
+    window: ``0 <= t - known_at < W`` in float64 nanoseconds -- the same
+    arithmetic as ``analysis.panel_insider_density.density``
+    (``age = t - known``, ``age >= 0``, ``age < window_ns``).
     """
     n = len(known_f)
     if n == 0 or len(t_f) == 0:
         empty = np.zeros(0, dtype=np.int64)
         return empty, empty, np.zeros(0)
-    same_next = np.r_[groups[1:] == groups[:-1], False]
-    next_known = np.where(same_next, np.r_[known_f[1:], np.inf], np.inf)
     lo = np.searchsorted(t_f, known_f, side="left")  # first t >= known_at
-    hi_next = np.searchsorted(t_f, next_known, side="left")  # first t where a later event takes over
-    hi_window = np.searchsorted(t_f, known_f + window_ns + 1e6, side="right")  # exact check below
-    hi = np.minimum(hi_next, hi_window)
+    hi = np.searchsorted(t_f, known_f + window_ns + 1e6, side="right")  # exact age check below
+    hi = np.minimum(hi, np.searchsorted(t_f, until_f, side="left"))  # first t >= visible_until
     count = np.maximum(hi - lo, 0)
     event = np.repeat(np.arange(n), count)
     offset = np.arange(int(count.sum())) - np.repeat(np.cumsum(count) - count, count)
@@ -622,30 +670,67 @@ def _inside_pairs(
     return event[keep], decision[keep], age[keep]
 
 
+def _until_f(sel: pd.DataFrame) -> np.ndarray:
+    until = sel["visible_until"]
+    out = np.full(len(sel), np.inf)
+    has = until.notna().to_numpy()
+    if has.any():
+        out[has] = _ns_f(until[has])
+    return out
+
+
+#: Upper bound on (event, decision) pairs materialised at once; work is split
+#: by entity so a cell's sum order never depends on the chunking.
+MAX_PAIRS_PER_CHUNK = 4_000_000
+
+
+def _entity_chunks(ent: np.ndarray, known_f: np.ndarray, t_f: np.ndarray, window_ns: float):
+    """Row-index blocks of whole entities, each with at most about MAX_PAIRS_PER_CHUNK pairs."""
+    order = np.argsort(ent, kind="stable")
+    est = (np.searchsorted(t_f, known_f[order] + window_ns, side="right")
+           - np.searchsorted(t_f, known_f[order], side="left")).clip(0)
+    bounds = np.flatnonzero(np.r_[True, ent[order][1:] != ent[order][:-1], True])
+    start, load = 0, 0
+    for a, b in zip(bounds[:-1], bounds[1:], strict=True):
+        cost = int(est[a:b].sum())
+        if load and load + cost > MAX_PAIRS_PER_CHUNK:
+            yield order[start:a]
+            start, load = a, 0
+        load += cost
+    if start < len(order):
+        yield order[start:]
+
+
 def _density(sel: pd.DataFrame, spec: DensitySpec, entities: Sequence[str], decisions: pd.DatetimeIndex) -> np.ndarray:
-    """``sum over actors (in key order) of max exp(-age / tau)`` for age in [0, W)."""
+    """``sum over actors (in key order) of max over visible in-window events of exp(-age / tau)``."""
     t_f = decisions.asi8.astype(np.float64)
-    window_ns = spec.window_days * DAY_NS
-    tau_ns = spec.tau_days * DAY_NS
     out = np.zeros((len(decisions), len(entities)))
-    sel = sel.loc[sel["entity_id"].isin(entities)]
     if sel.empty:
         return out
-    known_f = _ns_f(sel["known_at"])
-    ent = pd.Index(entities).get_indexer(sel["entity_id"])
-    act, _ = pd.factorize(sel["actor_key"].astype(str), sort=True)  # codes in key order
-    order = np.lexsort((known_f, act, ent))
-    ent, act, known_f = ent[order], act[order], known_f[order]
-    groups = np.cumsum(np.r_[True, (ent[1:] != ent[:-1]) | (act[1:] != act[:-1])])
-    event, decision, age = _inside_pairs(groups, known_f, t_f, window_ns)
-    weight = np.exp(-age / tau_ns)
-    column = ent[event]
-    # Pairs are in (entity, actor-key, time) order and np.add.at is unbuffered
-    # and sequential, so each cell is ((0 + w_a1) + w_a2) + ... in actor-key
-    # order: the same sequential sum as panel_insider_density's
-    # per_actor.sum(axis=0), and an actor with nothing in the window adds
-    # nothing (append-future determinism holds bit for bit).
-    np.add.at(out, (decision, column), weight)
+    window_ns, tau_ns = spec.window_days * DAY_NS, spec.tau_days * DAY_NS
+    known_all, until_all = _ns_f(sel["known_at"]), _until_f(sel)
+    ent_all = pd.Index(entities).get_indexer(sel["entity_id"])
+    act_all = pd.factorize(sel["actor_key"].astype(str), sort=True)[0]  # codes in key order
+    for rows in _entity_chunks(ent_all, known_all, t_f, window_ns):
+        event, decision, age = _visible_pairs(known_all[rows], until_all[rows], t_f, window_ns)
+        if len(event) == 0:
+            continue
+        weight = np.exp(-age / tau_ns)
+        ent, act = ent_all[rows][event], act_all[rows][event]
+        order = np.lexsort((decision, act, ent))
+        ent, act, decision, weight = ent[order], act[order], decision[order], weight[order]
+        starts = np.flatnonzero(
+            np.r_[True, (ent[1:] != ent[:-1]) | (act[1:] != act[:-1]) | (decision[1:] != decision[:-1])]
+        )
+        best = np.maximum.reduceat(weight, starts)  # each actor once: its largest weight (latest event)
+        # Cells are filled in (entity, actor-key) order and np.add.at is
+        # unbuffered and sequential, so each cell is ((0 + w_a1) + w_a2) + ...
+        # in actor-key order -- panel_insider_density's per_actor.sum(axis=0)
+        # on a grid of two or more decisions -- and an actor with nothing
+        # visible adds nothing, so rows known after t never change a value at
+        # t, bit for bit. A cell belongs to one entity, so chunking by entity
+        # cannot reorder it.
+        np.add.at(out, (decision[starts], ent[starts]), best)
     return out
 
 
@@ -677,16 +762,19 @@ def density_A(
 ) -> pd.DataFrame:
     """``A(e, t)`` (decisions x entities). ``coverage=None`` returns unguarded raw values.
 
-    An event counts at ``t`` iff ``t - W < known_at <= t``; each actor once,
-    at the weight of its latest such event. ``coverage`` is keyword-only and
-    has no default, so a caller decides explicitly whether the coverage guard
-    applies (NaN where it fails).
+    An event counts at ``t`` iff ``t - W < known_at <= t`` (and it is not
+    superseded or retracted by ``t``); each actor once, at the weight of its
+    latest such event. ``coverage`` is keyword-only with no default, so a
+    caller decides explicitly whether the coverage guard applies (NaN where
+    it fails). Bit-identical to ``panel_insider_density.density`` on grids of
+    two or more decisions (a one-decision grid differs from it by an ulp: its
+    ``sum(axis=0)`` over an (n, 1) array is pairwise, this one sequential).
     """
     if spec.signed:
         raise ValueError(f"{spec.name} is a signed spec; use signed_S")
     decisions = _check_decisions(decisions)
     entities = _entities(entities)
-    sel = _select(events, spec, decisions, coverage)
+    sel = _select(events, spec, entities, decisions, coverage)
     values = _density(sel, spec, entities, decisions)
     return _frame(_guard(values, spec, entities, decisions, coverage), decisions, entities)
 
@@ -699,24 +787,22 @@ def channel_count_C(
     *,
     coverage: Sequence[CoverageSpan] | None,
 ) -> pd.DataFrame:
-    """``C(e, t)``: distinct channels of ``spec`` with a qualifying event in ``(t - W, t]``."""
+    """``C(e, t)``: distinct channels of ``spec`` with a visible qualifying event in ``(t - W, t]``."""
     decisions = _check_decisions(decisions)
     entities = _entities(entities)
-    sel = _select(events, spec, decisions, coverage)
+    sel = _select(events, spec, entities, decisions, coverage)
     t_f = decisions.asi8.astype(np.float64)
-    window_ns = spec.window_days * DAY_NS
-    out = np.zeros((len(decisions), len(entities)))
-    sel = sel.loc[sel["entity_id"].isin(entities)]
+    channels = sorted(spec.channels)
+    present = np.zeros((len(decisions), len(entities), len(channels)), dtype=bool)
     if not sel.empty:
-        known_f = _ns_f(sel["known_at"])
-        ent = pd.Index(entities).get_indexer(sel["entity_id"])
-        chan, _ = pd.factorize(sel["channel"].astype(str), sort=True)
-        order = np.lexsort((known_f, chan, ent))
-        ent, chan, known_f = ent[order], chan[order], known_f[order]
-        groups = np.cumsum(np.r_[True, (ent[1:] != ent[:-1]) | (chan[1:] != chan[:-1])])
-        event, decision, _age = _inside_pairs(groups, known_f, t_f, window_ns)
-        column = ent[event]
-        np.add.at(out, (decision, column), 1.0)
+        window_ns = spec.window_days * DAY_NS
+        known_all, until_all = _ns_f(sel["known_at"]), _until_f(sel)
+        ent_all = pd.Index(entities).get_indexer(sel["entity_id"])
+        chan_all = pd.Index(channels).get_indexer(sel["channel"])
+        for rows in _entity_chunks(ent_all, known_all, t_f, window_ns):
+            event, decision, _age = _visible_pairs(known_all[rows], until_all[rows], t_f, window_ns)
+            present[decision, ent_all[rows][event], chan_all[rows][event]] = True
+    out = present.sum(axis=2).astype(float)
     return _frame(_guard(out, spec, entities, decisions, coverage), decisions, entities)
 
 
@@ -727,19 +813,45 @@ def signed_S(
     decisions: pd.DatetimeIndex,
     *,
     coverage: Sequence[CoverageSpan] | None,
+    on_undetermined: str = "raise",
 ) -> pd.DataFrame:
     """``S(e, t) = A(positive events) - A(negative events)``; each actor once per sign.
 
-    Raises :class:`UndefinedFeature` when a Form 4 sell known by the last
-    decision carries no 10b5-1 determination. Planned (10b5-1) sells are
-    excluded. Non-Form-4 channels compute normally.
+    Planned (10b5-1) Form 4 sells are excluded. A Form 4 sell with **no**
+    determination is never counted and never silently dropped: every cell
+    ``(e, t)`` it would enter (visible and in the window) is undefined. With
+    ``on_undetermined="raise"`` (default) :class:`UndefinedFeature` names the
+    first such cell; with ``"nan"`` those cells are NaN and every other cell
+    is computed. Cells a sell cannot reach (other entities, decisions before
+    it is known or after it leaves the window) are unaffected, so appending
+    rows known after ``t`` never changes the value at ``t``. Non-Form-4
+    channels compute normally.
     """
+    if on_undetermined not in ("raise", "nan"):
+        raise ValueError("on_undetermined must be 'raise' or 'nan'")
     decisions = _check_decisions(decisions)
     entities = _entities(entities)
-    sel = _select(events, spec, decisions, coverage, need_sign=True)
-    pos = _density(sel.loc[sel["sign"] > 0], spec, entities, decisions)
-    neg = _density(sel.loc[sel["sign"] < 0], spec, entities, decisions)
-    return _frame(_guard(pos - neg, spec, entities, decisions, coverage), decisions, entities)
+    sel = _select(events, spec, entities, decisions, coverage, need_sign=True)
+    undetermined = sel.loc[sel["undetermined"]]
+    counted = sel.loc[~sel["undetermined"]]
+    pos = _density(counted.loc[counted["sign"] > 0], spec, entities, decisions)
+    neg = _density(counted.loc[counted["sign"] < 0], spec, entities, decisions)
+    values = pos - neg
+    if not undetermined.empty:
+        t_f = decisions.asi8.astype(np.float64)
+        event, decision, _age = _visible_pairs(
+            _ns_f(undetermined["known_at"]), _until_f(undetermined), t_f, spec.window_days * DAY_NS
+        )
+        if len(event):
+            ent = pd.Index(entities).get_indexer(undetermined["entity_id"])[event]
+            if on_undetermined == "raise":
+                first = int(np.argmin(decision))
+                raise UndefinedFeature(
+                    f"{spec.name}: a Form 4 sell with no 10b5-1 determination enters "
+                    f"{entities[ent[first]]} at {decisions[decision[first]]} ({len(set(zip(decision, ent, strict=True)))} cells)"
+                )
+            values[decision, ent] = np.nan
+    return _frame(_guard(values, spec, entities, decisions, coverage), decisions, entities)
 
 
 def _ny_dates(decisions: pd.DatetimeIndex) -> list[date]:
@@ -836,11 +948,14 @@ def sector_weekly_aggregates(
     decisions: pd.DatetimeIndex,
     *,
     coverage: Sequence[CoverageSpan],
+    on_undetermined: str = "raise",
 ) -> pd.DataFrame:
     """Per (Friday decision, sector, spec): sum A, #D_peer > 0.9, #covered, #members.
 
-    ``sum_A`` is over covered constituents and NaN when none is covered. The
-    coverage guard is mandatory here.
+    ``sum_A`` is over covered, defined constituents and NaN when there is
+    none. The coverage guard is mandatory here. ``on_undetermined`` is passed
+    to :func:`signed_S` for signed specs; its NaN cells are counted in
+    ``n_undefined``, separately from coverage.
     """
     decisions = _check_decisions(decisions)
     days = _ny_dates(decisions)
@@ -850,19 +965,25 @@ def sector_weekly_aggregates(
     sectors = _membership_matrix(membership, entities, days)
     rows = []
     for spec in sorted(specs, key=lambda s: s.name):
-        fn = signed_S if spec.signed else density_A
-        a = fn(events, spec, entities, decisions, coverage=coverage)
+        if spec.signed:
+            a = signed_S(events, spec, entities, decisions, coverage=coverage, on_undetermined=on_undetermined)
+        else:
+            a = density_A(events, spec, entities, decisions, coverage=coverage)
         peer = d_peer(a, membership).to_numpy()
         values = a.to_numpy()
+        guard = coverage_mask(spec, entities, decisions, coverage).to_numpy()
         for i, t in enumerate(decisions):
             for sector in sorted({s for s in sectors[i] if s is not None}):
                 members = sectors[i] == sector
-                covered = members & np.isfinite(values[i])
+                covered = members & guard[i]
+                scored = covered & np.isfinite(values[i])
                 rows.append({
                     "decision_at": t, "sector": str(sector), "spec": spec.name,
-                    "sum_A": float(values[i, covered].sum()) if covered.any() else np.nan,
+                    "sum_A": float(values[i, scored].sum()) if scored.any() else np.nan,
                     "n_dpeer_gt_0p9": int((members & (np.nan_to_num(peer[i], nan=-1.0) > D_PEER_HIGH)).sum()),
-                    "n_covered": int(covered.sum()), "n_members": int(members.sum()),
+                    "n_covered": int(covered.sum()),
+                    "n_undefined": int((covered & ~np.isfinite(values[i])).sum()),  # S with undetermined sells
+                    "n_members": int(members.sum()),
                 })
     frame = pd.DataFrame(rows, columns=list(AGGREGATE_COLUMNS))
     return frame.sort_values(["decision_at", "sector", "spec"], kind="mergesort").reset_index(drop=True)
@@ -889,7 +1010,7 @@ def _canonical_sha256(obj: Any) -> str:
 def event_set_sha256(events: pd.DataFrame) -> str:
     """Order-, timezone- and platform-independent hash of a normalised event frame."""
     cols = ["channel", "dedup_key", "known_at", "known_at_basis", "actor_id", "actor_id_basis",
-            "entity_id", "direction", "transaction_code", "plan_10b5_1", "event_time"]
+            "entity_id", "direction", "transaction_code", "plan_10b5_1", "event_time", "visible_until"]
     recs = []
     for row in events[cols].itertuples(index=False):
         rec = []
@@ -909,9 +1030,10 @@ def event_set_sha256(events: pd.DataFrame) -> str:
 
 def membership_sha256(membership: pd.DataFrame) -> str:
     recs = sorted(
-        [str(r.entity_id), str(r.sector), str(pd.Timestamp(r.valid_from).date()),
-         None if r.valid_to is None or pd.isna(r.valid_to) else str(pd.Timestamp(r.valid_to).date())]
-        for r in membership.itertuples(index=False)
+        ([str(r.entity_id), str(r.sector), str(pd.Timestamp(r.valid_from).date()),
+          None if r.valid_to is None or pd.isna(r.valid_to) else str(pd.Timestamp(r.valid_to).date())]
+         for r in membership.itertuples(index=False)),
+        key=json.dumps,  # a total order even when None sits next to a string
     )
     return _canonical_sha256(recs)
 
@@ -972,11 +1094,35 @@ def write_frozen_artifact(frame: pd.DataFrame, path: Path | str, *, receipt: Map
     return digest
 
 
+def coverage_sha256(coverage: Sequence[CoverageSpan] | None) -> str | None:
+    if coverage is None:
+        return None
+    recs = sorted(
+        ([s.channel, pd.Timestamp(s.start).tz_convert("UTC").isoformat(),
+          None if s.stop is None else pd.Timestamp(s.stop).tz_convert("UTC").isoformat(), s.entity_id, s.known_at_basis]
+         for s in coverage),
+        key=json.dumps,  # a total order even when None sits next to a string
+    )
+    return _canonical_sha256(recs)
+
+
+def _versions() -> dict[str, str]:
+    import platform
+
+    import pyarrow
+    import scipy
+
+    return {"python": platform.python_version(), "numpy": np.__version__, "pandas": pd.__version__,
+            "pyarrow": pyarrow.__version__, "scipy": scipy.__version__}
+
+
 def build_receipt(
     *,
     events: pd.DataFrame,
     specs: Sequence[DensitySpec],
     membership: pd.DataFrame,
+    decisions: pd.DatetimeIndex,
+    coverage: Sequence[CoverageSpan] | None,
     as_of: datetime,
     git_sha: str | None = None,
     contract: EventContract = PE_CONTRACT,
@@ -990,8 +1136,19 @@ def build_receipt(
         "as_of": pd.Timestamp(as_of).tz_convert("UTC").isoformat(),
         "event_set_sha256": event_set_sha256(events),
         "event_rows": int(len(events)),
+        "load_as_of": events.attrs.get("as_of"),
+        # None = unknown (the frame did not come from load_events, or lost its attrs).
+        "versioned_store_gap": events.attrs.get("versioned_store_gap"),
         "spec_sha256": {s.name: s.sha256 for s in sorted(specs, key=lambda s: s.name)},
         "membership_sha256": membership_sha256(membership),
+        "coverage_sha256": coverage_sha256(coverage),
+        "decisions": {
+            "count": int(len(decisions)),
+            "first": None if not len(decisions) else pd.Timestamp(decisions[0]).tz_convert("UTC").isoformat(),
+            "last": None if not len(decisions) else pd.Timestamp(decisions[-1]).tz_convert("UTC").isoformat(),
+            "sha256": _canonical_sha256([int(v) for v in _check_decisions(pd.DatetimeIndex(decisions)).asi8]),
+        },
+        "versions": _versions(),
         "code_sha256": code_sha256(),
         "git_sha": git_sha,
         "contract": asdict(contract),

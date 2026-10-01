@@ -84,6 +84,19 @@ def test_window_is_open_at_t_minus_w_and_closed_at_t():
     assert 0.0 < inside < np.exp(-1.99)
 
 
+def test_c_and_s_share_the_window_boundary():
+    t = ts("2024-06-14 20:00")
+    w = pd.Timedelta(days=90)
+    spec_c = P.DECLARED_SPECS["C_people_w90"]
+    spec_s = P.DECLARED_SPECS["S_insider_w90"]
+    for known, inside in ((t, True), (t - w, False), (t - w + pd.Timedelta(seconds=1), True),
+                          (t + pd.Timedelta(microseconds=1), False)):
+        rows = [ev(known_at=known, event_time=min(known, t) - 3 * DAY)]
+        c = P.channel_count_C(frame(rows), spec_c, [E1], one(t), coverage=None).iloc[0, 0]
+        s = P.signed_S(frame(rows), spec_s, [E1], one(t), coverage=None).iloc[0, 0]
+        assert bool(c == 1.0) == inside and bool(s > 0) == inside, known
+
+
 def test_event_time_never_enters_a_feature():
     t = ts("2024-06-14 20:00")
     base = [ev(known_at=t - 5 * DAY, event_time=t - 6 * DAY)]
@@ -126,20 +139,27 @@ def membership(n_entities=15, n_sectors=3) -> pd.DataFrame:
     })
 
 
-def all_features(events, decisions, members, coverage) -> dict[str, bytes]:
+def all_features(events, decisions, members, coverage, n=None) -> dict[str, bytes]:
+    """Every feature on ``decisions``, as bytes of the first ``n`` decision rows."""
+    n = len(decisions) if n is None else n
     entities = sorted(members["entity_id"])
+
+    def head(df) -> bytes:
+        return df.iloc[:n].to_numpy().tobytes()
+
     out = {}
     for name in ("A_multi_mc1_w90", "A_congress_w30", "A_inst_w90"):
         a = P.density_A(events, P.DECLARED_SPECS[name], entities, decisions, coverage=coverage)
-        out[name] = a.to_numpy().tobytes()
-        out[name + ":D_self"] = P.d_self(a).to_numpy().tobytes()
-        out[name + ":D_peer"] = P.d_peer(a, members).to_numpy().tobytes()
-    out["C"] = P.channel_count_C(events, P.DECLARED_SPECS["C_people_w90"], entities, decisions,
-                                 coverage=coverage).to_numpy().tobytes()
+        out[name] = head(a)
+        out[name + ":D_self"] = head(P.d_self(a))
+        out[name + ":D_peer"] = head(P.d_peer(a, members))
+    out["C"] = head(P.channel_count_C(events, P.DECLARED_SPECS["C_people_w90"], entities, decisions, coverage=coverage))
     for name in ("S_insider_w90", "S_congress_w30"):
-        out[name] = P.signed_S(events, P.DECLARED_SPECS[name], entities, decisions, coverage=coverage).to_numpy().tobytes()
+        out[name] = head(P.signed_S(events, P.DECLARED_SPECS[name], entities, decisions, coverage=coverage,
+                                    on_undetermined="nan"))
     agg = P.sector_weekly_aggregates(events, [P.DECLARED_SPECS["A_multi_mc1_w90"], P.DECLARED_SPECS["S_insider_w30"]],
-                                     members, decisions, coverage=coverage)
+                                     members, decisions, coverage=coverage, on_undetermined="nan")
+    agg = agg.loc[agg["decision_at"] <= decisions[n - 1]].reset_index(drop=True)
     out["aggregates"] = agg.to_json(orient="split", date_format="iso", date_unit="ns").encode()
     return out
 
@@ -161,12 +181,21 @@ def test_appending_events_known_after_T_changes_nothing_at_or_before_T(seed):
     future.loc[:50, "event_time"] = CUT - 20 * DAY
     decisions = P.weekly_decisions(date(2019, 1, 4), CUT.date())
     assert decisions[-1] == CUT
+    # The "after" grid runs a year past T, so the appended rows really are
+    # inside later windows; only the first len(decisions) rows must agree.
+    longer = P.weekly_decisions(date(2019, 1, 4), (CUT + 400 * DAY).date())
     members = membership()
     before = all_features(frame(base), decisions, members, COVERAGE)
-    after = all_features(frame(pd.concat([base, future], ignore_index=True)), decisions, members, COVERAGE)
+    both = frame(pd.concat([base, future], ignore_index=True))
+    after = all_features(both, longer, members, COVERAGE, n=len(decisions))
     assert before.keys() == after.keys()
     for key in before:
         assert before[key] == after[key], key
+    # Not vacuous: the appended rows do move the feature after T.
+    spec, entities = P.DECLARED_SPECS["A_multi_mc1_w90"], sorted(members["entity_id"])
+    a_base = P.density_A(frame(base), spec, entities, longer, coverage=COVERAGE).to_numpy()
+    a_both = P.density_A(both, spec, entities, longer, coverage=COVERAGE).to_numpy()
+    assert not np.array_equal(a_base[len(decisions):], a_both[len(decisions):], equal_nan=True)
 
 
 def test_features_at_t_do_not_depend_on_later_decisions():
@@ -291,6 +320,15 @@ def test_insider_buy_density_equals_vs1_panel_density_exactly(seed):
         "actor_type": "insider", "entity_cik": purchases["issuer_cik"].astype(str), "transaction_code": "P",
         "direction": "buy", "plan_10b5_1": None,
     }))
+    # Planned (10b5-1) purchases: VS1's event build drops them before density();
+    # the declared spec drops them itself, so feeding them in changes nothing.
+    planned = purchases.sample(frac=0.1, random_state=seed).assign(actor=lambda f: f["actor"] + 500)
+    events = pd.concat([events, P.events_frame(pd.DataFrame({
+        "channel": "form4", "dedup_key": [f"pl{i}" for i in range(len(planned))], "event_time": planned["known_at"],
+        "known_at": planned["known_at"], "known_at_basis": "filing",
+        "actor_id": [f"{a:010d}" for a in planned["actor"]], "actor_id_basis": "owner_cik", "actor_type": "insider",
+        "entity_cik": planned["issuer_cik"].astype(str), "transaction_code": "P", "direction": "buy", "plan_10b5_1": True,
+    }))], ignore_index=True)
     for feature, (window, tau) in v1.FEATURES.items():
         spec = P.DECLARED_SPECS[f"A_insider_buy_w{window}"]
         assert (spec.window_days, spec.tau_days) == (window, tau), feature
@@ -432,6 +470,80 @@ def test_signed_s_on_non_form4_channels_needs_no_determination():
         P.density_A(frame(rows), P.DECLARED_SPECS["S_congress_w90"], [E1], one(t), coverage=None)
 
 
+def test_s_refusal_is_scoped_to_the_cells_an_undetermined_sell_can_reach():
+    t0 = ts("2024-03-01 21:00")
+    decisions = pd.DatetimeIndex([t0 + i * 7 * DAY for i in range(30)])
+    spec = P.DECLARED_SPECS["S_insider_w30"]
+    buy = ev(known_at=t0 - DAY)
+    sell = ev(known_at=t0 + 70 * DAY, entity_cik="1002", actor_id="0000000002", transaction_code="S",
+              direction="sell", plan_10b5_1=None)
+    events = frame([buy, sell])
+    only_e1 = P.signed_S(events, spec, [E1], decisions, coverage=None)  # E2's sell never matters for E1
+    assert only_e1.notna().all().all()
+    with pytest.raises(P.UndefinedFeature, match=E2):
+        P.signed_S(events, spec, [E1, E2], decisions, coverage=None)
+    s = P.signed_S(events, spec, [E1, E2], decisions, coverage=None, on_undetermined="nan")
+    hit = s[E2].isna().to_numpy()
+    known = decisions >= pd.Timestamp(sell["known_at"])
+    in_window = (decisions - pd.Timestamp(sell["known_at"])) < pd.Timedelta(days=30)
+    assert np.array_equal(hit, known & in_window) and 0 < hit.sum() < len(decisions)
+    assert s[E1].equals(only_e1[E1])
+    # Before the sell is known, S on the same grid prefix is a number, not an exception.
+    early = decisions[decisions < pd.Timestamp(sell["known_at"])]
+    assert P.signed_S(events, spec, [E1, E2], early, coverage=None).notna().all().all()
+
+
+def test_superseded_and_retracted_versions_are_visible_only_until_then():
+    t0 = ts("2024-01-05 21:00")
+    decisions = pd.DatetimeIndex([t0 + i * DAY for i in range(40)])
+    s_at = t0 + 10 * DAY + pd.Timedelta(hours=2)
+    old = ev(known_at=t0, dedup_key="v1", superseded_at=s_at)
+    new = ev(known_at=s_at, dedup_key="v1b", event_time=t0 - 2 * DAY)  # the replacement: known_at = obs
+    a = P.density_A(frame([old, new]), SPEC30, [E1], decisions, coverage=None)[E1].to_numpy()
+    age_old = (decisions - t0) / pd.Timedelta(days=15)
+    age_new = (decisions - s_at) / pd.Timedelta(days=15)
+    expect = np.where(decisions < s_at, np.exp(-age_old), np.where(decisions - s_at < pd.Timedelta(days=30),
+                                                                   np.exp(-age_new), 0.0))
+    assert np.allclose(a, expect, rtol=0, atol=1e-15)
+    # A retracted later filing hands "latest" back to the earlier one.
+    first = ev(known_at=t0, dedup_key="a")
+    later = ev(known_at=t0 + 5 * DAY, dedup_key="b", retracted_at=t0 + 8 * DAY)
+    a = P.density_A(frame([first, later]), SPEC30, [E1], decisions, coverage=None)[E1].to_numpy()
+    expect = np.where((decisions >= t0 + 5 * DAY) & (decisions < t0 + 8 * DAY),
+                      np.exp(-((decisions - (t0 + 5 * DAY)) / pd.Timedelta(days=15))),
+                      np.where(decisions - t0 < pd.Timedelta(days=30), np.exp(-age_old), 0.0))
+    assert np.allclose(a, expect, rtol=0, atol=1e-15)
+
+
+def test_entity_chunking_never_changes_a_bit(monkeypatch):
+    rng = np.random.default_rng(8)
+    events = frame(random_events(rng, 3000, ts("2018-01-01"), ts("2021-01-01")))
+    entities = sorted(membership()["entity_id"])
+    decisions = P.weekly_decisions(date(2018, 6, 1), date(2020, 12, 25))
+    specs = (P.DECLARED_SPECS["A_multi_mc1_w90"], P.DECLARED_SPECS["C_people_w30"], P.DECLARED_SPECS["S_congress_w90"])
+
+    def run() -> list[bytes]:
+        out = []
+        for spec in specs:
+            fn = P.signed_S if spec.signed else (P.channel_count_C if spec.name.startswith("C_") else P.density_A)
+            out.append(fn(events, spec, entities, decisions, coverage=None).to_numpy().tobytes())
+        return out
+
+    whole = run()
+    monkeypatch.setattr(P, "MAX_PAIRS_PER_CHUNK", 50)  # roughly one entity per chunk
+    assert run() == whole
+
+
+def test_aggregates_count_undefined_s_cells_apart_from_coverage():
+    t = P.weekly_decisions(date(2024, 6, 14), date(2024, 6, 14))
+    rows = [ev(known_at=t[0] - DAY, entity_cik=str(1000 + e), actor_id=f"{e:010d}", transaction_code="S",
+               direction="sell", plan_10b5_1=None if e == 0 else False) for e in range(15)]
+    agg = P.sector_weekly_aggregates(frame(rows), [P.DECLARED_SPECS["S_insider_w30"]], membership(), t,
+                                     coverage=COVERAGE, on_undetermined="nan")
+    s0 = agg.loc[agg["sector"] == "S0"].iloc[0]
+    assert (s0["n_members"], s0["n_covered"], s0["n_undefined"]) == (5, 5, 1)
+
+
 # --- 11. basis filter -----------------------------------------------------------------------
 
 
@@ -492,7 +604,8 @@ def build_artifact(path: str) -> str:
     decisions = P.weekly_decisions(date(2020, 1, 3), date(2021, 5, 28))
     specs = [P.DECLARED_SPECS["A_multi_mc1_w90"], P.DECLARED_SPECS["A_inst_w30"]]
     agg = P.sector_weekly_aggregates(events, specs, members, decisions, coverage=COVERAGE)
-    receipt = P.build_receipt(events=events, specs=specs, membership=members, as_of=decisions[-1].to_pydatetime())
+    receipt = P.build_receipt(events=events, specs=specs, membership=members, decisions=decisions,
+                              coverage=COVERAGE, as_of=decisions[-1].to_pydatetime())
     return P.write_frozen_artifact(agg, path, receipt=receipt)
 
 
@@ -520,6 +633,30 @@ def test_code_hash_ignores_crlf_checkout(tmp_path):
     assert P.lf_sha256(tmp_path / "lf.py") == P.lf_sha256(tmp_path / "crlf.py") == P.code_sha256()
 
 
+def test_receipt_pins_inputs_that_change_the_artifact(tmp_path):
+    rng = np.random.default_rng(2)
+    events = frame(random_events(rng, 100, ts("2020-01-01"), ts("2020-06-01")))
+    members = membership()
+    decisions = P.weekly_decisions(date(2020, 3, 6), date(2020, 5, 29))
+    specs = [P.DECLARED_SPECS["A_inst_w30"]]
+    r = P.build_receipt(events=events, specs=specs, membership=members, decisions=decisions, coverage=COVERAGE,
+                        as_of=decisions[-1].to_pydatetime())
+    for key in ("event_set_sha256", "spec_sha256", "membership_sha256", "coverage_sha256", "decisions", "versions",
+                "code_sha256", "contract", "constants"):
+        assert key in r, key
+    assert r["decisions"]["count"] == len(decisions) and "pyarrow" in r["versions"]
+    r2 = P.build_receipt(events=events, specs=specs, membership=members, decisions=decisions,
+                         coverage=COVERAGE[:2], as_of=decisions[-1].to_pydatetime())
+    assert r2["coverage_sha256"] != r["coverage_sha256"]
+    # Realistic registries: same channel and start, mixing None with strings.
+    start = ts("2015-01-01")
+    mixed = [P.CoverageSpan("form4", start), P.CoverageSpan("form4", start, stop=ts("2020-01-01")),
+             P.CoverageSpan("form4", start, entity_id=E1), P.CoverageSpan("form4", start, known_at_basis="first_seen")]
+    assert P.coverage_sha256(mixed) == P.coverage_sha256(mixed[::-1])
+    open_and_closed = pd.concat([members, members.iloc[[0]].assign(valid_to=date(2011, 1, 1))], ignore_index=True)
+    assert P.membership_sha256(open_and_closed) == P.membership_sha256(open_and_closed.iloc[::-1])
+
+
 def test_event_set_hash_is_order_independent_and_specs_hash_stably():
     rows = random_events(np.random.default_rng(1), 200, ts("2020-01-01"), ts("2021-01-01"))
     assert P.event_set_sha256(frame(rows)) == P.event_set_sha256(frame(rows.sample(frac=1.0, random_state=3)))
@@ -540,14 +677,14 @@ def test_budget_200_entities_600_decisions_50k_events():
     entities = sorted(members["entity_id"])
     decisions = P.weekly_decisions(date(2012, 6, 1), date(2024, 1, 1))[:600]
     assert len(decisions) == 600
-    start = time.perf_counter()
+    start = time.process_time()  # CPU time: robust to a loaded runner / xdist neighbours
     events = frame(rows)
     a = P.density_A(events, P.DECLARED_SPECS["A_multi_mc1_w90"], entities, decisions, coverage=COVERAGE)
     P.channel_count_C(events, P.DECLARED_SPECS["C_people_w90"], entities, decisions, coverage=COVERAGE)
     P.signed_S(events, P.DECLARED_SPECS["S_insider_w90"], entities, decisions, coverage=COVERAGE)
     P.d_self(a)
     P.d_peer(a, members)
-    elapsed = time.perf_counter() - start
+    elapsed = time.process_time() - start
     assert elapsed < 30.0, f"{elapsed:.1f}s"
 
 
@@ -619,3 +756,7 @@ def test_declared_specs_are_frozen_and_complete():
         with pytest.raises(dataclasses.FrozenInstanceError):
             spec.window_days = 1  # type: ignore[misc]
     assert "gov_contract_qq_aggregate" not in P.DECLARED_SPECS["C_people_w90"].channels
+    for spec in P.DECLARED_SPECS.values():  # PE design F2 / GD-INDEX R6
+        assert spec.allowed_known_at_bases == ("filing", "first_seen", "publish")
+        assert "statutory_bound" not in spec.allowed_known_at_bases
+        assert "qq_last_modified" not in spec.allowed_known_at_bases
