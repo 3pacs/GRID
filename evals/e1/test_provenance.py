@@ -25,6 +25,12 @@ yfinance's source next to ``yfinance_pull``'s ``auto_adjust=False``).
 
 The fixture test (``test_gates_pg.py``) runs the shared writer
 (``BasePuller._insert_raw``) against the real DDL on PostgreSQL.
+
+``resolved_series`` vintages (E1-V7, :mod:`evals.e1.vintage_scan`): outside
+``normalization/resolver.py`` no writer may stamp ``release_date`` /
+``vintage_date`` with the row's ``obs_date`` (a backdated vintage), rewrite a
+stored vintage with ``ON CONFLICT ... DO UPDATE``, omit the NOT NULL date
+columns, or bind them in a way the scan cannot verify.
 """
 
 from __future__ import annotations
@@ -328,3 +334,177 @@ def pull(engine):
     implicit = contaminated.replace(", auto_adjust=True", "")
     assert any("auto_adjust=implicit" in p for p in
                price_writer_problems({"m.py": ("yfinance", False)}, {"m.py": implicit}))
+
+
+# ── resolved_series: no direct writer backdates a vintage (E1-V7) ──────
+
+from evals.e1 import vintage_scan  # noqa: E402
+
+_RESOLVED_WRITERS = vintage_scan.all_writers()
+
+# Direct resolved_series writer files on main that violate the rules in
+# evals/e1/vintage_scan.py (see known_violations.py). One ID per writer, so
+# fixing (or retiring) one turns exactly its xfail into an XPASS.
+_KNOWN_BACKDATING_WRITERS = {
+    "ingestion/coingecko.py": "E1-V6",
+    "analysis/research_agent.py": "E1-V7a",
+    "scripts/backfill_celestial_ephemeris.py": "E1-V7b",
+    "scripts/backfill_resolved_series_from_ticker_metrics.sql": "E1-V7c",
+    "scripts/bridge_crucix.py": "E1-V7d",
+    "scripts/load_alt_data.py": "E1-V7e",
+    "scripts/load_more_data.py": "E1-V7f",
+    "scripts/load_ticker_deep.py": "E1-V7g",
+    "scripts/load_wave2.py": "E1-V7h",
+    "scripts/load_wave3.py": "E1-V7i",
+    "scripts/load_yfinance.py": "E1-V7j",
+    "scripts/migrate_and_load.py": "E1-V7k",
+    "scripts/parse_edgar.py": "E1-V7l",
+    "scripts/parse_eia.py": "E1-V7m",
+    "scripts/parse_gdelt.py": "E1-V7n",
+    "scripts/pull_intraday.py": "E1-V7o",
+}
+
+
+def _resolved_writer_params():
+    for rel in sorted(_RESOLVED_WRITERS):
+        marks = [known_violation(_KNOWN_BACKDATING_WRITERS[rel])] if rel in _KNOWN_BACKDATING_WRITERS else []
+        yield pytest.param(rel, id=rel, marks=marks)
+
+
+def test_resolved_scan_finds_the_known_writer_population():
+    # A scanner that silently stopped matching would make every writer "pass".
+    assert len(_RESOLVED_WRITERS) >= 15, sorted(_RESOLVED_WRITERS)
+    for must in ("scripts/load_yfinance.py", "scripts/compute_derived_features.py", "ingestion/options.py"):
+        assert must in _RESOLVED_WRITERS
+    assert vintage_scan.RESOLVER not in _RESOLVED_WRITERS
+
+
+@pytest.mark.parametrize("rel", list(_resolved_writer_params()))
+def test_resolved_series_writer_never_backdates_or_rewrites_a_vintage(rel):
+    problems = _RESOLVED_WRITERS[rel]
+    assert not problems, "\n".join(str(p) for p in problems)
+
+
+def test_known_backdating_writers_are_still_writers():
+    assert set(_KNOWN_BACKDATING_WRITERS) <= set(_RESOLVED_WRITERS)
+
+
+def test_no_resolved_series_writer_bypasses_the_scan():
+    """Writers the SQL scan cannot see (ORM/pandas/COPY) are refused outright."""
+    assert vintage_scan.hidden_writers() == []
+
+
+def test_resolved_schema_requires_release_and_vintage_dates():
+    text = (REPO / "schema.sql").read_text(encoding="utf-8")
+    body = re.search(r"CREATE TABLE IF NOT EXISTS resolved_series \((.*?)\n\);", text, re.S).group(1)
+    for col in ("obs_date", "release_date", "vintage_date"):
+        line = next(ln for ln in body.splitlines() if ln.strip().startswith(col + " "))
+        assert "NOT NULL" in line.upper() and "DEFAULT" not in line.upper(), line
+
+
+def _problems(files: dict[str, str]) -> dict[str, list[str]]:
+    return {rel: [p.kind for p in ps] for rel, ps in vintage_scan.all_writers(files).items()}
+
+
+_BAD_POSITIONAL = '''
+def ins(cur, fid, d, val, sid):
+    cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value,source_priority_used) "
+                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING", (fid, d, d, d, val, sid))
+'''
+_BAD_SAME_NAME = '''
+def fill(conn, fid, hist):
+    for dt, row in hist.iterrows():
+        conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
+                          "source_priority_used) VALUES (:fid, :od, :od, :od, :val, 1) ON CONFLICT DO NOTHING"),
+                     {"fid": fid, "od": dt.date(), "val": row["Close"]})
+'''
+_BAD_BATCH = '''
+def run(conn, days):
+    batch = []
+    for d in days:
+        batch.append({"fid": 1, "od": d, "rd": d, "vd": d, "val": 1.0, "src": 2})
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
+                      "source_priority_used) VALUES (:fid, :od, :rd, :vd, :val, :src)"), batch)
+'''
+_BAD_SELECT_SQL = """INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, source_priority_used)
+SELECT fr.id, t.obs_date, t.obs_date AS release_date, t.as_of::date, t.close, 7 FROM t JOIN fr ON true
+ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING;"""
+_BAD_REWRITE = '''
+def save(conn, r):
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, value, source_priority_used) "
+                      "VALUES (:fid, :d, :d, :v, :src) ON CONFLICT (feature_id, obs_date, vintage_date) "
+                      "DO UPDATE SET value = :v"),
+                 {"fid": 1, "d": r["date"], "v": r["price"], "src": 3})
+'''
+
+
+def test_vintage_scanner_self_test_catches_backdating_writers():
+    got = _problems({"a.py": _BAD_POSITIONAL, "b.py": _BAD_SAME_NAME, "c.py": _BAD_BATCH,
+                     "d.sql": _BAD_SELECT_SQL, "e.py": _BAD_REWRITE})
+    assert got["a.py"] == ["backdate", "backdate"]
+    assert got["b.py"] == ["backdate", "backdate"]
+    assert got["c.py"] == ["backdate", "backdate"]
+    assert got["d.sql"] == ["backdate"]
+    assert sorted(got["e.py"]) == ["backdate", "missing", "rewrite"]
+
+
+_GOOD_RUN_DATE = '''
+def insert(conn, fid, series, run_date):
+    rows = [{"feature_id": fid, "obs_date": d, "release_date": run_date, "vintage_date": run_date, "value": v}
+            for d, v in series.items()]
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:feature_id, :obs_date, :release_date, :vintage_date, :value) "
+                      "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"), rows)
+'''
+_GOOD_SAME_DAY = '''
+def push(conn, fid, val):
+    snap = date.today()
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, "
+                      "source_priority_used) VALUES (:fid, :d, :d, :d, :v, 1) ON CONFLICT DO NOTHING"),
+                 {"fid": fid, "d": snap, "v": val})
+'''
+_GOOD_PULL_DATE = """
+def bulk(conn):
+    conn.execute(text('''INSERT INTO resolved_series (feature_id, obs_date, value, release_date, vintage_date,
+                         source_priority_used) SELECT :fid, w.obs_date, w.value, w.pull_timestamp::date,
+                         w.pull_timestamp::date, 1 FROM winners w ON CONFLICT DO NOTHING'''), {"fid": 1})
+"""
+
+
+def test_vintage_scanner_self_test_passes_honest_writers_and_exempts_the_resolver():
+    got = _problems({
+        "a.py": _GOOD_RUN_DATE,       # stamped at computation time (compute_derived_features)
+        "b.py": _GOOD_SAME_DAY,       # same-day snapshot (options live push)
+        "c.py": _GOOD_PULL_DATE,      # vintage from the pull timestamp (bulk_resolve)
+        vintage_scan.RESOLVER: _BAD_SAME_NAME,  # the resolver is exempt whatever it holds
+        "d.py": 'DOC = "pulls prices and insert into resolved_series."',  # prose, not a writer
+    })
+    assert got == {"a.py": [], "b.py": [], "c.py": []}, got
+
+
+def test_vintage_scanner_self_test_reports_dynamic_sql_as_unverifiable():
+    got = _problems({
+        "a.py": '''
+def w(conn, cols, row):
+    conn.execute(text(f"INSERT INTO resolved_series ({cols}) VALUES (:fid, :od, :rd, :vd, :v)"), row)
+''',
+        "b.py": '''
+def w(cur, rows):
+    for row in rows:
+        cur.execute("INSERT INTO resolved_series (feature_id,obs_date,release_date,vintage_date,value) "
+                    "VALUES (%s,%s,%s,%s,%s)", row)
+''',
+        "c.py": '''
+def w(conn, params):
+    conn.execute(text("INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value) "
+                      "VALUES (:fid, :od, :rd, :vd, :v)"), params)
+''',
+        "d.py": 'Q = "INSERT INTO resolved_series VALUES (1, 2, 3)"',
+    })
+    assert set(got) == {"a.py", "b.py", "c.py", "d.py"}, got
+    for rel, kinds in got.items():
+        assert kinds and set(kinds) == {vintage_scan.UNVERIFIABLE}, (rel, kinds)
+    hidden = vintage_scan.hidden_writers({"x.py": "df.to_sql('resolved_series', engine)",
+                                          "y.sql": "COPY resolved_series FROM STDIN;",
+                                          "z.sql": "COPY resolved_series_retractions TO STDOUT;"})
+    assert hidden == ["x.py", "y.sql"]
