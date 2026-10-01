@@ -37,24 +37,39 @@ def test_fail_closed_until_bound(tmp_path):
     assert s6.GATE_SPEC_SHA256 == "fa2fa2bd1b1ef5cb81168f393135795824991e08829b60f66a109decdf401174"
     body = (s4.REPO / s6.PREREG_PATH).read_text(encoding="utf-8")
     assert s6.GATE_SPEC_SHA256 in v1.prereg_body(body) and "@@GATE_SPEC@@" not in body
-    assert s6.PREREG_BODY_SHA256 is None and s6.V8_REGISTRATION_HEAD_SHA256 is None
+    assert s6.V8_REGISTRATION_HEAD_SHA256 == v8.REGISTERED_RECORD_SHA256[1]
+    assert s6.V8_REGISTRATION_HEAD_SHA256 in v1.prereg_body(body) and "@@" not in body
+    assert s6.check_prereg() == s6.PREREG_BODY_SHA256  # the committed body is final and bound
     assert s6.REGISTERED_RECORD_SHA256 is None and s6.REGISTERED_ANCHOR_LINE is None
     assert s6.REGISTRY_ID == "sectors-v6" and s6.WITNESS_PATH == v1.canonical_witness_path("sectors-v6")
-    for call in (s6.check_prereg, lambda: s6.registry(tmp_path), lambda: s6.registration_records(NOW, "a" * 40)):
-        with pytest.raises(PermissionError, match="not bound"):
-            call()
+
+
+def test_unbound_pins_and_gate_spec_mismatch_fail_closed(monkeypatch, tmp_path):
+    from analysis import generalization_gate as gate
+
+    for name in ("PREREG_BODY_SHA256", "V8_REGISTRATION_HEAD_SHA256", "GATE_SPEC_SHA256"):
+        with monkeypatch.context() as m:
+            m.setattr(s6, name, None)
+            for call in (s6.check_prereg, lambda: s6.registry(tmp_path),
+                         lambda: s6.registration_records(NOW, "a" * 40)):
+                with pytest.raises(PermissionError):
+                    call()
+    monkeypatch.setattr(gate, "GATE_SPEC_V1_SHA256", "0" * 64)
+    with pytest.raises(PermissionError, match="GateSpec v1 in code differs"):
+        s6.check_prereg()
     with pytest.raises(PermissionError, match="no reviewed sectors-v6 joint-run harness"):
         s6.check_open()
 
 
 GATE_SPEC = s6.GATE_SPEC_SHA256
+REAL_V8_HEAD = s6.V8_REGISTRATION_HEAD_SHA256
 V8_AT = datetime(2026, 10, 2, 0, 0, tzinfo=timezone.utc)
 
 
 def _bind_v8(monkeypatch, tmp_path):
     """A synthetic v8 registration (real v8 code, monkeypatched pins) and an s6 bound to it.
 
-    The body is a temp copy with the two placeholders filled, as the real pin PR will do.
+    The body is a temp copy citing the synthetic v8 head instead of the real one.
     """
     v8_reg = tmp_path / "v8reg"
     log = v8.registry(v8_reg)
@@ -65,8 +80,7 @@ def _bind_v8(monkeypatch, tmp_path):
     monkeypatch.setattr(v8, "REGISTERED_ANCHOR_LINE", anchor)
     body = (s4.REPO / s6.PREREG_PATH).read_text(encoding="utf-8")
     filled = tmp_path / "s6-prereg.md"
-    filled.write_bytes(body.replace("@@V8_HEAD@@", heads[1]).replace("@@GATE_SPEC@@", GATE_SPEC)
-                       .encode("utf-8"))
+    filled.write_bytes(body.replace(REAL_V8_HEAD, heads[1]).encode("utf-8"))
     monkeypatch.setattr(s6, "PREREG_PATH", filled)
     monkeypatch.setattr(s6, "V8_REGISTRATION_HEAD_SHA256", heads[1])
     monkeypatch.setattr(s6, "PREREG_BODY_SHA256", v1.prereg_body_sha256(filled))
@@ -143,9 +157,11 @@ def test_registration_refuses_wrong_v8_head_or_changed_body(monkeypatch, tmp_pat
     monkeypatch.setattr(s6, "PREREG_BODY_SHA256", "e" * 64)
     with pytest.raises(PermissionError, match="differs from its pin"):
         s6.check_prereg()
-    monkeypatch.setattr(s6, "PREREG_PATH", s4.REPO / "docs/paper_log/vs1-sectors-v6-preregistration.md")
+    leftover = tmp_path / "left.md"
+    leftover.write_bytes(s6.PREREG_PATH.read_bytes().replace(heads[1].encode(), b"@@V8_HEAD@@"))
+    monkeypatch.setattr(s6, "PREREG_PATH", leftover)
     with pytest.raises(PermissionError, match="placeholder"):
-        s6.check_prereg()  # the committed draft still carries @@ placeholders
+        s6.check_prereg()
 
 
 def test_cli_execute_requires_the_dry_run_head(monkeypatch, tmp_path, capsys):

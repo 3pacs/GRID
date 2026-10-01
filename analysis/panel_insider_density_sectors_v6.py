@@ -29,11 +29,11 @@ from analysis.research_forward_log import ForwardLog
 VERSION = "vs1-sectors-v6"
 REGISTRY_ID = v8.SECTORS_V6  # "sectors-v6"
 PREREG_PATH = Path("docs/paper_log/vs1-sectors-v6-preregistration.md")
-PREREG_BODY_SHA256: str | None = None  # pinned at review, after the GateSpec v1 hash is cited
+PREREG_BODY_SHA256: str | None = "5a8f7b6e73f8924d9578ee4a53f990127f22510ca357018da2bb63e147c3da76"
 #: The exact witnessed two-record v8 registration head; bound only after v8 is registered and witnessed.
-V8_REGISTRATION_HEAD_SHA256: str | None = None
+V8_REGISTRATION_HEAD_SHA256: str | None = "69a7d3276da1fffc10f0ea023151ff283dd0e154b9ee3509495c670ddff42bb5"
 #: sha256 of GD10b GateSpec v1 (analysis.generalization_gate.GATE_SPEC_V1_SHA256, PR #784 head 05c7a89a).
-#: A runtime equality check against the merged module is added once #784 is on main.
+#: Checked at run time against the merged module in :func:`_bound`.
 GATE_SPEC_SHA256: str | None = "fa2fa2bd1b1ef5cb81168f393135795824991e08829b60f66a109decdf401174"
 REGISTRY_LOG = "granular_panel_prereg_sectors_v6.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_sectors_v6.anchors.jsonl"
@@ -59,6 +59,10 @@ STAGE0 = {"target_ic": v1.POWER_GATE_IC, "gate": v1.POWER_GATE, "alpha_one_sided
 
 
 def _bound() -> tuple[str, str]:
+    from analysis import generalization_gate as gate
+
+    if gate.GATE_SPEC_V1_SHA256 != GATE_SPEC_SHA256 or gate.spec_sha256(gate.GATE_SPEC_V1) != GATE_SPEC_SHA256:
+        raise PermissionError("GateSpec v1 in code differs from the sectors-v6 pin")
     if not (v1._is_hex64(PREREG_BODY_SHA256) and v1._is_hex64(V8_REGISTRATION_HEAD_SHA256)
             and v1._is_hex64(GATE_SPEC_SHA256)
             and v8.REGISTERED_RECORD_SHA256 and v8.REGISTERED_RECORD_SHA256[1] == V8_REGISTRATION_HEAD_SHA256
