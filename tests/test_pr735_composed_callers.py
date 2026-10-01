@@ -181,7 +181,7 @@ def _smart(monkeypatch, capture, kwargs):
 
 CASES = [
     ("full", "SUCCESS", 400, 200),
-    ("gem", "PARTIAL", 18, 9),
+    ("gem", "PARTIAL", 16, 8),  # eight GEM tickers (BHRB dropped)
     ("subset", "PARTIAL", 6, 3),
     ("reduced_expiry", "PARTIAL", 400, 200),
     ("mixed", "PARTIAL", 396, 200),

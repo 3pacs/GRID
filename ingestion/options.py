@@ -47,6 +47,7 @@ MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
 # limits and a local transaction deadline fit inside the scheduler's 60s margin.
 CATALOG_PUBLICATION_SECONDS = 15
 _EQUITY_TZ = ZoneInfo("America/New_York")
+DEFAULT_CAPTURE_SOURCE = "options_puller"
 
 
 class _OptionsBudgetExpired(Exception):
@@ -276,34 +277,14 @@ class OptionsPuller(BasePuller):
     def _ensure_tables(self) -> None:
         """Create options tables if they don't exist."""
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS options_snapshots (
-                    id           BIGSERIAL PRIMARY KEY,
-                    ticker       TEXT NOT NULL,
-                    snap_date    DATE NOT NULL,
-                    expiry       DATE NOT NULL,
-                    opt_type     TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
-                    strike       DOUBLE PRECISION NOT NULL,
-                    last_price   DOUBLE PRECISION,
-                    bid          DOUBLE PRECISION,
-                    ask          DOUBLE PRECISION,
-                    volume       INTEGER,
-                    open_interest INTEGER,
-                    implied_vol  DOUBLE PRECISION,
-                    in_the_money BOOLEAN,
-                    created_at   TIMESTAMPTZ DEFAULT NOW(),
-                    capture_batch_id TEXT,
-                    capture_ordinal BIGINT,
-                    capture_started_at TIMESTAMPTZ,
-                    capture_completed_at TIMESTAMPTZ,
-                    provider_regular_market_at TIMESTAMPTZ,
-                    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
-                )
-            """))
-            conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
-                ON options_snapshots (ticker, snap_date)
-            """))
+            # The chain store is migration-owned since
+            # options_append_only_20260930: ``options_snapshots_all`` keeps
+            # every capture batch, ``options_capture_batches`` registers the
+            # complete ones, and ``options_snapshots`` is a *view* of the
+            # latest complete batch per ticker/day. DDL against that name
+            # (CREATE INDEX ... ON options_snapshots) would fail on the view,
+            # so this method no longer touches it; a database without the
+            # migration makes every capture fail closed at publication.
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS options_daily_signals (
                     id              BIGSERIAL PRIMARY KEY,
@@ -337,6 +318,7 @@ class OptionsPuller(BasePuller):
         include_catalyst_universe: bool = True,
         max_expirations: int = MAX_EXPIRATIONS,
         should_continue: Callable[[], bool] | None = None,
+        capture_source: str = DEFAULT_CAPTURE_SOURCE,
     ) -> OptionsPullResults:
         """Pull options chains for all tickers and compute signals.
 
@@ -354,6 +336,8 @@ class OptionsPuller(BasePuller):
             should_continue: Deadline check between tickers, expirations and
                 publication statements. Cancellation rolls back the current
                 ticker and reports it and the remaining tickers as DEFERRED.
+            capture_source: Writer label recorded on each registered batch
+                in ``options_capture_batches`` (e.g. "gem_daily").
 
         Returns:
             OptionsPullResults: List-compatible results with a source-wide
@@ -400,9 +384,14 @@ class OptionsPuller(BasePuller):
                     for t in tickers[idx:]
                 )
                 break
-            result = self._pull_ticker(
-                ticker, today_str, max_expirations=max_expirations, should_continue=should_continue,
-            )
+            ticker_kwargs: dict[str, Any] = {
+                "max_expirations": max_expirations, "should_continue": should_continue,
+            }
+            if capture_source != DEFAULT_CAPTURE_SOURCE:
+                # Only non-default writers pass a label; the default call
+                # shape stays what existing wrappers and doubles expect.
+                ticker_kwargs["capture_source"] = capture_source
+            result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
             if result["status"] == "DEFERRED":
                 results.extend(
@@ -485,6 +474,7 @@ class OptionsPuller(BasePuller):
     def _pull_ticker(
         self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,
         should_continue: Callable[[], bool] | None = None,
+        capture_source: str = DEFAULT_CAPTURE_SOURCE,
     ) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
@@ -643,31 +633,50 @@ class OptionsPuller(BasePuller):
                     {"ticker": ticker, "snap_date": today_str},
                 )
                 latest = conn.execute(
-                    text("""SELECT MAX(capture_ordinal) FROM options_snapshots
+                    text("""SELECT MAX(capture_ordinal) FROM options_capture_batches
                              WHERE ticker = :ticker AND snap_date = :snap_date"""),
                     {"ticker": ticker, "snap_date": today_str},
                 ).fetchone()
-                if latest and latest[0] is not None and latest[0] > capture_ordinal:
-                    log.info("{t}: older overlapping options capture skipped", t=ticker)
-                    return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
-                            "reason": "newer options capture already published"}
+                # Append-only (options_append_only_20260930): nothing deletes
+                # or replaces an earlier batch. Every complete capture is
+                # registered and kept; readers of the ``options_snapshots``
+                # view see the highest-ordinal batch, and any earlier batch
+                # stays replayable by capture_batch_id. An older-started
+                # capture that commits after a newer one is still kept, but
+                # it does not overwrite the newer batch's daily signals.
+                is_latest = not (latest and latest[0] is not None and latest[0] > capture_ordinal)
 
-                # A ticker/day is one full capture, not a growing union of four
-                # scheduled pulls. Remove old/legacy rows and publish the new
-                # batch in the same transaction. A concurrent legacy insert
-                # after commit remains mixed and is rejected by the reader.
+                # One row per contract per batch. A provider page that repeats
+                # a contract keeps its first quote; the unique batch key then
+                # makes any further conflict a hard failure, never a silent
+                # partial batch.
+                unique_rows: dict[tuple, dict[str, Any]] = {}
+                for row in snapshot_rows:
+                    unique_rows.setdefault((row["expiry"], row["opt_type"], float(row["strike"])), row)
+                batch_rows = list(unique_rows.values())
+
                 _check_budget(should_continue)
                 conn.execute(
-                    text("DELETE FROM options_snapshots WHERE ticker = :ticker AND snap_date = :snap_date"),
-                    {"ticker": ticker, "snap_date": today_str},
+                    text(
+                        "INSERT INTO options_capture_batches "
+                        "(capture_batch_id, ticker, snap_date, capture_ordinal, "
+                        "capture_started_at, capture_completed_at, row_count, "
+                        "spot_price, capture_source) "
+                        "VALUES (:batch_id, :ticker, :snap_date, :ordinal, "
+                        ":started_at, :completed_at, :row_count, :spot, :source)"
+                    ),
+                    {"batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
+                     "ordinal": capture_ordinal, "started_at": capture_started_at,
+                     "completed_at": completed_at, "row_count": len(batch_rows),
+                     "spot": float(spot_price), "source": capture_source},
                 )
                 snapshots_inserted = 0
                 rows_known = True
-                for row in snapshot_rows:
+                for row in batch_rows:
                     _check_budget(should_continue)
                     written = conn.execute(
                         text(
-                            "INSERT INTO options_snapshots "
+                            "INSERT INTO options_snapshots_all "
                             "(ticker, snap_date, expiry, opt_type, strike, "
                             "last_price, bid, ask, volume, open_interest, "
                             "implied_vol, in_the_money, capture_batch_id, "
@@ -676,8 +685,7 @@ class OptionsPuller(BasePuller):
                             "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
                             ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
                             ":batch_id, :ordinal, :started_at, :completed_at, "
-                            ":provider_regular_market_at) "
-                            "ON CONFLICT DO NOTHING"
+                            ":provider_regular_market_at)"
                         ),
                         {**row, "ordinal": capture_ordinal,
                          "started_at": capture_started_at, "completed_at": completed_at},
@@ -685,6 +693,19 @@ class OptionsPuller(BasePuller):
                     count = _affected_rows(written)
                     rows_known = rows_known and count is not None
                     snapshots_inserted += count or 0
+                if not rows_known or snapshots_inserted != len(batch_rows):
+                    # Roll back the header and every row: a batch is complete
+                    # or absent, never partial.
+                    raise ValueError("options batch insert count mismatch")
+
+                if not is_latest:
+                    log.info("{t}: older overlapping options capture kept as batch {b}; "
+                             "newer batch keeps the daily signals", t=ticker, b=batch_id)
+                    return {"ticker": ticker, "status": "SUCCESS",
+                            "snapshots": snap_count, "snapshots_inserted": snapshots_inserted,
+                            "rows_inserted": snapshots_inserted,
+                            "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
+                            "latest_batch": False}
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
@@ -801,6 +822,8 @@ class OptionsPuller(BasePuller):
                 "ticker": ticker, "status": "SUCCESS",
                 "snapshots": snap_count, "snapshots_inserted": snapshots_inserted if rows_known else None,
                 "rows_inserted": rows_inserted,
+                "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
+                "latest_batch": True,
                 "signals": {
                     "put_call_ratio": put_call_ratio,
                     "max_pain": max_pain,

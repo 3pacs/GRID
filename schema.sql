@@ -719,33 +719,110 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
     ON agent_runs (decision_journal_id);
 
 -- ============================================================
--- TABLE: options_snapshots
--- Raw options chain snapshots per ticker/expiry/strike.
+-- TABLE: options_snapshots_all  (append-only; migration options_append_only_20260930)
+-- Every options chain capture batch, one row per contract per batch; rows
+-- are immutable. options_capture_batches registers each complete batch and
+-- the options_snapshots VIEW shows the latest complete batch per ticker/day
+-- (what the old delete-then-insert table held).
+-- Fresh installs only: the whole block is skipped when options_snapshots
+-- already exists (table before the migration, view after it), so running
+-- this file against an existing database never races the migration.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS options_snapshots (
-    id              BIGSERIAL PRIMARY KEY,
-    ticker          TEXT NOT NULL,
-    snap_date       DATE NOT NULL,
-    expiry          DATE NOT NULL,
-    opt_type        TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
-    strike          DOUBLE PRECISION NOT NULL,
-    last_price      DOUBLE PRECISION,
-    bid             DOUBLE PRECISION,
-    ask             DOUBLE PRECISION,
-    volume          INTEGER,
-    open_interest   INTEGER,
-    implied_vol     DOUBLE PRECISION,
-    in_the_money    BOOLEAN,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    capture_batch_id TEXT,
-    capture_ordinal BIGINT,
-    capture_started_at TIMESTAMPTZ,
-    capture_completed_at TIMESTAMPTZ,
-    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
-);
-
-CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
-    ON options_snapshots (ticker, snap_date);
+DO $options_store$
+BEGIN
+IF to_regclass('options_snapshots') IS NULL THEN
+    CREATE TABLE options_snapshots_all (
+        id              BIGSERIAL PRIMARY KEY,
+        ticker          TEXT NOT NULL,
+        snap_date       DATE NOT NULL,
+        expiry          DATE NOT NULL,
+        opt_type        TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
+        strike          DOUBLE PRECISION NOT NULL,
+        last_price      DOUBLE PRECISION,
+        bid             DOUBLE PRECISION,
+        ask             DOUBLE PRECISION,
+        volume          INTEGER,
+        open_interest   INTEGER,
+        implied_vol     DOUBLE PRECISION,
+        in_the_money    BOOLEAN,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        capture_batch_id TEXT,
+        capture_ordinal BIGINT,
+        capture_started_at TIMESTAMPTZ,
+        capture_completed_at TIMESTAMPTZ,
+        provider_regular_market_at TIMESTAMPTZ
+    );
+    CREATE INDEX idx_opts_snap_ticker_date ON options_snapshots_all (ticker, snap_date);
+    CREATE UNIQUE INDEX options_snapshots_all_batch_contract_key
+        ON options_snapshots_all (capture_batch_id, expiry, opt_type, strike)
+        WHERE capture_batch_id IS NOT NULL;
+    CREATE TABLE options_capture_batches (
+        capture_batch_id     TEXT PRIMARY KEY,
+        ticker               TEXT NOT NULL,
+        snap_date            DATE NOT NULL,
+        capture_ordinal      BIGINT NOT NULL CHECK (capture_ordinal > 0),
+        capture_started_at   TIMESTAMPTZ NOT NULL,
+        capture_completed_at TIMESTAMPTZ NOT NULL,
+        row_count            INTEGER NOT NULL CHECK (row_count > 0),
+        spot_price           DOUBLE PRECISION,
+        capture_source       TEXT NOT NULL,
+        backfilled           BOOLEAN NOT NULL DEFAULT false,
+        registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        CHECK (capture_started_at <= capture_completed_at),
+        CONSTRAINT options_capture_batches_identity_key
+            UNIQUE (capture_batch_id, capture_ordinal, ticker, snap_date),
+        CONSTRAINT options_capture_batches_day_ordinal_key
+            UNIQUE (ticker, snap_date, capture_ordinal)
+    );
+    ALTER TABLE options_snapshots_all
+        ADD CONSTRAINT options_snapshots_all_batch_required CHECK (
+            capture_batch_id IS NOT NULL AND capture_ordinal IS NOT NULL
+            AND capture_started_at IS NOT NULL
+            AND capture_completed_at IS NOT NULL
+            AND provider_regular_market_at IS NOT NULL
+        ) NOT VALID;
+    ALTER TABLE options_snapshots_all
+        ADD CONSTRAINT options_snapshots_all_batch_fk
+        FOREIGN KEY (capture_batch_id, capture_ordinal, ticker, snap_date)
+        REFERENCES options_capture_batches
+            (capture_batch_id, capture_ordinal, ticker, snap_date)
+        NOT VALID;
+    CREATE FUNCTION options_capture_append_only_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+    BEGIN
+        RAISE EXCEPTION 'options capture history is append-only: % on % refused',
+            TG_OP, TG_TABLE_NAME USING ERRCODE = 'restrict_violation';
+    END
+    $guard$;
+    CREATE TRIGGER options_snapshots_all_no_row_mutation
+        BEFORE UPDATE OR DELETE ON options_snapshots_all
+        FOR EACH ROW EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_snapshots_all_no_truncate
+        BEFORE TRUNCATE ON options_snapshots_all
+        FOR EACH STATEMENT EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_capture_batches_no_row_mutation
+        BEFORE UPDATE OR DELETE ON options_capture_batches
+        FOR EACH ROW EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_capture_batches_no_truncate
+        BEFORE TRUNCATE ON options_capture_batches
+        FOR EACH STATEMENT EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE VIEW options_snapshots AS
+    SELECT s.id, s.ticker, s.snap_date, s.expiry, s.opt_type, s.strike,
+           s.last_price, s.bid, s.ask, s.volume, s.open_interest,
+           s.implied_vol, s.in_the_money, s.created_at,
+           s.capture_batch_id, s.capture_ordinal, s.capture_started_at,
+           s.capture_completed_at, s.provider_regular_market_at
+    FROM options_snapshots_all s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM options_capture_batches b
+        WHERE b.ticker = s.ticker
+          AND b.snap_date = s.snap_date
+          AND b.capture_batch_id IS DISTINCT FROM s.capture_batch_id
+          AND b.capture_ordinal >= COALESCE(s.capture_ordinal, 0)
+    );
+END IF;
+END
+$options_store$;
 
 -- ============================================================
 -- TABLE: options_daily_signals
