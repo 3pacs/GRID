@@ -29,7 +29,7 @@ from __future__ import annotations
 from datetime import date, datetime
 from pathlib import Path
 
-from evals.e2.adapters import SourceView, build_view
+from evals.e2.adapters import DATA_ERRORS, SourceView, build_view, quarantine
 from evals.e2.chain import ChainError, verify_source_chain
 from evals.e2.records import iso, parse_ts, session_close_utc
 from evals.e2.resolve import entry_close_after_issue, resolve_price_call
@@ -61,35 +61,38 @@ class E2StreamAdapter:
         out, seen = [], set()
         late, bad = 0, 0
         for i, record in enumerate(view.records):
-            if record.get("kind") != "prediction" or record["prediction_id"] in seen:
-                continue
-            seen.add(record["prediction_id"])
-            if CALL_FOR_RULE.get(record.get("rule_id")) != (record.get("call") or {}).get("kind"):
-                bad += 1
-                continue
-            horizon = dict(record["horizon"])
-            exit_day = date.fromisoformat(horizon["exit_date"])
-            horizon["ends_at"] = iso(session_close_utc(exit_day))
-            pred = {
-                "stream": self.stream,
-                "family": record["family"],
-                "sector": record.get("sector"),
-                "prediction_id": record["prediction_id"],
-                "issued_at": iso(parse_ts(record["run_at"])),
-                "log_receipt": view.receipt(i, writer_code_sha=record.get("code_sha"),
-                                            witness="stream hash chain + self-reported run_at"),
-                "target": record["target"],
-                "horizon": horizon,
-                "outcome_not_before": iso(session_close_utc(exit_day, early=True)),
-                "call": record["call"],
-                "rule_id": record["rule_id"],
-                "unit": (f"{self.stream}:{record['family']}:{horizon['label']}:{horizon['entry_date']}"
-                         if record["rule_id"] == "e2.rank_ic.v1" else None),
-            }
-            if not entry_close_after_issue(pred):
-                late += 1
-                continue
-            out.append(pred)
+            try:
+                if record.get("kind") != "prediction" or record["prediction_id"] in seen:
+                    continue
+                seen.add(record["prediction_id"])
+                if CALL_FOR_RULE.get(record.get("rule_id")) != (record.get("call") or {}).get("kind"):
+                    bad += 1
+                    continue
+                horizon = dict(record["horizon"])
+                exit_day = date.fromisoformat(horizon["exit_date"])
+                horizon["ends_at"] = iso(session_close_utc(exit_day))
+                pred = {
+                    "stream": self.stream,
+                    "family": record["family"],
+                    "sector": record.get("sector"),
+                    "prediction_id": record["prediction_id"],
+                    "issued_at": iso(parse_ts(record["run_at"])),
+                    "log_receipt": view.receipt(i, writer_code_sha=record.get("code_sha"),
+                                                witness="stream hash chain + self-reported run_at"),
+                    "target": record["target"],
+                    "horizon": horizon,
+                    "outcome_not_before": iso(session_close_utc(exit_day, early=True)),
+                    "call": record["call"],
+                    "rule_id": record["rule_id"],
+                    "unit": (f"{self.stream}:{record['family']}:{horizon['label']}:{horizon['entry_date']}"
+                             if record["rule_id"] == "e2.rank_ic.v1" else None),
+                }
+                if not entry_close_after_issue(pred):
+                    late += 1
+                    continue
+                out.append(pred)
+            except DATA_ERRORS as exc:  # a malformed upstream record is quarantined, not fatal
+                quarantine(view, i, exc)
         view.extra["late_entry"], view.extra["bad_rule"] = late, bad
         return out
 
@@ -101,4 +104,5 @@ class E2StreamAdapter:
 
     def activity(self, view: SourceView) -> dict:
         return {"records": len(view.records), "late_entry_refused": view.extra["late_entry"],
-                "rule_call_mismatch_refused": view.extra["bad_rule"]}
+                "rule_call_mismatch_refused": view.extra["bad_rule"],
+                "quarantined_records": len(view.extra.get("quarantined", []))}

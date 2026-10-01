@@ -22,13 +22,15 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 
 from evals.e2 import scoring
+from evals.e2.adapters import DATA_ERRORS
 from evals.e2.chain import ChainError, Ledger, digest
-from evals.e2.records import LookAheadError, RecordError, iso, parse_ts, prediction_sha256, session_close_utc, validate_prediction
+from evals.e2.records import (LookAheadError, PriceSourceLookAhead, RecordError, iso, parse_ts, prediction_sha256,
+                              session_close_utc, validate_prediction)
 
 PER_PREDICTION_RULES = frozenset({"e2.direction.v1", "e2.probability.v1", "gex.level_hold.v1", "gex.h3_net_pnl.v1"})
 METRIC_KIND = {"hit": "binary", "net_return": "sum", "brier": "mean", "log_loss": "mean",
@@ -52,7 +54,8 @@ def ledger_state(records: Iterable[dict]) -> dict:
             state["scores"].append(r)
             state["unit_scored"].add(r["unit"])
         elif kind == "integrity_alert":
-            state["alerts"].add((r.get("prediction_id") or r.get("stream"), r.get("observed_sha256")))
+            state["alerts"].add((r.get("alert_key") or r.get("prediction_id") or r.get("stream"),
+                                 r.get("observed_sha256")))
         elif kind == "snapshot":
             for name, s in (r.get("streams") or {}).items():
                 if s.get("ok") and s.get("source_records_seen"):
@@ -130,6 +133,24 @@ def _rank_ic_units(stream: str, state: dict, now: datetime, rules: dict) -> list
     return out
 
 
+def _alert(new: list, state: dict, now: datetime, *, key: str, kind: str, stream: str, detail: str,
+           prediction_id: str | None = None) -> None:
+    """Append one integrity alert per (key, kind), ever (deduplicated against the ledger)."""
+    if (key, kind) in state["alerts"]:
+        return
+    record = {"kind": "integrity_alert", "run_at": iso(now), "alert_key": key, "observed_sha256": kind,
+              "stream": stream, "detail": detail}
+    if prediction_id is not None:
+        record["prediction_id"] = prediction_id
+    new.append(record)
+    state["alerts"].add((key, kind))
+
+
+def _void(reason: str, now: datetime, refusal: str) -> dict:
+    return {"status": "void", "reason": reason, "available_at": iso(now), "receipt": {"refusal": refusal},
+            "outcome": None}
+
+
 def _source_prefix_alert(stream: str, view, state: dict, now: datetime) -> dict | None:
     """The stream log must still hold the prefix E2 saw last run (same count, same head)."""
     seen = state["source_seen"].get(stream)
@@ -157,8 +178,22 @@ def _check_resolution(pred: dict, res: dict, now: datetime) -> None:
 def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules: dict, cost_model: dict) -> dict:
     """Ingest, resolve and score one stream; appends to ``new`` and mutates ``state``."""
     ingested = 0
-    for pred in adapter.predictions(view):
-        validate_prediction(pred, rules)
+    preds = adapter.predictions(view)
+    quarantined = list(view.extra.get("quarantined", []))
+    valid = []
+    for pred in preds:
+        try:
+            validate_prediction(pred, rules)
+            valid.append(pred)
+        except (RecordError, KeyError, TypeError) as exc:  # breaks the E2 record contract: quarantined
+            receipt = pred.get("log_receipt") or {}
+            quarantined.append({"line_index": receipt.get("line_index"), "line_sha256": receipt.get("line_sha256"),
+                                "error": f"{type(exc).__name__}: {exc}"[:500]})
+    for q in quarantined:
+        _alert(new, state, now, key=q["line_sha256"] or f"{adapter.stream}:{q['line_index']}", kind="quarantine",
+               stream=adapter.stream, detail=f"malformed record at {view.path.name} line {q['line_index']} set "
+               f"aside (never ingested): {q['error']}")
+    for pred in valid:
         pid, sha = pred["prediction_id"], prediction_sha256(pred)
         known = state["prediction_sha"].get(pid)
         if known is not None:
@@ -182,18 +217,24 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
             continue
         try:
             res = adapter.resolve(view, pred, now)
+        except PriceSourceLookAhead as exc:
+            # E2's own price source misbehaved (possibly transiently): alert, keep the prediction
+            # pending, and void it only once the grace period after its horizon has passed.
+            _alert(new, state, now, key=pid, kind="lookahead", stream=adapter.stream, prediction_id=pid,
+                   detail=f"price source look-ahead refused; pending until the grace period ends: {exc}")
+            grace = timedelta(days=int(rules["resolution"]["grace_days"]))
+            if now < parse_ts(pred["horizon"]["ends_at"]) + grace:
+                continue
+            res = _void("lookahead_refused", now, f"PriceSourceLookAhead: {exc}")
         except LookAheadError as exc:
-            # Contained to this prediction: it is voided for good (its outcome source offered
-            # data that was not observable), one alert is recorded, the stream carries on.
-            error = f"LookAheadError: {exc}"
-            res = {"status": "void", "reason": "lookahead_refused", "available_at": iso(now),
-                   "receipt": {"refusal": error}, "outcome": None}
-            if (pid, "lookahead") not in state["alerts"]:
-                new.append({"kind": "integrity_alert", "run_at": iso(now), "prediction_id": pid,
-                            "stream": adapter.stream, "ledger_sha256": state["prediction_sha"][pid],
-                            "observed_sha256": "lookahead",
-                            "detail": f"look-ahead refused; the prediction is void and never scored: {error}"})
-                state["alerts"].add((pid, "lookahead"))
+            # The stream's own (append-only) log offered the outcome too early: void for good.
+            _alert(new, state, now, key=exc.key or pid, kind="lookahead", stream=adapter.stream, prediction_id=pid,
+                   detail=f"look-ahead refused in the stream log; affected predictions are void: {exc}")
+            res = _void("lookahead_refused", now, f"LookAheadError: {exc}")
+        except DATA_ERRORS as exc:
+            _alert(new, state, now, key=pid, kind="malformed_outcome", stream=adapter.stream, prediction_id=pid,
+                   detail=f"the outcome record could not be read; the prediction is void: {exc}")
+            res = _void("malformed_outcome_record", now, f"{type(exc).__name__}: {exc}"[:500])
         if res is None:
             continue
         _check_resolution(pred, res, now)
@@ -206,7 +247,13 @@ def _process_stream(adapter, view, state: dict, new: list, now: datetime, rules:
             new.append(score)
             state["scores"].append(score)
             state["unit_scored"].add(score["unit"])
-    for score in adapter.unit_scores(view, state, now) + _rank_ic_units(adapter.stream, state, now, rules):
+    try:
+        unit_scores = adapter.unit_scores(view, state, now)
+    except DATA_ERRORS as exc:  # malformed upstream data under a unit (e.g. an S10 plan): alert, retry next run
+        unit_scores = []
+        _alert(new, state, now, key=f"{adapter.stream}:unit_scores:{type(exc).__name__}:{exc}"[:300],
+               kind="malformed_unit", stream=adapter.stream, detail=f"unit scoring skipped this run: {exc}")
+    for score in unit_scores + _rank_ic_units(adapter.stream, state, now, rules):
         registered = parse_ts(rules["registered_at"])
         score = {"prediction_ids": [], "role": "candidate", **score, "kind": "score", "run_at": iso(now),
                  "official": parse_ts(score["available_at"]) > registered}

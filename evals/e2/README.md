@@ -46,10 +46,16 @@ A record resolves only once its outcome was observable at the run instant.
   - `SpyCloseReceiptSource` reads `astrogrid.price_close_receipt`.
   - A close is observable at `max(pull_timestamp, 16:00 ET)`. A revision pulled after
     the run instant is never used.
-  - Any source that offers a close "available" before its session closed, or after
-    the run instant, raises `LookAheadError`. The refusal is contained to that one
-    prediction: it is recorded as void (`lookahead_refused`, never scored), one
-    `integrity_alert` is appended for it, and the rest of the stream carries on.
+  - Look-ahead is refused per prediction, never by failing the whole stream or run:
+    - If E2's own price source offers a close as "available" before its session
+      closed, or after the run instant, it raises `PriceSourceLookAhead`. The
+      prediction stays pending and one `integrity_alert` is appended. It is voided
+      (`lookahead_refused`, never scored) only once the grace period after its
+      horizon has passed, since the source defect may be transient.
+    - If a stream's own append-only log offers an outcome too early (an S10
+      outcome read before publication, a GEX post-close fetched before the close),
+      every affected prediction is voided at once. One alert is appended per
+      offending source record.
   - The entry close must come after the prediction was logged.
 - **Resolution receipts** carry the price source, the series and the vintage
   (pull timestamp or fetch time) of every price used.
@@ -101,9 +107,12 @@ A record resolves only once its outcome was observable at the run instant.
 - **Ingestion is once per prediction id.** If a stream later shows different content
   under the same id, E2 appends an `integrity_alert` and keeps the original. If a
   stream log no longer holds the prefix E2 saw on the last run, E2 appends one alert
-  for that stream. A stream that emits a record breaking the E2 contract is reported
-  not-ok for that run with nothing recorded from it; an unexpected exception aborts the
-  run. Aggregate rows carry `stream_ok_this_run`.
+  for that stream.
+- **Malformed records are quarantined, not fatal.** An upstream record that cannot be
+  normalized, or that breaks the record contract, is set aside: it is never ingested,
+  it is counted in `quarantined_records`, and one alert is appended keyed by its line
+  hash. The rest of the stream and every other stream proceed. An unexpected exception
+  (an E2 bug) aborts the run. Aggregate rows carry `stream_ok_this_run`.
 - **Off-host witness** (`witness.py`, the VS1 pattern):
   - `run --witness-worktree` appends anchor lines to
     `05-GRID/Paper-Log/e2/e2_scoreboard_<version>.anchors.jsonl` in a vault clone,

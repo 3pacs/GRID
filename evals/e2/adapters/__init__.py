@@ -20,6 +20,11 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+#: Data errors raised while normalizing one upstream record. They quarantine that record
+#: (counted, one integrity alert keyed by its line hash) instead of failing the stream or the
+#: run. Anything else (an E2 bug) still aborts the run.
+DATA_ERRORS = (KeyError, TypeError, ValueError, AttributeError, IndexError)
+
 
 @dataclass
 class SourceView:
@@ -67,3 +72,12 @@ def build_view(stream: str, path: Path, pairs: list[tuple[bytes, dict]], now, ru
         shas.append(sha256_hex(line))
         prevs.append(record.get("prev_sha256"))
     return SourceView(stream, Path(path), kept, shas, prevs, len(pairs), shas[-1] if shas else None)
+
+
+def quarantine(view: SourceView, index: int, exc: BaseException) -> None:
+    """Set one malformed upstream record aside; the board alerts once per line hash."""
+    view.extra.setdefault("quarantined", []).append({
+        "line_index": index,
+        "line_sha256": view.line_sha256[index],
+        "error": f"{type(exc).__name__}: {exc}"[:500],
+    })

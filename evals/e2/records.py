@@ -46,7 +46,20 @@ class RecordError(ValueError):
 
 
 class LookAheadError(RuntimeError):
-    """An outcome was offered before it could have been observable."""
+    """An outcome was offered before it could have been observable.
+
+    ``key`` names the offending source record (e.g. a stream line's sha256) so one bad
+    record raises one integrity alert, however many predictions it touches.
+    """
+
+    def __init__(self, message: str, key: str | None = None) -> None:
+        super().__init__(message)
+        self.key = key
+
+
+class PriceSourceLookAhead(LookAheadError):
+    """E2's own price source offered a value too early: possibly transient, so the
+    prediction stays pending (with an alert) and is voided only after the grace period."""
 
 
 def parse_ts(value: str) -> datetime:

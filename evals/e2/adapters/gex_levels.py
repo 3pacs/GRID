@@ -30,7 +30,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-from evals.e2.adapters import SourceView, build_view
+from evals.e2.adapters import DATA_ERRORS, SourceView, build_view, quarantine
 from evals.e2.chain import verify_source_chain
 from evals.e2.records import LookAheadError, iso, parse_ts, session_close_utc, session_open_utc
 
@@ -79,52 +79,62 @@ class GexLevelsAdapter:
     def predictions(self, view: SourceView) -> list[dict]:
         out = []
         for session, slot in sorted(view.extra["sessions"].items()):
-            if "preopen" not in slot or self._preopen_valid(view, slot["preopen"]) is not None:
+            if "preopen" not in slot:
                 continue
             i = slot["preopen"]
-            pre = view.records[i]
-            day = date.fromisoformat(session)
-            receipt = view.receipt(i, writer_code_sha=pre.get("code_sha"),
-                                   witness="stream hash chain + self-reported run_at; vault mirror of the log")
-            base = {
-                "stream": STREAM,
-                "sector": self.rules.get("sector"),
-                "issued_at": iso(parse_ts(pre["run_at"])),
-                "log_receipt": receipt,
-                "target": {"instrument": self.rules["instrument"],
-                           "instrument_class": self.rules["instrument_class"],
-                           "reference_price_p0": (pre.get("p0") or {}).get("price")},
-                "horizon": {"label": "session_close", "session_date": session,
-                            "ends_at": iso(session_close_utc(day))},
-                # earliest possible close (a 13:00 ET early close): conservative for timing claims
-                "outcome_not_before": iso(session_close_utc(day, early=True)),
-                "unit": None,
-            }
-            regime = (pre.get("engine") or {}).get("regime")
-            for arm in ARMS:
-                levels = (pre.get("levels") or {}).get(arm) or {}
-                present = {}
-                for name in LEVELS:
-                    value = _level_value(levels, name, arm)
-                    if value is None:
-                        continue
-                    present[name] = value
-                    out.append({
-                        **base,
-                        "family": f"gex_level_hold_{arm}",
-                        "prediction_id": f"{STREAM}:{session}:{arm}:hold:{name}",
-                        "call": {"kind": "conditional_binary", "condition": "first_reach_today",
-                                 "predicts": "held", "level_name": name, "level": value, "arm": arm},
-                        "rule_id": "gex.level_hold.v1",
-                    })
+            try:
+                if self._preopen_valid(view, i) is not None:
+                    continue
+                out.extend(self._session_predictions(view, session, i))
+            except DATA_ERRORS as exc:  # a malformed upstream record is quarantined, not fatal
+                quarantine(view, i, exc)
+        return out
+
+    def _session_predictions(self, view: SourceView, session: str, i: int) -> list[dict]:
+        out: list[dict] = []
+        pre = view.records[i]
+        day = date.fromisoformat(session)
+        receipt = view.receipt(i, writer_code_sha=pre.get("code_sha"),
+                               witness="stream hash chain + self-reported run_at; vault mirror of the log")
+        base = {
+            "stream": STREAM,
+            "sector": self.rules.get("sector"),
+            "issued_at": iso(parse_ts(pre["run_at"])),
+            "log_receipt": receipt,
+            "target": {"instrument": self.rules["instrument"],
+                       "instrument_class": self.rules["instrument_class"],
+                       "reference_price_p0": (pre.get("p0") or {}).get("price")},
+            "horizon": {"label": "session_close", "session_date": session,
+                        "ends_at": iso(session_close_utc(day))},
+            # earliest possible close (a 13:00 ET early close): conservative for timing claims
+            "outcome_not_before": iso(session_close_utc(day, early=True)),
+            "unit": None,
+        }
+        regime = (pre.get("engine") or {}).get("regime")
+        for arm in ARMS:
+            levels = (pre.get("levels") or {}).get(arm) or {}
+            present = {}
+            for name in LEVELS:
+                value = _level_value(levels, name, arm)
+                if value is None:
+                    continue
+                present[name] = value
                 out.append({
                     **base,
-                    "family": f"gex_h3_{arm}",
-                    "prediction_id": f"{STREAM}:{session}:{arm}:h3",
-                    "call": {"kind": "rule_trade", "rule": "gex_levels_v1_h3", "regime": regime,
-                             "walls": {k: v for k, v in present.items() if k != "gamma_flip"}, "arm": arm},
-                    "rule_id": "gex.h3_net_pnl.v1",
+                    "family": f"gex_level_hold_{arm}",
+                    "prediction_id": f"{STREAM}:{session}:{arm}:hold:{name}",
+                    "call": {"kind": "conditional_binary", "condition": "first_reach_today",
+                             "predicts": "held", "level_name": name, "level": value, "arm": arm},
+                    "rule_id": "gex.level_hold.v1",
                 })
+            out.append({
+                **base,
+                "family": f"gex_h3_{arm}",
+                "prediction_id": f"{STREAM}:{session}:{arm}:h3",
+                "call": {"kind": "rule_trade", "rule": "gex_levels_v1_h3", "regime": regime,
+                         "walls": {k: v for k, v in present.items() if k != "gamma_flip"}, "arm": arm},
+                "rule_id": "gex.h3_net_pnl.v1",
+            })
         return out
 
     # -- resolution --------------------------------------------------------------------
@@ -161,7 +171,7 @@ class GexLevelsAdapter:
                 return {**_void("postclose_without_fetch_time", written), "receipt": receipt}
             if parse_ts(fetched) < close_at:
                 raise LookAheadError(f"{pred['prediction_id']}: post-close {key} {fetched} precedes the "
-                                     f"session close {iso(close_at)}")
+                                     f"session close {iso(close_at)}", key=receipt["postclose_line_sha256"])
         available = max(parse_ts(receipt["bars_fetched_at"]), parse_ts(receipt["ohlc_fetched_at"]))
         arm = pred["call"]["arm"]
         if pred["rule_id"] == "gex.level_hold.v1":
@@ -202,7 +212,10 @@ class GexLevelsAdapter:
             if "preopen" not in slot:
                 reason = "no_preopen"
             else:
-                reason = self._preopen_valid(view, slot["preopen"])
+                try:
+                    reason = self._preopen_valid(view, slot["preopen"])
+                except DATA_ERRORS:
+                    reason = "malformed_preopen"
             if reason is None and "postclose" in slot and view.records[slot["postclose"]].get("excluded"):
                 reason = f"postclose_excluded:{view.records[slot['postclose']].get('exclusion_reason')}"
             if reason is None and "postclose" in slot:
@@ -215,6 +228,7 @@ class GexLevelsAdapter:
             "valid_sessions": valid,
             "excluded_sessions": excluded,
             "duplicate_records": sum(len(s.get("duplicates", [])) for s in sessions.values()),
+            "quarantined_records": len(view.extra.get("quarantined", [])),
             "interim": valid < evaluation_at,
             "evaluation_after_valid_sessions": evaluation_at,
         }

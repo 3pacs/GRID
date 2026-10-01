@@ -27,7 +27,7 @@ from datetime import datetime
 from pathlib import Path
 
 from evals.e2 import scoring
-from evals.e2.adapters import SourceView, build_view
+from evals.e2.adapters import DATA_ERRORS, SourceView, build_view, quarantine
 from evals.e2.chain import raw_lines, verify_source_chain
 from evals.e2.records import LookAheadError, iso, parse_ts
 
@@ -51,14 +51,18 @@ class S10Adapter:
         admissions, predictions, outcomes, verdicts = {}, {}, {}, {}
         for i, record in enumerate(view.records):
             kind, cid = record.get("kind"), record.get("candidate_id")
-            if kind == "admission":
-                admissions[cid] = i
-            elif kind == "prediction":
-                predictions.setdefault((cid, record["k"]), i)
-            elif kind == "outcome":
-                outcomes.setdefault((cid, record["k"]), i)
-            elif kind == "verdict":
-                verdicts.setdefault(cid, i)
+            try:
+                if kind == "admission":
+                    record["plan"]["family"]  # an admission without a usable plan is quarantined
+                    admissions[cid] = i
+                elif kind == "prediction":
+                    predictions.setdefault((cid, int(record["k"])), i)
+                elif kind == "outcome":
+                    outcomes.setdefault((cid, int(record["k"])), i)
+                elif kind == "verdict":
+                    verdicts.setdefault(cid, i)
+            except DATA_ERRORS as exc:
+                quarantine(view, i, exc)
         view.extra.update(admissions=admissions, predictions=predictions, outcomes=outcomes, verdicts=verdicts,
                           anchors=sum(1 for _ in raw_lines(self.anchor_path)))
         return view
@@ -70,31 +74,34 @@ class S10Adapter:
     def predictions(self, view: SourceView) -> list[dict]:
         out = []
         for (cid, k), i in sorted(view.extra["predictions"].items()):
-            record = view.records[i]
-            if record.get("excluded") or cid not in view.extra["admissions"]:
-                continue
-            if parse_ts(record["run_at"]) >= parse_ts(record["label_known_at"]):
-                continue  # logged too late to be a prediction (S10 itself excludes these)
-            _, plan = self._plan(view, cid)
-            out.append({
-                "stream": STREAM,
-                "family": plan["family"],
-                "sector": self.rules.get("sector"),
-                "prediction_id": f"{STREAM}:{cid}:k{k}",
-                "issued_at": iso(parse_ts(record["run_at"])),
-                "log_receipt": view.receipt(i, writer_code_sha=record.get("code_sha"),
-                                            witness="stream hash chain + chained anchor file"),
-                "target": {"series_id": plan["target"]["series_id"], "label": plan["target"]["label"],
-                           "instrument_class": "not_tradable"},
-                "horizon": {"label": f"{plan['horizon_sessions']}_sessions", "decision_at": record["decision_at"],
-                            "ends_at": record["label_end"], "horizon_sessions": plan["horizon_sessions"], "k": k},
-                "outcome_not_before": iso(parse_ts(record["label_known_at"])),
-                "call": {"kind": "signal", "feature": record["feature"]["name"],
-                         "value": record["feature"]["value"], "feature_known_at": record["feature"]["known_at"],
-                         "direction": plan["direction"], "statistic": plan["statistic"]},
-                "rule_id": "s10.ts_ic.v1",
-                "unit": f"{STREAM}:{cid}",
-            })
+            try:
+                record = view.records[i]
+                if record.get("excluded") or cid not in view.extra["admissions"]:
+                    continue
+                if parse_ts(record["run_at"]) >= parse_ts(record["label_known_at"]):
+                    continue  # logged too late to be a prediction (S10 itself excludes these)
+                _, plan = self._plan(view, cid)
+                out.append({
+                    "stream": STREAM,
+                    "family": plan["family"],
+                    "sector": self.rules.get("sector"),
+                    "prediction_id": f"{STREAM}:{cid}:k{k}",
+                    "issued_at": iso(parse_ts(record["run_at"])),
+                    "log_receipt": view.receipt(i, writer_code_sha=record.get("code_sha"),
+                                                witness="stream hash chain + chained anchor file"),
+                    "target": {"series_id": plan["target"]["series_id"], "label": plan["target"]["label"],
+                               "instrument_class": "not_tradable"},
+                    "horizon": {"label": f"{plan['horizon_sessions']}_sessions", "decision_at": record["decision_at"],
+                                "ends_at": record["label_end"], "horizon_sessions": plan["horizon_sessions"], "k": k},
+                    "outcome_not_before": iso(parse_ts(record["label_known_at"])),
+                    "call": {"kind": "signal", "feature": record["feature"]["name"],
+                             "value": record["feature"]["value"], "feature_known_at": record["feature"]["known_at"],
+                             "direction": plan["direction"], "statistic": plan["statistic"]},
+                    "rule_id": "s10.ts_ic.v1",
+                    "unit": f"{STREAM}:{cid}",
+                })
+            except DATA_ERRORS as exc:  # a malformed upstream record is quarantined, not fatal
+                quarantine(view, i, exc)
         return out
 
     def resolve(self, view: SourceView, pred: dict, now: datetime) -> dict | None:
@@ -107,9 +114,10 @@ class S10Adapter:
         read_at = parse_ts(outcome["run_at"])
         if read_at < known:
             raise LookAheadError(f"{pred['prediction_id']}: S10 outcome read at {outcome['run_at']} before its "
-                                 f"label was published ({outcome['label_known_at']})")
+                                 f"label was published ({outcome['label_known_at']})", key=view.line_sha256[idx])
         if known > now:
-            raise LookAheadError(f"{pred['prediction_id']}: outcome not observable at the run instant")
+            raise LookAheadError(f"{pred['prediction_id']}: outcome not observable at the run instant",
+                                 key=view.line_sha256[idx])
         admission, _ = self._plan(view, cid)
         receipt = {"price_source": f"store.observations latest-vintage panel: {pred['target']['series_id']}",
                    "panel_receipt_sha256": outcome.get("receipt"), "outcome_line_sha256": view.line_sha256[idx],
@@ -203,4 +211,5 @@ class S10Adapter:
             "verdicts": states,
             "source_anchor_lines": view.extra["anchors"],
             "sealed_candidates": len(set(view.extra["admissions"]) - set(view.extra["verdicts"])),
+            "quarantined_records": len(view.extra.get("quarantined", [])),
         }

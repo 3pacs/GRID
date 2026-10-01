@@ -164,22 +164,28 @@ def _ledger(tmp_path):
     return Ledger(tmp_path / "board", "e2-v1").read_all()
 
 
-def test_price_offered_before_the_close_voids_only_those_predictions(tmp_path):
-    snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 1, 12)))["snapshot"]
+def test_price_offered_before_the_close_is_refused_pending_then_void_after_grace(tmp_path):
+    hostile = _Hostile(S.utc(2026, 10, 1, 12))
+    snap = _run(tmp_path, AFTER, price_source=hostile)["snapshot"]
     assert snap["streams"][S.STREAM]["ok"] is True
-    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 10}
+    assert snap["counts"]["resolutions"] == 0 and snap["counts"]["pending"] == 10
     assert snap["counts"]["integrity_alerts"] == 10
+    alert = [r for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"][0]
+    assert "before the session closed" in alert["detail"]
+    # still inside the grace period (exit close 10-02 20:00Z + 5 days): pending, no repeated alerts
+    again = _run(tmp_path, S.utc(2026, 10, 7, 19), price_source=hostile)["snapshot"]
+    assert again["counts"]["pending"] == 10 and again["counts"]["integrity_alerts"] == 10
+    late = _run(tmp_path, S.utc(2026, 10, 7, 21), price_source=hostile)["snapshot"]
+    assert late["counts"]["void_by_reason"] == {"lookahead_refused": 10}
+    assert late["counts"]["integrity_alerts"] == 10
     assert all(not r["metrics"] for r in _ledger(tmp_path) if r["kind"] == "score")  # nothing was scored
-    refusal = [r for r in _ledger(tmp_path) if r["kind"] == "resolution"][0]["receipt"]["refusal"]
-    assert "before the session closed" in refusal
-    again = _run(tmp_path, S.utc(2026, 10, 3, 23), price_source=_Hostile(S.utc(2026, 10, 1, 12)))["snapshot"]
-    assert again["counts"]["integrity_alerts"] == 10 and again["counts"]["resolutions"] == 10  # no repeats
 
 
 def test_price_offered_from_the_future_is_refused(tmp_path):
     snap = _run(tmp_path, AFTER, price_source=_Hostile(S.utc(2026, 10, 3, 12)))["snapshot"]
-    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 10}
-    assert "not observable until" in [r for r in _ledger(tmp_path) if r["kind"] == "resolution"][0]["receipt"]["refusal"]
+    assert snap["counts"]["resolutions"] == 0 and snap["counts"]["pending"] == 10
+    details = [r["detail"] for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"]
+    assert len(details) == 10 and all("not observable until" in d for d in details)
 
 
 class _HostileFor:
@@ -200,17 +206,45 @@ class _HostileFor:
 def test_one_look_ahead_does_not_block_the_rest_of_the_stream(tmp_path):
     snap = _run(tmp_path, AFTER, price_source=_HostileFor("AAA"))["snapshot"]
     assert snap["streams"][S.STREAM]["ok"] is True
-    assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 3}  # d1, p1 and r_AAA
+    assert snap["counts"]["pending"] == 3 and snap["counts"]["integrity_alerts"] == 3  # d1, p1, r_AAA
     scores = _scores(tmp_path / "board")
     assert scores[f"{S.STREAM}:d2"]["metrics"]["hit"] == 0 and scores[f"{S.STREAM}:p2"]["metrics"]["brier"] == 0.09
-    assert scores[f"{S.STREAM}:rank:1d:2026-10-01"]["metrics"] == {}  # 4 resolved names < min_names
-    assert snap["counts"]["integrity_alerts"] == 3
     again = _run(tmp_path, S.utc(2026, 10, 3, 23), price_source=_HostileFor("AAA"))["snapshot"]
     assert again["counts"]["integrity_alerts"] == 3
 
 
+def _with(records, index, **changes):
+    out = list(records)
+    rec = {**out[index], **changes}
+    for key, value in changes.items():
+        if value is None:
+            rec.pop(key)
+    out[index] = rec
+    return out
+
+
+@pytest.mark.parametrize("broken", ["missing_family", "exit_before_issue", "bad_date"])
+def test_a_malformed_record_is_quarantined_not_fatal(tmp_path, broken):
+    records = S.stream_records()
+    if broken == "missing_family":
+        records = _with(records, 2, family=None)
+    elif broken == "exit_before_issue":
+        records = _with(records, 2, horizon={"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-09-30"})
+    else:
+        records = _with(records, 2, horizon={"label": "1d", "entry_date": "2026-10-01", "exit_date": "2026-13-45"})
+    log = tmp_path / "stream.jsonl"
+    S.write_chain(log, records)
+    snap = _run(tmp_path, AFTER, log=log)["snapshot"]
+    assert snap["streams"][S.STREAM]["ok"] is True
+    assert snap["counts"]["predictions"] == 9 and snap["counts"]["pending"] == 0
+    alerts = [r for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"]
+    assert len(alerts) == 1 and alerts[0]["observed_sha256"] == "quarantine" and "line 2" in alerts[0]["detail"]
+    _run(tmp_path, S.utc(2026, 10, 3, 23), log=log)
+    assert len([r for r in _ledger(tmp_path) if r["kind"] == "integrity_alert"]) == 1
+
+
 class _BrokenAdapter:
-    """A stream adapter whose records break the E2 contract (an unregistered rule)."""
+    """A second stream whose only record breaks the E2 contract."""
 
     stream = "broken_v1"
 
@@ -233,7 +267,7 @@ class _BrokenAdapter:
 
 
 @pytest.mark.parametrize("broken_first", [True, False])
-def test_a_stream_breaking_the_record_contract_is_isolated(tmp_path, broken_first):
+def test_a_broken_stream_never_affects_another(tmp_path, broken_first):
     log = tmp_path / "stream.jsonl"
     S.write_chain(log, S.stream_records())
     rules = S.rules()
@@ -242,11 +276,10 @@ def test_a_stream_breaking_the_record_contract_is_isolated(tmp_path, broken_firs
         adapters.reverse()
     snap = board.run(tmp_path / "board", adapters, AFTER, rules=rules, cost_model=S.cost_model(),
                      manifest_info=S.MANIFEST_INFO, code_sha=S.CODE_SHA)["snapshot"]
-    assert snap["streams"]["broken_v1"]["ok"] is False
-    assert snap["streams"]["broken_v1"]["error"].startswith("RecordError")
     assert snap["streams"][S.STREAM]["ok"] is True
     assert (snap["counts"]["predictions"], snap["counts"]["pending"], snap["counts"]["scores"]) == (10, 0, 6)
-    assert not [r for r in _ledger(tmp_path) if "broken_v1" in json.dumps(r.get("prediction") or {})]
+    assert snap["counts"]["integrity_alerts"] == 1  # the broken record, quarantined
+    assert not [r for r in _ledger(tmp_path) if "broken_v1:x" in json.dumps(r.get("prediction") or {})]
 
 
 def test_prediction_whose_entry_close_precedes_it_is_never_ingested(tmp_path):

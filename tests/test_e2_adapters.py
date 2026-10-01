@@ -153,7 +153,8 @@ def test_gex_postclose_fetched_before_the_close_is_look_ahead(tmp_path):
     snap = _run(tmp_path / "board", [_gex(logs)], S.utc(2026, 10, 2))["snapshot"]
     assert snap["streams"]["gex_levels_v1"]["ok"] is True
     assert snap["counts"]["void_by_reason"] == {"lookahead_refused": 7}
-    assert snap["counts"]["scores"] == 0 and snap["counts"]["integrity_alerts"] == 7
+    assert snap["counts"]["scores"] == 0
+    assert snap["counts"]["integrity_alerts"] == 1  # one alert for the one bad post-close record
     refusal = next(iter(_resolutions(tmp_path / "board").values()))["receipt"]["refusal"]
     assert "precedes the session close" in refusal
 
@@ -294,3 +295,15 @@ def test_real_s10_log_copy_header_only(tmp_path):
     assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is True
     assert snap["streams"]["s10_hypothesis_forward_v1"]["activity"]["candidates"] == 0
     assert snap["counts"]["predictions"] == 0
+
+
+def test_s10_malformed_admission_plan_is_quarantined_not_fatal(tmp_path):
+    logs = tmp_path / "s10"
+    events = _s10_events(verdict=True)
+    events[0] = {**events[0], "plan": {k: v for k, v in events[0]["plan"].items() if k != "min_n"}}
+    _s10_log(logs, events)
+    snap = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 14, 12))["snapshot"]
+    assert snap["streams"]["s10_hypothesis_forward_v1"]["ok"] is True
+    assert snap["counts"]["scores"] == 0 and snap["counts"]["integrity_alerts"] == 1
+    again = _run(tmp_path / "board", [_s10(logs)], S.utc(2026, 10, 15, 12))["snapshot"]
+    assert again["counts"]["integrity_alerts"] == 1  # not repeated

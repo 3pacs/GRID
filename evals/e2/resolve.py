@@ -6,7 +6,7 @@ date D as it was observable at instant ``now``*. It returns a
 observable -- never earlier than the session's close -- or ``None`` if no
 such value was observable yet. :func:`resolve_price_call` then refuses any
 observation that claims to be available before the horizon's close or after
-``now`` (:class:`~evals.e2.records.LookAheadError`), so a buggy or hostile
+``now`` (:class:`~evals.e2.records.PriceSourceLookAhead`), so a buggy or hostile
 source cannot slip a future price into a score.
 
 Database sources open nothing themselves: they take a connection the caller
@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Protocol
 
 from evals.e2 import scoring
-from evals.e2.records import LookAheadError, iso, parse_ts, session_close_utc
+from evals.e2.records import PriceSourceLookAhead, iso, parse_ts, session_close_utc
 
 
 @dataclass(frozen=True)
@@ -182,10 +182,10 @@ def resolve_price_call(pred: dict, prices: PriceSource | None, now: datetime, ru
         return None
     for obs, close_at in ((entry, session_close_utc(entry_date)), (exit_, exit_close)):
         if obs.available_at < close_at:
-            raise LookAheadError(f"{pred['prediction_id']}: {obs.source} offered the {obs.obs_date} close as "
+            raise PriceSourceLookAhead(f"{pred['prediction_id']}: {obs.source} offered the {obs.obs_date} close as "
                                  f"available at {iso(obs.available_at)}, before the session closed")
         if obs.available_at > now:
-            raise LookAheadError(f"{pred['prediction_id']}: {obs.source} offered a close not observable until "
+            raise PriceSourceLookAhead(f"{pred['prediction_id']}: {obs.source} offered a close not observable until "
                                  f"{iso(obs.available_at)} at run instant {iso(now)}")
     ret = exit_.value / entry.value - 1.0
     outcome = {"entry_price": entry.value, "exit_price": exit_.value, "return": ret}
