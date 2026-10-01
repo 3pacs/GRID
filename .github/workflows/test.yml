@@ -161,6 +161,28 @@ jobs:
             exit 1
           fi
 
+      # GD5 people-density look-ahead canary (tests/test_people_density_lookahead.py,
+      # acceptance test 13 of the GD5 slice): on a real people_events table
+      # built from the migration DDL, load_events never returns a row known
+      # after as_of and appending such rows changes no density feature (A, C,
+      # S, D_self, D_peer); a leak self-test proves the canary trips when the
+      # store filters on event_time. E1-style fixture: GRID_TEST_DB_URL only,
+      # E1_REQUIRE_PG=1 so an unreachable PostgreSQL fails; a skip fails this step.
+      - name: People density look-ahead canary (PostgreSQL)
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_people_density_lookahead.py -q -rA | tee /tmp/grid-people-density-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-people-density-pg.txt; then
+            echo "::error::People density look-ahead canary was skipped"
+            exit 1
+          fi
+
       # GEM append-only options capture (options_append_only_20260930):
       # proves on real PostgreSQL that two same-day capture batches both
       # survive, the options_snapshots view (every default reader, including
