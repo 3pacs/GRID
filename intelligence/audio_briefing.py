@@ -4,8 +4,10 @@ Generates a NotebookLM-style audio briefing from GRID's live data:
   1. Pulls flow engine state (8 layers, regime, stress)
   2. Pulls CDS dashboard (credit regime, spreads)
   3. Pulls top thesis scores and unified market direction
-  4. Builds a narrative briefing script via Gemini
-  5. Converts script to audio via OpenAI TTS (tts-1-hd, voice=nova)
+  4. Builds a narrative briefing script via the LOCAL LLM (llm.router
+     Tier.REASON); paid Gemini/OpenAI only when GRID_ALLOW_PAID_LLM is set
+  5. Converts script to audio via LOCAL Kokoro TTS (GRID_KOKORO_URL); OpenAI
+     TTS only when Kokoro is not configured AND GRID_ALLOW_PAID_LLM is set
   6. Optionally generates a title card + combines into MP4 via ffmpeg
 
 Public API:
@@ -14,7 +16,7 @@ Public API:
     generate_briefing_video(engine) -> BriefingResult
     get_latest_briefing() -> BriefingResult | None
 
-Requires GEMINI_API_KEY and OPENAI_API_KEY in environment.
+No paid key is needed for the default path: local LLM text + local Kokoro.
 """
 
 from __future__ import annotations
@@ -72,30 +74,32 @@ def _lf_emit_generation(
 
 _GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 _OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-_OUTPUT_DIR = Path("/data/grid_v4/grid_repo/output/briefings")
+
+# Output location. Briefings used to be written to the hard-coded old
+# checkout /data/grid_v4/grid_repo/output/briefings (Wave 3 triage #5). New
+# recordings go to a writable data dir chosen by ``briefing_output_dir()``
+# (same immutable-release rule as scripts/storage_curator.py, #761). The old
+# directory stays readable so the 2026-04 archive still lists and plays.
+RUNTIME_GRID_ROOT = Path("/data/grid_v4")
+_LEGACY_OUTPUT_DIR = RUNTIME_GRID_ROOT / "grid_repo" / "output" / "briefings"
+_CHECKOUT_OUTPUT_DIR = Path(__file__).resolve().parent.parent / "outputs" / "briefings"
 
 # TTS settings
 #
-# TTS_PROVIDER selects backend:
-#   "openai" (default) — OpenAI tts-1-hd, requires OPENAI_API_KEY, MP3 output
-#   "kokoro_koala"     — local Kokoro server on koala:8091, 54 voices, WAV
-#                        output transcoded to MP3 via ffmpeg
-#
-# To use Kokoro: set TTS_PROVIDER=kokoro_koala, optionally TTS_VOICE
-# (e.g. "af_sarah", "am_michael", "bf_emma" — see /v1/voices on the
-# Kokoro server for the full list).
-#
-# F5-TTS is installed on koala but requires a reference audio clip per
-# voice (it's a voice-cloning model, not a default-voice TTS). Wired in
-# a follow-up once we have approved character voice references.
-TTS_PROVIDER = os.getenv("TTS_PROVIDER", "openai").strip().lower()
+# Local first: when GRID_KOKORO_URL points at a Kokoro-FastAPI server, audio
+# is synthesized there (MP3, no API cost) and a failure is reported honestly
+# as "local TTS unavailable" -- it never falls through to a paid provider.
+# OpenAI tts-1-hd is used only when Kokoro is NOT configured and
+# GRID_ALLOW_PAID_LLM is explicitly set. See config.py GRID_KOKORO_*.
 TTS_MODEL = "tts-1-hd"
 TTS_VOICE = os.getenv("TTS_VOICE", "shimmer").strip()
 TTS_FORMAT = "mp3"
+KOKORO_MODEL = "kokoro"
+KOKORO_CONNECT_TIMEOUT_SECONDS = 5.0
 
-# Kokoro server (local TTS, no API cost)
-KOKORO_TTS_BASE_URL = os.getenv("KOKORO_TTS_BASE_URL", "http://koala:8091").strip()
-KOKORO_TTS_TIMEOUT = int(os.getenv("KOKORO_TTS_TIMEOUT_SECONDS", "120"))
+
+class LocalTTSUnavailable(RuntimeError):
+    """Local Kokoro TTS is not configured, unreachable, or returned no audio."""
 
 # Gemini model for script generation
 GEMINI_SCRIPT_MODEL = "gemini-2.5-flash"
@@ -127,6 +131,10 @@ class BriefingResult:
     duration_ms: int = 0
     provider: str = ""
     audio_note: str = ""
+    # "generated" | "unavailable" (local TTS failed) | "not_configured" |
+    # "" (script-only request). ``tts_provider`` is "kokoro" or "openai".
+    audio_status: str = ""
+    tts_provider: str = ""
     flow_summary: dict = field(default_factory=dict)
     credit_summary: dict = field(default_factory=dict)
     thesis_summary: dict = field(default_factory=dict)
@@ -142,6 +150,8 @@ class BriefingResult:
             "duration_ms": self.duration_ms,
             "provider": self.provider,
             "audio_note": self.audio_note,
+            "audio_status": self.audio_status,
+            "tts_provider": self.tts_provider,
             "flow_summary": self.flow_summary,
             "credit_summary": self.credit_summary,
             "thesis_summary": self.thesis_summary,
@@ -509,7 +519,17 @@ def _generate_script_text(data: dict[str, Any]) -> tuple[str, str]:
         log.warning("Local LLM script gen failed: {e}", e=str(exc))
 
     # 2. Paid fallback: Gemini direct, then OpenAI via router. Both stay
-    # gated behind GRID_ALLOW_PAID_LLM (unchanged from before this fix).
+    # gated behind GRID_ALLOW_PAID_LLM; with the gate closed (the default)
+    # no paid client is even constructed and the caller gets a plain
+    # "no local LLM" failure instead of a paid-provider error chain.
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise RuntimeError(
+            "No local LLM answered for the briefing script (llm.router "
+            "Tier.REASON); paid fallback is disabled (GRID_ALLOW_PAID_LLM unset)."
+        )
+
     gemini_exc: Exception | None = None
     try:
         client = _get_gemini_client()
@@ -560,7 +580,60 @@ def _generate_script_text(data: dict[str, Any]) -> tuple[str, str]:
         )
 
 
-# -- Audio Generation via OpenAI TTS ----------------------------------------
+# -- Output location ---------------------------------------------------------
+
+def briefing_output_dir(
+    *, source_file: Path | None = None, data_root: Path | None = None
+) -> Path:
+    """Writable directory for new briefing MP3s and JSON sidecars.
+
+    ``GRID_BRIEFING_DIR`` wins when set. Otherwise, code running from an
+    immutable production release (``<data_root>/grid_release.releases/<sha>``)
+    writes to ``<data_root>/briefings`` -- never into the release tree or the
+    old ``grid_repo`` checkout -- and a local checkout writes to its own
+    git-ignored ``outputs/briefings``. Same rule as #761's
+    ``scripts/storage_curator.storage_report_dir``.
+    """
+    from config import settings
+
+    configured = str(getattr(settings, "GRID_BRIEFING_DIR", "") or "").strip()
+    if configured:
+        return Path(configured)
+    data_root = data_root if data_root is not None else RUNTIME_GRID_ROOT
+    source = (source_file or Path(__file__)).resolve()
+    if data_root / "grid_release.releases" in source.parents:
+        return data_root / "briefings"
+    return _CHECKOUT_OUTPUT_DIR
+
+
+def _archive_dirs() -> list[Path]:
+    """Directories to read briefings from: current output dir, then legacy."""
+    dirs = [briefing_output_dir()]
+    if _LEGACY_OUTPUT_DIR not in dirs:
+        dirs.append(_LEGACY_OUTPUT_DIR)
+    return dirs
+
+
+def _ensure_output_dir() -> Path:
+    """Create the output directory if needed."""
+    out = briefing_output_dir()
+    out.mkdir(parents=True, exist_ok=True)
+    return out
+
+
+def _new_audio_path(briefing_date: str) -> Path:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return _ensure_output_dir() / f"briefing_{briefing_date}_{timestamp}.{TTS_FORMAT}"
+
+
+# -- Audio Generation: local Kokoro first, paid OpenAI only when opted in ----
+
+def _kokoro_url() -> str:
+    """Configured Kokoro-FastAPI base URL, or "" when local TTS is not set up."""
+    from config import settings
+
+    return str(getattr(settings, "GRID_KOKORO_URL", "") or "").strip().rstrip("/")
+
 
 def _get_openai_client():
     """Lazy-load OpenAI client for TTS.
@@ -584,28 +657,28 @@ def _get_openai_client():
     return OpenAI(api_key=key)
 
 
-def _ensure_output_dir() -> Path:
-    """Create output directory if needed."""
-    _OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    return _OUTPUT_DIR
+def _generate_audio_file(script_text: str, briefing_date: str) -> tuple[str, str]:
+    """Convert script text to MP3. Returns ``(path, tts_provider)``.
 
-
-def _generate_audio_file(script_text: str, briefing_date: str) -> str:
-    """Convert script text to MP3.
-
-    Routes by TTS_PROVIDER env var:
-      "openai" (default) — OpenAI tts-1-hd
-      "kokoro_koala"     — local Kokoro server on koala:8091
-
-    Returns the file path of the saved audio.
+    Local Kokoro when ``GRID_KOKORO_URL`` is set (a failure raises
+    ``LocalTTSUnavailable`` -- there is no silent paid fallback). Otherwise
+    OpenAI TTS, which ``_get_openai_client`` refuses unless
+    ``GRID_ALLOW_PAID_LLM`` is set.
     """
-    if TTS_PROVIDER == "kokoro_koala":
-        return _generate_audio_file_kokoro(script_text, briefing_date)
-    return _generate_audio_file_openai(script_text, briefing_date)
+    if _kokoro_url():
+        return _generate_audio_file_kokoro(script_text, briefing_date), "kokoro"
+    from llm.router import _paid_llm_allowed
+
+    if not _paid_llm_allowed():
+        raise LocalTTSUnavailable(
+            "local TTS is not configured (set GRID_KOKORO_URL to a Kokoro "
+            "server); paid TTS is disabled"
+        )
+    return _generate_audio_file_openai(script_text, briefing_date), "openai"
 
 
 def _generate_audio_file_openai(script_text: str, briefing_date: str) -> str:
-    """Convert script text to MP3 via OpenAI TTS.
+    """Convert script text to MP3 via OpenAI TTS (paid; gated).
 
     The router does not yet expose audio synthesis, so this still calls
     the OpenAI SDK directly. We tag the call with a manual Langfuse
@@ -613,10 +686,7 @@ def _generate_audio_file_openai(script_text: str, briefing_date: str) -> str:
     as routed chat traffic.
     """
     client = _get_openai_client()
-    output_dir = _ensure_output_dir()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    filename = f"briefing_{briefing_date}_{timestamp}.{TTS_FORMAT}"
-    file_path = output_dir / filename
+    file_path = _new_audio_path(briefing_date)
 
     log.info(
         "Generating audio (openai): model={m}, voice={v}, format={f}",
@@ -655,78 +725,106 @@ def _generate_audio_file_openai(script_text: str, briefing_date: str) -> str:
     return str(file_path)
 
 
+def _looks_like_mp3(data: bytes) -> bool:
+    """ID3 tag or an MPEG audio frame sync at the start of the body."""
+    if data.startswith(b"ID3"):
+        return True
+    return len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0
+
+
 def _generate_audio_file_kokoro(script_text: str, briefing_date: str) -> str:
-    """Convert script text to MP3 via local Kokoro TTS server.
+    """Convert script text to MP3 via the local Kokoro-FastAPI server.
 
-    Kokoro returns WAV (24kHz mono PCM 16-bit). We transcode to MP3 via
-    ffmpeg so the rest of the pipeline (which expects MP3 from
-    audio_briefing) is unchanged.
+    ``POST {GRID_KOKORO_URL}/v1/audio/speech`` with the OpenAI-compatible body
+    ``{"model": "kokoro", "input", "voice", "response_format": "mp3",
+    "stream": false}`` -- non-streaming so a mid-synthesis failure surfaces
+    as an HTTP error instead of a truncated 200. Kokoro-FastAPI returns MP3
+    directly, so no ffmpeg step is needed.
 
-    Server endpoint: ``POST {KOKORO_TTS_BASE_URL}/v1/audio/speech`` with
-    JSON ``{"input": <text>, "voice": <voice_id>, "response_format":
-    "wav", "speed": 1.0}``. Returns audio/wav bytes.
+    Raises ``LocalTTSUnavailable`` (with the reason) on a connection error,
+    timeout, non-200, non-audio or empty body. Nothing is written unless a
+    complete MP3 came back; the file appears atomically via rename.
     """
     import requests
 
-    output_dir = _ensure_output_dir()
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    wav_path = output_dir / f"briefing_{briefing_date}_{timestamp}.wav"
-    mp3_path = output_dir / f"briefing_{briefing_date}_{timestamp}.mp3"
+    from config import settings
 
-    voice = TTS_VOICE if TTS_VOICE.startswith(("af_", "am_", "bf_", "bm_")) else "af_sarah"
-    log.info(
-        "Generating audio (kokoro_koala): voice={v} server={s}",
-        v=voice, s=KOKORO_TTS_BASE_URL,
-    )
+    base = _kokoro_url()
+    if not base:
+        raise LocalTTSUnavailable("GRID_KOKORO_URL is not set")
+    voice = str(getattr(settings, "GRID_KOKORO_VOICE", "") or "af_heart").strip()
+    read_timeout = float(getattr(settings, "GRID_KOKORO_TIMEOUT_SECONDS", 60.0) or 60.0)
 
+    log.info("Generating audio (kokoro): voice={v} server={s}", v=voice, s=base)
     t0 = time.monotonic()
-    resp = requests.post(
-        f"{KOKORO_TTS_BASE_URL}/v1/audio/speech",
-        json={
-            "input": script_text,
-            "voice": voice,
-            "response_format": "wav",
-            "speed": 1.0,
-        },
-        timeout=KOKORO_TTS_TIMEOUT,
-    )
-    resp.raise_for_status()
-    wav_path.write_bytes(resp.content)
-    duration_hdr = resp.headers.get("X-Audio-Duration-Seconds")
+    try:
+        resp = requests.post(
+            f"{base}/v1/audio/speech",
+            json={
+                "model": KOKORO_MODEL,
+                "input": script_text,
+                "voice": voice,
+                "response_format": TTS_FORMAT,
+                "speed": 1.0,
+                "stream": False,
+            },
+            timeout=(KOKORO_CONNECT_TIMEOUT_SECONDS, read_timeout),
+        )
+    # User-facing reasons stay host-free; the server URL and any response
+    # body go to the log only.
+    except requests.Timeout as exc:
+        log.warning("Kokoro TTS timeout at {s}: {e}", s=base, e=str(exc))
+        raise LocalTTSUnavailable(
+            f"Kokoro TTS timed out ({type(exc).__name__}, "
+            f"read timeout {read_timeout:.0f}s)"
+        ) from exc
+    except requests.RequestException as exc:
+        log.warning("Kokoro TTS unreachable at {s}: {e}", s=base, e=str(exc))
+        raise LocalTTSUnavailable(
+            f"Kokoro TTS is unreachable ({type(exc).__name__})"
+        ) from exc
 
-    # Transcode WAV -> MP3 to keep downstream compatible
-    subprocess.run(
-        [
-            "ffmpeg", "-loglevel", "error", "-y",
-            "-i", str(wav_path),
-            "-codec:a", "libmp3lame", "-q:a", "2",
-            str(mp3_path),
-        ],
-        check=True,
-    )
-    wav_path.unlink(missing_ok=True)
+    if resp.status_code != 200:
+        log.warning(
+            "Kokoro TTS at {s} returned HTTP {c}: {d}",
+            s=base, c=resp.status_code, d=(resp.text or "")[:300],
+        )
+        raise LocalTTSUnavailable(f"Kokoro TTS returned HTTP {resp.status_code}")
+    content_type = (resp.headers.get("Content-Type") or "").lower()
+    audio = resp.content or b""
+    if not content_type.startswith("audio/") or not _looks_like_mp3(audio):
+        raise LocalTTSUnavailable(
+            f"Kokoro TTS returned no MP3 audio "
+            f"(content-type {content_type or 'missing'}, {len(audio)} bytes)"
+        )
+
+    mp3_path = _new_audio_path(briefing_date)
+    tmp_path = mp3_path.with_name(mp3_path.name + ".part")
+    try:
+        tmp_path.write_bytes(audio)
+        os.replace(tmp_path, mp3_path)
+    finally:
+        tmp_path.unlink(missing_ok=True)
 
     latency_ms = int((time.monotonic() - t0) * 1000)
-    file_size = mp3_path.stat().st_size
     log.info(
-        "Audio saved: {p} ({kb}KB, {d}s)",
-        p=mp3_path, kb=file_size // 1024, d=duration_hdr or "?",
+        "Audio saved: {p} ({kb}KB, {ms}ms)",
+        p=mp3_path, kb=len(audio) // 1024, ms=latency_ms,
     )
 
     _lf_emit_generation(
         name="audio_briefing.tts",
         model=f"kokoro:{voice}",
-        provider="kokoro_koala",
+        provider="kokoro",
         input_payload={"voice": voice, "format": TTS_FORMAT,
                        "script_chars": len(script_text)},
-        output_payload={"path": str(mp3_path), "bytes": file_size,
-                        "audio_duration_s": duration_hdr},
+        output_payload={"path": str(mp3_path), "bytes": len(audio)},
         usage_details={"input": len(script_text), "output": 0},
         metadata={
             "module": "audio_briefing.tts",
             "briefing_date": briefing_date,
             "latency_ms": latency_ms,
-            "server": KOKORO_TTS_BASE_URL,
+            "server": base,
         },
     )
     return str(mp3_path)
@@ -896,20 +994,20 @@ def _save_metadata(result: BriefingResult) -> None:
 
 
 def generate_briefing_audio(engine) -> BriefingResult:
-    """Generate the briefing script (local LLM first) and, only when paid
-    generation is explicitly allowed, synthesize it to audio via OpenAI TTS.
+    """Generate the briefing script (local LLM) and synthesize it to MP3
+    with local Kokoro TTS.
 
-    Wave 3 fix (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5): TTS has no
-    local option today (Kokoro on koala has been offline ~48 days), so when
-    ``GRID_ALLOW_PAID_LLM`` is not set this returns a text-only on-demand
-    result (``audio_path=None``, ``audio_note`` explains why) instead of
-    raising. Setting ``GRID_ALLOW_PAID_LLM=1`` restores the MP3.
+    Audio path, in order:
+      * ``GRID_KOKORO_URL`` set -> local Kokoro. If it is unreachable, times
+        out or returns no audio, the result is text-only with
+        ``audio_status="unavailable"`` and an ``audio_note`` that says
+        "Local TTS unavailable: <reason>" -- never a paid fallback and never
+        a fake audio path.
+      * Kokoro not configured and ``GRID_ALLOW_PAID_LLM`` set -> OpenAI TTS
+        (the pre-existing opt-in path).
+      * Otherwise -> text-only with ``audio_status="not_configured"``.
 
-    Steps:
-        1. Collect data from all GRID engines
-        2. Generate script (local LLM, or paid fallback if opted in)
-        3. Convert to audio via OpenAI TTS -- only if paid is allowed
-        4. Save JSON metadata sidecar for archival -- only if audio was made
+    A JSON sidecar is saved next to the MP3 only when audio was made.
     """
     from llm.router import _paid_llm_allowed
 
@@ -921,21 +1019,45 @@ def generate_briefing_audio(engine) -> BriefingResult:
 
     audio_path: str | None = None
     audio_note = ""
-    if _paid_llm_allowed():
-        audio_path = _generate_audio_file(script, briefing_date)
+    tts_provider = ""
+    if _kokoro_url() or _paid_llm_allowed():
+        try:
+            audio_path, tts_provider = _generate_audio_file(script, briefing_date)
+            audio_status = "generated"
+        except LocalTTSUnavailable as exc:
+            audio_status = "unavailable"
+            tts_provider = "kokoro"
+            audio_note = (
+                f"Local TTS unavailable: {exc}. Text-only briefing; no audio "
+                "was made and no paid TTS was tried."
+            )
+            log.warning("Briefing audio skipped: {e}", e=str(exc))
+        except OSError as exc:
+            # Synthesis may have worked but the MP3 could not be stored
+            # (e.g. GRID_BRIEFING_DIR unwritable). Keep the script; say so.
+            audio_status = "unavailable"
+            tts_provider = "kokoro" if _kokoro_url() else "openai"
+            audio_note = (
+                f"Audio could not be saved ({type(exc).__name__}). "
+                "Text-only briefing; no audio was kept."
+            )
+            log.warning(
+                "Briefing audio could not be written to {d}: {e}",
+                d=briefing_output_dir(), e=str(exc),
+            )
     else:
+        audio_status = "not_configured"
         audio_note = (
-            "Text-only on-demand briefing: audio synthesis needs a paid TTS "
-            "provider (set GRID_ALLOW_PAID_LLM=1 to enable OpenAI TTS; the "
-            "local Kokoro option has been offline)."
+            "Text-only briefing: local TTS is not configured (set "
+            "GRID_KOKORO_URL to a Kokoro server). Paid TTS stays off."
         )
-        log.info("Skipping audio synthesis (GRID_ALLOW_PAID_LLM not set): text-only briefing")
+        log.info("Skipping audio synthesis (GRID_KOKORO_URL not set): text-only briefing")
 
     duration_ms = int((time.monotonic() - t0) * 1000)
 
     log.info(
         "Briefing complete: {ms}ms, provider={p}, audio={a}",
-        ms=duration_ms, p=provider, a=audio_path or "(text-only)",
+        ms=duration_ms, p=provider, a=audio_path or f"(text-only: {audio_status})",
     )
 
     result = BriefingResult(
@@ -946,6 +1068,8 @@ def generate_briefing_audio(engine) -> BriefingResult:
         duration_ms=duration_ms,
         provider=provider,
         audio_note=audio_note,
+        audio_status=audio_status,
+        tts_provider=tts_provider,
         flow_summary=data.get("flow", {}),
         credit_summary=data.get("credit", {}),
         thesis_summary=data.get("thesis", {}),
@@ -961,9 +1085,10 @@ def generate_briefing_video(engine) -> BriefingResult:
 
     Steps:
         1. Collect data from all GRID engines
-        2. Generate script via Gemini
-        3. Convert to audio via OpenAI TTS
-        4. Generate title card via Gemini Imagen
+        2. Generate script (local LLM; paid only if opted in)
+        3. Convert to audio (local Kokoro; OpenAI only if not configured and
+           paid is opted in) -- raises ``LocalTTSUnavailable`` otherwise
+        4. Generate title card via Gemini Imagen (paid; gated)
         5. Combine into MP4 via ffmpeg
     """
     t0 = time.monotonic()
@@ -971,7 +1096,7 @@ def generate_briefing_video(engine) -> BriefingResult:
 
     data = _collect_all_data(engine)
     script, provider = _generate_script_text(data)
-    audio_path = _generate_audio_file(script, briefing_date)
+    audio_path, tts_provider = _generate_audio_file(script, briefing_date)
     title_card_path = _generate_title_card(briefing_date)
     video_path = _combine_to_video(audio_path, title_card_path, briefing_date)
 
@@ -991,6 +1116,8 @@ def generate_briefing_video(engine) -> BriefingResult:
         generated_at=datetime.now(timezone.utc).isoformat(),
         duration_ms=duration_ms,
         provider=provider,
+        audio_status="generated",
+        tts_provider=tts_provider,
         flow_summary=data.get("flow", {}),
         credit_summary=data.get("credit", {}),
         thesis_summary=data.get("thesis", {}),
@@ -1019,6 +1146,9 @@ def _load_metadata(mp3_path: Path) -> BriefingResult:
                 # all generated via the (then paid-only) Gemini/OpenAI path.
                 provider=data.get("provider", "gemini"),
                 audio_note=data.get("audio_note", ""),
+                audio_status=data.get("audio_status", "generated"),
+                # Pre-Kokoro recordings were all OpenAI TTS.
+                tts_provider=data.get("tts_provider", "openai"),
                 flow_summary=data.get("flow_summary", {}),
                 credit_summary=data.get("credit_summary", {}),
                 thesis_summary=data.get("thesis_summary", {}),
@@ -1034,23 +1164,38 @@ def _load_metadata(mp3_path: Path) -> BriefingResult:
             mp3_path.stat().st_mtime, tz=timezone.utc
         ).isoformat(),
         provider="unknown",
+        audio_status="generated",
     )
+
+
+def _all_briefing_mp3s() -> list[Path]:
+    """Saved briefing MP3s across the current and legacy dirs, newest first.
+
+    A filename present in more than one dir is listed once (the current
+    output dir wins). Unreadable dirs are skipped.
+    """
+    seen: set[str] = set()
+    files: list[Path] = []
+    for directory in _archive_dirs():
+        try:
+            if not directory.is_dir():
+                continue
+            candidates = list(directory.glob("briefing_*.mp3"))
+        except OSError as exc:
+            log.warning("Cannot read briefing dir {d}: {e}", d=directory, e=str(exc))
+            continue
+        for mp3 in candidates:
+            if mp3.name not in seen:
+                seen.add(mp3.name)
+                files.append(mp3)
+    return sorted(files, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
 def get_latest_briefing() -> BriefingResult | None:
     """Find the most recent briefing audio file and return a result with metadata."""
-    if not _OUTPUT_DIR.exists():
-        return None
-
-    mp3_files = sorted(
-        _OUTPUT_DIR.glob("briefing_*.mp3"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
+    mp3_files = _all_briefing_mp3s()
     if not mp3_files:
         return None
-
     return _load_metadata(mp3_files[0])
 
 
@@ -1060,17 +1205,8 @@ def list_all_briefings() -> list[dict[str, Any]]:
     Returns a list of dicts with filename, date, size, and whether
     metadata (script text) is available.
     """
-    if not _OUTPUT_DIR.exists():
-        return []
-
-    mp3_files = sorted(
-        _OUTPUT_DIR.glob("briefing_*.mp3"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-
     results = []
-    for mp3 in mp3_files:
+    for mp3 in _all_briefing_mp3s():
         parts = mp3.stem.split("_")
         briefing_date = parts[1] if len(parts) > 1 else ""
         meta_path = mp3.with_suffix(".json")
@@ -1090,12 +1226,14 @@ def list_all_briefings() -> list[dict[str, Any]]:
 
 
 def get_briefing_by_filename(filename: str) -> BriefingResult | None:
-    """Load a specific briefing by its MP3 filename."""
+    """Load a specific briefing by its MP3 filename (a bare name, no path)."""
     if not filename.endswith(".mp3"):
         filename = f"{filename}.mp3"
-
-    file_path = _OUTPUT_DIR / filename
-    if not file_path.exists():
+    if Path(filename).name != filename or "\\" in filename or not filename.startswith("briefing_"):
         return None
 
-    return _load_metadata(file_path)
+    for directory in _archive_dirs():
+        file_path = directory / filename
+        if file_path.is_file():
+            return _load_metadata(file_path)
+    return None

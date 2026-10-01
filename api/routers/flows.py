@@ -2742,9 +2742,15 @@ async def generate_briefing(
     Explicit write: calls the script LLM and, when ``audio`` is true (the
     default), text-to-speech, saving the MP3 and its JSON sidecar.
 
+    Generation is blocking I/O (local LLM call, then a Kokoro TTS request of
+    ~20-60s on CPU), so it runs in a worker thread: grid-api is a single
+    uvicorn process and calling it inline would freeze every other request.
+
     Returns:
         Script text, audio path, flow/credit/thesis summaries.
     """
+    import asyncio
+
     from intelligence.audio_briefing import (
         generate_briefing_audio,
         generate_briefing_script,
@@ -2753,10 +2759,8 @@ async def generate_briefing(
     engine = get_db_engine()
 
     try:
-        if audio:
-            result = generate_briefing_audio(engine)
-        else:
-            result = generate_briefing_script(engine)
+        generate = generate_briefing_audio if audio else generate_briefing_script
+        result = await asyncio.to_thread(generate, engine)
     except Exception as exc:
         log.error("Briefing generation failed: {e}", e=str(exc))
         return {"error": str(exc), "status": "FAILED"}
