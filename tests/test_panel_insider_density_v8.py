@@ -352,6 +352,8 @@ def test_a_sectors_v6_appearing_after_discovery_is_contamination_and_refuses_hol
     assert not v8.contamination([with_s6, with_s6])["contaminated"]  # present from the first opening
     late = v8.contamination([without, with_s6])
     assert late["contaminated"] and "sectors-v6 (appeared after a v8 opening)" in str(late["detail"])
+    gone = v8.contamination([with_s6, without])
+    assert gone["contaminated"] and "disappeared" in str(gone["detail"])
     opened = {"kind": "discovery_opened", "supersession": {"vs1_witness_census": without}}
     monkeypatch.setattr(v8.V8, "_chain", lambda log: [{"kind": "header"}, {"kind": "preregistration"}, opened])
     witness = types.SimpleNamespace(census=with_s6)

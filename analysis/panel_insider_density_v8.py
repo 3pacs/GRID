@@ -30,7 +30,7 @@ from analysis.research_forward_log import canonical
 VERSION = "vs1-v8"
 REGISTRY_ID = VERSION
 PREREG_PATH = Path("docs/paper_log/vs1-insider-density-v8-preregistration.md")
-PREREG_BODY_SHA256 = "636b8c7eddbbc0e040ef05fa09751216f036228926c5a0e123c8c2c62916e7cb"
+PREREG_BODY_SHA256 = "74679d001564bc29d9f44fda1f288fa935c95ab80585994ed414d8738e0efb25"
 #: The witnessed v7 terminal STOP head (3 records; vault main 4456453d, anchor file SHA-256 bd018b11...).
 V7_STOP_HEAD_SHA256: str | None = "5d8d7c9c2fc5c943fadc083c347e766586c6137352f609424e60d1e89c0440b4"
 #: The exact second line of the witnessed v7 anchor file.
@@ -194,7 +194,7 @@ def contamination(censuses: list[Mapping[str, Any] | None]) -> dict:
     """The known v6/v7 STOPs are clean; every other non-v8 growth or unknown is not."""
     found: dict[str, Any] = {}
     unknown: set[str] = set()
-    absent_earlier = False  # censuses are chronological: v8 openings, then the current one
+    absent_earlier = present_earlier = False  # censuses are chronological: v8 openings, then the current one
     for census in censuses:
         if not census:
             continue
@@ -207,7 +207,10 @@ def contamination(censuses: list[Mapping[str, Any] | None]) -> dict:
             found[SECTORS_V6] = counts[SECTORS_V6]
         if SECTORS_V6 in counts and absent_earlier:
             found["sectors-v6 (appeared after a v8 opening)"] = counts[SECTORS_V6]
+        if SECTORS_V6 not in counts and present_earlier:
+            found["sectors-v6 (disappeared after a v8 opening)"] = None
         absent_earlier = absent_earlier or SECTORS_V6 not in counts
+        present_earlier = present_earlier or SECTORS_V6 in counts
         for key in set(counts) - ALLOWED_REGISTRIES:
             found[key] = counts[key]
     return {"contaminated": bool(found or unknown),
