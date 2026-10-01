@@ -279,8 +279,14 @@ def test_follow_splits_partial_lines_and_cleans_up_the_child(monkeypatch, mode) 
 
     monkeypatch.setattr(daily.subprocess, "Popen", fake_popen)
     stream = daily._follow_scheduler_journal(DAY, poll_seconds=0.1)
-    got = [item for item in (next(stream) for _ in range(8)) if item is not None][:2] \
-        if mode == "hang" else None
+    got = None
+    if mode == "hang":
+        import time as _time
+        got, deadline = [], _time.monotonic() + 10
+        while len(got) < 2 and _time.monotonic() < deadline:
+            item = next(stream)
+            if item is not None:
+                got.append(item)
     if mode == "eof":
         lines = []
         with pytest.raises(OSError):
