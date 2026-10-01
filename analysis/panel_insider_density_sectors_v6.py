@@ -6,11 +6,13 @@ registration head and this body are bound by reviewed pin changes.
 
 Order (v8 body section 0, this body section 5): sectors-v6 must be registered and
 witnessed while the v8 witness covers exactly v8's two registration records, i.e.
-after v8's registration witness and before v8 ``discovery_opened``.
+after v8's registration witness and before any later v8 record (``inputs_frozen``,
+a STOP or ``discovery_opened``) is witnessed.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import tempfile
 from datetime import datetime
@@ -19,6 +21,7 @@ from typing import Any, Mapping
 
 from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_sectors_v4 as s4
+from analysis import panel_insider_density_v2 as v2
 from analysis import panel_insider_density_v7 as v7
 from analysis import panel_insider_density_v8 as v8
 from analysis.research_forward_log import ForwardLog
@@ -29,6 +32,8 @@ PREREG_PATH = Path("docs/paper_log/vs1-sectors-v6-preregistration.md")
 PREREG_BODY_SHA256: str | None = None  # pinned at review, after the GateSpec v1 hash is cited
 #: The exact witnessed two-record v8 registration head; bound only after v8 is registered and witnessed.
 V8_REGISTRATION_HEAD_SHA256: str | None = None
+#: sha256 of GD10b GateSpec v1 (analysis.generalization_gate.GATE_SPEC_V1_SHA256); bound once GD10b merges.
+GATE_SPEC_SHA256: str | None = None
 REGISTRY_LOG = "granular_panel_prereg_sectors_v6.jsonl"
 REGISTRY_ANCHORS = "granular_panel_prereg_sectors_v6.anchors.jsonl"
 REGISTRY_LOCK = ".granular_panel_prereg_sectors_v6.lock"
@@ -41,21 +46,32 @@ HOLDOUT = {"start": v1.SPLIT, "end": v1.END}
 PROBE_WINDOW = (v8.PROBE_START, "2019-12-31")
 CONFIRMATORY = {"trial": s4.PRIMARY_TRIAL, "direction": v1.PRIMARY_DIRECTION,
                 "discovery_alpha_one_sided": 0.05, "holdout_alpha_one_sided": 0.10}
-GATE = {"breadth_sectors": 4, "of": 11, "of_if_v8_stopped": 10, "survival_alpha_one_sided": 0.10,
-        "loso_alpha": 0.05, "top_entity_share_max": 0.25, "forward_supported_min": 2,
-        "gate_spec": "GD10b GateSpec v1 (sha256 cited in the body)"}
+GATE = {"spec": "GD10b GateSpec v1", "min_survivors": 4, "of": 11, "branch_10_min_survivors": 4,
+        "holdout_alpha_one_sided": 0.10, "breadth_alpha": 0.05,
+        "breadth_null": "joint_block_signflip_centred_union_grid_max_block",
+        "loso_alpha": 0.05, "top_entity_max_share": 0.25, "min_forward": 2}
+STAGE0 = {"target_ic": v1.POWER_GATE_IC, "gate": v1.POWER_GATE, "alpha_one_sided": 0.05,
+          "gaussian": {"sims": v8.GAUSSIAN_SIMS, "perms": v1.POWER_PERMS, "seed": v1.SEED},
+          "e0": {"scenario": v8.E0_GATED_SCENARIO, "sims": v8.E0_SIMS, "perms": v1.POWER_PERMS,
+                 "manifest_sha256": v8.E0_MANIFEST_SHA256},
+          "untestable": "below 0.50 on either model, or admission/probe/benchmark failure after one attempt"}
 
 
 def _bound() -> tuple[str, str]:
     if not (v1._is_hex64(PREREG_BODY_SHA256) and v1._is_hex64(V8_REGISTRATION_HEAD_SHA256)
+            and v1._is_hex64(GATE_SPEC_SHA256)
             and v8.REGISTERED_RECORD_SHA256 and v8.REGISTERED_RECORD_SHA256[1] == V8_REGISTRATION_HEAD_SHA256
             and v8.REGISTERED_ANCHOR_LINE is not None):
-        raise PermissionError("sectors-v6 body and the witnessed v8 registration are not bound")
+        raise PermissionError("sectors-v6 body, GateSpec and the witnessed v8 registration are not bound")
     return PREREG_BODY_SHA256, V8_REGISTRATION_HEAD_SHA256
 
 
 def check_prereg(repo_root: Path = s4.REPO) -> str:
-    body, _ = _bound()
+    """The body hashes to its pin, has no placeholder left, and cites the bound v8 head and GateSpec."""
+    body, v8_head = _bound()
+    text = v1.prereg_body((Path(repo_root) / PREREG_PATH).read_text(encoding="utf-8"))
+    if "@@" in text or v8_head not in text or GATE_SPEC_SHA256 not in text:
+        raise PermissionError("sectors-v6 body still has a placeholder or does not cite the bound pins")
     actual = v1.prereg_body_sha256(Path(repo_root) / PREREG_PATH)
     if actual != body:
         raise PermissionError("sectors-v6 preregistration body differs from its pin")
@@ -123,14 +139,24 @@ def registration_records(now: datetime, code_sha: str) -> list[dict]:
          "run": {"sectors": list(s4.SECTOR_ETF), "benchmarks": dict(s4.SECTOR_ETF),
                  "trials_per_sector": list(v1.trial_names()), "confirmatory": dict(CONFIRMATORY)},
          "discovery": dict(DISCOVERY), "holdout": dict(HOLDOUT), "probe_window": list(PROBE_WINDOW),
-         "generalization_gate": dict(GATE)},
+         "stage0": json.loads(json.dumps(STAGE0)),
+         "generalization_gate": {**GATE, "spec_sha256": GATE_SPEC_SHA256}},
     ]
 
 
-def register(log_dir: Path, now: datetime, code_sha: str, *, v8_log_dir: Path, witness_repo: Path,
-             census: Mapping[str, Any], dry_run: bool = True) -> dict:
-    """One new sectors-v6 chain, only while v8 is exactly at its witnessed registration."""
-    check_registration_census(census, v8_log_dir=v8_log_dir, witness_repo=witness_repo)
+def register(log_dir: Path, now: datetime, code_sha: str, *, v8_log_dir: Path, witness,
+             dry_run: bool = True) -> dict:
+    """One new sectors-v6 chain, only while v8 is exactly at its witnessed registration.
+
+    ``witness`` must be the fresh v8 ``OffhostWitness`` issued by ``v8.check_offhost`` (a raw
+    census from an older tip is refused by type).
+    """
+    if not isinstance(witness, v2.OffhostWitness) or witness.path != v8.WITNESS_PATH:
+        raise PermissionError("sectors-v6 registration needs a fresh v8 off-host witness (v8.check_offhost)")
+    registered_at = datetime.fromisoformat(v8.registry(v8_log_dir).read_all()[-1]["run_at"])
+    if now.tzinfo is None or now < registered_at:
+        raise ValueError("sectors-v6 registration time must follow v8's registration")
+    check_registration_census(witness.census, v8_log_dir=v8_log_dir, witness_repo=witness.repo)
     records = registration_records(now, code_sha)
     heads = v1.chained_sha256(records)
     if REGISTERED_RECORD_SHA256 is not None and tuple(heads) != REGISTERED_RECORD_SHA256:

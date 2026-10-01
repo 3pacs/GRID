@@ -47,7 +47,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     s6.check_prereg()
     witness = v8.check_offhost(args.vault_repo)
-    kwargs = {"v8_log_dir": args.v8_log_dir, "witness_repo": args.vault_repo, "census": witness.census}
+    kwargs = {"v8_log_dir": args.v8_log_dir, "witness": witness}
     run_at = _run_at(args.run_at)
     preview = s6.register(args.log_dir, run_at, args.code_sha, dry_run=True, **kwargs)
     if not args.execute:
@@ -57,7 +57,7 @@ def main(argv: list[str] | None = None) -> None:
         raise SystemExit("--expected-head differs from the dry-run head: nothing registered")
     out = s6.register(args.log_dir, run_at, args.code_sha, dry_run=False, **kwargs)
     print(json.dumps({**out, "chain": s6.registry(args.log_dir).verify_chain(),
-                      "next": f"publish the anchor to {s6.WITNESS_PATH} before v8 discovery_opened"},
+                      "next": f"publish the anchor to {s6.WITNESS_PATH} before any later v8 record is witnessed"},
                      indent=2, sort_keys=True))
 
 
