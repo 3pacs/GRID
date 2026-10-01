@@ -32,7 +32,7 @@ def _load_script():
     # A plain import from scripts/ (on sys.path), so --jobs process-pool workers (spawned with the
     # parent's sys.path) can unpickle the script's job functions.
     if str(SCRIPT.parent) not in sys.path:
-        sys.path.insert(0, str(SCRIPT.parent))
+        sys.path.append(str(SCRIPT.parent))  # appended: scripts/ must never shadow a top-level package
     return importlib.import_module(SCRIPT.stem)
 
 
