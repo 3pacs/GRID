@@ -490,6 +490,23 @@ class TestWritePlan:
         grid = pd.date_range("2026-04-04 03:00", "2026-10-10", freq="12h", tz="UTC")
         assert P.max_visible_versions(final, grid) == 1
 
+    def test_floor_clamped_tighten_is_labelled_first_seen(self):
+        qq = _resolved(signal_sources=[qq_insider(uploaded="2026-04-03T23:00:00Z")])
+        stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(qq, pd.DataFrame(), OBSERVED), OBSERVED)
+        gone = _resolved(form345=[sec_row(owner_cik="9", owner_name="OTHER PERSON")])
+        retract_at = OBSERVED + timedelta(days=1)
+        stored = P.apply_in_memory(stored, P.build_write_plan(gone, stored, retract_at, complete_channels=["form4"]),
+                                   retract_at)
+        back_at = OBSERVED + timedelta(days=10)
+        # It re-appears in a payload with no timestamp: known only from this run's observation.
+        bare = A.from_signal_sources(frame([qq_insider(fileDate=None)]), back_at)[0]
+        bare_ev = S.resolve_securities(M.merge_candidates(bare).events, pd.DataFrame())
+        stored = P.apply_in_memory(stored, P.build_write_plan(bare_ev, stored, back_at), back_at)
+        both = _resolved(form345=[sec_row()], signal_sources=[qq_insider(uploaded="2026-04-03T23:00:00Z")])
+        plan = P.build_write_plan(both, stored, back_at + timedelta(days=1))
+        tight = plan[plan["op"] == "tighten_known_at"].iloc[0]
+        assert tight["known_at"] == pd.Timestamp(retract_at) and tight["known_at_basis"] == "first_seen"
+
     def test_retract_only_for_complete_scope(self):
         stored = P.apply_in_memory(pd.DataFrame(), P.build_write_plan(_resolved(form345=[sec_row()]),
                                                                        pd.DataFrame(), OBSERVED), OBSERVED)
