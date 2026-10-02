@@ -255,6 +255,7 @@ class TestFREDPuller:
         """fedfred can expose realtime vintage dates in a column named date."""
         mock_engine = MagicMock()
         mock_conn = MagicMock()
+        mock_engine.connect.return_value = mock_conn
         mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
         mock_engine.connect.return_value.__exit__ = MagicMock(return_value=False)
         mock_engine.begin.return_value.__enter__ = MagicMock(return_value=mock_conn)
