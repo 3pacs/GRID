@@ -270,6 +270,11 @@ def test_leak_self_test_canary_trips_on_a_store_and_reader_keyed_on_event_time(p
     leaky_sql = pe_store._READ_SQL_TEMPLATE.replace("WHERE known_at <= :as_of", "WHERE event_time <= :as_of")
     assert leaky_sql != pe_store._READ_SQL_TEMPLATE
     monkeypatch.setattr(pe_store, "_READ_SQL_TEMPLATE", leaky_sql)
+    # The v2 store is read through read_event_versions: regress it the same way.
+    leaky_history = pe_store._HISTORY_SQL_TEMPLATE.replace("WHERE known_at <= :known_by",
+                                                           "WHERE event_time <= :known_by")
+    assert leaky_history != pe_store._HISTORY_SQL_TEMPLATE
+    monkeypatch.setattr(pe_store, "_HISTORY_SQL_TEMPLATE", leaky_history)
 
     def leaky_read() -> pd.DataFrame:
         return P.events_frame(
