@@ -30,7 +30,6 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
-from sqlalchemy.exc import DBAPIError
 
 from ingestion.altdata.quiverquant_identity import (
     fiscal_quarter_end,
@@ -364,7 +363,7 @@ def _store_signals(
         try:
             write(batch)
         except Exception as exc:
-            if tx.is_connection_error(exc) or not isinstance(exc, DBAPIError):
+            if not tx.is_rolled_back_write_error(exc):
                 raise QuiverStoreAborted(
                     "QuiverQuant writes stopped; inspect acknowledged count before any retry",
                     stored=rows_inserted, failed=failed,
@@ -376,7 +375,7 @@ def _store_signals(
                 try:
                     write([params])
                 except Exception as row_exc:
-                    if tx.is_connection_error(row_exc) or not isinstance(row_exc, DBAPIError):
+                    if not tx.is_rolled_back_write_error(row_exc):
                         raise QuiverStoreAborted(
                             "QuiverQuant row writes stopped; no automatic replay",
                             stored=rows_inserted, failed=failed,

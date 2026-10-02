@@ -398,7 +398,7 @@ def apply_moves(
                         else:
                             raced += 1
             except Exception as exc:
-                if tx.is_connection_error(exc) or not common.is_lock_or_timeout(exc):
+                if not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
                     common.preserve_committed(exc, moved)
                     raise
                 timeout_batches += 1

@@ -357,6 +357,7 @@ def test_trust_scorer_scores_a_quiverquant_feed_as_one_source(monkeypatch):
     class _Rows:
         def __init__(self, rows):
             self._rows = rows
+            self.rowcount = len(rows)
 
         def fetchall(self):
             return self._rows
@@ -381,8 +382,11 @@ def test_trust_scorer_scores_a_quiverquant_feed_as_one_source(monkeypatch):
                     ("quiverquant:house", "qq_house_trading", "CORRECT", 0.03, today, "CCC"),
                     ("congressional", "Jane Doe", "CORRECT", 0.01, today, "DDD"),
                 ])
+            if "SELECT id FROM signal_sources" in sql:
+                return _Rows([(1,)] if params["after_id"] == 0 else [])
             if "UPDATE signal_sources" in sql:
                 self.updates.append(params)
+                return _Rows([(1,)])
             return _Rows([])
 
     class _Engine:

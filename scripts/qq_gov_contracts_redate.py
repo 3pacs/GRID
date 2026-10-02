@@ -362,7 +362,7 @@ def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forwar
                         else:
                             chain_blocked += 1
             except Exception as exc:
-                if tx.is_connection_error(exc) or not common.is_lock_or_timeout(exc):
+                if not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
                     common.preserve_committed(exc, moved)
                     raise
                 timeout_chains.append(chain[0].ticker)
