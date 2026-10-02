@@ -32,10 +32,10 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
 ):
     engine, counts = pg
     if script is rekey:
-        seed(engine, [{"ticker": t} for t in ("FIRST", "MIDDLE", "LAST")])
+        seed(engine, [{"ticker": t} for t in ("FIRST", "MIDDLE", "ZZZ_LAST")])
         moves = rekey_plan(engine)
     else:
-        rows = sum((quarter_moves(1, t)[0] for t in ("FIRST", "MIDDLE", "LAST")), [])
+        rows = sum((quarter_moves(1, t)[0] for t in ("FIRST", "MIDDLE", "ZZZ_LAST")), [])
         seed(engine, [{**r, "source_type": redate.SOURCE_TYPE} for r in rows])
         with engine.connect() as conn:
             moves = redate.plan_redate(redate.load_rows(conn)).moves
