@@ -97,6 +97,25 @@ class BLSPuller(BasePuller):
             return None
         return date(int(year), month, 1)
 
+    def pull_all(self, start_year: int | None = None) -> dict[str, Any]:
+        """SmartScheduler entry point: the default BLS series, one bounded request.
+
+        Pulls :data:`BLS_SERIES_LIST` from ``start_year`` (default: two years
+        before the current one) through the current year. That window is a
+        single BLS query per 50-series chunk -- well under the 20-year span
+        a keyed request allows -- and wide enough to pick up any monthly
+        observation first published since the previous weekly run. Dates
+        already stored as SUCCESS are skipped, so raw_series is only ever
+        appended to (see :meth:`_fetch_and_store`).
+
+        Returns:
+            The :meth:`pull_series` result (``rows_inserted``, ``status``,
+            ``errors``).
+        """
+        if start_year is None:
+            start_year = date.today().year - 2
+        return self.pull_series(start_year=start_year)
+
     def pull_series(
         self,
         series_ids: list[str] | None = None,

@@ -163,13 +163,9 @@ def run_pipeline(historical: bool = False) -> dict:
             log.info("DexScreener — {r}", r=result)
         except Exception as exc:
             log.warning("DexScreener failed: {e}", e=str(exc))
-        try:
-            from ingestion.pumpfun import PumpFunPuller
-            puller = PumpFunPuller(db_engine=engine)
-            result = puller.pull_all()
-            log.info("PumpFun — {r}", r=result)
-        except Exception as exc:
-            log.warning("PumpFun failed: {e}", e=str(exc))
+        # PumpFun is not pulled: PumpFunPuller has no pull_all (this call
+        # raised every run) and the source is dead as designed -- see the
+        # note above "dexscreener" in ingestion/smart_scheduler.PULLER_REGISTRY.
     summary["steps"]["crypto_ingest"] = _safe_run("Crypto Ingestion", _crypto_ingest)
 
     # -----------------------------------------------------------------------

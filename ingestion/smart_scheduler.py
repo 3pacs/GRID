@@ -499,12 +499,21 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "tiingo_fundamentals","mod": "ingestion.tiingo_fundamentals_pull","cls": "TiingoFundamentalsPuller", "method": "pull_all",      "freq_h": 24, "timeout_s": 120, "api_key": "TIINGO_API_KEY", "api_key_mode": "env"},
     {"name": "quiverquant",       "mod": "ingestion.altdata.quiverquant",      "cls": "QuiverQuantPuller",        "method": "pull_all",      "freq_h": 12, "timeout_s": 120, "api_key": "QUIVERQUANT_API_KEY", "api_key_mode": "env"},
 
-    # ── Crypto (DexScreener, PumpFun) ──
+    # ── Crypto (DexScreener) ──
+    # PumpFun is deliberately not registered (E1-V3): the entry named a
+    # pull_all that PumpFunPuller never had, so every 6-hour run raised. It is
+    # not re-pointed at pull_aggregate_signals because the source is dead as
+    # designed: /coins/latest and /coins/king-of-the-hill return 404 on
+    # frontend-api-v3 (v2 answers 403), which the puller turns into stored
+    # 0.0 "signals", and the two live endpoints are fixed-size pages
+    # (limit=1 / limit=50), so pump_live_token_count and pump_graduated_count
+    # would be the page size, not a measurement. Checked 2026-09-30.
     {"name": "dexscreener",       "mod": "ingestion.dexscreener",             "cls": "DexScreenerPuller",        "method": "pull_aggregate_signals", "freq_h": 4,  "timeout_s": 60},
-    {"name": "pumpfun",           "mod": "ingestion.pumpfun",                 "cls": "PumpFunPuller",            "method": "pull_all",      "freq_h": 6,  "timeout_s": 60},
 
     # ── Government / regulatory ──
-    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY", "hold_reason": "No pull_all contract; bounded BLS adapter required"},
+    # BLSPuller(db_engine, api_key=None): keyword mode, never positional.
+    # pull_all is one bounded request (see BLSPuller.pull_all).
+    {"name": "bls",               "mod": "ingestion.bls",                     "cls": "BLSPuller",                "method": "pull_all",      "freq_h": 168, "timeout_s": 120, "api_key": "BLS_API_KEY", "api_key_mode": "keyword"},
     {"name": "edgar",             "mod": "ingestion.edgar",                   "cls": "EDGARPuller",              "method": "pull_all",      "freq_h": 24, "timeout_s": 180},
     {"name": "cftc_cot",          "mod": "ingestion.altdata.cftc_cot",        "cls": "CFTCCOTPuller",            "method": "pull_all",      "freq_h": 168, "timeout_s": 120},  # due/not-due decided by _cftc_cot_is_due (holiday/DST-aware release window + 1-day retry), not freq_h — see the GRID task A1 note above _cftc_current_report_date
 
@@ -513,7 +522,7 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "fear_greed",        "mod": "ingestion.altdata.fear_greed",      "cls": "FearGreedPuller",          "method": "pull_all",      "freq_h": 12, "timeout_s": 30},
     {"name": "social_sentiment",  "mod": "ingestion.social_sentiment",        "cls": "SocialSentimentPuller",    "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
     {"name": "polymarket",        "mod": "ingestion.altdata.polymarket",      "cls": "PolymarketPuller",         "method": "pull_all",      "freq_h": 12, "timeout_s": 60},
-    {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60, "hold_reason": "No persistent write contract; narrative-only pull_today"},
+    {"name": "wiki_history",      "mod": "ingestion.wiki_history",            "cls": "WikiHistoryPuller",        "method": "pull_all",      "freq_h": 24, "timeout_s": 60},
 
     # ── International (missing) ──
     {"name": "eurostat",          "mod": "ingestion.international.eurostat",   "cls": "EurostatPuller",           "method": "pull_all",      "freq_h": 168, "timeout_s": 180},
