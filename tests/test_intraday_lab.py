@@ -6,6 +6,7 @@ import pytest
 
 from scripts.intraday_lab.features import FEATURES, compute
 from scripts.intraday_lab.evaluate import evaluate, outcome
+from scripts.intraday_lab.capture import normalize
 
 
 def row(t, instrument="SPY", **values):
@@ -169,3 +170,25 @@ def test_paired_baseline_and_cost_sensitivity_on_identical_timestamps():
     scenarios = result["extra_cost_sensitivities"]
     assert scenarios["10"]["mean_net_bps"] == pytest.approx(scenarios["0"]["mean_net_bps"] - 10)
     assert result["paired_excess_lower"] is None  # can't infer significance from one session
+
+
+def test_finite_overflow_does_not_create_neutral_depth_or_flow():
+    p = packet()
+    p["observations"] += [row(1200, "ES_BOOK", bid=5000, ask=5000.25, bid_size=1e308, ask_size=1e308),
+                          row(1200, "ES_FLOW", buy_volume=1e308, sell_volume=1e308,
+                              window_seconds=60, classification="verified_aggressor")]
+    f = compute(p)["features"]
+    assert f["es_depth"]["value"] is None
+    assert f["es_aggression"]["value"] is None
+
+
+def test_inventory_cannot_admit_anik_clock_or_rtd_exchange_time():
+    state = {"quote": {"price": 769, "as_of": "2026-10-02T16:00:00Z"}}
+    p = normalize(state, 1790956810, "ANIK")
+    assert p["provenance"] != "prospective"
+    assert p["observations"][0]["clock"] != "trusted_receipt"
+    state["quote"]["is_rtd"] = True
+    p = normalize(state, 1790956810, "grid-svr")
+    assert p["observations"][0]["available_at"] == 1790956810
+    assert p["observations"][0]["event_at"] is None
+    assert p["observations"][0]["status"] == "unavailable"

@@ -80,7 +80,9 @@ def compute(packet):
             and r["values"]["bid_size"] > 0 and r["values"]["ask_size"] > 0]
     if book:
         v = book[-1]["values"]
-        put("es_depth", (v["bid_size"] - v["ask_size"]) / (v["bid_size"] + v["ask_size"]), book[-1:])
+        total = v["bid_size"] + v["ask_size"]
+        if number(total):
+            put("es_depth", (v["bid_size"] - v["ask_size"]) / total, book[-1:])
     if (len(book) > 1 and book[0]["event_at"] <= t - 50
             and all(b["event_at"] - a["event_at"] <= 10 for a, b in zip(book, book[1:]))):
         ofi = 0
@@ -91,13 +93,14 @@ def compute(packet):
                     - b["ask_size"] * (b["ask"] <= a["ask"])
                     + a["ask_size"] * (b["ask"] >= a["ask"]))
         depth = mean(r["values"]["bid_size"] + r["values"]["ask_size"] for r in book)
-        put("es_ofi", ofi / depth, book)
+        if number(ofi) and number(depth):
+            put("es_ofi", ofi / depth, book)
     flow = rows(packet, "ES_FLOW", ("buy_volume", "sell_volume", "window_seconds"), 10)
     if flow:
         r = flow[-1]
         v = r["values"]
         total = v["buy_volume"] + v["sell_volume"]
-        if (v["buy_volume"] >= 0 and v["sell_volume"] >= 0 and total > 0
+        if (v["buy_volume"] >= 0 and v["sell_volume"] >= 0 and number(total) and total > 0
                 and v["window_seconds"] == 60 and v.get("classification") == "verified_aggressor"):
             delta = (v["buy_volume"] - v["sell_volume"]) / total
             put("es_aggression", delta, [r])
@@ -110,7 +113,7 @@ def compute(packet):
     if breadth:
         v = breadth[-1]["values"]
         total = v["up_volume"] + v["down_volume"]
-        if total > 0:
+        if number(total) and total > 0:
             strength = .5 * max(-1, min(1, v["tick"] / 1000)) + .5 * (v["up_volume"] - v["down_volume"]) / total
             put("breadth", strength, breadth[-1:])
             if spy and strength * move(spy) < 0:
@@ -126,12 +129,12 @@ def compute(packet):
         r, v = auction[-1], auction[-1]["values"]
         total = v["buy_notional"] + v["sell_notional"]
         if (0 <= v["seconds_to_close"] <= 600 and min(v["buy_notional"], v["sell_notional"]) >= 0
-                and total > 0 and v.get("universe") == "SPX_CONSTITUENTS"):
+                and number(total) and total > 0 and v.get("universe") == "SPX_CONSTITUENTS"):
             put("auction", (v["buy_notional"] - v["sell_notional"]) / total, [r])
     long_path = path(packet, "SPY", 1200)
     if long_path:
         prices = [r["values"]["price"] for r in long_path]
-        returns = [math.log(b / a) for a, b in zip(prices, prices[1:])]
+        returns = [math.log(b) - math.log(a) for a, b in zip(prices, prices[1:])]
         # Same sampling cadence for both volatility windows.
         steps = [b["event_at"] - a["event_at"] for a, b in zip(long_path, long_path[1:])]
         if max(steps) == min(steps) and min(steps) > 0:
