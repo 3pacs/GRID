@@ -827,19 +827,28 @@ def run_intelligence_loop() -> None:
     #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
     #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
     def _pboc_omo_daily() -> None:
-        """CAT-3: PBoC 7-day reverse repo + MLF daily pull."""
+        """CAT-3: PBoC open-market-operation announcements (official pbc.gov.cn).
+
+        2026-09-29: switched from ingestion.altdata.pboc_omo (akshare; the
+        preferred functions do not exist and its fallbacks wrote mislabeled
+        FR007/LPR data frozen in 2020) to pboc_omo_official, which writes
+        under its own source_catalog row ``pboc_omo_announcements``.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.pboc_omo import run_pboc_omo_puller
-            result = run_pboc_omo_puller(_ge())
+            from ingestion.altdata.pboc_omo_official import (
+                run_pboc_omo_announcements_puller,
+            )
+            result = run_pboc_omo_announcements_puller(_ge())
             log.info(
-                "PBoC OMO: {o} OMO rows, {m} MLF rows, {i} inserted",
-                o=result.get("omo_rows", 0),
-                m=result.get("mlf_rows", 0),
-                i=result.get("inserted", 0),
+                "PBoC OMO announcements: status={s}, {a} parsed, {i} inserted, latest={d}",
+                s=result.get("status"),
+                a=result.get("announcements", 0),
+                i=result.get("rows_inserted", 0),
+                d=result.get("latest_op_date"),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("PBoC OMO daily failed: {e}", e=str(exc))
+            log.warning("PBoC OMO announcements daily failed: {e}", e=str(exc))
 
     def _taiwan_exports_monthly() -> None:
         """CAT-9: Taiwan export orders + foundry utilization monthly."""
