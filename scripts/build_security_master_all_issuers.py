@@ -44,13 +44,22 @@ Rows (see the PR body for the rationale):
   either class, so a class missing from the latest filing has not stopped trading.
 * ``company_tickers`` supplies a ticker that no filing named, dated ``--tickers-as-of`` (the
   snapshot day) with ``valid_to`` NULL.
-* An issuer that went silent while its ticker was still "open" (its last filing naming it is older than
-  another CIK's first filing naming it) is closed the day before the other CIK starts: the ticker was
-  handed over, not contested (``apply_handoff_clamp``; ``--no-handoff-clamp`` keeps the literal rule).
-  The row keeps ``conflict_detail.kind = ticker_reuse_handoff`` and ``conflict_flag`` false.
-* A ticker claimed by two different CIKs over overlapping windows (both still filing under it) is NOT
-  resolved here: both rows keep ``conflict_flag`` true, ``is_primary`` false, and the pair is written to
-  ``conflicts.json``.
+* **Silent issuers** (``apply_silent_closure``). A window the family rule leaves open stays open only if the
+  issuer is the ``company_tickers`` holder of the ticker (or a class sibling), or its last filing naming it
+  is within 400 days of the end of the data. Otherwise it ends 400 days after that last filing, or the day
+  before another CIK first names the ticker, whichever is earlier. 400 days = one year plus 35 days, a
+  measured bound (99.6% of the gaps between consecutive filings naming the same ticker are shorter). The
+  row keeps ``conflict_detail.kind = silent_issuer_closed``. ``--no-close-silent`` keeps the literal rule.
+  Consequences to know: a stray *latest* filing by the real holder that names another ticker closes the real
+  ticker the day before that filing (its later ticker-keyed events are ``ticker_outside_validity``), and a
+  late Form 4/A that re-names an old ticker after its window closed does not reopen it; neither affects
+  CIK-keyed Form 4 events.
+* A ticker claimed by two different CIKs over overlapping windows is flagged, never hidden: both rows keep
+  ``conflict_flag`` true and the pair goes to ``conflicts.json``. Exactly one claimant per contested overlap
+  gets ``is_primary`` (``_contest``): the ``company_tickers`` holder for an overlap still open at the
+  snapshot, else the claimant with more filing days naming the ticker inside the overlap, then the
+  ``company_tickers`` holder, the later last filing, the smaller entity_id. So the consumer's tie-break
+  (``is_primary``, then latest ``valid_from``) lands on the evidence, not on the newest claimant.
 
 Not touched: ``security_sector_membership`` (non-Technology sector membership needs a SIC-to-sector
 mapping, a later step) and every existing seed row (the loader only ever INSERTs).
@@ -515,7 +524,7 @@ def apply_silent_closure(rows: list[dict[str, Any]], *, grace_days: int, data_en
     for group in by_ticker.values():
         for a in group:
             last = a["_fam_last"]  # the family's last filing: a class missing from the latest filing is not silent
-            if a["valid_to"] is not None or last is None or a["_ct"]:
+            if a["valid_to"] is not None or last is None or a["_fam_ct"]:
                 continue
             horizon = date.fromisoformat(last) + timedelta(days=grace_days)
             later = [b["valid_from"] for b in group if b["entity_id"] != a["entity_id"] and b["valid_from"] > last]
@@ -703,7 +712,8 @@ def build_rows(
         row["_last_seen"] = w["last_seen"]
         row["_fam_last"] = fam_last[(w["cik"], w["family"])]
         row["_dates"] = w["dates"]
-        row["_ct"] = bool(ct_tickers & set(w["family"]))  # the SEC lists this ticker (or a class sibling) for the CIK
+        row["_ct"] = w["ticker"] in ct_tickers  # the SEC lists exactly this ticker for the CIK
+        row["_fam_ct"] = bool(ct_tickers & set(w["family"]))  # ... or a share-class sibling of it (keeps the family open)
         ticker_rows.append(row)
         open_by_entity[(w["cik"], w["ticker"])] = open_by_entity.get((w["cik"], w["ticker"]), False) or w["valid_to"] is None
     added_from_company_tickers = 0
@@ -716,13 +726,14 @@ def build_rows(
             row["_fam_last"] = None
             row["_dates"] = []
             row["_ct"] = True
+            row["_fam_ct"] = True
             ticker_rows.append(row)
             added_from_company_tickers += 1
 
     closed = apply_silent_closure(ticker_rows, grace_days=grace_days, data_end=hist["data_end"]) if close_silent else {}
     conflicts = flag_conflicts(ticker_rows)
     for r in ticker_rows:
-        for k in ("_last_seen", "_fam_last", "_dates", "_ct"):
+        for k in ("_last_seen", "_fam_last", "_dates", "_ct", "_fam_ct"):
             r.pop(k, None)
     id_rows.extend(ticker_rows)
 
