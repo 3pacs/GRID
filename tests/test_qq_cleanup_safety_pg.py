@@ -76,7 +76,9 @@ def test_successful_commit_then_cleanup_57014_must_stop_transition_not_skip(pg, 
         event.remove(engine.pool, 'checkin', callback)
     actual = all_rows(engine)
     print('REAL_COMMIT_THEN_CLEANUP57014_TRANSITION', script.__name__, json.dumps({
-        'checkins':calls[0], 'reported':result, 'uncertain':caught is not None,
+        'checkins':calls[0], 'reported':result, 'stopped':caught is not None,
+        'commit_uncertain':getattr(caught, 'commit_uncertain', None),
+        'acknowledged_moved':getattr(caught, 'committed_rows', None),
         'audit_rows':len((tmp_path/'audit').read_text().splitlines()),
         'actual_changed':sum(r['source_id']!='qq_house_trading' for r in actual) if script is rekey else sum(r['signal_date']==moves[0].new_date for r in actual)}))
     assert caught is not None, 'Cleanup SQLSTATE57014 AFTER actual COMMIT was reported as a skipped rollback, leaving committed transition row absent from audit and continuing'
