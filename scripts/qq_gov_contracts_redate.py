@@ -65,14 +65,18 @@ aggregate in place after it, so a stored value must not be scored as known at
 
 Safety
 ------
-* Dry run by default: read-only session, 20 s statement timeout, 2 s lock timeout.
+* Dry run by default: read-only session, 2 s statement timeout, 1 s lock timeout.
 * Both the dry run and ``--apply`` refuse to start, and refuse to continue between
-  tickers, inside 03:30-10:30 UTC (nightly ``pg_dump`` window).
+  writes and COMMIT, inside 03:30-10:30Z, 10:58-11:12Z and weekday 13:25-14:20Z.
+  Writes also refuse within five seconds of a blackout or once the marker appears.
 * ``--apply`` requires ``--audit-log`` (a new file): one JSON line per move. Each
-  ticker's chain is one transaction and every UPDATE re-checks that its target slot
+  ticker group is one transaction of at most 50 rows; an oversized group refuses
+  the WHOLE apply before any writes or audit-file creation. Every UPDATE re-checks that its target slot
   is free and that the row still has the date the plan saw. A chain that hits the lock
   or statement timeout (a concurrent uncommitted write) is rolled back whole, reported
   (``chains_skipped_timeout``) and skipped; the run continues.
+  Skips need operator review; COMMIT/connection uncertainty and audit I/O failure
+  stop without replay, retaining only the acknowledged committed prefix.
 * ``--revert AUDIT_LOG`` undoes an apply, processing each ticker in *descending*
   date order for the same reason.
 * Moved rows keep ``outcome`` / ``outcome_return`` / ``trust_score`` untouched. The dry
@@ -101,7 +105,6 @@ from typing import Any, Iterable, Iterator
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import OperationalError
 
 from ingestion.altdata.quiverquant_identity import (
     calendar_quarter_end,
@@ -110,6 +113,7 @@ from ingestion.altdata.quiverquant_identity import (
     parse_year_qtr,
 )
 from scripts import qq_transition_common as common
+from ingestion.altdata import quiverquant_transactions as tx
 
 SOURCE_TYPE = "quiverquant:gov_contracts"
 SAMPLE_LIMIT = 10
@@ -264,6 +268,7 @@ def summarize(plan: RedatePlan, today: date) -> dict[str, Any]:
         "no_signal_date": plan.skipped.get("no_signal_date", 0),
         "longest_collision_chain": plan.longest_chain,
         "collision_chains": plan.chain_count,
+        "oversized_ticker_groups": sum(len(g) > tx.MAX_WRITE_ROWS for g in _by_ticker(plan.moves, descending=False)),
         "moves_by_quarter_shift": dict(sorted(Counter(
             f"Q{m.qtr}: {m.old_date.isoformat()[5:]} -> {m.new_date.isoformat()[5:]}" for m in plan.moves
         ).items())),
@@ -295,6 +300,7 @@ _MOVE_SQL = text(
      WHERE id = :id
        AND source_type = :source_type
        AND signal_date = :old_date
+       AND source_id = :source_id AND ticker = :ticker AND signal_type = :signal_type
        AND NOT EXISTS (
             SELECT 1 FROM signal_sources t
              WHERE t.source_type = :source_type AND t.source_id = :source_id
@@ -327,42 +333,52 @@ def _by_ticker(moves: Iterable[Redate], *, descending: bool) -> list[list[Redate
     return [sorted(g, key=lambda r: r.old_date, reverse=descending) for g in groups.values()]
 
 
-def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forward: bool = True) -> dict[str, Any]:
-    """Run each ticker's chain in one transaction, ascending (``forward``) or descending.
+def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forward: bool = True,
+                guard_check: bool = True) -> dict[str, Any]:
+    """Atomic ticker groups of <=50 rows, ascending forward or descending revert.
+
+    Oversized groups are refused before ANY write or audit file creation.
 
     A chain that hits ``lock_timeout`` / ``statement_timeout`` is rolled back whole,
     reported and skipped; any other database error propagates.
     """
+    chains = _by_ticker(moves, descending=not forward)
+    oversized = [(g[0].ticker, len(g)) for g in chains if len(g) > tx.MAX_WRITE_ROWS]
+    if oversized:
+        raise ValueError(f"refusing before writes: ticker groups exceed {tx.MAX_WRITE_ROWS} rows: {oversized}")
     moved = blocked = 0
     timeout_chains: list[str] = []
     with audit_path.open("x", encoding="utf-8") as audit:
-        for chain in _by_ticker(moves, descending=not forward):
-            common.check_window()
+        for chain in chains:
             done: list[Redate] = []
             chain_blocked = 0
             try:
-                with engine.begin() as conn:
+                with tx.write_transaction(engine, guard=lambda: common.write_guard(guard_check=guard_check)) as (conn, check):
                     for m in chain:
+                        check()
                         res = conn.execute(_MOVE_SQL, _params(m, forward=forward))
                         if res.rowcount == 1:
                             done.append(m)
                         else:
                             chain_blocked += 1
-            except OperationalError as exc:
-                if not common.is_lock_or_timeout(exc):
+            except Exception as exc:
+                if tx.is_connection_error(exc) or not common.is_lock_or_timeout(exc):
+                    common.preserve_committed(exc, moved)
                     raise
                 timeout_chains.append(chain[0].ticker)
                 continue
             blocked += chain_blocked
-            for m in done:  # logged after the chain committed
-                audit.write(json.dumps({
+            moved += len(done)
+            try:
+                common.append_audit(audit, [{
                     "direction": "forward" if forward else "revert",
                     "id": m.id, "source_id": m.source_id, "ticker": m.ticker, "signal_type": m.signal_type,
                     "year": m.year, "qtr": m.qtr,
                     "old_date": m.old_date.isoformat(), "new_date": m.new_date.isoformat(),
-                }) + "\n")
-            audit.flush()
-            moved += len(done)
+                } for m in done])
+            except Exception as exc:
+                common.preserve_committed(exc, moved)
+                raise
     return {
         "moved": moved,
         "not_moved_slot_taken_or_row_changed": blocked,
@@ -394,6 +410,7 @@ def run(
     apply: bool,
     audit_path: Path | None,
     today: date | None = None,
+    guard_check: bool = True,
 ) -> dict[str, Any]:
     """Plan (and with ``apply`` execute) the re-date."""
     today = today or datetime.now(timezone.utc).date()
@@ -409,7 +426,7 @@ def run(
     }
     if apply:
         assert audit_path is not None
-        report["applied"] = apply_moves(engine, plan.moves, audit_path=audit_path)
+        report["applied"] = apply_moves(engine, plan.moves, audit_path=audit_path, guard_check=guard_check)
     return report
 
 
@@ -454,13 +471,21 @@ def main(argv: list[str] | None = None) -> int:
         if args.revert:
             report = {
                 "mode": "revert",
-                "applied": apply_moves(engine, read_audit(args.revert), audit_path=args.audit_log, forward=False),
+                "applied": apply_moves(engine, read_audit(args.revert), audit_path=args.audit_log, forward=False,
+                                       guard_check=not args.no_guard_check),
             }
         else:
-            report = run(engine, apply=args.apply, audit_path=args.audit_log)
+            report = run(engine, apply=args.apply, audit_path=args.audit_log, guard_check=not args.no_guard_check)
     except common.WindowClosed as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"{exc}; acknowledged committed rows={getattr(exc, 'committed_rows', 0)}", file=sys.stderr)
         return 3
+    except Exception as exc:
+        print(json.dumps({"status": "ABORTED", "error_type": type(exc).__name__,
+                          "reason": str(exc) if isinstance(exc, ValueError) else "database/audit failure; inspect private evidence",
+                          "acknowledged_committed_rows": getattr(exc, "committed_rows", 0),
+                          "commit_uncertain": getattr(exc, "commit_uncertain", False),
+                          "action": "stop; reconcile database and audit before a separately reviewed retry"}), file=sys.stderr)
+        return 5
     finally:
         engine.dispose()
     rendered = json.dumps(report, indent=2, sort_keys=True)

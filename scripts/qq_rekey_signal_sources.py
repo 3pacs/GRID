@@ -57,17 +57,21 @@ means a pull got through before the apply.
 Safety
 ------
 * Dry run by default: a read-only session (``default_transaction_read_only=on``),
-  20 s statement timeout, 2 s lock timeout, nothing is written.
+  2 s statement timeout, 1 s lock timeout, nothing is written.
 * Both the dry run and ``--apply`` refuse to start, and refuse to continue between
-  batches, inside 03:30-10:30 UTC (nightly ``pg_dump`` window).
+  writes and COMMIT, inside 03:30-10:30Z, 10:58-11:12Z and weekday 13:25-14:20Z.
+  Writes also refuse within five seconds of a blackout or once the marker appears.
 * ``--apply`` requires ``--audit-log`` (a new file): one JSON line per move with
   ``direction``, ``id``, ``old_source_id`` and ``new_source_id``. Each UPDATE
   re-checks that the target key is still free, so a concurrent writer cannot make it
   collide.
-* ``--apply`` commits in batches (``--batch-size``); ``--max-moves`` stops early. A
+* ``--apply`` commits in batches of 1-50 (``--batch-size``); ``--max-moves`` stops early. A
   batch that hits the lock or statement timeout (a concurrent uncommitted write) is
   rolled back, counted in the report (``batches_skipped_timeout``, with the skipped
-  row ids) and skipped; the run continues. Re-running picks those rows up.
+  row ids) and skipped; the run continues. Skips require operator review before retry.
+  COMMIT/connection uncertainty and audit I/O errors stop without automatic replay;
+  failures retain the acknowledged committed prefix, which can differ from the audit
+  after an audit-device failure and never includes an uncertain COMMIT.
 * ``--revert AUDIT_LOG`` undoes an apply from its audit log.
 
 Identity limits to know
@@ -117,7 +121,6 @@ from typing import Any, Iterable, Iterator
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
-from sqlalchemy.exc import OperationalError
 
 from ingestion.altdata.quiverquant_identity import (
     IDENTITY_SEPARATOR,
@@ -131,8 +134,9 @@ from ingestion.altdata.quiverquant_identity import (
     source_id_for,
 )
 from scripts import qq_transition_common as common
+from ingestion.altdata import quiverquant_transactions as tx
 
-DEFAULT_BATCH_SIZE = 500
+DEFAULT_BATCH_SIZE = tx.MAX_WRITE_ROWS
 EXTRACTOR_LOOKBACK_DAYS = int(os.environ.get("GRID_EXTRACTOR_LOOKBACK_DAYS", "45"))
 SAMPLE_LIMIT = 10
 
@@ -318,6 +322,7 @@ _MOVE_SQL = text(
      WHERE id = :id
        AND source_type = :source_type
        AND source_id = :old_id
+       AND ticker = :ticker AND signal_date = :signal_date AND signal_type = :signal_type
        AND NOT EXISTS (
             SELECT 1 FROM signal_sources t
              WHERE t.source_type = :source_type AND t.source_id = :new_id
@@ -359,12 +364,16 @@ def apply_moves(
     audit_path: Path,
     max_moves: int | None = None,
     direction: str = "forward",
+    guard_check: bool = True,
 ) -> dict[str, Any]:
-    """Execute planned moves in committed batches, appending each to the audit log.
+    """Execute planned moves in batches of 1-50 rows, auditing acknowledged commits.
 
     A batch that hits ``lock_timeout`` / ``statement_timeout`` is rolled back whole,
     reported and skipped; any other database error propagates.
     """
+    tx.validate_batch_size(batch_size)
+    if max_moves is not None and max_moves < 0:
+        raise ValueError("max_moves must be nonnegative")
     moved = 0
     lost_race = 0
     timeout_batches = 0
@@ -372,13 +381,13 @@ def apply_moves(
     todo = moves if max_moves is None else moves[:max_moves]
     with audit_path.open("x", encoding="utf-8") as audit:
         for start in range(0, len(todo), batch_size):
-            common.check_window()
             batch = todo[start:start + batch_size]
             done: list[Move] = []
             raced = 0
             try:
-                with engine.begin() as conn:
+                with tx.write_transaction(engine, guard=lambda: common.write_guard(guard_check=guard_check)) as (conn, check):
                     for m in batch:
+                        check()
                         res = conn.execute(_MOVE_SQL, {
                             "id": m.id, "source_type": m.source_type, "old_id": m.old_source_id,
                             "new_id": m.new_source_id, "ticker": m.ticker,
@@ -388,20 +397,23 @@ def apply_moves(
                             done.append(m)
                         else:
                             raced += 1
-            except OperationalError as exc:
-                if not common.is_lock_or_timeout(exc):
+            except Exception as exc:
+                if tx.is_connection_error(exc) or not common.is_lock_or_timeout(exc):
+                    common.preserve_committed(exc, moved)
                     raise
                 timeout_batches += 1
                 skipped_ids.extend(m.id for m in batch)
                 continue
             lost_race += raced
-            for m in done:  # written after the batch committed: the log never claims a move that did not happen
-                audit.write(json.dumps({
+            moved += len(done)  # acknowledged COMMIT, even if the audit device then fails
+            try:
+                common.append_audit(audit, [{
                     "direction": direction, "id": m.id, "source_type": m.source_type,
                     "old_source_id": m.old_source_id, "new_source_id": m.new_source_id,
-                }) + "\n")
-            audit.flush()
-            moved += len(done)
+                } for m in done])
+            except Exception as exc:
+                common.preserve_committed(exc, moved)
+                raise
     return {
         "moved": moved,
         "not_moved_target_taken_or_row_changed": lost_race,
@@ -428,11 +440,13 @@ _REVERT_FETCH_SQL = text(
 )
 
 
-def revert_moves(engine: Engine, audit_in: Path, *, batch_size: int, audit_path: Path) -> dict[str, Any]:
+def revert_moves(engine: Engine, audit_in: Path, *, batch_size: int, audit_path: Path, guard_check: bool = True) -> dict[str, Any]:
     """Undo an apply: each row goes back to its old source_id (if its key there is free)."""
+    tx.validate_batch_size(batch_size)
     reverse: list[Move] = []
     with engine.connect() as conn:
         for rec in read_audit(audit_in):
+            common.check_window()
             row = conn.execute(_REVERT_FETCH_SQL, {"id": int(rec["id"]), "source_type": rec["source_type"]}).fetchone()
             sdate = as_date(row[1]) if row is not None else None
             if row is None or sdate is None:
@@ -441,7 +455,7 @@ def revert_moves(engine: Engine, audit_in: Path, *, batch_size: int, audit_path:
                 id=int(rec["id"]), source_type=rec["source_type"], ticker=str(row[0]), signal_date=sdate,
                 signal_type=str(row[2]), old_source_id=rec["new_source_id"], new_source_id=rec["old_source_id"],
             ))
-    return apply_moves(engine, reverse, batch_size=batch_size, audit_path=audit_path, direction="revert")
+    return apply_moves(engine, reverse, batch_size=batch_size, audit_path=audit_path, direction="revert", guard_check=guard_check)
 
 
 _KEYED_ROWS_SQL = text(
@@ -496,6 +510,7 @@ def run(
     max_moves: int | None = None,
     before: date | None = None,
     today: date | None = None,
+    guard_check: bool = True,
 ) -> dict[str, Any]:
     """Plan (and with ``apply`` execute) the re-key for each source_type."""
     today = today or datetime.now(timezone.utc).date()
@@ -526,7 +541,7 @@ def run(
         assert audit_path is not None
         all_moves = [m for st in source_types for m in plans[st].moves]
         report["applied"] = apply_moves(
-            engine, all_moves, batch_size=batch_size, audit_path=audit_path, max_moves=max_moves
+            engine, all_moves, batch_size=batch_size, audit_path=audit_path, max_moves=max_moves, guard_check=guard_check
         )
     return report
 
@@ -548,6 +563,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--db-url-env", help="env var holding the database URL (default: config.settings.DB_URL)")
     ap.add_argument("--out", type=Path, help="also write the JSON report here (must not exist)")
     args = ap.parse_args(argv)
+
+    try:
+        tx.validate_batch_size(args.batch_size)
+        if args.max_moves is not None and args.max_moves < 0:
+            raise ValueError("--max-moves must be nonnegative")
+        before = date.fromisoformat(args.before) if args.before else None
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     if (args.apply or args.revert) and not args.audit_log:
         print("--apply and --revert require --audit-log", file=sys.stderr)
@@ -581,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.revert:
             report = {"mode": "revert", "applied": revert_moves(
-                engine, args.revert, batch_size=args.batch_size, audit_path=args.audit_log)}
+                engine, args.revert, batch_size=args.batch_size, audit_path=args.audit_log, guard_check=not args.no_guard_check)}
         elif args.probe_duplicates:
             with engine.connect() as conn:
                 if engine.dialect.name == "postgresql":
@@ -595,11 +619,18 @@ def main(argv: list[str] | None = None) -> int:
                 audit_path=args.audit_log,
                 batch_size=args.batch_size,
                 max_moves=args.max_moves,
-                before=date.fromisoformat(args.before) if args.before else None,
+                before=before, guard_check=not args.no_guard_check,
             )
     except common.WindowClosed as exc:
-        print(str(exc), file=sys.stderr)
+        print(f"{exc}; acknowledged committed rows={getattr(exc, 'committed_rows', 0)}", file=sys.stderr)
         return 3
+    except Exception as exc:
+        print(json.dumps({"status": "ABORTED", "error_type": type(exc).__name__,
+                          "reason": str(exc) if isinstance(exc, ValueError) else "database/audit failure; inspect private evidence",
+                          "acknowledged_committed_rows": getattr(exc, "committed_rows", 0),
+                          "commit_uncertain": getattr(exc, "commit_uncertain", False),
+                          "action": "stop; reconcile database and audit before a separately reviewed retry"}), file=sys.stderr)
+        return 5
     finally:
         engine.dispose()
     rendered = json.dumps(report, indent=2, sort_keys=True)

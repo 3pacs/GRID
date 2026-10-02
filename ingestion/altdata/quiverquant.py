@@ -30,6 +30,7 @@ import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import DBAPIError
 
 from ingestion.altdata.quiverquant_identity import (
     fiscal_quarter_end,
@@ -39,11 +40,23 @@ from ingestion.altdata.quiverquant_identity import (
     transition_marker_path,
 )
 from ingestion.base import BasePuller
+from ingestion.altdata import quiverquant_transactions as tx
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
 _TIMEOUT = 120
 _MAX_ATTEMPTS = 3
+STORE_BATCH_ROWS = tx.MAX_WRITE_ROWS
+
+
+class QuiverStoreAborted(RuntimeError):
+    """Preserve acknowledged writes without claiming an uncertain transaction."""
+
+    def __init__(self, message: str, *, stored: int, failed: int = 0, uncertain: bool = False):
+        super().__init__(message)
+        self.stored = stored
+        self.failed = failed
+        self.commit_uncertain = uncertain
 
 # Endpoints to pull with their config
 ENDPOINTS = {
@@ -285,13 +298,15 @@ def _store_signals(
 
     import json as _json
 
-    rows_inserted = 0
+    rows_inserted = failed = 0
+    tx.validate_batch_size(STORE_BATCH_ROWS)
+    prepared: list[dict[str, Any]] = []
     today = date.today()
     seen_keys: set[tuple[str, str, date, str]] = set()
     key_repeats = 0
 
-    with engine.begin() as conn:
-        for rec in records:
+    for rec in records:
+        try:
             ticker = rec.get("Ticker") or rec.get("ticker") or ""
             if not ticker:
                 continue
@@ -320,25 +335,59 @@ def _store_signals(
                 key_repeats += 1
             seen_keys.add(key)
 
-            try:
-                conn.execute(text("""
+            prepared.append({
+                "source_type": source_type, "source_id": source_id,
+                "signal_type": signal_type, "ticker": ticker.upper(),
+                "signal_date": signal_date, "signal_value": _json.dumps(signal_value),
+            })
+        except (ValueError, TypeError, AttributeError):
+            failed += 1
+            log.warning("QuiverQuant {}: malformed record skipped before writing", endpoint_key)
+
+    statement = text("""
                     INSERT INTO signal_sources
                         (source_type, source_id, signal_type, ticker, signal_date, signal_value, created_at)
                     VALUES
                         (:source_type, :source_id, :signal_type, :ticker, :signal_date, CAST(:signal_value AS jsonb), NOW())
                     ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type)
                     DO UPDATE SET signal_value = EXCLUDED.signal_value
-                """), {
-                    "source_type": source_type,
-                    "source_id": source_id,
-                    "signal_type": signal_type,
-                    "ticker": ticker.upper(),
-                    "signal_date": signal_date,
-                    "signal_value": _json.dumps(signal_value),
-                })
-                rows_inserted += 1
-            except Exception as exc:
-                log.debug("QuiverQuant insert skip for {}: {}", ticker, exc)
+                """)
+
+    def write(batch: list[dict[str, Any]]) -> None:
+        with tx.write_transaction(engine) as (conn, check):
+            for params in batch:
+                check()
+                conn.execute(statement, params)
+
+    for start in range(0, len(prepared), STORE_BATCH_ROWS):
+        batch = prepared[start:start + STORE_BATCH_ROWS]
+        try:
+            write(batch)
+        except Exception as exc:
+            if tx.is_connection_error(exc) or not isinstance(exc, DBAPIError):
+                raise QuiverStoreAborted(
+                    "QuiverQuant writes stopped; inspect acknowledged count before any retry",
+                    stored=rows_inserted, failed=failed,
+                    uncertain=isinstance(exc, tx.CommitUncertain),
+                ) from exc
+            # The failed batch was rolled back successfully. Isolate bad rows
+            # in NEW transactions; PostgreSQL's aborted transaction is never reused.
+            for params in batch:
+                try:
+                    write([params])
+                except Exception as row_exc:
+                    if tx.is_connection_error(row_exc) or not isinstance(row_exc, DBAPIError):
+                        raise QuiverStoreAborted(
+                            "QuiverQuant row writes stopped; no automatic replay",
+                            stored=rows_inserted, failed=failed,
+                            uncertain=isinstance(row_exc, tx.CommitUncertain),
+                        ) from row_exc
+                    failed += 1
+                    log.warning("QuiverQuant {}: one rejected row skipped", endpoint_key)
+                else:
+                    rows_inserted += 1
+        else:
+            rows_inserted += len(batch)
 
     if key_repeats:
         log.info(
@@ -347,6 +396,8 @@ def _store_signals(
             endpoint_key, key_repeats, len(records),
         )
 
+    if failed:
+        raise QuiverStoreAborted("QuiverQuant stored valid rows with rejected records", stored=rows_inserted, failed=failed)
     return rows_inserted
 
 
@@ -383,6 +434,14 @@ def pull_endpoint(
         log.info("QuiverQuant {}: {} records fetched, {} stored", endpoint_key, len(records), rows)
         time.sleep(_RATE_LIMIT)
         return {"endpoint": endpoint_key, "status": "SUCCESS", "fetched": len(records), "stored": rows}
+    except QuiverStoreAborted as exc:
+        log.error("QuiverQuant {} stopped: {}", endpoint_key, exc)
+        return {
+            "endpoint": endpoint_key, "status": "FAILED", "error": str(exc),
+            "stored": exc.stored, "failed_records": exc.failed,
+            "stored_is_acknowledged_prefix": True,
+            "commit_uncertain": exc.commit_uncertain,
+        }
     except Exception as exc:
         log.error("QuiverQuant {} failed: {}", endpoint_key, exc)
         return {"endpoint": endpoint_key, "status": "FAILED", "error": str(exc)}
