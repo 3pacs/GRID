@@ -8,7 +8,6 @@ can exhaust PostgreSQL's shared lock table. pull_ticker had the same shape
 
 from __future__ import annotations
 
-from datetime import date
 from unittest.mock import MagicMock
 
 from ingestion.altdata import unusual_whales as uw
