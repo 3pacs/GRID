@@ -37,7 +37,8 @@ class TransactionReceipt:
         return self.commit_ack != "ACKNOWLEDGED" or self.cleanup_failed
 
 
-def transaction(engine, work: Callable, should_continue: Callable | None = None) -> TransactionReceipt:
+def transaction(engine, work: Callable, should_continue: Callable | None = None,
+                *, lock_timeout_seconds: int = 5) -> TransactionReceipt:
     """Keep COMMIT acknowledgement separate from connection cleanup.
 
     The caller never retries this transaction. Unknown COMMIT acknowledgement
@@ -47,12 +48,14 @@ def transaction(engine, work: Callable, should_continue: Callable | None = None)
     conn = trans = None
     committing = False
     try:
+        if lock_timeout_seconds not in (3, 5):
+            raise ValueError("unsupported bounded lock timeout")
         if should_continue is not None and not should_continue():
             raise PublicationBudgetExpired
         conn = engine.connect()
         trans = conn.begin()
         conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
-        conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+        conn.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout_seconds}s'"))
         conn.execute(text("SET LOCAL statement_timeout = '5s'"))
         conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
         # DDL cannot change the audited trigger closure between this check and

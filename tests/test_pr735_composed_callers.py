@@ -2,10 +2,10 @@
 
 Provider captures are boundary doubles. The real full-universe pull loop,
 bounded catalog publisher, SmartScheduler tick, group/PullContext and repair
-wrapper execute. PostgreSQL-only SET LOCAL commands are recorded by a bridge;
-the catalog UPDATE, transaction rollback and pull_log records execute on SQLite.
+wrapper execute. PostgreSQL commands/trigger closure are bridge doubles; the
+catalog UPDATE, explicit COMMIT/rollback and pull_log execute on SQLite. This
+does not certify PostgreSQL trigger closure or server COMMIT acknowledgement.
 """
-from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
@@ -43,28 +43,50 @@ class _CatalogBridge:
         self.limits, self.config = [], None
         self.started = self.committed = self.rolled_back = self.disposed = 0
 
-    @contextmanager
-    def begin(self):
-        self.started += 1
-        try:
-            with self.engine.begin() as conn:
-                bridge = self
+    def connect(self):
+        conn = self.engine.connect()
+        bridge = self
 
-                class Connection:
-                    def execute(self, statement, params=None):
-                        if str(statement).startswith("SET LOCAL "):
-                            bridge.limits.append(str(statement))
-                            return MagicMock()
-                        result = conn.execute(statement, params or {})
-                        if bridge.fail:
-                            raise RuntimeError("controlled catalog publication failure after UPDATE")
-                        return result
+        class Connection:
+            info = {}
 
-                yield Connection()
-            self.committed += 1
-        except BaseException:
-            self.rolled_back += 1
-            raise
+            def begin(self):
+                bridge.started += 1
+                transaction = conn.begin()
+
+                class Transaction:
+                    def commit(self):
+                        transaction.commit()
+                        bridge.committed += 1
+
+                    def rollback(self):
+                        transaction.rollback()
+                        bridge.rolled_back += 1
+
+                return Transaction()
+
+            def execute(self, statement, params=None):
+                sql = str(statement)
+                if sql.startswith("SET LOCAL "):
+                    if "grid.options_bounded" not in sql:
+                        bridge.limits.append(sql)
+                    return MagicMock()
+                if sql.startswith("SET TRANSACTION") or "options_bounded_assert_trigger_closure" in sql:
+                    return MagicMock()
+                if "pg_stat_xact_user_tables" in sql:
+                    return conn.execute(text("SELECT total_changes()"))
+                result = conn.execute(statement, params or {})
+                if bridge.fail:
+                    raise RuntimeError("controlled catalog publication failure after UPDATE")
+                return result
+
+            def exec_driver_sql(self, statement):
+                assert statement.startswith("LOCK TABLE ")
+
+            def close(self):
+                conn.close()
+
+        return Connection()
 
     def dispose(self):
         self.disposed += 1

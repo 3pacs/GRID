@@ -25,8 +25,12 @@ at most 50 rows. These prepared artifacts remain append-only evidence.
 
 Keep `options_capture_batches` as the public registration name, now a view. It
 exposes original atomic headers and prepared headers only after an immutable
-completion receipt. `registered_at` on a prepared capture is actual receipt
-publication time; provider completion and quote timestamps remain unchanged.
+completion receipt. `registered_at` on a prepared capture is the server clock
+sample at receipt insertion, before COMMIT; it is not an exact COMMIT or client
+ACK timestamp. Provider completion and quote timestamps remain unchanged. The
+view exposes the receipt only after server COMMIT, and an as-of lookup excludes
+it before that recorded timestamp. Exact commit-time retrospective PIT across
+the receipt-insertion/COMMIT interval needs a separate reviewed contract.
 `options_snapshots` selects only published captures when superseding a previous
 complete capture. Unregistered legacy rows retain their original fallback.
 
@@ -38,8 +42,9 @@ signals. The completion trigger checks the full declared contract count and
 metadata under a header row lock. The contract trigger takes the same lock and
 refuses appends after completion, preventing a concurrent late append.
 
-Each transaction uses explicit COMMIT handling, 5-second statement/lock/idle
-limits, and a cooperative 15-second deadline. PG14 cannot impose an absolute
+Each transaction uses explicit COMMIT handling, 5-second statement/idle limits,
+a 5-second capture lock limit (the existing catalog limit stays 3 seconds), and
+a cooperative 15-second deadline. PG14 cannot impose an absolute
 wall-time transaction or WAL/COMMIT deadline; connection checkout is also outside
 the DATA transaction. No provider work, SAVEPOINT, replay, or retry is inside
 this publisher. Failure stops the remaining ticker scope. Acknowledged rows

@@ -455,7 +455,9 @@ class OptionsPuller(BasePuller):
                 conn.execute(text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
                              {"sid": self.source_id})
                 check_publication_budget()
-            self._catalog_receipt = bounded_transaction(catalog_engine, update_catalog, should_continue)
+            self._catalog_receipt = bounded_transaction(
+                catalog_engine, update_catalog, should_continue, lock_timeout_seconds=3,
+            )
             return not self._catalog_receipt.stop
         except _OptionsBudgetExpired:
             log.info("options: source_catalog freshness publication deferred by budget")
