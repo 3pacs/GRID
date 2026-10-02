@@ -301,3 +301,34 @@ def test_equity_fred_keeps_incremental_overlap(monkeypatch, start_date):
         sched._run_equity_pulls(start_date=start_date)
 
     puller.pull_series.assert_called_once_with("DFF", "2026-09-24", None)
+
+
+def test_equity_fred_unknown_commit_summary_is_an_acknowledged_lower_bound(monkeypatch):
+    import db
+    import ingestion.fred as fred
+    import ingestion.scheduler as sched
+    import ingestion.yfinance_pull as yf
+
+    class StopAfterFred(BaseException):
+        pass
+
+    puller = MagicMock()
+    puller.pull_all.return_value = [
+        {"series_id": "DFF", "status": "PARTIAL", "rows_inserted": 50,
+         "commit_outcome_unknown": True, "rows_inserted_total": None},
+        {"series_id": "UNRATE", "status": "SKIPPED", "rows_inserted": 0, "aborted": True},
+    ]
+    yf_puller = MagicMock()
+    yf_puller.pull_all.side_effect = StopAfterFred
+    monkeypatch.setattr(fred, "FREDPuller", lambda **_kwargs: puller)
+    monkeypatch.setattr(yf, "YFinancePuller", lambda **_kwargs: yf_puller)
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(sched, "log", MagicMock())
+    with pytest.raises(StopAfterFred):
+        sched._run_equity_pulls(start_date="2026-10-02")
+    summary = next(c for c in sched.log.info.call_args_list if c.args[0].startswith("FRED daily pull complete"))
+    assert summary.kwargs == {"ok": 0, "total": 2, "rows": 50}
+    assert "acknowledged inserts" in summary.args[0]
+    assert any("unknown commit outcomes" in c.args[0] and "lower bound" in c.args[0]
+               for c in sched.log.warning.call_args_list)
+    yf_puller.pull_all.assert_called_once_with(start_date="2026-10-02")
