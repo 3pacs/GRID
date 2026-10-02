@@ -35,7 +35,7 @@ def test_manifest_pins_every_suite_file():
 def test_known_violations_are_exactly_the_ones_the_gates_use():
     used = set()
     for path in SUITE.glob("test_*.py"):
-        used |= set(re.findall(r"""["'](E1-V\d+)["']""", path.read_text(encoding="utf-8")))
+        used |= set(re.findall(r"""["'](E1-V\d+[a-z]?)["']""", path.read_text(encoding="utf-8")))
     assert used == set(KNOWN), {"unregistered": sorted(used - set(KNOWN)), "unused": sorted(set(KNOWN) - used)}
     for vid, v in KNOWN.items():
         assert v.gate and v.title and v.location and len(v.detail) > 80, vid

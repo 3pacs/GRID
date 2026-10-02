@@ -111,33 +111,9 @@ def run_intelligence_loop() -> None:
         except Exception as exc:
             log.debug("Taxonomy audit failed: {e}", e=str(exc))
 
-    def _price_fallback() -> None:
-        """Pull stale equity/crypto prices via fallback sources."""
-        try:
-            from ingestion.price_fallback import PriceFallbackPuller
-            from db import get_engine as _ge
-            from sqlalchemy import text as _t
-
-            eng = _ge()
-            pfp = PriceFallbackPuller(db_engine=eng)
-            with eng.connect() as conn:
-                stale = conn.execute(_t(
-                    "SELECT fr.name FROM feature_registry fr "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
-                    "  ORDER BY obs_date DESC LIMIT 1"
-                    ") rs ON TRUE "
-                    "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
-                    "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
-                    "AND fr.name LIKE '%\\_full' ESCAPE '\\'"
-                )).fetchall()
-            tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
-            if tickers:
-                results = pfp.pull_many(tickers[:20])
-                pfp.save_to_db(results)
-                log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
-        except Exception as exc:
-            log.debug("Price fallback failed: {e}", e=str(exc))
+    # _price_fallback (ingestion/price_fallback.py) is retired: it wrote
+    # backdated resolved_series vintages directly and every write failed on
+    # the production schema (E1-V7 / DATA-FIX DFa).
 
     def _paper_trading_signals() -> None:
         try:
@@ -294,7 +270,6 @@ def run_intelligence_loop() -> None:
         _sched.every(1).hours.do(_paper_trading_signals)
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)
-    _sched.every(6).hours.do(_price_fallback)
     # Note (2026-04-20): Moved from 02:00 → 02:45 to avoid overlap with
     # hermes_operator's 02:00–02:10 hypothesis discovery + backtest scan.
     # Both services run at the same hour; staggering prevents DB contention

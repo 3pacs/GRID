@@ -53,8 +53,10 @@ GUARDED_MODULES = (
 MODULES_REQUIRING_SQL = (
     "normalization/resolver.py",
     "scripts/hermes_fixers.py",
-    "ingestion/scheduler.py",
 )
+# ingestion/scheduler.py stays guarded but no longer yields resolved_series
+# SQL: its only literal was the stale-price lookup feeding the retired
+# PriceFallback writer (E1-V7 / DATA-FIX DFa), removed with it.
 
 # scripts/hermes_operator.py is the exception, and deliberately so: since the
 # b0a02b4 statement was removed it carries no resolved_series SQL at all, and

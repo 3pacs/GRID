@@ -85,6 +85,17 @@
       "released_in": "#768",
       "approved_by": "3pacs (owner; merges #768)",
       "note": "E1 v1.2: E1-V3, V4, V6 fixed and their xfails removed (evals.e1.SUITE_VERSION e1-v1.2)."
+    },
+    {
+      "seq": 7,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.3",
+      "path": "evals/e1",
+      "manifest_sha256": "40ad82687dd017241e0fdc7693f7f51a96ee49c876691d7bbe95460a10023fe8",
+      "released_in": "#787",
+      "approved_by": "3pacs (owner; 'yes to all recs' 2026-10-02T06:46Z, release order #794 -> #768 -> #781 -> #785 -> #787)",
+      "note": "E1 v1.3: E1-V7 gate (no direct resolved_series writer backdates or rewrites a vintage; strict xfails E1-V7a..o; REVIEWED_SAME_DAY exemption for options._push_to_resolved). DATA-FIX DFa."
     }
   ]
 }
