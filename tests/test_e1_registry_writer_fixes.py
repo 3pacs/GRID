@@ -6,7 +6,9 @@
   the full-pipeline crypto step.
 * V4: the watchlist live-price cache no longer writes raw_series at all.
 * V6: coingecko's ``CG:<id>:usd`` spot series are mapped for the resolver
-  exactly for the coins whose ``*_usd_full`` feature has no other feed.
+  exactly for the coins whose ``*_usd_full`` feature has no other feed
+  (BTC, ETH and SOL are fed by the yfinance close), and no ``CG:`` target is
+  ever fed by a second series.
 """
 
 from __future__ import annotations
@@ -82,17 +84,33 @@ def test_watchlist_price_cache_no_longer_writes_raw_series() -> None:
         assert "INSERT INTO RAW_SERIES" not in " ".join(source.upper().split()), rel
 
 
-def test_coingecko_spot_series_map_to_usd_full_except_btc_and_eth() -> None:
+def test_coingecko_spot_series_map_to_usd_full_except_btc_eth_sol() -> None:
     mapped = {k: v for k, v in em.NEW_MAPPINGS_V2.items() if k.startswith("CG:") and k.endswith(":usd")}
     expected = {
         coingecko.spot_series_id(cg_id): f"{ticker.lower()}_usd_full"
         for ticker, cg_id in coingecko.CRYPTO_MAP.items()
-        if ticker not in {"BTC", "ETH"}
+        if ticker not in {"BTC", "ETH", "SOL"}
     }
     assert mapped == expected
-    # BTC/ETH *_usd_full keep their single yfinance daily-close feed.
+    # BTC/ETH/SOL *_usd_full keep their single yfinance daily-close feed.
     assert em.NEW_MAPPINGS_V2["YF:BTC-USD:close"] == "btc_usd_full"
     assert em.NEW_MAPPINGS_V2["YF:ETH-USD:close"] == "eth_usd_full"
+    assert em.NEW_MAPPINGS_V2["YF:SOL-USD:close"] == "sol_usd_full"
+
+
+def test_no_coingecko_target_is_fed_by_a_second_series() -> None:
+    """A CG:-fed feature with any other feed is a first-writer-wins race in the resolver."""
+    static = {**em.SEED_MAPPINGS, **em.NEW_MAPPINGS_V2}
+    cg_targets = {v for k, v in static.items() if k.startswith("CG:") and k.endswith(":usd")}
+    assert cg_targets
+    shared = sorted((k, v) for k, v in static.items() if v in cg_targets and not k.startswith("CG:"))
+    assert shared == [], shared
+    # Nor through the YF:<T>-USD:<field> pattern fallback: no yfinance price
+    # puller requests the -USD symbol of a CG-fed coin.
+    yf_universe = (REPO / "ingestion" / "yfinance_pull.py").read_text(encoding="utf-8")
+    for target in sorted(cg_targets):
+        symbol = target[: -len("_usd_full")].upper() + "-USD"
+        assert f'"{symbol}"' not in yf_universe, (target, symbol)
 
 
 def test_coingecko_is_a_base_puller_under_its_catalog_name() -> None:

@@ -15,8 +15,11 @@ One ``/simple/price`` request per run returns the USD spot quote and its
 
 Values reach ``resolved_series`` only through the normal resolver
 (``normalization.entity_map`` maps ``CG:<id>:usd`` to ``<ticker>_usd_full``,
-except BTC and ETH, whose ``*_usd_full`` features carry the yfinance daily
-close). Before E1-V6 this module wrote ``resolved_series`` directly
+except BTC, ETH and SOL, whose ``*_usd_full`` features carry the yfinance
+daily close). The resolved value is the first spot quote of the UTC quote
+day, not a daily close (the legacy ``*_usd_full`` feature_registry
+descriptions say "daily close"; those rows are production data and are not
+rewritten here). Before E1-V6 this module wrote ``resolved_series`` directly
 (``source_priority_used = 1``, ``release_date = vintage_date = obs_date``,
 ``ON CONFLICT ... DO UPDATE``); those rows are left in place pending an
 owner decision.
@@ -146,6 +149,10 @@ class CoinGeckoPuller(BasePuller):
         inserted = 0
         unchanged = 0
         with self.engine.begin() as conn:
+            # One writer at a time (an orphaned timed-out run, grid-scheduler
+            # and Hermes can overlap): the dedupe read and the insert must not
+            # interleave, or two runs both store the same quote day.
+            self._file_advisory_lock(conn, "spot")
             for ticker, cg_id in targets:
                 quote = quotes.get(cg_id)
                 price = quote.get("usd") if isinstance(quote, dict) else None

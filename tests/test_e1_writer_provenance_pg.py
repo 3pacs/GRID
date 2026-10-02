@@ -268,10 +268,10 @@ def test_coingecko_writes_raw_series_and_resolves_through_the_resolver(pg_engine
     from ingestion.coingecko import CoinGeckoPuller
     from normalization.resolver import Resolver
 
-    sol, btc = _feature(pg_engine, "sol_usd_full"), _feature(pg_engine, "btc_usd_full")
+    xrp, btc = _feature(pg_engine, "xrp_usd_full"), _feature(pg_engine, "btc_usd_full")
     puller = CoinGeckoPuller(pg_engine)  # auto-creates the coingecko catalog row
     quoted_at = datetime.now(timezone.utc) - timedelta(days=1)
-    quote = {"solana": {"usd": 150.5, "usd_market_cap": 7.1e10, "usd_24h_vol": 3.2e9,
+    quote = {"ripple": {"usd": 0.525, "usd_market_cap": 3.0e10, "usd_24h_vol": 1.2e9,
                         "last_updated_at": int(quoted_at.timestamp())},
              "bitcoin": {"usd": 60000.0, "last_updated_at": int(quoted_at.timestamp())}}
     calls: list[dict] = []
@@ -282,7 +282,7 @@ def test_coingecko_writes_raw_series_and_resolves_through_the_resolver(pg_engine
 
     monkeypatch.setattr(puller._session, "get", get)
 
-    out = puller.pull_all(tickers=["SOL", "BTC"])
+    out = puller.pull_all(tickers=["XRP", "BTC"])
     assert out["rows_inserted"] == 2 and _outcome(out) == ss.OUTCOME_SUCCESS
     assert len(calls) == 1 and calls[0]["url"].endswith("/simple/price")
     with pg_engine.connect() as conn:
@@ -292,18 +292,18 @@ def test_coingecko_writes_raw_series_and_resolves_through_the_resolver(pg_engine
     rows = _rows(pg_engine, "CG:")
     assert [(r.series_id, r.obs_date, r.value, r.pull_status, r.name) for r in rows] == [
         ("CG:bitcoin:usd", quoted_at.date(), 60000.0, "SUCCESS", "coingecko"),
-        ("CG:solana:usd", quoted_at.date(), 150.5, "SUCCESS", "coingecko"),
+        ("CG:ripple:usd", quoted_at.date(), 0.525, "SUCCESS", "coingecko"),
     ]
     pulled_on = {r.pull_timestamp.astimezone(timezone.utc).date() for r in rows}
     assert pulled_on == {datetime.now(timezone.utc).date()}  # honest pull time, not the quote date
 
-    quote["solana"]["usd"] = 999.0  # same quote day, new price: not rewritten
-    again = puller.pull_all(tickers=["SOL", "BTC"])
+    quote["ripple"]["usd"] = 9.99  # same quote day, new price: not rewritten
+    again = puller.pull_all(tickers=["XRP", "BTC"])
     assert again["rows_inserted"] == 0 and _outcome(again) == ss.OUTCOME_NO_NEW_DATA
-    assert [r.value for r in _rows(pg_engine, "CG:solana:usd")] == [150.5]
+    assert [r.value for r in _rows(pg_engine, "CG:ripple:usd")] == [0.525]
 
     quote.pop("bitcoin")
-    partial = puller.pull_all(tickers=["SOL", "BTC"])
+    partial = puller.pull_all(tickers=["XRP", "BTC"])
     assert _outcome(partial) == ss.OUTCOME_PARTIAL and "BTC" in partial["error"]
 
     summary = Resolver(pg_engine).resolve_pending(workers=1, lookback_days=3)
@@ -314,9 +314,9 @@ def test_coingecko_writes_raw_series_and_resolves_through_the_resolver(pg_engine
             "FROM resolved_series ORDER BY feature_id"
         )).fetchall()
     (pull_day,) = pulled_on
-    # SOL resolves under coingecko's own source id, dated when GRID learned it.
+    # XRP resolves under coingecko's own source id, dated when GRID learned it.
     # BTC stays unmapped: btc_usd_full belongs to the yfinance daily close.
-    assert [tuple(r) for r in resolved] == [(sol, quoted_at.date(), pull_day, pull_day, 150.5, cg_id)]
+    assert [tuple(r) for r in resolved] == [(xrp, quoted_at.date(), pull_day, pull_day, 0.525, cg_id)]
     assert btc not in {r.feature_id for r in resolved}
 
 

@@ -726,14 +726,18 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # CoinGecko live USD spot quotes (ingestion/coingecko.py writes
     # CG:<coingecko id>:usd to raw_series; E1-V6). These are the *_usd_full
     # features the puller used to write into resolved_series directly, now
-    # reached through the resolver. BTC and ETH are deliberately NOT mapped:
-    # btc_usd_full / eth_usd_full carry the yfinance daily close
-    # (YF:BTC-USD:close, YF:ETH-USD:close above), and a first-of-day spot quote
-    # from a second series would race it for the same (feature, obs_date,
-    # vintage_date) key. CG:bitcoin:usd stays in raw_series (thesis_scorer
-    # reads it directly).
+    # reached through the resolver. The value is the FIRST spot quote GRID
+    # stored for that UTC quote day -- not a daily close, whatever the legacy
+    # feature_registry description says. BTC, ETH and SOL are deliberately
+    # NOT mapped: btc_usd_full / eth_usd_full / sol_usd_full are fed by the
+    # yfinance daily close (YF:BTC-USD:close, YF:ETH-USD:close,
+    # YF:SOL-USD:close above), and a spot quote from a second series would race
+    # it for the same (feature, obs_date, vintage_date) key (the resolver
+    # inserts ON CONFLICT DO NOTHING, so first writer wins).
+    # tests/test_e1_registry_writer_fixes.py keeps every CG target single-fed.
+    # CG:bitcoin:usd stays in raw_series (thesis_scorer reads it directly).
     **{f"CG:{cg_id}:usd": f"{ticker}_usd_full" for ticker, cg_id in (
-        ("sol", "solana"), ("bnb", "binancecoin"), ("xrp", "ripple"),
+        ("bnb", "binancecoin"), ("xrp", "ripple"),
         ("tao", "bittensor"), ("doge", "dogecoin"), ("ada", "cardano"),
         ("avax", "avalanche-2"), ("link", "chainlink"), ("dot", "polkadot"),
         ("matic", "matic-network"), ("uni", "uniswap"), ("aave", "aave"),
