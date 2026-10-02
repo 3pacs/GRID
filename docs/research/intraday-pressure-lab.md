@@ -67,7 +67,9 @@ python -m scripts.intraday_lab.capture --output /scratch/intraday-capture
 ```
 
 Evaluator splits entire chronological sessions 60/20/20; fixed formulas do not
-fit any outcome. It compares baseline and candidate at identical active timestamps,
+fit any outcome. Reserved test outcomes are not evaluated by default; the explicit
+`--include-holdout` flag records `holdout_examined=true` and does not make a sealed
+or official holdout. It compares baseline and candidate at identical active timestamps,
 never crosses sessions, requires complete future paths, and excludes overlapping
 decisions independently at 1/5/15-minute horizons. Horizons and candidates still
 overlap statistically: descriptive session-block bootstrap uses a fixed 42-trial

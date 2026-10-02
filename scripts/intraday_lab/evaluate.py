@@ -28,7 +28,7 @@ SPEC = {"version": "intraday_lab_v1_exploratory", "horizons": HORIZONS,
         "family_size": len(FEATURES) * len(HORIZONS),
         "extra_roundtrip_cost_bps": [0, 5, 10],
         "strategy": "SPYU long when positive, otherwise cash; no synthetic short returns",
-        "splits": "first 60% discovery, next 20% validation, final 20% untouched holdout"}
+        "splits": "first 60% discovery, next 20% validation, final 20% reserved test; hidden by default"}
 
 
 def canonical(obj):
@@ -102,7 +102,7 @@ def block_lower(values_by_session, family_size=42):
     return draws[int(len(draws) * .05 / family_size)]
 
 
-def evaluate(packets):
+def evaluate(packets, include_holdout=False):
     if any(not number(p.get("decision_at")) or not p.get("session") for p in packets):
         raise ValueError("invalid packet identity")
     packets = sorted(packets, key=lambda p: p["decision_at"])
@@ -114,7 +114,8 @@ def evaluate(packets):
               for i, s in enumerate(sessions)}
     result = {"status": "EXPLORATORY_NO_VALIDATED_EDGE", "spec": SPEC, "engine_sha256": engine_hash(),
               "packet_sha256": hashlib.sha256(canonical(packets)).hexdigest(),
-              "session_splits": splits, "excluded_nonprospective": 0, "results": [],
+              "session_splits": splits, "holdout_examined": bool(include_holdout),
+              "excluded_nonprospective": 0, "results": [],
               "limitations": ["Thresholds are uncalibrated research candidates, not learned probabilities.",
                               "No E2/E3 registration, power gate or external witness: no promotion.",
                               "Quoted spread plus 0/5/10 bp extra-cost sensitivities; no actual fills.",
@@ -130,6 +131,8 @@ def evaluate(packets):
                 if seconds == HORIZONS[0]:
                     result["excluded_nonprospective"] += 1
                 continue
+            if splits[p["session"]] == "holdout" and not include_holdout:
+                continue
             if p["decision_at"] < next_start.get(p["session"], 0):
                 continue
             y = outcome(p, packets[i + 1:], seconds)
@@ -139,6 +142,8 @@ def evaluate(packets):
             cases.append((p, features[i]["features"], y))
         for name in FEATURES:
             for split in ("discovery", "validation", "holdout"):
+                if split == "holdout" and not include_holdout:
+                    continue
                 selected = [(p, f, y) for p, f, y in cases if splits[p["session"]] == split
                             and f[name]["status"] == "available" and f["price_momentum"]["status"] == "available"]
                 active = [(p, f, y) for p, f, y in selected if abs(f[name]["value"]) >= THRESHOLDS[name]

@@ -124,7 +124,9 @@ def test_gaps_cross_session_and_retrospective_labels_are_unscoreable():
     report = evaluate([packet()])
     assert report["status"] == "EXPLORATORY_NO_VALIDATED_EDGE"
     assert report["excluded_nonprospective"] == 1
-    assert len(report["results"]) == len(FEATURES) * 3 * 3
+    assert len(report["results"]) == len(FEATURES) * 3 * 2
+    assert report["holdout_examined"] is False
+    assert all(r["split"] != "holdout" for r in report["results"])
     assert all(r["active"] == 0 for r in report["results"])
 
 
@@ -159,7 +161,7 @@ def test_paired_baseline_and_cost_sensitivity_on_identical_timestamps():
             q = forward(t + offset, 100 + t / 10000, 50., 50.2)
             q["session"] = p["session"]
             packets.append(q)
-    report = evaluate(packets)
+    report = evaluate(packets, include_holdout=True)
     result = next(r for r in report["results"] if r["feature"] == "es_depth" and r["seconds"] == 60 and r["split"] == "holdout")
     assert result["active"] == result["economic_observations"] == 1
     assert result["paired_excess_bps"] == 0  # same long decision as momentum baseline
