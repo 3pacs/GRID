@@ -119,9 +119,11 @@ def capture(monkeypatch):
 
     controls = dict(engine=engine, obj=obj, bridge=bridge, universe=universe,
                     lookup=lookup, calls=[], updates=catalog_updates, case="full",
-                    completion_rows=completion_rows)
+                    completion_rows=completion_rows, capture_source="options_puller")
 
-    def ticker(ticker, _today, *, max_expirations, should_continue):
+    def ticker(ticker, _today, *, max_expirations, should_continue,
+               capture_source="options_puller"):
+        assert capture_source == controls["capture_source"]
         assert max_expirations in (6, 12)
         assert should_continue is None or callable(should_continue)
         controls["calls"].append((ticker, max_expirations))
@@ -161,12 +163,13 @@ def _smart(monkeypatch, capture, kwargs):
                  method="pull", freq_h=6, timeout_s=900, stop_margin_s=60, kwargs={})
     adapter = ss._OptionsSchedulerAdapter.__new__(ss._OptionsSchedulerAdapter)
     adapter._puller = capture["obj"]
-    # The real adapter passes only should_continue; explicit smaller scopes
+    # The real adapter passes its budget and provenance; explicit smaller scopes
     # are exercised through the actual pull method with the same job name.
     if kwargs:
         instance, entry["method"], entry["kwargs"] = capture["obj"], "pull_all", kwargs
     else:
         instance = adapter
+        capture["capture_source"] = "smart_scheduler"
     monkeypatch.setattr(ss, "PULLER_REGISTRY", [entry])
     monkeypatch.setattr(ss.SmartScheduler, "_warn_registry_divergence", lambda _self: None)
     smart = ss.SmartScheduler(capture["engine"])
