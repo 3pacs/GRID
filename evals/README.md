@@ -36,6 +36,8 @@ the change is a good idea.
      equals the latest `e1` entry's `version`.
    - E2: bump `evals.e2.VERSION` and `rules.json`, then
      `python -m evals.e2 manifest --write --version e2-vN`.
+   - E3: bump `evals.e3.VERSION`, then `python -m evals.e3.manifest --write`
+     (versioned header, so `version` must equal it).
 2. Hash the new manifest: `python evals/released.py lf-sha256 evals/<dir>/MANIFEST.sha256`.
 3. Append **one** entry to `entries` with the next `seq`:
 
@@ -59,8 +61,8 @@ the change is a good idea.
    python -I evals/released.py check --base-dir /tmp/evals-base --head-dir .
    ```
 
-Released today (see `RELEASED.json`): e0-v1 at `evals/e0`, e1-v1 then e1-v1.1
-at `evals/e1`, e2-v1 at `evals/e2`.
+Released today (see `RELEASED.json`): e0-v1 at `evals/e0`, e1-v1, e1-v1.1 then
+e1-v1.2 at `evals/e1`, e2-v1 at `evals/e2`, e3-v1 at `evals/e3`.
 
 Two PRs that each append an entry will conflict on `RELEASED.json`. That is
 intended: the second one rebases and takes the next `seq`.

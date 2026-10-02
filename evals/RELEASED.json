@@ -101,6 +101,34 @@
         ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7",
         "tests/test_e0_ic01_recovery.py": "a13cb2dcd6aba3dface7c8211f7795d3b4153a4211732a9cffa056e23c383934"
       }
+    },
+    {
+      "seq": 8,
+      "kind": "suite",
+      "suite": "e3",
+      "version": "e3-v1",
+      "path": "evals/e3",
+      "manifest_sha256": "d88378a05cd9fa1c039cb3a6aeef87709a1f9085958ee50da5f4bdda3aadc11e",
+      "released_in": "#785",
+      "approved_by": "3pacs (owner; 'yes to all recs', 2026-10-01 06:46Z)",
+      "note": "E3A candidate ledger v1 (every hill-climb candidate counts; files only, binds the canonical S11 ledger grid-hypothesis-loop)."
+    },
+    {
+      "seq": 9,
+      "kind": "guards",
+      "version": "guards-v4",
+      "files": {
+        "tests/test_e0_manifest_guard.py": "901e38094b0603fc7421c7142d76ccbb1a0b072ab072dfa9f7a0dd09c418d9b4",
+        "tests/test_e0_benchmark.py": "4a4cb6d97e64b68fdbdcfabb8da00316704898514c781e8a16fa8d5c4b5f1454",
+        "tests/test_e2_manifest_guard.py": "00059ed848c778078ca2e0e828a49c273fae8980b86d9d8a76300255b5936187",
+        "tests/test_evals_released.py": "d4422f330d47e91ce2804834510590a266ebb7b7d4f118bce5e5e0df2ea563dd",
+        "evals/released.py": "0ce91b25c1d0c11a820e2696b8dc8e3349f185ffb25d5e6d798d560edc4c8917",
+        "evals/README.md": "04e4b80fc9e0b3e69ad0b4703e79deaf38083be4985ff87ada19abaa2631d89c",
+        "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
+        ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7",
+        "tests/test_e0_ic01_recovery.py": "a13cb2dcd6aba3dface7c8211f7795d3b4153a4211732a9cffa056e23c383934",
+        "tests/test_e3_ledger.py": "cc6b90ca2b52dc9ed678677bee4553b01b46aacb529e80d4f1a3ff4af4474e5e"
+      }
     }
   ]
 }
