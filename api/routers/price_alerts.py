@@ -15,8 +15,6 @@ rather than mutating request history.
 
 from __future__ import annotations
 
-from datetime import date
-
 from fastapi import APIRouter, Depends
 from loguru import logger as log
 from pydantic import BaseModel, Field
@@ -26,7 +24,6 @@ from api.auth import require_auth
 from api.dependencies import get_db_engine
 from api.routers.chat import _user_id_from_token
 from api.routers.watchlist_helpers import (
-    _cache_price_to_db,
     _fetch_live_price,
     _resolve_feature_names,
 )
@@ -89,12 +86,7 @@ def current_price(ticker: str, *, prefer_live: bool = False) -> tuple[float | No
         try:
             live = _fetch_live_price(tk)
             if live and live.get("price") is not None:
-                px = float(live["price"])
-                try:
-                    _cache_price_to_db(engine, tk, px, date.today())
-                except Exception:
-                    pass
-                return px
+                return float(live["price"])
         except Exception as exc:
             log.debug("Alert price (live) failed for {t}: {e}", t=tk, e=str(exc))
         return None

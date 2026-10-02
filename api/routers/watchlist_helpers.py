@@ -2,7 +2,6 @@
 
 Exported symbols used outside this package:
     _batch_fetch_prices     — api.routers.astrogrid_core, scripts/seed_astrogrid_prediction_corpus
-    _cache_price_to_db      — api.routers.astrogrid_core
     _resolve_feature_names  — api.routers.astrogrid_helpers
 """
 
@@ -287,47 +286,6 @@ def _fetch_live_price(ticker: str) -> dict | None:
         return None
 
 
-def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> None:
-    """Write yfinance price back to raw_series for future lookups."""
-    try:
-        from datetime import datetime, timezone
-
-        with engine.begin() as conn:
-            src_row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = 'yfinance' LIMIT 1")
-            ).fetchone()
-            if src_row is None:
-                src_row = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog (name, source_type) "
-                        "VALUES ('yfinance', 'market') RETURNING id"
-                    )
-                ).fetchone()
-            source_id = src_row[0]
-
-            series_id = f"yf_{ticker.lower()}_close"
-            obs_date = date if date else datetime.now(timezone.utc).date()
-
-            conn.execute(
-                text(
-                    "INSERT INTO raw_series "
-                    "(source_id, series_id, obs_date, value, pull_timestamp) "
-                    "VALUES (:source_id, :series_id, :obs_date, :value, NOW()) "
-                    "ON CONFLICT (source_id, series_id, obs_date) "
-                    "DO UPDATE SET value = EXCLUDED.value, pull_timestamp = NOW()"
-                ),
-                {
-                    "source_id": source_id,
-                    "series_id": series_id,
-                    "obs_date": str(obs_date),
-                    "value": price,
-                },
-            )
-        log.debug("Cached price to DB: {t} = {p} on {d}", t=ticker, p=price, d=date)
-    except Exception as exc:
-        log.debug("Failed to cache price to DB for {t}: {e}", t=ticker, e=str(exc))
-
-
 def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
     """Batch-fetch live prices for multiple tickers via yf.download.
 
@@ -361,9 +319,8 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
         yf_tickers = list(yf_map.values())
         joined = " ".join(yf_tickers)
         # auto_adjust=False: these closes are shown to the user as the live
-        # price and are written back into raw_series by _cache_price_to_db,
-        # so they must stay on the same raw, unadjusted basis as the rest of
-        # the price stack (raw_series "YF:{ticker}:close", fast_info.
+        # price, so they must stay on the same raw, unadjusted basis as the
+        # rest of the price stack (raw_series "YF:{ticker}:close", fast_info.
         # last_price). yfinance's default flipped to True in 0.2.x. The
         # pct_1d/pct_1w returns below would be marginally more correct on an
         # adjusted basis, but over a 5-day window that only differs across a

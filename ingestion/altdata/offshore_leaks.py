@@ -28,7 +28,7 @@ from __future__ import annotations
 import csv
 import os
 import re
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -181,7 +181,9 @@ class OffshoreLeaksPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://offshoreleaks.icij.org",
         "cost_tier": "FREE",
-        "latency_class": "STATIC",
+        # source_catalog.latency_class allows REALTIME/EOD/WEEKLY/MONTHLY only;
+        # "STATIC" made the auto-create INSERT (and so __init__) fail.
+        "latency_class": "MONTHLY",
         "pit_available": False,
         "revision_behavior": "RARE",
         "trust_score": "HIGH",
@@ -527,44 +529,56 @@ class OffshoreLeaksPuller(BasePuller):
                         actor_name, entity_name, jurisdiction,
                     )
 
-                    # Check dedup
-                    if self._row_exists(series_id, today, conn, dedup_hours=720):
+                    # Dedup: a match already stored in the last 30 days (any
+                    # obs_date) is not stored again. raw_series is append-only.
+                    if conn.execute(text("""
+                        SELECT 1 FROM raw_series
+                        WHERE series_id = :sid AND source_id = :src
+                          AND pull_status = 'SUCCESS' AND pull_timestamp >= :since
+                        LIMIT 1
+                    """), {
+                        "sid": series_id, "src": self.source_id,
+                        "since": now - timedelta(hours=720),
+                    }).fetchone():
                         continue
 
-                    # raw_series insert
+                    # raw_series insert (pull_timestamp: schema DEFAULT NOW()).
+                    # Each insert runs in its own SAVEPOINT: on PostgreSQL a
+                    # failed statement would otherwise abort the whole
+                    # transaction and silently roll back every row before it.
                     try:
-                        conn.execute(text("""
-                            INSERT INTO raw_series
-                                (series_id, source_id, obs_date, release_date,
-                                 value, raw_payload)
-                            VALUES
-                                (:sid, :src, :obs, :rel, :val, :payload)
-                        """), {
-                            "sid": series_id,
-                            "src": self.source_id,
-                            "obs": today,
-                            "rel": today,
-                            "val": 1.0,  # binary flag: match exists
-                            "payload": _json_dumps({
-                                "actor_id": actor_id,
-                                "actor_name": actor_name,
-                                "actor_tier": match.get("actor_tier", ""),
-                                "officer_name": match["officer_name"],
-                                "officer_node_id": match["officer_node_id"],
-                                "entity_name": entity_name,
-                                "jurisdiction": jurisdiction,
-                                "entity_status": entity.get("entity_status", ""),
-                                "incorporation_date": entity.get(
-                                    "incorporation_date", "",
-                                ),
-                                "rel_type": entity.get("rel_type", ""),
-                                "match_type": match["match_type"],
-                                "leak_source": entity.get("entity_source", ""),
-                            }),
-                        })
+                        with conn.begin_nested():
+                            conn.execute(text("""
+                                INSERT INTO raw_series
+                                    (series_id, source_id, obs_date,
+                                     value, raw_payload, pull_status)
+                                VALUES
+                                    (:sid, :src, :obs, :val, :payload, 'SUCCESS')
+                            """), {
+                                "sid": series_id,
+                                "src": self.source_id,
+                                "obs": today,
+                                "val": 1.0,  # binary flag: match exists
+                                "payload": _json_dumps({
+                                    "actor_id": actor_id,
+                                    "actor_name": actor_name,
+                                    "actor_tier": match.get("actor_tier", ""),
+                                    "officer_name": match["officer_name"],
+                                    "officer_node_id": match["officer_node_id"],
+                                    "entity_name": entity_name,
+                                    "jurisdiction": jurisdiction,
+                                    "entity_status": entity.get("entity_status", ""),
+                                    "incorporation_date": entity.get(
+                                        "incorporation_date", "",
+                                    ),
+                                    "rel_type": entity.get("rel_type", ""),
+                                    "match_type": match["match_type"],
+                                    "leak_source": entity.get("entity_source", ""),
+                                }),
+                            })
                         raw_count += 1
                     except Exception as exc:
-                        log.debug(
+                        log.warning(
                             "Failed to insert offshore raw_series: {e}",
                             e=str(exc),
                         )
@@ -572,30 +586,31 @@ class OffshoreLeaksPuller(BasePuller):
 
                     # signal_sources insert — emit as offshore_leak
                     try:
-                        conn.execute(text("""
-                            INSERT INTO signal_sources
-                                (source_type, source_id, ticker, signal_type,
-                                 signal_date, signal_value, metadata)
-                            VALUES
-                                (:stype, :sid, :ticker, :signal_type,
-                                 :sdate, :sval, :meta)
-                        """), {
-                            "stype": "offshore_leak",
-                            "sid": series_id,
-                            "ticker": actor_id,  # use actor_id as ticker proxy
-                            "signal_type": "SELL",  # offshore = bearish signal
-                            "sdate": now,
-                            "sval": 1.0,
-                            "meta": _json_dumps({
-                                "actor_name": actor_name,
-                                "entity_name": entity_name,
-                                "jurisdiction": jurisdiction,
-                                "match_type": match["match_type"],
-                                "officer_name": match["officer_name"],
-                                "entity_status": entity.get("entity_status", ""),
-                                "leak_source": entity.get("entity_source", ""),
-                            }),
-                        })
+                        with conn.begin_nested():
+                            conn.execute(text("""
+                                INSERT INTO signal_sources
+                                    (source_type, source_id, ticker, signal_type,
+                                     signal_date, signal_value, metadata)
+                                VALUES
+                                    (:stype, :sid, :ticker, :signal_type,
+                                     :sdate, :sval, :meta)
+                            """), {
+                                "stype": "offshore_leak",
+                                "sid": series_id,
+                                "ticker": actor_id,  # use actor_id as ticker proxy
+                                "signal_type": "SELL",  # offshore = bearish signal
+                                "sdate": now,
+                                "sval": 1.0,
+                                "meta": _json_dumps({
+                                    "actor_name": actor_name,
+                                    "entity_name": entity_name,
+                                    "jurisdiction": jurisdiction,
+                                    "match_type": match["match_type"],
+                                    "officer_name": match["officer_name"],
+                                    "entity_status": entity.get("entity_status", ""),
+                                    "leak_source": entity.get("entity_source", ""),
+                                }),
+                            })
                         signal_count += 1
                     except Exception as exc:
                         log.debug(
