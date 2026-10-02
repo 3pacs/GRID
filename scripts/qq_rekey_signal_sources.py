@@ -274,8 +274,9 @@ _MOVE_SQL = text(
 def load_legacy_rows(conn: Connection, source_type: str) -> Iterator[dict[str, Any]]:
     """Stream the legacy rows of one source_type."""
     legacy = legacy_source_id(KEYED_SOURCE_TYPES[source_type])
-    result = conn.execution_options(stream_results=True).execute(
-        _LEGACY_ROWS_SQL, {"source_type": source_type, "legacy": legacy}
+    result = conn.execute(
+        _LEGACY_ROWS_SQL, {"source_type": source_type, "legacy": legacy},
+        execution_options={"stream_results": True},  # per statement: never leaks onto the connection
     )
     for row in result.mappings():
         yield dict(row)

@@ -281,7 +281,7 @@ _MOVE_SQL = text(
 
 def load_rows(conn: Connection) -> Iterator[dict[str, Any]]:
     """Stream every row of the source_type (keyed by ``source_type``, its index's lead column)."""
-    result = conn.execution_options(stream_results=True).execute(_ROWS_SQL, {"source_type": SOURCE_TYPE})
+    result = conn.execute(_ROWS_SQL, {"source_type": SOURCE_TYPE}, execution_options={"stream_results": True})
     for row in result.mappings():
         yield dict(row)
 
