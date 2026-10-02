@@ -20,6 +20,9 @@ from typing import Any
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
+
+from ingestion.altdata.quiverquant_identity import transition_marker_exists, transition_marker_path
 
 from intelligence.people_events_pipeline.readonly import (
     BACKUP_WINDOW_UTC,
@@ -37,6 +40,11 @@ __all__ = [
     "database_url",
     "open_engine",
     "assert_read_only",
+    "check_window",
+    "require_guard_closed",
+    "is_lock_or_timeout",
+    "transition_marker_exists",
+    "transition_marker_path",
 ]
 
 
@@ -78,3 +86,32 @@ def assert_read_only(conn: Any) -> None:
 def check_window(now: datetime | None = None) -> None:
     """Raise ``WindowClosed`` inside 03:30-10:30 UTC."""
     assert_db_window_open(now)
+
+
+def require_guard_closed() -> None:
+    """Refuse ``--apply`` / ``--revert`` once the transition marker exists.
+
+    Until the marker is created the writer does not pull the guarded endpoints, so
+    nothing can land between the dry run and the apply (a pull in between creates
+    keyed duplicates next to the legacy rows, or overwrites a calendar-dated
+    gov_contracts row with the next quarter's payload). A marker that already exists
+    means pulls may already be flowing.
+    """
+    if transition_marker_exists():
+        raise RuntimeError(
+            f"refusing to write: the transition marker {transition_marker_path()} exists, so QuiverQuant "
+            "pulls may already be running. Remove the marker to re-close the guard (and confirm the "
+            "scheduler records quiverquant as SKIPPED), or pass --no-guard-check if QuiverQuant is "
+            "paused another way."
+        )
+
+
+def is_lock_or_timeout(exc: BaseException) -> bool:
+    """True for a lock_not_available (55P03) or query_canceled (57014) database error.
+
+    Raised when ``lock_timeout`` / ``statement_timeout`` fires, e.g. against a
+    concurrent uncommitted write to the same row. The scripts report and skip.
+    """
+    if not isinstance(exc, OperationalError):
+        return False
+    return getattr(getattr(exc, "orig", None), "pgcode", None) in {"55P03", "57014"}

@@ -407,3 +407,218 @@ def test_trust_scorer_scores_a_quiverquant_feed_as_one_source(monkeypatch):
     assert feed_update["keyed_len"] == len("qq_house_trading:")
     other_update = next(u for u in engine.conn.updates if u["si"] == "Jane Doe")
     assert other_update["keyed_prefix"] is None
+
+
+# ── identity: partial identities, adapter-aligned aliases, BioGuide-less key ──
+
+
+def test_partial_identity_is_reported():
+    assert not ident.is_partial_identity("insider_trading", INSIDER)
+    assert ident.is_partial_identity("insider_trading", {k: v for k, v in INSIDER.items() if k != "PricePerShare"})
+    assert ident.is_partial_identity("house_trading", {"Representative": "Jane Doe", "Transaction": "Purchase"})
+    assert not ident.is_partial_identity("wsb", {})  # aggregate endpoints have no identity
+
+
+def test_field_aliases_match_the_people_events_adapters():
+    from intelligence.people_events_pipeline import adapters as A
+
+    for key in A._QQ_MEMBER:
+        rec = {key: "Jane Doe", "Transaction": "Purchase", "Range": "$1,001 - $15,000"}
+        assert ident.act_identity("house_trading", rec) == "jane doe|purchase|1001-15000", key
+    for key in A._QQ_OWNER:
+        rec = {key: "Jane Doe", "TransactionCode": "S", "Shares": 1, "PricePerShare": 2}
+        assert ident.act_identity("insider_trading", rec) == "jane doe|s|1|2", key
+    # Range falls back to Amount, as in the adapter
+    assert ident.act_identity("senate_trading", {"Senator": "J R", "Transaction": "Sale", "Amount": 15001}) \
+        == "j r|sale|15001"
+    assert ident.act_identity("house_trading", {"Representative": "J D", "Transaction": "Sale", "Range": "$1 - $2",
+                                                "Amount": 1}) == "j d|sale|1-2"  # Range wins
+
+
+def test_member_loose_key_ignores_bioguide():
+    with_id = {**HOUSE}
+    without_id = {k: v for k, v in HOUSE.items() if k != "BioGuideID"}
+    assert ident.has_bioguide(with_id) and not ident.has_bioguide(without_id)
+    assert ident.act_identity("house_trading", with_id) != ident.act_identity("house_trading", without_id)
+    assert ident.member_loose_key("house_trading", with_id) == ident.member_loose_key("house_trading", without_id)
+    assert ident.member_loose_key("insider_trading", INSIDER) is None
+
+
+# ── trust_scorer: last_signal_date is the newest, not the first row seen ──────
+
+
+def test_trust_scorer_last_signal_date_is_the_max_across_a_feeds_rows(monkeypatch):
+    from datetime import timedelta
+
+    from intelligence import trust_scorer
+
+    monkeypatch.setattr(trust_scorer, "_ensure_tables", lambda engine: None)
+    today = date.today()
+
+    class _Rows:
+        def __init__(self, rows):
+            self._rows = rows
+
+        def fetchall(self):
+            return self._rows
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, statement, params=None):
+            if "SELECT source_type, source_id, outcome" in str(statement):
+                # ordered by the per-act source_id, so the newest row is NOT first
+                return _Rows([
+                    ("quiverquant:house", "qq_house_trading:a|buy|1", "CORRECT", 0.01, today - timedelta(days=30), "AAA"),
+                    ("quiverquant:house", "qq_house_trading:b|buy|1", "CORRECT", 0.01, today, "BBB"),
+                    ("quiverquant:house", "qq_house_trading:c|buy|1", "WRONG", -0.01, today - timedelta(days=9), "CCC"),
+                ])
+            return _Rows([])
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+        begin = connect
+
+    result = trust_scorer.update_trust_scores(_Engine())
+    assert [s["last_signal_date"] for s in result["sources"]] == [str(today)]
+
+
+# ── the transition guard ─────────────────────────────────────────────────────
+
+
+@pytest.fixture()
+def guard(monkeypatch, tmp_path):
+    marker = tmp_path / "quiverquant_transition_done"
+    monkeypatch.setenv(ident.MARKER_FILE_ENV, str(marker))
+    monkeypatch.delenv(ident.GUARD_OFF_ENV, raising=False)
+    return marker
+
+
+def _no_network(monkeypatch):
+    def _boom(*a, **k):
+        raise AssertionError("a guarded pull must not reach the API")
+
+    monkeypatch.setattr(qq, "_get_api_key", _boom)
+    monkeypatch.setattr(qq, "_fetch_endpoint", _boom)
+    monkeypatch.setattr(qq, "_store_signals", _boom)
+
+
+@pytest.mark.parametrize("endpoint", sorted(ident.TRANSITION_GUARDED_ENDPOINTS))
+def test_guarded_endpoints_do_not_pull_until_the_marker_exists(guard, monkeypatch, endpoint):
+    _no_network(monkeypatch)
+    out = qq.pull_endpoint(object(), endpoint)
+    assert out["status"] == "SKIPPED" and out["stored"] == 0
+    assert str(guard) in out["skipped_reason"] and "transition marker" in out["skipped_reason"]
+
+
+def test_guard_covers_the_four_keyed_endpoints_and_gov_contracts_only():
+    assert ident.TRANSITION_GUARDED_ENDPOINTS == {
+        "insider_trading", "house_trading", "senate_trading", "lobbying", "gov_contracts"}
+
+
+@pytest.mark.parametrize("endpoint", ["wsb", "off_exchange", "flights", "twitter", "political_beta"])
+def test_aggregate_endpoints_are_not_held(guard, monkeypatch, endpoint):
+    monkeypatch.setattr(qq, "_get_api_key", lambda: "k")
+    monkeypatch.setattr(qq, "_fetch_endpoint", lambda path, key: [])
+    monkeypatch.setattr(qq, "_store_signals", lambda *a, **k: 0)
+    monkeypatch.setattr(qq.time, "sleep", lambda s: None)
+    assert qq.pull_endpoint(object(), endpoint)["status"] == "SUCCESS"
+
+
+def test_pulls_resume_once_the_marker_exists(guard, monkeypatch):
+    monkeypatch.setattr(qq, "_get_api_key", lambda: "k")
+    monkeypatch.setattr(qq, "_fetch_endpoint", lambda path, key: [{"Ticker": "A"}])
+    monkeypatch.setattr(qq, "_store_signals", lambda *a, **k: 1)
+    monkeypatch.setattr(qq.time, "sleep", lambda s: None)
+    assert qq.pull_endpoint(object(), "insider_trading")["status"] == "SKIPPED"
+    guard.write_text("done")
+    out = qq.pull_endpoint(object(), "insider_trading")
+    assert out["status"] == "SUCCESS" and out["stored"] == 1
+
+
+def test_guard_off_switch(guard, monkeypatch):
+    monkeypatch.setenv(ident.GUARD_OFF_ENV, "off")
+    assert not ident.transition_guard_blocks("insider_trading")
+
+
+def test_the_skip_logs_a_warning(guard, monkeypatch):
+    _no_network(monkeypatch)
+    messages: list[str] = []
+    sink = qq.log.add(lambda m: messages.append(str(m)), level="WARNING")
+    try:
+        qq.pull_endpoint(object(), "lobbying")
+    finally:
+        qq.log.remove(sink)
+    assert any("SKIPPED" in m and "transition marker" in m for m in messages)
+
+
+def test_scheduler_reads_a_guarded_pull_as_skipped_not_success(guard, monkeypatch):
+    """Honest-success contract: a held pull must not count toward freshness."""
+    from ingestion import smart_scheduler as sched
+
+    monkeypatch.setattr(qq, "_get_api_key", lambda: "k")
+    monkeypatch.setattr(qq, "_fetch_endpoint", lambda path, key: [])
+    monkeypatch.setattr(qq, "_store_signals", lambda *a, **k: 0)
+    monkeypatch.setattr(qq.time, "sleep", lambda s: None)
+
+    held = [qq.pull_endpoint(object(), k) for k in qq.ENDPOINTS]
+    outcome, rows, note = sched._classify_outcome(held)
+    assert outcome not in (sched.OUTCOME_SUCCESS, sched.OUTCOME_NO_NEW_DATA)
+    assert "skipped" in (note or "")
+
+    only_guarded = [qq.pull_endpoint(object(), k) for k in sorted(ident.TRANSITION_GUARDED_ENDPOINTS)]
+    assert sched._classify_outcome(only_guarded)[0] == sched.OUTCOME_SKIPPED
+
+
+# ── consumers that showed or counted the act key ─────────────────────────────
+
+
+def test_actor_context_shows_the_person_not_the_act_key(monkeypatch):
+    from intelligence.actors import analysis
+
+    monkeypatch.setattr(analysis, "_ensure_tables", lambda engine: None)
+    monkeypatch.setattr(analysis, "_load_actors_from_db", lambda engine: {})
+
+    class _Rows:
+        def fetchall(self):
+            return [
+                ("quiverquant:house", ident.source_id_for("house_trading", HOUSE), "BUY", date(2026, 9, 1),
+                 json.dumps({"Representative": "Jane Doe"}), 0.6),
+            ]
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def execute(self, statement, params=None):
+            return _Rows()
+
+    class _Engine:
+        def connect(self):
+            return _Conn()
+
+    out = analysis.get_actor_context_for_ticker(_Engine(), "ACME")
+    assert [a["actor"] for a in out["recent_actions"]] == ["Jane Doe"]
+
+
+def test_readers_resolve_the_person_in_sql():
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1]
+    sleuth = (root / "intelligence" / "sleuth.py").read_text(encoding="utf-8")
+    assert "COUNT(DISTINCT source_id)" not in sleuth and "DISTINCT {_IDENTITY_SQL}" in sleuth
+    canvas = (root / "api" / "routers" / "canvas_expand.py").read_text(encoding="utf-8")
+    assert "SELECT DISTINCT ss.source_id FROM signal_sources ss" not in canvas and "{_LP_IDENTITY_SQL}" in canvas
+    overview = (root / "api" / "routers" / "watchlist_overview.py").read_text(encoding="utf-8")
+    assert overview.count("{qq_feed}") == 4
+    discovery = (root / "intelligence" / "actor_discovery.py").read_text(encoding="utf-8")
+    assert discovery.count("<> 'qq_'") == 2

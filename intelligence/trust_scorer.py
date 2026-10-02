@@ -971,7 +971,9 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             for outcome, ret, sig_date, ticker in rows:
                 sig_dt = sig_date if isinstance(sig_date, date) else sig_date.date()
 
-                if last_signal_date is None:
+                # Rows of one feed interleave (their source_ids differ per act),
+                # so the newest date is a max, not the first row seen.
+                if last_signal_date is None or sig_dt > last_signal_date:
                     last_signal_date = sig_dt
 
                 # Recency weight: exponential decay from today

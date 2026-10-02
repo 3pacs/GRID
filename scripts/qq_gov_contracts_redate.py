@@ -40,6 +40,25 @@ Each row of ``quiverquant:gov_contracts`` is classified:
 It never deletes and never touches ``signal_value`` or any column other than
 ``signal_date``.
 
+Run order (important)
+---------------------
+Run this **before the next QuiverQuant pull**. The fiscal writer's first pull
+overwrites each calendar-dated row in place with the *next* quarter's payload (the
+row at ``calendar_end(Y, Q-1)`` is the slot ``fiscal_end(Y, Q)`` writes to), so a pull
+before this script destroys the old row's payload and leaves one stale future-dated
+duplicate per ticker. The writer therefore guards itself: until the transition marker
+file exists (``~/.grid/quiverquant_transition_done`` or
+``$GRID_QQ_TRANSITION_DONE_FILE``) gov_contracts and the four act-keyed endpoints return
+SKIPPED (a warning in the log, no API call, no write), including the overdue pull the
+scheduler fires on its first tick after a deploy restart. Procedure: deploy, dry run,
+apply (and ``scripts/qq_rekey_signal_sources.py``), then
+``mkdir -p ~/.grid && touch ~/.grid/quiverquant_transition_done``.
+
+``--apply`` and ``--revert`` refuse to run once the marker exists (``--no-guard-check``
+overrides). Rows are not "known" at their fiscal date: QuiverQuant rewrites the
+aggregate in place after it, so a stored value must not be scored as known at
+``signal_date`` (the people-events channel is report-only for that reason).
+
 Safety
 ------
 * Dry run by default: read-only session, 20 s statement timeout, 2 s lock timeout.
@@ -47,17 +66,14 @@ Safety
   tickers, inside 03:30-10:30 UTC (nightly ``pg_dump`` window).
 * ``--apply`` requires ``--audit-log`` (a new file): one JSON line per move. Each
   ticker's chain is one transaction and every UPDATE re-checks that its target slot
-  is free and that the row still has the date the plan saw.
+  is free and that the row still has the date the plan saw. A chain that hits the lock
+  or statement timeout (a concurrent uncommitted write) is rolled back whole, reported
+  (``chains_skipped_timeout``) and skipped; the run continues.
 * ``--revert AUDIT_LOG`` undoes an apply, processing each ticker in *descending*
   date order for the same reason.
-
-Run order matters
------------------
-Run it after the fiscal-quarter writer is deployed (the old writer would re-create
-calendar-dated rows). After the first pull of the new writer most rows are already
-fiscal-dated (it overwrites the calendar-dated rows in place, one slot down); what is
-left is the latest quarter's stale future-dated row per ticker, reported as
-``duplicate_of_fiscal_row``.
+* Moved rows keep ``outcome`` / ``outcome_return`` / ``trust_score`` untouched. The dry
+  run reports how many moved rows already carry a CORRECT or WRONG outcome
+  (``moves_with_scored_outcome``): that outcome was computed for the old date.
 
 Usage (grid-svr; see the PR for the run procedure)
 --------------------------------------------------
@@ -81,6 +97,7 @@ from typing import Any, Iterable, Iterator
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError
 
 from ingestion.altdata.quiverquant_identity import (
     calendar_quarter_end,
@@ -111,6 +128,7 @@ class Redate:
     qtr: int
     old_date: date
     new_date: date
+    outcome: str | None = None
 
 
 @dataclass
@@ -179,6 +197,7 @@ def plan_redate(rows: Iterable[dict[str, Any]]) -> RedatePlan:
             candidates[(source_id, ticker, stype)].append(Redate(
                 id=int(row["id"]), source_id=source_id, ticker=ticker, signal_type=stype,
                 year=year_qtr[0], qtr=year_qtr[1], old_date=sdate, new_date=fiscal,
+                outcome=(str(row["outcome"]).upper() if row.get("outcome") else None),
             ))
         else:
             plan.skipped["not_post_fix_row"] += 1
@@ -244,6 +263,8 @@ def summarize(plan: RedatePlan, today: date) -> dict[str, Any]:
         "moves_by_quarter_shift": dict(sorted(Counter(
             f"Q{m.qtr}: {m.old_date.isoformat()[5:]} -> {m.new_date.isoformat()[5:]}" for m in plan.moves
         ).items())),
+        "moves_with_scored_outcome": dict(sorted(Counter(
+            m.outcome for m in plan.moves if m.outcome in ("CORRECT", "WRONG")).items())),
         "future_dated_moves_before": moved_future,
         "future_dated_moves_after": still_future,
         "conflict_sample": [
@@ -258,7 +279,7 @@ def summarize(plan: RedatePlan, today: date) -> dict[str, Any]:
 
 _ROWS_SQL = text(
     """
-    SELECT id, source_id, ticker, signal_date, signal_type, signal_value
+    SELECT id, source_id, ticker, signal_date, signal_type, signal_value, outcome
       FROM signal_sources
      WHERE source_type = :source_type
     """
@@ -302,29 +323,48 @@ def _by_ticker(moves: Iterable[Redate], *, descending: bool) -> list[list[Redate
     return [sorted(g, key=lambda r: r.old_date, reverse=descending) for g in groups.values()]
 
 
-def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forward: bool = True) -> dict[str, int]:
-    """Run each ticker's chain in one transaction, ascending (``forward``) or descending."""
+def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forward: bool = True) -> dict[str, Any]:
+    """Run each ticker's chain in one transaction, ascending (``forward``) or descending.
+
+    A chain that hits ``lock_timeout`` / ``statement_timeout`` is rolled back whole,
+    reported and skipped; any other database error propagates.
+    """
     moved = blocked = 0
+    timeout_chains: list[str] = []
     with audit_path.open("x", encoding="utf-8") as audit:
         for chain in _by_ticker(moves, descending=not forward):
             common.check_window()
             done: list[Redate] = []
-            with engine.begin() as conn:
-                for m in chain:
-                    res = conn.execute(_MOVE_SQL, _params(m, forward=forward))
-                    if res.rowcount == 1:
-                        done.append(m)
-                    else:
-                        blocked += 1
+            chain_blocked = 0
+            try:
+                with engine.begin() as conn:
+                    for m in chain:
+                        res = conn.execute(_MOVE_SQL, _params(m, forward=forward))
+                        if res.rowcount == 1:
+                            done.append(m)
+                        else:
+                            chain_blocked += 1
+            except OperationalError as exc:
+                if not common.is_lock_or_timeout(exc):
+                    raise
+                timeout_chains.append(chain[0].ticker)
+                continue
+            blocked += chain_blocked
             for m in done:  # logged after the chain committed
                 audit.write(json.dumps({
+                    "direction": "forward" if forward else "revert",
                     "id": m.id, "source_id": m.source_id, "ticker": m.ticker, "signal_type": m.signal_type,
                     "year": m.year, "qtr": m.qtr,
                     "old_date": m.old_date.isoformat(), "new_date": m.new_date.isoformat(),
                 }) + "\n")
             audit.flush()
             moved += len(done)
-    return {"moved": moved, "not_moved_slot_taken_or_row_changed": blocked}
+    return {
+        "moved": moved,
+        "not_moved_slot_taken_or_row_changed": blocked,
+        "chains_skipped_timeout": len(timeout_chains),
+        "skipped_timeout_tickers": timeout_chains[:SAMPLE_LIMIT * 10],
+    }
 
 
 def read_audit(path: Path) -> list[Redate]:
@@ -334,6 +374,8 @@ def read_audit(path: Path) -> list[Redate]:
         if not line.strip():
             continue
         rec = json.loads(line)
+        if rec.get("direction", "forward") != "forward":
+            continue
         moves.append(Redate(
             id=int(rec["id"]), source_id=rec["source_id"], ticker=rec["ticker"], signal_type=rec["signal_type"],
             year=int(rec["year"]), qtr=int(rec["qtr"]),
@@ -371,6 +413,8 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--apply", action="store_true", help="write (default: dry run, read-only session)")
     ap.add_argument("--revert", type=Path, metavar="AUDIT_LOG", help="undo the moves recorded in an audit log")
+    ap.add_argument("--no-guard-check", action="store_true",
+                    help="allow --apply/--revert although the transition marker exists (QuiverQuant paused another way)")
     ap.add_argument("--audit-log", type=Path, help="new JSONL file recording every move (required with --apply/--revert)")
     ap.add_argument("--db-url-env", help="env var holding the database URL (default: config.settings.DB_URL)")
     ap.add_argument("--out", type=Path, help="also write the JSON report here (must not exist)")
@@ -393,6 +437,12 @@ def main(argv: list[str] | None = None) -> int:
         return 3
 
     writing = bool(args.apply or args.revert)
+    if writing and not args.no_guard_check:
+        try:
+            common.require_guard_closed()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
     engine = common.open_engine(
         common.database_url(args.db_url_env), read_only=not writing, application_name="qq_gov_contracts_redate",
     )

@@ -127,7 +127,7 @@ def test_target_id_equals_what_the_writer_would_have_written():
     assert rekey.target_source_id("quiverquant:house", HOUSE) == HOUSE_KEY
     assert rekey.target_source_id("quiverquant:house", json.dumps(HOUSE) and HOUSE) == HOUSE_KEY
     assert rekey.target_source_id("quiverquant:wsb", {"Mentions": 3}) is None  # aggregate feeds are never re-keyed
-    assert rekey.target_source_id("quiverquant:house", {"Amount": 1}) is None  # no identity fields at all
+    assert rekey.target_source_id("quiverquant:house", {"Foo": 1}) is None  # no identity fields at all
 
 
 def test_plan_moves_free_rows_and_reports_conflicts():
@@ -137,7 +137,7 @@ def test_plan_moves_free_rows_and_reports_conflicts():
         _legacy(2, HOUSE2),                                  # keyed row already there: conflict
         _legacy(3, HOUSE, ticker="OTHER"),                   # different ticker: move
         _legacy(4, "not json"),                              # unreadable
-        _legacy(5, {"Amount": 9}),                           # nothing to key on
+        _legacy(5, {"Foo": 9}),                              # nothing to key on
         _legacy(6, HOUSE, sid=HOUSE_KEY),                    # not a legacy row at all
     ]
     plan = rekey.plan_rekey("quiverquant:house", rows, existing)
@@ -189,7 +189,8 @@ def test_apply_moves_only_free_rows_and_never_deletes(engine, open_window, tmp_p
     after = {r["id"]: r for r in _all_rows(engine)}
 
     assert set(after) == set(before)  # nothing deleted, nothing added
-    assert report["applied"] == {"moved": 2, "not_moved_target_taken_or_row_changed": 0}
+    assert report["applied"]["moved"] == 2 and report["applied"]["not_moved_target_taken_or_row_changed"] == 0
+    assert report["applied"]["batches_skipped_timeout"] == 0
     assert after[1]["source_id"] == HOUSE_KEY
     assert after[2]["source_id"] == "qq_house_trading"          # conflict: left exactly as it was
     assert after[4]["source_id"] == "qq_insider_trading:smith john q|s|1000|12.5"
@@ -222,7 +223,7 @@ def test_apply_loses_gracefully_to_a_concurrent_writer(engine, open_window, tmp_
 
     monkeypatch.setattr(rekey, "plan_rekey", _plan_then_race)
     report = rekey.run(engine, source_types=["quiverquant:house"], apply=True, audit_path=tmp_path / "a.jsonl")
-    assert report["applied"] == {"moved": 0, "not_moved_target_taken_or_row_changed": 1}
+    assert report["applied"]["moved"] == 0 and report["applied"]["not_moved_target_taken_or_row_changed"] == 1
     legacy = [r for r in _all_rows(engine) if r["id"] == 1][0]
     assert legacy["source_id"] == "qq_house_trading"
 
@@ -383,7 +384,7 @@ def test_redate_apply_uses_the_real_unique_constraint_and_never_deletes(engine, 
     audit = tmp_path / "audit.jsonl"
     report = redate.run(engine, apply=True, audit_path=audit, today=date(2026, 10, 2))
     after = _all_rows(engine)
-    assert report["applied"] == {"moved": 5, "not_moved_slot_taken_or_row_changed": 0}
+    assert report["applied"]["moved"] == 5 and report["applied"]["not_moved_slot_taken_or_row_changed"] == 0
     assert [r["id"] for r in after] == [r["id"] for r in before]
     for b, a in zip(before, after):
         assert {k: v for k, v in a.items() if k != "signal_date"} == {k: v for k, v in b.items() if k != "signal_date"}
@@ -406,7 +407,7 @@ def test_redate_revert_restores_every_date(engine, open_window, tmp_path):
     redate.run(engine, apply=True, audit_path=audit)
     assert _dates(engine) != original
     reverted = redate.apply_moves(engine, redate.read_audit(audit), audit_path=tmp_path / "revert.jsonl", forward=False)
-    assert reverted == {"moved": 5, "not_moved_slot_taken_or_row_changed": 0}
+    assert reverted["moved"] == 5 and reverted["not_moved_slot_taken_or_row_changed"] == 0
     assert _dates(engine) == original
 
 
@@ -418,7 +419,7 @@ def test_redate_does_not_move_onto_a_slot_taken_since_the_plan(engine, open_wind
     _insert(engine, "quiverquant:gov_contracts", "qq_gov_contracts", "LMT", date(2026, 3, 31), "gov_contracts",
             {"Year": 2026, "Qtr": 2, "Amount": 2.0})  # the fiscal writer got there first
     result = redate.apply_moves(engine, plan.moves, audit_path=tmp_path / "a.jsonl")
-    assert result == {"moved": 0, "not_moved_slot_taken_or_row_changed": 1}
+    assert result["moved"] == 0 and result["not_moved_slot_taken_or_row_changed"] == 1
     assert len(_all_rows(engine)) == 2
 
 
@@ -447,3 +448,167 @@ def test_adapter_treats_fiscal_and_calendar_quarter_ends_as_post_fix_rows():
     assert known["quiverquant:gov_contracts:1"] == pd.Timestamp(R.next_session_open_after(date(2026, 5, 2)))
     assert known["quiverquant:gov_contracts:2"] == pd.Timestamp(observed)
     assert known["quiverquant:gov_contracts:3"] == pd.Timestamp(observed)  # not trusted as first_seen
+
+
+# ═══ review follow-ups: guard check, partial identities, probe, revert, timeouts, outcomes ═══
+
+
+@pytest.fixture()
+def marker(monkeypatch, tmp_path):
+    path = tmp_path / "quiverquant_transition_done"
+    monkeypatch.setenv(ident.MARKER_FILE_ENV, str(path))
+    return path
+
+
+@pytest.mark.parametrize("script", [rekey, redate])
+def test_apply_and_revert_refuse_once_the_transition_marker_exists(script, marker, monkeypatch, tmp_path):
+    monkeypatch.setattr(common, "check_window", lambda now=None: None)
+    monkeypatch.setattr(common, "open_engine", lambda *a, **k: pytest.fail("opened a connection"))
+    marker.write_text("done")
+    assert script.main(["--apply", "--audit-log", str(tmp_path / "a.jsonl")]) == 4
+    assert script.main(["--revert", str(tmp_path / "x.jsonl"), "--audit-log", str(tmp_path / "b.jsonl")]) == 4
+
+
+@pytest.mark.parametrize("script", [rekey, redate])
+def test_no_guard_check_overrides_the_marker(script, marker, monkeypatch, tmp_path):
+    class _Stop(Exception):
+        pass
+
+    def _open(*a, **k):
+        raise _Stop
+
+    monkeypatch.setattr(common, "check_window", lambda now=None: None)
+    monkeypatch.setattr(common, "database_url", lambda env: "postgresql://unused")
+    monkeypatch.setattr(common, "open_engine", _open)
+    marker.write_text("done")
+    with pytest.raises(_Stop):
+        script.main(["--apply", "--no-guard-check", "--audit-log", str(tmp_path / "a.jsonl")])
+
+
+def test_dry_run_reports_partial_identities_and_bioguide_less_rows(engine, open_window):
+    _insert(engine, "quiverquant:house", "qq_house_trading", "ACME", date(2026, 9, 1), "house_trading", HOUSE)
+    no_bg = {k: v for k, v in HOUSE.items() if k != "BioGuideID"}
+    _insert(engine, "quiverquant:house", "qq_house_trading", "ZZZ", date(2026, 9, 2), "house_trading", no_bg)
+    no_range = {k: v for k, v in HOUSE.items() if k != "Range"}
+    _insert(engine, "quiverquant:house", "qq_house_trading", "YYY", date(2026, 9, 3), "house_trading", no_range)
+    report = rekey.run(engine, source_types=["quiverquant:house"], apply=False, audit_path=None,
+                       today=date(2026, 10, 2))
+    house = report["source_types"]["quiverquant:house"]
+    assert house["without_bioguide"] == 1 and house["partial_identity_rows"] == 1
+    report = rekey.run(engine, source_types=["quiverquant:insider"], apply=False, audit_path=None)
+    assert report["source_types"]["quiverquant:insider"]["without_bioguide"] is None
+
+
+def test_probe_counts_house_acts_stored_under_two_keys(engine):
+    no_bg = {k: v for k, v in HOUSE.items() if k != "BioGuideID"}
+    _insert(engine, "quiverquant:house", HOUSE_KEY, "ACME", date(2026, 9, 1), "house_trading", HOUSE)
+    _insert(engine, "quiverquant:house", ident.source_id_for("house_trading", no_bg), "ACME", date(2026, 9, 1),
+            "house_trading", no_bg)   # same act, BioGuideID dropped: a second key
+    _insert(engine, "quiverquant:house", HOUSE2_KEY, "ACME", date(2026, 9, 1), "house_trading", HOUSE2)
+    _insert(engine, "quiverquant:house", "qq_house_trading", "ACME", date(2026, 9, 1), "house_trading", HOUSE)  # legacy
+    with engine.connect() as conn:
+        out = rekey.probe_duplicates(conn)
+    assert out["quiverquant:house"]["keyed_rows"] == 3
+    assert out["quiverquant:house"]["acts_under_two_or_more_keys"] == 1
+    assert out["quiverquant:house"]["rows_involved"] == 2
+    assert out["quiverquant:senate"]["acts_under_two_or_more_keys"] == 0
+
+
+def test_rekey_revert_restores_the_legacy_ids(engine, open_window, tmp_path):
+    _seed_rekey(engine)
+    original = {r["id"]: r["source_id"] for r in _all_rows(engine)}
+    audit = tmp_path / "audit.jsonl"
+    rekey.run(engine, source_types=sorted(rekey.KEYED_SOURCE_TYPES), apply=True, audit_path=audit)
+    assert {r["id"]: r["source_id"] for r in _all_rows(engine)} != original
+    assert all(json.loads(line)["direction"] == "forward" for line in audit.read_text().splitlines())
+    result = rekey.revert_moves(engine, audit, batch_size=10, audit_path=tmp_path / "revert.jsonl")
+    assert result["moved"] == 2
+    assert {r["id"]: r["source_id"] for r in _all_rows(engine)} == original
+    assert all(json.loads(line)["direction"] == "revert" for line in (tmp_path / "revert.jsonl").read_text().splitlines())
+
+
+def _timeout_error():
+    from sqlalchemy.exc import OperationalError
+
+    class _Orig(Exception):
+        pgcode = "55P03"
+
+    return OperationalError("UPDATE signal_sources", {}, _Orig("could not obtain lock"))
+
+
+def test_rekey_reports_and_skips_a_batch_that_hits_the_lock_timeout(engine, open_window, tmp_path, monkeypatch):
+    for i in range(4):
+        _insert(engine, "quiverquant:house", "qq_house_trading", f"T{i}", date(2026, 9, 1), "house_trading", HOUSE)
+    real_begin, calls = engine.begin, {"n": 0}
+
+    class _Eng:
+        dialect = engine.dialect
+
+        def connect(self):
+            return engine.connect()
+
+        def begin(self):
+            calls["n"] += 1
+            if calls["n"] == 1:   # first batch: a concurrent uncommitted write holds the row
+                raise _timeout_error()
+            return real_begin()
+
+    plan = rekey.plan_rekey("quiverquant:house", rekey.load_legacy_rows(engine.connect(), "quiverquant:house"), set())
+    result = rekey.apply_moves(_Eng(), plan.moves, batch_size=2, audit_path=tmp_path / "a.jsonl")
+    assert result["batches_skipped_timeout"] == 1 and result["skipped_timeout_rows"] == 2
+    assert result["moved"] == 2
+    assert sum(r["source_id"] == "qq_house_trading" for r in _all_rows(engine)) == 2   # the skipped batch is untouched
+    assert len((tmp_path / "a.jsonl").read_text().splitlines()) == 2
+
+
+def test_other_database_errors_still_propagate(engine, open_window, tmp_path):
+    from sqlalchemy.exc import OperationalError
+
+    class _Eng:
+        def begin(self):
+            raise OperationalError("UPDATE", {}, Exception("connection reset"))
+
+    move = rekey.Move(1, "quiverquant:house", "ACME", date(2026, 9, 1), "house_trading", "qq_house_trading", HOUSE_KEY)
+    with pytest.raises(OperationalError):
+        rekey.apply_moves(_Eng(), [move], batch_size=1, audit_path=tmp_path / "a.jsonl")
+
+
+def test_redate_reports_moved_rows_that_already_carry_a_scored_outcome(engine, open_window):
+    _seed_gov(engine)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE signal_sources SET outcome = 'CORRECT' WHERE id IN (1, 2)"))
+        conn.execute(text("UPDATE signal_sources SET outcome = 'WRONG' WHERE id = 3"))
+    before = {r["id"]: r["outcome"] for r in _all_rows(engine)}
+    report = redate.run(engine, apply=False, audit_path=None)
+    assert report["summary"]["moves_with_scored_outcome"] == {"CORRECT": 2, "WRONG": 1}
+    assert {r["id"]: r["outcome"] for r in _all_rows(engine)} == before   # a dry run never resets them
+
+
+def test_redate_apply_keeps_outcomes(engine, open_window, tmp_path):
+    _seed_gov(engine)
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE signal_sources SET outcome = 'CORRECT' WHERE id = 2"))
+    redate.run(engine, apply=True, audit_path=tmp_path / "a.jsonl")
+    assert [r["outcome"] for r in _all_rows(engine) if r["id"] == 2] == ["CORRECT"]
+
+
+def test_redate_reports_and_skips_a_chain_that_hits_the_lock_timeout(engine, open_window, tmp_path):
+    _seed_gov(engine)
+    for r in _calendar_chain("NOC", 100):
+        _insert(engine, "quiverquant:gov_contracts", "qq_gov_contracts", "NOC", r["signal_date"], "gov_contracts",
+                r["signal_value"])
+    plan = redate.plan_redate(redate.load_rows(engine.connect()))
+    real_begin, calls = engine.begin, {"n": 0}
+
+    class _Eng:
+        def begin(self):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise _timeout_error()
+            return real_begin()
+
+    result = redate.apply_moves(_Eng(), plan.moves, audit_path=tmp_path / "a.jsonl")
+    assert result["chains_skipped_timeout"] == 1 and result["moved"] == 5
+    assert len(result["skipped_timeout_tickers"]) == 1
+    moved_tickers = {json.loads(line)["ticker"] for line in (tmp_path / "a.jsonl").read_text().splitlines()}
+    assert moved_tickers.isdisjoint(result["skipped_timeout_tickers"])

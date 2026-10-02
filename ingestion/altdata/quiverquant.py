@@ -35,6 +35,8 @@ from ingestion.altdata.quiverquant_identity import (
     fiscal_quarter_end,
     parse_year_qtr,
     source_id_for,
+    transition_guard_blocks,
+    transition_marker_path,
 )
 from ingestion.base import BasePuller
 
@@ -207,6 +209,11 @@ def _gov_contract_period_date(rec: dict) -> date | None:
     late (the people-events PIT canary saw "2026 Q4" on 2026-09-11, before
     calendar Q4 began, and ``max(signal_date)`` was a future 2026-12-31).
 
+    The date is a stable key, not a "known at" time: QuiverQuant publishes the
+    aggregate while its quarter is still running and rewrites it in place on every
+    pull after the quarter ends too (``DO UPDATE SET signal_value``), so a stored
+    value was not known at ``signal_date``. Do not score it as known then.
+
     Parameters:
         rec: A raw QuiverQuant ``/live/govcontracts`` record.
 
@@ -350,6 +357,18 @@ def pull_endpoint(
     """Pull a single QuiverQuant endpoint."""
     if endpoint_key not in ENDPOINTS:
         return {"endpoint": endpoint_key, "status": "UNKNOWN", "rows": 0}
+
+    if transition_guard_blocks(endpoint_key):
+        # Fail-closed until the coordinator has run the re-key / re-date scripts and
+        # created the marker file: no API call (the API is paid) and no write. Returned
+        # as SKIPPED, never SUCCESS, so the scheduler neither counts it toward freshness
+        # nor feeds its failure backoff (it retries in 30 minutes).
+        reason = (
+            f"QuiverQuant {endpoint_key} held: transition marker {transition_marker_path()} not found "
+            "(create it after scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run)"
+        )
+        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        return {"endpoint": endpoint_key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0}
 
     cfg = ENDPOINTS[endpoint_key]
     api_key = _get_api_key()

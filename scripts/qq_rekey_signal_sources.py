@@ -29,6 +29,27 @@ other column, and never touches a row that is not a legacy row. The coordinator
 decides what to do with the reported conflicts (they are exact duplicates of a
 keyed row).
 
+Run order (important)
+---------------------
+Run this **before the next QuiverQuant pull**, never after one. A pull between the
+deploy and this script writes keyed rows next to the legacy rows (every one of them
+then a conflict this script can only skip, and a duplicate that trust_scorer,
+lever_pullers and the money-flow layer count twice). The writer therefore guards
+itself: until the transition marker file exists (``~/.grid/quiverquant_transition_done``
+or ``$GRID_QQ_TRANSITION_DONE_FILE``) the four act-keyed endpoints and gov_contracts
+return SKIPPED (a warning in the log, no API call, no write), including the overdue pull
+the scheduler fires on its first tick after a deploy restart. The procedure:
+
+1. deploy; confirm the scheduler records ``quiverquant`` as skipped (marker absent);
+2. dry run both transition scripts;
+3. apply both: this one first with ``--before <today - 45d>``, then without;
+4. ``mkdir -p ~/.grid && touch ~/.grid/quiverquant_transition_done`` to release the
+   writer. (Re-key and re-date counts are 0 conflicts as long as no pull got through.)
+
+``--apply`` and ``--revert`` refuse to run once the marker exists (``--no-guard-check``
+overrides, if QuiverQuant is paused another way). A non-zero ``conflicts_skipped``
+means a pull got through before the apply.
+
 Safety
 ------
 * Dry run by default: a read-only session (``default_transaction_read_only=on``),
@@ -36,30 +57,46 @@ Safety
 * Both the dry run and ``--apply`` refuse to start, and refuse to continue between
   batches, inside 03:30-10:30 UTC (nightly ``pg_dump`` window).
 * ``--apply`` requires ``--audit-log`` (a new file): one JSON line per move with
-  ``id``, ``old_source_id`` and ``new_source_id``. Each UPDATE re-checks that the
-  target key is still free, so a concurrent writer cannot make it collide.
-* ``--apply`` commits in batches (``--batch-size``); ``--max-moves`` stops early.
+  ``direction``, ``id``, ``old_source_id`` and ``new_source_id``. Each UPDATE
+  re-checks that the target key is still free, so a concurrent writer cannot make it
+  collide.
+* ``--apply`` commits in batches (``--batch-size``); ``--max-moves`` stops early. A
+  batch that hits the lock or statement timeout (a concurrent uncommitted write) is
+  rolled back, counted in the report (``batches_skipped_timeout``, with the skipped
+  row ids) and skipped; the run continues. Re-running picks those rows up.
+* ``--revert AUDIT_LOG`` undoes an apply from its audit log.
+
+Identity limits to know
+-----------------------
+The key is the whole identity, so an act whose identity changes between pulls gets a
+second key: House/Senate rows that gain or lose a ``BioGuideID`` (the key falls back to
+the member name), an amended Form 4 (shares or price restated) and a lobbying filing
+whose Amount is restated. The dry run counts the payloads at risk
+(``without_bioguide``, ``partial_identity_rows``); ``--probe-duplicates`` (read-only,
+run after pulls resume) counts House/Senate acts that now exist under two keys.
 
 Side effect to know before applying
 -----------------------------------
 ``intelligence/signal_extractor`` de-duplicates on the composite
 ``source_type:source_id:ticker`` + ``signal_date``. A re-keyed row inside the
 extractor's look-back (45 days, ``GRID_EXTRACTOR_LOOKBACK_DAYS``) is therefore
-extracted into ``signal_data`` once more under its new id. The report counts those
-rows (``in_extractor_window``); use ``--before`` to leave them out of a run.
-
-Revert (from the audit log)
----------------------------
-    UPDATE signal_sources SET source_id = :old
-     WHERE id = :id AND source_id = :new;
+extracted into ``signal_data`` once more under its new id; the writer change alone
+does the same for any act it re-writes under a keyed id. The report counts the
+re-keyed rows involved (``in_extractor_window``); ``--before`` leaves them out of a run.
 
 Usage (grid-svr; see the PR for the run procedure)
 --------------------------------------------------
     cd /data/grid_v4/grid_release
     set -a; . /home/grid/grid_v4/grid_repo/.env; set +a
-    /home/grid/grid_v4/venv/bin/python -m scripts.qq_rekey_signal_sources            # dry run
-    /home/grid/grid_v4/venv/bin/python -m scripts.qq_rekey_signal_sources --apply \\
-        --audit-log ~/research/qq_rekey_audit_YYYYMMDD.jsonl
+    PY=/home/grid/grid_v4/venv/bin/python
+    $PY -m scripts.qq_rekey_signal_sources                                    # dry run
+    $PY -m scripts.qq_rekey_signal_sources --apply --before <today-45d> \\
+        --audit-log ~/research/qq_rekey_audit_old.jsonl                       # older than 45 days
+    $PY -m scripts.qq_rekey_signal_sources --apply \\
+        --audit-log ~/research/qq_rekey_audit_rest.jsonl                      # the rest
+    $PY -m scripts.qq_rekey_signal_sources --probe-duplicates                 # after pulls resume
+    $PY -m scripts.qq_rekey_signal_sources --revert ~/research/qq_rekey_audit_old.jsonl \\
+        --audit-log ~/research/qq_rekey_revert.jsonl
 """
 
 from __future__ import annotations
@@ -76,12 +113,16 @@ from typing import Any, Iterable, Iterator
 
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+from sqlalchemy.exc import OperationalError
 
 from ingestion.altdata.quiverquant_identity import (
     IDENTITY_SEPARATOR,
     KEYED_SOURCE_TYPES,
     act_identity,
+    has_bioguide,
+    is_partial_identity,
     legacy_source_id,
+    member_loose_key,
     parse_payload,
     source_id_for,
 )
@@ -122,6 +163,8 @@ class RekeyPlan:
     min_date: date | None = None
     max_date: date | None = None
     date_counts: Counter = field(default_factory=Counter)
+    partial_identity: int = 0
+    without_bioguide: int = 0
 
 
 def as_date(value: Any) -> date | None:
@@ -192,6 +235,10 @@ def plan_rekey(
         if new_id is None or sdate is None:
             plan.skipped["no_identity_fields"] += 1
             continue
+        endpoint = KEYED_SOURCE_TYPES[source_type]
+        plan.partial_identity += is_partial_identity(endpoint, payload)
+        if endpoint in ("house_trading", "senate_trading") and not has_bioguide(payload):
+            plan.without_bioguide += 1
         move = Move(
             id=int(row["id"]), source_type=source_type, ticker=str(row["ticker"]),
             signal_date=sdate, signal_type=str(row["signal_type"]),
@@ -225,6 +272,11 @@ def summarize(plan: RekeyPlan, today: date) -> dict[str, Any]:
         "skipped": dict(plan.skipped),
         "in_extractor_window": in_window,
         "legacy_rows_by_age": age_buckets,
+        # identities with a missing field (a "?" part): still moved, but an act whose
+        # payload later gains the field gets a second key
+        "partial_identity_rows": plan.partial_identity,
+        "without_bioguide": plan.without_bioguide if plan.source_type in (
+            "quiverquant:house", "quiverquant:senate") else None,
         "legacy_date_range": [
             plan.min_date.isoformat() if plan.min_date else None,
             plan.max_date.isoformat() if plan.max_date else None,
@@ -302,35 +354,132 @@ def apply_moves(
     batch_size: int,
     audit_path: Path,
     max_moves: int | None = None,
-) -> dict[str, int]:
-    """Execute planned moves in committed batches, appending each to the audit log."""
+    direction: str = "forward",
+) -> dict[str, Any]:
+    """Execute planned moves in committed batches, appending each to the audit log.
+
+    A batch that hits ``lock_timeout`` / ``statement_timeout`` is rolled back whole,
+    reported and skipped; any other database error propagates.
+    """
     moved = 0
     lost_race = 0
+    timeout_batches = 0
+    skipped_ids: list[int] = []
     todo = moves if max_moves is None else moves[:max_moves]
     with audit_path.open("x", encoding="utf-8") as audit:
         for start in range(0, len(todo), batch_size):
             common.check_window()
             batch = todo[start:start + batch_size]
             done: list[Move] = []
-            with engine.begin() as conn:
-                for m in batch:
-                    res = conn.execute(_MOVE_SQL, {
-                        "id": m.id, "source_type": m.source_type, "old_id": m.old_source_id,
-                        "new_id": m.new_source_id, "ticker": m.ticker,
-                        "signal_date": m.signal_date, "signal_type": m.signal_type,
-                    })
-                    if res.rowcount == 1:
-                        done.append(m)
-                    else:
-                        lost_race += 1
+            raced = 0
+            try:
+                with engine.begin() as conn:
+                    for m in batch:
+                        res = conn.execute(_MOVE_SQL, {
+                            "id": m.id, "source_type": m.source_type, "old_id": m.old_source_id,
+                            "new_id": m.new_source_id, "ticker": m.ticker,
+                            "signal_date": m.signal_date, "signal_type": m.signal_type,
+                        })
+                        if res.rowcount == 1:
+                            done.append(m)
+                        else:
+                            raced += 1
+            except OperationalError as exc:
+                if not common.is_lock_or_timeout(exc):
+                    raise
+                timeout_batches += 1
+                skipped_ids.extend(m.id for m in batch)
+                continue
+            lost_race += raced
             for m in done:  # written after the batch committed: the log never claims a move that did not happen
                 audit.write(json.dumps({
-                    "id": m.id, "source_type": m.source_type,
+                    "direction": direction, "id": m.id, "source_type": m.source_type,
                     "old_source_id": m.old_source_id, "new_source_id": m.new_source_id,
                 }) + "\n")
             audit.flush()
             moved += len(done)
-    return {"moved": moved, "not_moved_target_taken_or_row_changed": lost_race}
+    return {
+        "moved": moved,
+        "not_moved_target_taken_or_row_changed": lost_race,
+        "batches_skipped_timeout": timeout_batches,
+        "skipped_timeout_rows": len(skipped_ids),
+        "skipped_timeout_ids": skipped_ids[:SAMPLE_LIMIT * 10],
+    }
+
+
+def read_audit(path: Path) -> list[dict[str, Any]]:
+    """Forward moves recorded by a previous ``--apply``."""
+    records = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        rec = json.loads(line)
+        if rec.get("direction", "forward") == "forward":
+            records.append(rec)
+    return records
+
+
+_REVERT_FETCH_SQL = text(
+    "SELECT ticker, signal_date, signal_type FROM signal_sources WHERE id = :id AND source_type = :source_type"
+)
+
+
+def revert_moves(engine: Engine, audit_in: Path, *, batch_size: int, audit_path: Path) -> dict[str, Any]:
+    """Undo an apply: each row goes back to its old source_id (if its key there is free)."""
+    reverse: list[Move] = []
+    with engine.connect() as conn:
+        for rec in read_audit(audit_in):
+            row = conn.execute(_REVERT_FETCH_SQL, {"id": int(rec["id"]), "source_type": rec["source_type"]}).fetchone()
+            sdate = as_date(row[1]) if row is not None else None
+            if row is None or sdate is None:
+                continue
+            reverse.append(Move(
+                id=int(rec["id"]), source_type=rec["source_type"], ticker=str(row[0]), signal_date=sdate,
+                signal_type=str(row[2]), old_source_id=rec["new_source_id"], new_source_id=rec["old_source_id"],
+            ))
+    return apply_moves(engine, reverse, batch_size=batch_size, audit_path=audit_path, direction="revert")
+
+
+_KEYED_ROWS_SQL = text(
+    """
+    SELECT id, source_id, ticker, signal_date, signal_type, signal_value
+      FROM signal_sources
+     WHERE source_type = :source_type AND source_id <> :legacy
+    """
+)
+
+
+def probe_duplicates(conn: Connection) -> dict[str, Any]:
+    """House/Senate acts stored under two keys because BioGuideID appeared or disappeared.
+
+    Groups keyed rows by (ticker, date, signal_type, name + Transaction + Range) and counts
+    groups holding more than one distinct ``source_id``. Read-only; counts and row ids only.
+    """
+    report: dict[str, Any] = {}
+    for st in ("quiverquant:house", "quiverquant:senate"):
+        endpoint = KEYED_SOURCE_TYPES[st]
+        legacy = legacy_source_id(endpoint)
+        groups: dict[tuple, dict[str, int]] = defaultdict(dict)
+        rows = 0
+        result = conn.execute(
+            _KEYED_ROWS_SQL, {"source_type": st, "legacy": legacy}, execution_options={"stream_results": True}
+        )
+        for row in result.mappings():
+            rows += 1
+            payload = parse_payload(row["signal_value"])
+            loose = member_loose_key(endpoint, payload)
+            sdate = as_date(row["signal_date"])
+            if loose is None or sdate is None:
+                continue
+            groups[(str(row["ticker"]), sdate, str(row["signal_type"]), loose)][str(row["source_id"])] = int(row["id"])
+        multi = [g for g in groups.values() if len(g) > 1]
+        report[st] = {
+            "keyed_rows": rows,
+            "acts_under_two_or_more_keys": len(multi),
+            "rows_involved": sum(len(g) for g in multi),
+            "sample_row_ids": [sorted(g.values()) for g in multi[:SAMPLE_LIMIT]],
+        }
+    return report
 
 
 def run(
@@ -387,12 +536,20 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     ap.add_argument("--max-moves", type=int, help="stop --apply after this many moves")
     ap.add_argument("--before", help="only re-key rows with signal_date before this ISO date")
+    ap.add_argument("--revert", type=Path, metavar="AUDIT_LOG", help="undo the moves recorded in an audit log")
+    ap.add_argument("--probe-duplicates", action="store_true",
+                    help="read-only: count House/Senate acts stored under two keys (run after pulls resume)")
+    ap.add_argument("--no-guard-check", action="store_true",
+                    help="allow --apply/--revert although the transition marker exists (QuiverQuant paused another way)")
     ap.add_argument("--db-url-env", help="env var holding the database URL (default: config.settings.DB_URL)")
     ap.add_argument("--out", type=Path, help="also write the JSON report here (must not exist)")
     args = ap.parse_args(argv)
 
-    if args.apply and not args.audit_log:
-        print("--apply requires --audit-log", file=sys.stderr)
+    if (args.apply or args.revert) and not args.audit_log:
+        print("--apply and --revert require --audit-log", file=sys.stderr)
+        return 2
+    if sum(bool(x) for x in (args.apply, args.revert, args.probe_duplicates)) > 1:
+        print("--apply, --revert and --probe-duplicates are exclusive", file=sys.stderr)
         return 2
     if args.audit_log and args.audit_log.exists():
         print(f"refusing to overwrite {args.audit_log}", file=sys.stderr)
@@ -406,20 +563,36 @@ def main(argv: list[str] | None = None) -> int:
         print(str(exc), file=sys.stderr)
         return 3
 
+    writing = bool(args.apply or args.revert)
+    if writing and not args.no_guard_check:
+        try:
+            common.require_guard_closed()
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            return 4
     engine = common.open_engine(
-        common.database_url(args.db_url_env), read_only=not args.apply,
+        common.database_url(args.db_url_env), read_only=not writing,
         application_name="qq_rekey_signal_sources",
     )
     try:
-        report = run(
-            engine,
-            source_types=args.source_type or sorted(KEYED_SOURCE_TYPES),
-            apply=args.apply,
-            audit_path=args.audit_log,
-            batch_size=args.batch_size,
-            max_moves=args.max_moves,
-            before=date.fromisoformat(args.before) if args.before else None,
-        )
+        if args.revert:
+            report = {"mode": "revert", "applied": revert_moves(
+                engine, args.revert, batch_size=args.batch_size, audit_path=args.audit_log)}
+        elif args.probe_duplicates:
+            with engine.connect() as conn:
+                if engine.dialect.name == "postgresql":
+                    common.assert_read_only(conn)
+                report = {"mode": "probe_duplicates", "result": probe_duplicates(conn)}
+        else:
+            report = run(
+                engine,
+                source_types=args.source_type or sorted(KEYED_SOURCE_TYPES),
+                apply=args.apply,
+                audit_path=args.audit_log,
+                batch_size=args.batch_size,
+                max_moves=args.max_moves,
+                before=date.fromisoformat(args.before) if args.before else None,
+            )
     except common.WindowClosed as exc:
         print(str(exc), file=sys.stderr)
         return 3

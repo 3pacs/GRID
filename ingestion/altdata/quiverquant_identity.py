@@ -29,10 +29,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import unicodedata
 from datetime import date
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Mapping
 
 # endpoint key (ingestion.altdata.quiverquant.ENDPOINTS) -> constant feed id.
@@ -68,17 +70,25 @@ _DIGEST_LEN = 12
 
 _UNKNOWN = "?"
 
+# Field-name fallbacks mirror the people-events adapters
+# (intelligence/people_events_pipeline/adapters.py: _QQ_OWNER, _QQ_MEMBER,
+# _QQ_TXN, _QQ_RANGE) so both read a payload the same way.
+_MEMBER_KEYS = (
+    "Representative", "Senator", "Name", "Politician", "Member",
+    "representative", "senator", "name", "politician", "member",
+)
 _NAME_KEYS = {
-    "insider_trading": ("Name", "name"),
-    "house_trading": ("Representative", "representative", "Name", "name"),
-    "senate_trading": ("Senator", "senator", "Name", "name"),
+    "insider_trading": ("Name", "Insider", "InsiderName", "Reporter", "Owner", "OwnerName", "name"),
+    "house_trading": _MEMBER_KEYS,
+    "senate_trading": _MEMBER_KEYS,
 }
 _BIOGUIDE_KEYS = ("BioGuideID", "BioguideID", "bioguide_id", "bioguide")
 _CODE_KEYS = ("TransactionCode", "transactionCode", "transaction_code", "Code")
 _SHARES_KEYS = ("Shares", "shares")
 _PRICE_KEYS = ("PricePerShare", "pricePerShare", "Price", "price")
 _TXN_KEYS = ("Transaction", "transaction", "Type", "TransactionType")
-_RANGE_KEYS = ("Range", "range", "amount_range")
+# A disclosure range; when the payload has none the adapters fall back to Amount.
+_RANGE_KEYS = ("Range", "range", "amount_range", "Amount", "amount")
 _REGISTRANT_KEYS = ("Registrant", "registrant")
 _CLIENT_KEYS = ("Client", "client")
 _AMOUNT_KEYS = ("Amount", "amount")
@@ -169,6 +179,33 @@ def _person(endpoint_key: str, rec: Mapping[str, Any]) -> str:
     return normalize_text(_first(rec, _NAME_KEYS[endpoint_key]))
 
 
+def identity_parts(endpoint_key: str, rec: Mapping[str, Any]) -> list[str] | None:
+    """The normalised fields an act's identity is made of, or ``None`` for an aggregate endpoint.
+
+    A part is ``"?"`` when the payload does not carry that field.
+    """
+    if endpoint_key not in KEYED_ENDPOINTS:
+        return None
+    if endpoint_key == "insider_trading":
+        return [
+            normalize_text(_first(rec, _NAME_KEYS[endpoint_key])),
+            normalize_code(_first(rec, _CODE_KEYS)),
+            normalize_number(_first(rec, _SHARES_KEYS)),
+            normalize_number(_first(rec, _PRICE_KEYS)),
+        ]
+    if endpoint_key in ("house_trading", "senate_trading"):
+        return [
+            _person(endpoint_key, rec),
+            normalize_code(_first(rec, _TXN_KEYS)),
+            normalize_range(_first(rec, _RANGE_KEYS)),
+        ]
+    return [  # lobbying
+        normalize_text(_first(rec, _REGISTRANT_KEYS)),
+        normalize_text(_first(rec, _CLIENT_KEYS)),
+        normalize_number(_first(rec, _AMOUNT_KEYS)),
+    ]
+
+
 def act_identity(endpoint_key: str, rec: Mapping[str, Any]) -> str | None:
     """The normalised identity of one act, or ``None`` for an aggregate endpoint.
 
@@ -180,6 +217,13 @@ def act_identity(endpoint_key: str, rec: Mapping[str, Any]) -> str | None:
       + Transaction + Range
     * ``lobbying``: Registrant + Client + Amount
 
+    Known limit: every part is part of the key, so an act whose part *changes*
+    between pulls gets a second key. That is how an amended Form 4 (different
+    shares or price), a lobbying filing whose Amount is restated, and a House or
+    Senate record that gains or loses its BioGuideID behave: the old row stays and
+    a new one appears. The re-key script's duplicate probe counts the
+    BioGuideID case.
+
     Parameters:
         endpoint_key: Key of ``quiverquant.ENDPOINTS``.
         rec: The raw QuiverQuant record, or the stored ``signal_value`` of one
@@ -189,28 +233,37 @@ def act_identity(endpoint_key: str, rec: Mapping[str, Any]) -> str | None:
         The identity string (not including the feed prefix), or ``None`` when
         the endpoint keeps the constant id.
     """
-    if endpoint_key not in KEYED_ENDPOINTS:
+    parts = identity_parts(endpoint_key, rec)
+    if parts is None:
         return None
-    if endpoint_key == "insider_trading":
-        parts = [
-            normalize_text(_first(rec, _NAME_KEYS[endpoint_key])),
-            normalize_code(_first(rec, _CODE_KEYS)),
-            normalize_number(_first(rec, _SHARES_KEYS)),
-            normalize_number(_first(rec, _PRICE_KEYS)),
-        ]
-    elif endpoint_key in ("house_trading", "senate_trading"):
-        parts = [
-            _person(endpoint_key, rec),
-            normalize_code(_first(rec, _TXN_KEYS)),
-            normalize_range(_first(rec, _RANGE_KEYS)),
-        ]
-    else:  # lobbying
-        parts = [
-            normalize_text(_first(rec, _REGISTRANT_KEYS)),
-            normalize_text(_first(rec, _CLIENT_KEYS)),
-            normalize_number(_first(rec, _AMOUNT_KEYS)),
-        ]
     return _bound(IDENTITY_SEPARATOR.join(parts))
+
+
+def has_bioguide(rec: Mapping[str, Any]) -> bool:
+    """True when a House/Senate payload carries a BioGuideID."""
+    return _first(rec, _BIOGUIDE_KEYS) is not None
+
+
+def is_partial_identity(endpoint_key: str, rec: Mapping[str, Any]) -> bool:
+    """True when at least one identity field is missing from the payload."""
+    parts = identity_parts(endpoint_key, rec)
+    return bool(parts) and any(part == _UNKNOWN for part in parts)
+
+
+def member_loose_key(endpoint_key: str, rec: Mapping[str, Any]) -> str | None:
+    """House/Senate identity that ignores BioGuideID (name + Transaction + Range).
+
+    Two stored rows on one ticker, date and side with the same loose key but
+    different ``source_id`` are one act that got two keys because BioGuideID
+    appeared or disappeared between pulls.
+    """
+    if endpoint_key not in ("house_trading", "senate_trading"):
+        return None
+    return IDENTITY_SEPARATOR.join([
+        normalize_text(_first(rec, _NAME_KEYS[endpoint_key])),
+        normalize_code(_first(rec, _TXN_KEYS)),
+        normalize_range(_first(rec, _RANGE_KEYS)),
+    ])
 
 
 def source_id_for(endpoint_key: str, rec: Mapping[str, Any]) -> str:
@@ -307,3 +360,43 @@ def calendar_quarter_end(year: int, qtr: int) -> date | None:
         return date(year, *month_day)
     except ValueError:
         return None
+
+
+# ── transition guard ───────────────────────────────────────────────────────
+
+MARKER_FILE_ENV = "GRID_QQ_TRANSITION_DONE_FILE"
+DEFAULT_MARKER_FILE = "~/.grid/quiverquant_transition_done"
+GUARD_OFF_ENV = "GRID_QQ_TRANSITION_GUARD"  # set to "off" to disable the guard outright
+
+# Endpoints whose stored rows the transition scripts touch: a pull of any of them
+# before the scripts have run writes keyed duplicates next to legacy rows (the four
+# act-keyed feeds) or overwrites a calendar-dated row with the next quarter's payload
+# (gov_contracts). The aggregate endpoints are unaffected and keep pulling.
+TRANSITION_GUARDED_ENDPOINTS: frozenset[str] = KEYED_ENDPOINTS | {"gov_contracts"}
+
+
+def transition_marker_path() -> Path:
+    """Where the "transition applied" marker file lives (env-overridable)."""
+    return Path(os.environ.get(MARKER_FILE_ENV) or DEFAULT_MARKER_FILE).expanduser()
+
+
+def transition_marker_exists() -> bool:
+    try:
+        return transition_marker_path().exists()
+    except OSError:
+        return False
+
+
+def transition_guard_blocks(endpoint_key: str) -> bool:
+    """True when the writer must refuse to pull ``endpoint_key``.
+
+    Fail-closed: the guarded endpoints do not pull until the coordinator creates the
+    marker file after running ``scripts/qq_rekey_signal_sources.py`` and
+    ``scripts/qq_gov_contracts_redate.py`` (or decides to skip them). The guard exists
+    because the scheduler rebuilds its state from ``pull_log`` on restart and fires an
+    overdue pull on the first tick after a deploy. Remove the guard in a follow-up once
+    the transition is done.
+    """
+    if os.environ.get(GUARD_OFF_ENV, "").strip().lower() == "off":
+        return False
+    return endpoint_key in TRANSITION_GUARDED_ENDPOINTS and not transition_marker_exists()
