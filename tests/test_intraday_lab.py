@@ -139,3 +139,31 @@ def test_appending_future_input_cannot_change_features():
 def test_reject_duplicate_decisions():
     with pytest.raises(ValueError, match="duplicate"):
         evaluate([packet(), packet()])
+
+
+def test_paired_baseline_and_cost_sensitivity_on_identical_timestamps():
+    packets = []
+    for day in range(5, 10):
+        offset = (day - 5) * 10000
+        p = packet()
+        p["provenance"] = "prospective"  # fixture exercises the admitted-packet contract
+        p["session"] = f"2026-10-{day:02}"
+        p["decision_at"] += offset
+        for r in p["observations"]:
+            r["event_at"] += offset
+            r["available_at"] += offset
+        p["observations"] += [row(1200 + offset, "ES_BOOK", bid=5000, ask=5000.25, bid_size=900, ask_size=100),
+                              row(1200 + offset, "SPYU", bid=49.9, ask=50.1, bid_size=100, ask_size=100)]
+        packets.append(p)
+        for t in range(1205, 1261, 5):
+            q = forward(t + offset, 100 + t / 10000, 50., 50.2)
+            q["session"] = p["session"]
+            packets.append(q)
+    report = evaluate(packets)
+    result = next(r for r in report["results"] if r["feature"] == "es_depth" and r["seconds"] == 60 and r["split"] == "holdout")
+    assert result["active"] == result["economic_observations"] == 1
+    assert result["paired_excess_bps"] == 0  # same long decision as momentum baseline
+    assert result["mean_spyu_net_bps"] < 0
+    scenarios = result["extra_cost_sensitivities"]
+    assert scenarios["10"]["mean_net_bps"] == pytest.approx(scenarios["0"]["mean_net_bps"] - 10)
+    assert result["paired_excess_lower"] is None  # can't infer significance from one session
