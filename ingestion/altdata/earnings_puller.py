@@ -16,14 +16,16 @@ Schedule: daily pull via hermes operator.
 
 from __future__ import annotations
 
-import math
 import logging
+import math
 import time
 from datetime import date
+from types import SimpleNamespace
 from typing import Any
 
 import pandas as pd
 from loguru import logger as log
+from sqlalchemy import exc as sa_exc
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, log_pull_failure, retry_on_failure
@@ -59,6 +61,32 @@ _RATE_LIMIT_DELAY = 0.5
 
 # Beat/miss threshold for flagging
 _SIGNIFICANT_SURPRISE_PCT = 10.0
+
+# Bound modified rows across all earnings fields, not upstream observations.
+STORE_BATCH_ROWS = 50
+MAX_CONSECUTIVE_CONNECTION_FAILURES = 2
+
+
+class EarningsStoreAborted(RuntimeError):
+    """Database unavailable; ``stored`` counts committed rows in this batch."""
+
+    def __init__(self, message: str, stored: int = 0, failed: int = 0, errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.stored = stored
+        self.failed = failed
+        self.errors = errors or []
+
+
+class _ConnectionFailure(Exception):
+    """A transaction could not open, or its connection became unusable."""
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    # Match the fail-closed unusual_whales writer: operational errors also
+    # include timeouts/deadlocks, which are safe reasons to stop this pull.
+    return isinstance(exc, (sa_exc.OperationalError, sa_exc.DisconnectionError, sa_exc.TimeoutError)) or bool(
+        getattr(exc, "connection_invalidated", False)
+    )
 
 
 def _safe_float(val: Any) -> float | None:
@@ -144,78 +172,42 @@ class EarningsPuller(BasePuller):
             raise RuntimeError(f"yfinance unavailable: {_YFINANCE_IMPORT_ERROR}")
         return yf.Ticker(ticker)
 
-    def _store_series_point(
+    def _collect_series_point(
         self,
-        conn: Any,
+        points: list[dict[str, Any]],
         ticker: str,
         field: str,
         obs_date: date,
         value: float,
         raw_payload: dict[str, Any] | None = None,
-    ) -> bool:
-        """Store a single earnings data point in raw_series.
-
-        Uses dedup via _get_existing_dates for efficiency. The INSERT is
-        wrapped in a SAVEPOINT so a constraint violation or other row-
-        level failure only rolls back the savepoint — the surrounding
-        per-ticker transaction stays healthy. Without this, one bad row
-        would poison the rest of the ticker with
-        ``psycopg2.errors.InFailedSqlTransaction``.
-
-        Returns:
-            True if inserted, False if the savepoint rolled back.
-        """
-        series_id = f"earnings:{ticker}:{field}"
-        sp = conn.begin_nested()
-        try:
-            self._insert_raw(
-                conn=conn,
-                series_id=series_id,
-                obs_date=obs_date,
-                value=value,
-                raw_payload=raw_payload,
-            )
-            sp.commit()
-            return True
-        except Exception as exc:
-            sp.rollback()
-            log.debug(
-                "earnings insert savepoint rollback {sid} @ {d}: {e}",
-                sid=series_id, d=obs_date, e=str(exc),
-            )
-            return False
+    ) -> None:
+        """Collect one point in memory; database writes happen after fetching."""
+        points.append({
+            "series_id": f"earnings:{ticker}:{field}",
+            "obs_date": obs_date,
+            "value": value,
+            "raw_payload": raw_payload,
+        })
 
     def _process_earnings_dates(
         self,
-        conn: Any,
         ticker: str,
         stock: yf.Ticker,
-    ) -> int:
+    ) -> list[dict[str, Any]]:
         """Process .earnings_dates — EPS estimates, actuals, surprise.
 
-        Returns number of rows inserted.
+        Returns points to store, without opening a database transaction.
         """
-        inserted = 0
+        points: list[dict[str, Any]] = []
 
         try:
             earnings_dates = stock.earnings_dates
         except Exception as exc:
             log.debug("No earnings_dates for {t}: {e}", t=ticker, e=str(exc))
-            return 0
+            return points
 
         if earnings_dates is None or earnings_dates.empty:
-            return 0
-
-        # Pre-fetch existing dates for dedup
-        existing_eps_actual = self._get_existing_dates(
-            f"earnings:{ticker}:eps_actual", conn
-        )
-        existing_eps_estimate = self._get_existing_dates(
-            f"earnings:{ticker}:eps_estimate", conn
-        )
-        existing_surprise = self._get_existing_dates(
-            f"earnings:{ticker}:surprise_pct", conn
-        )
+            return points
 
         for idx, row in earnings_dates.iterrows():
             try:
@@ -237,31 +229,27 @@ class EarningsPuller(BasePuller):
                     "classification": classify_beat_miss(surprise_raw),
                 }
 
-                if eps_est is not None and obs not in existing_eps_estimate:
-                    self._store_series_point(
-                        conn, ticker, "eps_estimate", obs, eps_est, payload
+                if eps_est is not None:
+                    self._collect_series_point(
+                        points, ticker, "eps_estimate", obs, eps_est, payload
                     )
-                    inserted += 1
 
-                if eps_act is not None and obs not in existing_eps_actual:
-                    self._store_series_point(
-                        conn, ticker, "eps_actual", obs, eps_act, payload
+                if eps_act is not None:
+                    self._collect_series_point(
+                        points, ticker, "eps_actual", obs, eps_act, payload
                     )
-                    inserted += 1
 
-                if surprise_raw is not None and obs not in existing_surprise:
-                    self._store_series_point(
-                        conn, ticker, "surprise_pct", obs, round(surprise_raw, 4), payload
+                if surprise_raw is not None:
+                    self._collect_series_point(
+                        points, ticker, "surprise_pct", obs, round(surprise_raw, 4), payload
                     )
-                    inserted += 1
 
                     # Flag significant beats/misses with a dedicated series
                     if abs(surprise_raw) > _SIGNIFICANT_SURPRISE_PCT:
                         beat_val = 1.0 if surprise_raw > 0 else -1.0
-                        self._store_series_point(
-                            conn, ticker, "beat_flag", obs, beat_val, payload
+                        self._collect_series_point(
+                            points, ticker, "beat_flag", obs, beat_val, payload
                         )
-                        inserted += 1
 
             except Exception as row_exc:
                 log.debug(
@@ -269,32 +257,27 @@ class EarningsPuller(BasePuller):
                     t=ticker, d=idx, e=str(row_exc),
                 )
 
-        return inserted
+        return points
 
     def _process_quarterly_earnings(
         self,
-        conn: Any,
         ticker: str,
         stock: yf.Ticker,
-    ) -> int:
+    ) -> list[dict[str, Any]]:
         """Process .quarterly_earnings — historical quarterly EPS data.
 
-        Returns number of rows inserted.
+        Returns points to store, without opening a database transaction.
         """
-        inserted = 0
+        points: list[dict[str, Any]] = []
 
         try:
             qe = stock.quarterly_earnings
         except Exception as exc:
             log.debug("No quarterly_earnings for {t}: {e}", t=ticker, e=str(exc))
-            return 0
+            return points
 
         if qe is None or (isinstance(qe, pd.DataFrame) and qe.empty):
-            return 0
-
-        existing_revenue = self._get_existing_dates(
-            f"earnings:{ticker}:revenue_actual", conn
-        )
+            return points
 
         for idx, row in qe.iterrows():
             try:
@@ -319,19 +302,17 @@ class EarningsPuller(BasePuller):
                     "earnings": earnings,
                 }
 
-                if revenue is not None and obs not in existing_revenue:
-                    self._store_series_point(
-                        conn, ticker, "revenue_actual", obs, revenue, payload
+                if revenue is not None:
+                    self._collect_series_point(
+                        points, ticker, "revenue_actual", obs, revenue, payload
                     )
-                    inserted += 1
 
                 if earnings is not None:
                     # earnings from quarterly_earnings may overlap with eps_actual
                     # Store under quarterly_earnings field to avoid collision
-                    self._store_series_point(
-                        conn, ticker, "quarterly_earnings", obs, earnings, payload
+                    self._collect_series_point(
+                        points, ticker, "quarterly_earnings", obs, earnings, payload
                     )
-                    inserted += 1
 
             except Exception as row_exc:
                 log.debug(
@@ -339,32 +320,27 @@ class EarningsPuller(BasePuller):
                     t=ticker, d=idx, e=str(row_exc),
                 )
 
-        return inserted
+        return points
 
     def _process_earnings_history(
         self,
-        conn: Any,
         ticker: str,
         stock: yf.Ticker,
-    ) -> int:
+    ) -> list[dict[str, Any]]:
         """Process .earnings_history — historical EPS with surprise data.
 
-        Returns number of rows inserted.
+        Returns points to store, without opening a database transaction.
         """
-        inserted = 0
+        points: list[dict[str, Any]] = []
 
         try:
             eh = stock.earnings_history
         except Exception as exc:
             log.debug("No earnings_history for {t}: {e}", t=ticker, e=str(exc))
-            return 0
+            return points
 
         if eh is None or (isinstance(eh, pd.DataFrame) and eh.empty):
-            return 0
-
-        existing_hist = self._get_existing_dates(
-            f"earnings:{ticker}:history_surprise_pct", conn
-        )
+            return points
 
         for idx, row in eh.iterrows():
             try:
@@ -395,12 +371,11 @@ class EarningsPuller(BasePuller):
                     "classification": classify_beat_miss(surprise),
                 }
 
-                if surprise is not None and obs not in existing_hist:
-                    self._store_series_point(
-                        conn, ticker, "history_surprise_pct", obs,
+                if surprise is not None:
+                    self._collect_series_point(
+                        points, ticker, "history_surprise_pct", obs,
                         round(surprise, 4), payload,
                     )
-                    inserted += 1
 
             except Exception as row_exc:
                 log.debug(
@@ -408,7 +383,90 @@ class EarningsPuller(BasePuller):
                     t=ticker, e=str(row_exc),
                 )
 
-        return inserted
+        return points
+
+    def _write(self, fn) -> None:
+        """Commit one short transaction; distinguish unavailable connections."""
+        opened = False
+        try:
+            with self.engine.begin() as conn:
+                opened = True
+                fn(conn)
+        except Exception as exc:
+            if not opened or _is_connection_error(exc):
+                raise _ConnectionFailure(exc) from exc
+            raise
+
+    def _store_points(self, conn: Any, points: list[dict[str, Any]]) -> int:
+        """Insert at most 50 points, deduping successful observations only."""
+        dates: dict[str, set[date]] = {}
+        for point in points:
+            dates.setdefault(point["series_id"], set()).add(point["obs_date"])
+        existing = {
+            sid: self._get_existing_dates(sid, conn, start_date=min(days), end_date=max(days))
+            for sid, days in dates.items()
+        }
+        stored = 0
+        for point in points:
+            days = existing[point["series_id"]]
+            if point["obs_date"] in days:
+                continue
+            self._insert_raw(conn=conn, **point)
+            days.add(point["obs_date"])
+            stored += 1
+        return stored
+
+    @staticmethod
+    def _note_connection_failure(
+        streak: dict[str, int], exc: BaseException | None, stored: int,
+        failed: int = 0, errors: list[str] | None = None,
+    ) -> None:
+        streak["connection_failures"] += 1
+        if streak["connection_failures"] >= MAX_CONSECUTIVE_CONNECTION_FAILURES:
+            raise EarningsStoreAborted(f"database unavailable: {exc}", stored=stored, failed=failed, errors=errors) from exc
+
+    def _store_batch(
+        self, ticker: str, batch: list[dict[str, Any]], streak: dict[str, int],
+    ) -> tuple[int, int, list[str]]:
+        """Rollback a failed batch, then retry each point in its own transaction."""
+        if len(batch) > STORE_BATCH_ROWS:
+            raise ValueError(f"earnings batch exceeds {STORE_BATCH_ROWS} rows")
+        counter = {"stored": 0}
+
+        def store_all(conn: Any) -> None:
+            counter["stored"] = self._store_points(conn, batch)
+
+        try:
+            self._write(store_all)
+            streak["connection_failures"] = 0
+            return counter["stored"], 0, []
+        except _ConnectionFailure as exc:
+            self._note_connection_failure(streak, exc.__cause__, stored=0)
+        except Exception as exc:
+            log.warning("Earnings: {t} batch failed; retrying one row per transaction: {e}", t=ticker, e=str(exc))
+
+        stored = failed = 0
+        errors: list[str] = []
+        for point in batch:
+            def store_one(conn: Any, point: dict[str, Any] = point) -> None:
+                counter["stored"] = self._store_points(conn, [point])
+
+            try:
+                self._write(store_one)
+                streak["connection_failures"] = 0
+                stored += counter["stored"]
+            except _ConnectionFailure as exc:
+                failed += 1
+                errors.append(f"{point['series_id']} @ {point['obs_date']}: connection failure")
+                self._note_connection_failure(streak, exc.__cause__, stored=stored, failed=failed, errors=errors)
+            except Exception as exc:
+                # An answered data error proves the database is reachable.
+                streak["connection_failures"] = 0
+                failed += 1
+                message = f"{point['series_id']} @ {point['obs_date']}: {str(exc)[:200]}"
+                errors.append(message)
+                log.warning("Earnings row failed: {e}", e=message)
+        return stored, failed, errors
 
     def pull_ticker(self, ticker: str) -> dict[str, Any]:
         """Pull all earnings data for a single ticker.
@@ -425,6 +483,7 @@ class EarningsPuller(BasePuller):
         result: dict[str, Any] = {
             "ticker": ticker,
             "rows_inserted": 0,
+            "rows_failed": 0,
             "status": "SUCCESS",
             "errors": [],
             "significant_surprises": [],
@@ -433,38 +492,49 @@ class EarningsPuller(BasePuller):
         try:
             stock = self._fetch_ticker_data(ticker)
 
-            with self.engine.begin() as conn:
-                # Each phase runs inside a SAVEPOINT so a poisoned
-                # statement in one phase doesn't cascade into
-                # InFailedSqlTransaction errors on the next phase.
-                for label, phase_fn in (
-                    ("earnings_dates", self._process_earnings_dates),
-                    ("quarterly_earnings", self._process_quarterly_earnings),
-                    ("earnings_history", self._process_earnings_history),
-                ):
-                    sp = conn.begin_nested()
-                    try:
-                        n = phase_fn(conn, ticker, stock)
-                        sp.commit()
-                        result["rows_inserted"] += n
-                    except Exception as phase_exc:
-                        sp.rollback()
-                        # Phase failures are upstream/data-shape issues
-                        # for individual tickers; demote to WARNING so
-                        # one bad ticker doesn't drown errors.jsonl.
-                        log.warning(
-                            "earnings phase {p} failed for {t}: {e}",
-                            p=label, t=ticker, e=str(phase_exc),
-                        )
-                        result["errors"].append(f"{label}: {phase_exc}")
+            # yfinance properties can each make network calls. Fetch them
+            # once, before opening any transaction, including the reporting
+            # input so surprise detection never re-fetches after writes.
+            snapshot = SimpleNamespace()
+            points: list[dict[str, Any]] = []
+            for label, phase_fn in (
+                ("earnings_dates", self._process_earnings_dates),
+                ("quarterly_earnings", self._process_quarterly_earnings),
+                ("earnings_history", self._process_earnings_history),
+            ):
+                try:
+                    setattr(snapshot, label, getattr(stock, label))
+                    points.extend(phase_fn(ticker, snapshot))
+                except Exception as phase_exc:
+                    setattr(snapshot, label, None)
+                    log.warning("earnings phase {p} failed for {t}: {e}", p=label, t=ticker, e=str(phase_exc))
+                    result["errors"].append(f"{label}: {phase_exc}")
 
-            # Detect significant surprises for reporting
             result["significant_surprises"] = self._detect_significant_surprises(
-                ticker, stock
+                ticker, snapshot
             )
 
-            if result["rows_inserted"] == 0:
+            streak = {"connection_failures": 0}
+            for start in range(0, len(points), STORE_BATCH_ROWS):
+                try:
+                    stored, failed, errors = self._store_batch(ticker, points[start:start + STORE_BATCH_ROWS], streak)
+                except EarningsStoreAborted as exc:
+                    result["rows_inserted"] += exc.stored
+                    result["rows_failed"] += exc.failed
+                    result["errors"].extend(exc.errors)
+                    result["status"] = "PARTIAL" if result["rows_inserted"] else "FAILED"
+                    result["aborted"] = True
+                    result["errors"].append(str(exc))
+                    return result
+                result["rows_inserted"] += stored
+                result["rows_failed"] += failed
+                result["errors"].extend(errors)
+
+            if result["rows_failed"] and not result["rows_inserted"]:
+                result["status"] = "FAILED"
+            elif result["errors"] or result["rows_inserted"] == 0:
                 result["status"] = "PARTIAL"
+            if not points and not result["errors"]:
                 result["errors"].append("No earnings data available")
 
         except Exception as exc:
@@ -473,7 +543,7 @@ class EarningsPuller(BasePuller):
             # Genuine code bugs (KeyError, AttributeError, ImportError)
             # still escalate to ERROR via log_pull_failure.
             log_pull_failure("Earnings", ticker, exc)
-            result["status"] = "FAILED"
+            result["status"] = "PARTIAL" if result["rows_inserted"] else "FAILED"
             result["errors"].append(str(exc))
 
         return result
@@ -545,6 +615,10 @@ class EarningsPuller(BasePuller):
         for i, ticker in enumerate(ticker_list):
             res = self.pull_ticker(ticker)
             results.append(res)
+
+            if res.get("aborted"):
+                log.warning("Earnings scan stopped: database unavailable at {t}", t=ticker)
+                break
 
             if res["significant_surprises"]:
                 all_significant.extend(res["significant_surprises"])

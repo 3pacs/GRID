@@ -31,7 +31,7 @@ from typing import Any
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.engine.url import make_url
 
@@ -453,3 +453,102 @@ def test_unusual_whales_commits_each_batch_on_its_own(pg_engine, monkeypatch) ->
         running += written
         assert seen_now == running, visible
     assert puller.pull_ticker("SPY")["rows_inserted"] == 0  # same day: deduped, not rewritten
+
+
+# ── earnings: short transactions after the 2026-10-02 lock incident ──
+
+
+def _earnings_stock(n):
+    from types import SimpleNamespace
+    import pandas as pd
+
+    return SimpleNamespace(
+        earnings_dates=pd.DataFrame({
+            'EPS Estimate': [1.0] * n, 'Reported EPS': [1.05] * n, 'Surprise(%)': [5.0] * n,
+        }, index=pd.date_range('2025-01-01', periods=n)),
+        quarterly_earnings=pd.DataFrame(),
+        earnings_history=pd.DataFrame(),
+    )
+
+
+def _earnings_transaction_sizes(engine):
+    counts = {'inserts': 0}
+    sizes = []
+
+    def begin(conn):
+        counts['inserts'] = 0
+
+    def statement(conn, cursor, sql, parameters, context, executemany):
+        if sql.lstrip().upper().startswith('INSERT INTO RAW_SERIES'):
+            counts['inserts'] += 1
+
+    def finish(conn):
+        sizes.append(counts['inserts'])
+
+    event.listen(engine, 'begin', begin)
+    event.listen(engine, 'before_cursor_execute', statement)
+    event.listen(engine, 'commit', finish)
+    event.listen(engine, 'rollback', finish)
+    return sizes
+
+
+def test_earnings_commits_short_batches_with_provenance_and_append_only(pg_engine, monkeypatch):
+    from ingestion.altdata import earnings_puller as ep
+
+    puller = ep.EarningsPuller(pg_engine)
+    stock = _earnings_stock(45)
+    monkeypatch.setattr(puller, '_fetch_ticker_data', lambda ticker: stock)
+    sizes = _earnings_transaction_sizes(pg_engine)
+    visible = []
+    real_store = puller._store_batch
+
+    def store(ticker, batch, streak):
+        out = real_store(ticker, batch, streak)
+        with pg_engine.connect() as conn:
+            visible.append(conn.execute(text(
+                "SELECT count(*) FROM raw_series WHERE series_id LIKE 'earnings:AAPL:%'"
+            )).scalar_one())
+        return out
+
+    monkeypatch.setattr(puller, '_store_batch', store)
+    before = datetime.now(timezone.utc)
+    out = puller.pull_ticker('AAPL')
+    after = datetime.now(timezone.utc)
+    assert out['status'] == 'SUCCESS' and out['rows_inserted'] == 135
+    assert visible == [50, 100, 135]  # separate connection witnesses each commit
+    rows = _rows(pg_engine, 'earnings:AAPL:')
+    assert len(rows) == 135
+    assert all(r.pull_status == 'SUCCESS' and r.name == 'yfinance_earnings' for r in rows)
+    assert all(before <= r.pull_timestamp <= after for r in rows)
+    with pg_engine.connect() as conn:
+        assert conn.execute(text(
+            "SELECT count(*) FROM raw_series WHERE series_id LIKE 'earnings:AAPL:%' "
+            "AND raw_payload->>'source' = 'earnings_dates' AND raw_payload->>'classification' = 'beat'"
+        )).scalar_one() == 135
+    original = list(rows)
+    stock.earnings_dates['Reported EPS'] = 100.0
+    assert puller.pull_ticker('AAPL')['rows_inserted'] == 0
+    assert _rows(pg_engine, 'earnings:AAPL:') == original
+    assert max(sizes) <= ep.STORE_BATCH_ROWS
+
+
+def test_earnings_middle_row_constraint_failure_keeps_the_other_rows(pg_engine, monkeypatch):
+    from ingestion.altdata import earnings_puller as ep
+
+    # Synthetic constraint in this test's disposable schema, never production.
+    with pg_engine.begin() as conn:
+        conn.execute(text(
+            "ALTER TABLE raw_series ADD CONSTRAINT earnings_bad_middle_row "
+            "CHECK (obs_date <> DATE '2025-01-08' OR split_part(series_id, ':', 3) <> 'eps_actual')"
+        ))
+    puller = ep.EarningsPuller(pg_engine)
+    monkeypatch.setattr(puller, '_fetch_ticker_data', lambda ticker: _earnings_stock(45))
+    sizes = _earnings_transaction_sizes(pg_engine)
+    out = puller.pull_ticker('AAPL')
+    assert out['status'] == 'PARTIAL' and out['rows_inserted'] == 134
+    assert out['rows_failed'] == 1 and out['errors']
+    rows = _rows(pg_engine, 'earnings:AAPL:')
+    assert len(rows) == 134
+    assert any(r.obs_date == date(2025, 2, 14) and r.series_id.endswith(':eps_actual') for r in rows)
+    assert all(r.pull_status == 'SUCCESS' and r.name == 'yfinance_earnings' for r in rows)
+    assert max(sizes) <= ep.STORE_BATCH_ROWS
