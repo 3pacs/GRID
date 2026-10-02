@@ -113,7 +113,12 @@ class _ConnectionFailure(Exception):
 
 
 def _is_connection_error(exc: BaseException) -> bool:
-    """True for errors that mean the database is unusable, not that one row is bad."""
+    """True for errors that mean the database is unusable, not that one row is bad.
+
+    psycopg2 also raises OperationalError for statement/lock timeouts and
+    deadlocks; two of those in a row stop the scan too, which errs on the safe
+    side for a puller that can simply run again next tick.
+    """
     if isinstance(exc, (sa_exc.OperationalError, sa_exc.DisconnectionError, sa_exc.TimeoutError)):
         return True
     return bool(getattr(exc, "connection_invalidated", False))
@@ -523,6 +528,7 @@ class UnusualWhalesPuller(BasePuller):
             except Exception as exc:
                 failed += 1
                 errors.append(str(exc)[:200])
+                streak["connection_failures"] = 0  # the database answered: a data error
                 log.warning(
                     "Whale: row insert failed — "
                     "date={d} ticker={t} strike={s} exp={e} dir={dir}: {err}",
@@ -667,6 +673,8 @@ class UnusualWhalesPuller(BasePuller):
                 # CONFLICT DO NOTHING), including ones whose raw row exists.
                 self._emit_batch(ticker, batch, today)
         except WhaleStoreAborted as exc:
+            # Rows in exc.stored got no signal_sources row in this run; a
+            # same-day rerun emits them (see the comment above).
             inserted += exc.stored
             if not inserted:
                 raise
@@ -704,7 +712,9 @@ class UnusualWhalesPuller(BasePuller):
     ) -> list[dict[str, Any]]:
         """Scan all watchlist tickers for unusual options activity.
 
-        Never stops on a single-ticker failure -- logs and continues.
+        A single-ticker failure is logged and the scan continues, except
+        when the database is unusable (WhaleStoreAborted, or a ticker result
+        marked ``aborted``): then the scan stops.
 
         Parameters:
             tickers: Override watchlist (default: WATCHLIST).
