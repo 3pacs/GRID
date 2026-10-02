@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, time, timezone
-from typing import Any
+from typing import Any, Callable
 
 import pandas as pd
 from sqlalchemy import column, insert, table, text
@@ -190,7 +190,8 @@ def _finish_run(conn: Connection, run_id: str, counts: dict[str, int], error: st
 
 
 def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *, run_id: str, mode: str,
-                     observed_at: datetime, inputs: dict[str, Any] | None = None) -> dict[str, Any]:
+                     observed_at: datetime, inputs: dict[str, Any] | None = None,
+                     before_transaction: Callable[[], None] | None = None) -> dict[str, Any]:
     """Apply ``plan`` (from ``plan.build_write_plan``) for the resolved ``events``. Returns counts + status.
 
     ``observed_at`` must be the moment the inputs finished loading (never in
@@ -211,14 +212,17 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
         raise RuntimeError("another people_events writer holds the lock")
     try:
         return _apply_locked(engine, by_key, counts, plan, run_id=run_id, mode=mode, observed_at=observed_at,
-                             inputs=inputs)
+                             inputs=inputs, before_transaction=before_transaction)
     finally:
         lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
         lock_conn.close()
 
 
 def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd.DataFrame, *, run_id: str,
-                  mode: str, observed_at: datetime, inputs: dict[str, Any] | None) -> dict[str, Any]:
+                  mode: str, observed_at: datetime, inputs: dict[str, Any] | None,
+                  before_transaction: Callable[[], None] | None = None) -> dict[str, Any]:
+    if before_transaction:
+        before_transaction()
     with engine.begin() as conn:
         _start_run(conn, run_id, mode, inputs or {})
     ops = plan.to_dict("records")
@@ -227,6 +231,8 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
         for start in range(0, len(ops), CHUNK_ROWS):
             chunk = ops[start:start + CHUNK_ROWS]
             pending = dict(counts)
+            if before_transaction:
+                before_transaction()
             with engine.begin() as conn:
                 inserts = []
                 for p in chunk:
@@ -272,9 +278,13 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
                     conn.execute(insert(_TABLE), inserts)
             counts = pending  # only after the chunk committed
     except Exception as exc:
+        if before_transaction:
+            before_transaction()
         with engine.begin() as conn:
             _finish_run(conn, run_id, counts, error=f"{type(exc).__name__}: {exc}"[:2000])
         raise
+    if before_transaction:
+        before_transaction()
     with engine.begin() as conn:
         status = _finish_run(conn, run_id, counts)
     return {"run_id": run_id, "status": status, "counts": counts}

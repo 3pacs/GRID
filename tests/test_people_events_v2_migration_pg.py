@@ -386,3 +386,34 @@ def test_read_event_versions_omits_current_only_counts_and_rejects_naive_time(v2
     assert "attrs" in rows[0]
     with pytest.raises(ValueError):
         read_event_versions(v2, datetime(2026, 9, 30))
+
+
+def test_gd3_progress_digest_matches_real_postgres_audit_and_all_table_growth(v2, tmp_path):
+    from intelligence.people_events_pipeline.writer import apply_write_plan
+    from scripts import people_events_backfill as B
+    from scripts import people_events_backfill_safety as G
+
+    prefix = "gd3-20261002T180000Z"
+    observed = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    events, plan = _plan(v2, observed, form345=[_sec()])
+    before = B._scalar(v2, B._SIZE_SQL)
+    guards = []
+    result = apply_write_plan(v2, events, plan, run_id=prefix + "-b00000", mode="backfill",
+        observed_at=observed, inputs={"form345_sha256": "0" * 64, "batch": 0},
+        before_transaction=lambda: guards.append(1))
+    assert result["counts"]["insert"] == 1 and len(guards) == 3
+    after = B._scalar(v2, B._SIZE_SQL)
+    with v2.connect() as conn:
+        relation_sizes = [conn.execute(text("SELECT pg_total_relation_size(:name)"),
+                                      {"name": name}).scalar()
+                          for name in ("people_events", "people_event_revisions", "people_events_runs")]
+        assert conn.execute(text("SELECT count(*) FROM people_event_revisions")).scalar() == 0
+    assert after == sum(relation_sizes) and after > before
+    path = tmp_path / G.PROGRESS_NAME
+    G.append_progress(path, {"run_id": prefix + "-b00000", "status": "SUCCESS", "batch_rows": 1,
+                             "rows_written": 1})
+    batches, rows, digest = G.read_progress(path, prefix)
+    audit = B._run_audit(v2, prefix, "0" * 64)
+    G.validate_resume(batches=batches, rows=rows, progress_digest=digest, database=audit,
+                      stored_rows=1, plan_counts={"unchanged": 1}, total_rows=1)
+    assert B._run_audit(v2, prefix, "wrong-source-hash")["invalid"] == 1
