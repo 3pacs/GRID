@@ -1,6 +1,6 @@
 # offshore_leaks match quality: why it is held, and a proposed minimum rule
 
-**Status:** `offshore_leaks` is held in `ingestion/smart_scheduler.PULLER_REGISTRY` (`hold_reason`) until the owner approves a match rule. The rule below is a proposal, not implemented.
+**Status:** `offshore_leaks` is held in `ingestion/smart_scheduler.PULLER_REGISTRY` (`hold_reason`) until the owner approves a match rule. Every automated path honours the hold: SmartScheduler, the Hermes operator and fixers, and grid-scheduler (`ingestion/scheduler.py`, through `smart_scheduler.hold_reason_for`). The rule below is a proposal, not implemented.
 
 ## Facts (2026-10-02)
 
@@ -32,6 +32,6 @@ Never accept a single-token key, i.e. a bare surname or one word.
 
 For institutional actors (corporations, funds, banks, governments), require (1) only. Alternatively, require a curated ICIJ node id.
 
-On the numbers above, this keeps **≤ 185** matches, about 0.3% of today's output, instead of 71,903. The exact subset is 42. Each would still be a *candidate* link for review, not a signal.
+On the numbers above, this keeps **about 185–227** matches, about 0.3% of today's output, instead of 71,903. The range is fuzzy because an exact match on a one-word name may fall outside the 185. The exact subset is 42. Each would still be a *candidate* link for review, not a signal.
 
-**Before un-holding:** implement the rule in `_build_known_names_index` and `_match_officer_to_actor`, and add tests with real false-positive shapes. Re-run the read-only count. Then decide whether the result belongs in `raw_series` at all, or in an actor-link table with review status. The `signal_sources` emission ("offshore = SELL") also needs its own decision; it is inactive today (wrong column).
+**Before un-holding:** implement the rule in `_build_known_names_index` and `_match_officer_to_actor`, and add tests with real false-positive shapes. The same loose matcher has a second consumer that needs the same rule: `intelligence/actor_discovery._cross_reference_icij_with_known_actors` (around line 3063), reached through `run_scale_discovery` → `import_icij_offshore`. The daily cycle does not reach it today. Re-run the read-only count. Then decide whether the result belongs in `raw_series` at all, or in an actor-link table with review status. The `signal_sources` emission ("offshore = SELL") also needs its own decision; it is inactive today (wrong column).
