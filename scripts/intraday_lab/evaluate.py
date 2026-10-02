@@ -6,6 +6,7 @@ contracts and a witnessed forward registry. No database or production imports.
 from __future__ import annotations
 
 from collections import defaultdict
+from bisect import bisect_right
 import hashlib
 import json
 from pathlib import Path
@@ -122,7 +123,8 @@ def evaluate(packets, include_holdout=False):
                               "Short pressure is evaluated directionally; SPYU strategy is long/cash.",
                               "Actual SPYU bid/ask required for economic scoring."]}
     # Features only see each packet's admitted history; outcomes are in a separate pass.
-    features = [compute(p) for p in packets]
+    features = {}
+    timestamps = [p["decision_at"] for p in packets]
     for seconds in HORIZONS:
         cases = []
         next_start = {}
@@ -135,10 +137,13 @@ def evaluate(packets, include_holdout=False):
                 continue
             if p["decision_at"] < next_start.get(p["session"], 0):
                 continue
-            y = outcome(p, packets[i + 1:], seconds)
+            stop = bisect_right(timestamps, p["decision_at"] + seconds + 5)
+            y = outcome(p, packets[i + 1:stop], seconds)
             if y is None:
                 continue
             next_start[p["session"]] = y["exit_at"] + 1
+            if i not in features:
+                features[i] = compute(p)
             cases.append((p, features[i]["features"], y))
         for name in FEATURES:
             for split in ("discovery", "validation", "holdout"):

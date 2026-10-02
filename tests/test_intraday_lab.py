@@ -1,6 +1,10 @@
 """Research integrity controls; synthetic outcomes cannot establish an edge."""
 from copy import deepcopy
 import math
+import json
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -192,3 +196,14 @@ def test_inventory_cannot_admit_anik_clock_or_rtd_exchange_time():
     assert p["observations"][0]["available_at"] == 1790956810
     assert p["observations"][0]["event_at"] is None
     assert p["observations"][0]["status"] == "unavailable"
+
+
+def test_cli_publishes_json_safe_input_rejection(tmp_path):
+    source, output = tmp_path / "bad.jsonl", tmp_path / "receipt.json"
+    source.write_text('{"decision_at": NaN, "session": "fixture"}\n', encoding="utf-8")
+    subprocess.run([sys.executable, "-m", "scripts.intraday_lab", str(source), "--output", str(output)],
+                   cwd=Path(__file__).resolve().parents[1], check=True, capture_output=True)
+    receipt = json.loads(output.read_text(encoding="utf-8"))
+    assert receipt["status"] == "INPUT_REJECTED"
+    assert len(receipt["input_sha256"]) == 64
+    assert "NaN" not in output.read_text(encoding="utf-8")
