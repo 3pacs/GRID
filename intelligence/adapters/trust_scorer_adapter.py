@@ -10,6 +10,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import feed_source_id_sql
 from intelligence.adapters.base import BaseAdapter, clamp, now_utc, sid
 from intelligence.signal_registry import RegisteredSignal, SignalType
 
@@ -75,11 +76,12 @@ class TrustScorerAdapter(BaseAdapter):
     def _source_trust(self, engine: Engine, now: datetime, vu: datetime) -> list[RegisteredSignal]:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_type, source_id, AVG(trust_score) AS trust,
+                SELECT source_type, {feed_id} AS source_id, AVG(trust_score) AS trust,
                        SUM(hit_count) AS hits, SUM(miss_count) AS misses, COUNT(*) AS total
                 FROM signal_sources WHERE outcome IN ('CORRECT','WRONG','PENDING')
-                GROUP BY source_type, source_id HAVING COUNT(*) >= :min
-            """), {"min": _MIN_TOTAL_SIGNALS}).fetchall()
+                GROUP BY source_type, {feed_id} HAVING COUNT(*) >= :min
+            """.replace("{feed_id}", feed_source_id_sql("source_id"))),
+                {"min": _MIN_TOTAL_SIGNALS}).fetchall()
         signals: list[RegisteredSignal] = []
         for src_type, src_id, trust, hits, misses, total in rows:
             tf = clamp(float(trust or 0.5))

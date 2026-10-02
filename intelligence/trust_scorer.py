@@ -33,6 +33,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import feed_source_id, feed_source_id_sql
+
 
 # ── Constants ──────────────────────────────────────────────────────────────
 
@@ -940,7 +942,10 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
         rows_by_source: dict[tuple[str, str], list[tuple[Any, Any, Any, Any]]] = {}
         source_keys: list[tuple[str, str]] = []
         for src_type, src_id, outcome, ret, sig_date, ticker in scored_rows:
-            key = (src_type, src_id)
+            # QuiverQuant act rows (qq_<endpoint>:<identity>) are scored as one
+            # feed, exactly as when they shared a constant source_id; trust per
+            # single act would be one outcome with a prior.
+            key = (src_type, feed_source_id(src_id))
             if key not in rows_by_source:
                 rows_by_source[key] = []
                 source_keys.append(key)
@@ -1035,15 +1040,21 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
                 "last_signal_date": str(last_signal_date) if last_signal_date else "",
             })
 
-            # Propagate aggregates to all rows for this source
+            # Propagate aggregates to all rows for this source. A QuiverQuant
+            # feed id also covers its act-keyed rows (``<feed id>:<identity>``).
             conn.execute(text("""
                 UPDATE signal_sources
                 SET trust_score = :ts,
                     hit_count = :hc,
                     miss_count = :mc,
                     avg_lead_time_hours = :alt
-                WHERE source_type = :st AND source_id = :si
+                WHERE source_type = :st
+                  AND (source_id = :si
+                       OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
+                           AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
             """), {
+                "keyed_prefix": f"{src_id}:" if src_id.startswith("qq_") else None,
+                "keyed_len": len(src_id) + 1,
                 "ts": round(trust, 4),
                 "hc": raw_hits,
                 "mc": raw_misses,
@@ -1198,19 +1209,20 @@ def get_trusted_sources(
 
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT source_type, source_id,
+            SELECT source_type, {feed_id} AS source_id,
                    trust_score, hit_count, miss_count,
                    avg_lead_time_hours,
                    MAX(signal_date) AS last_signal,
                    COUNT(*) AS total_signals
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
-            GROUP BY source_type, source_id, trust_score, hit_count,
+            GROUP BY source_type, {feed_id}, trust_score, hit_count,
                      miss_count, avg_lead_time_hours
             HAVING (hit_count + miss_count) >= :min_sig
                AND trust_score >= :min_trust
             ORDER BY trust_score DESC
-        """), {"min_sig": min_signals, "min_trust": min_trust}).fetchall()
+        """.replace("{feed_id}", feed_source_id_sql("source_id"))),
+            {"min_sig": min_signals, "min_trust": min_trust}).fetchall()
 
     results: list[SourceScore] = []
     for rank, r in enumerate(rows, 1):

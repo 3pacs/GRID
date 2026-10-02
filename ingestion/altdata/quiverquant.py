@@ -12,6 +12,11 @@ Pulls all available endpoints from QuiverQuant API (Trader plan $75/mo):
   - Political Beta (party correlation)
 
 All data stored in signal_sources with source_type='quiverquant:{endpoint}'.
+
+source_id identifies the act, not the feed: insider / house / senate / lobbying
+rows are keyed ``qq_<endpoint>:<identity>`` (see ``quiverquant_identity``) so
+that two acts on the same ticker and date no longer overwrite each other; the
+aggregate endpoints keep the constant ``qq_<endpoint>``.
 """
 
 from __future__ import annotations
@@ -26,6 +31,11 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import (
+    fiscal_quarter_end,
+    parse_year_qtr,
+    source_id_for,
+)
 from ingestion.base import BasePuller
 
 _BASE_URL = "https://api.quiverquant.com/beta"
@@ -188,48 +198,37 @@ def _insider_signal_type(rec: dict[str, Any]) -> str:
     return "insider_buy" if "buy" in txn or "purchase" in txn else "insider_sell"
 
 
-# Calendar-quarter end dates. gov_contracts records carry a fiscal (Year,
-# Qtr) pair for a quarterly aggregate, not a per-event date, so this maps
-# the quarter to a stable marker for that period rather than to "today".
-_QUARTER_END_MONTH_DAY: dict[int, tuple[int, int]] = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-
-
 def _gov_contract_period_date(rec: dict) -> date | None:
     """Resolve a stable period-end date for a gov_contracts quarterly record.
+
+    QuiverQuant's ``(Year, Qtr)`` is the US *federal fiscal* quarter: FY Y Q1
+    is Oct-Dec of Y-1, Q2 Jan-Mar Y, Q3 Apr-Jun Y, Q4 Jul-Sep Y. GD-FIX (#694)
+    read it as a calendar quarter, which dated every aggregate one quarter too
+    late (the people-events PIT canary saw "2026 Q4" on 2026-09-11, before
+    calendar Q4 began, and ``max(signal_date)`` was a future 2026-12-31).
 
     Parameters:
         rec: A raw QuiverQuant ``/live/govcontracts`` record.
 
     Returns:
-        The quarter-end date for the record's (Year, Qtr), or ``None`` when
-        those fields aren't present/parseable.
+        The fiscal-quarter end date for the record's (Year, Qtr), or ``None``
+        when those fields aren't present/parseable.
     """
-    year = rec.get("Year") or rec.get("year")
-    qtr = rec.get("Qtr") or rec.get("qtr") or rec.get("Quarter") or rec.get("quarter")
-    try:
-        year = int(year)
-        qtr = int(qtr)
-    except (TypeError, ValueError):
+    year_qtr = parse_year_qtr(rec)
+    if year_qtr is None:
         return None
-    month_day = _QUARTER_END_MONTH_DAY.get(qtr)
-    if month_day is None:
-        return None
-    month, day = month_day
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
+    return fiscal_quarter_end(*year_qtr)
 
 
 def _resolve_signal_date(rec: dict, endpoint_key: str, today: date) -> date:
     """Resolve the signal_date to store for one QuiverQuant record.
 
     GD-FIX: gov_contracts records have no per-event date — only a (Year,
-    Qtr) pair describing the aggregate's fiscal quarter — so the old
+    Qtr) pair describing the aggregate's federal fiscal quarter — so the old
     fallback of ``signal_date = today`` meant the same ~821 quarterly rows
     were re-inserted under a new date every single daily pull (the plan's
     evidence: the row count multiplying about 30x/month). Anchoring
-    signal_date to the quarter's own end date instead means a re-pull of
+    signal_date to the fiscal quarter's own end date instead means a re-pull of
     unchanged data hits the same (source_type, source_id, ticker,
     signal_date, signal_type) key and updates in place via the existing
     ON CONFLICT clause, rather than inserting a new row.
@@ -266,7 +265,14 @@ def _store_signals(
     source_type: str,
     endpoint_key: str,
 ) -> int:
-    """Store QuiverQuant records into signal_sources table."""
+    """Store QuiverQuant records into signal_sources table.
+
+    ``source_id`` is built from the act's identity (``source_id_for``), so two
+    acts that share a ticker and a date land in two rows instead of the second
+    overwriting the first. Records that still share a full key (an identical
+    act reported twice, or acts QuiverQuant gives us no field to tell apart)
+    upsert onto one row, and the count is logged so the residue is visible.
+    """
     if not records:
         return 0
 
@@ -274,6 +280,8 @@ def _store_signals(
 
     rows_inserted = 0
     today = date.today()
+    seen_keys: set[tuple[str, str, date, str]] = set()
+    key_repeats = 0
 
     with engine.begin() as conn:
         for rec in records:
@@ -299,6 +307,12 @@ def _store_signals(
             elif endpoint_key == "insider_trading":
                 signal_type = _insider_signal_type(rec)
 
+            source_id = source_id_for(endpoint_key, rec)
+            key = (source_id, ticker.upper(), signal_date, signal_type)
+            if key in seen_keys:
+                key_repeats += 1
+            seen_keys.add(key)
+
             try:
                 conn.execute(text("""
                     INSERT INTO signal_sources
@@ -309,7 +323,7 @@ def _store_signals(
                     DO UPDATE SET signal_value = EXCLUDED.signal_value
                 """), {
                     "source_type": source_type,
-                    "source_id": f"qq_{endpoint_key}",
+                    "source_id": source_id,
                     "signal_type": signal_type,
                     "ticker": ticker.upper(),
                     "signal_date": signal_date,
@@ -318,6 +332,13 @@ def _store_signals(
                 rows_inserted += 1
             except Exception as exc:
                 log.debug("QuiverQuant insert skip for {}: {}", ticker, exc)
+
+    if key_repeats:
+        log.info(
+            "QuiverQuant {}: {} of {} records repeat a full signal_sources key "
+            "(same act twice, or indistinguishable acts) and were upserted onto one row",
+            endpoint_key, key_repeats, len(records),
+        )
 
     return rows_inserted
 
