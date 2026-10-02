@@ -7,7 +7,7 @@ Takes the artifact written by ``scripts/build_security_master_all_issuers.py``
 * **Dry run is the default.** Without ``--db-url`` it only counts the artifact. With ``--db-url`` it also
   reads the current ``security_master`` / ``security_identifiers`` keys in a read-only transaction and
   reports exactly what an apply would insert and what it would skip. It writes nothing to any database.
-* ``--apply`` writes, and needs ``--db-url`` (or ``config.settings.DB_URL`` from the environment).
+* ``--apply`` writes, and needs ``--db-url`` / ``--db-url-env NAME`` (or ``config.settings.DB_URL`` from the environment).
 * **No database connection is opened between 03:30 and 10:30 UTC** (the nightly ``pg_dump`` window),
   for a dry run or an apply. A long apply re-checks before every batch and stops cleanly if the
   window starts, leaving a partial but consistent state (every batch is its own transaction and the
@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -356,6 +357,8 @@ def run(args: argparse.Namespace, *, now: Optional[Callable[[], datetime]] = Non
         "writes_to_database": False,
     }
     db_url = args.db_url
+    if getattr(args, "db_url_env", None):
+        db_url = os.environ[args.db_url_env]  # keeps the URL out of argv and shell history
     if args.apply and not db_url:
         from config import settings
 
@@ -409,6 +412,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--seed-dir", type=Path, required=True, help="directory holding security_master_seed.jsonl + receipt.json")
     ap.add_argument("--apply", action="store_true", help="write (default: dry run). Needs --db-url or the settings DB_URL")
     ap.add_argument("--db-url", help="SQLAlchemy URL. Without --apply it is only read, in a read-only transaction")
+    ap.add_argument("--db-url-env", help="name of an environment variable holding the SQLAlchemy URL (instead of --db-url)")
     ap.add_argument("--expect-output-sha256", help="refuse unless the artifact has this sha256 (from receipt.json)")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
     ap.add_argument("--statement-timeout-ms", type=int, default=DEFAULT_STATEMENT_TIMEOUT_MS)

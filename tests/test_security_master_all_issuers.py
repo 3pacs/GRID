@@ -589,6 +589,17 @@ def test_apply_refuses_inside_the_backup_window_before_connecting(tmp_path):
                    engine_factory=lambda _u: pytest.fail("connected inside the window"))
 
 
+def test_db_url_env_is_read_from_the_environment_not_argv(tmp_path, monkeypatch):
+    art, _ = _written_artifact(tmp_path)
+    monkeypatch.setenv("SM_TEST_URL", "postgresql://u:secret@dbhost:5432/griddb")
+    monkeypatch.setattr(loader, "read_existing", lambda *_a, **_k: (loader.Existing(), {"security_master": 7, "security_identifiers": 9}))
+    seen = []
+    rec = loader.run(_args(art, db_url_env="SM_TEST_URL"), now=lambda: _utc(12), engine_factory=lambda url: seen.append(url) or _FakeEngine())
+    assert seen == ["postgresql://u:secret@dbhost:5432/griddb"]
+    assert rec["status"] == "dry_run_complete" and rec["before_counts"] == {"security_master": 7, "security_identifiers": 9}
+    assert "secret" not in json.dumps(rec)
+
+
 def test_apply_requires_the_receipt_and_a_matching_hash(tmp_path):
     art, _ = _written_artifact(tmp_path)
     with pytest.raises(ValueError, match="--expect-output-sha256"):
