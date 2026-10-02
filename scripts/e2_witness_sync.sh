@@ -20,8 +20,10 @@
 #      the folder is checked and committed;
 #   3. refuses (commits nothing, pushes nothing) unless every change in the folder
 #      is an append: no deletion or rename, only *.anchors.jsonl and .gitattributes,
-#      every *.jsonl ends with a newline, and every tracked one still starts with
-#      its committed bytes;
+#      every *.jsonl ends with a newline, every tracked one still starts with
+#      its committed bytes, and every one is a byte-prefix of the scoreboard
+#      ledger's own anchor file of the same name (so a blank or foreign line
+#      can never reach the witness);
 #   4. under the clone's sync lock, keeps 05-GRID/Paper-Log/e2/.gitattributes at
 #      "*.jsonl -text" and commits ONLY that folder (git commit -- <folder>);
 #   5. releases the locks and runs obsidian-vault-sync.sh on the clone (integrate
@@ -31,7 +33,8 @@
 #      origin/main afterwards: a push that never lands must not be silent.
 #
 # Environment overrides (tests): E2_VAULT_SYNC (sync script), E2_SCOREBOARD_LOCK,
-# E2_PAPERLOG_CLONE, E2_WITNESS_LOCK_WAIT_S.
+# E2_PAPERLOG_CLONE, E2_BOARD_DIR, E2_WITNESS_LOCK_WAIT_S.
+# An exit-4 refusal repeats on every run until a human repairs the folder.
 # Exit codes: 0 ok / nothing to do; 2 unsafe clone or missing tool; 3 changes
 # outside the folder; 4 the folder is not a pure append; 5 not pushed.
 set -euo pipefail
@@ -41,6 +44,7 @@ FOLDER="05-GRID/Paper-Log/e2"
 SYNC="${E2_VAULT_SYNC:-/home/grid/bin/obsidian-vault-sync.sh}"
 SCOREBOARD_LOCK="${E2_SCOREBOARD_LOCK:-/tmp/grid-e2-scoreboard.lock}"
 PAPERLOG="${E2_PAPERLOG_CLONE:-/home/grid/dev/obsidian-vault-paperlog}"
+BOARD_DIR="${E2_BOARD_DIR:-/data/grid/evals/e2_scoreboard}"
 LOCK_WAIT_S="${E2_WITNESS_LOCK_WAIT_S:-30}"
 
 say() { echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] e2-witness: $*"; }
@@ -54,7 +58,7 @@ alert() {
   fi
 }
 
-for tool in git flock cmp; do
+for tool in git flock cmp stat; do
   command -v "$tool" >/dev/null 2>&1 || { say "refusing: $tool is not installed"; exit 2; }
 done
 
@@ -92,6 +96,8 @@ while IFS= read -r -d '' entry; do
     *.anchors.jsonl)
       if [ -s "$path" ] && [ "$(tail -c 1 "$path" | od -An -tx1 | tr -d ' \n')" != "0a" ]; then
         problems="$problems partial-last-line:$name"
+      elif [ ! -f "$BOARD_DIR/$name" ] || ! cmp -s -n "$(stat -c%s "$path")" "$path" "$BOARD_DIR/$name"; then
+        problems="$problems not-in-the-ledger-anchors:$name"
       elif git cat-file -e "HEAD:$path" 2>/dev/null; then
         committed="$(git cat-file -s "HEAD:$path")"
         if ! git show "HEAD:$path" | cmp -s -n "$committed" - "$path"; then
@@ -115,9 +121,9 @@ fi
     if [ "$(cat "$FOLDER/.gitattributes" 2>/dev/null || true)" != "*.jsonl -text" ]; then
       printf '%s\n' "*.jsonl -text" > "$FOLDER/.gitattributes"
     fi
-    git add -- "$FOLDER"
+    git -c gc.auto=0 add -- "$FOLDER"
     if ! git diff --cached --quiet -- "$FOLDER"; then
-      git commit -q -m "e2 scoreboard: witness anchors $(date -u +%Y-%m-%dT%H:%M:%SZ)" -- "$FOLDER"
+      git -c gc.auto=0 commit -q -m "e2 scoreboard: witness anchors $(date -u +%Y-%m-%dT%H:%M:%SZ)" -- "$FOLDER"
       say "committed $(git rev-parse --short HEAD) ($FOLDER only)"
     else
       say "no new anchor lines"

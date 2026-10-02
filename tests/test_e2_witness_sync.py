@@ -110,6 +110,8 @@ class Witness:
                                               b"git push -q origin main\n")
         self.dead_sync = self._stub("dead-sync.sh", b"exit 0\n")
         self.lock = tmp_path / "scoreboard.lock"
+        self.board = tmp_path / "board"
+        self.board.mkdir()
         self.paperlog = tmp_path / "obsidian-vault-paperlog"
 
     def _stub(self, name: str, body: bytes) -> Path:
@@ -120,13 +122,16 @@ class Witness:
 
     def run(self, path: Path | None = None, sync: Path | None = None) -> subprocess.CompletedProcess:
         env = {**os.environ, "E2_VAULT_SYNC": str(sync or self.good_sync), "E2_WITNESS_LOCK_WAIT_S": "2",
-               "E2_SCOREBOARD_LOCK": str(self.lock), "E2_PAPERLOG_CLONE": str(self.paperlog)}
+               "E2_SCOREBOARD_LOCK": str(self.lock), "E2_PAPERLOG_CLONE": str(self.paperlog),
+               "E2_BOARD_DIR": str(self.board)}
         return subprocess.run(["bash", str(SCRIPT), str(path or self.clone)], env=env, capture_output=True,
                               text=True)
 
-    def write(self, data: bytes) -> None:
+    def write(self, data: bytes, ledger: bytes | None = None) -> None:
+        """The vault copy, and the ledger's own anchor file (by default the same bytes)."""
         (self.clone / FOLDER).mkdir(parents=True, exist_ok=True)
         (self.clone / ANCHORS).write_bytes(data)
+        (self.board / Path(ANCHORS).name).write_bytes(data if ledger is None else ledger)
 
     def origin_head(self) -> str:
         return _git(self.origin, "rev-parse", "main")
@@ -161,7 +166,8 @@ def test_commits_and_pushes_only_the_e2_folder_and_check_offhost_accepts_it(w):
     assert offhost["content"] == LINE1 + LINE2
 
 
-@pytest.mark.parametrize("case", ["partial_line", "edited", "deleted", "unexpected_file"])
+@pytest.mark.parametrize("case", ["partial_line", "edited", "deleted", "unexpected_file", "blank_line",
+                                  "foreign_line"])
 def test_refuses_anything_but_a_pure_append(w, case):
     w.write(LINE1)
     assert w.run().returncode == 0
@@ -172,9 +178,13 @@ def test_refuses_anything_but_a_pure_append(w, case):
         w.write(LINE2 + LINE1)
     elif case == "deleted":
         (w.clone / ANCHORS).unlink()
-    else:
+    elif case == "unexpected_file":
         w.write(LINE1 + LINE2)
         (w.clone / FOLDER / "notes.md").write_text("x\n", encoding="utf-8")
+    elif case == "blank_line":
+        w.write(LINE1 + b"\n", ledger=LINE1 + LINE2)
+    else:
+        w.write(LINE1 + b'{"junk":1}\n', ledger=LINE1 + LINE2)
     result = w.run()
     assert result.returncode == 4, result.stdout + result.stderr
     assert "not a pure append" in result.stdout
@@ -235,3 +245,11 @@ def test_a_push_that_never_lands_fails_loudly(w):
     w.write(LINE1)
     result = w.run(sync=w.dead_sync)
     assert result.returncode == 5 and "not on origin/main" in result.stdout
+
+
+@pytest.mark.unit
+def test_stop_timeout_covers_both_lock_waits_and_the_push():
+    lines = _joined((SYSTEMD / "grid-e2-scoreboard.service.template").read_text(encoding="utf-8"))
+    value = _value(lines, "TimeoutStopSec")
+    assert value is not None and value.endswith("min") and int(value[:-3]) >= 5
+    assert 'LOCK_WAIT_S="${E2_WITNESS_LOCK_WAIT_S:-30}"' in SCRIPT.read_text(encoding="utf-8")
