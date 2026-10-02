@@ -416,6 +416,9 @@ twice a day it reads the S10 forward log and the GEX-levels v1 paper log
 read-only, appends predictions, point-in-time resolutions, scores and a
 snapshot to its own append-only, hash-chained ledger in
 `/data/grid/evals/e2_scoreboard/`, and appends the ledger's anchor lines to
-the vault witness file `05-GRID/Paper-Log/e2/`. No database connection, no
+the vault witness file `05-GRID/Paper-Log/e2/` in its own clone
+`/home/grid/dev/obsidian-vault-e2witness` (never the GEX mirror's
+`obsidian-vault-paperlog`), which `scripts/e2_witness_sync.sh` commits and
+pushes after each run. No database connection, no
 orders. Templates only; installing them is an owner step (see the service
 template header and `evals/e2/README.md`).
