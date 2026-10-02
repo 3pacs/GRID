@@ -23,6 +23,9 @@ from evals.e0 import machinery, replication
 from evals.e0.replication import PricePanel, ReplicationGuardError
 from evals.e0.structure import PACKAGE as E0_PACKAGE
 
+#: Hard ceiling, independent of config: E0 v2 never reads a date on or after 2007-11-01.
+MAX_CUTOFF = date(2007, 11, 1)
+
 
 def _sha256(path) -> str:
     h = hashlib.sha256()
@@ -36,6 +39,8 @@ def load_prices(config: Mapping) -> PricePanel:
     """The pinned v1 replication panel cut at ``cutoff_exclusive`` (only earlier dates are returned)."""
     spec = config["replication"]
     cutoff = date.fromisoformat(spec["cutoff_exclusive"])
+    if cutoff > MAX_CUTOFF:  # refused before the panel file is opened
+        raise ReplicationGuardError(f"replication cutoff {cutoff} is after {MAX_CUTOFF}: E0 v2 reads no later date")
     path = E0_PACKAGE / spec["file"]
     sha = _sha256(path)
     if sha != spec["file_sha256"]:

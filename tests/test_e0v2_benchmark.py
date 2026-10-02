@@ -233,12 +233,16 @@ def test_replication_refuses_a_changed_panel():
         replication.load_prices(cfg)
 
 
-def test_replication_refuses_a_late_cutoff():
+def test_replication_refuses_a_late_cutoff_before_opening_the_panel(monkeypatch):
+    def refuse(*_a, **_k):
+        raise AssertionError("the replication panel was opened")
+
+    monkeypatch.setattr(replication.np, "load", refuse)
     cfg = json.loads(json.dumps(_config()))
-    cfg["replication"]["cutoff_exclusive"] = "2012-01-01"  # the panel's own last date is 2010-12-30
-    panel = replication.load_prices(cfg)  # still guarded by v1's check_guards at that cutoff
-    assert panel.dates[-1] < date(2012, 1, 1)
-    assert _config()["replication"]["cutoff_exclusive"] == "2007-11-01"
+    cfg["replication"]["cutoff_exclusive"] = "2007-11-02"
+    with pytest.raises(PermissionError, match="after 2007-11-01"):
+        replication.load_prices(cfg)
+    assert replication.MAX_CUTOFF == CUTOFF and _config()["replication"]["cutoff_exclusive"] == "2007-11-01"
 
 
 def test_v8_crosscheck_section_is_information_only():
@@ -247,4 +251,22 @@ def test_v8_crosscheck_section_is_information_only():
         "factor_t_garch_calibrated_exposed_030": {"power": 0.49}})
     assert section["status"].startswith("information, not a gate")
     assert section["reproduction_of_v8_registered_v1_rows"]["factor_t_garch_exposed"]["matches"] is True
-    assert section["headline_below_gate"] is True
+    assert section["headline_below_gate_on_414_date_proxy"] is True
+
+
+def test_v8_rule_power_is_v8s_e0_power():
+    """The cross-check loop is bit-identical to VS1 v8's own e0_power on the committed geometry."""
+    from analysis import panel_insider_density_v8 as v8
+
+    config = _config()
+    structure = load_structure(config)
+    name = "factor_t_garch_exposed"
+    features = {t: ts.feature for t, ts in structure.trials.items()}
+    theirs = v8.e0_power(features, structure.n_sessions, name, sims=6, perms=99)
+    scale = benchmark.scale_for(structure, config, name, config["scenarios"][name], [TARGET_IC],
+                                config["planted"]["pilot_sims"])[structure.primary_trial]["scales"]["0.01"]
+    ours = benchmark.v8_rule_power(structure, name, config["scenarios"][name], scale=scale, sims=6, perms=99,
+                                   base_seed=config["seeds"]["base"], alpha=v8.CONFIRMATORY_ALPHA_ONE_SIDED)
+    assert ours["plant_scale"] == theirs["plant_scale"]
+    assert ours["power"] == theirs["power"] and ours["realized_mean_ic"] == theirs["realized_mean_ic"]
+    assert ours["usable_dates"] == theirs["usable_dates"] == 414

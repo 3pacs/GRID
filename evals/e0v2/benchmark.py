@@ -194,6 +194,7 @@ def run(profile: str = "full", *, replicate: bool = True, crosscheck: bool | Non
             "power_ic_0.01_holm": scorer.power_at(head, 0.01, "power_holm_run_alpha"),
             "power_ic_0.02_holm": scorer.power_at(head, 0.02, "power_holm_run_alpha"),
             "power_ic_0.01_raw_threshold": scorer.power_at(head, 0.01, "power_raw_threshold"),
+            "power_ic_0.02_raw_threshold": scorer.power_at(head, 0.02, "power_raw_threshold"),
             "power_ic_0.01_bh": scorer.power_at(head, 0.01, "power_bh"),
             "power_ic_0.02_bh": scorer.power_at(head, 0.02, "power_bh"),
             "empirical_fdr_bh_all": head["fdr"]["all_simulations"]["fdr_bh"]["rate"],
@@ -254,7 +255,9 @@ def _crosscheck_section(config: Mapping, cross: Mapping[str, dict]) -> dict:
         "reproduction_of_v8_registered_v1_rows": repro,
         "headline_scenario": head,
         "headline_power": head_power,
-        "headline_below_gate": None if head_power is None else head_power < spec["gate"],
+        # On the 414-date v7 geometry: a conservative proxy for v8's selected 603-date 2008 design
+        # (under every v1 model the 603-date geometry has the higher power).
+        "headline_below_gate_on_414_date_proxy": None if head_power is None else head_power < spec["gate"],
         "source": spec["source"],
     }
 
