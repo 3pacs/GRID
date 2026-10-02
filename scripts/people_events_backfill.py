@@ -36,7 +36,7 @@ import hashlib
 import json
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +57,10 @@ DEFAULT_CODES = ("P", "S", "A")
 # estimate (0.8-1.0 KB/row) with margin. Outside this band the run stops.
 BYTES_PER_ROW_BAND = (300.0, 2000.0)
 GROWTH_CHECK_MIN_ROWS = 100_000
+# The load + merge of the full parquet takes ~30 min before the first write;
+# execute refuses to start unless this much time remains before 03:30Z.
+MIN_MINUTES_BEFORE_WINDOW = 60
+VERIFY_STATEMENT_TIMEOUT_MS = 600_000
 
 _SIZE_SQL = "SELECT pg_total_relation_size('people_events') AS bytes"
 _COUNT_BY_YEAR_CODE_SQL = """
@@ -120,6 +124,22 @@ def growth_check(bytes_before: int, bytes_now: int, rows_written: int, rows_plan
     return ok, info
 
 
+def minutes_until_window(now: datetime | None = None) -> float:
+    """Minutes from ``now`` until the next 03:30Z (0 inside the window)."""
+    now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    lo, hi = RO.BACKUP_WINDOW_UTC
+    if lo <= now.time() < hi:
+        return 0.0
+    start = datetime.combine(now.date(), lo, tzinfo=timezone.utc)
+    if now >= start:
+        start += timedelta(days=1)
+    return (start - now).total_seconds() / 60.0
+
+
+def _write(path: Path, receipt: dict[str, Any]) -> None:
+    path.write_text(json.dumps(D.to_jsonable(receipt), indent=2, sort_keys=True, default=str))
+
+
 def _rw_engine(url: str) -> Engine:
     options = "-c statement_timeout=120000 -c lock_timeout=5000 -c application_name=people_events_backfill"
     return create_engine(url, connect_args={"options": options}, pool_size=2, max_overflow=0, pool_pre_ping=True)
@@ -167,10 +187,29 @@ def main(argv: list[str] | None = None) -> int:
     RO.assert_db_window_open()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    if args.mode == "execute":
+        if args.quarters:
+            # Dedup keys (owner-name collision splits, cross-accession merges)
+            # depend on the loaded scope: a partial load could store a key a
+            # later full load would split, i.e. duplicate acts. Full scope only.
+            print("refusing --quarters in execute: the backfill must load the full history", file=sys.stderr)
+            return 2
+        left = minutes_until_window()
+        if left < MIN_MINUTES_BEFORE_WINDOW:
+            print(f"refusing to start: {left:.0f} min before the 03:30Z window (< {MIN_MINUTES_BEFORE_WINDOW})",
+                  file=sys.stderr)
+            return 2
 
     t0 = time.perf_counter()
-    events, stats, stored = _load(args, url)
+    try:
+        events, stats, stored = _load(args, url)
+    except RO.WindowClosed as exc:
+        _write(args.out_dir / f"{args.mode}_{stamp}.json",
+               {"mode": args.mode, "status": "STOPPED_WINDOW", "error": str(exc)})
+        print(json.dumps({"status": "STOPPED_WINDOW"}))
+        return 4
     observed_at = datetime.now(timezone.utc)  # after every read
+    stats["pit"] = M.pit_violations(events, pd.Timestamp(observed_at))
     plan = P.build_write_plan(events, stored, pd.Timestamp(observed_at))
     counts = P.plan_counts(plan).get("form4", {})
     receipt: dict[str, Any] = {
@@ -188,7 +227,10 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.mode == "verify":
-        engine = RO.readonly_engine(url)
+        # Precondition: before the backfill the table held no form4 rows from
+        # another source (true on 2026-10-02: empty), so every planned act is a
+        # sec_form345 row. Full-table aggregates need more than the 20 s default.
+        engine = RO.readonly_engine(url, statement_timeout_ms=VERIFY_STATEMENT_TIMEOUT_MS)
         try:
             with engine.connect() as conn:
                 RO._assert_read_only(conn)
@@ -213,7 +255,8 @@ def main(argv: list[str] | None = None) -> int:
     # execute
     from intelligence.people_events_pipeline.writer import apply_write_plan
 
-    if stats["pit"]["known_before_event"] or stats["pit"]["missing_known_at"]:
+    if (stats["pit"]["known_before_event"] or stats["pit"]["missing_known_at"]
+            or stats["pit"]["known_after_observation"]):
         print("refusing to execute: PIT invariants violated in the plan", file=sys.stderr)
         return 3
     todo = plan[plan["op"] != "unchanged"].reset_index(drop=True)
@@ -225,6 +268,11 @@ def main(argv: list[str] | None = None) -> int:
     position = {k: i for i, k in enumerate(zip(events["channel"], events["dedup_key"]))}
     written = 0
     status = "DONE"
+    run_id = None
+    # Each batch's apply_write_plan takes and releases the writer's advisory
+    # lock, so another writer could interleave between batches; the unique
+    # index and the one-row UPDATE checks make that fail (FAILED receipt),
+    # never duplicate. Run nothing else against people_events meanwhile.
     try:
         for n, start in enumerate(range(0, len(todo), args.batch_rows)):
             if args.max_batches is not None and n >= args.max_batches:
@@ -251,14 +299,24 @@ def main(argv: list[str] | None = None) -> int:
                 status = "STOPPED_GROWTH"
                 break
             time.sleep(args.sleep)
+    except BaseException as exc:  # noqa: BLE001 -- recorded, then re-raised
+        status = "FAILED"
+        receipt["error"] = repr(exc)[:2000]
+        receipt["failed_run_id"] = run_id
+        raise
     finally:
         receipt["status"] = status
         receipt["rows_written"] = written
-        receipt["bytes_after"] = int(_scalar(engine, _SIZE_SQL))
-        log_path.write_text(json.dumps(D.to_jsonable(receipt), indent=2, sort_keys=True, default=str))
+        try:
+            receipt["bytes_after"] = int(_scalar(engine, _SIZE_SQL))
+        except Exception as exc:  # noqa: BLE001 -- never mask the original error
+            receipt["bytes_after"] = None
+            receipt["bytes_after_error"] = repr(exc)[:500]
+        _write(log_path, receipt)
         engine.dispose()
+    growth = None if receipt["bytes_after"] is None else receipt["bytes_after"] - bytes_before
     print(json.dumps({"out": str(log_path), "status": status, "rows_written": written,
-                      "bytes_growth": receipt["bytes_after"] - bytes_before}, default=str))
+                      "bytes_growth": growth}, default=str))
     return 0 if status == "DONE" else 4
 
 

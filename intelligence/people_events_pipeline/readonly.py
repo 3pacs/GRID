@@ -67,9 +67,9 @@ def guard_sql(sql: str) -> str:
     return body
 
 
-def readonly_engine(url: str) -> Engine:
+def readonly_engine(url: str, *, statement_timeout_ms: int = STATEMENT_TIMEOUT_MS) -> Engine:
     options = (
-        f"-c default_transaction_read_only=on -c statement_timeout={STATEMENT_TIMEOUT_MS} "
+        f"-c default_transaction_read_only=on -c statement_timeout={int(statement_timeout_ms)} "
         f"-c lock_timeout={LOCK_TIMEOUT_MS} -c idle_in_transaction_session_timeout=60000 "
         "-c application_name=people_events_dry_run"
     )
@@ -158,8 +158,7 @@ _PEOPLE_EVENTS_ROWS_V2_BY_CHANNEL_SQL = """
            entity_cik, superseded_at, retracted_at
     FROM people_events
     WHERE channel = :channel
-    ORDER BY id
-"""
+"""  # no ORDER BY: current rows and version floors are order-independent
 
 
 def read_stored_rows(url: str, channels: list[str], *, now: datetime | None = None) -> pd.DataFrame:
