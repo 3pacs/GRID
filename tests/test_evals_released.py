@@ -248,7 +248,8 @@ def test_f_the_guard_and_workflow_are_always_pinned(trees):
     files = dict(released.latest_by_key(released.entries(head))[released.GUARDS_KEY]["files"])
     del files["evals/released.py"]
     doc = _doc(head)
-    doc["entries"][1]["files"] = files
+    latest = max(i for i, e in enumerate(doc["entries"]) if e.get("kind") == "guards")
+    doc["entries"][latest]["files"] = files
     _save(head, doc)
     _fails(base, head, "unpins guard file evals/released.py")
 
@@ -473,7 +474,7 @@ def test_bootstrap_base_without_registry(trees):
 
 
 def test_e1_style_repin_appends_a_new_entry(trees):
-    """What #768 does: re-pin evals/e1 and append e1-v1.2; editing e1-v1.1 instead fails."""
+    """What an e1 release does (#768): re-pin evals/e1 and append the next e1 version; editing the released entry instead fails."""
     base, head = trees
     suite = head / "evals" / "e1"
     init = suite / "__init__.py"
@@ -491,7 +492,10 @@ def test_e1_style_repin_appends_a_new_entry(trees):
     _fails(base, head, f"released entry {latest} changed")
     doc["entries"][latest]["manifest_sha256"] = _doc(base)["entries"][latest]["manifest_sha256"]
     _save(head, doc)
-    _append(head, **_suite_entry("e1", "e1-v1.2", "evals/e1", new_sha))
+    # The next version after the latest released one; a literal ("e1-v1.2")
+    # collides with the real e1-v1.2 entry once #768 lands it (R6).
+    nxt = doc["entries"][latest]["version"] + "-next"
+    _append(head, **_suite_entry("e1", nxt, "evals/e1", new_sha))
     _passes(base, head)
 
 
