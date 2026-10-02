@@ -143,6 +143,9 @@ jobs:
       # PostgreSQL (test_people_events_migration_pg.py) and the upsert/read
       # store contract -- known_at LEAST() merge, PIT known_at <= as_of
       # filtering, dedup-key collision merging -- against a real database.
+      # people_events_v2_20261001 (test_people_events_v2_migration_pg.py):
+      # TEXT security_id FK, append-only guards, revision log, one current
+      # version per key, run log honesty, writer idempotency/supersession.
       # `-m "not unit"` excludes test_people_events_store.py's PeopleEvent
       # validation tests (pure-Python, already covered by the main suite
       # above) and keeps only its DB-backed contract tests. A skip
@@ -155,7 +158,7 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_people_events_migration_pg.py tests/test_people_events_store.py -m "not unit" -q -rA | tee /tmp/grid-people-events-pg.txt
+          python -m pytest tests/test_people_events_migration_pg.py tests/test_people_events_store.py tests/test_people_events_v2_migration_pg.py -m "not unit" -q -rA | tee /tmp/grid-people-events-pg.txt
           if grep -q "SKIPPED" /tmp/grid-people-events-pg.txt; then
             echo "::error::People events PostgreSQL contract was skipped"
             exit 1

@@ -1,8 +1,8 @@
 """GD5 acceptance test 13: the people_events-backed look-ahead canary (PostgreSQL).
 
 E1-style canary for ``analysis.people_density`` on a real ``people_events``
-table, built from the real migration DDL
-(``migrations/versions/people_events_20260927.py``) in a throwaway schema:
+table, built from the real migration DDL (people_events_20260927 ->
+security_master_20260927 -> people_events_v2_20261001) in a throwaway schema:
 
 1. ``load_events(engine, as_of, ...)`` never returns a row with
    ``known_at > as_of`` -- including rows whose ``event_time`` is before
@@ -79,15 +79,21 @@ def _run_migration(engine) -> None:
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = importlib.import_module("migrations.versions.people_events_20260927")
+    # The store targets the v2 schema (people_events_v2_20261001: partial
+    # unique index, versioning columns, TEXT security_id FK onto
+    # security_master), so the scratch table is built from the whole chain.
     with engine.connect() as conn:
         trans = conn.begin()
-        real_op = migration.op
-        migration.op = Operations(MigrationContext.configure(conn))
-        try:
-            migration.upgrade()
-        finally:
-            migration.op = real_op
+        for name in ("migrations.versions.people_events_20260927",
+                     "migrations.versions.security_master_20260927",
+                     "migrations.versions.people_events_v2_20261001"):
+            migration = importlib.import_module(name)
+            real_op = migration.op
+            migration.op = Operations(MigrationContext.configure(conn))
+            try:
+                migration.upgrade()
+            finally:
+                migration.op = real_op
         trans.commit()
 
 
@@ -211,7 +217,7 @@ def test_load_events_is_pit_and_features_ignore_rows_known_after_as_of(pe_scratc
 
     before_frame = P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)
     assert len(before_frame) == len(base) + 1
-    assert before_frame.attrs["versioned_store_gap"] is False  # v1 table: no versioning columns
+    assert before_frame.attrs["versioned_store_gap"] is False  # v2 table read through read_event_versions
     assert (before_frame["known_at"] <= pd.Timestamp(AS_OF)).all()
     assert not before_frame["dedup_key"].str.startswith("echo").any()
     before = _features(before_frame)
@@ -264,6 +270,11 @@ def test_leak_self_test_canary_trips_on_a_store_and_reader_keyed_on_event_time(p
     leaky_sql = pe_store._READ_SQL_TEMPLATE.replace("WHERE known_at <= :as_of", "WHERE event_time <= :as_of")
     assert leaky_sql != pe_store._READ_SQL_TEMPLATE
     monkeypatch.setattr(pe_store, "_READ_SQL_TEMPLATE", leaky_sql)
+    # The v2 store is read through read_event_versions: regress it the same way.
+    leaky_history = pe_store._HISTORY_SQL_TEMPLATE.replace("WHERE known_at <= :known_by",
+                                                           "WHERE event_time <= :known_by")
+    assert leaky_history != pe_store._HISTORY_SQL_TEMPLATE
+    monkeypatch.setattr(pe_store, "_HISTORY_SQL_TEMPLATE", leaky_history)
 
     def leaky_read() -> pd.DataFrame:
         return P.events_frame(
@@ -290,3 +301,22 @@ def test_leak_self_test_canary_trips_on_a_store_and_reader_keyed_on_event_time(p
     # 3) ... and stays silent on the real one.
     monkeypatch.undo()
     assert _features(P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)) == honest_before
+
+
+def test_superseded_version_stays_visible_to_earlier_decisions(pe_scratch):
+    """v2: a version superseded before AS_OF still counts for decisions before its supersession."""
+    first = _event(70_000, known_at=datetime(2024, 3, 1, 2, tzinfo=UTC), tag="ver")
+    upsert_event(pe_scratch, first)
+    with pe_scratch.begin() as conn:
+        conn.execute(text("UPDATE people_events SET superseded_at = :t WHERE dedup_key = 'ver|70000'"),
+                     {"t": datetime(2024, 5, 1, tzinfo=UTC)})
+    upsert_event(pe_scratch, _event(70_000, known_at=datetime(2024, 5, 1, tzinfo=UTC), tag="ver",
+                                    direction="sell"))
+    frame = P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)
+    ver = frame[frame["dedup_key"] == "ver|70000"].sort_values("known_at")
+    assert len(ver) == 2
+    assert ver.iloc[0]["visible_until"] == pd.Timestamp("2024-05-01", tz="UTC")
+    assert pd.isna(ver.iloc[1]["visible_until"])
+    early = P.load_events(pe_scratch, datetime(2024, 4, 1, tzinfo=UTC), CHANNELS, resolve_tickers=False)
+    ver_early = early[early["dedup_key"] == "ver|70000"]
+    assert len(ver_early) == 1 and pd.isna(ver_early.iloc[0]["visible_until"])  # later end is masked
