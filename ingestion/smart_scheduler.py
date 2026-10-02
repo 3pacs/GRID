@@ -575,7 +575,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "ads_index",             "mod": "ingestion.altdata.ads_index",          "cls": "ADSIndexPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
     {"name": "baltic_exchange",       "mod": "ingestion.altdata.baltic_dry",         "cls": "BalticDryPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 60,  "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
-    {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600},
+    # Held 2026-10-02: name matching is too loose to publish (71,903 matches against 204 actors,
+    # mostly "partial" substring hits such as GTC MANAGEMENT LTD. -> Oaktree). See
+    # docs/handoffs/2026-10-02/OFFSHORE-LEAKS-MATCH-QUALITY.md for the proposed minimum rule.
+    {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600, "hold_reason": "Match quality under review: partial substring name matches (see docs/handoffs/2026-10-02/OFFSHORE-LEAKS-MATCH-QUALITY.md)"},
     {"name": "wikidata_persons",      "mod": "ingestion.altdata.wikidata_persons",   "cls": "WikidataPersonPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 1800},
 
     # ── Wave 1 activation (2026-09-27): merged-but-unscheduled pullers ──
