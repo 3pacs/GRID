@@ -22,8 +22,10 @@ Takes the artifact written by ``scripts/build_security_master_all_issuers.py``
   ``(entity_id, id_scheme, id_value, valid_from)`` that already exists. A CIK identifier is also
   skipped when the entity already has that CIK value under another ``valid_from`` (the Technology seed
   dated its own at the seed day). A new ticker row that overlaps a DIFFERENT entity's ticker row already
-  in the database is inserted with ``conflict_flag`` true and ``is_primary`` false and reported, so the
-  existing row keeps winning ties.
+  in the database is split at the overlap boundaries: the overlapping piece is inserted with
+  ``conflict_flag`` true and ``is_primary`` false (the existing row keeps winning ties inside the overlap
+  only), the rest of the window keeps the builder's flags. Every split is listed in the receipt as
+  ``ticker_overlaps_for_review`` for review before an apply.
 * A run writes a receipt (``--receipt``, default next to the artifact). It is written when the run starts
   and rewritten when it ends.
 
@@ -52,7 +54,7 @@ import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 import time as time_mod
-from datetime import datetime, time, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -224,7 +226,7 @@ class Plan:
             "cik_collisions": len(self.cik_collisions),
             "cik_collision_examples": self.cik_collisions[:20],
             "new_ticker_rows_overlapping_existing_other_entity": len(self.db_ticker_overlaps),
-            "overlap_examples": self.db_ticker_overlaps[:20],
+            "overlap_examples": self.db_ticker_overlaps[:20],  # the full list is the receipt's ``ticker_overlaps_for_review``
         }
 
 
@@ -268,23 +270,63 @@ def plan_inserts(seed: Seed, existing: Optional[Existing] = None) -> Plan:
             plan.skipped["security_identifiers:cik_already_identified"] += 1
             continue
         if row["id_scheme"] == "ticker":
-            row = _flag_against_existing(row, ex, plan)
+            plan.si_inserts.extend(_split_against_existing(row, ex, plan))
+            continue
         plan.si_inserts.append(row)
     return plan
 
 
-def _flag_against_existing(row: dict[str, Any], ex: Existing, plan: Plan) -> dict[str, Any]:
+def _next_day(iso: str) -> str:
+    return (date.fromisoformat(iso) + timedelta(days=1)).isoformat()
+
+
+def _prev_day(iso: str) -> str:
+    return (date.fromisoformat(iso) - timedelta(days=1)).isoformat()
+
+
+def _split_against_existing(row: dict[str, Any], ex: Existing, plan: Plan) -> list[dict[str, Any]]:
+    """Demote a new ticker row only where it overlaps ANOTHER entity's ticker row already in the database.
+
+    The existing row keeps winning ties, but only inside the overlap: the new row is split at the overlap
+    boundaries into pieces (a different ``valid_from`` per piece, so the unique key is unaffected), and the
+    overlapping pieces get ``conflict_flag`` true and ``is_primary`` false. The part of the window that no
+    other entity holds keeps the builder's flags. Every split is listed in ``plan.db_ticker_overlaps``,
+    which the receipt carries in full as ``ticker_overlaps_for_review``.
+    """
     norm = normalize_ticker(row["id_value"])
-    others = sorted({
-        eid for eid, vfrom, vto in ex.tickers.get(norm or "", [])
-        if eid != row["entity_id"] and _window_overlap(row["valid_from"], row["valid_to"], vfrom, vto)
+    hits = []
+    for eid, vfrom, vto in ex.tickers.get(norm or "", []):
+        if eid == row["entity_id"] or not _window_overlap(row["valid_from"], row["valid_to"], vfrom, vto):
+            continue
+        start = max(row["valid_from"], vfrom)
+        ends = [e for e in (row["valid_to"], vto) if e is not None]
+        hits.append((start, min(ends) if ends else None, eid))
+    if not hits:
+        return [row]
+    merged: list[list[Any]] = []
+    for start, end, eid in sorted(hits, key=lambda h: (h[0], h[1] or "9999-12-31")):
+        if merged and (merged[-1][1] is None or start <= _next_day(merged[-1][1])):
+            merged[-1][1] = None if end is None or merged[-1][1] is None else max(merged[-1][1], end)
+            merged[-1][2].add(eid)
+        else:
+            merged.append([start, end, {eid}])
+    pieces: list[dict[str, Any]] = []
+    cursor: Optional[str] = row["valid_from"]
+    for start, end, eids in merged:
+        if cursor is not None and start > cursor:
+            pieces.append({**row, "valid_from": cursor, "valid_to": _prev_day(start)})
+        detail = dict(row.get("conflict_detail") or {})
+        detail.update({"kind": detail.get("kind") or "overlap_with_existing_db_row", "existing_db_entities": sorted(eids)[:25]})
+        pieces.append({**row, "valid_from": start, "valid_to": end, "conflict_flag": True, "is_primary": False, "conflict_detail": detail})
+        cursor = None if end is None else _next_day(end)
+    if cursor is not None and (row["valid_to"] is None or cursor <= row["valid_to"]):
+        pieces.append({**row, "valid_from": cursor})
+    plan.db_ticker_overlaps.append({
+        "entity_id": row["entity_id"], "ticker": row["id_value"], "new_window": [row["valid_from"], row["valid_to"]],
+        "demoted_segments": [[p["valid_from"], p["valid_to"], p["conflict_detail"]["existing_db_entities"]]
+                             for p in pieces if (p["conflict_detail"] or {}).get("existing_db_entities")],
     })
-    if not others:
-        return row
-    detail = dict(row.get("conflict_detail") or {})
-    detail.update({"kind": detail.get("kind") or "overlap_with_existing_db_row", "existing_db_entities": others[:25]})
-    plan.db_ticker_overlaps.append({"entity_id": row["entity_id"], "ticker": row["id_value"], "existing_entities": others[:5]})
-    return {**row, "conflict_flag": True, "is_primary": False, "conflict_detail": detail}
+    return pieces
 
 
 # --- database -------------------------------------------------------------------------------
@@ -429,7 +471,7 @@ def run(
 
     if db_url is None:
         plan = plan_inserts(seed, None)
-        receipt.update(status="counted_artifact_only", plan=plan.summary(),
+        receipt.update(status="counted_artifact_only", plan=plan.summary(), ticker_overlaps_for_review=plan.db_ticker_overlaps,
                        note="no --db-url: nothing was read from any database, so every row counts as new")
         write_receipt(receipt_path, receipt)
         return receipt
@@ -442,7 +484,7 @@ def run(
     try:
         existing, before = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
         plan = plan_inserts(seed, existing)
-        receipt.update(before_counts=before, plan=plan.summary())
+        receipt.update(before_counts=before, plan=plan.summary(), ticker_overlaps_for_review=plan.db_ticker_overlaps)
         if not args.apply:
             receipt["status"] = "dry_run_complete"
             write_receipt(receipt_path, receipt)

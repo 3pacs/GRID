@@ -49,7 +49,7 @@ def scratch(pg_engine: Engine):
 def _seed(tmp_path):
     sub = pd.DataFrame(
         [("a1", "2006-02-02", "320193", "AAPL"), ("a2", "2020-02-02", "320193", "AAPL"),
-         ("b1", "2010-01-04", "1", "OLD"), ("b2", "2012-01-04", "1", "NEW"), ("b3", "2020-01-04", "1", "NEW"),
+         ("b1", "2010-01-04", "1", "OLD"), ("b1b", "2011-12-01", "1", "OLD"), ("b2", "2012-01-04", "1", "NEW"), ("b3", "2020-01-04", "1", "NEW"),
          ("c1", "2008-01-02", "2", "REUSE"), ("c2", "2015-07-01", "2", "REUSE"), ("c3", "2015-10-01", "2", "REUSE"),
          ("c4", "2020-01-02", "2", "REUSE"), ("d1", "2015-06-01", "3", "REUSE")],
         columns=["accession_number", "filing_date", "issuer_cik", "issuer_ticker"])
@@ -109,8 +109,8 @@ def test_apply_inserts_once_keeps_existing_rows_and_is_idempotent(scratch, tmp_p
         assert new.valid_to is None
         flagged = conn.execute(text(
             "SELECT entity_id, is_primary, conflict_flag, conflict_detail->>'kind' AS kind FROM security_identifiers "
-            "WHERE id_value = 'REUSE' ORDER BY entity_id")).all()
-        # both claimants stay flagged; exactly one is primary (the one with more filing days in the overlap)
+            "WHERE id_value = 'REUSE' AND conflict_flag ORDER BY entity_id")).all()
+        # only the contested piece is flagged, on both claimants; exactly one is primary (more filing days in the overlap)
         assert [(r.entity_id, r.is_primary, r.conflict_flag, r.kind) for r in flagged] == [
             ("sm_0000000002", True, True, "overlapping_ticker_claim"), ("sm_0000000003", False, True, "overlapping_ticker_claim")]
         # The AAPL ticker row dated at the first filing was added to the existing entity.

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 import re
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +29,17 @@ def _subs(rows: list[tuple[str, str, str, str]]) -> pd.DataFrame:
 
 def _build(rows, company_tickers=None, **kw):
     return builder.build_rows(_subs(rows), company_tickers or {}, tickers_as_of=TICKERS_AS_OF, **kw)
+
+
+def _plus(iso, days):
+    return (date.fromisoformat(iso) + timedelta(days=days)).isoformat()
+
+
+def _rows_of(built, cik, ticker):
+    """Ticker rows of one entity for one ticker, in window order."""
+    out = [r for r in built["security_identifiers"] if r["id_scheme"] == "ticker" and r["id_value"] == ticker
+           and r["entity_id"] == builder.entity_id_for_cik(cik)]
+    return sorted(out, key=lambda r: r["valid_from"])
 
 
 def _tickers(built, cik=None):
@@ -80,6 +91,7 @@ def test_placeholders_are_rejected(raw):
     ("BF/B", ("BFB",)),
     ("UA/UAA", ("UA", "UAA")),
     ("AT&T", ("T",)),
+    ("AT & T", ("T",)),
     ("Z & ZG", ("Z", "ZG")),
     ("AAPL.O", ("AAPL",)),
     ("ABC.N", ("ABC",)),
@@ -146,7 +158,7 @@ def test_company_tickers_parse_and_merge():
 def test_ticker_change_gives_closed_and_open_windows():
     built = _build([
         ("a1", "2015-03-02", "100", "OLD"),
-        ("a2", "2016-05-10", "100", "OLD"),
+        ("a2", "2017-12-01", "100", "OLD"),
         ("a3", "2018-01-15", "100", "NEW"),
         ("a4", "2019-07-01", "100", "NEW"),
     ])
@@ -154,6 +166,18 @@ def test_ticker_change_gives_closed_and_open_windows():
         ("OLD", "2015-03-02", "2018-01-14"),  # the day before the first later filing naming another ticker
         ("NEW", "2018-01-15", None),          # still the latest
     }
+
+
+def test_a_closed_window_is_capped_at_the_grace_period_after_the_issuers_last_filing():
+    """OLDT is named in 2008 and the issuer is silent until 2020 (when it names NEWT): OLDT ends in 2009, not 2019."""
+    built = _build([("a1", "2008-03-01", "400", "OLDT"), ("a2", "2020-01-01", "400", "NEWT")])
+    rows = _tickers(built, 400)
+    assert set(rows) == {("OLDT", "2008-03-01", _plus("2008-03-01", 400)), ("NEWT", "2020-01-01", None)}
+    detail = rows[("OLDT", "2008-03-01", _plus("2008-03-01", 400))]["conflict_detail"]
+    assert detail["reason"] == "grace_period_before_the_issuers_next_ticker"
+    assert built["report"]["silent_windows_closed"] == {"grace_period_before_the_issuers_next_ticker": 1}
+    assert _resolve_ticker(built, [("OLDT", "2008-06-01"), ("OLDT", "2015-01-01"), ("OLDT", "2019-06-01")]) == [
+        ("sm_0000000400", "ticker", False), (None, "ticker_outside_validity", False), (None, "ticker_outside_validity", False)]
 
 
 def test_placeholder_filings_do_not_close_a_window():
@@ -189,17 +213,18 @@ def test_share_class_siblings_stay_open_when_a_filing_names_only_one_class():
         ("a3", "2014-03-03", "400", "GOOG"),
         ("a4", "2016-04-04", "400", "XYZ"),
     ])
-    assert set(_tickers(built, 400)) == {
-        ("GOOG", "2010-01-04", "2016-04-03"), ("GOOGL", "2012-02-02", "2016-04-03"), ("XYZ", "2016-04-04", None)}
+    close = _plus("2014-03-03", 400)  # capped at the family's last filing + grace, not held to the next ticker's day
+    assert set(_tickers(built, 400)) == {("GOOG", "2010-01-04", close), ("GOOGL", "2012-02-02", close), ("XYZ", "2016-04-04", None)}
 
 
 def test_an_old_ticker_ends_even_if_the_next_filing_is_in_a_multi_ticker_field():
     built = _build([
         ("a1", "2010-01-04", "300", "AAA"),
-        ("a2", "2012-06-01", "300", "BBB, BBC"),
+        ("a2", "2010-11-01", "300", "AAA"),
+        ("a3", "2011-06-01", "300", "BBB, BBC"),
     ])
     assert set(_tickers(built, 300)) == {
-        ("AAA", "2010-01-04", "2012-05-31"), ("BBB", "2012-06-01", None), ("BBC", "2012-06-01", None)}
+        ("AAA", "2010-01-04", "2011-05-31"), ("BBB", "2011-06-01", None), ("BBC", "2011-06-01", None)}
 
 
 def test_cik_identifier_is_unpadded_and_dated_at_the_first_filing():
@@ -318,13 +343,17 @@ def test_probe_acquired_subsidiary_does_not_hold_the_parents_ticker():
             + [(f"s{y}", f"{y}-02-01", "65100", "MER") for y in (2006, 2007, 2008)]
             + [(f"s{y}", f"{y}-05-01", "65100", "BAC") for y in (2009, 2010, 2011, 2012)])
     built = _build(rows, {70858: {"name": "Bank of America", "tickers": ["BAC"]}})
-    sub = _tickers(built, 65100)[("BAC", "2009-05-01", "2013-06-05")]  # 2012-05-01 + 400 days
+    sub_close = _plus("2012-05-01", 400)
+    (sub,) = _rows_of(built, 65100, "BAC")
+    assert (sub["valid_from"], sub["valid_to"]) == ("2009-05-01", sub_close)
     assert sub["conflict_flag"] is True and sub["is_primary"] is False
-    parent = _tickers(built, 70858)[("BAC", "2006-03-01", None)]
-    assert parent["conflict_flag"] is True and parent["is_primary"] is True
+    before, during, after = _rows_of(built, 70858, "BAC")
+    assert (before["valid_to"], during["valid_from"], during["valid_to"], after["valid_from"]) == (
+        "2009-04-30", "2009-05-01", sub_close, _plus(sub_close, 1))
+    assert [(r["is_primary"], r["conflict_flag"]) for r in (before, during, after)] == [(True, False), (True, True), (True, False)]
     got = _resolve_ticker(built, [("BAC", "2008-06-01"), ("BAC", "2010-06-01"), ("BAC", "2018-06-01"), ("BAC", "2026-06-01")])
-    assert [g[0] for g in got] == ["sm_0000070858", "sm_0000070858", "sm_0000070858", "sm_0000070858"]
-    assert all(g[2] for g in got)  # the primary claimant keeps its conflict flag: the conflict is reported, not hidden
+    assert [g[0] for g in got] == ["sm_0000070858"] * 4
+    assert [g[2] for g in got] == [False, True, False, False]  # only the contested period carries the conflict
 
 
 def test_probe_one_stray_filing_cannot_hijack_a_ticker():
@@ -332,7 +361,8 @@ def test_probe_one_stray_filing_cannot_hijack_a_ticker():
     built = _build(rows, {320193: {"name": "Apple", "tickers": ["AAPL"]}})
     got = _resolve_ticker(built, [("AAPL", "2015-06-01"), ("AAPL", "2015-12-01"), ("AAPL", "2016-09-01"), ("AAPL", "2026-06-01")])
     assert [g[0] for g in got] == ["sm_0000320193"] * 4
-    stray = _tickers(built, 999)[("AAPL", "2015-07-01", "2016-08-04")]
+    (stray,) = _rows_of(built, 999, "AAPL")
+    assert (stray["valid_from"], stray["valid_to"]) == ("2015-07-01", "2016-08-04")
     assert stray["is_primary"] is False and stray["conflict_flag"] is True
 
 
@@ -352,6 +382,54 @@ def test_probe_a_stray_latest_filing_closes_the_real_ticker_and_is_documented_be
     assert _resolve_ticker(built, [("ABCD", "2026-03-01")])[0][:2] == (None, "ticker_outside_validity")
 
 
+def test_r1_probe_a_holder_that_loses_one_contest_is_still_primary_everywhere_else():
+    """Holder A (company_tickers, files yearly 2006-2026) loses a 2009 contest on filing days to subsidiary B; a stray C
+    files once in 2018. A must be primary in 2018/2019, not the stray."""
+    rows = ([(f"a{y}", f"{y}-03-01", "100", "TKR") for y in range(2006, 2027)]
+            + [(f"b{m}{d}", f"2009-0{m}-1{d}", "200", "TKR") for m in (4, 5, 6) for d in range(0, 4)]
+            + [("c1", "2018-07-01", "300", "TKR")])
+    built = _build(rows, {100: {"name": "Holder", "tickers": ["TKR"]}})
+    got = _resolve_ticker(built, [("TKR", "2009-05-15"), ("TKR", "2018-08-01"), ("TKR", "2019-06-01"), ("TKR", "2022-01-01")])
+    assert [g[0] for g in got] == ["sm_0000000200", "sm_0000000100", "sm_0000000100", "sm_0000000100"]
+    assert [g[2] for g in got] == [True, True, True, False]  # 2009 and the stray's window (to 2019-08-05) are contested
+    holder = _rows_of(built, 100, "TKR")
+    lost = [r for r in holder if not r["is_primary"]]
+    assert len(lost) == 1 and lost[0]["valid_from"].startswith("2009") and lost[0]["conflict_flag"]  # only the 2009 contest
+    assert [r["conflict_flag"] for r in holder].count(True) == 2
+    (stray,) = _rows_of(built, 300, "TKR")
+    assert stray["is_primary"] is False and stray["conflict_flag"] is True
+    assert built["report"]["overlap_pairs_without_primary"] == 0 and built["report"]["overlap_segments_with_two_primaries"] == 0
+    assert builder.primary_violations(built["security_identifiers"]) == []
+
+
+def test_primary_violations_reports_segments_without_exactly_one_primary():
+    def row(entity, vf, vt, primary):
+        return {"entity_id": entity, "id_scheme": "ticker", "id_value": "T", "valid_from": vf, "valid_to": vt, "is_primary": primary}
+
+    ok = [row("sm_1", "2010-01-01", None, True), row("sm_2", "2015-01-01", "2016-12-31", False)]
+    assert builder.primary_violations(ok) == []
+    none_primary = [row("sm_1", "2010-01-01", None, False), row("sm_2", "2015-01-01", "2016-12-31", False)]
+    (v,) = builder.primary_violations(none_primary)
+    assert (v["kind"], v["from"], v["to"], v["pairs"]) == ("no_primary", "2015-01-01", "2016-12-31", 1)
+    two = [row("sm_1", "2010-01-01", None, True), row("sm_2", "2015-01-01", "2016-12-31", True)]
+    (v,) = builder.primary_violations(two)
+    assert v["kind"] == "two_primaries"
+    # The old per-row scheme: A primary only until a contest it lost, so a later overlap has no primary at all.
+    per_row = [row("sm_1", "2006-01-01", None, False), row("sm_2", "2009-01-01", "2009-12-31", True), row("sm_3", "2018-07-01", "2019-08-01", False)]
+    assert [x["kind"] for x in builder.primary_violations(per_row)] == ["no_primary"]
+
+
+def test_every_contested_segment_has_exactly_one_primary_in_a_busy_fixture():
+    rows = (_quarterly("a", 1, "BUSY", 2008, 2024) + _quarterly("b", 2, "BUSY", 2012, 2016) + _quarterly("c", 3, "BUSY", 2014, 2020)
+            + [("d1", "2015-03-03", "4", "BUSY")])
+    built = _build(rows, {3: {"name": "Holder", "tickers": ["BUSY"]}})
+    assert built["report"]["contested_overlap_segments"] > 3
+    assert built["report"]["overlap_pairs_without_primary"] == 0 and built["report"]["overlap_segments_with_two_primaries"] == 0
+    assert builder.primary_violations(built["security_identifiers"]) == []
+    keys = [(r["entity_id"], r["id_scheme"], r["id_value"], r["valid_from"]) for r in built["security_identifiers"]]
+    assert len(keys) == len(set(keys))  # split pieces never collide on the table's unique key
+
+
 # --- conflicts: a ticker reused by a different CIK ------------------------------------------
 
 
@@ -369,15 +447,17 @@ def _reuse_rows():
 
 def test_ticker_reuse_by_a_different_cik_is_flagged_and_one_primary_is_chosen_by_evidence():
     built = _build(_reuse_rows())
-    rows = {r["entity_id"]: r for r in built["security_identifiers"] if r["id_value"] == "REUSE"}
-    assert set(rows) == {"sm_0000000001", "sm_0000000002"} and all(r["conflict_flag"] for r in rows.values())
-    assert rows["sm_0000000001"]["is_primary"] is True and rows["sm_0000000002"]["is_primary"] is False
-    detail = rows["sm_0000000001"]["conflict_detail"]
+    one, two = _rows_of(built, 1, "REUSE"), _rows_of(built, 2, "REUSE")
+    (stray,) = two
+    assert (stray["valid_from"], stray["conflict_flag"], stray["is_primary"]) == ("2015-06-01", True, False)
+    before, during, after = one
+    assert [(r["is_primary"], r["conflict_flag"]) for r in one] == [(True, False), (True, True), (True, False)]
+    assert (during["valid_from"], during["valid_to"]) == (stray["valid_from"], stray["valid_to"])
+    detail = during["conflict_detail"]
     assert detail["kind"] == "overlapping_ticker_claim" and detail["other_entities"] == ["sm_0000000002"]
     assert detail["primary_basis"] == ["most_filing_days_in_overlap"]
     assert [c["ticker"] for c in built["conflicts"]] == ["REUSE"]
-    assert built["conflicts"][0]["pairs"][0]["overlap_from"] == "2015-06-01"
-    assert built["conflicts"][0]["primary_entities"] == ["sm_0000000001"]
+    assert built["conflicts"][0]["segments"][0]["from"] == "2015-06-01" and built["conflicts"][0]["primary_entities"] == ["sm_0000000001"]
     assert built["report"]["conflict_tickers"] == 1 and built["report"]["conflict_identifier_rows"] == 2
     unrelated = [r for r in built["security_identifiers"] if r["id_value"] in {"CHG", "CHG2"}]
     assert unrelated and not any(r["conflict_flag"] for r in unrelated)
@@ -386,16 +466,16 @@ def test_ticker_reuse_by_a_different_cik_is_flagged_and_one_primary_is_chosen_by
 def test_the_company_tickers_holder_wins_an_overlap_that_is_open_at_the_snapshot():
     rows = [*_quarterly("a", 1, "BOTH", 2010, 2026), *_quarterly("b", 2, "BOTH", 2012, 2026)]
     built = _build(rows, {2: {"name": "Holder", "tickers": ["BOTH"]}})
-    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "BOTH"}
+    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "BOTH" and r["conflict_flag"]}
     assert prim == {"sm_0000000001": False, "sm_0000000002": True}
-    basis = next(r for r in built["security_identifiers"] if r["id_value"] == "BOTH")["conflict_detail"]["primary_basis"]
+    basis = next(r for r in built["security_identifiers"] if r["id_value"] == "BOTH" and r["conflict_flag"])["conflict_detail"]["primary_basis"]
     assert basis == ["company_tickers_holder_open_at_snapshot"]
 
 
 def test_an_exact_tie_falls_to_the_smaller_entity_id_deterministically():
     rows = [("a1", "2012-01-02", "1", "TIE"), ("b1", "2012-01-02", "2", "TIE"), ("z1", "2012-02-01", "6", "LIVE")]
     built = _build(rows)
-    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "TIE"}
+    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "TIE" and r["conflict_flag"]}
     assert prim == {"sm_0000000001": True, "sm_0000000002": False}
 
 
@@ -449,7 +529,24 @@ def test_receipt_records_inputs_hash_counts_and_code(tmp_path):
     assert on_disk["counts"]["entities"] == 1 and on_disk["writes_to_database"] is False
     assert on_disk["output"]["sha256"] == receipt["output"]["sha256"]
     with pytest.raises(FileExistsError):
-        builder.write_artifact(built, tmp_path / "out", inputs=inputs, params={})
+        builder.write_artifact(built, tmp_path / "out", inputs=inputs, params={}, code_sha="deadbeef")
+
+
+def test_the_builder_refuses_a_dirty_git_tree_unless_allowed(monkeypatch):
+    class Done:
+        def __init__(self, out):
+            self.returncode, self.stdout = 0, out
+
+    def fake_run(argv, **_kw):
+        return Done("abc123\n" if argv[1] == "rev-parse" else " M scripts/x.py\n")
+
+    monkeypatch.setattr(builder.subprocess, "run", fake_run)
+    with pytest.raises(ValueError, match="uncommitted changes"):
+        builder._code_sha(None)
+    assert builder._code_sha(None, allow_dirty=True)["dirty"] is True
+    assert builder._code_sha("pinned")["dirty"] is None  # an explicit --code-sha is taken as given
+    monkeypatch.setattr(builder.subprocess, "run", lambda argv, **_kw: Done("abc123\n" if argv[1] == "rev-parse" else ""))
+    assert builder._code_sha(None) == {**builder._code_sha(None), "git_head": "abc123", "dirty": False}
 
 
 def test_builder_and_loader_never_open_a_connection_or_update_or_delete():
@@ -484,6 +581,8 @@ def _events(rows: list[tuple]) -> pd.DataFrame:
 def test_resolve_securities_matches_by_cik_and_by_in_window_ticker_and_rejects_out_of_window():
     built = _build([
         ("a1", "2015-03-02", "100", "OLD"),
+        ("a1b", "2016-05-10", "100", "OLD"),
+        ("a1c", "2017-12-01", "100", "OLD"),
         ("a2", "2018-01-15", "100", "NEW"),
         ("a3", "2019-07-01", "100", "NEW"),
         ("z1", "2016-01-04", "200", "OTHER"),
@@ -509,7 +608,7 @@ def test_resolve_securities_counts_conflicts_and_lands_on_the_primary_claimant()
     out = S.resolve_securities(_events([(None, "REUSE", "2015-07-01"), (None, "REUSE", "2010-01-01")]), _identifiers_frame(built))
     # 2015-07: both CIKs claim it (flagged); the evidence-backed primary (CIK 1) wins, not the newer claimant (CIK 2).
     assert list(out["security_id"]) == ["sm_0000000001", "sm_0000000001"]
-    assert list(out["security_conflict"]) == [True, True]
+    assert list(out["security_conflict"]) == [True, False]  # 2010 is outside the contested period
 
 
 def test_multi_ticker_filings_resolve_through_each_ticker():
@@ -569,13 +668,67 @@ def test_exact_duplicate_keys_are_skipped():
     assert plan.skipped["security_identifiers:exists"] == 1
 
 
-def test_new_ticker_overlapping_another_entitys_existing_row_is_inserted_flagged(tmp_path):
+def test_new_ticker_overlapping_another_entitys_existing_row_is_demoted_only_inside_the_overlap(tmp_path):
     plan = loader.plan_inserts(_aapl_seed(tmp_path), _tech_existing())
-    cflt = [r for r in plan.si_inserts if r["id_value"] == "CFLT"]
-    assert len(cflt) == 1
-    assert cflt[0]["conflict_flag"] is True and cflt[0]["is_primary"] is False
-    assert cflt[0]["conflict_detail"]["existing_db_entities"] == ["sm_tkr_CFLT"]
-    assert plan.summary()["new_ticker_rows_overlapping_existing_other_entity"] == 1
+    cflt = sorted((r for r in plan.si_inserts if r["id_value"] == "CFLT"), key=lambda r: r["valid_from"])
+    assert [(r["valid_from"], r["valid_to"], r["is_primary"], r["conflict_flag"]) for r in cflt] == [
+        ("2019-02-02", "2026-09-27", True, False),   # nobody else holds CFLT here: the builder's flags stand
+        ("2026-09-28", None, False, True),           # the existing sm_tkr_CFLT row wins only from its own start
+    ]
+    assert cflt[1]["conflict_detail"]["existing_db_entities"] == ["sm_tkr_CFLT"]
+    summary = plan.summary()
+    assert summary["new_ticker_rows_overlapping_existing_other_entity"] == 1
+    (review,) = plan.db_ticker_overlaps
+    assert review["entity_id"] == "sm_0001699838" and review["new_window"] == ["2019-02-02", None]
+    assert review["demoted_segments"] == [["2026-09-28", None, ["sm_tkr_CFLT"]]]
+
+
+def _ticker_row(entity, vf, vt, **kw):
+    return {"entity_id": entity, "id_scheme": "ticker", "id_value": "MID", "valid_from": vf, "valid_to": vt, "is_primary": True,
+            "source": "all_issuers_v1:sec_form345", "conflict_flag": False, "conflict_detail": None, **kw}
+
+
+def test_a_new_row_is_split_into_before_overlap_after_when_an_existing_window_sits_inside_it():
+    ex = loader.build_existing([("sm_old", None)], [("sm_old", "ticker", "MID", "2012-01-01", "2013-12-31"),
+                                                    ("sm_old", "ticker", "MID", "2015-01-01", "2015-06-30")])
+    plan = loader.Plan()
+    pieces = loader._split_against_existing(_ticker_row("sm_new", "2010-01-01", "2020-12-31"), ex, plan)
+    assert [(p["valid_from"], p["valid_to"], p["is_primary"], p["conflict_flag"]) for p in pieces] == [
+        ("2010-01-01", "2011-12-31", True, False), ("2012-01-01", "2013-12-31", False, True),
+        ("2014-01-01", "2014-12-31", True, False), ("2015-01-01", "2015-06-30", False, True),
+        ("2015-07-01", "2020-12-31", True, False)]
+    keys = {(p["entity_id"], p["id_value"], p["valid_from"]) for p in pieces}
+    assert len(keys) == len(pieces)  # the unique key (entity, scheme, value, valid_from) never collides
+
+
+def test_a_new_row_with_no_overlap_or_overlapping_only_its_own_entity_is_untouched():
+    ex = loader.build_existing([("sm_old", None)], [("sm_old", "ticker", "MID", "2005-01-01", "2009-12-31"),
+                                                    ("sm_new", "ticker", "MID", "2010-01-01", None)])
+    row = _ticker_row("sm_new", "2010-06-01", None)
+    plan = loader.Plan()
+    assert loader._split_against_existing(row, ex, plan) == [row] and plan.db_ticker_overlaps == []
+
+
+def test_the_overlap_split_is_idempotent_against_the_database_after_an_apply(tmp_path):
+    seed = _aapl_seed(tmp_path)
+    first = loader.plan_inserts(seed, _tech_existing())
+    existing = loader.build_existing(
+        [("sm_0000320193", 320193), ("sm_tkr_CFLT", None)] + [(r["entity_id"], r["cik"]) for r in first.sm_inserts],
+        [("sm_0000320193", "cik", "320193", "2026-09-28", None), ("sm_0000320193", "ticker", "AAPL", "2026-09-28", None),
+         ("sm_tkr_CFLT", "ticker", "CFLT", "2026-09-28", None)]
+        + [(r["entity_id"], r["id_scheme"], r["id_value"], r["valid_from"], r["valid_to"]) for r in first.si_inserts])
+    again = loader.plan_inserts(seed, existing)
+    assert again.sm_inserts == [] and again.si_inserts == [] and again.db_ticker_overlaps == []
+
+
+def test_the_dry_run_receipt_lists_every_overlap_for_review(tmp_path, monkeypatch):
+    art, built = _written_artifact(tmp_path)
+    existing = loader.build_existing([("sm_tkr_REUSE", None)], [("sm_tkr_REUSE", "ticker", "REUSE", "2010-01-01", None)])
+    monkeypatch.setattr(loader, "read_existing", lambda *_a, **_k: (existing, {"security_master": 1, "security_identifiers": 1}))
+    rec = loader.run(_args(art, db_url="postgresql://u@h/db"), now=lambda: _utc(12), engine_factory=lambda _u: _FakeEngine())
+    review = rec["ticker_overlaps_for_review"]
+    assert review and all(r["ticker"] == "REUSE" and r["demoted_segments"] for r in review)
+    assert rec["plan"]["new_ticker_rows_overlapping_existing_other_entity"] == len(review)
 
 
 def test_cik_held_by_a_different_entity_blocks_the_new_entity_and_its_identifiers():

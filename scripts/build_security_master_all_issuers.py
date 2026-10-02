@@ -130,7 +130,7 @@ _EXCHANGE_PREFIX = re.compile(
     r"NYSEARCA|OTCBB|OTCQB|OTCQX|OTC(?:\s*MARKETS)?|NMS|TSX|TSXV|LSE|PINK(?:\s*SHEETS)?)\s*[:\-]\s*"
 )
 _EXCHANGE_SUFFIX = re.compile(r"(?:[.\-](?:PK|OB|OQ|OTC|NYSE|NASDAQ)|\.[ON])$")  # ".O"/".N": Reuters-style market suffix
-_KNOWN_FIELDS = {"AT&T": "T"}  # "&" separates tickers only when spaced ("Z & ZG"); AT&T's own ticker is T
+_KNOWN_FIELDS = {"AT&T": "T", "AT & T": "T"}  # "&" separates tickers only when spaced ("Z & ZG"); AT&T's own ticker is T
 # "BDG/BDGA", "UA/UAA", "BRK.A/BRK.B": a slash between two 2+ character halves separates two tickers,
 # while "BRK/B" and "BF/B" (a 1 character half) are one ticker with a class separator.
 _SLASH_PAIR = re.compile(r"([A-Z0-9.\-]+)/([A-Z0-9.\-]+)")
@@ -524,7 +524,17 @@ def apply_silent_closure(rows: list[dict[str, Any]], *, grace_days: int, data_en
     for group in by_ticker.values():
         for a in group:
             last = a["_fam_last"]  # the family's last filing: a class missing from the latest filing is not silent
-            if a["valid_to"] is not None or last is None or a["_fam_ct"]:
+            if a["valid_to"] is not None and last is not None:
+                # Closed by the issuer's own later ticker: the old ticker still ends no later than the grace period
+                # after the family's last filing (OLDT named in 2008, silent, NEWT in 2020: OLDT ends in 2009).
+                cap = (date.fromisoformat(last) + timedelta(days=grace_days)).isoformat()
+                if a["valid_to"] > cap:
+                    a["valid_to"] = cap
+                    a["conflict_detail"] = {"kind": "silent_issuer_closed", "reason": "grace_period_before_the_issuers_next_ticker",
+                                            "last_filing_naming_ticker": last, "grace_days": grace_days}
+                    closed["grace_period_before_the_issuers_next_ticker"] += 1
+                continue
+            if last is None or a["_fam_ct"]:
                 continue
             horizon = date.fromisoformat(last) + timedelta(days=grace_days)
             later = [b["valid_from"] for b in group if b["entity_id"] != a["entity_id"] and b["valid_from"] > last]
@@ -568,66 +578,151 @@ def _contest(a: dict[str, Any], b: dict[str, Any], overlap: tuple[str, Optional[
     return (a if a["entity_id"] < b["entity_id"] else b), "entity_id"
 
 
-def flag_conflicts(rows: list[dict[str, Any]], max_listed: int = 25) -> list[dict[str, Any]]:
-    """Flag every ticker row that overlaps another CIK's row; pick ONE primary claimant per contested window.
+def _next_day(iso: str) -> str:
+    return (date.fromisoformat(iso) + timedelta(days=1)).isoformat()
 
-    Both claimants keep ``conflict_flag`` true (the conflict is reported, never hidden). ``is_primary`` is
-    given only to the claimant that wins every overlap it is in, by the evidence in ``_contest``, so the
-    consumer's tie-break (``is_primary``, then latest ``valid_from``) lands on the evidence-backed holder
-    instead of on whichever CIK filed under the ticker last.
+
+def _covers(r: dict[str, Any], start: str, end: Optional[str]) -> bool:
+    return r["valid_from"] <= start and (r["valid_to"] is None or (end is not None and r["valid_to"] >= end))
+
+
+def _segments(grp: list[dict[str, Any]]) -> list[tuple[str, Optional[str], list[int]]]:
+    """Elementary segments of the rows' windows, cut at every window boundary, with the rows covering each.
+
+    Windows are inclusive, so a window ending on D cuts at D+1. A segment is ``(start, end_inclusive_or_None,
+    [row index, ...])``; segments no row covers are dropped.
+    """
+    cuts = sorted({r["valid_from"] for r in grp} | {_next_day(r["valid_to"]) for r in grp if r["valid_to"] is not None})
+    out: list[tuple[str, Optional[str], list[int]]] = []
+    for i, start in enumerate(cuts):
+        end = _prev_day(cuts[i + 1]) if i + 1 < len(cuts) else None
+        cover = [k for k, r in enumerate(grp) if _covers(r, start, end)]
+        if cover:
+            out.append((start, end, cover))
+    return out
+
+
+def flag_conflicts(rows: list[dict[str, Any]], max_listed: int = 25) -> list[dict[str, Any]]:
+    """Flag contested ticker windows and pick ONE primary claimant per contested segment.
+
+    A contest is per overlap, not per row, so each row of a contested ticker is split at every overlap
+    boundary (identifiers are dated, so one claim can be several rows). In a segment covered by two or
+    more CIKs, every covering row has ``conflict_flag`` true (the conflict is reported, never hidden) and
+    only the holder, by the evidence in ``_contest``, has ``is_primary``. The holder of a segment is the
+    claimant that wins its pairwise contest against every other claimant there; a row can therefore be primary
+    in one period and not in another, and a stray filer can never win a segment the holder is in. A segment
+    with a single CIK is uncontested: ``is_primary`` true, no flag. ``rows`` is extended in place with the
+    split-off pieces; the conflict groups are returned. ``primary_violations`` re-checks the result.
     """
     by_ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         by_ticker[r["id_value"]].append(r)
     groups: list[dict[str, Any]] = []
+    new_rows: list[dict[str, Any]] = []
     for ticker in sorted(by_ticker):
         grp = sorted(by_ticker[ticker], key=lambda r: (r["valid_from"], r["entity_id"]))
         if len({r["entity_id"] for r in grp}) < 2:
             continue
-        others: dict[int, set[str]] = defaultdict(set)
-        lost: set[int] = set()
-        basis: dict[int, set[str]] = defaultdict(set)
-        pairs: list[dict[str, Any]] = []
-        for i, a in enumerate(grp):
-            for j in range(i + 1, len(grp)):
-                b = grp[j]
-                if a["entity_id"] == b["entity_id"]:
-                    continue
-                ov = _overlap(a, b)
-                if ov is None:
-                    continue
-                win, why = _contest(a, b, ov)
-                lost.add(j if win is a else i)
-                basis[i].add(why)
-                basis[j].add(why)
-                others[i].add(b["entity_id"])
-                others[j].add(a["entity_id"])
-                pairs.append({"a": a["entity_id"], "b": b["entity_id"], "overlap_from": ov[0], "overlap_to": ov[1],
-                              "holder": win["entity_id"], "basis": why})
-        if not pairs:
+        segs = _segments(grp)
+        cache: dict[tuple[int, int], tuple[int, str]] = {}
+
+        def pair(i: int, j: int) -> tuple[int, str]:
+            key = (i, j) if i < j else (j, i)
+            if key not in cache:
+                lo, hi = key
+                ov = _overlap(grp[lo], grp[hi])
+                win, why = _contest(grp[lo], grp[hi], ov) if ov else (grp[lo], "no_overlap")
+                cache[key] = (lo if win is grp[lo] else hi, why)
+            return cache[key]
+
+        info: list[dict[str, Any]] = []
+        for start, end, cover in segs:
+            ents = {grp[k]["entity_id"] for k in cover}
+            if len(ents) < 2:
+                info.append({"start": start, "end": end, "cover": cover, "contested": False})
+                continue
+            beats_all = [k for k in cover if all(pair(k, j)[0] == k for j in cover if grp[j]["entity_id"] != grp[k]["entity_id"])]
+            if not beats_all:  # an intransitive cycle: fall back to the best single claimant
+                beats_all = [max(cover, key=lambda k: (grp[k]["_ct"], len(grp[k]["_dates"]), grp[k]["_last_seen"] or "", grp[k]["entity_id"]))]
+            holder = grp[beats_all[0]]["entity_id"]
+            basis = sorted({pair(k, j)[1] for k in cover for j in cover if grp[k]["entity_id"] != grp[j]["entity_id"]})
+            info.append({"start": start, "end": end, "cover": cover, "contested": True, "holder": holder, "basis": basis,
+                         "entities": sorted(ents)})
+        if not any(x["contested"] for x in info):
             continue
-        contested = sorted(others)
-        primaries = [i for i in contested if i not in lost]
-        if not primaries:  # an intransitive cycle: fall back to the best single row
-            primaries = [max(contested, key=lambda i: (grp[i]["_ct"], len(grp[i]["_dates"]), grp[i]["_last_seen"] or "", grp[i]["entity_id"]))]
-        for i in contested:
-            r = grp[i]
-            r["conflict_flag"] = True
-            r["is_primary"] = i in primaries
-            r["conflict_detail"] = {
-                "kind": "overlapping_ticker_claim",
-                "other_entities": sorted(others[i])[:max_listed],
-                "n_other_entities": len(others[i]),
-                "primary_basis": sorted(basis[i]),
-            }
+        for k, r in enumerate(grp):
+            pieces: list[dict[str, Any]] = []
+            for x in info:
+                if k not in x["cover"]:
+                    continue
+                if x["contested"]:
+                    others = sorted(set(x["entities"]) - {r["entity_id"]})
+                    state = (r["entity_id"] == x["holder"], True, tuple(others), tuple(x["basis"]))
+                else:
+                    state = (True, False, (), ())
+                if pieces and pieces[-1]["state"] == state:
+                    pieces[-1]["end"] = x["end"]
+                else:
+                    pieces.append({"start": x["start"], "end": x["end"], "state": state})
+            original_detail = r["conflict_detail"]
+            for n, pc in enumerate(pieces):
+                is_primary, flagged, others, basis = pc["state"]
+                target = r if n == 0 else dict(r)
+                target["valid_from"] = pc["start"]
+                target["valid_to"] = pc["end"]
+                target["is_primary"] = is_primary
+                target["conflict_flag"] = flagged
+                last_piece = n == len(pieces) - 1
+                if flagged:
+                    target["conflict_detail"] = {
+                        "kind": "overlapping_ticker_claim",
+                        "other_entities": list(others)[:max_listed],
+                        "n_other_entities": len(others),
+                        "primary_basis": list(basis),
+                        **({"closure": original_detail} if original_detail and last_piece else {}),
+                    }
+                else:
+                    target["conflict_detail"] = original_detail if last_piece else None
+                if n > 0:
+                    new_rows.append(target)
+        contested = [x for x in info if x["contested"]]
         groups.append({
             "ticker": ticker,
-            "entities": sorted({e for p in pairs for e in (p["a"], p["b"])}),
-            "primary_entities": sorted(grp[i]["entity_id"] for i in primaries),
-            "n_pairs": len(pairs),
-            "pairs": pairs[:max_listed],
+            "entities": sorted({e for x in contested for e in x["entities"]}),
+            "primary_entities": sorted({x["holder"] for x in contested}),
+            "n_contested_segments": len(contested),
+            "segments": [{"from": x["start"], "to": x["end"], "entities": x["entities"], "holder": x["holder"], "basis": x["basis"]}
+                         for x in contested[:max_listed]],
         })
+    rows.extend(new_rows)
     return groups
+
+
+def primary_violations(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Recompute, from the final rows alone, every overlap segment without exactly one primary CIK.
+
+    For each ticker, cut the rows at their boundaries; a segment covered by two or more CIKs must have exactly one
+    CIK with an ``is_primary`` row there. Returns ``{"ticker", "from", "to", "kind", "entities", "pairs"}``
+    for each segment that has none (``no_primary``) or several (``two_primaries``).
+    """
+    by_ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for r in rows:
+        if r["id_scheme"] == ID_SCHEME_TICKER:
+            by_ticker[r["id_value"]].append(r)
+    out: list[dict[str, Any]] = []
+    for ticker in sorted(by_ticker):
+        grp = by_ticker[ticker]
+        if len({r["entity_id"] for r in grp}) < 2:
+            continue
+        for start, end, cover in _segments(grp):
+            ents = {grp[k]["entity_id"] for k in cover}
+            if len(ents) < 2:
+                continue
+            prim = {grp[k]["entity_id"] for k in cover if grp[k]["is_primary"]}
+            if len(prim) != 1:
+                out.append({"ticker": ticker, "from": start, "to": end, "kind": "no_primary" if not prim else "two_primaries",
+                            "entities": sorted(ents), "pairs": len(ents) * (len(ents) - 1) // 2})
+    return out
 
 
 # --- assembly -------------------------------------------------------------------------------
@@ -732,6 +827,9 @@ def build_rows(
 
     closed = apply_silent_closure(ticker_rows, grace_days=grace_days, data_end=hist["data_end"]) if close_silent else {}
     conflicts = flag_conflicts(ticker_rows)
+    violations = primary_violations(ticker_rows)
+    if violations:
+        raise RuntimeError(f"{len(violations)} contested overlap segments without exactly one primary CIK: {violations[:3]}")
     for r in ticker_rows:
         for k in ("_last_seen", "_fam_last", "_dates", "_ct", "_fam_ct"):
             r.pop(k, None)
@@ -751,6 +849,9 @@ def build_rows(
         "distinct_tickers": len({r["id_value"] for r in ticker_rows}),
         "ticker_identifiers_from_company_tickers": added_from_company_tickers,
         "conflict_tickers": len(conflicts),
+        "contested_overlap_segments": sum(g["n_contested_segments"] for g in conflicts),
+        "overlap_pairs_without_primary": sum(v["pairs"] for v in violations if v["kind"] == "no_primary"),
+        "overlap_segments_with_two_primaries": sum(1 for v in violations if v["kind"] == "two_primaries"),
         "conflict_identifier_rows": len(flagged),
         "conflict_entities": len({r["entity_id"] for r in flagged}),
         "close_silent": close_silent,
@@ -790,21 +891,31 @@ def seed_lines(built: dict[str, Any]) -> Iterable[str]:
         yield json.dumps({"t": "si", **r}, sort_keys=True, separators=(",", ":"))
 
 
-def _code_sha(explicit: Optional[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {"builder_file_sha256_lf": sha256_text_file(Path(__file__).resolve()), "git_head": explicit}
+def _code_sha(explicit: Optional[str], allow_dirty: bool = False) -> dict[str, Any]:
+    """The commit this code was built from. Without ``explicit`` it asks git and refuses a dirty tree."""
+    out: dict[str, Any] = {"builder_file_sha256_lf": sha256_text_file(Path(__file__).resolve()), "git_head": explicit, "dirty": None}
     if explicit is None:
         try:
-            # Fixed argv, no shell, no user input: only records the commit this code was built from.
-            res = subprocess.run(  # nosec B603 B607
+            # Fixed argv, no shell, no user input: read-only git queries about the checkout this code runs from.
+            head = subprocess.run(  # nosec B603 B607
                 ["git", "rev-parse", "HEAD"], cwd=_PROJECT_ROOT, capture_output=True, text=True, timeout=10, check=False)
-            out["git_head"] = res.stdout.strip() or None
+            status = subprocess.run(  # nosec B603 B607
+                ["git", "status", "--porcelain", "--untracked-files=no"], cwd=_PROJECT_ROOT, capture_output=True, text=True,
+                timeout=30, check=False)
+            if head.returncode == 0 and status.returncode == 0:
+                out["git_head"] = head.stdout.strip() or None
+                out["dirty"] = bool(status.stdout.strip())
         except (OSError, subprocess.SubprocessError):
-            out["git_head"] = None
+            pass
+        if out["dirty"] and not allow_dirty:
+            raise ValueError("refusing to build from a git tree with uncommitted changes: the receipt's code SHA would not "
+                             "describe the code (commit first, pass --code-sha, or --allow-dirty)")
     return out
 
 
 def write_artifact(built: dict[str, Any], out_dir: Path, *, inputs: list[dict[str, Any]], params: dict[str, Any],
-                   code_sha: Optional[str] = None) -> dict[str, Any]:
+                   code_sha: Optional[str] = None, allow_dirty: bool = False) -> dict[str, Any]:
+    code = _code_sha(code_sha, allow_dirty)
     out_dir.mkdir(parents=True, exist_ok=True)
     seed_path = out_dir / SEED_FILE
     for name in (SEED_FILE, "receipt.json", "conflicts.json", "ticker_noise.json"):
@@ -824,7 +935,7 @@ def write_artifact(built: dict[str, Any], out_dir: Path, *, inputs: list[dict[st
         "builder": "scripts/build_security_master_all_issuers.py",
         "builder_version": BUILDER_VERSION,
         "built_at": datetime.now(timezone.utc).isoformat(),
-        "code": _code_sha(code_sha),
+        "code": code,
         "params": params,
         "inputs": inputs,
         "output": {"name": SEED_FILE, "lines": n_lines, "sha256": h.hexdigest(), "bytes": seed_path.stat().st_size},
@@ -847,9 +958,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--grace-days", type=int, default=GRACE_DAYS,
                     help="a silent non-holder's window ends this many days after its last filing naming the ticker")
     ap.add_argument("--code-sha", help="git commit of this code when it is not run from a git checkout")
+    ap.add_argument("--allow-dirty", action="store_true", help="build from a git tree with uncommitted changes")
     ap.add_argument("--out-dir", type=Path, required=True)
     args = ap.parse_args(argv)
 
+    _code_sha(args.code_sha, args.allow_dirty)  # refuse a dirty tree before spending a minute building
     inputs = []
     for label, path in ([("company_tickers", p) for p in args.company_tickers]
                         + [("submissions", args.submissions)]
@@ -868,7 +981,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                                              for p in args.company_tickers)),
     )
     receipt = write_artifact(
-        built, args.out_dir, inputs=inputs, code_sha=args.code_sha,
+        built, args.out_dir, inputs=inputs, code_sha=args.code_sha, allow_dirty=args.allow_dirty,
         params={"tickers_as_of": args.tickers_as_of, "close_silent": not args.no_close_silent, "grace_days": args.grace_days},
     )
     print(json.dumps({"out_dir": str(args.out_dir), "output_sha256": receipt["output"]["sha256"], **receipt["counts"]}, indent=2, sort_keys=True))
