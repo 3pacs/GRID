@@ -74,6 +74,20 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     except Exception as exc:
         log.debug("Push notification integration skipped: {e}", e=str(exc))
 
+    # Start email alert scheduler (fast — just spawns a daemon thread that
+    # fires alerts.email.daily_digest() at 07:00 UTC). Restored 2026-09-16:
+    # this call existed briefly (bb9ab4b1) and was dropped by the very next
+    # commit that touched this function, leaving the GRID Intelligence
+    # newsletter (regime, 100x scans, long plays) unreachable for ~4 months
+    # while alerts/scheduler.py and alerts/email.py::daily_digest() sat
+    # unused. scripts/daily_digest.py (the separate ops/health digest run
+    # from the Hermes cycle) was unaffected and kept sending.
+    try:
+        from alerts.scheduler import schedule_alerts
+        schedule_alerts()
+    except Exception as exc:
+        log.debug("Alert scheduler start skipped: {e}", e=str(exc))
+
     # ── Schedule slow startup work in a separate thread so it NEVER blocks requests ──
     import threading
 
@@ -130,6 +144,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
 
     log.info("GRID API shutting down")
+    try:
+        from alerts.scheduler import stop_alerts
+        stop_alerts()
+    except Exception:
+        pass
     try:
         from events.bus import bus as _event_bus_stop
         await _event_bus_stop.stop()
