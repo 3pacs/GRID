@@ -15,8 +15,10 @@ Nothing here deletes anything.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import datetime, time, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable, Iterator, TextIO
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -117,6 +119,38 @@ def preserve_committed(exc: BaseException, moved: int) -> None:
     """Fatal errors carry the acknowledged prefix, excluding uncertain COMMITs."""
     exc.committed_rows = moved
     exc.commit_uncertain = isinstance(exc, tx.CommitUncertain)
+
+
+@contextmanager
+def audit_context(path: Path, *, acknowledged_rows: Callable[[], int]) -> Iterator[TextIO]:
+    """Keep resolution state through audit enter/exit failures; never retry I/O.
+
+    The body error is captured before file cleanup can replace it. Counts come
+    only from observed COMMIT ACKs; an audit error cannot resolve a pending
+    COMMIT. Preserve the initial cause separately from subsequent audit errors.
+    """
+    body_error: BaseException | None = None
+    try:
+        with path.open("x", encoding="utf-8") as audit:
+            try:
+                yield audit
+            except BaseException as exc:
+                body_error = exc
+                raise
+        if body_error is not None:
+            # A context must not suppress a fatal resolution/audit error.
+            raise body_error
+    except BaseException as exc:
+        exc.committed_rows = acknowledged_rows()
+        exc.commit_uncertain = bool(getattr(body_error, "commit_uncertain", isinstance(body_error, tx.CommitUncertain)))
+        resolution_cause = getattr(body_error, "resolution_cause", body_error)
+        if (resolution_cause is body_error and body_error is not None
+                and isinstance(body_error.__cause__, (tx.CommitUncertain, tx.CommitAcknowledgedCleanupError))):
+            resolution_cause = body_error.__cause__
+        exc.resolution_cause = resolution_cause
+        if body_error is not None and exc is not body_error:
+            raise exc from body_error
+        raise
 
 
 def require_guard_closed() -> None:

@@ -379,7 +379,7 @@ def apply_moves(
     timeout_batches = 0
     skipped_ids: list[int] = []
     todo = moves if max_moves is None else moves[:max_moves]
-    with audit_path.open("x", encoding="utf-8") as audit:
+    with common.audit_context(audit_path, acknowledged_rows=lambda: moved) as audit:
         for start in range(0, len(todo), batch_size):
             batch = todo[start:start + batch_size]
             done: list[Move] = []
@@ -638,6 +638,8 @@ def main(argv: list[str] | None = None) -> int:
                           "reason": str(exc) if isinstance(exc, ValueError) else "database/audit failure; inspect private evidence",
                           "acknowledged_committed_rows": getattr(exc, "committed_rows", 0),
                           "commit_uncertain": getattr(exc, "commit_uncertain", False),
+                          "resolution_error_type": (type(exc.resolution_cause).__name__
+                                                    if getattr(exc, "resolution_cause", None) is not None else None),
                           "action": "stop; reconcile database and audit before a separately reviewed retry"}), file=sys.stderr)
         return 5
     finally:

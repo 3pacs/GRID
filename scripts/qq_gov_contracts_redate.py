@@ -348,7 +348,7 @@ def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forwar
         raise ValueError(f"refusing before writes: ticker groups exceed {tx.MAX_WRITE_ROWS} rows: {oversized}")
     moved = blocked = 0
     timeout_chains: list[str] = []
-    with audit_path.open("x", encoding="utf-8") as audit:
+    with common.audit_context(audit_path, acknowledged_rows=lambda: moved) as audit:
         for chain in chains:
             done: list[Redate] = []
             chain_blocked = 0
@@ -493,6 +493,8 @@ def main(argv: list[str] | None = None) -> int:
                           "reason": str(exc) if isinstance(exc, ValueError) else "database/audit failure; inspect private evidence",
                           "acknowledged_committed_rows": getattr(exc, "committed_rows", 0),
                           "commit_uncertain": getattr(exc, "commit_uncertain", False),
+                          "resolution_error_type": (type(exc.resolution_cause).__name__
+                                                    if getattr(exc, "resolution_cause", None) is not None else None),
                           "action": "stop; reconcile database and audit before a separately reviewed retry"}), file=sys.stderr)
         return 5
     finally:
