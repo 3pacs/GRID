@@ -539,6 +539,9 @@ class TestGetSummary:
         assert summary["failed"] == 1
         assert summary["partial"] == 1
         assert summary["total_rows_inserted"] == 15
+        assert summary["actual_rows_inserted"] == 15
+        assert summary["acknowledged_rows_inserted"] == 15
+        assert summary["commit_outcome_unknown"] is False
         assert summary["failed_tickers"] == ["BAD"]
         assert len(summary["significant_beats"]) == 1
         assert len(summary["significant_misses"]) == 0

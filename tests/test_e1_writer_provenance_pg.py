@@ -552,3 +552,54 @@ def test_earnings_middle_row_constraint_failure_keeps_the_other_rows(pg_engine, 
     assert any(r.obs_date == date(2025, 2, 14) and r.series_id.endswith(':eps_actual') for r in rows)
     assert all(r.pull_status == 'SUCCESS' and r.name == 'yfinance_earnings' for r in rows)
     assert max(sizes) <= ep.STORE_BATCH_ROWS
+
+
+def test_earnings_answered_lock_timeout_keeps_later_rows_and_tickers(pg_engine, monkeypatch):
+    from ingestion.altdata import earnings_puller as ep
+
+    puller = ep.EarningsPuller(pg_engine)
+    monkeypatch.setattr(puller, '_fetch_ticker_data', lambda ticker: _earnings_stock(1))
+    with pg_engine.begin() as conn:
+        conn.execute(text("""
+            CREATE FUNCTION earnings_wait() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN
+                IF NEW.series_id = 'earnings:AAPL:eps_actual' THEN
+                    PERFORM pg_advisory_xact_lock(80855529);
+                END IF;
+                RETURN NEW;
+            END; $$
+        """))
+        conn.execute(text("CREATE TRIGGER earnings_wait BEFORE INSERT ON raw_series "
+                          "FOR EACH ROW EXECUTE FUNCTION earnings_wait()"))
+
+    sqlstates, disconnects = [], []
+
+    def timeout(conn):
+        conn.exec_driver_sql("SET LOCAL lock_timeout = '25ms'")
+
+    def record_error(context):
+        sqlstates.append(context.original_exception.pgcode)
+        disconnects.append(context.is_disconnect)
+
+    event.listen(pg_engine, 'begin', timeout)
+    event.listen(pg_engine, 'handle_error', record_error)
+    sizes = _earnings_transaction_sizes(pg_engine)
+    holder = pg_engine.connect()
+    holder.execute(text('SELECT pg_advisory_lock(80855529)'))
+    try:
+        out = puller.pull_all(['AAPL', 'MSFT'], rate_limit=0)
+    finally:
+        holder.execute(text('SELECT pg_advisory_unlock(80855529)'))
+        holder.rollback()
+        holder.close()
+        event.remove(pg_engine, 'begin', timeout)
+        event.remove(pg_engine, 'handle_error', record_error)
+    assert sqlstates == ['55P03', '55P03'] and not any(disconnects)
+    assert [row['ticker'] for row in out] == ['AAPL', 'MSFT']
+    assert out[0]['rows_failed'] == 1 and out[0]['rows_inserted'] == 2
+    assert out[1]['status'] == 'SUCCESS' and out[1]['rows_inserted'] == 3
+    assert not any(row.get('aborted') for row in out)
+    assert len(_rows(pg_engine, 'earnings:')) == 5
+    with pg_engine.connect() as conn:
+        assert conn.execute(text('SELECT 1')).scalar_one() == 1
+    assert max(sizes) <= ep.STORE_BATCH_ROWS

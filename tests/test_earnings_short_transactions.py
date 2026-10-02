@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -235,3 +236,90 @@ def test_store_batch_rejects_an_oversized_transaction():
     with pytest.raises(ValueError, match="exceeds 50"):
         puller._store_batch("AAPL", [{}] * 51, {"connection_failures": 0})
     assert engine.begin_calls == 0
+
+
+def _operational_error(code, driver="pgcode"):
+    original = Exception("server answered transaction failure")
+    setattr(original, driver, code)
+    return sa_exc.OperationalError("INSERT", {}, original, connection_invalidated=False)
+
+
+@pytest.mark.parametrize("code", ["40P01", "55P03", "57014"])
+@pytest.mark.parametrize("driver", ["pgcode", "sqlstate"])
+def test_answered_statement_failures_rollback_and_continue_tickers(code, driver):
+    engine = _Engine(insert_error=_operational_error(code, driver))
+    out = _puller(engine, _frames(1)).pull_all(["AAPL", "MSFT"], rate_limit=0)
+    assert [row["ticker"] for row in out] == ["AAPL", "MSFT"]
+    assert all(row["rows_failed"] == 6 and row["status"] == "FAILED" for row in out)
+    assert all(not row.get("aborted") and not row.get("commit_outcome_unknown") for row in out)
+    assert not engine.committed and engine.begin_calls == 14  # batch plus six singles per ticker
+
+
+@pytest.mark.parametrize("code", ["40P01", "55P03", "57014"])
+def test_answered_commit_rejection_allows_rollback_fallback(code):
+    engine = _Engine(commit_error=_operational_error(code))
+    out = _puller(engine, _frames(1)).pull_all(["AAPL", "MSFT"], rate_limit=0)
+    assert len(out) == 2 and engine.begin_calls == 14
+    assert all(row["rows_failed"] == 6 and not row.get("aborted") for row in out)
+    assert all(not row.get("commit_outcome_unknown") for row in out)
+    assert not engine.committed
+
+
+@pytest.mark.parametrize("driver", ["pgcode", "sqlstate"])
+def test_sqlstate_class_08_stops_even_without_driver_invalidation(driver):
+    engine = _Engine(insert_error=_operational_error("08006", driver))
+    out = _puller(engine).pull_all(["AAPL", "MSFT"], rate_limit=0)
+    assert len(out) == 1 and out[0]["aborted"]
+    assert engine.begin_calls == ep.MAX_CONSECUTIVE_CONNECTION_FAILURES
+    assert out[0]["rows_inserted"] == 0 and not engine.committed
+
+
+@pytest.mark.parametrize("acknowledged", [0, 50])
+def test_lost_ack_summary_and_completion_log_keep_actual_total_unknown(acknowledged):
+    class LostAckTxn(_Txn):
+        def __exit__(self, exc_type, *rest):
+            if self.engine.begin_calls == acknowledged // 50 + 1:
+                self.engine.commit_error = sa_exc.OperationalError("COMMIT", {}, Exception("lost acknowledgement"))
+                self.engine.commit_before_error = True
+            return super().__exit__(exc_type, *rest)
+
+    class LostAckEngine(_Engine):
+        def begin(self):
+            self.begin_calls += 1
+            assert not self.active
+            return LostAckTxn(self)
+
+    engine = LostAckEngine()
+    puller = _puller(engine)
+    messages = []
+    handler = ep.log.add(lambda message: messages.append(str(message)), format="{message}")
+    try:
+        out = puller.pull_all(["AAPL", "MSFT"], rate_limit=0)
+    finally:
+        ep.log.remove(handler)
+    summary = puller.get_summary(out)
+    assert len(out) == 1 and out[0]["aborted"] and engine.begin_calls == acknowledged // 50 + 1
+    assert len(engine.committed) == acknowledged + 50
+    assert summary["acknowledged_rows_inserted"] == acknowledged
+    assert summary["commit_outcome_unknown"] is True
+    assert summary["actual_rows_inserted"] is None and summary["total_rows_inserted"] is None
+    completion = next(message for message in messages if "Earnings pull complete" in message)
+    assert f"{acknowledged} rows acknowledged" in completion
+    assert "actual rows inserted: unknown (COMMIT outcome unknown)" in completion
+
+
+@pytest.mark.parametrize("unknown", [False, True])
+def test_cli_labels_acknowledged_and_actual_counts(unknown, monkeypatch, capsys):
+    engine = _Engine(
+        commit_error=sa_exc.OperationalError("COMMIT", {}, Exception("lost acknowledgement")) if unknown else None,
+        commit_before_error=unknown,
+    )
+    puller = _puller(engine, _frames(1))
+    monkeypatch.setattr(ep, "EARNINGS_TICKERS", ["AAPL", "MSFT"])
+    monkeypatch.setattr(ep.time, "sleep", lambda _: None)
+    monkeypatch.setattr(ep, "EarningsPuller", lambda db_engine: puller)
+    monkeypatch.setitem(sys.modules, "db", SimpleNamespace(get_engine=lambda: engine))
+    ep.main()
+    output = capsys.readouterr().out
+    assert f"Acknowledged rows: {0 if unknown else 12}" in output
+    assert f"Actual total rows: {'unknown (COMMIT outcome unknown)' if unknown else 12}" in output

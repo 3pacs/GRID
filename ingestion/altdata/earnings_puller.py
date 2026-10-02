@@ -89,11 +89,20 @@ class _ConnectionFailure(Exception):
         self.commit_outcome_unknown = commit_outcome_unknown
 
 
+def _sqlstate(exc: BaseException) -> str | None:
+    """Read the server's SQLSTATE through psycopg2/psycopg3 wrappers."""
+    original = getattr(exc, "orig", exc)
+    return getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+
+
 def _is_connection_error(exc: BaseException) -> bool:
-    # Match the fail-closed unusual_whales writer: operational errors also
-    # include timeouts/deadlocks, which are safe reasons to stop this pull.
-    return isinstance(exc, (sa_exc.OperationalError, sa_exc.DisconnectionError, sa_exc.TimeoutError)) or bool(
-        getattr(exc, "connection_invalidated", False)
+    # OperationalError also covers answered deadlocks, lock timeouts and
+    # cancellations. Those leave a usable connection after rollback.
+    state = _sqlstate(exc)
+    return (
+        isinstance(exc, (sa_exc.DisconnectionError, sa_exc.TimeoutError))
+        or bool(getattr(exc, "connection_invalidated", False))
+        or bool(state and state.startswith("08"))
     )
 
 
@@ -403,7 +412,12 @@ class EarningsPuller(BasePuller):
                 fn(conn)
                 statements_completed = True
         except Exception as exc:
-            if not opened or _is_connection_error(exc):
+            # An unanswered COMMIT may already have committed on the server.
+            # Keep it unknown and never replay it, even if the driver failed
+            # to mark its connection invalidated. An answered non-08 SQLSTATE
+            # instead confirms a rejected transaction and permits fallback.
+            unanswered_commit = statements_completed and _sqlstate(exc) is None
+            if not opened or _is_connection_error(exc) or unanswered_commit:
                 raise _ConnectionFailure(exc, commit_outcome_unknown=statements_completed) from exc
             raise
 
@@ -459,6 +473,7 @@ class EarningsPuller(BasePuller):
                                            commit_outcome_unknown=True) from exc
             self._note_connection_failure(streak, exc.__cause__, stored=0)
         except Exception as exc:
+            streak["connection_failures"] = 0
             log.warning("Earnings: {t} batch failed; retrying one row per transaction: {e}", t=ticker, e=str(exc))
 
         stored = failed = 0
@@ -660,14 +675,13 @@ class EarningsPuller(BasePuller):
                     total=len(ticker_list),
                 )
 
-        ok = sum(1 for r in results if r["status"] == "SUCCESS")
-        total_rows = sum(r["rows_inserted"] for r in results)
-
+        summary = self.get_summary(results)
         log.info(
-            "Earnings pull complete — {ok}/{total} succeeded, {rows} rows inserted",
-            ok=ok,
+            "Earnings pull complete — {ok}/{total} succeeded, {ack} rows acknowledged; actual rows inserted: {actual}",
+            ok=summary["succeeded"],
             total=len(results),
-            rows=total_rows,
+            ack=summary["acknowledged_rows_inserted"],
+            actual="unknown (COMMIT outcome unknown)" if summary["commit_outcome_unknown"] else summary["actual_rows_inserted"],
         )
 
         if all_significant:
@@ -694,6 +708,8 @@ class EarningsPuller(BasePuller):
 
         Returns:
             Summary dict with counts, failures, and significant surprises.
+            Actual/total inserted rows are None after any unknown COMMIT;
+            acknowledged_rows_inserted remains a confirmed lower bound.
         """
         succeeded = [r for r in results if r["status"] == "SUCCESS"]
         failed = [r for r in results if r["status"] == "FAILED"]
@@ -701,13 +717,19 @@ class EarningsPuller(BasePuller):
         all_surprises = []
         for r in results:
             all_surprises.extend(r.get("significant_surprises", []))
+        acknowledged_rows = sum(r["rows_inserted"] for r in results)
+        unknown_commit = any(r.get("commit_outcome_unknown", False) for r in results)
+        actual_rows = None if unknown_commit else acknowledged_rows
 
         return {
             "total_tickers": len(results),
             "succeeded": len(succeeded),
             "failed": len(failed),
             "partial": len(partial),
-            "total_rows_inserted": sum(r["rows_inserted"] for r in results),
+            "total_rows_inserted": actual_rows,
+            "actual_rows_inserted": actual_rows,
+            "acknowledged_rows_inserted": acknowledged_rows,
+            "commit_outcome_unknown": unknown_commit,
             "failed_tickers": [r["ticker"] for r in failed],
             "significant_surprises": all_surprises,
             "significant_beats": [
@@ -719,7 +741,7 @@ class EarningsPuller(BasePuller):
         }
 
 
-if __name__ == "__main__":
+def main() -> None:
     from db import get_engine
 
     puller = EarningsPuller(db_engine=get_engine())
@@ -728,8 +750,14 @@ if __name__ == "__main__":
     print("\nEarnings Pull Summary:")
     print(f"  Succeeded: {summary['succeeded']}/{summary['total_tickers']}")
     print(f"  Failed: {summary['failed']} — {summary['failed_tickers']}")
-    print(f"  Total rows: {summary['total_rows_inserted']}")
+    print(f"  Acknowledged rows: {summary['acknowledged_rows_inserted']}")
+    actual = "unknown (COMMIT outcome unknown)" if summary["commit_outcome_unknown"] else summary["actual_rows_inserted"]
+    print(f"  Actual total rows: {actual}")
     print(f"  Significant beats: {len(summary['significant_beats'])}")
     print(f"  Significant misses: {len(summary['significant_misses'])}")
     for s in summary["significant_surprises"]:
         print(f"    {s['ticker']} {s['date']}: {s['surprise_pct']:+.1f}% ({s['classification']})")
+
+
+if __name__ == "__main__":
+    main()
