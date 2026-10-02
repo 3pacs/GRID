@@ -62,6 +62,7 @@ def test_trust_mock_pages_all_rows_without_changing_feed_statistics(monkeypatch,
         def fetchall(self): return self.rows
     class Conn:
         def __init__(self): self.changed = 0
+        def commit(self): counts.append(self.changed)
         def execute(self, statement, params=None):
             sql = str(statement)
             if "SELECT source_type" in sql:
@@ -82,7 +83,6 @@ def test_trust_mock_pages_all_rows_without_changing_feed_statistics(monkeypatch,
         def begin(self):
             conn = Conn()
             yield conn
-            counts.append(conn.changed)
     result = trust.update_trust_scores(Engine())
     assert [n for n in counts if n] == [50, 50, 1]
     assert len(table) == 101 and result["total"] == 1

@@ -21,6 +21,14 @@ class CommitUncertain(RuntimeError):
     """Transaction resolution was not acknowledged: stop and reconcile manually."""
 
 
+class CommitAcknowledgedCleanupError(RuntimeError):
+    """COMMIT returned successfully, but closing/checking in the connection failed.
+
+    The caller must preserve this transaction's acknowledged count and audit,
+    then stop. This error never authorizes rollback fallback or replay.
+    """
+
+
 def is_rolled_back_write_error(exc: BaseException) -> bool:
     """Only an acquired write body with confirmed rollback may enter fallback."""
     return (isinstance(exc, sa_exc.DBAPIError)
@@ -75,6 +83,8 @@ def write_transaction(
     phase = "acquisition"
     conn = driver = None
     body_error: BaseException | None = None
+    commit_error: BaseException | None = None
+    acknowledged = False
     started = time.monotonic()
 
     def check() -> None:
@@ -103,16 +113,35 @@ def write_transaction(
                 # from COMMIT: even SET LOCAL can outlast the open window.
                 check()
                 phase = "commit"
+                # Engine.begin() also closes/checks in the connection. Only
+                # this call's exception can be a server COMMIT rejection.
+                try:
+                    conn.commit()
+                except BaseException as exc:
+                    commit_error = exc
+                    if _known_commit_rejection(exc, conn, driver):
+                        exc.qq_write_rolled_back = True
+                        exc.qq_failure_phase = "commit_rejected"
+                        raise
+                    raise CommitUncertain("QuiverQuant COMMIT resolution is uncertain; no replay") from exc
+                acknowledged = True
+                phase = "cleanup"
             except BaseException as exc:
                 body_error = exc
                 raise
     except BaseException as exc:
-        if phase == "commit":
-            if _known_commit_rejection(exc, conn, driver):
-                exc.qq_write_rolled_back = True
-                exc.qq_failure_phase = "commit_rejected"
+        if acknowledged:
+            raise CommitAcknowledgedCleanupError(
+                "QuiverQuant COMMIT acknowledged but connection cleanup failed; stop without replay"
+            ) from exc
+        if commit_error is not None:
+            # A cleanup failure replacing the COMMIT response loses the proof
+            # of a clean rejection. It cannot authorize fallback.
+            if exc is commit_error and getattr(exc, "qq_write_rolled_back", False):
                 raise
-            raise CommitUncertain("QuiverQuant COMMIT resolution is uncertain; no replay") from exc
+            if isinstance(exc, CommitUncertain):
+                raise
+            raise CommitUncertain("QuiverQuant transaction resolution is uncertain; no replay") from exc
         if body_error is not None and exc is not body_error:
             raise CommitUncertain("QuiverQuant transaction resolution is uncertain; no replay") from exc
         exc.qq_failure_phase = phase

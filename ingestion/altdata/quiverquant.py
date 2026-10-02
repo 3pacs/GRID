@@ -363,6 +363,8 @@ def _store_signals(
         try:
             write(batch)
         except Exception as exc:
+            if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                rows_inserted += len(batch)
             if not tx.is_rolled_back_write_error(exc):
                 raise QuiverStoreAborted(
                     "QuiverQuant writes stopped; inspect acknowledged count before any retry",
@@ -375,6 +377,8 @@ def _store_signals(
                 try:
                     write([params])
                 except Exception as row_exc:
+                    if isinstance(row_exc, tx.CommitAcknowledgedCleanupError):
+                        rows_inserted += 1
                     if not tx.is_rolled_back_write_error(row_exc):
                         raise QuiverStoreAborted(
                             "QuiverQuant row writes stopped; no automatic replay",

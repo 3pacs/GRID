@@ -24,6 +24,9 @@ class _Conn:
     def __exit__(self, exc_type, exc, tb):
         return False
 
+    def commit(self):
+        pass
+
     def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)

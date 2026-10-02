@@ -126,9 +126,13 @@ def test_pg_writer_commit_ack_loss_keeps_only_acknowledged_prefix(pg,monkeypatch
         def begin(self):
             calls[0]+=1
             with engine.begin() as conn:
+                real_commit = conn.commit
+                def commit():
+                    real_commit()
+                    if calls[0] == 2:
+                        raise OperationalError("COMMIT", {}, OSError("synthetic lost COMMIT acknowledgment"))
+                conn.commit = commit
                 yield conn
-            if calls[0]==2:
-                raise OperationalError("COMMIT",{},OSError("synthetic lost COMMIT acknowledgment"))
     with pytest.raises(qq.QuiverStoreAborted) as caught:
         qq._store_signals(AckLoss(),records(5),"quiverquant:lobbying","lobbying")
     assert caught.value.stored==2 and caught.value.commit_uncertain
@@ -216,9 +220,13 @@ def test_pg_server_commits_then_ack_is_lost_never_replayed_or_audited(pg,tmp_pat
         def begin(self):
             calls[0]+=1
             with engine.begin() as conn:
+                real_commit = conn.commit
+                def commit():
+                    real_commit()
+                    if calls[0] == 2:
+                        raise OperationalError("COMMIT", {}, OSError("synthetic ack loss after real COMMIT"))
+                conn.commit = commit
                 yield conn
-            if calls[0]==2:
-                raise OperationalError("COMMIT",{},OSError("synthetic ack loss after real COMMIT"))
     counts.clear()
     kwargs={"batch_size":1} if script is rekey else {}
     with pytest.raises(tx.CommitUncertain) as caught:

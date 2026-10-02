@@ -557,7 +557,7 @@ def test_rekey_reports_and_skips_a_batch_that_hits_the_lock_timeout(engine, open
                     if calls["n"] == 1:
                         raise _timeout_error()
                     return conn.execute(*args, **kwargs)
-                yield SimpleNamespace(execute=execute)
+                yield SimpleNamespace(execute=execute, commit=conn.commit)
 
     plan = rekey.plan_rekey("quiverquant:house", rekey.load_legacy_rows(engine.connect(), "quiverquant:house"), set())
     result = rekey.apply_moves(_Eng(), plan.moves, batch_size=2, audit_path=tmp_path / "a.jsonl")
@@ -615,7 +615,7 @@ def test_redate_reports_and_skips_a_chain_that_hits_the_lock_timeout(engine, ope
                     if calls["n"] == 1:
                         raise _timeout_error()
                     return conn.execute(*args, **kwargs)
-                yield SimpleNamespace(execute=execute)
+                yield SimpleNamespace(execute=execute, commit=conn.commit)
 
     result = redate.apply_moves(_Eng(), plan.moves, audit_path=tmp_path / "a.jsonl")
     assert result["chains_skipped_timeout"] == 1 and result["moved"] == 5

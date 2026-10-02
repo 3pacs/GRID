@@ -384,6 +384,7 @@ def apply_moves(
             batch = todo[start:start + batch_size]
             done: list[Move] = []
             raced = 0
+            cleanup_error = None
             try:
                 with tx.write_transaction(engine, guard=lambda: common.write_guard(guard_check=guard_check)) as (conn, check):
                     for m in batch:
@@ -398,12 +399,15 @@ def apply_moves(
                         else:
                             raced += 1
             except Exception as exc:
-                if not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
+                if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                    cleanup_error = exc
+                elif not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
                     common.preserve_committed(exc, moved)
                     raise
-                timeout_batches += 1
-                skipped_ids.extend(m.id for m in batch)
-                continue
+                else:
+                    timeout_batches += 1
+                    skipped_ids.extend(m.id for m in batch)
+                    continue
             lost_race += raced
             moved += len(done)  # acknowledged COMMIT, even if the audit device then fails
             try:
@@ -413,7 +417,12 @@ def apply_moves(
                 } for m in done])
             except Exception as exc:
                 common.preserve_committed(exc, moved)
+                if cleanup_error is not None:
+                    raise exc from cleanup_error
                 raise
+            if cleanup_error is not None:
+                common.preserve_committed(cleanup_error, moved)
+                raise cleanup_error
     return {
         "moved": moved,
         "not_moved_target_taken_or_row_changed": lost_race,

@@ -352,6 +352,7 @@ def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forwar
         for chain in chains:
             done: list[Redate] = []
             chain_blocked = 0
+            cleanup_error = None
             try:
                 with tx.write_transaction(engine, guard=lambda: common.write_guard(guard_check=guard_check)) as (conn, check):
                     for m in chain:
@@ -362,11 +363,14 @@ def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forwar
                         else:
                             chain_blocked += 1
             except Exception as exc:
-                if not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
+                if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                    cleanup_error = exc
+                elif not tx.is_rolled_back_write_error(exc) or not common.is_lock_or_timeout(exc):
                     common.preserve_committed(exc, moved)
                     raise
-                timeout_chains.append(chain[0].ticker)
-                continue
+                else:
+                    timeout_chains.append(chain[0].ticker)
+                    continue
             blocked += chain_blocked
             moved += len(done)
             try:
@@ -378,7 +382,12 @@ def apply_moves(engine: Engine, moves: list[Redate], *, audit_path: Path, forwar
                 } for m in done])
             except Exception as exc:
                 common.preserve_committed(exc, moved)
+                if cleanup_error is not None:
+                    raise exc from cleanup_error
                 raise
+            if cleanup_error is not None:
+                common.preserve_committed(cleanup_error, moved)
+                raise cleanup_error
     return {
         "moved": moved,
         "not_moved_slot_taken_or_row_changed": blocked,

@@ -51,11 +51,12 @@ class WriterEngine:
                 raise OperationalError("INSERT", {}, OSError("connection lost"))
             pending[params["ticker"]] = json.loads(params["signal_value"])
 
-        yield SimpleNamespace(execute=execute)
-        self.table = pending
-        if self.fault_batch == index and self.commit_fault:
-            raise OperationalError("COMMIT", {}, OSError("ack lost"))
-        self.commits.append(count[0])
+        def commit():
+            self.table = pending
+            if self.fault_batch == index and self.commit_fault:
+                raise OperationalError("COMMIT", {}, OSError("ack lost"))
+            self.commits.append(count[0])
+        yield SimpleNamespace(execute=execute, commit=commit)
 
 
 def test_writer_uses_at_most_fifty_modifications_and_keeps_all_valid_records():
@@ -240,8 +241,9 @@ def test_commit_ack_loss_stops_transitions_without_inventing_audit(script, open_
         @contextmanager
         def begin(self):
             calls[0] += 1
-            yield SimpleNamespace(execute=lambda *a: SimpleNamespace(rowcount=1))
-            raise OperationalError("COMMIT", {}, OSError("ack lost"))
+            def commit():
+                raise OperationalError("COMMIT", {}, OSError("ack lost"))
+            yield SimpleNamespace(execute=lambda *a: SimpleNamespace(rowcount=1), commit=commit)
     moves = ([rekey.Move(1,"quiverquant:house","T",date(2026,9,1),"house_trading","old","new")]
              if script is rekey else quarter_moves(1)[1])
     kwargs = {"batch_size": 1} if script is rekey else {}

@@ -1054,6 +1054,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
         after_id = 0
         propagated = 0
         while True:
+            changed = 0
             try:
                 with tx.write_transaction(engine) as (conn, check):
                     ids = [row[0] for row in conn.execute(text("""
@@ -1077,6 +1078,8 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
                         """).bindparams(bindparam("target_ids", expanding=True)),
                             {**params, "target_ids": ids}).rowcount
             except Exception as exc:
+                if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                    propagated += int(changed)
                 exc.trust_rows_updated = sum(s.get("propagated_rows", 0) for s in sources_updated) + propagated
                 raise
             if not ids:

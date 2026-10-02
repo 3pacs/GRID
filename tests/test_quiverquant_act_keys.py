@@ -33,6 +33,9 @@ class _UpsertConn:
     def __exit__(self, *exc):
         return False
 
+    def commit(self):
+        pass
+
     def execute(self, statement, params):
         sql = str(statement)
         assert "INSERT INTO signal_sources" in sql
@@ -363,6 +366,9 @@ def test_trust_scorer_scores_a_quiverquant_feed_as_one_source(monkeypatch):
             return self._rows
 
     class _Conn:
+        def commit(self):
+            pass
+
         def __init__(self):
             self.updates: list[dict] = []
 
@@ -467,6 +473,9 @@ def test_trust_scorer_last_signal_date_is_the_max_across_a_feeds_rows(monkeypatc
             return self._rows
 
     class _Conn:
+        def commit(self):
+            pass
+
         def __enter__(self):
             return self
 
@@ -631,6 +640,9 @@ def test_actor_context_shows_the_person_not_the_act_key(monkeypatch):
             ]
 
     class _Conn:
+        def commit(self):
+            pass
+
         def __enter__(self):
             return self
 
