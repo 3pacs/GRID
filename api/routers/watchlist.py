@@ -12,7 +12,6 @@ Sub-routers:
 
 Re-exports for external callers that import from this module directly:
   _batch_fetch_prices    — api.routers.astrogrid_core
-  _cache_price_to_db     — api.routers.astrogrid_core
   _resolve_feature_names — api.routers.astrogrid_helpers
 """
 
@@ -28,7 +27,6 @@ from api.routers.watchlist_overview import router as _overview_router
 # continue to work without changes.
 from api.routers.watchlist_helpers import (  # noqa: F401
     _batch_fetch_prices,
-    _cache_price_to_db,
     _resolve_feature_names,
 )
 
