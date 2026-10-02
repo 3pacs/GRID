@@ -1224,10 +1224,17 @@ def _get_pullers_for_group(
             pullers.append(("FEC_Campaign_Finance", CampaignFinancePuller(db_engine), "pull_all", {}))
         except Exception as exc:
             log.warning("Campaign Finance puller init failed: {err}", err=str(exc))
-        # ICIJ Offshore Leaks — monthly check for database updates + re-scan actors
+        # ICIJ Offshore Leaks — monthly check for database updates + re-scan actors.
+        # Honors the SmartScheduler registry hold (match quality under review,
+        # docs/handoffs/2026-10-02/OFFSHORE-LEAKS-MATCH-QUALITY.md).
         try:
-            from ingestion.altdata.offshore_leaks import OffshoreLeaksPuller
-            pullers.append(("ICIJ_Offshore", OffshoreLeaksPuller(db_engine), "pull", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _offshore_hold = hold_reason_for("offshore_leaks")
+            if _offshore_hold:
+                log.info("ICIJ Offshore Leaks held: {r}", r=_offshore_hold)
+            else:
+                from ingestion.altdata.offshore_leaks import OffshoreLeaksPuller
+                pullers.append(("ICIJ_Offshore", OffshoreLeaksPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("ICIJ Offshore Leaks puller init failed: {err}", err=str(exc))
 

@@ -575,7 +575,10 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "ads_index",             "mod": "ingestion.altdata.ads_index",          "cls": "ADSIndexPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 60},
     {"name": "baltic_exchange",       "mod": "ingestion.altdata.baltic_dry",         "cls": "BalticDryPuller",            "method": "pull_all",  "freq_h": 24,  "timeout_s": 60,  "api_key": "FRED_API_KEY", "api_key_mode": "first"},
     {"name": "finra_ats",             "mod": "ingestion.altdata.finra_ats",          "cls": "FINRAATSPuller",             "method": "pull_all",  "freq_h": 168, "timeout_s": 120},
-    {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600},
+    # Held 2026-10-02: name matching is too loose to publish (71,903 matches against 204 actors,
+    # mostly "partial" substring hits such as GTC MANAGEMENT LTD. -> Oaktree). See
+    # docs/handoffs/2026-10-02/OFFSHORE-LEAKS-MATCH-QUALITY.md for the proposed minimum rule.
+    {"name": "offshore_leaks",        "mod": "ingestion.altdata.offshore_leaks",     "cls": "OffshoreLeaksPuller",        "method": "pull",      "freq_h": 720, "timeout_s": 600, "hold_reason": "Match quality under review: partial substring name matches (see docs/handoffs/2026-10-02/OFFSHORE-LEAKS-MATCH-QUALITY.md)"},
     {"name": "wikidata_persons",      "mod": "ingestion.altdata.wikidata_persons",   "cls": "WikidataPersonPuller",       "method": "pull_all",  "freq_h": 168, "timeout_s": 1800},
 
     # ── Wave 1 activation (2026-09-27): merged-but-unscheduled pullers ──
@@ -682,6 +685,13 @@ SMART_PULL_LOG_PREFIX = "smart:"
 # pull_log lookback used to rebuild a failure streak (and so the cooldown)
 # on restart. Longer than the 24h maximum cooldown in _record_result.
 RESTART_FAILURE_LOOKBACK_H = 48
+
+
+def hold_reason_for(registry_name: str) -> str | None:
+    """The registry entry's hold_reason, if held. Other schedulers that run the
+    same puller (ingestion/scheduler.py) consult this so a hold is one switch."""
+    entry = next((e for e in PULLER_REGISTRY if e["name"] == registry_name), None)
+    return entry.get("hold_reason") if entry else None
 
 
 def catalog_name_for(registry_name: str) -> str:
