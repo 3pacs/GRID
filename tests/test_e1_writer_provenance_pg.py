@@ -405,3 +405,51 @@ def test_coingecko_provider_outage_writes_nothing(pg_engine, monkeypatch) -> Non
     out = puller.pull_all()
     assert _outcome(out) == ss.OUTCOME_FAILED and out["rows_inserted"] == 0
     assert _rows(pg_engine, "CG:") == []
+
+
+# ── unusual_whales: short batched transactions (2026-10-02 lock incident) ──
+
+
+def test_unusual_whales_commits_each_batch_on_its_own(pg_engine, monkeypatch) -> None:
+    from ingestion.altdata import unusual_whales as uw
+
+    with pg_engine.begin() as conn:  # production has this row; SOURCE_CONFIG's INTRADAY fails the CHECK
+        conn.execute(text(
+            "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class, pit_available, "
+            "revision_behavior, trust_score, priority_rank) "
+            "VALUES ('Unusual_Whales', 'https://finance.yahoo.com/', 'FREE', 'EOD', FALSE, 'NEVER', 'LOW', 40)"
+        ))
+    puller = uw.UnusualWhalesPuller(pg_engine)
+    monkeypatch.setattr(uw.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(puller, "_get_expirations", lambda ticker: ["2026-10-16"])
+    monkeypatch.setattr(puller, "_fetch_options_chain", lambda ticker, exp: {"calls": [{}], "puts": []})
+    n = 2 * uw.STORE_BATCH_ROWS + 9
+    signals = [{
+        "ticker": "SPY", "strike": 400.0 + i, "expiration": "2026-10-16", "direction": "CALL",
+        "open_interest": 10, "volume": 5000, "last_price": 1.5, "implied_volatility": 0.2,
+        "notional_premium": 750000.0, "signals": ["volume_spike"], "oi_ratio": 1.0,
+        "volume_ratio": 9.0, "avg_oi": 10.0, "avg_volume": 100.0,
+    } for i in range(n)]
+    monkeypatch.setattr(puller, "_detect_unusual_activity", lambda t, e, o, d: list(signals))
+
+    visible: list[tuple[int, int]] = []
+    real_store = uw.UnusualWhalesPuller._store_batch
+
+    def store(self, ticker, batch, today, streak):
+        out = real_store(self, ticker, batch, today, streak)
+        with pg_engine.connect() as c:  # a second connection already sees the batch: it committed
+            visible.append((out[0], c.execute(text(
+                "SELECT count(*) FROM raw_series WHERE series_id LIKE 'WHALE:SPY:%'"
+            )).scalar_one()))
+        return out
+
+    monkeypatch.setattr(uw.UnusualWhalesPuller, "_store_batch", store)
+    out = puller.pull_ticker("SPY")
+    assert out["status"] == "SUCCESS" and out["rows_inserted"] == n
+    assert len(visible) >= 3
+    running = 0
+    for written, seen_now in visible:
+        assert written <= uw.STORE_BATCH_ROWS
+        running += written
+        assert seen_now == running, visible
+    assert puller.pull_ticker("SPY")["rows_inserted"] == 0  # same day: deduped, not rewritten
