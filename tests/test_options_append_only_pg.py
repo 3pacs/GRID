@@ -104,6 +104,61 @@ def _run(engine: Engine, fn_name: str) -> None:
             raise
 
 
+@pytest.mark.parametrize("source, day_offset, start_offset, completed_offset, backfilled, qualifies", [
+    ("daily_scheduler", 0, -120, -60, False, True),
+    ("smart_scheduler", 0, -120, -60, False, True),
+    ("options_puller", 0, -120, -60, False, False),
+    ("pre_append_only", 0, -120, -60, True, False),
+    ("gem", 0, -120, -60, False, False),
+    ("daily_scheduler", 0, -120, -60, True, False),
+    ("daily_scheduler", -1, -120, -60, False, False),
+    ("daily_scheduler", 0, -120, 60, False, False),
+    ("daily_scheduler", 0, -86400, -60, False, False),
+])
+def test_hermes_retry_observes_only_current_completed_scheduler_batches(
+        scratch, monkeypatch, source, day_offset, start_offset, completed_offset, backfilled, qualifies):
+    from scripts import hermes_fixers as hf
+
+    engine, _url = scratch
+    _run(engine, "upgrade")
+    # A UTC/NY boundary and a non-UTC PostgreSQL session prove DATE/TIMESTAMPTZ
+    # predicates use the same UTC date contract as the options writer.
+    now = datetime(2026, 10, 3, 0, 30, tzinfo=timezone.utc)
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+    monkeypatch.setattr(hf, "datetime", Clock)
+    timezone_url = engine.url.update_query_dict({
+        "options": engine.url.query["options"] + " -ctimezone=America/Los_Angeles",
+    })
+    observer = create_engine(timezone_url)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO options_capture_batches
+                (capture_batch_id,ticker,snap_date,capture_ordinal,capture_started_at,
+                 capture_completed_at,row_count,capture_source,backfilled)
+                VALUES ('synthetic-retry-batch','SPY',:day,1,:start,:complete,2,:source,:backfilled)
+            """), {"day": now.date() + timedelta(days=day_offset),
+                   "start": now + timedelta(seconds=start_offset),
+                   "complete": now + timedelta(seconds=completed_offset),
+                   "source": source, "backfilled": backfilled})
+        result = hf._scheduler_options_retry_guard(observer)
+        if qualifies:
+            assert result["outcome"] == "SKIPPED" and result["rows_inserted"] == 0
+            assert result["scheduler_capture_source"] == source
+            assert result["observed_session"] == "2026-10-03"
+        else:
+            assert result is None
+        with engine.connect() as conn:
+            assert conn.execute(text("SELECT COUNT(*) FROM options_capture_batches")).scalar() == 1
+    finally:
+        observer.dispose()
+
+
 def _seed_legacy(engine: Engine) -> str:
     """One NULL-provenance day and one pre-append-only batched day."""
     batch = str(uuid4())
