@@ -33,6 +33,7 @@ wrote nothing is ``NO_NEW_ROWS``, never ``SUCCESS``.
 from __future__ import annotations
 
 import json
+from contextlib import contextmanager
 from datetime import datetime, time, timezone
 from typing import Any, Callable
 
@@ -191,12 +192,17 @@ def _finish_run(conn: Connection, run_id: str, counts: dict[str, int], error: st
 
 def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *, run_id: str, mode: str,
                      observed_at: datetime, inputs: dict[str, Any] | None = None,
-                     before_transaction: Callable[[], None] | None = None) -> dict[str, Any]:
+                     before_transaction: Callable[[], None] | None = None,
+                     before_commit: Callable[[], None] | None = None) -> dict[str, Any]:
     """Apply ``plan`` (from ``plan.build_write_plan``) for the resolved ``events``. Returns counts + status.
 
     ``observed_at`` must be the moment the inputs finished loading (never in
     the future): it becomes ``superseded_at``/``retracted_at`` and the
     known_at of superseding versions.
+
+    Optional guards run before entry and inside each transaction before commit.
+    If no separate commit guard is supplied, reuse the entry guard. A raised
+    guard rolls back the active transaction; absent guards preserve existing callers.
     """
     if observed_at.tzinfo is None or observed_at > datetime.now(timezone.utc):
         raise ValueError("observed_at must be timezone-aware and not in the future")
@@ -212,18 +218,28 @@ def apply_write_plan(engine: Engine, events: pd.DataFrame, plan: pd.DataFrame, *
         raise RuntimeError("another people_events writer holds the lock")
     try:
         return _apply_locked(engine, by_key, counts, plan, run_id=run_id, mode=mode, observed_at=observed_at,
-                             inputs=inputs, before_transaction=before_transaction)
+                             inputs=inputs, before_transaction=before_transaction, before_commit=before_commit)
     finally:
         lock_conn.execute(text("SELECT pg_advisory_unlock(:k)"), {"k": ADVISORY_LOCK_KEY})
         lock_conn.close()
 
 
-def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd.DataFrame, *, run_id: str,
-                  mode: str, observed_at: datetime, inputs: dict[str, Any] | None,
-                  before_transaction: Callable[[], None] | None = None) -> dict[str, Any]:
+@contextmanager
+def _guarded_transaction(engine: Engine, before_transaction, before_commit):
     if before_transaction:
         before_transaction()
     with engine.begin() as conn:
+        yield conn
+        guard = before_commit or before_transaction
+        if guard:
+            guard()
+
+
+def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd.DataFrame, *, run_id: str,
+                  mode: str, observed_at: datetime, inputs: dict[str, Any] | None,
+                  before_transaction: Callable[[], None] | None = None,
+                  before_commit: Callable[[], None] | None = None) -> dict[str, Any]:
+    with _guarded_transaction(engine, before_transaction, before_commit) as conn:
         _start_run(conn, run_id, mode, inputs or {})
     ops = plan.to_dict("records")
     try:
@@ -231,9 +247,7 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
         for start in range(0, len(ops), CHUNK_ROWS):
             chunk = ops[start:start + CHUNK_ROWS]
             pending = dict(counts)
-            if before_transaction:
-                before_transaction()
-            with engine.begin() as conn:
+            with _guarded_transaction(engine, before_transaction, before_commit) as conn:
                 inserts = []
                 for p in chunk:
                     key = (p["channel"], p["dedup_key"])
@@ -278,13 +292,9 @@ def _apply_locked(engine: Engine, by_key: dict, counts: dict[str, int], plan: pd
                     conn.execute(insert(_TABLE), inserts)
             counts = pending  # only after the chunk committed
     except Exception as exc:
-        if before_transaction:
-            before_transaction()
-        with engine.begin() as conn:
+        with _guarded_transaction(engine, before_transaction, before_commit) as conn:
             _finish_run(conn, run_id, counts, error=f"{type(exc).__name__}: {exc}"[:2000])
         raise
-    if before_transaction:
-        before_transaction()
-    with engine.begin() as conn:
+    with _guarded_transaction(engine, before_transaction, before_commit) as conn:
         status = _finish_run(conn, run_id, counts)
     return {"run_id": run_id, "status": status, "counts": counts}

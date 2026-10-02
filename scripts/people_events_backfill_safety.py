@@ -7,7 +7,7 @@ import json
 import os
 import re
 from contextlib import contextmanager
-from datetime import datetime, time, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 
 MAX_TRANSACTION_ROWS = 50
@@ -15,23 +15,44 @@ THROTTLE_ROWS = 20_000
 GROWTH_RESERVE_BYTES = 32 * 1024 * 1024
 MANIFEST_NAME = "gd3_manifest.json"
 PROGRESS_NAME = "gd3_progress.jsonl"
+STATEMENT_TIMEOUT_MS = 120_000
+LOCK_TIMEOUT_MS = 5_000
+COMMIT_MARGIN_SECONDS = 5
+# GD3 issues one mutation statement per transaction. Include the lock bound
+# and commit reserve conservatively even though lock wait is statement time.
+ENTRY_MARGIN_SECONDS = (STATEMENT_TIMEOUT_MS + LOCK_TIMEOUT_MS) / 1000 + COMMIT_MARGIN_SECONDS
+ZERO_COUNT_KEYS = ("add_sources", "tighten_known_at", "enrich_identity", "supersede", "retract",
+                   "actor_conflict", "report_only", "unchanged")
 
 
 class WriteWindowClosed(RuntimeError):
     pass
 
 
-def write_window_open(now: datetime | None = None) -> bool:
+def write_window_open(now: datetime | None = None, *, margin_seconds: float = 0) -> bool:
     """Stop an hour before nightly backup, and before both daytime blackouts."""
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     value = now.time().replace(tzinfo=None)
-    return not (time(2, 30) <= value < time(10, 30)
-                or time(10, 58) <= value < time(11, 12)
-                or time(13, 25) <= value < time(14, 20))
+    if (time(2, 30) <= value < time(10, 30)
+            or time(10, 58) <= value < time(11, 12)
+            or time(13, 25) <= value < time(14, 20)):
+        return False
+    for cutoff in (time(2, 30), time(10, 58), time(13, 25)):
+        start = datetime.combine(now.date(), cutoff, tzinfo=timezone.utc)
+        if start < now:
+            start += timedelta(days=1)
+        if (start - now).total_seconds() <= margin_seconds:
+            return False
+    return True
+
+
+def require_write_entry_window() -> None:
+    if not write_window_open(margin_seconds=ENTRY_MARGIN_SECONDS):
+        raise WriteWindowClosed("GD3 transaction entry refused by blackout or statement/lock/commit margin")
 
 
 def require_write_window() -> None:
-    if not write_window_open():
+    if not write_window_open(margin_seconds=COMMIT_MARGIN_SECONDS):
         raise WriteWindowClosed("GD3 short transaction refused by operational blackout")
 
 
@@ -108,7 +129,7 @@ def load_manifest(directory: Path, identity: dict, *, baseline_bytes: int | None
 
 def read_progress(path: Path, prefix: str) -> tuple[int, int, str]:
     batches = rows = 0
-    digest = hashlib.md5(usedforsecurity=False)
+    digest = hashlib.sha256()
     with path.open(encoding="utf-8") as handle:
         for line in handle:
             if not line.endswith("\n"):
@@ -124,9 +145,17 @@ def read_progress(path: Path, prefix: str) -> tuple[int, int, str]:
             rows += batch_rows
             if batches:
                 digest.update(b"\n")
-            digest.update(f"{record['run_id']}:{batch_rows}".encode("ascii"))
+            digest.update(batch_audit_record(record["run_id"], batches,
+                                            {"insert": batch_rows, "written": batch_rows,
+                                             **dict.fromkeys(ZERO_COUNT_KEYS, 0)}))
             batches += 1
     return batches, rows, digest.hexdigest()
+
+
+def batch_audit_record(run_id: str, batch: int, counts: dict) -> bytes:
+    """Bind the sequential identity and every audited counter to the journal."""
+    return json.dumps({"run_id": run_id, "batch": batch, "counts": counts},
+                      sort_keys=True, separators=(",", ":")).encode("ascii")
 
 
 def append_progress(path: Path, record: dict) -> None:

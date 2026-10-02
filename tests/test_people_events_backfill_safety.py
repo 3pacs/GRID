@@ -1,7 +1,7 @@
 """Operational boundary and crash/resume checks; no database connections."""
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 
 import pandas as pd
@@ -93,7 +93,7 @@ def test_writer_guard_runs_before_every_short_write_transaction(monkeypatch):
     W._apply_locked(Engine(), {key: {} for key in keys}, {"insert": 0}, plan,
                     run_id="test", mode="backfill", observed_at=datetime.now(timezone.utc), inputs={},
                     before_transaction=lambda: guards.append(len(transactions)))
-    assert transactions == [[1], [50], [1]] and guards == [0, 1, 2]
+    assert transactions == [[1], [50], [1]] and guards == [0, 1, 1, 2, 2, 3]
 
 
 def test_writer_never_opens_next_transaction_after_blackout(monkeypatch):
@@ -115,3 +115,114 @@ def test_writer_never_opens_next_transaction_after_blackout(monkeypatch):
         W._apply_locked(Engine(), {}, {"insert": 0}, pd.DataFrame([{"op": "insert"}]), run_id="test",
                         mode="backfill", observed_at=datetime.now(timezone.utc), inputs={}, before_transaction=guard)
     assert transactions == [1]
+
+
+@pytest.mark.parametrize("hour,minute", [(2, 30), (10, 58), (13, 25)])
+def test_entry_margin_covers_statement_lock_and_commit_bounds(hour, minute):
+    cutoff = datetime(2026, 10, 2, hour, minute, tzinfo=timezone.utc)
+    assert G.ENTRY_MARGIN_SECONDS >= (G.STATEMENT_TIMEOUT_MS + G.LOCK_TIMEOUT_MS) / 1000
+    assert not G.write_window_open(cutoff - timedelta(seconds=G.ENTRY_MARGIN_SECONDS),
+                                   margin_seconds=G.ENTRY_MARGIN_SECONDS)
+    assert G.write_window_open(cutoff - timedelta(seconds=G.ENTRY_MARGIN_SECONDS + 1),
+                               margin_seconds=G.ENTRY_MARGIN_SECONDS)
+    assert not G.write_window_open(cutoff - timedelta(seconds=G.COMMIT_MARGIN_SECONDS),
+                                   margin_seconds=G.COMMIT_MARGIN_SECONDS)
+
+
+@pytest.mark.parametrize("hour,minute", [(2, 30), (10, 58), (13, 25)])
+@pytest.mark.parametrize("crossing", ["creation", "events", "success_finalization", "error_finalization"])
+def test_every_transaction_rolls_back_when_writes_cross_blackout(monkeypatch, hour, minute, crossing):
+    cutoff = datetime(2026, 10, 2, hour, minute, tzinfo=timezone.utc)
+    current = [cutoff - timedelta(seconds=G.ENTRY_MARGIN_SECONDS + 1)]
+    committed, rolled_back, entries = [], [], []
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return current[0]
+
+    class Engine:
+        @contextmanager
+        def begin(self):
+            entries.append([])
+            pending = entries[-1]
+            try:
+                yield self
+            except BaseException:
+                rolled_back.extend(pending)
+                raise
+            else:
+                committed.extend(pending)
+
+        def execute(self, statement, rows):
+            mutation("events")
+            if crossing == "error_finalization":
+                raise RuntimeError("synthetic insert failure")
+
+    def mutation(family):
+        entries[-1].append(family)
+        if family == crossing:
+            current[0] = cutoff
+
+    def finish(conn, run_id, counts, error=None):
+        mutation("error_finalization" if error else "success_finalization")
+        return "FAILED" if error else "SUCCESS"
+
+    monkeypatch.setattr(G, "datetime", Clock)
+    monkeypatch.setattr(W, "_start_run", lambda *args: mutation("creation"))
+    monkeypatch.setattr(W, "_finish_run", finish)
+    monkeypatch.setattr(W, "event_row", lambda event, **kwargs: event)
+    plan = pd.DataFrame([{"channel": "form4", "dedup_key": "synthetic", "op": "insert"}])
+    with pytest.raises(G.WriteWindowClosed):
+        W._apply_locked(Engine(), {("form4", "synthetic"): {}}, {"insert": 0}, plan,
+            run_id="synthetic", mode="backfill", observed_at=datetime.now(timezone.utc), inputs={},
+            before_transaction=G.require_write_entry_window, before_commit=G.require_write_window)
+    assert crossing in rolled_back
+    assert crossing not in committed
+    assert committed == {"creation": [], "events": ["creation"],
+                         "success_finalization": ["creation", "events"],
+                         "error_finalization": ["creation"]}[crossing]
+    assert len(entries) == {"creation": 1, "events": 2, "success_finalization": 3,
+                            "error_finalization": 3}[crossing]
+
+
+def test_writer_without_optional_guards_preserves_default_behavior(monkeypatch):
+    committed = []
+
+    class Engine:
+        @contextmanager
+        def begin(self):
+            yield self
+            committed.append(1)
+
+    monkeypatch.setattr(W, "_start_run", lambda *args: None)
+    monkeypatch.setattr(W, "_finish_run", lambda *args, **kwargs: "NO_NEW_ROWS")
+    result = W._apply_locked(Engine(), {}, {"insert": 0}, pd.DataFrame(), run_id="synthetic",
+        mode="backfill", observed_at=datetime.now(timezone.utc), inputs={})
+    assert result["status"] == "NO_NEW_ROWS" and committed == [1, 1]
+
+
+def test_existing_entry_callback_is_also_used_to_roll_back_before_commit(monkeypatch):
+    outcomes, calls = [], []
+
+    class Engine:
+        @contextmanager
+        def begin(self):
+            try:
+                yield self
+            except G.WriteWindowClosed:
+                outcomes.append("rollback")
+                raise
+            else:
+                outcomes.append("commit")
+
+    def guard():
+        calls.append(1)
+        if len(calls) == 2:
+            raise G.WriteWindowClosed("synthetic crossing")
+
+    monkeypatch.setattr(W, "_start_run", lambda *args: None)
+    with pytest.raises(G.WriteWindowClosed):
+        W._apply_locked(Engine(), {}, {"insert": 0}, pd.DataFrame(), run_id="synthetic",
+            mode="backfill", observed_at=datetime.now(timezone.utc), inputs={}, before_transaction=guard)
+    assert calls == [1, 1] and outcomes == ["rollback"]

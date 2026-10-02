@@ -67,18 +67,9 @@ _SIZE_SQL = """SELECT pg_total_relation_size('people_events')
     + pg_total_relation_size('people_event_revisions')
     + pg_total_relation_size('people_events_runs') AS bytes"""
 _RUN_AUDIT_SQL = """
-    SELECT count(*) AS batches,
-           count(*) FILTER (WHERE status = 'SUCCESS') AS successful,
-           coalesce(sum((counts->>'insert')::bigint), 0) AS inserted,
-           coalesce(sum((counts->>'written')::bigint), 0) AS written,
-           coalesce(md5(string_agg(run_id || ':' || (counts->>'insert'), E'\\n'
-                     ORDER BY (inputs->>'batch')::bigint)), md5('')) AS progress_digest,
-           count(*) FILTER (WHERE mode <> 'backfill' OR materializer_version <> :version
-             OR inputs->>'form345_sha256' IS DISTINCT FROM :source_hash
-             OR (counts - 'insert' - 'written' - 'unchanged' - 'actor_conflict' - 'report_only')
-                <> '{"add_sources": 0, "tighten_known_at": 0, "enrich_identity": 0, "supersede": 0, "retract": 0}'::jsonb)
-             AS invalid
-    FROM people_events_runs WHERE left(run_id, length(:prefix) + 2) = :prefix || '-b'
+    SELECT run_id, mode, materializer_version, inputs, counts, status, started_at, finished_at, error
+    FROM people_events_runs WHERE left(run_id, length(:prefix)) = :prefix
+    ORDER BY length(run_id), run_id
 """
 _COUNT_BY_YEAR_CODE_SQL = """
     SELECT extract(year FROM known_at AT TIME ZONE 'UTC')::int AS year, transaction_code AS code, count(*) AS n
@@ -158,7 +149,8 @@ def _write(path: Path, receipt: dict[str, Any]) -> None:
 
 
 def _rw_engine(url: str) -> Engine:
-    options = "-c statement_timeout=120000 -c lock_timeout=5000 -c application_name=people_events_backfill"
+    options = (f"-c statement_timeout={G.STATEMENT_TIMEOUT_MS} -c lock_timeout={G.LOCK_TIMEOUT_MS} "
+               "-c application_name=people_events_backfill")
     return create_engine(url, connect_args={"options": options}, pool_size=2, max_overflow=0, pool_pre_ping=True)
 
 
@@ -168,11 +160,44 @@ def _scalar(engine: Engine, sql: str) -> Any:
 
 
 def _run_audit(engine: Engine, prefix: str, source_hash: str) -> dict:
-    # A fixed SELECT with bound values. guard_sql intentionally rejects even
-    # the JSON counter key 'insert', so it cannot parse this audit expression.
-    with engine.connect() as conn:
-        return dict(conn.execute(text(_RUN_AUDIT_SQL),
-            {"prefix": prefix, "version": PIPELINE_VERSION, "source_hash": source_hash}).mappings().one())
+    """One streamed full audit at startup/resume; never scan run history per batch.
+
+    Validate JSON types before using counters: SQL casts accept string integers
+    and can fail unpredictably on malformed state. Invalid runs remain evidence
+    and make validate_resume refuse continuation without reconciliation.
+    """
+    audit = dict(batches=0, successful=0, inserted=0, written=0, invalid=0)
+    digest = hashlib.sha256()
+    required_counts = {"insert", "written", *G.ZERO_COUNT_KEYS}
+    with engine.connect().execution_options(stream_results=True) as conn:
+        for row in conn.execute(text(_RUN_AUDIT_SQL), {"prefix": prefix}).mappings():
+            batch = audit["batches"]
+            inputs, counts = row["inputs"], row["counts"]
+            valid_inputs = (isinstance(inputs, dict) and set(inputs) == {"batch", "form345_sha256"}
+                            and type(inputs["batch"]) is int and inputs["batch"] == batch
+                            and inputs["form345_sha256"] == source_hash)
+            valid_counts = (isinstance(counts, dict) and set(counts) == required_counts
+                            and all(type(value) is int for value in counts.values())
+                            and 1 <= counts["insert"] <= G.MAX_TRANSACTION_ROWS
+                            and counts["written"] == counts["insert"]
+                            and all(counts[key] == 0 for key in G.ZERO_COUNT_KEYS))
+            completed = (isinstance(row["started_at"], datetime) and isinstance(row["finished_at"], datetime)
+                         and row["finished_at"] >= row["started_at"] and row["error"] is None)
+            valid = (row["run_id"] == f"{prefix}-b{batch:05d}" and valid_inputs and valid_counts
+                     and row["mode"] == "backfill" and row["materializer_version"] == PIPELINE_VERSION
+                     and row["status"] == "SUCCESS" and completed)
+            audit["batches"] += 1
+            audit["successful"] += row["status"] == "SUCCESS"
+            for key, total in (("insert", "inserted"), ("written", "written")):
+                if isinstance(counts, dict) and type(counts.get(key)) is int:
+                    audit[total] += counts[key]
+            if not valid:
+                audit["invalid"] += 1
+                continue
+            if batch:
+                digest.update(b"\n")
+            digest.update(G.batch_audit_record(row["run_id"], inputs["batch"], counts))
+    return {**audit, "progress_digest": digest.hexdigest()}
 
 
 def _load(args: argparse.Namespace, url: str) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
@@ -359,7 +384,7 @@ def main(argv: list[str] | None = None) -> int:
                 run_id = f"{manifest['run_prefix']}-b{batches_before + n:05d}"
                 res = apply_write_plan(engine, ev_batch, batch, run_id=run_id, mode="backfill",
                     observed_at=observed_at, inputs={"form345_sha256": source_hash, "batch": batches_before + n},
-                    before_transaction=G.require_write_window)
+                    before_transaction=G.require_write_entry_window, before_commit=G.require_write_window)
                 if res["status"] != "SUCCESS" or int(res["counts"]["insert"]) != len(batch):
                     raise RuntimeError("GD3 writer did not commit the complete insert-only batch")
                 written += int(res["counts"]["insert"])

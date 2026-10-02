@@ -77,13 +77,14 @@ def _fake_world(monkeypatch, n_events: int, writer):
     monkeypatch.setattr(B, "_scalar", scalar)
     monkeypatch.setattr(B.RO, "assert_db_window_open", lambda now=None: None)
     monkeypatch.setattr(B, "minutes_until_window", lambda now=None: 600.0)
-    monkeypatch.setattr(B.G, "write_window_open", lambda now=None: True)
+    monkeypatch.setattr(B.G, "write_window_open", lambda now=None, **kwargs: True)
     monkeypatch.setattr(B.time, "sleep", lambda s: None)
     import intelligence.people_events_pipeline.writer as W
 
     def fake_apply(engine, ev, plan, **kw):
         kw["before_transaction"]()
         result = writer(ev, plan)
+        kw["before_commit"]()
         size["bytes"] += 1000 * len(plan) + 500  # include run metadata, not just events
         stored.extend(ev.to_dict("records"))
         audit.append((kw["run_id"], len(plan)))
@@ -94,8 +95,9 @@ def _fake_world(monkeypatch, n_events: int, writer):
     def fake_audit(engine, prefix, source_hash):
         values = [(run, count) for run, count in audit if run.startswith(prefix + "-b")]
         n = sum(count for _, count in values)
-        digest = hashlib.md5("\n".join(f"{run}:{count}" for run, count in values).encode(),
-                             usedforsecurity=False).hexdigest()
+        digest = hashlib.sha256(b"\n".join(B.G.batch_audit_record(run, batch,
+            {"insert": count, "written": count, **dict.fromkeys(B.G.ZERO_COUNT_KEYS, 0)})
+            for batch, (run, count) in enumerate(values))).hexdigest()
         return {"batches": len(values), "successful": len(values), "inserted": n, "written": n,
                 "invalid": 0, "progress_digest": digest}
 
@@ -158,7 +160,7 @@ def test_execute_stops_on_max_batches_and_refuses_partial_scope(tmp_path, monkey
 def test_execute_refuses_close_to_the_window(tmp_path, monkeypatch):
     monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
     _fake_world(monkeypatch, 2, lambda ev, plan: {"status": "SUCCESS", "counts": {"insert": len(plan)}})
-    monkeypatch.setattr(B.G, "write_window_open", lambda now=None: False)
+    monkeypatch.setattr(B.G, "write_window_open", lambda now=None, **kwargs: False)
     assert B.main(_args(tmp_path)) == 2
 
 
@@ -269,3 +271,20 @@ def test_execute_throttle_preserves_twenty_thousand_row_cadence(tmp_path, monkey
     monkeypatch.setattr(B.time, "sleep", sleeps.append)
     assert B.main(_args(tmp_path, "--batch-rows", "50", "--sleep", "2")) == 0
     assert sleeps == [2.0]
+
+
+def test_execute_audits_full_run_history_once_per_start_or_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    _fake_world(monkeypatch, 12, lambda ev, plan: {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    original = B._run_audit
+    calls = []
+
+    def audit(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(B, "_run_audit", audit)
+    assert B.main(_args(tmp_path, "--max-batches", "2")) == 4
+    assert calls == [1]
+    assert B.main(_args(tmp_path)) == 0
+    assert calls == [1, 1]
