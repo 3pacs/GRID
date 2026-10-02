@@ -1,0 +1,22 @@
+# GRID jobs in grid-svr's `grid` user crontab, after the OPS-W1 cutover.
+#
+# REFERENCE ONLY. Do not install this file with `crontab`: it is not the whole
+# crontab (the OCMRI, podcast, vault-sync and paper-log jobs live in the same
+# crontab). The cutover is done by scripts/crontab_release_cutover.py, which
+# rewrites exactly these lines in a `crontab -l` backup and refuses on any
+# drift; tests/test_crontab_release_cutover.py checks that its output matches
+# this file. Regenerate with:
+#   python3 scripts/crontab_release_cutover.py --print-target
+#
+# Every job runs from the deployed release tree (/data/grid_v4/grid_release)
+# and loads the GRID env file through scripts/grid_cron_env.sh.
+0 * * * * /usr/bin/flock -n /tmp/grid-hourly-catchup.lock /bin/bash /data/grid_v4/grid_release/scripts/grid_hourly_catchup.sh >> /data/grid/logs/hourly-catchup.log 2>&1 # GRID-CRON-hourly-catchup
+5 * * * * /usr/bin/flock -n /tmp/astrogrid-hourly-catchup.lock /bin/bash /data/grid_v4/grid_release/scripts/astrogrid_hourly_catchup.sh >> /data/grid/logs/astrogrid-hourly-catchup.log 2>&1 # GRID-CRON-astrogrid-hourly-catchup
+0 6 * * 1-5 /data/grid_v4/grid_release/scripts/grid_cron.sh briefing daily # GRID-CRON-briefing-daily
+30 6 * * 1-5 /data/grid_v4/grid_release/scripts/grid_cron.sh analyst # GRID-CRON-analyst
+0 7 * * 1 /data/grid_v4/grid_release/scripts/grid_cron.sh briefing weekly # GRID-CRON-briefing-weekly
+0 5 * * * /data/grid_v4/grid_release/scripts/grid_cron_run.sh -m scripts.auto_improve_from_postmortems >> /home/grid/logs/auto-improve.log 2>&1 # GRID-CRON-auto-improve
+*/15 * * * * /usr/bin/flock -n /tmp/sd-price-alerts.lock /usr/bin/env SD_IMESSAGE_DAD=<SD_IMESSAGE_DAD value carried over from the current crontab> /data/grid_v4/grid_release/scripts/grid_cron_run.sh -m scripts.check_price_alerts >> /data/grid/logs/price-alerts.log 2>&1 # GRID-CRON-price-alerts
+# OPS-W1-DISABLED <stamp> dashboard-cache-warm (failing every run since 2026-04-11 (no env file -> GRID_JWT_SECRET unset); duplicate of the hourly catch-up's dashboard_cache_warm step) # <original line>
+# OPS-W1-DISABLED <stamp> trial-ingestor (never completed from cron (/bin/sh is dash: 'source: not found'); re-enabling this DB writer needs a separate owner decision) # <original line>
+# OPS-W1-DISABLED <stamp> git-catchup (stashes and merges inside the old grid_repo checkout (fetch failing since 2026-07-14); old checkout stays frozen during cooling-off) # <original line>
