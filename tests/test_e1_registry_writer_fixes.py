@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 from datetime import date
+from itertools import chain
 from pathlib import Path
 
 import ingestion.smart_scheduler as ss
@@ -100,17 +101,19 @@ def test_coingecko_spot_series_map_to_usd_full_except_btc_eth_sol() -> None:
 
 def test_no_coingecko_target_is_fed_by_a_second_series() -> None:
     """A CG:-fed feature with any other feed is a first-writer-wins race in the resolver."""
-    static = {**em.SEED_MAPPINGS, **em.NEW_MAPPINGS_V2}
-    cg_targets = {v for k, v in static.items() if k.startswith("CG:") and k.endswith(":usd")}
+    # Both tables, unmerged: a SEED entry shadowed by a V2 key must still count.
+    static = list(chain(em.SEED_MAPPINGS.items(), em.NEW_MAPPINGS_V2.items()))
+    cg_targets = {v for k, v in static if k.startswith("CG:") and k.endswith(":usd")}
     assert cg_targets
-    shared = sorted((k, v) for k, v in static.items() if v in cg_targets and not k.startswith("CG:"))
+    shared = sorted((k, v) for k, v in static if v in cg_targets and not k.startswith("CG:"))
     assert shared == [], shared
-    # Nor through the YF:<T>-USD:<field> pattern fallback: no yfinance price
-    # puller requests the -USD symbol of a CG-fed coin.
-    yf_universe = (REPO / "ingestion" / "yfinance_pull.py").read_text(encoding="utf-8")
-    for target in sorted(cg_targets):
-        symbol = target[: -len("_usd_full")].upper() + "-USD"
-        assert f'"{symbol}"' not in yf_universe, (target, symbol)
+    # Nor through the YF:<T>-USD:<field> pattern fallback: the yfinance price
+    # puller's default universe never requests the -USD symbol of a CG-fed coin.
+    from ingestion.yfinance_pull import YF_TICKER_LIST
+
+    universe = {t.upper() for t in YF_TICKER_LIST}
+    clashes = sorted(t for t in cg_targets if t[: -len("_usd_full")].upper() + "-USD" in universe)
+    assert clashes == [], clashes
 
 
 def test_coingecko_is_a_base_puller_under_its_catalog_name() -> None:
