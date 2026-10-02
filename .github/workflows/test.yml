@@ -542,6 +542,26 @@ jobs:
             exit 1
           fi
 
+      # security_master all-issuers seed loader (scripts/apply_security_master_seed.py):
+      # runs the real batched INSERT ... ON CONFLICT DO NOTHING and the printed rollback
+      # SQL against a throwaway schema -- proves types and NULLs round-trip, an existing
+      # row is never rewritten, a second apply inserts nothing, and the rollback aborts
+      # when people_events or security_sector_membership reference the seeded entities.
+      - name: security_master seed loader PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_apply_security_master_seed_pg.py -q -rA | tee /tmp/grid-security-master-seed-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-security-master-seed-pg.txt; then
+            echo "::error::security_master seed loader PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Slice N2 causal-link persistence
       # (migrations/versions/causal_links_provenance_20260927.py,
       # intelligence/causal_links.py, scripts/run_causal_links.py): additive

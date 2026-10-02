@@ -64,7 +64,7 @@ import json
 import re
 import subprocess  # nosec B404
 import sys
-from bisect import bisect_right
+from bisect import bisect_left, bisect_right
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -120,13 +120,14 @@ _EXCHANGE_PREFIX = re.compile(
     r"^(?:NYSE(?:\s*(?:MKT|AMERICAN|ARCA|AMEX))?|NASDAQ(?:\s*(?:GS|GM|CM|NM|NMS))?|NASD|AMEX|NYSEMKT|"
     r"NYSEARCA|OTCBB|OTCQB|OTCQX|OTC(?:\s*MARKETS)?|NMS|TSX|TSXV|LSE|PINK(?:\s*SHEETS)?)\s*[:\-]\s*"
 )
-_EXCHANGE_SUFFIX = re.compile(r"[.\-](?:PK|OB|OQ|OTC|NYSE|NASDAQ)$")
-# "BDG/BDGA", "KELYA/KELYB", "BRK.A/BRK.B": a slash between two 3+ character halves separates two tickers,
-# while "BRK/B" and "BF/B" (a 1-2 character half) are one ticker with a class separator.
+_EXCHANGE_SUFFIX = re.compile(r"(?:[.\-](?:PK|OB|OQ|OTC|NYSE|NASDAQ)|\.[ON])$")  # ".O"/".N": Reuters-style market suffix
+_KNOWN_FIELDS = {"AT&T": "T"}  # "&" separates tickers only when spaced ("Z & ZG"); AT&T's own ticker is T
+# "BDG/BDGA", "UA/UAA", "BRK.A/BRK.B": a slash between two 2+ character halves separates two tickers,
+# while "BRK/B" and "BF/B" (a 1 character half) are one ticker with a class separator.
 _SLASH_PAIR = re.compile(r"([A-Z0-9.\-]+)/([A-Z0-9.\-]+)")
 _MAX_TICKER_LEN = 6
 _CLASS_SHORTHAND = re.compile(r"^([A-Z0-9.\-]+)\s+/\s+([A-Z])$")  # "BWINA / B" = BWINA and BWINB
-_FIELD_SPLIT = re.compile(r"\s*(?:[,;&|_]|\s/\s)\s*|\s+AND\s+")
+_FIELD_SPLIT = re.compile(r"\s*(?:[,;|_]|\s/\s)\s*|\s+(?:AND|&)\s+")
 _BRACKETS = str.maketrans({c: " " for c in "()[]{}\"'`"})
 
 
@@ -140,7 +141,7 @@ def _common_prefix_len(parts: list[str]) -> int:
 
 
 def _slash_pairs_to_commas(s: str) -> str:
-    return _SLASH_PAIR.sub(lambda m: f"{m.group(1)},{m.group(2)}" if min(len(m.group(1)), len(m.group(2))) >= 3 else m.group(0), s)
+    return _SLASH_PAIR.sub(lambda m: f"{m.group(1)},{m.group(2)}" if min(len(m.group(1)), len(m.group(2))) >= 2 else m.group(0), s)
 
 
 def _split_whitespace(token: str) -> tuple[list[str], Optional[str]]:
@@ -168,6 +169,7 @@ def parse_ticker_field(raw: Any) -> tuple[tuple[str, ...], Optional[str]]:
     s = re.sub(r"\s+", " ", str(raw).upper().translate(_BRACKETS)).strip()
     if s in _PLACEHOLDERS:
         return (), "placeholder"
+    s = _KNOWN_FIELDS.get(s, s)
     s = _slash_pairs_to_commas(s)
     shorthand = _CLASS_SHORTHAND.match(s)
     if shorthand:
@@ -220,6 +222,11 @@ def parse_ticker_field(raw: Any) -> tuple[tuple[str, ...], Optional[str]]:
 
 
 # --- inputs ---------------------------------------------------------------------------------
+
+
+def sha256_text_file(path: Path) -> str:
+    """sha256 of a source file with CRLF folded to LF, so a Windows checkout hashes like the git blob."""
+    return hashlib.sha256(Path(path).read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def sha256_file(path: Path) -> str:
@@ -410,6 +417,7 @@ def derive_ticker_history(submissions: pd.DataFrame) -> dict[str, Any]:
     rejected: Counter = Counter()
     multi_fields = 0
     seen: dict[tuple[int, str], list[str]] = {}
+    named_on: dict[tuple[int, str], set[str]] = defaultdict(set)
     bearing: dict[int, set[str]] = defaultdict(set)
     co_named: dict[int, list[tuple[str, ...]]] = defaultdict(list)
     for cik, fdate, raw, n in zip(triples["cik"], triples["fdate"], triples["raw"], triples["n"]):
@@ -423,6 +431,7 @@ def derive_ticker_history(submissions: pd.DataFrame) -> dict[str, Any]:
             co_named[int(cik)].append(tickers)
         bearing[int(cik)].add(fdate)
         for t in tickers:
+            named_on[(int(cik), t)].add(fdate)
             span = seen.get((int(cik), t))
             if span is None:
                 seen[(int(cik), t)] = [fdate, fdate]
@@ -446,14 +455,15 @@ def derive_ticker_history(submissions: pd.DataFrame) -> dict[str, Any]:
             valid_to = _prev_day(ds[idx]) if idx < len(ds) else None
             for t in group:
                 first, last = seen[(cik, t)]
-                windows.append({"cik": cik, "ticker": t, "valid_from": first, "valid_to": valid_to, "last_seen": last})
+                windows.append({"cik": cik, "ticker": t, "valid_from": first, "valid_to": valid_to, "last_seen": last,
+                                "family": tuple(group), "dates": sorted(named_on[(cik, t)])})
     stats["issuer_ticker_families_with_siblings"] = sibling_groups
     noise = {
         "stats": dict(sorted(stats.items())),
         "rejected": [{"raw": raw, "reason": why, "rows": n} for (raw, why), n in sorted(rejected.items(), key=lambda kv: (-kv[1], kv[0][0]))],
         "tickers_without_cik": {"rows": int(bad_cik.sum()), "distinct_tickers": len(no_cik_tickers), "tickers": sorted(no_cik_tickers)[:200]},
     }
-    return {"issuers": issuers, "windows": windows, "noise": noise}
+    return {"issuers": issuers, "windows": windows, "noise": noise, "data_end": str(sub["fdate"].max())}
 
 
 def parse_many(values: pd.Series) -> set[str]:
@@ -475,34 +485,88 @@ def _overlap(a: dict[str, Any], b: dict[str, Any]) -> Optional[tuple[str, Option
     return start, end
 
 
-def apply_handoff_clamp(rows: list[dict[str, Any]]) -> int:
-    """Close an open window whose issuer went silent before another CIK took the ticker.
+GRACE_DAYS = 400
 
-    Evidence rule: if CIK A's window for T is still open but A's last filing naming T is earlier than
-    CIK B's first filing naming T, A stopped using T before B started, so A's window ends the day
-    before B's starts. Windows that are still contested (A filed T after B began) stay open and are
-    flagged by ``flag_conflicts``. Returns the number of windows closed.
+
+def apply_silent_closure(rows: list[dict[str, Any]], *, grace_days: int, data_end: str) -> dict[str, int]:
+    """Close the open window of an issuer that has gone silent and is not the current holder of the ticker.
+
+    A window that the family rule left open (the issuer's latest ticker-bearing filing is still in the
+    family) stays open only while the issuer can still be using the ticker:
+
+    * it is in ``company_tickers`` with that ticker (or a share-class sibling): the SEC's own current
+      listing says so; or
+    * its last filing naming the ticker is within ``grace_days`` of the end of the data and no other CIK
+      has named the ticker since (it has not had time to go silent).
+
+    Otherwise the window ends ``grace_days`` after the last filing naming the ticker, or the day before
+    another CIK first names the ticker after that last filing, whichever is earlier. 400 days is one year
+    plus 35 days: an issuer's insiders file a Form 5 (or a Form 3/4 for a change) at least yearly, and the
+    measured gaps between consecutive filings naming the same ticker are almost all inside that (see the
+    PR body); a longer silence is a stale window, and a stale window answers wrongly for as long as the
+    ticker stays unused by that issuer. The cost of a premature close is only ``ticker_outside_validity``
+    for a ticker-keyed feed; CIK-keyed Form 4 events are unaffected.
     """
+    end = date.fromisoformat(data_end)
     by_ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         by_ticker[r["id_value"]].append(r)
-    closed = 0
+    closed: Counter = Counter()
     for group in by_ticker.values():
-        if len({r["entity_id"] for r in group}) < 2:
-            continue
         for a in group:
-            if a["valid_to"] is not None or a["_last_seen"] is None:
+            last = a["_fam_last"]  # the family's last filing: a class missing from the latest filing is not silent
+            if a["valid_to"] is not None or last is None or a["_ct"]:
                 continue
-            later = [b["valid_from"] for b in group if b["entity_id"] != a["entity_id"] and b["valid_from"] > a["_last_seen"]]
-            if later:
-                a["valid_to"] = _prev_day(min(later))
-                a["conflict_detail"] = {"kind": "ticker_reuse_handoff", "closed_by_first_filing_of_other_cik": min(later)}
-                closed += 1
-    return closed
+            horizon = date.fromisoformat(last) + timedelta(days=grace_days)
+            later = [b["valid_from"] for b in group if b["entity_id"] != a["entity_id"] and b["valid_from"] > last]
+            if horizon >= end and not later:
+                continue  # silent for less than the grace period and nobody else has taken the ticker
+            close = horizon.isoformat()
+            reason = "grace_period_after_last_filing"
+            if later and _prev_day(min(later)) < close:
+                close, reason = _prev_day(min(later)), "other_cik_took_the_ticker"
+            a["valid_to"] = close
+            a["conflict_detail"] = {"kind": "silent_issuer_closed", "reason": reason, "last_filing_naming_ticker": last,
+                                    "grace_days": grace_days}
+            closed[reason] += 1
+    return dict(closed)
+
+
+def _count_between(dates: list[str], start: str, end: Optional[str]) -> int:
+    lo = bisect_left(dates, start)
+    hi = len(dates) if end is None else bisect_right(dates, end)
+    return max(0, hi - lo)
+
+
+def _contest(a: dict[str, Any], b: dict[str, Any], overlap: tuple[str, Optional[str]]) -> tuple[dict[str, Any], str]:
+    """Which of two overlapping claimants of one ticker holds it, and the evidence used.
+
+    1. An overlap still open at the snapshot goes to the ``company_tickers`` holder, if exactly one is.
+    2. Otherwise the claimant with more filing days naming the ticker inside the overlap.
+    3. Ties: the ``company_tickers`` holder, then the later last filing, then the smaller entity_id.
+    """
+    start, end = overlap
+    if end is None and a["_ct"] != b["_ct"]:
+        return (a if a["_ct"] else b), "company_tickers_holder_open_at_snapshot"
+    na, nb = _count_between(a["_dates"], start, end), _count_between(b["_dates"], start, end)
+    if na != nb:
+        return (a if na > nb else b), "most_filing_days_in_overlap"
+    if a["_ct"] != b["_ct"]:
+        return (a if a["_ct"] else b), "company_tickers_holder"
+    la, lb = a["_last_seen"] or a["valid_from"], b["_last_seen"] or b["valid_from"]
+    if la != lb:
+        return (a if la > lb else b), "latest_filing_naming_ticker"
+    return (a if a["entity_id"] < b["entity_id"] else b), "entity_id"
 
 
 def flag_conflicts(rows: list[dict[str, Any]], max_listed: int = 25) -> list[dict[str, Any]]:
-    """Flag every ticker row that overlaps another CIK's row for the same ticker; return the conflict groups."""
+    """Flag every ticker row that overlaps another CIK's row; pick ONE primary claimant per contested window.
+
+    Both claimants keep ``conflict_flag`` true (the conflict is reported, never hidden). ``is_primary`` is
+    given only to the claimant that wins every overlap it is in, by the evidence in ``_contest``, so the
+    consumer's tie-break (``is_primary``, then latest ``valid_from``) lands on the evidence-backed holder
+    instead of on whichever CIK filed under the ticker last.
+    """
     by_ticker: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
         by_ticker[r["id_value"]].append(r)
@@ -512,6 +576,8 @@ def flag_conflicts(rows: list[dict[str, Any]], max_listed: int = 25) -> list[dic
         if len({r["entity_id"] for r in grp}) < 2:
             continue
         others: dict[int, set[str]] = defaultdict(set)
+        lost: set[int] = set()
+        basis: dict[int, set[str]] = defaultdict(set)
         pairs: list[dict[str, Any]] = []
         for i, a in enumerate(grp):
             for j in range(i + 1, len(grp)):
@@ -521,23 +587,34 @@ def flag_conflicts(rows: list[dict[str, Any]], max_listed: int = 25) -> list[dic
                 ov = _overlap(a, b)
                 if ov is None:
                     continue
+                win, why = _contest(a, b, ov)
+                lost.add(j if win is a else i)
+                basis[i].add(why)
+                basis[j].add(why)
                 others[i].add(b["entity_id"])
                 others[j].add(a["entity_id"])
-                pairs.append({"a": a["entity_id"], "b": b["entity_id"], "overlap_from": ov[0], "overlap_to": ov[1]})
+                pairs.append({"a": a["entity_id"], "b": b["entity_id"], "overlap_from": ov[0], "overlap_to": ov[1],
+                              "holder": win["entity_id"], "basis": why})
         if not pairs:
             continue
-        for i, r in enumerate(grp):
-            if i in others:
-                r["conflict_flag"] = True
-                r["is_primary"] = False
-                r["conflict_detail"] = {
-                    "kind": "overlapping_ticker_claim",
-                    "other_entities": sorted(others[i])[:max_listed],
-                    "n_other_entities": len(others[i]),
-                }
+        contested = sorted(others)
+        primaries = [i for i in contested if i not in lost]
+        if not primaries:  # an intransitive cycle: fall back to the best single row
+            primaries = [max(contested, key=lambda i: (grp[i]["_ct"], len(grp[i]["_dates"]), grp[i]["_last_seen"] or "", grp[i]["entity_id"]))]
+        for i in contested:
+            r = grp[i]
+            r["conflict_flag"] = True
+            r["is_primary"] = i in primaries
+            r["conflict_detail"] = {
+                "kind": "overlapping_ticker_claim",
+                "other_entities": sorted(others[i])[:max_listed],
+                "n_other_entities": len(others[i]),
+                "primary_basis": sorted(basis[i]),
+            }
         groups.append({
             "ticker": ticker,
             "entities": sorted({e for p in pairs for e in (p["a"], p["b"])}),
+            "primary_entities": sorted(grp[i]["entity_id"] for i in primaries),
             "n_pairs": len(pairs),
             "pairs": pairs[:max_listed],
         })
@@ -554,7 +631,8 @@ def build_rows(
     tickers_as_of: str,
     nonderiv_names: Optional[dict[int, str]] = None,
     sic_map: Optional[dict[int, dict[str, Any]]] = None,
-    handoff_clamp: bool = True,
+    close_silent: bool = True,
+    grace_days: int = GRACE_DAYS,
     company_tickers_no_cik: Optional[Iterable[str]] = None,
 ) -> dict[str, Any]:
     """Pure: frames and dicts in, proposed rows and the report out."""
@@ -596,6 +674,7 @@ def build_rows(
         }
         if sic is not None:
             provenance["sic_source"] = "sec_submissions_current_not_point_in_time"
+            provenance["sic_fetched_at"] = sic_rec.get("fetched_at")
         sm_rows.append({
             "entity_id": entity_id,
             "cik": cik,
@@ -612,11 +691,19 @@ def build_rows(
         id_rows.append(_identifier(entity_id, ID_SCHEME_CIK, str(cik), info["first"] if info else tickers_as_of,
                                    None, True, SOURCE_FILINGS if info else SOURCE_COMPANY_TICKERS))
 
+    fam_last: dict[tuple[int, tuple[str, ...]], str] = {}
+    for w in hist["windows"]:
+        k = (w["cik"], w["family"])
+        fam_last[k] = max(fam_last.get(k, ""), w["last_seen"])
     ticker_rows: list[dict[str, Any]] = []
     open_by_entity: dict[tuple[int, str], bool] = {}
     for w in hist["windows"]:
         row = _identifier(entity_id_for_cik(w["cik"]), ID_SCHEME_TICKER, w["ticker"], w["valid_from"], w["valid_to"], True, SOURCE_FILINGS)
+        ct_tickers = set((company_tickers.get(w["cik"]) or {}).get("tickers", ()))
         row["_last_seen"] = w["last_seen"]
+        row["_fam_last"] = fam_last[(w["cik"], w["family"])]
+        row["_dates"] = w["dates"]
+        row["_ct"] = bool(ct_tickers & set(w["family"]))  # the SEC lists this ticker (or a class sibling) for the CIK
         ticker_rows.append(row)
         open_by_entity[(w["cik"], w["ticker"])] = open_by_entity.get((w["cik"], w["ticker"]), False) or w["valid_to"] is None
     added_from_company_tickers = 0
@@ -626,13 +713,17 @@ def build_rows(
                 continue  # a filing already names it and the window is open: the filings win
             row = _identifier(entity_id_for_cik(cik), ID_SCHEME_TICKER, tkr, tickers_as_of, None, True, SOURCE_COMPANY_TICKERS)
             row["_last_seen"] = None
+            row["_fam_last"] = None
+            row["_dates"] = []
+            row["_ct"] = True
             ticker_rows.append(row)
             added_from_company_tickers += 1
 
-    clamped = apply_handoff_clamp(ticker_rows) if handoff_clamp else 0
+    closed = apply_silent_closure(ticker_rows, grace_days=grace_days, data_end=hist["data_end"]) if close_silent else {}
     conflicts = flag_conflicts(ticker_rows)
     for r in ticker_rows:
-        r.pop("_last_seen", None)
+        for k in ("_last_seen", "_fam_last", "_dates", "_ct"):
+            r.pop(k, None)
     id_rows.extend(ticker_rows)
 
     sm_rows.sort(key=lambda r: r["entity_id"])
@@ -651,8 +742,10 @@ def build_rows(
         "conflict_tickers": len(conflicts),
         "conflict_identifier_rows": len(flagged),
         "conflict_entities": len({r["entity_id"] for r in flagged}),
-        "handoff_clamp": handoff_clamp,
-        "handoff_windows_closed": clamped,
+        "close_silent": close_silent,
+        "grace_days": grace_days,
+        "data_end": hist["data_end"],
+        "silent_windows_closed": closed,
         "name_source": dict(sorted(name_source.items())),
         "sic": dict(sorted(sic_counts.items())),
         "is_active_candidates_sec_absence_only": sum(1 for r in sm_rows if r["delisted_basis"]),
@@ -687,7 +780,7 @@ def seed_lines(built: dict[str, Any]) -> Iterable[str]:
 
 
 def _code_sha(explicit: Optional[str]) -> dict[str, Any]:
-    out: dict[str, Any] = {"builder_file_sha256": sha256_file(Path(__file__).resolve()), "git_head": explicit}
+    out: dict[str, Any] = {"builder_file_sha256_lf": sha256_text_file(Path(__file__).resolve()), "git_head": explicit}
     if explicit is None:
         try:
             # Fixed argv, no shell, no user input: only records the commit this code was built from.
@@ -738,9 +831,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--nonderiv", type=Path, help="Form 4 nonderiv_transactions.parquet (fallback name source)")
     ap.add_argument("--sic-map", type=Path, help="issuer_sic_map.jsonl (current SIC, not point-in-time)")
     ap.add_argument("--tickers-as-of", required=True, help="YYYY-MM-DD snapshot day of company_tickers.json")
-    ap.add_argument("--no-handoff-clamp", action="store_true",
-                    help="keep a silent issuer's last ticker open forever (the literal reading of the window rule); "
-                         "by default its window is closed the day before another CIK first names the ticker")
+    ap.add_argument("--no-close-silent", action="store_true",
+                    help="keep a silent issuer's last ticker open forever (the literal reading of the window rule)")
+    ap.add_argument("--grace-days", type=int, default=GRACE_DAYS,
+                    help="a silent non-holder's window ends this many days after its last filing naming the ticker")
     ap.add_argument("--code-sha", help="git commit of this code when it is not run from a git checkout")
     ap.add_argument("--out-dir", type=Path, required=True)
     args = ap.parse_args(argv)
@@ -757,13 +851,14 @@ def main(argv: Optional[list[str]] = None) -> int:
         tickers_as_of=args.tickers_as_of,
         nonderiv_names=load_latest_names(args.nonderiv) if args.nonderiv else None,
         sic_map=load_sic_map(args.sic_map) if args.sic_map else None,
-        handoff_clamp=not args.no_handoff_clamp,
+        close_silent=not args.no_close_silent,
+        grace_days=args.grace_days,
         company_tickers_no_cik=set().union(*(company_tickers_without_cik(json.loads(Path(p).read_text(encoding="utf-8")))
                                              for p in args.company_tickers)),
     )
     receipt = write_artifact(
         built, args.out_dir, inputs=inputs, code_sha=args.code_sha,
-        params={"tickers_as_of": args.tickers_as_of, "handoff_clamp": not args.no_handoff_clamp},
+        params={"tickers_as_of": args.tickers_as_of, "close_silent": not args.no_close_silent, "grace_days": args.grace_days},
     )
     print(json.dumps({"out_dir": str(args.out_dir), "output_sha256": receipt["output"]["sha256"], **receipt["counts"]}, indent=2, sort_keys=True))
     return 0

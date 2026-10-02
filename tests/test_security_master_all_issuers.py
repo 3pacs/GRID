@@ -78,6 +78,12 @@ def test_placeholders_are_rejected(raw):
     ("BDG/BDGA", ("BDG", "BDGA")),
     ("STZ/STZ.B", ("STZ", "STZB")),
     ("BF/B", ("BFB",)),
+    ("UA/UAA", ("UA", "UAA")),
+    ("AT&T", ("T",)),
+    ("Z & ZG", ("Z", "ZG")),
+    ("AAPL.O", ("AAPL",)),
+    ("ABC.N", ("ABC",)),
+    ("BRK.A", ("BRKA",)),
     ("ENTX-PK", ("ENTX",)),
     ("NM", ("NM",)),   # a real ticker that is also a market tag
     ("PK", ("PK",)),
@@ -249,35 +255,148 @@ def test_sic_is_optional_and_zero_means_none():
         "sec_submissions_current_not_point_in_time"
 
 
+# --- silent issuers: windows that must not stay open forever --------------------------------
+
+
+def _quarterly(prefix, cik, ticker, first_year, last_year):
+    """Four filings a year naming ``ticker``: an issuer whose insiders file all the time."""
+    return [(f"{prefix}{y}{m}", f"{y}-{m:02d}-15", str(cik), ticker) for y in range(first_year, last_year + 1) for m in (2, 5, 8, 11)]
+
+
+def _resolve_ticker(built, events):
+    ids = _identifiers_frame(built)
+    out = S.resolve_securities(_events([(None, t, d) for t, d in events]), ids)
+    return list(zip(out["security_id"], out["security_match_basis"], out["security_conflict"]))
+
+
+def test_a_silent_non_holder_closes_400_days_after_its_last_filing():
+    built = _build([("a1", "2008-03-01", "5", "ARMX"), ("a2", "2010-03-01", "5", "ARMX"),
+                    ("z1", "2026-01-05", "6", "LIVE")])  # data runs to 2026-01-05
+    row = _tickers(built, 5)
+    assert set(row) == {("ARMX", "2008-03-01", "2011-04-05")}  # 2010-03-01 + 400 days
+    detail = row[("ARMX", "2008-03-01", "2011-04-05")]["conflict_detail"]
+    assert detail["kind"] == "silent_issuer_closed" and detail["grace_days"] == 400
+    assert detail["reason"] == "grace_period_after_last_filing" and detail["last_filing_naming_ticker"] == "2010-03-01"
+    assert built["report"]["silent_windows_closed"] == {"grace_period_after_last_filing": 1}
+
+
+def test_an_issuer_inside_the_grace_period_of_the_data_end_stays_open():
+    built = _build([("a1", "2024-03-01", "5", "NEWCO"), ("z1", "2025-03-01", "6", "LIVE")])  # 2024-03-01 + 400d is after 2025-03-01
+    assert set(_tickers(built, 5)) == {("NEWCO", "2024-03-01", None)}
+
+
+def test_the_company_tickers_holder_stays_open_however_long_it_has_been_quiet():
+    ct = {5: {"name": "Quiet Co", "tickers": ["QUIET"]}}
+    built = _build([("a1", "2008-03-01", "5", "QUIET"), ("z1", "2026-01-05", "6", "LIVE")], ct)
+    assert set(_tickers(built, 5)) == {("QUIET", "2008-03-01", None)}
+
+
+def test_a_silent_issuer_is_closed_the_day_before_another_cik_takes_its_ticker():
+    built = _build([("a1", "2008-01-02", "1", "GONE"), ("b1", "2008-06-01", "2", "GONE"),
+                    *_quarterly("b", 2, "GONE", 2009, 2012)])
+    gone = _tickers(built, 1)
+    assert set(gone) == {("GONE", "2008-01-02", "2008-05-31")}
+    assert gone[("GONE", "2008-01-02", "2008-05-31")]["conflict_detail"]["reason"] == "other_cik_took_the_ticker"
+    assert not built["conflicts"]
+
+
+def test_silent_closure_can_be_turned_off_and_the_grace_period_changed():
+    rows = [("a1", "2008-03-01", "5", "ARMX"), ("z1", "2026-01-05", "6", "LIVE")]
+    assert set(_tickers(_build(rows, close_silent=False), 5)) == {("ARMX", "2008-03-01", None)}
+    assert set(_tickers(_build(rows, grace_days=30), 5)) == {("ARMX", "2008-03-01", "2008-03-31")}
+
+
+def test_share_class_siblings_are_closed_together_by_the_silence_rule():
+    built = _build([("a1", "2010-01-04", "400", "GOOG"), ("a2", "2012-02-02", "400", "GOOGL"), ("a3", "2014-03-03", "400", "GOOG"),
+                    ("z1", "2026-01-05", "6", "LIVE")])
+    assert {k[2] for k in _tickers(built, 400)} == {"2015-04-07"}  # the family's last filing (2014-03-03) + 400 days
+
+
+def test_probe_acquired_subsidiary_does_not_hold_the_parents_ticker():
+    """A subsidiary naming BAC in 2009-2012 must not capture BAC for the rest of time."""
+    rows = ([(f"p{y}", f"{y}-03-01", "70858", "BAC") for y in range(2006, 2027)]
+            + [(f"s{y}", f"{y}-02-01", "65100", "MER") for y in (2006, 2007, 2008)]
+            + [(f"s{y}", f"{y}-05-01", "65100", "BAC") for y in (2009, 2010, 2011, 2012)])
+    built = _build(rows, {70858: {"name": "Bank of America", "tickers": ["BAC"]}})
+    sub = _tickers(built, 65100)[("BAC", "2009-05-01", "2013-06-05")]  # 2012-05-01 + 400 days
+    assert sub["conflict_flag"] is True and sub["is_primary"] is False
+    parent = _tickers(built, 70858)[("BAC", "2006-03-01", None)]
+    assert parent["conflict_flag"] is True and parent["is_primary"] is True
+    got = _resolve_ticker(built, [("BAC", "2008-06-01"), ("BAC", "2010-06-01"), ("BAC", "2018-06-01"), ("BAC", "2026-06-01")])
+    assert [g[0] for g in got] == ["sm_0000070858", "sm_0000070858", "sm_0000070858", "sm_0000070858"]
+    assert all(g[2] for g in got)  # the primary claimant keeps its conflict flag: the conflict is reported, not hidden
+
+
+def test_probe_one_stray_filing_cannot_hijack_a_ticker():
+    rows = [(f"a{y}", f"{y}-03-01", "320193", "AAPL") for y in range(2006, 2027)] + [("x1", "2015-07-01", "999", "AAPL")]
+    built = _build(rows, {320193: {"name": "Apple", "tickers": ["AAPL"]}})
+    got = _resolve_ticker(built, [("AAPL", "2015-06-01"), ("AAPL", "2015-12-01"), ("AAPL", "2016-09-01"), ("AAPL", "2026-06-01")])
+    assert [g[0] for g in got] == ["sm_0000320193"] * 4
+    stray = _tickers(built, 999)[("AAPL", "2015-07-01", "2016-08-04")]
+    assert stray["is_primary"] is False and stray["conflict_flag"] is True
+
+
+def test_probe_dead_issuer_is_not_resolved_after_a_non_filer_takes_the_ticker():
+    rows = [("d1", "2008-03-01", "5", "ARMX"), ("d2", "2010-03-01", "5", "ARMX"), ("z1", "2026-01-05", "6", "LIVE")]
+    built = _build(rows, {9: {"name": "Foreign ADR plc", "tickers": ["ARMX"]}})
+    got = _resolve_ticker(built, [("ARMX", "2009-01-01"), ("ARMX", "2020-01-01"), ("ARMX", "2026-09-30")])
+    assert got[0][:2] == ("sm_0000000005", "ticker")
+    assert got[1][:2] == (None, "ticker_outside_validity")  # not silently the dead issuer
+    assert got[2][:2] == ("sm_0000000009", "ticker")
+
+
+def test_probe_a_stray_latest_filing_closes_the_real_ticker_and_is_documented_behaviour():
+    rows = [(f"a{y}", f"{y}-03-01", "111", "ABCD") for y in range(2010, 2026)] + [("z", "2026-01-05", "111", "WXYZ")]
+    built = _build(rows)
+    assert ("ABCD", "2010-03-01", "2026-01-04") in _tickers(built, 111)  # a last filing naming another ticker ends it
+    assert _resolve_ticker(built, [("ABCD", "2026-03-01")])[0][:2] == (None, "ticker_outside_validity")
+
+
 # --- conflicts: a ticker reused by a different CIK ------------------------------------------
 
 
 def _reuse_rows():
     return [
-        # CIK 1 used REUSE from 2008 and is still filing under it, CIK 2 starts using it in 2015: contested.
-        ("a1", "2008-01-02", "1", "REUSE"),
-        ("a2", "2020-01-02", "1", "REUSE"),
+        # CIK 1 files under REUSE every quarter 2008-2020; CIK 2 files twice in 2015: contested, CIK 1 has the evidence.
+        *_quarterly("a", 1, "REUSE", 2008, 2020),
         ("b1", "2015-06-01", "2", "REUSE"),
+        ("b2", "2015-09-01", "2", "REUSE"),
         # a clean ticker change on CIK 3 (not a conflict)
         ("c1", "2010-01-04", "3", "CHG"),
         ("c2", "2012-01-04", "3", "CHG2"),
     ]
 
 
-def test_ticker_reuse_by_a_different_cik_is_flagged_never_silently_resolved():
+def test_ticker_reuse_by_a_different_cik_is_flagged_and_one_primary_is_chosen_by_evidence():
     built = _build(_reuse_rows())
-    rows = [r for r in built["security_identifiers"] if r["id_value"] == "REUSE"]
-    assert len(rows) == 2 and all(r["conflict_flag"] for r in rows)
-    assert all(r["is_primary"] is False for r in rows)
-    assert {r["entity_id"] for r in rows} == {"sm_0000000001", "sm_0000000002"}
-    detail = {r["entity_id"]: r["conflict_detail"] for r in rows}
-    assert detail["sm_0000000001"]["other_entities"] == ["sm_0000000002"]
-    assert detail["sm_0000000001"]["kind"] == "overlapping_ticker_claim"
+    rows = {r["entity_id"]: r for r in built["security_identifiers"] if r["id_value"] == "REUSE"}
+    assert set(rows) == {"sm_0000000001", "sm_0000000002"} and all(r["conflict_flag"] for r in rows.values())
+    assert rows["sm_0000000001"]["is_primary"] is True and rows["sm_0000000002"]["is_primary"] is False
+    detail = rows["sm_0000000001"]["conflict_detail"]
+    assert detail["kind"] == "overlapping_ticker_claim" and detail["other_entities"] == ["sm_0000000002"]
+    assert detail["primary_basis"] == ["most_filing_days_in_overlap"]
     assert [c["ticker"] for c in built["conflicts"]] == ["REUSE"]
     assert built["conflicts"][0]["pairs"][0]["overlap_from"] == "2015-06-01"
+    assert built["conflicts"][0]["primary_entities"] == ["sm_0000000001"]
     assert built["report"]["conflict_tickers"] == 1 and built["report"]["conflict_identifier_rows"] == 2
     unrelated = [r for r in built["security_identifiers"] if r["id_value"] in {"CHG", "CHG2"}]
     assert unrelated and not any(r["conflict_flag"] for r in unrelated)
+
+
+def test_the_company_tickers_holder_wins_an_overlap_that_is_open_at_the_snapshot():
+    rows = [*_quarterly("a", 1, "BOTH", 2010, 2026), *_quarterly("b", 2, "BOTH", 2012, 2026)]
+    built = _build(rows, {2: {"name": "Holder", "tickers": ["BOTH"]}})
+    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "BOTH"}
+    assert prim == {"sm_0000000001": False, "sm_0000000002": True}
+    basis = next(r for r in built["security_identifiers"] if r["id_value"] == "BOTH")["conflict_detail"]["primary_basis"]
+    assert basis == ["company_tickers_holder_open_at_snapshot"]
+
+
+def test_an_exact_tie_falls_to_the_smaller_entity_id_deterministically():
+    rows = [("a1", "2012-01-02", "1", "TIE"), ("b1", "2012-01-02", "2", "TIE"), ("z1", "2012-02-01", "6", "LIVE")]
+    built = _build(rows)
+    prim = {r["entity_id"]: r["is_primary"] for r in built["security_identifiers"] if r["id_value"] == "TIE"}
+    assert prim == {"sm_0000000001": True, "sm_0000000002": False}
 
 
 def test_sequential_reuse_with_closed_windows_is_not_a_conflict():
@@ -288,23 +407,6 @@ def test_sequential_reuse_with_closed_windows_is_not_a_conflict():
     ])
     assert not built["conflicts"]
     assert _tickers(built, 1)[("SEQ", "2008-01-02", "2009-01-01")]["conflict_flag"] is False
-
-
-def test_handoff_clamp_only_closes_silent_issuers_and_can_be_turned_off():
-    rows = [
-        ("a1", "2008-01-02", "1", "GONE"),     # CIK 1 stopped filing in 2008 and never changed ticker
-        ("b1", "2015-06-01", "2", "GONE"),
-        ("c1", "2008-01-02", "5", "LIVE"),     # CIK 5 is still filing under LIVE after CIK 6 starts: contested
-        ("c2", "2020-01-02", "5", "LIVE"),
-        ("d1", "2015-06-01", "6", "LIVE"),
-    ]
-    literal = _build(rows, handoff_clamp=False)
-    assert {c["ticker"] for c in literal["conflicts"]} == {"GONE", "LIVE"}
-    clamped = _build(rows)
-    assert {c["ticker"] for c in clamped["conflicts"]} == {"LIVE"}
-    gone = _tickers(clamped, 1)[("GONE", "2008-01-02", "2015-05-31")]
-    assert gone["conflict_flag"] is False and gone["conflict_detail"]["kind"] == "ticker_reuse_handoff"
-    assert clamped["report"]["handoff_windows_closed"] == 1
 
 
 # --- idempotency ----------------------------------------------------------------------------
@@ -342,7 +444,7 @@ def test_receipt_records_inputs_hash_counts_and_code(tmp_path):
     inputs = [{"label": "company_tickers", "path": str(src), "sha256": builder.sha256_file(src), "bytes": 2}]
     receipt = builder.write_artifact(built, tmp_path / "out", inputs=inputs, params={"tickers_as_of": TICKERS_AS_OF}, code_sha="deadbeef")
     on_disk = json.loads((tmp_path / "out" / "receipt.json").read_text(encoding="utf-8"))
-    assert on_disk["code"]["git_head"] == "deadbeef" and len(on_disk["code"]["builder_file_sha256"]) == 64
+    assert on_disk["code"]["git_head"] == "deadbeef" and len(on_disk["code"]["builder_file_sha256_lf"]) == 64
     assert on_disk["inputs"][0]["sha256"] == builder.sha256_file(src)
     assert on_disk["counts"]["entities"] == 1 and on_disk["writes_to_database"] is False
     assert on_disk["output"]["sha256"] == receipt["output"]["sha256"]
@@ -402,11 +504,11 @@ def test_resolve_securities_matches_by_cik_and_by_in_window_ticker_and_rejects_o
         "cik", "ticker", "ticker_outside_validity", "ticker", "ticker_outside_validity", "unmatched", "cik"]
 
 
-def test_resolve_securities_counts_conflicts_and_prefers_the_non_conflicted_row():
+def test_resolve_securities_counts_conflicts_and_lands_on_the_primary_claimant():
     built = _build(_reuse_rows())
-    out = S.resolve_securities(_events([(None, "REUSE", "2016-01-01"), (None, "REUSE", "2010-01-01")]), _identifiers_frame(built))
-    # 2016: both CIKs claim it (conflict, resolved deterministically by latest valid_from); 2010: only CIK 1 does.
-    assert list(out["security_id"]) == ["sm_0000000002", "sm_0000000001"]
+    out = S.resolve_securities(_events([(None, "REUSE", "2015-07-01"), (None, "REUSE", "2010-01-01")]), _identifiers_frame(built))
+    # 2015-07: both CIKs claim it (flagged); the evidence-backed primary (CIK 1) wins, not the newer claimant (CIK 2).
+    assert list(out["security_id"]) == ["sm_0000000001", "sm_0000000001"]
     assert list(out["security_conflict"]) == [True, True]
 
 
@@ -553,10 +655,21 @@ class _FakeEngine:
         self.disposed = True
 
 
+_REAL_CODE_IDENTITY = loader.code_identity
+CLEAN_CODE = {"git_head": "c0ffee", "dirty": False, "loader_file_sha256_lf": "0" * 64}
+
+
+@pytest.fixture(autouse=True)
+def _clean_checkout(monkeypatch):
+    monkeypatch.setattr(loader, "code_identity", lambda: dict(CLEAN_CODE))
+
+
 def _args(seed_dir, **kw):
     base = dict(seed_dir=seed_dir, apply=False, db_url=None, expect_output_sha256=None, batch_size=2,
-                statement_timeout_ms=60000, lock_timeout_ms=5000, receipt=None)
+                statement_timeout_ms=60000, lock_timeout_ms=5000, receipt=None, allow_dirty=False)
     base.update(kw)
+    if base["apply"] and base["expect_output_sha256"] is None and (Path(seed_dir) / "receipt.json").exists():
+        base["expect_output_sha256"] = json.loads((Path(seed_dir) / "receipt.json").read_text(encoding="utf-8"))["output"]["sha256"]
     return SimpleNamespace(**base)
 
 
@@ -679,3 +792,76 @@ def test_match_rate_harness_reports_full_ticker_only_and_agreement():
     assert after["ticker_only"]["matched"] == 2          # NEW resolves by ticker alone, inside its open window
     assert after["agreement"] == {"events_resolved_by_cik_and_by_ticker": 1, "same_entity": 1, "agreement_rate": 1.0}
     assert before["full"]["matched"] == 0 and before["full"]["match_rate"] == 0.0
+
+
+# --- loader: apply guards, code identity, window labelling ---------------------------------
+
+
+def test_apply_requires_an_expected_artifact_hash(tmp_path):
+    art, _ = _written_artifact(tmp_path)
+    args = _args(art, apply=True, db_url="postgresql://u@h/db")
+    args.expect_output_sha256 = None
+    with pytest.raises(ValueError, match="--apply requires --expect-output-sha256"):
+        loader.run(args, now=lambda: _utc(12), engine_factory=lambda _u: pytest.fail("connected without a pinned hash"))
+    with pytest.raises(SystemExit):  # the CLI refuses earlier, at argument parsing
+        loader.main(["--seed-dir", str(art), "--apply", "--db-url", "postgresql://u@h/db"])
+
+
+def test_apply_refuses_a_dirty_tree_unless_allowed_and_records_the_loader_code(tmp_path, monkeypatch):
+    art, _ = _written_artifact(tmp_path)
+    monkeypatch.setattr(loader, "code_identity", lambda: {**CLEAN_CODE, "dirty": True})
+    monkeypatch.setattr(loader, "read_existing", lambda *_a, **_k: (loader.Existing(), {"security_master": 0, "security_identifiers": 0}))
+    with pytest.raises(ValueError, match="uncommitted changes"):
+        loader.run(_args(art, apply=True, db_url="postgresql://u@h/db"), now=lambda: _utc(12), engine_factory=lambda _u: _FakeEngine())
+    rec = loader.run(_args(art, apply=True, db_url="postgresql://u@h/db", allow_dirty=True), now=lambda: _utc(12),
+                     engine_factory=lambda _u: _FakeEngine())
+    assert rec["loader_code"]["dirty"] is True and rec["status"] == "applied"
+    dry = loader.run(_args(art), now=lambda: _utc(12))  # a dry run never needs a clean tree
+    assert dry["loader_code"]["git_head"] == "c0ffee"
+
+
+def _lf_sha(path):
+    import hashlib
+
+    data = Path(path).read_bytes()
+    return hashlib.sha256(data.replace(bytes([13, 10]), bytes([10]))).hexdigest()
+
+
+def test_code_identity_hashes_the_loader_with_lf_line_endings():
+    ident = _REAL_CODE_IDENTITY()
+    assert ident["loader_file_sha256_lf"] == _lf_sha(loader.__file__)
+    assert ident["dirty"] in (True, False, None) and (ident["git_head"] is None or len(ident["git_head"]) == 40)
+    assert builder.sha256_text_file(Path(builder.__file__)) == _lf_sha(builder.__file__)
+
+
+
+def test_a_batch_that_would_cross_into_the_window_is_not_started(tmp_path):
+    art, _ = _written_artifact(tmp_path)
+    seed = loader.load_seed(art, require_receipt=True)
+    plan = loader.plan_inserts(seed, loader.Existing())
+    engine = _FakeEngine()
+    # 03:29:45 plus the 30 s first-batch estimate is 03:30:15: refused before any statement is sent.
+    with pytest.raises(loader.WindowRefused):
+        loader.apply_plan(engine, plan, now=lambda: datetime(2026, 10, 2, 3, 29, 45, tzinfo=timezone.utc))
+    assert engine.log == []
+    # A smaller estimate lets the same batch start.
+    loader.apply_plan(engine, plan, now=lambda: datetime(2026, 10, 2, 3, 29, 45, tzinfo=timezone.utc), batch_estimate_s=5)
+    assert engine.log
+
+
+def test_a_run_that_finished_before_the_window_is_labelled_applied_not_stopped(tmp_path, monkeypatch):
+    art, built = _written_artifact(tmp_path)
+    engine = _FakeEngine()
+    calls = {"n": 0}
+
+    def reads(*_a, **kw):
+        calls["n"] += 1
+        if calls["n"] == 2:  # the post-apply count runs after 03:30
+            raise loader.WindowRefused("window started")
+        return loader.Existing(), {"security_master": 0, "security_identifiers": 0}
+
+    monkeypatch.setattr(loader, "read_existing", reads)
+    clock = iter([_utc(3, 0)] * 100)
+    rec = loader.run(_args(art, apply=True, db_url="postgresql://u@h/db"), now=lambda: next(clock), engine_factory=lambda _u: engine)
+    assert rec["status"] == "applied" and rec["after_counts"] is None and "re-run the dry run after 10:30Z".lower() in rec["note"].lower()
+    assert rec["inserted"]["security_master"] == len(built["security_master"])

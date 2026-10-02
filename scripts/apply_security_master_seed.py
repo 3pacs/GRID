@@ -7,7 +7,10 @@ Takes the artifact written by ``scripts/build_security_master_all_issuers.py``
 * **Dry run is the default.** Without ``--db-url`` it only counts the artifact. With ``--db-url`` it also
   reads the current ``security_master`` / ``security_identifiers`` keys in a read-only transaction and
   reports exactly what an apply would insert and what it would skip. It writes nothing to any database.
-* ``--apply`` writes, and needs ``--db-url`` / ``--db-url-env NAME`` (or ``config.settings.DB_URL`` from the environment).
+* ``--apply`` writes. It needs ``--expect-output-sha256`` (the artifact's sha256 from its ``receipt.json``) and a
+  database URL: ``--db-url-env NAME`` (preferred; keeps the URL out of argv), ``--db-url``, or
+  ``config.settings.DB_URL`` from the environment. It refuses to run from a git tree with uncommitted
+  changes unless ``--allow-dirty``; the receipt records this loader's own commit and LF-normalized file hash.
 * **No database connection is opened between 03:30 and 10:30 UTC** (the nightly ``pg_dump`` window),
   for a dry run or an apply. A long apply re-checks before every batch and stops cleanly if the
   window starts, leaving a partial but consistent state (every batch is its own transaction and the
@@ -24,21 +27,17 @@ Takes the artifact written by ``scripts/build_security_master_all_issuers.py``
 * A run writes a receipt (``--receipt``, default next to the artifact). It is written when the run starts
   and rewritten when it ends.
 
-Rollback (printed, never executed). Every row this loader adds has ``source = 'all_issuers_v1'`` (entities)
-or ``source LIKE 'all_issuers_v1:%'`` (identifiers), so it can be removed without touching the
-Technology seed::
-
-    DELETE FROM security_identifiers WHERE source LIKE 'all_issuers_v1:%';
-    DELETE FROM security_master      WHERE source = 'all_issuers_v1';
-
-Run both outside 03:30-10:30 UTC and before ``people_events.security_id`` references any of the new
-entities (that foreign key would block the delete by design).
+Rollback (printed, never executed; see ``ROLLBACK_SQL``). Every row this loader adds has
+``source = 'all_issuers_v1'`` (entities) or ``left(source, 15) = 'all_issuers_v1:'`` (identifiers), so it
+can be removed without touching the Technology seed. It is one transaction (BEGIN ... COMMIT) that first
+counts ``people_events`` and ``security_sector_membership`` rows that reference a seeded entity and
+aborts (RAISE EXCEPTION, nothing deleted) if either count is above 0. Run it outside 03:30-10:30 UTC.
 
 Usage::
 
     python -m scripts.apply_security_master_seed --seed-dir <dir>                       # count only
     python -m scripts.apply_security_master_seed --seed-dir <dir> --db-url ...          # dry run with diff
-    python -m scripts.apply_security_master_seed --seed-dir <dir> --db-url ... --apply \\
+    python -m scripts.apply_security_master_seed --seed-dir <dir> --db-url-env SM_DB_URL --apply \\
         --expect-output-sha256 <sha256 from receipt.json>
 """
 
@@ -48,10 +47,12 @@ import argparse
 import hashlib
 import json
 import os
+import subprocess  # nosec B404
 import sys
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
-from datetime import datetime, time, timezone
+import time as time_mod
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -72,9 +73,24 @@ DEFAULT_STATEMENT_TIMEOUT_MS = 60_000
 DEFAULT_LOCK_TIMEOUT_MS = 5_000
 
 ROLLBACK_SQL = (
-    "DELETE FROM security_identifiers WHERE source LIKE 'all_issuers_v1:%';\n"
-    "DELETE FROM security_master WHERE source = 'all_issuers_v1';"
+    "BEGIN;\n"
+    "DO $$\n"
+    "DECLARE n bigint;\n"
+    "BEGIN\n"
+    "  IF to_regclass('people_events') IS NOT NULL THEN\n"
+    "    SELECT count(*) INTO n FROM people_events WHERE security_id::text IN\n"
+    "      (SELECT entity_id FROM security_master WHERE source = 'all_issuers_v1');\n"
+    "    IF n > 0 THEN RAISE EXCEPTION 'rollback aborted: % people_events rows reference seeded entities', n; END IF;\n"
+    "  END IF;\n"
+    "  SELECT count(*) INTO n FROM security_sector_membership WHERE entity_id IN\n"
+    "    (SELECT entity_id FROM security_master WHERE source = 'all_issuers_v1');\n"
+    "  IF n > 0 THEN RAISE EXCEPTION 'rollback aborted: % security_sector_membership rows reference seeded entities', n; END IF;\n"
+    "END $$;\n"
+    "DELETE FROM security_identifiers WHERE left(source, 15) = 'all_issuers_v1:';\n"
+    "DELETE FROM security_master WHERE source = 'all_issuers_v1';\n"
+    "COMMIT;"
 )
+DEFAULT_BATCH_ESTIMATE_S = 30.0
 
 _INSERT_SM = """
 INSERT INTO security_master
@@ -313,23 +329,54 @@ def apply_plan(
     lock_timeout_ms: int = DEFAULT_LOCK_TIMEOUT_MS,
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     on_progress: Optional[Callable[[dict[str, int]], None]] = None,
+    batch_estimate_s: float = DEFAULT_BATCH_ESTIMATE_S,
 ) -> dict[str, int]:
-    """INSERT ... ON CONFLICT DO NOTHING in batches. Returns rows actually inserted per table."""
+    """INSERT ... ON CONFLICT DO NOTHING in batches. Returns rows actually inserted per table.
+
+    Before every batch the window is checked at ``now + estimate``, where the estimate is twice the slowest
+    batch so far (``batch_estimate_s`` before the first), so a batch that would run into 03:30 is not started.
+    """
     inserted = {"security_master": 0, "security_identifiers": 0}
+    slowest = 0.0
     for table, sql, rows in (
         ("security_master", _INSERT_SM, plan.sm_inserts),
         ("security_identifiers", _INSERT_SI, plan.si_inserts),
     ):
         for batch in _batches(rows, batch_size):
-            check_window(now())
+            check_window(now() + timedelta(seconds=max(batch_estimate_s if not slowest else 0.0, 2 * slowest)))
+            t0 = time_mod.monotonic()
             with engine.begin() as conn:
                 conn.execute(_SET_LOCAL, {"k": "statement_timeout", "v": f"{int(statement_timeout_ms)}ms"})
                 conn.execute(_SET_LOCAL, {"k": "lock_timeout", "v": f"{int(lock_timeout_ms)}ms"})
                 res = conn.execute(text(sql), {"payload": json.dumps(batch, separators=(",", ":"))})
                 inserted[table] += int(res.rowcount or 0)
+            slowest = max(slowest, time_mod.monotonic() - t0)
             if on_progress:
                 on_progress(dict(inserted))
     return inserted
+
+
+def code_identity() -> dict[str, Any]:
+    """This loader's own commit, dirty flag and LF-normalized file hash (None where git is unavailable)."""
+    here = Path(__file__).resolve()
+    out: dict[str, Any] = {
+        "loader_file_sha256_lf": hashlib.sha256(here.read_bytes().replace(b"\r\n", b"\n")).hexdigest(),
+        "git_head": None,
+        "dirty": None,
+    }
+    try:
+        # Fixed argv, no shell, no user input: read-only git queries about the checkout this code runs from.
+        head = subprocess.run(  # nosec B603 B607
+            ["git", "rev-parse", "HEAD"], cwd=_PROJECT_ROOT, capture_output=True, text=True, timeout=10, check=False)
+        status = subprocess.run(  # nosec B603 B607
+            ["git", "status", "--porcelain", "--untracked-files=no"], cwd=_PROJECT_ROOT, capture_output=True, text=True,
+            timeout=30, check=False)
+        if head.returncode == 0 and status.returncode == 0:
+            out["git_head"] = head.stdout.strip() or None
+            out["dirty"] = bool(status.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return out
 
 
 # --- receipt + CLI --------------------------------------------------------------------------
@@ -342,8 +389,20 @@ def write_receipt(path: Path, receipt: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
-def run(args: argparse.Namespace, *, now: Optional[Callable[[], datetime]] = None, engine_factory: Optional[Callable[[str], Any]] = None) -> dict[str, Any]:
+def run(
+    args: argparse.Namespace,
+    *,
+    now: Optional[Callable[[], datetime]] = None,
+    engine_factory: Optional[Callable[[str], Any]] = None,
+    code: Optional[Callable[[], dict[str, Any]]] = None,
+) -> dict[str, Any]:
     clock = now or (lambda: datetime.now(timezone.utc))
+    identity = (code or code_identity)()
+    if args.apply:
+        if not args.expect_output_sha256:
+            raise ValueError("--apply requires --expect-output-sha256 (the artifact sha256 from receipt.json)")
+        if identity.get("dirty") and not getattr(args, "allow_dirty", False):
+            raise ValueError("refusing --apply from a git tree with uncommitted changes (use --allow-dirty to override)")
     seed = load_seed(args.seed_dir, expect_sha256=args.expect_output_sha256, require_receipt=args.apply)
     started = clock()
     receipt: dict[str, Any] = {
@@ -353,6 +412,7 @@ def run(args: argparse.Namespace, *, now: Optional[Callable[[], datetime]] = Non
         "artifact": {"dir": str(args.seed_dir), "sha256": seed.sha256, "rows": {
             "security_master": len(seed.security_master), "security_identifiers": len(seed.security_identifiers)}},
         "code_sha": (seed.receipt or {}).get("code"),
+        "loader_code": identity,
         "rollback_sql": ROLLBACK_SQL,
         "writes_to_database": False,
     }
@@ -393,8 +453,15 @@ def run(args: argparse.Namespace, *, now: Optional[Callable[[], datetime]] = Non
             engine, plan, batch_size=args.batch_size, statement_timeout_ms=args.statement_timeout_ms,
             lock_timeout_ms=args.lock_timeout_ms, now=clock,
             on_progress=lambda p: receipt.update(inserted_so_far=p))
-        _, after = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
-        receipt.update(status="applied", inserted=inserted, after_counts=after, finished_at=clock().isoformat())
+        receipt.update(status="applied", inserted=inserted)
+        try:
+            _, after = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
+            receipt["after_counts"] = after
+        except WindowRefused:
+            # Every batch had finished before the window opened: the run is complete, only the check read is skipped.
+            receipt.update(after_counts=None, note="applied in full; the post-apply count was skipped because the "
+                                                   "03:30-10:30Z window had started. Re-run the dry run after 10:30Z")
+        receipt["finished_at"] = clock().isoformat()
     except WindowRefused as exc:
         receipt.update(status="stopped_backup_window", error=str(exc), finished_at=clock().isoformat())
     except Exception as exc:  # noqa: BLE001 - the receipt must record any failure before it propagates
@@ -413,12 +480,15 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--apply", action="store_true", help="write (default: dry run). Needs --db-url or the settings DB_URL")
     ap.add_argument("--db-url", help="SQLAlchemy URL. Without --apply it is only read, in a read-only transaction")
     ap.add_argument("--db-url-env", help="name of an environment variable holding the SQLAlchemy URL (instead of --db-url)")
-    ap.add_argument("--expect-output-sha256", help="refuse unless the artifact has this sha256 (from receipt.json)")
+    ap.add_argument("--expect-output-sha256", help="refuse unless the artifact has this sha256 (from receipt.json); required with --apply")
+    ap.add_argument("--allow-dirty", action="store_true", help="allow --apply from a git tree with uncommitted changes")
     ap.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
     ap.add_argument("--statement-timeout-ms", type=int, default=DEFAULT_STATEMENT_TIMEOUT_MS)
     ap.add_argument("--lock-timeout-ms", type=int, default=DEFAULT_LOCK_TIMEOUT_MS)
     ap.add_argument("--receipt", type=Path, help="receipt path (default: next to the artifact)")
     args = ap.parse_args(argv)
+    if args.apply and not args.expect_output_sha256:
+        ap.error("--apply requires --expect-output-sha256")
     try:
         receipt = run(args)
     except WindowRefused as exc:
