@@ -1,0 +1,79 @@
+# TEMPLATE — NOT INSTALLED BY ANY CODE PATH, CI JOB OR DEPLOY WORKFLOW.
+# Installing this unit (and its .timer) is the E2 forward-scoreboard activation
+# step: an owner decision. Read evals/e2/README.md first.
+#
+# What each run does: verifies the E2 manifest (refuses to run on changed
+# scoring code), verifies the E2 ledger's hash chain and anchors, reads the S10
+# forward log and the GEX-levels v1 paper log READ-ONLY (it never writes to
+# either directory and never imports their code), appends new predictions,
+# point-in-time resolutions, scores and one snapshot to the append-only,
+# hash-chained ledger under BOARD_DIR, regenerates SCOREBOARD.md /
+# latest_snapshot.json (views, not anchors), and appends the new anchor lines
+# to the E2 witness file in the vault worktree given by --witness-worktree.
+# It opens NO database connection: neither live stream needs one (both log
+# their own outcomes). No orders, no weights, no promotion.
+#
+# Runs from the deployed release tree /data/grid_v4/grid_release (the same
+# tree grid-api runs from), as `grid`, with the repo `.env` (unused by this
+# job, kept for parity with the other release-tree writers).
+#
+# Owner steps at activation (not done by this template):
+#   1. sudo mkdir -p /data/grid/evals/e2_scoreboard && sudo chown grid:grid /data/grid/evals/e2_scoreboard
+#   2. Confirm the witness clone. --witness-worktree below is the mirror-only
+#      vault clone the GEX paper-log mirror already uses
+#      (/home/grid/dev/obsidian-vault-paperlog, pushed to main of
+#      github.com/3pacs/obsidian-vault by obsidian-vault-sync.sh every 15 min).
+#      The job only appends lines to 05-GRID/Paper-Log/e2/e2_scoreboard_e2-v1.anchors.jsonl
+#      there; the sync script commits and pushes them. If the owner prefers a
+#      separate clone, change the flag; `python -m evals.e2 verify --board-dir ...
+#      --vault-repo <clone>` then checks the ledger against the pushed anchors.
+#   3. Optional hardening: run the job as a dedicated user that alone can write
+#      BOARD_DIR (the systemd-template invariant test requires User=grid here, so
+#      that is a deliberate deviation recorded in the activation note).
+#
+# Install:
+#   sudo cp deploy/systemd/grid-e2-scoreboard.service.template /etc/systemd/system/grid-e2-scoreboard.service
+#   sudo cp deploy/systemd/grid-e2-scoreboard.timer.template   /etc/systemd/system/grid-e2-scoreboard.timer
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now grid-e2-scoreboard.timer   # the TIMER only
+#
+# Verify without writing anything:
+#   cd /data/grid_v4/grid_release && PYTHONPATH=. /usr/bin/python3 -m evals.e2 verify --board-dir /data/grid/evals/e2_scoreboard
+#   cd /data/grid_v4/grid_release && PYTHONPATH=. /usr/bin/python3 -m evals.e2 report --board-dir /data/grid/evals/e2_scoreboard
+#
+# Uninstall: `sudo systemctl disable --now grid-e2-scoreboard.timer`. Never
+# delete or edit the ledger under BOARD_DIR: it is the permanent record (a
+# changed scoreboard is a new version with its own ledger file).
+[Unit]
+Description=GRID E2 forward scoreboard v1 — ingest, resolve, score, snapshot (append-only)
+Documentation=file:///data/grid_v4/grid_release/evals/e2/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/data/grid_v4/grid_release
+
+# flock -n: a run still going when the timer fires again is skipped. The
+# board directory is a persistent path outside the per-commit release tree.
+ExecStart=/usr/bin/flock -n /tmp/grid-e2-scoreboard.lock \
+    /usr/bin/python3 -m evals.e2 run \
+        --board-dir /data/grid/evals/e2_scoreboard \
+        --s10-log-dir /data/grid/paper_log/hypothesis_forward_v1 \
+        --gex-log-dir /data/grid/paper_log/gex_levels_v1 \
+        --witness-worktree /home/grid/dev/obsidian-vault-paperlog
+
+TimeoutStartSec=10min
+TimeoutStopSec=60
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

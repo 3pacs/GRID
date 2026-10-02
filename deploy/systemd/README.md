@@ -408,3 +408,14 @@ Stop / roll back: `sudo systemctl disable --now grid-hypothesis-forward-log.time
 Never delete `/data/grid/paper_log/hypothesis_forward_v1/hypothesis_forward_v1.jsonl`
 — it is the permanent, append-only research record; archive it first if
 v1 is ever abandoned (see the pre-registration's Integrity section).
+
+## `grid-e2-scoreboard.{service,timer}`
+
+The E2 forward scoreboard (`evals/e2/`, milestone M2 of the evals plan):
+twice a day it reads the S10 forward log and the GEX-levels v1 paper log
+read-only, appends predictions, point-in-time resolutions, scores and a
+snapshot to its own append-only, hash-chained ledger in
+`/data/grid/evals/e2_scoreboard/`, and appends the ledger's anchor lines to
+the vault witness file `05-GRID/Paper-Log/e2/`. No database connection, no
+orders. Templates only; installing them is an owner step (see the service
+template header and `evals/e2/README.md`).

@@ -1,0 +1,83 @@
+{
+  "version": "e2-v1",
+  "registered_at": "2026-10-01T12:00:00+00:00",
+  "registration_note": "The rules below are fixed from this instant. A score is OFFICIAL only if its outcome became observable strictly after registered_at; earlier outcomes are scored under the same rules but reported in a separate PRE_REGISTRATION bucket and never enter an official aggregate.",
+  "aggregation": {
+    "group_keys": [["stream", "role"], ["stream", "family"], ["stream", "family", "sector", "horizon"]],
+    "role_note": "role is control for placebo arms and candidate otherwise; a stream-level rollup never pools the two",
+    "windows": ["all", "last_20", "last_60"],
+    "window_order": "issued_at, then prediction/unit id",
+    "bootstrap": {"n_boot": 2000, "ci": 0.95, "method": "percentile", "rng": "splitmix64 seeded by the first 8 bytes of sha256(rule_id|metric|group key|window)"},
+    "binomial_ci": "wilson score interval, z = 1.959963984540054",
+    "min_n_for_ci": 2
+  },
+  "resolution": {
+    "grace_days": 5,
+    "price_available_at": "max(pull_timestamp, 16:00 America/New_York on the observation date); a close is never available before its session closes",
+    "entry_must_follow_issue": true
+  },
+  "rules": {
+    "e2.direction.v1": {
+      "applies_to": "call.kind == direction (side +1/-1 on one instrument, entry close -> exit close)",
+      "metrics": {
+        "hit": "1 if side * return > 0, 0 if side * return < 0; return == 0 is a push (void, reason push)",
+        "net_return": "cost_model.json formula for the target's instrument_class; absent for not_tradable"
+      }
+    },
+    "e2.probability.v1": {
+      "applies_to": "call.kind == probability (p of the declared event, event 'up' = exit close > entry close)",
+      "metrics": {
+        "brier": "(p - y)^2",
+        "log_loss": "-(y ln p + (1 - y) ln (1 - p)) with p clipped to [1e-6, 1 - 1e-6]"
+      },
+      "eps": 1e-6
+    },
+    "e2.rank_ic.v1": {
+      "applies_to": "call.kind == rank_score; unit = (stream, family, horizon, entry date)",
+      "metrics": {
+        "rank_ic": "Spearman correlation between score and realized return across the unit's resolved members (average ranks for ties)"
+      },
+      "min_names": 5
+    },
+    "gex.level_hold.v1": {
+      "applies_to": "GEX-levels v1 tested level (flip, put wall, call wall) or its mirror placebo, per session",
+      "metrics": {
+        "hit": "1 if the level's first reach held (closed on the open's side), 0 if it broke; gap_through and not-reached are void (pre-registration H2 definitions)"
+      }
+    },
+    "gex.h3_net_pnl.v1": {
+      "applies_to": "GEX-levels v1 H3 rule trade (real walls, and the mirror-placebo walls as a control), per session",
+      "metrics": {
+        "net_return": "cost_model.json us_equity_etf_large applied to the logged raw entry and exit prices (NOT the pre-registration's 1 bp/side)",
+        "hit": "1 if net_return > 0 else 0"
+      },
+      "instrument_class": "us_equity_etf_large"
+    },
+    "s10.ts_ic.v1": {
+      "applies_to": "S10 hypothesis forward-log candidate; unit = candidate",
+      "metrics": {
+        "signed_ic": "direction * the candidate's pre-registered statistic (spearman or pearson) over the first min_n valid pairs in decision order, recomputed from the log and checked against the S10 verdict"
+      },
+      "min_pairs": 3
+    }
+  },
+  "streams": {
+    "s10_hypothesis_forward_v1": {
+      "adapter": "s10",
+      "prereg_sha256": "b0bfbd11e1047dde0c2d692f0ad0615b9fd52a6fcc36b010a42fbe387b33e814",
+      "disclosure": "sealed_until_verdict",
+      "disclosure_note": "The S10 pre-registration allows one look per candidate. E2 logs predictions and outcomes as activity but emits no score for a candidate until its S10 verdict record exists.",
+      "sector": null
+    },
+    "gex_levels_v1": {
+      "adapter": "gex_levels",
+      "prereg_sha256": "ce9b55e27913626a0259852ce1f39d81616b7cbe64fddc43bcaa4513c3ffcf77",
+      "disclosure": "interim_labelled",
+      "evaluation_after_valid_sessions": 60,
+      "disclosure_note": "The GEX pre-registration evaluates once at 60 valid sessions; any earlier look is labelled interim and cannot stop, extend or change the test. Every GEX aggregate carries interim=true until 60 valid sessions.",
+      "sector": "us_index_etf",
+      "instrument": "SPY",
+      "instrument_class": "us_equity_etf_large"
+    }
+  }
+}
