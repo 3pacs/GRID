@@ -111,11 +111,8 @@ Every file in `evals/e3/` is pinned in `MANIFEST.sha256`. It uses the E0 "versio
 - `python -m evals.e3.manifest --check` verifies the pins.
 - Any change is a new suite version. Bump `evals.e3.VERSION`, run `python -m evals.e3.manifest --write`, and append a new `e3` entry to `evals/RELEASED.json` (EVAL-E0H1). Never edit a released entry.
 
-## Open owner decisions
+## Owner decisions (approved 2026-10-01)
 
-- **S11 binding:** `genesis(s11_ledger_id=...)` has no default, on purpose.
-  - The recommendation is the canonical `grid-hypothesis-loop`. That gives one global error budget shared with the hypothesis loop.
-  - The alternative is a separate `grid-e3-v1` S11 ledger with its own q.
-  - As of 2026-10-01, no canonical S11 ledger has had its genesis on grid-svr.
-- **Directories:** where `GRID_E3_LEDGER_DIR` and `GRID_E3_ANCHOR_DIR` live on grid-svr. They must be separate, and the anchor directory must not be writable by proposers.
-- **Release approval:** e3-v1.
+- **S11 binding: the canonical `grid-hypothesis-loop` ledger.** One global error budget is shared with the hypothesis loop. `genesis(s11_ledger_id=...)` still has no default, so the binding is explicit at genesis. As of 2026-10-01, the canonical S11 ledger has not had its genesis on grid-svr; that is a separate, owner-gated step.
+- **Release:** e3-v1 is approved, enrolled by appending to `evals/RELEASED.json`.
+- **Directories:** the ledger and anchor directories on grid-svr are approved. They are separate, owned by `grid`, and the anchor directory is not writable by proposers. They are created only after this suite is merged and deployed, outside the backup window.
