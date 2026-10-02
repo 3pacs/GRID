@@ -74,6 +74,17 @@
         "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
         ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7"
       }
+    },
+    {
+      "seq": 6,
+      "kind": "suite",
+      "suite": "e1",
+      "version": "e1-v1.3",
+      "path": "evals/e1",
+      "manifest_sha256": "ae9682f334db3d478da1bfc617e455791822a270102916e55648e48af5f39271",
+      "released_in": "#787",
+      "approved_by": "3pacs (owner; 'yes to all recs' 2026-10-02T06:46Z, E1-V7 release order #794 -> #768 -> #781 -> #785 -> #787)",
+      "note": "E1 v1.3: E1-V7 gate (no direct resolved_series writer backdates or rewrites a vintage; strict xfails E1-V7a..o; REVIEWED_SAME_DAY exemption for options._push_to_resolved). DATA-FIX DFa."
     }
   ]
 }
