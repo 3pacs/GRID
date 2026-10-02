@@ -251,6 +251,17 @@ def test_resolve_entity_conflict_prefers_primary_row(sqlite_engine):
     assert sm.resolve_entity(sqlite_engine, "ticker", "DUP", as_of=date(2026, 9, 27)) == "sm_primary_claim"
 
 
+def test_resolve_entity_full_tie_breaks_on_the_smallest_entity_id_whatever_the_insert_order(sqlite_engine):
+    """Same primary flag and same valid_from: the answer must not depend on physical row order."""
+    with sqlite_engine.begin() as conn:
+        for entity_id in ("sm_0000000030", "sm_0000000010", "sm_0000000020"):  # deliberately not sorted
+            _insert_identifier(
+                conn, entity_id=entity_id, id_scheme="ticker", id_value="TIE",
+                valid_from="2020-01-01", source="sector_map", is_primary=True, conflict_flag=True,
+            )
+    assert sm.resolve_entity(sqlite_engine, "ticker", "TIE", as_of=date(2026, 9, 27)) == "sm_0000000010"
+
+
 def test_resolve_entity_unknown_scheme_returns_none(sqlite_engine):
     assert sm.resolve_entity(sqlite_engine, "ticker", "NOPE", as_of=date(2026, 9, 27)) is None
 
