@@ -162,4 +162,61 @@ setInterval(()=>{if(!document.querySelector('[data-view="Structure"].panel').hid
 renderStructural();
 
 </script>
+<script id="gamma-regime-alert">
+// Independent state machine: delayed provider sign changes, never trade direction.
+function gammaRegimeStep(previous, state, now=Date.now()) {
+ const g=state?.gex,stamp=Date.parse(g?.as_of),receipt=Date.parse(g?.received_at);
+ const net=g?.net_gex_at_spot,source=g?.source;
+ const valid=!!g&&!state.gex_error&&Number.isFinite(stamp)&&Number.isFinite(receipt)&&
+  stamp<=receipt&&receipt<=now&&now-stamp<=1800000&&now-stamp>=0&&
+  Number.isFinite(net)&&net!==0&&Number.isFinite(g.spot)&&g.spot>0&&
+  typeof source==='string'&&source.length>0&&g.market_phase==='open'&&
+  ((g.regime==='long'&&net>0)||(g.regime==='short'&&net<0));
+ if(!valid)return {baseline:null,event:null,status:'unavailable'};
+ const day=new Date(stamp).toISOString().slice(0,10),sign=net>0?'positive':'negative';
+ const baseline={stamp,seen:now,source,day,sign};
+ if(!previous||previous.source!==source||previous.day!==day||now-previous.seen>180000||stamp-previous.stamp>300000)
+  return {baseline,event:null,status:'baseline'};
+ if(stamp<previous.stamp)return {baseline:null,event:null,status:'out_of_order'};
+ if(stamp===previous.stamp){
+  if(sign!==previous.sign)return {baseline:null,event:null,status:'revision_requires_baseline'};
+  return {baseline:{...previous,seen:now},event:null,status:'unchanged'};
+ }
+ return {baseline,status:sign===previous.sign?'unchanged':'changed',event:sign===previous.sign?null:
+  {id:source+'|'+stamp+'|'+sign,before:previous.sign,after:sign,source_at:g.as_of,
+   received_at:g.received_at,observed_at:now,source,spot:g.spot,flip:g.gamma_flip,
+   delay_seconds:Math.round((now-stamp)/1000)}};
+}
+if(typeof module!=='undefined')module.exports={gammaRegimeStep};
+if(typeof document!=='undefined'){
+ const banner=document.createElement('section');banner.id='gammaRegimeBanner';
+ banner.setAttribute('role','status');banner.setAttribute('aria-live','assertive');
+ banner.style.cssText='position:sticky;top:0;z-index:8;margin:12px 0;padding:20px;border:2px solid #7bdfff;border-radius:10px;background:#112b40;box-shadow:0 0 24px #76dfff35';
+ const headline=document.createElement('strong');headline.style.cssText='display:block;font-size:24px;letter-spacing:.5px';
+ const detail=document.createElement('p');detail.style.cssText='margin:9px 0;white-space:pre-line';
+ const ack=document.createElement('button');ack.textContent='Acknowledge change';ack.hidden=true;
+ const audio=document.createElement('button');audio.textContent='Enable gamma-change sound';
+ banner.append(headline,detail,ack,audio);$('freshness').before(banner);
+ let previous=null,latestEvent=null,acknowledged=null,lastRendered='',context=null;
+ audio.onclick=async()=>{try{const Audio=window.AudioContext||window.webkitAudioContext;context=new Audio();await context.resume();audio.textContent='Gamma-change sound enabled';audio.disabled=true;}catch{audio.textContent='Sound unavailable — visual alert remains active';}};
+ ack.onclick=()=>{acknowledged=latestEvent?.id;updateGammaBanner();};
+ function beep(){if(!context||context.state!=='running')return;for(let i=0;i<3;i++){const o=context.createOscillator(),v=context.createGain();o.connect(v);v.connect(context.destination);o.frequency.value=660+i*110;v.gain.value=.08;const start=context.currentTime+i*.3;o.start(start);o.stop(start+.15);}}
+ function updateGammaBanner(){
+  const r=gammaRegimeStep(previous,state);previous=r.baseline;
+  if(latestEvent&&r.baseline&&(latestEvent.source!==r.baseline.source||new Date(latestEvent.source_at).toISOString().slice(0,10)!==r.baseline.day))latestEvent=null;
+  if(r.event){latestEvent=r.event;beep();}
+  const current=r.baseline?.sign,pending=latestEvent&&acknowledged!==latestEvent.id;
+  let title,body;
+  if(!current){title='GAMMA CONTEXT UNAVAILABLE';body='Stale, failed or inconsistent provider snapshot. Regime alerts paused; feed recovery establishes a new baseline.';}
+  else if(pending){title='GAMMA SWITCH: '+latestEvent.before.toUpperCase()+' → '+latestEvent.after.toUpperCase();
+   body=`Observed ${et(latestEvent.observed_at)} ET · provider snapshot ${et(latestEvent.source_at)} ET · delayed ${Math.floor(latestEvent.delay_seconds/60)}m at detection.\n${latestEvent.source} · provider spot $${fmt(latestEvent.spot)} · modeled flip $${fmt(latestEvent.flip)}.\n${latestEvent.after==='positive'?'Potential dampening / range persistence':'Potential amplification in either direction'} — dealer positions assumed; direction unconfirmed. Current modeled regime: ${current}.`;
+  }else{title='MODELED '+current.toUpperCase()+' GAMMA';body=`${current==='positive'?'Potential dampening / range persistence':'Potential amplification in either direction'} · direction unconfirmed.\nProvider ${et(state.gex.as_of)} ET · ${ageText(state.gex.as_of)} · ${state.gex.source}. ${r.status==='baseline'?'Initial/recovered snapshot; no switch inferred.':''}`;}
+  ack.hidden=!pending;
+  banner.style.borderColor=!current?'#ffb96a':pending?'#ffdf7d':current==='positive'?'#62e2b6':'#ff8a97';
+  // Avoid announcing the same message every second to assistive technology.
+  const text=title+'\n'+body;if(text!==lastRendered){headline.textContent=title;detail.textContent=body;lastRendered=text;}
+ }
+ setInterval(updateGammaBanner,1000);updateGammaBanner();
+}
+</script>
 </body></html>
