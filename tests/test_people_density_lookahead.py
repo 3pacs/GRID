@@ -1,8 +1,8 @@
 """GD5 acceptance test 13: the people_events-backed look-ahead canary (PostgreSQL).
 
 E1-style canary for ``analysis.people_density`` on a real ``people_events``
-table, built from the real migration DDL
-(``migrations/versions/people_events_20260927.py``) in a throwaway schema:
+table, built from the real migration DDL (people_events_20260927 ->
+security_master_20260927 -> people_events_v2_20261001) in a throwaway schema:
 
 1. ``load_events(engine, as_of, ...)`` never returns a row with
    ``known_at > as_of`` -- including rows whose ``event_time`` is before
@@ -79,15 +79,21 @@ def _run_migration(engine) -> None:
     from alembic.migration import MigrationContext
     from alembic.operations import Operations
 
-    migration = importlib.import_module("migrations.versions.people_events_20260927")
+    # The store targets the v2 schema (people_events_v2_20261001: partial
+    # unique index, versioning columns, TEXT security_id FK onto
+    # security_master), so the scratch table is built from the whole chain.
     with engine.connect() as conn:
         trans = conn.begin()
-        real_op = migration.op
-        migration.op = Operations(MigrationContext.configure(conn))
-        try:
-            migration.upgrade()
-        finally:
-            migration.op = real_op
+        for name in ("migrations.versions.people_events_20260927",
+                     "migrations.versions.security_master_20260927",
+                     "migrations.versions.people_events_v2_20261001"):
+            migration = importlib.import_module(name)
+            real_op = migration.op
+            migration.op = Operations(MigrationContext.configure(conn))
+            try:
+                migration.upgrade()
+            finally:
+                migration.op = real_op
         trans.commit()
 
 
