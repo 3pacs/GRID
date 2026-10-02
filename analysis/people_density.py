@@ -421,23 +421,31 @@ def load_events(
     Ticker-only rows are resolved through ``security_master.resolve_entity``
     as of the event's ``known_at`` New York date.
 
-    Versioned store (people_events v2, PR #780): ``read_events`` returns the
-    versions visible *at* ``as_of`` and hides one superseded or retracted
-    before it, so a grid of decisions earlier than ``as_of`` would lose that
-    version for ``[known_at, superseded_at)``. Until the store can return
-    superseded/retracted versions with their timestamps (which the features
-    already honour through ``visible_until``), call this with ``as_of`` equal
-    to the grid's last decision and treat earlier decisions as subject to that
-    caveat; on the v1 store (no versioning) there is none. The frame says so:
-    ``attrs["versioned_store_gap"]`` is True when the store is versioned but
-    the rows carry no visibility timestamps, and :func:`build_receipt`
-    records it.
+    Versioned store (people_events v2, PR #780): reads every version known by
+    ``as_of`` through ``read_event_versions`` instead, with superseded/
+    retracted timestamps masked to NULL when they lie after ``as_of``; the
+    features honour them through ``visible_until``, so every decision
+    ``<= as_of`` sees exactly the version visible at it (no gap). Historically
+    (before #780) a versioned read through ``read_events`` lost a version
+    superseded before ``as_of`` for earlier decisions. ``attrs
+    ["versioned_store_gap"]`` (recorded by :func:`build_receipt`) is kept for
+    receipt compatibility and is now always False: the v1 store has no
+    versions and the v2 store is read through the version API.
     """
     if as_of.tzinfo is None:
         raise ValueError("as_of must be tz-aware")
-    rows: list[PeopleEvent] = []
-    for channel in channels:
-        rows.extend(read_events(engine, as_of, channel=channel, known_at_after=known_at_after, exclude_echoes=True))
+    versioned = _store_is_versioned(engine)
+    rows: list[PeopleEvent] | pd.DataFrame
+    if versioned:
+        # v2 store: every version known by as_of, each with its PIT-masked
+        # superseded_at / retracted_at (store.people_events.read_event_versions),
+        # so every decision <= as_of sees exactly the version visible at it.
+        rows = _read_versions(engine, as_of, channels, known_at_after)
+    else:
+        rows = []
+        for channel in channels:
+            rows.extend(read_events(engine, as_of, channel=channel, known_at_after=known_at_after,
+                                    exclude_echoes=True))
     resolver = None
     if resolve_tickers:
         from intelligence.security_master import resolve_entity
@@ -453,7 +461,9 @@ def load_events(
     frame = events_frame(rows, ticker_resolver=resolver, contract=contract)
     if (frame["known_at"] > pd.Timestamp(as_of).tz_convert("UTC")).any():  # defence in depth over read_events
         raise AssertionError("load_events returned an event with known_at > as_of")
-    frame.attrs["versioned_store_gap"] = _store_is_versioned(engine) and not frame["visible_until"].notna().any()
+    # The gap exists only when a versioned store is read through read_events
+    # (one as_of view); the version path above closes it.
+    frame.attrs["versioned_store_gap"] = False
     frame.attrs["as_of"] = pd.Timestamp(as_of).tz_convert("UTC").isoformat()
     return frame
 
@@ -463,6 +473,26 @@ _VERSIONED_COLUMNS_SQL = text(
     "WHERE table_schema = current_schema() AND table_name = 'people_events' "
     "AND column_name IN ('superseded_at', 'retracted_at')"
 )
+
+
+def _read_versions(engine: Any, as_of: datetime, channels: Sequence[str],
+                   known_at_after: datetime | None) -> pd.DataFrame:
+    """All versions known by ``as_of`` as an ``events_frame`` input (echoes are dropped there)."""
+    from store.people_events import read_event_versions
+
+    parts = []
+    for channel in channels:
+        got = pd.DataFrame(read_event_versions(engine, as_of, channel=channel))
+        if got.empty:
+            continue
+        if known_at_after is not None:
+            got = got[pd.to_datetime(got["known_at"], utc=True) > pd.Timestamp(known_at_after)]
+        parts.append(got)
+    if not parts:
+        return pd.DataFrame(columns=[c for c in EVENT_COLUMNS if c != "entity_id"] + list(_EXTRA_COLUMNS))
+    frame = pd.concat(parts, ignore_index=True)
+    frame["provenance"] = [{"attrs": a} if isinstance(a, Mapping) else None for a in frame.pop("attrs")]
+    return frame
 
 
 def _store_is_versioned(engine: Any) -> bool:
