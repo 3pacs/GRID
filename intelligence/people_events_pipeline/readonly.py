@@ -67,9 +67,9 @@ def guard_sql(sql: str) -> str:
     return body
 
 
-def readonly_engine(url: str) -> Engine:
+def readonly_engine(url: str, *, statement_timeout_ms: int = STATEMENT_TIMEOUT_MS) -> Engine:
     options = (
-        f"-c default_transaction_read_only=on -c statement_timeout={STATEMENT_TIMEOUT_MS} "
+        f"-c default_transaction_read_only=on -c statement_timeout={int(statement_timeout_ms)} "
         f"-c lock_timeout={LOCK_TIMEOUT_MS} -c idle_in_transaction_session_timeout=60000 "
         "-c application_name=people_events_dry_run"
     )
@@ -134,7 +134,64 @@ _PEOPLE_EVENTS_ROWS_V1_SQL = """
     FROM people_events
     ORDER BY id
 """
-STORED_ROWS_CAP = 2_000_000
+STREAM_BATCH = 50_000
+
+
+def _stream(conn: Connection, sql: str, params: dict[str, Any]) -> pd.DataFrame:
+    """A guarded SELECT read through a server-side cursor in batches (no row cap, bounded memory per fetch)."""
+    assert_db_window_open()
+    result = conn.execution_options(stream_results=True, max_row_buffer=STREAM_BATCH).execute(
+        text(guard_sql(sql)), params)
+    cols = list(result.keys())
+    parts = []
+    while True:
+        assert_db_window_open()  # a long read must not drift into the backup window
+        chunk = result.fetchmany(STREAM_BATCH)
+        if not chunk:
+            break
+        parts.append(pd.DataFrame(chunk, columns=cols))
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame(columns=cols)
+
+
+_PEOPLE_EVENTS_ROWS_V2_BY_CHANNEL_SQL = """
+    SELECT channel, dedup_key, known_at, known_at_basis, source_refs, content_hash, actor_id, actor_id_basis,
+           entity_cik, superseded_at, retracted_at
+    FROM people_events
+    WHERE channel = :channel
+"""  # no ORDER BY: current rows and version floors are order-independent
+
+
+def read_stored_rows(url: str, channels: list[str], *, now: datetime | None = None) -> pd.DataFrame:
+    """Every stored version (current, superseded, retracted) of ``channels``, streamed, no cap.
+
+    The stored-row reader incremental planning needs once the table holds
+    millions of rows (design doc D11): ``plan.build_write_plan`` diffs
+    against it and computes each key's version floor from it. v2 schema only.
+    """
+    assert_db_window_open(now)
+    engine = readonly_engine(url)
+    try:
+        with engine.connect() as conn:
+            _assert_read_only(conn)
+            if int(_query(conn, _PEOPLE_EVENTS_HAS_V2_SQL, {}).iloc[0]["n"]) == 0:
+                raise RuntimeError("people_events has no v2 columns; apply people_events_v2_20261001 first")
+            parts = [_stream(conn, _PEOPLE_EVENTS_ROWS_V2_BY_CHANNEL_SQL, {"channel": c}) for c in channels]
+    finally:
+        engine.dispose()
+    parts = [p for p in parts if not p.empty]
+    return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+def read_security_identifiers(url: str, *, now: datetime | None = None) -> pd.DataFrame:
+    """``security_identifiers`` (ticker/cik schemes) for ``security.resolve_securities``."""
+    assert_db_window_open(now)
+    engine = readonly_engine(url)
+    try:
+        with engine.connect() as conn:
+            _assert_read_only(conn)
+            return _stream(conn, _IDENTIFIERS_SQL, {})
+    finally:
+        engine.dispose()
 
 
 def read_inputs(url: str, *, since: Any, limit_per_source: int, source_types: list[str] | None = None,
@@ -160,14 +217,11 @@ def read_inputs(url: str, *, since: Any, limit_per_source: int, source_types: li
             out["frames"]["security_identifiers"] = _query(conn, _IDENTIFIERS_SQL, {})
             out["security_master"] = _query(conn, _MASTER_COUNT_SQL, {}).iloc[0].to_dict()
             out["people_events_counts"] = _query(conn, _PEOPLE_EVENTS_COUNT_SQL, {}).to_dict("records")
-            total = int(_query(conn, _PEOPLE_EVENTS_TOTAL_SQL, {}).iloc[0]["n"])
-            if total > STORED_ROWS_CAP:
-                # A partial view of stored rows would make every "would write"
-                # count wrong; refuse instead of reporting a misleading plan.
-                raise RuntimeError(f"people_events holds {total} rows (> {STORED_ROWS_CAP}); "
-                                   "the dry run needs a per-channel stored-row reader first")
+            out["people_events_total"] = int(_query(conn, _PEOPLE_EVENTS_TOTAL_SQL, {}).iloc[0]["n"])
             v2 = int(_query(conn, _PEOPLE_EVENTS_HAS_V2_SQL, {}).iloc[0]["n"]) > 0
-            out["frames"]["people_events"] = _query(
+            # Streamed, no cap: a partial view of stored rows would make every
+            # "would write" count wrong.
+            out["frames"]["people_events"] = _stream(
                 conn, _PEOPLE_EVENTS_ROWS_V2_SQL if v2 else _PEOPLE_EVENTS_ROWS_V1_SQL, {})
             out["people_events_schema"] = "v2" if v2 else "v1"
     finally:

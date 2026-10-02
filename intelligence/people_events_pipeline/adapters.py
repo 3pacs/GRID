@@ -239,7 +239,7 @@ def form4_from_form345(frame: pd.DataFrame) -> tuple[pd.DataFrame, Counter]:
         return empty_candidates(), skips
 
     # Fold joint filers: one row per (accession, line); actor = lowest owner CIK.
-    base["_owner_sort"] = base["owner_cik"].fillna(np.inf)
+    base["_owner_sort"] = base["owner_cik"].astype("float64").fillna(np.inf)  # nullable Int64 -> float
     base = base.sort_values(["accession", "line", "_owner_sort", "owner_name"], kind="mergesort")
     line_key = base["accession"] + "#" + base["line"].fillna("")
     sizes = line_key.map(line_key.value_counts())
