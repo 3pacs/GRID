@@ -1,0 +1,8 @@
+{
+ "schema": "gex-p2b-receipt-v1",
+ "url": "synthetic-fixture-not-market-data",
+ "request_started_at": "2026-10-01T05:58:48.473080Z",
+ "receipt_completed_at": "2026-10-01T05:59:08.333157Z",
+ "clock": "untrusted_workstation",
+ "raw_sha256": "a7fe68ca31080ce45657f50fe8b40aeab274faff081a175921d6f010e023b5f2"
+}
