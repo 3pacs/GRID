@@ -70,15 +70,23 @@ MAX_CONSECUTIVE_CONNECTION_FAILURES = 2
 class EarningsStoreAborted(RuntimeError):
     """Database unavailable; ``stored`` counts committed rows in this batch."""
 
-    def __init__(self, message: str, stored: int = 0, failed: int = 0, errors: list[str] | None = None) -> None:
+    def __init__(
+        self, message: str, stored: int = 0, failed: int = 0,
+        errors: list[str] | None = None, commit_outcome_unknown: bool = False,
+    ) -> None:
         super().__init__(message)
         self.stored = stored
         self.failed = failed
         self.errors = errors or []
+        self.commit_outcome_unknown = commit_outcome_unknown
 
 
 class _ConnectionFailure(Exception):
     """A transaction could not open, or its connection became unusable."""
+
+    def __init__(self, cause: BaseException, commit_outcome_unknown: bool = False) -> None:
+        super().__init__(str(cause))
+        self.commit_outcome_unknown = commit_outcome_unknown
 
 
 def _is_connection_error(exc: BaseException) -> bool:
@@ -388,13 +396,15 @@ class EarningsPuller(BasePuller):
     def _write(self, fn) -> None:
         """Commit one short transaction; distinguish unavailable connections."""
         opened = False
+        statements_completed = False
         try:
             with self.engine.begin() as conn:
                 opened = True
                 fn(conn)
+                statements_completed = True
         except Exception as exc:
             if not opened or _is_connection_error(exc):
-                raise _ConnectionFailure(exc) from exc
+                raise _ConnectionFailure(exc, commit_outcome_unknown=statements_completed) from exc
             raise
 
     def _store_points(self, conn: Any, points: list[dict[str, Any]]) -> int:
@@ -441,6 +451,12 @@ class EarningsPuller(BasePuller):
             streak["connection_failures"] = 0
             return counter["stored"], 0, []
         except _ConnectionFailure as exc:
+            if exc.commit_outcome_unknown:
+                # The server may have committed before the connection died.
+                # Neither zero nor the tentative count is confirmed. Do not
+                # turn a retry/dedupe response into an invented exact count.
+                raise EarningsStoreAborted("database connection failed during commit; outcome unknown",
+                                           commit_outcome_unknown=True) from exc
             self._note_connection_failure(streak, exc.__cause__, stored=0)
         except Exception as exc:
             log.warning("Earnings: {t} batch failed; retrying one row per transaction: {e}", t=ticker, e=str(exc))
@@ -456,6 +472,11 @@ class EarningsPuller(BasePuller):
                 streak["connection_failures"] = 0
                 stored += counter["stored"]
             except _ConnectionFailure as exc:
+                if exc.commit_outcome_unknown:
+                    raise EarningsStoreAborted(
+                        "database connection failed during commit; outcome unknown",
+                        stored=stored, failed=failed, errors=errors, commit_outcome_unknown=True,
+                    ) from exc
                 failed += 1
                 errors.append(f"{point['series_id']} @ {point['obs_date']}: connection failure")
                 self._note_connection_failure(streak, exc.__cause__, stored=stored, failed=failed, errors=errors)
@@ -479,6 +500,8 @@ class EarningsPuller(BasePuller):
 
         Returns:
             dict with ticker, rows_inserted, status, errors, significant_surprises.
+            rows_inserted counts acknowledged commits; commit_outcome_unknown
+            flags a lost commit acknowledgement rather than claiming an exact total.
         """
         result: dict[str, Any] = {
             "ticker": ticker,
@@ -524,6 +547,8 @@ class EarningsPuller(BasePuller):
                     result["errors"].extend(exc.errors)
                     result["status"] = "PARTIAL" if result["rows_inserted"] else "FAILED"
                     result["aborted"] = True
+                    if exc.commit_outcome_unknown:
+                        result["commit_outcome_unknown"] = True
                     result["errors"].append(str(exc))
                     return result
                 result["rows_inserted"] += stored

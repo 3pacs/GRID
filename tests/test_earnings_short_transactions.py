@@ -28,7 +28,8 @@ def _frames(n: int = 45) -> SimpleNamespace:
 
 
 class _Engine:
-    def __init__(self, *, bad_dates=(), begin_error=None, fail_after=None, insert_error=None, commit_error=None):
+    def __init__(self, *, bad_dates=(), begin_error=None, fail_after=None, insert_error=None,
+                 commit_error=None, commit_before_error=False):
         self.committed: dict[tuple[str, date], dict] = {}
         self.per_txn: list[int] = []
         self.rolled_back: list[int] = []
@@ -39,6 +40,7 @@ class _Engine:
         self.fail_after = fail_after
         self.insert_error = insert_error
         self.commit_error = commit_error
+        self.commit_before_error = commit_before_error
 
     def begin(self):
         self.begin_calls += 1
@@ -63,6 +65,8 @@ class _Txn:
     def __exit__(self, exc_type, *rest):
         self.engine.active = False
         if exc_type is None and self.engine.commit_error:
+            if self.engine.commit_before_error:
+                self.engine.committed.update(self.pending)
             self.engine.rolled_back.append(self.insert_attempts)
             raise self.engine.commit_error
         if exc_type is None:
@@ -168,6 +172,17 @@ def test_database_outage_stops_before_other_tickers(failure):
     assert engine.begin_calls == ep.MAX_CONSECUTIVE_CONNECTION_FAILURES
 
 
+def test_lost_commit_acknowledgement_stops_and_reports_an_unknown_total():
+    error = sa_exc.OperationalError("COMMIT", {}, Exception("connection disappeared"))
+    engine = _Engine(commit_error=error, commit_before_error=True)
+    out = _puller(engine).pull_all(["AAPL", "MSFT"])
+    assert len(out) == 1 and out[0]["status"] == "FAILED" and out[0]["aborted"]
+    assert out[0]["commit_outcome_unknown"]
+    assert out[0]["rows_inserted"] == 0  # no acknowledged commit; actual total is explicitly unknown
+    assert len(engine.committed) == 50  # server committed before losing its acknowledgement
+    assert engine.begin_calls == 1  # no retry silently recasts these as duplicates
+
+
 @pytest.mark.parametrize("where", ["insert_error", "commit_error"])
 def test_connection_errors_during_statement_or_commit_do_not_count_rolled_back_rows(where):
     error = sa_exc.DBAPIError("INSERT", {}, Exception("connection gone"), connection_invalidated=True)
@@ -175,7 +190,10 @@ def test_connection_errors_during_statement_or_commit_do_not_count_rolled_back_r
     out = _puller(engine).pull_ticker("AAPL")
     assert out["status"] == "FAILED" and out["aborted"]
     assert out["rows_inserted"] == 0 and not engine.committed
-    assert engine.begin_calls == ep.MAX_CONSECUTIVE_CONNECTION_FAILURES
+    if where == "commit_error":
+        assert engine.begin_calls == 1 and out["commit_outcome_unknown"]
+    else:
+        assert engine.begin_calls == ep.MAX_CONSECUTIVE_CONNECTION_FAILURES
 
 
 def test_outage_preserves_prior_committed_batch_count():
