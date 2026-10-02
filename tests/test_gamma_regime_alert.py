@@ -54,7 +54,7 @@ const freshness={before:node=>freshness.banner=node};
 global.document={createElement:tag=>({tag,style:{},children:[],setAttribute(){},append(...nodes){this.children.push(...nodes);}})};
 const $=id=>freshness,et=x=>new Date(x).toISOString(),fmt=x=>String(x),ageText=x=>'delayed';
 function sample(minutes,sign){return {gex:{as_of:new Date(clock-minutes*60000).toISOString(),received_at:new Date(clock-1000).toISOString(),net_gex_at_spot:sign==='long'?1e9:-1e9,spot:769,source:'ZeroGEX delayed',regime:sign,market_phase:'open',gamma_flip:766}};}
-let state=sample(18,'short');
+let state=sample(18,'short'),lastSuccess=clock;
 """
     checks = r"""
 const [heading,details,ack,sound]=freshness.banner.children;
@@ -67,6 +67,8 @@ ack.onclick();assert.equal(heading.textContent,'MODELED POSITIVE GAMMA');assert.
 state.gex_error='failed';intervals[0]();assert.equal(heading.textContent,'GAMMA CONTEXT UNAVAILABLE');
 state=sample(15,'short');intervals[0]();assert.equal(heading.textContent,'MODELED NEGATIVE GAMMA');
 assert.equal(sound.disabled,undefined);console.log('passed');
+lastSuccess=0;intervals[0]();assert.equal(heading.textContent,'GAMMA CONTEXT UNAVAILABLE');
+lastSuccess=clock;state=sample(14,'long');intervals[0]();assert.equal(heading.textContent,'MODELED POSITIVE GAMMA');
 """
     result = subprocess.run([node, "-e", setup + code + checks], check=True, capture_output=True, text=True)
     assert result.stdout.strip() == "passed"

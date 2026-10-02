@@ -190,9 +190,10 @@ function gammaRegimeStep(previous, state, now=Date.now()) {
 if(typeof module!=='undefined')module.exports={gammaRegimeStep};
 if(typeof document!=='undefined'){
  const banner=document.createElement('section');banner.id='gammaRegimeBanner';
- banner.setAttribute('role','status');banner.setAttribute('aria-live','assertive');
+ banner.setAttribute('role','region');banner.setAttribute('aria-label','Gamma regime context');
  banner.style.cssText='position:sticky;top:0;z-index:8;margin:12px 0;padding:20px;border:2px solid #7bdfff;border-radius:10px;background:#112b40;box-shadow:0 0 24px #76dfff35';
  const headline=document.createElement('strong');headline.style.cssText='display:block;font-size:24px;letter-spacing:.5px';
+ headline.setAttribute('role','status');headline.setAttribute('aria-live','assertive');
  const detail=document.createElement('p');detail.style.cssText='margin:9px 0;white-space:pre-line';
  const ack=document.createElement('button');ack.textContent='Acknowledge change';ack.hidden=true;
  const audio=document.createElement('button');audio.textContent='Enable gamma-change sound';
@@ -202,7 +203,8 @@ if(typeof document!=='undefined'){
  ack.onclick=()=>{acknowledged=latestEvent?.id;updateGammaBanner();};
  function beep(){if(!context||context.state!=='running')return;for(let i=0;i<3;i++){const o=context.createOscillator(),v=context.createGain();o.connect(v);v.connect(context.destination);o.frequency.value=660+i*110;v.gain.value=.08;const start=context.currentTime+i*.3;o.start(start);o.stop(start+.15);}}
  function updateGammaBanner(){
-  const r=gammaRegimeStep(previous,state);previous=r.baseline;
+  const input=typeof lastSuccess!=='undefined'&&(!lastSuccess||Date.now()-lastSuccess>15000)?{...state,gex_error:'Page refresh stalled'}:state;
+  const r=gammaRegimeStep(previous,input);previous=r.baseline;
   if(latestEvent&&r.baseline&&(latestEvent.source!==r.baseline.source||new Date(latestEvent.source_at).toISOString().slice(0,10)!==r.baseline.day))latestEvent=null;
   if(r.event){latestEvent=r.event;beep();}
   const current=r.baseline?.sign,pending=latestEvent&&acknowledged!==latestEvent.id;
@@ -214,7 +216,7 @@ if(typeof document!=='undefined'){
   ack.hidden=!pending;
   banner.style.borderColor=!current?'#ffb96a':pending?'#ffdf7d':current==='positive'?'#62e2b6':'#ff8a97';
   // Avoid announcing the same message every second to assistive technology.
-  const text=title+'\n'+body;if(text!==lastRendered){headline.textContent=title;detail.textContent=body;lastRendered=text;}
+  const text=title+'\n'+body;if(text!==lastRendered){if(headline.textContent!==title)headline.textContent=title;detail.textContent=body;lastRendered=text;}
  }
  setInterval(updateGammaBanner,1000);updateGammaBanner();
 }
