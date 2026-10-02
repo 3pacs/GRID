@@ -255,15 +255,18 @@ def test_offshore_store_matches_commits_in_short_transactions(pg_engine, tmp_pat
     matches = [_offshore_match(i) for i in range(n)]
     matches.append(_offshore_match(0))  # a duplicate inside one run is written once
 
-    seen_xids: set[int] = set()
+    visible: list[tuple[int, int]] = []  # (rows written by the batch, rows visible after it)
     real_store = ol.OffshoreLeaksPuller._store_batch
 
     def store(self, batch, *args):
         out = real_store(self, batch, *args)
-        with pg_engine.connect() as c:  # each committed batch is its own top-level transaction
-            seen_xids.update(r[0] for r in c.execute(text(
-                "SELECT DISTINCT xmin::text::bigint FROM raw_series WHERE series_id LIKE 'OFFSHORE:%'"
-            )).fetchall())
+        # Another connection already sees the batch: it committed on its own,
+        # not as a savepoint inside one long run-wide transaction.
+        with pg_engine.connect() as c:
+            seen_now = c.execute(text(
+                "SELECT count(*) FROM raw_series WHERE series_id LIKE 'OFFSHORE:Actor_%'"
+            )).scalar_one()
+        visible.append((len(out), seen_now))
         return out
 
     ol.OffshoreLeaksPuller._store_batch = store
@@ -279,7 +282,12 @@ def test_offshore_store_matches_commits_in_short_transactions(pg_engine, tmp_pat
             "WHERE series_id LIKE 'OFFSHORE:%' GROUP BY 1) t"
         )).scalar_one()
     assert per_xact <= ol.STORE_BATCH_ROWS  # never one transaction across the whole run
-    assert len(seen_xids) >= 3
+    assert len(visible) >= 3
+    running = 0
+    for written, seen_now in visible:
+        assert written <= ol.STORE_BATCH_ROWS
+        running += written
+        assert seen_now == running, visible
 
 
 def test_offshore_dedupe_spans_30_days_across_obs_dates(pg_engine, tmp_path) -> None:

@@ -53,6 +53,8 @@ _CSV_RELATIONSHIPS: str = "relationships.csv"
 #: Max raw_series rows written per transaction by store_matches (see its
 #: locking contract). Keeps lock and WAL footprint per transaction small.
 STORE_BATCH_ROWS: int = 50
+#: store_matches stops a run after this many consecutive failed batches.
+MAX_CONSECUTIVE_BATCH_FAILURES: int = 3
 
 # Default local data directory
 # Canonical bulk location: /data/grid/bulk/icij (shared with actor_discovery)
@@ -540,14 +542,25 @@ class OffshoreLeaksPuller(BasePuller):
 
         raw_count = 0
         signal_count = 0
+        failed_batches = 0
+        consecutive_failures = 0
+        errors: list[str] = []
         seen: set[str] = set()
         for start in range(0, len(rows), STORE_BATCH_ROWS):
             batch = rows[start:start + STORE_BATCH_ROWS]
             try:
                 inserted = self._store_batch(batch, seen, today, since)
             except Exception as exc:
+                failed_batches += 1
+                consecutive_failures += 1
+                errors.append(str(exc)[:200])
                 log.warning("Offshore raw_series batch failed ({n} rows): {e}", n=len(batch), e=str(exc))
+                if consecutive_failures >= MAX_CONSECUTIVE_BATCH_FAILURES:
+                    log.warning("Offshore leaks: {k} consecutive batch failures, stopping this run",
+                                k=consecutive_failures)
+                    break
                 continue
+            consecutive_failures = 0
             raw_count += len(inserted)
             signal_count += self._emit_signals(inserted, now)
 
@@ -559,6 +572,8 @@ class OffshoreLeaksPuller(BasePuller):
         return {
             "raw_series_inserted": raw_count,
             "signals_emitted": signal_count,
+            "failed_batches": failed_batches,
+            "errors": errors[:5],
         }
 
     def _store_batch(
@@ -578,6 +593,7 @@ class OffshoreLeaksPuller(BasePuller):
         if not sids:
             return []
         written: list[dict[str, Any]] = []
+        batch_ids: set[str] = set()
         with self.engine.begin() as conn:
             stored = {row[0] for row in conn.execute(text("""
                 SELECT DISTINCT series_id FROM raw_series
@@ -586,7 +602,7 @@ class OffshoreLeaksPuller(BasePuller):
             """), {"src": self.source_id, "sids": sids, "since": since}).fetchall()}
             for row in batch:
                 series_id = row["series_id"]
-                if series_id in stored or series_id in seen:
+                if series_id in stored or series_id in seen or series_id in batch_ids:
                     continue
                 match, entity = row["match"], row["entity"]
                 conn.execute(text("""
@@ -615,8 +631,9 @@ class OffshoreLeaksPuller(BasePuller):
                         "leak_source": entity.get("entity_source", ""),
                     }),
                 })
-                seen.add(series_id)
+                batch_ids.add(series_id)
                 written.append(row)
+        seen |= batch_ids  # only once the batch has committed
         return written
 
     def _emit_signals(self, rows: list[dict[str, Any]], now: datetime) -> int:
@@ -711,14 +728,19 @@ class OffshoreLeaksPuller(BasePuller):
                 "entity_names": entity_names[:5],  # cap for logging
             })
 
+        status = "SUCCESS"
+        if store_result.get("failed_batches"):
+            status = "PARTIAL" if store_result["raw_series_inserted"] else "FAILED"
         result = {
-            "status": "SUCCESS",
+            "status": status,
             "total_matches": len(matches),
             "actors_matched": len({m["actor_id"] for m in matches}),
             "raw_series_inserted": store_result["raw_series_inserted"],
             "signals_emitted": store_result["signals_emitted"],
             "actor_summary": actor_summary,
         }
+        if store_result.get("failed_batches"):
+            result["errors"] = store_result["errors"]
 
         log.warning(
             "OFFSHORE LEAKS INGESTION COMPLETE: {n} matches across {a} actors. "

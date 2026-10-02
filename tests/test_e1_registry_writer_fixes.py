@@ -169,3 +169,29 @@ def test_offshore_store_matches_never_holds_one_transaction_across_many_inserts(
     out = puller.store_matches(matches)
     assert out["raw_series_inserted"] == 600
     assert max(per_txn) <= ol.STORE_BATCH_ROWS
+
+
+def test_offshore_failed_batches_are_reported_and_bounded(monkeypatch) -> None:
+    from unittest.mock import MagicMock
+
+    from ingestion.altdata import offshore_leaks as ol
+
+    puller = ol.OffshoreLeaksPuller.__new__(ol.OffshoreLeaksPuller)
+    puller.engine = MagicMock()
+    puller.engine.begin.side_effect = RuntimeError("out of shared memory")
+    puller.source_id = 7
+    matches = [{
+        "actor_name": f"A{i}", "actor_id": f"a{i}", "officer_name": f"O{i}", "officer_node_id": str(i),
+        "officer_jurisdiction": "VGB", "match_type": "partial", "connected_entities": [],
+    } for i in range(500)]
+    out = puller.store_matches(matches)
+    assert out["raw_series_inserted"] == 0
+    assert out["failed_batches"] == ol.MAX_CONSECUTIVE_BATCH_FAILURES  # stopped, not 10 retries
+    assert puller.engine.begin.call_count == ol.MAX_CONSECUTIVE_BATCH_FAILURES
+
+    monkeypatch.setattr(puller, "ensure_data", lambda: True)
+    monkeypatch.setattr(puller, "match_actors", lambda: matches)
+    pulled = puller.pull()
+    assert pulled["status"] == "FAILED"
+    import ingestion.smart_scheduler as ss
+    assert ss._classify_outcome(pulled)[0] == ss.OUTCOME_FAILED
