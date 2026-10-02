@@ -217,7 +217,7 @@ def test_load_events_is_pit_and_features_ignore_rows_known_after_as_of(pe_scratc
 
     before_frame = P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)
     assert len(before_frame) == len(base) + 1
-    assert before_frame.attrs["versioned_store_gap"] is False  # v1 table: no versioning columns
+    assert before_frame.attrs["versioned_store_gap"] is False  # v2 table read through read_event_versions
     assert (before_frame["known_at"] <= pd.Timestamp(AS_OF)).all()
     assert not before_frame["dedup_key"].str.startswith("echo").any()
     before = _features(before_frame)
@@ -296,3 +296,22 @@ def test_leak_self_test_canary_trips_on_a_store_and_reader_keyed_on_event_time(p
     # 3) ... and stays silent on the real one.
     monkeypatch.undo()
     assert _features(P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)) == honest_before
+
+
+def test_superseded_version_stays_visible_to_earlier_decisions(pe_scratch):
+    """v2: a version superseded before AS_OF still counts for decisions before its supersession."""
+    first = _event(70_000, known_at=datetime(2024, 3, 1, 2, tzinfo=UTC), tag="ver")
+    upsert_event(pe_scratch, first)
+    with pe_scratch.begin() as conn:
+        conn.execute(text("UPDATE people_events SET superseded_at = :t WHERE dedup_key = 'ver|70000'"),
+                     {"t": datetime(2024, 5, 1, tzinfo=UTC)})
+    upsert_event(pe_scratch, _event(70_000, known_at=datetime(2024, 5, 1, tzinfo=UTC), tag="ver",
+                                    direction="sell"))
+    frame = P.load_events(pe_scratch, AS_OF, CHANNELS, resolve_tickers=False)
+    ver = frame[frame["dedup_key"] == "ver|70000"].sort_values("known_at")
+    assert len(ver) == 2
+    assert ver.iloc[0]["visible_until"] == pd.Timestamp("2024-05-01", tz="UTC")
+    assert pd.isna(ver.iloc[1]["visible_until"])
+    early = P.load_events(pe_scratch, datetime(2024, 4, 1, tzinfo=UTC), CHANNELS, resolve_tickers=False)
+    ver_early = early[early["dedup_key"] == "ver|70000"]
+    assert len(ver_early) == 1 and pd.isna(ver_early.iloc[0]["visible_until"])  # later end is masked
