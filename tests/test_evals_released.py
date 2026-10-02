@@ -141,7 +141,7 @@ def test_e0_v1_is_entry_zero_with_its_released_hash():
 
 
 def test_every_suite_on_main_is_enrolled_at_its_package_version():
-    from evals import e1, e2
+    from evals import e1, e2, e3
     from evals.e0 import VERSION as E0_VERSION
 
     assert released.latest_entry("e0", path="evals/e0")["version"] == E0_VERSION
@@ -152,6 +152,7 @@ def test_every_suite_on_main_is_enrolled_at_its_package_version():
         "evals/e1/MANIFEST.sha256 appends a NEW e1 entry with the new version")
     assert e1_entry["manifest_sha256"] == _lf(REPO / "evals" / "e1" / "MANIFEST.sha256")
     assert released.latest_entry("e2", path="evals/e2")["version"] == e2.VERSION
+    assert released.latest_entry("e3", path="evals/e3")["version"] == e3.VERSION
 
 
 def test_guards_entry_pins_the_guard_files():
