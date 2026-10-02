@@ -758,3 +758,54 @@ def test_late_earlier_close_exposes_outcome_finality_gap(receipt_pg_engine: Engi
     assert now_selected and now_selected["receipt_id"] == earlier_day["receipt_id"]
     assert stored_id == later_day["receipt_id"]
     assert store.score_predictions(prediction_ids=[prediction_id])["scored"] == 0
+
+
+def test_resolver_never_backdates_a_spy_full_vintage(receipt_pg_engine: Engine) -> None:
+    """DATA-FIX DFa: a 5-year adjusted SPY fill pulled on one day cannot become
+    backdated ``spy_full`` history through the resolver.
+
+    The production defect: 1,420 ``spy_full`` rows (obs 2021-03-26 onward)
+    carry ``release_date = vintage_date = obs_date`` although they were
+    written in 2026 from a 2026-03-26 adjusted-close fill. Through the
+    resolver, the same raw rows (unmarked ``YF:SPY:close`` and an
+    ``YF:SPY:adj_close`` series) produce no ``spy_full`` row at all, and the
+    one policy capture becomes a vintage dated by its real pull time, with a
+    receipt whose ``available_at`` is that pull time.
+    """
+    from normalization.resolver import Resolver
+
+    engine = receipt_pg_engine
+    fill_ts = datetime(2026, 3, 26, 4, 34, 21, tzinfo=timezone.utc)
+    fill_days = [date(2021, 3, 26), date(2021, 3, 29), date(2024, 6, 3), date(2026, 3, 25)]
+    for obs in fill_days:
+        _raw(engine, obs, fill_ts, 0.146 * 400.0, None)  # legacy unmarked close (adjusted basis)
+        with engine.begin() as conn:
+            conn.execute(text("""
+                INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, pull_status)
+                VALUES ('YF:SPY:adj_close', 1, :od, :ts, 380.0, 'SUCCESS')
+            """), {"od": obs, "ts": fill_ts})
+    obs = date(2026, 9, 29)
+    capture_ts = datetime(2026, 9, 30, 0, 5, tzinfo=timezone.utc)
+    capture_raw = _raw(engine, obs, capture_ts, 661.5, capture_payload(obs, capture_ts))
+
+    summary = Resolver(engine).resolve_pending(
+        since=datetime(2026, 3, 1, tzinfo=timezone.utc),
+        until=datetime(2026, 10, 1, tzinfo=timezone.utc),
+        workers=1,
+    )
+    assert summary["errors"] == 0, summary
+
+    with engine.connect() as conn:
+        rows = conn.execute(text("""
+            SELECT obs_date, release_date, vintage_date, value FROM resolved_series
+            WHERE feature_id = 2791 ORDER BY obs_date
+        """)).fetchall()
+        assert rows == [(obs, capture_ts.date(), capture_ts.date(), 661.5)]
+        assert conn.execute(text("""
+            SELECT count(*) FROM resolved_series
+            WHERE feature_id = 2791 AND (release_date = obs_date OR vintage_date = obs_date)
+        """)).scalar_one() == 0
+        receipt = conn.execute(text("""
+            SELECT raw_series_id, available_at FROM astrogrid.price_close_receipt
+        """)).fetchall()
+        assert receipt == [(capture_raw, capture_ts)]

@@ -770,6 +770,25 @@ jobs:
             exit 1
           fi
 
+      # scripts/audit_backdated_vintages.py (DATA-FIX DFa): exact per-feature
+      # counts of backdated resolved_series vintages on a real PostgreSQL
+      # schema, read-only transactions, DB-window refusal. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Backdated vintages audit PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BACKDATED_AUDIT_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_audit_backdated_vintages_pg.py -q -rA | tee /tmp/grid-backdated-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-backdated-audit-pg.txt; then
+            echo "::error::Backdated vintages audit PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
