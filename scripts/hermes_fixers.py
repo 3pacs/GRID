@@ -1555,6 +1555,15 @@ def _retry_source(
     """
     source_key = source_name.lower()
 
+    if source_key.replace(" ", "_").replace("-", "_") in {"options", "yfinance_options"}:
+        from ingestion.options import automatic_options_capture_guard
+
+        guarded = automatic_options_capture_guard(engine)
+        if guarded is not None:
+            # Before construction, provider calls, backlog publication or a
+            # catalog freshness write; every repair entry point comes here.
+            return guarded
+
     with _REPAIRS_LOCK:
         existing = _REPAIRS_IN_FLIGHT.get(source_key)
         if existing is not None and _thread_is_alive(existing.get("thread")):

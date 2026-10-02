@@ -11,6 +11,7 @@ Falls back to yfinance if the direct API fails.
 from __future__ import annotations
 
 import math
+import os
 import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
@@ -109,6 +110,44 @@ class OptionsPullResults(list[dict[str, Any]]):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def automatic_options_capture_guard(engine: Engine) -> dict[str, Any] | None:
+    """Owner-gated daily-writer policy for automatic secondary callers only.
+
+    Batch existence is diagnostic, never proof of complete source coverage or
+    scheduler provenance. Secondary writers also defer with no batches: letting
+    one start while the daily writer is fetching would recreate the race. The
+    daily scheduler and explicit GEM capture do not call this guard.
+    """
+    policy = os.getenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "legacy").strip().lower()
+    if policy in {"", "legacy"}:
+        return None
+    result: dict[str, Any] = {
+        "status": "SKIPPED", "outcome": "SKIPPED", "rows_inserted": 0,
+        "reason": "daily_scheduler_owns_options",
+        "observed_session": _utc_now().date().isoformat(),
+        "registered_non_gem_batches": None, "captured_tickers": None,
+    }
+    if policy != "daily_scheduler":
+        result["reason"] = "invalid_options_writer_policy"
+        return result
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+            conn.execute(text("SET LOCAL lock_timeout = '1s'"))
+            row = conn.execute(text(
+                "SELECT COUNT(*), COUNT(DISTINCT ticker) FROM options_capture_batches "
+                "WHERE snap_date = :day AND capture_source <> 'gem'"
+            ), {"day": result["observed_session"]}).fetchone()
+            result.update(registered_non_gem_batches=int(row[0]), captured_tickers=int(row[1]))
+    except Exception as exc:
+        # A failed observation cannot grant another writer permission. Avoid
+        # publishing connection details from driver exceptions.
+        log.warning("Options writer-policy observation unavailable ({kind})", kind=type(exc).__name__)
+        result["observation_error"] = type(exc).__name__
+    return result
 
 
 def _regular_market_time(quote: Any, session_day: date) -> datetime | None:
