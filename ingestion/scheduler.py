@@ -1683,29 +1683,9 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         except Exception as exc2:
             log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
 
-    # Auto-fallback for stale price features
-    try:
-        from ingestion.price_fallback import PriceFallbackPuller
-        stale_query = text(
-            "SELECT fr.name FROM feature_registry fr "
-            "LEFT JOIN LATERAL ("
-            "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
-            "  ORDER BY obs_date DESC LIMIT 1"
-            ") rs ON TRUE "
-            "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
-            "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
-            "AND fr.name LIKE '%_full'"
-        )
-        with engine.connect() as conn:
-            stale = conn.execute(stale_query).fetchall()
-        tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
-        if tickers:
-            pfp = PriceFallbackPuller(db_engine=engine)
-            results = pfp.pull_many(tickers[:30])
-            pfp.save_to_db(results)
-            log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
-    except Exception as exc:
-        log.warning("Price fallback failed: {e}", e=str(exc))
+    # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
+    # it wrote backdated resolved_series vintages directly and, on the
+    # production schema, every write failed (E1-V7 / DATA-FIX DFa).
 
     # EDGAR Form 4 insider transactions (daily)
     try:
