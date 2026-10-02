@@ -163,6 +163,19 @@ def _capture(engine: Engine, monkeypatch, started: datetime, oi: dict[float, int
     puller = options.OptionsPuller.__new__(options.OptionsPuller)
     puller.engine = engine
     puller._ensure_tables()
+    # The original append-only migration is still tested unchanged. The new
+    # writer additionally needs the reviewed preparation/publication contract.
+    # Empty support tables suffice here because resolved writing is mocked;
+    # the new bounded PG contract separately executes the real resolved writer.
+    with engine.begin() as conn:
+        if conn.execute(text("SELECT to_regclass('options_capture_batches_all')")).scalar() is None:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS source_catalog (id integer);
+                CREATE TABLE IF NOT EXISTS feature_registry (id integer);
+                CREATE TABLE IF NOT EXISTS resolved_series (id integer);
+            """))
+            conn.execute(text((Path(__file__).resolve().parents[1] /
+                "docs/handoffs/2026-10-02/options-bounded-publication.sql").read_text()))
     puller._yahoo = _Yahoo(oi, started - timedelta(minutes=1))
     puller._push_to_resolved = lambda *_a, **_k: 0
     event.listen(engine, "before_cursor_execute", fixed_clock, retval=True)

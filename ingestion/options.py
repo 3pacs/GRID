@@ -27,6 +27,9 @@ from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
 from ingestion.market_calendar import is_market_open
+from ingestion.options_publication import (
+    check_deadline, publish as publish_bounded, transaction as bounded_transaction,
+)
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -88,7 +91,7 @@ class OptionsPullResults(list[dict[str, Any]]):
         deferred = statuses.count("DEFERRED")
         if not self or all(s == "SKIPPED" for s in statuses):
             status, note = "SKIPPED", "no ticker capture completed"
-        elif not ok and not deferred:
+        elif not ok and not deferred and "PARTIAL" not in statuses:
             status, note = "FAILED", "no ticker succeeded"
         elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
             status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
@@ -393,9 +396,9 @@ class OptionsPuller(BasePuller):
                 ticker_kwargs["capture_source"] = capture_source
             result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
-            if result["status"] == "DEFERRED":
+            if result["status"] == "DEFERRED" or result.get("stop_scope"):
                 results.extend(
-                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
+                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "scope stopped after publication failure"}
                     for t in tickers[idx + 1:]
                 )
                 break
@@ -413,6 +416,8 @@ class OptionsPuller(BasePuller):
                 outcome.publication_error = "time budget expired before catalog publication"
             elif not self._mark_catalog_pulled(should_continue=should_continue):
                 outcome.publication_error = "catalog publication deferred or failed"
+            elif getattr(getattr(self, "_catalog_receipt", None), "cleanup_failed", False):
+                outcome.publication_error = "catalog COMMIT acknowledged; cleanup failed"
         return outcome
 
     def _mark_catalog_pulled(self, *, should_continue: Callable[[], bool] | None = None) -> bool:
@@ -445,22 +450,13 @@ class OptionsPuller(BasePuller):
                 },
             )
             check_publication_budget()
-            with catalog_engine.begin() as conn:
+            def update_catalog(conn):
                 check_publication_budget()
-                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                conn.execute(text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                             {"sid": self.source_id})
                 check_publication_budget()
-                conn.execute(text("SET LOCAL statement_timeout = '5s'"))
-                check_publication_budget()
-                conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
-                check_publication_budget()
-                conn.execute(
-                    text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
-                    {"sid": self.source_id},
-                )
-                # A callback that expires during UPDATE must roll back that
-                # update rather than allow context-manager exit to commit it.
-                check_publication_budget()
-            return True
+            self._catalog_receipt = bounded_transaction(catalog_engine, update_catalog, should_continue)
+            return not self._catalog_receipt.stop
         except _OptionsBudgetExpired:
             log.info("options: source_catalog freshness publication deferred by budget")
             return False
@@ -469,7 +465,13 @@ class OptionsPuller(BasePuller):
             return False
         finally:
             if catalog_engine is not None:
-                catalog_engine.dispose()
+                try:
+                    catalog_engine.dispose()
+                except Exception:
+                    # Disposal follows transaction cleanup; never erase a known
+                    # COMMIT receipt or replay the catalog transaction.
+                    if hasattr(self, "_catalog_receipt"):
+                        self._catalog_receipt.cleanup_failed = True
 
     def _pull_ticker(
         self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,
@@ -615,144 +617,78 @@ class OptionsPuller(BasePuller):
             if not complete or not snap_count or time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
                 raise ValueError("incomplete options chain response")
 
-            # Provider availability begins after the final response. Sample
-            # the database clock before waiting for the short publish lock.
+            # Normalize/deduplicate the complete fetched scope before DATA work.
+            unique_rows: dict[tuple, dict[str, Any]] = {}
+            for row in snapshot_rows:
+                unique_rows.setdefault((row["expiry"], row["opt_type"], float(row["strike"])), row)
+            batch_rows = list(unique_rows.values())
+            clock_receipt = bounded_transaction(
+                self.engine, lambda conn: conn.execute(text("SELECT clock_timestamp()")).scalar_one(),
+                should_continue,
+            )
+            if clock_receipt.stop:
+                return {"ticker": ticker, "status": "DEFERRED" if clock_receipt.error == "PublicationBudgetExpired" else "FAILED",
+                        "rows_inserted": 0, "stop_scope": True, "commit_ack": clock_receipt.commit_ack,
+                        "error": clock_receipt.error}
+            completed_at = clock_receipt.value
+            if (completed_at.astimezone(timezone.utc).date() != session_day
+                    or completed_at.astimezone(_EQUITY_TZ).date() != session_day
+                    or capture_started_at.astimezone(timezone.utc).date() != session_day
+                    or capture_started_at.astimezone(_EQUITY_TZ).date() != session_day
+                    or any(row["provider_regular_market_at"] > completed_at for row in batch_rows)):
+                raise ValueError("options capture crossed session date or quote time is future")
             publish_clock = time.monotonic()
-            with self.engine.begin() as conn:
-                conn.execute(text("SET LOCAL lock_timeout = '5s'"))
-                conn.execute(text("SET LOCAL statement_timeout = '30s'"))
-                completed_at = conn.execute(text("SELECT clock_timestamp()")).fetchone()[0]
-                if (completed_at.astimezone(timezone.utc).date() != session_day
-                        or completed_at.astimezone(_EQUITY_TZ).date() != session_day
-                        or capture_started_at.astimezone(timezone.utc).date() != session_day
-                        or capture_started_at.astimezone(_EQUITY_TZ).date() != session_day
-                        or any(row["provider_regular_market_at"] > completed_at for row in snapshot_rows)):
-                    raise ValueError("options capture crossed session date or quote time is future")
-                conn.execute(
-                    text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
-                    {"ticker": ticker, "snap_date": today_str},
-                )
-                latest = conn.execute(
-                    text("""SELECT MAX(capture_ordinal) FROM options_capture_batches
-                             WHERE ticker = :ticker AND snap_date = :snap_date"""),
-                    {"ticker": ticker, "snap_date": today_str},
-                ).fetchone()
-                # Append-only (options_append_only_20260930): nothing deletes
-                # or replaces an earlier batch. Every complete capture is
-                # registered and kept; readers of the ``options_snapshots``
-                # view see the highest-ordinal batch, and any earlier batch
-                # stays replayable by capture_batch_id. An older-started
-                # capture that commits after a newer one is still kept, but
-                # it does not overwrite the newer batch's daily signals.
-                is_latest = not (latest and latest[0] is not None and latest[0] > capture_ordinal)
+            # Compute signals from nearest LIQUID expiration
+            # Skip expiries within 2 days (near-worthless, garbage data)
+            today_ts = datetime.now(timezone.utc).timestamp()
+            min_dte_seconds = 2 * 86400  # 2 days
+            liquid_expirations = [e for e in selected_expirations
+                                  if e - today_ts >= min_dte_seconds]
+            if not liquid_expirations:
+                liquid_expirations = selected_expirations  # Fallback within captured chain
+            near_expiry = datetime.utcfromtimestamp(liquid_expirations[0]).strftime("%Y-%m-%d")
 
-                # One row per contract per batch. A provider page that repeats
-                # a contract keeps its first quote; the unique batch key then
-                # makes any further conflict a hard failure, never a silent
-                # partial batch.
-                unique_rows: dict[tuple, dict[str, Any]] = {}
-                for row in snapshot_rows:
-                    unique_rows.setdefault((row["expiry"], row["opt_type"], float(row["strike"])), row)
-                batch_rows = list(unique_rows.values())
+            # If the nearest expiry was skipped, rebuild near_calls/puts from the correct expiry
+            if liquid_expirations[0] != selected_expirations[0]:
+                # Find which index in our pulled chains matches the liquid expiry
+                liquid_idx = None
+                for ci, e in enumerate(selected_expirations):
+                    if e == liquid_expirations[0]:
+                        liquid_idx = ci
+                        break
+                if liquid_idx is not None and liquid_idx < len(all_calls_dfs) and liquid_idx < len(all_puts_dfs):
+                    near_calls_df = all_calls_dfs[liquid_idx]
+                    near_puts_df = all_puts_dfs[liquid_idx]
+                    log.info("{t}: skipped near-expiry, using DTE {d}d chain",
+                             t=ticker, d=int((liquid_expirations[0] - today_ts) / 86400))
 
-                _check_budget(should_continue)
-                conn.execute(
-                    text(
-                        "INSERT INTO options_capture_batches "
-                        "(capture_batch_id, ticker, snap_date, capture_ordinal, "
-                        "capture_started_at, capture_completed_at, row_count, "
-                        "spot_price, capture_source) "
-                        "VALUES (:batch_id, :ticker, :snap_date, :ordinal, "
-                        ":started_at, :completed_at, :row_count, :spot, :source)"
-                    ),
-                    {"batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
-                     "ordinal": capture_ordinal, "started_at": capture_started_at,
-                     "completed_at": completed_at, "row_count": len(batch_rows),
-                     "spot": float(spot_price), "source": capture_source},
-                )
-                snapshots_inserted = 0
-                rows_known = True
-                for row in batch_rows:
-                    _check_budget(should_continue)
-                    written = conn.execute(
-                        text(
-                            "INSERT INTO options_snapshots_all "
-                            "(ticker, snap_date, expiry, opt_type, strike, "
-                            "last_price, bid, ask, volume, open_interest, "
-                            "implied_vol, in_the_money, capture_batch_id, "
-                            "capture_ordinal, capture_started_at, capture_completed_at, "
-                            "provider_regular_market_at) "
-                            "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
-                            ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
-                            ":batch_id, :ordinal, :started_at, :completed_at, "
-                            ":provider_regular_market_at)"
-                        ),
-                        {**row, "ordinal": capture_ordinal,
-                         "started_at": capture_started_at, "completed_at": completed_at},
-                    )
-                    count = _affected_rows(written)
-                    rows_known = rows_known and count is not None
-                    snapshots_inserted += count or 0
-                if not rows_known or snapshots_inserted != len(batch_rows):
-                    # Roll back the header and every row: a batch is complete
-                    # or absent, never partial.
-                    raise ValueError("options batch insert count mismatch")
+            put_call_ratio = float(total_put_oi / total_call_oi) if total_call_oi > 0 else None
+            max_pain = compute_max_pain(near_calls_df, near_puts_df, spot_price)
+            iv_skew = compute_iv_skew(near_puts_df, spot_price)
+            total_oi = int(total_call_oi + total_put_oi)
+            total_volume = int(total_call_vol + total_put_vol)
 
-                if not is_latest:
-                    log.info("{t}: older overlapping options capture kept as batch {b}; "
-                             "newer batch keeps the daily signals", t=ticker, b=batch_id)
-                    return {"ticker": ticker, "status": "SUCCESS",
-                            "snapshots": snap_count, "snapshots_inserted": snapshots_inserted,
-                            "rows_inserted": snapshots_inserted,
-                            "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
-                            "latest_batch": False}
+            # ATM IV
+            iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
-                # Compute signals from nearest LIQUID expiration
-                # Skip expiries within 2 days (near-worthless, garbage data)
-                today_ts = datetime.now(timezone.utc).timestamp()
-                min_dte_seconds = 2 * 86400  # 2 days
-                liquid_expirations = [e for e in selected_expirations
-                                      if e - today_ts >= min_dte_seconds]
-                if not liquid_expirations:
-                    liquid_expirations = selected_expirations  # Fallback within captured chain
-                near_expiry = datetime.utcfromtimestamp(liquid_expirations[0]).strftime("%Y-%m-%d")
+            # 25-delta wings
+            iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
+            iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
 
-                # If the nearest expiry was skipped, rebuild near_calls/puts from the correct expiry
-                if liquid_expirations[0] != selected_expirations[0]:
-                    # Find which index in our pulled chains matches the liquid expiry
-                    liquid_idx = None
-                    for ci, e in enumerate(selected_expirations):
-                        if e == liquid_expirations[0]:
-                            liquid_idx = ci
-                            break
-                    if liquid_idx is not None and liquid_idx < len(all_calls_dfs) and liquid_idx < len(all_puts_dfs):
-                        near_calls_df = all_calls_dfs[liquid_idx]
-                        near_puts_df = all_puts_dfs[liquid_idx]
-                        log.info("{t}: skipped near-expiry, using DTE {d}d chain",
-                                 t=ticker, d=int((liquid_expirations[0] - today_ts) / 86400))
+            # Term structure slope (IV of far expiry - near expiry)
+            term_slope = None
+            if len(expiry_ivs) >= 2:
+                term_slope = expiry_ivs[-1][1] - expiry_ivs[0][1]
 
-                put_call_ratio = float(total_put_oi / total_call_oi) if total_call_oi > 0 else None
-                max_pain = compute_max_pain(near_calls_df, near_puts_df, spot_price)
-                iv_skew = compute_iv_skew(near_puts_df, spot_price)
-                total_oi = int(total_call_oi + total_put_oi)
-                total_volume = int(total_call_vol + total_put_vol)
+            # OI concentration (max single strike OI / total OI)
+            oi_conc = _compute_oi_concentration(near_calls_df, near_puts_df, total_oi)
 
-                # ATM IV
-                iv_atm = _compute_atm_iv(near_calls_df, near_puts_df, spot_price)
 
-                # 25-delta wings
-                iv_25d_put = _compute_wing_iv(near_puts_df, spot_price, delta_strike_pct=0.90)
-                iv_25d_call = _compute_wing_iv(near_calls_df, spot_price, delta_strike_pct=1.10)
-
-                # Term structure slope (IV of far expiry - near expiry)
-                term_slope = None
-                if len(expiry_ivs) >= 2:
-                    term_slope = expiry_ivs[-1][1] - expiry_ivs[0][1]
-
-                # OI concentration (max single strike OI / total OI)
-                oi_conc = _compute_oi_concentration(near_calls_df, near_puts_df, total_oi)
-
-                # Insert daily signals
+            def finish(conn):
+                def final_budget():
+                    check_deadline(conn)
+                    return should_continue is None or should_continue()
+                # At most 1 signal + 10 feature rows + 10 resolved rows.
                 _check_budget(should_continue)
                 signal_write = conn.execute(
                     text(
@@ -799,14 +735,25 @@ class OptionsPuller(BasePuller):
                     "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                }, should_continue=should_continue)
-                _check_budget(should_continue)
+                }, should_continue=final_budget)
                 signals_written = _affected_rows(signal_write)
-                rows_inserted = (
-                    snapshots_inserted + signals_written + resolved_inserted
-                    if rows_known and signals_written is not None and resolved_inserted is not None else None
-                )
+                return (signals_written + resolved_inserted
+                        if signals_written is not None and resolved_inserted is not None else None)
 
+            publication = publish_bounded(self.engine, {
+                "batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
+                "ordinal": capture_ordinal, "started_at": capture_started_at,
+                "completed_at": completed_at, "row_count": len(batch_rows),
+                "spot": float(spot_price), "source": capture_source,
+            }, batch_rows, finish, should_continue)
+            if publication["stop_scope"]:
+                return {"ticker": ticker,
+                        "status": "DEFERRED" if publication["error"] == "PublicationBudgetExpired"
+                                  and publication["data_rows_acknowledged"] == 0 else "PARTIAL",
+                        "capture_batch_id": batch_id,
+                        "capture_ordinal": capture_ordinal, **publication}
+            snapshots_inserted = publication["snapshots_inserted"]
+            rows_inserted = publication["rows_inserted"]
             log.info(
                 "{t}: {n} snaps, capture={capture:.1f}s, publish={publish:.1f}s, "
                 "PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
@@ -820,10 +767,13 @@ class OptionsPuller(BasePuller):
             )
             return {
                 "ticker": ticker, "status": "SUCCESS",
-                "snapshots": snap_count, "snapshots_inserted": snapshots_inserted if rows_known else None,
+                "snapshots": snap_count, "snapshots_inserted": snapshots_inserted,
                 "rows_inserted": rows_inserted,
                 "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
-                "latest_batch": True,
+                "latest_batch": publication["latest_batch"],
+                "data_rows_acknowledged": publication["data_rows_acknowledged"],
+                "commit_ack": publication["commit_ack"],
+                "transaction_rows": publication["transaction_rows"],
                 "signals": {
                     "put_call_ratio": put_call_ratio,
                     "max_pain": max_pain,
