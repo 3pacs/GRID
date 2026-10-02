@@ -192,7 +192,7 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
     assert len(audit_path.read_text().splitlines()) == audit_lines and len(durable_prefix) == durable
     expected_ids = [r["id"] for r in before if r["ticker"] != "MIDDLE"] if resolution == "reject57014" else [r["id"] for r in before[:actual]]
     assert changed_ids == expected_ids
-    if actual < 3:
+    if actual < 3 and resolution != "reject57014":
         assert after[-1] == before[-1], "later scope must remain untouched after fatal STOP"
     assert attempts["close"] == 1 and attempts["checkin"] == writes
     body_error, reporting_error = incoming[0], reporting_errors[0]
@@ -214,11 +214,15 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
         assert reporting_error.__cause__ is body_error
     if fault:
         assert attempts["write"] <= 2 and attempts["flush"] <= 2 and attempts["fsync"] <= 2
+        expected_attempts = {"append": (2, 1, 1), "flush": (2, 2, 1),
+                             "fsync": (2, 2, 2), "first_fsync": (1, 1, 1)}[fault]
+        assert tuple(attempts[k] for k in ("write", "flush", "fsync")) == expected_attempts
+    assert [json.loads(line)["id"] for line in audit_path.read_text().splitlines()] == changed_ids[:audit_lines]
     assert "stop; reconcile" in receipt["action"]
     print("AUDIT_CONTEXT_ACTUAL_CLI", script.__name__, json.dumps({
         "resolution": resolution, "audit_fault": fault, "close_failure": close_failure,
         "CLI_exit": result, "acknowledged_rows": prefix, "actual_changed": actual,
         "audit_lines": audit_lines, "durable_prefix_rows": durable,
         "commit_uncertain": uncertain, "resolution_error_type": receipt["resolution_error_type"],
-        "attempt_counts": attempts, "later_scope_untouched": actual < 3,
+        "attempt_counts": attempts, "later_scope_untouched": actual < 3 and resolution != "reject57014",
     }))
