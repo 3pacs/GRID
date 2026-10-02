@@ -687,6 +687,13 @@ SMART_PULL_LOG_PREFIX = "smart:"
 RESTART_FAILURE_LOOKBACK_H = 48
 
 
+def hold_reason_for(registry_name: str) -> str | None:
+    """The registry entry's hold_reason, if held. Other schedulers that run the
+    same puller (ingestion/scheduler.py) consult this so a hold is one switch."""
+    entry = next((e for e in PULLER_REGISTRY if e["name"] == registry_name), None)
+    return entry.get("hold_reason") if entry else None
+
+
 def catalog_name_for(registry_name: str) -> str:
     """The source_catalog name a registry entry's puller writes under."""
     return REGISTRY_CATALOG_NAMES.get(registry_name, registry_name)

@@ -204,3 +204,9 @@ def test_offshore_leaks_is_held_until_match_quality_is_reviewed() -> None:
     sched = ss.SmartScheduler.__new__(ss.SmartScheduler)
     assert sched._run_puller(dict(entry))["status"] == ss.OUTCOME_SKIPPED
     assert (REPO / "docs" / "handoffs" / "2026-10-02" / "OFFSHORE-LEAKS-MATCH-QUALITY.md").exists()
+    # grid-scheduler builds its own OffshoreLeaksPuller: it must honor the same hold.
+    assert ss.hold_reason_for("offshore_leaks") == entry["hold_reason"]
+    assert ss.hold_reason_for("no_such_entry") is None
+    source = (REPO / "ingestion" / "scheduler.py").read_text(encoding="utf-8")
+    block = source[source.index("# ICIJ Offshore Leaks"):source.index('pullers.append(("ICIJ_Offshore"')]
+    assert 'hold_reason_for("offshore_leaks")' in block
