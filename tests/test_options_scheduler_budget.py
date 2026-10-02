@@ -191,3 +191,80 @@ def test_partial_retry_survives_restart(monkeypatch):
     sched = ss.SmartScheduler(engine)
     assert sched._state["options"]["cooldown_until"] == now + timedelta(minutes=30)
     assert sched._state["options"]["last_success"] is None
+
+
+@pytest.mark.parametrize("policy", ["", "legacy"])
+def test_owner_policy_is_disabled_until_owner_selects_it(monkeypatch, policy):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", policy)
+    engine = MagicMock()
+    assert options.automatic_options_capture_guard(engine) is None
+    engine.connect.assert_not_called()
+
+
+@pytest.mark.parametrize("counts", [(0, 0), (1, 1), (122, 122), (366, 122)])
+def test_daily_owner_policy_defers_before_during_and_after_partial_capture(monkeypatch, counts):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    engine = MagicMock()
+    conn = engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = counts
+    result = options.automatic_options_capture_guard(engine)
+    assert result["status"] == "SKIPPED" and result["rows_inserted"] == 0
+    assert result["captured_tickers"] == counts[1]
+    assert result["registered_non_gem_batches"] == counts[0]
+    sql = [str(call.args[0]) for call in conn.execute.call_args_list]
+    assert sql[0] == "SET TRANSACTION READ ONLY"
+    assert "capture_source <> 'gem'" in sql[-1]
+    assert not any(word in statement for statement in sql for word in ["INSERT", "UPDATE", "DELETE"])
+
+
+def test_owner_policy_cannot_fall_back_to_a_writer_when_metadata_is_unavailable(monkeypatch):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    engine = MagicMock()
+    engine.connect.side_effect = RuntimeError("unavailable")
+    result = options.automatic_options_capture_guard(engine)
+    assert result["outcome"] == "SKIPPED"
+    assert result["captured_tickers"] is None
+    assert result["observation_error"] == "RuntimeError"
+
+
+def test_smart_options_owner_policy_skips_before_constructor(monkeypatch):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    engine = MagicMock()
+    constructor = MagicMock(side_effect=AssertionError("secondary writer constructed"))
+    monkeypatch.setattr(options, "OptionsPuller", constructor)
+    adapter = ss._OptionsSchedulerAdapter(engine)
+    result = adapter.pull()
+    assert result["status"] == "SKIPPED"
+    constructor.assert_not_called()
+
+
+@pytest.mark.parametrize("source", ["options", "yfinance_options", "YFINANCE_OPTIONS", "yfinance-options"])
+def test_hermes_owner_policy_skips_before_resolution_and_keeps_freshness_unknown(monkeypatch, source):
+    from scripts import hermes_fixers as hf
+
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    resolve = MagicMock(side_effect=AssertionError("secondary writer resolved"))
+    monkeypatch.setattr(hf, "_resolve_puller", resolve)
+    engine = MagicMock()
+    result = hf._retry_source(source, engine, attempt=3)
+    assert result["status"] == "SKIPPED" and result["rows_inserted"] == 0
+    assert hf.retry_not_fresh_reason(result) == "puller reported SKIPPED"
+    resolve.assert_not_called()
+    engine.begin.assert_not_called()
+
+
+def test_daily_owner_policy_does_not_gate_explicit_gem_capture(monkeypatch):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "daily_scheduler")
+    obj = _puller(monkeypatch, {"SPY": "SUCCESS"})
+    result = obj.pull_all(tickers=["SPY"], include_catalyst_universe=False, capture_source="gem")
+    assert result[0]["status"] == "SUCCESS"
+    assert result.summary["status"] == "PARTIAL"  # never full-source freshness
+
+
+def test_invalid_owner_policy_defers_without_querying_or_writing(monkeypatch):
+    monkeypatch.setenv("GRID_OPTIONS_AUTOMATIC_WRITER_POLICY", "typo")
+    engine = MagicMock()
+    result = options.automatic_options_capture_guard(engine)
+    assert result["reason"] == "invalid_options_writer_policy"
+    assert result["status"] == "SKIPPED"
+    engine.connect.assert_not_called()

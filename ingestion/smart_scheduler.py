@@ -236,11 +236,19 @@ class _OptionsSchedulerAdapter:
     SOURCE_NAME = "YFINANCE_OPTIONS"
 
     def __init__(self, db_engine: Engine) -> None:
-        from ingestion.options import OptionsPuller
-
-        self._puller = OptionsPuller(db_engine=db_engine)
+        # Do not construct the puller (which resolves catalog identity) until
+        # the secondary-writer policy has allowed a real attempt.
+        self._engine = db_engine
+        self._puller = None
 
     def pull(self, should_continue: Any = None) -> dict[str, Any]:
+        from ingestion.options import OptionsPuller, automatic_options_capture_guard
+
+        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))
+        if guarded is not None:
+            return guarded
+        if self._puller is None:
+            self._puller = OptionsPuller(db_engine=self._engine)
         return self._puller.pull_all(should_continue=should_continue).summary
 
 
