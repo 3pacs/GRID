@@ -123,3 +123,75 @@ def test_coingecko_is_a_base_puller_under_its_catalog_name() -> None:
     assert coingecko.CoinGeckoPuller.SOURCE_NAME == ss.catalog_name_for("coingecko")
     source = (REPO / "ingestion" / "coingecko.py").read_text(encoding="utf-8")
     assert "resolved_series (" not in source and "INSERT INTO resolved_series" not in source
+
+
+def test_offshore_store_matches_never_holds_one_transaction_across_many_inserts() -> None:
+    """Every transaction writes <= STORE_BATCH_ROWS rows and never opens savepoints."""
+    from unittest.mock import MagicMock
+
+    from ingestion.altdata import offshore_leaks as ol
+
+    per_txn: list[int] = []
+
+    class Conn:
+        def __init__(self) -> None:
+            self.inserts = 0
+
+        def execute(self, stmt, params=None):
+            sql = " ".join(str(stmt).split()).upper()
+            if sql.startswith("INSERT INTO RAW_SERIES"):
+                self.inserts += 1
+            res = MagicMock()
+            res.fetchall.return_value = []
+            return res
+
+        def begin_nested(self):
+            raise AssertionError("savepoint per row: each one holds a subtransaction lock")
+
+    class Begin:
+        def __enter__(self):
+            self.conn = Conn()
+            return self.conn
+
+        def __exit__(self, *exc):
+            per_txn.append(self.conn.inserts)
+            return False
+
+    puller = ol.OffshoreLeaksPuller.__new__(ol.OffshoreLeaksPuller)
+    puller.engine = MagicMock()
+    puller.engine.begin.side_effect = lambda: Begin()
+    puller.source_id = 7
+    matches = [{
+        "actor_name": f"A{i}", "actor_id": f"a{i}", "officer_name": f"O{i}", "officer_node_id": str(i),
+        "officer_jurisdiction": "VGB", "match_type": "partial",
+        "connected_entities": [{"entity_name": f"E{i}-{j}", "entity_jurisdiction": "VGB"} for j in range(3)],
+    } for i in range(200)]
+    out = puller.store_matches(matches)
+    assert out["raw_series_inserted"] == 600
+    assert max(per_txn) <= ol.STORE_BATCH_ROWS
+
+
+def test_offshore_failed_batches_are_reported_and_bounded(monkeypatch) -> None:
+    from unittest.mock import MagicMock
+
+    from ingestion.altdata import offshore_leaks as ol
+
+    puller = ol.OffshoreLeaksPuller.__new__(ol.OffshoreLeaksPuller)
+    puller.engine = MagicMock()
+    puller.engine.begin.side_effect = RuntimeError("out of shared memory")
+    puller.source_id = 7
+    matches = [{
+        "actor_name": f"A{i}", "actor_id": f"a{i}", "officer_name": f"O{i}", "officer_node_id": str(i),
+        "officer_jurisdiction": "VGB", "match_type": "partial", "connected_entities": [],
+    } for i in range(500)]
+    out = puller.store_matches(matches)
+    assert out["raw_series_inserted"] == 0
+    assert out["failed_batches"] == ol.MAX_CONSECUTIVE_BATCH_FAILURES  # stopped, not 10 retries
+    assert puller.engine.begin.call_count == ol.MAX_CONSECUTIVE_BATCH_FAILURES
+
+    monkeypatch.setattr(puller, "ensure_data", lambda: True)
+    monkeypatch.setattr(puller, "match_actors", lambda: matches)
+    pulled = puller.pull()
+    assert pulled["status"] == "FAILED"
+    import ingestion.smart_scheduler as ss
+    assert ss._classify_outcome(pulled)[0] == ss.OUTCOME_FAILED

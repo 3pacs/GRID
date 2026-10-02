@@ -50,6 +50,12 @@ _CSV_ADDRESSES: str = "nodes-addresses.csv"
 _CSV_INTERMEDIARIES: str = "nodes-intermediaries.csv"
 _CSV_RELATIONSHIPS: str = "relationships.csv"
 
+#: Max raw_series rows written per transaction by store_matches (see its
+#: locking contract). Keeps lock and WAL footprint per transaction small.
+STORE_BATCH_ROWS: int = 50
+#: store_matches stops a run after this many consecutive failed batches.
+MAX_CONSECUTIVE_BATCH_FAILURES: int = 3
+
 # Default local data directory
 # Canonical bulk location: /data/grid/bulk/icij (shared with actor_discovery)
 # Falls back to user-local path for development.
@@ -492,131 +498,71 @@ class OffshoreLeaksPuller(BasePuller):
     ) -> dict[str, int]:
         """Persist offshore leak matches to raw_series and signal_sources.
 
+        Locking contract (2026-10-02 incident): every write runs in a short
+        transaction of at most :data:`STORE_BATCH_ROWS` rows, never one
+        transaction for the whole run and never a savepoint per row. A
+        committed savepoint is a subtransaction whose XID lock is held until
+        the top-level commit, so 71,903 matches in one transaction exhausted
+        griddb's shared lock table (max_locks_per_transaction x
+        max_connections) and every new connection failed.
+
+        The 30-day dedupe is one set-based read per batch (``series_id =
+        ANY(...)`` + ``pull_timestamp >= since``), not one query per row.
+
         Parameters:
             matches: List of match dicts from match_actors().
 
         Returns:
             Dict with counts: raw_series_inserted, signals_emitted.
         """
-        raw_count = 0
-        signal_count = 0
         today = date.today()
         now = datetime.now(timezone.utc)
+        since = now - timedelta(hours=720)
 
-        with self.engine.begin() as conn:
-            for match in matches:
-                actor_name = match["actor_name"]
-                actor_id = match["actor_id"]
+        rows: list[dict[str, Any]] = []
+        for match in matches:
+            # Store each connected entity as a separate series row
+            entities = match.get("connected_entities", [])
+            if not entities:
+                # No entity link — store the officer match itself
+                entities = [{
+                    "entity_name": match["officer_name"],
+                    "entity_jurisdiction": match["officer_jurisdiction"],
+                    "entity_status": "unknown",
+                    "incorporation_date": "",
+                    "rel_type": "officer",
+                    "entity_source": match.get("officer_source_id", ""),
+                }]
+            for entity in entities:
+                rows.append({"match": match, "entity": entity, "series_id": self._build_series_id(
+                    match["actor_name"],
+                    entity.get("entity_name", "unknown"),
+                    entity.get("entity_jurisdiction", "unknown"),
+                )})
 
-                # Store each connected entity as a separate series row
-                entities = match.get("connected_entities", [])
-                if not entities:
-                    # No entity link — store the officer match itself
-                    entities = [{
-                        "entity_name": match["officer_name"],
-                        "entity_jurisdiction": match["officer_jurisdiction"],
-                        "entity_status": "unknown",
-                        "incorporation_date": "",
-                        "rel_type": "officer",
-                        "entity_source": match.get("officer_source_id", ""),
-                    }]
-
-                for entity in entities:
-                    entity_name = entity.get("entity_name", "unknown")
-                    jurisdiction = entity.get("entity_jurisdiction", "unknown")
-
-                    series_id = self._build_series_id(
-                        actor_name, entity_name, jurisdiction,
-                    )
-
-                    # Dedup: a match already stored in the last 30 days (any
-                    # obs_date) is not stored again. raw_series is append-only.
-                    if conn.execute(text("""
-                        SELECT 1 FROM raw_series
-                        WHERE series_id = :sid AND source_id = :src
-                          AND pull_status = 'SUCCESS' AND pull_timestamp >= :since
-                        LIMIT 1
-                    """), {
-                        "sid": series_id, "src": self.source_id,
-                        "since": now - timedelta(hours=720),
-                    }).fetchone():
-                        continue
-
-                    # raw_series insert (pull_timestamp: schema DEFAULT NOW()).
-                    # Each insert runs in its own SAVEPOINT: on PostgreSQL a
-                    # failed statement would otherwise abort the whole
-                    # transaction and silently roll back every row before it.
-                    try:
-                        with conn.begin_nested():
-                            conn.execute(text("""
-                                INSERT INTO raw_series
-                                    (series_id, source_id, obs_date,
-                                     value, raw_payload, pull_status)
-                                VALUES
-                                    (:sid, :src, :obs, :val, :payload, 'SUCCESS')
-                            """), {
-                                "sid": series_id,
-                                "src": self.source_id,
-                                "obs": today,
-                                "val": 1.0,  # binary flag: match exists
-                                "payload": _json_dumps({
-                                    "actor_id": actor_id,
-                                    "actor_name": actor_name,
-                                    "actor_tier": match.get("actor_tier", ""),
-                                    "officer_name": match["officer_name"],
-                                    "officer_node_id": match["officer_node_id"],
-                                    "entity_name": entity_name,
-                                    "jurisdiction": jurisdiction,
-                                    "entity_status": entity.get("entity_status", ""),
-                                    "incorporation_date": entity.get(
-                                        "incorporation_date", "",
-                                    ),
-                                    "rel_type": entity.get("rel_type", ""),
-                                    "match_type": match["match_type"],
-                                    "leak_source": entity.get("entity_source", ""),
-                                }),
-                            })
-                        raw_count += 1
-                    except Exception as exc:
-                        log.warning(
-                            "Failed to insert offshore raw_series: {e}",
-                            e=str(exc),
-                        )
-                        continue
-
-                    # signal_sources insert — emit as offshore_leak
-                    try:
-                        with conn.begin_nested():
-                            conn.execute(text("""
-                                INSERT INTO signal_sources
-                                    (source_type, source_id, ticker, signal_type,
-                                     signal_date, signal_value, metadata)
-                                VALUES
-                                    (:stype, :sid, :ticker, :signal_type,
-                                     :sdate, :sval, :meta)
-                            """), {
-                                "stype": "offshore_leak",
-                                "sid": series_id,
-                                "ticker": actor_id,  # use actor_id as ticker proxy
-                                "signal_type": "SELL",  # offshore = bearish signal
-                                "sdate": now,
-                                "sval": 1.0,
-                                "meta": _json_dumps({
-                                    "actor_name": actor_name,
-                                    "entity_name": entity_name,
-                                    "jurisdiction": jurisdiction,
-                                    "match_type": match["match_type"],
-                                    "officer_name": match["officer_name"],
-                                    "entity_status": entity.get("entity_status", ""),
-                                    "leak_source": entity.get("entity_source", ""),
-                                }),
-                            })
-                        signal_count += 1
-                    except Exception as exc:
-                        log.debug(
-                            "Failed to emit offshore signal: {e}",
-                            e=str(exc),
-                        )
+        raw_count = 0
+        signal_count = 0
+        failed_batches = 0
+        consecutive_failures = 0
+        errors: list[str] = []
+        seen: set[str] = set()
+        for start in range(0, len(rows), STORE_BATCH_ROWS):
+            batch = rows[start:start + STORE_BATCH_ROWS]
+            try:
+                inserted = self._store_batch(batch, seen, today, since)
+            except Exception as exc:
+                failed_batches += 1
+                consecutive_failures += 1
+                errors.append(str(exc)[:200])
+                log.warning("Offshore raw_series batch failed ({n} rows): {e}", n=len(batch), e=str(exc))
+                if consecutive_failures >= MAX_CONSECUTIVE_BATCH_FAILURES:
+                    log.warning("Offshore leaks: {k} consecutive batch failures, stopping this run",
+                                k=consecutive_failures)
+                    break
+                continue
+            consecutive_failures = 0
+            raw_count += len(inserted)
+            signal_count += self._emit_signals(inserted, now)
 
         log.info(
             "Offshore leaks stored: {r} raw_series, {s} signals emitted",
@@ -626,7 +572,113 @@ class OffshoreLeaksPuller(BasePuller):
         return {
             "raw_series_inserted": raw_count,
             "signals_emitted": signal_count,
+            "failed_batches": failed_batches,
+            "errors": errors[:5],
         }
+
+    def _store_batch(
+        self,
+        batch: list[dict[str, Any]],
+        seen: set[str],
+        today: date,
+        since: datetime,
+    ) -> list[dict[str, Any]]:
+        """Insert one batch in ONE short transaction (no savepoints). Returns the rows written.
+
+        A match already stored as SUCCESS in the last 30 days (any obs_date),
+        or already written earlier in this run, is skipped: raw_series is
+        append-only. pull_timestamp comes from the schema's DEFAULT NOW().
+        """
+        sids = sorted({r["series_id"] for r in batch} - seen)
+        if not sids:
+            return []
+        written: list[dict[str, Any]] = []
+        batch_ids: set[str] = set()
+        with self.engine.begin() as conn:
+            stored = {row[0] for row in conn.execute(text("""
+                SELECT DISTINCT series_id FROM raw_series
+                WHERE source_id = :src AND series_id = ANY(:sids)
+                  AND pull_status = 'SUCCESS' AND pull_timestamp >= :since
+            """), {"src": self.source_id, "sids": sids, "since": since}).fetchall()}
+            for row in batch:
+                series_id = row["series_id"]
+                if series_id in stored or series_id in seen or series_id in batch_ids:
+                    continue
+                match, entity = row["match"], row["entity"]
+                conn.execute(text("""
+                    INSERT INTO raw_series
+                        (series_id, source_id, obs_date,
+                         value, raw_payload, pull_status)
+                    VALUES
+                        (:sid, :src, :obs, :val, :payload, 'SUCCESS')
+                """), {
+                    "sid": series_id,
+                    "src": self.source_id,
+                    "obs": today,
+                    "val": 1.0,  # binary flag: match exists
+                    "payload": _json_dumps({
+                        "actor_id": match["actor_id"],
+                        "actor_name": match["actor_name"],
+                        "actor_tier": match.get("actor_tier", ""),
+                        "officer_name": match["officer_name"],
+                        "officer_node_id": match["officer_node_id"],
+                        "entity_name": entity.get("entity_name", "unknown"),
+                        "jurisdiction": entity.get("entity_jurisdiction", "unknown"),
+                        "entity_status": entity.get("entity_status", ""),
+                        "incorporation_date": entity.get("incorporation_date", ""),
+                        "rel_type": entity.get("rel_type", ""),
+                        "match_type": match["match_type"],
+                        "leak_source": entity.get("entity_source", ""),
+                    }),
+                })
+                batch_ids.add(series_id)
+                written.append(row)
+        seen |= batch_ids  # only once the batch has committed
+        return written
+
+    def _emit_signals(self, rows: list[dict[str, Any]], now: datetime) -> int:
+        """signal_sources rows for a committed batch, in their own short transaction.
+
+        Intentionally inactive on production: this insert targets a
+        ``metadata`` column that schema.sql's signal_sources does not have, so
+        it fails and is only logged. Do not "repair" it here -- that would
+        start a new signal stream (an owner decision). All-or-nothing per
+        batch, never a savepoint per row.
+        """
+        if not rows:
+            return 0
+        try:
+            with self.engine.begin() as conn:
+                for row in rows:
+                    match, entity = row["match"], row["entity"]
+                    conn.execute(text("""
+                        INSERT INTO signal_sources
+                            (source_type, source_id, ticker, signal_type,
+                             signal_date, signal_value, metadata)
+                        VALUES
+                            (:stype, :sid, :ticker, :signal_type,
+                             :sdate, :sval, :meta)
+                    """), {
+                        "stype": "offshore_leak",
+                        "sid": row["series_id"],
+                        "ticker": match["actor_id"],  # use actor_id as ticker proxy
+                        "signal_type": "SELL",  # offshore = bearish signal
+                        "sdate": now,
+                        "sval": 1.0,
+                        "meta": _json_dumps({
+                            "actor_name": match["actor_name"],
+                            "entity_name": entity.get("entity_name", "unknown"),
+                            "jurisdiction": entity.get("entity_jurisdiction", "unknown"),
+                            "match_type": match["match_type"],
+                            "officer_name": match["officer_name"],
+                            "entity_status": entity.get("entity_status", ""),
+                            "leak_source": entity.get("entity_source", ""),
+                        }),
+                    })
+        except Exception as exc:
+            log.debug("Failed to emit offshore signals ({n} rows): {e}", n=len(rows), e=str(exc))
+            return 0
+        return len(rows)
 
     # ------------------------------------------------------------------
     # Full pull: parse, match, store
@@ -676,14 +728,19 @@ class OffshoreLeaksPuller(BasePuller):
                 "entity_names": entity_names[:5],  # cap for logging
             })
 
+        status = "SUCCESS"
+        if store_result.get("failed_batches"):
+            status = "PARTIAL" if store_result["raw_series_inserted"] else "FAILED"
         result = {
-            "status": "SUCCESS",
+            "status": status,
             "total_matches": len(matches),
             "actors_matched": len({m["actor_id"] for m in matches}),
             "raw_series_inserted": store_result["raw_series_inserted"],
             "signals_emitted": store_result["signals_emitted"],
             "actor_summary": actor_summary,
         }
+        if store_result.get("failed_batches"):
+            result["errors"] = store_result["errors"]
 
         log.warning(
             "OFFSHORE LEAKS INGESTION COMPLETE: {n} matches across {a} actors. "

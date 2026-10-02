@@ -225,7 +225,7 @@ def test_offshore_matches_land_and_are_not_restored(pg_engine, tmp_path) -> None
     }
     first = puller.store_matches([match])
     # signal_sources has production's shape (no metadata column), so that insert
-    # fails -- inside its own savepoint, without rolling back the raw row.
+    # fails -- in its own transaction, after the raw row has committed.
     assert first["raw_series_inserted"] == 1
     assert puller.store_matches([match])["raw_series_inserted"] == 0
 
@@ -233,6 +233,79 @@ def test_offshore_matches_land_and_are_not_restored(pg_engine, tmp_path) -> None
     assert [(r.series_id, r.value, r.pull_status, r.name) for r in rows] == [
         ("OFFSHORE:Example_Person:Example_Holdings_Ltd:VGB", 1.0, "SUCCESS", "ICIJ_OFFSHORE"),
     ]
+
+
+def _offshore_match(i: int) -> dict:
+    return {
+        "actor_name": f"Actor {i}", "actor_id": f"ACT{i:04d}", "actor_tier": "tier_2",
+        "officer_name": f"OFFICER {i}", "officer_node_id": f"n{i}",
+        "officer_jurisdiction": "VGB", "match_type": "partial", "officer_source_id": "panama",
+        "connected_entities": [{"entity_name": f"Entity {i} Ltd", "entity_jurisdiction": "VGB",
+                                "entity_status": "Active", "incorporation_date": "",
+                                "rel_type": "officer_of", "entity_source": "panama"}],
+    }
+
+
+def test_offshore_store_matches_commits_in_short_transactions(pg_engine, tmp_path) -> None:
+    """2026-10-02 incident: one transaction + a savepoint per row exhausted the shared lock table."""
+    from ingestion.altdata import offshore_leaks as ol
+
+    puller = ol.OffshoreLeaksPuller(pg_engine, data_dir=str(tmp_path))
+    n = 2 * ol.STORE_BATCH_ROWS + 7
+    matches = [_offshore_match(i) for i in range(n)]
+    matches.append(_offshore_match(0))  # a duplicate inside one run is written once
+
+    visible: list[tuple[int, int]] = []  # (rows written by the batch, rows visible after it)
+    real_store = ol.OffshoreLeaksPuller._store_batch
+
+    def store(self, batch, *args):
+        out = real_store(self, batch, *args)
+        # Another connection already sees the batch: it committed on its own,
+        # not as a savepoint inside one long run-wide transaction.
+        with pg_engine.connect() as c:
+            seen_now = c.execute(text(
+                "SELECT count(*) FROM raw_series WHERE series_id LIKE 'OFFSHORE:Actor_%'"
+            )).scalar_one()
+        visible.append((len(out), seen_now))
+        return out
+
+    ol.OffshoreLeaksPuller._store_batch = store
+    try:
+        out = puller.store_matches(matches)
+    finally:
+        ol.OffshoreLeaksPuller._store_batch = real_store
+    assert out["raw_series_inserted"] == n
+    assert len(_rows(pg_engine, "OFFSHORE:Actor_")) == n
+    with pg_engine.connect() as c:
+        per_xact = c.execute(text(
+            "SELECT max(cnt) FROM (SELECT xmin::text, count(*) AS cnt FROM raw_series "
+            "WHERE series_id LIKE 'OFFSHORE:%' GROUP BY 1) t"
+        )).scalar_one()
+    assert per_xact <= ol.STORE_BATCH_ROWS  # never one transaction across the whole run
+    assert len(visible) >= 3
+    running = 0
+    for written, seen_now in visible:
+        assert written <= ol.STORE_BATCH_ROWS
+        running += written
+        assert seen_now == running, visible
+
+
+def test_offshore_dedupe_spans_30_days_across_obs_dates(pg_engine, tmp_path) -> None:
+    from ingestion.altdata.offshore_leaks import OffshoreLeaksPuller
+
+    puller = OffshoreLeaksPuller(pg_engine, data_dir=str(tmp_path))
+    match = _offshore_match(1)
+    sid = "OFFSHORE:Actor_1:Entity_1_Ltd:VGB"
+    with pg_engine.begin() as c:  # stored 10 days ago, under an older obs_date
+        c.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status, pull_timestamp) "
+            "VALUES (:s, :src, CURRENT_DATE - 10, 1.0, 'SUCCESS', NOW() - INTERVAL '10 days')"
+        ), {"s": sid, "src": puller.source_id})
+    assert puller.store_matches([match])["raw_series_inserted"] == 0
+    with pg_engine.begin() as c:  # older than 30 days: stored again
+        c.execute(text("UPDATE raw_series SET pull_timestamp = NOW() - INTERVAL '31 days' WHERE series_id = :s"),
+                  {"s": sid})
+    assert puller.store_matches([match])["raw_series_inserted"] == 1
 
 
 # ── E1-V4: scripts/full_universe_pull ──────────────────────────────────
