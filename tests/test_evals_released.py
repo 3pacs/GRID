@@ -313,13 +313,13 @@ def test_k_deleting_a_released_suite_fails(trees):
 def test_l_two_live_paths_for_one_suite(trees):
     base, head = trees
     for root in (base, head):
-        sha = _make_e0_sibling(root, "evals/e0v2", "e0-v2")
-        _append(root, **_suite_entry("e0", "e0-v2", "evals/e0v2", sha))
+        sha = _make_e0_sibling(root, "evals/e0v9", "e0-v9")  # hypothetical (evals/e0v2 is real)
+        _append(root, **_suite_entry("e0", "e0-v9", "evals/e0v9", sha))
     _passes(base, head)
     assert released.latest_entry("e0", path="evals/e0", root=head)["manifest_sha256"] == E0_V1_SHA
-    assert released.latest_entry("e0", root=head)["version"] == "e0-v2"
+    assert released.latest_entry("e0", root=head)["version"] == "e0-v9"
 
-    for target in ("evals/e0", "evals/e0v2"):
+    for target in ("evals/e0", "evals/e0v9"):
         scorer = head / target / "scorer.py"
         original = scorer.read_bytes()
         scorer.write_bytes(original + b"\n# edit\n")
@@ -330,8 +330,8 @@ def test_l_two_live_paths_for_one_suite(trees):
 
 def test_l_releasing_a_sibling_version_in_a_pr_passes(trees):
     base, head = trees
-    sha = _make_e0_sibling(head, "evals/e0v2", "e0-v2")
-    _append(head, **_suite_entry("e0", "e0-v2", "evals/e0v2", sha))
+    sha = _make_e0_sibling(head, "evals/e0v9", "e0-v9")  # hypothetical (evals/e0v2 is real)
+    _append(head, **_suite_entry("e0", "e0-v9", "evals/e0v9", sha))
     _passes(base, head)
 
 
@@ -439,9 +439,9 @@ def test_shadowing_the_guard_module_fails(trees):
 
 def test_header_version_must_match_the_entry(trees):
     base, head = trees
-    sha = _make_e0_sibling(head, "evals/e0v2", "e0-v2")
-    _append(head, **_suite_entry("e0", "e0-v3", "evals/e0v2", sha))
-    _fails(base, head, "header says e0-v2")
+    sha = _make_e0_sibling(head, "evals/e0v9", "e0-v9")  # hypothetical (evals/e0v2 is real)
+    _append(head, **_suite_entry("e0", "e0-v10", "evals/e0v9", sha))
+    _fails(base, head, "header says e0-v9")
 
 
 def test_a_path_cannot_change_suite(trees):
