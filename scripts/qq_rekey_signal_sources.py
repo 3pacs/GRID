@@ -46,6 +46,10 @@ the scheduler fires on its first tick after a deploy restart. The procedure:
 4. ``mkdir -p ~/.grid && touch ~/.grid/quiverquant_transition_done`` to release the
    writer. (Re-key and re-date counts are 0 conflicts as long as no pull got through.)
 
+The marker path is under ``$HOME`` by default: run the scripts as the scheduler's user
+(``grid``), or set ``GRID_QQ_TRANSITION_DONE_FILE`` to the same absolute path for the
+service and the scripts. (The held-pull warning in the service log prints the path it checks.)
+
 ``--apply`` and ``--revert`` refuse to run once the marker exists (``--no-guard-check``
 overrides, if QuiverQuant is paused another way). A non-zero ``conflicts_skipped``
 means a pull got through before the apply.

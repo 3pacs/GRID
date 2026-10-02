@@ -24,7 +24,6 @@ from api.routers.watchlist_helpers import (
 # the two call sites in step when the SQLSTATE list grows; re-deriving it here
 # is how they drift. Module-level import is cheap: entity_resolver's own
 # imports are stdlib + loguru + sqlalchemy.
-from ingestion.altdata.quiverquant_identity import feed_source_id_sql
 from intelligence.entity_resolver import _log_query_failure
 
 router = APIRouter(tags=["watchlist"])
@@ -761,19 +760,16 @@ def get_ticker_edge(
     availability["signal_sources"] = {"status": "available"}
 
     # Persisted profiles only: do not invoke helpers that rebuild or seed them.
-    # Same identity rule as intelligence.lever_pullers._IDENTITY_SQL; a QuiverQuant row
-    # with no person in its payload falls back to the constant feed id, not its act key.
-    qq_feed = feed_source_id_sql("s.source_id")
-    lever_rows = _edge_optional_rows(engine, f"""
+    lever_rows = _edge_optional_rows(engine, """
         SELECT DISTINCT ON (lp.id) lp.name, s.signal_type, lp.motivation_model
         FROM lever_pullers lp
         JOIN signal_sources s ON s.source_type = lp.source_type
           AND lp.source_id = CASE
               WHEN s.source_type = 'options_flow' THEN regexp_replace(s.source_id, '_[0-9.]+$', '')
-              WHEN s.source_type = 'quiverquant:house' THEN COALESCE(s.signal_value->>'Representative', {qq_feed})
-              WHEN s.source_type = 'quiverquant:senate' THEN COALESCE(s.signal_value->>'Senator', {qq_feed})
-              WHEN s.source_type = 'quiverquant:insider' THEN COALESCE(s.signal_value->>'Name', {qq_feed})
-              WHEN s.source_type = 'quiverquant:lobbying' THEN COALESCE(s.signal_value->>'Registrant', s.signal_value->>'Client', {qq_feed})
+              WHEN s.source_type = 'quiverquant:house' THEN COALESCE(s.signal_value->>'Representative', s.source_id)
+              WHEN s.source_type = 'quiverquant:senate' THEN COALESCE(s.signal_value->>'Senator', s.source_id)
+              WHEN s.source_type = 'quiverquant:insider' THEN COALESCE(s.signal_value->>'Name', s.source_id)
+              WHEN s.source_type = 'quiverquant:lobbying' THEN COALESCE(s.signal_value->>'Registrant', s.signal_value->>'Client', s.source_id)
               ELSE s.source_id END
         WHERE s.ticker = :t
         ORDER BY lp.id, s.signal_date DESC

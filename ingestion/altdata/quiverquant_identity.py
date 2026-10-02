@@ -157,6 +157,10 @@ def normalize_range(value: Any) -> str:
     text = text.replace("$", "").replace(",", "")
     text = re.sub(r"\s*-\s*", "-", text)
     text = re.sub(r"\s+", " ", text).strip()
+    # A bare number (House/Senate payloads with no Range fall back to Amount) is a
+    # number, not a range: 1001, 1001.0 and "1,001.00" are one value.
+    if re.fullmatch(r"[+-]?(\d+\.?\d*|\.\d+)(e[+-]?\d+)?", text):
+        return normalize_number(text)
     return text or _UNKNOWN
 
 
@@ -376,7 +380,13 @@ TRANSITION_GUARDED_ENDPOINTS: frozenset[str] = KEYED_ENDPOINTS | {"gov_contracts
 
 
 def transition_marker_path() -> Path:
-    """Where the "transition applied" marker file lives (env-overridable)."""
+    """Where the "transition applied" marker file lives (env-overridable).
+
+    The default is under ``$HOME``, so the scheduler (service user ``grid``) and the
+    transition scripts must run as the same user, or ``GRID_QQ_TRANSITION_DONE_FILE`` must
+    be set to the same absolute path for both. The held-pull warning prints the path the
+    service actually checks.
+    """
     return Path(os.environ.get(MARKER_FILE_ENV) or DEFAULT_MARKER_FILE).expanduser()
 
 

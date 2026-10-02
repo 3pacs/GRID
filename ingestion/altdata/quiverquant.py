@@ -361,8 +361,10 @@ def pull_endpoint(
     if transition_guard_blocks(endpoint_key):
         # Fail-closed until the coordinator has run the re-key / re-date scripts and
         # created the marker file: no API call (the API is paid) and no write. Returned
-        # as SKIPPED, never SUCCESS, so the scheduler neither counts it toward freshness
-        # nor feeds its failure backoff (it retries in 30 minutes).
+        # as SKIPPED, never SUCCESS. NB: only an all-skipped result is read by the
+        # scheduler as SKIPPED (flat 30-minute retry, no backoff); a mixed one is PARTIAL
+        # and feeds the exponential failure backoff. ``pull_all`` therefore holds the
+        # whole job while any endpoint is held, so the scheduler sees all-skipped.
         reason = (
             f"QuiverQuant {endpoint_key} held: transition marker {transition_marker_path()} not found "
             "(create it after scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run)"
@@ -387,7 +389,26 @@ def pull_endpoint(
 
 
 def pull_all(engine: Engine) -> list[dict[str, Any]]:
-    """Pull all QuiverQuant endpoints."""
+    """Pull all QuiverQuant endpoints.
+
+    While the transition guard holds any endpoint, the whole job is held: every endpoint
+    is reported SKIPPED and nothing is pulled. A mixed result (aggregates pulled, guarded
+    endpoints skipped) would be classified PARTIAL by ``smart_scheduler``, which feeds its
+    exponential failure backoff (30 min .. 24 h, rebuilt from ``pull_log`` on restart) and
+    could delay the first real pull after the marker is created. An all-skipped result
+    retries every 30 minutes with no backoff, makes no API call, and cannot hide an
+    aggregate-endpoint failure because no aggregate endpoint runs while held.
+    """
+    held = [key for key in ENDPOINTS if transition_guard_blocks(key)]
+    if held:
+        reason = (
+            f"QuiverQuant job held: transition marker {transition_marker_path()} not found "
+            f"(guarded endpoints: {', '.join(sorted(held))}); create it after "
+            "scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run"
+        )
+        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        return [{"endpoint": key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0} for key in ENDPOINTS]
+
     log.info("QuiverQuant: pulling all {} endpoints", len(ENDPOINTS))
     results = []
     for key in ENDPOINTS:

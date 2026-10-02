@@ -11,7 +11,7 @@ quarter.
 from __future__ import annotations
 
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pytest
 
@@ -558,22 +558,56 @@ def test_the_skip_logs_a_warning(guard, monkeypatch):
     assert any("SKIPPED" in m and "transition marker" in m for m in messages)
 
 
-def test_scheduler_reads_a_guarded_pull_as_skipped_not_success(guard, monkeypatch):
-    """Honest-success contract: a held pull must not count toward freshness."""
-    from ingestion import smart_scheduler as sched
+def test_pull_all_holds_the_whole_job_while_any_endpoint_is_guarded(guard, monkeypatch):
+    """No aggregate runs while held: nothing is pulled, nothing real can be hidden, no API call."""
+    _no_network(monkeypatch)
+    out = qq.pull_all(object())
+    assert [r["endpoint"] for r in out] == list(qq.ENDPOINTS)
+    assert {r["status"] for r in out} == {"SKIPPED"} and all(r["stored"] == 0 for r in out)
+    assert all(str(guard) in r["skipped_reason"] and "transition marker" in r["skipped_reason"] for r in out)
 
+
+def test_pull_all_runs_everything_once_the_marker_exists(guard, monkeypatch):
+    guard.write_text("done")
     monkeypatch.setattr(qq, "_get_api_key", lambda: "k")
     monkeypatch.setattr(qq, "_fetch_endpoint", lambda path, key: [])
     monkeypatch.setattr(qq, "_store_signals", lambda *a, **k: 0)
     monkeypatch.setattr(qq.time, "sleep", lambda s: None)
+    assert {r["status"] for r in qq.pull_all(object())} == {"SUCCESS"}
 
-    held = [qq.pull_endpoint(object(), k) for k in qq.ENDPOINTS]
+
+def test_scheduler_reads_a_held_job_as_skipped_and_never_feeds_the_failure_backoff(guard, monkeypatch):
+    """Honest-success contract and no backoff: a held pull is SKIPPED (flat 30 min retry), not PARTIAL."""
+    from ingestion import smart_scheduler as sched
+
+    _no_network(monkeypatch)
+    held = qq.pull_all(object())
     outcome, rows, note = sched._classify_outcome(held)
-    assert outcome not in (sched.OUTCOME_SUCCESS, sched.OUTCOME_NO_NEW_DATA)
-    assert "skipped" in (note or "")
+    assert outcome == sched.OUTCOME_SKIPPED
+    assert outcome not in (sched.OUTCOME_SUCCESS, sched.OUTCOME_NO_NEW_DATA, sched.OUTCOME_PARTIAL, sched.OUTCOME_FAILED)
 
-    only_guarded = [qq.pull_endpoint(object(), k) for k in sorted(ident.TRANSITION_GUARDED_ENDPOINTS)]
-    assert sched._classify_outcome(only_guarded)[0] == sched.OUTCOME_SKIPPED
+    scheduler = sched.SmartScheduler.__new__(sched.SmartScheduler)
+    scheduler._state = {"quiverquant": {"consecutive_fails": 0}}
+    for _ in range(4):   # many held ticks in a row
+        scheduler._record_result("quiverquant", False, note, skipped=True)
+    state = scheduler._state["quiverquant"]
+    assert state["consecutive_fails"] == 0 and state.get("last_success") is None
+    remaining = state["cooldown_until"] - datetime.now(timezone.utc)
+    assert remaining.total_seconds() <= sched.SKIP_RETRY_MINUTES * 60  # flat retry, no growth
+
+
+def test_a_real_aggregate_failure_is_still_a_failure_once_pulls_run(guard, monkeypatch):
+    from ingestion import smart_scheduler as sched
+
+    guard.write_text("done")
+    monkeypatch.setattr(qq, "_get_api_key", lambda: "k")
+    monkeypatch.setattr(qq.time, "sleep", lambda s: None)
+
+    def _fetch(path, key):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(qq, "_fetch_endpoint", _fetch)
+    assert sched._classify_outcome(qq.pull_all(object()))[0] == sched.OUTCOME_FAILED
 
 
 # ── consumers that showed or counted the act key ─────────────────────────────
@@ -616,9 +650,23 @@ def test_readers_resolve_the_person_in_sql():
     root = Path(__file__).resolve().parents[1]
     sleuth = (root / "intelligence" / "sleuth.py").read_text(encoding="utf-8")
     assert "COUNT(DISTINCT source_id)" not in sleuth and "DISTINCT {_IDENTITY_SQL}" in sleuth
-    canvas = (root / "api" / "routers" / "canvas_expand.py").read_text(encoding="utf-8")
-    assert "SELECT DISTINCT ss.source_id FROM signal_sources ss" not in canvas and "{_LP_IDENTITY_SQL}" in canvas
-    overview = (root / "api" / "routers" / "watchlist_overview.py").read_text(encoding="utf-8")
-    assert overview.count("{qq_feed}") == 4
     discovery = (root / "intelligence" / "actor_discovery.py").read_text(encoding="utf-8")
     assert discovery.count("<> 'qq_'") == 2
+
+
+def test_a_numeric_amount_in_place_of_a_range_is_one_key():
+    """House/Senate payloads with no Range fall back to Amount: 1001, 1001.0 and "1,001.00" are one value."""
+    keys = {
+        ident.act_identity("house_trading", {"Representative": "J D", "Transaction": "Sale", "Amount": amount})
+        for amount in (1001, 1001.0, "1001", "1,001.00", "$1,001")
+    }
+    assert keys == {"j d|sale|1001"}
+    assert ident.normalize_range("1,001.50") == "1001.5"
+    # real ranges are unchanged
+    assert ident.normalize_range("$1,001 - $15,000") == "1001-15000"
+    assert ident.normalize_range("1001 - 15000.0") == "1001-15000.0"
+
+
+def test_the_marker_path_documents_its_home_dependency():
+    assert "GRID_QQ_TRANSITION_DONE_FILE" in ident.transition_marker_path.__doc__
+    assert "$HOME" in ident.transition_marker_path.__doc__

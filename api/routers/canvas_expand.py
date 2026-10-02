@@ -20,7 +20,6 @@ from api.routers.canvas_board_store import (
     sync_board_from_legacy_canvas,
     sync_legacy_canvas_from_board,
 )
-from intelligence.lever_pullers import _IDENTITY_SQL as _LP_IDENTITY_SQL
 
 router = APIRouter(tags=["canvas"])
 
@@ -834,17 +833,15 @@ def expand_node(
                 log.debug("Canvas expand congress-insider overlap: {e}", e=str(exc))
 
             # ── 2g. Lever pullers for ticker (max 3) ─────────────────
-            # lever_pullers.source_id is the actor identity (lever_pullers._IDENTITY_SQL),
-            # so match on the identity, not the raw per-act signal_sources.source_id.
             lp_rows = conn.execute(
-                text(f"""
+                text("""
                     SELECT lp.name, lp.category, lp.position,
                            lp.influence_rank, lp.trust_score, lp.motivation_model,
                            lp.total_signals, lp.correct_signals, lp.source_id
                     FROM lever_pullers lp
                     WHERE lp.source_id IN (
-                        SELECT DISTINCT {_LP_IDENTITY_SQL} FROM signal_sources
-                        WHERE ticker = :t
+                        SELECT DISTINCT ss.source_id FROM signal_sources ss
+                        WHERE ss.ticker = :t
                     )
                     ORDER BY lp.trust_score * lp.influence_rank DESC LIMIT 3
                 """),

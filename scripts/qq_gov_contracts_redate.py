@@ -54,6 +54,10 @@ scheduler fires on its first tick after a deploy restart. Procedure: deploy, dry
 apply (and ``scripts/qq_rekey_signal_sources.py``), then
 ``mkdir -p ~/.grid && touch ~/.grid/quiverquant_transition_done``.
 
+The marker path is under ``$HOME`` by default: run the scripts as the scheduler's user
+(``grid``), or set ``GRID_QQ_TRANSITION_DONE_FILE`` to the same absolute path for the
+service and the scripts. (The held-pull warning in the service log prints the path it checks.)
+
 ``--apply`` and ``--revert`` refuse to run once the marker exists (``--no-guard-check``
 overrides). Rows are not "known" at their fiscal date: QuiverQuant rewrites the
 aggregate in place after it, so a stored value must not be scored as known at
