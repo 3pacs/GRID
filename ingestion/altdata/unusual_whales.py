@@ -86,6 +86,10 @@ _MIN_OI_THRESHOLD: int = 100
 # Rate limit between ticker scans (seconds)
 _RATE_LIMIT_DELAY: float = 0.5
 
+#: Max whale signals written per transaction (see pull_ticker's locking
+#: contract): no long per-ticker transaction, no savepoint per row.
+STORE_BATCH_ROWS: int = 50
+
 # Maximum expirations to scan per ticker (nearest N)
 _MAX_EXPIRATIONS: int = 6
 
@@ -420,6 +424,54 @@ class UnusualWhalesPuller(BasePuller):
     # Main pull methods
     # ------------------------------------------------------------------ #
 
+    def _store_batch(self, ticker: str, batch: list[dict[str, Any]], today: date) -> int:
+        """Store one batch in one short transaction; on failure, one row per transaction."""
+        try:
+            with self.engine.begin() as conn:
+                return sum(1 for signal in batch if self._store_whale_signal(conn, signal, today))
+        except Exception as exc:
+            log.warning("Whale: {t} batch of {n} failed ({e}); retrying row by row",
+                        t=ticker, n=len(batch), e=str(exc))
+        stored = 0
+        for signal in batch:
+            try:
+                with self.engine.begin() as conn:
+                    if self._store_whale_signal(conn, signal, today):
+                        stored += 1
+            except Exception as exc:
+                log.warning(
+                    "Whale: row insert failed — "
+                    "date={d} ticker={t} strike={s} exp={e} dir={dir}: {err}",
+                    d=today,
+                    t=ticker,
+                    s=signal.get("strike"),
+                    e=signal.get("expiration"),
+                    dir=signal.get("direction"),
+                    err=str(exc),
+                )
+        return stored
+
+    def _emit_batch(self, ticker: str, batch: list[dict[str, Any]], today: date) -> None:
+        """signal_sources rows for one batch in one short transaction; on failure, one row per transaction."""
+        try:
+            with self.engine.begin() as conn:
+                for signal in batch:
+                    self._emit_whale_signal(conn, signal, today)
+            return
+        except Exception as exc:
+            log.debug("Whale: signal emission batch failed for {t}: {e}", t=ticker, e=str(exc))
+        for signal in batch:
+            try:
+                with self.engine.begin() as conn:
+                    self._emit_whale_signal(conn, signal, today)
+            except Exception as exc:
+                log.debug(
+                    "Whale: signal emission failed for {t} strike={s}: {e}",
+                    t=ticker,
+                    s=signal.get("strike"),
+                    e=str(exc),
+                )
+
     def pull_ticker(
         self,
         ticker: str,
@@ -471,61 +523,36 @@ class UnusualWhalesPuller(BasePuller):
                 "rows_inserted": 0,
             }
 
+        signals: list[dict[str, Any]] = []
+        for raw_signal in all_signals:
+            # Strip NaN/Inf floats up-front so they never reach
+            # ``json.dumps`` or a bound numeric parameter.
+            signal = _clean_nans(raw_signal)
+            # If the value column itself (notional_premium) was NaN,
+            # there's nothing meaningful to store — skip.
+            if signal.get("notional_premium") is None:
+                log.debug(
+                    "Whale: skipping {t} strike={s} exp={e} — "
+                    "notional_premium was NaN after sanitisation",
+                    t=ticker,
+                    s=raw_signal.get("strike"),
+                    e=raw_signal.get("expiration"),
+                )
+                continue
+            signals.append(signal)
+
+        # Locking contract (2026-10-02 offshore_leaks incident): short
+        # transactions of at most STORE_BATCH_ROWS signals, never one
+        # transaction per ticker with a SAVEPOINT per row. Each committed
+        # savepoint is a subtransaction whose XID lock is held until the
+        # top-level commit, so a ticker with thousands of signals could
+        # exhaust the shared lock table. A failed batch is retried one row
+        # per transaction, so one bad row still only loses itself.
         inserted = 0
-        with self.engine.begin() as conn:
-            for raw_signal in all_signals:
-                # Strip NaN/Inf floats up-front so they never reach
-                # ``json.dumps`` or a bound numeric parameter.
-                signal = _clean_nans(raw_signal)
-
-                # If the value column itself (notional_premium) was
-                # NaN, there's nothing meaningful to store — skip.
-                if signal.get("notional_premium") is None:
-                    log.debug(
-                        "Whale: skipping {t} strike={s} exp={e} — "
-                        "notional_premium was NaN after sanitisation",
-                        t=ticker,
-                        s=raw_signal.get("strike"),
-                        e=raw_signal.get("expiration"),
-                    )
-                    continue
-
-                # Per-row SAVEPOINT so a single bad row only rolls
-                # back itself — the outer transaction commits
-                # everything that survived.  ``begin_nested`` issues a
-                # SAVEPOINT on entry and RELEASE / ROLLBACK TO on exit
-                # depending on whether the block raised.
-                try:
-                    with conn.begin_nested():
-                        stored = self._store_whale_signal(
-                            conn, signal, today,
-                        )
-                    if stored:
-                        inserted += 1
-                except Exception as exc:
-                    log.warning(
-                        "Whale: row insert failed — "
-                        "date={d} ticker={t} strike={s} exp={e} dir={dir}: {err}",
-                        d=today,
-                        t=ticker,
-                        s=signal.get("strike"),
-                        e=signal.get("expiration"),
-                        dir=signal.get("direction"),
-                        err=str(exc),
-                    )
-                    # SAVEPOINT already rolled back; carry on with the
-                    # next signal under the same outer transaction.
-
-                try:
-                    with conn.begin_nested():
-                        self._emit_whale_signal(conn, signal, today)
-                except Exception as exc:
-                    log.debug(
-                        "Whale: signal emission failed for {t} strike={s}: {e}",
-                        t=ticker,
-                        s=signal.get("strike"),
-                        e=str(exc),
-                    )
+        for start in range(0, len(signals), STORE_BATCH_ROWS):
+            batch = signals[start:start + STORE_BATCH_ROWS]
+            inserted += self._store_batch(ticker, batch, today)
+            self._emit_batch(ticker, batch, today)
 
         log.info(
             "WHALE {t}: {n} unusual signals detected, {ins} stored",
