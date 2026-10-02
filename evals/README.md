@@ -48,7 +48,7 @@ the change is a good idea.
    ```
 
    `version` must be new for that suite. For a manifest with a `# version:`
-   header (E0, E2), `version` must equal the header. Never edit an existing
+   header (E0, E2, E3), `version` must equal the header. Never edit an existing
    entry, including the previous version for the same path.
 4. To change a guard file, append a `guards` entry instead:
    `{"seq": N, "kind": "guards", "version": "guards-vN", "files": {"<path>": "<lf sha256>", ...}}`.

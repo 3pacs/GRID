@@ -123,7 +123,7 @@
         "tests/test_e2_manifest_guard.py": "00059ed848c778078ca2e0e828a49c273fae8980b86d9d8a76300255b5936187",
         "tests/test_evals_released.py": "d4422f330d47e91ce2804834510590a266ebb7b7d4f118bce5e5e0df2ea563dd",
         "evals/released.py": "0ce91b25c1d0c11a820e2696b8dc8e3349f185ffb25d5e6d798d560edc4c8917",
-        "evals/README.md": "04e4b80fc9e0b3e69ad0b4703e79deaf38083be4985ff87ada19abaa2631d89c",
+        "evals/README.md": "ff5730d8b25f714417457f3a82021d7ec364bb7a0bfc7d0bf10256a7da34cc1a",
         "evals/__init__.py": "99aa26d5a5948347316b8790ddb32b9250a7c2dff0559b0ed35fb48ce08b0ee7",
         ".github/workflows/evals-freeze.yml": "20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7",
         "tests/test_e0_ic01_recovery.py": "a13cb2dcd6aba3dface7c8211f7795d3b4153a4211732a9cffa056e23c383934",
