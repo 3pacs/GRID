@@ -4,12 +4,19 @@
 row holds one subtransaction XID lock per row until the top-level commit and
 can exhaust PostgreSQL's shared lock table. pull_ticker had the same shape
 (one transaction per ticker, two savepoints per signal).
+
+The fake engine keeps committed raw_series series_ids, so ``_row_exists``
+dedupe (inside a batch, across batches and across a per-row retry) is real.
 """
 
 from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+import pytest
+from sqlalchemy import exc as sa_exc
+
+import ingestion.smart_scheduler as ss
 from ingestion.altdata import unusual_whales as uw
 
 
@@ -22,63 +29,100 @@ def _signal(i: int) -> dict:
     }
 
 
-class _Conn:
-    def __init__(self, fail_on: set[int] | None = None) -> None:
-        self.raw_inserts = 0
-        self.fail_on = fail_on or set()
+class _Engine:
+    """engine.begin() -> a transaction whose raw_series inserts commit only on success."""
 
-    def execute(self, stmt, params=None):
-        sql = " ".join(str(stmt).split()).upper()
-        if sql.startswith("INSERT INTO RAW_SERIES"):
-            strike = int(float(params["sid"].split(":")[2]))
-            if strike in self.fail_on:
-                raise RuntimeError("bad row")
-            self.raw_inserts += 1
-        res = MagicMock()
-        res.fetchone.return_value = None
-        res.fetchall.return_value = []
-        return res
+    def __init__(self, fail_on: set[int] | None = None, begin_error: Exception | None = None) -> None:
+        self.committed: set[str] = set()
+        self.per_txn: list[int] = []
+        self.begin_calls = 0
+        self.fail_on = fail_on or set()
+        self.begin_error = begin_error
+
+    def begin(self):
+        self.begin_calls += 1
+        if self.begin_error is not None:
+            raise self.begin_error
+        return _Txn(self)
+
+
+class _Txn:
+    def __init__(self, engine: _Engine) -> None:
+        self.engine = engine
+        self.pending: list[str] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *rest):
+        if exc_type is None:
+            self.engine.committed.update(self.pending)
+            self.engine.per_txn.append(len(self.pending))
+        return False
 
     def begin_nested(self):
         raise AssertionError("savepoint per row: each one holds a subtransaction lock")
 
+    def execute(self, stmt, params=None):
+        sql = " ".join(str(stmt).split()).upper()
+        res = MagicMock()
+        res.fetchall.return_value = []
+        res.fetchone.return_value = None
+        if sql.startswith("SELECT 1 FROM RAW_SERIES"):
+            sid = params["sid"]
+            res.fetchone.return_value = (1,) if sid in self.engine.committed or sid in self.pending else None
+        elif sql.startswith("INSERT INTO RAW_SERIES"):
+            if int(float(params["sid"].split(":")[2])) in self.engine.fail_on:
+                raise sa_exc.IntegrityError("INSERT", {}, Exception("bad row"))
+            self.pending.append(params["sid"])
+        return res
 
-def _puller(per_txn: list[int], fail_on: set[int] | None = None):
-    class Begin:
-        def __enter__(self):
-            self.conn = _Conn(fail_on)
-            return self.conn
 
-        def __exit__(self, exc_type, *rest):
-            if exc_type is None:
-                per_txn.append(self.conn.raw_inserts)
-            return False
-
+def _puller(engine: _Engine, signals: list[dict], monkeypatch) -> uw.UnusualWhalesPuller:
+    monkeypatch.setattr(uw.time, "sleep", lambda _s: None)
     puller = uw.UnusualWhalesPuller.__new__(uw.UnusualWhalesPuller)
-    puller.engine = MagicMock()
-    puller.engine.begin.side_effect = lambda: Begin()
+    puller.engine = engine
     puller.source_id = 9
     puller._get_expirations = lambda ticker: ["2026-10-16"]
     puller._fetch_options_chain = lambda ticker, exp: {"calls": [{}], "puts": []}
+    puller._detect_unusual_activity = lambda t, e, o, d: [dict(s) for s in signals]
     return puller
 
 
 def test_pull_ticker_never_holds_one_transaction_across_many_inserts(monkeypatch) -> None:
-    per_txn: list[int] = []
-    puller = _puller(per_txn)
-    monkeypatch.setattr(uw.time, "sleep", lambda _s: None)
-    puller._detect_unusual_activity = lambda t, e, o, d: [_signal(i) for i in range(230)]
-    out = puller.pull_ticker("SPY")
-    assert out["rows_inserted"] == 230
-    assert max(per_txn) <= uw.STORE_BATCH_ROWS
-    assert sum(per_txn) == 230
+    engine = _Engine()
+    signals = [_signal(i) for i in range(230)] + [_signal(3), _signal(120)]  # two duplicates
+    out = _puller(engine, signals, monkeypatch).pull_ticker("SPY")
+    assert out["status"] == "SUCCESS" and out["rows_inserted"] == 230
+    assert max(engine.per_txn) <= uw.STORE_BATCH_ROWS
+    assert len(engine.committed) == 230
+    rerun = _puller(engine, signals, monkeypatch).pull_ticker("SPY")
+    assert rerun["rows_inserted"] == 0  # same day: deduped, never rewritten
 
 
-def test_a_bad_row_only_loses_itself(monkeypatch) -> None:
-    per_txn: list[int] = []
-    puller = _puller(per_txn, fail_on={407})
-    monkeypatch.setattr(uw.time, "sleep", lambda _s: None)
-    puller._detect_unusual_activity = lambda t, e, o, d: [_signal(i) for i in range(60)]
-    out = puller.pull_ticker("SPY")
-    assert out["rows_inserted"] == 59  # batch 1 retried row by row; batch 2 intact
-    assert max(per_txn) <= uw.STORE_BATCH_ROWS
+def test_a_bad_row_only_loses_itself_and_is_reported(monkeypatch) -> None:
+    engine = _Engine(fail_on={407})
+    signals = [_signal(i) for i in range(60)] + [_signal(5)]  # duplicate of a row in the retried batch
+    out = _puller(engine, signals, monkeypatch).pull_ticker("SPY")
+    assert out["rows_inserted"] == 59 and len(engine.committed) == 59
+    assert out["status"] == "PARTIAL" and out["errors"]
+    assert ss._classify_outcome([out])[0] == ss.OUTCOME_PARTIAL
+    assert max(engine.per_txn) <= uw.STORE_BATCH_ROWS
+
+
+def test_database_outage_fails_fast_and_stops_the_scan(monkeypatch) -> None:
+    engine = _Engine(begin_error=RuntimeError("db down"))
+    puller = _puller(engine, [_signal(i) for i in range(120)], monkeypatch)
+    out = puller.pull_all(["SPY", "QQQ", "IWM"])
+    assert [r["status"] for r in out] == ["FAILED"]  # scan stopped, no other ticker attempted
+    assert engine.begin_calls == uw.MAX_CONSECUTIVE_WRITE_FAILURES
+    assert ss._classify_outcome(out)[0] == ss.OUTCOME_FAILED
+
+
+def test_connection_level_error_aborts_after_batch_and_first_retry(monkeypatch) -> None:
+    down = sa_exc.OperationalError("connect", {}, Exception("FATAL: out of shared memory"))
+    engine = _Engine(begin_error=down)
+    puller = _puller(engine, [_signal(i) for i in range(120)], monkeypatch)
+    with pytest.raises(uw.WhaleStoreAborted):
+        puller.pull_ticker("SPY")
+    assert engine.begin_calls == 2

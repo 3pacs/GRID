@@ -435,17 +435,17 @@ def test_unusual_whales_commits_each_batch_on_its_own(pg_engine, monkeypatch) ->
     visible: list[tuple[int, int]] = []
     real_store = uw.UnusualWhalesPuller._store_batch
 
-    def store(self, ticker, batch, today):
-        written = real_store(self, ticker, batch, today)
+    def store(self, ticker, batch, today, streak):
+        out = real_store(self, ticker, batch, today, streak)
         with pg_engine.connect() as c:  # a second connection already sees the batch: it committed
-            visible.append((written, c.execute(text(
+            visible.append((out[0], c.execute(text(
                 "SELECT count(*) FROM raw_series WHERE series_id LIKE 'WHALE:SPY:%'"
             )).scalar_one()))
-        return written
+        return out
 
     monkeypatch.setattr(uw.UnusualWhalesPuller, "_store_batch", store)
     out = puller.pull_ticker("SPY")
-    assert out["rows_inserted"] == n
+    assert out["status"] == "SUCCESS" and out["rows_inserted"] == n
     assert len(visible) >= 3
     running = 0
     for written, seen_now in visible:

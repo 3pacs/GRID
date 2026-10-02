@@ -25,6 +25,7 @@ from datetime import date
 from typing import Any
 
 from loguru import logger as log
+from sqlalchemy import exc as sa_exc
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
@@ -89,6 +90,19 @@ _RATE_LIMIT_DELAY: float = 0.5
 #: Max whale signals written per transaction (see pull_ticker's locking
 #: contract): no long per-ticker transaction, no savepoint per row.
 STORE_BATCH_ROWS: int = 50
+#: A ticker's writes stop after this many consecutive failed transactions.
+MAX_CONSECUTIVE_WRITE_FAILURES: int = 3
+
+
+class WhaleStoreAborted(RuntimeError):
+    """Writes cannot proceed (connection-level failure or repeated failures): stop the scan."""
+
+
+def _is_connection_error(exc: BaseException) -> bool:
+    """True for errors that mean the database is unusable, not that one row is bad."""
+    if isinstance(exc, (sa_exc.OperationalError, sa_exc.DisconnectionError, sa_exc.TimeoutError)):
+        return True
+    return bool(getattr(exc, "connection_invalidated", False))
 
 # Maximum expirations to scan per ticker (nearest N)
 _MAX_EXPIRATIONS: int = 6
@@ -424,21 +438,44 @@ class UnusualWhalesPuller(BasePuller):
     # Main pull methods
     # ------------------------------------------------------------------ #
 
-    def _store_batch(self, ticker: str, batch: list[dict[str, Any]], today: date) -> int:
-        """Store one batch in one short transaction; on failure, one row per transaction."""
+    def _store_batch(
+        self,
+        ticker: str,
+        batch: list[dict[str, Any]],
+        today: date,
+        streak: dict[str, int],
+    ) -> tuple[int, int, list[str]]:
+        """Store one batch in one short transaction; on failure, one row per transaction.
+
+        Returns ``(stored, failed, errors)``. Raises :class:`WhaleStoreAborted`
+        when the batch and its first per-row retry both fail on a
+        connection-level error, or after ``MAX_CONSECUTIVE_WRITE_FAILURES``
+        consecutive failed transactions -- a database outage must surface as
+        a failure, not as "0 rows, nothing new".
+        """
         try:
             with self.engine.begin() as conn:
-                return sum(1 for signal in batch if self._store_whale_signal(conn, signal, today))
+                stored = sum(1 for signal in batch if self._store_whale_signal(conn, signal, today))
+            streak["failures"] = 0
+            return stored, 0, []
         except Exception as exc:
+            batch_exc = exc
+            streak["failures"] += 1
             log.warning("Whale: {t} batch of {n} failed ({e}); retrying row by row",
                         t=ticker, n=len(batch), e=str(exc))
         stored = 0
-        for signal in batch:
+        failed = 0
+        errors: list[str] = []
+        for i, signal in enumerate(batch):
             try:
                 with self.engine.begin() as conn:
                     if self._store_whale_signal(conn, signal, today):
                         stored += 1
+                streak["failures"] = 0
             except Exception as exc:
+                failed += 1
+                streak["failures"] += 1
+                errors.append(str(exc)[:200])
                 log.warning(
                     "Whale: row insert failed — "
                     "date={d} ticker={t} strike={s} exp={e} dir={dir}: {err}",
@@ -449,10 +486,20 @@ class UnusualWhalesPuller(BasePuller):
                     dir=signal.get("direction"),
                     err=str(exc),
                 )
-        return stored
+                if i == 0 and _is_connection_error(batch_exc) and _is_connection_error(exc):
+                    raise WhaleStoreAborted(f"database unavailable: {exc}") from exc
+                if streak["failures"] >= MAX_CONSECUTIVE_WRITE_FAILURES:
+                    raise WhaleStoreAborted(
+                        f"{streak['failures']} consecutive failed writes: {exc}"
+                    ) from exc
+        return stored, failed, errors
 
     def _emit_batch(self, ticker: str, batch: list[dict[str, Any]], today: date) -> None:
-        """signal_sources rows for one batch in one short transaction; on failure, one row per transaction."""
+        """signal_sources rows for one batch in one short transaction; on failure, one row per transaction.
+
+        Best-effort: stops after ``MAX_CONSECUTIVE_WRITE_FAILURES`` consecutive
+        failures instead of retrying every row against a failing database.
+        """
         try:
             with self.engine.begin() as conn:
                 for signal in batch:
@@ -460,17 +507,22 @@ class UnusualWhalesPuller(BasePuller):
             return
         except Exception as exc:
             log.debug("Whale: signal emission batch failed for {t}: {e}", t=ticker, e=str(exc))
+        consecutive = 0
         for signal in batch:
             try:
                 with self.engine.begin() as conn:
                     self._emit_whale_signal(conn, signal, today)
+                consecutive = 0
             except Exception as exc:
+                consecutive += 1
                 log.debug(
                     "Whale: signal emission failed for {t} strike={s}: {e}",
                     t=ticker,
                     s=signal.get("strike"),
                     e=str(exc),
                 )
+                if consecutive >= MAX_CONSECUTIVE_WRITE_FAILURES:
+                    return
 
     def pull_ticker(
         self,
@@ -549,10 +601,32 @@ class UnusualWhalesPuller(BasePuller):
         # exhaust the shared lock table. A failed batch is retried one row
         # per transaction, so one bad row still only loses itself.
         inserted = 0
-        for start in range(0, len(signals), STORE_BATCH_ROWS):
-            batch = signals[start:start + STORE_BATCH_ROWS]
-            inserted += self._store_batch(ticker, batch, today)
-            self._emit_batch(ticker, batch, today)
+        failed = 0
+        errors: list[str] = []
+        streak = {"failures": 0}  # consecutive failed transactions for this ticker
+        try:
+            for start in range(0, len(signals), STORE_BATCH_ROWS):
+                batch = signals[start:start + STORE_BATCH_ROWS]
+                stored, batch_failed, batch_errors = self._store_batch(ticker, batch, today, streak)
+                inserted += stored
+                failed += batch_failed
+                errors.extend(batch_errors)
+                # Stored rows and their signal_sources rows commit in separate
+                # transactions: a crash in between can leave a raw_series row
+                # without its signal_sources row (the emit is best-effort and
+                # ON CONFLICT DO NOTHING, so the next run does not repair it).
+                self._emit_batch(ticker, batch, today)
+        except WhaleStoreAborted as exc:
+            if not inserted:
+                raise
+            log.warning("WHALE {t}: writes aborted after {n} rows: {e}", t=ticker, n=inserted, e=str(exc))
+            return {
+                "ticker": ticker,
+                "status": "PARTIAL",
+                "signals_found": len(all_signals),
+                "rows_inserted": inserted,
+                "errors": (errors + [str(exc)])[:5],
+            }
 
         log.info(
             "WHALE {t}: {n} unusual signals detected, {ins} stored",
@@ -561,12 +635,16 @@ class UnusualWhalesPuller(BasePuller):
             ins=inserted,
         )
 
-        return {
+        result: dict[str, Any] = {
             "ticker": ticker,
             "status": "SUCCESS",
             "signals_found": len(all_signals),
             "rows_inserted": inserted,
         }
+        if failed:
+            result["status"] = "PARTIAL"
+            result["errors"] = errors[:5] or [f"{failed} rows failed to store"]
+        return result
 
     def pull_all(
         self,
@@ -600,6 +678,10 @@ class UnusualWhalesPuller(BasePuller):
                 results.append(res)
                 total_signals += res.get("signals_found", 0)
                 total_inserted += res.get("rows_inserted", 0)
+            except WhaleStoreAborted as exc:
+                log.error("Whale scan stopped at {t}: {e}", t=ticker, e=str(exc))
+                results.append({"ticker": ticker, "status": "FAILED", "error": str(exc)})
+                break
             except Exception as exc:
                 log.error(
                     "Whale scan failed for {t}: {e}",
