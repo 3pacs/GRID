@@ -38,7 +38,8 @@ def test_phase_failure_stops_once_without_row_fallback(phase):
     ("08006", False, True, False), ("XX000", False, True, False),
 ])
 def test_commit_state_requires_narrow_rejection_and_healthy_idle_driver(code, invalidated, idle, known):
-    class Orig(Exception): pgcode = code
+    class Orig(Exception):
+        pgcode = code
     class Driver:
         closed = False
         def get_transaction_status(self): return 0 if idle else 2
@@ -63,13 +64,15 @@ def test_trust_mock_pages_all_rows_without_changing_feed_statistics(monkeypatch,
         def __init__(self): self.changed = 0
         def execute(self, statement, params=None):
             sql = str(statement)
-            if "SELECT source_type" in sql: return Result(rows)
+            if "SELECT source_type" in sql:
+                return Result(rows)
             if "SELECT id FROM" in sql:
                 ids = list(range(params["after_id"] + 1, min(101, params["after_id"] + 50) + 1))
                 return Result([(i,) for i in ids])
             if "UPDATE" in sql:
                 assert "id IN" in sql and len(params["target_ids"]) <= 50
-                for i in params["target_ids"]: table[i] = (params["hc"], params["mc"], params["ts"])
+                for i in params["target_ids"]:
+                    table[i] = (params["hc"], params["mc"], params["ts"])
                 self.changed += len(params["target_ids"])
                 return Result(rowcount=len(params["target_ids"]))
     class Engine:

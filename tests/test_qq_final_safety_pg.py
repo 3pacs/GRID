@@ -1,7 +1,9 @@
 """Actual bounded PG14 trust propagation; only explicitly supplied private fixtures."""
 from sqlalchemy import text
 from intelligence import trust_scorer as trust
-from tests.test_qq_short_transactions_pg import pg, all_rows
+from tests.test_qq_short_transactions_pg import pg as _pg, all_rows
+
+pg = _pg
 
 
 def test_pg_trust_101_rows_uses_50_50_1_and_preserves_payload_outcomes(pg, monkeypatch):
