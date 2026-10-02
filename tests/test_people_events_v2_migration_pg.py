@@ -386,3 +386,138 @@ def test_read_event_versions_omits_current_only_counts_and_rejects_naive_time(v2
     assert "attrs" in rows[0]
     with pytest.raises(ValueError):
         read_event_versions(v2, datetime(2026, 9, 30))
+
+
+def test_gd3_progress_digest_matches_real_postgres_audit_and_all_table_growth(v2, tmp_path):
+    from intelligence.people_events_pipeline.writer import apply_write_plan
+    from scripts import people_events_backfill as B
+    from scripts import people_events_backfill_safety as G
+
+    prefix = "gd3-20261002T180000Z"
+    observed = datetime(2026, 9, 1, 12, tzinfo=UTC)
+    events, plan = _plan(v2, observed, form345=[_sec()])
+    before = B._scalar(v2, B._SIZE_SQL)
+    guards = []
+    result = apply_write_plan(v2, events, plan, run_id=prefix + "-b00000", mode="backfill",
+        observed_at=observed, inputs={"form345_sha256": "0" * 64, "batch": 0},
+        before_transaction=lambda: guards.append(1))
+    assert result["counts"]["insert"] == 1 and len(guards) == 6
+    after = B._scalar(v2, B._SIZE_SQL)
+    with v2.connect() as conn:
+        relation_sizes = [conn.execute(text("SELECT pg_total_relation_size(:name)"),
+                                      {"name": name}).scalar()
+                          for name in ("people_events", "people_event_revisions", "people_events_runs")]
+        assert conn.execute(text("SELECT count(*) FROM people_event_revisions")).scalar() == 0
+    assert after == sum(relation_sizes) and after > before
+    path = tmp_path / G.PROGRESS_NAME
+    G.append_progress(path, {"run_id": prefix + "-b00000", "status": "SUCCESS", "batch_rows": 1,
+                             "rows_written": 1})
+    batches, rows, digest = G.read_progress(path, prefix)
+    audit = B._run_audit(v2, prefix, "0" * 64)
+    G.validate_resume(batches=batches, rows=rows, progress_digest=digest, database=audit,
+                      stored_rows=1, plan_counts={"unchanged": 1}, total_rows=1)
+    assert B._run_audit(v2, prefix, "wrong-source-hash")["invalid"] == 1
+
+
+@pytest.mark.parametrize("malformation", [
+    "missing_batch", "null_batch", "string_batch", "float_batch", "boolean_batch", "negative_batch",
+    "wrong_batch", "duplicate_batch", "swapped_batches", "gap_run_id", "wrong_run_id", "missing_run_suffix",
+    "missing_source", "null_source", "wrong_source", "inputs_array", "extra_input",
+    "missing_insert", "string_insert", "float_insert", "boolean_insert", "zero_insert", "oversize_insert",
+    "string_written", "offsetting_written", "counts_array", "extra_counter",
+    "missing_zero_counter", "nonzero_update", "nonzero_unchanged", "boolean_zero_counter",
+    "missing_finished", "finished_before_start", "error_present", "empty_error", "running", "wrong_version",
+    "wrong_mode",
+])
+def test_gd3_resume_refuses_malformed_real_postgres_run_metadata(v2, tmp_path, malformation):
+    """The run schema permits these states; aggregate totals alone must not accept them."""
+    import json
+
+    from intelligence.people_events_pipeline import PIPELINE_VERSION
+    from scripts import people_events_backfill as B
+    from scripts import people_events_backfill_safety as G
+
+    prefix, source_hash = "gd3-20261002T180000Z", "0" * 64
+
+    def record(batch):
+        return {"run_id": f"{prefix}-b{batch:05d}", "mode": "backfill", "version": PIPELINE_VERSION,
+                "inputs": {"batch": batch, "form345_sha256": source_hash},
+                "counts": {"insert": 50, "written": 50, **dict.fromkeys(G.ZERO_COUNT_KEYS, 0)},
+                "status": "SUCCESS", "started": "2026-10-02T18:00:00Z",
+                "finished": "2026-10-02T18:00:01Z", "error": None}
+
+    rows = [record(0)]
+    row = rows[0]
+    if malformation == "missing_batch":
+        del row["inputs"]["batch"]
+    elif malformation in {"null_batch", "string_batch", "float_batch", "boolean_batch", "negative_batch", "wrong_batch"}:
+        row["inputs"]["batch"] = {"null_batch": None, "string_batch": "0", "float_batch": 0.5,
+                                  "boolean_batch": False, "negative_batch": -1, "wrong_batch": 1}[malformation]
+    elif malformation in {"duplicate_batch", "swapped_batches", "offsetting_written"}:
+        rows.append(record(1))
+        if malformation == "duplicate_batch":
+            rows[1]["inputs"]["batch"] = 0
+        elif malformation == "swapped_batches":
+            rows[0]["inputs"]["batch"], rows[1]["inputs"]["batch"] = 1, 0
+        else:
+            rows[0]["counts"]["written"], rows[1]["counts"]["written"] = 49, 51
+    elif malformation in {"gap_run_id", "wrong_run_id", "missing_run_suffix"}:
+        row["run_id"] = prefix + {"gap_run_id": "-b00001", "wrong_run_id": "-bjunk", "missing_run_suffix": ""}[malformation]
+    elif malformation == "missing_source":
+        del row["inputs"]["form345_sha256"]
+    elif malformation in {"null_source", "wrong_source"}:
+        row["inputs"]["form345_sha256"] = None if malformation == "null_source" else "1" * 64
+    elif malformation == "inputs_array":
+        row["inputs"] = []
+    elif malformation == "extra_input":
+        row["inputs"]["unexpected"] = 0
+    elif malformation == "missing_insert":
+        del row["counts"]["insert"]
+    elif malformation in {"string_insert", "float_insert", "boolean_insert", "zero_insert", "oversize_insert"}:
+        row["counts"]["insert"] = {"string_insert": "50", "float_insert": 50.5, "boolean_insert": True,
+                                    "zero_insert": 0, "oversize_insert": 51}[malformation]
+        if malformation == "oversize_insert":
+            row["counts"]["written"] = 51
+    elif malformation == "string_written":
+        row["counts"]["written"] = "50"  # PostgreSQL's existing CHECK casts this string successfully.
+    elif malformation == "counts_array":
+        row["counts"], row["status"] = [], "RUNNING"  # schema's SUCCESS CHECK forbids this combination.
+    elif malformation == "extra_counter":
+        row["counts"]["unexpected"] = 0
+    elif malformation == "missing_zero_counter":
+        del row["counts"]["add_sources"]
+    elif malformation in {"nonzero_update", "nonzero_unchanged", "boolean_zero_counter"}:
+        key = "unchanged" if malformation == "nonzero_unchanged" else "add_sources"
+        row["counts"][key] = False if malformation == "boolean_zero_counter" else 1
+    elif malformation == "missing_finished":
+        row["finished"] = None
+    elif malformation == "finished_before_start":
+        row["finished"] = "2026-10-02T17:59:59Z"
+    elif malformation in {"error_present", "empty_error"}:
+        row["error"] = "synthetic failure" if malformation == "error_present" else ""
+    elif malformation == "running":
+        row["status"] = "RUNNING"
+    elif malformation == "wrong_version":
+        row["version"] = "unknown-version"
+    elif malformation == "wrong_mode":
+        row["mode"] = "incremental"
+    else:
+        pytest.fail("unhandled malformed fixture")
+    with v2.begin() as conn:
+        for value in rows:
+            params = {**value, "inputs": json.dumps(value["inputs"]), "counts": json.dumps(value["counts"])}
+            conn.execute(text("INSERT INTO people_events_runs (run_id, mode, materializer_version, inputs, counts, "
+                              "status, started_at, finished_at, error) VALUES (:run_id, :mode, :version, "
+                              "CAST(:inputs AS jsonb), CAST(:counts AS jsonb), :status, :started, :finished, :error)"), params)
+    path = tmp_path / G.PROGRESS_NAME
+    for batch in range(len(rows)):
+        G.append_progress(path, {"run_id": f"{prefix}-b{batch:05d}", "status": "SUCCESS", "batch_rows": 50,
+                                 "rows_written": (batch + 1) * 50})
+    batches, count, digest = G.read_progress(path, prefix)
+    audit = B._run_audit(v2, prefix, source_hash)
+    assert audit["invalid"] > 0
+    if malformation == "offsetting_written":
+        assert audit["inserted"] == audit["written"] == 100 and audit["invalid"] == 2
+    with pytest.raises(RuntimeError, match="controller inspection"):
+        G.validate_resume(batches=batches, rows=count, database=audit, stored_rows=count,
+                          plan_counts={"unchanged": count}, total_rows=count, progress_digest=digest)
