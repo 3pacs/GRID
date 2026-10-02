@@ -102,7 +102,9 @@ def test_adapter_forwards_deadline_and_summary():
     def deadline():
         return True
     assert adapter.pull(deadline)["status"] == "PARTIAL"
-    adapter._puller.pull_all.assert_called_once_with(should_continue=deadline)
+    adapter._puller.pull_all.assert_called_once_with(
+        should_continue=deadline, capture_source="smart_scheduler",
+    )
 
 
 def test_registry_budget_can_cover_measured_universe():

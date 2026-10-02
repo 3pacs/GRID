@@ -241,7 +241,9 @@ class _OptionsSchedulerAdapter:
         self._puller = OptionsPuller(db_engine=db_engine)
 
     def pull(self, should_continue: Any = None) -> dict[str, Any]:
-        return self._puller.pull_all(should_continue=should_continue).summary
+        return self._puller.pull_all(
+            should_continue=should_continue, capture_source="smart_scheduler",
+        ).summary
 
 
 class _SECFTDSchedulerAdapter:
