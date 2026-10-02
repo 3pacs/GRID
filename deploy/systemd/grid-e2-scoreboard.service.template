@@ -9,7 +9,8 @@
 # point-in-time resolutions, scores and one snapshot to the append-only,
 # hash-chained ledger under BOARD_DIR, regenerates SCOREBOARD.md /
 # latest_snapshot.json (views, not anchors), and appends the new anchor lines
-# to the E2 witness file in the vault worktree given by --witness-worktree.
+# to the E2 witness file in the dedicated vault clone given by --witness-worktree,
+# then commits and pushes that folder (ExecStopPost).
 # It opens NO database connection: neither live stream needs one (both log
 # their own outcomes). No orders, no weights, no promotion.
 #
@@ -19,14 +20,17 @@
 #
 # Owner steps at activation (not done by this template):
 #   1. sudo mkdir -p /data/grid/evals/e2_scoreboard && sudo chown grid:grid /data/grid/evals/e2_scoreboard
-#   2. Confirm the witness clone. --witness-worktree below is the mirror-only
-#      vault clone the GEX paper-log mirror already uses
-#      (/home/grid/dev/obsidian-vault-paperlog, pushed to main of
-#      github.com/3pacs/obsidian-vault by obsidian-vault-sync.sh every 15 min).
-#      The job only appends lines to 05-GRID/Paper-Log/e2/e2_scoreboard_e2-v1.anchors.jsonl
-#      there; the sync script commits and pushes them. If the owner prefers a
-#      separate clone, change the flag; `python -m evals.e2 verify --board-dir ...
-#      --vault-repo <clone>` then checks the ledger against the pushed anchors.
+#   2. The witness clone /home/grid/dev/obsidian-vault-e2witness: a clone of
+#      github.com/3pacs/obsidian-vault (same remote and gh credential helper
+#      as grid-svr's other vault clones, LF only) that ONLY this job writes.
+#      Never point it at the GEX paper-log mirror's clone: that mirror refuses
+#      to run while its clone has changes outside its own folder.
+#      The job appends anchor lines to
+#      05-GRID/Paper-Log/e2/e2_scoreboard_e2-v1.anchors.jsonl there; ExecStopPost
+#      (scripts/e2_witness_sync.sh) commits only that folder and pushes it with
+#      obsidian-vault-sync.sh, after every run, failed or not. Then
+#      `python -m evals.e2 verify --board-dir ... --vault-repo <any clone>`
+#      checks the ledger against the pushed anchors.
 #   3. Optional hardening: run the job as a dedicated user that alone can write
 #      BOARD_DIR (the systemd-template invariant test requires User=grid here, so
 #      that is a deliberate deviation recorded in the activation note).
@@ -66,7 +70,10 @@ ExecStart=/usr/bin/flock -n /tmp/grid-e2-scoreboard.lock \
         --board-dir /data/grid/evals/e2_scoreboard \
         --s10-log-dir /data/grid/paper_log/hypothesis_forward_v1 \
         --gex-log-dir /data/grid/paper_log/gex_levels_v1 \
-        --witness-worktree /home/grid/dev/obsidian-vault-paperlog
+        --witness-worktree /home/grid/dev/obsidian-vault-e2witness
+# Commit (only 05-GRID/Paper-Log/e2/) and push the exported anchor lines.
+# ExecStopPost, not ExecStartPost: it also runs when the scoreboard run fails.
+ExecStopPost=/bin/bash /data/grid_v4/grid_release/scripts/e2_witness_sync.sh /home/grid/dev/obsidian-vault-e2witness
 
 TimeoutStartSec=10min
 TimeoutStopSec=60
