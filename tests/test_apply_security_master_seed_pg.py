@@ -16,6 +16,7 @@ Uses the shared ``pg_engine`` fixture (``GRID_TEST_DB_URL``); skips when no Post
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pandas as pd
@@ -208,3 +209,64 @@ def test_rollback_runs_when_people_events_exists_but_does_not_reference_the_seed
         conn.execute(text("INSERT INTO people_events (security_id) VALUES (NULL)"))
     _run_rollback(scratch)
     assert _count(scratch, "security_master") == 1
+
+
+# --- an interrupted apply, resumed, ends exactly where a clean apply ends ---------------------------------
+
+_STATE_SQL = {
+    "security_master": text("SELECT entity_id, cik, name, sic, source, provenance::text FROM security_master ORDER BY entity_id"),
+    "security_identifiers": text(
+        "SELECT entity_id, id_scheme, id_value, valid_from::text, valid_to::text, is_primary, source, conflict_flag, "
+        "COALESCE(conflict_detail::text, '') AS detail FROM security_identifiers "
+        "ORDER BY entity_id, id_scheme, id_value, valid_from"),
+}
+_WIPE_SQL = (text("DELETE FROM security_identifiers WHERE left(source, 15) = 'all_issuers_v1:'"),
+             text("DELETE FROM security_master WHERE source = 'all_issuers_v1'"))
+
+
+def _state(engine):
+    with engine.connect() as conn:
+        return {name: [tuple(r) for r in conn.execute(sql)] for name, sql in _STATE_SQL.items()}
+
+
+def _r1_artifact(tmp_path):
+    sub = pd.DataFrame(
+        [(f"a{y}", f"{y}-03-01", "100", "TKR") for y in range(2006, 2027)]
+        + [(f"b{m}{d}", f"2009-0{m}-1{d}", "200", "TKR") for m in (4, 5, 6) for d in range(0, 4)]
+        + [("c1", "2018-07-01", "300", "TKR")],
+        columns=["accession_number", "filing_date", "issuer_cik", "issuer_ticker"])
+    built = builder.build_rows(sub, {100: {"name": "Holder", "tickers": ["TKR"]}}, tickers_as_of="2026-09-27")
+    builder.write_artifact(built, tmp_path / "r1", inputs=[], params={}, code_sha="test")
+    return loader.load_seed(tmp_path / "r1", require_receipt=True)
+
+
+@pytest.mark.parametrize("incumbent", [False, True], ids=["empty_db", "incumbent_sm_tkr_row"])
+def test_an_interrupted_apply_resumed_ends_with_exactly_the_rows_of_a_clean_apply(scratch, tmp_path, incumbent):
+    seed = _r1_artifact(tmp_path)
+    if incumbent:  # the L2 shape: a Technology-seed row covering 2005-2007 under another entity
+        with scratch.begin() as conn:
+            conn.execute(text("INSERT INTO security_master (entity_id, name, source) VALUES ('sm_tkr_TKR', 'Tkr (tech seed)', 'sector_map')"))
+            conn.execute(text("INSERT INTO security_identifiers (entity_id, id_scheme, id_value, valid_from, valid_to, source) "
+                              "VALUES ('sm_tkr_TKR', 'ticker', 'TKR', '2005-01-01', '2007-12-31', 'sector_map')"))
+    existing, _ = _existing(scratch)
+    clean_plan = loader.plan_inserts(seed, existing)
+    assert clean_plan.violations == []
+    loader.apply_plan(scratch, clean_plan, batch_size=3, now=lambda: NOON)
+    clean = _state(scratch)
+    n_rows = len(clean_plan.si_inserts)
+    assert n_rows >= 8
+    for stop_after in sorted({0, 1, 2, 3, 4, 5, 7, n_rows // 2, n_rows - 1}):
+        with scratch.begin() as conn:
+            for sql in _WIPE_SQL:
+                conn.execute(sql)
+        # interrupted: every entity row and only the first `stop_after` identifier rows were written
+        loader.apply_plan(scratch, loader.Plan(sm_inserts=clean_plan.sm_inserts, si_inserts=clean_plan.si_inserts[:stop_after]),
+                          batch_size=3, now=lambda: NOON)
+        # resumed through the real run(): plan from what the table now holds, apply, verify
+        args = SimpleNamespace(seed_dir=tmp_path / "r1", apply=True, db_url="postgresql://u@h/db", db_url_env=None,
+                               expect_output_sha256=seed.sha256, batch_size=3, statement_timeout_ms=60000, lock_timeout_ms=5000,
+                               receipt=tmp_path / f"resume_{incumbent}_{stop_after}.json", allow_dirty=False)
+        rec = loader.run(args, now=lambda: NOON, engine_factory=lambda _u: scratch,
+                         code=lambda: {"git_head": "x", "dirty": False, "loader_file_sha256_lf": "0" * 64})
+        assert rec["status"] == "applied" and rec["after_primary_violations"] == [], (stop_after, rec["status"])
+        assert _state(scratch) == clean, f"stopped after {stop_after} identifier rows"

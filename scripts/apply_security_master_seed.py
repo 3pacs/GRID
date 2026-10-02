@@ -26,6 +26,12 @@ Takes the artifact written by ``scripts/build_security_master_all_issuers.py``
   ``conflict_flag`` true and ``is_primary`` false (the existing row keeps winning ties inside the overlap
   only), the rest of the window keeps the builder's flags. Every split is listed in the receipt as
   ``ticker_overlaps_for_review`` for review before an apply.
+* **Resume is supported.** An apply that stopped part-way (the window opened, a timeout, a crash) can simply be run
+  again: the plan treats only rows NOT sourced ``all_issuers_v1:...`` as incumbents, splits every ticker row against
+  those first and only then checks each piece's key, so the resumed run inserts exactly the pieces that are missing and
+  the final table equals a clean apply's. Before and after writing, ``primary_violations`` is run over the existing rows
+  plus the planned inserts; a new overlap segment without exactly one primary CIK refuses the apply (status
+  ``refused_primary_violations``) and is reported if it appears after one (``applied_primary_violations``).
 * A run writes a receipt (``--receipt``, default next to the artifact). It is written when the run starts
   and rewritten when it ends.
 
@@ -65,9 +71,11 @@ if _PROJECT_ROOT not in sys.path:
 from sqlalchemy import text  # noqa: E402
 
 from intelligence.people_events_pipeline.rules import normalize_ticker  # noqa: E402
+from scripts.build_security_master_all_issuers import primary_violations  # noqa: E402
 
 SEED_FILE = "security_master_seed.jsonl"
 ENTITY_SOURCE = "all_issuers_v1"
+SEEDED_SOURCE_PREFIX = "all_issuers_v1:"
 BLOCKED_START = time(3, 30)
 BLOCKED_END = time(10, 30)
 DEFAULT_BATCH = 2000
@@ -121,7 +129,7 @@ ON CONFLICT (entity_id, id_scheme, id_value, valid_from) DO NOTHING
 _SET_LOCAL = text("SELECT set_config(:k, :v, true)")
 _READ_ENTITIES = "SELECT entity_id, cik FROM security_master"
 _READ_IDENTIFIERS = (
-    "SELECT entity_id, id_scheme, id_value, valid_from, valid_to FROM security_identifiers "
+    "SELECT entity_id, id_scheme, id_value, valid_from, valid_to, source, is_primary FROM security_identifiers "
     "WHERE id_scheme IN ('cik', 'ticker')"
 )
 _COUNTS = {
@@ -186,7 +194,11 @@ class Existing:
     cik_to_entity: dict[int, str] = field(default_factory=dict)
     identifier_keys: set[tuple[str, str, str, str]] = field(default_factory=set)
     entity_cik_values: set[tuple[str, str]] = field(default_factory=set)
+    # Incumbents only: ticker rows that this artifact did NOT insert (``source`` not ``all_issuers_v1:...``). Rows a
+    # previous, interrupted run of the same artifact inserted are not incumbents, or a resume would demote them.
     tickers: dict[str, list[tuple[str, str, Optional[str]]]] = field(default_factory=lambda: defaultdict(list))
+    # Every ticker row (incumbent or seeded), as the dicts ``primary_violations`` reads.
+    ticker_rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _iso(d: Any) -> Optional[str]:
@@ -199,14 +211,19 @@ def build_existing(entity_rows: Iterable[tuple[Any, Any]], identifier_rows: Iter
         ex.entities.add(entity_id)
         if cik is not None:
             ex.cik_to_entity[int(cik)] = entity_id
-    for entity_id, scheme, value, vfrom, vto in identifier_rows:
+    for entity_id, scheme, value, vfrom, vto, *rest in identifier_rows:
+        source = rest[0] if rest else None
+        is_primary = True if len(rest) < 2 or rest[1] is None else bool(rest[1])
         ex.identifier_keys.add((entity_id, scheme, value, _iso(vfrom) or ""))
         if scheme == "cik":
             ex.entity_cik_values.add((entity_id, str(value)))
         elif scheme == "ticker":
             norm = normalize_ticker(value)
             if norm:
-                ex.tickers[norm].append((entity_id, _iso(vfrom) or "", _iso(vto)))
+                ex.ticker_rows.append({"entity_id": entity_id, "id_scheme": "ticker", "id_value": norm, "valid_from": _iso(vfrom) or "",
+                                       "valid_to": _iso(vto), "is_primary": is_primary})
+                if not str(source or "").startswith(SEEDED_SOURCE_PREFIX):
+                    ex.tickers[norm].append((entity_id, _iso(vfrom) or "", _iso(vto)))
     return ex
 
 
@@ -217,6 +234,8 @@ class Plan:
     skipped: Counter = field(default_factory=Counter)
     cik_collisions: list[dict[str, Any]] = field(default_factory=list)
     db_ticker_overlaps: list[dict[str, Any]] = field(default_factory=list)
+    violations: list[dict[str, Any]] = field(default_factory=list)  # new overlap segments without exactly one primary CIK
+    baseline_violations: list[dict[str, Any]] = field(default_factory=list)  # already in the database before this plan
 
     def summary(self) -> dict[str, Any]:
         return {
@@ -227,6 +246,8 @@ class Plan:
             "cik_collision_examples": self.cik_collisions[:20],
             "new_ticker_rows_overlapping_existing_other_entity": len(self.db_ticker_overlaps),
             "overlap_examples": self.db_ticker_overlaps[:20],  # the full list is the receipt's ``ticker_overlaps_for_review``
+            "primary_violations": len(self.violations),
+            "primary_violation_examples": self.violations[:20],
         }
 
 
@@ -263,17 +284,38 @@ def plan_inserts(seed: Seed, existing: Optional[Existing] = None) -> Plan:
         if eid not in new_entities and eid not in ex.entities:
             plan.skipped["security_identifiers:no_entity"] += 1
             continue
+        if row["id_scheme"] == "ticker":
+            # Split FIRST (against the incumbents only), then check each piece: a resumed run must find the pieces
+            # the interrupted run did not get to, and must not treat its own earlier pieces as incumbents.
+            pieces = _split_against_existing(row, ex)
+            fresh = [pc for pc in pieces if (eid, pc["id_scheme"], pc["id_value"], pc["valid_from"]) not in ex.identifier_keys]
+            plan.skipped["security_identifiers:exists"] += len(pieces) - len(fresh)
+            plan.si_inserts.extend(fresh)
+            demoted = [pc for pc in fresh if (pc["conflict_detail"] or {}).get("existing_db_entities")]
+            if demoted:
+                plan.db_ticker_overlaps.append({
+                    "entity_id": eid, "ticker": row["id_value"], "new_window": [row["valid_from"], row["valid_to"]],
+                    "demoted_segments": [[pc["valid_from"], pc["valid_to"], pc["conflict_detail"]["existing_db_entities"]] for pc in demoted],
+                })
+            continue
         if (eid, row["id_scheme"], row["id_value"], row["valid_from"]) in ex.identifier_keys:
             plan.skipped["security_identifiers:exists"] += 1
             continue
         if row["id_scheme"] == "cik" and (eid, row["id_value"]) in ex.entity_cik_values:
             plan.skipped["security_identifiers:cik_already_identified"] += 1
             continue
-        if row["id_scheme"] == "ticker":
-            plan.si_inserts.extend(_split_against_existing(row, ex, plan))
-            continue
         plan.si_inserts.append(row)
+    plan.baseline_violations = primary_violations(ex.ticker_rows)
+    planned = [{"entity_id": r["entity_id"], "id_scheme": "ticker", "id_value": normalize_ticker(r["id_value"]) or r["id_value"],
+                "valid_from": r["valid_from"], "valid_to": r["valid_to"], "is_primary": r["is_primary"]}
+               for r in plan.si_inserts if r["id_scheme"] == "ticker"]
+    known = {_violation_key(v) for v in plan.baseline_violations}
+    plan.violations = [v for v in primary_violations(ex.ticker_rows + planned) if _violation_key(v) not in known]
     return plan
+
+
+def _violation_key(v: dict[str, Any]) -> tuple[Any, ...]:
+    return (v["ticker"], v["from"], v["to"], v["kind"])
 
 
 def _next_day(iso: str) -> str:
@@ -284,14 +326,14 @@ def _prev_day(iso: str) -> str:
     return (date.fromisoformat(iso) - timedelta(days=1)).isoformat()
 
 
-def _split_against_existing(row: dict[str, Any], ex: Existing, plan: Plan) -> list[dict[str, Any]]:
+def _split_against_existing(row: dict[str, Any], ex: Existing) -> list[dict[str, Any]]:
     """Demote a new ticker row only where it overlaps ANOTHER entity's ticker row already in the database.
 
     The existing row keeps winning ties, but only inside the overlap: the new row is split at the overlap
     boundaries into pieces (a different ``valid_from`` per piece, so the unique key is unaffected), and the
     overlapping pieces get ``conflict_flag`` true and ``is_primary`` false. The part of the window that no
-    other entity holds keeps the builder's flags. Every split is listed in ``plan.db_ticker_overlaps``,
-    which the receipt carries in full as ``ticker_overlaps_for_review``.
+    other entity holds keeps the builder's flags. Pure, and a function of the artifact row and the incumbents
+    only (never of rows this artifact inserted earlier), so a resumed apply splits exactly as a clean one.
     """
     norm = normalize_ticker(row["id_value"])
     hits = []
@@ -321,11 +363,6 @@ def _split_against_existing(row: dict[str, Any], ex: Existing, plan: Plan) -> li
         cursor = None if end is None else _next_day(end)
     if cursor is not None and (row["valid_to"] is None or cursor <= row["valid_to"]):
         pieces.append({**row, "valid_from": cursor})
-    plan.db_ticker_overlaps.append({
-        "entity_id": row["entity_id"], "ticker": row["id_value"], "new_window": [row["valid_from"], row["valid_to"]],
-        "demoted_segments": [[p["valid_from"], p["valid_to"], p["conflict_detail"]["existing_db_entities"]]
-                             for p in pieces if (p["conflict_detail"] or {}).get("existing_db_entities")],
-    })
     return pieces
 
 
@@ -484,7 +521,15 @@ def run(
     try:
         existing, before = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
         plan = plan_inserts(seed, existing)
-        receipt.update(before_counts=before, plan=plan.summary(), ticker_overlaps_for_review=plan.db_ticker_overlaps)
+        receipt.update(before_counts=before, plan=plan.summary(), ticker_overlaps_for_review=plan.db_ticker_overlaps,
+                       primary_violations=plan.violations)
+        if plan.violations:
+            receipt.update(status="refused_primary_violations", finished_at=clock().isoformat(),
+                           error=f"the plan would leave {len(plan.violations)} overlap segments without exactly one primary CIK")
+            write_receipt(receipt_path, receipt)
+            if args.apply:
+                raise ValueError(receipt["error"])
+            return receipt
         if not args.apply:
             receipt["status"] = "dry_run_complete"
             write_receipt(receipt_path, receipt)
@@ -497,8 +542,13 @@ def run(
             on_progress=lambda p: receipt.update(inserted_so_far=p))
         receipt.update(status="applied", inserted=inserted)
         try:
-            _, after = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
+            after_state, after = read_existing(engine, statement_timeout_ms=args.statement_timeout_ms, now=clock())
             receipt["after_counts"] = after
+            known = {_violation_key(v) for v in plan.baseline_violations}
+            left = [v for v in primary_violations(after_state.ticker_rows) if _violation_key(v) not in known]
+            receipt["after_primary_violations"] = left
+            if left:
+                receipt["status"] = "applied_primary_violations"
         except WindowRefused:
             # Every batch had finished before the window opened: the run is complete, only the check read is skipped.
             receipt.update(after_counts=None, note="applied in full; the post-apply count was skipped because the "
@@ -507,7 +557,8 @@ def run(
     except WindowRefused as exc:
         receipt.update(status="stopped_backup_window", error=str(exc), finished_at=clock().isoformat())
     except Exception as exc:  # noqa: BLE001 - the receipt must record any failure before it propagates
-        receipt.update(status="failed", error=f"{type(exc).__name__}: {exc}", finished_at=clock().isoformat())
+        if receipt.get("status") != "refused_primary_violations":
+            receipt.update(status="failed", error=f"{type(exc).__name__}: {exc}", finished_at=clock().isoformat())
         write_receipt(receipt_path, receipt)
         raise
     finally:
@@ -540,6 +591,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         "mode", "status", "artifact", "target", "before_counts", "plan", "inserted", "after_counts", "receipt_path")},
         indent=2, sort_keys=True, default=str))
     print("rollback (not executed):\n" + ROLLBACK_SQL)
+    if receipt["status"] in ("refused_primary_violations", "applied_primary_violations"):
+        print("PRIMARY VIOLATIONS: " + json.dumps(receipt.get("primary_violations") or receipt.get("after_primary_violations"))[:2000], file=sys.stderr)
     return 0 if receipt["status"] in ("counted_artifact_only", "dry_run_complete", "applied") else 4
 
 

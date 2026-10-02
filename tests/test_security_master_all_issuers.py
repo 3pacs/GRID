@@ -691,8 +691,7 @@ def _ticker_row(entity, vf, vt, **kw):
 def test_a_new_row_is_split_into_before_overlap_after_when_an_existing_window_sits_inside_it():
     ex = loader.build_existing([("sm_old", None)], [("sm_old", "ticker", "MID", "2012-01-01", "2013-12-31"),
                                                     ("sm_old", "ticker", "MID", "2015-01-01", "2015-06-30")])
-    plan = loader.Plan()
-    pieces = loader._split_against_existing(_ticker_row("sm_new", "2010-01-01", "2020-12-31"), ex, plan)
+    pieces = loader._split_against_existing(_ticker_row("sm_new", "2010-01-01", "2020-12-31"), ex)
     assert [(p["valid_from"], p["valid_to"], p["is_primary"], p["conflict_flag"]) for p in pieces] == [
         ("2010-01-01", "2011-12-31", True, False), ("2012-01-01", "2013-12-31", False, True),
         ("2014-01-01", "2014-12-31", True, False), ("2015-01-01", "2015-06-30", False, True),
@@ -705,8 +704,7 @@ def test_a_new_row_with_no_overlap_or_overlapping_only_its_own_entity_is_untouch
     ex = loader.build_existing([("sm_old", None)], [("sm_old", "ticker", "MID", "2005-01-01", "2009-12-31"),
                                                     ("sm_new", "ticker", "MID", "2010-01-01", None)])
     row = _ticker_row("sm_new", "2010-06-01", None)
-    plan = loader.Plan()
-    assert loader._split_against_existing(row, ex, plan) == [row] and plan.db_ticker_overlaps == []
+    assert loader._split_against_existing(row, ex) == [row]
 
 
 def test_the_overlap_split_is_idempotent_against_the_database_after_an_apply(tmp_path):
@@ -1018,3 +1016,96 @@ def test_a_run_that_finished_before_the_window_is_labelled_applied_not_stopped(t
     rec = loader.run(_args(art, apply=True, db_url="postgresql://u@h/db"), now=lambda: next(clock), engine_factory=lambda _u: engine)
     assert rec["status"] == "applied" and rec["after_counts"] is None and "re-run the dry run after 10:30Z".lower() in rec["note"].lower()
     assert rec["inserted"]["security_master"] == len(built["security_master"])
+
+
+# --- loader: an interrupted apply can be resumed and ends exactly where a clean apply ends --------------
+
+
+def _r1_seed(tmp_path):
+    """The review's R1 fixture: holder 100 (company_tickers) loses 2009 to sub 200, stray 300 files once in 2018."""
+    rows = ([(f"a{y}", f"{y}-03-01", "100", "TKR") for y in range(2006, 2027)]
+            + [(f"b{m}{d}", f"2009-0{m}-1{d}", "200", "TKR") for m in (4, 5, 6) for d in range(0, 4)]
+            + [("c1", "2018-07-01", "300", "TKR")])
+    built = _build(rows, {100: {"name": "Holder", "tickers": ["TKR"]}})
+    _artifact(tmp_path, "r1", built)
+    return loader.load_seed(tmp_path / "r1", require_receipt=True)
+
+
+def _as_db(rows):
+    """Plan rows as the loader's SELECT returns them from the table: (entity, scheme, value, from, to, source, is_primary)."""
+    return [(r["entity_id"], r["id_scheme"], r["id_value"], r["valid_from"], r["valid_to"], r["source"], r["is_primary"]) for r in rows]
+
+
+def _final_state(rows):
+    return sorted((r["entity_id"], r["id_scheme"], r["id_value"], r["valid_from"], r["valid_to"], r["is_primary"], r["conflict_flag"],
+                   json.dumps(r["conflict_detail"], sort_keys=True)) for r in rows)
+
+
+INCUMBENTS = [
+    [],  # an empty database
+    [("sm_tkr_TKR", "ticker", "TKR", "2005-01-01", "2007-12-31", "sector_map", True)],  # the review's L2 repro: a Technology-seed row
+    [("sm_tkr_TKR", "ticker", "TKR", "2009-01-01", None, "sector_map", True)],          # an incumbent over the sub's winning 2009 piece
+]
+
+
+@pytest.mark.parametrize("incumbent_rows", INCUMBENTS, ids=["empty_db", "incumbent_2005_2007", "incumbent_open_from_2009"])
+def test_resuming_an_interrupted_apply_ends_exactly_where_a_clean_apply_ends(tmp_path, incumbent_rows):
+    seed = _r1_seed(tmp_path)
+    incumbent_entities = [("sm_tkr_TKR", None)] if incumbent_rows else []
+    clean = loader.plan_inserts(seed, loader.build_existing(incumbent_entities, incumbent_rows))
+    assert clean.violations == []
+    want = _final_state(clean.si_inserts)
+    entities = [(r["entity_id"], r["cik"]) for r in seed.security_master]
+    for done_n in range(len(clean.si_inserts) + 1):  # every possible stopping point
+        done = clean.si_inserts[:done_n]
+        existing = loader.build_existing(incumbent_entities + entities, incumbent_rows + _as_db(done))
+        resumed = loader.plan_inserts(seed, existing)
+        assert resumed.violations == [], f"stopped after {done_n}: {resumed.violations}"
+        got = _final_state(done + resumed.si_inserts)
+        assert got == want, f"stopped after {done_n} identifier rows"
+        keys = [(r[0], r[1], r[2], r[3]) for r in got]
+        assert len(keys) == len(set(keys))
+    # ... and a stop while still inserting entities
+    for k in (0, 1, len(entities) - 1):
+        existing = loader.build_existing(incumbent_entities + entities[:k], incumbent_rows)
+        resumed = loader.plan_inserts(seed, existing)
+        assert [r["entity_id"] for r in resumed.sm_inserts] == [e for e, _ in entities[k:]]
+        assert _final_state(resumed.si_inserts) == want
+
+
+def test_rows_inserted_by_an_earlier_run_of_the_same_artifact_are_not_incumbents(tmp_path):
+    seed = _r1_seed(tmp_path)
+    clean = loader.plan_inserts(seed, loader.Existing())
+    winner = next(r for r in clean.si_inserts if r["entity_id"] == "sm_0000000200" and r["id_scheme"] == "ticker" and r["is_primary"])
+    entities = [(r["entity_id"], r["cik"]) for r in seed.security_master]
+    resumed_ex = loader.build_existing(entities, _as_db([winner]))
+    assert all(eid != "sm_0000000200" for rows in resumed_ex.tickers.values() for eid, _, _ in rows)  # not an incumbent
+    assert len(resumed_ex.ticker_rows) == 1                                                            # but still a row for the invariant
+    # Read from a table where the source column is absent (an old five-column tuple) the row IS an incumbent: the safe default.
+    legacy = loader.build_existing(entities, [(winner["entity_id"], "ticker", "TKR", winner["valid_from"], winner["valid_to"])])
+    assert any(eid == "sm_0000000200" for rows in legacy.tickers.values() for eid, _, _ in rows)
+
+
+def test_a_plan_that_would_leave_an_overlap_without_exactly_one_primary_refuses_to_apply(tmp_path, monkeypatch):
+    def row(entity, vf, vt, primary):
+        return {"entity_id": entity, "id_scheme": "ticker", "id_value": "BAD", "valid_from": vf, "valid_to": vt, "is_primary": primary,
+                "source": "all_issuers_v1:sec_form345", "conflict_flag": False, "conflict_detail": None}
+
+    sm = lambda cik: {"entity_id": f"sm_{cik:010d}", "cik": cik, "name": "x", "security_type": "equity", "is_active": True,   # noqa: E731
+                      "delisted_at": None, "delisted_reason": None, "delisted_basis": None, "sic": None, "source": "all_issuers_v1",
+                      "provenance": {}}
+    seed = loader.Seed([sm(1), sm(2)], [row("sm_0000000001", "2010-01-01", None, True), row("sm_0000000002", "2012-01-01", None, True)], "x",
+                       {"output": {"sha256": "x"}})
+    plan = loader.plan_inserts(seed, loader.Existing())
+    assert [v["kind"] for v in plan.violations] == ["two_primaries"]
+    art, _ = _written_artifact(tmp_path)
+    monkeypatch.setattr(loader, "load_seed", lambda *_a, **_k: seed)
+    monkeypatch.setattr(loader, "read_existing", lambda *_a, **_k: (loader.Existing(), {"security_master": 0, "security_identifiers": 0}))
+    engine = _FakeEngine()
+    with pytest.raises(ValueError, match="without exactly one primary"):
+        loader.run(_args(art, apply=True, db_url="postgresql://u@h/db"), now=lambda: _utc(12), engine_factory=lambda _u: engine)
+    assert not [s for s, _ in engine.log if "INSERT" in s]  # nothing was written
+    rec = json.loads(next(art.glob("apply_receipt_*.json")).read_text(encoding="utf-8"))
+    assert rec["status"] == "refused_primary_violations" and rec["primary_violations"]
+    dry = loader.run(_args(art, db_url="postgresql://u@h/db"), now=lambda: _utc(12), engine_factory=lambda _u: _FakeEngine())
+    assert dry["status"] == "refused_primary_violations"
