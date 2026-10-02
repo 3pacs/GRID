@@ -1,0 +1,58 @@
+# CODEOWNERS for 3pacs/GRID
+#
+# Reconciles two 2026-10-01 build briefs (wha/outputs/slices-20261001/):
+#   - OPS-BP-branch-protection.md        (repo-level ruleset + CODEOWNERS)
+#   - EVAL-E0H3-codeowners-ruleset-guide.md (evals/PIT/holdout judge protection)
+#
+# Every path below resolves to @3pacs because every PR in this repo is
+# authored and merged by the 3pacs account today (agents run `gh`/`git push`
+# as the owner). See GRID-BRANCH-PROTECTION-GUIDE-20261001.md for what that
+# means for "require review from Code Owners" and why it does not yet block
+# the owner's own agent PRs.
+#
+# GitHub CODEOWNERS uses last-match-wins: the LAST pattern in this file that
+# matches a path decides its owner(s). Keep broad directory rules above the
+# narrower rules nested inside them within each section, and never add a
+# trailing catch-all (`* @someone`) below these without re-checking that it
+# does not blank out a narrower rule above it (tests/test_codeowners.py
+# checks this invariant for the patterns below).
+#
+# Paths re-verified against origin/main (cdf1b7f7, 2026-10-01) before this
+# file was written; EVAL-E0H3's own draft listed several paths (docs/evals/,
+# engine/) that do not exist yet on main. Non-existent paths are dropped
+# here rather than listed speculatively, except /engine/ which EVAL-E0H3
+# explicitly flagged as a deliberate future reservation for the E4 proposer
+# work; add /docs/evals/ back here the day that directory is created.
+
+# --- CI / repo configuration ---
+/.github/                                  @3pacs
+
+# --- Evals, scoring, pre-registration, PIT/holdout judge (frozen surfaces) ---
+/evals/                                    @3pacs
+/tests/test_e0_*                           @3pacs
+/tests/test_evals_*                        @3pacs
+/tests/test_codeowners.py                  @3pacs
+/docs/paper_log/                           @3pacs
+/paper_log/                                @3pacs
+/store/pit.py                              @3pacs
+/store/observations.py                     @3pacs
+
+# --- Research-loop integrity: ledgers, forward logs, admission probes ---
+/analysis/offline_research_proof.py        @3pacs
+/analysis/ledger_steered_exploration.py    @3pacs
+/analysis/research_forward_log.py          @3pacs
+/analysis/research_real_panel.py           @3pacs
+/analysis/panel_insider_density*.py        @3pacs
+/analysis/price_admission_*.py             @3pacs
+/scripts/research_forward_log.py           @3pacs
+/scripts/run_vs1_*                         @3pacs
+
+# --- Production surfaces: deploy, migrations, trading, payments ---
+/deploy/                                   @3pacs
+/migrations/                               @3pacs
+/trading/                                  @3pacs
+/payments/                                 @3pacs
+
+# --- Future (not created yet on main; keep ready so protection is live
+#     from the first commit under the path, per EVAL-E0H3 E4 note) ---
+/engine/                                   @3pacs
