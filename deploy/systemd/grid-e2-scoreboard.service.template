@@ -76,7 +76,8 @@ ExecStart=/usr/bin/flock -n /tmp/grid-e2-scoreboard.lock \
 ExecStopPost=/bin/bash /data/grid_v4/grid_release/scripts/e2_witness_sync.sh /home/grid/dev/obsidian-vault-e2witness
 
 TimeoutStartSec=10min
-TimeoutStopSec=60
+# ExecStopPost (witness commit + push) counts against TimeoutStopSec.
+TimeoutStopSec=5min
 Nice=10
 
 StandardOutput=journal

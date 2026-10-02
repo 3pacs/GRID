@@ -730,6 +730,24 @@ jobs:
             exit 1
           fi
 
+      # E2 witness sync (scripts/e2_witness_sync.sh): commits only the E2
+      # anchor folder of its dedicated vault clone, refuses anything but a
+      # pure append, never the GEX mirror's clone. The general run above
+      # cannot show a skip (bash/git/flock missing), so this reruns the
+      # file on its own and fails if any test skipped.
+      - name: E2 witness sync contract
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_witness_sync.py -q -rA | tee /tmp/grid-e2-witness-sync.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-witness-sync.txt; then
+            echo "::error::E2 witness sync contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."

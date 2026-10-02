@@ -8,8 +8,12 @@
   that clone (so anchors are pushed after failed runs too).
 * The script, exercised against a throwaway origin with a stub sync script:
   commits ONLY ``05-GRID/Paper-Log/e2/`` (plus its ``*.jsonl -text``
-  attributes), pushes, refuses a clone with changes elsewhere, refuses the
-  paperlog clone by name, and makes no empty commits.
+  attributes) and pushes; the pushed history passes the real
+  ``evals.e2.witness.check_offhost``; it refuses (commits and pushes nothing)
+  a clone with changes elsewhere, a partial last line, an edited or deleted
+  anchor file, an unexpected file, a rename out of the folder, the paperlog
+  clone, a clone off main, and a held scoreboard lock; a push that does not
+  land fails loudly; no empty commits.
 """
 
 from __future__ import annotations
@@ -69,7 +73,7 @@ def test_service_witnesses_into_the_dedicated_clone_and_syncs_after_every_run():
 
 
 def _tools() -> str | None:
-    for tool in ("bash", "git", "flock"):
+    for tool in ("bash", "git", "flock", "cmp", "od", "realpath"):
         if shutil.which(tool) is None:
             return tool
     return None
@@ -79,71 +83,155 @@ def _git(cwd: Path, *args: str) -> str:
     return subprocess.run(["git", "-C", str(cwd), *args], check=True, capture_output=True, text=True).stdout
 
 
+ANCHORS = f"{FOLDER}/e2_scoreboard_e2-v1.anchors.jsonl"
+LINE1 = b'{"head_sha256":"a","prev_anchor_sha256":null,"records":1,"run_at":"t1"}\n'
+LINE2 = b'{"head_sha256":"b","prev_anchor_sha256":"x","records":2,"run_at":"t2"}\n'
+
+
+class Witness:
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp = tmp_path
+        self.origin = tmp_path / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True)
+        seed = tmp_path / "seed"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(seed)], check=True, capture_output=True)
+        _git(seed, "config", "user.name", "t")
+        _git(seed, "config", "user.email", "t@t")
+        _git(seed, "checkout", "-q", "-b", "main")
+        (seed / "README.md").write_text("vault\n", encoding="utf-8")
+        _git(seed, "add", "-A")
+        _git(seed, "commit", "-q", "-m", "seed")
+        _git(seed, "push", "-q", "origin", "main")
+        self.clone = tmp_path / "obsidian-vault-e2witness"
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.clone)], check=True, capture_output=True)
+        _git(self.clone, "config", "user.name", "e2")
+        _git(self.clone, "config", "user.email", "e2@t")
+        self.good_sync = self._stub("sync.sh", b"git fetch -q origin main\ngit merge -q --ff-only origin/main\n"
+                                              b"git push -q origin main\n")
+        self.dead_sync = self._stub("dead-sync.sh", b"exit 0\n")
+        self.lock = tmp_path / "scoreboard.lock"
+        self.paperlog = tmp_path / "obsidian-vault-paperlog"
+
+    def _stub(self, name: str, body: bytes) -> Path:
+        stub = self.tmp / name
+        stub.write_bytes(b'#!/usr/bin/env bash\nset -e\ncd "$1"\n' + body)
+        stub.chmod(0o755)
+        return stub
+
+    def run(self, path: Path | None = None, sync: Path | None = None) -> subprocess.CompletedProcess:
+        env = {**os.environ, "E2_VAULT_SYNC": str(sync or self.good_sync), "E2_WITNESS_LOCK_WAIT_S": "2",
+               "E2_SCOREBOARD_LOCK": str(self.lock), "E2_PAPERLOG_CLONE": str(self.paperlog)}
+        return subprocess.run(["bash", str(SCRIPT), str(path or self.clone)], env=env, capture_output=True,
+                              text=True)
+
+    def write(self, data: bytes) -> None:
+        (self.clone / FOLDER).mkdir(parents=True, exist_ok=True)
+        (self.clone / ANCHORS).write_bytes(data)
+
+    def origin_head(self) -> str:
+        return _git(self.origin, "rev-parse", "main")
+
+
 @pytest.fixture
-def witness(tmp_path):
+def w(tmp_path):
     missing = _tools()
     if missing:
         pytest.skip(f"{missing} is not available")
-    origin = tmp_path / "origin.git"
-    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
-    seed = tmp_path / "seed"
-    subprocess.run(["git", "clone", "-q", str(origin), str(seed)], check=True, capture_output=True)
-    for repo in (seed,):
-        _git(repo, "config", "user.name", "t")
-        _git(repo, "config", "user.email", "t@t")
-        _git(repo, "checkout", "-q", "-b", "main")
-    (seed / "README.md").write_text("vault\n", encoding="utf-8")
-    _git(seed, "add", "-A")
-    _git(seed, "commit", "-q", "-m", "seed")
-    _git(seed, "push", "-q", "origin", "main")
-    clone = tmp_path / "obsidian-vault-e2witness"
-    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True, capture_output=True)
-    _git(clone, "config", "user.name", "e2")
-    _git(clone, "config", "user.email", "e2@t")
-    stub = tmp_path / "sync.sh"
-    stub.write_bytes(b'#!/usr/bin/env bash\nset -e\ncd "$1"\ngit fetch -q origin main\n'
-                     b'git merge -q --ff-only origin/main\ngit push -q origin main\n')
-    stub.chmod(0o755)
-    env = {**os.environ, "E2_VAULT_SYNC": str(stub), "E2_WITNESS_LOCK_WAIT_S": "5"}
-
-    def run(path: Path = clone) -> subprocess.CompletedProcess:
-        return subprocess.run(["bash", str(SCRIPT), str(path)], env=env, capture_output=True, text=True)
-
-    return origin, clone, run
+    return Witness(tmp_path)
 
 
-def test_commits_and_pushes_only_the_e2_folder(witness):
-    origin, clone, run = witness
-    (clone / FOLDER).mkdir(parents=True)
-    (clone / FOLDER / "e2_scoreboard_e2-v1.anchors.jsonl").write_bytes(b'{"records":1}\n')
-    result = run()
+def test_commits_and_pushes_only_the_e2_folder_and_check_offhost_accepts_it(w):
+    from evals.e2 import witness
+
+    w.write(LINE1)
+    result = w.run()
     assert result.returncode == 0, result.stdout + result.stderr
-    changed = _git(origin, "show", "--name-only", "--format=", "main").split()
-    assert sorted(changed) == [f"{FOLDER}/.gitattributes", f"{FOLDER}/e2_scoreboard_e2-v1.anchors.jsonl"]
-    assert _git(origin, "show", f"main:{FOLDER}/.gitattributes") == "*.jsonl -text\n"
+    changed = _git(w.origin, "show", "--name-only", "--format=", "main").split()
+    assert sorted(changed) == [f"{FOLDER}/.gitattributes", ANCHORS]
+    assert _git(w.origin, "show", f"main:{FOLDER}/.gitattributes") == "*.jsonl -text\n"
     assert "pushed" in result.stdout
-    before = _git(origin, "rev-parse", "main")
-    again = run()
+    before = w.origin_head()
+    again = w.run()
     assert again.returncode == 0 and "no new anchor lines" in again.stdout
-    assert _git(origin, "rev-parse", "main") == before  # no empty commit
+    assert w.origin_head() == before  # no empty commit
+    w.write(LINE1 + LINE2)
+    assert w.run().returncode == 0
+    offhost = witness.check_offhost(w.clone, "e2-v1", remote_url=str(w.origin))
+    assert [v["covered_records"] for v in offhost["versions"]] == [1, 2]
+    assert offhost["content"] == LINE1 + LINE2
 
 
-def test_refuses_a_clone_with_changes_outside_the_folder(witness):
-    origin, clone, run = witness
-    before = _git(origin, "rev-parse", "main")
-    (clone / FOLDER).mkdir(parents=True)
-    (clone / FOLDER / "e2_scoreboard_e2-v1.anchors.jsonl").write_bytes(b'{"records":1}\n')
-    (clone / "70-Inbox").mkdir()
-    (clone / "70-Inbox" / "stray.md").write_text("x\n", encoding="utf-8")
-    result = run()
+@pytest.mark.parametrize("case", ["partial_line", "edited", "deleted", "unexpected_file"])
+def test_refuses_anything_but_a_pure_append(w, case):
+    w.write(LINE1)
+    assert w.run().returncode == 0
+    before = w.origin_head()
+    if case == "partial_line":
+        w.write(LINE1 + LINE2[:-10])
+    elif case == "edited":
+        w.write(LINE2 + LINE1)
+    elif case == "deleted":
+        (w.clone / ANCHORS).unlink()
+    else:
+        w.write(LINE1 + LINE2)
+        (w.clone / FOLDER / "notes.md").write_text("x\n", encoding="utf-8")
+    result = w.run()
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "not a pure append" in result.stdout
+    assert w.origin_head() == before
+    assert len(_git(w.clone, "log", "--format=%H").split()) == 2  # seed + the first anchors commit
+
+
+def test_refuses_a_clone_with_changes_outside_the_folder(w):
+    before = w.origin_head()
+    w.write(LINE1)
+    (w.clone / "70-Inbox").mkdir()
+    (w.clone / "70-Inbox" / "stray.md").write_text("x\n", encoding="utf-8")
+    result = w.run()
     assert result.returncode == 3 and "outside" in result.stdout
-    assert _git(origin, "rev-parse", "main") == before
-    assert _git(clone, "log", "-1", "--format=%s") == "seed\n"
+    assert w.origin_head() == before
+    assert _git(w.clone, "log", "-1", "--format=%s") == "seed\n"
 
 
-def test_refuses_the_gex_paperlog_clone(witness, tmp_path):
-    _, clone, run = witness
-    paperlog = tmp_path / "obsidian-vault-paperlog"
-    clone.rename(paperlog)
-    result = run(paperlog)
+def test_refuses_a_rename_out_of_the_folder(w):
+    w.write(LINE1)
+    assert w.run().returncode == 0
+    before = w.origin_head()
+    _git(w.clone, "mv", ANCHORS, "moved.jsonl")
+    result = w.run()
+    assert result.returncode == 3, result.stdout
+    assert w.origin_head() == before
+
+
+def test_refuses_the_gex_paperlog_clone_and_a_clone_off_main(w):
+    w.clone.rename(w.paperlog)
+    result = w.run(w.paperlog)
     assert result.returncode == 2 and "paper-log mirror" in result.stdout
+    w.paperlog.rename(w.clone)
+    _git(w.clone, "checkout", "-q", "-b", "side")
+    result = w.run()
+    assert result.returncode == 2 and "not on main" in result.stdout
+
+
+def test_waits_for_a_running_scoreboard_and_commits_nothing(w):
+    import fcntl
+
+    w.write(LINE1)
+    before = w.origin_head()
+    with open(w.lock, "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        result = w.run()
+    assert result.returncode == 0 and "holds" in result.stdout
+    assert w.origin_head() == before
+    assert _git(w.clone, "log", "-1", "--format=%s") == "seed\n"
+
+
+def test_no_folder_yet_is_a_no_op(w):
+    result = w.run()
+    assert result.returncode == 0 and "no 05-GRID/Paper-Log/e2 yet" in result.stdout
+
+
+def test_a_push_that_never_lands_fails_loudly(w):
+    w.write(LINE1)
+    result = w.run(sync=w.dead_sync)
+    assert result.returncode == 5 and "not on origin/main" in result.stdout
