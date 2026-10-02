@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import json
 from datetime import date
+from unittest.mock import MagicMock
+
+import pytest
 
 
 class _FakeResult:
@@ -274,3 +277,27 @@ def test_clean_zero_row_run_is_logged_but_not_fresh(monkeypatch):
     assert log_row["error_message"].startswith("NO_NEW_DATA:")
     assert engine.touched_source_ids == []
     assert json.loads(engine.events[0]["payload"])["status"] == "NO_NEW_DATA"
+
+
+@pytest.mark.parametrize("start_date", ["2026-10-02", date(2026, 10, 1)])
+def test_equity_fred_keeps_incremental_overlap(monkeypatch, start_date):
+    """The equity date floor must not erase FRED's revision overlap."""
+    import db
+    import ingestion.fred as fred
+    import ingestion.scheduler as sched
+
+    class StopAfterFred(BaseException):
+        """Stop before the unrelated equity providers can run."""
+
+    # Run the real FRED incremental logic without its API/DB constructor.
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller._get_latest_date = MagicMock(return_value=date(2026, 10, 1))
+    puller.pull_series = MagicMock(side_effect=StopAfterFred)
+    monkeypatch.setattr(fred, "FRED_SERIES_LIST", ["DFF"])
+    monkeypatch.setattr(fred, "FREDPuller", lambda **_kwargs: puller)
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+
+    with pytest.raises(StopAfterFred):
+        sched._run_equity_pulls(start_date=start_date)
+
+    puller.pull_series.assert_called_once_with("DFF", "2026-09-24", None)

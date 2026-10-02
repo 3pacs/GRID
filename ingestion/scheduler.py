@@ -1590,7 +1590,9 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         fred = FREDPuller(api_key=settings.FRED_API_KEY, db_engine=engine)
-        results = fred.pull_all(start_date=start_date)
+        # Keep FRED's per-series seven-day revision overlap; the equity date
+        # floor would otherwise discard recent observations and revisions.
+        results = fred.pull_all()
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
