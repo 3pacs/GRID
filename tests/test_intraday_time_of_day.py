@@ -118,3 +118,9 @@ def test_nonfinite_baseline_cannot_become_zero_activity():
         row["value"] = 1e308
     result = normalize_activity(packet, "volume", min_sessions=2, max_sessions=2)
     assert result["status"] == "unavailable"
+
+
+def test_malformed_packets_fail_closed():
+    for packet in (None, [], {}, {"sessions": [None], "observations": []},
+                   {"sessions": [], "observations": ["bad"]}):
+        assert normalize_activity(packet, "volume")["status"] == "unavailable"

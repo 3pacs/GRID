@@ -23,7 +23,13 @@ def normalize_activity(packet, metric, *, bucket_seconds=300, min_sessions=20, m
     available_at, clock, status, bucket_start_at, bucket_end_at}]. event_at is
     bucket_end_at. Daily sample count is at most one; duplicates fail closed.
     """
-    unavailable = lambda reason: {"status": "unavailable", "value": None, "reason": reason}
+    def unavailable(reason):
+        return {"status": "unavailable", "value": None, "reason": reason}
+
+    if (not isinstance(packet, dict) or not isinstance(packet.get("sessions"), list)
+            or not isinstance(packet.get("observations"), list)
+            or any(not isinstance(row, dict) for row in packet["sessions"] + packet["observations"])):
+        return unavailable("invalid packet shape")
     if (not _number(packet.get("decision_at")) or not packet.get("session")
             or isinstance(bucket_seconds, bool) or not isinstance(bucket_seconds, int)
             or bucket_seconds <= 0 or not isinstance(metric, str) or not metric
@@ -34,10 +40,10 @@ def normalize_activity(packet, metric, *, bucket_seconds=300, min_sessions=20, m
     calendars = {}
     for row in packet.get("sessions", []):
         key, opening, closing = row.get("session"), row.get("open_at"), row.get("close_at")
-        if not key or key in calendars or not _number(opening) or not _number(closing) or closing <= opening:
+        if not isinstance(key, str) or not key or key in calendars or not _number(opening) or not _number(closing) or closing <= opening:
             return unavailable("invalid or duplicate calendar session")
         calendars[key] = (opening, closing)
-    if packet["session"] not in calendars:
+    if not isinstance(packet["session"], str) or packet["session"] not in calendars:
         return unavailable("missing current exchange session")
     opening, closing = calendars[packet["session"]]
     if not opening + bucket_seconds <= decision <= closing:
@@ -46,7 +52,7 @@ def normalize_activity(packet, metric, *, bucket_seconds=300, min_sessions=20, m
                  int((closing - opening) // bucket_seconds) - 1)
     accepted = []
     for row in packet.get("observations", []):
-        if row.get("metric") != metric or row.get("session") not in calendars:
+        if row.get("metric") != metric or not isinstance(row.get("session"), str) or row.get("session") not in calendars:
             continue
         row_open, row_close = calendars[row["session"]]
         start = row_open + bucket * bucket_seconds
@@ -55,7 +61,8 @@ def normalize_activity(packet, metric, *, bucket_seconds=300, min_sessions=20, m
             continue
         event, receipt, value = row.get("event_at"), row.get("available_at"), row.get("value")
         if (row.get("status") == "available" and row.get("clock") == "trusted_receipt"
-                and row.get("source_id") and row.get("instrument") and _number(value) and value >= 0
+                and isinstance(row.get("source_id"), str) and row["source_id"]
+                and isinstance(row.get("instrument"), str) and row["instrument"] and _number(value) and value >= 0
                 and _number(event) and _number(receipt) and event == end <= receipt <= decision
                 and (row["session"] == packet["session"] or row_close <= opening)):
             accepted.append(row)
