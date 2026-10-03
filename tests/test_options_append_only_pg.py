@@ -163,6 +163,19 @@ def _capture(engine: Engine, monkeypatch, started: datetime, oi: dict[float, int
     puller = options.OptionsPuller.__new__(options.OptionsPuller)
     puller.engine = engine
     puller._ensure_tables()
+    # The original append-only migration is still tested unchanged. The new
+    # writer additionally needs the reviewed preparation/publication contract.
+    # Empty support tables suffice here because resolved writing is mocked;
+    # the new bounded PG contract separately executes the real resolved writer.
+    with engine.begin() as conn:
+        if conn.execute(text("SELECT to_regclass('options_capture_batches_all')")).scalar() is None:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS source_catalog (id integer);
+                CREATE TABLE IF NOT EXISTS feature_registry (id integer);
+                CREATE TABLE IF NOT EXISTS resolved_series (id integer);
+            """))
+            conn.execute(text((Path(__file__).resolve().parents[1] /
+                "docs/handoffs/2026-10-02/options-bounded-publication.sql").read_text()))
     puller._yahoo = _Yahoo(oi, started - timedelta(minutes=1))
     puller._push_to_resolved = lambda *_a, **_k: 0
     event.listen(engine, "before_cursor_execute", fixed_clock, retval=True)
@@ -243,7 +256,7 @@ def test_two_same_day_batches_survive_and_default_readers_see_latest(two_batches
     "DELETE FROM options_snapshots WHERE ticker = 'SPY'",
     "UPDATE options_capture_batches SET row_count = 1",
     "DELETE FROM options_capture_batches",
-    "TRUNCATE options_capture_batches CASCADE",
+    "TRUNCATE options_capture_batches_all CASCADE",
 ])
 def test_mutation_is_refused(two_batches, statement: str) -> None:
     engine = two_batches[0]
@@ -266,6 +279,13 @@ def test_rows_without_registered_batch_are_refused(two_batches) -> None:
                 "capture_batch_id, capture_ordinal, capture_started_at, capture_completed_at, "
                 "provider_regular_market_at) VALUES ('SPY', '2026-09-25', '2026-10-16', 'call', "
                 "1.0, 'unregistered', 99999999, now(), now(), now())")
+
+
+def test_public_registration_view_cannot_be_truncated(two_batches) -> None:
+    engine = two_batches[0]
+    with pytest.raises(DBAPIError, match="is not a table"):
+        with engine.begin() as conn:
+            conn.exec_driver_sql("TRUNCATE options_capture_batches CASCADE")
 
 
 def test_frozen_v1_readers_see_exactly_one_batch(two_batches) -> None:
