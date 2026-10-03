@@ -15,10 +15,13 @@ Nothing here deletes anything.
 from __future__ import annotations
 
 import os
+import json
+import stat
+import sys
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, TextIO
+from typing import Any, Callable, BinaryIO, Iterator, TextIO
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -152,6 +155,174 @@ def audit_context(path: Path, *, acknowledged_rows: Callable[[], int]) -> Iterat
             raise exc from body_error
         raise
 
+
+
+def validate_output_paths(out: Path | None, audit: Path | None, revert: Path | None) -> None:
+    """Refuse existing destinations and aliases before acquiring a database."""
+    protected = [p for p in (revert, transition_marker_path()) if p is not None]
+    destinations = [p for p in (out, audit) if p is not None]
+    for i, path in enumerate(destinations):
+        if os.path.lexists(path):
+            raise ValueError(f"refusing to overwrite {path}")
+        normalized = os.path.normcase(str(path.expanduser().resolve()))
+        for other in destinations[i + 1:] + protected:
+            if normalized == os.path.normcase(str(other.expanduser().resolve())):
+                raise ValueError("report, new audit, revert input and transition marker must have distinct paths")
+
+
+class ReportFile:
+    """Reserve a new output before DB access; publish only to its pinned handle.
+
+    Never unlink/replace any path. An empty or partial failed report remains
+    diagnostic evidence, and grants no authority to resume or replay DATA.
+    """
+
+    def __init__(self, path: Path):
+        self.path = path.expanduser().absolute()
+        self.stream: BinaryIO | None = None
+        self.identity: tuple[int, int] | None = None
+        self.parent_identity: tuple[int, int] | None = None
+
+    @staticmethod
+    def identity_of(status: os.stat_result) -> tuple[int, int]:
+        return status.st_dev, status.st_ino
+
+    def reserve(self) -> None:
+        self.parent_identity = self.identity_of(self.path.parent.stat())
+        self.stream = self.path.open("xb", buffering=0)
+        self.identity = self.identity_of(os.fstat(self.stream.fileno()))
+        self.check_identity()
+
+    def check_identity(self) -> None:
+        assert self.stream is not None
+        status = os.fstat(self.stream.fileno())
+        named = self.path.lstat()
+        if (self.identity_of(status) != self.identity or self.identity_of(named) != self.identity
+                or self.identity_of(self.path.parent.stat()) != self.parent_identity
+                or not stat.S_ISREG(named.st_mode) or status.st_nlink != 1 or status.st_size != 0):
+            raise OSError("reserved report identity/scope changed; refusing publication")
+
+    def publish(self, rendered: str) -> None:
+        assert self.stream is not None
+        self.check_identity()
+        encoded = rendered.encode("utf-8")
+        if self.stream.write(encoded) != len(encoded):
+            raise OSError("partial report write; publication failed")
+        self.stream.flush()
+        os.fsync(self.stream.fileno())
+
+    def close(self) -> None:
+        stream, self.stream = self.stream, None
+        if stream is not None:
+            stream.close()
+
+
+def finalize_cli(
+    engine_factory: Callable[[], Engine], operation: Callable[[Engine], dict[str, Any]], *, out: Path | None,
+) -> int:
+    """Preserve actual body resolution through once-only cleanup and reporting.
+
+    Only the body or its returned result supplies resolution. Secondary errors
+    cannot forge an ACK prefix, clear uncertainty, or replace the original cause.
+    Failed I/O is never retried; stderr and stdout are distinct bounded channels.
+    """
+    engine = None
+    output = ReportFile(out) if out is not None else None
+    error: Exception | None = None
+    phase = "reserve_output"
+    failed_phase = None
+    acknowledged = 0
+    uncertain = False
+    resolution_cause = None
+    completed = False
+    secondary: list[tuple[str, Exception]] = []
+    stdout_failed = False
+
+    def failure(exc: Exception, where: str) -> None:
+        nonlocal error, failed_phase
+        if error is None:
+            error, failed_phase = exc, where
+        else:
+            secondary.append((where, exc))
+
+    try:
+        if output is not None:
+            output.reserve()
+        phase = "acquire_database"
+        engine = engine_factory()
+        phase = "resolve"
+        report = operation(engine)
+        # Capture the completed ACK outcome before any disposal/render/I/O.
+        acknowledged = report.get("applied", {}).get("moved", 0)
+        completed = True
+    except Exception as exc:
+        if phase == "resolve":
+            acknowledged = getattr(exc, "committed_rows", 0)
+            uncertain = bool(getattr(exc, "commit_uncertain", isinstance(exc, tx.CommitUncertain)))
+            resolution_cause = getattr(exc, "resolution_cause", exc)
+        failure(exc, phase)
+
+    owned_engine, engine = engine, None
+    if owned_engine is not None:
+        try:
+            owned_engine.dispose()
+        except Exception as exc:
+            failure(exc, "dispose")
+    if error is None:
+        try:
+            phase = "render_report"
+            rendered = json.dumps(report, indent=2, sort_keys=True)
+            if output is not None:
+                phase = "publish_report"
+                output.publish(rendered + "\n")
+        except Exception as exc:
+            failure(exc, phase)
+    if output is not None:
+        try:
+            output.close()
+        except Exception as exc:
+            failure(exc, "close_report")
+    if error is None:
+        try:
+            print(rendered, flush=True)
+        except Exception as exc:
+            stdout_failed = True
+            failure(exc, "stdout")
+    if error is None:
+        return 0
+
+    error.committed_rows = acknowledged
+    error.commit_uncertain = uncertain
+    error.resolution_cause = resolution_cause
+    error.resolution_completed = completed
+    error.failure_phase = failed_phase
+    error.secondary_errors = tuple(secondary)
+    receipt = json.dumps({
+        "status": "ABORTED", "error_type": type(error).__name__,
+        "reason": str(error) if isinstance(error, ValueError) else "database/audit/publication failure; inspect private evidence",
+        "acknowledged_committed_rows": acknowledged, "commit_uncertain": uncertain,
+        "resolution_error_type": type(resolution_cause).__name__ if resolution_cause is not None else None,
+        "resolution_completed": completed, "failure_phase": failed_phase,
+        "secondary_error_types": [{"phase": where, "error_type": type(exc).__name__} for where, exc in secondary],
+        "action": "stop; reconcile database and audit before a separately reviewed retry",
+    })
+    reporting_errors = []
+    try:
+        print(receipt, file=sys.stderr, flush=True)
+    except Exception as exc:
+        reporting_errors.append(exc)
+        if not stdout_failed and sys.stdout is not sys.stderr:
+            try:
+                print(receipt, file=sys.stdout, flush=True)
+            except Exception as other:
+                reporting_errors.append(other)
+            else:
+                error.reporting_errors = tuple(reporting_errors)
+                return 5
+        error.reporting_errors = tuple(reporting_errors)
+        # Keep the annotated original error/cause when both channels are broken.
+        raise error
+    return 3 if isinstance(error, WindowClosed) and not secondary else 5
 
 def require_guard_closed() -> None:
     """Refuse ``--apply`` / ``--revert`` once the transition marker exists.

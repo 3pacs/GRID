@@ -456,10 +456,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.apply and args.revert:
         print("--apply and --revert are exclusive", file=sys.stderr)
         return 2
-    for path in (args.audit_log, args.out):
-        if path and path.exists():
-            print(f"refusing to overwrite {path}", file=sys.stderr)
-            return 2
+    try:
+        common.validate_output_paths(args.out, args.audit_log, args.revert)
+    except (ValueError, OSError) as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     try:
         common.check_window()
     except common.WindowClosed as exc:
@@ -473,10 +474,13 @@ def main(argv: list[str] | None = None) -> int:
         except RuntimeError as exc:
             print(str(exc), file=sys.stderr)
             return 4
-    engine = common.open_engine(
-        common.database_url(args.db_url_env), read_only=not writing, application_name="qq_gov_contracts_redate",
-    )
-    try:
+    def engine_factory():
+        return common.open_engine(
+            common.database_url(args.db_url_env), read_only=not writing,
+            application_name="qq_gov_contracts_redate",
+        )
+
+    def operation(engine):
         if args.revert:
             report = {
                 "mode": "revert",
@@ -485,25 +489,9 @@ def main(argv: list[str] | None = None) -> int:
             }
         else:
             report = run(engine, apply=args.apply, audit_path=args.audit_log, guard_check=not args.no_guard_check)
-    except common.WindowClosed as exc:
-        print(f"{exc}; acknowledged committed rows={getattr(exc, 'committed_rows', 0)}", file=sys.stderr)
-        return 3
-    except Exception as exc:
-        print(json.dumps({"status": "ABORTED", "error_type": type(exc).__name__,
-                          "reason": str(exc) if isinstance(exc, ValueError) else "database/audit failure; inspect private evidence",
-                          "acknowledged_committed_rows": getattr(exc, "committed_rows", 0),
-                          "commit_uncertain": getattr(exc, "commit_uncertain", False),
-                          "resolution_error_type": (type(exc.resolution_cause).__name__
-                                                    if getattr(exc, "resolution_cause", None) is not None else None),
-                          "action": "stop; reconcile database and audit before a separately reviewed retry"}), file=sys.stderr)
-        return 5
-    finally:
-        engine.dispose()
-    rendered = json.dumps(report, indent=2, sort_keys=True)
-    if args.out:
-        args.out.write_text(rendered + "\n", encoding="utf-8")
-    print(rendered)
-    return 0
+        return report
+
+    return common.finalize_cli(engine_factory, operation, out=args.out)
 
 
 if __name__ == "__main__":
