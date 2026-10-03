@@ -1,4 +1,5 @@
 """Synthetic mechanics tests; these do not establish predictive edge."""
+
 from copy import deepcopy
 
 from scripts.intraday_lab.time_of_day import normalize_activity
@@ -9,14 +10,30 @@ def fixture():
     for i in range(4):
         opening = 100000 + i * 86400
         session = f"s{i}"
-        sessions.append({"session": session, "open_at": opening, "close_at": opening + 23400})
-        observations.append({"session": session, "source_id": "trusted_volume", "instrument": "SPY",
-                             "metric": "volume", "value": 100 if i < 3 else 200,
-                             "event_at": opening + 300, "available_at": opening + 301,
-                             "bucket_start_at": opening, "bucket_end_at": opening + 300,
-                             "clock": "trusted_receipt", "status": "available"})
-    return {"session": "s3", "decision_at": sessions[-1]["open_at"] + 310,
-            "sessions": sessions, "observations": observations}
+        sessions.append(
+            {"session": session, "open_at": opening, "close_at": opening + 23400}
+        )
+        observations.append(
+            {
+                "session": session,
+                "source_id": "trusted_volume",
+                "instrument": "SPY",
+                "metric": "volume",
+                "value": 100 if i < 3 else 200,
+                "event_at": opening + 300,
+                "available_at": opening + 301,
+                "bucket_start_at": opening,
+                "bucket_end_at": opening + 300,
+                "clock": "trusted_receipt",
+                "status": "available",
+            }
+        )
+    return {
+        "session": "s3",
+        "decision_at": sessions[-1]["open_at"] + 310,
+        "sessions": sessions,
+        "observations": observations,
+    }
 
 
 def run(packet):
@@ -27,7 +44,9 @@ def test_normalizes_and_preserves_lineage():
     result = run(fixture())
     assert result["value"] == 2
     assert result["baseline_sessions"] == ["s0", "s1", "s2"]
-    assert result["latest_available_at"] == fixture()["observations"][-1]["available_at"]
+    assert (
+        result["latest_available_at"] == fixture()["observations"][-1]["available_at"]
+    )
 
 
 def test_current_session_never_enters_baseline():
@@ -108,8 +127,15 @@ def test_history_window_is_deterministic_and_bounded():
 
 
 def test_invalid_configuration_returns_unavailable():
-    for options in [{"bucket_seconds": True}, {"min_sessions": True}, {"max_sessions": 0}]:
-        assert normalize_activity(fixture(), "volume", **options)["status"] == "unavailable"
+    for options in [
+        {"bucket_seconds": True},
+        {"min_sessions": True},
+        {"max_sessions": 0},
+    ]:
+        assert (
+            normalize_activity(fixture(), "volume", **options)["status"]
+            == "unavailable"
+        )
 
 
 def test_nonfinite_baseline_cannot_become_zero_activity():
@@ -121,6 +147,11 @@ def test_nonfinite_baseline_cannot_become_zero_activity():
 
 
 def test_malformed_packets_fail_closed():
-    for packet in (None, [], {}, {"sessions": [None], "observations": []},
-                   {"sessions": [], "observations": ["bad"]}):
+    for packet in (
+        None,
+        [],
+        {},
+        {"sessions": [None], "observations": []},
+        {"sessions": [], "observations": ["bad"]},
+    ):
         assert normalize_activity(packet, "volume")["status"] == "unavailable"

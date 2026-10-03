@@ -61,7 +61,9 @@ def compute_repricing(packet, *, max_age=10, max_window=300):
             continue
         if row.get("instrument") == "OPTION":
             raw_values = row.get("values")
-            key = raw_values.get("contract_id") if isinstance(raw_values, dict) else None
+            key = (
+                raw_values.get("contract_id") if isinstance(raw_values, dict) else None
+            )
             groups.setdefault(
                 key if isinstance(key, str) and key else "missing_identity", []
             ).append(row)
@@ -198,5 +200,8 @@ def compute_repricing(packet, *, max_age=10, max_window=300):
         "status": "available"
         if any(v["status"] == "available" for v in output.values())
         else "unavailable",
-        "interpretation": "European proxy decomposition; provider IV; no validated lead, dealer inventory or executable midpoint return",
+        "interpretation": (
+            "European proxy decomposition; provider IV; no validated lead, "
+            "dealer inventory or executable midpoint return"
+        ),
     }

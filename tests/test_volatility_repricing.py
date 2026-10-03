@@ -186,11 +186,20 @@ def test_non_string_source_is_rejected_before_hashing():
 
 
 def test_decomposition_conserves_with_changing_spot_iv_carry():
-    p = packet(spot=770, iv=.25)
-    p["observations"][-1]["values"]["rate"] = .05
-    p["observations"][-1]["values"]["yield"] = .015
+    p = packet(spot=770, iv=0.25)
+    p["observations"][-1]["values"]["rate"] = 0.05
+    p["observations"][-1]["values"]["yield"] = 0.015
     v = vals(p)
-    components = sum(v[k] for k in ("spot_component", "time_component", "iv_component", "carry_component", "model_residual"))
+    components = sum(
+        v[k]
+        for k in (
+            "spot_component",
+            "time_component",
+            "iv_component",
+            "carry_component",
+            "model_residual",
+        )
+    )
     assert components == pytest.approx(v["midpoint_change"], abs=1e-12)
 
 

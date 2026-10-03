@@ -1,4 +1,5 @@
 """Offline point-in-time participation diagnostics; no directional forecast."""
+
 from datetime import datetime
 import math
 
@@ -27,9 +28,15 @@ def participation(packet, decision_at, max_age_seconds=60, max_skew_seconds=5):
         available = _time(packet["weights_available_at"])
         if not start < end <= decision or effective > start or available > start:
             raise ValueError("weights/interval not point-in-time")
-        if max_age_seconds < 0 or max_skew_seconds < 0:
+        if any(
+            isinstance(limit, bool) or not math.isfinite(limit) or limit < 0
+            for limit in (max_age_seconds, max_skew_seconds)
+        ):
             raise ValueError("invalid freshness limits")
-        if not weights or any(isinstance(w, bool) or not math.isfinite(w) or w <= 0 for w in weights.values()):
+        if not weights or any(
+            isinstance(w, bool) or not math.isfinite(w) or w <= 0
+            for w in weights.values()
+        ):
             raise ValueError("invalid weights")
         if not math.isclose(math.fsum(weights.values()), 1.0, abs_tol=1e-9, rel_tol=0):
             raise ValueError("incomplete weight universe")
@@ -44,9 +51,12 @@ def participation(packet, decision_at, max_age_seconds=60, max_skew_seconds=5):
             source, receipt = _time(row["source_at"]), _time(row["available_at"])
             if not end <= source <= receipt <= decision:
                 raise ValueError("invalid source/receipt lineage")
-            if (decision-source).total_seconds() > max_age_seconds:
+            if (decision - source).total_seconds() > max_age_seconds:
                 raise ValueError("stale constituent")
-            if _time(row["interval_start"]) != start or _time(row["interval_end"]) != end:
+            if (
+                _time(row["interval_start"]) != start
+                or _time(row["interval_end"]) != end
+            ):
                 raise ValueError("mismatched return intervals")
             value = row["return"]
             if isinstance(value, bool) or not math.isfinite(value) or value < -1:
@@ -60,25 +70,46 @@ def participation(packet, decision_at, max_age_seconds=60, max_skew_seconds=5):
             sectors[sector] = sectors.get(sector, 0) + contribution
             receipts.append(receipt)
             sources.append(source)
-        if max((max(receipts)-min(receipts)).total_seconds(), (max(sources)-min(sources)).total_seconds()) > max_skew_seconds:
+        if (
+            max(
+                (max(receipts) - min(receipts)).total_seconds(),
+                (max(sources) - min(sources)).total_seconds(),
+            )
+            > max_skew_seconds
+        ):
             raise ValueError("unsynchronized receipts")
         gross = math.fsum(abs(c) for c in contributions)
         result = {
-            "status": "VALID_DIAGNOSTIC", "directional_edge": "UNVALIDATED",
+            "status": "VALID_DIAGNOSTIC",
+            "directional_edge": "UNVALIDATED",
             "weighted_return": math.fsum(contributions),
-            "advancing_fraction": sum(r > 0 for r in returns)/len(returns),
-            "declining_fraction": sum(r < 0 for r in returns)/len(returns),
-            "advancing_weight": math.fsum(w for w, r in zip(weights.values(), returns) if r > 0),
-            "contribution_hhi": math.fsum((abs(c)/gross)**2 for c in contributions) if gross else None,
-            "largest_absolute_contribution_share": max(abs(c) for c in contributions)/gross if gross else None,
+            "advancing_fraction": sum(r > 0 for r in returns) / len(returns),
+            "declining_fraction": sum(r < 0 for r in returns) / len(returns),
+            "advancing_weight": math.fsum(
+                w for w, r in zip(weights.values(), returns) if r > 0
+            ),
+            "contribution_hhi": math.fsum((abs(c) / gross) ** 2 for c in contributions)
+            if gross
+            else None,
+            "largest_absolute_contribution_share": max(abs(c) for c in contributions)
+            / gross
+            if gross
+            else None,
             "sector_contributions": sectors,
             "available_at": max(receipts).isoformat(),
-            "interval_start": start.isoformat(), "interval_end": end.isoformat(),
+            "interval_start": start.isoformat(),
+            "interval_end": end.isoformat(),
             "universe_id": packet["universe_id"],
             "weights_source_id": packet["weights_source_id"],
         }
-        if not all(math.isfinite(c) for c in contributions) or not math.isfinite(result["weighted_return"]):
+        if not all(math.isfinite(c) for c in contributions) or not math.isfinite(
+            result["weighted_return"]
+        ):
             raise ValueError("numerical overflow")
         return result
     except (KeyError, TypeError, ValueError, AttributeError, OverflowError) as error:
-        return {"status": "UNAVAILABLE", "reason": str(error), "directional_edge": "UNVALIDATED"}
+        return {
+            "status": "UNAVAILABLE",
+            "reason": str(error),
+            "directional_edge": "UNVALIDATED",
+        }
