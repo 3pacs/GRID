@@ -100,6 +100,7 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
     monkeypatch.setattr(Path, "open", open_file)
     monkeypatch.setattr(common.os, "fsync", fsync)
     attached_pool = engine.pool
+    faulted_connections = []
 
     def checkin(dbapi, record):
         attempts["checkin"] += 1
@@ -111,6 +112,7 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
         except Exception as cause:
             dbapi.rollback()
             assert cause.pgcode == "57014" and dbapi.get_transaction_status() == 0
+            faulted_connections.append(dbapi)
             raise OperationalError("CHECKIN AFTER COMMIT", {}, cause)
 
     class ExecutionEngine:
@@ -169,6 +171,10 @@ def test_actual_cli_audit_exit_keeps_ack_prefix_cause_and_pending_uncertainty(
     finally:
         if installed[0]:
             event.remove(attached_pool, "checkin", checkin)
+        # A raising checkin hook can leave its driver handle outside the pool.
+        # Release only this test's private fault-injection handles after STOP.
+        for dbapi in faulted_connections:
+            dbapi.close()
     after = all_rows(engine)
     column = "source_id" if script is rekey else "signal_date"
     changed_ids = [a["id"] for a, b in zip(after, before) if a[column] != b[column]]
