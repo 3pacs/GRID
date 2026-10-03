@@ -28,8 +28,7 @@ exposes original atomic headers and prepared headers only after an immutable
 completion receipt. `registered_at` on a prepared capture is the server clock
 sample at receipt insertion, before COMMIT; it is not an exact COMMIT or client
 ACK timestamp. Provider completion and quote timestamps remain unchanged. The
-view exposes the receipt only after server COMMIT, and an as-of lookup excludes
-it before that recorded timestamp. Exact commit-time retrospective PIT across
+view exposes the receipt only after server COMMIT. Exact commit-time retrospective PIT across
 the receipt-insertion/COMMIT interval needs a separate reviewed contract.
 `options_snapshots` selects only published captures when superseding a previous
 complete capture. Unregistered legacy rows retain their original fallback.

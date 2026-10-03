@@ -23,8 +23,16 @@ CREATE TRIGGER options_capture_publications_no_truncate
 CREATE FUNCTION options_bounded_contract_guard() RETURNS trigger LANGUAGE plpgsql AS $$
 DECLARE h options_capture_batches_all;
 BEGIN
-    SELECT * INTO STRICT h FROM options_capture_batches_all
+    -- Preserve the exact original required-metadata CHECK and header FK error
+    -- paths. They reject missing/unknown registrations after BEFORE triggers.
+    IF NEW.capture_batch_id IS NULL THEN
+        RETURN NEW;
+    END IF;
+    SELECT * INTO h FROM options_capture_batches_all
         WHERE capture_batch_id = NEW.capture_batch_id FOR UPDATE;
+    IF NOT FOUND THEN
+        RETURN NEW;
+    END IF;
     IF h.requires_publication THEN
         IF current_setting('transaction_isolation') <> 'read committed' THEN
             RAISE EXCEPTION 'prepared options writes require READ COMMITTED';

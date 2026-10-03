@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import create_engine, event, text
+from sqlalchemy.exc import DBAPIError
 
 from ingestion import options, options_publication as pub
 
@@ -20,6 +21,30 @@ ROOT = Path(__file__).resolve().parents[1]
 DAY = date(2026, 10, 2)
 START = datetime(2026, 10, 2, 14, tzinfo=timezone.utc)
 SQL = ROOT / "docs/handoffs/2026-10-02/options-bounded-publication.sql"
+
+
+def test_original_required_fk_guards_and_registration_view_refusal(bounded_pg_engine):
+    engine, _, counts = bounded_pg_engine
+    statements = [
+        ("options_snapshots_all_batch_required", """
+            INSERT INTO options_snapshots_all (ticker, snap_date, expiry, opt_type, strike)
+            VALUES ('SPY', '2026-10-02', '2026-10-16', 'call', 1)
+        """),
+        ("options_snapshots_all_batch_fk", """
+            INSERT INTO options_snapshots_all (ticker, snap_date, expiry, opt_type, strike,
+                capture_batch_id, capture_ordinal, capture_started_at, capture_completed_at,
+                provider_regular_market_at)
+            VALUES ('SPY', '2026-10-02', '2026-10-16', 'call', 1,
+                'unregistered', 99999999, now(), now(), now())
+        """),
+        ("is not a table", "TRUNCATE options_capture_batches CASCADE"),
+        ("append-only", "TRUNCATE options_capture_batches_all CASCADE"),
+    ]
+    for expected, statement in statements:
+        with pytest.raises(DBAPIError, match=expected):
+            with engine.begin() as conn:
+                conn.exec_driver_sql(statement)
+    assert max(counts) <= 50
 
 
 @pytest.fixture
