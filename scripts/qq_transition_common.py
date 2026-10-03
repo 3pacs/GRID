@@ -220,72 +220,88 @@ class ReportFile:
 def finalize_cli(
     engine_factory: Callable[[], Engine], operation: Callable[[Engine], dict[str, Any]], *, out: Path | None,
 ) -> int:
-    """Preserve actual body resolution through once-only cleanup and reporting.
+    """Capture resolution before guarded, once-only cleanup and reporting.
 
-    Only the body or its returned result supplies resolution. Secondary errors
-    cannot forge an ACK prefix, clear uncertainty, or replace the original cause.
-    Failed I/O is never retried; stderr and stdout are distinct bounded channels.
+    An interruption keeps its control-flow identity and observed ACK prefix.
+    Secondary cleanup/receipt failures cannot replace the trusted original.
+    Each resource is detached before its sole cleanup attempt; failed rendering
+    and I/O are never retried, including when fatal receipt construction fails.
     """
     engine = None
     output = ReportFile(out) if out is not None else None
-    error: Exception | None = None
+    error: BaseException | None = None
     phase = "reserve_output"
     failed_phase = None
     acknowledged = 0
     uncertain = False
     resolution_cause = None
     completed = False
-    secondary: list[tuple[str, Exception]] = []
+    secondary: list[tuple[str, BaseException]] = []
     stdout_failed = False
+    interrupted = False
 
-    def failure(exc: Exception, where: str) -> None:
-        nonlocal error, failed_phase
+    def control_flow(exc: BaseException | None) -> BaseException | None:
+        # Only our trusted transaction wrappers may wrap COMMIT/checkin exits.
+        while isinstance(exc, (tx.CommitUncertain, tx.CommitAcknowledgedCleanupError)):
+            exc = exc.__cause__
+        return exc if exc is not None and not isinstance(exc, Exception) else None
+
+    def failure(exc: BaseException, where: str) -> None:
+        nonlocal error, failed_phase, interrupted
+        interrupted = interrupted or not isinstance(exc, Exception)
         if error is None:
             error, failed_phase = exc, where
         else:
             secondary.append((where, exc))
 
     try:
-        if output is not None:
-            output.reserve()
-        phase = "acquire_database"
-        engine = engine_factory()
-        phase = "resolve"
-        report = operation(engine)
-        # Capture the completed ACK outcome before any disposal/render/I/O.
-        acknowledged = report.get("applied", {}).get("moved", 0)
-        completed = True
-    except Exception as exc:
-        if phase == "resolve":
-            acknowledged = getattr(exc, "committed_rows", 0)
-            uncertain = bool(getattr(exc, "commit_uncertain", isinstance(exc, tx.CommitUncertain)))
-            resolution_cause = getattr(exc, "resolution_cause", exc)
-        failure(exc, phase)
-
-    owned_engine, engine = engine, None
-    if owned_engine is not None:
         try:
-            owned_engine.dispose()
-        except Exception as exc:
-            failure(exc, "dispose")
-    if error is None:
-        try:
-            phase = "render_report"
-            rendered = json.dumps(report, indent=2, sort_keys=True)
             if output is not None:
-                phase = "publish_report"
-                output.publish(rendered + "\n")
-        except Exception as exc:
+                output.reserve()
+            phase = "acquire_database"
+            engine = engine_factory()
+            phase = "resolve"
+            report = operation(engine)
+            # Capture the completed ACK outcome before disposal/render/I/O.
+            acknowledged = report.get("applied", {}).get("moved", 0)
+            completed = True
+        except BaseException as exc:
+            if phase == "resolve":
+                acknowledged = getattr(exc, "committed_rows", 0)
+                uncertain = bool(getattr(exc, "commit_uncertain", isinstance(exc, tx.CommitUncertain)))
+                resolution_cause = getattr(exc, "resolution_cause", exc)
+                control = control_flow(resolution_cause) or control_flow(exc)
+                if control is not None and control is not exc:
+                    failure(control, phase)
             failure(exc, phase)
-    if output is not None:
-        try:
-            output.close()
-        except Exception as exc:
-            failure(exc, "close_report")
+        finally:
+            # Disposal interruption cannot bypass the outer descriptor finally.
+            owned_engine, engine = engine, None
+            if owned_engine is not None:
+                try:
+                    owned_engine.dispose()
+                except BaseException as exc:
+                    failure(exc, "dispose")
+        if error is None:
+            try:
+                phase = "render_report"
+                rendered = json.dumps(report, indent=2, sort_keys=True)
+                if output is not None:
+                    phase = "publish_report"
+                    output.publish(rendered + "\n")
+            except BaseException as exc:
+                failure(exc, phase)
+    finally:
+        if output is not None:
+            owned_output, output = output, None
+            try:
+                owned_output.close()
+            except BaseException as exc:
+                failure(exc, "close_report")
     if error is None:
         try:
             print(rendered, flush=True)
-        except Exception as exc:
+        except BaseException as exc:
             stdout_failed = True
             failure(exc, "stdout")
     if error is None:
@@ -297,35 +313,38 @@ def finalize_cli(
     error.resolution_completed = completed
     error.failure_phase = failed_phase
     error.secondary_errors = tuple(secondary)
-    receipt = json.dumps({
-        "status": "ABORTED", "error_type": type(error).__name__,
-        "reason": str(error) if isinstance(error, ValueError) and failed_phase == "resolve" else "database/audit/publication failure; inspect private evidence",
-        "acknowledged_committed_rows": acknowledged, "commit_uncertain": uncertain,
-        "resolution_error_type": type(resolution_cause).__name__ if resolution_cause is not None else None,
-        "resolution_completed": completed, "failure_phase": failed_phase,
-        "secondary_error_types": [{"phase": where, "error_type": type(exc).__name__} for where, exc in secondary],
-        "action": "stop; reconcile database and audit before a separately reviewed retry",
-    })
     reporting_errors = []
     try:
+        receipt = json.dumps({
+            "status": "ABORTED", "error_type": type(error).__name__,
+            "reason": str(error) if isinstance(error, ValueError) and failed_phase == "resolve" else "database/audit/publication failure; inspect private evidence",
+            "acknowledged_committed_rows": acknowledged, "commit_uncertain": uncertain,
+            "resolution_error_type": type(resolution_cause).__name__ if resolution_cause is not None else None,
+            "resolution_completed": completed, "failure_phase": failed_phase,
+            "secondary_error_types": [{"phase": where, "error_type": type(exc).__name__} for where, exc in secondary],
+            "action": "stop; reconcile database and audit before a separately reviewed retry",
+        })
+    except BaseException as exc:
+        # No receipt exists: preserve the original, with no recursive rendering.
+        error.reporting_errors = (exc,)
+        raise error
+    try:
         print(receipt, file=sys.stderr, flush=True)
-    except Exception as exc:
+    except BaseException as exc:
         reporting_errors.append(exc)
-        if not stdout_failed and sys.stdout is not sys.stderr:
+        if isinstance(exc, Exception) and not stdout_failed and sys.stdout is not sys.stderr:
             try:
                 print(receipt, file=sys.stdout, flush=True)
-            except Exception as other:
+            except BaseException as other:
                 reporting_errors.append(other)
             else:
                 error.reporting_errors = tuple(reporting_errors)
-                if failed_phase == "acquire_database":
+                if interrupted or failed_phase == "acquire_database":
                     raise error
                 return 5
         error.reporting_errors = tuple(reporting_errors)
-        # Keep the annotated original error/cause when both channels are broken.
         raise error
-    # Preserve the existing callable acquisition boundary after its fatal receipt.
-    if failed_phase == "acquire_database":
+    if interrupted or failed_phase == "acquire_database":
         raise error
     return 3 if isinstance(error, WindowClosed) and not secondary else 5
 
