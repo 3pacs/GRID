@@ -170,6 +170,8 @@ class BLSPuller(BasePuller):
             series_chunks.append(series_ids[i : i + _MAX_SERIES_PER_QUERY])
 
         total_inserted = 0
+        requests_attempted = 0
+        requests_succeeded = 0
 
         for chunk in series_chunks:
             for yr_start, yr_end in year_ranges:
@@ -182,12 +184,21 @@ class BLSPuller(BasePuller):
                     result["errors"].append(msg)
                     result["status"] = "PARTIAL"
                     result["rows_inserted"] = total_inserted
+                    if requests_attempted and not requests_succeeded:
+                        result["status"] = "FAILED"
                     return result
 
                 inserted = self._fetch_and_store(chunk, yr_start, yr_end, result)
-                total_inserted += inserted
+                requests_attempted += 1
+                if inserted is not None:
+                    # A successful empty or duplicate-only response still
+                    # counts as request success, independently of stored rows.
+                    requests_succeeded += 1
+                    total_inserted += inserted
 
         result["rows_inserted"] = total_inserted
+        if requests_attempted and not requests_succeeded:
+            result["status"] = "FAILED"
         log.info("BLS pull complete — {n} rows inserted", n=total_inserted)
         return result
 
@@ -197,7 +208,7 @@ class BLSPuller(BasePuller):
         start_year: int,
         end_year: int,
         result: dict[str, Any],
-    ) -> int:
+    ) -> int | None:
         """Make a single BLS API request and store the results.
 
         Parameters:
@@ -207,7 +218,8 @@ class BLSPuller(BasePuller):
             result: Mutable result dict to append errors to.
 
         Returns:
-            int: Number of rows inserted.
+            Number of rows inserted (including zero on a successful response),
+            or None when the request fails. Database errors still propagate.
         """
         payload: dict[str, Any] = {
             "seriesid": series_ids,
@@ -236,14 +248,14 @@ class BLSPuller(BasePuller):
             log.error("BLS API request failed: {err}", err=str(exc))
             result["errors"].append(str(exc))
             result["status"] = "PARTIAL"
-            return 0
+            return None
 
         if data.get("status") != "REQUEST_SUCCEEDED":
             msg = f"BLS API error: {data.get('message', 'Unknown error')}"
             log.error(msg)
             result["errors"].append(msg)
             result["status"] = "PARTIAL"
-            return 0
+            return None
 
         inserted = 0
         with self.engine.begin() as conn:
