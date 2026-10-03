@@ -299,7 +299,7 @@ def finalize_cli(
     error.secondary_errors = tuple(secondary)
     receipt = json.dumps({
         "status": "ABORTED", "error_type": type(error).__name__,
-        "reason": str(error) if isinstance(error, ValueError) else "database/audit/publication failure; inspect private evidence",
+        "reason": str(error) if isinstance(error, ValueError) and failed_phase == "resolve" else "database/audit/publication failure; inspect private evidence",
         "acknowledged_committed_rows": acknowledged, "commit_uncertain": uncertain,
         "resolution_error_type": type(resolution_cause).__name__ if resolution_cause is not None else None,
         "resolution_completed": completed, "failure_phase": failed_phase,
@@ -318,9 +318,14 @@ def finalize_cli(
                 reporting_errors.append(other)
             else:
                 error.reporting_errors = tuple(reporting_errors)
+                if failed_phase == "acquire_database":
+                    raise error
                 return 5
         error.reporting_errors = tuple(reporting_errors)
         # Keep the annotated original error/cause when both channels are broken.
+        raise error
+    # Preserve the existing callable acquisition boundary after its fatal receipt.
+    if failed_phase == "acquire_database":
         raise error
     return 3 if isinstance(error, WindowClosed) and not secondary else 5
 

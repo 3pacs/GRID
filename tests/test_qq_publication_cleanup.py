@@ -24,7 +24,9 @@ def test_absent_alias_refused_before_reservation(tmp_path, monkeypatch, alias):
     audit = tmp_path / "audit"
     out = audit
     if alias == "dot":
-        out = tmp_path / "." / "audit"
+        segment = tmp_path / "normalization-segment"
+        segment.mkdir()
+        out = segment / ".." / "audit"
     elif alias == "relative":
         monkeypatch.chdir(tmp_path)
         out = Path("audit")

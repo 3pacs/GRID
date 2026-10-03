@@ -50,7 +50,9 @@ def test_alias_preexisting_protected_inputs_refuse_before_any_DB(pg, tmp_path, m
     revert = None
     original = b"synthetic original audit/control/report\n"
     if alias == "dot":
-        out = tmp_path / "." / "audit"
+        segment = tmp_path / "normalization-segment"
+        segment.mkdir()
+        out = segment / ".." / "audit"
     elif alias == "relative":
         monkeypatch.chdir(tmp_path)
         out = Path("audit")
@@ -90,7 +92,7 @@ def test_alias_preexisting_protected_inputs_refuse_before_any_DB(pg, tmp_path, m
 
 
 @pytest.mark.parametrize("script", [rekey, redate])
-@pytest.mark.parametrize("mode", ["dispose", "report_write", "report_partial", "report_flush", "report_fsync", "report_close", "dispose_close", "lost_dispose", "lost_close", "lost_dispose_close", "lost_dispose_channels", "replace_symlink", "replace_hardlink", "replace_report", "extra_link", "parent_scope", "reserve_refusal", "acquire_failure", "stdout_failure"])
+@pytest.mark.parametrize("mode", ["dispose", "report_write", "report_partial", "report_flush", "report_fsync", "report_close", "dispose_close", "lost_dispose", "lost_close", "lost_dispose_close", "lost_dispose_channels", "replace_symlink", "replace_hardlink", "replace_report", "extra_link", "parent_scope", "reserve_refusal", "acquire_failure", "stdout_failure", "stdout_flush_failure", "render_failure"])
 def test_final_cleanup_publication_receipt_keeps_actual_ACK(pg, tmp_path, monkeypatch, capsys, script, mode):
     engine, counts = pg
     seed_scope(engine, script)
@@ -204,7 +206,22 @@ def test_final_cleanup_publication_receipt_keeps_actual_ACK(pg, tmp_path, monkey
     result = None
     escaped = None
     bad_out, bad_err = BrokenChannel(), BrokenChannel()
+    class FlushFailure:
+        def write(self, data):
+            return len(data)
+        def flush(self):
+            raise OSError("synthetic stdout flush failure after completed ACK resolution")
+    render_attempts = []
+    real_dumps = json.dumps
+    def render_failure(obj, *a, **kw):
+        if mode == "render_failure" and isinstance(obj, dict) and "applied" in obj:
+            render_attempts.append("render")
+            raise OSError("synthetic final report rendering failure")
+        return real_dumps(obj, *a, **kw)
+    monkeypatch.setattr(common.json, "dumps", render_failure)
     with monkeypatch.context() as patch:
+        if mode == "stdout_flush_failure":
+            patch.setattr(common.sys, "stdout", FlushFailure())
         if mode in {"stdout_failure", "lost_dispose_channels"}:
             patch.setattr(common.sys, "stdout", bad_out)
         if mode == "lost_dispose_channels":
@@ -235,7 +252,11 @@ def test_final_cleanup_publication_receipt_keeps_actual_ACK(pg, tmp_path, monkey
         assert escaped.resolution_cause is incoming[0] and len(escaped.reporting_errors) == 2
         assert bad_err.writes == bad_out.writes == 1
     else:
-        assert escaped is None and result == 5
+        if mode == "acquire_failure":
+            assert isinstance(escaped, OperationalError) and result is None
+            assert escaped.committed_rows == 0 and escaped.commit_uncertain is False
+        else:
+            assert escaped is None and result == 5
         receipt = json.loads(output.err.splitlines()[-1])
         assert receipt["acknowledged_committed_rows"] == ack and receipt["commit_uncertain"] is pending
         assert receipt["resolution_completed"] is (actual == 3)
@@ -250,6 +271,8 @@ def test_final_cleanup_publication_receipt_keeps_actual_ACK(pg, tmp_path, monkey
         assert out.read_bytes() == b"foreign preexisting replacement\n"
     if mode == "report_partial":
         assert out.stat().st_size > 0
+    if mode == "render_failure":
+        assert render_attempts == ["render"] and io["write"] == 0
     if mode == "stdout_failure":
         assert bad_out.writes == 1 and json.loads(out.read_bytes())["applied"]["moved"] == 3
     snapshot = {"before": before, "after": after}
