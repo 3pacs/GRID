@@ -126,7 +126,7 @@ def test_actual_feature_checks_remain_enforced(bounded_pg_engine, column, value)
     ("INSERT INTO options_daily_signals(ticker,signal_date) VALUES ('SPY','2026-10-02'),('SPY','2026-10-02')", "unique constraint"),
     ("INSERT INTO resolved_series(feature_id,obs_date,release_date,vintage_date,value,source_priority_used) VALUES (99999,'2026-10-02','2026-10-02','2026-10-02',1,1)", "foreign key constraint"),
     ("INSERT INTO resolved_series(feature_id,obs_date,release_date,vintage_date,value,source_priority_used) VALUES (1,'2026-10-02',NULL,'2026-10-02',1,1)", "not-null constraint"),
-    ("INSERT INTO feature_registry(name,family,transformation,transformation_version,normalization,missing_data_policy,eligible_from_date) VALUES ('bad-version','vol','RAW',0,'RAW','NAN','2026-10-02')", "check constraint"),
+    ("INSERT INTO feature_registry(name,family,description,transformation,transformation_version,normalization,missing_data_policy,eligible_from_date) VALUES ('bad-version','vol','synthetic positive-version constraint probe','RAW',0,'RAW','NAN','2026-10-02')", "check constraint"),
 ])
 def test_signal_resolved_and_positive_version_constraints(bounded_pg_engine, sql, expected):
     engine, _, counts = bounded_pg_engine
