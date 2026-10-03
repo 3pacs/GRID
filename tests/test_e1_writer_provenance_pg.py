@@ -413,13 +413,15 @@ def test_coingecko_provider_outage_writes_nothing(pg_engine, monkeypatch) -> Non
 def test_unusual_whales_commits_each_batch_on_its_own(pg_engine, monkeypatch) -> None:
     from ingestion.altdata import unusual_whales as uw
 
-    with pg_engine.begin() as conn:  # production has this row; SOURCE_CONFIG's INTRADAY fails the CHECK
-        conn.execute(text(
-            "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class, pit_available, "
-            "revision_behavior, trust_score, priority_rank) "
-            "VALUES ('Unusual_Whales', 'https://finance.yahoo.com/', 'FREE', 'EOD', FALSE, 'NEVER', 'LOW', 40)"
-        ))
-    puller = uw.UnusualWhalesPuller(pg_engine)
+    with pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM source_catalog")).scalar_one() == 0
+    puller = uw.UnusualWhalesPuller(pg_engine)  # first registration must pass the real CHECKs
+    with pg_engine.connect() as conn:
+        registered = conn.execute(text(
+            "SELECT name, base_url, latency_class FROM source_catalog WHERE id = :id"
+        ), {"id": puller.source_id}).one()
+    assert tuple(registered) == ("Unusual_Whales", "https://finance.yahoo.com/", "EOD")
+    assert uw.UnusualWhalesPuller(pg_engine).source_id == puller.source_id
     monkeypatch.setattr(uw.time, "sleep", lambda _s: None)
     monkeypatch.setattr(puller, "_get_expirations", lambda ticker: ["2026-10-16"])
     monkeypatch.setattr(puller, "_fetch_options_chain", lambda ticker, exp: {"calls": [{}], "puts": []})
@@ -453,3 +455,41 @@ def test_unusual_whales_commits_each_batch_on_its_own(pg_engine, monkeypatch) ->
         running += written
         assert seen_now == running, visible
     assert puller.pull_ticker("SPY")["rows_inserted"] == 0  # same day: deduped, not rewritten
+
+    # Count all DATA tables together: catalogue registration, raw storage and
+    # signal emission must each commit within the whole-transaction row cap.
+    with pg_engine.connect() as conn:
+        per_xact = conn.execute(text(
+            "SELECT max(n) FROM (SELECT xid, count(*) AS n FROM ("
+            "SELECT xmin::text AS xid FROM source_catalog UNION ALL "
+            "SELECT xmin::text FROM raw_series UNION ALL "
+            "SELECT xmin::text FROM signal_sources) rows GROUP BY xid) transactions"
+        )).scalar_one()
+        assert conn.execute(text("SELECT count(*) FROM source_catalog")).scalar_one() == 1
+        assert conn.execute(text("SELECT count(*) FROM signal_sources")).scalar_one() == n
+    assert per_xact <= 50
+
+
+@pytest.mark.parametrize("name", ["Unusual_Whales", "unusual_whales"])
+def test_unusual_whales_reuses_existing_catalogue_without_rewriting(pg_engine, name) -> None:
+    from ingestion.altdata.unusual_whales import UnusualWhalesPuller
+
+    with pg_engine.begin() as conn:
+        source_id = conn.execute(text(
+            "INSERT INTO source_catalog (name, base_url, cost_tier, latency_class, pit_available, "
+            "revision_behavior, trust_score, priority_rank, active) "
+            "VALUES (:name, 'https://fixture.invalid/', 'FREE', 'WEEKLY', FALSE, 'NEVER', 'LOW', 40, FALSE) "
+            "RETURNING id"
+        ), {"name": name}).scalar_one()
+    with pg_engine.connect() as conn:
+        before = tuple(conn.execute(text("SELECT * FROM source_catalog WHERE id = :id"),
+                                    {"id": source_id}).one())
+
+    assert UnusualWhalesPuller(pg_engine).source_id == source_id
+    assert UnusualWhalesPuller(pg_engine).source_id == source_id
+
+    with pg_engine.connect() as conn:
+        after = tuple(conn.execute(text("SELECT * FROM source_catalog WHERE id = :id"),
+                                   {"id": source_id}).one())
+        assert conn.execute(text("SELECT count(*) FROM source_catalog")).scalar_one() == 1
+    assert after == before  # preserves operator metadata, active state and created_at
