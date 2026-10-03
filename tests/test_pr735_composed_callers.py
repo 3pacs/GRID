@@ -16,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 
 from ingestion import options, pull_context, scheduler, smart_scheduler as ss
 from scripts import hermes_fixers as hf
+from tests.options_publication_protocol import reviewed_function_rows
 
 
 def _engine():
@@ -67,6 +68,10 @@ class _CatalogBridge:
 
             def execute(self, statement, params=None):
                 sql = str(statement)
+                if "p.prosrc" in sql and "pg_catalog.pg_proc" in sql:
+                    result = MagicMock()
+                    result.all.return_value = reviewed_function_rows()
+                    return result
                 if sql.startswith("SET LOCAL "):
                     if "grid.options_bounded" not in sql:
                         bridge.limits.append(sql)
@@ -315,7 +320,8 @@ def test_composed_options_callers(capture, monkeypatch, caller, case, expected, 
         assert bridge.config["poolclass"].__name__ == "NullPool"
         assert bridge.config["connect_args"]["connect_timeout"] == 5
         assert bridge.limits == ["SET LOCAL lock_timeout = '3s'", "SET LOCAL statement_timeout = '5s'",
-                                 "SET LOCAL idle_in_transaction_session_timeout = '5s'"]
+                                 "SET LOCAL idle_in_transaction_session_timeout = '5s'",
+                                 "SET LOCAL search_path=public,pg_catalog"]
 
 
 @pytest.mark.parametrize("outcome", [

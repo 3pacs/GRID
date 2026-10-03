@@ -824,10 +824,11 @@ class OptionsPuller(BasePuller):
                     "transformation_version, lag_days, normalization, "
                     "missing_data_policy, eligible_from_date, model_eligible) "
                     "VALUES (:name, :fam, :desc, 'RAW', 1, 0, 'ZSCORE', "
-                    "'FORWARD_FILL', '2024-04-01', TRUE) "
+                    "'FORWARD_FILL', :eligible_from, TRUE) "
                     "ON CONFLICT (name) DO NOTHING RETURNING id"
                 ),
-                {"name": feat_name, "fam": family, "desc": desc},
+                {"name": feat_name, "fam": family, "desc": desc,
+                 "eligible_from": today_str},
             ).fetchone()
 
             if row:

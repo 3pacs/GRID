@@ -14,6 +14,7 @@ from typing import Any, Self
 import pytest
 
 from ingestion import options
+from tests.options_publication_protocol import reviewed_function_rows
 
 SESSION_NOW = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
 
@@ -28,6 +29,9 @@ class _Result:
 
     def fetchone(self) -> tuple:
         return self.row
+
+    def all(self):
+        return list(self.row)
 
 
 class _DB:
@@ -67,6 +71,8 @@ class _DB:
         sql = str(statement)
         values = params or {}
         self.calls.append((sql, values))
+        if "p.prosrc" in sql and "pg_catalog.pg_proc" in sql:
+            return _Result(tuple(reviewed_function_rows()))
         if "txid_current()" in sql:
             self.next_xid += 1
             started = SESSION_NOW + self.clock_offsets.get(

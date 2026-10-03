@@ -17,7 +17,33 @@ _TABLES = (
     "options_capture_batches_all", "options_snapshots_all",
     "options_capture_publications", "options_daily_signals",
     "feature_registry", "resolved_series", "source_catalog",
+    "options_bounded_trigger_contracts", "options_bounded_schema_contract",
 )
+
+# Exact reviewed SQL bodies, not authority inferred from function names.
+_FUNCTION_SOURCES = {
+    "options_bounded_contract_guard": "06aae7e600e8e87f6f6c80183299bd31dabb0005eec7f3510c74609801fd8243",
+    "options_bounded_completion_guard": "f5baf6feeb4f45a2ee1d75a6ad095fc92c3900ea3f58e4ed9f324f5a129aef2e",
+    "options_bounded_row_budget": "79749e63a2d4328ef4ba65b7d8fe633ef99222319da6016cfea57193ffa56b6a",
+    "options_bounded_catalog_image": "f3680ccfbf51a9ed11ce55c6982c1e7d3bc505cce2fb1751d672288a710cf74b",
+    "options_bounded_assert_trigger_closure": "f29ec71c1f5fbdd165142a50d3aeba214a5f71d5d320532a7be3876064b3a4e6"
+}
+
+
+def assert_function_sources(conn) -> None:
+    rows = conn.execute(text("""
+        SELECT p.proname, pg_catalog.encode(pg_catalog.sha256(pg_catalog.convert_to(p.prosrc,'UTF8')),'hex'), p.prosecdef,
+               pg_catalog.pg_get_userbyid(p.proowner), p.proconfig, p.proacl::text
+        FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace
+        WHERE n.nspname='public' AND p.proname IN
+          ('options_bounded_contract_guard','options_bounded_completion_guard',
+           'options_bounded_row_budget','options_bounded_catalog_image',
+           'options_bounded_assert_trigger_closure')
+    """)).all()
+    expected = {(name, digest, False, "grid", None, None)
+                for name, digest in _FUNCTION_SOURCES.items()}
+    if set(rows) != expected:
+        raise RuntimeError("unreviewed options function source/catalog identity")
 
 
 class PublicationBudgetExpired(Exception):
@@ -54,19 +80,22 @@ def transaction(engine, work: Callable, should_continue: Callable | None = None,
             raise PublicationBudgetExpired
         conn = engine.connect()
         trans = conn.begin()
+        conn.info["options_transaction_deadline"] = time.monotonic() + 15
         conn.execute(text("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"))
         conn.execute(text(f"SET LOCAL lock_timeout = '{lock_timeout_seconds}s'"))
         conn.execute(text("SET LOCAL statement_timeout = '5s'"))
         conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
+        conn.execute(text("SET LOCAL search_path=public,pg_catalog"))
         # DDL cannot change the audited trigger closure between this check and
         # commit. No row locks are retained across independent transactions.
         conn.exec_driver_sql("LOCK TABLE " + ", ".join(_TABLES) + " IN ROW EXCLUSIVE MODE")
+        assert_function_sources(conn)
         conn.execute(text("SELECT options_bounded_assert_trigger_closure()"))
         conn.execute(text("SET LOCAL grid.options_bounded = 'on'"))
-        conn.info["options_transaction_deadline"] = time.monotonic() + 15
+        check_deadline(conn)
         count_sql = text("""
-            SELECT COALESCE(SUM(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint
-            FROM pg_stat_xact_user_tables
+            SELECT COALESCE(pg_catalog.sum(n_tup_ins + n_tup_upd + n_tup_del), 0)::bigint
+            FROM pg_catalog.pg_stat_xact_user_tables
         """)
         baseline = conn.execute(count_sql).scalar_one()
         receipt.value = work(conn)
@@ -77,6 +106,11 @@ def transaction(engine, work: Callable, should_continue: Callable | None = None,
         rows = conn.execute(count_sql).scalar_one() - baseline
         if rows < 0 or rows > 50:
             raise RuntimeError("options DATA transaction budget exceeded")
+        check_deadline(conn)
+        if should_continue is not None and not should_continue():
+            raise PublicationBudgetExpired
+        assert_function_sources(conn)
+        conn.execute(text("SELECT options_bounded_assert_trigger_closure()"))
         check_deadline(conn)
         if should_continue is not None and not should_continue():
             raise PublicationBudgetExpired
@@ -104,7 +138,7 @@ def transaction(engine, work: Callable, should_continue: Callable | None = None,
 
 def check_deadline(conn) -> None:
     if time.monotonic() >= conn.info["options_transaction_deadline"]:
-        raise RuntimeError("options transaction deadline expired")
+        raise PublicationBudgetExpired("options transaction deadline expired")
 
 
 _HEADER = text("""

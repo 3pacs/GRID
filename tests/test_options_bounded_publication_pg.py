@@ -5,14 +5,12 @@ Old >50 defect is an arithmetic/static witness, never executed on PostgreSQL.
 """
 from __future__ import annotations
 
-import ast
-import os
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import create_engine, event, text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 
 from ingestion import options, options_publication as pub
@@ -49,74 +47,8 @@ def test_original_required_fk_guards_and_registration_view_refusal(bounded_pg_en
 
 @pytest.fixture
 def bounded_pg_engine():
-    url = os.environ.get("GRID_TEST_DB_URL")
-    if not url:
-        pytest.skip("explicit private test database required")
-    base = create_engine(url)
-    schema = "options_bounded_" + uuid4().hex[:12]
-    with base.begin() as conn:
-        conn.exec_driver_sql(f'CREATE SCHEMA "{schema}"')
-    engine = create_engine(base.url.update_query_dict({"options": f"-csearch_path={schema}"}))
-    counts = []
-
-    def baseline(conn):
-        conn.info["fixture_data_baseline"] = conn.exec_driver_sql(
-            "SELECT COALESCE(SUM(n_tup_ins+n_tup_upd+n_tup_del),0) "
-            "FROM pg_stat_xact_user_tables").scalar_one()
-
-    def count_global(conn):
-        n = conn.exec_driver_sql("SELECT COALESCE(SUM(n_tup_ins+n_tup_upd+n_tup_del),0) "
-                                 "FROM pg_stat_xact_user_tables").scalar_one() - conn.info["fixture_data_baseline"]
-        assert 0 <= n <= 50, "actual global DATA transaction exceeded 50"
-        counts.append(int(n))
-
-    event.listen(engine, "begin", baseline)
-    event.listen(engine, "commit", count_global)
-    try:
-        tree = ast.parse((ROOT / "tests/test_options_append_only_pg.py").read_text())
-        legacy = next(ast.literal_eval(n.value) for n in tree.body
-                      if isinstance(n, ast.Assign) and any(
-                          isinstance(t, ast.Name) and t.id == "_LEGACY_DDL" for t in n.targets))
-        with engine.begin() as conn:
-            conn.exec_driver_sql(legacy)
-            conn.exec_driver_sql("""
-                CREATE TABLE source_catalog (id serial PRIMARY KEY, name text UNIQUE,
-                    last_pull_at timestamptz, last_pull_status text);
-                CREATE TABLE feature_registry (id serial PRIMARY KEY, name text UNIQUE,
-                    family text, description text, transformation text, transformation_version int,
-                    lag_days int, normalization text, missing_data_policy text,
-                    eligible_from_date date, model_eligible boolean);
-                CREATE TABLE resolved_series (id serial PRIMARY KEY,
-                    feature_id int REFERENCES feature_registry, obs_date date,
-                    release_date date, vintage_date date, value double precision,
-                    source_priority_used int REFERENCES source_catalog,
-                    UNIQUE(feature_id,obs_date,vintage_date));
-            """)
-        # Execute the exact migration upgrade AST with a connection-bound op;
-        # no Alembic environment/config, and no existing legacy DATA backfill.
-        tree = ast.parse((ROOT / "migrations/versions/options_append_only_20260930.py").read_text())
-        fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "upgrade")
-        with engine.begin() as conn:
-            class Op:
-                def execute(self, sql):
-                    conn.execute(text(sql))
-            ns = {"op": Op()}
-            exec(compile(ast.Module(body=[fn], type_ignores=[]), "exact_options_migration", "exec"), ns)
-            ns["upgrade"]()
-        p = options.OptionsPuller.__new__(options.OptionsPuller)
-        p.engine = engine
-        p._ensure_tables()
-        with engine.begin() as conn:
-            conn.execute(text(SQL.read_text()))
-        with engine.begin() as conn:
-            p.source_id = conn.exec_driver_sql("INSERT INTO source_catalog(name) "
-                                              "VALUES ('YFINANCE_OPTIONS') RETURNING id").scalar_one()
-        yield engine, p, counts
-    finally:
-        engine.dispose()
-        with base.begin() as conn:
-            conn.exec_driver_sql(f'DROP SCHEMA "{schema}" CASCADE')
-        base.dispose()
+    from tests.options_production_shape_fixture import owned_fixture
+    yield from owned_fixture(ROOT)
 
 
 def packet(n, ordinal=10):

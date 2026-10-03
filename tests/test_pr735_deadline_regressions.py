@@ -13,6 +13,7 @@ import ingestion.options as options
 import ingestion.smart_scheduler as ss
 from scripts import hermes_operator as ho
 from tests.test_options_scheduler_budget import _puller
+from tests.options_publication_protocol import reviewed_function_rows
 
 
 def test_expiration_after_final_capture_is_partial_without_catalog_write(monkeypatch):
@@ -35,6 +36,7 @@ def _catalog_puller(monkeypatch):
     conn = catalog_engine.connect.return_value
     conn.info = {}
     conn.execute.return_value.scalar_one.return_value = 0
+    conn.execute.return_value.all.return_value = reviewed_function_rows()
     # Baseline uses the shared engine; repaired code must use bounded connection setup.
     obj.engine.begin.return_value.__enter__.return_value = conn
     factory = MagicMock(return_value=catalog_engine)
@@ -88,6 +90,7 @@ def test_catalog_cancellation_rolls_back_at_each_publication_boundary(monkeypatc
             live[0] = False
         result = MagicMock(rowcount=1)
         result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
         return result
 
     conn.execute.side_effect = execute
@@ -110,6 +113,7 @@ def test_catalog_lock_timeout_is_bounded_and_not_success(monkeypatch):
             raise TimeoutError("offline simulated catalog lock timeout")
         result = MagicMock(rowcount=1)
         result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
         return result
 
     conn.execute.side_effect = execute
@@ -136,6 +140,7 @@ def test_catalog_own_transaction_deadline_blocks_update(monkeypatch):
             clock[0] += 16
         result = MagicMock(rowcount=1)
         result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
         return result
 
     conn.execute.side_effect = execute
@@ -143,7 +148,9 @@ def test_catalog_own_transaction_deadline_blocks_update(monkeypatch):
     assert not any(str(call.args[0]).startswith("UPDATE") for call in conn.execute.call_args_list)
     conn.begin.return_value.rollback.assert_called_once_with()
     conn.begin.return_value.commit.assert_not_called()
-    assert obj._catalog_receipt.error == "_OptionsBudgetExpired"
+    # The publisher now includes lock/closure setup in its 15s deadline and
+    # expires before invoking the catalog callback's separate budget check.
+    assert obj._catalog_receipt.error == "PublicationBudgetExpired"
 
 
 def test_catalog_unknown_commit_ack_stops_without_replay(monkeypatch):
