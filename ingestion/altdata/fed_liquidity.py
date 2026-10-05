@@ -33,6 +33,7 @@ Derived features stored as COMPUTED:* series:
 from __future__ import annotations
 
 import time
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -47,6 +48,34 @@ from ingestion.base import BasePuller, retry_on_failure
 # MILLIONS of USD. Every net-liquidity combination must scale RRP by this
 # factor first; combining the raw values understates the RRP drain by 1000x.
 RRPONTSYD_TO_MILLIONS: float = 1_000.0
+
+
+def format_liquidity_usd(
+    value: float | None, *, unit: str | None, display_unit: str = "millions_usd",
+    signed: bool = False,
+) -> str:
+    """Render a monetary value only when its input and output units are known.
+
+    Publication boundary only: never change the value used by a scorer.
+    Missing/invalid values and unknown units stay unavailable, including NaN.
+    """
+    scales = {"usd": 1.0, "millions_usd": 1e6, "billions_usd": 1e9}
+    if not isinstance(unit, str) or not isinstance(display_unit, str):
+        return "unavailable"
+    unit, display_unit = unit.lower(), display_unit.lower()
+    if unit not in scales or display_unit not in scales or value is None:
+        return "unavailable"
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return "unavailable"
+    try:
+        amount = float(value) * scales[unit] / scales[display_unit]
+    except OverflowError:
+        return "unavailable"
+    if not math.isfinite(amount):
+        return "unavailable"
+    suffix = {"usd": "", "millions_usd": "M", "billions_usd": "B"}[display_unit]
+    precision = 3 if display_unit == "billions_usd" else 0
+    return f"${amount:{'+' if signed else ''},.{precision}f}{suffix}"
 
 
 def net_liquidity_millions(

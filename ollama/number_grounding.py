@@ -54,6 +54,8 @@ Scope / limitations (documented, not accidental):
 from __future__ import annotations
 
 import re
+import math
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
@@ -61,6 +63,116 @@ from typing import Any, Literal
 from loguru import logger as log
 
 NumberKind = Literal["dollar", "percent", "decimal", "integer", "ratio"]
+
+
+PUBLICATION_EVIDENCE_RULES = (
+    "Correlation and structural flow edges are model proxies, not measured money transfers. "
+    "Stock changes are not transaction flows. Unknown sources cannot support transfer claims. "
+    "Put/call ratios measure relative contracts, not buyer initiation, opening/closing, "
+    "hedging intent, protection purchases or signed dealer gamma. "
+    "VIX measures implied volatility; do not substitute it for realized volatility. "
+    "Narrative text is commentary, never authoritative evidence for those claims. "
+    "Do not invent causal predictions or action thresholds."
+)
+
+
+def flow_evidence_kind(edge: dict[str, Any]) -> str:
+    """Classify structured evidence, never prose or a confidence adjective.
+
+    All current FlowEngine edges are inferred. A future source-reported transfer
+    needs a known transactional source, receipt reference, bounded interval,
+    explicit USD unit and declared conservation/dedup receipts. These declarations
+    are provenance requirements, not independent verification of provider truth.
+    """
+    if edge.get("channel") == "risk_correlation":
+        return "correlation_proxy"
+    if edge.get("source_type") in ("structural_estimate", "inferred_proxy"):
+        return "structural_estimate"
+    if edge.get("source_type") not in ("transaction_ledger", "etf_flow", "on_chain_transfer"):
+        return "unknown"
+    if edge.get("unit") != "USD" or edge.get("direction") not in ("inflow", "outflow"):
+        return "unknown"
+    value = edge.get("value_usd")
+    if isinstance(value, bool) or not isinstance(value, (float, int)) or value < 0:
+        return "unknown"
+    try:
+        if not math.isfinite(value):
+            return "unknown"
+    except OverflowError:
+        return "unknown"
+    for key in ("source_id", "receipt_id", "conservation_receipt_id", "dedup_receipt_id"):
+        if not isinstance(edge.get(key), str) or not edge[key].strip():
+            return "unknown"
+    if edge.get("conservation_status") != "passed" or edge.get("dedup_status") != "passed":
+        return "unknown"
+    try:
+        start = datetime.fromisoformat(edge["interval_start"])
+        end = datetime.fromisoformat(edge["interval_end"])
+        if start.utcoffset() is None or end.utcoffset() is None or end <= start:
+            return "unknown"
+    except (KeyError, TypeError, ValueError):
+        return "unknown"
+    return "reported_flow"
+
+
+def _reported_flow_clause_supported(clause: str, reported: list[dict[str, Any]]) -> bool:
+    """Bind a single source/direction/amount, never a bag of sentence tokens.
+
+    Only this narrow attribution grammar grants permission. Additional causal
+    prose, multiple directions and unmatched trailing clauses fail closed.
+    Rounding is at the amount's explicitly displayed unit/decimal precision.
+    """
+    match = re.fullmatch(
+        r"\s*(?P<source>[\w:/.-]+)\s+"
+        r"(?:(?:recorded|reported|saw)\s+(?:an?\s+)?|source-reported\s+)?"
+        r"(?P<direction>inflow|outflow)\s+(?:of\s+)?"
+        r"(?P<amount>\$[\d,.]+\s*(?:trillion|billion|million|thousand|[tbmk])?)"
+        r"(?:\s+over\s+the\s+(?:reported\s+)?interval)?\s*",
+        clause,
+    )
+    if match is None:
+        return False
+    amount = _DOLLAR_RE.fullmatch(match['amount'].strip())
+    if amount is None:
+        return False
+    scale = _UNIT_MULTIPLIERS.get((amount[2] or '').lower(), 1.0)
+    precision = _decimal_places(amount[1])
+    return any(
+        edge['source_id'].lower() == match['source']
+        and edge['direction'] == match['direction']
+        and round(edge['value_usd'] / scale, precision) == _to_float(amount[1])
+        for edge in reported
+    )
+
+
+def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Bounded lexical gate for known publication failures, before writes/TTS.
+
+    Fail closed on protected claims. No broad flag such as has_measured_flow,
+    social commentary, or model confidence grants permission. A flow statement
+    must identify its structured source and direction with a matching amount.
+    This is deliberately conservative, not a complete natural-language verifier.
+    """
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "".join(c for c in normalized if unicodedata.category(c) != "Cf")
+    normalized = re.sub(r"[*_`]+", "", normalized).lower()
+    reasons: set[str] = set()
+    reported = [e for e in (flow_edges or []) if flow_evidence_kind(e) == "reported_flow"]
+    # Bind each clause independently. Decimal dots are never boundaries.
+    # Commas in numbers are thousands separators, not clause separators.
+    sentences = re.split(r"[.!?]+(?:\s+|$)|[;\n]+|,(?!\d)\s*|\s+(?:and|while|but|whereas|however)\s+", normalized)
+    for sentence in sentences:
+        # Remove only fixed nonclaim phrases, never a whole sentence containing
+        # an unmeasured/unavailable adjective (which can precede a false claim).
+        sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? unavailable|(?:money )?flow engine)\b", "", sentence)
+        if re.search(r"\b(?:hedg\w*|(?:buy\w*|purchas\w*|sell\w*|writ\w*)\s+(?:[\w'-]+\s+){0,5}(?:downside\s+protection|puts?|calls?)|(?:puts?|calls?)\s+(?:buy\w*|purchas\w*|sell\w*)|downside\s+protection|signed\s+(?:dealer\s+)?gamma)\b", sentence):
+            reasons.add("unsupported_options_intent")
+        if re.search(r"\breali[sz]ed\s+vol(?:atility)?\b", sentence):
+            reasons.add("unsupported_realized_volatility")
+        if _DOLLAR_RE.fullmatch(sentence.strip()) or re.search(r"\b(?:(?:in|out)?flows?|flowed|transfer(?:red|s)?|wired|money\s+(?:is\s+)?flowing|capital\s+(?:moved|rotat\w*|flight)|(?:moved|poured|rotated|drained|siphoned)\s+(?:directly\s+)?(?:from|into|out))\b", sentence):
+            if not _reported_flow_clause_supported(sentence.strip(), reported):
+                reasons.add("unsupported_money_transfer")
+    return {"passed": not reasons, "reasons": sorted(reasons), "scope": "bounded_publication_claims_v1"}
 
 # ── Configuration ────────────────────────────────────────────────────────
 # Public so callers (and tests) can reference or override it explicitly —
