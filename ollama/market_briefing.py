@@ -397,6 +397,7 @@ class MarketBriefingEngine:
                 "Definition: SPY put/call ratio, open interest, all "
                 "expiries (put open interest / call open interest)."
             )
+            lines.append("Interpretation: relative contracts only; buyer/seller initiation and hedge intent are unmeasured.")
             lines.append(
                 f"- Value: {pcr['value']} (as of {pcr['date']}, "
                 f"source: {pcr['source']})"
@@ -562,6 +563,23 @@ class MarketBriefingEngine:
             content = self._generate_fallback_briefing(snapshot)
             log.warning("LLM unavailable — using fallback briefing")
 
+        from ollama.number_grounding import check_publication_claims
+
+        claim_guard = check_publication_claims(content)
+        snapshot["publication_claim_guard"] = claim_guard
+        if not claim_guard["passed"]:
+            # Replace the whole candidate instead of leaving its causal story
+            # intact with a numeric footnote. Only future generations change.
+            summary = self._generate_fallback_briefing(snapshot)
+            summary_guard = check_publication_claims(summary)
+            claim_guard["fallback"] = summary_guard
+            if not summary_guard["passed"]:
+                raise ValueError("Data summary withheld: unsupported source interpretation.")
+            content = (
+                "**AI narrative withheld: unsupported source interpretation. Data summary only.**\n\n"
+                + summary
+            )
+
         # ── Number-grounding gate ──
         # Runs on every generated briefing before it is written: numeric
         # claims (decimals, percents, $ amounts, ratios) must be backed by
@@ -583,6 +601,7 @@ class MarketBriefingEngine:
             "type": briefing_type,
             "sentiment": sentiment.to_dict() if sentiment else None,
             "grounding": grounding_stats,
+            "publication_claim_guard": claim_guard,
         }
 
         if save:
@@ -613,9 +632,8 @@ class MarketBriefingEngine:
             "You are GRID's market analyst AI. You write briefings for a solo "
             "systematic trader who needs to know WHAT IS HAPPENING, WHY IT MATTERS, "
             "and WHAT TO DO ABOUT IT. Never list raw numbers — interpret every data "
-            "point. Never say 'the VIX is 25.5' — say 'VIX at 25.5 signals elevated "
-            "fear, typical of regime transitions. Historically this level precedes "
-            "either a sharp selloff or a vol crush within 2 weeks.' "
+            "point with evidence. Describe VIX as implied volatility. Historical "
+            "frequency or return predictions require supplied empirical evidence. "
             "Be direct. Be opinionated. Give actionable conclusions. "
             "Start with the single most important thing happening right now. "
             "Separate LEVERS (actor actions that open/close liquidity valves) from "
@@ -623,6 +641,8 @@ class MarketBriefingEngine:
             "lever, then the condition. If you cannot name the actor, the valve, "
             "and the flow direction, do not make the call."
         )
+        from ollama.number_grounding import PUBLICATION_EVIDENCE_RULES
+        base += " " + PUBLICATION_EVIDENCE_RULES
 
         if briefing_type == "hourly":
             return (
@@ -730,13 +750,14 @@ class MarketBriefingEngine:
         regime = snapshot.get("latest_regime")
         if regime:
             lines.append("## Latest Regime")
-            lines.append(f"- State: **{regime['state']}**")
-            lines.append(f"- Confidence: {regime['confidence']}")
-            lines.append(f"- Recommendation: {regime['recommendation']}")
+            lines.append(f"- Reported state: **{regime['state']}**")
+            lines.append(f"- Reported model confidence (calibration unverified): {regime['confidence']}")
+            # Preserve the original recommendation in the audit snapshot,
+            # not in the deterministic publication's factual data summary.
             lines.append("")
 
         lines.append("---")
-        lines.append("*LLM offline — set OPENAI_API_KEY or start a local model for AI-powered analysis*")
+        lines.append("*Data summary; AI narrative unavailable.*")
 
         return "\n".join(lines)
 

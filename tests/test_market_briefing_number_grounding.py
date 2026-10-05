@@ -19,6 +19,8 @@ import json
 import os
 from datetime import date
 
+import pytest
+
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from ollama.market_briefing import MarketBriefingEngine
@@ -228,8 +230,7 @@ def test_generate_briefing_flags_fabricated_number_leaves_real_one_alone(tmp_pat
 
     fake_llm = _FakeOllamaClient(
         "## What's Happening Now\n"
-        "SPY is trading near 5789.12 today. The P/C ratio of 8.96 signals "
-        "maximum hedging demand.\n\n"
+        "SPY is trading near 5789.12 today. The P/C ratio is 8.96.\n\n"
         "## Action\nWatch the tape.\n"
     )
     conn = _FakeConnection(
@@ -255,6 +256,100 @@ def test_generate_briefing_flags_fabricated_number_leaves_real_one_alone(tmp_pat
     saved_stats = json.loads(sidecar.read_text(encoding="utf-8"))
     assert saved_stats["ungrounded_count"] == 1
     assert saved_stats["ungrounded_values"] == ["8.96"]
+
+
+@pytest.mark.parametrize("briefing_type", ["hourly", "daily", "weekly"])
+def test_generate_briefing_withholds_hedging_claim_before_persistence(
+    tmp_path, monkeypatch, briefing_type,
+):
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+
+    class RecordingConnection(_FakeConnection):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.publications = []
+
+        def execute(self, stmt, params=None):
+            if "INSERT INTO market_briefings" in str(stmt):
+                self.publications.append(dict(params))
+            return super().execute(stmt, params)
+
+    # Keep the original mixed numeric/semantic incident intact here. The
+    # numeric-only test above retains every existing grounding assertion.
+    candidate = (
+        "## What's Happening Now\n"
+        "SPY is trading near 5789.12 today. The P/C ratio of 8.96 signals "
+        "maximum hedging demand.\n\n"
+        "## Action\nWatch the tape.\n"
+    )
+    fake_llm = _FakeOllamaClient(candidate)
+    conn = RecordingConnection(
+        row_by_sid={"YF:^GSPC:close": (5789.12, date(2026, 9, 24))},
+        pcr_row=(2.68, date(2026, 9, 24)),
+    )
+    engine = _make_engine(fake_llm, _FakeEngine(conn), tmp_path)
+    result = engine.generate_briefing(briefing_type=briefing_type, save=True)
+
+    assert len(fake_llm.calls) == 1
+    guard = result["publication_claim_guard"]
+    assert guard["passed"] is False
+    assert guard["reasons"] == ["unsupported_options_intent"]
+    assert result["snapshot"]["publication_claim_guard"] == guard
+    assert "AI narrative withheld" in result["content"]
+    assert "5789.12" in result["content"]
+    for unsupported in [candidate, "8.96", "hedging demand"]:
+        assert unsupported not in result["content"]
+
+    md_files = list(tmp_path.glob(f"{briefing_type}_*.md"))
+    assert len(md_files) == 1
+    assert result["content"] in md_files[0].read_text(encoding="utf-8")
+    assert "hedging demand" not in md_files[0].read_text(encoding="utf-8")
+    assert len(conn.publications) == 1
+    assert conn.publications[0]["content"] == result["content"]
+    persisted_snapshot = json.loads(conn.publications[0]["snap"])
+    assert persisted_snapshot["publication_claim_guard"] == guard
+
+
+@pytest.mark.parametrize("response", [None, "PCR proves maximum hedging demand."])
+def test_snapshot_recommendation_cannot_reintroduce_withheld_claim(
+    tmp_path, monkeypatch, response,
+):
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    engine = _make_engine(_FakeOllamaClient(response), _FakeEngine(_FakeConnection()), tmp_path)
+    snapshot = _empty_snapshot()
+    snapshot["latest_regime"] = {
+        "state": "FRAGILE", "confidence": 0.8, "transition_prob": 0.2,
+        "timestamp": "2026-09-24T00:00:00+00:00",
+        "recommendation": "SPY put/call ratio proves maximum hedging demand.",
+    }
+    monkeypatch.setattr(engine, "_gather_market_snapshot", lambda: snapshot)
+    result = engine.generate_briefing(briefing_type="hourly", save=True)
+    assert "hedging demand" not in result["content"]
+    assert "hedging demand" not in next(tmp_path.glob("hourly_*.md")).read_text()
+    assert result["snapshot"]["latest_regime"]["recommendation"] == snapshot["latest_regime"]["recommendation"]
+    assert "calibration unverified" in result["content"]
+
+
+def test_unsafe_data_summary_is_withheld_before_publication_writes(tmp_path, monkeypatch):
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    client = _FakeOllamaClient("PCR proves maximum hedging demand.")
+    conn = _FakeConnection()
+    engine = _make_engine(client, _FakeEngine(conn), tmp_path)
+    snapshot = _empty_snapshot()
+    snapshot["latest_regime"] = {
+        "state": "maximum hedging demand", "confidence": 0.8,
+        "transition_prob": 0.2, "timestamp": "2026-09-24T00:00:00+00:00",
+        "recommendation": "SPY put/call ratio proves maximum hedging demand.",
+    }
+    monkeypatch.setattr(engine, "_gather_market_snapshot", lambda: snapshot)
+    with pytest.raises(ValueError, match="Data summary withheld"):
+        engine.generate_briefing(briefing_type="hourly", save=True)
+    assert len(client.calls) == 1
+    assert not list(tmp_path.glob("*.md"))
+    assert not any("INSERT INTO market_briefings" in query for query in conn.executed)
 
 
 def test_generate_briefing_all_grounded_produces_no_banner_or_tags(tmp_path, monkeypatch):
