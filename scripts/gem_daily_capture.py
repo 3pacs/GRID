@@ -368,7 +368,8 @@ def _append_only_schema_ok(engine) -> bool:
               (SELECT COUNT(*) FROM pg_trigger
                 WHERE NOT tgisinternal
                   AND tgrelid IN (to_regclass('options_snapshots_all'),
-                                  to_regclass('options_capture_batches'))
+                                  COALESCE(to_regclass('options_capture_batches_all'),
+                                           to_regclass('options_capture_batches')))
                   AND tgname IN (
                   'options_snapshots_all_no_row_mutation',
                   'options_snapshots_all_no_truncate',

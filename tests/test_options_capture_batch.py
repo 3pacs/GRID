@@ -14,6 +14,7 @@ from typing import Any, Self
 import pytest
 
 from ingestion import options
+from tests.options_publication_protocol import reviewed_function_rows
 
 SESSION_NOW = datetime(2026, 9, 25, 19, tzinfo=timezone.utc)
 
@@ -23,8 +24,14 @@ class _Result:
         self.row = row
         self.rowcount = 1
 
+    def scalar_one(self):
+        return self.row[0]
+
     def fetchone(self) -> tuple:
         return self.row
+
+    def all(self):
+        return list(self.row)
 
 
 class _DB:
@@ -32,10 +39,15 @@ class _DB:
         self.calls: list[tuple[str, dict]] = []
         self.rows: list[dict] = []
         self.batches: list[dict] = []
+        self.prepared: list[dict] = []
+        self.data_rows = 0
         self.fail_after_inserts: int | None = None
         self.next_xid = 0
         self.clock_offsets: dict[str, timedelta] = {}
         self.allocations: list[tuple[str, int, datetime]] = []
+
+    def connect(self):
+        return _Connection(self)
 
     def begin(self) -> Self:
         return self
@@ -44,17 +56,23 @@ class _DB:
         self._before = [row.copy() for row in self.rows]
         self._before_batches = [batch.copy() for batch in self.batches]
         self._insert_count = 0
+        self._before_prepared = [row.copy() for row in self.prepared]
+        self._before_data_rows = self.data_rows
         return self
 
     def __exit__(self, exc_type: object, *_args: object) -> None:
         if exc_type is not None:
             self.rows = self._before
             self.batches = self._before_batches
+            self.prepared = self._before_prepared
+            self.data_rows = self._before_data_rows
 
     def execute(self, statement: Any, params: dict | None = None) -> _Result:
         sql = str(statement)
         values = params or {}
         self.calls.append((sql, values))
+        if "p.prosrc" in sql and "pg_catalog.pg_proc" in sql:
+            return _Result(tuple(reviewed_function_rows()))
         if "txid_current()" in sql:
             self.next_xid += 1
             started = SESSION_NOW + self.clock_offsets.get(
@@ -72,16 +90,55 @@ class _DB:
             return _Result((max(ordinals) if ordinals else None,))
         if "DELETE" in sql.upper().split() or sql.lstrip().upper().startswith("UPDATE OPTIONS"):
             raise AssertionError(f"append-only store mutated: {sql}")
-        if "INSERT INTO options_capture_batches" in sql:
+        if "INSERT INTO options_capture_batches_all" in sql:
+            self.prepared.append(values.copy())
+            self.data_rows += 1
+        elif "INSERT INTO options_capture_publications" in sql:
+            self.batches.append(next(b.copy() for b in self.prepared if b["batch_id"] == values["batch_id"]))
+            self.data_rows += 1
+        elif "INSERT INTO options_capture_batches" in sql:
             self.batches.append(values.copy())
+            self.data_rows += 1
         elif "INSERT INTO options_snapshots_all" in sql:
-            assert any(b["batch_id"] == values["batch_id"] for b in self.batches), \
+            assert any(b["batch_id"] == values["batch_id"] for b in self.batches + self.prepared), \
                 "row written before its batch was registered"
             self.rows.append(values.copy())
+            self.data_rows += 1
             self._insert_count += 1
             if self._insert_count == self.fail_after_inserts:
                 raise RuntimeError("simulated insert failure")
+        elif "INSERT INTO options_daily_signals" in sql:
+            self.data_rows += 1
         return _Result((None,))
+
+
+class _Connection:
+    """Offline protocol double; real COMMIT/visibility proof lives in PG tests."""
+    def __init__(self, db):
+        self.db = db
+        self.info = {}
+        self.baseline = db.data_rows
+
+    def begin(self):
+        context = self.db.begin()
+        context.__enter__()
+        class Transaction:
+            def commit(self):
+                context.__exit__(None, None, None)
+            def rollback(self):
+                context.__exit__(RuntimeError, None, None)
+        return Transaction()
+
+    def execute(self, statement, params=None):
+        if "pg_stat_xact_user_tables" in str(statement):
+            return _Result((self.db.data_rows - self.baseline,))
+        return self.db.execute(statement, params)
+
+    def exec_driver_sql(self, statement):
+        return self.execute(statement)
+
+    def close(self):
+        pass
 
 
 def _visible(db: _DB, ticker: str = "SPY") -> list[dict]:
@@ -89,7 +146,8 @@ def _visible(db: _DB, ticker: str = "SPY") -> list[dict]:
     day = SESSION_NOW.date().isoformat()
     registered = [b for b in db.batches if b["ticker"] == ticker and b["snap_date"] == day]
     if not registered:
-        return [r for r in db.rows if r["ticker"] == ticker and r["snap_date"] == day]
+        return [r for r in db.rows if r["ticker"] == ticker and r["snap_date"] == day
+                and not any(h["batch_id"] == r.get("batch_id") for h in db.prepared)]
     latest = max(registered, key=lambda b: b["ordinal"])["batch_id"]
     return [r for r in db.rows if r.get("batch_id") == latest]
 
@@ -192,9 +250,10 @@ def test_completed_batch_time_follows_final_provider_response(
     assert "txid_current()" in sql[0]
     assert not any("nextval(" in statement for statement in sql)
     assert not any("DELETE" in statement.upper() for statement in sql)
-    assert next(i for i, s in enumerate(sql) if "pg_advisory_xact_lock" in s) < next(
-        i for i, s in enumerate(sql) if "INSERT INTO options_capture_batches" in s
-    ) < next(i for i, s in enumerate(sql) if "INSERT INTO options_snapshots_all" in s)
+    assert next(i for i, s in enumerate(sql) if "INSERT INTO options_capture_batches_all" in s) < next(
+        i for i, s in enumerate(sql) if "INSERT INTO options_snapshots_all" in s
+    ) < next(i for i, s in enumerate(sql) if "pg_advisory_xact_lock" in s) < next(
+        i for i, s in enumerate(sql) if "INSERT INTO options_capture_publications" in s)
     assert result["capture_batch_id"] == db.rows[0]["batch_id"]
     assert result["capture_ordinal"] == db.rows[0]["ordinal"]
     assert result["latest_batch"] is True
@@ -225,7 +284,7 @@ def test_cancel_during_publish_rolls_back_ticker(puller):
     assert not puller.engine.rows
 
 
-def test_short_snapshot_insert_rolls_back_whole_batch(puller, monkeypatch):
+def test_short_snapshot_insert_keeps_prepared_header_without_publication(puller, monkeypatch):
     """A batch is complete or absent: an unexpected insert count fails closed."""
     execute = puller.engine.execute
 
@@ -237,7 +296,9 @@ def test_short_snapshot_insert_rolls_back_whole_batch(puller, monkeypatch):
 
     monkeypatch.setattr(puller.engine, "execute", with_conflict)
     result, _ = _run(puller, [100.0])
-    assert result["status"] == "FAILED"
+    assert result["status"] == "PARTIAL"
+    assert result["data_rows_acknowledged"] == 1
+    assert len(puller.engine.prepared) == 1
     assert puller.engine.rows == [] and puller.engine.batches == []
 
 
@@ -405,7 +466,9 @@ def test_insert_failure_rolls_back_partial_new_batch_and_keeps_old(
     prior = [row.copy() for row in puller.engine.rows]
     prior_batches = [b.copy() for b in puller.engine.batches]
     puller.engine.fail_after_inserts = 2
-    assert _run(puller, [100.0, 120.0])[0]["status"] == "FAILED"
+    result = _run(puller, [100.0, 120.0])[0]
+    assert result["status"] == "PARTIAL" and result["stop_scope"]
+    assert len(puller.engine.prepared) == len(prior_batches) + 1
     assert puller.engine.rows == prior
     assert puller.engine.batches == prior_batches
 
@@ -486,3 +549,73 @@ def test_complete_pull_supersedes_but_keeps_preexisting_legacy_rows(
     assert {row["strike"] for row in _visible(puller.engine)} == {100.0}
     assert all(row["batch_id"] and row["ordinal"] and row["started_at"] and row["completed_at"]
                for row in _visible(puller.engine))
+
+
+def test_resolver_deferred_to_completion_and_skipped_for_older_capture(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = []
+    completion_connections = []
+    publish = options.publish_bounded
+
+    def publish_with_completion_probe(engine, header, rows, finish, should_continue=None):
+        assert calls == []  # constructing the deferred resolver must do no I/O
+
+        def checked_finish(conn):
+            completion_connections.append(conn)
+            return finish(conn)
+
+        return publish(engine, header, rows, checked_finish, should_continue)
+
+    monkeypatch.setattr(options, "publish_bounded", publish_with_completion_probe)
+
+    def mock_push(conn, ticker, today_str, signals, *, should_continue=None):
+        assert conn is completion_connections[-1]
+        assert conn.db is puller.engine
+        assert "options_transaction_deadline" in conn.info
+        assert should_continue is not None and should_continue()
+        calls.append({
+            "conn": conn,
+            "ticker": ticker,
+            "today_str": today_str,
+            "signals": signals,
+            "has_snapshots": len(puller.engine.rows) > 0,
+            "has_publications": len(puller.engine.batches) > 0,
+        })
+        return 0  # observer only: this protocol double performs no resolved writes
+
+    monkeypatch.setattr(puller, "_push_to_resolved", mock_push)
+
+    # 1. Successful capture: resolver executes inside completion transaction
+    expirations = [int((SESSION_NOW + timedelta(days=days)).timestamp()) for days in (10, 20)]
+    yahoo = _Yahoo(expirations, [100.0])
+    yahoo.is_available = True
+    monkeypatch.setattr(options, "YahooOptionsClient", lambda: yahoo)
+    outcome = puller.pull_all(tickers=["SPY"], include_catalyst_universe=False)
+    result = outcome[0]
+    assert result["status"] == "SUCCESS"
+    assert len(calls) == 1
+    call = calls[0]
+    # Proves original clock-bound today_str from pull_all clock
+    assert call["today_str"] == SESSION_NOW.date().isoformat()
+    assert call["ticker"] == "SPY"
+    # Proves final connection binding to completion transaction
+    assert call["conn"] is completion_connections[0]
+    # Proves resolver deferred until completion (after snapshots written, before publication registered)
+    assert call["has_snapshots"] is True
+    assert call["has_publications"] is False
+
+    # 2. Older capture where newer batch already published: resolver must NOT run
+    calls.clear()
+    puller.engine.batches.append({
+        "ticker": "SPY",
+        "snap_date": SESSION_NOW.date().isoformat(),
+        "ordinal": 999,
+        "batch_id": "newer-batch",
+    })
+    older_result, _ = _run(puller, [100.0])
+    assert older_result["status"] == "SUCCESS"
+    assert older_result["latest_batch"] is False
+    # Proves older capture does not run resolver
+    assert len(calls) == 0
+    assert len(completion_connections) == 1
