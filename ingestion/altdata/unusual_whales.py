@@ -155,7 +155,9 @@ class UnusualWhalesPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://finance.yahoo.com/",
         "cost_tier": "FREE",
-        "latency_class": "INTRADAY",
+        # Conservative catalogue class for daily Yahoo/yfinance chain scans;
+        # polling during market hours does not establish REALTIME provenance.
+        "latency_class": "EOD",
         "pit_available": True,
         "revision_behavior": "FREQUENT",
         "trust_score": "MED",
