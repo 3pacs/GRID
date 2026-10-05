@@ -3,10 +3,44 @@
   "minimum_decisions": 40,
   "minimum_sessions": 120,
   "owner_parameters_pending_approval": [
-    "minimum_decisions",
-    "minimum_sessions",
-    "holdout_segment_boundaries",
-    "judge_only_extract_directory"
+    "holdout_segment_boundaries"
   ],
-  "scope": "fixture-only; no canonical activation"
+  "scope": "fixture-only; no canonical activation",
+  "serial_null_control": {
+    "definition": "exact-block-v1",
+    "dgp": "exact_block_exchangeability_repeats",
+    "n_blocks": 60,
+    "h": 4,
+    "n_rows": 240,
+    "entities": 40,
+    "sims": 300,
+    "seed": 7,
+    "perms": 999,
+    "trials": [
+      "A90|fwd5",
+      "A90|fwd20",
+      "A30|fwd5",
+      "A30|fwd20"
+    ],
+    "selection": {
+      "ledger_q": 0.1,
+      "run_k": 1,
+      "bh_q": 0.1,
+      "direction": 1,
+      "alpha": 0.05,
+      "threshold": 0.0125
+    },
+    "source_pins": {
+      "tests/test_offline_research_stats_core.py": "385803a54eaafd7f93bf22e46f590f58c534f0752383723007f878ef42b17248",
+      "tests/test_panel_insider_density.py": "f7f8e99107f14d6d4a5993d10a9a7bafb9b190e46c50d311c822315700fe9562"
+    },
+    "provenance": {
+      "source_pins": {
+        "tests/test_offline_research_stats_core.py": "385803a54eaafd7f93bf22e46f590f58c534f0752383723007f878ef42b17248",
+        "tests/test_panel_insider_density.py": "f7f8e99107f14d6d4a5993d10a9a7bafb9b190e46c50d311c822315700fe9562"
+      },
+      "sentinel": "Sentinel_e1792402696c81919050eb9ed1a7fa74",
+      "approved_at": "23:38:30Z"
+    }
+  }
 }

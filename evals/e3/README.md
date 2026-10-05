@@ -128,4 +128,16 @@ After SCREEN and GATES, the judge creates an S11 allocation using existing polic
 
 Source authority: owner-supplied binding acceptance text for `EVAL-E3B-staged-funnel-and-holdout.md` (2026-10-05). Owner-reported original SHA256: `d7f246435f5b2208c25b19e9b0b01b13426d36eed8f5f7c2bc82a1301187ff82`; original bytes were unavailable in this execution environment, so that original hash is not independently verified.
 
-Owner parameters remain pending approval for operations: 40 decisions, 120-session floor, holdout segment boundaries, and the judge-only extract directory on grid-svr. This slice uses synthetic/file-backed fixtures only. Canonical S11 creation/activation, live holdout, scoring-hold release, deploy, merge, migrations and trading are outside its scope. Canonical S11 was reported absent; its separate controller-owned dry-run/execute-once/verify/vault-witness procedure is required before live use.
+Owner accepted 40 decisions, the 120-session floor, and the judge-only extract directory on grid-svr (2026-10-05). Exact holdout segment boundaries remain proposed for review; activation is separate. This slice uses synthetic/file-backed fixtures only. Canonical S11 creation/activation, live holdout, scoring-hold release, deploy, merge, migrations and trading are outside its scope. Canonical S11 was reported absent; its separate controller-owned dry-run/execute-once/verify/vault-witness procedure is required before live use.
+
+
+### Approved Exact-Block Supplement & Ledger Compatibility (E3B / E0)
+
+- **Approved Exact-Block Supplement**: Incorporates exact-block exchangeability serial null control (`exact-block-v1`, repeats DGP) as a supplementary diagnostic gate in `evals/e3/gates.py`. Runs fresh candidate machinery across 300 simulated worlds (60 blocks repeated $H=4$ times to 240 rows across 40 entities) and validates FDR, FWER, and strict KS uniformity calibration.
+- **Immutable v1 Compatibility**: Historical `e3-v1` ledgers remain immutable and replay verbatim. `candidate_core` binds `e3_version` from `state.genesis["e3_version"]`, preserving hash symmetry across write and replay without retroactive migrations or anchor ID rewrites.
+- **Asymmetric Forward Compatibility**: The historical `e3-v1` reader accepts `e3-v2` genesis records (as the original v1 validator checked only that `e3_version` was a string, without rejecting unknown genesis versions), but fails on `e3-v2` proposals due to candidate-ID hash mismatch (since the v1 reader hardcodes `VERSION="e3-v1"` in `candidate_core`).
+- **Adaptive Block Limit**: Validity of this supplementary null DGP is strictly established for the declared fixed block size ($H=4$); it does not establish calibration for adaptive block length selection.
+- **Source Criteria Unchanged**: Released E0 baseline card checks, power curve monotonicity, and manifest integrity checks remain enforced without relaxation or bypass.
+- **Canonical Operations Separate**: Owner-accepted minima and judge-only extraction remain subject to separate controller activation; no live merge, deployment, or trading operations are executed.
+
+Historical callers of `candidate_core` must pass the journal genesis version explicitly (for example, `candidate_core(record, e3_version=state.genesis["e3_version"])`); the default uses the current package version. Journal writer and replay already pass it explicitly.

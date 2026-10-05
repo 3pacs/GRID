@@ -176,10 +176,10 @@
       "suite": "e3",
       "version": "e3-v2",
       "path": "evals/e3",
-      "manifest_sha256": "ad8f5c1616334abba986deb5fed3b0c18244c005ba223c71634a27c41836097d",
+      "manifest_sha256": "ae32745109f597e9e53f031e6050e140bc7b88fdbd5166851b53889487b7d9ac",
       "released_in": "E3B draft; merge pending",
-      "approved_by": "Owner authorized normal milestone draft PR; exact-head review pending",
-      "note": "E3B fixture-only staged funnel, S11 holdout custody and prospective research promotion. IID sensitivity acceptance unresolved; operational owner parameters and canonical activation pending."
+      "approved_by": "Owner approved E3B fixes/ledger.py exception (2026-10-05); exact-head review pending",
+      "note": "E3B fixture-only funnel, S11 custody and research promotion; approved exact-block serial-null supplement and genesis-bound v1/v2 proposal identities. Owner minima40decisions/120sessions and judge-only extraction accepted. Boundary review and canonical activation remain separate controller gates."
     },
     {
       "seq": 14,
@@ -198,8 +198,8 @@
         "tests/test_e3_ledger.py": "cc6b90ca2b52dc9ed678677bee4553b01b46aacb529e80d4f1a3ff4af4474e5e",
         "tests/test_e0v2_benchmark.py": "cfecbbf59c71128fc3aedbc809d29f6108f6f79143ecaace53166e7f84997966",
         "tests/test_e3_funnel.py": "ff7c5876005067d4c63eb0ba9a594ec53158df2512dfb088054445baf7b71df4",
-        "tests/test_e3_gates.py": "3ad5e6b0a555c5c67d97d5c10c9a6a221d38ac3ca0107ea377b1b3fd28bb54b5",
-        "tests/test_e3_holdout.py": "8659b16a8462099fde358da026fb36858a587ce0e7b30805f19a3289bdc4f4f3"
+        "tests/test_e3_gates.py": "e824fd225df0d307a4a2af90e495928d304d3a7aa844dd67ff889cf8259c5789",
+        "tests/test_e3_holdout.py": "947fbd17cf430f0403de3447efccac3abff9f2b69b01321463316e493b71d692"
       }
     }
   ]

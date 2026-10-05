@@ -277,3 +277,66 @@ def test_evaluate_gates_conjunction(base_env, clean_cards):
         and res["e0"]["passed"] is True
     )
     assert len(res["digest"]) == 64
+
+
+def test_e0_gate_machinery_change_signflip_block1_mutation_fails(
+    base_env, clean_cards, monkeypatch
+):
+    from analysis import panel_insider_density as panel
+
+    orig_signflip = panel.signflip_pvalues
+
+    def _mutated_signflip(ic, block, perms, seed, direction):
+        return orig_signflip(ic, 1, perms, seed, direction)
+
+    monkeypatch.setattr(panel, "signflip_pvalues", _mutated_signflip)
+
+    mach, digs = base_env
+    res = gates.e0_gate(
+        "machinery-change",
+        baseline_hashes=mach,
+        baseline_cards=clean_cards,
+        baseline_digests=digs,
+        repo_root=REPO,
+    )
+    assert res["passed"] is False
+
+    fresh = res["details"]["cards"]
+    assert set(fresh.keys()) == set(clean_cards.keys())
+    for card in fresh.values():
+        for chk in card["checks"].values():
+            assert all(chk.get(flg) is True for flg in gates.SCENARIO_FLAGS)
+
+    receipt = res["details"]["serial_null"]
+    assert receipt["flags"]["fdr_bh_controlled"] is False
+    assert receipt["flags"]["null_p_uniform_ks"] is False
+
+
+def test_exact_block_control_clean_actual():
+    res = gates.exact_block_control(repo_root=REPO)
+    assert res["passed"] is True
+    receipt = res["receipt"]
+    assert len(receipt["spec_sha256"]) == 64
+    assert receipt["raw_scores"]["fdr"]["rate"] == pytest.approx(0.0966666667, rel=1e-5)
+    assert receipt["raw_scores"]["null_calibration"]["ks_stat"] == pytest.approx(
+        0.0265, abs=1e-3
+    )
+    assert receipt["flags"]["fdr_bh_controlled"] is True
+    assert receipt["flags"]["fwer_holm_controlled"] is True
+    assert receipt["flags"]["null_p_uniform_ks"] is True
+
+
+def test_exact_block_control_malformed_config_float_rejected(tmp_path):
+    cfg_dir = tmp_path / "evals" / "e3"
+    cfg_dir.mkdir(parents=True)
+    real_cfg_file = REPO / "evals" / "e3" / "config.json"
+    cfg = json.loads(real_cfg_file.read_text(encoding="utf-8"))
+    cfg["serial_null_control"]["n_rows"] = 240.0
+    (cfg_dir / "config.json").write_text(json.dumps(cfg), encoding="utf-8")
+
+    res = gates.exact_block_control(repo_root=tmp_path)
+    assert res["passed"] is False
+    assert (
+        "serial_null_control parameters do not match static approved definition"
+        in res["reason"]
+    )

@@ -1,6 +1,6 @@
 """E3B holdout custodian adapter.
 
-In-process Python is not an OS security boundary and live extraction directory approval pending.
+In-process Python is not an OS security boundary and judge-only extraction accepted; live use remains controller-gated.
 """
 
 from __future__ import annotations
