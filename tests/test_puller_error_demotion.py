@@ -145,7 +145,7 @@ class TestEarningsErrorDemotion:
         from ingestion.altdata.earnings_puller import EarningsPuller
 
         engine = _mock_engine_with_source()
-        conn = engine.begin.return_value.__enter__.return_value
+        conn = engine.connect.return_value
         conn.begin_nested.side_effect = AssertionError("earnings must not use savepoints")
         puller = EarningsPuller(db_engine=engine)
         puller._get_existing_dates = MagicMock(return_value=set())
@@ -160,7 +160,11 @@ class TestEarningsErrorDemotion:
         assert outcomes[0][0:2] == (0, 1)
         assert "WARNING" in {level for level, _ in records}
         assert "ERROR" not in {level for level, _ in records}
-        assert engine.begin.call_count == 2  # rolled-back batch, isolated row retry
+        assert conn.begin.call_count == 2  # rolled-back batch, isolated row retry
+        assert conn.begin.return_value.rollback.call_count == 2
+        conn.begin.return_value.commit.assert_not_called()
+        assert conn.close.call_count == 2
+        engine.begin.assert_not_called()
         conn.begin_nested.assert_not_called()
 
 
