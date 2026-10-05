@@ -117,7 +117,7 @@ class TestUSPTOErrorDemotion:
 
 # ---------------------------------------------------------------------------
 # Earnings puller — yfinance noise must not log ERROR; one bad row must not
-# poison the per-ticker transaction
+# poison subsequent short transactions
 # ---------------------------------------------------------------------------
 
 
@@ -141,39 +141,31 @@ class TestEarningsErrorDemotion:
         )
         assert "WARNING" in levels
 
-    def test_savepoint_isolates_failed_row_from_outer_transaction(self):
-        """A failed _insert_raw must not poison the per-ticker transaction.
-
-        Reproduces the May 6-8 `psycopg2.errors.InFailedSqlTransaction`
-        bug (6 ERRORs/wk). Before the savepoint fix, one failed insert
-        aborted the whole `with engine.begin()` block.
-        """
+    def test_bad_row_retry_logs_warning_without_savepoints(self):
         from ingestion.altdata.earnings_puller import EarningsPuller
 
         engine = _mock_engine_with_source()
-        # The connection's begin_nested() returns a context-managed savepoint.
-        sp = MagicMock()
-        conn = engine.begin.return_value.__enter__.return_value
-        conn.begin_nested.return_value = sp
-
+        conn = engine.connect.return_value
+        conn.begin_nested.side_effect = AssertionError("earnings must not use savepoints")
         puller = EarningsPuller(db_engine=engine)
-
-        # Calling _store_series_point with a failing _insert_raw should
-        # return False and call sp.rollback() rather than re-raising.
-        with patch.object(puller, "_insert_raw", side_effect=Exception("boom")):
-            ok = puller._store_series_point(
-                conn=conn,
-                ticker="AAPL",
-                field="eps_actual",
-                obs_date=__import__("datetime").date(2026, 5, 1),
-                value=1.23,
-            )
-
-        assert ok is False, (
-            "savepoint should swallow row-level failure and return False"
-        )
-        sp.rollback.assert_called_once()
-        sp.commit.assert_not_called()
+        puller._get_existing_dates = MagicMock(return_value=set())
+        points = []
+        puller._collect_series_point(points, "AAPL", "eps_actual",
+                                     __import__("datetime").date(2026, 5, 1), 1.23)
+        outcomes = []
+        with patch.object(puller, "_insert_raw", side_effect=ValueError("bad row")):
+            records = _capture_levels(lambda: outcomes.append(
+                puller._store_batch("AAPL", points, {"connection_failures": 0})
+            ))
+        assert outcomes[0][0:2] == (0, 1)
+        assert "WARNING" in {level for level, _ in records}
+        assert "ERROR" not in {level for level, _ in records}
+        assert conn.begin.call_count == 2  # rolled-back batch, isolated row retry
+        assert conn.begin.return_value.rollback.call_count == 2
+        conn.begin.return_value.commit.assert_not_called()
+        assert conn.close.call_count == 2
+        engine.begin.assert_not_called()
+        conn.begin_nested.assert_not_called()
 
 
 @pytest.mark.unit

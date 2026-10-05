@@ -1590,15 +1590,19 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         fred = FREDPuller(api_key=settings.FRED_API_KEY, db_engine=engine)
-        results = fred.pull_all(start_date=start_date)
+        # Keep FRED's per-series seven-day fetch overlap; existing observation
+        # dates remain deduped, so this does not persist revised values.
+        results = fred.pull_all()
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
-            "FRED daily pull complete — {ok}/{total} series, {rows} rows",
+            "FRED daily pull complete — {ok}/{total} series, {rows} acknowledged inserts",
             ok=succeeded,
             total=len(results),
             rows=total_rows,
         )
+        if any(r.get("commit_outcome_unknown") for r in results):
+            log.warning("FRED daily pull has unknown commit outcomes; insert sum is an acknowledged lower bound")
     except Exception as exc:
         log.error("FRED daily pull failed: {err}", err=str(exc))
         try:
@@ -1718,7 +1722,7 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         puller = OptionsPuller(db_engine=engine)
-        results = puller.pull_all()
+        results = puller.pull_all(capture_source="daily_scheduler")
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_snaps = sum(r.get("snapshots", 0) for r in results)
         log.info(

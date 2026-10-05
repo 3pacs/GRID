@@ -1484,6 +1484,62 @@ def retry_not_fresh_reason(pull_result: dict[str, Any]) -> str | None:
     return f"puller reported {outcome}" + (f": {note}" if note else "")
 
 
+def _scheduler_options_retry_guard(engine: Any) -> dict[str, Any] | None:
+    """Observe a completed scheduler capture before constructing a retry.
+
+    Only the explicit caller labels prove scheduler provenance. Legacy
+    options_puller/pre_append_only batches and GEM never qualify. A registered
+    batch proves one completed positive-row ticker capture, not whole-source
+    coverage or freshness. Empty/unavailable evidence leaves retry unchanged.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    observation_engine = None
+    try:
+        # Avoid waiting on the shared pool; the connection and read have their
+        # own bounds. No writer/catalog/provider is constructed by observation.
+        observation_engine = create_engine(
+            engine.url, poolclass=NullPool,
+            connect_args={"connect_timeout": 5, "options":
+                          engine.url.query.get("options", "") +
+                          " -c statement_timeout=5000 -c lock_timeout=1000 "
+                          "-c idle_in_transaction_session_timeout=5000"},
+        )
+        with observation_engine.connect() as conn:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            row = conn.execute(text("""
+                SELECT capture_batch_id, capture_source
+                FROM options_capture_batches
+                WHERE snap_date = :day
+                  AND capture_source IN ('daily_scheduler', 'smart_scheduler')
+                  AND row_count > 0 AND NOT backfilled
+                  AND capture_started_at >= :day_start
+                  AND capture_completed_at >= capture_started_at
+                  AND capture_completed_at <= :now
+                LIMIT 1
+            """), {"day": now.date(), "day_start": day_start, "now": now}).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": "SKIPPED", "outcome": "SKIPPED", "rows_inserted": 0,
+            "reason": "scheduler_options_batch_exists",
+            "observed_session": now.date().isoformat(),
+            "scheduler_capture_batch_id": row[0], "scheduler_capture_source": row[1],
+        }
+    except Exception as exc:
+        # An unavailable observation is unknown, not zero or proof of capture.
+        # Keep the prior retry path and never expose driver connection details.
+        log.warning("Options scheduler capture observation unavailable ({kind}); retry unchanged",
+                    kind=type(exc).__name__)
+        return None
+    finally:
+        if observation_engine is not None:
+            observation_engine.dispose()
+
+
 def _retry_source(
     source_name: str,
     engine: Any,
@@ -1576,6 +1632,11 @@ def _retry_source(
         }
 
     try:
+        if source_key.replace(" ", "_").replace("-", "_") in {"options", "yfinance_options"}:
+            guarded = _scheduler_options_retry_guard(engine)
+            if guarded is not None:
+                # A skip does not clear repair backlog or publish freshness.
+                return guarded
         log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
 
         puller, method, kwargs = _resolve_puller(source_name, engine)
