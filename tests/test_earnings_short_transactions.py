@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 
 import pandas as pd
 import pytest
-from sqlalchemy import exc as sa_exc
+from sqlalchemy import create_engine, exc as sa_exc
 
 from ingestion.altdata import earnings_puller as ep
 
@@ -30,7 +30,8 @@ def _frames(n: int = 45) -> SimpleNamespace:
 
 class _Engine:
     def __init__(self, *, bad_dates=(), begin_error=None, fail_after=None, insert_error=None,
-                 commit_error=None, commit_before_error=False):
+                 commit_error=None, commit_before_error=False, connect_error=None,
+                 rollback_error=None, close_error=None):
         self.committed: dict[tuple[str, date], dict] = {}
         self.per_txn: list[int] = []
         self.rolled_back: list[int] = []
@@ -42,6 +43,14 @@ class _Engine:
         self.insert_error = insert_error
         self.commit_error = commit_error
         self.commit_before_error = commit_before_error
+        self.connect_error = connect_error
+        self.rollback_error = rollback_error
+        self.close_error = close_error
+
+    def connect(self):
+        if self.connect_error:
+            raise self.connect_error
+        return _Conn(self)
 
     def begin(self):
         self.begin_calls += 1
@@ -50,7 +59,40 @@ class _Engine:
             raise self.begin_error
         if self.fail_after is not None and len(self.committed) >= self.fail_after:
             raise sa_exc.OperationalError("connect", {}, Exception("database unavailable"))
-        return _Txn(self)
+        txn = _Txn(self)
+        self.active = True
+        return txn
+
+
+class _Conn:
+    def __init__(self, engine: _Engine):
+        self.engine = engine
+        self.active_txn: _Txn | None = None
+        self.closed = False
+
+    def begin(self):
+        txn = self.engine.begin()
+        self.active_txn = txn
+        return txn
+
+    def execute(self, stmt, params=None):
+        if self.active_txn is not None:
+            return self.active_txn.execute(stmt, params)
+        raise RuntimeError("cannot execute without active transaction")
+
+    def close(self):
+        self.closed = True
+        if self.engine.close_error:
+            err = self.engine.close_error
+            self.engine.close_error = None
+            raise err
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, *rest):
+        self.close()
+        return False
 
 
 class _Txn:
@@ -62,6 +104,16 @@ class _Txn:
     def __enter__(self):
         self.engine.active = True
         return self
+
+    def commit(self):
+        return self.__exit__(None, None, None)
+
+    def rollback(self):
+        if self.engine.rollback_error:
+            err = self.engine.rollback_error
+            self.engine.rollback_error = None
+            raise err
+        return self.__exit__(Exception, None, None)
 
     def __exit__(self, exc_type, *rest):
         self.engine.active = False
@@ -323,3 +375,105 @@ def test_cli_labels_acknowledged_and_actual_counts(unknown, monkeypatch, capsys)
     output = capsys.readouterr().out
     assert f"Acknowledged rows: {0 if unknown else 12}" in output
     assert f"Actual total rows: {'unknown (COMMIT outcome unknown)' if unknown else 12}" in output
+
+
+@pytest.mark.parametrize("state", [None, "57P01", "57P02", "57P03"])
+@pytest.mark.parametrize("driver", ["pgcode", "sqlstate"])
+def test_unanswered_or_server_shutdown_statement_uses_bounded_outage_stop(state, driver):
+    original = Exception("server shutdown or dropped connection")
+    if state is not None:
+        setattr(original, driver, state)
+    engine = _Engine(insert_error=sa_exc.OperationalError("INSERT", {}, original))
+    out = _puller(engine, _frames(1)).pull_all(["AAPL", "MSFT"], rate_limit=0)
+    assert len(out) == 1 and out[0].get("aborted")
+    assert engine.begin_calls <= ep.MAX_CONSECUTIVE_CONNECTION_FAILURES
+
+
+def test_real_sqlalchemy_unacknowledged_rollback_is_not_row_fallback(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    with engine.connect():
+        pass
+    original_rollback = engine.dialect.do_rollback
+    calls = []
+
+    def lost_rollback(connection):
+        calls.append("rollback")
+        if len(calls) == 1:
+            raise sa_exc.OperationalError("ROLLBACK", {}, RuntimeError("synthetic acknowledgement lost"))
+        return original_rollback(connection)
+
+    monkeypatch.setattr(engine.dialect, "do_rollback", lost_rollback)
+    puller = _puller(engine)
+
+    def rejected_statement(connection):
+        raise sa_exc.IntegrityError("INSERT", {}, SimpleNamespace(pgcode="23514"))
+
+    try:
+        with pytest.raises(ep._ConnectionFailure):
+            puller._write(rejected_statement)
+    finally:
+        engine.dispose()
+
+
+def test_prior_acknowledged_rows_retained_on_rollback_error():
+    class RollbackErrorTxn(_Txn):
+        def rollback(self):
+            raise sa_exc.OperationalError("ROLLBACK", {}, Exception("lost rollback ack"))
+
+    class RollbackErrorEngine(_Engine):
+        def begin(self):
+            self.begin_calls += 1
+            assert not self.active, "nested transaction"
+            self.active = True
+            if self.begin_calls > 1:
+                self.insert_error = sa_exc.IntegrityError("INSERT", {}, Exception("bad row"))
+                return RollbackErrorTxn(self)
+            return _Txn(self)
+
+    engine = RollbackErrorEngine()
+    frames = _frames(45)
+    puller = _puller(engine, frames)
+    out = puller.pull_ticker("AAPL")
+    assert out["status"] == "PARTIAL" and out["aborted"]
+    assert out["rows_inserted"] == 50 == len(engine.committed)
+    assert not out.get("commit_outcome_unknown")
+    assert engine.begin_calls == 2
+
+
+def test_close_after_commit_preserves_current_batch_and_is_not_unknown():
+    class CloseAfterCommitEngine(_Engine):
+        def connect(self):
+            conn = super().connect()
+            def failing_close():
+                if self.begin_calls == 1:
+                    raise sa_exc.OperationalError("CLOSE", {}, Exception("close died after commit"))
+            conn.close = failing_close
+            return conn
+
+    engine = CloseAfterCommitEngine()
+    frames = _frames(45)
+    out = _puller(engine, frames).pull_all(["AAPL", "MSFT"], rate_limit=0)
+    assert len(out) == 1 and out[0]["aborted"]
+    assert out[0]["rows_inserted"] == 50 == len(engine.committed)
+    assert not out[0].get("commit_outcome_unknown")
+    assert engine.begin_calls == 1
+
+
+def test_unknown_commit_remains_unknown_when_close_also_fails():
+    class CommitAndCloseFailEngine(_Engine):
+        def connect(self):
+            conn = super().connect()
+            def failing_close():
+                raise sa_exc.OperationalError("CLOSE", {}, Exception("close cleanup failed"))
+            conn.close = failing_close
+            return conn
+
+    engine = CommitAndCloseFailEngine(
+        commit_error=sa_exc.OperationalError("COMMIT", {}, Exception("unanswered commit")),
+        commit_before_error=True,
+    )
+    out = _puller(engine).pull_all(["AAPL", "MSFT"])
+    assert len(out) == 1 and out[0]["status"] == "FAILED" and out[0]["aborted"]
+    assert out[0]["commit_outcome_unknown"] is True
+    assert out[0]["rows_inserted"] == 0
+    assert engine.begin_calls == 1

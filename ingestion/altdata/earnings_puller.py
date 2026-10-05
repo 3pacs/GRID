@@ -84,26 +84,44 @@ class EarningsStoreAborted(RuntimeError):
 class _ConnectionFailure(Exception):
     """A transaction could not open, or its connection became unusable."""
 
-    def __init__(self, cause: BaseException, commit_outcome_unknown: bool = False) -> None:
+    def __init__(
+        self,
+        cause: BaseException,
+        commit_outcome_unknown: bool = False,
+        terminal: bool = False,
+        acknowledged_rows: int = 0,
+    ) -> None:
         super().__init__(str(cause))
         self.commit_outcome_unknown = commit_outcome_unknown
+        self.terminal = terminal
+        self.acknowledged_rows = acknowledged_rows
 
 
 def _sqlstate(exc: BaseException) -> str | None:
     """Read the server's SQLSTATE through psycopg2/psycopg3 wrappers."""
     original = getattr(exc, "orig", exc)
-    return getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+    code = (
+        getattr(original, "sqlstate", None)
+        or getattr(original, "pgcode", None)
+        or getattr(exc, "sqlstate", None)
+        or getattr(exc, "pgcode", None)
+    )
+    return str(code) if code is not None else None
 
 
 def _is_connection_error(exc: BaseException) -> bool:
-    # OperationalError also covers answered deadlocks, lock timeouts and
-    # cancellations. Those leave a usable connection after rollback.
+    # OperationalError also covers answered deadlocks (40P01), lock timeouts (55P03)
+    # and cancellations (57014). Those leave a usable connection after rollback.
     state = _sqlstate(exc)
-    return (
-        isinstance(exc, (sa_exc.DisconnectionError, sa_exc.TimeoutError))
-        or bool(getattr(exc, "connection_invalidated", False))
-        or bool(state and state.startswith("08"))
-    )
+    if isinstance(exc, (sa_exc.DisconnectionError, sa_exc.TimeoutError)):
+        return True
+    if bool(getattr(exc, "connection_invalidated", False)):
+        return True
+    if state and (state.startswith("08") or state in ("57P01", "57P02", "57P03")):
+        return True
+    if isinstance(exc, sa_exc.DBAPIError) and not isinstance(exc, (sa_exc.IntegrityError, sa_exc.DataError, sa_exc.ProgrammingError)) and state is None:
+        return True
+    return False
 
 
 def _safe_float(val: Any) -> float | None:
@@ -402,24 +420,82 @@ class EarningsPuller(BasePuller):
 
         return points
 
-    def _write(self, fn) -> None:
+    def _write(self, fn) -> int:
         """Commit one short transaction; distinguish unavailable connections."""
-        opened = False
-        statements_completed = False
         try:
-            with self.engine.begin() as conn:
-                opened = True
-                fn(conn)
-                statements_completed = True
+            conn = self.engine.connect()
         except Exception as exc:
-            # An unanswered COMMIT may already have committed on the server.
-            # Keep it unknown and never replay it, even if the driver failed
-            # to mark its connection invalidated. An answered non-08 SQLSTATE
-            # instead confirms a rejected transaction and permits fallback.
-            unanswered_commit = statements_completed and _sqlstate(exc) is None
-            if not opened or _is_connection_error(exc) or unanswered_commit:
-                raise _ConnectionFailure(exc, commit_outcome_unknown=statements_completed) from exc
-            raise
+            raise _ConnectionFailure(exc, commit_outcome_unknown=False, terminal=False, acknowledged_rows=0) from exc
+
+        transaction = None
+        inserted = 0
+        acknowledged = False
+        unknown = False
+        try:
+            try:
+                transaction = conn.begin()
+            except Exception as exc:
+                raise _ConnectionFailure(exc, commit_outcome_unknown=False, terminal=False, acknowledged_rows=0) from exc
+
+            try:
+                ret = fn(conn)
+                inserted = ret if isinstance(ret, int) else 0
+            except Exception as exc:
+                try:
+                    if transaction is not None:
+                        transaction.rollback()
+                except Exception as rollback_exc:
+                    raise _ConnectionFailure(
+                        rollback_exc,
+                        commit_outcome_unknown=False,
+                        terminal=True,
+                        acknowledged_rows=0,
+                    ) from rollback_exc
+
+                if _is_connection_error(exc):
+                    raise _ConnectionFailure(
+                        exc,
+                        commit_outcome_unknown=False,
+                        terminal=False,
+                        acknowledged_rows=0,
+                    ) from exc
+                raise
+
+            try:
+                transaction.commit()
+                acknowledged = True
+            except Exception as exc:
+                if _is_connection_error(exc) or _sqlstate(exc) is None:
+                    unknown = True
+                    raise _ConnectionFailure(
+                        exc,
+                        commit_outcome_unknown=True,
+                        terminal=True,
+                        acknowledged_rows=0,
+                    ) from exc
+                try:
+                    if transaction is not None:
+                        transaction.rollback()
+                except Exception as rollback_exc:
+                    raise _ConnectionFailure(
+                        rollback_exc,
+                        commit_outcome_unknown=False,
+                        terminal=True,
+                        acknowledged_rows=0,
+                    ) from rollback_exc
+                raise
+        finally:
+            try:
+                conn.close()
+            except Exception as close_exc:
+                raise _ConnectionFailure(
+                    close_exc,
+                    commit_outcome_unknown=unknown,
+                    terminal=True,
+                    acknowledged_rows=inserted if acknowledged else 0,
+                ) from close_exc
+
+        return inserted
 
     def _store_points(self, conn: Any, points: list[dict[str, Any]]) -> int:
         """Insert at most 50 points, deduping successful observations only."""
@@ -457,8 +533,9 @@ class EarningsPuller(BasePuller):
             raise ValueError(f"earnings batch exceeds {STORE_BATCH_ROWS} rows")
         counter = {"stored": 0}
 
-        def store_all(conn: Any) -> None:
+        def store_all(conn: Any) -> int:
             counter["stored"] = self._store_points(conn, batch)
+            return counter["stored"]
 
         try:
             self._write(store_all)
@@ -469,8 +546,18 @@ class EarningsPuller(BasePuller):
                 # The server may have committed before the connection died.
                 # Neither zero nor the tentative count is confirmed. Do not
                 # turn a retry/dedupe response into an invented exact count.
-                raise EarningsStoreAborted("database connection failed during commit; outcome unknown",
-                                           commit_outcome_unknown=True) from exc
+                raise EarningsStoreAborted(
+                    "database connection failed during commit; outcome unknown",
+                    commit_outcome_unknown=True,
+                ) from exc
+            if exc.terminal:
+                raise EarningsStoreAborted(
+                    f"database recovery failed: {exc}",
+                    stored=exc.acknowledged_rows,
+                    failed=0,
+                    errors=[str(exc)],
+                    commit_outcome_unknown=False,
+                ) from exc
             self._note_connection_failure(streak, exc.__cause__, stored=0)
         except Exception as exc:
             streak["connection_failures"] = 0
@@ -479,8 +566,10 @@ class EarningsPuller(BasePuller):
         stored = failed = 0
         errors: list[str] = []
         for point in batch:
-            def store_one(conn: Any, point: dict[str, Any] = point) -> None:
-                counter["stored"] = self._store_points(conn, [point])
+            def store_one(conn: Any, point: dict[str, Any] = point) -> int:
+                count = self._store_points(conn, [point])
+                counter["stored"] = count
+                return count
 
             try:
                 self._write(store_one)
@@ -491,6 +580,14 @@ class EarningsPuller(BasePuller):
                     raise EarningsStoreAborted(
                         "database connection failed during commit; outcome unknown",
                         stored=stored, failed=failed, errors=errors, commit_outcome_unknown=True,
+                    ) from exc
+                if exc.terminal:
+                    raise EarningsStoreAborted(
+                        f"database recovery failed: {exc}",
+                        stored=stored + exc.acknowledged_rows,
+                        failed=failed,
+                        errors=errors + [str(exc)],
+                        commit_outcome_unknown=False,
                     ) from exc
                 failed += 1
                 errors.append(f"{point['series_id']} @ {point['obs_date']}: connection failure")
