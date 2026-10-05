@@ -9,11 +9,13 @@ Run via:
 
 import argparse
 from datetime import date
+from decimal import Decimal, localcontext
 import json
 import math
 from pathlib import Path
 
 from .harness import canonical, digest, finite, instant, packet, reconcile
+from .reference import Ball
 
 
 def _parse_unique_json(raw: bytes) -> dict:
@@ -53,6 +55,103 @@ def _aggregate(contracts: list) -> dict:
             c["signed_usd_per_1pct"] for c in contracts if c["side"] == "put"
         ),
         "signed_net": math.fsum(c["signed_usd_per_1pct"] for c in contracts),
+    }
+
+
+def _format_diagnostic(b: Ball) -> dict:
+    if b.lo > 0:
+        sign = "POSITIVE"
+    elif b.hi < 0:
+        sign = "NEGATIVE"
+    else:
+        sign = "INDETERMINATE"
+    return {
+        "absolute_error_bound": str(b.e),
+        "lower": str(b.lo),
+        "upper": str(b.hi),
+        "sign": sign,
+    }
+
+
+def _recenter_ball(b: Ball, actual_float: float) -> Ball:
+    actual_f = float(actual_float)
+    if not math.isfinite(actual_f):
+        raise ArithmeticError(f"non-finite actual float: {actual_f}")
+    actual_d = Decimal.from_float(actual_f)
+    discrepancy = abs(b.v - actual_d)
+    scale = max(abs(b.lo), abs(b.hi), abs(actual_d))
+    from decimal import getcontext
+
+    guard = Decimal(10) ** (-getcontext().prec + 3) * max(Decimal(1), scale)
+    new_e = b.e + discrepancy + guard
+    if not new_e.is_finite():
+        raise ArithmeticError("non-finite error bound in recenter")
+    return Ball(actual_d, new_e)
+
+
+def _sum_balls(balls: list) -> Ball:
+    if not balls:
+        return Ball(Decimal(0), Decimal(0))
+    res = balls[0]
+    for b in balls[1:]:
+        res = res + b
+    return res
+
+
+def _aggregate_bounds(grp_contracts: list, grp_balls: list) -> dict:
+    agg_floats = _aggregate(grp_contracts)
+
+    call_oi_balls = [b["oi_gross"] for b in grp_balls if b["side"] == "call"]
+    call_oi_ball = _recenter_ball(
+        _sum_balls(call_oi_balls), agg_floats["call_oi_gross"]
+    )
+
+    put_oi_balls = [b["oi_gross"] for b in grp_balls if b["side"] == "put"]
+    put_oi_ball = _recenter_ball(_sum_balls(put_oi_balls), agg_floats["put_oi_gross"])
+
+    all_oi_balls = [b["oi_gross"] for b in grp_balls]
+    oi_ball = _recenter_ball(_sum_balls(all_oi_balls), agg_floats["oi_gross"])
+
+    call_inv_balls = [b["inventory_gross"] for b in grp_balls if b["side"] == "call"]
+    call_inv_ball = _recenter_ball(
+        _sum_balls(call_inv_balls), agg_floats["call_inventory_gross"]
+    )
+
+    put_inv_balls = [b["inventory_gross"] for b in grp_balls if b["side"] == "put"]
+    put_inv_ball = _recenter_ball(
+        _sum_balls(put_inv_balls), agg_floats["put_inventory_gross"]
+    )
+
+    all_inv_balls = [b["inventory_gross"] for b in grp_balls]
+    inv_ball = _recenter_ball(
+        _sum_balls(all_inv_balls), agg_floats["inventory_gross"]
+    )
+
+    call_signed_balls = [b["signed_usd"] for b in grp_balls if b["side"] == "call"]
+    call_signed_ball = _recenter_ball(
+        _sum_balls(call_signed_balls), agg_floats["call_signed"]
+    )
+
+    put_signed_balls = [b["signed_usd"] for b in grp_balls if b["side"] == "put"]
+    put_signed_ball = _recenter_ball(
+        _sum_balls(put_signed_balls), agg_floats["put_signed"]
+    )
+
+    all_signed_balls = [b["signed_usd"] for b in grp_balls]
+    signed_net_ball = _recenter_ball(
+        _sum_balls(all_signed_balls), agg_floats["signed_net"]
+    )
+
+    return {
+        "call_oi_gross": _format_diagnostic(call_oi_ball),
+        "put_oi_gross": _format_diagnostic(put_oi_ball),
+        "oi_gross": _format_diagnostic(oi_ball),
+        "call_inventory_gross": _format_diagnostic(call_inv_ball),
+        "put_inventory_gross": _format_diagnostic(put_inv_ball),
+        "inventory_gross": _format_diagnostic(inv_ball),
+        "call_signed": _format_diagnostic(call_signed_ball),
+        "put_signed": _format_diagnostic(put_signed_ball),
+        "signed_net": _format_diagnostic(signed_net_ball),
     }
 
 
@@ -391,6 +490,7 @@ def build(raw: bytes) -> dict:
                 "Net signed exposure is an arithmetic sensitivity envelope, not a directional signal or confidence interval.",
                 "European Black-Scholes approximation for SPY American options; dividend/early-exercise effects unmodeled.",
                 "0DTE defined strictly by calendar UTC date matching valuation UTC date; no exchange-local trading session claim.",
+                "Conditional arithmetic error bounds assume binary64 round-to-nearest, transcendental error <=2 ulp, gradual underflow, no overflow, and fixed hypothetical inventory fractions; unmodeled American/dividend and market effects are excluded.",
             ]
         )
 
@@ -403,6 +503,8 @@ def build(raw: bytes) -> dict:
                 "inventory_status": "HYPOTHETICAL_UNOBSERVED",
                 "units": "USD_per_1pct_underlying_move",
                 "scope": "declared_fixture_universe_only",
+                "arithmetic_scope": "conditional_numerical_bounds_under_fixed_hypothetical_fractions",
+                "bound_assumption": "binary64 round-to-nearest; exp/log/sqrt <=2 ulp; gradual underflow; no overflow; fixed hypothetical inputs; European model only",
                 "full_market_coverage": None,
                 "source_authentication": "SYNTHETIC"
                 if is_synthetic
@@ -483,9 +585,32 @@ def build(raw: bytes) -> dict:
         for s in spots:
             pt = engine_point_map.get(s)
             if pt and pt.get("status") == "PASS_NUMERICAL":
-                spot_gamma_maps[s] = {
-                    tuple(c["identity"]): c["actual"] for c in pt["contracts"]
-                }
+                pt_contracts = pt.get("contracts")
+                if not isinstance(pt_contracts, list):
+                    raise ValueError(f"malformed contracts in reconcile point for spot {s}")
+                c_map = {}
+                for c in pt_contracts:
+                    if not isinstance(c, dict):
+                        raise ValueError(f"malformed contract check in reconcile for spot {s}")
+                    if c.get("status") != "PASS_NUMERICAL":
+                        raise ValueError(f"non-pass contract check in PASS point: {c.get('identity')}")
+                    eb_raw = c.get("error_bound")
+                    if eb_raw is None or isinstance(eb_raw, bool):
+                        raise ValueError(f"missing error_bound for contract {c.get('identity')}")
+                    try:
+                        eb_dec = Decimal(str(eb_raw))
+                    except Exception as exc:
+                        raise ValueError(f"invalid error_bound decimal '{eb_raw}': {exc}")
+                    if not eb_dec.is_finite() or eb_dec < 0:
+                        raise ValueError(f"non-finite or negative error_bound: {eb_dec}")
+                    actual_g = c.get("actual")
+                    if actual_g is None or isinstance(actual_g, bool) or not isinstance(actual_g, (int, float)):
+                        raise ValueError(f"missing or non-numeric actual gamma: {actual_g}")
+                    actual_g = float(actual_g)
+                    if not math.isfinite(actual_g) or actual_g < 0:
+                        raise ValueError(f"non-finite or negative actual gamma: {actual_g}")
+                    c_map[tuple(c["identity"])] = (actual_g, eb_dec)
+                spot_gamma_maps[s] = c_map
             else:
                 spot_gamma_maps[s] = None
 
@@ -500,126 +625,195 @@ def build(raw: bytes) -> dict:
             ),
         )
 
-        scenario_outputs = []
-        for sc in all_scenarios:
-            sc_spots = []
-            for s in spots:
-                pt = engine_point_map.get(s)
-                gamma_map = spot_gamma_maps.get(s)
+        with localcontext() as ctx:
+            ctx.prec = 80
+            scenario_outputs = []
+            for sc in all_scenarios:
+                sc_spots = []
+                for s in spots:
+                    pt = engine_point_map.get(s)
+                    gamma_map = spot_gamma_maps.get(s)
 
-                if not pt or pt.get("status") != "PASS_NUMERICAL" or gamma_map is None:
+                    if not pt or pt.get("status") != "PASS_NUMERICAL" or gamma_map is None:
+                        sc_spots.append(
+                            {
+                                "spot": s,
+                                "status": pt.get("status", "NOT_SUPPORTED")
+                                if pt
+                                else "NOT_SUPPORTED",
+                                "reason": pt.get("reason")
+                                if pt
+                                else "engine evaluation unavailable",
+                                "aggregates": None,
+                                "arithmetic_bounds": None,
+                                "contracts": None,
+                            }
+                        )
+                        continue
+
+                    contracts = []
+                    contract_balls = []
+                    expiry_groups = {}
+                    expiry_group_balls = {}
+                    strike_groups = {}
+                    strike_group_balls = {}
+
+                    s_ball = Ball(s)
+                    s2_ball = s_ball * s_ball
+
+                    for r in sorted_admitted_rows:
+                        cid = r["contract_id"]
+                        exp_iso = instant(r["expiry"]).isoformat()
+                        k = float(r["strike"])
+                        mult = float(r["multiplier"])
+                        oi = float(r["oi"])
+                        row_key = (r["underlying"], exp_iso, k, r["side"], mult)
+                        if row_key not in gamma_map:
+                            raise ValueError(f"contract {row_key} missing from gamma map")
+                        g, eb_dec = gamma_map[row_key]
+                        frac = sc["fractions"][cid]
+                        oi_gross = g * oi * mult * (s**2) * 0.01
+                        inv_gross = oi_gross * abs(frac)
+                        signed_usd = oi_gross * frac
+
+                        if (
+                            not math.isfinite(oi_gross)
+                            or not math.isfinite(inv_gross)
+                            or not math.isfinite(signed_usd)
+                        ):
+                            raise ArithmeticError(f"non-finite exposure for {cid}")
+
+                        gamma_ball = Ball(g, eb_dec)
+                        term_ball = gamma_ball * oi * mult * s2_ball * 0.01
+                        oi_gross_ball = _recenter_ball(term_ball, oi_gross)
+
+                        inv_raw = oi_gross_ball * abs(frac)
+                        inv_gross_ball = _recenter_ball(inv_raw, inv_gross)
+
+                        signed_raw = oi_gross_ball * frac
+                        signed_usd_ball = _recenter_ball(signed_raw, signed_usd)
+
+                        c_bounds_dict = {
+                            "oi_gross_usd_per_1pct": _format_diagnostic(oi_gross_ball),
+                            "inventory_gross_usd_per_1pct": _format_diagnostic(inv_gross_ball),
+                            "signed_usd_per_1pct": _format_diagnostic(signed_usd_ball),
+                        }
+
+                        c_dict = {
+                            "contract_id": cid,
+                            "expiry": exp_iso,
+                            "strike": k,
+                            "side": r["side"],
+                            "iv": float(r["iv"]),
+                            "iv_origin": r.get("iv_origin", "direct"),
+                            "oi_as_of": r.get("oi_as_of"),
+                            "gamma": g,
+                            "oi": oi,
+                            "multiplier": mult,
+                            "assumed_dealer_fraction": frac,
+                            "signed_position_contracts": oi * frac,
+                            "oi_gross_usd_per_1pct": oi_gross,
+                            "inventory_gross_usd_per_1pct": inv_gross,
+                            "signed_usd_per_1pct": signed_usd,
+                            "arithmetic_bounds": c_bounds_dict,
+                            "clocks": r["clocks"],
+                            "unknown": {
+                                "oi_as_of": r.get("oi_as_of") is None,
+                                "quote_source_at": r["clocks"]["quote"].get("source_at")
+                                is None,
+                                "greek_source_at": r["clocks"]["greek"].get("source_at")
+                                is None,
+                                "oi_source_at": r["clocks"]["oi"].get("source_at") is None,
+                            },
+                        }
+                        if "bid" in r:
+                            c_dict["bid"] = r["bid"]
+                        if "ask" in r:
+                            c_dict["ask"] = r["ask"]
+                        if "provider_gamma" in r:
+                            c_dict["provider_gamma"] = r["provider_gamma"]
+                            c_dict["provider_gamma_provenance"] = "NOT_FRESH"
+
+                        c_ball_item = {
+                            "oi_gross": oi_gross_ball,
+                            "inventory_gross": inv_gross_ball,
+                            "signed_usd": signed_usd_ball,
+                            "side": r["side"],
+                        }
+
+                        contracts.append(c_dict)
+                        contract_balls.append(c_ball_item)
+                        expiry_groups.setdefault(exp_iso, []).append(c_dict)
+                        expiry_group_balls.setdefault(exp_iso, []).append(c_ball_item)
+                        strike_groups.setdefault((exp_iso, k), []).append(c_dict)
+                        strike_group_balls.setdefault((exp_iso, k), []).append(c_ball_item)
+
+                    by_expiry = []
+                    by_expiry_bounds = []
+                    for exp in sorted(expiry_groups.keys()):
+                        grp = expiry_groups[exp]
+                        grp_b = expiry_group_balls[exp]
+                        by_expiry.append(
+                            {
+                                "expiry": exp,
+                                "is_0dte": instant(exp).date() == valuation.date(),
+                                **_aggregate(grp),
+                            }
+                        )
+                        by_expiry_bounds.append(
+                            {
+                                "expiry": exp,
+                                **_aggregate_bounds(grp, grp_b),
+                            }
+                        )
+
+                    by_strike = []
+                    by_strike_bounds = []
+                    for exp, k in sorted(strike_groups.keys()):
+                        grp = strike_groups[(exp, k)]
+                        grp_b = strike_group_balls[(exp, k)]
+                        by_strike.append(
+                            {
+                                "expiry": exp,
+                                "strike": k,
+                                **_aggregate(grp),
+                            }
+                        )
+                        by_strike_bounds.append(
+                            {
+                                "expiry": exp,
+                                "strike": k,
+                                **_aggregate_bounds(grp, grp_b),
+                            }
+                        )
+
+                    bounds_total = _aggregate_bounds(contracts, contract_balls)
+
                     sc_spots.append(
                         {
                             "spot": s,
-                            "status": pt.get("status", "NOT_SUPPORTED")
-                            if pt
-                            else "NOT_SUPPORTED",
-                            "reason": pt.get("reason")
-                            if pt
-                            else "engine evaluation unavailable",
-                            "aggregates": None,
-                            "contracts": None,
-                        }
-                    )
-                    continue
-
-                contracts = []
-                expiry_groups = {}
-                strike_groups = {}
-
-                for r in sorted_admitted_rows:
-                    cid = r["contract_id"]
-                    exp_iso = instant(r["expiry"]).isoformat()
-                    k = float(r["strike"])
-                    mult = float(r["multiplier"])
-                    oi = float(r["oi"])
-                    row_key = (r["underlying"], exp_iso, k, r["side"], mult)
-                    g = gamma_map[row_key]
-                    frac = sc["fractions"][cid]
-                    oi_gross = g * oi * mult * (s**2) * 0.01
-                    inv_gross = oi_gross * abs(frac)
-                    signed_usd = oi_gross * frac
-
-                    c_dict = {
-                        "contract_id": cid,
-                        "expiry": exp_iso,
-                        "strike": k,
-                        "side": r["side"],
-                        "iv": float(r["iv"]),
-                        "iv_origin": r.get("iv_origin", "direct"),
-                        "oi_as_of": r.get("oi_as_of"),
-                        "gamma": g,
-                        "oi": oi,
-                        "multiplier": mult,
-                        "assumed_dealer_fraction": frac,
-                        "signed_position_contracts": oi * frac,
-                        "oi_gross_usd_per_1pct": oi_gross,
-                        "inventory_gross_usd_per_1pct": inv_gross,
-                        "signed_usd_per_1pct": signed_usd,
-                        "clocks": r["clocks"],
-                        "unknown": {
-                            "oi_as_of": r.get("oi_as_of") is None,
-                            "quote_source_at": r["clocks"]["quote"].get("source_at")
-                            is None,
-                            "greek_source_at": r["clocks"]["greek"].get("source_at")
-                            is None,
-                            "oi_source_at": r["clocks"]["oi"].get("source_at") is None,
-                        },
-                    }
-                    if "bid" in r:
-                        c_dict["bid"] = r["bid"]
-                    if "ask" in r:
-                        c_dict["ask"] = r["ask"]
-                    if "provider_gamma" in r:
-                        c_dict["provider_gamma"] = r["provider_gamma"]
-                        c_dict["provider_gamma_provenance"] = "NOT_FRESH"
-
-                    contracts.append(c_dict)
-                    expiry_groups.setdefault(exp_iso, []).append(c_dict)
-                    strike_groups.setdefault((exp_iso, k), []).append(c_dict)
-
-                by_expiry = []
-                for exp in sorted(expiry_groups.keys()):
-                    grp = expiry_groups[exp]
-                    by_expiry.append(
-                        {
-                            "expiry": exp,
-                            "is_0dte": instant(exp).date() == valuation.date(),
-                            **_aggregate(grp),
+                            "status": "PASS_NUMERICAL",
+                            "aggregates": {
+                                "total": _aggregate(contracts),
+                                "by_expiry": by_expiry,
+                                "by_strike_within_expiry": by_strike,
+                            },
+                            "arithmetic_bounds": {
+                                "total": bounds_total,
+                                "by_expiry": by_expiry_bounds,
+                                "by_strike_within_expiry": by_strike_bounds,
+                            },
+                            "contracts": contracts,
                         }
                     )
 
-                by_strike = []
-                for exp, k in sorted(strike_groups.keys()):
-                    grp = strike_groups[(exp, k)]
-                    by_strike.append(
-                        {
-                            "expiry": exp,
-                            "strike": k,
-                            **_aggregate(grp),
-                        }
-                    )
-
-                sc_spots.append(
+                scenario_outputs.append(
                     {
-                        "spot": s,
-                        "status": "PASS_NUMERICAL",
-                        "aggregates": {
-                            "total": _aggregate(contracts),
-                            "by_expiry": by_expiry,
-                            "by_strike_within_expiry": by_strike,
-                        },
-                        "contracts": contracts,
+                        "name": sc["name"],
+                        "kind": sc["kind"],
+                        "spots": sc_spots,
                     }
                 )
-
-            scenario_outputs.append(
-                {
-                    "name": sc["name"],
-                    "kind": sc["kind"],
-                    "spots": sc_spots,
-                }
-            )
 
         code_hashes = dict(p2a_result.get("code_hashes", {}))
         code_hashes["granular"] = digest(Path(__file__).read_bytes())
@@ -634,6 +828,8 @@ def build(raw: bytes) -> dict:
             "inventory_status": "HYPOTHETICAL_UNOBSERVED",
             "units": "USD_per_1pct_underlying_move",
             "scope": "declared_fixture_universe_only",
+            "arithmetic_scope": "conditional_numerical_bounds_under_fixed_hypothetical_fractions",
+            "bound_assumption": "binary64 round-to-nearest; exp/log/sqrt <=2 ulp; gradual underflow; no overflow; fixed hypothetical inputs; European model only",
             "full_market_coverage": None,
             "source_authentication": "SYNTHETIC" if is_synthetic else "NOT_VERIFIED",
             "raw_sha256": raw_hash,

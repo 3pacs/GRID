@@ -2,6 +2,7 @@
 
 import copy
 from datetime import datetime
+from decimal import Decimal, localcontext
 import json
 import math
 from pathlib import Path
@@ -11,6 +12,7 @@ import pytest
 
 from scripts.gex_p2a import granular as g
 from scripts.gex_p2a.harness import canonical
+from scripts.gex_p2a.reference import gamma as ref_gamma_fn
 
 FIXTURE = Path(__file__).parent / "fixtures/gex_p2a/granular.json"
 
@@ -237,3 +239,222 @@ def test_cli_rejection_and_retry_evidence(tmp_path):
     with pytest.raises(FileExistsError):
         g.main([str(source), "--output", str(output)])
     assert before == {p.name: p.read_bytes() for p in output.iterdir()}
+
+
+
+
+def test_independent_reference_enclosure_all_levels(packet):
+    """Oracle verification: independent high-precision gamma and exact binary64
+
+    exposure interval enclosure across all contracts, groups, and totals.
+    No new bound helper imports or implementation tolerance duplication.
+    """
+    result = build(packet)
+    assert result["status"] == "PASS_NUMERICAL"
+    r_val = packet["r"]
+    q_val = packet["q"]
+    now = datetime.fromisoformat(packet["valuation_at"].replace("Z", "+00:00"))
+
+    with localcontext() as ctx:
+        ctx.prec = 100
+        for sc in result["scenarios"]:
+            for pt in sc["spots"]:
+                s = pt["spot"]
+                s_dec = Decimal.from_float(s)
+                exact_contracts = []
+
+                for c in pt["contracts"]:
+                    cid = c["contract_id"]
+                    row = next(r for r in packet["rows"] if r["contract_id"] == cid)
+                    exp_dt = datetime.fromisoformat(row["expiry"].replace("Z", "+00:00"))
+                    t = Decimal((exp_dt - now).total_seconds()) / Decimal(365 * 86400)
+                    k = Decimal.from_float(float(row["strike"]))
+                    iv = Decimal.from_float(float(row["iv"]))
+                    oi = Decimal.from_float(float(row["oi"]))
+                    mult = Decimal.from_float(float(row["multiplier"]))
+                    frac = Decimal.from_float(float(c["assumed_dealer_fraction"]))
+
+                    gamma_exact = ref_gamma_fn(s, float(k), float(t), r_val, q_val, float(iv), precision=100)
+                    exact_factor = oi * mult * (s_dec * s_dec) * Decimal.from_float(0.01)
+                    exact_oi = gamma_exact * exact_factor
+                    exact_inv = exact_oi * abs(frac)
+                    exact_signed = exact_oi * frac
+
+                    cb = c["arithmetic_bounds"]
+                    assert Decimal(cb["oi_gross_usd_per_1pct"]["lower"]) <= exact_oi <= Decimal(cb["oi_gross_usd_per_1pct"]["upper"])
+                    assert Decimal(cb["inventory_gross_usd_per_1pct"]["lower"]) <= exact_inv <= Decimal(cb["inventory_gross_usd_per_1pct"]["upper"])
+                    assert Decimal(cb["signed_usd_per_1pct"]["lower"]) <= exact_signed <= Decimal(cb["signed_usd_per_1pct"]["upper"])
+
+                    exact_contracts.append(
+                        {
+                            "contract_id": cid,
+                            "expiry": c["expiry"],
+                            "strike": c["strike"],
+                            "side": c["side"],
+                            "oi_gross": exact_oi,
+                            "inv_gross": exact_inv,
+                            "signed": exact_signed,
+                        }
+                    )
+
+                def _verify_diag_map(diag_map, contract_subset):
+                    c_calls = [x for x in contract_subset if x["side"] == "call"]
+                    c_puts = [x for x in contract_subset if x["side"] == "put"]
+
+                    expected = {
+                        "call_oi_gross": sum((x["oi_gross"] for x in c_calls), Decimal(0)),
+                        "put_oi_gross": sum((x["oi_gross"] for x in c_puts), Decimal(0)),
+                        "oi_gross": sum((x["oi_gross"] for x in contract_subset), Decimal(0)),
+                        "call_inventory_gross": sum((x["inv_gross"] for x in c_calls), Decimal(0)),
+                        "put_inventory_gross": sum((x["inv_gross"] for x in c_puts), Decimal(0)),
+                        "inventory_gross": sum((x["inv_gross"] for x in contract_subset), Decimal(0)),
+                        "call_signed": sum((x["signed"] for x in c_calls), Decimal(0)),
+                        "put_signed": sum((x["signed"] for x in c_puts), Decimal(0)),
+                        "signed_net": sum((x["signed"] for x in contract_subset), Decimal(0)),
+                    }
+                    for field_name, exp_val in expected.items():
+                        diag = diag_map[field_name]
+                        lo = Decimal(diag["lower"])
+                        hi = Decimal(diag["upper"])
+                        assert lo <= exp_val <= hi, f"Field {field_name} expected {exp_val} not in [{lo}, {hi}]"
+
+                ab = pt["arithmetic_bounds"]
+                _verify_diag_map(ab["total"], exact_contracts)
+
+                for b in ab["by_expiry"]:
+                    subset = [x for x in exact_contracts if x["expiry"] == b["expiry"]]
+                    _verify_diag_map(b, subset)
+
+                for b in ab["by_strike_within_expiry"]:
+                    subset = [
+                        x
+                        for x in exact_contracts
+                        if x["expiry"] == b["expiry"] and math.isclose(x["strike"], b["strike"], abs_tol=1e-9)
+                    ]
+                    _verify_diag_map(b, subset)
+
+
+def test_sign_classification_indeterminate_and_definite(packet):
+    r_pos = build(packet)
+    pt_pos = point(r_pos, "oi_sign_baseline")
+    call_diag = pt_pos["arithmetic_bounds"]["total"]["call_signed"]
+    assert call_diag["sign"] == "POSITIVE"
+    assert Decimal(call_diag["lower"]) > 0
+
+    pt_neg = point(r_pos, "all_short")
+    net_diag = pt_neg["arithmetic_bounds"]["total"]["signed_net"]
+    assert net_diag["sign"] == "NEGATIVE"
+    assert Decimal(net_diag["upper"]) < 0
+
+    q = copy.deepcopy(packet)
+    q["spots"] = [765]
+    q["rows"] = [
+        r for r in q["rows"] if r["contract_id"] in ("SPY-20260928-765-C", "SPY-20260928-765-P")
+    ]
+    q["rows"][0]["oi"] = 1000
+    q["rows"][1]["oi"] = 1000
+    q["rows"][0]["iv"] = 0.20
+    q["rows"][1]["iv"] = 0.20
+    ids = [r["contract_id"] for r in q["rows"]]
+    q["granular"]["expected_contract_ids"] = ids
+    q["granular"]["scenarios"] = [
+        {
+            "name": "near_cancel",
+            "kind": "hypothetical_signed_inventory",
+            "fractions": {
+                ids[0]: 1.0,
+                ids[1]: -math.nextafter(1.0, 0.0),
+            },
+        }
+    ]
+    r_cancel = build(q)
+    pt_cancel = point(r_cancel, "near_cancel")
+    cancel_diag = pt_cancel["arithmetic_bounds"]["total"]["signed_net"]
+    assert pt_cancel["aggregates"]["total"]["signed_net"] != 0.0
+    assert cancel_diag["sign"] == "INDETERMINATE"
+    assert Decimal(cancel_diag["lower"]) <= Decimal(0) <= Decimal(cancel_diag["upper"])
+
+
+def test_malformed_reconcile_bound_refusal(packet, monkeypatch):
+    from scripts.gex_p2a import granular as g_mod
+
+    orig_reconcile = g_mod.reconcile
+
+    def bad_eb_reconcile(raw):
+        res = orig_reconcile(raw)
+        for eng in res.get("engines", []):
+            for pt in eng.get("points", []):
+                for c in pt.get("contracts", []):
+                    c["error_bound"] = "-0.001"
+                    return res
+        return res
+
+    monkeypatch.setattr(g_mod, "reconcile", bad_eb_reconcile)
+    res = build(packet)
+    assert res["status"] == "INPUT_REJECTED"
+
+    def missing_eb_reconcile(raw):
+        res = orig_reconcile(raw)
+        for eng in res.get("engines", []):
+            for pt in eng.get("points", []):
+                for c in pt.get("contracts", []):
+                    del c["error_bound"]
+                    return res
+        return res
+
+    monkeypatch.setattr(g_mod, "reconcile", missing_eb_reconcile)
+    res2 = build(packet)
+    assert res2["status"] == "INPUT_REJECTED"
+
+
+def test_empty_subsets_zero_and_unsupported_semantics(packet, monkeypatch):
+    q = copy.deepcopy(packet)
+    q["rows"] = [r for r in q["rows"] if r["contract_id"] != "SPY-20260928-765-P"]
+    q["granular"]["expected_contract_ids"] = [
+        cid for cid in q["granular"]["expected_contract_ids"] if cid != "SPY-20260928-765-P"
+    ]
+    for sc in q["granular"]["scenarios"]:
+        sc["fractions"].pop("SPY-20260928-765-P", None)
+
+    r = build(q)
+    pt = point(r)
+    b0 = pt["arithmetic_bounds"]["by_expiry"][0]
+    agg0 = pt["aggregates"]["by_expiry"][0]
+    assert agg0["put_oi_gross"] == 0.0
+    assert b0["put_oi_gross"]["sign"] == "INDETERMINATE"
+    assert Decimal(b0["put_oi_gross"]["lower"]) <= Decimal(0) <= Decimal(b0["put_oi_gross"]["upper"])
+
+    zero_c = next(c for c in pt["contracts"] if c["contract_id"] == "SPY-20261016-760-P")
+    assert zero_c["oi_gross_usd_per_1pct"] == 0.0
+    assert zero_c["arithmetic_bounds"]["oi_gross_usd_per_1pct"]["sign"] == "INDETERMINATE"
+    assert Decimal(zero_c["arithmetic_bounds"]["oi_gross_usd_per_1pct"]["lower"]) <= Decimal(0) <= Decimal(zero_c["arithmetic_bounds"]["oi_gross_usd_per_1pct"]["upper"])
+
+    from scripts.gex_p2a import granular as g_mod
+    orig_reconcile = g_mod.reconcile
+
+    def mock_unsupported_reconcile(raw):
+        res = orig_reconcile(raw)
+        for eng in res.get("engines", []):
+            if eng["name"] == "grid_primitive":
+                eng["points"][0] = {
+                    "spot": eng["points"][0]["spot"],
+                    "status": "NOT_SUPPORTED",
+                    "reason": "GRID T floor differs from exact T",
+                }
+        return res
+
+    monkeypatch.setattr(g_mod, "reconcile", mock_unsupported_reconcile)
+    r_unsupp = build(packet)
+    unsupp_pt = r_unsupp["scenarios"][0]["spots"][0]
+    assert unsupp_pt["status"] == "NOT_SUPPORTED"
+    assert unsupp_pt["aggregates"] is None
+    assert unsupp_pt["arithmetic_bounds"] is None
+    assert unsupp_pt["contracts"] is None
+
+
+def test_deterministic_repeated_builds(packet):
+    raw = canonical(packet)
+    res1 = g.build(raw)
+    res2 = g.build(raw)
+    assert canonical(res1) == canonical(res2)
+    assert res1 == res2

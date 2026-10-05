@@ -178,3 +178,35 @@ held-out labels are prerequisites for a later empirical benchmark, not features
 implemented by this synthetic arithmetic slice. No market/participant labels,
 provider performance, live holdout, E3B blocked-draft adapter or model promotion
 were used here.
+
+---
+
+## 7. Conditional Forward Arithmetic Error Bounds and Sign Classification
+
+### 7.1 Payload Location and Structure
+Forward arithmetic error bounds are reported in separate diagnostic scopes parallel to numeric aggregates without mutating existing float mappings:
+1. **Per-Contract Diagnostics**: In each contract entry within `contracts`, under `arithmetic_bounds`:
+   - `oi_gross_usd_per_1pct`
+   - `inventory_gross_usd_per_1pct`
+   - `signed_usd_per_1pct`
+2. **Spot-Level Aggregate Diagnostics**: Parallel to spot `aggregates`, under `arithmetic_bounds`:
+   - `total`: 9 bounded diagnostics matching the aggregate fields.
+   - `by_expiry`: Array of objects containing the `expiry` ISO string identity and 9 bounded diagnostics.
+   - `by_strike_within_expiry`: Array of objects containing `expiry` and `strike` identities and 9 bounded diagnostics.
+
+Each scalar bound diagnostic consists of:
+- `absolute_error_bound`: Decimal string representing the propagated forward error interval radius ($e$).
+- `lower`: Decimal string representing interval lower bound ($v - e$).
+- `upper`: Decimal string representing interval upper bound ($v + e$).
+- `sign`: Arithmetic sign classification:
+  - `POSITIVE`: Strictly positive interval ($lower > 0$).
+  - `NEGATIVE`: Strictly negative interval ($upper < 0$).
+  - `INDETERMINATE`: Interval spans or includes zero ($lower \le 0 \le upper$).
+
+### 7.2 Units and Conditional Meaning
+All bound intervals are expressed in exposure units: `USD_per_1pct_underlying_move`.
+The sign classification describes **conditional arithmetic resolution only** under the exact input numbers and declared hypothetical scenario fractions. It does **not** assert market conviction, directional price probability, statistical confidence, or trading edge. In particular, near cancellation where opposite signed exposures nearly offset, a tiny floating-point residual whose interval spans zero is conservatively classified as `INDETERMINATE`.
+
+### 7.3 Model Scope and Invariant Exclusions
+1. **Arithmetic Scope**: Bounds cover forward floating-point rounding and verified Greek recomputation error under IEEE 754 binary64 round-to-nearest arithmetic, standard transcendental approximations ($\le 2$ ulp), gradual underflow, and absence of overflow under fixed hypothetical fractions (`arithmetic_scope`: `conditional_numerical_bounds_under_fixed_hypothetical_fractions`).
+2. **Strict Exclusions**: Numerical error intervals explicitly exclude unmodeled financial and market phenomena: American early-exercise optionality, discrete cash dividend drops, borrow costs, dealer inventory estimation uncertainty, market impact, execution slippage, bid-ask spread crossing, and exchange latency.
