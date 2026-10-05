@@ -1,0 +1,12 @@
+{
+  "version": "e3-v2",
+  "minimum_decisions": 40,
+  "minimum_sessions": 120,
+  "owner_parameters_pending_approval": [
+    "minimum_decisions",
+    "minimum_sessions",
+    "holdout_segment_boundaries",
+    "judge_only_extract_directory"
+  ],
+  "scope": "fixture-only; no canonical activation"
+}
