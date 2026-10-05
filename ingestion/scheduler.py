@@ -1722,7 +1722,7 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
 
         engine = get_engine()
         puller = OptionsPuller(db_engine=engine)
-        results = puller.pull_all()
+        results = puller.pull_all(capture_source="daily_scheduler")
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_snaps = sum(r.get("snapshots", 0) for r in results)
         log.info(
