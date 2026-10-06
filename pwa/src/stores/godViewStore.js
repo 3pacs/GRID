@@ -7,7 +7,7 @@
  */
 import { create } from 'zustand';
 import { api } from '../api.js';
-import { createReadScope, safeRequestMessage } from '../requestState.js';
+import { createReadScope, safeRequestMessage, requireRead } from '../requestState.js';
 
 let activeScope = null;
 
@@ -25,7 +25,7 @@ const useGodViewStore = create((set, get) => ({
         set({ loading: true, error: null, requestSeq: seq });
         let result;
         try {
-            result = await scope.run(api.getGodViewLatest({ asOf, ...scope.options }));
+            result = requireRead(await scope.run(api.getGodViewLatest({ asOf, ...scope.options })));
         } catch (err) {
             result = { error: true, status: err?.status, code: err?.code };
         } finally {

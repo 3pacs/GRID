@@ -741,7 +741,7 @@ function TradesTab() {
 
 export function TickerRecommendations({ ticker }) {
     const { data, loading, error, refetch } = useAsyncData(
-        scope => api.getOptionsRecommendations(ticker, scope.options),
+        scope => api.getOptionsRecommendations(ticker, scope.options).then(requireRead),
         { deps: [ticker], skip: !ticker, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
     );
     const valid = !error && data?.scan_summary?.source !== 'unavailable' && Array.isArray(data?.recommendations);

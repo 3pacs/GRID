@@ -312,7 +312,7 @@ function AnomalyInsightCard({ card }) {
 function CrossFamilyCard({ card }) {
     const [expanded, setExpanded] = useState(false);
     const { data: lagData, loading: lagLoading, error: lagError, refetch } = useAsyncData(
-        scope => api.getLagAnalysis(card.a, card.b, 10, scope.options),
+        scope => api.getLagAnalysis(card.a, card.b, 10, scope.options).then(requireRead),
         { deps: [card.a, card.b], skip: !expanded, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
     );
     const corrColor = (card.corr || 0) > 0 ? colors.green : colors.red;

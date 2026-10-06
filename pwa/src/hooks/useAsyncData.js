@@ -86,7 +86,7 @@ export function useAsyncData(fetcher, options = {}) {
 
     useEffect(() => {
         mountedRef.current = true;
-        if (resetOnChange) { setData(fallback); setStale(false); hasDataRef.current = false; }
+        if (resetOnChange) { setData(fallback); setError(null); setStale(false); hasDataRef.current = false; }
         if (!skip) {
             refetch({ force: false });
         } else {

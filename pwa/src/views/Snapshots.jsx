@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { api } from '../api.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
-import { READ_DEADLINE_MS, safeRequestMessage } from '../requestState.js';
+import { READ_DEADLINE_MS, safeRequestMessage, requireRead } from '../requestState.js';
 import ErrorState from '../components/ErrorState.jsx';
 import ReadAge from '../components/ReadAge.jsx';
 import { colors, shared } from '../styles/shared.js';
@@ -27,10 +27,8 @@ const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 // let the truthy, non-array error marker (or any other malformed value)
 // flow straight into state.
 //
-// `res.message` is built by api.js from `parsed.detail || parsed.message ||
-// body` — the server's own response text. That must never reach the user
-// verbatim (same rule applied elsewhere on this branch); classify by
-// `res.status` / safe transport codes instead and show category-only wording.
+// Classify failures by safe transport codes/status or a domain error marker;
+// never display the backend's message/error text verbatim.
 const unavailableReason = (res, notFoundText) => {
     if (res?.code === 'timeout' || res?.code === 'cancelled') return safeRequestMessage(res);
     if (res?.code === 'invalid_response' || res?.message === 'Invalid JSON response') {
@@ -48,7 +46,7 @@ const normalizeSnapshotList = (res) => {
     if (Array.isArray(res)) {
         return { list: res, error: null };
     }
-    if (res && typeof res === 'object' && res.error === true) {
+    if (res && typeof res === 'object' && res.error) {
         return {
             list: [],
             error: `Snapshots unavailable: ${unavailableReason(res, 'this category has no snapshot history on the server.')}`,
@@ -90,7 +88,7 @@ export default function Snapshots() {
     }, { deps: [category], timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true });
 
     const { data: comparison, loading: comparing, error: compareError, refetch: runCompare } = useAsyncData(
-        scope => api.compareSnapshots(category, dateA, dateB, scope.options),
+        scope => api.compareSnapshots(category, dateA, dateB, scope.options).then(requireRead),
         { deps: [category, dateA, dateB], skip: true, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
     );
     const loading = dataLoading || comparing;

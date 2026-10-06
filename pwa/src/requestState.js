@@ -43,6 +43,14 @@ export function requireListPayload(result, key) {
     return result;
 }
 
+export function requireCountPayload(result) {
+    requireRead(result);
+    if (!Number.isSafeInteger(result?.count) || result.count < 0) {
+        throw Object.assign(new Error(safeRequestMessage({ code: 'invalid_response' })), { code: 'invalid_response' });
+    }
+    return result;
+}
+
 // Race even an uncooperative fetch/body/mock against cancellation. Abort alone
 // is insufficient when a response parser or an old adapter ignores its signal.
 export function raceCancellation(operation, signal) {

@@ -7,7 +7,7 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
-import { READ_DEADLINE_MS, requireListPayload } from '../requestState.js';
+import { READ_DEADLINE_MS, requireListPayload, requireCountPayload } from '../requestState.js';
 import ReadAge from '../components/ReadAge.jsx';
 
 const hypoStateColors = {
@@ -172,7 +172,7 @@ export function ResearchRunPanel() {
 // state instead — count only, no per-hypothesis metrics, no promote action.
 function TestedHypotheses() {
     const { data: summary, loading, error, refetch } = useAsyncData(
-        scope => api.getHypothesisResults({}, scope.options),
+        scope => api.getHypothesisResults({}, scope.options).then(requireCountPayload),
         { timeoutMs: READ_DEADLINE_MS, safeErrors: true },
     );
     if (loading) return <div role="status">Loading tested hypothesis count...</div>;

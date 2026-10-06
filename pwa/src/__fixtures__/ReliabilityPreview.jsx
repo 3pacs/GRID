@@ -20,6 +20,7 @@ const fixture = path => {
         dealer_gex: { status: 'unavailable', reason: 'no_verified_spot', ticker: 'SPY' },
     } };
     if (path.includes('/snapshots/research/')) return { status: 'no_runs' };
+    if (path.includes('/snapshots/compare/')) return { metrics_a: { synthetic_zero: 0 }, metrics_b: { synthetic_zero: 1 } };
     if (path.includes('/snapshots/')) return [{ id: path, created_at: '2026-09-23T00:00:00Z', payload: { synthetic_zero: 0 } }];
     if (path.includes('/discovery/results/')) return { result: null };
     if (path.includes('/discovery/jobs')) return { jobs: [] };
@@ -29,6 +30,8 @@ const fixture = path => {
     if (path.includes('/options/signals')) return { signals: [] };
     if (path.includes('/options/')) return { opportunities: [] };
     if (path.includes('/associations/anomalies')) return { anomalies: [] };
+    if (path.includes('/correlation-matrix')) return { strong_pairs: [{ a: 'FOO', b: 'BAR', kind: 'interesting', corr: 0.5 }] };
+    if (path.includes('/lag-analysis')) return { lags: [] };
     if (path.includes('/derivatives/gex/')) return { ticker: path.split('/').pop(), spot: 321, per_strike: [], profile: [], gex_aggregate: 0 };
     if (path.includes('/derivatives/vanna-charm/')) return { ticker: path.split('/').pop(), vanna_exposure: 0, charm_exposure: 0 };
     if (path.includes('/derivatives/flow-timeline/')) return { history: [
@@ -44,6 +47,13 @@ window.fetch = async (url, options = {}) => {
         deniedMutations += 1;
         return { ok: false, status: 403 };
     }
+    const path = String(url);
+    if (mode === 'domain error' && ['/godview/', '/hypotheses/results', '/lag-analysis', '/snapshots/compare/', '/options/recommendations'].some(read => path.includes(read))) {
+        return { ok: true, status: 200, json: () => Promise.resolve({ ...fixture(path), error: 'Synthetic private database failure' }) };
+    }
+    if (mode === 'unknown count' && path.includes('/hypotheses/results')) return { ok: true, status: 200, json: () => Promise.resolve({ count: null }) };
+    if (mode === 'stored failed run' && path.includes('/snapshots/research/')) return { ok: true, status: 200, json: () => Promise.resolve({ status: 'failed', run_id: 'synthetic-saved-run', error: 'Synthetic private stored error', phase: 'feature_list' }) };
+    if (mode === 'comparison 404' && path.includes('/snapshots/compare/')) return { ok: false, status: 404 };
     if (mode === 'timeout') return new Promise(() => {}); // deliberately ignores abort to test racing
     if (mode === 'offline') throw new Error('Synthetic offline failure');
     if (mode === '524') return { ok: false, status: 524, text: () => Promise.resolve('<html>Cloudflare synthetic private text</html>') };
@@ -61,7 +71,7 @@ function Preview() {
             <strong>OFFLINE SYNTHETIC FIXTURES — no production data or provider calls</strong>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
                 <label>Screen <select aria-label="Screen" value={view} onChange={event => { api.clearCache(); setView(event.target.value); }}>{Object.keys(views).map(name => <option key={name}>{name}</option>)}</select></label>
-                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON'].map(name => <option key={name}>{name}</option>)}</select></label>
+                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON', 'domain error', 'unknown count', 'stored failed run', 'comparison 404'].map(name => <option key={name}>{name}</option>)}</select></label>
                 <button onClick={() => { api.clearCache(); setGeneration(value => value + 1); }}>Remount selected screen</button>
                 <span>API fixtures requested: {requests}; mutations denied: {deniedMutations}</span>
             </div>
