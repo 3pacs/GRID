@@ -398,6 +398,22 @@ jobs:
             exit 1
           fi
 
+      # G5 is fixture-only here: no capture or provider calls. A skipped PG
+      # proof must fail admission rather than silently pass the general suite.
+      - name: Godview GEX writer PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_dealer_gex_writer_pg.py -q -rA | tee /tmp/grid-godview-g5-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g5-pg.txt; then
+            echo "::error::Godview GEX writer PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # God view G6 (migrations/versions/godview_view_v2_20260927.py): the
       # legacy matview replaced by a PIT plain view on the real G2 schema;
       # rows join a day only once released and acquired, legacy rows never

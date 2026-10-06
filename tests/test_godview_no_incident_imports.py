@@ -103,8 +103,8 @@ def test_runner_and_writers_load_no_incident_module_at_runtime():
     code = (
         "import sys, json\n"
         "import scripts.run_godview_writers as r\n"
-        "r._writer('fed'); r._writer('cftc')\n"
-        "import godview.fed_liquidity, godview.cftc_positioning\n"
+        "r._writer('fed'); r._writer('cftc'); r._writer('gex')\n"
+        "import godview.fed_liquidity, godview.cftc_positioning, godview.dealer_gex\n"
         "print(json.dumps(sorted(sys.modules)))\n"
     )
     out = subprocess.run(
