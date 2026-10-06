@@ -91,7 +91,8 @@ describe('GodView honest states', () => {
         api.getGodViewLatest.mockResolvedValue({ error: true, status: 503, message: 'godview_store_unavailable' });
         render(<GodView />);
         await waitFor(() => expect(screen.getByText('God view unavailable')).toBeTruthy());
-        expect(screen.getByText('godview_store_unavailable')).toBeTruthy();
+        expect(screen.getByText('The server is unavailable (status 503). Please retry.')).toBeTruthy();
+        expect(screen.queryByText('godview_store_unavailable')).toBeNull();
         expect(screen.queryByTestId('pillar-fed')).toBeNull();
         expect(screen.getByText('Retry')).toBeTruthy();
     });

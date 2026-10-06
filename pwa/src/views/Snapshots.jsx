@@ -1,5 +1,9 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { api } from '../api.js';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import { READ_DEADLINE_MS, safeRequestMessage } from '../requestState.js';
+import ErrorState from '../components/ErrorState.jsx';
+import ReadAge from '../components/ReadAge.jsx';
 import { colors, shared } from '../styles/shared.js';
 
 const CATEGORIES = [
@@ -26,11 +30,10 @@ const fmtDate = (d) => d ? d.substring(0, 19).replace('T', ' ') : '-';
 // `res.message` is built by api.js from `parsed.detail || parsed.message ||
 // body` — the server's own response text. That must never reach the user
 // verbatim (same rule applied elsewhere on this branch); classify by
-// `res.status` instead and show category-only wording. The one exception is
-// checking for api.js's own `'Invalid JSON response'` sentinel, which is a
-// local constant api.js itself produces, not backend text.
+// `res.status` / safe transport codes instead and show category-only wording.
 const unavailableReason = (res, notFoundText) => {
-    if (res?.message === 'Invalid JSON response') {
+    if (res?.code === 'timeout' || res?.code === 'cancelled') return safeRequestMessage(res);
+    if (res?.code === 'invalid_response' || res?.message === 'Invalid JSON response') {
         return 'the server sent an unreadable response.';
     }
     const status = res?.status;
@@ -61,28 +64,20 @@ export default function Snapshots() {
     const [compareMode, setCompareMode] = useState(false);
     const [dateA, setDateA] = useState('');
     const [dateB, setDateB] = useState('');
-    const [comparison, setComparison] = useState(null);
-    const [loading, setLoading] = useState(false);
-    const [error, setError] = useState(null);
     const [latestError, setLatestError] = useState(null);
     const [historyError, setHistoryError] = useState(null);
     const [expandedId, setExpandedId] = useState(null);
 
-    useEffect(() => {
-        loadData();
-    }, [category]);
-
-    const loadData = async () => {
-        setLoading(true);
-        setError(null);
+    const { data: receipt, loading: dataLoading, error: dataError, refetch: loadData } = useAsyncData(async (scope) => {
         setLatestError(null);
         setHistoryError(null);
-        setComparison(null);
-        try {
-            const [latestRes, historyRes] = await Promise.all([
-                api.getSnapshotLatest(category, 1),
-                api.getSnapshotHistory(category),
-            ]);
+        setLatest(null);
+        setHistory([]);
+        const [latestRes, historyRes] = await Promise.all([
+            scope.run(api.getSnapshotLatest(category, 1, scope.options)),
+            scope.run(api.getSnapshotHistory(category, null, null, scope.options)),
+        ]);
+        if (scope.current()) {
             const latestNorm = normalizeSnapshotList(latestRes);
             setLatest(latestNorm.list[0] || null);
             setLatestError(latestNorm.error);
@@ -90,33 +85,15 @@ export default function Snapshots() {
             const historyNorm = normalizeSnapshotList(historyRes);
             setHistory(historyNorm.list);
             setHistoryError(historyNorm.error);
-        } catch (e) {
-            setError(e.message || 'Failed to load snapshots');
         }
-        setLoading(false);
-    };
+        return latestRes;
+    }, { deps: [category], timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true });
 
-    const runCompare = async () => {
-        if (!dateA || !dateB) return;
-        setLoading(true);
-        setError(null);
-        try {
-            const res = await api.compareSnapshots(category, dateA, dateB);
-            if (res && typeof res === 'object' && res.error === true) {
-                // compare_snapshots (api/routers/snapshots.py:81-83) raises a 404
-                // with the store's own message when a date is missing; api.js
-                // resolves that to this marker rather than throwing. Never echo
-                // res.message (backend text) — category-only wording only.
-                setComparison(null);
-                setError(`Comparison failed: ${unavailableReason(res, 'the comparison dates could not both be found.')}`);
-            } else {
-                setComparison(res);
-            }
-        } catch (e) {
-            setError(e.message || 'Comparison failed');
-        }
-        setLoading(false);
-    };
+    const { data: comparison, loading: comparing, error: compareError, refetch: runCompare } = useAsyncData(
+        scope => api.compareSnapshots(category, dateA, dateB, scope.options),
+        { deps: [category, dateA, dateB], skip: true, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
+    );
+    const loading = dataLoading || comparing;
 
     const extractMetrics = (snap) => {
         if (!snap) return {};
@@ -189,7 +166,9 @@ export default function Snapshots() {
                 ))}
             </div>
 
-            {error && <div style={shared.error}>{error}</div>}
+            {dataError && <ErrorState title="Snapshots unavailable" error={dataError} onRetry={loadData} />}
+            {compareError && <ErrorState title="Comparison failed" error={compareError} onRetry={runCompare} />}
+            {receipt && !receipt.error && <ReadAge value={receipt} />}
             {loading && <div style={{ color: colors.textMuted, fontSize: '13px', padding: '12px' }}>Loading...</div>}
 
             {/* Latest Snapshot */}
@@ -233,7 +212,7 @@ export default function Snapshots() {
                     }} onClick={() => setCompareMode(!compareMode)}>
                         {compareMode ? 'Compare: ON' : 'Compare'}
                     </button>
-                    <button style={shared.buttonSmall} onClick={loadData}>Refresh</button>
+                    <button style={shared.buttonSmall} onClick={() => loadData()}>Refresh</button>
                 </div>
             )}
 

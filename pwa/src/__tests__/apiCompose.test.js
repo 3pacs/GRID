@@ -152,7 +152,7 @@ describe('api.compose / api.askStream / auth expiry', () => {
             try {
                 const result = await api.get('/api/v1/watchlist/');
 
-                expect(result).toEqual({ error: true, status: 401, message: 'Session expired' });
+                expect(result).toEqual({ error: true, status: 401, code: 'http', message: 'Your session has expired. Please sign in again.' });
                 expect(api.token).toBeNull();
                 expect(listener).toHaveBeenCalledTimes(1);
             } finally {

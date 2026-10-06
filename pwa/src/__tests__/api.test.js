@@ -282,7 +282,8 @@ describe('GRIDApi', () => {
             expect(result).toEqual({
                 error: true,
                 status: 422,
-                message: 'Invalid data',
+                code: 'http',
+                message: 'The request failed (status 422). Please retry.',
             });
         });
 
@@ -298,7 +299,7 @@ describe('GRIDApi', () => {
 
             expect(result.error).toBe(true);
             expect(result.status).toBe(422);
-            expect(result.message).toBe('Validation error');
+            expect(result.message).toBe('The request failed (status 422). Please retry.');
         });
 
         it('clears token on 401', async () => {
@@ -331,7 +332,8 @@ describe('GRIDApi', () => {
             expect(result).toEqual({
                 error: true,
                 status: 500,
-                message: 'Internal Server Error',
+                code: 'http',
+                message: 'The server is unavailable (status 500). Please retry.',
             });
         });
     });

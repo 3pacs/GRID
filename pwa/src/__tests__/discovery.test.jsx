@@ -106,7 +106,7 @@ describe('Discovery view async data', () => {
 
         render(<Discovery />);
 
-        expect(await screen.findByText('discovery jobs unavailable')).toBeInTheDocument();
+        expect(await screen.findByText('The server could not be reached. Please retry.')).toBeInTheDocument();
         const retryBtn = screen.getByRole('button', { name: 'Retry' });
 
         api.getJobs.mockResolvedValueOnce({ jobs: [] });
@@ -115,7 +115,7 @@ describe('Discovery view async data', () => {
         await waitFor(() => {
             expect(api.getJobs).toHaveBeenCalledTimes(2);
         });
-        expect(screen.queryByText('discovery jobs unavailable')).not.toBeInTheDocument();
+        expect(screen.queryByText('The server could not be reached. Please retry.')).not.toBeInTheDocument();
     });
 
     it('keeps a populated orthogonality result visible when clustering fails', async () => {
@@ -206,7 +206,7 @@ describe('ResearchRunPanel', () => {
         api.get.mockReset();
     });
 
-    it('renders a failed run with its phase, error, and skip/failure reasons', async () => {
+    it('renders a failed run with its phase and reason codes without private error text', async () => {
         api.get.mockResolvedValue({
             run_id: 'abc-123',
             status: 'failed',
@@ -228,7 +228,8 @@ describe('ResearchRunPanel', () => {
         expect(await screen.findByText('FAILED')).toBeInTheDocument();
         expect(screen.getByText('abc-123')).toBeInTheDocument();
         expect(screen.getByText('phase: feature_list')).toBeInTheDocument();
-        expect(screen.getByText('column "f.does_not_exist" does not exist')).toBeInTheDocument();
+        expect(screen.getByText('Stored research run reported a failure.')).toBeInTheDocument();
+        expect(screen.queryByText('column "f.does_not_exist" does not exist')).not.toBeInTheDocument();
         expect(screen.getByText(/fenced_before_iteration_2/)).toBeInTheDocument();
         expect(screen.getByText(/backtest_error/)).toBeInTheDocument();
         expect(screen.getByText(/deadbeef/)).toBeInTheDocument();
@@ -252,7 +253,7 @@ describe('ResearchRunPanel', () => {
         render(<ResearchRunPanel />);
 
         expect(await screen.findByText(
-            'Research status unavailable: relation "analytical_snapshots" does not exist',
+            'Research status unavailable.',
         )).toBeInTheDocument();
     });
 
@@ -261,6 +262,7 @@ describe('ResearchRunPanel', () => {
 
         render(<ResearchRunPanel />);
 
-        expect(await screen.findByText('Research status unavailable: network error')).toBeInTheDocument();
+        expect(await screen.findByText('Research status unavailable')).toBeInTheDocument();
+        expect(screen.getByText('The server could not be reached. Please retry.')).toBeInTheDocument();
     });
 });

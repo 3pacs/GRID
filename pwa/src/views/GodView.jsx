@@ -13,6 +13,7 @@ import React, { useEffect } from 'react';
 import { Eye, RefreshCw } from 'lucide-react';
 import useGodViewStore from '../stores/godViewStore.js';
 import ErrorState from '../components/ErrorState.jsx';
+import ReadAge from '../components/ReadAge.jsx';
 import GEXProvenance from '../components/GEXProvenance.jsx';
 import { colors, shared, tokens } from '../styles/shared.js';
 
@@ -275,7 +276,8 @@ export default function GodView() {
     const loadLatest = useGodViewStore((s) => s.loadLatest);
 
     useEffect(() => {
-        loadLatest();
+        loadLatest({ force: false });
+        return () => useGodViewStore.getState().cancel();
     }, [loadLatest]);
 
     const pillars = latest?.pillars || {};
@@ -298,6 +300,7 @@ export default function GodView() {
                 </div>
             )}
             {error && <ErrorState title="God view unavailable" error={error} onRetry={() => loadLatest()} />}
+            {latest && <ReadAge value={latest} retained={loading || !!error} />}
             {loading && !latest && !error && (
                 <div data-testid="godview-loading" style={{ color: colors.textMuted, fontSize: '13px' }}>Loading god view…</div>
             )}

@@ -17,6 +17,7 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from 'react';
+import { createReadScope, safeRequestMessage } from '../requestState.js';
 
 /**
  * @param {() => Promise<T>} fetcher - Async function that returns the data
@@ -32,7 +33,7 @@ import { useState, useEffect, useCallback, useRef } from 'react';
  * never left holding it.
  */
 export function useAsyncData(fetcher, options = {}) {
-    const { fallback = null, deps = [], skip = false } = options;
+    const { fallback = null, deps = [], skip = false, timeoutMs = null, safeErrors = false, resetOnChange = false } = options;
 
     const [data, setData] = useState(fallback);
     const [loading, setLoading] = useState(!skip);
@@ -41,30 +42,43 @@ export function useAsyncData(fetcher, options = {}) {
     const mountedRef = useRef(true);
     const fetcherRef = useRef(fetcher);
     fetcherRef.current = fetcher;
+    const scopeRef = useRef(null);
+    const sequenceRef = useRef(0);
+    const hasDataRef = useRef(false);
 
-    const refetch = useCallback(async () => {
+    const refetch = useCallback(async ({ force = true } = {}) => {
         if (!mountedRef.current) return;
+        const sequence = ++sequenceRef.current;
+        scopeRef.current?.cancel();
+        const scope = createReadScope({ force, timeoutMs });
+        scopeRef.current = scope;
+        const owns = () => mountedRef.current && sequence === sequenceRef.current;
+        const current = () => owns() && !scope.signal.aborted;
         setLoading(true);
         setError(null);
-        if (data !== fallback) setStale(true);
+        if (hasDataRef.current) setStale(true);
 
         try {
-            const result = await fetcherRef.current();
+            const result = await scope.run(fetcherRef.current({ ...scope, current }));
             if (result && typeof result === 'object' && result.error === true) {
                 const err = new Error(result.message || 'Request failed');
                 err.status = result.status;
+                err.code = result.code;
                 throw err;
             }
-            if (mountedRef.current) {
+            if (current()) {
                 setData(result);
+                hasDataRef.current = true;
                 setStale(false);
             }
         } catch (err) {
-            if (mountedRef.current) {
-                setError(err);
+            if (owns()) {
+                const error = safeErrors ? Object.assign(new Error(safeRequestMessage(err)), { status: err?.status, code: err?.code }) : err;
+                setError(error);
             }
         } finally {
-            if (mountedRef.current) {
+            scope.finish();
+            if (owns()) {
                 setLoading(false);
             }
         }
@@ -72,10 +86,13 @@ export function useAsyncData(fetcher, options = {}) {
 
     useEffect(() => {
         mountedRef.current = true;
+        if (resetOnChange) { setData(fallback); setStale(false); hasDataRef.current = false; }
         if (!skip) {
-            refetch();
+            refetch({ force: false });
+        } else {
+            setLoading(false);
         }
-        return () => { mountedRef.current = false; };
+        return () => { mountedRef.current = false; sequenceRef.current += 1; scopeRef.current?.cancel(); };
     }, [refetch, skip]);
 
     return { data, loading, error, refetch, stale };

@@ -4,9 +4,10 @@
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
 import useRealtimeStore from './stores/realtimeStore.js';
+import { READ_DEADLINE_MS, raceCancellation, requestFailure } from './requestState.js';
 
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
-const PRELOAD_CONCURRENCY = 4;
+const PRELOAD_CONCURRENCY = 2;
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -27,6 +28,12 @@ class GRIDApi {
         this._wsShouldReconnect = false;
         this._cache = new Map();
         this._inflight = new Map();
+        this._cacheVersions = new Map();
+        this._cacheEpoch = 0;
+        this._responseInfo = new WeakMap();
+        this._background = new Set();
+        this._foregroundRequests = 0;
+        this._foregroundWaiters = new Set();
     }
 
     get token() {
@@ -43,8 +50,8 @@ class GRIDApi {
     }
 
     /** Public GET helper — delegates to _fetch. */
-    async get(path) {
-        return this._fetch(path);
+    async get(path, options = {}) {
+        return this._fetch(path, options);
     }
 
     /** Public POST helper — delegates to _fetch. */
@@ -78,6 +85,7 @@ class GRIDApi {
     }
 
     clearCache({ prefix = null } = {}) {
+        this._cacheEpoch += 1;
         if (!prefix) {
             this._cache?.clear();
             this._inflight?.clear();
@@ -95,31 +103,80 @@ class GRIDApi {
         this.clearCache({ prefix });
     }
 
-    async preload(paths = [], { ttlMs = DEFAULT_GET_CACHE_TTL_MS, concurrency = PRELOAD_CONCURRENCY, force = false, onProgress = null } = {}) {
+    getResponseInfo(value) {
+        const info = value && typeof value === 'object' ? this._responseInfo.get(value) : null;
+        return info ? { ...info, ageMs: Math.max(0, Date.now() - info.receivedAt) } : null;
+    }
+
+    _isMaterializationRead(path) {
+        return !path.includes('/stream') && /^\/api\/v1\/(godview\/|snapshots\/|discovery\/(jobs|results\/|hypotheses|smart-heatmap)|associations\/|options\/(signals|scan|100x|history|recommendations)|derivatives\/(gex|vanna-charm|flow-timeline)\/|signals\/timeseries)/.test(path);
+    }
+
+    _foregroundDone() {
+        this._foregroundRequests -= 1;
+        if (this._foregroundRequests === 0) {
+            for (const resume of this._foregroundWaiters) resume();
+            this._foregroundWaiters.clear();
+        }
+    }
+
+    async waitForForeground(signal) {
+        if (this._foregroundRequests === 0) return;
+        let resume;
+        const waiting = new Promise(resolve => { resume = resolve; this._foregroundWaiters.add(resolve); });
+        try { await (signal ? raceCancellation(waiting, signal) : waiting); }
+        finally { this._foregroundWaiters.delete(resume); }
+    }
+
+    _subscribe(entry, signal) {
+        entry.owners += 1;
+        const operation = signal ? raceCancellation(entry.promise, signal).catch(error =>
+            requestFailure(error?.code === 'timeout' ? 'timeout' : 'cancelled')) : entry.promise;
+        return operation.finally(() => {
+            entry.owners -= 1;
+            if (entry.owners === 0 && !entry.settled) entry.controller.abort(requestFailure('cancelled'));
+        });
+    }
+
+    async preload(paths = [], { ttlMs = DEFAULT_GET_CACHE_TTL_MS, concurrency = PRELOAD_CONCURRENCY, force = false, onProgress = null, signal = null, budgetMs = 45_000 } = {}) {
         const queue = [...new Set(paths.filter(Boolean))];
         let completed = 0;
         let index = 0;
+        let failed = 0;
+        const budget = new AbortController();
+        const cancel = () => budget.abort(requestFailure('cancelled'));
+        signal?.addEventListener('abort', cancel, { once: true });
+        if (signal?.aborted) cancel();
+        const timer = setTimeout(cancel, budgetMs);
 
         const worker = async () => {
-            while (index < queue.length) {
+            while (index < queue.length && !budget.signal.aborted) {
+                if (this._foregroundRequests > 0) {
+                    try { await this.waitForForeground(budget.signal); } catch { break; }
+                }
+                if (budget.signal.aborted) break;
                 const path = queue[index];
                 index += 1;
-                await this._fetch(path, {
+                const result = await this._fetch(path, {
                     gridTtlMs: ttlMs,
                     gridForce: force,
                     gridPreload: true,
+                    gridTimeoutMs: READ_DEADLINE_MS,
+                    signal: budget.signal,
                 }).catch(() => null);
+                if (!result || result.error) failed += 1;
                 completed += 1;
                 onProgress?.({ completed, total: queue.length, path });
             }
         };
 
         const workers = Array.from(
-            { length: Math.min(concurrency, queue.length) },
+            { length: Math.min(concurrency, PRELOAD_CONCURRENCY, queue.length) },
             () => worker(),
         );
-        await Promise.all(workers);
-        return { completed, total: queue.length };
+        try { await Promise.all(workers); }
+        finally { clearTimeout(timer); signal?.removeEventListener('abort', cancel); }
+        return { completed, total: queue.length, failed, skipped: queue.length - completed };
     }
 
     async _fetch(path, options = {}) {
@@ -127,12 +184,15 @@ class GRIDApi {
             gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
             gridForce = false,
             gridPreload = false,
+            gridTimeoutMs,
+            signal,
             ...fetchOptions
         } = options;
         const method = String(fetchOptions.method || 'GET').toUpperCase();
         const cacheable = method === 'GET' && this._isCacheableGet(path);
         const cacheKey = this._cacheKey(path);
         const now = Date.now();
+        if (signal?.aborted) return requestFailure('cancelled');
 
         if (cacheable && !gridForce) {
             const cached = this._cache.get(cacheKey);
@@ -140,10 +200,24 @@ class GRIDApi {
                 return cached.value;
             }
             const inflight = this._inflight.get(cacheKey);
-            if (inflight) {
-                return inflight;
+            if (inflight && !inflight.controller.signal.aborted && (gridPreload || !inflight.background)) {
+                return this._subscribe(inflight, signal);
             }
         }
+
+        const controller = new AbortController();
+        const entry = { controller, owners: 0, settled: false, background: gridPreload, promise: null };
+        const foreground = method === 'GET' && !gridPreload;
+        if (foreground) {
+            this._foregroundRequests += 1;
+            for (const background of this._background) background.controller.abort(requestFailure('cancelled'));
+        }
+        if (gridPreload) this._background.add(entry);
+        const timeoutMs = gridTimeoutMs ?? (method === 'GET' && this._isMaterializationRead(path) ? READ_DEADLINE_MS : null);
+        const timer = timeoutMs == null ? null : setTimeout(() => controller.abort(requestFailure('timeout')), timeoutMs);
+        const epoch = this._cacheEpoch;
+        const version = (this._cacheVersions.get(cacheKey) || 0) + 1;
+        this._cacheVersions.set(cacheKey, version);
 
         const headers = { 'Content-Type': 'application/json', ...fetchOptions.headers };
         if (this.token) {
@@ -156,22 +230,15 @@ class GRIDApi {
                 response = await fetch(`${this.baseUrl}${path}`, {
                     ...fetchOptions,
                     headers,
+                    signal: controller.signal,
+                    ...(gridForce && method === 'GET' ? { cache: 'no-store' } : {}),
                 });
             } catch (networkErr) {
-                // Network error (offline, CORS, DNS) — return error object, don't throw
-                return { error: true, status: 0, message: networkErr.message || 'Network error' };
+                return requestFailure('network');
             }
 
+            if (controller.signal.aborted) return requestFailure('cancelled');
             if (!response.ok) {
-                const body = await response.text().catch(() => '');
-                let message = response.statusText;
-                try {
-                    const parsed = JSON.parse(body);
-                    message = parsed.detail || parsed.message || message;
-                } catch (_) {
-                    if (body) message = body;
-                }
-
                 // Only treat 401 as session expiry for non-auth endpoints
                 if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                     this.token = null;
@@ -181,36 +248,41 @@ class GRIDApi {
                     window.location.hash = '#/login';
                 }
 
-                return { error: true, status: response.status, message };
+                // Do not read or display backend bodies: proxies can send HTML,
+                // SQL details or private text. Status is enough for recovery.
+                return requestFailure('http', response.status);
             }
 
             try {
                 const data = await response.json();
+                if (controller.signal.aborted) return requestFailure('cancelled');
+                if (data?.error === 'offline') return requestFailure('network'); // service-worker offline sentinel
+                if (data?.error === true) return requestFailure('http', data.status || response.status);
                 if (method !== 'GET') {
                     this.clearCache();
-                } else if (cacheable && !data?.error) {
+                } else if (cacheable && !data?.error && epoch === this._cacheEpoch && this._cacheVersions.get(cacheKey) === version) {
                     this._cache.set(cacheKey, {
                         value: data,
                         expiresAt: Date.now() + gridTtlMs,
                     });
                 }
+                if (data && typeof data === 'object') this._responseInfo.set(data, { receivedAt: Date.now() });
                 return data;
             } catch (parseErr) {
-                return { error: true, status: response.status, message: 'Invalid JSON response' };
+                return requestFailure('invalid_response', response.status);
             }
         })();
 
-        if (cacheable && !gridForce && !gridPreload) {
-            this._inflight.set(cacheKey, request);
-        }
-
-        try {
-            return await request;
-        } finally {
-            if (cacheable) {
-                this._inflight.delete(cacheKey);
-            }
-        }
+        entry.promise = raceCancellation(request, controller.signal).catch(error =>
+            requestFailure(error?.code === 'timeout' ? 'timeout' : 'cancelled')).finally(() => {
+            clearTimeout(timer);
+            entry.settled = true;
+            this._background.delete(entry);
+            if (foreground) this._foregroundDone();
+            if (this._inflight.get(cacheKey) === entry) this._inflight.delete(cacheKey);
+        });
+        if (cacheable) this._inflight.set(cacheKey, entry);
+        return this._subscribe(entry, signal);
     }
 
     // Auth
@@ -552,11 +624,11 @@ class GRIDApi {
     async getDiscoveryCorrelationMatrix(period = 90, regime = 'all') {
         return this._fetch(`/api/v1/discovery/correlation-matrix?period=${period}&regime=${encodeURIComponent(regime)}`);
     }
-    async getJobs() { return this._fetch('/api/v1/discovery/jobs'); }
-    async getResults(type) { return this._fetch(`/api/v1/discovery/results/${type}`); }
-    async getHypotheses(params = {}) {
+    async getJobs(options = {}) { return this._fetch('/api/v1/discovery/jobs', options); }
+    async getResults(type, options = {}) { return this._fetch(`/api/v1/discovery/results/${type}`, options); }
+    async getHypotheses(params = {}, options = {}) {
         const qs = new URLSearchParams(params).toString();
-        return this._fetch(`/api/v1/discovery/hypotheses?${qs}`);
+        return this._fetch(`/api/v1/discovery/hypotheses?${qs}`, options);
     }
 
     // Config
@@ -654,9 +726,9 @@ class GRIDApi {
     async promoteHypothesis(hypothesisId) {
         return this._fetch(`/api/v1/discovery/hypotheses/${hypothesisId}/promote`, { method: 'POST' });
     }
-    async getHypothesisResults(params = {}) {
+    async getHypothesisResults(params = {}, options = {}) {
         const qs = new URLSearchParams(params).toString();
-        return this._fetch(`/api/v1/discovery/hypotheses/results?${qs}`);
+        return this._fetch(`/api/v1/discovery/hypotheses/results?${qs}`, options);
     }
 
     // Settings
@@ -673,11 +745,11 @@ class GRIDApi {
 
     // God view (G8): read-only, point-in-time pillar summary. asOf is an ISO
     // date or an offset-qualified ISO datetime; omitted means server now.
-    async getGodViewLatest({ asOf = null } = {}) {
+    async getGodViewLatest({ asOf = null, ...options } = {}) {
         const params = new URLSearchParams();
         if (asOf) params.set('as_of', asOf);
         const qs = params.toString();
-        return this._fetch(`/api/v1/godview/latest${qs ? `?${qs}` : ''}`);
+        return this._fetch(`/api/v1/godview/latest${qs ? `?${qs}` : ''}`, options);
     }
     async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
@@ -719,35 +791,35 @@ class GRIDApi {
     }
 
     // Options
-    async getOptionsSignals(ticker = '', limit = 50) {
+    async getOptionsSignals(ticker = '', limit = 50, options = {}) {
         const qs = new URLSearchParams({ ...(ticker && { ticker }), limit: String(limit) }).toString();
-        return this._fetch(`/api/v1/options/signals?${qs}`);
+        return this._fetch(`/api/v1/options/signals?${qs}`, options);
     }
-    async scanMispricing(minScore = 5.0) {
-        return this._fetch(`/api/v1/options/scan?min_score=${minScore}`);
+    async scanMispricing(minScore = 5.0, options = {}) {
+        return this._fetch(`/api/v1/options/scan?min_score=${minScore}`, options);
     }
-    async get100xOpportunities() { return this._fetch('/api/v1/options/100x'); }
-    async getGEXProfile(ticker) {
-        return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`);
+    async get100xOpportunities(options = {}) { return this._fetch('/api/v1/options/100x', options); }
+    async getGEXProfile(ticker, options = {}) {
+        return this._fetch(`/api/v1/derivatives/gex/${encodeURIComponent(ticker)}`, options);
     }
-    async getVannaCharm(ticker) {
-        return this._fetch(`/api/v1/derivatives/vanna-charm/${encodeURIComponent(ticker)}`);
+    async getVannaCharm(ticker, options = {}) {
+        return this._fetch(`/api/v1/derivatives/vanna-charm/${encodeURIComponent(ticker)}`, options);
     }
-    async getFlowTimeline(ticker, days = 90) {
-        return this._fetch(`/api/v1/derivatives/flow-timeline/${encodeURIComponent(ticker)}?days=${days}`);
+    async getFlowTimeline(ticker, days = 90, options = {}) {
+        return this._fetch(`/api/v1/derivatives/flow-timeline/${encodeURIComponent(ticker)}?days=${days}`, options);
     }
 
     // Options Recommendations
-    async getOptionsRecommendations(ticker = '') {
+    async getOptionsRecommendations(ticker = '', options = {}) {
         const qs = ticker ? `?ticker=${encodeURIComponent(ticker)}` : '';
-        return this._fetch(`/api/v1/options/recommendations${qs}`);
+        return this._fetch(`/api/v1/options/recommendations${qs}`, options);
     }
     async refreshOptionsRecommendations() {
         return this._fetch('/api/v1/options/recommendations/refresh', { method: 'POST' });
     }
-    async getOptionsRecommendationHistory(params = {}) {
+    async getOptionsRecommendationHistory(params = {}, options = {}) {
         const qs = new URLSearchParams(params).toString();
-        return this._fetch(`/api/v1/options/recommendations/history?${qs}`);
+        return this._fetch(`/api/v1/options/recommendations/history?${qs}`, options);
     }
 
     async getOptionsHistory(ticker = '', days = 30, only100x = false, limit = 50) {
@@ -1164,46 +1236,46 @@ class GRIDApi {
     async getTrends(days = 90) { return this._fetch(`/api/v1/intelligence/trends?days=${days}`); }
 
     // Associations
-    async getCorrelationMatrix(days = 252) {
-        return this._fetch(`/api/v1/associations/correlation-matrix?days=${days}`);
+    async getCorrelationMatrix(days = 252, options = {}) {
+        return this._fetch(`/api/v1/associations/correlation-matrix?days=${days}`, options);
     }
-    async getSmartHeatmap(family = null, orthogonalOnly = true) {
+    async getSmartHeatmap(family = null, orthogonalOnly = true, options = {}) {
         let url = `/api/v1/discovery/smart-heatmap?orthogonal_only=${orthogonalOnly}`;
         if (family) url += `&family=${encodeURIComponent(family)}`;
-        return this._fetch(url);
+        return this._fetch(url, options);
     }
-    async getTimeseries(featureNames, days = 30) {
-        return this._fetch(`/api/v1/signals/timeseries?features=${encodeURIComponent(featureNames.join(','))}&days=${days}`);
+    async getTimeseries(featureNames, days = 30, options = {}) {
+        return this._fetch(`/api/v1/signals/timeseries?features=${encodeURIComponent(featureNames.join(','))}&days=${days}`, options);
     }
-    async getLagAnalysis(featureA, featureB, maxLag = 10) {
+    async getLagAnalysis(featureA, featureB, maxLag = 10, options = {}) {
         return this._fetch(
-            `/api/v1/associations/lag-analysis?feature_a=${encodeURIComponent(featureA)}&feature_b=${encodeURIComponent(featureB)}&max_lag=${maxLag}`
+            `/api/v1/associations/lag-analysis?feature_a=${encodeURIComponent(featureA)}&feature_b=${encodeURIComponent(featureB)}&max_lag=${maxLag}`, options
         );
     }
     async getAssociationClusters() {
         return this._fetch('/api/v1/associations/clusters');
     }
-    async getRegimeFeatures(days = 504) {
-        return this._fetch(`/api/v1/associations/regime-features?days=${days}`);
+    async getRegimeFeatures(days = 504, options = {}) {
+        return this._fetch(`/api/v1/associations/regime-features?days=${days}`, options);
     }
-    async getAnomalies(sigma = 2.5) {
-        return this._fetch(`/api/v1/associations/anomalies?sigma_threshold=${sigma}`);
+    async getAnomalies(sigma = 2.5, options = {}) {
+        return this._fetch(`/api/v1/associations/anomalies?sigma_threshold=${sigma}`, options);
     }
 
     // Snapshots
-    async getSnapshotLatest(category, n = 1) {
-        return this._fetch(`/api/v1/snapshots/latest/${encodeURIComponent(category)}?n=${n}`);
+    async getSnapshotLatest(category, n = 1, options = {}) {
+        return this._fetch(`/api/v1/snapshots/latest/${encodeURIComponent(category)}?n=${n}`, options);
     }
-    async getSnapshotHistory(category, startDate = null, endDate = null) {
+    async getSnapshotHistory(category, startDate = null, endDate = null, options = {}) {
         const params = new URLSearchParams();
         if (startDate) params.set('start_date', startDate);
         if (endDate) params.set('end_date', endDate);
         const qs = params.toString();
-        return this._fetch(`/api/v1/snapshots/history/${encodeURIComponent(category)}${qs ? '?' + qs : ''}`);
+        return this._fetch(`/api/v1/snapshots/history/${encodeURIComponent(category)}${qs ? '?' + qs : ''}`, options);
     }
-    async compareSnapshots(category, dateA, dateB) {
+    async compareSnapshots(category, dateA, dateB, options = {}) {
         return this._fetch(
-            `/api/v1/snapshots/compare/${encodeURIComponent(category)}?date_a=${encodeURIComponent(dateA)}&date_b=${encodeURIComponent(dateB)}`
+            `/api/v1/snapshots/compare/${encodeURIComponent(category)}?date_a=${encodeURIComponent(dateA)}&date_b=${encodeURIComponent(dateB)}`, options
         );
     }
     async getOperatorIssues(daysBack = 30, category = null, severity = null) {

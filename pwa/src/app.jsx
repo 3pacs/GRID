@@ -2,6 +2,7 @@ import React, { useState, useEffect, Suspense, useCallback } from 'react';
 import { createRoot } from 'react-dom/client';
 import useStore from './store.js';
 import { api } from './api.js';
+import { raceCancellation } from './requestState.js';
 import NavBar from './components/NavBar.jsx';
 import DadNav from './components/DadNav.jsx';
 import { isSimpleUser } from './authSession.js';
@@ -232,6 +233,9 @@ export function App() {
     const [preloadStatus, setPreloadStatus] = useState({ state: 'idle', completed: 0, total: 0 });
     const lastSocketEventAtRef = React.useRef(lastSocketEventAt);
     const preloadRunRef = React.useRef(0);
+    const preloadAbortRef = React.useRef(null);
+    useEffect(() => { preloadAbortRef.current?.abort(); }, [activeView]);
+    useEffect(() => () => { preloadAbortRef.current?.abort(); }, []);
 
     const shouldUseRealtimeSocket = isAuthenticated
         && documentVisible
@@ -320,23 +324,31 @@ export function App() {
         }
     }, [simple, activeView, setActiveView]);
 
-    const preloadViewModules = useCallback(async (viewIds, { onProgress = null } = {}) => {
+    const preloadViewModules = useCallback(async (viewIds, { onProgress = null, signal } = {}) => {
         const uniqueViewIds = [...new Set(viewIds)];
         let completed = 0;
+        let failed = 0;
         for (const viewId of uniqueViewIds) {
+            if (signal.aborted) break;
+            try { await api.waitForForeground(signal); } catch { break; }
             const loader = routeLoaders[viewId] || extraRouteLoaders[viewId] || childRouteLoaders[viewId];
             if (loader) {
-                await loader().catch(() => null);
+                await raceCancellation(loader(), signal).catch(() => { failed += 1; });
             }
+            if (signal.aborted) break;
             completed += 1;
             onProgress?.({ completed, total: uniqueViewIds.length, viewId });
         }
-        return { completed, total: uniqueViewIds.length };
+        return { completed, total: uniqueViewIds.length, failed };
     }, []);
 
     const warmVisualizations = useCallback(async ({ force = false, hotOnly = false } = {}) => {
         const runId = preloadRunRef.current + 1;
         preloadRunRef.current = runId;
+        preloadAbortRef.current?.abort();
+        const controller = new AbortController();
+        preloadAbortRef.current = controller;
+        const budgetTimer = setTimeout(() => controller.abort(), 45_000);
 
         const viewIds = simple
             ? DAD_PRELOAD_VIEW_IDS
@@ -356,21 +368,31 @@ export function App() {
             }
         };
 
-        await preloadViewModules(viewIds, { onProgress: tick });
-        await api.preload(paths, {
-            ttlMs: force ? 5_000 : 90_000,
-            force,
-            concurrency: simple ? 2 : 4,
-            onProgress: tick,
-        });
+        try {
+            const modules = await preloadViewModules(viewIds, { onProgress: tick, signal: controller.signal });
+            if (controller.signal.aborted) return;
+            const result = await api.preload(paths, {
+                ttlMs: force ? 5_000 : 90_000,
+                force,
+                concurrency: simple ? 2 : 4,
+                onProgress: tick,
+                signal: controller.signal,
+            });
 
-        if (preloadRunRef.current === runId) {
-            setPreloadStatus({ state: 'ready', completed: total, total });
+            if (preloadRunRef.current === runId) {
+                setPreloadStatus({ state: modules.failed || result.failed || result.skipped ? 'idle' : 'ready', completed, total });
+            }
+        } finally {
+            clearTimeout(budgetTimer);
+            if (controller.signal.aborted && preloadRunRef.current === runId) {
+                setPreloadStatus({ state: 'idle', completed, total });
+            }
         }
     }, [preloadViewModules, simple]);
 
     useEffect(() => {
         if (!isAuthenticated || !documentVisible) {
+            preloadAbortRef.current?.abort();
             return undefined;
         }
         return scheduleIdleTask(() => {

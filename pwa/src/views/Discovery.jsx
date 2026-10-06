@@ -7,6 +7,8 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
+import { READ_DEADLINE_MS, requireListPayload } from '../requestState.js';
+import ReadAge from '../components/ReadAge.jsx';
 
 const hypoStateColors = {
     CANDIDATE: { bg: '#1A6EBF22', color: '#1A6EBF' },
@@ -26,9 +28,9 @@ const jobStatusColors = {
 
 const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED', 'PROMOTED'];
 
-async function loadAuditResult(type) {
+async function loadAuditResult(type, scope) {
     try {
-        const response = await api.getResults(type);
+        const response = await scope.run(api.getResults(type, scope.options));
         if (!response || response.error || !Object.hasOwn(response, 'result')) {
             return { status: 'unavailable', result: null };
         }
@@ -69,27 +71,12 @@ const researchRunStatusColors = {
 // Valuation.jsx) — rather than adding a new named method to api.js, which is claimed
 // by another lane in this branch.
 export function ResearchRunPanel() {
-    const [data, setData] = useState(null);
-    const [loaded, setLoaded] = useState(false);
-
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            let result;
-            try {
-                result = await api.get('/api/v1/snapshots/research/latest');
-            } catch (err) {
-                result = { status: 'unavailable', reason: err?.message || 'request failed' };
-            }
-            if (!cancelled) {
-                setData(result);
-                setLoaded(true);
-            }
-        })();
-        return () => { cancelled = true; };
-    }, []);
-
-    if (!loaded) return null;
+    const { data, loading, error, refetch } = useAsyncData(
+        scope => api.get('/api/v1/snapshots/research/latest', scope.options),
+        { timeoutMs: READ_DEADLINE_MS, safeErrors: true },
+    );
+    if (loading) return <div role="status">Loading research status...</div>;
+    if (error) return <ErrorState title="Research status unavailable" error={error} onRetry={refetch} />;
 
     if (!data || data.status === 'no_runs') {
         return (
@@ -107,7 +94,8 @@ export function ResearchRunPanel() {
             <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
                 <div style={shared.sectionTitle}>RESEARCH RUN</div>
                 <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>
-                    Research status unavailable: {data.reason || 'unknown reason'}
+                    Research status unavailable.
+                    <button style={shared.buttonSmall} onClick={refetch}>Retry</button>
                 </div>
             </div>
         );
@@ -156,7 +144,7 @@ export function ResearchRunPanel() {
             </div>
             {data.error && (
                 <div style={{ fontSize: tokens.fontSize.xs, color: colors.red, marginBottom: tokens.space.xs }}>
-                    {data.error}
+                    Stored research run reported a failure.
                 </div>
             )}
             {reasons.length > 0 && (
@@ -183,20 +171,13 @@ export function ResearchRunPanel() {
 // purely by |correlation| > 0.4). Show the honest "research lane off"
 // state instead — count only, no per-hypothesis metrics, no promote action.
 function TestedHypotheses() {
-    const [summary, setSummary] = useState(null);
-    const [loaded, setLoaded] = useState(false);
-
-    useEffect(() => {
-        (async () => {
-            try {
-                const data = await api.getHypothesisResults({});
-                setSummary({ count: data.count || 0, note: data.note || null });
-            } catch { /* fallback: no results endpoint yet */ }
-            setLoaded(true);
-        })();
-    }, []);
-
-    if (!loaded || !summary) return null;
+    const { data: summary, loading, error, refetch } = useAsyncData(
+        scope => api.getHypothesisResults({}, scope.options),
+        { timeoutMs: READ_DEADLINE_MS, safeErrors: true },
+    );
+    if (loading) return <div role="status">Loading tested hypothesis count...</div>;
+    if (error) return <ErrorState title="Tested hypothesis count unavailable" error={error} onRetry={refetch} />;
+    if (!summary) return null;
 
     return (
         <div style={{ marginBottom: tokens.space.xl }}>
@@ -231,41 +212,35 @@ export default function Discovery({ focusHypothesis = '' }) {
     const [running, setRunning] = useState({});
     const { isMobile } = useDevice();
 
-    useEffect(() => { loadHypotheses(); }, [hypoFilter]);
     useEffect(() => { setHypoQuery(focusHypothesis || ''); }, [focusHypothesis]);
 
-    const { loading, error, refetch: loadData } = useAsyncData(async () => {
+    const { error: hypoError, refetch: loadHypotheses } = useAsyncData(async (scope) => {
+        const params = hypoFilter === 'ALL' ? {} : { state: hypoFilter };
+        const data = requireListPayload(await scope.run(api.getHypotheses(params, scope.options)), 'hypotheses');
+        if (scope.current()) setHypotheses(data.hypotheses || []);
+        return data;
+    }, { deps: [hypoFilter], timeoutMs: READ_DEADLINE_MS, safeErrors: true });
+
+    const { data: receipt, loading, error, refetch: loadData } = useAsyncData(async (scope) => {
         setOrthoStatus('loading');
         setClusterStatus('loading');
         setOrthoResult(null);
         setClusterResult(null);
-        try {
-            await Promise.all([
-                api.getJobs().then((j) => setJobs(j.jobs || [])),
-                loadAuditResult('orthogonality').then((ortho) => {
+        const results = await Promise.all([
+                scope.run(api.getJobs(scope.options)).then(result => requireListPayload(result, 'jobs')).then((j) => { if (scope.current()) setJobs(j.jobs); return j; }),
+                loadAuditResult('orthogonality', scope).then((ortho) => {
+                    if (!scope.current()) return;
                     setOrthoResult(ortho.result);
                     setOrthoStatus(ortho.status);
                 }),
-                loadAuditResult('clustering').then((cluster) => {
+                loadAuditResult('clustering', scope).then((cluster) => {
+                    if (!scope.current()) return;
                     setClusterResult(cluster.result);
                     setClusterStatus(cluster.status);
                 }),
             ]);
-        } finally {
-            await loadHypotheses();
-        }
-    }, { fallback: null });
-
-    const loadHypotheses = async () => {
-        const params = {};
-        if (hypoFilter !== 'ALL') params.state = hypoFilter;
-        try {
-            const data = await api.getHypotheses(params);
-            setHypotheses(data.hypotheses || []);
-        } catch (err) {
-            addNotification('error', 'Failed to load hypotheses');
-        }
-    };
+        return results[0];
+    }, { fallback: null, timeoutMs: READ_DEADLINE_MS, safeErrors: true });
 
     const triggerOrtho = async () => {
         setRunning(r => ({ ...r, ortho: true }));
@@ -310,6 +285,9 @@ export default function Discovery({ focusHypothesis = '' }) {
             </div>
 
             <ResearchRunPanel />
+            {hypoError && <ErrorState title="Hypotheses unavailable" error={hypoError} onRetry={loadHypotheses} />}
+            {receipt && <ReadAge value={receipt} retained={loading || !!error} />}
+            <button style={shared.buttonSmall} onClick={loadData} disabled={loading}>Refresh saved discovery results</button>
 
             {loading && !jobs.length && orthoStatus === 'loading' && clusterStatus === 'loading' ? (
                 <LoadingSkeleton variant="card" count={3} />

@@ -7,6 +7,8 @@
  */
 import React, { useState, useCallback } from 'react';
 import { api } from '../api.js';
+import { READ_DEADLINE_MS, requireRead } from '../requestState.js';
+import ReadAge from '../components/ReadAge.jsx';
 import useStore from '../store.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import { useDevice } from '../hooks/useDevice.js';
@@ -309,22 +311,13 @@ function AnomalyInsightCard({ card }) {
 // ── Card: Cross-Family Discovery (tap to expand lag chart) ──────────
 function CrossFamilyCard({ card }) {
     const [expanded, setExpanded] = useState(false);
-    const [lagData, setLagData] = useState(null);
-    const [lagLoading, setLagLoading] = useState(false);
+    const { data: lagData, loading: lagLoading, error: lagError, refetch } = useAsyncData(
+        scope => api.getLagAnalysis(card.a, card.b, 10, scope.options),
+        { deps: [card.a, card.b], skip: !expanded, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
+    );
     const corrColor = (card.corr || 0) > 0 ? colors.green : colors.red;
 
-    const handleTap = async () => {
-        if (expanded) { setExpanded(false); return; }
-        setExpanded(true);
-        if (!lagData) {
-            setLagLoading(true);
-            try {
-                const d = await api.getLagAnalysis(card.a, card.b, 10);
-                setLagData(d);
-            } catch { /* ignore */ }
-            setLagLoading(false);
-        }
-    };
+    const handleTap = () => setExpanded(value => !value);
 
     return (
         <div onClick={handleTap} style={{
@@ -356,6 +349,7 @@ function CrossFamilyCard({ card }) {
                 <div style={{ marginTop: tokens.space.md, paddingTop: tokens.space.sm, borderTop: `1px solid ${colors.borderSubtle}` }}>
                     <WhyTooltip text={interpretCrossFamily(card)} />
                     {lagLoading && <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm, padding: tokens.space.sm }}>Computing lag analysis...</div>}
+                    {lagError && <ErrorState title="Lag analysis unavailable" error={lagError} onRetry={event => { event.stopPropagation(); refetch(); }} />}
                     {lagData && <InlineLagChart data={lagData} />}
                 </div>
             )}
@@ -652,20 +646,18 @@ function buildCards(anomalies, correlations, regimeFeatures, smartHeatmap) {
 // ── Main Component ──────────────────────────────────────────────────
 export default function Associations({ onNavigate }) {
     const { addNotification } = useStore();
-    const [cards, setCards] = useState([]);
     const [filter, setFilter] = useState('all');
     const { isMobile } = useDevice();
 
-    const { loading, error, refetch: loadAll } = useAsyncData(async () => {
+    const { data, loading, error, refetch: loadAll } = useAsyncData(async (scope) => {
         const [anomalies, correlations, regimeFeatures, smartHeatmap] = await Promise.all([
-            api.getAnomalies(),
-            api.getCorrelationMatrix().catch(() => null),
-            api.getRegimeFeatures().catch(() => null),
-            api.getSmartHeatmap(null, true).catch(() => null),
+            scope.run(api.getAnomalies(2.5, scope.options)).then(requireRead),
+            scope.run(api.getCorrelationMatrix(252, scope.options)).then(requireRead),
+            scope.run(api.getRegimeFeatures(504, scope.options)).then(requireRead),
+            scope.run(api.getSmartHeatmap(null, true, scope.options)).then(requireRead),
         ]);
         const builtCards = buildCards(anomalies, correlations, regimeFeatures, smartHeatmap);
-        setCards(builtCards);
-        notifyIfExtreme(builtCards);
+        if (scope.current()) notifyIfExtreme(builtCards);
 
         // Fetch sparklines for feature spotlight cards (non-blocking)
         const spotlightFeatures = builtCards
@@ -673,18 +665,19 @@ export default function Associations({ onNavigate }) {
             .map(c => c.feature)
             .slice(0, 20);
         if (spotlightFeatures.length > 0) {
-            api.getTimeseries(spotlightFeatures, 30).then(ts => {
+            const ts = requireRead(await scope.run(api.getTimeseries(spotlightFeatures, 30, scope.options)));
                 if (ts?.series) {
-                    setCards(prev => prev.map(c => {
+                    return { receipt: anomalies, cards: builtCards.map(c => {
                         if (c.type === 'feature_spotlight' && ts.series[c.feature]) {
                             return { ...c, sparkline: ts.series[c.feature].slice(-14) };
                         }
                         return c;
-                    }));
+                    }) };
                 }
-            }).catch(() => {});
         }
-    }, { fallback: null });
+        return { receipt: anomalies, cards: builtCards };
+    }, { fallback: null, timeoutMs: READ_DEADLINE_MS, safeErrors: true });
+    const cards = data?.cards || [];
 
     const filtered = cards.filter(c => filterMatch(c, filter));
 
@@ -733,6 +726,8 @@ export default function Associations({ onNavigate }) {
             </div>
 
             {/* Loading */}
+            {data && <ReadAge value={data.receipt} retained={loading || !!error} />}
+            <button style={shared.buttonSmall} onClick={loadAll} disabled={loading}>Refresh saved associations</button>
             {loading && cards.length === 0 && (
                 <LoadingSkeleton variant="card" count={4} />
             )}

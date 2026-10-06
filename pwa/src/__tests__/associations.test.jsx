@@ -65,7 +65,7 @@ describe('Associations view async data', () => {
 
         render(<Associations />);
 
-        expect(await screen.findByText('associations feed unavailable')).toBeInTheDocument();
+        expect(await screen.findByText('The server could not be reached. Please retry.')).toBeInTheDocument();
         const retryBtn = screen.getByRole('button', { name: 'Retry' });
 
         api.getAnomalies.mockResolvedValueOnce({ anomalies: [] });
@@ -74,6 +74,6 @@ describe('Associations view async data', () => {
         await waitFor(() => {
             expect(api.getAnomalies).toHaveBeenCalledTimes(2);
         });
-        expect(screen.queryByText('associations feed unavailable')).not.toBeInTheDocument();
+        expect(screen.queryByText('The server could not be reached. Please retry.')).not.toBeInTheDocument();
     });
 });

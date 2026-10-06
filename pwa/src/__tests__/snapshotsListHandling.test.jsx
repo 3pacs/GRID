@@ -155,7 +155,8 @@ describe('Snapshots list handling per the real API contract', () => {
         fireEvent.click(runButton);
 
         await waitFor(() => {
-            expect(screen.getByText('Comparison failed: the comparison dates could not both be found.')).toBeInTheDocument();
+            expect(screen.getByText('Comparison failed')).toBeInTheDocument();
+            expect(screen.getByText('This data is unavailable on the server.')).toBeInTheDocument();
         });
         expect(screen.queryByText(/No snapshot found for category/)).not.toBeInTheDocument();
     });

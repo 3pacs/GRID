@@ -1,4 +1,8 @@
 import React, { useEffect, useState } from 'react';
+import { useAsyncData } from '../hooks/useAsyncData.js';
+import { READ_DEADLINE_MS, requireRead, requireListPayload, safeRequestMessage } from '../requestState.js';
+import ReadAge from '../components/ReadAge.jsx';
+import ErrorState from '../components/ErrorState.jsx';
 import { api } from '../api.js';
 import { shared, colors } from '../styles/shared.js';
 import ViewHelp from '../components/ViewHelp.jsx';
@@ -595,45 +599,35 @@ function TradesTab() {
     const [savedStatus, setSavedStatus] = useState(null);
     const [savedAt, setSavedAt] = useState(null);
     const [history, setHistory] = useState([]);
-    const [loading, setLoading] = useState(true);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState(null);
 
-    useEffect(() => { loadTrades(); }, []);
-
-    const loadTrades = async () => {
-        setLoading(true);
+    const { data: receipt, loading, error: readError, refetch: loadTrades } = useAsyncData(async scope => {
         setError(null);
-        try {
             const [active, hist] = await Promise.all([
-                api.getOptionsRecommendations(),
-                api.getOptionsRecommendationHistory(),
+                scope.run(api.getOptionsRecommendations('', scope.options)).then(requireRead),
+                scope.run(api.getOptionsRecommendationHistory({}, scope.options)).then(requireRead),
             ]);
-            if (active?.error && hist?.error) {
-                setError('Failed to load trade recommendations');
-            }
+            if (!scope.current()) return;
             setRecs(active?.error ? [] : (active.recommendations || []));
             setSavedStatus(active?.error ? 'unavailable' : active?.scan_summary?.data_status);
             setSavedAt(active?.generated_at || null);
             setHistory(hist?.error ? [] : (hist.history || hist.recommendations || []));
-        } catch (e) {
-            setError('Failed to load trade recommendations');
-        }
-        setLoading(false);
-    };
+            return active;
+    }, { timeoutMs: READ_DEADLINE_MS, safeErrors: true });
 
     const handleRefresh = async () => {
         setRefreshing(true);
         try {
             const refreshed = await api.refreshOptionsRecommendations();
             if (refreshed?.error) {
-                setError(refreshed.message || 'Refresh failed');
+                setError(safeRequestMessage(refreshed));
                 setRefreshing(false);
                 return;
             }
             await loadTrades();
         } catch (e) {
-            setError('Refresh failed: ' + (e.message || 'unknown error'));
+            setError(safeRequestMessage(e));
         }
         setRefreshing(false);
     };
@@ -650,6 +644,7 @@ function TradesTab() {
         return <div style={styles.loadingState}>Loading trade recommendations...</div>;
     }
 
+    if (readError) return <ErrorState title="Saved trades unavailable" error={readError} onRetry={loadTrades} />;
     if (error) {
         return (
             <div style={styles.emptyState}>
@@ -662,6 +657,7 @@ function TradesTab() {
     return (
         <div>
             {/* Refresh button */}
+            {receipt && <ReadAge value={receipt} />}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '12px' }}>
                 <div style={{
                     fontSize: '10px', fontWeight: 700, letterSpacing: '1.5px',
@@ -744,47 +740,18 @@ function TradesTab() {
    ═══════════════════════════════════════════════════════════════════ */
 
 export function TickerRecommendations({ ticker }) {
-    const [recs, setRecs] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [availability, setAvailability] = useState('loading');
-    const [savedStatus, setSavedStatus] = useState(null);
-    const [savedAt, setSavedAt] = useState(null);
+    const { data, loading, error, refetch } = useAsyncData(
+        scope => api.getOptionsRecommendations(ticker, scope.options),
+        { deps: [ticker], skip: !ticker, timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true },
+    );
+    const valid = !error && data?.scan_summary?.source !== 'unavailable' && Array.isArray(data?.recommendations);
+    const recs = valid ? data.recommendations.filter(rec => rec?.ticker?.toUpperCase() === ticker.toUpperCase()) : [];
+    const availability = !ticker || (valid && !recs.length) ? 'empty' : valid ? 'available' : 'unavailable';
+    const savedStatus = data?.scan_summary?.data_status;
+    const savedAt = data?.generated_at;
 
-    useEffect(() => {
-        if (!ticker) {
-            setRecs([]);
-            setAvailability('empty');
-            setLoading(false);
-            return;
-        }
-        let active = true;
-        setLoading(true);
-        setRecs([]);
-        setAvailability('loading');
-        setSavedStatus(null);
-        setSavedAt(null);
-        api.getOptionsRecommendations(ticker)
-            .then(data => {
-                if (!active) return;
-                if (data?.error || data?.scan_summary?.source === 'unavailable'
-                    || !Array.isArray(data?.recommendations)) {
-                    setAvailability('unavailable');
-                    return;
-                }
-                const tickerRecs = data.recommendations.filter(
-                    rec => rec?.ticker?.toUpperCase() === ticker.toUpperCase(),
-                );
-                setRecs(tickerRecs);
-                setSavedStatus(data?.scan_summary?.data_status);
-                setSavedAt(data?.generated_at || null);
-                setAvailability(tickerRecs.length > 0 ? 'available' : 'empty');
-            })
-            .catch(() => { if (active) setAvailability('unavailable'); })
-            .finally(() => { if (active) setLoading(false); });
-        return () => { active = false; };
-    }, [ticker]);
-
-    if (loading) return null;
+    if (loading) return <div role="status">Loading saved trade recommendations...</div>;
+    if (error) return <ErrorState title="Trade recommendations unavailable." error={error} onRetry={refetch} />;
     if (availability !== 'available') {
         return <div role="status" style={styles.emptyState}>
             {availability === 'empty'
@@ -795,6 +762,7 @@ export function TickerRecommendations({ ticker }) {
 
     return (
         <div>
+            <ReadAge value={data} />
             {savedStatus === 'stale' && (
                 <div role="status" style={{ ...styles.emptyState, padding: '10px 0' }}>
                     Saved recommendations are stale{savedAt ? ` (last generated ${savedAt.slice(0, 10)} UTC)` : ''}. No fresh scan was run.
@@ -892,99 +860,47 @@ function HundredXCard({ item }) {
 
 export default function Options({ selectedTicker = '' }) {
     const [activeTab, setActiveTab] = useState('Signals');
-    const [signals, setSignals] = useState([]);
-    const [scanner, setScanner] = useState([]);
-    const [opportunities, setOpportunities] = useState([]);
-    const [loading, setLoading] = useState(true);
-    const [error, setError] = useState(null);
     const [gexTicker, setGexTicker] = useState('SPY');
-    const [gexData, setGexData] = useState(null);
-    const [gexLoading, setGexLoading] = useState(false);
-    const [gexError, setGexError] = useState(null);
-    const [vannaCharmData, setVannaCharmData] = useState(null);
-    const [flowTimelineData, setFlowTimelineData] = useState(null);
-
-    useEffect(() => { loadData(); }, []);
-
-    const loadGEX = async (t) => {
-        setGexLoading(true);
-        setGexError(null);
-        const tickerVal = t || gexTicker;
-        try {
-            const [d, vc, ft] = await Promise.allSettled([
-                api.getGEXProfile(tickerVal),
-                api.getVannaCharm(tickerVal),
-                api.getFlowTimeline(tickerVal, 90),
-            ]);
-            if (d.status === 'fulfilled' && !d.value.error) {
-                setGexData(d.value);
-            } else {
-                setGexError(d.status === 'fulfilled' ? d.value.error : (d.reason?.message || 'Failed to load GEX data'));
-                setGexData(null);
-            }
-            if (vc.status === 'fulfilled' && !vc.value.error) {
-                setVannaCharmData(vc.value);
-            } else {
-                setVannaCharmData(null);
-            }
-            if (ft.status === 'fulfilled' && !ft.value.error) {
-                setFlowTimelineData(ft.value);
-            } else {
-                setFlowTimelineData(null);
-            }
-        } catch (e) {
-            setGexError(e.message || 'Failed to load GEX data');
-            setGexData(null);
-            setVannaCharmData(null);
-            setFlowTimelineData(null);
-        }
-        setGexLoading(false);
+    const mainTab = ['Signals', 'Scanner', '100x'].includes(activeTab);
+    const { data: mainData, loading, error, refetch: loadData } = useAsyncData(async scope => {
+        const [sig, scan, opps] = await Promise.all([
+            scope.run(api.getOptionsSignals('', 50, scope.options)).then(result => requireListPayload(result, 'signals')),
+            scope.run(api.scanMispricing(5.0, scope.options)).then(result => requireListPayload(result, 'opportunities')),
+            scope.run(api.get100xOpportunities(scope.options)).then(result => requireListPayload(result, 'opportunities')),
+        ]);
+        return { sig, scan, opps };
+    }, { skip: !mainTab, timeoutMs: READ_DEADLINE_MS, safeErrors: true });
+    const signals = mainData?.sig?.signals || [];
+    const scanner = [...(mainData?.scan?.opportunities || [])].sort((a, b) => (b.score || 0) - (a.score || 0));
+    const opportunities = mainData?.opps?.opportunities || [];
+    const { data: dealerData, loading: gexLoading, error: gexError, refetch: refetchGEX } = useAsyncData(async scope => {
+        const results = await Promise.all([
+            scope.run(api.getGEXProfile(gexTicker, scope.options)).then(requireRead),
+            scope.run(api.getVannaCharm(gexTicker, scope.options)).then(requireRead),
+            scope.run(api.getFlowTimeline(gexTicker, 90, scope.options)).then(requireRead),
+        ]);
+        return results;
+    }, { deps: [gexTicker], skip: activeTab !== 'Dealer Flow', timeoutMs: READ_DEADLINE_MS, safeErrors: true, resetOnChange: true });
+    const [gexData, vannaCharmData, flowTimelineData] = dealerData || [];
+    const loadGEX = (ticker) => {
+        if (ticker && ticker !== gexTicker) setGexTicker(ticker);
+        else refetchGEX();
     };
-
-    useEffect(() => {
-        if (activeTab === 'Dealer Flow' && !gexData && !gexLoading) {
-            loadGEX();
-        }
-    }, [activeTab]);
 
     useEffect(() => {
         const nextTicker = selectedTicker.trim().toUpperCase();
         if (!nextTicker) return;
         setActiveTab('Dealer Flow');
         setGexTicker(nextTicker);
-        loadGEX(nextTicker);
     }, [selectedTicker]);
-
-    const loadData = async () => {
-        setLoading(true);
-        setError(null);
-        try {
-            const [sig, scan, opps] = await Promise.all([
-                api.getOptionsSignals().catch(() => ({ signals: [] })),
-                api.scanMispricing(5.0).catch(() => ({ opportunities: [] })),
-                api.get100xOpportunities().catch(() => ({ opportunities: [] })),
-            ]);
-            setSignals(sig.signals || []);
-            setScanner((scan.opportunities || []).sort((a, b) => (b.score || 0) - (a.score || 0)));
-            setOpportunities(opps.opportunities || []);
-        } catch (e) {
-            setError('Failed to load options data');
-        }
-        setLoading(false);
-    };
 
     const renderContent = () => {
         if (activeTab === 'Gamma Watch') return <GammaWatch />;
-        if (loading) {
+        if (loading && mainTab) {
             return <div style={styles.loadingState}>Loading options data...</div>;
         }
-        if (error) {
-            return (
-                <div style={styles.emptyState}>
-                    <div style={{ color: colors.red, marginBottom: '12px' }}>{error}</div>
-                    <button style={shared.buttonSmall} onClick={loadData}>Retry</button>
-                </div>
-            );
+        if (error && mainTab) {
+            return <ErrorState title="Options data unavailable" error={error} onRetry={loadData} />;
         }
 
         switch (activeTab) {
@@ -1036,7 +952,7 @@ export default function Options({ selectedTicker = '' }) {
                             <div style={styles.loadingState}>Loading GEX profile for {gexTicker}...</div>
                         ) : gexError ? (
                             <div style={styles.emptyState}>
-                                <div style={{ color: colors.red, marginBottom: '12px' }}>{gexError}</div>
+                                <div style={{ color: colors.red, marginBottom: '12px' }}>{gexError.message}</div>
                                 <button style={shared.buttonSmall} onClick={() => loadGEX()}>Retry</button>
                             </div>
                         ) : (
@@ -1090,7 +1006,7 @@ export default function Options({ selectedTicker = '' }) {
                         {tab}
                     </button>
                 ))}
-                <button
+                {(mainTab || activeTab === 'Dealer Flow') && <button
                     style={{
                         ...shared.buttonSmall,
                         marginLeft: 'auto',
@@ -1099,12 +1015,14 @@ export default function Options({ selectedTicker = '' }) {
                         color: colors.textMuted,
                         fontSize: '12px',
                     }}
-                    onClick={loadData}
+                    onClick={() => activeTab === 'Dealer Flow' ? refetchGEX() : loadData()}
                 >
                     Refresh
-                </button>
+                </button>}
             </div>
 
+            {mainTab && mainData && <ReadAge value={mainData.sig} retained={loading || !!error} />}
+            {activeTab === 'Dealer Flow' && gexData && <ReadAge value={gexData} retained={gexLoading || !!gexError} />}
             {renderContent()}
         </div>
     );
