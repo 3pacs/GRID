@@ -69,10 +69,23 @@ Publication guards are enforced in the upsert itself:
   `immutable_batch_model_conflict`; this writer does not silently retcon a model.
 - Refusals create a terminal run with reasons and no numeric row. A previous
   valid daily row stays unchanged; the reader's existing stale rules apply.
-- If any write/commit fails, both writes roll back. A new bounded transaction
-  attempts a sanitized failed run (exception class only). If that also fails,
-  the result and runner summary explicitly report `ledger_recorded = false`.
-  Recovery is a subsequent separately authorized invocation, never automatic.
+- A failure within the transaction body cannot commit either write. After its
+  rollback, a new bounded transaction attempts a sanitized failed run (exception
+  class only). A failure before that failed-run transaction reaches commit is
+  reported with `ledger_recorded = false`.
+- A COMMIT exception after the terminal insert can mean a lost reply to a durable
+  commit. It triggers exactly one bounded read-only lookup by the original run ID,
+  never a duplicate failed-run insert or another publication attempt. A visible
+  terminal run returns its actual status/counts/code identity with `reconciled =
+  true`. A receipt remains valid even if exiting that read-only transaction fails.
+- Missing receipt or unavailable reconciliation returns `OUTCOME_UNKNOWN`,
+  `outcome = unknown`, the original run ID, and NULL written/skipped/ledger and
+  persisted fields. Absence at a single read does not prove an in-flight commit
+  finished. `unknown` is an ephemeral caller state; it is never stored as a new
+  ledger status. The same rule protects an uncertain failed-run COMMIT.
+- Recovery is a subsequent separately authorized invocation, never automatic.
+  A replay after an already durable publication is a no-op and retains its row,
+  run and code identity; after actual rollback it can publish the row once.
 
 ## Verification and adoption
 

@@ -125,6 +125,8 @@ class MemoryEngine:
         self.calls = []
         self.fail = None
         self.rollbacks = 0
+        self.commit_fault = None
+        self.reconcile_fails = False
 
     @contextmanager
     def begin(self):
@@ -135,6 +137,12 @@ class MemoryEngine:
             self.row, self.runs = saved
             self.rollbacks += 1
             raise
+        if self.commit_fault is not None:
+            fault, self.commit_fault = self.commit_fault, None
+            if fault == "rollback":
+                self.row, self.runs = saved
+                self.rollbacks += 1
+            raise RuntimeError("synthetic uncertain COMMIT acknowledgement")
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
@@ -155,11 +163,18 @@ class MemoryEngine:
             return Result()
         if "FROM dealer_gex_daily" in sql:
             return Result(self.row)
+        if "FROM godview_runs" in sql:
+            if self.reconcile_fails:
+                raise RuntimeError("synthetic reconciliation unavailable")
+            return Result(next((copy.deepcopy(row) for row in self.runs
+                                if row["run_id"] == params["run_id"]), None))
         if "INSERT INTO godview_runs" in sql:
             if self.fail in {"ledger_once", "ledger_always"}:
                 if self.fail == "ledger_once":
                     self.fail = None
                 raise RuntimeError("synthetic ledger failure")
+            if any(row["run_id"] == params["run_id"] for row in self.runs):
+                raise RuntimeError("synthetic duplicate ledger primary key")
             self.runs.append(copy.deepcopy(params))
         return Result()
 
@@ -255,3 +270,80 @@ def test_missing_or_invalid_code_sha_is_refused_before_transaction(engine):
     with pytest.raises(ValueError):
         dg.materialize_dealer_gex(engine, code_sha="")
     assert engine.calls == []
+
+
+def test_durable_commit_with_lost_reply_reconciles_exact_original_run(engine):
+    engine.commit_fault = "durable_reply_lost"
+    result = run(engine)
+    assert result.status == "SUCCESS" and result.rows_written == 1
+    assert result.ledger_recorded is True and result.reconciled is True
+    assert result.outcome == "confirmed"
+    assert result.run_id == engine.row["run_id"] == engine.runs[0]["run_id"]
+    assert result.code_sha == engine.row["code_sha"] == engine.runs[0]["code_sha"]
+    assert len(engine.runs) == 1
+    assert engine.calls.count("SET TRANSACTION READ ONLY") == 1
+    assert sum("FROM godview_runs" in query for query in engine.calls) == 1
+
+
+def test_actual_commit_rollback_without_visible_run_stays_unknown_until_authorized_retry(engine):
+    engine.commit_fault = "rollback"
+    result = run(engine)
+    assert engine.row is None and engine.runs == [] and engine.rollbacks == 1
+    assert result.status == "OUTCOME_UNKNOWN" and result.outcome == "unknown"
+    assert result.rows_written is None and result.rows_skipped is None
+    assert result.ledger_recorded is None and result.run_id
+    # Absence at one read is not proof that an uncertain server commit finished.
+    assert sum("INSERT INTO godview_runs" in query for query in engine.calls) == 1
+    retried = run(engine)  # separate, explicitly requested invocation
+    assert retried.status == "SUCCESS" and retried.run_id != result.run_id
+    assert engine.row["run_id"] == retried.run_id and len(engine.runs) == 1
+
+
+def test_unavailable_reconciliation_never_asserts_zero_or_retries_uncertain_write(engine):
+    engine.commit_fault = "durable_reply_lost"
+    engine.reconcile_fails = True
+    result = run(engine)
+    assert engine.row is not None and len(engine.runs) == 1
+    assert result.status == "OUTCOME_UNKNOWN" and result.run_status == "unknown"
+    assert result.rows_written is None and result.rows_skipped is None and result.ledger_recorded is None
+    assert result.run_id == engine.runs[0]["run_id"]
+    assert result.message == "commit_outcome_unknown"
+    assert sum("INSERT INTO godview_runs" in query for query in engine.calls) == 1
+    assert sum("FROM godview_runs" in query for query in engine.calls) == 1
+
+
+def test_separately_requested_replay_after_unknown_durable_commit_preserves_original_identity(engine):
+    engine.commit_fault = "durable_reply_lost"
+    engine.reconcile_fails = True
+    uncertain = run(engine)
+    saved = copy.deepcopy(engine.row)
+    retried = run(engine)
+    assert uncertain.status == "OUTCOME_UNKNOWN" and retried.run_status == "noop"
+    assert engine.row == saved and engine.row["run_id"] == uncertain.run_id
+    assert len(engine.runs) == 2 and engine.runs[1]["status"] == "noop"
+
+
+def test_failed_run_commit_reply_loss_is_reconciled_without_duplicate_failure_insert(engine):
+    engine.fail = "upsert"  # known body failure; business row rolled back
+    engine.commit_fault = "durable_reply_lost"  # failed-run COMMIT only
+    result = run(engine)
+    assert result.status == "FAILED" and result.rows_written == 0
+    assert result.ledger_recorded is True and result.reconciled is True
+    assert engine.row is None and len(engine.runs) == 1
+    assert engine.runs[0]["status"] == "failed"
+
+
+def test_reconciliation_commit_reply_loss_retains_already_read_durable_receipt(engine):
+    engine.commit_fault = "durable_reply_lost"
+    original_execute = engine.execute
+
+    def execute(stmt, params=None):
+        receipt = original_execute(stmt, params)
+        if "FROM godview_runs" in str(stmt):
+            engine.commit_fault = "durable_reply_lost"  # read-only transaction exit
+        return receipt
+
+    engine.execute = execute
+    result = run(engine)
+    assert result.status == "SUCCESS" and result.reconciled is True
+    assert result.rows_written == 1 and result.ledger_recorded is True

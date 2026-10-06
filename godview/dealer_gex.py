@@ -45,13 +45,15 @@ class RowResult:
 class MaterializationResult:
     status: str
     run_status: str
-    rows_written: int
-    rows_skipped: int
+    rows_written: int | None
+    rows_skipped: int | None
     rows: tuple[RowResult, ...]
     run_id: str
     code_sha: str
-    ledger_recorded: bool
+    ledger_recorded: bool | None
     message: str
+    outcome: str = "confirmed"
+    reconciled: bool = False
 
 
 def _timestamp(value: Any) -> datetime:
@@ -249,6 +251,14 @@ _RUN_SQL = text("""
     VALUES (CAST(:run_id AS UUID), 'dealer_gex', :started_at, :finished_at, :status,
             :rows_written, :rows_skipped, CAST(:reasons AS JSONB), CAST(:input_watermarks AS JSONB), :error, :code_sha)
 """)
+_RUN_LOOKUP_SQL = text("""
+    SELECT run_id, status, rows_written, rows_skipped, reasons, code_sha
+    FROM godview_runs WHERE run_id = CAST(:run_id AS UUID) AND pillar = 'dealer_gex'
+""")
+_PUBLIC_STATUSES = {"complete": "SUCCESS", "noop": "SUCCESS_NOOP",
+                    "partial_blocked_by_legacy": "PARTIAL_BLOCKED_BY_LEGACY", "failed": "FAILED"}
+_TERMINAL_STATUSES = frozenset({*_PUBLIC_STATUSES, "inputs_missing", "inputs_stale", "non_session",
+                               "no_completed_capture", "no_verified_spot"})
 
 
 class _ConnectionEngine:
@@ -271,6 +281,43 @@ def _timeouts(conn: Any) -> None:
     conn.execute(text("SET LOCAL statement_timeout = '60s'"))
 
 
+def _reconcile_run(engine: Any, run_id: str, day: date) -> MaterializationResult | None:
+    """One bounded read-only lookup; absence/error cannot disprove an in-flight commit.
+
+    A receipt read before this read-only transaction's exit fails still confirms
+    the original publication. No writer, failed-run insert or retry runs here.
+    """
+    receipt = None
+    try:
+        with engine.begin() as conn:
+            _timeouts(conn)
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            row = conn.execute(_RUN_LOOKUP_SQL, {"run_id": run_id}).mappings().first()
+            receipt = dict(row) if row is not None else None
+    except Exception:
+        pass
+    if receipt is None:
+        return None
+    try:
+        state, written, skipped = (receipt[k] for k in ("status", "rows_written", "rows_skipped"))
+        reasons = receipt["reasons"]
+        reasons = json.loads(reasons) if isinstance(reasons, str) else reasons
+        sha = receipt["code_sha"]
+        if (str(receipt["run_id"]) != run_id or state not in _TERMINAL_STATUSES
+                or type(written) is not int or written not in (0, 1)
+                or type(skipped) is not int or skipped not in (0, 1)
+                or not isinstance(reasons, dict) or len(reasons) > 1
+                or not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{7,40}", sha)):
+            return None
+        row_state = "written" if written else "skipped" if skipped else "noop"
+        reason = next(iter(reasons), None)
+        return MaterializationResult(_PUBLIC_STATUSES.get(state, "EMPTY"), state, written, skipped,
+                                     (RowResult(day, row_state, reason),), run_id, sha, True,
+                                     reason or state, reconciled=True)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def materialize_dealer_gex(
     engine: Any, *, code_sha: str, session_date: date | None = None,
     as_of_ts: datetime | None = None,
@@ -279,8 +326,10 @@ def materialize_dealer_gex(
 
     An explicit earlier cutoff replays its own ET session. It cannot manufacture
     today's row from a prior session, or downgrade a later materialization. A
-    failed publication rolls back; its sanitized failed run is attempted in a
-    new bounded transaction. If that also fails, ledger_recorded is False.
+    body failure cannot commit and gets a bounded sanitized failed-run attempt.
+    An exception after the terminal insert may be a lost COMMIT reply. Reconcile
+    its exact run once; if unconfirmed, preserve unknown counts and run identity.
+    Never automatically retry an uncertain publication or failure-ledger write.
     """
     if not isinstance(code_sha, str) or not re.fullmatch(r"[0-9a-f]{7,40}", code_sha):
         raise ValueError("GEX materialization requires a 7-40 character lowercase hex code_sha")
@@ -293,6 +342,7 @@ def materialize_dealer_gex(
         raise ValueError("session_date must be a date")
     run_id = str(uuid.uuid4())
     state, reason, written, row_state = "noop", None, 0, "noop"
+    publication_ready = False
     watermarks = {"session_date": day.isoformat(), "cutoff": cutoff.isoformat()}
 
     def ledger(conn: Any, *, error: str | None = None) -> None:
@@ -303,11 +353,18 @@ def materialize_dealer_gex(
                                "input_watermarks": json.dumps(watermarks), "error": error, "code_sha": code_sha})
 
     def result(recorded: bool) -> MaterializationResult:
-        public_status = {"complete": "SUCCESS", "noop": "SUCCESS_NOOP",
-                         "partial_blocked_by_legacy": "PARTIAL_BLOCKED_BY_LEGACY", "failed": "FAILED"}.get(state, "EMPTY")
+        public_status = _PUBLIC_STATUSES.get(state, "EMPTY")
         return MaterializationResult(public_status, state, written, int(row_state == "skipped"),
                                      (RowResult(day, row_state, reason),), run_id, code_sha, recorded,
                                      reason or state)
+
+    def reconcile_or_unknown() -> MaterializationResult:
+        reconciled = _reconcile_run(engine, run_id, day)
+        if reconciled is not None:
+            return reconciled
+        return MaterializationResult("OUTCOME_UNKNOWN", "unknown", None, None,
+                                     (RowResult(day, "unknown", "commit_outcome_unknown"),),
+                                     run_id, code_sha, None, "commit_outcome_unknown", outcome="unknown")
 
     try:
         with engine.begin() as conn:
@@ -349,14 +406,21 @@ def materialize_dealer_gex(
             except Refused as exc:
                 state, reason, written, row_state = exc.status, exc.reason, 0, "skipped"
             ledger(conn)
+            publication_ready = True
         return result(True)
     except Exception as exc:
+        if publication_ready:
+            return reconcile_or_unknown()
         # Never retain raw SQL/connection/provider errors in durable notes.
         state, reason, written, row_state = "failed", "materialization_failed", 0, "skipped"
+        failed_ledger_ready = False
         try:
             with engine.begin() as conn:
                 _timeouts(conn)
                 ledger(conn, error=type(exc).__name__)
+                failed_ledger_ready = True
         except Exception:
+            if failed_ledger_ready:
+                return reconcile_or_unknown()
             return result(False)
         return result(True)

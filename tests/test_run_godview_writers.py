@@ -13,6 +13,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
@@ -234,6 +235,23 @@ def test_gex_import_surface_covers_computation_and_receipt_dependencies():
     assert {"godview", "physics/dealer_gamma.py", "physics/greeks", "store",
             "ingestion/market_calendar.py", "price_close_contract.py",
             "oracle/astrogrid_universe.py"} <= set(runner.IMPORT_SURFACE)
+
+
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_gex_unknown_commit_summary_preserves_null_outcome_counts(monkeypatch, dry_run):
+    result = SimpleNamespace(status="OUTCOME_UNKNOWN", run_status="unknown", rows_written=None,
+                             rows_skipped=None, rows=(), run_id="uncertain-id", code_sha="abcdef1",
+                             message="commit_outcome_unknown", ledger_recorded=None,
+                             outcome="unknown", reconciled=False)
+    monkeypatch.setattr(runner, "_writer", lambda pillar: lambda *a, **kw: result)
+    args = runner.parse_args(["--pillar", "gex", "--code-sha", "abcdef1"]
+                             + (["--dry-run"] if dry_run else []))
+    code, summary = runner.run(args, object())
+    assert code == runner.EXIT_FAILED
+    assert summary["rows_written"] is None and summary["rows_skipped"] is None
+    assert summary["outcome"] == "unknown" and summary["run_id"] == "uncertain-id"
+    assert summary["persisted"] is (False if dry_run else None)
+    assert summary["ledger_recorded"] is (False if dry_run else None)
 
 
 def test_timeout_literals_match_constants():

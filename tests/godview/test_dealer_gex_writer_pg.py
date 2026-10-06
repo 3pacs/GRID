@@ -8,6 +8,7 @@ computation, writer SQL, constraints and read-model mapping run unchanged.
 from __future__ import annotations
 
 import os
+from contextlib import contextmanager
 from datetime import date, timedelta
 from uuid import uuid4
 
@@ -210,3 +211,61 @@ def test_runner_dry_run_rolls_back_both_and_requires_no_second_connection(gex_pg
     code, summary = runner.run(args, gex_pg)
     assert code == 0 and summary["rows_written"] == 1 and summary["ledger_recorded"] is False
     assert rows(gex_pg, "gex") == [] and rows(gex_pg, "runs") == []
+
+
+@pytest.mark.parametrize("fault,unavailable", [
+    ("durable_reply_lost", False), ("durable_reply_lost", True),
+    ("actual_rollback", False), ("deferred_fk_failure", False),
+])
+def test_real_pg_commit_outcome_reconciliation_and_separate_replay(gex_pg, fault, unavailable):
+    """Synthetic reply loss after real SQL, not a real transport interruption.
+
+    The deferred-FK case really fails at server COMMIT. All schemas/data are
+    disposable fixtures; no live inputs, actual network fault or PG proof here
+    is claimed until this test executes on the authorized test database.
+    """
+    seed(gex_pg)
+    queries = []
+
+    def observe(conn, cursor, statement, parameters, context, executemany):
+        queries.append(statement)
+
+    class FaultEngine:
+        first = True
+
+        @contextmanager
+        def begin(self):
+            first, self.first = self.first, False
+            if not first and unavailable:
+                raise RuntimeError("synthetic reconciliation unavailable")
+            source = runner.TransactionEngine(gex_pg, commit=False) if first and fault == "actual_rollback" else gex_pg
+            with source.begin() as conn:
+                yield conn
+                if first and fault == "deferred_fk_failure":
+                    # Break the real deferred row->run FK only in this fixture.
+                    conn.execute(text("DELETE FROM godview_runs"))
+            if first:
+                raise RuntimeError("synthetic COMMIT reply lost")
+
+    event.listen(gex_pg, "before_cursor_execute", observe)
+    try:
+        result = run(FaultEngine())
+    finally:
+        event.remove(gex_pg, "before_cursor_execute", observe)
+    durable = fault == "durable_reply_lost"
+    before = rows(gex_pg, "gex")
+    assert len(before) == int(durable)
+    assert len(rows(gex_pg, "runs")) == int(durable)
+    assert sum("INSERT INTO godview_runs" in query for query in queries) == 1
+    if durable and not unavailable:
+        assert result.status == "SUCCESS" and result.reconciled and result.rows_written == 1
+        assert result.run_id == str(rows(gex_pg, "runs")[0]["run_id"])
+        assert "SET TRANSACTION READ ONLY" in queries
+    else:
+        assert result.status == "OUTCOME_UNKNOWN" and result.rows_written is None
+        assert runner.summarize("gex", result, dry_run=False)["persisted"] is None
+    replay = run(gex_pg)  # a new, separately requested invocation
+    assert replay.run_status == ("noop" if durable else "complete")
+    assert len(rows(gex_pg, "gex")) == 1
+    if durable:
+        assert rows(gex_pg, "gex") == before

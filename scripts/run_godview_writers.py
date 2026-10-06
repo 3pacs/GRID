@@ -216,9 +216,11 @@ def summarize(pillar: str, result: Any, *, dry_run: bool) -> dict[str, Any]:
     if missing:
         out["markets_without_observations"] = list(missing)
     if hasattr(result, "ledger_recorded"):
-        out["ledger_recorded"] = result.ledger_recorded and not dry_run
+        out["ledger_recorded"] = False if dry_run else result.ledger_recorded
         out["run_status"] = result.run_status
-        out["persisted"] = result.ledger_recorded and not dry_run
+        out["persisted"] = False if dry_run else result.ledger_recorded
+        out["outcome"] = result.outcome
+        out["reconciled"] = result.reconciled
     return out
 
 
