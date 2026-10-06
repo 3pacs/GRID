@@ -220,8 +220,10 @@ def _build_feature_matrix(
     return matrix
 
 
+# SQLAlchemy/PIT and pandas work are synchronous. Let FastAPI dispatch these
+# reads to its bounded worker pool instead of blocking unrelated API requests.
 @router.get("/correlation-matrix")
-async def get_correlation_matrix(
+def get_correlation_matrix(
     days: int = Query(default=252, ge=30, le=1000),
     min_corr: float = Query(default=0.3, ge=0.0, le=1.0),
     show_trivial: bool = Query(default=False, description="Include trivial/duplicate pairs"),
@@ -594,7 +596,7 @@ def get_regime_features(
 
 
 @router.get("/anomalies")
-async def get_anomalies(
+def get_anomalies(
     sigma_threshold: float = Query(default=2.5, ge=1.0, le=5.0),
     days: int = Query(default=252, ge=30, le=1000),
     _token: str = Depends(require_auth),
