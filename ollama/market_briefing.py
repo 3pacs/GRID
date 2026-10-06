@@ -347,6 +347,8 @@ class MarketBriefingEngine:
         Returns:
             str: Formatted data context.
         """
+        from ollama.number_grounding import publication_context_facts
+        facts = publication_context_facts(snapshot)
         lines: list[str] = []
         lines.append(f"## Market Data Snapshot — {snapshot['timestamp']}")
         lines.append("")
@@ -356,8 +358,35 @@ class MarketBriefingEngine:
             if data:
                 lines.append(f"### {category.upper()}")
                 for label, info in data.items():
+                    tenor = '^' + label.lstrip('^').upper()
+                    if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
+                        lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']} "
+                                     f"(source observation date: {(info or {}).get('date')})")
+                        continue
                     lines.append(f"- {label}: {info['value']} (as of {info['date']})")
                 lines.append("")
+
+        lines.append("### PUBLICATION CONTEXT LIMITS")
+        lines.append(f"- VIX eligibility cutoff: {facts['snapshot_cutoff_date']} "
+                     "(recorded snapshot calendar date; intraday availability unverified).")
+        lines.append(f"- VIX tenor observation dates: {json.dumps(facts['vix_observation_dates'])}")
+        lines.append(
+            "- VIX observation dates match; daily tenor levels may be compared. "
+            "Simultaneous intraday quotes and release/ingest times are unverified."
+            if facts["vix_dates_compatible"] else
+            "- VIX observation dates differ or are unavailable. Report each dated level; "
+            "a full three-tenor contemporaneous term-structure comparison is unavailable."
+        )
+        lines.append("- Regime comparator: unavailable; only the latest journal record is supplied. "
+                     "Trend, deterioration and improvement are unmeasured.")
+        lines.append("- Classifier confidence is the reported state-assignment score; calibration is unverified. "
+                     "Lower confidence does not establish stability or a new regime.")
+        lines.append("- Thesis conviction is absolute aggregate model-score magnitude (0..100; stored as 0..1); "
+                     "sentiment is a separate weighted "
+                     "directional score. Neither measures market-wide certainty or calibrated outcome probability.")
+        lines.append("- Aggregate PCR does not identify dealer side, inventory or causal exposure. "
+                     "No validated positioning policy or action threshold is supplied.")
+        lines.append("")
 
         # Feature values — select most informative via orthogonality
         features = snapshot.get("features", {})
@@ -413,9 +442,9 @@ class MarketBriefingEngine:
         if regime:
             lines.append("### LATEST REGIME INFERENCE")
             lines.append(f"- State: {regime['state']}")
-            lines.append(f"- Confidence: {regime['confidence']}")
-            lines.append(f"- Transition Probability: {regime['transition_prob']}")
-            lines.append(f"- Recommendation: {regime['recommendation']}")
+            lines.append(f"- Reported classifier confidence (calibration unverified): {regime['confidence']}")
+            lines.append(f"- Reported transition score (calibration unverified): {regime['transition_prob']}")
+            lines.append(f"- Journal recommendation (unvalidated policy): {regime['recommendation']}")
             lines.append(f"- Timestamp: {regime['timestamp']}")
             if regime.get("contradictions"):
                 lines.append(f"- Contradictions: {json.dumps(regime['contradictions'])}")
@@ -430,8 +459,13 @@ class MarketBriefingEngine:
                 lines.append(
                     f"- {evt['ticker']}: {evt['direction']} — "
                     f"{evt['sources']} sources ({sources}), "
-                    f"combined confidence {evt['confidence']}"
+                    f"reported combined confidence (calibration unverified) {evt['confidence']}"
                 )
+                from analysis.market_universe import search_company
+                matches = [c for c in search_company(evt['ticker']) if c['ticker'] == evt['ticker']]
+                if matches:
+                    company = matches[0]
+                    lines.append(f"  Company classification: {company['name']} — {company['sector']} / {company['industry']}")
             lines.append("")
 
         # High-trust signals
@@ -563,7 +597,10 @@ class MarketBriefingEngine:
             content = self._generate_fallback_briefing(snapshot)
             log.warning("LLM unavailable — using fallback briefing")
 
-        from ollama.number_grounding import check_publication_claims
+        from ollama.number_grounding import annotate_publication_context, check_publication_claims
+
+        content, context_guard = annotate_publication_context(content, snapshot)
+        snapshot["publication_context_guard"] = context_guard
 
         claim_guard = check_publication_claims(content)
         snapshot["publication_claim_guard"] = claim_guard
@@ -571,6 +608,8 @@ class MarketBriefingEngine:
             # Replace the whole candidate instead of leaving its causal story
             # intact with a numeric footnote. Only future generations change.
             summary = self._generate_fallback_briefing(snapshot)
+            summary, fallback_context_guard = annotate_publication_context(summary, snapshot)
+            context_guard["fallback"] = fallback_context_guard
             summary_guard = check_publication_claims(summary)
             claim_guard["fallback"] = summary_guard
             if not summary_guard["passed"]:
@@ -602,6 +641,7 @@ class MarketBriefingEngine:
             "sentiment": sentiment.to_dict() if sentiment else None,
             "grounding": grounding_stats,
             "publication_claim_guard": claim_guard,
+            "publication_context_guard": context_guard,
         }
 
         if save:
@@ -634,7 +674,7 @@ class MarketBriefingEngine:
             "and WHAT TO DO ABOUT IT. Never list raw numbers — interpret every data "
             "point with evidence. Describe VIX as implied volatility. Historical "
             "frequency or return predictions require supplied empirical evidence. "
-            "Be direct. Be opinionated. Give actionable conclusions. "
+            "Be direct. Describe source-supported observations and what to monitor. "
             "Start with the single most important thing happening right now. "
             "Separate LEVERS (actor actions that open/close liquidity valves) from "
             "CONDITIONS (environment that amplifies). Lead each section with the "
@@ -651,11 +691,12 @@ class MarketBriefingEngine:
                 "## What's Happening Now\n"
                 "One paragraph: the single most important market development right now and why it matters.\n\n"
                 "## Regime Check\n"
-                "One line: regime state, confidence, direction of travel (improving/worsening/stable).\n\n"
+                "One line: latest dated regime state and reported classifier confidence. "
+                "A trend is unavailable without a dated comparator.\n\n"
                 "## Contradictions\n"
                 "Any signals that disagree with each other. If none, say 'Signals aligned.'\n\n"
                 "## Action\n"
-                "One sentence: what the operator should do or watch in the next hour."
+                "One sentence: what evidence or observation dates to watch. No positioning instructions."
             )
         elif briefing_type == "daily":
             return (
@@ -664,15 +705,15 @@ class MarketBriefingEngine:
                 "## Bottom Line\n"
                 "Two sentences: What happened today and what it means for positioning.\n\n"
                 "## Regime\n"
-                "State, confidence, and whether conditions are improving or deteriorating. "
-                "Compare to yesterday. Name the top 3 drivers.\n\n"
+                "Report the latest dated state and classifier confidence. "
+                "Do not compare with yesterday without a supplied dated comparator.\n\n"
                 "## What Changed\n"
-                "Only mention signals that MOVED significantly. Don't list stable readings. "
+                "Only describe changes backed by dated prior and current observations. "
                 "For each: what moved, by how much, and what it implies.\n\n"
                 "## Risks\n"
                 "What could go wrong from here. Name specific scenarios.\n\n"
                 "## Opportunities\n"
-                "What setups look interesting based on the data. Be specific: sector, direction, timeframe.\n\n"
+                "Describe observations to investigate; use supplied company classifications.\n\n"
                 "## Tomorrow\n"
                 "What to watch for tomorrow. Scheduled data releases, key levels, catalysts."
             )
@@ -683,7 +724,7 @@ class MarketBriefingEngine:
                 "## The Week in One Sentence\n"
                 "Capture the week's story arc.\n\n"
                 "## Regime Evolution\n"
-                "How the regime changed (or didn't) over the week. Trend direction.\n\n"
+                "Report the dated regime record; disclose missing weekly history.\n\n"
                 "## Winners and Losers\n"
                 "Which sectors/assets outperformed and underperformed. Name specific "
                 "tickers and percentage moves. Explain WHY (flows, earnings, macro).\n\n"
@@ -693,9 +734,9 @@ class MarketBriefingEngine:
                 "## International\n"
                 "Anything outside the US that matters: China, Europe, Japan, EM.\n\n"
                 "## Three Scenarios for Next Week\n"
-                "Bull case, base case, bear case — with probabilities and triggers.\n\n"
+                "Qualitative hypotheses only; no probabilities or trade triggers without empirical support.\n\n"
                 "## Playbook\n"
-                "Specific positioning recommendations for next week."
+                "Evidence to investigate next week; no unsupported positioning instructions."
             )
 
     def _get_user_prompt(self, briefing_type: str, data_context: str) -> str:
@@ -732,6 +773,8 @@ class MarketBriefingEngine:
         Returns:
             str: Fallback briefing text.
         """
+        from ollama.number_grounding import publication_context_facts
+        facts = publication_context_facts(snapshot)
         lines = [
             f"# GRID Market Briefing — {snapshot['timestamp']}",
             "",
@@ -744,14 +787,21 @@ class MarketBriefingEngine:
             if data:
                 lines.append(f"## {category.replace('_', ' ').title()}")
                 for label, info in data.items():
+                    tenor = '^' + label.lstrip('^').upper()
+                    if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
+                        lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']}")
+                        continue
                     lines.append(f"- **{label}**: {info['value']} ({info['date']})")
                 lines.append("")
 
         regime = snapshot.get("latest_regime")
         if regime:
             lines.append("## Latest Regime")
-            lines.append(f"- Reported state: **{regime['state']}**")
+            state_display = " ".join(str(regime['state']).splitlines())
+            lines.append(f"- Reported state: **{state_display}**")
             lines.append(f"- Reported model confidence (calibration unverified): {regime['confidence']}")
+            lines.append(f"- Journal record timestamp: {regime['timestamp']}")
+            lines.append("- Prior regime comparator unavailable; trend unmeasured.")
             # Preserve the original recommendation in the audit snapshot,
             # not in the deterministic publication's factual data summary.
             lines.append("")
