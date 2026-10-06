@@ -412,9 +412,11 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
     # fred: 87 series took 91-176 s per pass on 2026-10-06 (grid-scheduler journal); one
     # stalled series costs up to 92 s more (3 x 30 s reads + fedfred's 2 x 1 s waits).
-    # FREDPuller.pull_all budgets itself against ingestion.fred.FRED_JOB_BUDGET_S, which
-    # must equal this timeout_s (pinned by tests/test_fred_transient_timeout.py).
-    {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 300, "api_key": "FRED_API_KEY"},
+    # FREDPuller.pull_all budgets itself against ingestion.fred.FRED_JOB_BUDGET_S /
+    # FRED_DEADLINE_MARGIN_S, which must equal timeout_s / stop_margin_s here (pinned by
+    # tests/test_fred_transient_timeout.py): the cooperative callback and FRED's own
+    # deadline both fall at 285 s.
+    {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 300, "stop_margin_s": 15, "api_key": "FRED_API_KEY"},
 
     # ── Alt data (daily) ──
     {"name": "insider_filings",   "mod": "ingestion.altdata.insider_filings",   "cls": "InsiderFilingsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 120},

@@ -170,6 +170,7 @@ def test_real_fedfred_retries_fit_the_registered_job_budget(monkeypatch):
     assert read_budgets == [fred.FRED_HTTP_TIMEOUT] * 3  # fedfred: stop_after_attempt(3)
     job = next(p for p in PULLER_REGISTRY if p["name"] == "fred")
     assert job["timeout_s"] == fred.FRED_JOB_BUDGET_S  # registry and self-budget stay pinned
+    assert job["stop_margin_s"] == fred.FRED_DEADLINE_MARGIN_S
     worst_case = sum(read_budgets) + sum(waits)
     assert worst_case < fred.FRED_JOB_BUDGET_S - fred.FRED_DEADLINE_MARGIN_S, (
         worst_case, fred.FRED_JOB_BUDGET_S)
@@ -314,3 +315,238 @@ def test_scheduler_timeout_stops_fred_before_later_series(monkeypatch):
     assert done.wait(5)
     assert calls == ["VIXCLS"]  # DFF never requested after the deadline
     assert writes == []  # the stalled VIXCLS response is not stored either
+
+
+# ---------------------------------------------------------------------------
+# After expiry: no retry attempt is sent, an allowed attempt cannot wait past
+# the deadline, and recovery opens no new transaction.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_fedfred_retry_attempts_stop_at_the_deadline(monkeypatch):
+    """The deadline passes during attempt 1: attempts 2 and 3 are never sent."""
+    from fedfred import FredAPI
+
+    fred._install_patient_httpx()
+    monkeypatch.setattr(fred.time, "sleep", lambda *_a: None)
+    expired = {"v": False}
+    sent: list[str] = []
+    waits: list[float] = []
+
+    def stalled(_transport, request):
+        sent.append(str(request.url))
+        expired["v"] = True  # the pass deadline passes while this attempt is in flight
+        raise httpx.ReadTimeout("synthetic stalled read", request=request)
+
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller.fred = FredAPI("0" * 32)
+    puller.engine, puller.source_id = MagicMock(), 1
+    retry = FredAPI._FredAPI__fred_get_request.retry
+    with patch.object(httpx.HTTPTransport, "handle_request", stalled), \
+         patch.object(retry, "sleep", lambda wait: waits.append(float(wait))), \
+         patch.object(puller, "_record_failure") as record_failure:
+        out = puller.pull_series("VIXCLS", should_continue=lambda: not expired["v"])
+
+    assert len(sent) == 1  # fedfred's two further attempts were refused before sending
+    assert out["status"] == "SKIPPED" and out["deadline"] is True
+    record_failure.assert_not_called()
+    puller.engine.connect.assert_not_called()
+    assert len(waits) <= 2
+
+
+@pytest.mark.unit
+def test_attempt_timeout_shrinks_to_the_remaining_budget(monkeypatch):
+    """An attempt that is still allowed may not wait past the pass deadline."""
+    from fedfred import FredAPI
+
+    fred._install_patient_httpx()
+    monkeypatch.setattr(fred.time, "sleep", lambda *_a: None)
+    seen: list[float] = []
+
+    def respond(_transport, request):
+        seen.append(request.extensions["timeout"]["read"])
+        return httpx.Response(200, request=request, json={"observations": [{
+            "date": "2026-10-05", "value": "15.52",
+            "realtime_start": "2026-10-06", "realtime_end": "2026-10-06",
+        }]})
+
+    writes: list[str] = []
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller.fred = FredAPI("0" * 32)
+    puller.engine, puller.source_id = MagicMock(), 1
+    puller._get_latest_date = lambda _sid: None
+    puller._store_batch = lambda sid, points: (writes.append(sid) or (len(points), 0, []))
+    with patch.object(httpx.HTTPTransport, "handle_request", respond):
+        results = puller.pull_all(["VIXCLS"], budget_s=fred.FRED_DEADLINE_MARGIN_S + 0.5)
+
+    assert results[0]["status"] == "SUCCESS" and writes == ["VIXCLS"]
+    assert len(seen) == 1
+    assert 0.0 < seen[0] <= 0.5 < fred.FRED_HTTP_TIMEOUT
+
+
+@pytest.mark.unit
+def test_no_failure_row_is_written_after_the_deadline(monkeypatch):
+    """A genuine bug surfacing after expiry is reported but not persisted."""
+    monkeypatch.setattr(fred.time, "sleep", lambda *_a: None)
+    expired = {"v": False}
+
+    def fetch(_sid, **_kw):
+        expired["v"] = True  # deadline passes while the provider call is in flight
+        raise ValueError("bad frame")
+
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller.fred = SimpleNamespace(get_series_observations=fetch)
+    puller.engine, puller.source_id = MagicMock(), 1
+    with patch.object(puller, "_record_failure") as record_failure:
+        out = puller.pull_series("VIXCLS", should_continue=lambda: not expired["v"])
+
+    assert out["status"] == "FAILED"  # still a real error in the result
+    assert out["deadline"] is True
+    assert any("failure row not recorded" in e for e in out["errors"])
+    record_failure.assert_not_called()
+    puller.engine.connect.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Alignment with the scheduler's cooperative deadline, and the reviewer's
+# modeled-clock cases (Codex PR-825 handoff, 2026-10-06).
+# ---------------------------------------------------------------------------
+
+try:
+    from tests.test_fred_short_transactions import FakeConnection, db_error, make_puller
+except ImportError:  # tests/ not importable as a package
+    from test_fred_short_transactions import FakeConnection, db_error, make_puller  # type: ignore
+
+
+def _scheduler_for(puller):
+    from threading import Lock, Semaphore
+
+    from ingestion.smart_scheduler import SmartScheduler
+
+    scheduler = SmartScheduler.__new__(SmartScheduler)
+    scheduler._thread_semaphore = Semaphore(1)
+    scheduler._threads_lock = Lock()
+    scheduler._active_threads = set()
+    scheduler._orphan_thread_count = 0
+    scheduler._build_puller_instance = lambda *_args: puller
+    scheduler._update_last_pull = MagicMock()
+    return scheduler
+
+
+@pytest.mark.unit
+def test_scheduler_callback_and_fred_self_deadline_agree(monkeypatch):
+    """The injected callback and FRED's own deadline fall at the same instant."""
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+
+    clock, captured = [0.0], []
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+
+    def pull_all(series_list=None, should_continue=None):
+        captured.append(should_continue)
+        return [{"status": "SKIPPED", "rows_inserted": 0}]
+
+    scheduler = _scheduler_for(SimpleNamespace(pull_all=pull_all))
+    spec = next(p.copy() for p in PULLER_REGISTRY if p["name"] == "fred")
+    assert scheduler._run_puller(spec)["status"] == "SKIPPED"
+    callback = captured[0]
+    deadline = fred.FRED_JOB_BUDGET_S - fred.FRED_DEADLINE_MARGIN_S
+    samples = {}
+    for instant in (0.0, deadline - 0.001, deadline, spec["timeout_s"], spec["timeout_s"] + 1):
+        clock[0] = instant
+        samples[instant] = callback()
+    assert samples == {0.0: True, deadline - 0.001: True, deadline: False,
+                       spec["timeout_s"]: False, spec["timeout_s"] + 1: False}, samples
+    assert deadline == 285.0
+
+
+@pytest.mark.unit
+def test_retry_attempts_respect_the_cooperative_deadline(monkeypatch):
+    """One second from the deadline: one bounded attempt, no later attempt, no row."""
+    from fedfred import FredAPI
+
+    clock, starts, allowances, waits = [0.0], [], [], []
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(fred.time, "sleep", lambda *_a: None)
+    fred._install_patient_httpx()
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller.fred = FredAPI("0" * 32)
+    puller.engine, puller.source_id = MagicMock(), 1
+
+    def latest(_sid):
+        clock[0] = 284.0  # one second before the 285 s cooperative deadline
+        return None
+
+    puller._get_latest_date = latest
+
+    def stalled(_transport, request):
+        starts.append(clock[0])
+        allowance = request.extensions["timeout"]["read"]
+        allowances.append(allowance)
+        clock[0] += allowance
+        raise httpx.ReadTimeout("synthetic stalled read", request=request)
+
+    def retry_sleep(wait):
+        waits.append(float(wait))
+        clock[0] += float(wait)
+
+    retry = FredAPI._FredAPI__fred_get_request.retry
+    with patch.object(httpx.HTTPTransport, "handle_request", stalled), \
+         patch.object(retry, "sleep", retry_sleep), \
+         patch.object(puller, "_record_failure") as record_failure:
+        results = puller.pull_all(["VIXCLS", "DFF"], should_continue=lambda: clock[0] < 285)
+
+    assert starts == [284.0]  # attempts 2 and 3 were refused before sending
+    assert allowances == [1.0]  # the one allowed read could not wait past 285 s
+    record_failure.assert_not_called()
+    puller.engine.connect.assert_not_called()
+    assert [r["status"] for r in results] == ["SKIPPED", "SKIPPED"]
+    assert all(r.get("deadline") for r in results)
+
+
+@pytest.mark.unit
+def test_store_fallback_does_not_open_new_writes_after_deadline(monkeypatch):
+    """A batch rejected after expiry is not retried point by point."""
+    from sqlalchemy import exc as sa_exc
+
+    clock, inserts = [0.0], []
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+    puller, engine, _frame, _calls = make_puller(monkeypatch, 3)
+    original = FakeConnection.execute
+    rejected = [False]
+
+    def expire_and_reject(self, sql, params):
+        if "INSERT" in str(sql):
+            if not rejected[0]:
+                rejected[0] = True
+                clock[0] = 301.0  # the batch's answer arrives after the deadline
+                raise db_error("23514", sa_exc.IntegrityError)
+            inserts.append(clock[0])
+        return original(self, sql, params)
+
+    monkeypatch.setattr(FakeConnection, "execute", expire_and_reject)
+    result = puller.pull_series("VIXCLS", should_continue=lambda: clock[0] < 295)
+
+    assert inserts == []  # no per-point fallback transaction after expiry
+    assert not engine.rows  # and no failure-metadata row either
+    assert result["status"] == "FAILED" and result["rows_inserted"] == 0
+    assert result["rows_failed"] == 3 and result["deadline"] is True
+
+
+@pytest.mark.unit
+def test_inflight_successful_batch_still_acknowledges_after_deadline(monkeypatch):
+    """A COMMIT already in flight at expiry is counted; only new work stops."""
+    clock = [0.0]
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+    puller, engine, _frame, _calls = make_puller(monkeypatch, 1)
+    original = FakeConnection.commit
+
+    def late_commit(self):
+        clock[0] = 301.0
+        return original(self)
+
+    monkeypatch.setattr(FakeConnection, "commit", late_commit)
+    result = puller.pull_series("VIXCLS", should_continue=lambda: clock[0] < 295)
+
+    assert (result["status"], result["rows_inserted"], result["rows_failed"]) == ("SUCCESS", 1, 0)
+    assert len(engine.rows) == 1
