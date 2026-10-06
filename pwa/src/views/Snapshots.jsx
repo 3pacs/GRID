@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { api } from '../api.js';
 import { useAsyncData } from '../hooks/useAsyncData.js';
-import { READ_DEADLINE_MS, safeRequestMessage, requireRead } from '../requestState.js';
+import { READ_DEADLINE_MS, safeRequestMessage, requireRead, readErrorCode } from '../requestState.js';
 import ErrorState from '../components/ErrorState.jsx';
 import ReadAge from '../components/ReadAge.jsx';
 import { colors, shared } from '../styles/shared.js';
@@ -46,10 +46,11 @@ const normalizeSnapshotList = (res) => {
     if (Array.isArray(res)) {
         return { list: res, error: null };
     }
-    if (res && typeof res === 'object' && res.error) {
+    const code = readErrorCode(res);
+    if (code) {
         return {
             list: [],
-            error: `Snapshots unavailable: ${unavailableReason(res, 'this category has no snapshot history on the server.')}`,
+            error: `Snapshots unavailable: ${unavailableReason({ ...res, code }, 'this category has no snapshot history on the server.')}`,
         };
     }
     return { list: [], error: 'Unexpected response from the snapshots service.' };

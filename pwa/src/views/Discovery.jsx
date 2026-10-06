@@ -7,7 +7,7 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
-import { READ_DEADLINE_MS, requireListPayload, requireCountPayload } from '../requestState.js';
+import { READ_DEADLINE_MS, requireListPayload, requireCountPayload, requireRead } from '../requestState.js';
 import ReadAge from '../components/ReadAge.jsx';
 
 const hypoStateColors = {
@@ -30,15 +30,15 @@ const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED'
 
 async function loadAuditResult(type, scope) {
     try {
-        const response = await scope.run(api.getResults(type, scope.options));
-        if (!response || response.error || !Object.hasOwn(response, 'result')) {
+        const response = requireRead(await scope.run(api.getResults(type, scope.options)));
+        if (!response || !Object.hasOwn(response, 'result')) {
             return { status: 'unavailable', result: null };
         }
         if (response.result === null) return { status: 'empty', result: null };
-        if (typeof response.result !== 'object' || response.result.error) {
+        if (typeof response.result !== 'object') {
             return { status: 'unavailable', result: null };
         }
-        return { status: 'available', result: response.result };
+        return { status: 'available', result: requireRead(response.result) };
     } catch {
         return { status: 'unavailable', result: null };
     }
@@ -142,7 +142,7 @@ export function ResearchRunPanel() {
                 <span>eval version: {data.inputs?.evaluation_version ?? '—'}</span>
                 <span>sha: {data.code_sha ? data.code_sha.substring(0, 8) : '—'}</span>
             </div>
-            {data.error && (
+            {(['failed', 'timeout', 'abandoned'].includes(data.status) || data.error) && (
                 <div style={{ fontSize: tokens.fontSize.xs, color: colors.red, marginBottom: tokens.space.xs }}>
                     Stored research run reported a failure.
                 </div>

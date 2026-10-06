@@ -4,7 +4,7 @@
  */
 import { clearAuthSession, getStoredToken } from './authSession.js';
 import useRealtimeStore from './stores/realtimeStore.js';
-import { READ_DEADLINE_MS, raceCancellation, requestFailure } from './requestState.js';
+import { READ_DEADLINE_MS, raceCancellation, requestFailure, readErrorCode, requireCountPayload, isResearchRunRecord } from './requestState.js';
 
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
 const PRELOAD_CONCURRENCY = 2;
@@ -256,11 +256,27 @@ class GRIDApi {
             try {
                 const data = await response.json();
                 if (controller.signal.aborted) return requestFailure('cancelled');
-                if (data?.error === 'offline') return requestFailure('network'); // service-worker offline sentinel
+                // The service worker returns exactly this sentinel. A persisted
+                // failed research record may legitimately have diagnostic "offline".
+                if (data?.error === 'offline' && Object.keys(data).length === 1) return requestFailure('network');
+                const materialization = method === 'GET' && this._isMaterializationRead(path);
+                const route = path.split('?')[0];
+                const storedResearch = materialization && route === '/api/v1/snapshots/research/latest' && isResearchRunRecord(data);
+                if (materialization && !storedResearch) {
+                    const code = readErrorCode(data);
+                    if (code) return requestFailure(code, typeof data.status === 'number' ? data.status : response.status);
+                    // Count failures and malformed counts must be rejected before
+                    // cache admission, so an ordinary read can recover immediately.
+                    if (route === '/api/v1/discovery/hypotheses/results') requireCountPayload(data);
+                    if (route.startsWith('/api/v1/discovery/results/')) {
+                        const nestedCode = readErrorCode(data?.result);
+                        if (nestedCode) return requestFailure(nestedCode, response.status);
+                    }
+                }
                 if (data?.error === true) return requestFailure('http', data.status || response.status);
                 if (method !== 'GET') {
                     this.clearCache();
-                } else if (cacheable && !data?.error && epoch === this._cacheEpoch && this._cacheVersions.get(cacheKey) === version) {
+                } else if (cacheable && (materialization ? storedResearch || !readErrorCode(data) : !data?.error) && epoch === this._cacheEpoch && this._cacheVersions.get(cacheKey) === version) {
                     this._cache.set(cacheKey, {
                         value: data,
                         expiresAt: Date.now() + gridTtlMs,

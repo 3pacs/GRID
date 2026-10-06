@@ -22,11 +22,28 @@ export function requestFailure(code, status = 0) {
     return { ...error, message: safeRequestMessage(error) };
 }
 
+export function readErrorCode(result) {
+    if (!result || typeof result !== 'object' || !Object.hasOwn(result, 'error')) return null;
+    // Analytic success envelopes omit error. Backend failures use str(exc),
+    // which can be empty. Null/false/other field types are malformed, not success.
+    if (typeof result.error === 'string') return 'http';
+    if (result.error === true) {
+        return ['http', 'network', 'timeout', 'cancelled', 'invalid_response'].includes(result.code) ? result.code : 'http';
+    }
+    return 'invalid_response';
+}
+
+export function isResearchRunRecord(result) {
+    // Only snapshots/research/latest uses this record contract: its persisted
+    // lifecycle data always carries nullable diagnostic metadata (autoresearch).
+    return typeof result?.run_id === 'string' && result.run_id.length > 0
+        && ['started', 'running', 'ok', 'failed', 'timeout', 'abandoned'].includes(result.status)
+        && (!Object.hasOwn(result, 'error') || result.error === null || typeof result.error === 'string');
+}
+
 export function requireRead(result) {
-    // Read endpoints also return HTTP 200 domain failures with an error string.
-    // Reject those at read boundaries without exposing their private contents.
-    if (result?.error) {
-        const code = result.code || 'http';
+    const code = readErrorCode(result);
+    if (code) {
         const error = new Error(safeRequestMessage({ ...result, code }));
         error.status = result.status;
         error.code = code;

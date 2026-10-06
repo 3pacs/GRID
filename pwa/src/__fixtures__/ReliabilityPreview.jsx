@@ -48,6 +48,11 @@ window.fetch = async (url, options = {}) => {
         return { ok: false, status: 403 };
     }
     const path = String(url);
+    const diagnosticModes = { 'empty diagnostic': '', 'null diagnostic': null, 'false diagnostic': false, 'malformed diagnostic': { private_detail: 'Synthetic private diagnostic' } };
+    if (Object.hasOwn(diagnosticModes, mode) && ['/godview/', '/hypotheses/results', '/lag-analysis', '/snapshots/compare/', '/options/recommendations', '/options/signals'].some(read => path.includes(read))) {
+        return { ok: true, status: 200, json: () => Promise.resolve({ ...fixture(path), error: diagnosticModes[mode] }) };
+    }
+    if (mode === 'stored empty diagnostic' && path.includes('/snapshots/research/')) return { ok: true, status: 200, json: () => Promise.resolve({ status: 'failed', run_id: 'synthetic-empty-diagnostic-run', error: '', phase: 'validation' }) };
     if (mode === 'domain error' && ['/godview/', '/hypotheses/results', '/lag-analysis', '/snapshots/compare/', '/options/recommendations'].some(read => path.includes(read))) {
         return { ok: true, status: 200, json: () => Promise.resolve({ ...fixture(path), error: 'Synthetic private database failure' }) };
     }
@@ -71,7 +76,7 @@ function Preview() {
             <strong>OFFLINE SYNTHETIC FIXTURES — no production data or provider calls</strong>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
                 <label>Screen <select aria-label="Screen" value={view} onChange={event => { api.clearCache(); setView(event.target.value); }}>{Object.keys(views).map(name => <option key={name}>{name}</option>)}</select></label>
-                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON', 'domain error', 'unknown count', 'stored failed run', 'comparison 404'].map(name => <option key={name}>{name}</option>)}</select></label>
+                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON', 'domain error', 'empty diagnostic', 'null diagnostic', 'false diagnostic', 'malformed diagnostic', 'unknown count', 'stored failed run', 'stored empty diagnostic', 'comparison 404'].map(name => <option key={name}>{name}</option>)}</select></label>
                 <button onClick={() => { api.clearCache(); setGeneration(value => value + 1); }}>Remount selected screen</button>
                 <span>API fixtures requested: {requests}; mutations denied: {deniedMutations}</span>
             </div>
