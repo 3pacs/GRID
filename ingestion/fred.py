@@ -15,11 +15,13 @@ import time
 from datetime import date, timedelta
 from typing import Any
 
+import httpx
 import pandas as pd
 from fedfred import FredAPI
 from loguru import logger as log
 from sqlalchemy import exc as sa_exc, text
 from sqlalchemy.engine import Engine
+from tenacity import RetryError
 
 from ingestion.base import BasePuller
 
@@ -190,6 +192,74 @@ FRED_SERIES_LIST: list[str] = [
 # Minimum delay between FRED API calls (seconds)
 _RATE_LIMIT_DELAY: float = 0.25
 
+# fedfred 3.x opens a fresh ``httpx.Client()`` per request and hard-codes
+# ``timeout=10`` on every GET (fedfred/clients.py, ``__fred_get_request``);
+# its constructor exposes no way to change it. FRED's observations endpoint
+# regularly takes longer than that for daily series, which is what produced
+# the 16:02Z/20:01Z ``RetryError[ReadTimeout]`` FAILED rows on VIXCLS, T10Y2Y
+# and DFF through September 2026. The scheduler already gives the FRED job a
+# 120 s budget, so a generous per-request read timeout is the right shape.
+FRED_HTTP_TIMEOUT: float = 60.0
+
+
+class _PatientClient(httpx.Client):
+    """``httpx.Client`` whose GET replaces fedfred's hard-coded 10 s timeout."""
+
+    def get(self, url, *args, timeout=None, **kwargs):  # noqa: D102 - httpx signature
+        return super().get(url, *args, timeout=FRED_HTTP_TIMEOUT, **kwargs)
+
+
+class _PatientHttpx:
+    """Drop-in for the ``httpx`` module name inside ``fedfred.clients``.
+
+    Everything is delegated to the real module except ``Client``, so fedfred's
+    ``with httpx.Client() as client: client.get(..., timeout=10)`` keeps working
+    unchanged but honours :data:`FRED_HTTP_TIMEOUT`.
+    """
+
+    Client = _PatientClient
+
+    def __init__(self, real_module) -> None:
+        self._real = real_module
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def _install_patient_httpx() -> None:
+    """Point ``fedfred.clients.httpx`` at :class:`_PatientHttpx` once."""
+    import fedfred.clients as fedfred_clients
+
+    current = getattr(fedfred_clients, "httpx", httpx)
+    if isinstance(current, _PatientHttpx):
+        return
+    fedfred_clients.httpx = _PatientHttpx(current)
+
+
+def _unwrap_retry(exc: BaseException) -> BaseException:
+    """fedfred wraps its 3 tenacity attempts; the transport error is in last_attempt."""
+    if isinstance(exc, RetryError):
+        try:
+            inner = exc.last_attempt.exception()
+        except Exception:
+            inner = None
+        if inner is not None:
+            return inner
+    return exc
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """Timeouts and connection failures: upstream weather, not an app bug.
+
+    These used to fall through to the generic branch, which logged at ERROR
+    and wrote a ``FAILED`` row dated *today* — a row for an observation date
+    that does not exist yet, which then rate-limited the retry that would
+    have succeeded. A transient transport error is handled like a 5xx:
+    WARNING, ``SKIPPED``, no failure row, try again next cycle.
+    """
+    inner = _unwrap_retry(exc)
+    return isinstance(inner, (httpx.TransportError, TimeoutError, ConnectionError))
+
 
 def _extract_http_status_code(exc: BaseException) -> int | None:
     """Best-effort status extraction across HTTP and retry wrappers."""
@@ -342,6 +412,7 @@ class FREDPuller(BasePuller):
             api_key: FRED API key.
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
+        _install_patient_httpx()
         self.fred = FredAPI(api_key)
         super().__init__(db_engine)
         log.info("FREDPuller initialised — source_id={sid}", sid=self.source_id)
@@ -652,6 +723,22 @@ class FREDPuller(BasePuller):
                 )
                 result["status"] = "SKIPPED"
                 result["errors"].append(f"transient HTTP {status_code}")
+                return result
+
+            # Read timeouts / connection resets after fedfred's own retries.
+            # Same treatment as 5xx: not our bug, and never a FAILED row dated
+            # today (that row blocked the next cycle's successful re-pull).
+            if _is_transient_transport_error(exc):
+                inner = _unwrap_retry(exc)
+                log.warning(
+                    "FRED {sid}: transient transport failure after retries "
+                    "({kind}: {err}); skipping this cycle without failure row",
+                    sid=series_id,
+                    kind=type(inner).__name__,
+                    err=str(inner)[:200],
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"transient {type(inner).__name__}")
                 return result
 
             # KeyError on 'date' / 'value' indicates fedfred returned a frame
