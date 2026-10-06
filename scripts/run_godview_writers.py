@@ -10,6 +10,7 @@ Pillars
 -------
 * ``fed``  -> ``godview.fed_liquidity.materialize_fed_liquidity`` (G3)
 * ``cftc`` -> ``godview.cftc_positioning.materialize_cftc_positioning`` (G4)
+* ``gex``  -> ``godview.dealer_gex.materialize_dealer_gex`` (G5, one SPY session)
 
 Safety
 ------
@@ -53,7 +54,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-PILLARS: tuple[str, ...] = ("fed", "cftc")
+PILLARS: tuple[str, ...] = ("fed", "cftc", "gex")
 
 LOCK_TIMEOUT = "5s"
 STATEMENT_TIMEOUT = "60s"
@@ -72,6 +73,11 @@ IMPORT_SURFACE: tuple[str, ...] = (
     "ingestion/altdata/cftc_markets.py",
     "ingestion/altdata/fed_liquidity.py",
     "intelligence/cot_extremes.py",
+    "physics/dealer_gamma.py",
+    "physics/greeks",
+    "ingestion/market_calendar.py",
+    "price_close_contract.py",
+    "oracle/astrogrid_universe.py",
     "store",
     "db.py",
     "config.py",
@@ -158,13 +164,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sha.add_argument("--code-sha-from-git", action="store_true", help="use git rev-parse HEAD of this tree")
     p.add_argument("--dry-run", action="store_true", help="run the writer and roll everything back")
     p.add_argument("--start", type=date.fromisoformat, default=None, help="earliest obs/report date to write")
+    p.add_argument("--session-date", type=date.fromisoformat, default=None, help="GEX only: one ET session date")
     p.add_argument(
         "--as-of-ts",
         type=_aware_ts,
         default=None,
         help="point-in-time replay: ignore pulls after this instant (ISO 8601, UTC if naive)",
     )
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.pillar == "gex" and args.start is not None:
+        p.error("GEX writes one session; use --session-date, not --start")
+    if args.pillar != "gex" and args.session_date is not None:
+        p.error("--session-date is only supported for GEX")
+    return args
 
 
 def _writer(pillar: str) -> Callable[..., Any]:
@@ -172,6 +184,10 @@ def _writer(pillar: str) -> Callable[..., Any]:
         from godview.fed_liquidity import materialize_fed_liquidity
 
         return materialize_fed_liquidity
+    if pillar == "gex":
+        from godview.dealer_gex import materialize_dealer_gex
+
+        return materialize_dealer_gex
     from godview.cftc_positioning import materialize_cftc_positioning
 
     return materialize_cftc_positioning
@@ -199,6 +215,10 @@ def summarize(pillar: str, result: Any, *, dry_run: bool) -> dict[str, Any]:
     missing = getattr(result, "markets_without_observations", None)
     if missing:
         out["markets_without_observations"] = list(missing)
+    if hasattr(result, "ledger_recorded"):
+        out["ledger_recorded"] = result.ledger_recorded and not dry_run
+        out["run_status"] = result.run_status
+        out["persisted"] = result.ledger_recorded and not dry_run
     return out
 
 
@@ -216,7 +236,11 @@ def run(args: argparse.Namespace, engine: Any) -> tuple[int, dict[str, Any]]:
     else:
         code_sha = validate_code_sha(args.code_sha)
     tx_engine = TransactionEngine(engine, commit=not args.dry_run)
-    result = _writer(args.pillar)(tx_engine, code_sha=code_sha, start=args.start, as_of_ts=args.as_of_ts)
+    if args.pillar == "gex":
+        result = _writer(args.pillar)(tx_engine, code_sha=code_sha,
+                                    session_date=args.session_date, as_of_ts=args.as_of_ts)
+    else:
+        result = _writer(args.pillar)(tx_engine, code_sha=code_sha, start=args.start, as_of_ts=args.as_of_ts)
     summary = summarize(args.pillar, result, dry_run=args.dry_run)
     return exit_code_for(result.status), summary
 

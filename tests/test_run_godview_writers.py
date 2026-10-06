@@ -32,7 +32,7 @@ def test_pillar_and_a_code_sha_source_are_required():
     with pytest.raises(SystemExit):
         runner.parse_args(["--pillar", "cftc"])
     with pytest.raises(SystemExit):
-        runner.parse_args(["--pillar", "gex", "--code-sha", "abcdef1"])
+        runner.parse_args(["--pillar", "unknown", "--code-sha", "abcdef1"])
     with pytest.raises(SystemExit):
         runner.parse_args(["--pillar", "fed", "--code-sha", "abcdef1", "--code-sha-from-git"])
 
@@ -65,6 +65,17 @@ def test_code_sha_from_git_returns_head_when_clean():
 def test_code_sha_from_git_refuses_a_modified_import_surface():
     def git(args):
         return "0123456789abcdef0123456789abcdef01234567" if args[0] == "rev-parse" else " M godview/x.py\n"
+
+    with pytest.raises(runner.CodeShaError, match="modified"):
+        runner.code_sha_from_git(git)
+
+
+@pytest.mark.parametrize("dependency", ["price_close_contract.py", "oracle/astrogrid_universe.py"])
+def test_code_sha_from_git_refuses_a_dirty_spy_receipt_dependency(dependency):
+    def git(args):
+        if args[0] == "rev-parse":
+            return "a" * 40
+        return f" M {dependency}\n" if dependency in args else ""
 
     with pytest.raises(runner.CodeShaError, match="modified"):
         runner.code_sha_from_git(git)
@@ -180,7 +191,7 @@ def test_exit_code_for(status, code):
 def test_run_dispatches_with_sha_and_wrapped_engine(monkeypatch, pillar):
     seen = {}
 
-    def fake_writer(engine, *, code_sha, start, as_of_ts):
+    def fake_writer(engine, *, code_sha, start=None, as_of_ts=None, session_date=None):
         seen.update(engine=engine, code_sha=code_sha, start=start, as_of_ts=as_of_ts)
         return _Result(
             status="PARTIAL_BLOCKED_BY_LEGACY",
@@ -202,10 +213,27 @@ def test_run_dispatches_with_sha_and_wrapped_engine(monkeypatch, pillar):
 
 def test_writer_dispatch_targets_the_g3_and_g4_writers():
     from godview.cftc_positioning import materialize_cftc_positioning
+    from godview.dealer_gex import materialize_dealer_gex
     from godview.fed_liquidity import materialize_fed_liquidity
 
     assert runner._writer("fed") is materialize_fed_liquidity
     assert runner._writer("cftc") is materialize_cftc_positioning
+    assert runner._writer("gex") is materialize_dealer_gex
+
+
+def test_gex_accepts_one_session_and_refuses_a_backfill_range():
+    a = runner.parse_args(["--pillar", "gex", "--code-sha", "abcdef1", "--session-date", "2026-09-29"])
+    assert a.session_date.isoformat() == "2026-09-29"
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--pillar", "gex", "--code-sha", "abcdef1", "--start", "2026-09-01"])
+    with pytest.raises(SystemExit):
+        runner.parse_args(["--pillar", "fed", "--code-sha", "abcdef1", "--session-date", "2026-09-29"])
+
+
+def test_gex_import_surface_covers_computation_and_receipt_dependencies():
+    assert {"godview", "physics/dealer_gamma.py", "physics/greeks", "store",
+            "ingestion/market_calendar.py", "price_close_contract.py",
+            "oracle/astrogrid_universe.py"} <= set(runner.IMPORT_SURFACE)
 
 
 def test_timeout_literals_match_constants():
@@ -245,7 +273,7 @@ def _unit(name: str) -> configparser.ConfigParser:
 _counter = iter(range(10_000))
 
 
-@pytest.mark.parametrize("pillar", runner.PILLARS)
+@pytest.mark.parametrize("pillar", ("fed", "cftc"))
 def test_service_unit_runs_the_runner_from_the_release_tree(pillar):
     svc = _unit(f"grid-godview-{pillar}.service")["Service"]
     assert svc["Type"] == "oneshot"
