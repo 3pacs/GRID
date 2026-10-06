@@ -68,6 +68,52 @@ export function requireCountPayload(result) {
     return result;
 }
 
+// Endpoint-specific envelope contracts, shared by cache admission and callers.
+// Stored record/pillar lifecycle states are data; these sentinels mean a read
+// failed. Match producer contracts, never search arbitrary diagnostic text.
+const listFields = {
+    '/api/v1/discovery/jobs': 'jobs',
+    '/api/v1/discovery/hypotheses': 'hypotheses',
+    '/api/v1/discovery/results/clustering/sectors': 'sectors',
+    '/api/v1/options/signals': 'signals',
+    '/api/v1/options/scan': 'opportunities',
+    '/api/v1/options/100x': 'opportunities',
+    '/api/v1/options/recommendations': 'recommendations',
+    '/api/v1/options/recommendations/history': 'history',
+    '/api/v1/options/history': 'history',
+};
+const auditUnavailable = new Set([
+    'orthogonality snapshot unavailable',
+    'clustering snapshot unavailable',
+    'clustering_sector snapshot unavailable',
+]);
+
+export function requireMaterializationRead(path, result) {
+    const route = path.split('?')[0];
+    if (route === '/api/v1/snapshots/research/latest' && isResearchRunRecord(result)) return result;
+    requireRead(result);
+    const fail = code => requireRead(requestFailure(code));
+    if (/^\/api\/v1\/discovery\/results\/(orthogonality|clustering)$/.test(route)) {
+        if (!result || !Object.hasOwn(result, 'result')) return fail('invalid_response');
+        if (result.result === null) {
+            if (auditUnavailable.has(result.message)) return fail('http');
+        } else if (!result.result || typeof result.result !== 'object' || Array.isArray(result.result)) {
+            return fail('invalid_response');
+        }
+    }
+    if (route.startsWith('/api/v1/discovery/results/')) requireRead(result?.result);
+    if (route === '/api/v1/discovery/results/clustering/sectors' && result?.message === 'clustering_sector snapshots unavailable') return fail('http');
+    if (route === '/api/v1/snapshots/research/latest') {
+        if (result?.status === 'unavailable') return fail('http');
+        if (result?.status !== 'no_runs') return fail('invalid_response');
+    }
+    if (route === '/api/v1/options/recommendations' && (result?.scan_summary?.source === 'unavailable' || result?.scan_summary?.data_status === 'unavailable')) return fail('http');
+    if (route === '/api/v1/discovery/hypotheses/results') requireCountPayload(result);
+    if (listFields[route]) requireListPayload(result, listFields[route]);
+    if (/^\/api\/v1\/snapshots\/(latest|history)\/[^/]+$/.test(route) && !Array.isArray(result)) return fail('invalid_response');
+    return result;
+}
+
 // Race even an uncooperative fetch/body/mock against cancellation. Abort alone
 // is insufficient when a response parser or an old adapter ignores its signal.
 export function raceCancellation(operation, signal) {

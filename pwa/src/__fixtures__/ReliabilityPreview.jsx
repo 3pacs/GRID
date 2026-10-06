@@ -48,6 +48,10 @@ window.fetch = async (url, options = {}) => {
         return { ok: false, status: 403 };
     }
     const path = String(url);
+    if (mode === 'audit lookup unavailable' && ['/results/orthogonality', '/results/clustering'].some(read => path.includes(read))) return { ok: true, status: 200, json: async () => ({ result: null, message: `${path.includes('orthogonality') ? 'orthogonality' : 'clustering'} snapshot unavailable` }) };
+    if (mode === 'dated audit' && ['/results/orthogonality', '/results/clustering'].some(read => path.includes(read))) return { ok: true, status: 200, json: async () => ({ result: path.includes('orthogonality') ? { true_dimensionality: 3 } : { best_k: 2, variance_explained: 0.5 }, source: 'analytical_snapshots', as_of_date: '2026-09-23' }) };
+    if (mode === 'research lookup unavailable' && path.includes('/snapshots/research/')) return { ok: true, status: 200, json: async () => ({ status: 'unavailable', reason: 'Synthetic private SQL detail' }) };
+    if (mode === 'recommendations lookup unavailable' && path.includes('/options/recommendations') && !path.includes('/options/recommendations/history')) return { ok: true, status: 200, json: async () => ({ recommendations: [], scan_summary: { source: 'unavailable', data_status: 'unavailable', reason: 'saved_recommendations_read_failed' } }) };
     const diagnosticModes = { 'empty diagnostic': '', 'null diagnostic': null, 'false diagnostic': false, 'malformed diagnostic': { private_detail: 'Synthetic private diagnostic' } };
     if (Object.hasOwn(diagnosticModes, mode) && ['/godview/', '/hypotheses/results', '/lag-analysis', '/snapshots/compare/', '/options/recommendations', '/options/signals'].some(read => path.includes(read))) {
         return { ok: true, status: 200, json: () => Promise.resolve({ ...fixture(path), error: diagnosticModes[mode] }) };
@@ -76,7 +80,7 @@ function Preview() {
             <strong>OFFLINE SYNTHETIC FIXTURES — no production data or provider calls</strong>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginTop: 12 }}>
                 <label>Screen <select aria-label="Screen" value={view} onChange={event => { api.clearCache(); setView(event.target.value); }}>{Object.keys(views).map(name => <option key={name}>{name}</option>)}</select></label>
-                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON', 'domain error', 'empty diagnostic', 'null diagnostic', 'false diagnostic', 'malformed diagnostic', 'unknown count', 'stored failed run', 'stored empty diagnostic', 'comparison 404'].map(name => <option key={name}>{name}</option>)}</select></label>
+                <label>Response <select aria-label="Response" value={selectedMode} onChange={event => { mode = event.target.value; setSelectedMode(mode); api.clearCache(); }}>{['success', 'timeout', '524', 'offline', 'bad JSON', 'domain error', 'empty diagnostic', 'null diagnostic', 'false diagnostic', 'malformed diagnostic', 'unknown count', 'stored failed run', 'stored empty diagnostic', 'audit lookup unavailable', 'dated audit', 'research lookup unavailable', 'recommendations lookup unavailable', 'comparison 404'].map(name => <option key={name}>{name}</option>)}</select></label>
                 <button onClick={() => { api.clearCache(); setGeneration(value => value + 1); }}>Remount selected screen</button>
                 <span>API fixtures requested: {requests}; mutations denied: {deniedMutations}</span>
             </div>

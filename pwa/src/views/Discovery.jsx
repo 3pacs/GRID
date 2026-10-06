@@ -7,7 +7,7 @@ import ViewHelp from '../components/ViewHelp.jsx';
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
-import { READ_DEADLINE_MS, requireListPayload, requireCountPayload, requireRead } from '../requestState.js';
+import { READ_DEADLINE_MS, requireListPayload, requireCountPayload, requireMaterializationRead } from '../requestState.js';
 import ReadAge from '../components/ReadAge.jsx';
 
 const hypoStateColors = {
@@ -30,7 +30,7 @@ const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED'
 
 async function loadAuditResult(type, scope) {
     try {
-        const response = requireRead(await scope.run(api.getResults(type, scope.options)));
+        const response = requireMaterializationRead(`/api/v1/discovery/results/${type}`, await scope.run(api.getResults(type, scope.options)));
         if (!response || !Object.hasOwn(response, 'result')) {
             return { status: 'unavailable', result: null };
         }
@@ -38,7 +38,10 @@ async function loadAuditResult(type, scope) {
         if (typeof response.result !== 'object') {
             return { status: 'unavailable', result: null };
         }
-        return { status: 'available', result: requireRead(response.result) };
+        return { status: 'available', result: {
+            ...response.result,
+            ...(response.as_of_date && !response.result.as_of_date ? { as_of_date: response.as_of_date } : {}),
+        } };
     } catch {
         return { status: 'unavailable', result: null };
     }
