@@ -318,8 +318,11 @@ on every PR, and so a `grid-svr` runner stall (it has stalled before — see
 
 Workflow jobs opt in via the `TEST_RUNNER` repository variable (Settings →
 Secrets and variables → Actions → Variables): when set to any non-empty value,
-`test.yml` targets `[self-hosted, alien, tests]`; when unset, jobs fall back to
-`ubuntu-latest` so CI never blocks on the Dell being offline.
+`test.yml` targets `[self-hosted, tests]` — any runner carrying the `tests`
+label (alien ×3, threadripper; see "Threadripper Runner" below); when unset,
+jobs fall back to `ubuntu-latest` so CI never blocks on a runner host being
+offline. Every `tests` runner must provide the same persistent Postgres
+contract (PostgreSQL 15 + TimescaleDB, `grid`/`testpass`, `griddb_test`, UTC).
 
 
 ### Where it actually lives (verified 2026-09-11)
@@ -534,3 +537,36 @@ Frontend Build; Backend Tests will not get there on this CPU without
 parallelising the suite (`pytest-xdist -n auto` across 24 cores, which needs
 per-worker DB isolation first), so treat alien as a resilience/second-runner
 win for the test lane, not a speed win, until that lands.
+
+## Threadripper Runner (Self-Hosted CI, bare-metal Linux)
+
+`threadripper` is a third test-lane host, added 2026-10-07. Unlike alien it is
+plain Ubuntu 24.04 on bare metal (no WSL boot contract), so it does not go
+offline when an SSH session closes. Same deal as alien: test lane only, no
+deploy credentials, never targeted by `deploy.yml` / `ops-exec.yml` /
+`gemini-task.yml`.
+
+| | |
+|---|---|
+| Host | tailnet `threadripper` / `100.78.68.72`, LAN `192.168.0.227`; SSH as `grid` (passwordless sudo) |
+| Hardware | Ryzen Threadripper 1950X (16c/32t), 62 GB RAM, 2× RTX A2000 12GB |
+| Runner | `threadripper`, labels `self-hosted, Linux, X64, threadripper, tests, gpu` |
+| Install | `/opt/github-actions/GRID/threadripper` (user `runner`), unit `actions.runner.3pacs-GRID.threadripper.service` |
+| Work dir | `/work/actions/GRID-threadripper` (`/work` is a separate 469 GB LV; keep CI off the root disk) |
+| Test DB | PostgreSQL 15.19 + TimescaleDB (PGDG + packagecloud apt repos, `timescaledb-tune` applied), `grid`/`testpass` owns `griddb_test` and its `public` schema, localhost scram-sha-256, `Etc/UTC` |
+| Python | 3.11 from deadsnakes, plus `build-essential`, `libpq-dev` (setup-python still provisions its own tool-cache copy) |
+
+The host also runs an OCMRI render-farm worker (user `grid`, `UMask=0077`,
+staging on `/work/render-farm`) and holds the parked OCMRI backup replica on
+`/archive` — neither is readable by `runner`; do not loosen those permissions
+for CI.
+
+```bash
+ssh grid@100.78.68.72 'systemctl status actions.runner.3pacs-GRID.threadripper --no-pager'
+ssh grid@100.78.68.72 'pg_isready -h localhost -U grid -d griddb_test'
+gh api repos/3pacs/GRID/actions/runners --jq '.runners[] | "\(.name) \(.status) busy=\(.busy)"'
+```
+
+To take threadripper out of rotation without touching the workflow, stop its
+runner service (`sudo systemctl stop actions.runner.3pacs-GRID.threadripper`);
+queued `tests` jobs then go to alien.
