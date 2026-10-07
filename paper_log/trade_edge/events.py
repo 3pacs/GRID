@@ -1,0 +1,342 @@
+"""Pure event logic: known_at, entry session, qualifying lines, positions.
+
+No I/O. Pre-registration §2-§3. The session calendar is the repository's
+(``ingestion.market_calendar`` via ``paper_log.gex_levels.sessions``, which adds
+the recurring 13:00 early closes), so an entry session's close instant is
+never assumed to be 16:00 on a day the market shut at 13:00.
+
+``entry_positions`` in ``analysis.panel_insider_density`` is the VS1 harness
+form of the same key (one position per issuer and entry session); it works on
+DataFrames with a 16:00 close for every session. This module is the forward
+(record-at-a-time) form with early closes; tests check the two agree on
+ordinary sessions.
+"""
+
+from __future__ import annotations
+
+import re
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Iterable
+
+from ingestion.market_calendar import is_market_open
+from paper_log.gex_levels.sessions import expected_close_time
+from paper_log.trade_edge.config import (
+    BUCKET_LARGE,
+    BUCKET_MICRO,
+    BUCKET_MID,
+    BUCKET_UNKNOWN,
+    CAP_MID_MAX,
+    CAP_SMALL_MAX,
+    DATA_READY_AFTER_CLOSE,
+    EASTERN,
+    INGEST_VISIBILITY_MARGIN,
+    LARGE_LINE_USD,
+    MAX_FILING_LAG_DAYS,
+    MIN_SHARES,
+    MIN_TRADE_USD,
+    PUBLIC_FALLBACK_LOCAL,
+    PURCHASE_CODE,
+    PURCHASE_FORM,
+    STRATUM_LARGE,
+    STRATUM_SMALL,
+)
+
+# ── sessions ────────────────────────────────────────────────────────────────
+
+
+def close_instant(d: date) -> datetime:
+    """The session's close as an aware America/New_York datetime."""
+    return datetime.combine(d, expected_close_time(d), tzinfo=EASTERN)
+
+
+def _aware(ts: datetime) -> datetime:
+    if ts.tzinfo is None:
+        raise ValueError("timestamps must be timezone-aware")
+    return ts
+
+
+def entry_session(known_at: datetime) -> date:
+    """First session whose close instant is strictly after ``known_at`` (§3)."""
+    known_at = _aware(known_at)
+    d = known_at.astimezone(EASTERN).date()
+    while True:
+        if is_market_open(d) and close_instant(d) > known_at:
+            return d
+        d += timedelta(days=1)
+
+
+def shift_sessions(d: date, n: int) -> date:
+    """The n-th session after session ``d`` (n >= 0; n = 0 returns ``d``)."""
+    if n < 0:
+        raise ValueError("n must be >= 0")
+    out = d
+    for _ in range(n):
+        out += timedelta(days=1)
+        while not is_market_open(out):
+            out += timedelta(days=1)
+    return out
+
+
+def sessions_after(start: date, end: date) -> int:
+    """Number of sessions s with start < s <= end."""
+    count = 0
+    d = start + timedelta(days=1)
+    while d <= end:
+        if is_market_open(d):
+            count += 1
+        d += timedelta(days=1)
+    return count
+
+
+def last_completed_session(now: datetime) -> date:
+    """Latest session whose data are available at ``now`` (close + 30 min)."""
+    now = _aware(now)
+    d = now.astimezone(EASTERN).date()
+    while True:
+        if is_market_open(d) and close_instant(d) + DATA_READY_AFTER_CLOSE <= now:
+            return d
+        d -= timedelta(days=1)
+
+
+# ── known_at (§2.4) ─────────────────────────────────────────────────────────
+
+
+def public_time(filing_date: date, acceptance_at: datetime | None) -> datetime:
+    """EDGAR acceptance time when known, else the filing date at 22:00 ET."""
+    if acceptance_at is not None:
+        return _aware(acceptance_at)
+    return datetime.combine(filing_date, PUBLIC_FALLBACK_LOCAL, tzinfo=EASTERN)
+
+
+def compute_known_at(
+    filing_date: date, acceptance_at: datetime | None, first_ingest_at: datetime
+) -> datetime:
+    """Later of the public time and GRID's first ingest (+ visibility margin), in UTC."""
+    ingest = _aware(first_ingest_at) + INGEST_VISIBILITY_MARGIN
+    known = max(public_time(filing_date, acceptance_at), ingest)
+    return known.astimezone(timezone.utc)
+
+
+# ── qualifying lines (§2.2) ─────────────────────────────────────────────────
+
+EXCL_NOT_FORM_4 = "not_form_4"
+EXCL_NOT_PURCHASE = "not_code_p"
+EXCL_DERIVATIVE = "derivative"
+EXCL_NOT_ACQUIRED = "not_acquired"
+EXCL_EQUITY_SWAP = "equity_swap"
+EXCL_10B5_1 = "rule_10b5_1"
+EXCL_LATE_FILING = "late_filing"
+EXCL_SMALL = "small_or_unpriced"
+
+
+def line_exclusion(line: dict[str, Any], filing_date: date, submission_type: str) -> str | None:
+    """The first rule a line fails, or None when it qualifies."""
+    if (submission_type or "").strip().upper() != PURCHASE_FORM:
+        return EXCL_NOT_FORM_4
+    if (line.get("code") or "").strip().upper() != PURCHASE_CODE:
+        return EXCL_NOT_PURCHASE
+    if line.get("is_derivative"):
+        return EXCL_DERIVATIVE
+    if (line.get("acq_disp") or "").strip().upper() != "A":
+        return EXCL_NOT_ACQUIRED
+    if line.get("equity_swap"):
+        return EXCL_EQUITY_SWAP
+    if line.get("is_10b5_1"):
+        return EXCL_10B5_1
+    trans = _as_date(line.get("trans_date"))
+    if trans is None:
+        return EXCL_LATE_FILING
+    lag = (filing_date - trans).days
+    if lag < 0 or lag > MAX_FILING_LAG_DAYS:
+        return EXCL_LATE_FILING
+    shares = line.get("shares")
+    price = line.get("price")
+    if shares is None or price is None or price <= 0 or shares < MIN_SHARES:
+        return EXCL_SMALL
+    if shares * price < MIN_TRADE_USD:
+        return EXCL_SMALL
+    return None
+
+
+def _as_date(value: Any) -> date | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except ValueError:
+        return None
+
+
+def _as_dt(value: Any) -> datetime | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value
+    return datetime.fromisoformat(str(value))
+
+
+# ── tickers / buckets ───────────────────────────────────────────────────────
+
+_TICKER_RE = re.compile(r"^[A-Z][A-Z0-9]{0,5}([.\-][A-Z0-9]{1,2})?$")
+_UNRESOLVED = frozenset({"", "NONE", "N/A", "NA", "NULL", "-"})
+
+
+def is_resolvable_ticker(ticker: str | None) -> bool:
+    t = (ticker or "").strip().upper()
+    return t not in _UNRESOLVED and bool(_TICKER_RE.match(t))
+
+
+def yahoo_symbol(ticker: str) -> str:
+    """EDGAR class-share dots (BRK.B) are dashes on Yahoo (BRK-B)."""
+    return ticker.strip().upper().replace(".", "-")
+
+
+def cap_bucket(market_cap_usd: float | None) -> str:
+    if market_cap_usd is None or not market_cap_usd > 0:
+        return BUCKET_UNKNOWN
+    if market_cap_usd < CAP_SMALL_MAX:
+        return BUCKET_MICRO
+    if market_cap_usd < CAP_MID_MAX:
+        return BUCKET_MID
+    return BUCKET_LARGE
+
+
+def stratum(largest_value: float) -> str:
+    return STRATUM_LARGE if largest_value >= LARGE_LINE_USD else STRATUM_SMALL
+
+
+# ── purchases and positions (§2.3, §3) ──────────────────────────────────────
+
+
+def issuer_keys(filings: Iterable[dict]) -> dict[str, str]:
+    """accession -> issuer key: ``cik:N`` when known, else ``ticker:T``.
+
+    A ``grid_db`` accession (no CIK) whose ticker some CIK-keyed accession also
+    carries is mapped to that CIK so one issuer never yields two keys.
+    """
+    filings = list(filings)
+    by_ticker: dict[str, int] = {}
+    for f in filings:
+        if f.get("issuer_cik") and is_resolvable_ticker(f.get("ticker")):
+            by_ticker.setdefault(f["ticker"].strip().upper(), int(f["issuer_cik"]))
+    out: dict[str, str] = {}
+    for f in filings:
+        if f.get("issuer_cik"):
+            out[f["accession"]] = f"cik:{int(f['issuer_cik'])}"
+        else:
+            t = (f.get("ticker") or "").strip().upper()
+            out[f["accession"]] = f"cik:{by_ticker[t]}" if t in by_ticker else f"ticker:{t or '?'}"
+    return out
+
+
+def actor_sort_key(actor: str) -> tuple:
+    """Smallest actor = smallest numeric CIK; name-keyed actors sort after CIKs."""
+    kind, _, rest = actor.partition(":")
+    if kind == "cik" and rest.isdigit():
+        return (0, int(rest), "")
+    return (1, 0, actor)
+
+
+def build_purchases(filings: Iterable[dict]) -> list[dict]:
+    """Qualifying purchases, de-duplicated across accessions (VS1 §2.1 (b)).
+
+    ``filings`` are ``filing`` records (§2.1). Each line already carries its
+    ``exclusion``; only lines with none are purchases.
+    """
+    filings = list(filings)
+    keys = issuer_keys(filings)
+    rows: list[dict] = []
+    for f in filings:
+        known_at = _as_dt(f["known_at"])
+        for line in f.get("lines", []):
+            if line.get("exclusion"):
+                continue
+            rows.append(
+                {
+                    "issuer_key": keys[f["accession"]],
+                    "issuer_cik": f.get("issuer_cik"),
+                    "issuer_name": f.get("issuer_name") or "",
+                    "ticker": (f.get("ticker") or "").strip().upper(),
+                    "accession": f["accession"],
+                    "actor": f["actor"],
+                    "owner_names": [o.get("name") or "" for o in f.get("owners", [])],
+                    "trans_date": str(line["trans_date"])[:10],
+                    "shares": float(line["shares"]),
+                    "price": float(line["price"]),
+                    "value": float(line["shares"]) * float(line["price"]),
+                    "filing_date": str(f["filing_date"])[:10],
+                    "acceptance_at": f.get("acceptance_at"),
+                    "first_ingest_at": f.get("first_ingest_at"),
+                    "known_at": known_at,
+                    "source": f.get("source"),
+                }
+            )
+    groups: dict[tuple, list[dict]] = {}
+    for r in rows:
+        k = (r["issuer_key"], r["trans_date"], round(r["shares"]), round(r["price"], 2))
+        groups.setdefault(k, []).append(r)
+    out = []
+    for members in groups.values():
+        members.sort(key=lambda r: (r["known_at"], r["accession"]))
+        keep = dict(members[0])
+        keep["actor"] = min((m["actor"] for m in members), key=actor_sort_key)
+        keep["n_reports"] = len({m["accession"] for m in members})
+        out.append(keep)
+    out.sort(key=lambda r: (r["issuer_key"], r["known_at"], r["actor"], r["trans_date"]))
+    return out
+
+
+def position_id(issuer_key: str, entry: date) -> str:
+    return f"{issuer_key}|{entry.isoformat()}"
+
+
+def group_positions(purchases: Iterable[dict]) -> dict[str, dict]:
+    """One position per (issuer, entry session), never per insider-day line."""
+    positions: dict[str, dict] = {}
+    for p in purchases:
+        entry = entry_session(p["known_at"])
+        pid = position_id(p["issuer_key"], entry)
+        pos = positions.get(pid)
+        if pos is None:
+            pos = positions[pid] = {
+                "position_id": pid,
+                "issuer_key": p["issuer_key"],
+                "issuer_cik": p["issuer_cik"],
+                "issuer_name": p["issuer_name"],
+                "ticker": p["ticker"],
+                "entry_session": entry.isoformat(),
+                "entry_close_at": close_instant(entry).isoformat(),
+                "_purchases": [],
+            }
+        pos["_purchases"].append(p)
+        if not pos["issuer_name"] and p["issuer_name"]:
+            pos["issuer_name"] = p["issuer_name"]
+        if not is_resolvable_ticker(pos["ticker"]) and is_resolvable_ticker(p["ticker"]):
+            pos["ticker"] = p["ticker"]
+    for pos in positions.values():
+        ps = pos.pop("_purchases")
+        values = [p["value"] for p in ps]
+        names = sorted({n for p in ps for n in p["owner_names"] if n})
+        pos.update(
+            {
+                "accessions": sorted({p["accession"] for p in ps}),
+                "actors": sorted({p["actor"] for p in ps}),
+                "n_actors": len({p["actor"] for p in ps}),
+                "insider_names": names,
+                "n_purchases": len(ps),
+                "total_value": round(sum(values), 2),
+                "largest_value": round(max(values), 2),
+                "stratum": stratum(max(values)),
+                "filing_dates": sorted({p["filing_date"] for p in ps}),
+                "acceptance_at": sorted({p["acceptance_at"] for p in ps if p["acceptance_at"]}),
+                "first_known_at": min(p["known_at"] for p in ps).isoformat(),
+                "last_known_at": max(p["known_at"] for p in ps).isoformat(),
+                "sources": sorted({p["source"] or "?" for p in ps}),
+                "ticker_resolved": is_resolvable_ticker(pos["ticker"]),
+            }
+        )
+    return positions
