@@ -514,7 +514,18 @@ class FREDPuller(BasePuller):
             conn = self.engine.connect()
         except Exception as exc:
             raise _StoreAborted() from exc
-        if not _deadline_ok():
+        try:
+            expired = not _deadline_ok()
+        except BaseException:
+            # A raising deadline callback must not leak the checked-out
+            # connection: release it deterministically, then let the caller
+            # see the callback's own failure.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        if expired:
             # The pool checkout itself consumed the remaining budget: admit
             # no new transaction. Nothing has been written on this connection.
             try:

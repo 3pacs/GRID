@@ -680,3 +680,62 @@ def test_scheduler_passes_its_absolute_deadline_to_pull_all(monkeypatch):
     assert captured["callback"]() is True
     clock[0] = 285.0
     assert captured["callback"]() is False
+
+
+# ---------------------------------------------------------------------------
+# Codex's c1dd1970 finding: a deadline callback that raises right after the
+# pool checkout must not leak the connection.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_raising_deadline_callback_after_checkout_still_closes_the_connection(monkeypatch):
+    puller, engine, _frame, _calls = make_puller(monkeypatch, 1)
+    closed = []
+    original_close = FakeConnection.close
+
+    def close(self):
+        closed.append(self)
+        return original_close(self)
+
+    monkeypatch.setattr(FakeConnection, "close", close)
+
+    def callback():
+        if engine.acquisitions:
+            raise RuntimeError("synthetic callback bug after pool checkout")
+        return True
+
+    out = puller.pull_series("DFF", should_continue=callback)
+
+    assert len(closed) == engine.acquisitions == 1  # checked out once, closed once
+    assert not engine.transactions and not engine.rows
+    assert out["status"] == "FAILED" and out["rows_inserted"] == 0
+    assert any("synthetic callback bug" in e for e in out["errors"])
+
+
+@pytest.mark.unit
+def test_raising_deadline_callback_releases_the_real_pool_slot(monkeypatch):
+    """Deterministic release on a real (local, in-memory SQLite) QueuePool of size one."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import QueuePool
+
+    puller, _engine, _frame, _calls = make_puller(monkeypatch, 1)
+    engine = create_engine("sqlite://", poolclass=QueuePool, pool_size=1, max_overflow=0, pool_timeout=0)
+    puller.engine = engine
+    prior = (getattr(fred._deadline_state, "deadline", None),
+             getattr(fred._deadline_state, "within_budget", None))
+    fred._deadline_state.deadline = None
+
+    def faulty_callback():
+        raise RuntimeError("synthetic callback failure")
+
+    fred._deadline_state.within_budget = faulty_callback
+    try:
+        with pytest.raises(RuntimeError, match="synthetic callback"):
+            puller._write(lambda conn: 1)
+        assert engine.pool.checkedout() == 0  # released before the exception left _write
+        with engine.connect() as conn:  # the single slot is usable again, no GC needed
+            assert conn is not None
+    finally:
+        fred._deadline_state.deadline, fred._deadline_state.within_budget = prior
+        engine.dispose()
