@@ -13,6 +13,9 @@ the same next-business-day lag. These tests pin:
   or the modeled lag), so later rows never change a past vector.
 * Provenance: only source ``CBOE`` rows count, and ``vix_basis`` records the
   series used, in memory and through the cache.
+* Late VIXCLS: only its trailing gap is filled from CBOE:VIX, never past the
+  date VIXCLS itself would be modeled as published by ``as_of``, and never
+  over a close VIXCLS has.
 
 Fixture: real ``raw_series`` + ``source_catalog`` on in-memory SQLite, the
 same shape as ``tests/test_regime_state_vector_pit.py``.
@@ -133,12 +136,15 @@ def _vix_dims(sv) -> tuple[float | None, float | None]:
 
 def _expected_vix_dims(fn, *, as_of_known: date = LAST_KNOWN) -> tuple[float, float]:
     """Independent recomputation of the two VIX dims from a seeded series."""
+    return _expected_from(
+        {d: fn(i) for i, d in enumerate(_bdays(HIST_START, HIST_END)) if d <= as_of_known}
+    )
+
+
+def _expected_from(points: dict) -> tuple[float, float]:
     from intelligence.regime.state_vector import NORM_LOOKBACK_DAYS, VALUE_LOOKBACK_DAYS
 
-    full = pd.Series(
-        {d: fn(i) for i, d in enumerate(_bdays(HIST_START, HIST_END)) if d <= as_of_known},
-        dtype=float,
-    ).sort_index()
+    full = pd.Series(points, dtype=float).sort_index()
     norm = full[full.index >= AS_OF - timedelta(days=NORM_LOOKBACK_DAYS)]
     window = full[full.index >= AS_OF - timedelta(days=VALUE_LOOKBACK_DAYS)]
     level = (float(window.iloc[-1]) - float(norm.mean())) / float(norm.std())
@@ -388,3 +394,126 @@ def test_vix_basis_is_reported_and_survives_the_cache(monkeypatch):
 
     legacy = {name: 0.5 for name in sv_mod.DIM_NAMES}  # row written before R4
     assert sv_mod._row_to_state_vector((AS_OF, legacy, 1.0, []), cached=True).vix_basis is None
+
+
+# ── Late VIXCLS: trailing gap filled from CBOE:VIX ───────────────────────
+
+
+def _cboe_by_date() -> dict:
+    return {d: _cboe_value(i) for i, d in enumerate(_bdays(HIST_START, HIST_END))}
+
+
+def _vixcls_by_date(end: date) -> dict:
+    return {d: _vixcls_value(i) for i, d in enumerate(_bdays(HIST_START, HIST_END)) if d <= end}
+
+
+def test_late_vixcls_trailing_gap_is_filled_from_cboe(engine):
+    """VIXCLS stops at Wed 06-04; Thu, Fri and Mon come from Cboe, nothing else changes."""
+    from intelligence.regime.state_vector import compute_state_vector
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value)
+
+    sv = compute_state_vector(engine, AS_OF)
+
+    assert sv.vix_basis == "VIXCLS+CBOE:VIX"
+    cboe = _cboe_by_date()
+    points = _vixcls_by_date(date(2025, 6, 4))
+    points.update({d: cboe[d] for d in (date(2025, 6, 5), date(2025, 6, 6), LAST_KNOWN)})
+    assert _vix_dims(sv) == pytest.approx(_expected_from(points), rel=1e-12)
+
+
+def test_gap_fill_never_replaces_a_vixcls_close(engine):
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value)
+    reader = sv_mod._AsOfReader(engine, AS_OF)
+
+    assert sv_mod._fill_vix_trailing_gap(reader) == 3
+    filled = reader.full("VIXCLS")
+    vixcls = _vixcls_by_date(date(2025, 6, 4))
+    assert {d: filled[d] for d in vixcls if d in filled.index} == {
+        d: v for d, v in vixcls.items() if d in filled.index
+    }
+    assert filled.index.is_monotonic_increasing and filled.index.is_unique
+    assert reader.window("VIXCLS").index[-1] == LAST_KNOWN
+
+
+def test_gap_fill_stops_at_vixcls_own_publication_horizon(engine):
+    """A Cboe close pulled live on as_of is fresher than VIXCLS could be: not used."""
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value, end=LAST_KNOWN)
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": AS_OF,
+                      "ts": datetime(2025, 6, 10, 21, 30), "v": 55.0}])
+    reader = sv_mod._AsOfReader(engine, AS_OF)
+
+    assert AS_OF in reader.window("CBOE:VIX").index  # Cboe knows it ...
+    sv_mod._fill_vix_trailing_gap(reader)
+    assert reader.window("VIXCLS").index[-1] == LAST_KNOWN  # ... the fill does not use it
+
+
+@pytest.mark.parametrize(
+    ("as_of", "horizon"),
+    [
+        (date(2025, 6, 10), date(2025, 6, 9)),   # Tue -> Mon
+        (date(2025, 6, 9), date(2025, 6, 6)),    # Mon -> Fri
+        (date(2025, 6, 14), date(2025, 6, 12)),  # Sat -> Thu (Fri close known Mon)
+        (date(2025, 9, 2), date(2025, 9, 1)),    # Tue after Labor Day -> the holiday, nothing to fill
+    ],
+)
+def test_vix_publication_horizon(as_of, horizon):
+    from intelligence.regime.state_vector import (
+        PUBLICATION_LAGS,
+        VIX_SERIES,
+        _vix_publication_horizon,
+    )
+
+    assert _vix_publication_horizon(as_of) == horizon
+    assert PUBLICATION_LAGS[VIX_SERIES].known_dates([horizon])[0] <= as_of
+
+
+def test_on_time_vixcls_over_a_weekend_reads_no_cboe(engine, monkeypatch):
+    from intelligence.regime.state_vector import compute_state_vector
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value)
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value)
+    seen = _record_reads(monkeypatch)
+
+    for as_of in (date(2025, 6, 9), date(2025, 6, 14), date(2025, 6, 15)):  # Mon, Sat, Sun
+        assert compute_state_vector(engine, as_of).vix_basis == "VIXCLS"
+    assert "CBOE:VIX" not in seen
+
+
+def test_later_rows_never_change_a_past_gap_filled_vector(engine):
+    from intelligence.regime.state_vector import compute_state_vector
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value, end=LAST_KNOWN)
+    before = compute_state_vector(engine, AS_OF)
+    later = datetime(2026, 10, 7, 22, 0)
+    _seed(engine, "CBOE:VIX", CBOE_SRC, lambda i: 80.0, start=AS_OF, end=date(2025, 12, 31), ts=later)
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": date(2025, 6, 6), "ts": later, "v": 77.0}])
+    after = compute_state_vector(engine, AS_OF)
+
+    assert before.vix_basis == after.vix_basis == "VIXCLS+CBOE:VIX"
+    assert after.values == before.values
+
+
+def test_failed_gap_fill_keeps_plain_vixcls(engine, monkeypatch):
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    unfilled = sv_mod.compute_state_vector(engine, AS_OF)  # no CBOE rows: nothing to fill
+
+    def boom(_reader):
+        raise RuntimeError("cboe read failed")
+
+    monkeypatch.setattr(sv_mod, "_fill_vix_trailing_gap", boom)
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value)
+    sv = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert unfilled.vix_basis == sv.vix_basis == "VIXCLS"
+    assert sv.values == unfilled.values

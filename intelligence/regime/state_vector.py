@@ -44,8 +44,10 @@ Availability contract (``as_of`` = end of that UTC day)
   cannot (absent, too short, or mixed-source at ``as_of``) does the whole
   series switch to the Cboe-published close ``CBOE:VIX`` (source ``CBOE``,
   the originator of VIXCLS), read with the same known-at rule and the same
-  next-business-day lag. One source per vector, never spliced per date;
-  the choice is recorded in ``StateVector.vix_basis``.
+  next-business-day lag. A usable VIXCLS that is only *late* keeps every
+  close it has; just its trailing gap, up to the date VIXCLS itself would be
+  modeled as published by ``as_of``, is filled from CBOE:VIX closes known
+  at ``as_of``. The choice is recorded in ``StateVector.vix_basis``.
 
 State vectors are cached in the `regime_state_vectors` table.
 """
@@ -211,12 +213,21 @@ PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
 # cboe_indices.py``, source ``CBOE``; history from 1990 via
 # ``scripts/bulk_historical_pull.py``). It is used only when VIXCLS cannot
 # produce the VIX dimensions at ``as_of``, and then as a whole series (values,
-# percentile window and z-score stats all from CBOE:VIX), so a vector never
-# mixes the two sources. The read pins ``source`` because both writers of
-# CBOE:VIX use the CBOE catalog entry and any other writer would be a
-# different provenance.
+# percentile window and z-score stats all from CBOE:VIX). The read pins
+# ``source`` because both writers of CBOE:VIX use the CBOE catalog entry and
+# any other writer would be a different provenance.
+#
+# A usable VIXCLS that is merely behind (FRED posts late: 2-6 days on ~8% of
+# dates since 2026-04, e.g. the 2026-09-23..25 closes landed on 09-29) gets
+# its *trailing* gap filled from CBOE:VIX: only dates after VIXCLS's last
+# known close, only Cboe closes known at ``as_of``, and only dates VIXCLS
+# itself would be modeled as published by ``as_of`` (its own lag), so the
+# fill never gives the VIX dims a fresher close than an on-time VIXCLS
+# would. A date VIXCLS has is never replaced. On griddb the two series agree
+# to the cent on all 9,150 overlapping dates (1990-01-02..2026-03-25).
 VIX_SERIES = 'VIXCLS'
 VIX_FALLBACK_SERIES = 'CBOE:VIX'
+VIX_GAP_FILLED_BASIS = 'VIXCLS+CBOE:VIX'
 SERIES_SOURCES: dict[str, str] = {VIX_FALLBACK_SERIES: 'CBOE'}
 
 # Raw ``YF:SPY:close`` fallback (E1-V1). A daily close is public when its
@@ -292,9 +303,11 @@ class StateVector:
     # for an in-memory computation that was never written.
     cached: bool = False
     # Which VIX close series fed vix_level/vix_percentile: VIX_SERIES
-    # ("VIXCLS"), the VIX_FALLBACK_SERIES ("CBOE:VIX"), or None when neither
-    # had enough known history (see _resolve_vix_series). Cached rows written
-    # before this field existed read back as None.
+    # ("VIXCLS"), VIX_GAP_FILLED_BASIS ("VIXCLS+CBOE:VIX", VIXCLS with its
+    # trailing gap filled), the VIX_FALLBACK_SERIES ("CBOE:VIX"), or None
+    # when neither had enough known history (see _resolve_vix_series and
+    # _fill_vix_trailing_gap). Cached rows written before this field existed
+    # read back as None.
     vix_basis: str | None = None
 
     @property
@@ -384,6 +397,11 @@ class _AsOfReader:
             )
         return self._windows[series_id]
 
+    def append(self, series_id: str, extra: pd.Series) -> None:
+        """Append later-dated observations to both memoized reads of ``series_id``."""
+        self._full[series_id] = pd.concat([self.full(series_id), extra]).sort_index()
+        self._windows[series_id] = pd.concat([self.window(series_id), extra]).sort_index()
+
 
 def _resolve_vix_series(reader: _AsOfReader) -> str | None:
     """VIX close series for ``vix_level``/``vix_percentile`` at ``reader.as_of``.
@@ -403,6 +421,40 @@ def _resolve_vix_series(reader: _AsOfReader) -> str | None:
         if len(reader.window(series_id)) >= need:
             return series_id
     return None
+
+
+def _vix_publication_horizon(as_of: date) -> date:
+    """Latest weekday close VIXCLS is modeled as published by the end of ``as_of``."""
+    lag = PUBLICATION_LAGS[VIX_SERIES]
+    horizon = as_of
+    while horizon.weekday() >= 5 or lag.known_dates([horizon])[0] > as_of:
+        horizon -= timedelta(days=1)
+    return horizon
+
+
+def _fill_vix_trailing_gap(reader: _AsOfReader) -> int:
+    """Fill VIXCLS's trailing gap from CBOE:VIX; return the number of dates filled.
+
+    Applies only when VIXCLS's last known close is older than
+    :func:`_vix_publication_horizon`, so an on-time VIXCLS is left exactly as
+    read (CBOE:VIX is not read at all, except the day after a federal holiday
+    the horizon still counts, where nothing can be filled). Fills dates
+    strictly after that close and no later than the horizon, from CBOE:VIX
+    closes known at ``as_of``. Dates VIXCLS has are never touched.
+    """
+    vixcls = reader.window(VIX_SERIES)
+    if vixcls.empty:
+        return 0
+    last = vixcls.index[-1]
+    horizon = _vix_publication_horizon(reader.as_of)
+    if last >= horizon:
+        return 0
+    cboe = reader.window(VIX_FALLBACK_SERIES)
+    fill = cboe[(cboe.index > last) & (cboe.index <= horizon)]
+    if fill.empty:
+        return 0
+    reader.append(VIX_SERIES, fill)
+    return len(fill)
 
 
 def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
@@ -797,6 +849,13 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         log.debug("state_vector: VIX basis unresolved for {dt}: {e}", dt=as_of, e=str(exc))
         vix_basis = None
     vix_series = vix_basis or VIX_SERIES
+    if vix_basis == VIX_SERIES:
+        try:
+            if _fill_vix_trailing_gap(reader):
+                vix_basis = VIX_GAP_FILLED_BASIS
+        except Exception as exc:
+            # No fill is the pre-R4 behaviour: VIXCLS as known, however late.
+            log.debug("state_vector: VIX gap fill skipped for {dt}: {e}", dt=as_of, e=str(exc))
     norm_stats = _get_normalization_stats(engine, as_of, reader)
     if vix_series != VIX_SERIES:
         # The fallback is z-scored against its own history, never VIXCLS's.
