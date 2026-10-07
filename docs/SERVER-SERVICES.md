@@ -556,6 +556,21 @@ deploy credentials, never targeted by `deploy.yml` / `ops-exec.yml` /
 | Test DB | PostgreSQL 15.19 + TimescaleDB (PGDG + packagecloud apt repos, `timescaledb-tune` applied), `grid`/`testpass` owns `griddb_test` and its `public` schema, localhost scram-sha-256, `Etc/UTC` |
 | Python | 3.11 from deadsnakes, plus `build-essential`, `libpq-dev` (setup-python still provisions its own tool-cache copy) |
 
+**Thermal limits (2026-10-07).** At its BIOS 4.0 GHz all-core P0 with only two
+fans, threadripper hard-froze twice ~3 min into a full 32-way suite (Tdie 85 °C,
+board AUXTIN0 75 °C and climbing; journal just stops). `cpu-freq-cap.service`
+caps every core at 2.8 GHz (P1, lower voltage) — at that cap the full suite ran
+in 5m30s with Tdie peaking at 54 °C and the box stayed up. Keep the cap until
+the BIOS overclock is reverted and case airflow is added. Safety nets: the
+`sp5100_tco` hardware watchdog (systemd `RuntimeWatchdogSec=60`) resets the
+board after a freeze (verified: frozen 07:23Z, back 07:26Z unattended),
+`net-selfheal.timer` recovers the NIC/tailnet, and a USB NIC (`enx*`) is a DHCP
+fallback.
+
+Validated 2026-10-07 by running the backend suite exactly as `test.yml` does
+against the persistent DB: 13,477 passed, 571 skipped; the only 2 failures need
+`git ls-files` and came from validating a `git archive` copy (no `.git`).
+
 The host also runs an OCMRI render-farm worker (user `grid`, `UMask=0077`,
 staging on `/work/render-farm`) and holds the parked OCMRI backup replica on
 `/archive` — neither is readable by `runner`; do not loosen those permissions
