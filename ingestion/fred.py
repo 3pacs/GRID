@@ -11,15 +11,18 @@ from __future__ import annotations
 
 import json
 import re
+import threading
 import time
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, Callable
 
+import httpx
 import pandas as pd
 from fedfred import FredAPI
 from loguru import logger as log
 from sqlalchemy import exc as sa_exc, text
 from sqlalchemy.engine import Engine
+from tenacity import RetryError
 
 from ingestion.base import BasePuller
 
@@ -190,6 +193,162 @@ FRED_SERIES_LIST: list[str] = [
 # Minimum delay between FRED API calls (seconds)
 _RATE_LIMIT_DELAY: float = 0.25
 
+# fedfred 3.x opens a fresh ``httpx.Client()`` per request and hard-codes
+# ``timeout=10`` on every GET (fedfred/clients.py, ``__fred_get_request``);
+# its constructor exposes no way to change it. FRED's observations endpoint
+# regularly takes longer than that for daily series, which is what produced
+# the 16:02Z/20:01Z ``RetryError[ReadTimeout]`` FAILED rows on VIXCLS, T10Y2Y
+# and DFF through September 2026.
+#
+# Budget arithmetic: fedfred wraps each GET in ``@retry(wait=wait_fixed(1),
+# stop=stop_after_attempt(3))``, so one series whose reads all stall costs
+# ``3 * FRED_HTTP_TIMEOUT + 2`` seconds before ``pull_series`` can classify
+# it as transient. 30 s triples fedfred's default and keeps that worst case
+# at 92 s.
+FRED_HTTP_TIMEOUT: float = 30.0
+
+# Job budget. ``pull_all`` budgets itself against the same number the
+# scheduler registers for the ``fred`` job (``timeout_s`` in
+# ingestion/smart_scheduler.py; a test pins the two together). A normal
+# 87-series pass measured 91-176 s on 2026-10-06, so 300 s covers a full pass
+# plus one stalled series.
+FRED_JOB_BUDGET_S: float = 300.0
+# The scheduler's ``should_continue`` callback turns False ``stop_margin_s``
+# before ``timeout_s`` (15 s for the fred job, declared in the registry), i.e.
+# at 285 s. FRED's own wall-clock deadline is pinned to the same instant so a
+# direct caller without the callback (the legacy ``ingestion.scheduler`` path)
+# gets the same guarantee: after 285 s no provider request is sent, no row is
+# stored and no failure row is written, while the scheduler reports TIMEOUT
+# at 300 s and orphans the worker thread.
+FRED_DEADLINE_MARGIN_S: float = 15.0
+
+
+# Per-thread deadline for the FRED pass in progress. ``pull_all`` installs a
+# wall-clock ``deadline`` (and the scheduler's ``should_continue`` as
+# ``within_budget``); ``pull_series`` installs a caller-supplied
+# ``should_continue``. Everything that could do work after expiry — fedfred's
+# own retry attempts, the store loop and the failure-row writer — consults it
+# through :func:`_deadline_ok`, so no provider request and no database
+# transaction starts once the pass has expired.
+_deadline_state = threading.local()
+
+
+class _DeadlineExpired(Exception):
+    """The pass deadline passed at a point where new work would otherwise start.
+
+    Raised by ``_PatientClient.get`` inside fedfred's retry loop (fedfred
+    retries any exception up to three times with 1 s waits, so at most two
+    1 s sleeps follow; no request is sent after expiry) and by ``_write``
+    when a pool checkout returns after the deadline (the connection is
+    closed and no transaction is begun). ``inserted``/``failed``/``errors``
+    carry the acknowledged and abandoned point counts up to the caller.
+    """
+
+    def __init__(self, message: str, inserted: int = 0, failed: int = 0,
+                 errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.inserted = inserted
+        self.failed = failed
+        self.errors = list(errors or [])
+
+
+def _remaining_budget_s() -> float | None:
+    """Seconds left in the current pass: ``None`` with no deadline, ``0.0`` once expired."""
+    within = getattr(_deadline_state, "within_budget", None)
+    deadline = getattr(_deadline_state, "deadline", None)
+    if within is not None and not within():
+        return 0.0
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def _deadline_ok() -> bool:
+    remaining = _remaining_budget_s()
+    return remaining is None or remaining > 0.0
+
+
+class _PatientClient(httpx.Client):
+    """``httpx.Client`` whose GET replaces fedfred's hard-coded 10 s timeout.
+
+    Every attempt of fedfred's retry loop comes through here, so this is also
+    where an expired pass stops: no request is sent after the deadline, and an
+    attempt that is still allowed may not wait past it.
+    """
+
+    def get(self, url, *args, timeout=None, **kwargs):  # noqa: D102 - httpx signature
+        remaining = _remaining_budget_s()
+        if remaining is None:
+            budget = FRED_HTTP_TIMEOUT
+        elif remaining <= 0.0:
+            raise _DeadlineExpired("FRED pass deadline passed before this attempt; request not sent")
+        else:
+            budget = min(FRED_HTTP_TIMEOUT, remaining)
+        return super().get(url, *args, timeout=budget, **kwargs)
+
+
+class _PatientHttpx:
+    """Drop-in for the ``httpx`` module name inside ``fedfred.clients``.
+
+    Everything is delegated to the real module except ``Client``, so fedfred's
+    ``with httpx.Client() as client: client.get(..., timeout=10)`` keeps working
+    unchanged but honours :data:`FRED_HTTP_TIMEOUT`.
+    """
+
+    Client = _PatientClient
+
+    def __init__(self, real_module) -> None:
+        self._real = real_module
+
+    def __getattr__(self, name: str):
+        return getattr(self._real, name)
+
+
+def _install_patient_httpx() -> None:
+    """Point ``fedfred.clients.httpx`` at :class:`_PatientHttpx` once."""
+    import fedfred.clients as fedfred_clients
+
+    current = getattr(fedfred_clients, "httpx", httpx)
+    if isinstance(current, _PatientHttpx):
+        return
+    fedfred_clients.httpx = _PatientHttpx(current)
+
+
+def _deadline_result(series_id: str, note: str) -> dict[str, Any]:
+    """Result for a series not attempted because the scheduler deadline passed."""
+    return {
+        "series_id": series_id,
+        "rows_inserted": 0,
+        "rows_failed": 0,
+        "status": "SKIPPED",
+        "errors": [note],
+        "deadline": True,
+    }
+
+
+def _unwrap_retry(exc: BaseException) -> BaseException:
+    """fedfred wraps its 3 tenacity attempts; the transport error is in last_attempt."""
+    if isinstance(exc, RetryError):
+        try:
+            inner = exc.last_attempt.exception()
+        except Exception:
+            inner = None
+        if inner is not None:
+            return inner
+    return exc
+
+
+def _is_transient_transport_error(exc: BaseException) -> bool:
+    """Timeouts and connection failures: upstream weather, not an app bug.
+
+    These used to fall through to the generic branch, which logged at ERROR
+    and wrote a ``FAILED`` row dated *today* — a row for an observation date
+    that does not exist yet. A transient transport error is handled like a 5xx:
+    WARNING, ``SKIPPED``, no failure row, try again next cycle.
+    """
+    inner = _unwrap_retry(exc)
+    return isinstance(inner, (httpx.TransportError, TimeoutError, ConnectionError))
+
 
 def _extract_http_status_code(exc: BaseException) -> int | None:
     """Best-effort status extraction across HTTP and retry wrappers."""
@@ -342,6 +501,7 @@ class FREDPuller(BasePuller):
             api_key: FRED API key.
             db_engine: SQLAlchemy engine connected to the GRID database.
         """
+        _install_patient_httpx()
         self.fred = FredAPI(api_key)
         super().__init__(db_engine)
         log.info("FREDPuller initialised — source_id={sid}", sid=self.source_id)
@@ -354,6 +514,28 @@ class FREDPuller(BasePuller):
             conn = self.engine.connect()
         except Exception as exc:
             raise _StoreAborted() from exc
+        try:
+            expired = not _deadline_ok()
+        except BaseException:
+            # A raising deadline callback must not leak the checked-out
+            # connection: release it deterministically, then let the caller
+            # see the callback's own failure.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise
+        if expired:
+            # The pool checkout itself consumed the remaining budget: admit
+            # no new transaction. Nothing has been written on this connection.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise _DeadlineExpired(
+                "scheduler deadline reached while waiting for a database connection; "
+                "transaction not started"
+            )
         transaction = None
         inserted = 0
         acknowledged = False
@@ -422,16 +604,32 @@ class FREDPuller(BasePuller):
             raise ValueError(f"FRED batch exceeds {STORE_BATCH_ROWS} rows")
         try:
             return self._write(lambda conn: self._store_points(series_id, points, conn)), 0, []
-        except _StoreAborted:
+        except (_StoreAborted, _DeadlineExpired):
             raise
         except Exception as exc:
             log.warning("FRED {sid}: batch rolled back; retrying one point per transaction: {e}",
                         sid=series_id, e=str(exc))
         inserted = failed = 0
         errors: list[str] = []
-        for point in points:
+        for index, point in enumerate(points):
+            if not _deadline_ok():
+                # Recovery must not admit new transactions after the pass
+                # deadline; acknowledged rows above stay counted.
+                failed += 1
+                errors.append(f"{series_id} @ {point[0]}: not retried, scheduler deadline reached")
+                continue
             try:
                 inserted += self._write(lambda conn: self._store_points(series_id, [point], conn))
+            except _DeadlineExpired as exc:
+                # The checkout for this point returned after expiry: this
+                # point and the rest are abandoned, acknowledged ones kept.
+                exc.inserted += inserted
+                exc.failed += failed + (len(points) - index)
+                exc.errors = errors + exc.errors + [
+                    f"{series_id} @ {p[0]}: not retried, scheduler deadline reached"
+                    for p in points[index:]
+                ]
+                raise
             except _StoreAborted as exc:
                 exc.inserted += inserted
                 exc.failed += failed
@@ -460,6 +658,26 @@ class FREDPuller(BasePuller):
             exc.inserted = 0
             raise
 
+    def _record_failure_within_budget(self, series_id: str, message: str, result: dict[str, Any]) -> None:
+        """Write the FAILED row unless the pass deadline has passed.
+
+        Recovery must not open a new database transaction after expiry; the
+        failure is still reported in the result, just not persisted.
+        """
+        if not _deadline_ok():
+            note = "failure row not recorded: scheduler deadline reached"
+            log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+            result["errors"].append(note)
+            result["deadline"] = True
+            return
+        try:
+            self._record_failure(series_id, message)
+        except _DeadlineExpired as exc:
+            note = f"failure row not recorded: {exc}"
+            log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+            result["errors"].append(note)
+            result["deadline"] = True
+
     @staticmethod
     def _abort_result(result: dict[str, Any], exc: _StoreAborted) -> None:
         result["rows_inserted"] += exc.inserted
@@ -478,6 +696,7 @@ class FREDPuller(BasePuller):
         series_id: str,
         start_date: str | date = "1990-01-01",
         end_date: str | date | None = None,
+        should_continue: Callable[[], bool] | None = None,
     ) -> dict[str, Any]:
         """Fetch a single series from FRED and insert into raw_series.
 
@@ -485,6 +704,11 @@ class FREDPuller(BasePuller):
             series_id: FRED series identifier (e.g. 'T10Y2Y').
             start_date: Earliest observation date to fetch.
             end_date: Latest observation date (default: today).
+            should_continue: Optional cooperative deadline (the scheduler's
+                ``should_continue`` contract). While it returns False no
+                provider request (including fedfred's retry attempts) is
+                sent, no rows are stored and no failure row is written.
+                Inside ``pull_all`` the pass deadline applies without it.
 
         Returns:
             dict: Result with keys ``series_id``, ``rows_inserted``,
@@ -492,6 +716,22 @@ class FREDPuller(BasePuller):
                   successful observation commits. A lost acknowledgement sets
                   commit_outcome_unknown and rows_inserted_total=None.
         """
+        if should_continue is None:
+            return self._pull_series_impl(series_id, start_date, end_date)
+        prior = getattr(_deadline_state, "within_budget", None)
+        _deadline_state.within_budget = should_continue
+        try:
+            return self._pull_series_impl(series_id, start_date, end_date)
+        finally:
+            _deadline_state.within_budget = prior
+
+    def _pull_series_impl(
+        self,
+        series_id: str,
+        start_date: str | date,
+        end_date: str | date | None,
+    ) -> dict[str, Any]:
+        """``pull_series`` body; deadline comes from ``_deadline_state``."""
         log.info("Pulling FRED series {sid} from {sd}", sid=series_id, sd=start_date)
         result: dict[str, Any] = {
             "series_id": series_id,
@@ -502,6 +742,11 @@ class FREDPuller(BasePuller):
         }
 
         try:
+            if not _deadline_ok():
+                note = "scheduler deadline reached before the provider request; not attempted"
+                log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+                return _deadline_result(series_id, note)
+
             obs_kwargs: dict[str, Any] = {
                 "observation_start": str(start_date),
             }
@@ -602,24 +847,46 @@ class FREDPuller(BasePuller):
                 points.append((obs_date_val, float(row["value"])))
 
             for start in range(0, len(points), STORE_BATCH_ROWS):
+                if not _deadline_ok():
+                    note = (
+                        f"scheduler deadline reached before storing rows "
+                        f"{start}-{len(points)}; {result['rows_inserted']} already acknowledged"
+                    )
+                    log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+                    result["errors"].append(note)
+                    result["status"] = "PARTIAL" if result["rows_inserted"] else "SKIPPED"
+                    result["deadline"] = True
+                    return result
                 inserted, failed, errors = self._store_batch(series_id, points[start:start + STORE_BATCH_ROWS])
                 result["rows_inserted"] += inserted
                 result["rows_failed"] += failed
                 result["errors"].extend(errors)
             if result["rows_failed"]:
                 result["status"] = "PARTIAL" if result["rows_inserted"] else "FAILED"
-                self._record_failure(series_id, "; ".join(result["errors"]))
+                self._record_failure_within_budget(series_id, "; ".join(result["errors"]), result)
             log.info(
                 "FRED {sid}: acknowledged {n} successful observation inserts ({status})",
                 sid=series_id,
                 n=result["rows_inserted"], status=result["status"],
             )
 
+        except _DeadlineExpired as exc:
+            result["rows_inserted"] += exc.inserted
+            result["rows_failed"] += exc.failed
+            result["errors"].extend(exc.errors + [str(exc)])
+            result["status"] = "PARTIAL" if result["rows_inserted"] else "SKIPPED"
+            result["deadline"] = True
+            log.warning("FRED {sid}: stopped at the scheduler deadline; acknowledged={n}, abandoned={f}",
+                        sid=series_id, n=result["rows_inserted"], f=exc.failed)
         except _StoreAborted as exc:
             self._abort_result(result, exc)
             log.warning("FRED {sid}: stopped database writes; acknowledged={n}, unknown={unknown}",
                         sid=series_id, n=result["rows_inserted"], unknown=exc.unknown)
         except Exception as exc:
+            if isinstance(_unwrap_retry(exc), _DeadlineExpired):
+                note = "scheduler deadline reached inside the provider retry loop; no further attempt sent"
+                log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+                return _deadline_result(series_id, note)
             status_code = _extract_http_status_code(exc)
             if status_code in (400, 403, 404, 429) or (
                 status_code is None and _contains_http_status_error(exc)
@@ -654,6 +921,22 @@ class FREDPuller(BasePuller):
                 result["errors"].append(f"transient HTTP {status_code}")
                 return result
 
+            # Read timeouts / connection resets after fedfred's own retries.
+            # Same treatment as 5xx: not our bug, and never a FAILED row dated
+            # today (that row blocked the next cycle's successful re-pull).
+            if _is_transient_transport_error(exc):
+                inner = _unwrap_retry(exc)
+                log.warning(
+                    "FRED {sid}: transient transport failure after retries "
+                    "({kind}: {err}); skipping this cycle without failure row",
+                    sid=series_id,
+                    kind=type(inner).__name__,
+                    err=str(inner)[:200],
+                )
+                result["status"] = "SKIPPED"
+                result["errors"].append(f"transient {type(inner).__name__}")
+                return result
+
             # KeyError on 'date' / 'value' indicates fedfred returned a frame
             # shape we didn't anticipate — log a WARNING with the actual
             # column layout so we can fix the normaliser, but don't flood
@@ -680,9 +963,9 @@ class FREDPuller(BasePuller):
             result["status"] = "PARTIAL" if result["rows_inserted"] else "FAILED"
             result["errors"].append(str(exc))
 
-            # Record the failure row
+            # Record the failure row (unless the pass deadline has passed)
             try:
-                self._record_failure(series_id, str(exc))
+                self._record_failure_within_budget(series_id, str(exc), result)
             except _StoreAborted as insert_exc:
                 self._abort_result(result, insert_exc)
             except Exception as insert_exc:
@@ -701,17 +984,37 @@ class FREDPuller(BasePuller):
         series_list: list[str] | None = None,
         start_date: str | date = "1990-01-01",
         end_date: str | date | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        budget_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
         """Pull multiple FRED series sequentially.
 
         Continues after a single-series data/provider failure. Stops database
         work after connection failure or an unknown commit; remaining series
-        are explicitly returned as unattempted SKIPPED results.
+        are explicitly returned as unattempted SKIPPED results. Stops all
+        provider requests and writes once the wall-clock budget expires or
+        ``should_continue`` returns False; remaining series are likewise
+        returned as unattempted SKIPPED results flagged ``deadline``.
 
         Parameters:
             series_list: List of FRED series IDs.  Defaults to FRED_SERIES_LIST.
             start_date: Earliest observation date.
             end_date: Latest observation date (default: today).
+            should_continue: The scheduler's cooperative callback (same
+                contract as the options adapter). ``None`` means not supplied.
+            budget_s: Wall-clock budget for the whole pass, measured from
+                entry; defaults to :data:`FRED_JOB_BUDGET_S`. The effective
+                deadline is ``budget_s - FRED_DEADLINE_MARGIN_S``.
+            deadline_at: Absolute ``time.monotonic()`` deadline supplied by
+                the scheduler (its cooperative deadline, measured from job
+                start). When given it is authoritative and ``budget_s`` is
+                ignored, so setup time before this call never extends the
+                budget.
+
+        The deadline is installed in thread-local state for the duration of
+        the pass; ``pull_series``, fedfred's retry attempts, the store loop
+        and the failure-row writer all consult it.
 
         Returns:
             list[dict]: One result dict per series.
@@ -719,6 +1022,28 @@ class FREDPuller(BasePuller):
         if series_list is None:
             series_list = FRED_SERIES_LIST
 
+        total_budget = FRED_JOB_BUDGET_S if budget_s is None else float(budget_s)
+        prior = (
+            getattr(_deadline_state, "deadline", None),
+            getattr(_deadline_state, "within_budget", None),
+        )
+        if deadline_at is not None:
+            _deadline_state.deadline = float(deadline_at)
+        else:
+            _deadline_state.deadline = time.monotonic() + total_budget - FRED_DEADLINE_MARGIN_S
+        _deadline_state.within_budget = should_continue
+        try:
+            return self._pull_all_impl(series_list, start_date, end_date)
+        finally:
+            _deadline_state.deadline, _deadline_state.within_budget = prior
+
+    def _pull_all_impl(
+        self,
+        series_list: list[str],
+        start_date: str | date,
+        end_date: str | date | None,
+    ) -> list[dict[str, Any]]:
+        """``pull_all`` body; deadline comes from ``_deadline_state``."""
         log.info(
             "Starting FRED bulk pull — {n} series from {sd}",
             n=len(series_list),
@@ -726,11 +1051,22 @@ class FREDPuller(BasePuller):
         )
         results: list[dict[str, Any]] = []
         aborted = False
+        deadline_hit = False
         for sid in series_list:
             if aborted:
                 results.append({"series_id": sid, "rows_inserted": 0, "rows_failed": 0,
                                 "status": "SKIPPED", "errors": ["Not attempted after database abort"],
                                 "aborted": True})
+                continue
+            if not deadline_hit and not _deadline_ok():
+                deadline_hit = True
+                log.warning(
+                    "FRED bulk pull: scheduler deadline reached before {sid}; "
+                    "remaining series not attempted",
+                    sid=sid,
+                )
+            if deadline_hit:
+                results.append(_deadline_result(sid, "Not attempted: scheduler deadline reached"))
                 continue
             # Use incremental start: only fetch from last known date - 7 day overlap
             try:
@@ -754,12 +1090,15 @@ class FREDPuller(BasePuller):
             res = self.pull_series(sid, effective_start, end_date)
             results.append(res)
             aborted = bool(res.get("aborted"))
+            deadline_hit = bool(res.get("deadline"))
         log.info(
-            "FRED bulk pull complete — {ok}/{total} succeeded; {rows} acknowledged inserts; {unknown} unknown commits",
+            "FRED bulk pull complete — {ok}/{total} succeeded; {rows} acknowledged inserts; "
+            "{unknown} unknown commits; {deadline} not attempted after deadline",
             ok=sum(1 for r in results if r["status"] == "SUCCESS"),
             total=len(results),
             rows=sum(r["rows_inserted"] for r in results),
             unknown=sum(bool(r.get("commit_outcome_unknown")) for r in results),
+            deadline=sum(bool(r.get("deadline")) for r in results),
         )
         return results
 

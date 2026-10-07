@@ -410,7 +410,13 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
     {"name": "yfinance",          "mod": "ingestion.yfinance_pull",       "cls": "YFinancePuller",           "method": "pull_all",  "freq_h": 4,  "timeout_s": 240, "kwargs": {"start_date": _yfinance_incremental_start}},
     {"name": "options",           "mod": "ingestion.smart_scheduler",     "cls": "_OptionsSchedulerAdapter", "method": "pull",      "freq_h": 6, "timeout_s": 900, "stop_margin_s": 60},
     {"name": "coingecko",         "mod": "ingestion.coingecko",           "cls": "CoinGeckoPuller",          "method": "pull_all",  "freq_h": 4,  "timeout_s": 60},
-    {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 120, "api_key": "FRED_API_KEY"},
+    # fred: 87 series took 91-176 s per pass on 2026-10-06 (grid-scheduler journal); one
+    # stalled series costs up to 92 s more (3 x 30 s reads + fedfred's 2 x 1 s waits).
+    # FREDPuller.pull_all budgets itself against ingestion.fred.FRED_JOB_BUDGET_S /
+    # FRED_DEADLINE_MARGIN_S, which must equal timeout_s / stop_margin_s here (pinned by
+    # tests/test_fred_transient_timeout.py): the cooperative callback and FRED's own
+    # deadline both fall at 285 s.
+    {"name": "fred",              "mod": "ingestion.fred",                "cls": "FREDPuller",               "method": "pull_all",  "freq_h": 12, "timeout_s": 300, "stop_margin_s": 15, "api_key": "FRED_API_KEY"},
 
     # ── Alt data (daily) ──
     {"name": "insider_filings",   "mod": "ingestion.altdata.insider_filings",   "cls": "InsiderFilingsPuller",     "method": "pull_all",      "freq_h": 12, "timeout_s": 120},
@@ -1243,6 +1249,12 @@ class SmartScheduler:
 
         name = puller["name"]
         timeout_s = puller.get("timeout_s", 120)
+        # The cooperative deadline is measured from job start, before import
+        # and instantiation, so setup time never extends a puller's budget.
+        # Pullers that accept ``deadline_at`` receive this same absolute
+        # instant and can cap individual operations against it (FRED does).
+        margin = puller.get("stop_margin_s", min(15, max(timeout_s // 8, 1)))
+        cooperative_deadline = time.monotonic() + max(timeout_s - margin, 1)
         result: dict[str, Any] = {"name": name, "status": "UNKNOWN"}
 
         if puller.get("hold_reason"):
@@ -1294,19 +1306,16 @@ class SmartScheduler:
             # timeout_s so it can stop itself between items instead of
             # being abandoned by the hard join timeout below. See this
             # method's docstring, mitigation 1.
-            if "should_continue" not in method_kwargs:
-                try:
-                    accepts_should_continue = (
-                        "should_continue" in inspect.signature(method).parameters
-                    )
-                except (TypeError, ValueError):
-                    accepts_should_continue = False
-                if accepts_should_continue:
-                    margin = puller.get("stop_margin_s", min(15, max(timeout_s // 8, 1)))
-                    deadline = time.monotonic() + max(timeout_s - margin, 1)
-                    method_kwargs["should_continue"] = (
-                        lambda _deadline=deadline: time.monotonic() < _deadline
-                    )
+            try:
+                accepted_params = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                accepted_params = {}
+            if "should_continue" not in method_kwargs and "should_continue" in accepted_params:
+                method_kwargs["should_continue"] = (
+                    lambda _deadline=cooperative_deadline: time.monotonic() < _deadline
+                )
+            if "deadline_at" not in method_kwargs and "deadline_at" in accepted_params:
+                method_kwargs["deadline_at"] = cooperative_deadline
 
             # Run with timeout — don't let any puller block for minutes
             out_box: list[Any] = [None]
