@@ -1249,6 +1249,12 @@ class SmartScheduler:
 
         name = puller["name"]
         timeout_s = puller.get("timeout_s", 120)
+        # The cooperative deadline is measured from job start, before import
+        # and instantiation, so setup time never extends a puller's budget.
+        # Pullers that accept ``deadline_at`` receive this same absolute
+        # instant and can cap individual operations against it (FRED does).
+        margin = puller.get("stop_margin_s", min(15, max(timeout_s // 8, 1)))
+        cooperative_deadline = time.monotonic() + max(timeout_s - margin, 1)
         result: dict[str, Any] = {"name": name, "status": "UNKNOWN"}
 
         if puller.get("hold_reason"):
@@ -1300,19 +1306,16 @@ class SmartScheduler:
             # timeout_s so it can stop itself between items instead of
             # being abandoned by the hard join timeout below. See this
             # method's docstring, mitigation 1.
-            if "should_continue" not in method_kwargs:
-                try:
-                    accepts_should_continue = (
-                        "should_continue" in inspect.signature(method).parameters
-                    )
-                except (TypeError, ValueError):
-                    accepts_should_continue = False
-                if accepts_should_continue:
-                    margin = puller.get("stop_margin_s", min(15, max(timeout_s // 8, 1)))
-                    deadline = time.monotonic() + max(timeout_s - margin, 1)
-                    method_kwargs["should_continue"] = (
-                        lambda _deadline=deadline: time.monotonic() < _deadline
-                    )
+            try:
+                accepted_params = inspect.signature(method).parameters
+            except (TypeError, ValueError):
+                accepted_params = {}
+            if "should_continue" not in method_kwargs and "should_continue" in accepted_params:
+                method_kwargs["should_continue"] = (
+                    lambda _deadline=cooperative_deadline: time.monotonic() < _deadline
+                )
+            if "deadline_at" not in method_kwargs and "deadline_at" in accepted_params:
+                method_kwargs["deadline_at"] = cooperative_deadline
 
             # Run with timeout — don't let any puller block for minutes
             out_box: list[Any] = [None]

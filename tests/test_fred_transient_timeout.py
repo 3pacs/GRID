@@ -550,3 +550,133 @@ def test_inflight_successful_batch_still_acknowledges_after_deadline(monkeypatch
 
     assert (result["status"], result["rows_inserted"], result["rows_failed"]) == ("SUCCESS", 1, 0)
     assert len(engine.rows) == 1
+
+
+# ---------------------------------------------------------------------------
+# Codex's fresh boundary cases against 416e6cbb: a pool checkout that returns
+# after expiry must not begin a transaction, and scheduler setup time must not
+# extend the attempt budget.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["observations", "failure_metadata", "point_fallback"])
+def test_slow_pool_checkout_does_not_begin_a_transaction_after_the_deadline(monkeypatch, path):
+    from sqlalchemy import exc as sa_exc
+
+    clock, begins, inserts = [284.0], [], []
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+    puller, engine, _frame, _calls = make_puller(monkeypatch, 2)
+    original_connect, original_begin, original_execute = engine.connect, FakeConnection.begin, FakeConnection.execute
+    connect_count = [0]
+
+    def slow_connect():
+        connect_count[0] += 1
+        # In the fallback variant the batch is admitted and rolled back before
+        # expiry; its first per-point checkout is the one that returns late.
+        if path != "point_fallback" or connect_count[0] == 2:
+            clock[0] = 301.0
+        return original_connect()
+
+    def begin(self):
+        begins.append(clock[0])
+        return original_begin(self)
+
+    rejected = [False]
+
+    def execute(self, sql, params):
+        if path == "point_fallback" and "INSERT" in str(sql) and not rejected[0]:
+            rejected[0] = True
+            raise db_error("23514", sa_exc.IntegrityError)
+        if "INSERT" in str(sql):
+            inserts.append(clock[0])
+        return original_execute(self, sql, params)
+
+    if path == "failure_metadata":
+        def failing_fetch(*_a, **_kw):
+            raise ValueError("synthetic frame error")
+        puller.fred = SimpleNamespace(get_series_observations=failing_fetch)
+    engine.connect = slow_connect
+    monkeypatch.setattr(FakeConnection, "begin", begin)
+    monkeypatch.setattr(FakeConnection, "execute", execute)
+
+    out = puller.pull_series("DFF", should_continue=lambda: clock[0] < 285)
+
+    assert not any(t >= 285 for t in begins), begins
+    assert not any(t >= 285 for t in inserts), inserts
+    assert out["deadline"] is True
+    assert len(engine.rows) == 0
+    if path == "observations":
+        assert out["status"] == "SKIPPED" and out["rows_inserted"] == 0
+    elif path == "failure_metadata":
+        assert out["status"] == "FAILED"
+    else:
+        assert out["status"] == "SKIPPED" and out["rows_failed"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("setup_seconds", [0.0, 10.0, 20.0])
+def test_scheduler_setup_delay_does_not_extend_the_attempt_budget(monkeypatch, setup_seconds):
+    from fedfred import FredAPI
+
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+
+    clock, starts, budgets = [0.0], [], []
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+    fred._install_patient_httpx()
+    puller = fred.FREDPuller.__new__(fred.FREDPuller)
+    puller.fred = FredAPI("0" * 32)
+    puller.engine, puller.source_id = MagicMock(), 1
+
+    def latest(_sid):
+        clock[0] = 284.0
+        return None
+
+    puller._get_latest_date = latest
+    scheduler = _scheduler_for(puller)
+
+    def slow_build(*_args):
+        clock[0] = setup_seconds  # construction ran after the scheduler's job start
+        return puller
+
+    scheduler._build_puller_instance = slow_build
+
+    def stalled(_transport, request):
+        starts.append(clock[0])
+        allowance = request.extensions["timeout"]["read"]
+        budgets.append(allowance)
+        clock[0] += allowance
+        raise httpx.ReadTimeout("synthetic stall", request=request)
+
+    retry = FredAPI._FredAPI__fred_get_request.retry
+    spec = next(p.copy() for p in PULLER_REGISTRY if p["name"] == "fred")
+    spec["kwargs"] = {"series_list": ["DFF"]}
+    with patch.object(httpx.HTTPTransport, "handle_request", stalled), \
+         patch.object(retry, "sleep", lambda w: clock.__setitem__(0, clock[0] + float(w))):
+        out = scheduler._run_puller(spec)
+
+    assert starts == [284.0]
+    assert budgets == [1.0], budgets  # capped against the job-start deadline (285), not entry + 285
+    assert out["status"] == "SKIPPED"
+
+
+@pytest.mark.unit
+def test_scheduler_passes_its_absolute_deadline_to_pull_all(monkeypatch):
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+
+    clock, captured = [0.0], {}
+    monkeypatch.setattr(fred.time, "monotonic", lambda: clock[0])
+
+    def pull_all(series_list=None, should_continue=None, deadline_at=None):
+        captured["deadline_at"] = deadline_at
+        captured["callback"] = should_continue
+        return [{"status": "SKIPPED", "rows_inserted": 0}]
+
+    scheduler = _scheduler_for(SimpleNamespace(pull_all=pull_all))
+    spec = next(p.copy() for p in PULLER_REGISTRY if p["name"] == "fred")
+    scheduler._run_puller(spec)
+    assert captured["deadline_at"] == fred.FRED_JOB_BUDGET_S - fred.FRED_DEADLINE_MARGIN_S == 285.0
+    clock[0] = 284.999
+    assert captured["callback"]() is True
+    clock[0] = 285.0
+    assert captured["callback"]() is False

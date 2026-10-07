@@ -234,11 +234,22 @@ _deadline_state = threading.local()
 
 
 class _DeadlineExpired(Exception):
-    """Raised inside fedfred's retry loop when the pass deadline has passed.
+    """The pass deadline passed at a point where new work would otherwise start.
 
-    fedfred retries any exception up to three times with 1 s waits, so at
-    most two 1 s sleeps follow; no request is sent after expiry.
+    Raised by ``_PatientClient.get`` inside fedfred's retry loop (fedfred
+    retries any exception up to three times with 1 s waits, so at most two
+    1 s sleeps follow; no request is sent after expiry) and by ``_write``
+    when a pool checkout returns after the deadline (the connection is
+    closed and no transaction is begun). ``inserted``/``failed``/``errors``
+    carry the acknowledged and abandoned point counts up to the caller.
     """
+
+    def __init__(self, message: str, inserted: int = 0, failed: int = 0,
+                 errors: list[str] | None = None) -> None:
+        super().__init__(message)
+        self.inserted = inserted
+        self.failed = failed
+        self.errors = list(errors or [])
 
 
 def _remaining_budget_s() -> float | None:
@@ -503,6 +514,17 @@ class FREDPuller(BasePuller):
             conn = self.engine.connect()
         except Exception as exc:
             raise _StoreAborted() from exc
+        if not _deadline_ok():
+            # The pool checkout itself consumed the remaining budget: admit
+            # no new transaction. Nothing has been written on this connection.
+            try:
+                conn.close()
+            except Exception:
+                pass
+            raise _DeadlineExpired(
+                "scheduler deadline reached while waiting for a database connection; "
+                "transaction not started"
+            )
         transaction = None
         inserted = 0
         acknowledged = False
@@ -571,14 +593,14 @@ class FREDPuller(BasePuller):
             raise ValueError(f"FRED batch exceeds {STORE_BATCH_ROWS} rows")
         try:
             return self._write(lambda conn: self._store_points(series_id, points, conn)), 0, []
-        except _StoreAborted:
+        except (_StoreAborted, _DeadlineExpired):
             raise
         except Exception as exc:
             log.warning("FRED {sid}: batch rolled back; retrying one point per transaction: {e}",
                         sid=series_id, e=str(exc))
         inserted = failed = 0
         errors: list[str] = []
-        for point in points:
+        for index, point in enumerate(points):
             if not _deadline_ok():
                 # Recovery must not admit new transactions after the pass
                 # deadline; acknowledged rows above stay counted.
@@ -587,6 +609,16 @@ class FREDPuller(BasePuller):
                 continue
             try:
                 inserted += self._write(lambda conn: self._store_points(series_id, [point], conn))
+            except _DeadlineExpired as exc:
+                # The checkout for this point returned after expiry: this
+                # point and the rest are abandoned, acknowledged ones kept.
+                exc.inserted += inserted
+                exc.failed += failed + (len(points) - index)
+                exc.errors = errors + exc.errors + [
+                    f"{series_id} @ {p[0]}: not retried, scheduler deadline reached"
+                    for p in points[index:]
+                ]
+                raise
             except _StoreAborted as exc:
                 exc.inserted += inserted
                 exc.failed += failed
@@ -627,7 +659,13 @@ class FREDPuller(BasePuller):
             result["errors"].append(note)
             result["deadline"] = True
             return
-        self._record_failure(series_id, message)
+        try:
+            self._record_failure(series_id, message)
+        except _DeadlineExpired as exc:
+            note = f"failure row not recorded: {exc}"
+            log.warning("FRED {sid}: {msg}", sid=series_id, msg=note)
+            result["errors"].append(note)
+            result["deadline"] = True
 
     @staticmethod
     def _abort_result(result: dict[str, Any], exc: _StoreAborted) -> None:
@@ -821,6 +859,14 @@ class FREDPuller(BasePuller):
                 n=result["rows_inserted"], status=result["status"],
             )
 
+        except _DeadlineExpired as exc:
+            result["rows_inserted"] += exc.inserted
+            result["rows_failed"] += exc.failed
+            result["errors"].extend(exc.errors + [str(exc)])
+            result["status"] = "PARTIAL" if result["rows_inserted"] else "SKIPPED"
+            result["deadline"] = True
+            log.warning("FRED {sid}: stopped at the scheduler deadline; acknowledged={n}, abandoned={f}",
+                        sid=series_id, n=result["rows_inserted"], f=exc.failed)
         except _StoreAborted as exc:
             self._abort_result(result, exc)
             log.warning("FRED {sid}: stopped database writes; acknowledged={n}, unknown={unknown}",
@@ -929,6 +975,7 @@ class FREDPuller(BasePuller):
         end_date: str | date | None = None,
         should_continue: Callable[[], bool] | None = None,
         budget_s: float | None = None,
+        deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
         """Pull multiple FRED series sequentially.
 
@@ -948,6 +995,11 @@ class FREDPuller(BasePuller):
             budget_s: Wall-clock budget for the whole pass, measured from
                 entry; defaults to :data:`FRED_JOB_BUDGET_S`. The effective
                 deadline is ``budget_s - FRED_DEADLINE_MARGIN_S``.
+            deadline_at: Absolute ``time.monotonic()`` deadline supplied by
+                the scheduler (its cooperative deadline, measured from job
+                start). When given it is authoritative and ``budget_s`` is
+                ignored, so setup time before this call never extends the
+                budget.
 
         The deadline is installed in thread-local state for the duration of
         the pass; ``pull_series``, fedfred's retry attempts, the store loop
@@ -964,7 +1016,10 @@ class FREDPuller(BasePuller):
             getattr(_deadline_state, "deadline", None),
             getattr(_deadline_state, "within_budget", None),
         )
-        _deadline_state.deadline = time.monotonic() + total_budget - FRED_DEADLINE_MARGIN_S
+        if deadline_at is not None:
+            _deadline_state.deadline = float(deadline_at)
+        else:
+            _deadline_state.deadline = time.monotonic() + total_budget - FRED_DEADLINE_MARGIN_S
         _deadline_state.within_budget = should_continue
         try:
             return self._pull_all_impl(series_list, start_date, end_date)
