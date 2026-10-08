@@ -4,7 +4,7 @@
 --          and extend oracle_models with model factory columns.
 --
 -- Run with:
---   psql postgresql://grid:gridmaster2026@localhost:5432/griddb -f scripts/add_signal_registry.sql
+--   psql postgresql://grid@localhost:5432/griddb -f scripts/add_signal_registry.sql
 
 -- ============================================================
 -- 1. signal_registry

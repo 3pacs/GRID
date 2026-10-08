@@ -2,7 +2,7 @@
 -- String IDs (gov_us_trump, corp_NVDA, icij_*) are canonical.
 -- UUID IDs (from GDELT/search) are aliases that map to canonical IDs.
 --
--- Run: PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -f scripts/migrations/add_actor_id_map.sql
+-- Run: PGPASSWORD="$GRID_DB_PASSWORD" psql -U grid -d griddb -h localhost -f scripts/migrations/add_actor_id_map.sql
 
 BEGIN;
 

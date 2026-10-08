@@ -63,7 +63,7 @@ import gem_proxy_map  # Task #128 — ticker-proxy for non-tradeable subjects
 DB_HOST = os.environ.get("PG_HOST", "100.75.185.36")
 DB_PORT = int(os.environ.get("PG_PORT", "5432"))
 DB_USER = os.environ.get("PG_USER", "grid")
-DB_PASS = os.environ.get("PG_PASSWORD", "gridmaster2026")
+DB_PASS = os.environ.get("PG_PASSWORD") or os.environ["GRID_DB_PASSWORD"]
 DB_NAME = os.environ.get("PG_DB", "griddb")
 
 FAISS_DIR = pathlib.Path(os.environ.get("FAISS_DIR", "/data/grid/faiss"))

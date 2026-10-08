@@ -285,7 +285,7 @@ python3 scripts/run_astrogrid_learning_loop.py \
 
 ```bash
 ssh grid@grid-svr
-export PGPASSWORD='gridmaster2026'
+export PGPASSWORD="$GRID_DB_PASSWORD"
 psql -h localhost -p 5432 -U grid -d griddb -At -F $'\t' -c \
   "SELECT review_key, review_payload::text FROM astrogrid.review_run ORDER BY created_at DESC LIMIT 1;"
 ```
@@ -298,7 +298,7 @@ Known good DB config:
 - port: `5432`
 - db: `griddb`
 - user: `grid`
-- password: `gridmaster2026`
+- password: `$GRID_DB_PASSWORD` (not stored in repo)
 
 Do not use the wrong local DB (`grid`). Earlier failures came from hitting the wrong database.
 

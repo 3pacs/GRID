@@ -8,7 +8,9 @@ from sqlalchemy import create_engine
 from intelligence.forensics import batch_forensics
 from loguru import logger as log
 
-DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
+from config import settings  # noqa: E402
+
+DB_URL = settings.DB_URL
 TICKERS = ["SPY", "BTC", "ETH", "QQQ", "AAPL"]
 THRESHOLD = 0.015
 
