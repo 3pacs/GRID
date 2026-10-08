@@ -59,7 +59,7 @@ echo " total puller files"
 
 echo ""
 echo "## DB Schema..."
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -c \"
+ssh grid-svr "psql -U grid -d griddb -h localhost -t -c \"
     SELECT table_name, array_to_string(array_agg(column_name ORDER BY ordinal_position), ', ')
     FROM information_schema.columns
     WHERE table_schema = 'public'
@@ -69,7 +69,7 @@ ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -
 
 echo ""
 echo "## DB Row Counts..."
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -c \"
+ssh grid-svr "psql -U grid -d griddb -h localhost -t -c \"
     SELECT schemaname || '.' || relname AS table, n_live_tup AS rows
     FROM pg_stat_user_tables
     ORDER BY n_live_tup DESC

@@ -56,7 +56,7 @@ read `DB_HOST`/`DB_PORT`/`DB_NAME`/`DB_USER`/`DB_PASSWORD` from the process
 env as `psycopg2.connect(**kwargs)`, `sys.exit` if `DB_PASSWORD` is unset.
 
 - **`scripts/evaluate_gem_outcomes.py`** — `DB_DSN` built a connection
-  string with `f"password={os.getenv('DB_PASSWORD', 'gridmaster2026')}"` —
+  string with `f"password={os.environ['DB_PASSWORD']}"` —
   a literal password as the *default* if the env var was ever unset.
   Replaced with `_connect_params_from_env()` / `DB_CONNECT_PARAMS`.
 - **`scripts/td_backfill_gem_tickers.py`** — `DSN` was a literal constant

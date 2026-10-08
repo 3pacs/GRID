@@ -153,12 +153,12 @@ describe('edge scanner auth reload path', () => {
         render(<Login />);
 
         fireEvent.change(screen.getByPlaceholderText('Password'), {
-            target: { value: 'gridmaster2026' },
+            target: { value: 'test-password' },
         });
         fireEvent.click(screen.getByRole('button', { name: 'AUTHENTICATE' }));
 
         await waitFor(() => {
-            expect(api.login).toHaveBeenCalledWith('gridmaster2026');
+            expect(api.login).toHaveBeenCalledWith('test-password');
             expect(useAuthStore.getState().isAuthenticated).toBe(true);
         });
 

@@ -1,0 +1,75 @@
+{
+  "skill_name": "actor-network-query",
+  "description": "Query GRID's actor network to understand who moves markets and why. Use when building predictions that cite specific actor levers, analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors and 250K+ discovery scale across sector networks.",
+  "results": [
+    {
+      "query": "Who actually controls the Treasury market liquidity valve right now? I need named actors, not 'the market', for a prediction.",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Map the conflicts of interest on the SEC leadership around digital asset rules. Previous employers, family holdings.",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Before CPI and the FOMC next week, run an intelligence sweep: who are the big holders and what are they likely to do?",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "China developer defaults are spreading. Which US lenders and REITs are exposed and who sits on the boards of both?",
+      "should_trigger": true,
+      "trigger_rate": 0.6666666666666666,
+      "triggers": 2,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Validate this prediction's lever, condition, thesis and invalidation against the standard.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "What does the paper engine do when win rate drops below 40%?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Is the Tiingo news puller writing per-article rows?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Rebuild the codebase index; counts in CLAUDE.md are off.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 5,
+    "failed": 3
+  }
+}

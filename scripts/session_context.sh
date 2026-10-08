@@ -8,7 +8,7 @@ set -euo pipefail
 
 GRID_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 SERVER="grid-svr"
-DB_CMD="PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -t -A"
+DB_CMD="psql -U grid -d griddb -h localhost -t -A"
 
 # --- Static index (always available) ---
 STATIC_INDEX=""
