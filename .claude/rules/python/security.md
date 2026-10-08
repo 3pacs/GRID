@@ -5,7 +5,7 @@ paths:
 ---
 # Python Security
 
-> Python-specific layer. General security checklist lives in the `security-review` skill.
+> Python-specific layer. General security checklist lives in `.claude/rules/security.md`.
 
 ## Secret Management
 
