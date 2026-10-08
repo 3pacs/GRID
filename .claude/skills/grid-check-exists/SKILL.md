@@ -1,11 +1,11 @@
 ---
 name: grid-check-exists
-description: "Before proposing to build a new GRID module, search the existing 405-module codebase for similar implementations. Use this whenever a session is about to propose a new intelligence module, puller, analytics engine, or oracle feature. Searches intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/, and ingestion/ for name and content matches, then cross-references docs/MODULE_CATALOG.md."
+description: "Before proposing to build a new GRID module, search the existing 700+-module codebase for similar implementations. Use this whenever a session is about to propose a new intelligence module, puller, analytics engine, or oracle feature. Searches intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/, and ingestion/ for name and content matches, then cross-references docs/MODULE_INVENTORY.md."
 ---
 
 # grid-check-exists
 
-**Purpose:** prevent duplicative work. CLAUDE.md documents only the 14 core intelligence modules, but the real codebase has 405 modules (46 in intelligence/, 104 in ingestion/, 16 in analysis/, plus physics/features/discovery/trading/oracle). Any session that proposes to "build a new sentiment tracker" or "build a network mapper" or "build a vol surface" is very likely duplicating existing code.
+**Purpose:** prevent duplicative work. CLAUDE.md documents only the 14 core intelligence modules, but the real codebase has 700+ modules (the eight directories below alone hold 544 non-test `.py` files as of 2026-10-08: 191 in intelligence/, 206 in ingestion/, 57 in analysis/, 34 in trading/, 31 in oracle/, 14 in physics/, 6 in features/, 5 in discovery/). Any session that proposes to "build a new sentiment tracker" or "build a network mapper" or "build a vol surface" is very likely duplicating existing code.
 
 Call this skill **before** writing any new module.
 
@@ -48,8 +48,8 @@ grep -rIl -iE "(class|def).*${KEYWORD// /.*}|[\"']${KEYWORD}[\"']" \
     2>/dev/null | head -15
 
 echo ""
-echo "## 3. MODULE_CATALOG.md mentions"
-grep -inE "${KEYWORD// /.*}" docs/MODULE_CATALOG.md 2>/dev/null | head -15
+echo "## 3. MODULE_INVENTORY.md mentions"
+grep -inE "${KEYWORD// /.*}" docs/MODULE_INVENTORY.md 2>/dev/null | head -15
 
 echo ""
 echo "## 4. Session roadmap mentions"
@@ -67,7 +67,7 @@ done
 
 - **Any filename match** → open the top 50 lines of the file before proposing anything new. Treat the task as "extend and wire," not "build new."
 - **Content matches without filename matches** → a similar concept lives inside another module. Read that module's public API.
-- **MODULE_CATALOG hits but no file matches** → the catalog may be stale; run `ls` directly to confirm.
+- **MODULE_INVENTORY hits but no file matches** → the inventory may be stale; run `ls` directly to confirm.
 - **Zero matches in all five sections** → genuinely new. Still grep broader terms before committing to a new file.
 
 ## Known "I almost built it but it already exists" list (from 2026-04-13 session)
@@ -95,5 +95,5 @@ Full list in `docs/planning/SESSION-ROADMAP-2026-04-13.md#1-session-start-pre-re
 ## See Also
 
 - `/grid-orient` — rebuild `.claude/CODEBASE_INDEX.md` after major changes
-- `docs/MODULE_CATALOG.md` — canonical 405-module inventory
+- `docs/MODULE_INVENTORY.md` — authoritative module inventory (700+ modules; `docs/MODULE_CATALOG.md` is a stale 2026-03-30 snapshot of 405)
 - `docs/planning/SESSION-ROADMAP-2026-04-13.md` — full session findings and known gaps
