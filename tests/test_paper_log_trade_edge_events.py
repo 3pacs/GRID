@@ -246,7 +246,8 @@ def test_reconcile_keeps_the_recorded_identity_and_one_slot_before_entry():
     rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
     # the enriched duplicate has the earlier known_at: the rebuilt position moved to 10-07, s3 stays on 10-08
     assert set(rebuilt) == {"cik:1|2026-10-07", "cik:1|2026-10-08"}
-    out, applied = ev.reconcile_positions(rebuilt, fs, recorded, aliases)
+    out, applied, late = ev.reconcile_positions(rebuilt, fs, recorded, aliases)
+    assert late == []  # nothing is late before entry
     # one position for issuer CIK 1 on the recorded session 10-08, carrying both purchases
     assert set(out) == {"ticker:ABC|2026-10-08"} and _one_slot_each(out, fs, aliases)
     kept = out["ticker:ABC|2026-10-08"]
@@ -262,7 +263,7 @@ def test_reconcile_keeps_the_recorded_identity_and_one_slot_before_entry():
         {"position_id": "ticker:ABC|2026-10-08", "superseded_id": "cik:1|2026-10-08", "issuer_key": "cik:1",
          "entry_session": "2026-10-08"},
     ]
-    assert ev.reconcile_positions(rebuilt, fs, {}, aliases) == (rebuilt, [])
+    assert ev.reconcile_positions(rebuilt, fs, {}, aliases) == (rebuilt, [], [])
     # a journal that recorded both identities of one purchase is refused, not merged
     both = {**recorded, "cik:1|2026-10-07": {**rebuilt["cik:1|2026-10-07"]}}
     with pytest.raises(ev.IdentityPolicyError):
@@ -272,29 +273,65 @@ def test_reconcile_keeps_the_recorded_identity_and_one_slot_before_entry():
 def test_reconcile_after_restart_keeps_the_folded_slot_without_refusal():
     fs, aliases = _moved_day_filings(), {"ABC": 1}
     rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
-    first, _ = ev.reconcile_positions(rebuilt, fs, _recorded(["g1"]), aliases)
+    first, _, _ = ev.reconcile_positions(rebuilt, fs, _recorded(["g1"]), aliases)
     # replay: the revised signal (and then the entry) recorded the folded accessions
     for kind in ("signal", "entry"):
-        out, applied = ev.reconcile_positions(rebuilt, fs, _recorded(["s2", "s3"], kind=kind), aliases)
-        assert out == first and _one_slot_each(out, fs, aliases)
+        out, applied, late = ev.reconcile_positions(rebuilt, fs, _recorded(["s2", "s3"], kind=kind), aliases)
+        assert out == first and _one_slot_each(out, fs, aliases) and late == []
         assert [a["superseded_id"] for a in applied] == ["cik:1|2026-10-07", "cik:1|2026-10-08"]
 
 
-def test_reconcile_refuses_a_distinct_group_joining_an_entered_slot():
+def test_reconcile_notes_a_moved_day_purchase_on_an_entered_slot_once():
     fs, aliases = _moved_day_filings(), {"ABC": 1}
     rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
-    with pytest.raises(ev.IdentityPolicyError, match=r"cik:1\|2026-10-08.*already entered as 'ticker:ABC\|2026-10-08'"):
-        ev.reconcile_positions(rebuilt, fs, _recorded(["g1"], kind="entry"), aliases)
-    # only the consumed purchase arriving (no distinct group) still reconciles under the entered id
+    entered = _recorded(["g1"], kind="entry")
+    out, applied, late = ev.reconcile_positions(rebuilt, fs, entered, aliases)
+    # no refusal and no second position: the distinct purchase s3 is a late member of the entered slot
+    assert set(out) == {"ticker:ABC|2026-10-08"} and _one_slot_each(out, fs, aliases)
+    assert late == [{"position_id": "ticker:ABC|2026-10-08", "issuer_key": "cik:1", "entry_session": "2026-10-08",
+                     "accession": "s3", "known_at": fs["s3"]["known_at"],
+                     "purchase_keys": [["cik:1", "2026-10-07", 5000, 60.0]],
+                     "reason": ev.LATE_MOVED_DAY, "rebuilt_id": "cik:1|2026-10-08"}]
+    assert entered == _recorded(["g1"], kind="entry")  # the recorded entry is not touched
+    # restart: a noted purchase is never noted again; everything else is unchanged
+    noted = [{"kind": ev.LATE_MEMBER_KIND, "run_at": "2026-10-09T08:30:00-04:00", **late[0]}]
+    assert ev.reconcile_positions(rebuilt, fs, entered, aliases, noted) == (out, applied, [])
+    # only the consumed purchase arriving (no distinct group) reconciles under the entered id, nothing is late
     fs2 = {k: fs[k] for k in ("g1", "s2")}
     rebuilt2 = ev.group_positions(ev.build_purchases(fs2.values(), aliases))
-    out, _ = ev.reconcile_positions(rebuilt2, fs2, _recorded(["g1"], kind="entry"), aliases)
+    out, _, late = ev.reconcile_positions(rebuilt2, fs2, entered, aliases)
     assert set(out) == {"ticker:ABC|2026-10-08"} and out["ticker:ABC|2026-10-08"]["accessions"] == ["s2"]
+    assert late == []
+
+
+def test_reconcile_notes_a_same_group_purchase_on_an_entered_slot_like_a_moved_one():
+    fs = {"g1": filing("g1", None, "name:jane", et(2026, 10, 7, 22), [ok()]),
+          "g4": filing("g4", None, "name:joe", et(2026, 10, 7, 23), [ok(trans="2026-10-07", shares=5_000.0)])}
+    rebuilt = ev.group_positions(ev.build_purchases(fs.values()))
+    assert set(rebuilt) == {"ticker:ABC|2026-10-08"}  # the late purchase rebuilds into the entered group itself
+    entered = _recorded(["g1"], kind="entry")
+    out, applied, late = ev.reconcile_positions(rebuilt, fs, entered, {})
+    assert set(out) == {"ticker:ABC|2026-10-08"} and applied == []
+    assert [(n["accession"], n["reason"], n["rebuilt_id"], n["issuer_key"], n["purchase_keys"]) for n in late] == [
+        ("g4", ev.LATE_SAME_GROUP, "ticker:ABC|2026-10-08", "ticker:ABC", [["ticker:ABC", "2026-10-07", 5000, 60.0]])]
+    # an enriched re-report of g1 later teaches ABC -> CIK 1: the group is reached by purchase identity and
+    # the noted purchase (now keyed cik:1) is matched canonically, so it is not noted twice
+    fs["s2"] = filing("s2", 1, "cik:10", et(2026, 10, 7, 22, 30), [ok()])
+    rebuilt2 = ev.group_positions(ev.build_purchases(fs.values(), {"ABC": 1}))
+    assert set(rebuilt2) == {"cik:1|2026-10-08"}
+    noted = [{"kind": ev.LATE_MEMBER_KIND, "run_at": "2026-10-09T08:30:00-04:00", **late[0]}]
+    out2, _, late2 = ev.reconcile_positions(rebuilt2, fs, entered, {"ABC": 1}, noted)
+    assert set(out2) == {"ticker:ABC|2026-10-08"} and late2 == []
+    _, _, unnoted = ev.reconcile_positions(rebuilt2, fs, entered, {"ABC": 1})
+    assert [(n["accession"], n["reason"], n["purchase_keys"]) for n in unnoted] == [
+        ("g4", ev.LATE_SAME_GROUP, [["cik:1", "2026-10-07", 5000, 60.0]])]
 
 
 def test_reconcile_refuses_two_recorded_positions_in_one_issuer_session():
     fs, aliases = _moved_day_filings(), {"ABC": 1}
     rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
-    two = {**_recorded(["g1"]), **_recorded(["s3"], pid="cik:1|2026-10-08", issuer_key="cik:1")}
-    with pytest.raises(ev.IdentityPolicyError, match=r"one issuer/entry session cik:1\|2026-10-08"):
-        ev.reconcile_positions(rebuilt, fs, two, aliases)
+    for kind in ("signal", "entry"):  # a genuine identity conflict is refused before and after entry
+        two = {**_recorded(["g1"], kind=kind),
+               **_recorded(["s3"], kind=kind, pid="cik:1|2026-10-08", issuer_key="cik:1")}
+        with pytest.raises(ev.IdentityPolicyError, match=r"one issuer/entry session cik:1\|2026-10-08"):
+            ev.reconcile_positions(rebuilt, fs, two, aliases)

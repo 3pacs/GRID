@@ -64,7 +64,8 @@ def status_from_records(records: list[dict]) -> dict:
     runs = [r for r in records if r.get("kind") == "run"]
     return {"records": len(records), "last_run": runs[-1] if runs else None,
             "banner": board["banner"], "label": board["label"],
-            "primary": board["tables"]["h30_large"]["all"], "missing_labels": board["missing_labels"]}
+            "primary": board["tables"]["h30_large"]["all"], "missing_labels": board["missing_labels"],
+            "late_members": sum(1 for r in records if r.get("kind") == "late_member")}
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -214,12 +214,23 @@ def stratum(largest_value: float) -> str:
 
 class IdentityPolicyError(ValueError):
     """The journal already holds two scored identities for one economic event,
-    or one (issuer, entry session) slot would need a second position.
+    or two recorded positions for one (issuer, entry session) slot.
 
-    Raised instead of merging or rewriting: which record is canonical, and how
-    late membership of an already entered slot is treated, are owner decisions
-    for a new log, never a code path.
+    Raised instead of merging or rewriting: which record is canonical is an
+    owner decision for a new log, never a code path. (A purchase that joins an
+    already entered slot is not a conflict: it is noted append-only as a
+    :data:`LATE_MEMBER_KIND` record, see :func:`reconcile_positions`.)
     """
+
+
+# A purchase visible only after its (issuer, recorded entry session) slot was
+# entered (owner decision (c), 2026-10-08). Appended once per accession and
+# slot; never scored, never changes the entry. ``reason`` is how it reached the
+# slot: in the rebuilt group the entered id resolves to, or moved onto the slot
+# by canonical (issuer, entry session) occupancy.
+LATE_MEMBER_KIND = "late_member"
+LATE_SAME_GROUP = "same_group_after_entry"
+LATE_MOVED_DAY = "moved_day_after_entry"
 
 
 def learn_aliases(filings: Iterable[dict], aliases: dict[str, int] | None = None) -> list[dict]:
@@ -356,14 +367,22 @@ def _purchase_keys(filings: dict[str, dict], keys: dict[str, str], accessions: I
     return out
 
 
+def _canonical_purchase_key(key: Iterable, by_ticker: dict[str, int]) -> tuple:
+    """A :func:`purchase_key` (or its JSON list form) with its issuer made canonical."""
+    issuer, trans, shares, price = key
+    return (canonical_issuer(str(issuer), by_ticker), str(trans)[:10], round(float(shares)), round(float(price), 2))
+
+
 def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], recorded: dict[str, dict],
-                        aliases: dict[str, int]) -> tuple[dict[str, dict], list[dict]]:
+                        aliases: dict[str, int], noted: Iterable[dict] = ()
+                        ) -> tuple[dict[str, dict], list[dict], list[dict]]:
     """Keep recorded identities: one position per purchase and per (issuer, entry session).
 
     ``positions`` are ``group_positions(build_purchases(filings, aliases))``;
     ``recorded`` are the journal's ``signal``/``entry`` records by position id
     (an ``entry`` record has ``kind == "entry"``); each lists the accessions
-    whose qualifying lines it consumed.
+    whose qualifying lines it consumed. ``noted`` are the journal's
+    :data:`LATE_MEMBER_KIND` records.
 
     1. Purchase identity. A rebuilt position holding any purchase (same
        :func:`purchase_key` under the current issuer keys, so a ``ticker:T``
@@ -373,24 +392,30 @@ def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], re
        entry day or, through an earlier ``known_at``, moved it to another.
     2. Slot occupancy. Every other rebuilt position whose canonical issuer
        (:func:`canonical_issuer`) and entry session equal a recorded
-       position's is that slot too. Before entry it is folded into the
-       recorded id, so the one position carries the registered aggregate of
-       all its purchases. A slot already entered is refused: its entry is
-       never rewritten, and treating late membership there is an owner
-       decision, so no second position is opened or scored.
-
-    Rebuilt positions that land on one recorded id are recombined from their
-    purchases with the :func:`group_positions` rules (largest/total values,
-    stratum, actors...) under the recorded id/session, so none is dropped or
-    overwritten; ``issuer_alias`` names the rebuilt key when it differs.
+       position's is that slot too, and goes to the recorded id.
+    3. Rebuilt positions that land on one recorded id are recombined from
+       their purchases with the :func:`group_positions` rules (largest/total
+       values, stratum, actors...) under the recorded id/session, so none is
+       dropped or overwritten; ``issuer_alias`` names the rebuilt key when it
+       differs. Before entry this is the slot's next signal revision; after
+       entry it is never recorded (the caller does not revise entries).
+    4. Late membership (owner decision (c)). On a slot already entered, a
+       purchase the entry did not consume is late: the entry, its identity,
+       membership, stratum/size and cap cost stay as recorded and no second
+       position is opened. Each such purchase not yet in ``noted`` (matched by
+       slot and canonical purchase key, so a later ticker -> CIK alias does not
+       note it twice) is returned as a late-member note, one per accession,
+       with ``reason`` :data:`LATE_SAME_GROUP` (its rebuilt group resolves to
+       the entered id) or :data:`LATE_MOVED_DAY` (it reached the slot by step 2).
 
     Refused with :class:`IdentityPolicyError` (never merged or rewritten): a
     recorded position holding a purchase another recorded position consumed;
-    a rebuilt position holding purchases of two recorded positions; two
-    recorded positions on one canonical (issuer, entry session); and a slot
-    already entered that a distinct purchase group would join.
+    a rebuilt position holding purchases of two recorded positions; and two
+    recorded positions on one canonical (issuer, entry session).
 
-    Returns the reconciled positions and the associations applied.
+    Returns the reconciled positions, the associations applied and the new
+    late-member notes (the caller appends them as :data:`LATE_MEMBER_KIND`
+    records).
     """
     flist = list(filings.values())
     keys = issuer_keys(flist, aliases)
@@ -427,25 +452,29 @@ def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], re
             raise IdentityPolicyError(
                 f"journal records {holder!r} and {rid!r} for one issuer/entry session {slot[0]}|{slot[1]}; "
                 "refusing to merge or rewrite (owner decision for a new log)")
+    moved: set[str] = set()
     for pid, pos in positions.items():
         if target[pid] != pid or pid in recorded:
             continue
-        slot = (canonical_issuer(pos["issuer_key"], by_ticker), pos["entry_session"])
-        rid = slots.get(slot)
-        if rid is None:
-            continue
-        if recorded[rid].get("kind") == "entry":
-            raise IdentityPolicyError(
-                f"rebuilt position {pid!r} (accessions {pos['accessions']}) falls in issuer/entry session "
-                f"{slot[0]}|{slot[1]}, already entered as {rid!r}; refusing to open a second position or to "
-                "change the recorded entry (late membership of an entered slot is an owner decision)")
-        target[pid] = rid
+        rid = slots.get((canonical_issuer(pos["issuer_key"], by_ticker), pos["entry_session"]))
+        if rid is not None:
+            target[pid] = rid
+            moved.add(pid)
+
+    by_pid: dict[str, list[dict]] = {}
+
+    def rebuilt_purchases(pid: str) -> list[dict]:
+        if not by_pid:
+            for p in build_purchases(flist, aliases):
+                by_pid.setdefault(position_id(p["issuer_key"], entry_session(p["known_at"])), []).append(p)
+            if set(by_pid) != set(positions):
+                raise ValueError("positions were not rebuilt from these filings and aliases")
+        return by_pid[pid]
 
     # 3. one reconciled position per target id
     members: dict[str, list[str]] = {}
     for pid in positions:
         members.setdefault(target[pid], []).append(pid)
-    by_pid: dict[str, list[dict]] | None = None
     out: dict[str, dict] = {}
     applied: list[dict] = []
     for tid, pids in members.items():
@@ -457,13 +486,7 @@ def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], re
             pos = {**positions[pids[0]], "position_id": tid, "issuer_key": rec["issuer_key"],
                    "entry_session": rec["entry_session"], "entry_close_at": rec["entry_close_at"]}
         else:
-            if by_pid is None:
-                by_pid = {}
-                for p in build_purchases(flist, aliases):
-                    by_pid.setdefault(position_id(p["issuer_key"], entry_session(p["known_at"])), []).append(p)
-                if set(by_pid) != set(positions):
-                    raise ValueError("positions were not rebuilt from these filings and aliases")
-            ps = [p for pid in pids for p in by_pid[pid]]
+            ps = [p for pid in pids for p in rebuilt_purchases(pid)]
             ps.sort(key=lambda r: (r["issuer_key"], r["known_at"], r["actor"], r["trans_date"]))
             pos = _position(tid, rec["issuer_key"], rec["entry_session"], rec["entry_close_at"], ps)
         rebuilt_keys = sorted({positions[pid]["issuer_key"] for pid in pids} - {rec["issuer_key"]})
@@ -475,7 +498,32 @@ def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], re
                                 "issuer_key": positions[pid]["issuer_key"],
                                 "entry_session": positions[pid]["entry_session"]})
         out[tid] = pos
-    return out, applied
+
+    # 4. late membership of entered slots: noted once, never scored
+    seen = {(r["position_id"], _canonical_purchase_key(k, by_ticker)) for r in noted for k in r["purchase_keys"]}
+    late: list[dict] = []
+    for tid in sorted(members):
+        rec = recorded.get(tid)
+        if rec is None or rec.get("kind") != "entry":
+            continue
+        took = set(rec.get("accessions", ()))
+        if all(set(positions[pid]["accessions"]) <= took for pid in members[tid]):
+            continue
+        entered = _purchase_keys(filings, keys, took)
+        notes: dict[str, dict] = {}
+        for pid in members[tid]:
+            for p in rebuilt_purchases(pid):
+                k = purchase_key(p["issuer_key"], p["trans_date"], p["shares"], p["price"])
+                if k in entered or (tid, _canonical_purchase_key(k, by_ticker)) in seen:
+                    continue
+                note = notes.setdefault(p["accession"], {
+                    "position_id": tid, "issuer_key": canonical_issuer(rec["issuer_key"], by_ticker),
+                    "entry_session": rec["entry_session"], "accession": p["accession"],
+                    "known_at": filings[p["accession"]]["known_at"], "purchase_keys": [],
+                    "reason": LATE_MOVED_DAY if pid in moved else LATE_SAME_GROUP, "rebuilt_id": pid})
+                note["purchase_keys"].append(list(k))
+        late += [notes[a] for a in sorted(notes)]
+    return out, applied, late
 
 
 def _position(pid: str, issuer_key: str, entry: str, entry_close_at: str, ps: list[dict]) -> dict:

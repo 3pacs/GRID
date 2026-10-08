@@ -31,6 +31,7 @@ from paper_log.trade_edge.config import (
 )
 from paper_log.trade_edge.events import (
     EXCL_LATE_FILING,
+    LATE_MEMBER_KIND,
     build_purchases,
     cap_bucket,
     close_instant,
@@ -96,9 +97,10 @@ def header_record(now: datetime, code_sha: str) -> dict:
 
 
 class State:
-    """Replay of the journal. ``look`` and ``alias`` records (both append-only)
-    carry the decisions later runs must consume: a decided look is never
-    re-evaluated and a ticker -> CIK association never changes.
+    """Replay of the journal. ``look``, ``alias`` and ``late_member`` records
+    (all append-only) carry the decisions later runs must consume: a decided
+    look is never re-evaluated, a ticker -> CIK association never changes and a
+    late purchase of an entered slot is noted once.
     """
 
     def __init__(self, records: list[dict]) -> None:
@@ -111,6 +113,7 @@ class State:
         self.marks: list[dict] = []
         self.looks: dict[int, dict] = {}
         self.aliases: dict[str, int] = {}
+        self.late_members: list[dict] = []
         self.run_labels: list[str] = []
         for r in records:
             self.add(r)
@@ -133,6 +136,8 @@ class State:
             self.looks[int(r["n"])] = r
         elif kind == "alias":
             self.aliases.setdefault(r["ticker"].strip().upper(), int(r["cik"]))
+        elif kind == LATE_MEMBER_KIND:
+            self.late_members.append(r)
         elif kind == "run" and r.get("label") is not None:
             self.run_labels.append(r["label"])
 
@@ -331,13 +336,16 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
             counts["new_filings"] += 1
 
         # issuer identity (§2.3): ticker -> CIK associations are learned once and
-        # appended; a position recorded before its ticker was enriched keeps its id
+        # appended; a position recorded before its ticker was enriched keeps its id.
+        # A purchase that joins an already entered slot is noted once and never scored.
         for assoc in learn_aliases(state.filings.values(), state.aliases):
             emit({"kind": "alias", "run_at": now.isoformat(), **assoc})
         positions = group_positions(build_purchases(state.filings.values(), state.aliases))
-        positions, reconciled = reconcile_positions(
-            positions, state.filings, {**state.signals, **state.entries}, state.aliases)
+        positions, reconciled, late = reconcile_positions(
+            positions, state.filings, {**state.signals, **state.entries}, state.aliases, state.late_members)
         counts["identity_reconciled"] = len(reconciled)
+        for note in late:
+            emit({"kind": LATE_MEMBER_KIND, "run_at": now.isoformat(), **note})
         admitted = {pid: p for pid, p in positions.items()
                     if datetime.fromisoformat(p["entry_close_at"]) > genesis}
 
@@ -447,7 +455,8 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
             "last_completed_session": last_done.isoformat(), "genesis": genesis.isoformat(),
             "counts": {**counts, "admitted_positions": len(admitted),
                        "written": {k: sum(1 for r in new if r["kind"] == k)
-                                   for k in ("filing", "signal", "entry", "marks", "exit", LOOK_KIND, "alias")}},
+                                   for k in ("filing", "signal", "entry", "marks", "exit", LOOK_KIND, "alias",
+                                             LATE_MEMBER_KIND)}},
             "sec_fetches": getattr(sec, "fetches", None),
             "price_failures": list(getattr(prices, "failures", [])),
             "freshness": freshness,

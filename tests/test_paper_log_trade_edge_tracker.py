@@ -10,7 +10,6 @@ import pytest
 
 from paper_log.trade_edge import source, tracker
 from paper_log.trade_edge.config import EASTERN, PREREG_PATH, PREREG_SHA256
-from paper_log.trade_edge.events import IdentityPolicyError
 from paper_log.trade_edge.sec import FetchDeferred, SecReader, SubmissionError, parse_submission, submission_url
 
 REPO = Path(__file__).resolve().parents[1]
@@ -584,22 +583,103 @@ def test_moved_day_distinct_purchase_folds_into_the_signalled_slot_before_entry(
     assert log.verify_chain()["ok"]
 
 
-def test_moved_day_distinct_purchase_on_an_entered_slot_is_refused_and_stays_refused(tmp_path, fake_db):
+def _body(rec):
+    return {k: v for k, v in rec.items() if k != "prev_sha256"}  # the record without its chain link
+
+
+def _entered_slot_runs(tmp_path, fake_db, late):
+    """ticker:BORR|2026-10-09 is entered; then the enriched re-report acc-2 (and, with ``late``, the
+    distinct purchase acc-3 of the same issuer/session) becomes visible; then a restart scores everything."""
     log, sec, prices = _moved_day_setup(tmp_path, fake_db)
     r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
-    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
-    assert first["position_id"] == "ticker:BORR|2026-10-09" and first["status"] == "opened"
     before = log.read_all()
+    fake_db["rows"] += [_filed_1008("acc-2", et(2026, 10, 8, 14, 0))]
+    if late:
+        fake_db["rows"] += [_filed_1008("acc-3", et(2026, 10, 8, 17, 0))]
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    return log, before, r1, r2, r3
 
-    _enriched_reports_arrive(fake_db)
-    refused = r"cik:1715497\|2026-10-09, already entered as 'ticker:BORR\|2026-10-09'"
-    with pytest.raises(IdentityPolicyError, match=refused):
-        tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
-    assert log.read_all() == before  # nothing appended: no second position, no rewritten entry
-    # restart: the refusal is replayed, never resolved by code
-    with pytest.raises(IdentityPolicyError, match=refused):
-        tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
-    assert log.read_all() == before and log.verify_chain()["ok"]
+
+def test_moved_day_distinct_purchase_on_an_entered_slot_is_noted_once_and_never_scored(tmp_path, fake_db):
+    from paper_log.trade_edge.__main__ import status_from_records
+    log, before, r1, r2, r3 = _entered_slot_runs(tmp_path / "late", fake_db, late=True)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-09" and first["accessions"] == ["acc-1"]
+    assert tracker.State(before).late_members == [] and status_from_records(before)["late_members"] == 0
+
+    kinds = [r["kind"] for r in r2["written"]]
+    assert kinds.count("alias") == 1 and kinds.count("late_member") == 1 and not {"signal", "entry"} & set(kinds)
+    (note,) = [r for r in r2["written"] if r["kind"] == "late_member"]
+    acc3 = next(r for r in r2["written"] if r["kind"] == "filing" and r["accession"] == "acc-3")
+    assert _body(note) == {"kind": "late_member", "run_at": et(2026, 10, 13, 8, 30).isoformat(),
+                           "position_id": "ticker:BORR|2026-10-09", "issuer_key": "cik:1715497",
+                           "entry_session": "2026-10-09", "accession": "acc-3", "known_at": acc3["known_at"],
+                           "purchase_keys": [["cik:1715497", "2026-10-07", 150000, 5.0]],
+                           "reason": "moved_day_after_entry", "rebuilt_id": "cik:1715497|2026-10-09"}
+    assert set(r2["admitted"]) == {"ticker:BORR|2026-10-09"}  # no second position for the slot
+    assert next(r for r in r2["written"] if r["kind"] == "run")["counts"]["written"]["late_member"] == 1
+    records = log.read_all()
+    assert records[:len(before)] == before  # nothing historical is rewritten
+
+    # restart (fresh replay): the note is replayed, not appended again; the entry is scored as recorded
+    kinds3 = [r["kind"] for r in r3["written"]]
+    assert "late_member" not in kinds3 and not {"signal", "entry"} & set(kinds3)
+    state = tracker.State(log.read_all())
+    assert state.late_members == [note] and state.entries == {first["position_id"]: first}
+    assert status_from_records(log.read_all())["late_members"] == 1
+    assert log.verify_chain()["ok"]
+
+    # the late purchase never counts: exits and statistics equal a log where it never appeared
+    fake_db["rows"] = []
+    log_c, _, r1_c, r2_c, r3_c = _entered_slot_runs(tmp_path / "control", fake_db, late=False)
+    assert "late_member" not in {r["kind"] for r in log_c.read_all()}
+    assert [_body(r) for r in r1_c["written"] if r["kind"] == "entry"] == [_body(first)]
+    assert [_body(r) for r in r3["written"] if r["kind"] == "exit"] == \
+        [_body(r) for r in r3_c["written"] if r["kind"] == "exit"]
+    assert r3["scoreboard"]["tables"] == r3_c["scoreboard"]["tables"]
+    assert r3["scoreboard"]["label"] == r3_c["scoreboard"]["label"]
+    assert r3["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 1
+
+
+def test_same_group_late_purchase_on_an_entered_slot_is_noted_like_a_moved_one(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-5": _large_filing("acc-5", "BORR", "0001715497", "20261012090000",
+                                          line=("2026-10-05", "S", "D", "100", "5", ""))})  # alias only, no purchase
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    fake_db["rows"] = [_filed_1008("acc-1", et(2026, 10, 8, 10, 0))]  # grid_db fallback: entry 10-09
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-09"
+
+    # a distinct fallback purchase ingested 10-08 11:00 becomes visible only now (ingest lag): same rebuilt group
+    row = raw_row("acc-4", "BORR", et(2026, 10, 8, 11, 0), value_shares=100_000)
+    fake_db["rows"].append({**row, "payload": {**row["payload"], "filing_date": "2026-10-08"}})
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds = [r["kind"] for r in r2["written"]]
+    assert kinds.count("late_member") == 1 and not {"signal", "entry"} & set(kinds)
+    (note,) = [r for r in r2["written"] if r["kind"] == "late_member"]
+    assert (note["position_id"], note["accession"], note["reason"], note["rebuilt_id"], note["purchase_keys"]) == (
+        "ticker:BORR|2026-10-09", "acc-4", "same_group_after_entry", "ticker:BORR|2026-10-09",
+        [["ticker:BORR", "2026-10-06", 100000, 5.0]])
+
+    # a later filing teaches BORR -> CIK 1715497: the noted purchase is matched canonically, not noted again
+    fake_db["rows"].append(raw_row("acc-5", "BORR", et(2026, 10, 12, 9, 0)))
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 10, 14, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds3 = [r["kind"] for r in r3["written"]]
+    assert kinds3.count("alias") == 1 and "late_member" not in kinds3 and not {"signal", "entry"} & set(kinds3)
+    r4 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert "late_member" not in [r["kind"] for r in r4["written"]]
+    assert [r["position_id"] for r in r4["written"] if r["kind"] == "exit" and r["horizon"] == 30] == \
+        ["ticker:BORR|2026-10-09"]
+    state = tracker.State(log.read_all())
+    assert state.late_members == [note] and state.entries == {first["position_id"]: first}
+    assert first["accessions"] == ["acc-1"] and first["n_purchases"] == 1  # membership for scoring stays frozen
+    assert r4["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 1
+    assert log.verify_chain()["ok"]
 
 
 # ── review R2: status reads the journal's look records (never decides) ──────
