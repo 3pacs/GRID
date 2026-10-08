@@ -1,0 +1,75 @@
+{
+  "skill_name": "tiingo-integration",
+  "description": "Use the Tiingo Pro API for price data, news, and fundamentals in GRID. Use when adding new tickers, backfilling historical data for new features, setting up news-sentiment signals, debugging Tiingo API issues, or planning bandwidth usage (40GB/month Pro tier).",
+  "results": [
+    {
+      "query": "Pull 5 years of daily history for a list of 40 new tickers from Tiingo and tell me whether that blows our monthly bandwidth.",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "tiingo news puller is returning nothing for BRK.B, what's the ticker format they want?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "I want a news-count sentiment feature per ticker built from the article feed we already pay for. What stores what?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Getting a 404 from the prices endpoint for CL=F. Is the key bad?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Resolve the YF:*:close rows already in raw_series into resolved_series without using the Python resolver.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "The overnight Hermes step didn't run last night; how do I see why?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Do we already have a news-sentiment module somewhere in intelligence/ or ingestion/?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Pull the latest FRED CPI series and check how stale it is.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 4,
+    "failed": 4
+  }
+}

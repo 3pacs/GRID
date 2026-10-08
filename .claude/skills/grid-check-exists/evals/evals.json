@@ -1,0 +1,42 @@
+{
+  "skill_name": "grid-check-exists",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Let's build a vol surface module for GRID: SVI fit per expiry, skew metrics, and butterfly-arbitrage checks. Where should it go and what should the API look like?",
+      "expected_output": "Searches the module directories first, finds analysis/vol_surface.py, and recommends extending and wiring it (not creating a new module).",
+      "files": [],
+      "expectations": [
+        "Runs or performs searches across the directories listed in the skill (intelligence, analysis, physics, features, discovery, trading, oracle, ingestion) BEFORE proposing any new file path",
+        "Searches docs/MODULE_CATALOG.md for the keyword",
+        "Finds analysis/vol_surface.py and opens the top of that file before designing anything",
+        "Frames the task as 'extend and wire' (vol_surface.py is built but not wired into scanner/recommender), not 'build new'",
+        "Does not create a new vol-surface file under intelligence/ or analysis/ in its response"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "/grid-check-exists zzqx plasma harmonic router",
+      "expected_output": "A nonsense keyword yields zero matches; the skill says to still grep broader terms before concluding it is new.",
+      "files": [],
+      "expectations": [
+        "Runs the numbered search sections (filename matches, content grep, MODULE_CATALOG mentions, roadmap mentions, file counts)",
+        "Reports zero matches compactly rather than dumping raw output",
+        "Does not declare the capability genuinely new immediately; greps at least one broader or related term before recommending a new file",
+        "Does not write any new file"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Quick one: I need per-ticker gamma exposure and a vanna/charm score for the options scanner. Propose the implementation.",
+      "expected_output": "Finds physics/dealer_gamma.py (GEX built, vanna/charm computed at lines ~248-250 but never scored) and proposes scoring/wiring.",
+      "files": [],
+      "expectations": [
+        "Checks physics/ and the known-exists table before proposing code",
+        "Identifies physics/dealer_gamma.py as already containing per-ticker GEX and vanna/charm computation",
+        "Notes the real gap is scoring/wiring (and the net-short-dealer assumption), not computation",
+        "Reads the existing module's public API (head of file) before proposing changes"
+      ]
+    }
+  ]
+}

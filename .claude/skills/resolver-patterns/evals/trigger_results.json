@@ -1,0 +1,75 @@
+{
+  "skill_name": "resolver-patterns",
+  "description": "Resolve raw_series into resolved_series in GRID. Use when adding new data sources or tickers, debugging why data isn't appearing in resolved_series, adding entity mappings (SEED_MAPPINGS), optimizing resolver performance for bulk loads, or understanding the PIT data pipeline.",
+  "results": [
+    {
+      "query": "I added YF:XLRE:close pulls but the feature never appears in resolved_series. How do I debug the mapping?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Backfilled 400k Tiingo rows into raw_series and need them in resolved_series quickly. What's the right approach, the Python resolver is crawling.",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "how do I register a brand new feature so panel_builder can see it? I need the SEED_MAPPINGS entry and the registry row",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "why does entity_map.get_feature_id() return None for one of my series and nothing in the logs?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Write the Tiingo puller call for daily prices with the right auth header and date params.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Is hermes running the Tiingo overnight pull? It should be 02:00-06:00 UTC.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Validate this prediction: lever is Tether minting $500M USDT, condition is low weekend volume.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Which FRED series are stale right now and what are the freshness thresholds?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 4,
+    "failed": 4
+  }
+}

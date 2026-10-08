@@ -1,0 +1,44 @@
+{
+  "skill_name": "hermes-operations",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Add a daily task to Hermes that refreshes the CFTC COT data at 18:15 UTC. Show me the code.",
+      "expected_output": "A time-gated block in run_cycle() with a date marker via getattr, try/except, dry_run guard, marker advanced only after a completed run.",
+      "files": [],
+      "expectations": [
+        "Places the block in scripts/hermes_operator.py run_cycle() with a step label (7x style) and a UTC time-gate",
+        "Reads the last-run marker with getattr(state, '_last_<name>_date', None) so existing persisted state stays backwards compatible",
+        "Wraps the task in try/except that logs a warning instead of raising",
+        "Skips execution when dry_run is set",
+        "Sets the state marker only after the task completes, not before",
+        "Mentions checking remaining cycle budget (CYCLE_TIMEOUT_SECONDS minus elapsed) and deferring if the task has its own timeout budget"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Stale data alert: dashboard shows data older than 26h and a puller returns 0 rows. Diagnose.",
+      "expected_output": "Follows the symptom table: API key/rate limit, blacklisted puller in source_catalog, health endpoint fields, dry-run cycle.",
+      "files": [],
+      "expectations": [
+        "Checks GET /api/v1/system/health and reads recent_data, pool_healthy, llm_available, thread_ingestion",
+        "Considers API key expiry or rate limiting for the 0-rows symptom (check .env, test the API manually)",
+        "Considers a blacklisted puller and checks source_catalog for it",
+        "Suggests python3 scripts/hermes_operator.py --once --dry-run to diagnose without fixing",
+        "Does not restart grid-hermes or edit code before diagnosing"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Hermes cycles are taking over 15 minutes lately. Why and what do I change?",
+      "expected_output": "Points at the resolver scanning full raw_series; fix lookback_days=7. Also considers cycle timeout budgeting.",
+      "files": [],
+      "expectations": [
+        "Identifies the resolver scanning full raw_series as the common cause and recommends lookback_days=7",
+        "Verifies in scripts/hermes_operator.py which call is actually responsible instead of only asserting it",
+        "Mentions per-cycle timeout (CYCLE_TIMEOUT_SECONDS) interaction with slow budgeted steps",
+        "Tells the user to restart grid-hermes only after a code change lands"
+      ]
+    }
+  ]
+}

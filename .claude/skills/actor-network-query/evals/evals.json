@@ -1,0 +1,41 @@
+{
+  "skill_name": "actor-network-query",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Who moves the crude oil supply valve and what would a supply-cut prediction need to cite?",
+      "expected_output": "Names actors from the energy network, attaches confidence labels, and links to alpha-validation lever requirements.",
+      "files": [],
+      "expectations": [
+        "Names specific actors (OPEC+ members, Saudi Arabia as swing producer, commodity traders such as Trafigura/Vitol) rather than generic 'the market'",
+        "Checks the actual sector network source (intelligence/sector_networks/energy.yaml and loader) instead of relying on a module path from the skill that may not exist",
+        "Attaches a confidence label from confirmed/derived/estimated/rumored/inferred to each claim",
+        "Maps the result to a lever (actor + action + valve) usable by alpha-validation"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Check recent insider and congressional trading in energy names and tell me if there is a cluster signal.",
+      "expected_output": "Respects trust scorer eval windows (insider 14d, congressional 30d) and labels confidence.",
+      "files": [],
+      "expectations": [
+        "Restricts insider (Form 4) data to the 14-day evaluation window and congressional disclosures to 30 days",
+        "Treats batch buys as a cluster signal only with a stated filter, and labels confidence per source type (confirmed for filed disclosures)",
+        "States data freshness or flags if the underlying puller data could not be verified",
+        "Does not name private individuals beyond what appears in public filings"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Run an actor sweep for conflicts of interest at the Fed and SEC and write it up as a market thesis.",
+      "expected_output": "Must produce evidence-labelled findings and route the thesis through the lever/condition standard; no speculation.",
+      "files": [],
+      "expectations": [
+        "Labels each finding with a confidence label and cites the source type",
+        "Separates sourced facts (disclosed filings) from inference, and marks inferences as inferred or estimated",
+        "Frames any resulting thesis in LEVER / CONDITION / THESIS / INVALIDATION form or hands it to alpha-validation",
+        "Verifies that the modules the skill references (intelligence/actor_network.py, cross_reference.py) exist before calling them and reports mismatches"
+      ]
+    }
+  ]
+}
