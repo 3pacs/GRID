@@ -1,38 +1,38 @@
 {
   "skill_name": "tiingo-integration",
-  "description": "Use the Tiingo Pro API for price data, news, and fundamentals in GRID. Use when adding new tickers, backfilling historical data for new features, setting up news-sentiment signals, debugging Tiingo API issues, or planning bandwidth usage (40GB/month Pro tier).",
+  "description": "Use when calling the Tiingo API, pulling or backfilling Tiingo prices or news, adding new tickers to Tiingo pulls, or planning bandwidth (40GB/month Pro tier); for resolving raw_series into resolved_series use resolver-patterns.",
   "results": [
     {
       "query": "Pull 5 years of daily history for a list of 40 new tickers from Tiingo and tell me whether that blows our monthly bandwidth.",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "tiingo news puller is returning nothing for BRK.B, what's the ticker format they want?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "I want a news-count sentiment feature per ticker built from the article feed we already pay for. What stores what?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Getting a 404 from the prices endpoint for CL=F. Is the key bad?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Resolve the YF:*:close rows already in raw_series into resolved_series without using the Python resolver.",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 8,
+    "failed": 0
   }
 }

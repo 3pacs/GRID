@@ -1,30 +1,30 @@
 {
   "skill_name": "resolver-patterns",
-  "description": "Resolve raw_series into resolved_series in GRID. Use when adding new data sources or tickers, debugging why data isn't appearing in resolved_series, adding entity mappings (SEED_MAPPINGS), optimizing resolver performance for bulk loads, or understanding the PIT data pipeline.",
+  "description": "Resolve raw_series into resolved_series in GRID. Use when resolving data into resolved_series, mapping new tickers or sources (SEED_MAPPINGS), or optimizing resolver throughput; for Tiingo API calls, news, and backfills use tiingo-integration.",
   "results": [
     {
       "query": "I added YF:XLRE:close pulls but the feature never appears in resolved_series. How do I debug the mapping?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Backfilled 400k Tiingo rows into raw_series and need them in resolved_series quickly. What's the right approach, the Python resolver is crawling.",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "how do I register a brand new feature so panel_builder can see it? I need the SEED_MAPPINGS entry and the registry row",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "why does entity_map.get_feature_id() return None for one of my series and nothing in the logs?",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 7,
+    "failed": 1
   }
 }

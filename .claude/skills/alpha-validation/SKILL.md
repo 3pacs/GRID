@@ -1,6 +1,6 @@
 ---
 name: alpha-validation
-description: Validate finished GRID predictions against the Prediction Causation Standard (levers vs conditions) before journal logging or trade execution; for gathering named actors and evidence for a lever use actor-network-query.
+description: Validate a finished GRID prediction (LEVER / CONDITION / THESIS / INVALIDATION) against the Prediction Causation Standard before it goes into the immutable journal. Use when a drafted prediction or thesis needs checking, when reviewing model output quality, when debugging why a backtest prediction failed, or when running post-mortems on failed trades. Rejects predictions built on conditions alone. Finding the named actors and evidence behind a lever is actor-network-query, not this skill.
 ---
 
 # alpha-validation

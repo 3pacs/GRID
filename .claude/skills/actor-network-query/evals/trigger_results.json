@@ -1,30 +1,30 @@
 {
   "skill_name": "actor-network-query",
-  "description": "Query GRID's actor network to understand who moves markets and why. Use when building predictions that cite specific actor levers, analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors and 250K+ discovery scale across sector networks.",
+  "description": "Query GRID's actor network to find the named actors, relationships and evidence behind a market lever. Use when a prediction needs specific actors (who pulled which valve), when analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors, 250K+ discovery scale and the per-sector networks. Gathers the lever and its evidence; validating the finished prediction is alpha-validation, not this skill.",
   "results": [
     {
       "query": "Who actually controls the Treasury market liquidity valve right now? I need named actors, not 'the market', for a prediction.",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Map the conflicts of interest on the SEC leadership around digital asset rules. Previous employers, family holdings.",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Before CPI and the FOMC next week, run an intelligence sweep: who are the big holders and what are they likely to do?",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "China developer defaults are spreading. Which US lenders and REITs are exposed and who sits on the boards of both?",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 5,
-    "failed": 3
+    "passed": 8,
+    "failed": 0
   }
 }

@@ -1,38 +1,38 @@
 {
   "skill_name": "data-health",
-  "description": "Monitor GRID data-source freshness, detect ingestion anomalies, and validate API-key availability across 37+ sources. Use on startup or after restarts, before running inference (verify critical data is fresh), when investigating unexpected model behavior that staleness could explain, or when adding/modifying ingestion sources.",
+  "description": "Monitor GRID data-source freshness thresholds, API-key availability, and NaN quality across sources; for scheduler cycle structure, time gates, or why a puller step did not run use hermes-operations.",
   "results": [
     {
       "query": "Hermes just restarted after the deploy. Before I run inference, are all the sources actually pulling?",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "The regime model is suddenly outputting weird labels. Could one of the feeds be stale or full of NaNs?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "which API keys is the system silently missing? I suspect KOSIS and Comtrade are returning 401 and we never noticed",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
       "runs": 3,
       "pass": false
     },
     {
       "query": "I'm adding a new ingestion source for weekly CFTC data. What freshness threshold should I alert on?",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Raw rows exist but nothing is in resolved_series for XLRE. Debug the entity mapping.",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 7,
+    "failed": 1
   }
 }
