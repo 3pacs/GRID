@@ -284,7 +284,7 @@ No port forwarding needed. Traffic flows: User → Cloudflare → tunnel → loc
 | API logs | `/data/grid/logs/api.log` |
 | Cron logs | `~/grid_v4/logs/cron/` |
 | .env | `~/grid_v4/grid_repo/grid/.env` |
-| DB credentials | `grid` / `gridmaster2026` / `griddb` on localhost:5432 |
+| DB credentials | `grid` / `$GRID_DB_PASSWORD` (see ~/.pgpass / .env on grid-svr) / `griddb` on localhost:5432 |
 
 ## Celestial/Astro Ingestion
 
