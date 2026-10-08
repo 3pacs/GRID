@@ -10,6 +10,7 @@ import pytest
 
 from paper_log.trade_edge import source, tracker
 from paper_log.trade_edge.config import EASTERN, PREREG_PATH, PREREG_SHA256
+from paper_log.trade_edge.events import IdentityPolicyError
 from paper_log.trade_edge.sec import FetchDeferred, SecReader, SubmissionError, parse_submission, submission_url
 
 REPO = Path(__file__).resolve().parents[1]
@@ -520,3 +521,142 @@ def test_journal_label_without_look_record_is_refused_not_rewritten(tmp_path, fa
     with pytest.raises(tracker.LookPolicyError):
         tracker.State(records + [legacy])
     assert tracker.State(records).looks == {}  # UNPROVEN run labels remain compatible
+
+
+# ── review R1: one position per canonical (issuer, recorded entry session) ──
+
+
+def _filed_1008(acc, ingest):
+    row = raw_row(acc, "BORR", ingest)
+    return {**row, "payload": {**row["payload"], "filing_date": "2026-10-08"}}
+
+
+def _moved_day_setup(tmp_path, fake_db):
+    """Fallback acc-1 (entry 10-09); acc-2 = the same purchase enriched with an earlier known_at
+    (entry 10-08); acc-3 = a distinct enriched purchase whose entry is the recorded 10-09."""
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-2": _large_filing("acc-2", "BORR", "0001715497", "20261008090000"),
+                   "acc-3": _large_filing("acc-3", "BORR", "0001715497", "20261008170000",
+                                          line=("2026-10-07", "P", "A", "150000", "5", ""))})
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    fake_db["rows"] = [_filed_1008("acc-1", et(2026, 10, 8, 10, 0))]
+    return log, sec, prices
+
+
+def _enriched_reports_arrive(fake_db):
+    fake_db["rows"] += [_filed_1008("acc-2", et(2026, 10, 8, 14, 0)), _filed_1008("acc-3", et(2026, 10, 8, 17, 0))]
+
+
+def test_moved_day_distinct_purchase_folds_into_the_signalled_slot_before_entry(tmp_path, fake_db):
+    log, sec, prices = _moved_day_setup(tmp_path, fake_db)
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 8, 23, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    assert [r["position_id"] for r in r1["written"] if r["kind"] == "signal"] == ["ticker:BORR|2026-10-09"]
+    assert "entry" not in [r["kind"] for r in r1["written"]]  # 10-09 is not completed yet
+
+    _enriched_reports_arrive(fake_db)
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 9, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds = [r["kind"] for r in r2["written"]]
+    assert kinds.count("alias") == 1 and "entry" not in kinds
+    (sig,) = [r for r in r2["written"] if r["kind"] == "signal"]  # no cik:...|2026-10-09 signal
+    assert sig["position_id"] == "ticker:BORR|2026-10-09" and sig["revision"] == 2
+    assert sig["entry_session"] == "2026-10-09" and sig["issuer_alias"] == "cik:1715497"
+    assert sig["accessions"] == ["acc-2", "acc-3"] and sig["n_purchases"] == 2
+    assert sig["total_value"] == pytest.approx(1_000_000 + 750_000) and sig["largest_value"] == pytest.approx(1_000_000)
+    assert set(r2["admitted"]) == {"ticker:BORR|2026-10-09"}
+    assert next(r for r in r2["written"] if r["kind"] == "run")["counts"]["identity_reconciled"] == 2
+
+    # restart (fresh replay): one entry for the slot with the registered aggregate, scored once
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert "signal" not in [r["kind"] for r in r3["written"]]
+    (ent,) = [r for r in r3["written"] if r["kind"] == "entry"]
+    assert ent["position_id"] == "ticker:BORR|2026-10-09" and ent["status"] == "opened"
+    assert ent["accessions"] == ["acc-2", "acc-3"] and ent["n_purchases"] == 2 and ent["stratum"] == "large"
+    assert [r["position_id"] for r in r3["written"] if r["kind"] == "exit" and r["horizon"] == 30] == \
+        ["ticker:BORR|2026-10-09"]
+    assert r3["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 1
+    r4 = tracker.run_once(log, conn=None, now=et(2026, 12, 16, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert set(r4["admitted"]) == {"ticker:BORR|2026-10-09"}
+    assert not {"signal", "entry", "exit"} & {r["kind"] for r in r4["written"]}
+    assert set(tracker.State(log.read_all()).entries) == {"ticker:BORR|2026-10-09"}
+    assert log.verify_chain()["ok"]
+
+
+def test_moved_day_distinct_purchase_on_an_entered_slot_is_refused_and_stays_refused(tmp_path, fake_db):
+    log, sec, prices = _moved_day_setup(tmp_path, fake_db)
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-09" and first["status"] == "opened"
+    before = log.read_all()
+
+    _enriched_reports_arrive(fake_db)
+    refused = r"cik:1715497\|2026-10-09, already entered as 'ticker:BORR\|2026-10-09'"
+    with pytest.raises(IdentityPolicyError, match=refused):
+        tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert log.read_all() == before  # nothing appended: no second position, no rewritten entry
+    # restart: the refusal is replayed, never resolved by code
+    with pytest.raises(IdentityPolicyError, match=refused):
+        tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert log.read_all() == before and log.verify_chain()["ok"]
+
+
+# ── review R2: status reads the journal's look records (never decides) ──────
+
+
+def _status_journal(nets, looks=(), run_label="UNPROVEN", looks_done=0):
+    recs = [{"kind": "header", "run_at": "2026-10-07T18:00:00-04:00"}]
+    for i, net in enumerate(nets):
+        pid = f"cik:{i + 1}|2026-10-{8 + i:02d}"
+        recs.append({"kind": "entry", "position_id": pid, "status": "opened", "stratum": "large",
+                     "cap_bucket": ">=2B", "entry_session": f"2026-10-{8 + i:02d}"})
+        recs.append({"kind": "exit", "position_id": pid, "horizon": 30, "status": "closed", "net_excess": net,
+                     "gross_excess": net + 0.003, "exit_session": f"2026-11-{19 + i:02d}"})
+    recs += [dict(rec) for rec in looks]
+    recs.append({"kind": "run", "run_at": "2026-12-16T08:30:00-05:00", "label": run_label,
+                 "looks_done": looks_done, "look_pending": None})
+    return recs
+
+
+def test_status_reads_terminal_and_completed_looks_and_keeps_undecided_interim(monkeypatch):
+    from paper_log.trade_edge import scoreboard as sb
+    from paper_log.trade_edge.__main__ import status_from_records
+    monkeypatch.setattr(sb, "LOOKS", (2, 4, 6))
+    nets = [-0.5, -0.4, 0.5]
+    members = ["cik:1|2026-10-08", "cik:2|2026-10-09"]
+    contrary_stats = sb.look_statistics([{"net_excess": n, "entry_session": s} for n, s in
+                                         ((-0.5, "2026-10-08"), (-0.4, "2026-10-09"))])
+
+    # terminal look: top-level label/banner are the journal's decision and agree with last_run
+    terminal = {"kind": "look", "run_at": "2026-12-16T08:30:00-05:00", "n": 2, "boundary_exit_session": "2026-11-20",
+                "members": members, "stats": contrary_stats, "decision": "CONTRARY", "terminal": True}
+    recs = _status_journal(nets, [terminal], run_label="CONTRARY", looks_done=1)
+    snapshot = [dict(r) for r in recs]
+    st = status_from_records(recs)
+    assert st["label"]["label"] == st["last_run"]["label"] == "CONTRARY"
+    assert st["banner"].startswith("CONTRARY") and st["label"]["basis"] == "journal"
+    assert st["label"]["looks_done"] == st["last_run"]["looks_done"] == 1 and st["label"]["decided_at_look"] == 2
+    assert st["label"]["look_stats"] == contrary_stats and recs == snapshot  # read only
+    for decision in ("SUPPORTED_FORWARD", "NOT_SUPPORTED"):
+        other = status_from_records(_status_journal(nets, [{**terminal, "decision": decision}], decision, 1))
+        assert other["label"]["label"] == decision and other["banner"].startswith(decision)
+
+    # completed unsuccessful look: its membership/statistics stay; the next look is not decided by status
+    unproven_stats = {**contrary_stats, "clustered_t": 0.5}
+    done = {**terminal, "stats": unproven_stats, "decision": "UNPROVEN", "terminal": False}
+    st2 = status_from_records(_status_journal(nets, [done], run_label="UNPROVEN", looks_done=1))
+    assert st2["label"]["label"] == st2["last_run"]["label"] == "UNPROVEN"
+    assert st2["label"]["looks_done"] == st2["last_run"]["looks_done"] == 1
+    assert st2["label"]["look_stats"] == unproven_stats and st2["label"]["basis"] == "journal"
+    assert st2["label"]["next_look_at_n_closed"] == 4
+
+    # undecided journal: interim UNPROVEN, even where the tracker would decide this look
+    undecided = _status_journal(nets)
+    st3 = status_from_records(undecided)
+    assert st3["label"]["label"] == "UNPROVEN" and st3["label"]["basis"] == "interim"
+    assert st3["label"]["looks_done"] == 0 and st3["label"]["look_pending"]["n"] == 2
+    assert st3["banner"].startswith("UNPROVEN") and "new_looks" not in st3
+    entries = [r for r in undecided if r["kind"] == "entry"]
+    exits = [r for r in undecided if r["kind"] == "exit"]
+    assert sb.build_scoreboard(entries, exits, looks={}, decide=True)["label"]["label"] == "CONTRARY"

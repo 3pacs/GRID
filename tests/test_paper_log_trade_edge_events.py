@@ -221,27 +221,80 @@ def test_aliases_are_learned_once_and_a_persisted_alias_wins():
     assert ev.issuer_keys(fs, {"ABC": 9})["g1"] == "cik:9"  # the journal's association is append-only
 
 
-def test_reconcile_keeps_the_recorded_identity_for_a_consumed_purchase_and_refuses_double_records():
-    fs = {
+def _moved_day_filings():
+    return {
         "g1": filing("g1", None, "name:jane", et(2026, 10, 7, 22), [ok()]),                      # fallback, no CIK
         "s2": filing("s2", 1, "cik:10", et(2026, 10, 7, 14, 15), [ok()]),                       # same purchase, enriched
         "s3": filing("s3", 1, "cik:10", et(2026, 10, 8, 9), [ok(trans="2026-10-07", shares=5_000.0)]),  # distinct
     }
-    recorded = {"ticker:ABC|2026-10-08": {"position_id": "ticker:ABC|2026-10-08", "issuer_key": "ticker:ABC",
-                                          "entry_session": "2026-10-08", "entry_close_at": "2026-10-08T16:00:00-04:00",
-                                          "accessions": ["g1"]}}
-    aliases = {"ABC": 1}
+
+
+def _recorded(accessions, kind="signal", pid="ticker:ABC|2026-10-08", issuer_key="ticker:ABC"):
+    return {pid: {"kind": kind, "position_id": pid, "issuer_key": issuer_key, "entry_session": "2026-10-08",
+                  "entry_close_at": "2026-10-08T16:00:00-04:00", "accessions": list(accessions)}}
+
+
+def _one_slot_each(out, fs, aliases):
+    by_ticker = ev._ticker_ciks(list(fs.values()), aliases)
+    slots = [(ev.canonical_issuer(p["issuer_key"], by_ticker), p["entry_session"]) for p in out.values()]
+    return len(slots) == len(set(slots))
+
+
+def test_reconcile_keeps_the_recorded_identity_and_one_slot_before_entry():
+    fs, aliases = _moved_day_filings(), {"ABC": 1}
+    recorded = _recorded(["g1"])  # only the signal of the fallback report is recorded
     rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
-    # the enriched duplicate has the earlier known_at: the rebuilt position moved to 10-07
+    # the enriched duplicate has the earlier known_at: the rebuilt position moved to 10-07, s3 stays on 10-08
     assert set(rebuilt) == {"cik:1|2026-10-07", "cik:1|2026-10-08"}
     out, applied = ev.reconcile_positions(rebuilt, fs, recorded, aliases)
-    assert set(out) == {"ticker:ABC|2026-10-08", "cik:1|2026-10-08"}
+    # one position for issuer CIK 1 on the recorded session 10-08, carrying both purchases
+    assert set(out) == {"ticker:ABC|2026-10-08"} and _one_slot_each(out, fs, aliases)
     kept = out["ticker:ABC|2026-10-08"]
     assert kept["issuer_key"] == "ticker:ABC" and kept["issuer_alias"] == "cik:1"
-    assert kept["entry_session"] == "2026-10-08" and kept["accessions"] == ["s2"]  # kept report, recorded day
-    assert applied == [{"position_id": "ticker:ABC|2026-10-08", "superseded_id": "cik:1|2026-10-07",
-                        "issuer_key": "cik:1", "entry_session": "2026-10-07"}]
+    assert kept["entry_session"] == "2026-10-08" and kept["entry_close_at"] == "2026-10-08T16:00:00-04:00"
+    assert kept["accessions"] == ["s2", "s3"] and kept["n_purchases"] == 2  # kept report + distinct purchase
+    assert kept["total_value"] == pytest.approx(600_000 + 300_000)
+    assert kept["largest_value"] == pytest.approx(600_000) and kept["stratum"] == "large"
+    assert kept["actors"] == ["cik:10"] and kept["n_actors"] == 1
+    assert applied == [
+        {"position_id": "ticker:ABC|2026-10-08", "superseded_id": "cik:1|2026-10-07", "issuer_key": "cik:1",
+         "entry_session": "2026-10-07"},
+        {"position_id": "ticker:ABC|2026-10-08", "superseded_id": "cik:1|2026-10-08", "issuer_key": "cik:1",
+         "entry_session": "2026-10-08"},
+    ]
     assert ev.reconcile_positions(rebuilt, fs, {}, aliases) == (rebuilt, [])
+    # a journal that recorded both identities of one purchase is refused, not merged
     both = {**recorded, "cik:1|2026-10-07": {**rebuilt["cik:1|2026-10-07"]}}
     with pytest.raises(ev.IdentityPolicyError):
         ev.reconcile_positions(rebuilt, fs, both, aliases)
+
+
+def test_reconcile_after_restart_keeps_the_folded_slot_without_refusal():
+    fs, aliases = _moved_day_filings(), {"ABC": 1}
+    rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
+    first, _ = ev.reconcile_positions(rebuilt, fs, _recorded(["g1"]), aliases)
+    # replay: the revised signal (and then the entry) recorded the folded accessions
+    for kind in ("signal", "entry"):
+        out, applied = ev.reconcile_positions(rebuilt, fs, _recorded(["s2", "s3"], kind=kind), aliases)
+        assert out == first and _one_slot_each(out, fs, aliases)
+        assert [a["superseded_id"] for a in applied] == ["cik:1|2026-10-07", "cik:1|2026-10-08"]
+
+
+def test_reconcile_refuses_a_distinct_group_joining_an_entered_slot():
+    fs, aliases = _moved_day_filings(), {"ABC": 1}
+    rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
+    with pytest.raises(ev.IdentityPolicyError, match=r"cik:1\|2026-10-08.*already entered as 'ticker:ABC\|2026-10-08'"):
+        ev.reconcile_positions(rebuilt, fs, _recorded(["g1"], kind="entry"), aliases)
+    # only the consumed purchase arriving (no distinct group) still reconciles under the entered id
+    fs2 = {k: fs[k] for k in ("g1", "s2")}
+    rebuilt2 = ev.group_positions(ev.build_purchases(fs2.values(), aliases))
+    out, _ = ev.reconcile_positions(rebuilt2, fs2, _recorded(["g1"], kind="entry"), aliases)
+    assert set(out) == {"ticker:ABC|2026-10-08"} and out["ticker:ABC|2026-10-08"]["accessions"] == ["s2"]
+
+
+def test_reconcile_refuses_two_recorded_positions_in_one_issuer_session():
+    fs, aliases = _moved_day_filings(), {"ABC": 1}
+    rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
+    two = {**_recorded(["g1"]), **_recorded(["s3"], pid="cik:1|2026-10-08", issuer_key="cik:1")}
+    with pytest.raises(ev.IdentityPolicyError, match=r"one issuer/entry session cik:1\|2026-10-08"):
+        ev.reconcile_positions(rebuilt, fs, two, aliases)

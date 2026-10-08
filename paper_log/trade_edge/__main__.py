@@ -44,9 +44,11 @@ def open_log(log_dir: Path):
 
 
 def status_from_records(records: list[dict]) -> dict:
-    from paper_log.trade_edge.scoreboard import build_scoreboard
+    """Read-only view of the journal. The label comes from its ``look`` records
+    (decided looks are authoritative); status never decides or appends a look."""
+    from paper_log.trade_edge.scoreboard import LOOK_KIND, build_scoreboard
 
-    entries, exits, filings = {}, {}, []
+    entries, exits, filings, looks = {}, {}, [], {}
     for r in records:
         if r.get("kind") == "entry":
             entries[r["position_id"]] = r
@@ -54,9 +56,11 @@ def status_from_records(records: list[dict]) -> dict:
             exits[(r["position_id"], r["horizon"])] = r
         elif r.get("kind") == "filing":
             filings.append(r)
+        elif r.get("kind") == LOOK_KIND:
+            looks[int(r["n"])] = r
     late = sum(1 for f in filings for line in f["lines"] if line.get("exclusion") == "late_filing")
     grid_db = sum(1 for f in filings if f["source"] == "grid_db")
-    board = build_scoreboard(entries.values(), exits.values(), late, grid_db)
+    board = build_scoreboard(entries.values(), exits.values(), late, grid_db, looks=looks, decide=False)
     runs = [r for r in records if r.get("kind") == "run"]
     return {"records": len(records), "last_run": runs[-1] if runs else None,
             "banner": board["banner"], "label": board["label"],

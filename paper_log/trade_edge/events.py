@@ -213,10 +213,12 @@ def stratum(largest_value: float) -> str:
 
 
 class IdentityPolicyError(ValueError):
-    """The journal already holds two scored identities for one economic event.
+    """The journal already holds two scored identities for one economic event,
+    or one (issuer, entry session) slot would need a second position.
 
-    Raised instead of merging or rewriting: which record is canonical is an
-    owner decision for a new log, never a code path.
+    Raised instead of merging or rewriting: which record is canonical, and how
+    late membership of an already entered slot is treated, are owner decisions
+    for a new log, never a code path.
     """
 
 
@@ -238,6 +240,23 @@ def learn_aliases(filings: Iterable[dict], aliases: dict[str, int] | None = None
     return out
 
 
+def _ticker_ciks(filings: list[dict], aliases: dict[str, int] | None) -> dict[str, int]:
+    """ticker -> CIK: the journal's ``aliases`` first, then what the filings carry."""
+    by_ticker: dict[str, int] = {t.strip().upper(): int(c) for t, c in (aliases or {}).items()}
+    for f in filings:
+        if f.get("issuer_cik") and is_resolvable_ticker(f.get("ticker")):
+            by_ticker.setdefault(f["ticker"].strip().upper(), int(f["issuer_cik"]))
+    return by_ticker
+
+
+def canonical_issuer(issuer_key: str, by_ticker: dict[str, int]) -> str:
+    """``ticker:T`` is ``cik:N`` once T's CIK is known; any other key is already canonical."""
+    kind, _, rest = issuer_key.partition(":")
+    if kind == "ticker" and rest in by_ticker:
+        return f"cik:{by_ticker[rest]}"
+    return issuer_key
+
+
 def issuer_keys(filings: Iterable[dict], aliases: dict[str, int] | None = None) -> dict[str, str]:
     """accession -> issuer key: ``cik:N`` when known, else ``ticker:T``.
 
@@ -247,10 +266,7 @@ def issuer_keys(filings: Iterable[dict], aliases: dict[str, int] | None = None) 
     take precedence over anything a later filing claims for the same ticker.
     """
     filings = list(filings)
-    by_ticker: dict[str, int] = {t.strip().upper(): int(c) for t, c in (aliases or {}).items()}
-    for f in filings:
-        if f.get("issuer_cik") and is_resolvable_ticker(f.get("ticker")):
-            by_ticker.setdefault(f["ticker"].strip().upper(), int(f["issuer_cik"]))
+    by_ticker = _ticker_ciks(filings, aliases)
     out: dict[str, str] = {}
     for f in filings:
         if f.get("issuer_cik"):
@@ -342,31 +358,50 @@ def _purchase_keys(filings: dict[str, dict], keys: dict[str, str], accessions: I
 
 def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], recorded: dict[str, dict],
                         aliases: dict[str, int]) -> tuple[dict[str, dict], list[dict]]:
-    """Keep a recorded position's identity for purchases it has already consumed.
+    """Keep recorded identities: one position per purchase and per (issuer, entry session).
 
-    ``recorded`` are the journal's ``signal``/``entry`` records by position id;
-    each lists the accessions whose qualifying lines it consumed. A rebuilt
-    position holding any purchase (same :func:`purchase_key` under the current
-    issuer keys, so a ``ticker:T`` fallback and its later ``cik:N`` enrichment
-    agree) that a recorded position already consumed is that position: it is
-    returned under the recorded id with the recorded entry session, and
-    ``issuer_alias`` names the rebuilt key when it differs. Later enrichment can
-    therefore never open or score the original purchase a second time, whether
-    it lands on the same entry day or, through an earlier ``known_at``, on
-    another. If a rebuilt position is itself recorded and also holds a purchase
-    another recorded position consumed, or holds purchases of two recorded
-    positions, the journal has two identities for one event: refuse
-    (:class:`IdentityPolicyError`) rather than merge or rewrite.
+    ``positions`` are ``group_positions(build_purchases(filings, aliases))``;
+    ``recorded`` are the journal's ``signal``/``entry`` records by position id
+    (an ``entry`` record has ``kind == "entry"``); each lists the accessions
+    whose qualifying lines it consumed.
+
+    1. Purchase identity. A rebuilt position holding any purchase (same
+       :func:`purchase_key` under the current issuer keys, so a ``ticker:T``
+       fallback and its later ``cik:N`` enrichment agree) that a recorded
+       position already consumed is that position: it goes to the recorded id
+       with the recorded entry session, whether enrichment left it on the same
+       entry day or, through an earlier ``known_at``, moved it to another.
+    2. Slot occupancy. Every other rebuilt position whose canonical issuer
+       (:func:`canonical_issuer`) and entry session equal a recorded
+       position's is that slot too. Before entry it is folded into the
+       recorded id, so the one position carries the registered aggregate of
+       all its purchases. A slot already entered is refused: its entry is
+       never rewritten, and treating late membership there is an owner
+       decision, so no second position is opened or scored.
+
+    Rebuilt positions that land on one recorded id are recombined from their
+    purchases with the :func:`group_positions` rules (largest/total values,
+    stratum, actors...) under the recorded id/session, so none is dropped or
+    overwritten; ``issuer_alias`` names the rebuilt key when it differs.
+
+    Refused with :class:`IdentityPolicyError` (never merged or rewritten): a
+    recorded position holding a purchase another recorded position consumed;
+    a rebuilt position holding purchases of two recorded positions; two
+    recorded positions on one canonical (issuer, entry session); and a slot
+    already entered that a distinct purchase group would join.
 
     Returns the reconciled positions and the associations applied.
     """
-    keys = issuer_keys(filings.values(), aliases)
+    flist = list(filings.values())
+    keys = issuer_keys(flist, aliases)
+    by_ticker = _ticker_ciks(flist, aliases)
     consumed: dict[tuple, str] = {}
     for pid, rec in recorded.items():
         for k in _purchase_keys(filings, keys, rec.get("accessions", ())):
             consumed.setdefault(k, pid)
-    out: dict[str, dict] = {}
-    applied: list[dict] = []
+
+    # 1. purchase identity
+    target: dict[str, str] = {}
     for pid, pos in positions.items():
         hits = {consumed[k] for k in _purchase_keys(filings, keys, pos["accessions"]) if k in consumed}
         if pid in recorded:
@@ -374,67 +409,120 @@ def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], re
                 raise IdentityPolicyError(
                     f"journal records {pid!r} and {sorted(hits - {pid})} for one purchase; "
                     "refusing to merge or rewrite (owner decision for a new log)")
+            target[pid] = pid
         elif len(hits) > 1:
             raise IdentityPolicyError(
                 f"rebuilt position {pid!r} holds purchases of two recorded positions {sorted(hits)}; "
                 "refusing to merge or rewrite (owner decision for a new log)")
-        elif hits:
-            (old_id,) = hits
-            rec = recorded[old_id]
-            pos = {**pos, "position_id": old_id, "issuer_key": rec["issuer_key"],
+        else:
+            target[pid] = next(iter(hits)) if hits else pid
+
+    # 2. one position per canonical (issuer, entry session)
+    slots: dict[tuple[str, str], str] = {}
+    for rid in sorted(recorded):
+        rec = recorded[rid]
+        slot = (canonical_issuer(rec["issuer_key"], by_ticker), rec["entry_session"])
+        holder = slots.setdefault(slot, rid)
+        if holder != rid:
+            raise IdentityPolicyError(
+                f"journal records {holder!r} and {rid!r} for one issuer/entry session {slot[0]}|{slot[1]}; "
+                "refusing to merge or rewrite (owner decision for a new log)")
+    for pid, pos in positions.items():
+        if target[pid] != pid or pid in recorded:
+            continue
+        slot = (canonical_issuer(pos["issuer_key"], by_ticker), pos["entry_session"])
+        rid = slots.get(slot)
+        if rid is None:
+            continue
+        if recorded[rid].get("kind") == "entry":
+            raise IdentityPolicyError(
+                f"rebuilt position {pid!r} (accessions {pos['accessions']}) falls in issuer/entry session "
+                f"{slot[0]}|{slot[1]}, already entered as {rid!r}; refusing to open a second position or to "
+                "change the recorded entry (late membership of an entered slot is an owner decision)")
+        target[pid] = rid
+
+    # 3. one reconciled position per target id
+    members: dict[str, list[str]] = {}
+    for pid in positions:
+        members.setdefault(target[pid], []).append(pid)
+    by_pid: dict[str, list[dict]] | None = None
+    out: dict[str, dict] = {}
+    applied: list[dict] = []
+    for tid, pids in members.items():
+        if pids == [tid]:
+            out[tid] = positions[tid]
+            continue
+        rec = recorded[tid]
+        if len(pids) == 1:
+            pos = {**positions[pids[0]], "position_id": tid, "issuer_key": rec["issuer_key"],
                    "entry_session": rec["entry_session"], "entry_close_at": rec["entry_close_at"]}
-            if pos["issuer_key"] != positions[pid]["issuer_key"]:
-                pos["issuer_alias"] = positions[pid]["issuer_key"]
-            applied.append({"position_id": old_id, "superseded_id": pid, "issuer_key": positions[pid]["issuer_key"],
-                            "entry_session": positions[pid]["entry_session"]})
-            pid = old_id
-        out[pid] = pos
+        else:
+            if by_pid is None:
+                by_pid = {}
+                for p in build_purchases(flist, aliases):
+                    by_pid.setdefault(position_id(p["issuer_key"], entry_session(p["known_at"])), []).append(p)
+                if set(by_pid) != set(positions):
+                    raise ValueError("positions were not rebuilt from these filings and aliases")
+            ps = [p for pid in pids for p in by_pid[pid]]
+            ps.sort(key=lambda r: (r["issuer_key"], r["known_at"], r["actor"], r["trans_date"]))
+            pos = _position(tid, rec["issuer_key"], rec["entry_session"], rec["entry_close_at"], ps)
+        rebuilt_keys = sorted({positions[pid]["issuer_key"] for pid in pids} - {rec["issuer_key"]})
+        if rebuilt_keys:
+            pos["issuer_alias"] = rebuilt_keys[0]
+        for pid in pids:
+            if pid != tid:
+                applied.append({"position_id": tid, "superseded_id": pid,
+                                "issuer_key": positions[pid]["issuer_key"],
+                                "entry_session": positions[pid]["entry_session"]})
+        out[tid] = pos
     return out, applied
 
 
-def group_positions(purchases: Iterable[dict]) -> dict[str, dict]:
-    """One position per (issuer, entry session), never per insider-day line."""
-    positions: dict[str, dict] = {}
-    for p in purchases:
-        entry = entry_session(p["known_at"])
-        pid = position_id(p["issuer_key"], entry)
-        pos = positions.get(pid)
-        if pos is None:
-            pos = positions[pid] = {
-                "position_id": pid,
-                "issuer_key": p["issuer_key"],
-                "issuer_cik": p["issuer_cik"],
-                "issuer_name": p["issuer_name"],
-                "ticker": p["ticker"],
-                "entry_session": entry.isoformat(),
-                "entry_close_at": close_instant(entry).isoformat(),
-                "_purchases": [],
-            }
-        pos["_purchases"].append(p)
+def _position(pid: str, issuer_key: str, entry: str, entry_close_at: str, ps: list[dict]) -> dict:
+    """One position over its purchases ``ps`` (registered aggregation, §3)."""
+    pos = {
+        "position_id": pid,
+        "issuer_key": issuer_key,
+        "issuer_cik": ps[0]["issuer_cik"],
+        "issuer_name": ps[0]["issuer_name"],
+        "ticker": ps[0]["ticker"],
+        "entry_session": entry,
+        "entry_close_at": entry_close_at,
+    }
+    for p in ps:
         if not pos["issuer_name"] and p["issuer_name"]:
             pos["issuer_name"] = p["issuer_name"]
         if not is_resolvable_ticker(pos["ticker"]) and is_resolvable_ticker(p["ticker"]):
             pos["ticker"] = p["ticker"]
-    for pos in positions.values():
-        ps = pos.pop("_purchases")
-        values = [p["value"] for p in ps]
-        names = sorted({n for p in ps for n in p["owner_names"] if n})
-        pos.update(
-            {
-                "accessions": sorted({p["accession"] for p in ps}),
-                "actors": sorted({p["actor"] for p in ps}),
-                "n_actors": len({p["actor"] for p in ps}),
-                "insider_names": names,
-                "n_purchases": len(ps),
-                "total_value": round(sum(values), 2),
-                "largest_value": round(max(values), 2),
-                "stratum": stratum(max(values)),
-                "filing_dates": sorted({p["filing_date"] for p in ps}),
-                "acceptance_at": sorted({p["acceptance_at"] for p in ps if p["acceptance_at"]}),
-                "first_known_at": min(p["known_at"] for p in ps).isoformat(),
-                "last_known_at": max(p["known_at"] for p in ps).isoformat(),
-                "sources": sorted({p["source"] or "?" for p in ps}),
-                "ticker_resolved": is_resolvable_ticker(pos["ticker"]),
-            }
-        )
-    return positions
+    values = [p["value"] for p in ps]
+    names = sorted({n for p in ps for n in p["owner_names"] if n})
+    pos.update(
+        {
+            "accessions": sorted({p["accession"] for p in ps}),
+            "actors": sorted({p["actor"] for p in ps}),
+            "n_actors": len({p["actor"] for p in ps}),
+            "insider_names": names,
+            "n_purchases": len(ps),
+            "total_value": round(sum(values), 2),
+            "largest_value": round(max(values), 2),
+            "stratum": stratum(max(values)),
+            "filing_dates": sorted({p["filing_date"] for p in ps}),
+            "acceptance_at": sorted({p["acceptance_at"] for p in ps if p["acceptance_at"]}),
+            "first_known_at": min(p["known_at"] for p in ps).isoformat(),
+            "last_known_at": max(p["known_at"] for p in ps).isoformat(),
+            "sources": sorted({p["source"] or "?" for p in ps}),
+            "ticker_resolved": is_resolvable_ticker(pos["ticker"]),
+        }
+    )
+    return pos
+
+
+def group_positions(purchases: Iterable[dict]) -> dict[str, dict]:
+    """One position per (issuer, entry session), never per insider-day line."""
+    groups: dict[str, tuple[str, date, list[dict]]] = {}
+    for p in purchases:
+        entry = entry_session(p["known_at"])
+        pid = position_id(p["issuer_key"], entry)
+        groups.setdefault(pid, (p["issuer_key"], entry, []))[2].append(p)
+    return {pid: _position(pid, key, entry.isoformat(), close_instant(entry).isoformat(), ps)
+            for pid, (key, entry, ps) in groups.items()}
