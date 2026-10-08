@@ -229,6 +229,12 @@ VIX_SERIES = 'VIXCLS'
 VIX_FALLBACK_SERIES = 'CBOE:VIX'
 VIX_GAP_FILLED_BASIS = 'VIXCLS+CBOE:VIX'
 SERIES_SOURCES: dict[str, str] = {VIX_FALLBACK_SERIES: 'CBOE'}
+# A backup series is read for numeric use only: a SUCCESS row whose value is
+# not a finite number (NaN, +/-inf) is not an observation, the same way the
+# reader already treats NULL, so it can neither fill a date, nor count toward
+# ``min_history``, nor enter the z-score history. VIXCLS and every other
+# primary series keep the reader's unchanged behaviour.
+FINITE_ONLY_SERIES: frozenset[str] = frozenset({VIX_FALLBACK_SERIES})
 
 # Raw ``YF:SPY:close`` fallback (E1-V1). A daily close is public when its
 # session ends (16:00 America/New_York = 20:00/21:00 UTC), so the close dated
@@ -345,7 +351,8 @@ def _fetch_series(
     :data:`PUBLICATION_LAGS` entry puts its release on or before ``as_of``
     (earliest pulled vintage). A series not in :data:`PUBLICATION_LAGS` gets
     no modeled path (pull evidence only). A series in :data:`SERIES_SOURCES`
-    is read from that source only. A series_id whose selected rows
+    is read from that source only; one in :data:`FINITE_ONLY_SERIES` keeps
+    only finite values. A series_id whose selected rows
     span more than one source (``store.observations.MixedSourceError``)
     degrades to an empty series rather than silently mixing sources; the
     caller already treats a short or empty series as "dimension unavailable".
@@ -362,10 +369,13 @@ def _fetch_series(
         return pd.Series(dtype=float)
     if not obs:
         return pd.Series(dtype=float)
-    return pd.Series(
+    series = pd.Series(
         {o.obs_date: o.value for o in obs},
         dtype=float,
     ).sort_index()
+    if series_id in FINITE_ONLY_SERIES:
+        series = series[np.isfinite(series.to_numpy())]
+    return series
 
 
 class _AsOfReader:
@@ -398,9 +408,17 @@ class _AsOfReader:
         return self._windows[series_id]
 
     def append(self, series_id: str, extra: pd.Series) -> None:
-        """Append later-dated observations to both memoized reads of ``series_id``."""
-        self._full[series_id] = pd.concat([self.full(series_id), extra]).sort_index()
-        self._windows[series_id] = pd.concat([self.window(series_id), extra]).sort_index()
+        """Append later-dated observations to both memoized reads of ``series_id``.
+
+        Both expanded series are built before either memo is assigned, so a
+        failure while building the second one leaves both reads exactly as
+        they were: the value/percentile window and the normalization history
+        can never disagree about which observations they contain.
+        """
+        full = pd.concat([self.full(series_id), extra]).sort_index()
+        window = pd.concat([self.window(series_id), extra]).sort_index()
+        self._full[series_id] = full
+        self._windows[series_id] = window
 
 
 def _resolve_vix_series(reader: _AsOfReader) -> str | None:
@@ -408,7 +426,9 @@ def _resolve_vix_series(reader: _AsOfReader) -> str | None:
 
     :data:`VIX_SERIES` whenever its known-at compute window has the
     ``min_history`` those dimensions need, else :data:`VIX_FALLBACK_SERIES`
-    under the same test, else ``None``. The fallback is therefore read only
+    under the same test (its window holds only finite closes, see
+    :data:`FINITE_ONLY_SERIES`, so the count is of numerically usable
+    history), else ``None``. The fallback is therefore read only
     when the VIXCLS dimensions would otherwise be unavailable; a vector whose
     VIXCLS is usable is computed exactly as before and never touches
     CBOE:VIX.
@@ -440,7 +460,10 @@ def _fill_vix_trailing_gap(reader: _AsOfReader) -> int:
     read (CBOE:VIX is not read at all, except the day after a federal holiday
     the horizon still counts, where nothing can be filled). Fills dates
     strictly after that close and no later than the horizon, from CBOE:VIX
-    closes known at ``as_of``. Dates VIXCLS has are never touched.
+    closes known at ``as_of``. Dates VIXCLS has are never touched. Only
+    finite Cboe closes are used: a NaN or infinite backup value fills nothing
+    for its date, and when nothing finite remains the series and its label
+    stay plain VIXCLS.
     """
     vixcls = reader.window(VIX_SERIES)
     if vixcls.empty:
@@ -451,6 +474,7 @@ def _fill_vix_trailing_gap(reader: _AsOfReader) -> int:
         return 0
     cboe = reader.window(VIX_FALLBACK_SERIES)
     fill = cboe[(cboe.index > last) & (cboe.index <= horizon)]
+    fill = fill[np.isfinite(fill.to_numpy())]
     if fill.empty:
         return 0
     reader.append(VIX_SERIES, fill)

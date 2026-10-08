@@ -16,6 +16,11 @@ the same next-business-day lag. These tests pin:
 * Late VIXCLS: only its trailing gap is filled from CBOE:VIX, never past the
   date VIXCLS itself would be modeled as published by ``as_of``, and never
   over a close VIXCLS has.
+* Robustness (independent review of ae990424, findings F1/F2): a failure
+  while appending the fill leaves both memoized reads untouched, so value,
+  percentile and z-score history never diverge; non-finite backup closes
+  (NaN, +/-inf) never fill a date, never count toward ``min_history`` and
+  never enter the normalization history.
 
 Fixture: real ``raw_series`` + ``source_catalog`` on in-memory SQLite, the
 same shape as ``tests/test_regime_state_vector_pit.py``.
@@ -517,3 +522,186 @@ def test_failed_gap_fill_keeps_plain_vixcls(engine, monkeypatch):
 
     assert unfilled.vix_basis == sv.vix_basis == "VIXCLS"
     assert sv.values == unfilled.values
+
+
+# ── Review findings on ae990424: partial append (F1), non-finite backup (F2) ──
+
+
+def test_append_stages_both_series_before_assigning_either(engine, monkeypatch):
+    """F1: a failure building the second expanded series leaves BOTH memos as read."""
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    reader = sv_mod._AsOfReader(engine, AS_OF)
+    full_before = reader.full("VIXCLS").copy()
+    window_before = reader.window("VIXCLS").copy()
+    extra = pd.Series({date(2025, 6, 5): 31.0, date(2025, 6, 6): 32.0}, dtype=float)
+    real_concat = sv_mod.pd.concat
+    calls = 0
+
+    def fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise MemoryError("synthetic failure building the second series")
+        return real_concat(*args, **kwargs)
+
+    monkeypatch.setattr(sv_mod.pd, "concat", fail_second)
+    with pytest.raises(MemoryError):
+        reader.append("VIXCLS", extra)
+
+    assert calls == 2
+    assert reader.full("VIXCLS").equals(full_before)
+    assert reader.window("VIXCLS").equals(window_before)
+    assert date(2025, 6, 5) not in reader.full("VIXCLS").index
+
+
+@pytest.mark.parametrize("fail_update", [1, 2])
+def test_append_failure_inside_the_real_fill_keeps_the_plain_vector(engine, monkeypatch, fail_update):
+    """F1 end to end (reviewer 01a11609's counterexample; parameter 2 is the one ae990424 failed).
+
+    VIXCLS stops at 06-04; deliberately different CBOE closes exist through
+    the horizon. The first or the second ``pd.concat`` that the real
+    ``_AsOfReader.append`` issues raises. The vector must be the plain
+    VIXCLS vector in both cases: same values, same label, and in particular
+    no CBOE close in the z-score history while the value window has none.
+    """
+    import inspect
+
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    baseline = sv_mod.compute_state_vector(engine, AS_OF)
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe_value)
+    real_concat = sv_mod.pd.concat
+    updates = 0
+
+    def fail_inside_append(*args, **kwargs):
+        nonlocal updates
+        caller = inspect.currentframe().f_back
+        if caller.f_code is sv_mod._AsOfReader.append.__code__:
+            updates += 1
+            if updates == fail_update:
+                raise MemoryError(f"synthetic failure at append update {fail_update}")
+        return real_concat(*args, **kwargs)
+
+    monkeypatch.setattr(sv_mod.pd, "concat", fail_inside_append)
+    actual = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert updates == fail_update
+    assert actual.vix_basis == baseline.vix_basis == "VIXCLS"
+    assert actual.values == baseline.values
+    assert actual.stale_dimensions == baseline.stale_dimensions
+
+
+def test_cboe_window_read_failure_keeps_vixcls(engine, monkeypatch):
+    """The optional backup read failing (not just the fill) leaves the VIXCLS vector intact."""
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    baseline = sv_mod.compute_state_vector(engine, AS_OF)
+    real_fetch = sv_mod._fetch_series
+
+    def failing_read(engine, sid, as_of, lookback_days=sv_mod.VALUE_LOOKBACK_DAYS):
+        if sid == sv_mod.VIX_FALLBACK_SERIES:
+            raise RuntimeError("synthetic CBOE read failure")
+        return real_fetch(engine, sid, as_of, lookback_days)
+
+    monkeypatch.setattr(sv_mod, "_fetch_series", failing_read)
+    actual = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert actual.values == baseline.values
+    assert actual.vix_basis == "VIXCLS"
+
+
+@pytest.mark.parametrize("bad", [float("inf"), float("-inf")])
+def test_nonfinite_cboe_tail_does_not_poison_valid_vixcls(engine, bad):
+    """F2 (reviewer 01a11609's counterexample): a non-finite backup close fills nothing.
+
+    VIXCLS is usable but one day late; the only CBOE close in the gap is not
+    a finite number. The vector must be exactly the plain VIXCLS vector with
+    the plain label. NaN cannot be stored through this schema (SQLite binds
+    it as NULL and ``raw_series.value`` is NOT NULL; the reader drops NULL
+    anyway), so NaN reaching the fill by any route is covered by
+    ``test_fill_itself_ignores_nonfinite_backup_values`` instead.
+    """
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 6))
+    baseline = sv_mod.compute_state_vector(engine, AS_OF)
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": LAST_KNOWN,
+                      "ts": datetime(2026, 3, 24), "v": bad}])
+
+    actual = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert all(v is None or math.isfinite(v) for v in _vix_dims(actual))
+    assert actual.values == baseline.values
+    assert actual.vix_basis == "VIXCLS"
+    assert LAST_KNOWN not in sv_mod._AsOfReader(engine, AS_OF).window("CBOE:VIX").index
+
+
+def test_mixed_finite_and_nonfinite_cboe_tail_fills_only_the_finite_dates(engine):
+    """F2: inf on 06-05, finite on 06-06 and 06-09 -> two dates filled, 06-05 left open."""
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    _insert(engine, [
+        {"sid": "CBOE:VIX", "src": CBOE_SRC, "d": date(2025, 6, 5), "ts": BACKFILL_TS, "v": float("inf")},
+        {"sid": "CBOE:VIX", "src": CBOE_SRC, "d": date(2025, 6, 6), "ts": BACKFILL_TS, "v": 40.0},
+        {"sid": "CBOE:VIX", "src": CBOE_SRC, "d": LAST_KNOWN, "ts": BACKFILL_TS, "v": 41.0},
+    ])
+
+    reader = sv_mod._AsOfReader(engine, AS_OF)
+    assert sv_mod._fill_vix_trailing_gap(reader) == 2
+    filled = reader.window("VIXCLS")
+    assert date(2025, 6, 5) not in filled.index
+    assert filled.index[-1] == LAST_KNOWN
+    assert bool(pd.Series(filled.to_numpy()).map(math.isfinite).all())
+
+    sv = sv_mod.compute_state_vector(engine, AS_OF)
+    assert sv.vix_basis == "VIXCLS+CBOE:VIX"
+    points = _vixcls_by_date(date(2025, 6, 4))
+    points.update({date(2025, 6, 6): 40.0, LAST_KNOWN: 41.0})
+    assert _vix_dims(sv) == pytest.approx(_expected_from(points), rel=1e-12)
+
+
+def test_fill_itself_ignores_nonfinite_backup_values(engine):
+    """F2 at the fill: NaN and +/-inf reaching the fill (any route) never enter either memo."""
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vixcls_value, end=date(2025, 6, 4))
+    reader = sv_mod._AsOfReader(engine, AS_OF)
+    reader._windows["CBOE:VIX"] = pd.Series(
+        {date(2025, 6, 5): float("nan"), date(2025, 6, 6): float("-inf"), LAST_KNOWN: 44.0},
+        dtype=float,
+    )
+    before = reader.full("VIXCLS").copy()
+
+    assert sv_mod._fill_vix_trailing_gap(reader) == 1
+    for series in (reader.full("VIXCLS"), reader.window("VIXCLS")):
+        assert series.index[-1] == LAST_KNOWN
+        assert date(2025, 6, 5) not in series.index and date(2025, 6, 6) not in series.index
+        assert bool(pd.Series(series.to_numpy()).map(math.isfinite).all())
+    assert reader.full("VIXCLS").loc[before.index].equals(before)
+
+
+def test_whole_fallback_min_history_counts_only_finite_closes(engine):
+    """F2 at the selector: 99 finite + 1 inf is not 100 usable rows; 100 finite + 1 inf is."""
+    import intelligence.regime.state_vector as sv_mod
+
+    dates = list(_bdays(HIST_START, LAST_KNOWN))
+    finite = dates[-99:]
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": d, "ts": BACKFILL_TS, "v": float(i + 10)}
+                     for i, d in enumerate(finite)])
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": dates[-100], "ts": BACKFILL_TS,
+                      "v": float("inf")}])
+    short = sv_mod.compute_state_vector(engine, AS_OF)
+    assert short.vix_basis is None
+    assert _vix_dims(short) == (None, None)
+
+    _insert(engine, [{"sid": "CBOE:VIX", "src": CBOE_SRC, "d": dates[-101], "ts": BACKFILL_TS, "v": 9.0}])
+    enough = sv_mod.compute_state_vector(engine, AS_OF)
+    assert enough.vix_basis == "CBOE:VIX"
+    points = {dates[-101]: 9.0, **{d: float(i + 10) for i, d in enumerate(finite)}}
+    assert _vix_dims(enough) == pytest.approx(_expected_from(points), rel=1e-12)
+    assert all(math.isfinite(v) for v in _vix_dims(enough))
