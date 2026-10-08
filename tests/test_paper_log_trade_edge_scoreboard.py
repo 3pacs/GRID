@@ -173,3 +173,109 @@ def test_build_scoreboard_splits_and_survivorship_warning():
     assert m["survivorship_warning"] is True
     assert board["label"]["label"] == LABEL_UNPROVEN
     assert board["banner"].startswith("UNPROVEN — not investment advice")
+
+
+# ── §10 looks are decided once and read back (review finding F1) ───────────
+
+
+def look_rec(n, decision, members=None, boundary="2026-12-31"):
+    members = members if members is not None else [f"cik:{i}|2026-10-08" for i in range(n)]
+    return {"kind": "look", "n": n, "boundary_exit_session": boundary, "members": list(members),
+            "stats": {"n": n, "clustered_t": 0.1, "n_clusters": 50, "median_net_excess": 0.0, "mean_net_excess": 0.0},
+            "decision": decision, "terminal": decision in sb.TERMINAL_LABELS}
+
+
+def test_look_waits_for_a_delayed_earlier_exit_then_decides_once():
+    rows = closed_rows(alternating(100, 0.08, 0.01))
+    boundary = sb.ordered_closed(rows)[99]["exit_session"]
+    blocked = sb.label_state(rows, {}, pending_exit_sessions=[boundary], decide=True)
+    assert blocked["label"] == LABEL_UNPROVEN and blocked["new_looks"] == []
+    assert blocked["look_pending"] == {"n": 100, "boundary_exit_session": boundary, "blocked_by_positions": 1,
+                                       "deferred_filings": 0, "decidable": False}
+    later = (date.fromisoformat(boundary) + timedelta(days=1)).isoformat()
+    decided = sb.label_state(rows, {}, pending_exit_sessions=[later], decide=True)
+    assert decided["label"] == LABEL_SUPPORTED and decided["basis"] == "decided_this_run"
+    (rec,) = decided["new_looks"]
+    assert rec["kind"] == "look" and rec["n"] == 100 and rec["terminal"] is True
+    assert rec["members"] == [r["position_id"] for r in sb.ordered_closed(rows)[:100]]
+    assert rec["boundary_exit_session"] == boundary and rec["stats"] == decided["look_stats"]
+
+
+def test_decided_look_is_immutable_when_an_earlier_exit_arrives_later():
+    rows = closed_rows(alternating(100, 0.08, 0.01))
+    (rec,) = sb.label_state(rows, {}, decide=True)["new_looks"]
+    late = {"net_excess": -0.90, "entry_session": "2026-09-01", "exit_session": "2026-10-01",
+            "position_id": "cik:late|2026-09-01"}
+    # re-selecting the first 100 would now include the late row
+    assert late["position_id"] in {r["position_id"] for r in sb.ordered_closed(rows + [late])[:100]}
+    state = sb.label_state(rows + [late], {100: rec}, decide=True)
+    assert state["label"] == LABEL_SUPPORTED and state["basis"] == "journal"
+    assert state["decided_at_look"] == 100 and state["look_stats"] == rec["stats"]
+    assert state["late_arrivals_after_look"] == 1 and state["new_looks"] == []
+
+
+def test_unsuccessful_look_is_not_rerun_with_changed_membership():
+    noise = closed_rows(alternating(100, 0.05, -0.05))
+    (rec,) = sb.label_state(noise, {}, decide=True)["new_looks"]
+    assert rec["decision"] == LABEL_UNPROVEN and rec["terminal"] is False
+    strong = [{"net_excess": 0.10, "entry_session": (date(2026, 8, 1) + timedelta(days=i % 40)).isoformat(),
+               "exit_session": (date(2026, 9, 15) + timedelta(days=i % 10)).isoformat(),
+               "position_id": f"cik:early{i}|2026-08"} for i in range(60)]
+    assert sb.label_state(strong + noise, {}, decide=True)["label"] == LABEL_SUPPORTED  # a re-selection would pass
+    state = sb.label_state(strong + noise, {100: rec}, decide=True)
+    assert state["label"] == LABEL_UNPROVEN and state["looks_done"] == 1
+    assert state["next_look_at_n_closed"] == 200 and state["look_stats"] == rec["stats"]
+    assert state["late_arrivals_after_look"] == 60 and state["new_looks"] == []
+
+
+def test_terminal_looks_read_back_from_journal_and_policy_refusals():
+    contrary = sb.label_state([], {100: look_rec(100, LABEL_CONTRARY)}, decide=True)
+    assert contrary["label"] == LABEL_CONTRARY and contrary["looks_done"] == 1 and contrary["new_looks"] == []
+    three = {100: look_rec(100, LABEL_UNPROVEN), 200: look_rec(200, LABEL_UNPROVEN),
+             300: look_rec(300, LABEL_NOT_SUPPORTED)}
+    ns = sb.label_state([], three, decide=True)
+    assert ns["label"] == LABEL_NOT_SUPPORTED and ns["looks_done"] == 3 and ns["decided_at_look"] == 300
+    with pytest.raises(sb.LookPolicyError):
+        sb.label_state([], {200: look_rec(200, LABEL_UNPROVEN)})
+    with pytest.raises(sb.LookPolicyError):
+        sb.label_state([], {100: look_rec(100, LABEL_SUPPORTED), 200: look_rec(200, LABEL_UNPROVEN)})
+    with pytest.raises(sb.LookPolicyError):
+        sb.label_state([], {100: look_rec(100, LABEL_UNPROVEN, members=["x"] * 99)})
+
+
+def test_decide_false_and_deferred_filings_never_decide():
+    rows = closed_rows(alternating(100, 0.08, 0.01))
+    view = sb.label_state(rows, {}, decide=False)
+    assert view["label"] == LABEL_UNPROVEN and view["new_looks"] == []
+    assert view["look_pending"]["decidable"] is True and view["basis"] == "interim"
+    deferred = sb.label_state(rows, {}, pending_filings=1, decide=True)
+    assert deferred["label"] == LABEL_UNPROVEN and deferred["new_looks"] == []
+    assert deferred["look_pending"]["deferred_filings"] == 1 and deferred["look_pending"]["decidable"] is False
+
+
+def test_two_looks_decided_in_one_run_and_third_is_terminal():
+    noise = alternating(300, 0.05, -0.05)
+    first = sb.label_state(closed_rows(noise[:250]), {}, decide=True)
+    assert [r["n"] for r in first["new_looks"]] == [100, 200]
+    assert all(r["decision"] == LABEL_UNPROVEN and not r["terminal"] for r in first["new_looks"])
+    assert first["label"] == LABEL_UNPROVEN and first["looks_done"] == 2 and first["next_look_at_n_closed"] == 300
+    journal = {r["n"]: r for r in first["new_looks"]}
+    final = sb.label_state(closed_rows(noise), journal, decide=True)
+    assert [r["n"] for r in final["new_looks"]] == [300] and final["new_looks"][0]["terminal"] is True
+    assert final["label"] == LABEL_NOT_SUPPORTED and final["looks_done"] == 3
+
+
+def test_build_scoreboard_reads_journal_looks_and_only_decides_when_asked():
+    entries = [{"position_id": f"cik:{i}|2026-10-08", "status": "opened", "stratum": "large",
+                "cap_bucket": ">=2B", "entry_session": (date(2026, 10, 8) + timedelta(days=i % 50)).isoformat()}
+               for i in range(100)]
+    exits = [{"position_id": e["position_id"], "horizon": 30, "status": "closed", "net_excess": 0.08 if i % 2 == 0 else 0.01,
+              "gross_excess": 0.09, "exit_session": (date(2026, 11, 20) + timedelta(days=i % 50)).isoformat()}
+             for i, e in enumerate(entries)]
+    quiet = sb.build_scoreboard(entries, exits)
+    assert quiet["label"]["label"] == LABEL_UNPROVEN and quiet["new_looks"] == []
+    assert quiet["label"]["look_pending"]["decidable"] is True
+    decided = sb.build_scoreboard(entries, exits, looks={}, decide=True)
+    assert decided["label"]["label"] == LABEL_SUPPORTED and [r["n"] for r in decided["new_looks"]] == [100]
+    journal = sb.build_scoreboard(entries, exits, looks={100: look_rec(100, LABEL_CONTRARY)})
+    assert journal["label"]["label"] == LABEL_CONTRARY and journal["banner"].startswith("CONTRARY")

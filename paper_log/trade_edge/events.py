@@ -212,14 +212,42 @@ def stratum(largest_value: float) -> str:
 # ── purchases and positions (§2.3, §3) ──────────────────────────────────────
 
 
-def issuer_keys(filings: Iterable[dict]) -> dict[str, str]:
+class IdentityPolicyError(ValueError):
+    """The journal already holds two scored identities for one economic event.
+
+    Raised instead of merging or rewriting: which record is canonical is an
+    owner decision for a new log, never a code path.
+    """
+
+
+def learn_aliases(filings: Iterable[dict], aliases: dict[str, int] | None = None) -> list[dict]:
+    """New ticker -> CIK associations in ``filings`` not yet in ``aliases`` (first wins).
+
+    Returned in filing order as ``{"ticker", "cik", "accession"}``; the caller
+    appends them as ``alias`` journal records so the association is append-only
+    and survives restarts.
+    """
+    known = dict(aliases or {})
+    out: list[dict] = []
+    for f in filings:
+        if f.get("issuer_cik") and is_resolvable_ticker(f.get("ticker")):
+            t = f["ticker"].strip().upper()
+            if t not in known:
+                known[t] = int(f["issuer_cik"])
+                out.append({"ticker": t, "cik": known[t], "accession": f["accession"]})
+    return out
+
+
+def issuer_keys(filings: Iterable[dict], aliases: dict[str, int] | None = None) -> dict[str, str]:
     """accession -> issuer key: ``cik:N`` when known, else ``ticker:T``.
 
     A ``grid_db`` accession (no CIK) whose ticker some CIK-keyed accession also
-    carries is mapped to that CIK so one issuer never yields two keys.
+    carries is mapped to that CIK so one issuer never yields two keys. The
+    journal's append-only ``aliases`` (ticker -> CIK, first association wins)
+    take precedence over anything a later filing claims for the same ticker.
     """
     filings = list(filings)
-    by_ticker: dict[str, int] = {}
+    by_ticker: dict[str, int] = {t.strip().upper(): int(c) for t, c in (aliases or {}).items()}
     for f in filings:
         if f.get("issuer_cik") and is_resolvable_ticker(f.get("ticker")):
             by_ticker.setdefault(f["ticker"].strip().upper(), int(f["issuer_cik"]))
@@ -241,14 +269,15 @@ def actor_sort_key(actor: str) -> tuple:
     return (1, 0, actor)
 
 
-def build_purchases(filings: Iterable[dict]) -> list[dict]:
+def build_purchases(filings: Iterable[dict], aliases: dict[str, int] | None = None) -> list[dict]:
     """Qualifying purchases, de-duplicated across accessions (VS1 §2.1 (b)).
 
     ``filings`` are ``filing`` records (§2.1). Each line already carries its
-    ``exclusion``; only lines with none are purchases.
+    ``exclusion``; only lines with none are purchases. ``aliases`` are the
+    journal's ticker -> CIK associations (see :func:`issuer_keys`).
     """
     filings = list(filings)
-    keys = issuer_keys(filings)
+    keys = issuer_keys(filings, aliases)
     rows: list[dict] = []
     for f in filings:
         known_at = _as_dt(f["known_at"])
@@ -277,7 +306,7 @@ def build_purchases(filings: Iterable[dict]) -> list[dict]:
             )
     groups: dict[tuple, list[dict]] = {}
     for r in rows:
-        k = (r["issuer_key"], r["trans_date"], round(r["shares"]), round(r["price"], 2))
+        k = purchase_key(r["issuer_key"], r["trans_date"], r["shares"], r["price"])
         groups.setdefault(k, []).append(r)
     out = []
     for members in groups.values():
@@ -292,6 +321,75 @@ def build_purchases(filings: Iterable[dict]) -> list[dict]:
 
 def position_id(issuer_key: str, entry: date) -> str:
     return f"{issuer_key}|{entry.isoformat()}"
+
+
+def purchase_key(issuer_key: str, trans_date: Any, shares: float, price: float) -> tuple:
+    """The economic-purchase identity used to de-duplicate reports (VS1 §2.1 (b))."""
+    return (issuer_key, str(trans_date)[:10], round(float(shares)), round(float(price), 2))
+
+
+def _purchase_keys(filings: dict[str, dict], keys: dict[str, str], accessions: Iterable[str]) -> set[tuple]:
+    out: set[tuple] = set()
+    for acc in accessions:
+        f = filings.get(acc)
+        if f is None:
+            continue
+        for line in f.get("lines", []):
+            if not line.get("exclusion"):
+                out.add(purchase_key(keys[acc], line["trans_date"], line["shares"], line["price"]))
+    return out
+
+
+def reconcile_positions(positions: dict[str, dict], filings: dict[str, dict], recorded: dict[str, dict],
+                        aliases: dict[str, int]) -> tuple[dict[str, dict], list[dict]]:
+    """Keep a recorded position's identity for purchases it has already consumed.
+
+    ``recorded`` are the journal's ``signal``/``entry`` records by position id;
+    each lists the accessions whose qualifying lines it consumed. A rebuilt
+    position holding any purchase (same :func:`purchase_key` under the current
+    issuer keys, so a ``ticker:T`` fallback and its later ``cik:N`` enrichment
+    agree) that a recorded position already consumed is that position: it is
+    returned under the recorded id with the recorded entry session, and
+    ``issuer_alias`` names the rebuilt key when it differs. Later enrichment can
+    therefore never open or score the original purchase a second time, whether
+    it lands on the same entry day or, through an earlier ``known_at``, on
+    another. If a rebuilt position is itself recorded and also holds a purchase
+    another recorded position consumed, or holds purchases of two recorded
+    positions, the journal has two identities for one event: refuse
+    (:class:`IdentityPolicyError`) rather than merge or rewrite.
+
+    Returns the reconciled positions and the associations applied.
+    """
+    keys = issuer_keys(filings.values(), aliases)
+    consumed: dict[tuple, str] = {}
+    for pid, rec in recorded.items():
+        for k in _purchase_keys(filings, keys, rec.get("accessions", ())):
+            consumed.setdefault(k, pid)
+    out: dict[str, dict] = {}
+    applied: list[dict] = []
+    for pid, pos in positions.items():
+        hits = {consumed[k] for k in _purchase_keys(filings, keys, pos["accessions"]) if k in consumed}
+        if pid in recorded:
+            if hits - {pid}:
+                raise IdentityPolicyError(
+                    f"journal records {pid!r} and {sorted(hits - {pid})} for one purchase; "
+                    "refusing to merge or rewrite (owner decision for a new log)")
+        elif len(hits) > 1:
+            raise IdentityPolicyError(
+                f"rebuilt position {pid!r} holds purchases of two recorded positions {sorted(hits)}; "
+                "refusing to merge or rewrite (owner decision for a new log)")
+        elif hits:
+            (old_id,) = hits
+            rec = recorded[old_id]
+            pos = {**pos, "position_id": old_id, "issuer_key": rec["issuer_key"],
+                   "entry_session": rec["entry_session"], "entry_close_at": rec["entry_close_at"]}
+            if pos["issuer_key"] != positions[pid]["issuer_key"]:
+                pos["issuer_alias"] = positions[pid]["issuer_key"]
+            applied.append({"position_id": old_id, "superseded_id": pid, "issuer_key": positions[pid]["issuer_key"],
+                            "entry_session": positions[pid]["entry_session"]})
+            pid = old_id
+        out[pid] = pos
+    return out, applied
 
 
 def group_positions(purchases: Iterable[dict]) -> dict[str, dict]:

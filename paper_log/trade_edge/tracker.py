@@ -20,11 +20,13 @@ from paper_log.trade_edge.config import (
     PRICE_GRACE_SESSIONS,
     PREREG_PATH,
     PREREG_SHA256,
+    PRIMARY_HORIZON,
     ST_CLOSED,
     ST_CLOSED_DELISTED,
     ST_NO_PRICE,
     ST_OPENED,
     ST_UNRESOLVED,
+    STRATUM_LARGE,
     VERSION,
 )
 from paper_log.trade_edge.events import (
@@ -36,12 +38,20 @@ from paper_log.trade_edge.events import (
     entry_session,
     group_positions,
     last_completed_session,
+    learn_aliases,
     line_exclusion,
+    reconcile_positions,
     sessions_after,
     shift_sessions,
     yahoo_symbol,
 )
-from paper_log.trade_edge.scoreboard import build_scoreboard, cost_round_trip
+from paper_log.trade_edge.scoreboard import (
+    LOOK_KIND,
+    TERMINAL_LABELS,
+    LookPolicyError,
+    build_scoreboard,
+    cost_round_trip,
+)
 from paper_log.trade_edge.sec import FetchDeferred, SubmissionError
 
 EXCL_NO_FILING_DATE = "no_filing_date"
@@ -86,6 +96,11 @@ def header_record(now: datetime, code_sha: str) -> dict:
 
 
 class State:
+    """Replay of the journal. ``look`` and ``alias`` records (both append-only)
+    carry the decisions later runs must consume: a decided look is never
+    re-evaluated and a ticker -> CIK association never changes.
+    """
+
     def __init__(self, records: list[dict]) -> None:
         self.header = records[0] if records else None
         self.filings: dict[str, dict] = {}
@@ -94,8 +109,12 @@ class State:
         self.entries: dict[str, dict] = {}
         self.exits: dict[tuple[str, int], dict] = {}
         self.marks: list[dict] = []
+        self.looks: dict[int, dict] = {}
+        self.aliases: dict[str, int] = {}
+        self.run_labels: list[str] = []
         for r in records:
             self.add(r)
+        self.check_policy()
 
     def add(self, r: dict) -> None:
         kind = r.get("kind")
@@ -110,6 +129,34 @@ class State:
             self.exits[(r["position_id"], int(r["horizon"]))] = r
         elif kind == "marks":
             self.marks.append(r)
+        elif kind == LOOK_KIND:
+            self.looks[int(r["n"])] = r
+        elif kind == "alias":
+            self.aliases.setdefault(r["ticker"].strip().upper(), int(r["cik"]))
+        elif kind == "run" and r.get("label") is not None:
+            self.run_labels.append(r["label"])
+
+    def check_policy(self) -> None:
+        """Refuse a journal whose recorded label was decided without a look record.
+
+        A ``run`` record labelled SUPPORTED/CONTRARY/NOT_SUPPORTED with no
+        terminal ``look`` record was written under the earlier re-selection
+        rule; this code neither rewrites that history nor re-decides it. The
+        boundary is an owner decision (a new v3 log), so the run refuses.
+        """
+        terminal_runs = [lab for lab in self.run_labels if lab in TERMINAL_LABELS]
+        if terminal_runs and not any(rec.get("terminal") for rec in self.looks.values()):
+            raise LookPolicyError(
+                f"journal run records carry the terminal label {terminal_runs[-1]!r} but hold no look record; "
+                "it was decided under the pre-look rule. Refusing to re-decide or rewrite it: starting a new "
+                "log (v3) is an owner decision")
+
+    def pending_primary_exit_sessions(self) -> list[str]:
+        """Exit sessions of opened primary-stratum positions whose primary-horizon exit is not recorded."""
+        return [shift_sessions(_d(e["entry_session"]), PRIMARY_HORIZON).isoformat()
+                for pid, e in self.entries.items()
+                if e["status"] == ST_OPENED and e["stratum"] == STRATUM_LARGE
+                and (pid, PRIMARY_HORIZON) not in self.exits]
 
     def mark_series(self, pid: str) -> list[tuple[date, float]]:
         out = []
@@ -206,19 +253,23 @@ def compute_exit(entry: dict, horizon: int, adj: dict[date, float], spy: dict[da
     else:
         if sessions_after(x, last_done) < PRICE_GRACE_SESSIONS:
             return None
+        # §4 fallback chain: the last usable close from the exit fetch, else the
+        # tracker's own daily marks (unadjusted, against the recorded unadjusted
+        # entry close), else the entry close (0%). An exit fetch that holds the
+        # entry close but no later close is "no usable post-entry close", not a
+        # 0% return: the retained marks decide before entry/0% does.
         status = ST_CLOSED_DELISTED
-        if pe:
-            later = [d for d in adj if e < d <= x]
-            end = max(later) if later else e
+        later = [d for d in adj if e < d <= x and adj[d]]
+        base = entry.get("entry_close_unadjusted")
+        m = [(d, c) for d, c in marks if e < d <= x]
+        if pe and later:
+            end = max(later)
             ret, basis = adj[end] / pe - 1.0, "adjusted_last_available"
+        elif m and base:
+            end, c = max(m)
+            ret, basis = c / base - 1.0, "unadjusted_marks"
         else:
-            base = entry.get("entry_close_unadjusted")
-            m = [(d, c) for d, c in marks if e < d <= x]
-            if m and base:
-                end, c = max(m)
-                ret, basis = c / base - 1.0, "unadjusted_marks"
-            else:
-                end, ret, basis = e, 0.0, "entry_close_only"
+            end, ret, basis = e, 0.0, "entry_close_only"
     spy_end = spy.get(end)
     if spy_end is None:
         found = _on_or_before(spy, end)
@@ -279,7 +330,14 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
             emit(make_filing_record(info, sub, now, err))
             counts["new_filings"] += 1
 
-        positions = group_positions(build_purchases(state.filings.values()))
+        # issuer identity (§2.3): ticker -> CIK associations are learned once and
+        # appended; a position recorded before its ticker was enriched keeps its id
+        for assoc in learn_aliases(state.filings.values(), state.aliases):
+            emit({"kind": "alias", "run_at": now.isoformat(), **assoc})
+        positions = group_positions(build_purchases(state.filings.values(), state.aliases))
+        positions, reconciled = reconcile_positions(
+            positions, state.filings, {**state.signals, **state.entries}, state.aliases)
+        counts["identity_reconciled"] = len(reconciled)
         admitted = {pid: p for pid, p in positions.items()
                     if datetime.fromisoformat(p["entry_close_at"]) > genesis}
 
@@ -378,17 +436,24 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
         late_lines = sum(1 for f in state.filings.values() for line in f["lines"]
                          if line.get("exclusion") == EXCL_LATE_FILING)
         grid_db = sum(1 for f in state.filings.values() if f["source"] == "grid_db")
-        board = build_scoreboard(state.entries.values(), state.exits.values(), late_lines, grid_db)
+        # label (§10): decided once per complete look, appended as ``look`` records
+        board = build_scoreboard(state.entries.values(), state.exits.values(), late_lines, grid_db,
+                                 looks=state.looks, pending_exit_sessions=state.pending_primary_exit_sessions(),
+                                 pending_filings=counts["sec_deferred"], decide=True)
+        for rec in board["new_looks"]:
+            emit({"kind": LOOK_KIND, "run_at": now.isoformat(), **rec})
         emit({
             "kind": "run", "run_at": now.isoformat(), "code_sha": code_sha,
             "last_completed_session": last_done.isoformat(), "genesis": genesis.isoformat(),
             "counts": {**counts, "admitted_positions": len(admitted),
                        "written": {k: sum(1 for r in new if r["kind"] == k)
-                                   for k in ("filing", "signal", "entry", "marks", "exit")}},
+                                   for k in ("filing", "signal", "entry", "marks", "exit", LOOK_KIND, "alias")}},
             "sec_fetches": getattr(sec, "fetches", None),
             "price_failures": list(getattr(prices, "failures", [])),
             "freshness": freshness,
             "label": board["label"]["label"],
+            "looks_done": board["label"]["looks_done"],
+            "look_pending": board["label"]["look_pending"],
         })
         written = log.append_locked(new)
     return {"written": written, "records": records + written, "freshness": freshness,

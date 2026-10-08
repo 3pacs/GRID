@@ -204,3 +204,44 @@ def test_close_instant_handles_early_close():
     assert ev.close_instant(date(2026, 11, 27)) == et(2026, 11, 27, 13, 0)
     assert ev.close_instant(date(2026, 10, 7)) == et(2026, 10, 7, 16, 0)
     assert ev.close_instant(date(2026, 10, 7)) - ev.close_instant(date(2026, 10, 6)) == timedelta(days=1)
+
+
+# ── issuer identity across runs (review finding F2) ────────────────────────
+
+
+def test_aliases_are_learned_once_and_a_persisted_alias_wins():
+    fs = [
+        filing("g1", None, "name:jane", et(2026, 10, 6, 22), [ok()]),
+        filing("s1", 1, "cik:10", et(2026, 10, 7, 9), [ok(shares=9_000.0)]),
+        filing("s2", 2, "cik:20", et(2026, 10, 8, 9), [ok(shares=8_000.0)]),  # same ticker, another CIK
+    ]
+    assert ev.learn_aliases(fs) == [{"ticker": "ABC", "cik": 1, "accession": "s1"}]
+    assert ev.learn_aliases(fs, {"ABC": 1}) == []
+    assert ev.issuer_keys(fs)["g1"] == "cik:1"
+    assert ev.issuer_keys(fs, {"ABC": 9})["g1"] == "cik:9"  # the journal's association is append-only
+
+
+def test_reconcile_keeps_the_recorded_identity_for_a_consumed_purchase_and_refuses_double_records():
+    fs = {
+        "g1": filing("g1", None, "name:jane", et(2026, 10, 7, 22), [ok()]),                      # fallback, no CIK
+        "s2": filing("s2", 1, "cik:10", et(2026, 10, 7, 14, 15), [ok()]),                       # same purchase, enriched
+        "s3": filing("s3", 1, "cik:10", et(2026, 10, 8, 9), [ok(trans="2026-10-07", shares=5_000.0)]),  # distinct
+    }
+    recorded = {"ticker:ABC|2026-10-08": {"position_id": "ticker:ABC|2026-10-08", "issuer_key": "ticker:ABC",
+                                          "entry_session": "2026-10-08", "entry_close_at": "2026-10-08T16:00:00-04:00",
+                                          "accessions": ["g1"]}}
+    aliases = {"ABC": 1}
+    rebuilt = ev.group_positions(ev.build_purchases(fs.values(), aliases))
+    # the enriched duplicate has the earlier known_at: the rebuilt position moved to 10-07
+    assert set(rebuilt) == {"cik:1|2026-10-07", "cik:1|2026-10-08"}
+    out, applied = ev.reconcile_positions(rebuilt, fs, recorded, aliases)
+    assert set(out) == {"ticker:ABC|2026-10-08", "cik:1|2026-10-08"}
+    kept = out["ticker:ABC|2026-10-08"]
+    assert kept["issuer_key"] == "ticker:ABC" and kept["issuer_alias"] == "cik:1"
+    assert kept["entry_session"] == "2026-10-08" and kept["accessions"] == ["s2"]  # kept report, recorded day
+    assert applied == [{"position_id": "ticker:ABC|2026-10-08", "superseded_id": "cik:1|2026-10-07",
+                        "issuer_key": "cik:1", "entry_session": "2026-10-07"}]
+    assert ev.reconcile_positions(rebuilt, fs, {}, aliases) == (rebuilt, [])
+    both = {**recorded, "cik:1|2026-10-07": {**rebuilt["cik:1|2026-10-07"]}}
+    with pytest.raises(ev.IdentityPolicyError):
+        ev.reconcile_positions(rebuilt, fs, both, aliases)

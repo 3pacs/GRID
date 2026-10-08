@@ -352,3 +352,171 @@ def test_status_and_verify_need_no_database(tmp_path, fake_db, capsys):
     assert main(["status", "--log-dir", str(tmp_path / "log")]) == 0
     out = capsys.readouterr().out
     assert "UNPROVEN" in out
+
+
+# ── review findings F3 (exit fallback chain), F2 and F1 end to end ──────────
+
+
+def test_exit_entry_only_adjusted_uses_retained_marks_before_zero():
+    days = sessions_from(date(2026, 10, 8), 12)
+    spy = {d: 100.0 + i for i, d in enumerate(days)}
+    now = et(2026, 10, 30)
+    marks = [(days[2], 7.0), (days[3], 5.0)]
+    x = tracker.compute_exit(entry(unadj=10.0), 5, {days[0]: 10.0}, spy, marks, days[10], now)
+    assert x["status"] == "closed_delisted" and x["price_basis"] == "unadjusted_marks"
+    assert x["end_session"] == days[3].isoformat() and x["return"] == pytest.approx(-0.5)
+    assert x["spy_return"] == pytest.approx(spy[days[3]] / spy[days[0]] - 1)  # legs aligned on the mark date
+    # a usable later close from the exit fetch still comes first
+    y = tracker.compute_exit(entry(unadj=10.0), 5, {days[0]: 10.0, days[2]: 6.0}, spy, marks, days[10], now)
+    assert y["price_basis"] == "adjusted_last_available" and y["end_session"] == days[2].isoformat()
+    assert y["return"] == pytest.approx(-0.4)
+    # entry-only and no marks (or no recorded unadjusted entry) -> entry close, 0%
+    z = tracker.compute_exit(entry(unadj=10.0), 5, {days[0]: 10.0}, spy, [], days[10], now)
+    assert z["price_basis"] == "entry_close_only" and z["return"] == 0.0 and z["end_session"] == days[0].isoformat()
+    w = tracker.compute_exit(entry(unadj=None), 5, {days[0]: 10.0}, spy, marks, days[10], now)
+    assert w["price_basis"] == "entry_close_only" and w["return"] == 0.0
+    # missing benchmark and the grace window still wait
+    assert tracker.compute_exit(entry(unadj=10.0), 5, {days[0]: 10.0}, {}, marks, days[10], now) is None
+    assert tracker.compute_exit(entry(unadj=10.0), 5, {days[0]: 10.0}, spy, marks, days[9], now) is None
+
+
+def _large_filing(acc, ticker, cik, accepted, line=("2026-10-06", "P", "A", "200000", "5", "")):
+    return submission(acc, accepted=accepted, ticker=ticker, issuer_cik=cik, owners=((f"{cik}9", "Buyer"),),
+                      lines=[line])
+
+
+def test_fallback_first_then_enriched_filing_keeps_one_position(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    spy = {d: 100.0 for d in days}
+    borr = {d: 5.0 + 0.01 * i for i, d in enumerate(days)}
+    prices = FakePrices(adj={"BORR": borr, "SPY": spy}, raw={"BORR": borr})
+    sec = FakeSec({"acc-2": _large_filing("acc-2", "BORR", "0001715497", "20261008075746",
+                                          line=("2026-10-07", "P", "A", "150000", "5", ""))})  # acc-1 -> grid_db
+    fake_db["rows"] = [raw_row("acc-1", "BORR", et(2026, 10, 7, 16, 5))]
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 9, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r2["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-08" and first["status"] == "opened"
+
+    # a later, distinct, enriched accession identifies BORR as CIK 1715497 (entry the next day)
+    fake_db["rows"].append(raw_row("acc-2", "BORR", et(2026, 10, 8, 16, 5)))
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds = [r["kind"] for r in r3["written"]]
+    assert kinds.count("alias") == 1 and kinds.count("entry") == 1
+    alias = next(r for r in r3["written"] if r["kind"] == "alias")
+    assert (alias["ticker"], alias["cik"], alias["accession"]) == ("BORR", 1715497, "acc-2")
+    assert set(r3["admitted"]) == {"ticker:BORR|2026-10-08", "cik:1715497|2026-10-09"}
+    assert r3["admitted"]["ticker:BORR|2026-10-08"]["issuer_alias"] == "cik:1715497"
+    assert next(r for r in r3["written"] if r["kind"] == "entry")["position_id"] == "cik:1715497|2026-10-09"
+    assert next(r for r in r3["written"] if r["kind"] == "run")["counts"]["identity_reconciled"] == 1
+
+    # restart (fresh replay) and score: the original purchase is scored exactly once
+    r4 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert "alias" not in [r["kind"] for r in r4["written"]] and "entry" not in [r["kind"] for r in r4["written"]]
+    exits30 = sorted(r["position_id"] for r in r4["written"] if r["kind"] == "exit" and r["horizon"] == 30)
+    assert exits30 == ["cik:1715497|2026-10-09", "ticker:BORR|2026-10-08"]
+    assert r4["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 2
+    state = tracker.State(log.read_all())
+    assert state.aliases == {"BORR": 1715497} and set(state.entries) == set(exits30)
+    assert log.verify_chain()["ok"]
+
+
+def test_enriched_same_day_filing_joins_the_recorded_position(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-2": _large_filing("acc-2", "BORR", "0001715497", "20261007080000")})
+    fake_db["rows"] = [raw_row("acc-1", "BORR", et(2026, 10, 7, 16, 5))]
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    fake_db["rows"].append(raw_row("acc-2", "BORR", et(2026, 10, 7, 16, 6)))  # same entry day, now with a CIK
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 7, 19, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    sig = [r for r in r2["written"] if r["kind"] == "signal"]
+    assert [s["position_id"] for s in sig] == ["ticker:BORR|2026-10-08"] and sig[0]["revision"] == 2
+    # one purchase reported twice: the enriched report (earlier known_at) is the kept report
+    assert sig[0]["accessions"] == ["acc-2"] and sig[0]["n_purchases"] == 1
+    assert sig[0]["issuer_alias"] == "cik:1715497" and sig[0]["entry_session"] == "2026-10-08"
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert [r["position_id"] for r in r3["written"] if r["kind"] == "entry"] == ["ticker:BORR|2026-10-08"]
+    assert sum(1 for r in r3["written"] if r["kind"] == "exit" and r["horizon"] == 30) == 1
+    assert len(r3["admitted"]) == 1
+
+
+def test_enrichment_that_moves_known_at_earlier_does_not_reopen_an_entered_position(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-2": _large_filing("acc-2", "BORR", "0001715497", "20261008090000")})
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+
+    def filed_1008(acc, ingest):
+        row = raw_row(acc, "BORR", ingest)
+        return {**row, "payload": {**row["payload"], "filing_date": "2026-10-08"}}
+
+    # fallback report ingested Thursday 10:00 (filing date 10-08 -> 22:00 rule): entry Friday 10-09
+    fake_db["rows"] = [filed_1008("acc-1", et(2026, 10, 8, 10, 0))]
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-09" and first["status"] == "opened"
+    # the same purchase, enriched, accepted 09:00 and ingested 14:00 on 10-08: known_at 14:15 -> entry 10-08
+    fake_db["rows"].append(filed_1008("acc-2", et(2026, 10, 8, 14, 0)))
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds = [r["kind"] for r in r2["written"]]
+    assert kinds.count("alias") == 1 and "entry" not in kinds and "signal" not in kinds
+    assert set(r2["admitted"]) == {"ticker:BORR|2026-10-09"}
+    pos = r2["admitted"]["ticker:BORR|2026-10-09"]
+    assert pos["issuer_alias"] == "cik:1715497" and pos["entry_session"] == "2026-10-09"
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert [r["position_id"] for r in r3["written"] if r["kind"] == "exit" and r["horizon"] == 30] == ["ticker:BORR|2026-10-09"]
+    assert r3["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 1
+
+
+def test_look_blocks_on_a_delayed_earlier_exit_and_is_decided_once(tmp_path, fake_db, monkeypatch):
+    from paper_log.trade_edge import scoreboard as sb
+    monkeypatch.setattr(sb, "LOOKS", (2, 4, 6))
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 60)
+    spy = {d: 100.0 for d in days}
+    paths = {"AAA": (5.0, 2.5), "BBB": (5.0, 3.0), "CCC": (5.0, 7.5)}  # -50%, -40%, +50% over the window
+    adj = {t: {d: lo + (hi - lo) * i / 60 for i, d in enumerate(days)} for t, (lo, hi) in paths.items()}
+    prices = FakePrices(adj={**adj, "SPY": spy}, raw=dict(adj))
+    sec = FakeSec({f"acc-{t}": _large_filing(f"acc-{t}", t, f"000000000{i}", "20261007080000")
+                   for i, t in enumerate(paths, start=1)})
+    ingest = {"AAA": et(2026, 10, 7, 16, 5), "BBB": et(2026, 10, 8, 16, 5), "CCC": et(2026, 10, 9, 16, 5)}
+    fake_db["rows"] = [raw_row(f"acc-{t}", t, ingest[t], url_cik=str(i)) for i, t in enumerate(paths, start=1)]
+    exit_b = sessions_from(date(2026, 10, 9), 30)[-1]  # BBB's primary exit session
+    spy_hole = spy.pop(exit_b)  # BBB's benchmark close is missing: its h30 exit waits
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    closed = sorted(r["position_id"] for r in r1["written"] if r["kind"] == "exit" and r["horizon"] == 30)
+    assert closed == ["cik:1|2026-10-08", "cik:3|2026-10-12"]  # AAA and CCC closed, BBB pending
+    lab = r1["scoreboard"]["label"]
+    assert lab["label"] == "UNPROVEN" and lab["look_pending"]["blocked_by_positions"] == 1
+    assert "look" not in [r["kind"] for r in r1["written"]]
+
+    spy[exit_b] = spy_hole
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 12, 16, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (look,) = [r for r in r2["written"] if r["kind"] == "look"]
+    assert look["n"] == 2 and look["members"] == ["cik:1|2026-10-08", "cik:2|2026-10-09"]  # not CCC
+    assert look["decision"] == "CONTRARY" and look["terminal"] is True
+    run = next(r for r in r2["written"] if r["kind"] == "run")
+    assert run["label"] == "CONTRARY" and run["looks_done"] == 1
+
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 12, 17, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert [r["kind"] for r in r3["written"]] == ["run"]
+    assert r3["scoreboard"]["label"]["label"] == "CONTRARY" and r3["scoreboard"]["label"]["basis"] == "journal"
+    assert tracker.State(log.read_all()).looks[2]["members"] == look["members"]
+    assert log.verify_chain()["ok"]
+
+
+def test_journal_label_without_look_record_is_refused_not_rewritten(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=FakeSec({}),
+                     prices=FakePrices({}, {}))
+    records = log.read_all()
+    legacy = {**records[-1], "label": "SUPPORTED_FORWARD"}  # a run decided under the re-selection rule
+    with pytest.raises(tracker.LookPolicyError):
+        tracker.State(records + [legacy])
+    assert tracker.State(records).looks == {}  # UNPROVEN run labels remain compatible
