@@ -1,6 +1,6 @@
 ---
 name: hermes-operations
-description: Operate the Hermes autonomous daemon — the 24/7 self-healing scheduler for all GRID background tasks. Use when adding scheduled tasks, debugging why a puller or pipeline step isn't running, understanding the Hermes cycle structure, or diagnosing stale data and failed cycles.
+description: Operate the Hermes autonomous daemon — the 24/7 self-healing scheduler for background tasks. Use when adding scheduled steps or debugging why a scheduled step or puller did not run (cycle structure, time gates, timeouts); for source freshness thresholds, API keys, or NaN quality use data-health.
 ---
 
 # hermes-operations
@@ -20,28 +20,42 @@ Operating the Hermes autonomous daemon — the 24/7 self-healing system that run
 Every 5 minutes, Hermes runs one cycle:
 
 ```
-1. Health check (DB, data freshness, LLM availability)
-2. Pull fixer (retry failed ingestion with diagnosis)
-3. Pipeline runner (full pipeline on 6h schedule)
-4. Data gatherer (fill historical gaps)
-5. Autoresearch (hypothesis generation when healthy)
-6. Self-diagnostics (read own error logs, propose fixes)
-7. Specialized tasks:
-   7a-7d. Scheduled pullers (FRED, yfinance, BLS, altdata)
-   7e.    Alpha research heartbeat + signal publishing
-   7f.    Intelligence modules (trust scoring, forensics, etc.)
-   7g.    Rotation paper trading (daily 17:00-17:30 UTC)
-   7h.    Tiingo bulk data pull (overnight 02:00-06:00 UTC)
-   7i.    AstroGrid celestial cycle (hourly; sky snapshot + interpretation)
+0. Git pull (sync latest code/config)
+1. Health check (DB, connection pool, Hermes health, alert thresholds)
+1b. Obsidian vault sync + agent cycle
+2. Fix broken pulls (diagnose_and_fix_pulls with cooldown + smart retry)
+2b. Proactively re-pull stale sources (up to 15 per cycle)
+3. Smart ingestion (SmartScheduler runs due/stale pullers)
+3b. Conflict resolution (raw_series → resolved_series via canonical resolver)
+4. Data gaps (skipped; handled by SmartScheduler)
+5. Self-diagnostics (every 6th cycle / 30 min)
+6. Autoresearch (every 12th cycle / 1 hour, bounded and fenced)
+7. Specialized periodic tasks:
+   7.      UX Audit (every 72nd cycle / ~6 hours)
+   7b.     Daily digest email (once per day)
+   7c.     100x Digest (every 4 hours)
+   7c-ii.  Solana top-volume snapshot (every 4 hours)
+   7c-iii. Supply Chain Pulse watchdog (every 6 hours)
+   7c-iv.  News contagion listener (every 15 minutes)
+   7c2.    AstroGrid celestial cycle (hourly, ahead of oracle; sky snapshot + interpretation)
+   7d.     Oracle prediction cycle (every 6 hours)
+   7d-ii.  TimesFM forecast cycle (every 6 hours)
+   7d-iii. AutoBNN changepoint detection (every 12 hours)
+   7d-iv - 7d-vi. Gemma micro classification, narration, knowledge mapping
+   7e.     Alpha research heartbeat + signal publishing (every cycle)
+   7f.     Sector health snapshot & intelligence modules (trust scoring, cross-reference, etc.)
+   7g.     Rotation paper trading (daily after 17:00 UTC)
+   7h.     Tiingo bulk data pull (overnight 02:00-06:00 UTC)
 8. Git push (commit analytical outputs)
-9. Save cycle snapshot
+8b. LLM Task Queue status
+9. Save cycle snapshot & Obsidian cycle report
 ```
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `scripts/hermes_operator.py` | Main daemon (~1800 lines) |
+| `scripts/hermes_operator.py` | Main daemon (~4700 lines) |
 | `ingestion/scheduler.py` | Pull schedule definitions |
 | `scripts/hermes_operator.py:run_cycle()` | One cycle logic |
 | `scripts/hermes_operator.py:OperatorState` | Persistent state across cycles |
@@ -75,12 +89,11 @@ Every 5 minutes, Hermes runs one cycle:
    if CYCLE_TIMEOUT_SECONDS - elapsed < MY_TASK_TIMEOUT_SECONDS:
        # defer; leave the marker alone so the next cycle retries
    ```
-
-   The budgeted steps ahead of 7i already total more than
-   `CYCLE_TIMEOUT_SECONDS`, so a slow cycle can reach a late step with nothing
-   left — and a budgeted step that starts there takes the whole cycle down
-   rather than just itself. Cycles run every 5 minutes, so deferring costs one
-   cycle, not the slot. See step 7i for a worked example.
+   The budgeted steps ahead of a task can consume cycle budget, so a slow
+   cycle can reach a step with insufficient time left — and a budgeted step
+   that starts without enough budget takes the whole cycle down rather than
+   just itself. Cycles run every 5 minutes, so deferring costs one cycle, not
+   the slot. See step 7c2 (AstroGrid celestial cycle) for a worked example.
 
 ## Service Management
 

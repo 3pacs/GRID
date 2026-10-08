@@ -1,6 +1,6 @@
 ---
 name: grid-check-exists
-description: "Before proposing to build a new GRID module, search the existing 405-module codebase for similar implementations. Use this whenever a session is about to propose a new intelligence module, puller, analytics engine, or oracle feature. Searches intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/, and ingestion/ for name and content matches, then cross-references docs/MODULE_CATALOG.md."
+description: "Before proposing to build a new GRID module or when asked 'does GRID already have X?', search the existing 700+-module codebase for similar implementations; for rebuilding the full index use grid-orient."
 ---
 
 # grid-check-exists

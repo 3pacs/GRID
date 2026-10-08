@@ -1,6 +1,6 @@
 ---
 name: data-health
-description: Monitor GRID data-source freshness, detect ingestion anomalies, and validate API-key availability across 37+ sources. Use on startup or after restarts, before running inference (verify critical data is fresh), when investigating unexpected model behavior that staleness could explain, or when adding/modifying ingestion sources.
+description: Monitor GRID data-source freshness thresholds, API-key availability, and NaN quality across sources; for scheduler cycle structure, time gates, or why a puller step did not run use hermes-operations.
 ---
 
 # data-health
@@ -21,33 +21,38 @@ Monitors GRID data source freshness, detects ingestion anomalies, and validates 
 GRID ingests from multiple categories:
 
 ### Macroeconomic (US Federal Reserve, Bureau of Labor Statistics, etc.)
-- `ingestion/fred.py` — Federal Reserve Economic Data (FRED API)
+- `ingestion/fred.py` — Federal Reserve Economic Data (FRED API; pulls macro series including retail sales/Census via RETAILSMNSA, initial claims/DOL via ICSA, and PCE inflation via PCEPI/PCEPILFE)
 - `ingestion/bls.py` — Bureau of Labor Statistics (CPI, unemployment, payroll)
-- `ingestion/census.py` — US Census Bureau (retail sales, manufacturing)
-- `ingestion/dol.py` — Department of Labor (jobless claims, initial claims)
-- `ingestion/pce.py` — Personal Consumption Expenditure (PCE inflation)
+- `ingestion/altdata/wage_tracker.py` — Atlanta Fed Wage Growth Tracker
+- `ingestion/altdata/h8_bank_balance.py` — Fed H.8 commercial bank assets and liabilities
 
 ### International Central Banks
 - `ingestion/international/ecb.py` — European Central Bank (rates, FX, economic indicators)
-- `ingestion/international/boe.py` — Bank of England (sterling, rates)
-- `ingestion/international/boj.py` — Bank of Japan (yen, rates, monetary policy)
-- `ingestion/international/pboc.py` — People's Bank of China (CNY, rates)
+- `ingestion/international/jquants.py` — Japan Exchange Group (Japanese equities and market structure)
+- `ingestion/international/edinet.py` — Japanese EDINET corporate disclosures
 - `ingestion/international/kosis.py` — Korean Statistics (K-economy data)
-- `ingestion/international/comtrade.py` — UN Comtrade (bilateral trade flows)
+- `ingestion/international/bis.py` — Bank for International Settlements (effective exchange rates, credit)
+- `ingestion/trade/comtrade.py` — UN Comtrade (bilateral trade flows)
 
 ### Commodity and Physical Data
-- `ingestion/physical/wti_crude.py` — WTI crude oil (EIA, ICE)
-- `ingestion/physical/brent_crude.py` — Brent crude oil
-- `ingestion/physical/gold.py` — Gold prices (London Bullion, COMEX)
-- `ingestion/physical/copper.py` — Copper (LME, COMEX)
-- `ingestion/physical/agriculture.py` — USDA agriculture (soybeans, corn, wheat)
-- `ingestion/physical/shipping.py` — Baltic Dry Index, container rates
+- `ingestion/altdata/eia_puller.py` — EIA energy data (WTI crude oil spot, Brent crude spot, Cushing storage)
+- `ingestion/altdata/jodi_oil.py` — JODI world crude oil production, closing stocks, refinery intake
+- `ingestion/altdata/refinery_cracks.py` — 3-2-1 refinery crack spread from WTI and Gulf Coast product spot
+- `ingestion/altdata/sge_premium.py` — Shanghai Gold Exchange (SGE) au9999 spot minus London PM fixing basis
+- `ingestion/altdata/lme_warehouse.py` — London Metal Exchange warehouse inventory (copper, aluminum, zinc, nickel)
+- `ingestion/altdata/ag_commodity_futures.py` — Agricultural commodity futures (corn, soybeans, wheat)
+- `ingestion/physical/usda_nass.py` — USDA National Agricultural Statistics Service
+- `ingestion/altdata/baltic_dry.py` — Baltic Dry Index and container freight rates
+- `ingestion/physical/viirs.py` — VIIRS satellite night-lights physical activity proxy
 
 ### Financial Market Data
-- `ingestion/market/volatility.py` — VIX, MOVE, OVX
-- `ingestion/market/rates.py` — Treasury yields, swap spreads, credit spreads
-- `ingestion/market/equities.py` — Equity market data (OHLCV, index levels)
-- `ingestion/market/crypto.py` — Bitcoin, Ethereum, major altcoins (CoinMarketCap, Kraken)
+- `ingestion/tiingo_pull.py` — Tiingo equities daily EOD prices (OHLCV)
+- `ingestion/yfinance_pull.py` — Yahoo Finance market fallbacks and ETF proxies
+- `ingestion/altdata/cboe_indices.py` — CBOE volatility indices (VIX, VVIX, SKEW)
+- `ingestion/altdata/yield_curve_full.py` — Full Treasury yield curve and term spread models
+- `ingestion/crypto_signals.py` — Crypto market data and technical signals
+- `ingestion/coingecko.py` — CoinGecko cryptocurrency prices and market cap
+- `ingestion/realtime/feeds/yahoo.py` & `binance.py` — Real-time price websocket listeners
 
 ### Alternative Data
 - `ingestion/altdata/congressional.py` — Congressional trading disclosures (House.gov, Senate.gov)
@@ -109,10 +114,33 @@ congressional   | 2025-12-31    | 90 days            | CRITICAL
 crypto          | 2026-03-30    | 0 minutes          | OK
 ```
 
-#### Option 2: Use Health Check Endpoint
+#### Option 2: Use Health Check Endpoints
 
+For unauthenticated system and database health:
 ```bash
-curl https://grid.stepdad.finance/api/health/sources
+curl https://grid.stepdad.finance/api/v1/system/health
+```
+
+Should return JSON:
+```json
+{
+  "status": "ok",
+  "checks": {
+    "database": true,
+    "features_registered": true,
+    "recent_data": true,
+    "pool_healthy": true,
+    "thread_ingestion": true,
+    "disk_percent": 45.2,
+    "llm_available": true
+  },
+  "degraded_reasons": []
+}
+```
+
+For authenticated comprehensive per-source pipeline health:
+```bash
+curl -H "Authorization: Bearer $GRID_TOKEN" https://grid.stepdad.finance/api/v1/system/pipeline-health
 ```
 
 Should return JSON:
@@ -121,22 +149,24 @@ Should return JSON:
   "sources": [
     {
       "name": "FRED",
-      "last_observation": "2026-03-28T16:00:00Z",
-      "staleness_hours": 48,
-      "status": "OK"
+      "status": "healthy",
+      "freshness": "green",
+      "last_pull": "2026-03-28T16:00:00Z",
+      "recent_rows": 150
     },
     {
-      "name": "dark_pool",
-      "last_observation": "2026-03-23T17:00:00Z",
-      "staleness_hours": 168,
-      "status": "STALE"
+      "name": "DarkPool",
+      "status": "stale",
+      "freshness": "yellow",
+      "last_pull": "2026-03-23T17:00:00Z",
+      "recent_rows": 0
     }
   ],
   "summary": {
-    "total_sources": 37,
-    "healthy": 34,
-    "warning": 2,
-    "critical": 1
+    "total_sources": 44,
+    "healthy": 40,
+    "stale": 3,
+    "broken": 1
   }
 }
 ```
