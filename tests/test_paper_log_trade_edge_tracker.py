@@ -740,3 +740,170 @@ def test_status_reads_terminal_and_completed_looks_and_keeps_undecided_interim(m
     entries = [r for r in undecided if r["kind"] == "entry"]
     exits = [r for r in undecided if r["kind"] == "exit"]
     assert sb.build_scoreboard(entries, exits, looks={}, decide=True)["label"]["label"] == "CONTRARY"
+
+
+# ── review R3/R4: exact purchase membership, proved from the ordered journal ─
+
+
+def test_multi_line_report_split_across_sessions_replays_without_a_false_conflict(tmp_path, fake_db):
+    """B (grid_db fallback, no CIK yet) reports Q for 10-07; A (EDGAR, with the CIK) reports Q again plus a
+    distinct P for 10-08. Q stays B's; A's own position is P only, through the alias and every restart."""
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 7), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-a": submission("acc-a", accepted="20261008090000", owners=(("00017154979", "Buyer"),),
+                                       lines=[("2026-10-06", "P", "A", "200000", "5", ""),
+                                              ("2026-10-07", "P", "A", "150000", "5", "")])})
+    tracker.run_once(log, conn=None, now=et(2026, 10, 6, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    row = raw_row("acc-b", "BORR", et(2026, 10, 6, 12, 0))  # filing date 10-06 -> known 22:00 -> entry 10-07
+    fake_db["rows"] = [{**row, "payload": {**row["payload"], "filing_date": "2026-10-06"}}]
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-07" and first["accessions"] == ["acc-b"]
+
+    fake_db["rows"].append(raw_row("acc-a", "BORR", et(2026, 10, 8, 9, 0)))  # known 09:15 -> entry 10-08
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 8, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds = [r["kind"] for r in r2["written"]]
+    assert kinds.count("alias") == 1 and "late_member" not in kinds
+    (sig,) = [r for r in r2["written"] if r["kind"] == "signal"]
+    (ent,) = [r for r in r2["written"] if r["kind"] == "entry"]
+    assert sig["position_id"] == ent["position_id"] == "cik:1715497|2026-10-08"
+    assert ent["accessions"] == ["acc-a"] and ent["n_purchases"] == 1
+    assert ent["total_value"] == pytest.approx(750_000)
+    assert set(r2["admitted"]) == {"ticker:BORR|2026-10-07", "cik:1715497|2026-10-08"}
+    witness = tracker.prove_membership(log.read_all())
+    assert witness.members == {"ticker:BORR|2026-10-07": [("ticker:BORR", "2026-10-06", 200000, 5.0)],
+                               "cik:1715497|2026-10-08": [("cik:1715497", "2026-10-07", 150000, 5.0)]}
+
+    # restart (fresh replay proved from the ordered prefixes): no conflict, nothing new, each scored once
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 10, 9, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert not {"signal", "entry", "alias", "late_member"} & {r["kind"] for r in r3["written"]}
+    r4 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    exits30 = sorted(r["position_id"] for r in r4["written"] if r["kind"] == "exit" and r["horizon"] == 30)
+    assert exits30 == ["cik:1715497|2026-10-08", "ticker:BORR|2026-10-07"]
+    assert r4["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 2
+    assert log.verify_chain()["ok"]
+
+
+def test_noted_late_purchase_stays_bound_when_an_earlier_duplicate_moves_its_day(tmp_path, fake_db):
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-6": _large_filing("acc-6", "BORR", "0001715497", "20261008090000",
+                                          line=("2026-10-06", "P", "A", "100000", "5", ""))})
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    fake_db["rows"] = [_filed_1008("acc-1", et(2026, 10, 8, 10, 0))]  # grid_db fallback: entry 10-09
+    r1 = tracker.run_once(log, conn=None, now=et(2026, 10, 10, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (first,) = [r for r in r1["written"] if r["kind"] == "entry"]
+    assert first["position_id"] == "ticker:BORR|2026-10-09"
+    row = raw_row("acc-4", "BORR", et(2026, 10, 8, 11, 0), value_shares=100_000)  # same group, visible late
+    fake_db["rows"].append({**row, "payload": {**row["payload"], "filing_date": "2026-10-08"}})
+    r2 = tracker.run_once(log, conn=None, now=et(2026, 10, 13, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    (note,) = [r for r in r2["written"] if r["kind"] == "late_member"]
+    assert (note["accession"], note["reason"], note["purchase_keys"]) == (
+        "acc-4", "same_group_after_entry", [["ticker:BORR", "2026-10-06", 100000, 5.0]])
+
+    # the noted purchase re-reported on EDGAR with the CIK and an earlier known_at (09:15 -> entry 10-08):
+    # its rebuilt group moves to 10-08, but it stays the entered slot's late member (no second scored position)
+    fake_db["rows"].append(raw_row("acc-6", "BORR", et(2026, 10, 8, 9, 0)))
+    r3 = tracker.run_once(log, conn=None, now=et(2026, 10, 14, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    kinds3 = [r["kind"] for r in r3["written"]]
+    assert kinds3.count("filing") == 1 and kinds3.count("alias") == 1
+    assert not {"signal", "entry", "late_member"} & set(kinds3)
+    assert set(r3["admitted"]) == {"ticker:BORR|2026-10-09"}
+    witness = tracker.prove_membership(log.read_all())
+    assert witness.late == [note]
+    assert witness.members == {"ticker:BORR|2026-10-09": [("ticker:BORR", "2026-10-06", 200000, 5.0)]}
+
+    r4 = tracker.run_once(log, conn=None, now=et(2026, 12, 15, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert not {"signal", "entry", "late_member"} & {r["kind"] for r in r4["written"]}
+    assert [r["position_id"] for r in r4["written"] if r["kind"] == "exit" and r["horizon"] == 30] == \
+        ["ticker:BORR|2026-10-09"]
+    assert r4["scoreboard"]["tables"]["h30_large"]["all"]["n_closed"] == 1
+    assert tracker.State(log.read_all()).entries == {first["position_id"]: first}
+    assert log.verify_chain()["ok"]
+
+
+PID_RE = r"cik:1715497\|2026-10-08"
+
+
+def _revised_then_entered(tmp_path, fake_db):
+    """acc-1 signals cik:1715497|2026-10-08 (revision 1); acc-2, a distinct purchase on that session,
+    revises it (revision 2) in the run that enters it."""
+    log = make_log(tmp_path)
+    days = sessions_from(date(2026, 10, 8), 45)
+    px = {d: 5.0 for d in days}
+    prices = FakePrices(adj={"BORR": px, "SPY": px}, raw={"BORR": px})
+    sec = FakeSec({"acc-1": _large_filing("acc-1", "BORR", "0001715497", "20261008090000"),
+                   "acc-2": _large_filing("acc-2", "BORR", "0001715497", "20261008100000",
+                                          line=("2026-10-07", "P", "A", "150000", "5", ""))})
+    tracker.run_once(log, conn=None, now=et(2026, 10, 7, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)  # genesis
+    fake_db["rows"] = [raw_row("acc-1", "BORR", et(2026, 10, 8, 9, 0))]
+    tracker.run_once(log, conn=None, now=et(2026, 10, 8, 10, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    fake_db["rows"].append(raw_row("acc-2", "BORR", et(2026, 10, 8, 10, 30)))
+    tracker.run_once(log, conn=None, now=et(2026, 10, 8, 18, 0), code_sha="a" * 40, sec=sec, prices=prices)
+    return log, sec, prices
+
+
+def test_each_signal_and_entry_is_proved_from_its_own_prefix_and_unproved_history_refuses(tmp_path, fake_db):
+    from paper_log.trade_edge.events import MembershipProofError
+    log, sec, prices = _revised_then_entered(tmp_path / "ok", fake_db)
+    journal = log.read_all()
+    pid = "cik:1715497|2026-10-08"
+    witness = tracker.prove_membership(journal)  # two revisions of one unentered id, then its own entry
+    assert witness.members == {pid: [("cik:1715497", "2026-10-06", 200000, 5.0),
+                                     ("cik:1715497", "2026-10-07", 150000, 5.0)]}
+    assert witness.recorded[pid]["kind"] == "entry" and witness.late == []
+
+    def at(pred):
+        return next(i for i, r in enumerate(journal) if pred(r))
+
+    sig1 = at(lambda r: r["kind"] == "signal" and r["revision"] == 1)
+    sig2 = at(lambda r: r["kind"] == "signal" and r["revision"] == 2)
+    ent = at(lambda r: r["kind"] == "entry")
+    f2 = at(lambda r: r["kind"] == "filing" and r["accession"] == "acc-2")
+    alias = at(lambda r: r["kind"] == "alias")
+    later = "2026-10-09T08:30:00-04:00"
+    e, s1 = journal[ent], journal[sig1]
+
+    # an entry needs its own witness: one inheriting the earlier signal's membership is refused
+    inherited = tracker.entry_record(pid, s1, s1, s1["run_at"], e["status"], e["entry_close_unadjusted"],
+                                     e["run_at"])
+    forged = [inherited if i == ent else r for i, r in enumerate(journal) if i != sig2]
+    moved_alias = [r for i, r in enumerate(journal) if i != alias]
+    moved_alias.insert(sig1, journal[alias])  # the alias now follows the signal it identified
+    cases = [
+        (forged, rf"journal record {ent - 1} \(entry {PID_RE}, run_at [^)]*\): it does not match its own "
+                 r"prefix witness on \['accessions', 'n_purchases', 'total_value'\]"),
+        # a revision whose filing is missing from its prefix
+        ([r for i, r in enumerate(journal) if i != f2],
+         rf"journal record {sig2 - 1} \(signal {PID_RE}, .*registered reconciliation of its prefix on "
+         r"\['acceptance_at', 'accessions', "),
+        # an overwritten filing (final State.add would hide it)
+        (journal + [{**journal[f2], "run_at": later, "lines": []}],
+         rf"journal record {len(journal)} \(filing acc-2, .*repeats the accession of journal record {f2}\b"),
+        # an entry no signal precedes
+        ([r for i, r in enumerate(journal) if i not in (sig1, sig2)],
+         rf"journal record {ent - 2} \(entry {PID_RE}, .*no signal of this position precedes it"),
+        # an alias the prefix's filings do not teach, and one journaled after the signal it identified
+        ([{**r, "cik": 42} if i == alias else r for i, r in enumerate(journal)],
+         rf"journal record {alias} \(alias acc-1, .*not the next ticker -> CIK association"),
+        (moved_alias, rf"prefix before journal record {sig1 - 1} \(run_at [^)]*\): its filings teach the association"),
+        # a signal after the entry froze the position
+        (journal + [{**journal[sig2], "run_at": later, "revision": 3}],
+         rf"journal record {len(journal)} \(signal {PID_RE}, .*was entered at journal record {ent}\b"),
+    ]
+    for records, match in cases:
+        with pytest.raises(MembershipProofError, match=match):
+            tracker.prove_membership(records)
+
+    # the run refuses such a journal before it fetches or appends anything
+    bad = make_log(tmp_path / "bad")
+    bad.append(forged)
+    before, fetches = bad.read_all(), sec.fetches
+    with pytest.raises(MembershipProofError, match=rf"journal record {ent - 1} \(entry {PID_RE}, "):
+        tracker.run_once(bad, conn=None, now=et(2026, 10, 9, 8, 30), code_sha="a" * 40, sec=sec, prices=prices)
+    assert bad.read_all() == before and sec.fetches == fetches
+    assert bad.verify_chain()["ok"]

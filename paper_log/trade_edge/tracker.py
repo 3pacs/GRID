@@ -32,6 +32,9 @@ from paper_log.trade_edge.config import (
 from paper_log.trade_edge.events import (
     EXCL_LATE_FILING,
     LATE_MEMBER_KIND,
+    IdentityPolicyError,
+    MembershipProofError,
+    Witness,
     build_purchases,
     cap_bucket,
     close_instant,
@@ -299,6 +302,196 @@ def compute_exit(entry: dict, horizon: int, adj: dict[date, float], spy: dict[da
     }
 
 
+# ── entries and their proof ────────────────────────────────────────────────
+
+
+def entry_record(pid: str, p: dict, sig: dict, first_seen: str, status: str, close: float | None,
+                 run_at: str) -> dict:
+    """The ``entry`` record of position ``p``: identity and membership frozen from
+    ``p``, the cap observation from its latest signal ``sig``, the price
+    observation (``status``, ``close``) as fetched. :func:`prove_membership`
+    checks a journal entry against this projection of its own prefix witness."""
+    return {
+        "kind": "entry", "run_at": run_at, "position_id": pid, "status": status,
+        "ticker": p["ticker"], "yahoo_symbol": yahoo_symbol(p["ticker"]) if p["ticker_resolved"] else None,
+        "issuer_key": p["issuer_key"], "issuer_name": p["issuer_name"],
+        "entry_session": p["entry_session"], "entry_close_at": p["entry_close_at"],
+        "entry_close_unadjusted": close, "stratum": p["stratum"],
+        "cap_bucket": sig["cap_bucket"], "market_cap_usd": sig["market_cap_usd"],
+        "cap_source": sig["cap_source"], "accessions": p["accessions"], "actors": p["actors"],
+        "n_actors": p["n_actors"], "n_purchases": p["n_purchases"],
+        "total_value": p["total_value"], "largest_value": p["largest_value"],
+        "first_known_at": p["first_known_at"], "first_signal_run_at": first_seen,
+        "late_logged": datetime.fromisoformat(first_seen) >= datetime.fromisoformat(p["entry_close_at"]),
+    }
+
+
+# Within one run the tracker appends filings, then aliases, then late notes, then
+# signals, then entries (then marks, exits, looks and the run record).
+_STAGE = {"filing": 0, "alias": 1, LATE_MEMBER_KIND: 2, "signal": 3, "entry": 4}
+_CAP_FIELDS = ("market_cap_usd", "cap_as_of", "cap_source", "cap_bucket")
+_SIGNAL_META = frozenset({"kind", "run_at", "revision", "prev_sha256", *_CAP_FIELDS})
+_ABSENT = object()
+
+
+def _mismatch(got: dict, want: dict, skip: frozenset = frozenset()) -> list[str]:
+    """Fields (other than ``skip``) whose values differ, a missing field included; exact, no tolerance."""
+    return sorted(k for k in (set(got) | set(want)) - skip if got.get(k, _ABSENT) != want.get(k, _ABSENT))
+
+
+def _unproved(where: str, reason: str) -> MembershipProofError:
+    return MembershipProofError(
+        f"{where}: {reason}. Refusing this journal before any append: its original membership is not proved "
+        "by the ordered records before it (no reset, rewrite, backdating or provider inference; continuing "
+        "an unproved history is an owner decision)")
+
+
+def _prefix_reconciliation(i: int, run_at: Any, filings: dict[str, dict], aliases: dict[str, int],
+                           witness: Witness) -> tuple[dict[str, dict], list[dict], dict[str, list[tuple]]]:
+    """The run's reconciliation, recomputed from the complete ordered prefix before journal record ``i``:
+    the filings and alias records then present and the membership proved by earlier runs."""
+    where = f"prefix before journal record {i} (run_at {run_at})"
+    taught = learn_aliases(filings.values(), aliases)
+    if taught:
+        raise _unproved(where, f"its filings teach the association {taught[0]} but no alias record holds it")
+    positions = group_positions(build_purchases(filings.values(), aliases))
+    try:
+        out, _, late, members = reconcile_positions(positions, filings, witness, aliases)
+    except IdentityPolicyError as exc:
+        raise _unproved(where, f"the registered reconciliation of this prefix refuses ({exc})") from exc
+    return out, late, members
+
+
+def prove_membership(records: list[dict]) -> Witness:
+    """Prove every recorded membership from the journal's complete ordered prefixes.
+
+    Walks ``records`` (``ForwardLog.read_all()`` order; never sorted, never the
+    final :class:`State` dictionaries) keeping only what each prefix held:
+    filings (an accession journaled twice refuses: an overwrite cannot be
+    proved), aliases (each must be the next ticker -> CIK association its
+    prefix's filings teach, first association wins) and the membership proved
+    so far. At the first ``late_member``/``signal``/``entry`` record of a run
+    (records sharing a ``run_at``, in the tracker's append order) it recomputes
+    that run's reconciliation from the prefix before it: exact de-duplicated
+    purchases, registered grouping, the folding justified by earlier proved
+    owners (:func:`~paper_log.trade_edge.events.reconcile_positions`). Then:
+
+    * a ``late_member`` must be a note that reconciliation produces, once;
+    * a ``signal`` must equal its reconciled position field for field, be the
+      next revision, revise only on an accession change, keep its first cap
+      observation and not follow the position's entry;
+    * an ``entry`` needs its own witness, not its signal's: it must equal
+      :func:`entry_record` of its own reconciled position with the cap of the
+      latest signal and the first-signal time before it, be due at its
+      ``run_at``, and carry a status the entry rule gives.
+
+    The proved records' purchase keys (a signal's latest revision, an entry's
+    frozen set) and late notes form the returned witness. Anything else --
+    a missing filing, an unjournaled alias, a fold the registered rules do not
+    give, an inconsistent overwrite -- raises :class:`MembershipProofError`
+    naming the record (0-based index) or prefix and the reason.
+    """
+    witness = Witness()
+    filings: dict[str, dict] = {}
+    aliases: dict[str, int] = {}
+    filed_at: dict[str, int] = {}
+    signals: dict[str, dict] = {}
+    first_signal_at: dict[str, str] = {}
+    entered_at: dict[str, int] = {}
+    genesis = (datetime.fromisoformat(records[0]["run_at"])
+               if records and records[0].get("kind") == "header" else None)
+    run_at: Any = _ABSENT
+    stage, batch, noted = -1, None, []
+    for i, r in enumerate(records):
+        kind = r.get("kind")
+        if kind not in _STAGE:
+            continue
+        where = (f"journal record {i} ({kind} {r.get('position_id') or r.get('accession') or r.get('ticker')}, "
+                 f"run_at {r.get('run_at')})")
+        if genesis is None:
+            raise _unproved(where, "no journal header precedes it")
+        if not isinstance(r.get("run_at"), str):
+            raise _unproved(where, "it carries no run_at")
+        if r["run_at"] != run_at:
+            run_at, stage, batch, noted = r["run_at"], -1, None, []
+        if _STAGE[kind] < stage:
+            raise _unproved(where, "it follows a later-stage record of its run (the tracker appends filings, "
+                                   "aliases, late notes, signals, entries in that order)")
+        stage = _STAGE[kind]
+        if kind == "filing":
+            if r.get("accession") in filed_at:
+                raise _unproved(where, f"it repeats the accession of journal record {filed_at[r.get('accession')]}")
+            filed_at[r["accession"]] = i
+            filings[r["accession"]] = r
+            continue
+        if kind == "alias":
+            got = {"ticker": r.get("ticker"), "cik": r.get("cik"), "accession": r.get("accession")}
+            taught = learn_aliases(filings.values(), aliases)
+            if not taught or taught[0] != got:
+                raise _unproved(where, f"it is not the next ticker -> CIK association its prefix's filings "
+                                       f"teach ({taught[0] if taught else 'none'})")
+            aliases[got["ticker"]] = got["cik"]
+            continue
+        if batch is None:
+            batch = _prefix_reconciliation(i, run_at, filings, aliases, witness)
+        out, late, members = batch
+        pid = r.get("position_id")
+        if kind == LATE_MEMBER_KIND:
+            note = {k: v for k, v in r.items() if k not in ("kind", "run_at", "prev_sha256")}
+            if note not in late or note in noted:
+                raise _unproved(where, "it is not a late note the registered reconciliation of its prefix "
+                                       "produces (or it repeats one)")
+            noted.append(note)
+            witness.late.append(r)
+            continue
+        if pid in entered_at:
+            raise _unproved(where, f"{pid!r} was entered at journal record {entered_at[pid]}; an entry is frozen")
+        p = out.get(pid)
+        if p is None:
+            raise _unproved(where, "the registered reconciliation of its prefix holds no such position")
+        if datetime.fromisoformat(p["entry_close_at"]) <= genesis:
+            raise _unproved(where, "its entry close is not after the journal's genesis, so it was never admitted")
+        prev = signals.get(pid)
+        if kind == "signal":
+            diff = _mismatch({k: v for k, v in r.items() if k not in _SIGNAL_META}, p)
+            if diff:
+                raise _unproved(where, f"it does not match the registered reconciliation of its prefix on {diff}")
+            if r.get("revision") != (prev["revision"] + 1 if prev else 1):
+                raise _unproved(where, f"revision {r.get('revision')!r} is not the next revision")
+            if prev is not None and prev["accessions"] == r["accessions"]:
+                raise _unproved(where, "it revises the signal without an accession change")
+            if prev is not None and any(r.get(k) != prev.get(k) for k in _CAP_FIELDS):
+                raise _unproved(where, "it changes the cap observation of the first signal")
+            if r.get("cap_bucket") != cap_bucket(r.get("market_cap_usd")):
+                raise _unproved(where, "its cap bucket is not the one its market cap gives")
+            signals[pid] = r
+            first_signal_at.setdefault(pid, r["run_at"])
+        else:
+            if prev is None:
+                raise _unproved(where, "no signal of this position precedes it")
+            status, close = r.get("status"), r.get("entry_close_unadjusted")
+            want = entry_record(pid, p, prev, first_signal_at[pid], status, close, r["run_at"])
+            diff = _mismatch(r, want, frozenset({"prev_sha256"}))
+            if diff:
+                raise _unproved(where, f"it does not match its own prefix witness on {diff}")
+            last_done = last_completed_session(datetime.fromisoformat(r["run_at"]))
+            if _d(p["entry_session"]) > last_done:
+                raise _unproved(where, f"its session {p['entry_session']} had not completed at its run_at")
+            if not p["ticker_resolved"]:
+                rule = status == ST_UNRESOLVED and close is None
+            elif status == ST_OPENED:
+                rule = bool(close)
+            else:
+                rule = (status == ST_NO_PRICE and close is None
+                        and sessions_after(_d(p["entry_session"]), last_done) >= PRICE_GRACE_SESSIONS)
+            if not rule:
+                raise _unproved(where, f"status {status!r} with entry close {close!r} is not one the entry rule gives")
+            entered_at[pid] = i
+        witness.recorded[pid] = r
+        witness.members[pid] = members[pid]
+    return witness
+
+
 # ── run ─────────────────────────────────────────────────────────────────────
 
 
@@ -310,6 +503,9 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
         if not records:
             new.append(header_record(now, code_sha))
         state = State(records + new)
+        # every recorded membership is proved from the journal's ordered prefixes before anything is
+        # fetched or appended; an unproved history refuses here (MembershipProofError)
+        witness = prove_membership(records)
         genesis = datetime.fromisoformat(state.header["run_at"])
 
         def emit(rec: dict) -> None:
@@ -337,12 +533,13 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
 
         # issuer identity (§2.3): ticker -> CIK associations are learned once and
         # appended; a position recorded before its ticker was enriched keeps its id.
-        # A purchase that joins an already entered slot is noted once and never scored.
+        # Ownership is exact purchase membership (proved for recorded positions); a
+        # purchase that joins an already entered slot is noted once, stays bound to
+        # that slot and is never scored.
         for assoc in learn_aliases(state.filings.values(), state.aliases):
             emit({"kind": "alias", "run_at": now.isoformat(), **assoc})
         positions = group_positions(build_purchases(state.filings.values(), state.aliases))
-        positions, reconciled, late = reconcile_positions(
-            positions, state.filings, {**state.signals, **state.entries}, state.aliases, state.late_members)
+        positions, reconciled, late, _ = reconcile_positions(positions, state.filings, witness, state.aliases)
         counts["identity_reconciled"] = len(reconciled)
         for note in late:
             emit({"kind": LATE_MEMBER_KIND, "run_at": now.isoformat(), **note})
@@ -396,20 +593,7 @@ def run_once(log, *, conn, now: datetime, code_sha: str, sec, prices) -> dict:
                     status = ST_NO_PRICE
                 else:
                     continue
-            first_seen = state.first_signal_at[pid]
-            emit({
-                "kind": "entry", "run_at": now.isoformat(), "position_id": pid, "status": status,
-                "ticker": p["ticker"], "yahoo_symbol": yahoo_symbol(p["ticker"]) if p["ticker_resolved"] else None,
-                "issuer_key": p["issuer_key"], "issuer_name": p["issuer_name"],
-                "entry_session": p["entry_session"], "entry_close_at": p["entry_close_at"],
-                "entry_close_unadjusted": close, "stratum": p["stratum"],
-                "cap_bucket": sig["cap_bucket"], "market_cap_usd": sig["market_cap_usd"],
-                "cap_source": sig["cap_source"], "accessions": p["accessions"], "actors": p["actors"],
-                "n_actors": p["n_actors"], "n_purchases": p["n_purchases"],
-                "total_value": p["total_value"], "largest_value": p["largest_value"],
-                "first_known_at": p["first_known_at"], "first_signal_run_at": first_seen,
-                "late_logged": datetime.fromisoformat(first_seen) >= datetime.fromisoformat(p["entry_close_at"]),
-            })
+            emit(entry_record(pid, p, sig, state.first_signal_at[pid], status, close, now.isoformat()))
 
         # marks (§5): once per completed session, latest unadjusted close of open positions
         open_pos = [e for pid, e in state.entries.items() if e["status"] == ST_OPENED
