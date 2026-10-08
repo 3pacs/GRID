@@ -1,38 +1,38 @@
 {
   "skill_name": "hermes-operations",
-  "description": "Operate the Hermes autonomous daemon \u2014 the 24/7 self-healing scheduler for all GRID background tasks. Use when adding scheduled tasks, debugging why a puller or pipeline step isn't running, understanding the Hermes cycle structure, or diagnosing stale data and failed cycles.",
+  "description": "Operate the Hermes autonomous daemon \u2014 the 24/7 self-healing scheduler for background tasks. Use when adding scheduled steps or debugging why a scheduled step or puller did not run (cycle structure, time gates, timeouts); for source freshness thresholds, API keys, or NaN quality use data-health.",
   "results": [
     {
       "query": "I want Hermes to run a new weekly COT positioning pull every Friday at 21:30 UTC. Where do I add it and how do I keep it from re-running every 5 minutes?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "FRED data in the dashboard is 30 hours old and the health endpoint says recent_data is false. Figure out why the puller isn't running.",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "grid-hermes cycle 6310 took 80 minutes and the later steps never ran. What's going on with the cycle budget?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "the overnight job that is supposed to fill our price history didn't fire last night, how do I tell if the daemon even ran its step?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Rows for YF:XLRE:close are in raw_series but nothing shows up in resolved_series. Why?",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 8,
+    "failed": 0
   }
 }

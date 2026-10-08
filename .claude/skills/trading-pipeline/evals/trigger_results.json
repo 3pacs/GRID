@@ -5,34 +5,34 @@
     {
       "query": "Paper P&L on adaptive_rotation_live looks wrong, positions opened 03-31 but equity curve is flat. How do I trace it?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "What has to be true before we flip the rotation trader from paper to real money on Hyperliquid?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "our wallet got auto-killed overnight and I don't know which threshold tripped. Which one is it, wallet or paper engine?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "how does the system decide how much to put into BTC vs ETH vs SOL when the market flips into risk-off?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "The regime-detection feature spy_full has gaps. How do I get it resolved from raw_series?",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 8,
+    "failed": 0
   }
 }

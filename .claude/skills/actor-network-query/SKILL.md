@@ -1,11 +1,11 @@
 ---
 name: actor-network-query
-description: Query GRID's actor network to gather named actors and evidence for a lever across 475+ named entities and sector networks; use alpha-validation to validate the finished prediction.
+description: Query GRID's actor network to find the named actors, relationships and evidence behind a market lever. Use when a prediction needs specific actors (who pulled which valve), when analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors, 250K+ discovery scale and the per-sector networks. Gathers the lever and its evidence; validating the finished prediction is alpha-validation, not this skill.
 ---
 
 # actor-network-query
 
-Query and analyze GRID's actor network intelligence layer to understand who moves markets, why they move them, and which actors control critical money flows. Combines 475+ named actors, 250K+ discovery scale, and intelligence networks across energy, real estate, commodities, and media sectors.
+Query and analyze GRID's actor network intelligence layer to understand who moves markets, why they move them, and which actors control critical money flows. Combines 475+ named actors, 250K+ discovery scale, and per-sector networks (banking, commodities, defense, defi, energy, media, pharma, real estate, sovereign wealth, tech) loaded from YAML.
 
 ## When to Use This Skill
 
@@ -386,23 +386,25 @@ Every actor network query result must include a confidence label from the standa
 ### Example 1: Find All Actors in Energy Sector
 
 ```python
-from intelligence.sector_networks.loader import get_actors, get_sector_data
+from intelligence.sector_networks import get_actors, get_sector_data, list_sectors
 
-# Load raw energy sector data and flattened actor list
-energy_data = get_sector_data("energy")
-actors = get_actors("energy")
+list_sectors()
+# ['defense', 'pharma', 'sovereign_wealth', 'banking', 'energy', 'tech',
+#  'real_estate', 'commodities', 'defi', 'media']
 
-# Get OPEC+ member governments
-opec_actors = [a for a in actors if a.get("category") == "government" or a.get("region") == "OPEC"]
-# Returns: [Saudi Arabia, Russia, UAE, Kuwait, Iraq, Iran, Venezuela, ...]
+energy = get_sector_data("energy")   # the YAML `data` mapping
+energy.keys()
+# meta, oil_majors, opec_plus, opec_plus_dynamics, energy_traders, renewables, cross_connections
 
-# Get oil major companies
-majors = [a for a in actors if a.get("type") == "oil_major"]
-# Returns: [Exxon, Chevron, Shell, BP, Saudi Aramco, ...]
+# Sections are dicts keyed by ticker or short name; entries carry name, ticker,
+# exchange, sector, market_cap_usd (+ *_confidence) and similar fields. There is
+# no `category`/`region` key to filter on — pick the section you need.
+majors = energy["oil_majors"]        # {"XOM": {"name": "Exxon Mobil Corporation", ...}, ...}
+opec = energy["opec_plus"]           # {"SAUDI_ARAMCO": {...}, "ADNOC": {...}, "ROSNEFT": {...}, ...}
+traders = energy["energy_traders"]   # {"VITOL": {...}, "GLEN": {...}, "TRAFIGURA": {...}, ...}
 
-# Get commodity traders
-traders = [a for a in actors if a.get("type") == "commodity_trader"]
-# Returns: [Trafigura, Vitol, Mercuria, Gunvor, ...]
+# Flat list of every actor-like entry (any dict with a `name` or `ticker`)
+all_energy_actors = get_actors("energy")
 ```
 
 ### Example 2: Query Actor Conflict Detection
@@ -496,18 +498,31 @@ for cluster in clusters:
 ### Example 5: Query Real Estate Network for Exposure
 
 ```python
-from intelligence.sector_networks.loader import get_actors, get_sector_data
+from intelligence.sector_networks import get_actors, get_sector_data
 
-re_data = get_sector_data("real_estate")
-actors = get_actors("real_estate")
+re_net = get_sector_data("real_estate")
+re_net.keys()
+# metadata, us_reits, uae_royal_property, chinese_developers, hk_tycoons,
+# singapore_reits, japanese_reits, private_real_estate, cre_crisis,
+# cross_network_connections
 
-# Find who is exposed to commercial real estate
-cre_exposed = [
-    a for a in actors
-    if a.get("exposure_type") == "office_space" or "office" in str(a.get("exposure", "")).lower()
-]
+# The network's own commercial-real-estate crisis section
+cre = re_net["cre_crisis"]
+cre.keys()
+# overview, office_vacancy_by_city, cmbs_delinquency, cre_loan_maturity_wall,
+# regional_bank_cre_exposure, extend_and_pretend, wfh_impact, systemic_risk_assessment
 
-# Output: [RealPage, SL Green, VORNADO, Brookfield, Welltower, ...]
+# The YAML is the data; there is no query API and no `exposure_type` key.
+# us_reits is keyed by lowercase ticker and each entry carries name, ticker,
+# market_cap_usd, total_assets_usd, hq and property_type — filter on those.
+office_reits = {
+    t: r for t, r in re_net["us_reits"].items()
+    if "office" in str(r.get("property_type", "")).lower()
+}
+
+# Or walk every named actor (REITs, developers, tycoons) in one flat list
+for actor in get_actors("real_estate"):
+    print(actor.get("name"), actor.get("ticker"))
 ```
 
 ## Integration with Predictions (alpha-validation)
@@ -552,6 +567,7 @@ Use results to update trust scores and confidence for future actor network queri
 
 - `intelligence/trust_scorer.py` — Bayesian trust scoring by source type
 - `intelligence/actor_discovery.py` — 250K+ actor expansion algorithm
+- `intelligence/sector_networks/loader.py` — YAML loader for the per-sector actor graphs
 - `intelligence/postmortem.py` — Analyze prediction failures by actor involvement
 - `intelligence/dollar_flows.py` — Normalize actor actions to USD flow equivalents
 - `intelligence/cross_reference.py` — Validate actor claims against physical data

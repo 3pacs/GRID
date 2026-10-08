@@ -12,8 +12,8 @@ Operating the Hermes autonomous daemon — the 24/7 self-healing system that run
 - Adding new scheduled tasks to Hermes
 - Debugging why a puller or pipeline step isn't running
 - Understanding the Hermes cycle structure
-- Monitoring system health and freshness
-- Diagnosing stale data or failed cycles
+- Reading the health and hermes-status endpoints (freshness thresholds and key presence are data-health)
+- Diagnosing failed or starved cycles (a step that never ran, a cycle that hit its budget)
 
 ## Cycle Structure
 
@@ -50,6 +50,13 @@ Every 5 minutes, Hermes runs one cycle:
 8b. LLM Task Queue status
 9. Save cycle snapshot & Obsidian cycle report
 ```
+
+The AstroGrid step first shipped as 7i, last in the cycle, and starved: every
+grid-hermes restart rebuilds `OperatorState`, which resets `last_oracle_cycle` and
+reopens the 6-hour oracle gate, so each post-restart cycle ran a full oracle pass
+and never reached the steps behind it. It now runs ahead of the oracle because it
+has no dependency on it. Steps 7e-7h still sit behind the oracle gate, which lives
+only in memory (source comment at step 7c2 in `run_cycle()`).
 
 ## Key Files
 
@@ -121,17 +128,17 @@ python3 scripts/hermes_operator.py --once --dry-run
 | Puller returns 0 rows | API key expired or rate limited | Check .env, test API manually |
 | Cycle takes >15 min | Resolver scanning full raw_series | Use lookback_days=7 |
 | Git push fails | Merge conflict or auth | Manual git pull/push |
-| LLM unavailable | llama.cpp crashed | `sudo systemctl restart grid-llamacpp` |
+| LLM unavailable | local LLM node down (`llm.router` Tier.LOCAL) | `grid-llamacpp` was retired 2026-09-10; see `docs/SERVER-SERVICES.md` for the current LLM nodes |
 | Stale data (>26h) | Puller blacklisted | Check source_catalog, clear blacklist |
 
 ## Monitoring
 
-Health endpoint: `GET http://localhost:8000/api/v1/system/health`
+Health endpoint: `GET http://localhost:8000/api/v1/system/health` (fields live under `checks`); per-task Hermes state: `GET /api/v1/system/hermes-status`
 
 Key fields:
 - `recent_data: true` — data pulled within 26h
 - `pool_healthy: true` — DB connection pool OK
-- `llm_available: true` — llama.cpp responding
-- `thread_ingestion: true` — background ingestion running
+- `llm_available: true` — `llm.router` local tier reachable
+- `database: true` — `SELECT 1` succeeded
 
 Cycle snapshots stored in `analytical_snapshots` table — query for history.

@@ -1,38 +1,38 @@
 {
   "skill_name": "grid-orient",
-  "description": "Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale or CLAUDE.md module counts drift from real file counts.",
+  "description": "Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale; for 'does module X exist' use grid-check-exists.",
   "results": [
     {
       "query": "I just merged four new intelligence modules and a schema migration. Refresh the codebase index so the next session starts with accurate context.",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "CLAUDE.md says 46 modules in intelligence/ but ls shows 136. Can you resync the orientation file?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "new session feels like it knows nothing about the services we deployed last week; the auto-loaded context is out of date",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Regenerate .claude/CODEBASE_INDEX.md",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Does GRID already have a module for tracking earnings call tone? Check before I build one.",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 8,
+    "failed": 0
   }
 }
