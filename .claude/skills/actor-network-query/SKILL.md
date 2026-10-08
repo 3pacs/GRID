@@ -1,6 +1,6 @@
 ---
 name: actor-network-query
-description: Query GRID's actor network to understand who moves markets and why. Use when building predictions that cite specific actor levers, analyzing cross-border money flows or regulatory arbitrage, identifying conflicted interests (SEC/Fed/Congress), tracking wealth concentration, or running intelligence sweeps before major market events. Covers 475+ named actors and 250K+ discovery scale across sector networks.
+description: Query GRID's actor network to gather named actors and evidence for a lever across 475+ named entities and sector networks; use alpha-validation to validate the finished prediction.
 ---
 
 # actor-network-query
@@ -116,7 +116,9 @@ Example: Fed Chair Powell → Board members → their institutional affiliations
 
 ### Layer 3: Sector-Specific Networks
 
-#### Energy Network (`intelligence/energy_network.py`)
+Sector networks are stored as YAML definitions under `intelligence/sector_networks/*.yaml` and loaded dynamically via `intelligence/sector_networks/loader.py` (which exposes `load_sector_network`, `get_sector_data`, and `get_actors`).
+
+#### Energy Network (`intelligence/sector_networks/energy.yaml`)
 Tracks influence and control across oil, gas, renewables, and commodity trading:
 
 **Key Nodes**
@@ -135,7 +137,7 @@ Tracks influence and control across oil, gas, renewables, and commodity trading:
 
 **Example Query**: "Who controls crude oil supply valve?" → OPEC+ nations, Saudi Arabia (swing producer), plus commodity traders hedging flows.
 
-#### Real Estate Network (`intelligence/real_estate_network.py`)
+#### Real Estate Network (`intelligence/sector_networks/real_estate.yaml`)
 Maps capital flows in the world's largest asset class:
 
 **Key Nodes**
@@ -154,7 +156,7 @@ Maps capital flows in the world's largest asset class:
 
 **Example Query**: "Who is exposed to CRE crisis?" → Regional banks, commercial RE lenders, REITs with office exposure, Chinese developers.
 
-#### Commodities & Agriculture Network (`intelligence/commodities_agriculture_network.py`)
+#### Commodities & Agriculture Network (`intelligence/sector_networks/commodities.yaml`)
 Monitors food security, metals, and ag-tech concentration:
 
 **Key Nodes**
@@ -173,7 +175,7 @@ Monitors food security, metals, and ag-tech concentration:
 
 **Example Query**: "What controls food prices?" → Weather (exogenous), ABCD traders (supply control), commodity financialization (speculators), geopolitical disruptions.
 
-#### Media Network (`intelligence/media_network.py`)
+#### Media Network (`intelligence/sector_networks/media.yaml`)
 Tracks information control and narrative propagation:
 
 **Key Nodes**
@@ -384,20 +386,22 @@ Every actor network query result must include a confidence label from the standa
 ### Example 1: Find All Actors in Energy Sector
 
 ```python
-from intelligence.energy_network import EnergyNetwork
+from intelligence.sector_networks.loader import get_actors, get_sector_data
 
-energy = EnergyNetwork()
+# Load raw energy sector data and flattened actor list
+energy_data = get_sector_data("energy")
+actors = get_actors("energy")
 
 # Get OPEC+ member governments
-opec_actors = energy.get_actors(category="government", region="OPEC")
+opec_actors = [a for a in actors if a.get("category") == "government" or a.get("region") == "OPEC"]
 # Returns: [Saudi Arabia, Russia, UAE, Kuwait, Iraq, Iran, Venezuela, ...]
 
 # Get oil major companies
-majors = energy.get_actors(category="corporation", type="oil_major")
+majors = [a for a in actors if a.get("type") == "oil_major"]
 # Returns: [Exxon, Chevron, Shell, BP, Saudi Aramco, ...]
 
 # Get commodity traders
-traders = energy.get_actors(category="corporation", type="commodity_trader")
+traders = [a for a in actors if a.get("type") == "commodity_trader"]
 # Returns: [Trafigura, Vitol, Mercuria, Gunvor, ...]
 ```
 
@@ -492,28 +496,18 @@ for cluster in clusters:
 ### Example 5: Query Real Estate Network for Exposure
 
 ```python
-from intelligence.real_estate_network import RealEstateNetwork
+from intelligence.sector_networks.loader import get_actors, get_sector_data
 
-re = RealEstateNetwork()
+re_data = get_sector_data("real_estate")
+actors = get_actors("real_estate")
 
-# Find who is exposed to commercial real estate crisis
-cre_exposed = re.get_actors(
-    exposure_type="office_space",
-    exposure_min_pct=5  # >5% of portfolio in office
-)
+# Find who is exposed to commercial real estate
+cre_exposed = [
+    a for a in actors
+    if a.get("exposure_type") == "office_space" or "office" in str(a.get("exposure", "")).lower()
+]
 
 # Output: [RealPage, SL Green, VORNADO, Brookfield, Welltower, ...]
-
-# Get their liabilities and financial health
-for actor in cre_exposed[:5]:
-    health = re.get_actor_health(actor)
-    print(f"""
-    {actor.name}:
-    - Loan-to-Value: {health.ltv}%
-    - Debt maturity wall: {health.debt_maturity_dates}
-    - Refinancing risk: {health.refi_risk_level}
-    - Default probability (est): {health.default_prob}%
-    """)
 ```
 
 ## Integration with Predictions (alpha-validation)

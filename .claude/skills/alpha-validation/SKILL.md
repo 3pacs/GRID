@@ -1,6 +1,6 @@
 ---
 name: alpha-validation
-description: Validate GRID predictions against the Prediction Causation Standard (levers vs conditions). Use before logging any prediction to the immutable journal, when reviewing model output quality, debugging why a backtest prediction failed, or running post-mortems on failed trades. Rejects predictions built on conditions alone.
+description: Validate finished GRID predictions against the Prediction Causation Standard (levers vs conditions) before journal logging or trade execution; for gathering named actors and evidence for a lever use actor-network-query.
 ---
 
 # alpha-validation
@@ -160,7 +160,7 @@ When citing intelligence sources for levers, verify freshness per `intelligence/
 | diplomatic_cable | 30 days | `ingestion/altdata/foia_cables.py` | confirmed (declassified) |
 | lobbying | 30 days | `ingestion/altdata/lobbying.py` | confirmed (disclosure) |
 | campaign_finance | 60 days | `ingestion/altdata/campaign_finance.py` | derived (PAC data) |
-| offshore_leak | 14 days | `ingestion/altdata/icij_papers.py` | confirmed (ICIJ verified) |
+| offshore_leak | 14 days | `ingestion/altdata/icij_puller.py` | confirmed (ICIJ verified) |
 
 **Source window validation:**
 - [ ] Source cited is within its eval window
@@ -279,24 +279,29 @@ VALIDATION: FAIL — invalidation "sentiment turns negative" is not observable. 
 ## Integration with GRID Modules
 
 ### Journal Logging
-Before logging any prediction to `journal/log.py`:
+Before logging any decision to `journal/log.py`:
 ```python
-from validation.prediction_validator import validate_prediction
+from db import get_engine
+from journal.log import DecisionJournal
 
-prediction_dict = {
-    "lever": "...",
-    "condition": "...",
-    "thesis": "...",
-    "invalidation": "...",
-    "confidence": "confirmed",  # or derived/estimated/rumored/inferred
-    "probability": 0.75  # optional; must be in [0, 1] if present
-}
+journal = DecisionJournal(db_engine=get_engine())
 
-is_valid, errors = validate_prediction(prediction_dict)
-if not is_valid:
-    log.error(f"Prediction validation failed: {errors}")
-    return  # Do not log to journal
+# DecisionJournal.log_decision validates input constraints (operator_confidence
+# in LOW/MEDIUM/HIGH, state_confidence and transition_probability in [0, 1]).
+decision_id = journal.log_decision(
+    model_version_id=1,
+    inferred_state="risk_off",
+    state_confidence=0.75,
+    transition_probability=0.20,
+    contradiction_flags={},
+    grid_recommendation="reduce_equity_exposure",
+    baseline_recommendation="hold",
+    action_taken="reduced_risk",
+    counterfactual="spx_drawdown",
+    operator_confidence="HIGH",
+)
 ```
+Note: There is no standalone `validation/prediction_validator.py` (`validation/` holds `backtest.py`, `execution_sim.py`, and `gates.py` for model promotion gates). Input validation and outcome immutability are enforced by `journal/log.py` at logging time, while E2 evaluation normalized prediction records are validated by `evals/e2/records.py` (`validate_prediction`). The four-section SOP structure (LEVER, CONDITION, THESIS, INVALIDATION) is enforced per the validation checklist in this skill.
 
 ### Post-Mortems
 When analyzing a failed prediction in `intelligence/postmortem.py`, re-validate the original prediction:
@@ -328,4 +333,4 @@ This skill can be called by:
 - `journal/log.py` — before persisting decision journal entries
 - Post-mortem analysis — to identify prediction structure failures
 
-See `validation/prediction_validator.py` for the validation function signature.
+See `journal/log.py` for DecisionJournal logging validation, and `evals/e2/records.py` for E2 normalized prediction validation.

@@ -1,6 +1,6 @@
 ---
 name: grid-orient
-description: Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale or CLAUDE.md module counts drift from real file counts.
+description: Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale; for 'does module X exist' use grid-check-exists.
 ---
 
 # grid-orient
