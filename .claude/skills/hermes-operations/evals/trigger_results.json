@@ -1,0 +1,75 @@
+{
+  "skill_name": "hermes-operations",
+  "description": "Operate the Hermes autonomous daemon \u2014 the 24/7 self-healing scheduler for all GRID background tasks. Use when adding scheduled tasks, debugging why a puller or pipeline step isn't running, understanding the Hermes cycle structure, or diagnosing stale data and failed cycles.",
+  "results": [
+    {
+      "query": "I want Hermes to run a new weekly COT positioning pull every Friday at 21:30 UTC. Where do I add it and how do I keep it from re-running every 5 minutes?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "FRED data in the dashboard is 30 hours old and the health endpoint says recent_data is false. Figure out why the puller isn't running.",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "grid-hermes cycle 6310 took 80 minutes and the later steps never ran. What's going on with the cycle budget?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "the overnight job that is supposed to fill our price history didn't fire last night, how do I tell if the daemon even ran its step?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Rows for YF:XLRE:close are in raw_series but nothing shows up in resolved_series. Why?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "What's Tiingo's per-ticker news payload size and how much of the 40GB/month does it use?",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Walk me through how the adaptive rotation strategy maps regime to allocation weights.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Check whether every ingestion source's API key is configured and which sources are stale.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 4,
+    "failed": 4
+  }
+}

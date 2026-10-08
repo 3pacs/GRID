@@ -1,0 +1,75 @@
+{
+  "skill_name": "grid-orient",
+  "description": "Rebuild the GRID codebase index (.claude/CODEBASE_INDEX.md) for fast session orientation. Use after adding modules or significant refactors, after schema migrations or new service deploys, or when auto-loaded context feels stale or CLAUDE.md module counts drift from real file counts.",
+  "results": [
+    {
+      "query": "I just merged four new intelligence modules and a schema migration. Refresh the codebase index so the next session starts with accurate context.",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "CLAUDE.md says 46 modules in intelligence/ but ls shows 136. Can you resync the orientation file?",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "new session feels like it knows nothing about the services we deployed last week; the auto-loaded context is out of date",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Regenerate .claude/CODEBASE_INDEX.md",
+      "should_trigger": true,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": false
+    },
+    {
+      "query": "Does GRID already have a module for tracking earnings call tone? Check before I build one.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Add a time-gated Hermes step that runs at 03:00 UTC.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Show me the current schema of resolved_series and how conflict_detail is populated.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    },
+    {
+      "query": "Summarize what the intelligence/ directory does for a new contributor.",
+      "should_trigger": false,
+      "trigger_rate": 0.0,
+      "triggers": 0,
+      "runs": 3,
+      "pass": true
+    }
+  ],
+  "summary": {
+    "total": 8,
+    "passed": 4,
+    "failed": 4
+  }
+}
