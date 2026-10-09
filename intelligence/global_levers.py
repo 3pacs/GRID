@@ -44,6 +44,7 @@ from sqlalchemy.engine import Engine
 # CFTC COT ids are keyed by cftc_contract_market_code (cftc.<code>.<metric>);
 # the legacy cftc.SP500/GOLD/CRUDE_OIL/NATGAS ids mixed several markets.
 from ingestion.altdata.cftc_markets import series_id_for_root as _cftc_sid
+from ingestion.altdata.quiverquant_identity import feed_source_id_sql as _feed_source_id_sql
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1716,17 +1717,17 @@ def _inject_dynamic_actors(engine: Engine, hierarchy: dict) -> None:
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("""
-                SELECT source_type, source_id,
+                SELECT source_type, {feed_id} AS source_id,
                        COUNT(*) as signal_count,
                        AVG(trust_score) as avg_trust,
                        MAX(signal_date) as last_signal
                 FROM signal_sources
                 WHERE signal_date >= CURRENT_DATE - 30
-                GROUP BY source_type, source_id
+                GROUP BY source_type, {feed_id}
                 HAVING COUNT(*) >= 2
                 ORDER BY AVG(trust_score) DESC
                 LIMIT 50
-            """)).fetchall()
+            """.replace("{feed_id}", _feed_source_id_sql("source_id")))).fetchall()
 
             for r in rows:
                 src_type, src_id = str(r[0]), str(r[1])

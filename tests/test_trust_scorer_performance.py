@@ -8,6 +8,7 @@ from datetime import date
 class _Rows:
     def __init__(self, rows):
         self._rows = rows
+        self.rowcount = len(rows)
 
     def fetchall(self):
         return self._rows
@@ -23,6 +24,9 @@ class _Conn:
     def __exit__(self, exc_type, exc, tb):
         return False
 
+    def commit(self):
+        pass
+
     def execute(self, statement, params=None):
         sql = str(statement)
         self.statements.append(sql)
@@ -35,6 +39,11 @@ class _Conn:
                 ("news", "a", "CORRECT", 0.02, date.today(), "NVDA"),
                 ("news", "b", "WRONG", -0.01, date.today(), "MSFT"),
             ])
+        if "SELECT id FROM signal_sources" in sql:
+            return _Rows([(1 if params["si"] == "a" else 2,)]) if params["after_id"] == 0 else _Rows([])
+        if "UPDATE signal_sources" in sql:
+            assert len(params["target_ids"]) <= 50
+            return _Rows(params["target_ids"])
         return _Rows([])
 
 
@@ -58,4 +67,5 @@ def test_update_trust_scores_batches_scored_signal_rows(monkeypatch):
     result = trust_scorer.update_trust_scores(engine)
 
     assert result["total"] == 2
+    assert sum("SELECT source_type, source_id, outcome" in sql for sql in engine.conn.statements) == 1
     assert sum("UPDATE signal_sources" in sql for sql in engine.conn.statements) == 2
