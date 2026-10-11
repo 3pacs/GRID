@@ -352,10 +352,10 @@ class TestCoordinatorIdempotent:
 
     def test_blocking_handlers_run_off_the_event_loop(self):
         for fn in (coord.complete_job, coord.claim_job, coord.start_job,
-                   coord.worker_heartbeat, coord.get_job, coord.coordinator_stats):
+                   coord.worker_heartbeat, coord.get_job, coord.coordinator_stats,
+                   coord.coordinator_queue_stats, coord.create_job):
             assert not inspect.iscoroutinefunction(fn), fn.__name__
-        # contract handlers driven with asyncio.run elsewhere stay async
-        assert inspect.iscoroutinefunction(coord.create_job)
+        # dry-run never touches the database, so it may stay async
         assert inspect.iscoroutinefunction(coord.dry_run_job)
 
 
