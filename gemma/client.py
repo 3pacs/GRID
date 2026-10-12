@@ -19,6 +19,8 @@ Deployment:
 
 from __future__ import annotations
 
+from llm.feedback_loop import trace_llm_call
+
 import time
 from typing import Any
 
@@ -111,6 +113,7 @@ class GemmaClient:
     # ------------------------------------------------------------------
     # Chat completion (OpenAI-compatible)
     # ------------------------------------------------------------------
+    @trace_llm_call(module="gemma", provider="gemma")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -396,6 +399,7 @@ class GemmaClient:
     # ------------------------------------------------------------------
     # Gemma-specific: multimodal chat (images + text)
     # ------------------------------------------------------------------
+    @trace_llm_call(module="gemma.vision", provider="gemma")
     def chat_with_image(
         self,
         prompt: str,

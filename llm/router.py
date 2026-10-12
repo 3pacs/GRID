@@ -28,6 +28,8 @@ Usage:
 
 from __future__ import annotations
 
+from llm.feedback_loop import trace_llm_call
+
 import time
 from enum import Enum
 from typing import Any
@@ -231,6 +233,7 @@ def _embed_chain() -> list[str]:
     return chain or ["ollama_z4", "ollama_koala", "ollama_z400", "ollama"]
 
 
+@trace_llm_call(module="embedding_router", provider="router", operation="embed")
 def embed(
     texts: list[str],
     model: str | None = None,
@@ -749,6 +752,7 @@ class _OpenAICompatibleClient:
     def _extra_payload_fields(self) -> dict[str, Any]:
         return {}
 
+    @trace_llm_call(module="openai_compatible", provider="openai-compatible", provider_attribute="_health_provider")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -975,6 +979,7 @@ class GeminiClient:
             )
         return contents, system_text.strip()
 
+    @trace_llm_call(module="gemini", provider="gemini")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -1155,6 +1160,7 @@ class AnthropicClient:
         self.is_available = bool(api_key)
         self._knowledge_cache: dict[str, str] = {}
 
+    @trace_llm_call(module="anthropic", provider="anthropic")
     def chat(
         self,
         messages: list[dict[str, str]],

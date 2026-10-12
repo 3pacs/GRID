@@ -8,6 +8,8 @@ any single LLM backend for core operations.
 
 from __future__ import annotations
 
+from llm.feedback_loop import trace_llm_call
+
 import os
 import time
 from typing import Any
@@ -90,6 +92,7 @@ class OllamaClient:
     # ------------------------------------------------------------------
     # Chat completion (native API)
     # ------------------------------------------------------------------
+    @trace_llm_call(module="ollama", provider="ollama")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -185,6 +188,7 @@ class OllamaClient:
     # ------------------------------------------------------------------
     # Generate (single-turn, no conversation)
     # ------------------------------------------------------------------
+    @trace_llm_call(module="ollama", provider="ollama")
     def generate(
         self,
         prompt: str,
@@ -271,6 +275,7 @@ class OllamaClient:
     # ------------------------------------------------------------------
     # Embeddings
     # ------------------------------------------------------------------
+    @trace_llm_call(module="ollama.embed", provider="ollama", operation="embed")
     def embed(
         self,
         texts: list[str],
@@ -436,6 +441,7 @@ class OpenAIClient:
     def load_all_knowledge(self) -> str:
         return load_all_knowledge_docs(self._knowledge_cache)
 
+    @trace_llm_call(module="openai_legacy", provider="openai")
     def chat(
         self,
         messages: list[dict[str, str]],

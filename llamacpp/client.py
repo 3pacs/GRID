@@ -11,6 +11,8 @@ No Ollama wrapper overhead. Direct llama.cpp on bare metal.
 
 from __future__ import annotations
 
+from llm.feedback_loop import trace_llm_call
+
 import time
 from typing import Any
 
@@ -136,6 +138,7 @@ class LlamaCppClient:
     # ------------------------------------------------------------------
     # Chat completion (OpenAI-compatible)
     # ------------------------------------------------------------------
+    @trace_llm_call(module="llamacpp", provider="llamacpp")
     def chat(
         self,
         messages: list[dict[str, str]],
@@ -356,6 +359,7 @@ class LlamaCppClient:
     # ------------------------------------------------------------------
     # Embeddings
     # ------------------------------------------------------------------
+    @trace_llm_call(module="llamacpp.embed", provider="llamacpp", operation="embed")
     def embed(
         self,
         texts: list[str],

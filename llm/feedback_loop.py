@@ -39,7 +39,11 @@ import json
 import hashlib
 import logging
 import datetime
-from typing import Any
+import functools
+import time
+import re
+from contextvars import ContextVar
+from typing import Any, Callable
 
 log = logging.getLogger("grid.llm.feedback_loop")
 
@@ -51,6 +55,137 @@ log = logging.getLogger("grid.llm.feedback_loop")
 # -----------------------------------------------------------------
 _LANGFUSE_CLIENT: Any = None
 _LANGFUSE_INIT_TRIED: bool = False
+_ACTIVE_OBSERVATION: ContextVar[Any] = ContextVar("grid_llm_observation", default=None)
+_ACTIVE_METADATA: ContextVar[dict[str, Any] | None] = ContextVar("grid_llm_metadata", default=None)
+
+# Exact public identifiers from the current router/client/endpoint registry.
+# Dynamic values are intentionally unknown, not guessed or substring-redacted.
+_TRACE_MODULES = frozenset({
+    "llamacpp", "llamacpp.embed", "embedding_router", "openai_compatible",
+    "gemma", "gemma.vision", "gemma_micro", "ollama", "ollama.embed",
+    "openai_legacy", "openai", "huggingface", "gemini", "anthropic",
+    "gemma_micro.signal_classifier", "gemma_micro.anomaly_narrator",
+    "gemma_micro.edgar_extractor", "gemma_micro.knowledge_mapper", "unknown",
+})
+_TRACE_PROVIDERS = frozenset({
+    "llamacpp", "gemma", "gemma_micro", "ollama", "openai",
+    "openai-compatible", "openrouter", "huggingface", "gemini", "anthropic",
+    "router", "unknown",
+})
+_TRACE_MODELS = frozenset({
+    "hermes", "llama3.1:8b", "nomic-embed-text", "gpt-4o-mini",
+    "text-embedding-3-small", "gemma-4-31B-it-Q4_K_M", "gemini-2.5-flash",
+    "claude-sonnet-4-6", "Qwen/Qwen2.5-72B-Instruct", "qwen2.5:32b",
+    "gemma2:9b", "qwen2.5:7b-instruct-q4_K_M", "qwen3:8b", "qwen3.8-27b",
+    "gemma-4-e4b-signal-classifier", "gemma-4-e4b-anomaly-narrator",
+    "gemma-4-e4b-edgar-extractor", "gemma-4-e4b-knowledge-mapper", "unknown",
+})
+
+
+def _trace_identifier(value: Any, allowed: frozenset[str]) -> str:
+    return value if type(value) is str and value in allowed else "unknown"
+
+
+def _trace_integer(value: Any, maximum: int) -> int | None:
+    return value if type(value) is int and 0 <= value <= maximum else None
+
+
+def _trace_metadata(values: dict[str, Any]) -> dict[str, Any]:
+    """Closed scalar allowlist; never forward arbitrary call-site metadata."""
+    result: dict[str, Any] = {
+        "module": _trace_identifier(values.get("module"), _TRACE_MODULES),
+        "provider": _trace_identifier(values.get("provider"), _TRACE_PROVIDERS),
+        "tier": _trace_identifier(values.get("tier"), frozenset({
+            "LOCAL", "REASON", "ORACLE", "local", "reason", "oracle", "batch", "micro", "unknown",
+        })),
+        "operation": _trace_identifier(values.get("operation"), frozenset({"chat", "embed", "unknown"})),
+        "call_status": _trace_identifier(values.get("call_status"), frozenset({
+            "returned", "unavailable", "exception", "unknown",
+        })),
+    }
+    for key in ("latency_ms", "elapsed_ms"):
+        value = _trace_integer(values.get(key), 86_400_000)
+        if value is not None:
+            result[key] = value
+    # The internal caller generates this ID; caller-supplied metadata cannot
+    # replace it. Reject noncanonical shapes as an additional format check.
+    call_id = values.get("call_id")
+    if type(call_id) is str and re.fullmatch(r"[0-9a-f]{16}", call_id):
+        result["call_id"] = call_id
+    provenance = values.get("usage_provenance")
+    if type(provenance) is dict:
+        result["usage_provenance"] = {
+            key: _trace_identifier(provenance.get(key), frozenset({"reported", "estimated", "unknown"}))
+            for key in ("input", "output")
+        }
+    return result
+
+
+def trace_llm_call(*, module: str, provider: str, operation: str = "chat",
+                   provider_attribute: str = "") -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Time a provider call without capturing new prompts, vectors or errors.
+
+    Success feedback updates this observation instead of emitting a second
+    generation. Unknown usage, cost and prediction outcome remain absent.
+    Telemetry failures must never change the wrapped call's behavior.
+    """
+    def decorate(func: Callable[..., Any]) -> Callable[..., Any]:
+        @functools.wraps(func)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            observation = None
+            observation_metadata: dict[str, Any] = {}
+            token = None
+            started = time.monotonic()
+            result = None
+            raised = False
+            try:
+                actual_provider = (
+                    getattr(args[0], provider_attribute, provider)
+                    if args and provider_attribute else provider
+                )
+                observation_metadata = _trace_metadata({
+                    "module": module, "provider": actual_provider, "operation": operation,
+                })
+                client = _get_langfuse()
+                if client is not None:
+                    observation = client.start_observation(
+                        name=observation_metadata["module"],
+                        as_type="embedding" if operation == "embed" else "generation",
+                        metadata=dict(observation_metadata),
+                    )
+            except Exception:
+                pass
+            # Set even when unavailable: nested calls cannot update a parent
+            # observation if their own telemetry initialization failed.
+            token = _ACTIVE_OBSERVATION.set(observation)
+            metadata_token = _ACTIVE_METADATA.set(observation_metadata if observation is not None else None)
+            try:
+                result = func(*args, **kwargs)
+                return result
+            except BaseException:
+                raised = True
+                raise
+            finally:
+                _ACTIVE_OBSERVATION.reset(token)
+                _ACTIVE_METADATA.reset(metadata_token)
+                if observation is not None:
+                    status = "exception" if raised else "unavailable" if result is None else "returned"
+                    try:
+                        observation.update(
+                            level="ERROR" if raised else "WARNING" if result is None else "DEFAULT",
+                            status_message=status,
+                            metadata=_trace_metadata({**observation_metadata,
+                                      "operation": operation, "call_status": status,
+                                      "elapsed_ms": int((time.monotonic() - started) * 1000)}),
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        observation.end()
+                    except Exception:
+                        pass
+        return wrapped
+    return decorate
 
 
 def _get_langfuse():
@@ -92,33 +227,43 @@ def _emit_to_langfuse(
     metadata: dict,
 ) -> None:
     """Best-effort fan-out to Langfuse. Silently swallows all errors."""
-    client = _get_langfuse()
-    if client is None:
-        return
     try:
-        obs = client.start_observation(
-            name=module,
-            as_type="generation",
-            model=model or None,
-            input={
-                "system": system_prompt,
-                "user": user_prompt,
-            },
-            output=output,
-            usage_details={
-                "input": int(context_tokens) if context_tokens else 0,
-                "output": int(output_tokens) if output_tokens else 0,
-            },
-            metadata={
+        # Calls wrapped by trace_llm_call already began before inference.
+        # Older callers retain their existing post-call fan-out.
+        obs = _ACTIVE_OBSERVATION.get()
+        active = obs is not None
+        client = _get_langfuse() if not active else None
+        if not active and client is None:
+            return
+        active_metadata = _ACTIVE_METADATA.get()
+        fields = dict(
+            # Langfuse is metadata-only, including successful calls. The
+            # training DB retains its existing separate payload contract.
+            model=_trace_identifier(model, _TRACE_MODELS),
+            usage_details={key: value for key, value in
+                           (("input", context_tokens), ("output", output_tokens))
+                           if _trace_integer(value, 1_000_000_000) is not None and value > 0},
+            metadata=_trace_metadata({
                 "tier": tier,
                 "provider": provider,
                 "module": module,
-                "latency_ms": int(latency_ms) if latency_ms else 0,
+                "operation": active_metadata.get("operation") if active_metadata is not None else "unknown",
+                "latency_ms": latency_ms,
                 "call_id": call_id,
-                **(metadata or {}),
-            },
+                "usage_provenance": metadata.get("usage_provenance") if type(metadata) is dict else None,
+            }),
         )
-        obs.end()
+        if active:
+            # SDK metadata updates may replace the complete map. Keep a
+            # context-local copy so final status cannot erase success tags.
+            if active_metadata is not None:
+                active_metadata.update(fields["metadata"])
+                fields["metadata"] = dict(active_metadata)
+            obs.update(**fields)
+        else:
+            obs = client.start_observation(name=_trace_identifier(module, _TRACE_MODULES),
+                                           as_type="generation", **fields)
+            obs.end()
     except Exception as e:
         log.debug(f"Langfuse emit failed: {e}")
 
@@ -213,7 +358,14 @@ def log_llm_call(
     raw = f"{module}:{system_prompt[:100]}:{user_prompt[:100]}:{ts}"
     call_id = hashlib.sha256(raw.encode()).hexdigest()[:16]
 
-    # Estimate tokens if not provided
+    # Preserve the distinction between provider counts and text estimates.
+    metadata = dict(metadata or {})
+    metadata["usage_provenance"] = {
+        "input": "reported" if context_tokens else "estimated" if system_prompt or user_prompt else "unknown",
+        "output": "reported" if output_tokens else "estimated" if output else "unknown",
+    }
+
+    # Estimate tokens if not provided (existing training-store behavior).
     if not context_tokens:
         context_tokens = (len(system_prompt) + len(user_prompt)) // 4
 

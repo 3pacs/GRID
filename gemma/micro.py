@@ -21,6 +21,8 @@ Deployment:
 
 from __future__ import annotations
 
+from llm.feedback_loop import trace_llm_call
+
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -158,6 +160,7 @@ class GemmaMicroClient:
                 url=config.base_url,
             )
 
+    @trace_llm_call(module="gemma_micro", provider="gemma_micro")
     def run(self, input_text: str) -> str | None:
         """Run the specialised task on input text.
 
