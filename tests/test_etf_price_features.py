@@ -3,6 +3,7 @@
 import ast
 import importlib.util
 import json
+import runpy
 import sys
 import types
 import unittest
@@ -26,17 +27,37 @@ def load(name, path):
     return module
 
 
-# A dormant package shell avoids repository/package/conftest entrypoints. The
-# accepted module is loaded with its exact canonical identity before candidate
-# import, so candidate uses only its public API, with no quality monkeypatch.
-package = types.ModuleType("analysis")
-package.__path__ = []
-sys.modules["analysis"] = package
-Q = load(
-    "analysis.feed_reliability_projection",
-    ROOT / "analysis/feed_reliability_projection.py",
-)
-M = load("numeric_contract_under_test", SOURCE)
+_MISSING_MODULE = object()
+
+
+def load_contract_modules(loader=load):
+    # The private shell avoids executing package/conftest entrypoints, but must
+    # never replace pytest's shared package/dependency state after collection.
+    names = (
+        "analysis",
+        "analysis.feed_reliability_projection",
+        "numeric_contract_under_test",
+    )
+    previous = {name: sys.modules.get(name, _MISSING_MODULE) for name in names}
+    try:
+        package = types.ModuleType("analysis")
+        package.__path__ = []
+        sys.modules["analysis"] = package
+        quality = loader(
+            "analysis.feed_reliability_projection",
+            ROOT / "analysis/feed_reliability_projection.py",
+        )
+        numeric = loader("numeric_contract_under_test", SOURCE)
+        return quality, numeric
+    finally:
+        for name, module in previous.items():
+            if module is _MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+
+Q, M = load_contract_modules()
 FIXTURE = json.loads((ROOT / "tests/fixtures/etf_price_features_v1.json").read_text())
 CONTROL_IDS = []
 T = datetime(2026, 1, 5, 14, 30, tzinfo=timezone.utc)
@@ -2266,11 +2287,163 @@ class FeatureMathTests(unittest.TestCase):
             self.check("M-large-context-unchanged", (str(ctx), dict(ctx.flags)), before)
 
 
+class DependencyLoadingTests(unittest.TestCase):
+    NAMES = (
+        "analysis",
+        "analysis.feed_reliability_projection",
+        "numeric_contract_under_test",
+        "analysis.temporal_feature_eligibility",
+    )
+
+    def setUp(self):
+        self.previous = {
+            name: sys.modules.get(name, _MISSING_MODULE) for name in self.NAMES
+        }
+
+    def tearDown(self):
+        for name, module in self.previous.items():
+            if module is _MISSING_MODULE:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def existing_state(self):
+        package = types.ModuleType("analysis")
+        package.__path__ = [str(ROOT / "analysis")]
+        package.marker = object()
+        quality = types.ModuleType("analysis.feed_reliability_projection")
+        alias = types.ModuleType("numeric_contract_under_test")
+        package.feed_reliability_projection = quality
+        sys.modules.update(
+            {
+                "analysis": package,
+                "analysis.feed_reliability_projection": quality,
+                "numeric_contract_under_test": alias,
+            }
+        )
+        sys.modules.pop("analysis.temporal_feature_eligibility", None)
+        return package
+
+    def snapshot(self):
+        entries = {
+            name: sys.modules.get(name, _MISSING_MODULE) for name in self.NAMES[:3]
+        }
+        parent = entries["analysis"]
+        attributes = (
+            dict(vars(parent)) if isinstance(parent, types.ModuleType) else None
+        )
+        path = (
+            attributes.get("__path__", _MISSING_MODULE)
+            if attributes is not None
+            else _MISSING_MODULE
+        )
+        contents = tuple(path) if path is not _MISSING_MODULE else None
+        return entries, attributes, path, contents
+
+    def assert_restored(self, before):
+        entries, attributes, path, contents = before
+        for name, original in entries.items():
+            CONTROL_IDS.append("collection-restores-" + name)
+            if original is _MISSING_MODULE:
+                self.assertNotIn(name, sys.modules)
+            else:
+                self.assertIs(sys.modules[name], original)
+        if attributes is not None:
+            parent = entries["analysis"]
+            self.assertEqual(set(vars(parent)), set(attributes))
+            for name, value in attributes.items():
+                self.assertIs(vars(parent)[name], value)
+            self.assertIs(parent.__path__, path)
+            self.assertEqual(tuple(parent.__path__), contents)
+
+    def test_existing_package_dependency_and_alias_are_restored(self):
+        package = self.existing_state()
+        before = self.snapshot()
+        quality, numeric = load_contract_modules()
+        self.assertIs(numeric.Observation, quality.Observation)
+        self.assert_restored(before)
+        # Ordinary import resolution/loading of another exact-head pure module
+        # must still work through the original real package path.
+        unrelated = importlib.import_module("analysis.temporal_feature_eligibility")
+        self.assertEqual(
+            Path(unrelated.__file__).resolve(),
+            (ROOT / "analysis/temporal_feature_eligibility.py").resolve(),
+        )
+        self.assertIs(sys.modules["analysis"], package)
+        self.assertIs(package.__path__, before[2])
+        CONTROL_IDS.append("collection-unrelated-import-after-loader")
+
+    def test_absent_entries_do_not_leak(self):
+        for name in self.NAMES:
+            sys.modules.pop(name, None)
+        before = self.snapshot()
+        quality, numeric = load_contract_modules()
+        self.assertIs(numeric.Observation, quality.Observation)
+        self.assert_restored(before)
+
+    def test_independently_missing_and_none_entries_are_restored(self):
+        for case in ("missing_child", "missing_parent", "none_bindings"):
+            with self.subTest(case=case):
+                self.existing_state()
+                if case == "missing_child":
+                    sys.modules.pop("analysis.feed_reliability_projection")
+                    sys.modules.pop("numeric_contract_under_test")
+                elif case == "missing_parent":
+                    sys.modules.pop("analysis")
+                    sys.modules["numeric_contract_under_test"] = None
+                else:
+                    sys.modules["analysis"] = None
+                    sys.modules["analysis.feed_reliability_projection"] = None
+                before = self.snapshot()
+                quality, numeric = load_contract_modules()
+                self.assertIs(numeric.Observation, quality.Observation)
+                self.assert_restored(before)
+
+    def test_exceptional_quality_and_candidate_load_restore_state(self):
+        for failing_name in self.NAMES[1:3]:
+            for exception in (RuntimeError, KeyboardInterrupt):
+                with self.subTest(name=failing_name, exception=exception):
+                    self.existing_state()
+                    before = self.snapshot()
+
+                    def fail_after_load(name, path):
+                        module = load(name, path)
+                        if name == failing_name:
+                            raise exception("synthetic_contract_loader_failure")
+                        return module
+
+                    with self.assertRaises(exception):
+                        load_contract_modules(fail_after_load)
+                    self.assert_restored(before)
+
+    def test_collection_import_preserves_state_and_all_test_bodies(self):
+        package = self.existing_state()
+        before = self.snapshot()
+        namespace = runpy.run_path(__file__, run_name="isolated_collection_regression")
+        self.assert_restored(before)
+        module = types.ModuleType("isolated_collection_regression")
+        vars(module).update(namespace)
+        collected = unittest.defaultTestLoader.loadTestsFromModule(module)
+        expected = sum(
+            unittest.defaultTestLoader.loadTestsFromTestCase(cls).countTestCases()
+            for cls in (NumericSessionTests, FeatureMathTests, DependencyLoadingTests)
+        )
+        self.assertEqual(collected.countTestCases(), expected)
+        self.assertEqual(expected, 51)
+        self.assertIs(
+            importlib.import_module("analysis.temporal_feature_eligibility"),
+            sys.modules["analysis.temporal_feature_eligibility"],
+        )
+        self.assertIs(sys.modules["analysis"], package)
+        CONTROL_IDS.append("collection-all51-bodies-available-with-unrelated-import")
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite(
         (
             unittest.defaultTestLoader.loadTestsFromTestCase(NumericSessionTests),
             unittest.defaultTestLoader.loadTestsFromTestCase(FeatureMathTests),
+            unittest.defaultTestLoader.loadTestsFromTestCase(DependencyLoadingTests),
         )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
