@@ -390,6 +390,78 @@ jobs:
           chmod +x scripts/deploy_verify_release_tree.sh
           ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
+      # grid-coordinator (uvicorn scripts.compute_coordinator:app, :8100) is a
+      # long-running daemon like grid-hermes: a deploy that does not restart it
+      # leaves it on whatever tree it booted with. It ran from the frozen
+      # /home/grid/grid_v4/grid_repo (5facbdf0) until 2026-10-14, so #836's
+      # connection-leak fix merged green and changed nothing live.
+      #
+      # Deliberately narrower than the API/Hermes steps:
+      #   - never writes a drop-in. Moving the coordinator onto $DEPLOY_PATH is
+      #     an operator decision (done 2026-10-14 via zz-release-worktree.conf);
+      #     a unit still pointed elsewhere is left alone, not repointed.
+      #   - only an already active, enabled unit whose WorkingDirectory is
+      #     exactly $DEPLOY_PATH is eligible; a stop/disable is a hold.
+      #   - try-restart, never start: a stop racing this step stays stopped.
+      # Job state lives in compute_jobs, so a restart costs workers a few
+      # seconds of refused connections, which they already retry.
+      - name: Restart grid-coordinator
+        id: coordinator_restart
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          coordinator_state() {
+            local raw key value active='' unit='' wd='' seen=0
+            raw="$(systemctl show grid-coordinator --property=ActiveState --property=UnitFileState --property=WorkingDirectory)" || {
+              echo "::error::cannot read grid-coordinator state" >&2; return 1;
+            }
+            while IFS='=' read -r key value; do
+              case "$key" in
+                ActiveState) [ -z "$active" ] && [ -n "$value" ] || return 1; active="$value" ;;
+                UnitFileState) [ -z "$unit" ] && [ -n "$value" ] || return 1; unit="$value" ;;
+                WorkingDirectory) [ -z "$wd" ] || return 1; wd="$value" ;;
+                *) echo "::error::malformed grid-coordinator state" >&2; return 1 ;;
+              esac
+              seen=$((seen + 1))
+            done <<< "$raw"
+            [ "$seen" -eq 3 ] || return 1
+            printf '%s|%s|%s\n' "$active" "$unit" "$wd"
+          }
+          echo "verify=false" >> "$GITHUB_OUTPUT"
+          eligible="active|enabled|$DEPLOY_PATH"
+          state="$(coordinator_state)"
+          if [ "$state" != "$eligible" ]; then
+            echo "grid-coordinator state preserved ($state); no restart"
+            exit 0
+          fi
+          sudo systemctl try-restart grid-coordinator
+          for attempt in {1..30}; do
+            if curl -fsS -m 5 http://localhost:8100/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 30 ]; then
+              echo "::error::grid-coordinator /health failed after restart"
+              sudo systemctl status grid-coordinator --no-pager -l || true
+              journalctl -u grid-coordinator -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          state="$(coordinator_state)"
+          if [ "$state" != "$eligible" ]; then
+            echo "grid-coordinator state changed after try-restart ($state); tree unverified"
+            exit 0
+          fi
+          echo "verify=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify grid-coordinator runs the deployed tree
+        if: ${{ (github.event_name == 'push' || inputs.do_restart == true) && steps.coordinator_restart.outputs.verify == 'true' }}
+        run: |
+          set -euo pipefail
+          pid="$(systemctl show -p MainPID --value grid-coordinator)"
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
+
       # grid-realtime has the exact same class of bug already fixed for
       # grid-hermes (#487/#490): its unit runs `ExecStart=/usr/bin/python3 -m
       # ingestion.realtime.ws_listener`, and `-m` resolves that module against
