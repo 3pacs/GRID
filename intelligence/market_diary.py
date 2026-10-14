@@ -80,6 +80,11 @@ def _env_bool(name: str, default: bool) -> bool:
 PRICES_ENABLED: bool = _env_bool("GRID_MARKET_DIARY_PRICES_ENABLED", False)
 PRICE_BASIS = "raw_close"  # YF:*:close is pulled with auto_adjust=False (ingestion/yfinance_pull.py)
 _PRICE_SOURCE = "yfinance"
+# Lower bound for the (today, prior) price read. Two accepted closes always
+# fall inside 14 calendar days for a daily series (>= 8 sessions even across
+# holidays); an unbounded read fetched every vintage back to 1990 (~2.2M
+# rows per series, ~10 min for the 21 diary reads) and timed the job out.
+_PRICE_LOOKBACK_DAYS = 14
 
 # ──────────────────────────────────────────────────────────────────
 # Schema
@@ -144,7 +149,10 @@ def _fresh_pair(conn: Any, series_id: str, target_date: date) -> tuple[Any, Any]
     pulled yet, or a re-pull landed on a different day) is refused rather
     than silently reported as "today's" move. See §4.1 fix #2(b).
     """
-    rows = read_latest_n(conn, series_id, 2, source=_PRICE_SOURCE, as_of=target_date)
+    rows = read_latest_n(
+        conn, series_id, 2, source=_PRICE_SOURCE,
+        start=target_date - timedelta(days=_PRICE_LOOKBACK_DAYS), as_of=target_date,
+    )
     if len(rows) < 2 or rows[0].obs_date != target_date:
         return None
     return rows[0], rows[1]
