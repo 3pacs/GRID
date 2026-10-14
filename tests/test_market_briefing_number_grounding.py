@@ -389,3 +389,61 @@ def test_generate_briefing_fallback_path_still_produces_grounding_stats(tmp_path
     # numbers are trivially grounded -- still worth asserting the gate ran.
     assert result["grounding"]["total_numbers"] >= 1
     assert result["grounding"]["ungrounded_count"] == 0
+
+
+# ── Prompt/guard contract (2026-10-14) ───────────────────────────────────
+# The prompt used to ask for "the flow direction" and hand the model the
+# sentiment `flows` component as "$X.XB in, $Y.YB out", while
+# check_publication_claims withholds any narrative that talks about flows.
+# 151 of 153 stored narratives (10-06..10-14) were withheld.
+
+
+def _sentiment_with_proxies():
+    from intelligence.sentiment_scorer import SentimentComponent, SentimentResult
+
+    return SentimentResult(
+        score=0.42, label="BULLISH", context="test", timestamp="2026-10-14T00:00:00",
+        components=[
+            SentimentComponent("flows", 0.9, 1.0, 0.2, "$29.2B in, $0.7B out, net ratio=+0.95"),
+            SentimentComponent("dark_pool", 0.1, 0.1, 0.0, "Dark pool: $120M in, $80M out, net=+0.20"),
+            SentimentComponent("etf_flows", 0.2, 0.2, 0.0, "ETF flows: $300M in, $100M out"),
+            SentimentComponent("put_call_ratio", 0.8, -0.3, 0.1, "P/C 0.80"),
+        ],
+    )
+
+
+def _run_with_sentiment(tmp_path, monkeypatch, response):
+    monkeypatch.setattr("ingestion.wiki_history.WikiHistoryPuller", _no_network)
+    monkeypatch.setattr("ingestion.social_sentiment.SocialSentimentPuller", _no_network)
+    monkeypatch.setattr("intelligence.sentiment_scorer.compute_sentiment", lambda _e: _sentiment_with_proxies())
+    monkeypatch.setattr("intelligence.sentiment_scorer.log_prediction", lambda *_a, **_k: None)
+    fake_llm = _FakeOllamaClient(response)
+    conn = _FakeConnection(row_by_sid={"YF:^GSPC:close": (5789.12, date(2026, 9, 24))})
+    engine = _make_engine(fake_llm, _FakeEngine(conn), tmp_path)
+    return fake_llm, engine.generate_briefing(briefing_type="hourly", save=False)
+
+
+def test_proxy_components_reach_the_prompt_without_flow_amounts(tmp_path, monkeypatch):
+    fake_llm, _ = _run_with_sentiment(tmp_path, monkeypatch, "## Action\nWatch the tape.\n")
+    user = next(m["content"] for m in fake_llm.calls[0]["messages"] if m["role"] == "user")
+    assert "positioning_proxy: score=+1.00" in user
+    assert "dark_pool_proxy" in user and "etf_activity_proxy" in user
+    for leaked in ("$29.2B in", "$0.7B out", "$120M in", "ETF flows:", "- flows:"):
+        assert leaked not in user
+    assert "put_call_ratio: score=-0.30, weight=10% — P/C 0.80" in user  # non-proxies unchanged
+
+
+def test_system_prompt_no_longer_asks_for_flow_direction(tmp_path, monkeypatch):
+    fake_llm, _ = _run_with_sentiment(tmp_path, monkeypatch, "## Action\nWatch the tape.\n")
+    system = next(m["content"] for m in fake_llm.calls[0]["messages"] if m["role"] == "system")
+    assert "flow direction" not in system
+    assert "Never use these words or phrases" in system
+
+
+def test_rejected_candidate_is_kept_internally_never_published(tmp_path, monkeypatch):
+    candidate = "## What's Happening Now\nDirectional flows are bullish.\n"
+    _, result = _run_with_sentiment(tmp_path, monkeypatch, candidate)
+    guard = result["publication_claim_guard"]
+    assert guard["passed"] is False and "unsupported_money_transfer" in guard["reasons"]
+    assert guard["rejected_candidate"] == candidate
+    assert "Directional flows" not in result["content"]

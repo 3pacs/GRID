@@ -37,6 +37,32 @@ class MarketBriefingEngine:
         db_engine: Optional SQLAlchemy engine for live data access.
     """
 
+    # Sentiment components that are proxies, not measured money transfers
+    # (dollar_flows is mostly options premium + estimated ETF activity). The
+    # publication guard (number_grounding.check_publication_claims) withholds any
+    # narrative that describes them as flows, so the prompt must not hand them to
+    # the model as "$X in / $Y out". Stored component names/details are unchanged;
+    # only how they are rendered into the prompt differs.
+    _PROXY_COMPONENT_LABELS = {
+        "flows": "positioning_proxy",
+        "dark_pool": "dark_pool_proxy",
+        "etf_flows": "etf_activity_proxy",
+    }
+    _PROXY_COMPONENT_NOTE = (
+        "proxy score from options premium / estimated ETF / off-exchange prints; "
+        "NOT a measured money transfer. Refer to it only by its score and direction "
+        "(supportive/unsupportive); quote no dollar amounts for it"
+    )
+    # Vocabulary the guard rejects outright (see check_publication_claims). Saying
+    # so up front costs a sentence; not saying so withheld 151 of 153 narratives
+    # between 2026-10-06 and 2026-10-14.
+    _GUARDED_VOCABULARY_RULE = (
+        "Never use these words or phrases: flow, flows, inflow, outflow, money "
+        "moving/flowing, transfer, capital rotation, hedge, hedging, protection, "
+        "buying/selling puts or calls, realized volatility. Any briefing that "
+        "contains them is withheld and replaced by a data-only summary."
+    )
+
     def __init__(
         self,
         ollama_client: Any = None,
@@ -534,7 +560,11 @@ class MarketBriefingEngine:
             data_context += f"- Score: {sentiment.score:+.2f} ({sentiment.label})\n"
             data_context += f"- Context: {sentiment.context}\n"
             for comp in sentiment.components:
-                data_context += f"- {comp.name}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {comp.detail}\n"
+                label = self._PROXY_COMPONENT_LABELS.get(comp.name)
+                if label is not None:
+                    data_context += f"- {label}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {self._PROXY_COMPONENT_NOTE}\n"
+                else:
+                    data_context += f"- {comp.name}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {comp.detail}\n"
             data_context += (
                 "\nIMPORTANT: The sentiment score above is computed from data. "
                 "Your job is to EXPLAIN why the score is what it is and what it means — "
@@ -568,6 +598,7 @@ class MarketBriefingEngine:
         claim_guard = check_publication_claims(content)
         snapshot["publication_claim_guard"] = claim_guard
         if not claim_guard["passed"]:
+            rejected = content
             # Replace the whole candidate instead of leaving its causal story
             # intact with a numeric footnote. Only future generations change.
             summary = self._generate_fallback_briefing(snapshot)
@@ -579,6 +610,11 @@ class MarketBriefingEngine:
                 "**AI narrative withheld: unsupported source interpretation. Data summary only.**\n\n"
                 + summary
             )
+            # Keep the full rejected candidate for review (llm_calls truncates
+            # at 2,000 chars, which hid late triggers). Set only after the
+            # data summary is built so it can never feed published text;
+            # snapshot_data is internal (the API returns only status/length).
+            claim_guard["rejected_candidate"] = rejected
 
         # ── Number-grounding gate ──
         # Runs on every generated briefing before it is written: numeric
@@ -638,11 +674,11 @@ class MarketBriefingEngine:
             "Start with the single most important thing happening right now. "
             "Separate LEVERS (actor actions that open/close liquidity valves) from "
             "CONDITIONS (environment that amplifies). Lead each section with the "
-            "lever, then the condition. If you cannot name the actor, the valve, "
-            "and the flow direction, do not make the call."
+            "lever, then the condition. If you cannot name the actor and the "
+            "valve, do not make the call."
         )
         from ollama.number_grounding import PUBLICATION_EVIDENCE_RULES
-        base += " " + PUBLICATION_EVIDENCE_RULES
+        base += " " + PUBLICATION_EVIDENCE_RULES + " " + self._GUARDED_VOCABULARY_RULE
 
         if briefing_type == "hourly":
             return (
