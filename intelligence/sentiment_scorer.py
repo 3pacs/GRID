@@ -40,6 +40,19 @@ from sqlalchemy.engine import Engine
 
 from store.observations import read_latest, read_latest_n, read_window
 
+
+def _recent_closes(conn: Any, series_id: str, n: int) -> list[Any]:
+    """The ``n`` newest yfinance closes for ``series_id``, newest first.
+
+    Bounds the scan to a calendar window that holds ``n`` sessions (7/5 per
+    session plus a 14-day holiday/gap margin). An unbounded ``read_latest_n``
+    fetched every vintage back to 1990 (~2M rows, ~8 s per call) for each of
+    the 15 reads a briefing makes. Same SUCCESS-only, latest-vintage rows; a
+    series with a gap longer than the margin returns fewer than ``n``.
+    """
+    start = datetime.now(timezone.utc).date() - timedelta(days=(n * 7) // 5 + 14)
+    return read_latest_n(conn, series_id, n, source="yfinance", start=start)
+
 # ── Configuration ─────────────────────────────────────────────────────────
 
 EVALUATION_WINDOW_DAYS = 5  # Score predictions after 5 trading days
@@ -326,7 +339,7 @@ def _score_momentum(engine: Engine) -> SentimentComponent:
 
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 25, source="yfinance")
+            rows = _recent_closes(conn, "YF:^GSPC:close", 25)
 
             if len(rows) >= 6:
                 latest = rows[0].value
@@ -422,7 +435,7 @@ def _score_breadth(engine: Engine) -> SentimentComponent:
             positive = 0
             total = 0
             for etf in etfs:
-                rows = read_latest_n(conn, f"YF:{etf}:close", 6, source="yfinance")
+                rows = _recent_closes(conn, f"YF:{etf}:close", 6)
                 if len(rows) >= 2:
                     total += 1
                     if rows[0].value > rows[1].value:
@@ -443,7 +456,7 @@ def _score_trend(engine: Engine) -> SentimentComponent:
     """SPY position relative to 50d and 200d moving averages."""
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 200, source="yfinance")
+            rows = _recent_closes(conn, "YF:^GSPC:close", 200)
             if len(rows) >= 50:
                 latest = rows[0].value
                 ma50 = sum(r.value for r in rows[:50]) / 50
@@ -629,8 +642,8 @@ def _score_credit_spread(engine: Engine) -> SentimentComponent:
     """HYG vs LQD ratio — rising = risk appetite (bullish), falling = flight to quality."""
     try:
         with engine.connect() as conn:
-            hyg_rows = read_latest_n(conn, "YF:HYG:close", 21, source="yfinance")
-            lqd_rows = read_latest_n(conn, "YF:LQD:close", 21, source="yfinance")
+            hyg_rows = _recent_closes(conn, "YF:HYG:close", 21)
+            lqd_rows = _recent_closes(conn, "YF:LQD:close", 21)
             if len(hyg_rows) >= 2 and len(lqd_rows) >= 2:
                 hyg_now = hyg_rows[0].value
                 lqd_now = lqd_rows[0].value
