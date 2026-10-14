@@ -52,6 +52,75 @@ def _build_watchlist_item(ticker_upper: str, item: Any) -> tuple[dict[str, Any],
     }, False
 
 
+def _attach_market_evidence(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Display existing response evidence without new reads or qualification."""
+    history = analysis.get("price_history")
+    rows = (
+        [
+            {"as_of": row.get("date"), "value": row.get("value")}
+            for row in history
+            if isinstance(row, dict)
+        ]
+        if isinstance(history, list)
+        else []
+    )
+    live = analysis.get("live_price")
+    if not rows and isinstance(live, dict) and "price" in live:
+        rows = [{"as_of": live.get("as_of"), "value": live.get("price")}]
+    availability = analysis.get("availability")
+    declared = availability.get("price") if isinstance(availability, dict) else None
+    negative = declared in ("unavailable", "failed", "stale", "unknown")
+    status = declared if negative else "observed" if rows else "unknown"
+    reason = (
+        "price_section_" + declared
+        if negative
+        else "existing_scalar_evidence"
+        if rows
+        else "no_returned_price_rows"
+    )
+    narrative = analysis.get("briefing")
+    # Only a supplied receipt; never fetch or invent a latest briefing.
+    receipt = (
+        {
+            "status": narrative.get("status"),
+            "reason": narrative.get("reason"),
+            "as_of": narrative.get("as_of"),
+        }
+        if isinstance(narrative, dict)
+        else None
+    )
+    return {
+        **analysis,
+        "market_features": {
+            "schema": "watchlist-existing-evidence-v1",
+            "ticker": analysis.get("ticker"),
+            "daily": {
+                "status": status,
+                "reason": reason,
+                "source": analysis.get("price_source"),
+                "section_availability": declared,
+                "rows": rows,
+                "returned_row_count": len(rows),
+                "as_of": rows[-1]["as_of"] if rows else None,
+                "freshness": {
+                    "status": "stale" if declared == "stale" else "unknown",
+                    "reason": "declared_price_section_stale"
+                    if declared == "stale"
+                    else "freshness_policy_not_supplied",
+                },
+                "served_from_cache": analysis.get("_cached") is True,
+                "representation": "existing_scalar_not_qualified_intraday",
+            },
+            "intraday": {
+                "status": "unavailable",
+                "reason": "qualified_intraday_result_absent",
+                "opening_range": None,
+                "trade_vwap": None,
+                "hlc3_volume_proxy": None,
+            },
+            "briefing_receipt": receipt,
+        },
+    }
 @router.get("/{ticker}/analysis")
 def get_ticker_analysis(
     ticker: str,
@@ -74,7 +143,7 @@ def get_ticker_analysis(
     # Return cached data instantly if fresh
     cached = _get_analysis_cached(ticker_upper, period)
     if cached is not None:
-        return {**cached, "_cached": True}
+        return _attach_market_evidence({**cached, "_cached": True})
 
     engine = get_db_engine()
     ticker_lower = ticker_upper.lower()
@@ -314,4 +383,4 @@ def get_ticker_analysis(
     if all(status == "available" for status in analysis["availability"].values()):
         _set_analysis_cache(ticker_upper, period, analysis)
 
-    return analysis
+    return _attach_market_evidence(analysis)

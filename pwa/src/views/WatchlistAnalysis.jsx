@@ -11,6 +11,7 @@ import { shared, colors, tokens } from '../styles/shared.js';
 import { formatTime, formatDate } from '../utils/formatTime.js';
 import { useDevice } from '../hooks/useDevice.js';
 import PriceChart from '../components/PriceChart.jsx';
+import ExactMarketFeatureCard from '../components/ExactMarketFeatureCard.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
 import VannaCharmViz from '../components/VannaCharmViz.jsx';
 import FlowTimeline from '../components/FlowTimeline.jsx';
@@ -1152,6 +1153,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [overviewUnavailable, setOverviewUnavailable] = useState(false);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
+    const analysisPeriodRef = useRef(period);
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(true);
@@ -1166,7 +1168,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     useEffect(() => {
         if (!ticker) return;
         let active = true;
-        periodRequestRef.current += 1;
+        const requestId = ++periodRequestRef.current;
+        const requestTicker = ticker;
+        const requestPeriod = period;
+        analysisPeriodRef.current = requestPeriod;
+        const isCurrentAnalysisRequest = () => active
+            && periodRequestRef.current === requestId
+            && currentTickerRef.current === requestTicker
+            && analysisPeriodRef.current === requestPeriod;
 
         // Reset state for new ticker
         setData(null);
@@ -1188,16 +1197,36 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
-            if (!active) return;
+            if (!active || currentTickerRef.current !== requestTicker) return;
             if (result?.error) {
+                if (!isCurrentAnalysisRequest()) return;
                 setError(result.message || 'Failed to load');
                 setData(null);
-            } else {
+            } else if (isCurrentAnalysisRequest()) {
                 setData(result);
+            } else {
+                // Same-ticker initial sections can still load, but their old
+                // period's price fields must not replace a newer request.
+                setData(prev => ({
+                    ...result,
+                    ...prev,
+                    price_history: prev?.price_history ?? [],
+                    price_source: prev?.price_source ?? 'unavailable',
+                    live_price: prev?.live_price ?? null,
+                    market_features: prev?.market_features ?? null,
+                    period: prev?.period ?? analysisPeriodRef.current,
+                    availability: {
+                        ...result?.availability,
+                        ...prev?.availability,
+                        price: prev?.availability?.price ?? 'unknown',
+                    },
+                }));
             }
+            // Ticker-only initial metadata has completed. Period loading is
+            // independently owned by the current period request.
             setDataLoading(false);
         }).catch(err => {
-            if (!active) return;
+            if (!isCurrentAnalysisRequest()) return;
             setError(err.message || 'Failed to load');
             setDataLoading(false);
         });
@@ -1257,36 +1286,50 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 ? ftResult.value : { error: 'Flow timeline unavailable' });
             setSecondaryLoading(false);
         });
-        return () => { active = false; };
+        return () => {
+            active = false;
+            periodRequestRef.current += 1;
+            analysisPeriodRef.current = null;
+        };
     }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
         const requestId = ++periodRequestRef.current;
         const requestTicker = ticker;
+        analysisPeriodRef.current = newPeriod;
+        const isCurrentAnalysisRequest = () => periodRequestRef.current === requestId
+            && currentTickerRef.current === requestTicker
+            && analysisPeriodRef.current === newPeriod;
         setPeriod(newPeriod);
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
-            if (periodRequestRef.current !== requestId || currentTickerRef.current !== requestTicker) return;
+            if (!isCurrentAnalysisRequest()) return;
             if (refreshed?.error) {
                 return;
             }
             setData(prev => ({
+                ...refreshed,
                 ...prev,
                 price_history: refreshed.price_history,
                 price_source: refreshed.price_source,
+                live_price: refreshed.live_price,
+                market_features: refreshed.market_features,
                 availability: {
+                    ...refreshed.availability,
                     ...prev?.availability,
                     price: refreshed.availability?.price,
                 },
                 period: refreshed.period,
             }));
+            setError(null);
         } catch (err) {
             // Keep existing data on failure
         } finally {
-            if (periodRequestRef.current === requestId && currentTickerRef.current === requestTicker) {
+            if (isCurrentAnalysisRequest()) {
                 setPriceLoading(false);
+                setDataLoading(false);
             }
         }
     }, [ticker, period]);
@@ -1373,6 +1416,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     </div>
                 </div>
             </div>
+
+            <ExactMarketFeatureCard analysis={data} ticker={ticker} loading={dataLoading} overview={overview} />
 
             {/* ═══ AI OVERVIEW ═══ */}
             {overviewLoading ? (
