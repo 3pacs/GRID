@@ -54,6 +54,17 @@ def module(name, **values):
     return result
 
 
+class FakeSettings:
+    """Plain stored fields with the ordinary object getter on Python 3.11+.
+
+    SimpleNamespace has its own getter on 3.11, so it is deliberately rejected
+    by the route's safety guard there. Keep that guard intact and use a plain
+    instance for configured-state fixtures on every supported Python version.
+    """
+    def __init__(self, **values):
+        self.__dict__.update(values)
+
+
 class SchemaBase:
     def __init__(self, **values):
         self.__dict__.update(values)
@@ -87,9 +98,9 @@ class FakeEngine:
 def route_fixture(cache=None, *, router_present=True, config_settings=None,
                   engine=None, thread_names=('ingestion',), systemd=False, old=False):
     engine = engine or FakeEngine()
-    settings = config_settings if config_settings is not None else SimpleNamespace(LLM_LOCAL_PROVIDER='llamacpp_quick')
+    settings = config_settings if config_settings is not None else FakeSettings(LLM_LOCAL_PROVIDER='llamacpp_quick')
     # Runtime route consumers of settings also use fakes.
-    if type(settings) is SimpleNamespace:
+    if type(settings) is FakeSettings:
         settings.AGENTS_ENABLED = False
         settings.AGENTS_SCHEDULE_ENABLED = False
         settings.audit_api_keys = lambda: {'synthetic': True}
@@ -232,9 +243,9 @@ class CachedHealthTests(unittest.TestCase):
         self.assertEqual(hits, [])
 
     def test_legacy_config_primary_resolution(self):
-        cases = [(SimpleNamespace(LLM_LOCAL_PROVIDER='', LLM_QUICK_PROVIDER='ollama'), 'ollama'),
-                 (SimpleNamespace(GEMMA_PRIMARY=True, GEMMA_ENABLED=True), 'gemma'),
-                 (SimpleNamespace(), 'llamacpp')]
+        cases = [(FakeSettings(LLM_LOCAL_PROVIDER='', LLM_QUICK_PROVIDER='ollama'), 'ollama'),
+                 (FakeSettings(GEMMA_PRIMARY=True, GEMMA_ENABLED=True), 'gemma'),
+                 (FakeSettings(), 'llamacpp')]
         for settings, primary in cases:
             with route_fixture({primary: SimpleNamespace(is_available=True)}, config_settings=settings) as (health, _, _, _):
                 self.assertTrue(health().checks['llm_available'])
@@ -248,7 +259,7 @@ class CachedHealthTests(unittest.TestCase):
             router._client_cache = {}
             sys.modules['config'].settings = None
             self.assertEqual(helper()['state'], 'unknown')
-            sys.modules['config'].settings = SimpleNamespace(LLM_LOCAL_PROVIDER='llamacpp_quick')
+            sys.modules['config'].settings = FakeSettings(LLM_LOCAL_PROVIDER='llamacpp_quick')
             with patch('inspect.getattr_static', side_effect=RuntimeError('synthetic read failure')):
                 self.assertEqual(helper()['state'], 'unknown')
             sys.modules['llm.router'] = SimpleNamespace(_client_cache={})
