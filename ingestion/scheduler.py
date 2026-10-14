@@ -214,7 +214,11 @@ def _touch_source_catalog_last_pull(
 
 
 def _extract_rows_inserted(result: Any) -> int | None:
-    """Use the same committed-write contract as every ingestion wrapper."""
+    """Use the shared committed-write AND whole-universe coverage contract.
+
+    Materialization totals preserve unknown commit counts as None; a SUMMARY
+    may not hide deferred leaves or promote a known subtotal to a full total.
+    """
     from ingestion.smart_scheduler import _extract_rows
 
     return _extract_rows(result)

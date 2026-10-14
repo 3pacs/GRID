@@ -390,3 +390,61 @@ def test_retry_source_never_marks_a_skipped_or_failed_run_fresh(monkeypatch, ret
     assert bumped is fresh
     reason = hermes_fixers.retry_not_fresh_reason(result)
     assert (reason is None) is fresh
+
+
+def _materialization_report(*, unknown=False, deferred=0):
+    leaves = [{"ticker": "A", "status": "SUCCESS", "rows": 2}]
+    if unknown:
+        leaves.append({"ticker": "B", "status": "FAILED", "rows": None, "error": "commit unknown"})
+    return leaves + [{"status": "SUMMARY", "accounting_version": "SEC_XBRL_SHARES_V1",
+                      "total": len(leaves) + deferred, "attempted": len(leaves),
+                      "succeeded": 1, "no_data": 0, "failed": int(unknown), "unknown": 0,
+                      "unattempted": deferred, "rows_written": None if unknown else 2,
+                      "known_committed_rows": 2, "unknown_commit_counts": int(unknown),
+                      "stopped_by_budget": bool(deferred)}]
+
+
+def test_materialization_summary_deferred_not_discarded():
+    assert _classify_outcome(_materialization_report(deferred=3))[:2] == (OUTCOME_PARTIAL, 2)
+
+
+def test_materialization_unknown_total_not_known_subtotal():
+    assert _classify_outcome(_materialization_report(unknown=True))[:2] == (OUTCOME_PARTIAL, None)
+    assert ss._extract_rows(_materialization_report(unknown=True)) is None
+
+
+def test_materialization_complete_positive_and_clean_zero():
+    assert _classify_outcome(_materialization_report())[:2] == (OUTCOME_SUCCESS, 2)
+    out = _materialization_report()
+    out[0].update(status="NO_NEW_DATA", rows=0)
+    out[-1].update(succeeded=0, no_data=1, rows_written=0, known_committed_rows=0)
+    assert _classify_outcome(out)[:2] == (OUTCOME_NO_NEW_DATA, 0)
+
+
+@pytest.mark.parametrize("key,value", [("attempted", 2), ("total", 0), ("succeeded", 0),
+                                       ("known_committed_rows", 3), ("unknown_commit_counts", 1),
+                                       ("rows_written", 3), ("unattempted", True),
+                                       ("failed", -1), ("stopped_by_budget", 1)])
+def test_materialization_summary_cannot_override_leaves(key, value):
+    out = _materialization_report()
+    out[-1][key] = value
+    assert _classify_outcome(out)[0] == OUTCOME_FAILED
+
+
+def test_materialization_unknown_commit_cannot_be_rounded_to_known():
+    out = _materialization_report(unknown=True)
+    out[-1]["rows_written"] = 2
+    assert _classify_outcome(out)[0] == OUTCOME_FAILED
+
+
+def test_materialization_duplicate_or_missing_summary_counts_refused():
+    out = _materialization_report()
+    assert _classify_outcome(out + [dict(out[-1])])[0] == OUTCOME_FAILED
+    del out[-1]["total"]
+    assert _classify_outcome(out)[0] == OUTCOME_FAILED
+
+
+def test_materialization_shared_scheduler_extracts_unknown_honestly():
+    from ingestion.scheduler import _extract_rows_inserted
+    assert _extract_rows_inserted(_materialization_report()) == 2
+    assert _extract_rows_inserted(_materialization_report(unknown=True)) is None
