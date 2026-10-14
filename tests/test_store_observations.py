@@ -173,6 +173,16 @@ def test_read_latest_n_counts_distinct_observation_dates(conn):
     ]
 
 
+def test_read_latest_n_start_bounds_the_scan(conn):
+    """``start`` excludes older dates; omitting it keeps the unbounded read."""
+    assert [o.obs_date for o in obs.read_latest_n(conn, "WALCL", 2)] == [
+        date(2026, 9, 16), date(2026, 9, 9),
+    ]
+    got = obs.read_latest_n(conn, "WALCL", 2, start=date(2026, 9, 10))
+    assert [o.obs_date for o in got] == [date(2026, 9, 16)]
+    assert obs.read_latest_n(conn, "WALCL", 2, start=date(2026, 9, 17)) == []
+
+
 def test_missing_series_is_none_or_empty_never_zero(conn):
     assert obs.read_latest(conn, "NOPE") is None
     assert obs.read_window(conn, "NOPE") == []

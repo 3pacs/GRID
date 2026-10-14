@@ -286,6 +286,7 @@ def read_latest_n(
     n: int,
     *,
     source: str | None = None,
+    start: date | None = None,
     as_of: date | None = None,
     as_of_ts: datetime | None = None,
 ) -> list[Observation]:
@@ -297,12 +298,18 @@ def read_latest_n(
 
     ``source`` restricts the read to one puller's rows (see :func:`read_window`);
     without it, raises :class:`MixedSourceError` on a mixed-source series_id.
+
+    ``start`` (optional) bounds the scan to ``obs_date >= start``. Without it
+    every accepted vintage back to the first observation is fetched and
+    collapsed in Python only to keep ``n`` rows -- ~2M rows for a long YF
+    series. Pass it whenever the caller knows how far back ``n`` dates can
+    be; fewer than ``n`` dates inside the bound returns fewer rows.
     """
     rows = conn.execute(
         text(_WINDOW_SQL),
         {
             "sid": series_id, "ok": SUCCESS, "source": source,
-            "start": None, "as_of": as_of, "as_of_ts": as_of_ts,
+            "start": start, "as_of": as_of, "as_of_ts": as_of_ts,
         },
     ).fetchall()
     if source is None:
