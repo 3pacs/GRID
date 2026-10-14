@@ -383,7 +383,9 @@ def test_generate_briefing_fallback_path_still_produces_grounding_stats(tmp_path
 
     result = engine.generate_briefing(briefing_type="hourly", save=False)
 
-    assert "AI analysis unavailable" in result["content"]
+    assert "Model response unavailable" in result["content"]
+    assert result["publication_status"]["reason"] == "model_unavailable"
+    assert result["publication_status"]["generation_outcome"] == "model_unavailable"
     assert "grounding" in result
     # The fallback text is built straight from the snapshot, so its own
     # numbers are trivially grounded -- still worth asserting the gate ran.
@@ -391,11 +393,132 @@ def test_generate_briefing_fallback_path_still_produces_grounding_stats(tmp_path
     assert result["grounding"]["ungrounded_count"] == 0
 
 
-# ── Prompt/guard contract (2026-10-14) ───────────────────────────────────
-# The prompt used to ask for "the flow direction" and hand the model the
-# sentiment `flows` component as "$X.XB in, $Y.YB out", while
-# check_publication_claims withholds any narrative that talks about flows.
-# 151 of 153 stored narratives (10-06..10-14) were withheld.
+class TestPublicationEvidenceOutcome:
+    """Synthetic model/optional-context callbacks; no live enrichment or scorer."""
+
+    def generate(self, response, *, save=True, model_error=None, snapshot=None):
+        import types
+        from unittest.mock import Mock, patch
+        from ollama import number_grounding
+
+        engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+        engine.engine = object()
+        engine.ollama = types.SimpleNamespace(chat=Mock(return_value=response, side_effect=model_error))
+        engine._gather_market_snapshot = Mock(return_value=snapshot if snapshot is not None else _empty_snapshot())
+        engine._build_data_context = Mock(return_value='Synthetic data with unknown source freshness.')
+        engine._save_briefing = Mock()
+        engine._persist_to_db = Mock()
+        self.last_engine = engine
+        optional = types.ModuleType('disabled_optional_context')
+        with patch.dict(__import__('sys').modules, {
+                'ollama.number_grounding': number_grounding,
+                'ingestion.wiki_history': optional,
+                'ingestion.social_sentiment': optional,
+                'intelligence.sentiment_scorer': optional}):
+            result = engine.generate_briefing(save=save)
+        return engine, result
+
+    def test_model_unavailable_is_not_guard_withheld(self):
+        engine, result = self.generate(None)
+        assert result['publication_status']['reason'] == 'model_unavailable'
+        assert result['publication_status']['generation_outcome'] == 'model_unavailable'
+        assert result['publication_claim_guard']['passed']
+        assert 'Model response unavailable' in result['content']
+        assert 'AI narrative withheld' not in result['content']
+        assert result['snapshot']['publication_status'] == result['publication_status']
+        engine.ollama.chat.assert_called_once()
+        engine._persist_to_db.assert_called_once_with(result)
+
+    def test_actor_withholding_is_not_model_unavailable(self):
+        engine, result = self.generate('institutional distribution is occurring beneath a retail-driven uptrend')
+        assert result['publication_status']['reason'] == 'claim_guard_withheld'
+        assert result['publication_status']['generation_outcome'] == 'model_response'
+        assert 'unsupported_actor_interpretation' in result['publication_claim_guard']['reasons']
+        assert 'AI narrative withheld' in result['content']
+        assert 'AI analysis unavailable' not in result['content']
+        assert 'Model response unavailable' not in result['content']
+        assert 'retail-driven' not in result['content']
+        engine.ollama.chat.assert_called_once()
+        engine._save_briefing.assert_called_once_with(result)
+        engine._persist_to_db.assert_called_once_with(result)
+
+    def test_clean_and_unknown_evidence_stay_distinct(self):
+        engine, result = self.generate('Retail positioning is unknown.', save=False)
+        assert result['publication_status']['content_kind'] == 'narrative'
+        assert result['publication_status']['reason'] is None
+        assert result['publication_status']['source_evidence_status'] == 'unknown'
+        assert result['publication_claim_guard']['passed']
+        engine._save_briefing.assert_not_called()
+        engine._persist_to_db.assert_not_called()
+
+    def test_model_error_is_not_relabelled_as_unavailability(self):
+        try:
+            self.generate(None, model_error=RuntimeError('synthetic model callback error'))
+        except RuntimeError as error:
+            assert str(error) == 'synthetic model callback error'
+        else:
+            raise AssertionError('model error must propagate')
+        self.last_engine.ollama.chat.assert_called_once()
+        self.last_engine._save_briefing.assert_not_called()
+        self.last_engine._persist_to_db.assert_not_called()
+
+    def test_source_attribution_survives_without_causal_permission(self):
+        snapshot = _empty_snapshot()
+        snapshot['actor_evidence'] = [{'source_type': 'ownership_filing', 'source_id': 'filing-A',
+            'receipt_id': 'filing-row-1', 'actor': 'institutional', 'instrument': 'SPY',
+            'measure': 'holdings', 'direction': 'decreased',
+            'interval_start': '2026-10-01T00:00:00+00:00',
+            'interval_end': '2026-10-02T00:00:00+00:00'}]
+        text = 'filing-A source-reported institutional holdings decreased for SPY over the reported interval.'
+        _, result = self.generate(text, snapshot=snapshot)
+        assert result['publication_claim_guard']['passed']
+        assert result['content'].startswith('filing-A source-reported')
+        _, result = self.generate(text + ' This proves institutional distribution.', snapshot=snapshot)
+        assert not result['publication_claim_guard']['passed']
+        assert result['publication_status']['reason'] == 'claim_guard_withheld'
+
+
+class TestPublicationReceiptGrounding:
+    """Final digest follows the existing numeric annotation, without raw retention."""
+
+    def test_emitted_digest_after_annotation(self):
+        import hashlib
+        from test_publication_semantics import PublicationReceiptConsumerTests
+
+        fixture = PublicationReceiptConsumerTests()
+        fixture.setUp()
+        try:
+            text = 'Spot price is 7777.77. VIX reflects implied volatility.'
+            result, receipt, _, transport, _ = fixture.run_receipted(text, save=False)
+            assert result['grounding']['ungrounded_count'] == 1
+            assert '[unverified]' in result['content']
+            assert receipt.ungrounded_count == 1
+            assert receipt.candidate_digest.sha256 == hashlib.sha256(text.encode('utf-8')).hexdigest()
+            assert receipt.grounding_input_digest == receipt.candidate_digest
+            assert receipt.emitted_digest.sha256 == hashlib.sha256(result['content'].encode('utf-8')).hexdigest()
+            assert receipt.emitted_digest.sha256 != receipt.candidate_digest.sha256
+            assert receipt.candidate_guard.passed
+            assert receipt.publication_outcome == 'not_requested'
+            transport.post.assert_called_once()
+        finally:
+            fixture.doCleanups()
+
+    def test_summary_digest_distinct_from_rejected_candidate_and_annotation_input(self):
+        from test_publication_semantics import PublicationReceiptConsumerTests
+
+        fixture = PublicationReceiptConsumerTests()
+        fixture.setUp()
+        try:
+            text = 'Traders purchased protective puts.'
+            result, receipt, _, _, _ = fixture.run_receipted(text)
+            assert not receipt.candidate_guard.passed
+            assert receipt.fallback_guards[0].passed
+            assert receipt.fallback_guards[0].input_digest != receipt.candidate_digest
+            assert receipt.fallback_guards[0].input_digest != receipt.grounding_input_digest
+            assert receipt.emitted_digest.sha256 == fixture.api.sha(result['content'])
+            assert receipt.publication_outcome == 'emitted_data_summary_acknowledged'
+        finally:
+            fixture.doCleanups()
 
 
 def _sentiment_with_proxies():
