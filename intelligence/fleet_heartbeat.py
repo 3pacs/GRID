@@ -1,10 +1,10 @@
-"""Fleet heartbeat monitor — hermes-driven, full-fleet liveness + auto-heal.
+"""Fleet heartbeat monitor — hermes-driven, full-fleet liveness + alerts.
 
 Runs every hermes cycle (wired into hermes_operator.run_cycle). Probes the
 whole fleet, records to ``fleet_heartbeats``, sends debounced (2-strike) email
-alerts on DOWN transitions, and — per operator policy — attempts auto-heal,
-including remote recovery over SSH (hermes has passwordless sudo on grid-svr and
-to the GPU nodes).
+alerts on DOWN transitions. Sweeps default to monitor/alert-only. Explicit
+auto-heal is cooldown-guarded and refuses primary grid-svr GPU recovery and
+intervention in its protected GPU-owning services; these need operator handling.
 
 Created 2026-05-25 after a session where p9d (offline 4d), the retired panda GPU host (PCIe
 bus errors), The Meter (stale days), and several systemd units all failed
@@ -19,18 +19,21 @@ Probe kinds:
   endpoint  — LLM/API endpoints (health + listener)
   freshness — The Meter output age, key table recency
 
-Auto-heal (cooldown-guarded to avoid loops):
+Explicit auto-heal (cooldown-guarded to avoid loops):
   unit offline      -> sudo systemctl restart <unit>
-  gpu wedged        -> ssh node: stop ollama; modprobe -r/-a nvidia*; reprobe
+  remote gpu wedged -> ssh node: stop ollama; modprobe -r/-a nvidia*; reprobe
   endpoint down     -> restart owning systemd service (local or via ssh)
   node offline      -> cannot self-heal (it's unreachable); alert only
 """
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import subprocess
+from urllib.parse import urlsplit
 from datetime import datetime, timezone
+from ipaddress import IPv4Address
 from typing import Any
 
 from loguru import logger as log
@@ -273,8 +276,112 @@ def probe_freshness() -> list[tuple]:
 
 
 # ── Auto-heal ─────────────────────────────────────────────────────────────────
+def _primary_host(host: str) -> bool:
+    """Recognize local/primary spellings without DNS or host inventory calls."""
+    name = host.lower().rstrip(".")
+    return (name.split(".")[0] in {"grid-svr", "localhost"}
+            or name == "::1" or name.startswith("127."))
+
+
+def _protected_gpu_unit(unit: str) -> bool:
+    name = unit.lower().removesuffix(".service")
+    # The oracle unit owns GPU inference; Ollama shares the primary GPU. The
+    # worker can own GPU jobs. Keep the protection independent of heal flags
+    # and ENDPOINTS so aliases or registry overrides cannot remove it.
+    return any(name == root or name.startswith((root + "-", root + "@"))
+               for root in ("ollama", "grid-llamacpp", "grid-worker", "nvidia"))
+
+
+def _valid_gpu_host(host: Any) -> bool:
+    """Validate source target identity, without inferring runtime routing."""
+    if not isinstance(host, str) or not host or len(host) > 253:
+        return False
+    if re.fullmatch(r"[0-9.]+", host):
+        try:
+            address = IPv4Address(host)
+            return not (address.is_unspecified or address.is_multicast
+                        or address == IPv4Address("255.255.255.255"))
+        except ValueError:
+            return False
+    return all(re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?", label)
+               for label in host.removesuffix(".").split("."))
+
+
+def _heal_refusal(entity: str, kind: str) -> str | None:
+    """Fail closed before constructing a destructive command or fallback."""
+    if not isinstance(entity, str) or not isinstance(kind, str) or not entity:
+        return "auto-heal refused: invalid identity"
+    if kind == "gpu":
+        parts = entity.split(":")
+        if len(parts) != 2 or parts[1] != "gpu":
+            return "auto-heal refused: invalid GPU identity"
+        node = parts[0]
+        if _primary_host(node):
+            return "auto-heal refused: primary GPU requires operator handling"
+        cfg = FLEET.get(node)
+        if not isinstance(cfg, dict) or "host" not in cfg:
+            return "auto-heal refused: unknown GPU target"
+        host = cfg["host"]
+        if host is None or (isinstance(host, str) and _primary_host(host)):
+            return "auto-heal refused: primary GPU requires operator handling"
+        if not _valid_gpu_host(host):
+            return "auto-heal refused: invalid GPU host"
+    elif kind in {"unit", "endpoint"}:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", entity):
+            return "auto-heal refused: invalid service identity"
+        if entity.lower().removesuffix(".service") == "oracle-27b":
+            return "auto-heal refused: primary GPU endpoint requires operator handling"
+        if kind == "unit" and entity in ENDPOINTS:
+            # A registered endpoint name can also be a systemd alias. Resolve
+            # its protected ownership even when the caller supplies unit kind.
+            refusal = _heal_refusal(entity, "endpoint")
+            if refusal is not None:
+                return refusal
+        if kind == "unit":
+            # Failed-unit probes emit the owner, not necessarily the endpoint
+            # key. Reverse-resolve declared bindings at this same command sink.
+            owner = entity.lower().removesuffix(".service")
+            for name, endpoint in ENDPOINTS.items():
+                if not isinstance(endpoint, tuple) or len(endpoint) != 3:
+                    continue
+                declared_owner = endpoint[2]
+                if isinstance(declared_owner, str) and declared_owner.lower().removesuffix(".service") == owner:
+                    refusal = _heal_refusal(name, "endpoint")
+                    if refusal is not None:
+                        return refusal
+        unit = entity
+        if kind == "endpoint":
+            endpoint = ENDPOINTS.get(entity)
+            if endpoint is None:
+                return "no owning unit (handled via gpu/node heal)"
+            if not isinstance(endpoint, tuple) or len(endpoint) != 3:
+                return "auto-heal refused: invalid endpoint binding"
+            url, _, unit = endpoint
+            try:
+                target = urlsplit(url)
+                if target.scheme not in {"http", "https"} or not target.hostname:
+                    return "auto-heal refused: invalid endpoint URL"
+                port = target.port  # validate even when the hostname is remote
+                if target.netloc.endswith(":") or port == 0:
+                    return "auto-heal refused: invalid endpoint port"
+                if _primary_host(target.hostname) and port in {8081, 8086, 11434}:
+                    return "auto-heal refused: primary GPU endpoint requires operator handling"
+            except (TypeError, ValueError, AttributeError):
+                return "auto-heal refused: invalid endpoint URL"
+            if unit is None:
+                return "no owning unit (handled via gpu/node heal)"
+        if not isinstance(unit, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.@-]*", unit):
+            return "auto-heal refused: invalid owning unit"
+        if _protected_gpu_unit(unit):
+            return "auto-heal refused: protected GPU service requires operator handling"
+    return None
+
+
 def _heal(entity: str, kind: str, detail: str) -> tuple[bool, str]:
     """Attempt recovery. Returns (attempted, result_detail)."""
+    refusal = _heal_refusal(entity, kind)
+    if refusal is not None:
+        return False, refusal
     if kind == "unit":
         rc, out = _run(["sudo", "-n", "systemctl", "restart", f"{entity}.service"], timeout=30)
         return True, f"systemctl restart -> rc={rc} {out[:120]}"
@@ -315,7 +422,7 @@ def _email(subject: str, body: str, severity: str) -> None:
 
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 def run_fleet_heartbeat(engine: Any, *, dry_run: bool = False,
-                        do_heal: bool = True) -> dict[str, Any]:
+                        do_heal: bool = False) -> dict[str, Any]:
     """One full fleet sweep. Returns summary dict for the hermes cycle_result."""
     ensure_schema(engine)
     probes = []
@@ -414,6 +521,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry-run", action="store_true", help="probe only, no record/heal/email")
     ap.add_argument("--no-heal", action="store_true", help="probe+record+alert, no heal")
+    ap.add_argument("--heal", action="store_true", help="opt in to permitted auto-heal; primary GPU stays protected")
     args = ap.parse_args()
 
     dsn = os.environ.get("DATABASE_URL") or \
@@ -421,7 +529,7 @@ if __name__ == "__main__":
         f"{os.environ.get('DB_PASSWORD','')}@{os.environ.get('DB_HOST','localhost')}:" \
         f"{os.environ.get('DB_PORT','5432')}/{os.environ.get('DB_NAME','griddb')}"
     eng = create_engine(dsn)
-    res = run_fleet_heartbeat(eng, dry_run=args.dry_run, do_heal=not args.no_heal)
+    res = run_fleet_heartbeat(eng, dry_run=args.dry_run, do_heal=args.heal and not args.no_heal)
     print(json.dumps({k: v for k, v in res.items() if k != "alert_lines"}, indent=2))
     for ln in res.get("alert_lines", []):
         print("  ", ln)

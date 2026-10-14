@@ -179,6 +179,49 @@ def test_sentiment_momentum_uses_distinct_dates_not_rows():
     assert "5d=+4.03%" in comp.detail
 
 
+def test_sentiment_reads_are_bounded_by_a_start_date(monkeypatch):
+    """Every price read passes a start bound (no full-history scan)."""
+    from intelligence import sentiment_scorer
+
+    seen = []
+    real = sentiment_scorer.read_latest_n
+
+    def spy(conn, series_id, n, **kw):
+        seen.append((series_id, n, kw.get("start")))
+        return real(conn, series_id, n, **kw)
+
+    monkeypatch.setattr(sentiment_scorer, "read_latest_n", spy)
+    engine = _engine(_daily("YF:^GSPC:close", 30))
+    sentiment_scorer._score_momentum(engine)
+    sentiment_scorer._score_trend(engine)
+    sentiment_scorer._score_breadth(engine)
+    sentiment_scorer._score_credit_spread(engine)
+
+    assert seen and all(start is not None for _, _, start in seen)
+    today = sentiment_scorer.datetime.now(sentiment_scorer.timezone.utc).date()
+    for _, n, start in seen:
+        assert (today - start).days >= n  # window always spans >= n calendar days
+
+
+def test_sentiment_trend_still_sees_200_sessions_inside_the_bound():
+    from intelligence.sentiment_scorer import _recent_closes
+
+    sid = "YF:^GSPC:close"
+    engine = _engine(_daily(sid, 220))
+    with engine.connect() as conn:
+        assert len(_recent_closes(conn, sid, 200)) == 200
+
+
+def test_sentiment_bound_excludes_closes_older_than_the_window():
+    from intelligence.sentiment_scorer import _recent_closes
+
+    sid = "YF:HYG:close"
+    rows = _daily(sid, 3) + [_row(sid, TODAY - timedelta(days=400), 50.0, h=500)]
+    with _engine(rows).connect() as conn:
+        got = _recent_closes(conn, sid, 21)
+    assert len(got) == 3 and 50.0 not in [o.value for o in got]
+
+
 # ── market diary ─────────────────────────────────────────────────────────
 
 def test_market_diary_index_moves_skip_failed_zero(monkeypatch):

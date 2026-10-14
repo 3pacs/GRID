@@ -751,6 +751,75 @@ def _result_children(out: dict) -> list[Any]:
     return [out[k] for k in _RESULT_KEYS if k in out and isinstance(out[k], (dict, list))]
 
 
+def _materialization_accounting(out: list) -> tuple[str, int | None, str | None] | None:
+    """Consume SEC's coverage summary AND leaves, not a successful prefix.
+
+    This bridges to existing outcome/freshness handling. The immutable helper
+    checks declared partitions only; it is not database durability proof.
+    """
+    marked = [item for item in out if isinstance(item, dict) and "accounting_version" in item]
+    if not marked:
+        return None
+    if len(marked) != 1 or marked[0].get("accounting_version") != "SEC_XBRL_SHARES_V1":
+        return OUTCOME_FAILED, None, "invalid materialization accounting version"
+    summary = marked[0]
+    items = [item for item in out if item is not summary]
+    required = ("total", "attempted", "succeeded", "no_data", "failed", "unknown",
+                "unattempted", "known_committed_rows", "unknown_commit_counts")
+    if summary.get("status") != "SUMMARY" or any(
+        key not in summary or type(summary[key]) is not int or summary[key] < 0
+        for key in required
+    ) or "rows_written" not in summary or type(summary.get("stopped_by_budget")) is not bool:
+        return OUTCOME_FAILED, None, "invalid materialization accounting counts"
+    if any(not isinstance(item, dict) or item.get("status") == "SUMMARY" for item in items):
+        return OUTCOME_FAILED, None, "invalid materialization leaf"
+    counts = {"succeeded": 0, "no_data": 0, "failed": 0, "unknown": 0}
+    status_keys = {"SUCCESS": "succeeded", "NO_NEW_DATA": "no_data",
+                   "FAILED": "failed", "PARTIAL": "unknown"}
+    known = unknown_counts = 0
+    for item in items:
+        key = status_keys.get(item.get("status"))
+        if key is None or "rows" not in item:
+            return OUTCOME_FAILED, None, "invalid materialization leaf outcome"
+        count = item["rows"]
+        if count is not None and (type(count) is not int or count < 0):
+            return OUTCOME_FAILED, None, "invalid materialization leaf rows"
+        if key == "no_data" and count != 0:
+            return OUTCOME_FAILED, None, "clean empty materialization has unknown or positive rows"
+        if key == "succeeded" and (count is None or count <= 0):
+            return OUTCOME_FAILED, None, "materialization success has no known positive rows"
+        counts[key] += 1
+        if count is None:
+            unknown_counts += 1
+        else:
+            known += count
+    if summary["attempted"] != len(items) or any(summary[k] != v for k, v in counts.items()):
+        return OUTCOME_FAILED, None, "materialization summary/leaf partition mismatch"
+    if summary["known_committed_rows"] != known or summary["unknown_commit_counts"] != unknown_counts:
+        return OUTCOME_FAILED, None, "materialization row accounting mismatch"
+    rows = None if unknown_counts else known
+    if summary["rows_written"] != rows or (
+        summary["rows_written"] is not None and type(summary["rows_written"]) is not int
+    ):
+        return OUTCOME_FAILED, None, "materialization total cannot override unknown committed rows"
+    from analysis.materialization_accounting import CoverageDeclaration, CoverageState, diagnose_coverage
+
+    coverage = diagnose_coverage(CoverageDeclaration(
+        summary["total"], summary["attempted"], counts["succeeded"], counts["no_data"],
+        counts["failed"], counts["unknown"], summary["unattempted"],
+    ))
+    if coverage.state is CoverageState.INCONSISTENT or coverage.unaccounted_items not in (None, 0):
+        return OUTCOME_FAILED, rows, "inconsistent materialization coverage"
+    if summary.get("error"):
+        return OUTCOME_FAILED, rows, str(summary["error"])
+    if coverage.state is not CoverageState.COMPLETE or summary["stopped_by_budget"]:
+        return OUTCOME_PARTIAL, rows, "materialization coverage incomplete or deferred"
+    if not items:
+        return OUTCOME_NO_NEW_DATA, rows, "materialization universe checked, no rows"
+    outcome, _leaf_rows, note = _classify_outcome(items)
+    return outcome, rows, note
+
+
 def _extract_rows(out: Any) -> int | None:
     """Reported committed writes; unknown counts stay None, never list length.
 
@@ -772,6 +841,9 @@ def _extract_rows(out: Any) -> int | None:
         children = _result_children(out)
         return _extract_rows(children) if children else None
     if isinstance(out, list):
+        materialization = _materialization_accounting(out)
+        if materialization is not None:
+            return materialization[1]
         items = [i for i in out if not isinstance(i, dict) or i.get("status") != "SUMMARY"]
         if not items:
             items = out  # a summary-only aggregate can report its own count
@@ -897,6 +969,9 @@ def _classify_outcome(out: Any) -> tuple[str, int | None, str | None]:
         return (OUTCOME_SUCCESS, rows, None) if rows > 0 else (OUTCOME_NO_NEW_DATA, 0, "run completed, 0 rows written")
 
     if isinstance(out, list):
+        materialization = _materialization_accounting(out)
+        if materialization is not None:
+            return materialization
         if not out:
             return OUTCOME_SKIPPED, 0, "puller returned no per-item results"
         items = [i for i in out if not isinstance(i, dict) or i.get("status") != "SUMMARY"]
