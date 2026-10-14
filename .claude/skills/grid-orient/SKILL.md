@@ -58,6 +58,9 @@ ls ingestion/*.py ingestion/altdata/*.py ingestion/international/*.py 2>/dev/nul
 echo " total puller files"
 
 echo ""
+# psql auth comes from ~/.pgpass on grid-svr (present, mode 600). If it is ever
+# missing there, export PGPASSWORD="$GRID_DB_PASSWORD" on grid-svr first.
+# Never inline the password in this file.
 echo "## DB Schema..."
 ssh grid-svr "psql -U grid -d griddb -h localhost -t -c \"
     SELECT table_name, array_to_string(array_agg(column_name ORDER BY ordinal_position), ', ')

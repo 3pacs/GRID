@@ -1,22 +1,22 @@
 {
   "skill_name": "grid-check-exists",
-  "description": "Before proposing to build a new GRID module, search the existing 405-module codebase for similar implementations. Use this whenever a session is about to propose a new intelligence module, puller, analytics engine, or oracle feature. Searches intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/, and ingestion/ for name and content matches, then cross-references docs/MODULE_CATALOG.md.",
+  "description": "Run this before writing any new module under intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/ or ingestion/. Use whenever a request says build, add, create or write a new tracker, detector, scanner, calendar, engine, scorer or puller, asks what to check before coding something new, or asks 'does GRID already have X?'. Searches the 700+-module codebase for name and content matches, then cross-references docs/MODULE_INVENTORY.md; for rebuilding the full index use grid-orient.",
   "results": [
     {
       "query": "I want to add a new intelligence module that computes an implied volatility skew and butterfly arbitrage check for SPY options. Plan the file layout under intelligence/.",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "does GRID already have anything for tracking insider buying clusters? don't want to duplicate it",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "about to write intelligence/catalyst_calendar.py for upcoming earnings and FOMC dates, thoughts on the structure?",
@@ -29,18 +29,18 @@
     {
       "query": "Let's build a transfer-entropy lead/lag detector between sector ETFs and credit spreads. Start by creating the new file in analysis/.",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
-      "runs": 3,
-      "pass": false
-    },
-    {
-      "query": "We keep ending up with three half-finished versions of the same thing. Before I ask you to code a Brier score tracker for our predictions, what's the right check to run first?",
-      "should_trigger": true,
       "trigger_rate": 0.6666666666666666,
       "triggers": 2,
       "runs": 3,
       "pass": true
+    },
+    {
+      "query": "We keep ending up with three half-finished versions of the same thing. Before I ask you to code a Brier score tracker for our predictions, what's the right check to run first?",
+      "should_trigger": true,
+      "trigger_rate": 0.3333333333333333,
+      "triggers": 1,
+      "runs": 3,
+      "pass": false
     },
     {
       "query": "Rebuild .claude/CODEBASE_INDEX.md, the module counts in CLAUDE.md look stale after last week's refactors.",
@@ -77,7 +77,7 @@
   ],
   "summary": {
     "total": 9,
-    "passed": 6,
-    "failed": 3
+    "passed": 8,
+    "failed": 1
   }
 }

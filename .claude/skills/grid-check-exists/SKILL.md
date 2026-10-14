@@ -1,6 +1,6 @@
 ---
 name: grid-check-exists
-description: "Before proposing to build a new GRID module or when asked 'does GRID already have X?', search the existing 700+-module codebase for similar implementations; for rebuilding the full index use grid-orient."
+description: "Run this before writing any new module under intelligence/, analysis/, physics/, features/, discovery/, trading/, oracle/ or ingestion/. Use whenever a request says build, add, create or write a new tracker, detector, scanner, calendar, engine, scorer or puller, asks what to check before coding something new, or asks 'does GRID already have X?'. Searches the 700+-module codebase for name and content matches, then cross-references docs/MODULE_INVENTORY.md; for rebuilding the full index use grid-orient."
 ---
 
 # grid-check-exists
@@ -81,7 +81,7 @@ Before proposing any of these, know they already exist:
 | LLM hypothesis generation with kill criteria | `intelligence/hypothesis_engine.py` | Extensible |
 | Brier / reliability / calibration tracking | `intelligence/prediction_calibration.py` | Not persisted, not per-horizon |
 | Signal inventory and backlinking | `intelligence/signal_registry.py`, `signal_backlinker.py`, `signal_extractor.py` | Reuse |
-| Sector network mappers (banking/energy/pharma/defense/tech/real_estate/commodities/defi) | `intelligence/banking_network.py` et al. | Already built per sector |
+| Sector network mappers (banking/energy/pharma/defense/tech/real_estate/commodities/defi/media/sovereign_wealth) | `intelligence/sector_networks/<sector>.yaml` via `intelligence/sector_networks/loader.py` | Already built per sector as YAML; the old `intelligence/<sector>_network.py` modules are gone |
 | Vanna / charm computation | `physics/dealer_gamma.py:248-250` | Computed but never scored |
 | Per-ticker GEX | `physics/dealer_gamma.py` | Built but assumes net-short dealers |
 | Actor network (495 actors) | `intelligence/actor_network.py` | Extend with temporal decay + governance graph |
