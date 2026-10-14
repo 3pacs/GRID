@@ -314,6 +314,56 @@ def test_gather_market_moves_stale_close_is_null(diary_engine, monkeypatch):
     assert entry == {"status": "no close for date"}
 
 
+def test_fresh_pair_bounds_the_price_read(diary_engine, monkeypatch):
+    """The (today, prior) read is bounded to _PRICE_LOOKBACK_DAYS, not every vintage since 1990."""
+    from intelligence import market_diary
+
+    seen = {}
+    real = market_diary.read_latest_n
+
+    def spy(conn, series_id, n, **kw):
+        seen.update(kw)
+        return real(conn, series_id, n, **kw)
+
+    monkeypatch.setattr(market_diary, "read_latest_n", spy)
+    target = date(2026, 9, 26)
+    market_diary._fresh_pair(diary_engine.connect(), "YF:^GSPC:close", target)
+    assert seen["start"] == target - timedelta(days=market_diary._PRICE_LOOKBACK_DAYS)
+    assert seen["as_of"] == target and seen["source"] == market_diary._PRICE_SOURCE
+
+
+def test_gather_market_moves_prior_across_holiday_weekend_still_found(diary_engine, monkeypatch):
+    """A prior close 4 days back (holiday weekend) is inside the lookback."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 8)  # Tuesday after Labor Day
+    prior = date(2026, 9, 4)   # Friday
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5100.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", prior, 5000.0, ts_offset_h=0),
+    ])
+
+    entry = market_diary._gather_market_moves(diary_engine, target)["indices"]["S&P 500"]
+    assert entry["close"] == 5100.0
+    assert entry["change_pct"] == pytest.approx(2.0)
+
+
+def test_gather_market_moves_prior_outside_lookback_is_null(diary_engine, monkeypatch):
+    """A prior close older than the lookback is refused, not diffed against today."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 26)
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5100.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", target - timedelta(days=30), 5000.0, ts_offset_h=0),
+    ])
+
+    entry = market_diary._gather_market_moves(diary_engine, target)["indices"]["S&P 500"]
+    assert entry == {"status": "no close for date"}
+
+
 def test_gather_market_moves_zero_prior_close_is_null_not_zero(diary_engine, monkeypatch):
     """A prior close of 0 must render change_pct=None, never a fabricated 0."""
     from intelligence import market_diary
