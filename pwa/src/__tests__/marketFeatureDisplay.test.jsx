@@ -63,7 +63,8 @@ describe('existing daily evidence card', () => {
         supplied.market_features.daily.freshness = { status: 'stale', reason: 'declared_price_section_stale' };
         render(<Card analysis={supplied} ticker="SPY" />);
         expect(screen.getByText(/Daily evidence: stale/)).toBeTruthy();
-        expect(screen.getByText(/price_section_stale/)).toBeTruthy();
+        expect(screen.getByText(/^price_section_stale · Returned rows: 2$/)).toBeTruthy();
+        expect(screen.getByText(/^Freshness: stale — declared_price_section_stale$/)).toBeTruthy();
         expect(screen.queryByText(/eligible|Daily evidence: current/)).toBeNull();
     });
 
