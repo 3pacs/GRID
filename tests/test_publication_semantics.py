@@ -7,6 +7,7 @@ from __future__ import annotations
 import ast
 import dataclasses
 import hashlib
+import json
 import math
 import socket
 import sys
@@ -29,7 +30,7 @@ def isolated(path, names=None, extra=None):
         body.insert(0, ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0))
     module = types.ModuleType('_publication_test_' + path.replace('/', '_').replace('.', '_'))
     sys.modules[module.__name__] = module
-    module.__dict__.update({'log': Mock(), 'Any': object, 'math': math,
+    module.__dict__.update({'log': Mock(), 'Any': object, 'math': math, 'json': json,
                             'dataclass': dataclasses.dataclass, 'hashlib': hashlib, 'uuid': uuid,
                             'datetime': datetime, 'date': date, 'timezone': timezone,
                             'text': str, 'RRPONTSYD_TO_MILLIONS': 1000.0,
@@ -539,18 +540,582 @@ class ActorContinuationTests(unittest.TestCase):
         engine._persist_to_db.assert_not_called()
 
 
+# Synthetic receipt protocol fixtures: normalized AST excerpts from the accepted
+# offline receipt sources, not imports or claims about deployed tracing. Only
+# selected client methods execute, with fake transport/storage/SDK dependencies.
+_PINNED_RECEIPT_SOURCE_EXCERPTS = {
+    'llm/feedback_loop.py': r'''@dataclass(frozen=True, slots=True)
+class LLMCallReceipt:
+    """In-memory evidence for one invocation; never a persistence acknowledgement."""
+    schema_version: str
+    attempt_id: str
+    attempt_id_state: str
+    provider: str
+    operation: str
+    request_stage: str
+    request_canonical_version: str
+    request_sha256: str | None
+    request_character_length: int | None
+    request_utf8_byte_length: int | None
+    request_capture_completeness: str
+    candidate_stage: str
+    candidate_sha256: str | None
+    candidate_character_length: int | None
+    candidate_utf8_byte_length: int | None
+    candidate_capture_completeness: str
+    logger_input_candidate_completeness: str
+    original_call_id: str | None
+    call_id_namespace: str | None
+    call_id_state: str
+    local_record_state: str
+    export_state: str
+    receipt_support_state: str
+    no_candidate_cause: str | None
+
+class _CallReceiptCapture:
+    """Invocation-local accumulator; holds digests, never request/response bodies."""
+
+    def __init__(self, callback, attempt_id, provider: str, operation: str):
+        valid_id = type(attempt_id) is str and bool(attempt_id.strip())
+        self.callback = callback
+        self.attempt_id = attempt_id if valid_id else uuid.uuid4().hex
+        self.attempt_id_state = 'caller_supplied' if valid_id else 'generated' if attempt_id is None else 'invalid_requested_id'
+        self.provider, self.operation = (provider, operation)
+        self.support = 'supported' if self.attempt_id_state != 'invalid_requested_id' else 'invalid_attempt_id'
+        self.request_stage = 'unavailable'
+        self.request_hash = self.request_chars = self.request_bytes = None
+        self.request_completeness = 'not_available'
+        self.candidate_hash = self.candidate_chars = self.candidate_bytes = None
+        self.candidate_completeness = 'not_available'
+        self.logger_input_completeness = 'not_logged'
+        self.call_id = None
+        self.call_id_state = 'not_logged'
+        self.local_state = self.export_state = 'not_attempted'
+        self.cause = 'unknown'
+        self.emitted = False
+
+    def payload(self, payload, stage: str='formed_transport_payload') -> None:
+        self.request_stage = stage
+        try:
+            text = json.dumps({'schema': 'grid.llm_request_payload.v1', 'payload': payload}, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+            raw = text.encode('utf-8')
+            self.request_hash = hashlib.sha256(raw).hexdigest()
+            self.request_chars, self.request_bytes = (len(text), len(raw))
+            self.request_completeness = 'full_in_memory'
+        except Exception:
+            self.request_hash = self.request_chars = self.request_bytes = None
+            self.request_completeness = 'capture_failed'
+
+    def candidate(self, value) -> None:
+        self.candidate_hash = self.candidate_chars = self.candidate_bytes = None
+        try:
+            if not isinstance(value, str) or not value.strip():
+                self.candidate_completeness = 'not_available'
+                self.cause = 'unknown' if value is None else 'no_usable_final_text'
+                return
+            raw = value.encode('utf-8')
+            self.candidate_hash = hashlib.sha256(raw).hexdigest()
+            self.candidate_chars, self.candidate_bytes = (len(value), len(raw))
+            self.candidate_completeness = 'full_in_memory'
+            self.cause = None
+        except Exception:
+            self.candidate_completeness = 'capture_failed'
+            self.cause = 'candidate_capture_failed'
+
+    def logging_started(self) -> None:
+        self.call_id_state = 'logging_failed'
+        self.local_state = self.export_state = 'unknown'
+        self.logger_input_completeness = 'prefix_only' if self.candidate_chars is not None and self.candidate_chars > 2000 else 'full' if self.candidate_chars is not None else 'not_available'
+
+    def returned_id(self, value) -> None:
+        self.call_id = value if type(value) is str and value else None
+        self.call_id_state = 'id_returned' if self.call_id is not None else 'not_returned'
+
+    def unavailable(self, cause: str) -> None:
+        self.candidate_hash = self.candidate_chars = self.candidate_bytes = None
+        self.candidate_completeness = 'not_available'
+        self.cause = cause
+
+    def emit(self, receipt: LLMCallReceipt | None=None) -> None:
+        if self.emitted:
+            return
+        self.emitted = True
+        try:
+            if receipt is None:
+                receipt = LLMCallReceipt('grid.llm_call_receipt.v1', self.attempt_id, self.attempt_id_state, self.provider, self.operation, self.request_stage, 'grid.llm_request_payload.v1', self.request_hash, self.request_chars, self.request_bytes, self.request_completeness, 'post_client_preprocessing', self.candidate_hash, self.candidate_chars, self.candidate_bytes, self.candidate_completeness, self.logger_input_completeness, self.call_id, 'grid.llm.feedback_loop.log_llm_call' if self.call_id is not None else None, self.call_id_state, self.local_state, self.export_state, self.support, self.cause)
+            self.callback(receipt)
+        except Exception:
+            pass
+
+def _emit_to_langfuse(*, call_id: str, module: str, tier: str, model: str, provider: str, system_prompt: str, user_prompt: str, output: str, context_tokens: int, output_tokens: int, latency_ms: int, metadata: dict) -> None:
+    """Best-effort fan-out to Langfuse. Silently swallows all errors."""
+    client = _get_langfuse()
+    if client is None:
+        return
+    try:
+        obs = client.start_observation(name=module, as_type='generation', model=model or None, input={'system': system_prompt, 'user': user_prompt}, output=output, usage_details={'input': int(context_tokens) if context_tokens else 0, 'output': int(output_tokens) if output_tokens else 0}, metadata={'tier': tier, 'provider': provider, 'module': module, 'latency_ms': int(latency_ms) if latency_ms else 0, 'call_id': call_id, **(metadata or {})})
+        obs.end()
+    except Exception as e:
+        log.debug(f'Langfuse emit failed: {e}')
+
+def log_llm_call(module: str, tier: str, system_prompt: str, user_prompt: str, output: str, context_tokens: int=0, output_tokens: int=0, latency_ms: int=0, model: str='', provider: str='', prompt_version: str='', metadata: dict=None) -> str:
+    """
+    Log an LLM call. Returns the call_id for later scoring.
+
+    The call_id is a hash of module + prompt + timestamp for dedup.
+    """
+    ts = datetime.datetime.utcnow().isoformat()
+    raw = f'{module}:{system_prompt[:100]}:{user_prompt[:100]}:{ts}'
+    call_id = hashlib.sha256(raw.encode()).hexdigest()[:16]
+    if not context_tokens:
+        context_tokens = (len(system_prompt) + len(user_prompt)) // 4
+    if not output_tokens and output:
+        output_tokens = len(output) // 4
+    try:
+        conn = _get_conn()
+        cur = conn.cursor()
+        cur.execute('\n            INSERT INTO llm_calls (\n                id, module, tier, model, provider,\n                system_prompt, user_prompt, context_tokens,\n                output, output_tokens, latency_ms,\n                prompt_version, metadata\n            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)\n            ON CONFLICT (id) DO NOTHING\n        ', (call_id, module, tier, model, provider, system_prompt, user_prompt, context_tokens, output, output_tokens, latency_ms, prompt_version, json.dumps(metadata or {})))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as e:
+        log.debug(f'Failed to log LLM call: {e}')
+    _emit_to_langfuse(call_id=call_id, module=module, tier=tier, model=model, provider=provider, system_prompt=system_prompt, user_prompt=user_prompt, output=output, context_tokens=context_tokens, output_tokens=output_tokens, latency_ms=latency_ms, metadata=metadata or {})
+    return call_id
+''',
+    'llm/router.py': r'''def chat_with_receipt(messages: list[dict[str, str]], *, tier: Tier=Tier.DEFAULT, provider: str | None=None, client: Any=None, attempt_id: str | None=None, receipt_callback: Any=None, **chat_options: Any) -> str | None:
+    """Opt-in per-invocation evidence without changing get_llm or its fallback chain.
+
+    Unsupported clients receive only their legacy arguments. Missing or
+    cross-attempt receipts never borrow another call's logger ID or request.
+    This entry point introduces no response retry or publication decision.
+    """
+    if receipt_callback is None:
+        selected = client if client is not None else get_llm(tier, provider)
+        return selected.chat(messages=messages, **chat_options)
+    try:
+        from llm.feedback_loop import LLMCallReceipt, _CallReceiptCapture
+        capture = _CallReceiptCapture(receipt_callback, attempt_id, 'unknown', 'chat')
+    except Exception:
+        selected = client if client is not None else get_llm(tier, provider)
+        return selected.chat(messages=messages, **chat_options)
+    capture.payload({'messages': messages, 'chat_options': chat_options}, 'caller_intent')
+    capture.call_id_state = 'unknown'
+    capture.local_state = capture.export_state = 'unknown'
+    capture.support = 'invalid_attempt_id' if capture.attempt_id_state == 'invalid_requested_id' else 'missing_receipt'
+    captured = []
+    candidate = None
+    accepted_receipt = None
+    try:
+        selected = client if client is not None else get_llm(tier, provider)
+        if type(selected).__dict__.get('supports_call_receipts', False) is True:
+            candidate = selected.chat(messages=messages, attempt_id=capture.attempt_id, receipt_callback=captured.append, **chat_options)
+        else:
+            capture.support = 'unsupported_provider'
+            candidate = selected.chat(messages=messages, **chat_options)
+        return candidate
+    finally:
+        capture.candidate(candidate)
+        if len(captured) == 1:
+            receipt = captured[0]
+            if isinstance(receipt, LLMCallReceipt) and receipt.schema_version == 'grid.llm_call_receipt.v1' and (capture.attempt_id_state != 'invalid_requested_id') and (receipt.attempt_id == capture.attempt_id) and (receipt.candidate_sha256 == capture.candidate_hash) and (receipt.candidate_character_length == capture.candidate_chars) and (receipt.candidate_utf8_byte_length == capture.candidate_bytes):
+                accepted_receipt = receipt
+            elif capture.attempt_id_state != 'invalid_requested_id':
+                capture.support = 'mismatched_receipt'
+        elif captured:
+            capture.support = 'multiple_receipts'
+        capture.emit(accepted_receipt)
+''',
+    'ollama/client.py': r'''class OllamaClient:
+    supports_call_receipts = True
+
+    def chat(self, messages: list[dict[str, str]], model: str | None=None, temperature: float=0.3, num_predict: int=2000, system_knowledge: list[str] | None=None, extra_metadata: dict | None=None, *, attempt_id: str | None=None, receipt_callback: Any=None) -> str | None:
+        """Send a chat completion request to Ollama.
+
+        Parameters:
+            messages: List of message dicts with ``role`` and ``content`` keys.
+            model: Model override (defaults to self.model).
+            temperature: Sampling temperature.
+            num_predict: Maximum tokens to generate.
+            system_knowledge: List of knowledge doc names to inject into
+                the system prompt as context.
+            extra_metadata: Optional dict of A/B-test or call-site tags
+                forwarded to the feedback-loop logger (Langfuse).
+
+        Returns:
+            str: The assistant's response text, or None if unavailable.
+        """
+        _receipt = None
+        if receipt_callback is not None:
+            try:
+                from llm.feedback_loop import _CallReceiptCapture
+                _receipt = _CallReceiptCapture(receipt_callback, attempt_id, 'ollama', 'chat')
+            except Exception:
+                pass
+        try:
+            if not self.is_available:
+                if _receipt is not None:
+                    _receipt.unavailable('availability_short_circuit')
+                return None
+            messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
+            payload: dict[str, Any] = {'model': model or self.model, 'messages': messages, 'stream': False, 'options': {'temperature': temperature, 'num_predict': num_predict}}
+            start = time.monotonic()
+            try:
+                if _receipt is not None:
+                    _receipt.payload(payload)
+                resp = requests.post(f'{self.base_url}/api/chat', json=payload, timeout=self.timeout)
+                latency_ms = (time.monotonic() - start) * 1000
+                resp.raise_for_status()
+                data = resp.json()
+                content = data.get('message', {}).get('content', '')
+                if _receipt is not None:
+                    _receipt.candidate(content)
+                model_used = data.get('model', model or self.model)
+                log.debug('Ollama chat — model={m}, latency={l:.0f}ms', m=model_used, l=latency_ms)
+                if _receipt is not None:
+                    _receipt.logging_started()
+                try:
+                    from llm.feedback_loop import log_llm_call
+                    sys_msg = next((m['content'] for m in messages if m['role'] == 'system'), '')
+                    usr_msg = next((m['content'] for m in messages if m['role'] == 'user'), '')
+                    _logger_call_id = log_llm_call(module='ollama', tier='unknown', system_prompt=sys_msg, user_prompt=usr_msg[:2000], output=(content or '')[:2000], context_tokens=data.get('prompt_eval_count', 0) or 0, output_tokens=data.get('eval_count', 0) or 0, latency_ms=int(latency_ms), model=model_used, provider='ollama', metadata=dict(extra_metadata) if extra_metadata else None)
+                    if _receipt is not None:
+                        _receipt.returned_id(_logger_call_id)
+                except Exception:
+                    pass
+                return content
+            except Exception as exc:
+                if _receipt is not None:
+                    _receipt.unavailable('transport_or_response_error')
+                latency_ms = (time.monotonic() - start) * 1000
+                log.warning('Ollama chat failed ({l:.0f}ms): {err}', l=latency_ms, err=str(exc))
+                return None
+        finally:
+            if _receipt is not None:
+                _receipt.emit()
+
+    def generate(self, prompt: str, model: str | None=None, system: str | None=None, temperature: float=0.3, num_predict: int=2000, extra_metadata: dict | None=None, *, attempt_id: str | None=None, receipt_callback: Any=None) -> str | None:
+        """Send a single-turn generate request.
+
+        Parameters:
+            prompt: The user prompt.
+            model: Model override.
+            system: System prompt.
+            temperature: Sampling temperature.
+            num_predict: Max tokens.
+            extra_metadata: Optional A/B-test / call-site tags forwarded
+                to the feedback-loop logger (Langfuse).
+
+        Returns:
+            str: Generated text, or None if unavailable.
+        """
+        _receipt = None
+        if receipt_callback is not None:
+            try:
+                from llm.feedback_loop import _CallReceiptCapture
+                _receipt = _CallReceiptCapture(receipt_callback, attempt_id, 'ollama', 'generate')
+            except Exception:
+                pass
+        try:
+            if not self.is_available:
+                if _receipt is not None:
+                    _receipt.unavailable('availability_short_circuit')
+                return None
+            payload: dict[str, Any] = {'model': model or self.model, 'prompt': prompt, 'stream': False, 'options': {'temperature': temperature, 'num_predict': num_predict}}
+            if system:
+                payload['system'] = system
+            start = time.monotonic()
+            try:
+                if _receipt is not None:
+                    _receipt.payload(payload)
+                resp = requests.post(f'{self.base_url}/api/generate', json=payload, timeout=self.timeout)
+                latency_ms = (time.monotonic() - start) * 1000
+                resp.raise_for_status()
+                data = resp.json()
+                log.debug('Ollama generate — latency={l:.0f}ms', l=latency_ms)
+                response_text = data.get('response', '') or ''
+                if _receipt is not None:
+                    _receipt.candidate(response_text)
+                if _receipt is not None:
+                    _receipt.logging_started()
+                try:
+                    from llm.feedback_loop import log_llm_call
+                    model_used = data.get('model', model or self.model)
+                    _logger_call_id = log_llm_call(module='ollama', tier='unknown', system_prompt=(system or '')[:2000], user_prompt=prompt[:2000], output=response_text[:2000], context_tokens=data.get('prompt_eval_count', 0) or 0, output_tokens=data.get('eval_count', 0) or 0, latency_ms=int(latency_ms), model=model_used, provider='ollama', metadata=dict(extra_metadata) if extra_metadata else None)
+                    if _receipt is not None:
+                        _receipt.returned_id(_logger_call_id)
+                except Exception:
+                    pass
+                return response_text
+            except Exception as exc:
+                if _receipt is not None:
+                    _receipt.unavailable('transport_or_response_error')
+                latency_ms = (time.monotonic() - start) * 1000
+                log.warning('Ollama generate failed ({l:.0f}ms): {err}', l=latency_ms, err=str(exc))
+                return None
+        finally:
+            if _receipt is not None:
+                _receipt.emit()
+''',
+    'llamacpp/client.py': r'''class LlamaCppClient:
+    supports_call_receipts = True
+
+    def chat(self, messages: list[dict[str, str]], model: str | None=None, temperature: float=0.3, num_predict: int | None=None, system_knowledge: list[str] | None=None, extra_metadata: dict | None=None, *, attempt_id: str | None=None, receipt_callback: Any=None) -> str | None:
+        """Send a chat completion request to llama-server.
+
+        Parameters:
+            messages: List of message dicts with ``role`` and ``content`` keys.
+            model: Model override (defaults to self.model).
+            temperature: Sampling temperature.
+            num_predict: Maximum tokens to generate.
+            system_knowledge: List of knowledge doc names to inject into
+                the system prompt as context.
+            extra_metadata: Optional dict of A/B-test or call-site tags
+                forwarded to the feedback-loop logger (Langfuse).
+
+        Returns:
+            str: The assistant's response text, or None if unavailable.
+        """
+        _receipt = None
+        if receipt_callback is not None:
+            try:
+                from llm.feedback_loop import _CallReceiptCapture
+                _receipt = _CallReceiptCapture(receipt_callback, attempt_id, 'llamacpp', 'chat')
+            except Exception:
+                pass
+        try:
+            if not self.is_available:
+                backoff_until = _ENDPOINT_BACKOFF_UNTIL.get(self._backoff_key)
+                if backoff_until and time.time() < backoff_until:
+                    if _receipt is not None:
+                        _receipt.unavailable('active_backoff')
+                    return None
+                try:
+                    resp = requests.get(f'{self.base_url}/health', timeout=3)
+                    self.is_available = resp.status_code == 200
+                except Exception:
+                    log.debug('llama.cpp health re-check failed', exc_info=True)
+                if not self.is_available:
+                    if _receipt is not None:
+                        _receipt.unavailable('availability_short_circuit')
+                    return None
+            messages = inject_knowledge(messages, system_knowledge, self._knowledge_cache)
+            requested_num_predict = self.default_num_predict if num_predict is None else max(num_predict, self.min_num_predict)
+            gen_budget = requested_num_predict + self.reasoning_headroom
+            payload: dict[str, Any] = {'model': model or self.model, 'messages': messages, 'max_tokens': gen_budget, 'temperature': temperature, 'stream': False}
+            total_prompt_chars = sum((len(m['content']) for m in messages))
+            est_prompt_tokens = total_prompt_chars // 3
+            max_ctx = getattr(self, '_ctx_size', None) or 4096
+            available_for_gen = max(256, max_ctx - est_prompt_tokens - 64)
+            if payload['max_tokens'] > available_for_gen:
+                log.debug('Clamping max_tokens {orig} → {clamped} (est prompt={p} tok)', orig=payload['max_tokens'], clamped=available_for_gen, p=est_prompt_tokens)
+                payload['max_tokens'] = available_for_gen
+            start = time.monotonic()
+            try:
+                if _receipt is not None:
+                    _receipt.payload(payload)
+                resp = requests.post(f'{self.base_url}/v1/chat/completions', json=payload, timeout=self.timeout)
+                latency_ms = (time.monotonic() - start) * 1000
+                if resp.status_code >= 400:
+                    error_body = ''
+                    try:
+                        error_body = resp.text[:500]
+                    except Exception:
+                        log.debug('Failed to read llama.cpp error response body', exc_info=True)
+                    log.warning('llama.cpp chat {status} ({l:.0f}ms): {body}', status=resp.status_code, l=latency_ms, body=error_body)
+                    if resp.status_code >= 500:
+                        self._mark_chat_failure(f'HTTP {resp.status_code}')
+                    if _receipt is not None:
+                        _receipt.unavailable('http_error')
+                    return None
+                data = resp.json()
+                choice = data['choices'][0]
+                message = choice['message']
+                content = message.get('content') or ''
+                reasoning_content = message.get('reasoning_content') or ''
+                if not content and reasoning_content:
+                    log.warning('llama.cpp chat returned reasoning without final content; finish={finish}, max_tokens={max_tokens}, reasoning_chars={chars}', finish=choice.get('finish_reason'), max_tokens=payload['max_tokens'], chars=len(reasoning_content))
+                    if _receipt is not None:
+                        _receipt.unavailable('reasoning_without_final')
+                    return None
+                if '<think>' in content and '</think>' in content:
+                    import re as _re_strip
+                    content = _re_strip.sub('<think>.*?</think>\\s*', '', content, flags=_re_strip.DOTALL).strip()
+                    if not content:
+                        if _receipt is not None:
+                            _receipt.unavailable('empty_after_preprocessing')
+                        return None
+                if _receipt is not None:
+                    _receipt.candidate(content)
+                model_used = data.get('model', model or self.model)
+                tokens = data.get('usage', {})
+                log.debug('llama.cpp chat — model={m}, latency={l:.0f}ms, prompt_tok={p}, gen_tok={g}', m=model_used, l=latency_ms, p=tokens.get('prompt_tokens', '?'), g=tokens.get('completion_tokens', '?'))
+                if _receipt is not None:
+                    _receipt.logging_started()
+                try:
+                    from llm.feedback_loop import log_llm_call
+                    sys_msg = next((m['content'] for m in messages if m['role'] == 'system'), '')
+                    usr_msg = next((m['content'] for m in messages if m['role'] == 'user'), '')
+                    _logger_call_id = log_llm_call(module='llamacpp', tier='unknown', system_prompt=sys_msg, user_prompt=usr_msg[:2000], output=content[:2000], context_tokens=tokens.get('prompt_tokens', 0) or 0, output_tokens=tokens.get('completion_tokens', 0) or 0, latency_ms=int(latency_ms), model=model_used, provider='llamacpp', metadata=dict(extra_metadata) if extra_metadata else None)
+                    if _receipt is not None:
+                        _receipt.returned_id(_logger_call_id)
+                except Exception:
+                    pass
+                return content
+            except Exception as exc:
+                if _receipt is not None:
+                    _receipt.unavailable('transport_or_response_error')
+                latency_ms = (time.monotonic() - start) * 1000
+                log.warning('llama.cpp chat failed ({l:.0f}ms): {err}', l=latency_ms, err=str(exc))
+                self._mark_chat_failure(str(exc))
+                return None
+        finally:
+            if _receipt is not None:
+                _receipt.emit()
+
+    def _mark_chat_failure(self, reason: str) -> None:
+        """Back off endpoints that pass /health but fail real chat calls."""
+        self.is_available = False
+        _ENDPOINT_BACKOFF_UNTIL[self._backoff_key] = time.time() + _ENDPOINT_BACKOFF_SECONDS
+        log.warning('llama.cpp endpoint disabled for {s:.0f}s after chat failure — {url}: {reason}', s=_ENDPOINT_BACKOFF_SECONDS, url=self.base_url, reason=reason[:200])
+
+    def generate(self, prompt: str, model: str | None=None, system: str | None=None, temperature: float=0.3, num_predict: int | None=None, extra_metadata: dict | None=None, *, attempt_id: str | None=None, receipt_callback: Any=None) -> str | None:
+        """Single-turn generation via chat endpoint.
+
+        Parameters:
+            prompt: The user prompt.
+            model: Model override.
+            system: System prompt.
+            temperature: Sampling temperature.
+            num_predict: Max tokens.
+            extra_metadata: Optional A/B-test / call-site tags forwarded
+                to the feedback-loop logger via ``chat()``.
+
+        Returns:
+            str: Generated text, or None if unavailable.
+        """
+        messages: list[dict[str, str]] = []
+        if system:
+            messages.append({'role': 'system', 'content': system})
+        messages.append({'role': 'user', 'content': prompt})
+        receipt_options = {'attempt_id': attempt_id, 'receipt_callback': receipt_callback} if receipt_callback is not None or attempt_id is not None else {}
+        return self.chat(messages, model=model, temperature=temperature, num_predict=num_predict, extra_metadata=extra_metadata, **receipt_options)
+''',
+}
+_PINNED_RECEIPT_SOURCE_HASHES = {'llm/feedback_loop.py': '1c7913d85cf96715ca2bbe0e737be3c0a773687d0d3cbf8232c319dc324e2c36', 'llm/router.py': 'daeb61e691497b00d5d7deb6e31d9b602042eedfcc526073c0db9f0d77ad204c', 'ollama/client.py': 'fd37bdeeb85823e4af38520bd3ee413aa6cb3657c73168d0208ca1ca296f43dd', 'llamacpp/client.py': '3a323c83dd2652bc983b3790a451c948ca9a5b518f30a4be5523f7fffa4f85b0'}
+_PINNED_RECEIPT_HELPERS = r'''import ast
+import copy
+import dataclasses
+import datetime
+import hashlib
+import json
+from pathlib import Path
+import sys
+import threading
+import types
+from unittest.mock import Mock, patch
+import uuid
+def source(path):
+    text = RECEIPT_SOURCE_EXCERPTS[path]
+    if hashlib.sha256(text.encode('utf-8')).hexdigest() != RECEIPT_SOURCE_HASHES[path]:
+        raise AssertionError('pinned receipt fixture changed: ' + path)
+    return text
+def excerpt(path, names, globals_=None, class_methods=None):
+    tree = ast.parse(source(path))
+    nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:
+            node = copy.deepcopy(node)
+            if class_methods and isinstance(node, ast.ClassDef):
+                node.body = [n for n in node.body if isinstance(n, ast.FunctionDef) and n.name in class_methods or (isinstance(n, ast.Assign) and any((isinstance(t, ast.Name) and t.id == 'supports_call_receipts' for t in n.targets)))]
+            nodes.append(node)
+    mod = types.ModuleType('_receipt_fenced_' + path.replace('/', '_').replace('.', '_'))
+    sys.modules[mod.__name__] = mod
+    mod.__dict__.update(dict(dataclass=dataclasses.dataclass, Any=object, json=json, hashlib=hashlib, uuid=uuid, log=Mock(), time=types.SimpleNamespace(monotonic=lambda: 1.0, time=lambda: 1.0)))
+    mod.__dict__.update(globals_ or {})
+    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])), '<fenced-' + path + '>', 'exec'), mod.__dict__)
+    return mod
+
+def canonical(payload):
+    text = json.dumps({'schema': 'grid.llm_request_payload.v1', 'payload': payload}, sort_keys=True, ensure_ascii=False, separators=(',', ':'), allow_nan=False)
+    return (hashlib.sha256(text.encode('utf-8')).hexdigest(), len(text), len(text.encode('utf-8')))
+
+def sha(text):
+    return hashlib.sha256(text.encode('utf-8')).hexdigest()
+
+class Ledger:
+
+    def __init__(self, storage_fails=False, sink_disabled=False, collision=False):
+        self.rows, self.emissions = ([], [])
+        self.lock, self.tick = (threading.Lock(), 0)
+        owner = self
+
+        class Cursor:
+
+            def execute(self, sql, values):
+                with owner.lock:
+                    owner.rows.append(tuple(values))
+
+            def close(self):
+                pass
+
+        def conn():
+            if storage_fails:
+                raise RuntimeError('synthetic unavailable storage')
+            return types.SimpleNamespace(cursor=Cursor, commit=lambda: None, close=lambda: None)
+
+        def utcnow():
+            with self.lock:
+                self.tick += 1
+                tick = 1 if collision else self.tick
+            return datetime.datetime(2026, 10, 13) + datetime.timedelta(microseconds=tick)
+
+        def start_observation(**kwargs):
+            with self.lock:
+                self.emissions.append(copy.deepcopy(kwargs))
+            return types.SimpleNamespace(end=lambda: None)
+        self.feedback = excerpt('llm/feedback_loop.py', ['LLMCallReceipt', '_CallReceiptCapture', 'log_llm_call', '_emit_to_langfuse'], {'datetime': types.SimpleNamespace(datetime=types.SimpleNamespace(utcnow=utcnow)), '_get_conn': conn, '_get_langfuse': lambda: None if sink_disabled else types.SimpleNamespace(start_observation=start_observation)})
+
+class Transport:
+
+    def __init__(self, kind, content='SYNTHETIC', status=200, reasoning='', error=None, dynamic=False, health=503):
+        self.kind, self.content, self.status, self.reasoning = (kind, content, status, reasoning)
+        self.error, self.dynamic = (error, dynamic)
+        self.post = Mock(side_effect=self._post)
+        self.get = Mock(return_value=types.SimpleNamespace(status_code=health))
+
+    def _post(self, url, json, timeout):
+        if self.error:
+            raise self.error
+        content = 'RETURN:' + json['messages'][-1]['content'] if self.dynamic else self.content
+        data = {'model': 'SYNTHETIC_MODEL', 'response': content, 'message': {'content': content}, 'prompt_eval_count': 4, 'eval_count': 8} if self.kind == 'ollama' else {'model': 'SYNTHETIC_MODEL', 'choices': [{'message': {'content': content, 'reasoning_content': self.reasoning}, 'finish_reason': 'stop'}], 'usage': {'prompt_tokens': 4, 'completion_tokens': 8}}
+
+        def raise_for_status():
+            if self.status >= 400:
+                raise RuntimeError('synthetic HTTP failure')
+        return types.SimpleNamespace(status_code=self.status, text='SYNTHETIC_ERROR', json=lambda: copy.deepcopy(data), raise_for_status=raise_for_status)
+
+def client(kind, transport, available=True, inject=None):
+    name = 'OllamaClient' if kind == 'ollama' else 'LlamaCppClient'
+    mod = excerpt(kind + '/client.py', [name], {'requests': transport, 'inject_knowledge': inject or (lambda messages, *_: copy.deepcopy(messages)), '_ENDPOINT_BACKOFF_UNTIL': {}, '_ENDPOINT_BACKOFF_SECONDS': 300}, class_methods={'chat', 'generate', '_mark_chat_failure'})
+    obj = getattr(mod, name).__new__(getattr(mod, name))
+    obj.__dict__.update(is_available=available, model='SYNTHETIC_MODEL', base_url='https://synthetic.invalid', timeout=1, _knowledge_cache={}, default_num_predict=800, min_num_predict=0, reasoning_headroom=0, _ctx_size=32768, _backoff_key='SYNTHETIC_ENDPOINT')
+    if kind == 'llamacpp' and (not available):
+        mod._ENDPOINT_BACKOFF_UNTIL[obj._backoff_key] = 10.0
+    return (obj, mod)
+
+def router(extra=None):
+    return excerpt('llm/router.py', ['chat_with_receipt'], {'Tier': types.SimpleNamespace(DEFAULT='reason'), **(extra or {})})
+'''
+
 def _publication_receipt_test_modules():
-    """Reuse accepted source-excerpt fixtures, without executing their test suite."""
-    path = ROOT / 'tests/test_llm_call_receipts.py'
-    tree = ast.parse(path.read_text())
-    names = {'source', 'excerpt', 'canonical', 'sha', 'Ledger', 'Transport', 'client', 'router'}
-    nodes = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom)) or
-             isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name in names]
+    """Self-contained synthetic protocol fixtures; no tracing checkout needed."""
     module = types.ModuleType('_publication_accepted_receipt_fixtures')
     sys.modules[module.__name__] = module
-    module.__dict__.update(ROOT=ROOT, MUTATION=None)
-    exec(compile(ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[])),
-                 str(path), 'exec'), module.__dict__)
+    module.__dict__.update(ROOT=ROOT,
+                          RECEIPT_SOURCE_EXCERPTS=_PINNED_RECEIPT_SOURCE_EXCERPTS,
+                          RECEIPT_SOURCE_HASHES=_PINNED_RECEIPT_SOURCE_HASHES)
+    exec(compile(_PINNED_RECEIPT_HELPERS, '<synthetic-publication-receipt-fixtures>', 'exec'), module.__dict__)
     return module
 
 

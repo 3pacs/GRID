@@ -483,7 +483,10 @@ class TestPublicationReceiptGrounding:
 
     def test_emitted_digest_after_annotation(self):
         import hashlib
-        from test_publication_semantics import PublicationReceiptConsumerTests
+        if __package__:
+            from .test_publication_semantics import PublicationReceiptConsumerTests
+        else:
+            from test_publication_semantics import PublicationReceiptConsumerTests
 
         fixture = PublicationReceiptConsumerTests()
         fixture.setUp()
@@ -504,7 +507,10 @@ class TestPublicationReceiptGrounding:
             fixture.doCleanups()
 
     def test_summary_digest_distinct_from_rejected_candidate_and_annotation_input(self):
-        from test_publication_semantics import PublicationReceiptConsumerTests
+        if __package__:
+            from .test_publication_semantics import PublicationReceiptConsumerTests
+        else:
+            from test_publication_semantics import PublicationReceiptConsumerTests
 
         fixture = PublicationReceiptConsumerTests()
         fixture.setUp()
