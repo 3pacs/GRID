@@ -721,7 +721,9 @@ class BasePuller:
         value: float,
         raw_payload: dict[str, Any] | None = None,
         pull_status: str = "SUCCESS",
-    ) -> None:
+        *,
+        return_result: bool = False,
+    ) -> Any:
         """Insert a row into raw_series.
 
         Runs sanity validation before inserting.  Warnings are logged
@@ -737,13 +739,16 @@ class BasePuller:
                 The schema also allows 'QUARANTINED', but pullers never
                 write it: it is set only by an explicit quarantine of
                 already-stored rows.
+            return_result: Opt in to the exact execute result. The default
+                still returns None. A result does not acknowledge commit.
         """
+        # Legacy callers retain None; opt-in callers inspect affected rows.
         import json
 
         # Run sanity validation (log-only, never blocks)
         self.validate_row(series_id, obs_date, value)
 
-        conn.execute(
+        result = conn.execute(
             text(
                 "INSERT INTO raw_series "
                 "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
@@ -758,3 +763,4 @@ class BasePuller:
                 "status": pull_status,
             },
         )
+        return result if return_result is True else None
