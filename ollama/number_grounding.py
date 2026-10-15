@@ -67,6 +67,7 @@ NumberKind = Literal["dollar", "percent", "decimal", "integer", "ratio"]
 
 PUBLICATION_EVIDENCE_RULES = 'Correlation and structural flow edges are model proxies, not measured money transfers. Stock changes are not transaction flows. Unknown sources cannot support transfer claims. Put/call ratios measure relative contracts, not buyer initiation, opening/closing, hedging intent, protection purchases or signed dealer gamma. VIX measures implied volatility; do not substitute it for realized volatility. Narrative text is commentary, never authoritative evidence for those claims. Price moves, insider/congressional ratios and confidence do not establish institutional distribution, accumulation, retail positioning or an actor-driven trend. Distinguish explicit unverified hypotheses/caveats from source-reported holdings facts. Do not invent causal predictions or action thresholds. VIX tenor comparisons require compatible observation dates. A single regime record does not establish a trend. Classifier confidence, thesis conviction and sentiment are distinct model outputs, not calibrated outcome probabilities. Narrative text is commentary, never authoritative evidence for those claims. Do not invent causal predictions or action thresholds.'
 
+PUBLICATION_EVIDENCE_RULES += ' Signal counts do not identify informed exits or institutional conviction. Order-book depth, gamma-driven market moves and tail-risk valuation require their own measurements; those measurements are not supplied here.'
 
 def publication_context_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
     """Limits of the current latest-only collector; prose cannot add evidence.
@@ -369,7 +370,7 @@ def _reported_flow_clause_supported(clause: str, reported: list[dict[str, Any]])
 def _actor_clause_nonclaim(clause: str) -> bool:
     """Only whole bounded caveats/hypotheses; never a permission-bearing adjective."""
     actor = r"(?:institutional|retail)"
-    subject = actor + r"\s+(?:distribution|accumulation|positioning|ownership|buying|selling)"
+    subject = actor + r"\s+(?:distribution|accumulation|positioning|ownership|buying|selling|conviction|sentiment)"
     if re.fullmatch(subject + r"\s+(?:is|remains)\s+(?:unmeasured|unknown|unverified|unavailable|not established(?: by these data)?)", clause):
         return True
     if re.fullmatch(r"(?:prices|ratios) alone cannot establish\s+" + subject, clause):
@@ -418,6 +419,79 @@ def _actor_clause_supported(clause: str, evidence: list[dict[str, Any]]) -> bool
     return False
 
 
+def _publication_structure_reasons(clause: str, context: set[str]) -> set[str]:
+    """Reject bounded proxy-to-motive/depth/mechanism upgrades, not the nouns.
+
+    Current inputs contain no order-book, informed-investor identification,
+    dealer exposure or independently valued tail distribution. Their labels or
+    a narrative flag cannot authenticate those measurements. Context carries
+    only to reject a subsequent elided assertion, never to grant permission.
+    """
+    actor = bool(re.search(r"\b(?:informed participants?|insiders?|congressional (?:activity|traders?))\b", clause))
+    book = bool(re.search(r"\b(?:bids?|bid depth|order[- ]book(?: depth)?)\b", clause))
+    gamma = bool(re.search(r"\bgamma\b", clause))
+    tail = bool(re.search(r"\btail[\s\u2010-\u2015-]+risk\b", clause))
+    context.update(k for k, present in (("actor", actor), ("book", book), ("gamma", gamma), ("tail", tail)) if present)
+    subject = (r"(?:bid depth|order[- ]book depth|informed participant exits|insider distribution|"
+               r"gamma[- ]driven moves|gamma exposure|tail risk mispricing)")
+    if re.fullmatch(subject + r"\s+(?:is|are|remains?)\s+(?:unknown|unmeasured|unverified|unavailable|not established)", clause.strip()):
+        return set()
+    if re.fullmatch(r"(?:prices|counts|pcr|ratios|vix|these data)(?: alone)?\s+(?:cannot|do not|does not) establish\s+" + subject, clause.strip()):
+        return set()
+    if re.fullmatch(r"hypothesis:\s*(?:informed participants (?:may|might|could) be exiting|gamma[- ]driven moves (?:may|might|could) occur)(?:\s+\(unverified\))?", clause.strip()):
+        return set()
+    pronoun = bool(re.match(r"^\s*(?:(?:but|and|however|yet|whereas)\s+)?(?:it|they|this|that|these|those|is|are)\b", clause))
+    reasons: set[str] = set()
+    if (actor or pronoun and "actor" in context) and re.search(
+        r"\b(?:exit\w*|distribut\w*|accumulat\w*|dump\w*|offload\w*|conviction|leading indicator|predict\w*|occur\w*)\b", clause
+    ):
+        reasons.add("unsupported_informed_actor")
+    if (book or pronoun and "book" in context) and re.search(
+        r"\b(?:robust|thin|weak|deep|strong|absent|shallow)\b", clause
+    ):
+        reasons.add("unsupported_bid_depth")
+    if re.search(r"\bgamma[\s\u2010-\u2015-]+driven\b", clause) or (
+        pronoun and "gamma" in context and re.search(r"\b(?:occur\w*|happening)\b", clause)
+    ) or (
+        (gamma or pronoun and "gamma" in context)
+        and re.search(r"\b(?:driv\w*|caus\w*|amplif\w*)\b.*\b(?:moves?|volatil\w*|decline|rally|risk)\b", clause)
+    ):
+        reasons.add("unsupported_gamma_mechanism")
+    if (tail or pronoun and "tail" in context) and re.search(r"\b(?:under|over)[- ]?pric\w*|\bmispric\w*", clause):
+        reasons.add("unsupported_tail_risk_valuation")
+    return reasons
+
+
+def _publication_inference_nonclaim(clause: str) -> bool:
+    """Whole measurement denials only, never a denial of observed activity.
+
+    No amounts, causal tails or free-form descriptions enter this grammar.
+    In particular, 'institutions are not buying puts' still asserts actor side.
+    """
+    target = (r"(?:institutional (?:distribution|positioning)|hedg(?:e|ing) intent|"
+              r"hedging|distribution|buyer initiation|fear|protection buying)")
+    targets = target + r"(?:\s+or\s+" + target + r"){0,3}"
+    return bool(
+        re.fullmatch(r"not (?:a measure|evidence) of\s+" + targets, clause)
+        or re.fullmatch(r"(?:it|this proxy)\s+(?:does not|cannot) (?:prove|confirm)\s+" + targets, clause)
+        or re.fullmatch(r"so it cannot be used to claim\s+" + targets, clause)
+        or clause in {"not a measured flow", "no positioning instructions are provided"}
+    )
+
+
+def _publication_explicit_nonactor_subject(clause: str) -> bool:
+    """Whole bounded model/count observations; never erase an actor referent."""
+    number = r"[+-]?\d+(?:\.\d+)?"
+    return bool(
+        re.fullmatch(r"sentiment is (?:neutral|bullish|bearish)(?: \(" + number + r"\))?", clause)
+        or re.fullmatch(
+            r"regime confidence: monitor if the classifier confidence moves above " + number
+            + r" \(higher conviction\)(?: or below " + number + r" \(lower conviction\))?", clause)
+        or clause == "insider data: check for any significant changes in the insider sell ratio"
+        or clause == "a shift toward buys could invalidate the negative insider signal"
+    )
+
+
 def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None = None, actor_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Bounded lexical gate for known publication failures, before writes/TTS.
 
@@ -434,18 +508,41 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
     sentences = re.split(r"([.!?]+(?:\s+|$)|[;\n]+|,(?!\d)\s*|\s+(?:and|while|but|whereas|however)\s+)", normalized)
     flow_clause_context = False
     actor_context = False
+    sentiment_subject = False
+    structure_context: set[str] = set()
     for index in range(0, len(sentences), 2):
         if index == 0 or re.search(r"[.!?\n]", sentences[index - 1]):
             flow_clause_context = False
+            sentiment_subject = False
         sentence = sentences[index]
         # Remove only fixed nonclaim phrases, never a whole sentence containing
         # an unmeasured/unavailable adjective (which can precede a false claim).
         sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? (?:is )?(?:unavailable|unmeasured)|hedge funds?|inflation hedge|(?:operating|free) cash flows?|(?:money )?flow engine)\b", "", sentence)
-        actor_context = actor_context or bool(re.search(
+        if not sentence.strip():
+            continue
+        # A model observation never erases an earlier protected actor. Its
+        # exception applies only to this whole bounded clause, not later prose.
+        actor_explicit = bool(re.search(
             r"\b(?:institution(?:al|s)?|retail|smart money|professional investors)\b", sentence))
+        inference_nonclaim = _publication_inference_nonclaim(sentence.strip())
+        actor_context = actor_context or actor_explicit
+        model_nonclaim = _publication_explicit_nonactor_subject(sentence.strip())
+        # The observed score is the grammatical subject of this one comma
+        # continuation. No free-form 'driven by' clause receives permission.
+        sentiment_continuation = sentiment_subject and index > 0 and sentences[index - 1].startswith(',') and bool(re.fullmatch(
+            r"driven by conflicting signals: strong trend \([+-]?\d+(?:\.\d+)?\)", sentence.strip()))
+        sentiment_subject = bool(re.fullmatch(
+            r"sentiment is (?:neutral|bullish|bearish)(?: \([+-]?\d+(?:\.\d+)?\))?", sentence.strip()))
+        if inference_nonclaim:
+            # A denial can still be the antecedent of a later unsupported
+            # assertion. It grants no permission to a following amount/claim.
+            flow_clause_context = flow_clause_context or bool(re.search(r"\bflow\b", sentence))
+            continue
+        reasons.update(_publication_structure_reasons(sentence, structure_context))
         if (actor_context
-                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*)\b", sentence)
+                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|conviction|euphori\w*|exit\w*)\b", sentence)
                 and not _actor_clause_nonclaim(sentence.strip())
+                and not model_nonclaim and not sentiment_continuation
                 and not _actor_clause_supported(sentence.strip(), actor_evidence if isinstance(actor_evidence, list) else [])):
             reasons.add("unsupported_actor_interpretation")
         commercial_hedge_subject = (

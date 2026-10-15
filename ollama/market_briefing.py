@@ -489,7 +489,12 @@ class MarketBriefingEngine:
         parts = [f"- {category}:{name}: raw value={info.get('value', 'unknown')}",
                  f"asof={asof}", f"source={source}",
                  f"unit={info.get('unit') or 'unknown'}",
-                 f"availability={info.get('available_at') or 'unknown'}", "freshness=unknown"]
+                 f"availability={info.get('available_at') or 'unknown'}", "freshness=unknown",
+                 f"event_date={info.get('event_date') or 'unknown'}",
+                 f"collected_at={info.get('collected_at') or info.get('pull_timestamp') or 'unknown'}",
+                 f"vintage={info.get('vintage_date') or 'unknown'}",
+                 f"basis={info.get('price_basis') or info.get('basis') or 'unknown'}",
+                 f"session_finality={info.get('session_finality') if info.get('session_finality') not in (None, '') else 'unknown'}"]
         if category == "features":
             normalization = info.get("normalization")
             if isinstance(normalization, dict):
@@ -540,6 +545,14 @@ class MarketBriefingEngine:
                 lines.append("")
 
         lines.append("### PUBLICATION CONTEXT LIMITS")
+        lines.append("- asof is the original observation date, not an event, collection or release time. "
+                     "A same-date Close field does not establish a final session close. "
+                     "Missing collection, revision and session-finality evidence remains unknown.")
+        lines.append("- Moving-average feature dates do not refresh with this snapshot. "
+                     "The separate trend score supplies no instrument/date/price-basis lineage here; "
+                     "do not infer current support or a current price/MA comparison from that score.")
+        lines.append("- Signal counts do not measure notional net selling, informed exits, institutional conviction, "
+                     "retail sentiment, bid depth, gamma-driven moves or tail-risk mispricing.")
         lines.append(f"- VIX eligibility cutoff: {facts['snapshot_cutoff_date']} "
                      "(recorded snapshot calendar date; intraday availability unverified).")
         lines.append(f"- VIX tenor observation dates: {json.dumps(facts['vix_observation_dates'])}")
@@ -751,7 +764,13 @@ class MarketBriefingEngine:
             data_context += f"- Context: {sentiment.context}\n"
             for comp in sentiment.components:
                 label = self._PROXY_COMPONENT_LABELS.get(comp.name)
-                if label is not None:
+                if comp.name == "trend":
+                    data_context += (
+                        f"- Trend model score: score={comp.score:+.2f}, weight={comp.weight:.0%} "
+                        "— instrument, observation dates and price-basis lineage unavailable here; "
+                        "current price/MA relationship unverified.\n"
+                    )
+                elif label is not None:
                     data_context += f"- {label}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {self._PROXY_COMPONENT_NOTE}\n"
                 else:
                     data_context += f"- {comp.name}: score={comp.score:+.2f}, weight={comp.weight:.0%} — {comp.detail}\n"

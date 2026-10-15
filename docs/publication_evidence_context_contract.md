@@ -1,5 +1,45 @@
 # Publication evidence context contract
 
+## October 14 bounded claim and provenance correction
+
+The October 14 replay uses the exact retained publications and snapshot fields;
+it does not repair or rewrite them. Current31 already rejects complete 4461/4463
+actor stories in some contexts (the exact replay receipt is authoritative).
+Individual informed-exit, bid-depth, retail-euphoria, gamma-driven-move and
+tail-risk-valuation phrases exposed additional bounded lexical gaps. Known
+assertions now reject before either writer, independently of flow/holdings
+receipts or narrative flags. A fixed whole-clause unknown/unmeasured statement,
+narrow explicitly labelled unverified hypothesis, technical definition, signal
+count report or the existing attributed holdings observation remains distinct.
+Context can retain a protected subject to reject an elided later assertion; it
+never grants authority. This remains a conservative, incomplete lexer, not a
+general mechanism verifier or authentication of a supplied source.
+
+Evidence lines preserve observation date, event date, collection/pull timestamp,
+availability, vintage, price basis and session finality separately when supplied.
+Missing fields stay unknown; false declared session finality stays false. No
+clock fills another, and no maximum-age or revision/finality policy is guessed.
+A same-date provider Close field does not certify a final session close.
+
+The current separately computed trend component reads YF:^GSPC closes but labels
+its detail SPY. The publication now renders its existing score/weight with
+explicitly unavailable instrument/date/basis lineage, rather than repeating that
+undated comparison in the prompt. Scoring inputs, math, logging and the original
+machine-readable sentiment result stay unchanged. March 21 SPY moving-average
+features and March 24 sp500 are separate dated inputs; their presence alone does
+not prove which observations produced a historical sentence or score. No
+arbitrary moving-average comparison is certified by this change.
+
+Diary 14's 52.03-point discrepancy against the retained FRED close, the repeated
+stored GSPC value and the current non-SPY duplicate-date insertion path are
+separate findings. Observation-date equality is insufficient session-finality
+evidence. Actual historical provider collection time, selected raw-row/vintage
+and freeze mechanism remain unproved without their receipts. Diary/collector
+repairs belong to their existing owners; no diary writer, collector, query,
+selector, scorer, schedule or historical row changes here. TLT raw price versus
+issuer NAV remains an unmatched basis comparison, not a fabricated same-basis
+error. Historical source/gate behavior is not inferred from current31 source.
+
 This boundary changes future presentation and rejection only. It does not authenticate providers, repair data freshness, change scoring/queries/selection, or revise historical publications. Numeric grounding remains a literal-context check and does not establish units, age, actor identity or causality.
 
 ## Clocks and feature identity
@@ -172,3 +212,37 @@ The V3 evidence formatter/raw-value versus z separation, selector inputs, blank 
 This integration starts from3d1f1565affd778a7046b14ce7f37e14b529faa6/tree883a0de1dbd0d86769f96630dc1617a0f95fc605. Existing PR844 proxy labels/notes, score-only component rendering, flow-direction removal, guarded vocabulary and three regression bodies/helpers are preserved. Full rejected_candidate retention remains an existing internal snapshot field, assigned after the summary is built and bound to the actual original pre-context claim input. No prompt/response export or additional raw retention is introduced by receipt metadata.
 
 All current tracing production files, including four router timeout additions, remain unchanged. Accepted tracing source is a read-only synthetic dependency projection only; this six-path change does not integrate its module/API into current main. An opt-in publication callback with unavailable tracing schema/router returns explicit unavailable/unknown provenance without inventing a logger ID, changing content, or retrying. Native/fullCI/provider/DB/SDK/export/durability and real publication are unrun. Exactly one new final child is allowed; frozen earlier results and failures are not replayed as current runtime proof.
+
+## Bounded measurement denials and actor referents
+
+Whole measurement denials such as `not evidence of hedging or distribution`,
+`it does not prove institutional distribution` and `not a measured flow` do not
+assert the activity they deny evidence for. A full-clause grammar recognizes
+these fixed forms. No generic negation substring, amount, causal tail or
+free-form description grants permission. `Institutions are not buying puts`
+still asserts unobserved actor side and remains rejected. A following affirmative
+actor, options or transfer clause receives its own existing evidence check.
+
+An actor referent persists through caveats, punctuation, headings, pronouns,
+bare predicates, unknown fragments and intervening model observations. Whole
+bounded sentiment-score, regime-confidence monitoring and insider-ratio
+monitoring clauses have local exceptions; they never clear the actor referent
+for later clauses. Only the immediate comma continuation of a recognized
+sentiment-score clause can use the bounded `driven by conflicting signals:
+strong trend (score)` form. An intervening actor clause breaks that binding.
+Prefix matches, unfamiliar noun phrases and affirmative tails receive no such
+exception. This is not a general natural-language parser.
+
+The exact offline replay of rejected candidates 4468/4469/4470 preserves their
+actual absent actor-evidence keys and supplies no invented actor/flow receipts.
+The corrected claim gate accepts their bounded nonclaims. Whole candidates
+4468 and 4470 pass that gate; 4469 remains withheld for other actor-predicate
+clauses, whose broader interpretation is not qualified here. This does not establish
+publication suitability: complete historical snapshots were not exported, and
+numeric grounding, context annotation, source availability, finality and writer
+acknowledgements remain separate. No historical publication is rewritten.
+
+Source tests and any separately approved static model advice grant no runtime,
+release or publication authority. Existing GPU-only inference and paid-provider
+gating, SQL, scoring, journal history and provider data are unchanged. Acceptance
+of the exact derivative still belongs to the same retained reviewer/controller.
