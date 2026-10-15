@@ -12,10 +12,14 @@ Can run as a standalone scheduler or be called from the API.
 from __future__ import annotations
 
 import json
+import hashlib
+import math
 import time
+import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import schedule
 from loguru import logger as log
@@ -23,6 +27,123 @@ from outputs.path_utils import ensure_output_dir
 
 # Output directory for saved briefings
 _BRIEFING_DIR = Path(__file__).parent.parent / "outputs" / "market_briefings"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationTextDigest:
+    sha256: str | None
+    character_length: int | None
+    utf8_byte_length: int | None
+    completeness: str
+
+
+def _publication_digest(value: str | None) -> PublicationTextDigest:
+    if value is None:
+        return PublicationTextDigest(None, None, None, "not_available")
+    try:
+        raw = value.encode("utf-8")
+        return PublicationTextDigest(hashlib.sha256(raw).hexdigest(), len(value), len(raw), "full_in_memory")
+    except Exception:
+        return PublicationTextDigest(None, None, None, "capture_failed")
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationGuardReceipt:
+    role: str
+    input_digest: PublicationTextDigest
+    passed: bool | None
+    reasons: tuple[str, ...]
+    implementation_version: str = "grid.publication_claim_guard.v2"
+    implementation_sha256: str | None = None
+    implementation_hash_state: str = "unknown"
+    scope: str = "check_publication_claims; supplied actor_evidence only"
+
+
+@dataclass(frozen=True, slots=True)
+class PublicationReceipt:
+    """Invocation evidence only; never persisted or used to relax a guard."""
+
+    schema_version: str
+    attempt_id: str
+    attempt_id_state: str
+    call_receipt: Any
+    provenance_state: str
+    candidate_digest: PublicationTextDigest
+    candidate_guard: PublicationGuardReceipt
+    fallback_guards: tuple[PublicationGuardReceipt, ...]
+    grounding_input_digest: PublicationTextDigest
+    emitted_digest: PublicationTextDigest
+    numeric_guard_scope: str
+    numeric_guard_implementation_hash_state: str
+    ungrounded_count: int | None
+    content_outcome: str
+    content_kind: str | None
+    no_candidate_cause: str | None
+    file_ack_state: str
+    database_ack_state: str
+    database_row_reference: int | None
+    publication_outcome: str
+    call_guard_correlation_eligible: bool
+    source_evidence_status: str = "unknown"
+    scoring_state: str = "not_scored"
+    publication_durability_state: str = "unknown"
+
+
+def _publication_call_binding(receipts: list[Any], attempt_id: str,
+                              attempt_state: str, candidate: str | None) -> tuple[Any, str]:
+    """Refuse foreign/incomplete identity rather than joining prefixes or clocks."""
+    try:
+        from llm.feedback_loop import LLMCallReceipt
+    except Exception:
+        return None, "receipt_schema_unavailable"
+
+    if attempt_state == "invalid_requested_id":
+        return None, "invalid_attempt_id"
+    if len(receipts) != 1:
+        return None, "multiple_receipts" if receipts else "missing_receipt"
+    r = receipts[0]
+    if not isinstance(r, LLMCallReceipt) or r.schema_version != "grid.llm_call_receipt.v1":
+        return None, "invalid_receipt"
+    if r.attempt_id != attempt_id or r.attempt_id_state not in ("caller_supplied", "generated"):
+        return None, "mismatched_attempt"
+    usable = isinstance(candidate, str) and bool(candidate.strip())
+    digest = _publication_digest(candidate if usable else None)
+    if (r.operation != "chat" or r.candidate_stage != "post_client_preprocessing"
+            or r.candidate_sha256 != digest.sha256
+            or r.candidate_character_length != digest.character_length
+            or r.candidate_utf8_byte_length != digest.utf8_byte_length
+            or r.candidate_capture_completeness != digest.completeness):
+        return None, "mismatched_candidate"
+    if usable and digest.completeness == "full_in_memory" and (
+            type(r.candidate_character_length) is not int or type(r.candidate_utf8_byte_length) is not int):
+        return None, "mismatched_candidate"
+    if r.request_capture_completeness == "full_in_memory" and (
+            r.request_canonical_version != "grid.llm_request_payload.v1"
+            or r.request_stage not in ("formed_transport_payload", "caller_intent")
+            or type(r.request_sha256) is not str or len(r.request_sha256) != 64
+            or any(c not in "0123456789abcdef" for c in r.request_sha256)
+            or type(r.request_character_length) is not int or r.request_character_length <= 0
+            or type(r.request_utf8_byte_length) is not int or r.request_utf8_byte_length < r.request_character_length):
+        return None, "invalid_request_capture"
+    if r.original_call_id is not None and (
+            type(r.original_call_id) is not str or not r.original_call_id
+            or r.call_id_namespace != "grid.llm.feedback_loop.log_llm_call"
+            or r.call_id_state != "id_returned" or r.receipt_support_state != "supported"):
+        return None, "invalid_call_id"
+    if r.call_id_state == "id_returned" and r.original_call_id is None:
+        return None, "invalid_call_id"
+    # The accepted logger supplies no durability/export acknowledgement.
+    if r.local_record_state not in ("unknown", "not_attempted") or r.export_state not in ("unknown", "not_attempted"):
+        return None, "invalid_durability_claim"
+    return r, r.receipt_support_state
+
+
+def _publication_guard(role: str, content: str | None, verdict: dict[str, Any] | None = None) -> PublicationGuardReceipt:
+    return PublicationGuardReceipt(
+        role, _publication_digest(content),
+        verdict["passed"] if verdict is not None else None,
+        tuple(verdict.get("reasons", ())) if verdict is not None else (),
+    )
 
 
 class MarketBriefingEngine:
@@ -37,25 +158,18 @@ class MarketBriefingEngine:
         db_engine: Optional SQLAlchemy engine for live data access.
     """
 
-    # Sentiment components that are proxies, not measured money transfers
-    # (dollar_flows is mostly options premium + estimated ETF activity). The
-    # publication guard (number_grounding.check_publication_claims) withholds any
-    # narrative that describes them as flows, so the prompt must not hand them to
-    # the model as "$X in / $Y out". Stored component names/details are unchanged;
-    # only how they are rendered into the prompt differs.
     _PROXY_COMPONENT_LABELS = {
         "flows": "positioning_proxy",
         "dark_pool": "dark_pool_proxy",
         "etf_flows": "etf_activity_proxy",
     }
+
     _PROXY_COMPONENT_NOTE = (
         "proxy score from options premium / estimated ETF / off-exchange prints; "
         "NOT a measured money transfer. Refer to it only by its score and direction "
         "(supportive/unsupportive); quote no dollar amounts for it"
     )
-    # Vocabulary the guard rejects outright (see check_publication_claims). Saying
-    # so up front costs a sentence; not saying so withheld 151 of 153 narratives
-    # between 2026-10-06 and 2026-10-14.
+
     _GUARDED_VOCABULARY_RULE = (
         "Never use these words or phrases: flow, flows, inflow, outflow, money "
         "moving/flowing, transfer, capital rotation, hedge, hedging, protection, "
@@ -364,6 +478,39 @@ class MarketBriefingEngine:
 
         return None
 
+    def _format_evidence_value(self, category: str, name: str, info: dict[str, Any]) -> str:
+        """Render original evidence, never the selector's raw-value ranking proxy.
+
+        Source/normalization references are declarations, not independently verified
+        truth or currentness. An assembly/generation clock cannot fill an evidence gap.
+        """
+        asof = info.get("obs_date") or info.get("date") or "unknown"
+        source = info.get("source_id") or info.get("source") or "unknown"
+        parts = [f"- {category}:{name}: raw value={info.get('value', 'unknown')}",
+                 f"asof={asof}", f"source={source}",
+                 f"unit={info.get('unit') or 'unknown'}",
+                 f"availability={info.get('available_at') or 'unknown'}", "freshness=unknown"]
+        if category == "features":
+            normalization = info.get("normalization")
+            if isinstance(normalization, dict):
+                value = normalization.get("value")
+                try:
+                    finite = (not isinstance(value, bool) and isinstance(value, (float, int))
+                              and math.isfinite(value))
+                except OverflowError:
+                    finite = False
+                if (normalization.get("kind") == "z_score" and finite
+                        and all(isinstance(normalization.get(key), str) and normalization[key].strip()
+                                for key in ("source_id", "receipt_id", "date"))):
+                    parts.append(f"source-reported z={value:+.2f} "
+                                 f"(asof={normalization['date']}, source={normalization['source_id']}, "
+                                 f"receipt={normalization['receipt_id']}; verification unestablished)")
+                else:
+                    parts.append("z-score=unknown")
+            else:
+                parts.append("z-score=unknown")
+        return " | ".join(parts)
+
     def _build_data_context(self, snapshot: dict[str, Any]) -> str:
         """Convert market snapshot to a readable text block for the LLM.
 
@@ -373,8 +520,10 @@ class MarketBriefingEngine:
         Returns:
             str: Formatted data context.
         """
+        from ollama.number_grounding import publication_context_facts
+        facts = publication_context_facts(snapshot)
         lines: list[str] = []
-        lines.append(f"## Market Data Snapshot — {snapshot['timestamp']}")
+        lines.append(f"## Market Data Snapshot — {snapshot['timestamp']} (assembly time, not an evidence clock)")
         lines.append("")
 
         for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
@@ -382,16 +531,44 @@ class MarketBriefingEngine:
             if data:
                 lines.append(f"### {category.upper()}")
                 for label, info in data.items():
-                    lines.append(f"- {label}: {info['value']} (as of {info['date']})")
+                    tenor = '^' + label.lstrip('^').upper()
+                    if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
+                        lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']} "
+                                     f"(source observation date: {(info or {}).get('date')})")
+                        continue
+                    lines.append(self._format_evidence_value(category, label, info))
                 lines.append("")
+
+        lines.append("### PUBLICATION CONTEXT LIMITS")
+        lines.append(f"- VIX eligibility cutoff: {facts['snapshot_cutoff_date']} "
+                     "(recorded snapshot calendar date; intraday availability unverified).")
+        lines.append(f"- VIX tenor observation dates: {json.dumps(facts['vix_observation_dates'])}")
+        lines.append(
+            "- VIX observation dates match; daily tenor levels may be compared. "
+            "Simultaneous intraday quotes and release/ingest times are unverified."
+            if facts["vix_dates_compatible"] else
+            "- VIX observation dates differ or are unavailable. Report each dated level; "
+            "a full three-tenor contemporaneous term-structure comparison is unavailable."
+        )
+        lines.append("- Regime comparator: unavailable; only the latest journal record is supplied. "
+                     "Trend, deterioration and improvement are unmeasured.")
+        lines.append("- Classifier confidence is the reported state-assignment score; calibration is unverified. "
+                     "Lower confidence does not establish stability or a new regime.")
+        lines.append("- Thesis conviction is absolute aggregate model-score magnitude (0..100; stored as 0..1); "
+                     "sentiment is a separate weighted "
+                     "directional score. Neither measures market-wide certainty or calibrated outcome probability.")
+        lines.append("- Aggregate PCR does not identify dealer side, inventory or causal exposure. "
+                     "No validated positioning policy or action threshold is supplied.")
+        lines.append("")
 
         # Feature values — select most informative via orthogonality
         features = snapshot.get("features", {})
         if features:
             try:
-                from analysis.prompt_optimizer import select_prompt_features, format_features_for_prompt
+                from analysis.prompt_optimizer import select_prompt_features
 
-                # Build feature dicts with z-scores (use value as proxy if z not available)
+                # Preserve the existing selector inputs/ordering. Its z field is
+                # a raw-value ranking proxy here, never displayed as measured z.
                 feat_list = [
                     {"name": name, "z": info["value"], "value": info["value"]}
                     for name, info in features.items()
@@ -399,7 +576,10 @@ class MarketBriefingEngine:
                 ]
                 selected = select_prompt_features(feat_list, max_count=20, corr_threshold=0.7)
                 lines.append(f"### GRID FEATURES ({len(features)} total, {len(selected)} selected by orthogonality)")
-                lines.append(format_features_for_prompt(selected, include_value=True))
+                lines.append("Selection uses absolute raw-value ranking proxies, not measured z-scores.")
+                for feature in selected:
+                    name = feature["name"]
+                    lines.append(self._format_evidence_value("features", name, features[name]))
                 lines.append("")
             except Exception:
                 # Fallback to simple truncation
@@ -408,7 +588,7 @@ class MarketBriefingEngine:
                 for name, info in features.items():
                     if shown >= 20:
                         break
-                    lines.append(f"- {name}: {info['value']} (as of {info['date']})")
+                    lines.append(self._format_evidence_value("features", name, info))
                     shown += 1
                 lines.append("")
 
@@ -439,9 +619,9 @@ class MarketBriefingEngine:
         if regime:
             lines.append("### LATEST REGIME INFERENCE")
             lines.append(f"- State: {regime['state']}")
-            lines.append(f"- Confidence: {regime['confidence']}")
-            lines.append(f"- Transition Probability: {regime['transition_prob']}")
-            lines.append(f"- Recommendation: {regime['recommendation']}")
+            lines.append(f"- Reported classifier confidence (calibration unverified): {regime['confidence']}")
+            lines.append(f"- Reported transition score (calibration unverified): {regime['transition_prob']}")
+            lines.append(f"- Journal recommendation (unvalidated policy): {regime['recommendation']}")
             lines.append(f"- Timestamp: {regime['timestamp']}")
             if regime.get("contradictions"):
                 lines.append(f"- Contradictions: {json.dumps(regime['contradictions'])}")
@@ -456,8 +636,13 @@ class MarketBriefingEngine:
                 lines.append(
                     f"- {evt['ticker']}: {evt['direction']} — "
                     f"{evt['sources']} sources ({sources}), "
-                    f"combined confidence {evt['confidence']}"
+                    f"reported combined confidence (calibration unverified) {evt['confidence']}"
                 )
+                from analysis.market_universe import search_company
+                matches = [c for c in search_company(evt['ticker']) if c['ticker'] == evt['ticker']]
+                if matches:
+                    company = matches[0]
+                    lines.append(f"  Company classification: {company['name']} — {company['sector']} / {company['industry']}")
             lines.append("")
 
         # High-trust signals
@@ -490,12 +675,17 @@ class MarketBriefingEngine:
         self,
         briefing_type: str = "hourly",
         save: bool = True,
+        *,
+        attempt_id: str | None = None,
+        receipt_callback: Callable[[PublicationReceipt], None] | None = None,
     ) -> dict[str, Any]:
         """Generate a market conditions briefing.
 
         Parameters:
             briefing_type: One of 'hourly', 'daily', 'weekly'.
             save: Whether to save the briefing to disk.
+            attempt_id: Optional caller identity for an opt-in invocation receipt.
+            receipt_callback: In-memory evidence, emitted after existing writers.
 
         Returns:
             dict: Briefing result with keys 'content', 'snapshot',
@@ -583,38 +773,120 @@ class MarketBriefingEngine:
             {"role": "user", "content": user_prompt},
         ]
 
-        content = self.ollama.chat(
-            messages=messages,
-            temperature=0.4,
-            num_predict=800,
-        )
+        if receipt_callback is None:
+            content = self.ollama.chat(
+                messages=messages,
+                temperature=0.4,
+                num_predict=800,
+            )
+        else:
+            valid_attempt = type(attempt_id) is str and bool(attempt_id.strip())
+            invocation_id = attempt_id if valid_attempt else uuid.uuid4().hex
+            invocation_state = ("caller_supplied" if valid_attempt else
+                                "generated" if attempt_id is None else "invalid_requested_id")
+            call_receipts: list[Any] = []
+            try:
+                from llm.router import chat_with_receipt
+            except Exception:
+                chat_with_receipt = None
+            if chat_with_receipt is None:
+                content = self.ollama.chat(messages=messages, temperature=0.4, num_predict=800)
+            else:
+                content = chat_with_receipt(
+                    client=self.ollama, messages=messages, temperature=0.4, num_predict=800,
+                    attempt_id=invocation_id, receipt_callback=call_receipts.append,
+                )
 
+        # Local evidence is discarded unless opted in; no persisted shape changes.
+        candidate = content
+        candidate_guard = None
+        fallback_guards: list[PublicationGuardReceipt] = []
+        grounding_input = None
+        ungrounded_count = None
+        file_ack = database_ack = "not_requested" if not save else "not_attempted"
+        row_reference = None
+
+        def emit_receipt(emitted: str | None, outcome: str) -> PublicationReceipt | None:
+            if receipt_callback is None:
+                return None
+            try:
+                call, provenance = _publication_call_binding(
+                    call_receipts, invocation_id, invocation_state, candidate,
+                )
+                usable = isinstance(candidate, str) and bool(candidate.strip())
+                guard = candidate_guard or _publication_guard("CANDIDATE_NOT_EVALUATED", None)
+                content_outcome = ("no_usable_candidate" if not usable else
+                                   "candidate_withheld" if guard.passed is False else
+                                   "narrative_guard_passed" if guard.passed is True else "guard_unknown")
+                receipt = PublicationReceipt(
+                    "grid.publication_call_guard.v1", invocation_id, invocation_state,
+                    call, provenance, _publication_digest(candidate), guard,
+                    tuple(fallback_guards), _publication_digest(grounding_input),
+                    _publication_digest(emitted), "check_numbers_grounded; annotation only",
+                    "unknown", ungrounded_count, content_outcome,
+                    publication_status["content_kind"] if emitted is not None else None,
+                    call.no_candidate_cause if call is not None and not usable else
+                    "unknown" if not usable else None,
+                    file_ack, database_ack, row_reference, outcome,
+                    bool(usable and call is not None and provenance == "supported"
+                         and call.original_call_id is not None
+                         and call.request_stage == "formed_transport_payload"
+                         and call.request_capture_completeness == "full_in_memory"
+                         and call.request_sha256 is not None
+                         and guard.passed is not None),
+                )
+            except Exception:
+                return None  # optional evidence cannot replace a primary result/error
+            try:
+                receipt_callback(receipt)
+            except Exception:
+                pass
+            return receipt
+
+        publication_status = {
+            "content_kind": "narrative", "reason": None,
+            "generation_outcome": "model_response" if content is not None else "model_unavailable",
+            "source_evidence_status": "unknown",
+        }
         if content is None:
-            content = self._generate_fallback_briefing(snapshot)
-            log.warning("LLM unavailable — using fallback briefing")
+            publication_status.update(content_kind="data_summary", reason="model_unavailable")
+            content = self._generate_fallback_briefing(snapshot, reason="model_unavailable")
+            log.warning("Model response unavailable — using fallback briefing")
 
-        from ollama.number_grounding import check_publication_claims
+        from ollama.number_grounding import annotate_publication_context, check_publication_claims
 
-        claim_guard = check_publication_claims(content)
+        claim_guard = check_publication_claims(content, actor_evidence=snapshot.get("actor_evidence"))
+        rejected = content if not claim_guard["passed"] else None
+        if receipt_callback is not None:
+            if candidate is None:
+                fallback_guards.append(_publication_guard("DATA_SUMMARY", content, claim_guard))
+            else:
+                candidate_guard = _publication_guard("CANDIDATE", candidate, claim_guard)
         snapshot["publication_claim_guard"] = claim_guard
+        content, context_guard = annotate_publication_context(content, snapshot)
+        snapshot["publication_context_guard"] = context_guard
         if not claim_guard["passed"]:
-            rejected = content
             # Replace the whole candidate instead of leaving its causal story
             # intact with a numeric footnote. Only future generations change.
-            summary = self._generate_fallback_briefing(snapshot)
-            summary_guard = check_publication_claims(summary)
+            publication_status.update(content_kind="data_summary", reason="claim_guard_withheld")
+            summary = self._generate_fallback_briefing(snapshot, reason="claim_guard_withheld")
+            summary_guard = check_publication_claims(summary, actor_evidence=snapshot.get("actor_evidence"))
+            if receipt_callback is not None:
+                fallback_guards.append(_publication_guard("DATA_SUMMARY", summary, summary_guard))
             claim_guard["fallback"] = summary_guard
+            summary, fallback_context_guard = annotate_publication_context(summary, snapshot)
+            context_guard["fallback"] = fallback_context_guard
             if not summary_guard["passed"]:
+                emit_receipt(None, "guard_withheld")
                 raise ValueError("Data summary withheld: unsupported source interpretation.")
             content = (
                 "**AI narrative withheld: unsupported source interpretation. Data summary only.**\n\n"
                 + summary
             )
-            # Keep the full rejected candidate for review (llm_calls truncates
-            # at 2,000 chars, which hid late triggers). Set only after the
-            # data summary is built so it can never feed published text;
-            # snapshot_data is internal (the API returns only status/length).
+            # Existing PR844 internal retention; never input to the summary.
             claim_guard["rejected_candidate"] = rejected
+
+        snapshot["publication_status"] = publication_status
 
         # ── Number-grounding gate ──
         # Runs on every generated briefing before it is written: numeric
@@ -625,9 +897,11 @@ class MarketBriefingEngine:
         # prompt instruction alone did not stop. See ollama/number_grounding.py.
         from ollama.number_grounding import check_numbers_grounded
 
+        grounding_input = content
         grounding = check_numbers_grounded(content, data_context)
         content = grounding.annotated_text
         grounding_stats = grounding.to_dict()
+        ungrounded_count = grounding_stats.get("ungrounded_count")
         snapshot["grounding"] = grounding_stats
 
         result = {
@@ -638,11 +912,41 @@ class MarketBriefingEngine:
             "sentiment": sentiment.to_dict() if sentiment else None,
             "grounding": grounding_stats,
             "publication_claim_guard": claim_guard,
+            "publication_context_guard": context_guard,
+            "publication_status": publication_status,
         }
 
         if save:
-            self._save_briefing(result)
-            self._persist_to_db(result)
+            try:
+                self._save_briefing(result)
+            except Exception:
+                file_ack = "failed"
+                emit_receipt(content, "writer_failed")
+                raise
+            file_ack = "unknown"  # existing file writer has no acknowledgement API
+            try:
+                database_result = self._persist_to_db(result)
+            except Exception:
+                database_ack = "failed"
+                emit_receipt(content, "writer_failed")
+                raise
+            if type(database_result) is int and database_result > 0:
+                database_ack, row_reference = "row_acknowledged", database_result
+            else:
+                database_ack = "unknown"
+
+        if receipt_callback is not None:
+            outcome = "not_requested" if not save else "acknowledgement_unknown"
+            if row_reference is not None:
+                if not isinstance(content, str) or not content.strip():
+                    outcome = "no_usable_emitted_content"
+                elif publication_status["content_kind"] == "data_summary":
+                    outcome = "emitted_data_summary_acknowledged"
+                elif publication_status["content_kind"] == "narrative":
+                    outcome = "emitted_narrative_acknowledged"
+            receipt = emit_receipt(content, outcome)
+            if receipt is not None:
+                result["publication_receipt"] = receipt
 
         log.info(
             "{t} briefing generated — {n} chars, sentiment={s}, "
@@ -670,7 +974,7 @@ class MarketBriefingEngine:
             "and WHAT TO DO ABOUT IT. Never list raw numbers — interpret every data "
             "point with evidence. Describe VIX as implied volatility. Historical "
             "frequency or return predictions require supplied empirical evidence. "
-            "Be direct. Be opinionated. Give actionable conclusions. "
+            "Be direct. Describe source-supported observations and what to monitor. "
             "Start with the single most important thing happening right now. "
             "Separate LEVERS (actor actions that open/close liquidity valves) from "
             "CONDITIONS (environment that amplifies). Lead each section with the "
@@ -687,11 +991,12 @@ class MarketBriefingEngine:
                 "## What's Happening Now\n"
                 "One paragraph: the single most important market development right now and why it matters.\n\n"
                 "## Regime Check\n"
-                "One line: regime state, confidence, direction of travel (improving/worsening/stable).\n\n"
+                "One line: latest dated regime state and reported classifier confidence. "
+                "A trend is unavailable without a dated comparator.\n\n"
                 "## Contradictions\n"
                 "Any signals that disagree with each other. If none, say 'Signals aligned.'\n\n"
                 "## Action\n"
-                "One sentence: what the operator should do or watch in the next hour."
+                "One sentence: what evidence or observation dates to watch. No positioning instructions."
             )
         elif briefing_type == "daily":
             return (
@@ -700,15 +1005,15 @@ class MarketBriefingEngine:
                 "## Bottom Line\n"
                 "Two sentences: What happened today and what it means for positioning.\n\n"
                 "## Regime\n"
-                "State, confidence, and whether conditions are improving or deteriorating. "
-                "Compare to yesterday. Name the top 3 drivers.\n\n"
+                "Report the latest dated state and classifier confidence. "
+                "Do not compare with yesterday without a supplied dated comparator.\n\n"
                 "## What Changed\n"
-                "Only mention signals that MOVED significantly. Don't list stable readings. "
+                "Only describe changes backed by dated prior and current observations. "
                 "For each: what moved, by how much, and what it implies.\n\n"
                 "## Risks\n"
                 "What could go wrong from here. Name specific scenarios.\n\n"
                 "## Opportunities\n"
-                "What setups look interesting based on the data. Be specific: sector, direction, timeframe.\n\n"
+                "Describe observations to investigate; use supplied company classifications.\n\n"
                 "## Tomorrow\n"
                 "What to watch for tomorrow. Scheduled data releases, key levels, catalysts."
             )
@@ -719,7 +1024,7 @@ class MarketBriefingEngine:
                 "## The Week in One Sentence\n"
                 "Capture the week's story arc.\n\n"
                 "## Regime Evolution\n"
-                "How the regime changed (or didn't) over the week. Trend direction.\n\n"
+                "Report the dated regime record; disclose missing weekly history.\n\n"
                 "## Winners and Losers\n"
                 "Which sectors/assets outperformed and underperformed. Name specific "
                 "tickers and percentage moves. Explain WHY (flows, earnings, macro).\n\n"
@@ -729,9 +1034,9 @@ class MarketBriefingEngine:
                 "## International\n"
                 "Anything outside the US that matters: China, Europe, Japan, EM.\n\n"
                 "## Three Scenarios for Next Week\n"
-                "Bull case, base case, bear case — with probabilities and triggers.\n\n"
+                "Qualitative hypotheses only; no probabilities or trade triggers without empirical support.\n\n"
                 "## Playbook\n"
-                "Specific positioning recommendations for next week."
+                "Evidence to investigate next week; no unsupported positioning instructions."
             )
 
     def _get_user_prompt(self, briefing_type: str, data_context: str) -> str:
@@ -759,7 +1064,9 @@ class MarketBriefingEngine:
             f"confidence level."
         )
 
-    def _generate_fallback_briefing(self, snapshot: dict[str, Any]) -> str:
+    def _generate_fallback_briefing(
+        self, snapshot: dict[str, Any], reason: str = "source_evidence_unknown",
+    ) -> str:
         """Generate a basic data-driven briefing when Ollama is unavailable.
 
         Parameters:
@@ -768,10 +1075,18 @@ class MarketBriefingEngine:
         Returns:
             str: Fallback briefing text.
         """
+        from ollama.number_grounding import publication_context_facts
+        facts = publication_context_facts(snapshot)
+        notes = {
+            "model_unavailable": "Model response unavailable. Data summary only.",
+            "claim_guard_withheld": "AI narrative withheld by publication claim guard. Data summary only.",
+            "source_evidence_unknown": "Source evidence unavailable or unknown. Data summary only.",
+        }
+        note = notes.get(reason, notes["source_evidence_unknown"])
         lines = [
-            f"# GRID Market Briefing — {snapshot['timestamp']}",
+            f"# GRID Market Briefing — {snapshot['timestamp']} (assembly time, not an evidence clock)",
             "",
-            "**Note: AI analysis unavailable. Data summary only.**",
+            f"**Note: {note}**",
             "",
         ]
 
@@ -780,20 +1095,35 @@ class MarketBriefingEngine:
             if data:
                 lines.append(f"## {category.replace('_', ' ').title()}")
                 for label, info in data.items():
-                    lines.append(f"- **{label}**: {info['value']} ({info['date']})")
+                    tenor = '^' + label.lstrip('^').upper()
+                    if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
+                        lines.append(f"- {label}: unavailable at snapshot cutoff {facts['snapshot_cutoff_date']} "
+                                     f"(source observation date: {(info or {}).get('date')})")
+                        continue
+                    lines.append(self._format_evidence_value(category, label, info))
                 lines.append("")
+
+        features = snapshot.get("features", {})
+        if features:
+            lines.append("## Retained Feature Evidence (first 20; freshness unknown)")
+            for name, info in list(features.items())[:20]:
+                lines.append(self._format_evidence_value("features", name, info))
+            lines.append("")
 
         regime = snapshot.get("latest_regime")
         if regime:
             lines.append("## Latest Regime")
-            lines.append(f"- Reported state: **{regime['state']}**")
+            state_display = " ".join(str(regime['state']).splitlines())
+            lines.append(f"- Reported state: **{state_display}**")
             lines.append(f"- Reported model confidence (calibration unverified): {regime['confidence']}")
+            lines.append(f"- Journal record timestamp: {regime['timestamp']}")
+            lines.append("- Prior regime comparator unavailable; trend unmeasured.")
             # Preserve the original recommendation in the audit snapshot,
             # not in the deterministic publication's factual data summary.
             lines.append("")
 
         lines.append("---")
-        lines.append("*Data summary; AI narrative unavailable.*")
+        lines.append("*Data summary only; no AI narrative is published.*")
 
         return "\n".join(lines)
 
