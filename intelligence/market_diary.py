@@ -44,13 +44,13 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from store.observations import read_latest_n
+from store.observations import read_daily_policy_n
 
 # ──────────────────────────────────────────────────────────────────
 # Price-freshness gate (Wave 3 §4.1 fix #2)
 # ──────────────────────────────────────────────────────────────────
 #
-# ``read_latest_n`` is already SUCCESS-only, vintage-collapsed and carries
+# The raw reader is SUCCESS-only, vintage-collapsed and carries
 # an ``as_of`` bound (store/observations.py) — but it must only feed this
 # diary once the "YF quarantine" (migration raw_series_quarantined_20260926,
 # which lets a once-accepted row be marked QUARANTINED and excluded) has
@@ -143,15 +143,16 @@ def _ensure_diary_columns(engine: Engine) -> None:
 def _fresh_pair(conn: Any, series_id: str, target_date: date) -> tuple[Any, Any] | None:
     """The (today, prior) Observation pair for ``series_id``, or None.
 
-    Requires >= 2 accepted observation dates AND the newest one dated
+    Requires >= 2 policy-qualified daily capture dates AND the newest one dated
     exactly ``target_date`` — a stale or wrong-vintage read (the newest
     accepted row dated before ``target_date``, e.g. because today hasn't
     pulled yet, or a re-pull landed on a different day) is refused rather
     than silently reported as "today's" move. See §4.1 fix #2(b).
     """
-    rows = read_latest_n(
+    rows = read_daily_policy_n(
         conn, series_id, 2, source=_PRICE_SOURCE,
         start=target_date - timedelta(days=_PRICE_LOOKBACK_DAYS), as_of=target_date,
+        as_of_ts=datetime.now(timezone.utc),
     )
     if len(rows) < 2 or rows[0].obs_date != target_date:
         return None

@@ -663,19 +663,38 @@ class TestYFinancePuller:
         assert result["ticker"] == "^GSPC"
 
     def test_yfinance_pull_skips_existing_success_dates(self):
-        """Existing SUCCESS rows should be skipped before insert."""
+        """Matching typed latest raw captures are idempotent, including UNKNOWN."""
         import sys
+        from datetime import datetime, timedelta, timezone
+        from price_close_contract import raw_capture_payload
 
         mock_yf_module = MagicMock()
         sys.modules.setdefault("yfinance", mock_yf_module)
 
-        mock_engine, _, execute_calls = _make_raw_series_engine(
+        mock_engine, mock_conn, execute_calls = _make_raw_series_engine(
             source_id=2,
             existing_dates={
                 "YF:^GSPC:close": {date(2024, 1, 3)},
                 "YF:^GSPC:volume": {date(2024, 1, 3)},
             },
         )
+
+        captured_at = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+        latest_values = {"YF:^GSPC:close": 102.0, "YF:^GSPC:volume": 1100000.0}
+        original_execute = mock_conn.execute.side_effect
+
+        def execute_with_latest_raw(sql, params=None):
+            result = original_execute(sql, params)
+            if ("SELECT raw_payload, pull_timestamp, value FROM raw_series" in str(sql)
+                    and params["od"] == date(2024, 1, 3)):
+                field = params["sid"].rsplit(":", 1)[1]
+                payload = raw_capture_payload("^GSPC", field, params["od"], captured_at, "1d")
+                result.fetchone.return_value = (
+                    payload, captured_at - timedelta(hours=1), latest_values[params["sid"]],
+                )
+            return result
+
+        mock_conn.execute.side_effect = execute_with_latest_raw
 
         dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
         mock_df = pd.DataFrame(
@@ -686,7 +705,8 @@ class TestYFinancePuller:
             index=dates,
         )
 
-        with patch("ingestion.yfinance_pull.yf") as mock_yf:
+        with patch("ingestion.yfinance_pull.yf") as mock_yf, \
+             patch("ingestion.yfinance_pull._utc_now", return_value=captured_at):
             mock_yf.download.return_value = mock_df
 
             from ingestion.yfinance_pull import YFinancePuller
@@ -700,6 +720,30 @@ class TestYFinancePuller:
         assert result["rows_inserted"] == 2
         assert len(insert_sql) == 2
         assert all("ON CONFLICT" not in sql for sql in insert_sql)
+
+    def test_yfinance_unmarked_existing_dates_do_not_suppress_typed_capture(self):
+        """An existing date without matching raw provenance cannot block a vintage."""
+        from datetime import datetime, timezone
+        from ingestion.yfinance_pull import YFinancePuller
+
+        mock_engine, _, calls = _make_raw_series_engine(
+            source_id=2,
+            existing_dates={
+                "YF:^GSPC:close": {date(2024, 1, 3)},
+                "YF:^GSPC:volume": {date(2024, 1, 3)},
+            },
+        )
+        frame = pd.DataFrame(
+            {"Close": [101.0, 102.0], "Volume": [1000000, 1100000]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+        with patch("ingestion.yfinance_pull.yf") as mock_yf, \
+             patch("ingestion.yfinance_pull._utc_now", return_value=datetime(2026, 10, 16, 12, tzinfo=timezone.utc)):
+            mock_yf.download.return_value = frame
+            result = YFinancePuller(db_engine=mock_engine).pull_ticker("^GSPC", "2024-01-01")
+        assert result["rows_inserted"] == 4
+        assert result["qualified_rows_inserted"] == 0
+        assert len([sql for sql, _ in calls if "INSERT INTO raw_series" in sql]) == 4
 
     def test_yfinance_invalid_ticker_is_skipped_before_network(self):
         from ingestion.yfinance_pull import YFinancePuller
