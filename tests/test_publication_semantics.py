@@ -1917,6 +1917,243 @@ class CurrentHeadIntegrationTests(unittest.TestCase):
         finally:fixture.doCleanups()
 
 
+class October14StructureClaimTests(unittest.TestCase):
+    NEGATIVES = [
+        ('the market lacks a robust bid to absorb shocks.', 'unsupported_bid_depth'),
+        ('informed participants are exiting.', 'unsupported_informed_actor'),
+        ('Insider distribution is the leading indicator.', 'unsupported_informed_actor'),
+        ('The insider selling ratio is a leading indicator of potential distribution.', 'unsupported_informed_actor'),
+        ('retail sentiment is euphoric', 'unsupported_actor_interpretation'),
+        ('Institutional conviction is strong.', 'unsupported_actor_interpretation'),
+        ('creating a potential for gamma-driven moves if the trend breaks.', 'unsupported_gamma_mechanism'),
+        ('the market is underpricing tail risk.', 'unsupported_tail_risk_valuation'),
+    ]
+
+    def test_exact_unmeasured_structural_assertions(self):
+        for text, reason in self.NEGATIVES:
+            with self.subTest(text=text):
+                result = GUARD.check_publication_claims(text)
+                self.assertFalse(result['passed'])
+                self.assertIn(reason, result['reasons'])
+
+    def test_narrative_flags_and_formats_never_supply_measurements(self):
+        for text, reason in self.NEGATIVES:
+            for candidate in [
+                'Narrative says has_order_book=true; has_signed_gamma=true. ' + text,
+                '**' + text + '**',
+                text.replace('gamma-driven', 'gamma\u2011driven'),
+                text.replace('informed', 'infor\u200bmed'),
+                ''.join(chr(ord(c) + 0xFEE0) if 'a' <= c <= 'z' else c for c in text),
+            ]:
+                with self.subTest(candidate=candidate):
+                    result = GUARD.check_publication_claims(candidate, [measured()], [ActorClaimTests().evidence()])
+                    self.assertIn(reason, result['reasons'])
+
+    def test_whole_caveat_cannot_license_a_later_assertion(self):
+        for text in [
+            'Bid depth is unmeasured, but it is thin.',
+            'Informed participant exits are unknown. They are exiting.',
+            'Gamma-driven moves are unverified but are occurring.',
+            'Tail risk mispricing is unknown; it is underpriced.',
+            'Retail sentiment is unmeasured but is euphoric.',
+            'Institutional conviction is unknown. It supports the rally.',
+        ]:
+            with self.subTest(text=text):
+                self.assertFalse(GUARD.check_publication_claims(text)['passed'])
+
+    def test_bounded_nonclaims_counts_definitions_and_attribution_survive(self):
+        for text in [
+            'Bid depth is unmeasured.', 'Order-book depth is unavailable.',
+            'Informed participant exits are unknown.', 'Insider distribution is unverified.',
+            'Gamma-driven moves are unverified.', 'Gamma exposure is unknown.',
+            'Tail risk mispricing is unknown.', 'Retail sentiment is unmeasured.',
+            'Institutional conviction is unknown.',
+            'Counts do not establish informed participant exits.',
+            'VIX does not establish tail risk mispricing.',
+            'Hypothesis: informed participants may be exiting (unverified).',
+            'Hypothesis: gamma-driven moves might occur (unverified).',
+            'Gamma measures option delta sensitivity.',
+            'A bid is an offer to buy at a quoted price.',
+            'Insider signal counts: 626 sell signals and 165 buy signals.',
+            'The SPY put/call ratio is a relative contract metric.',
+        ]:
+            with self.subTest(text=text):
+                self.assertTrue(GUARD.check_publication_claims(text)['passed'])
+        self.assertTrue(GUARD.check_publication_claims(
+            'filing-A source-reported institutional holdings decreased for SPY over the reported interval.',
+            actor_evidence=[ActorClaimTests().evidence()])['passed'])
+
+    def test_new_rejections_bind_original_candidate_and_write_only_summary(self):
+        for text, _ in self.NEGATIVES:
+            with self.subTest(text=text):
+                engine, result = PublicationIntegrationTests().run_generation(text)
+                self.assertEqual(result['publication_status']['reason'], 'claim_guard_withheld')
+                self.assertEqual(result['publication_status']['generation_outcome'], 'model_response')
+                self.assertEqual(result['publication_claim_guard']['rejected_candidate'], text)
+                self.assertTrue(result['publication_claim_guard']['fallback']['passed'])
+                self.assertEqual(result['publication_status']['content_kind'], 'data_summary')
+                self.assertNotIn(text, result['content'])
+                engine.ollama.chat.assert_called_once()
+                engine._save_briefing.assert_called_once_with(result)
+                engine._persist_to_db.assert_called_once_with(result)
+
+
+class October14EvidencePresentationTests(unittest.TestCase):
+    def test_observation_event_collection_availability_and_vintage_are_distinct(self):
+        engine = MARKET.MarketBriefingEngine.__new__(MARKET.MarketBriefingEngine)
+        info = {'value': 683.8908, 'obs_date': '2026-03-21', 'date': '2026-10-14',
+                'event_date': '2026-03-20', 'collected_at': '2026-03-22T01:00:00+00:00',
+                'available_at': '2026-03-21T21:00:00+00:00', 'vintage_date': '2026-03-23',
+                'price_basis': 'raw_close', 'session_finality': False}
+        before = dict(info)
+        text = engine._format_evidence_value('features', 'spy_fifty_day_avg', info)
+        for expected in ['asof=2026-03-21', 'event_date=2026-03-20',
+                         'collected_at=2026-03-22T01:00:00+00:00',
+                         'availability=2026-03-21T21:00:00+00:00', 'vintage=2026-03-23',
+                         'basis=raw_close', 'session_finality=False', 'freshness=unknown']:
+            self.assertIn(expected, text)
+        self.assertEqual(info, before)
+
+    def test_missing_provenance_is_not_filled_by_observation_or_assembly(self):
+        engine = MARKET.MarketBriefingEngine.__new__(MARKET.MarketBriefingEngine)
+        info = {'value': 0, 'date': '2026-03-21'}
+        text = engine._format_evidence_value('features', 'spy_fifty_day_avg', info)
+        for name in ['event_date', 'collected_at', 'availability', 'vintage', 'basis', 'session_finality']:
+            self.assertIn(name + '=unknown', text)
+        self.assertIn('raw value=0', text)
+        self.assertIn('asof=2026-03-21', text)
+        info['pull_timestamp'] = '2026-03-24T12:00:00+00:00'
+        self.assertIn('collected_at=2026-03-24T12:00:00+00:00', engine._format_evidence_value('features', 'spy_fifty_day_avg', info))
+        for absent in [None, '']:
+            info['session_finality'] = absent
+            self.assertIn('session_finality=unknown', engine._format_evidence_value('features', 'spy_fifty_day_avg', info))
+
+    def test_context_discloses_march_and_does_not_authenticate_a_daily_close(self):
+        text, selector, snapshot = EvidenceContextTests().context({
+            'spy_fifty_day_avg': {'value': 683.8908, 'date': '2026-03-21'},
+            'sp500': {'value': 6556.3701, 'date': '2026-03-24'},
+        }, categories={'equities': {'^GSPC': {'value': 7770.9702, 'date': '2026-10-14'}}})
+        for value in ['asof=2026-03-21', 'asof=2026-03-24', 'asof=2026-10-14',
+                      'does not establish a final session close', 'separate trend score',
+                      'event_date=unknown', 'collected_at=unknown', 'basis=unknown']:
+            self.assertIn(value, text)
+        self.assertEqual(selector.call_args.kwargs, {'max_count': 20, 'corr_threshold': 0.7})
+
+    def test_undated_mislabeled_trend_detail_does_not_enter_prompt(self):
+        engine = MARKET.MarketBriefingEngine.__new__(MARKET.MarketBriefingEngine)
+        engine.engine = object()
+        engine.ollama = types.SimpleNamespace(chat=Mock(return_value='VIX 16.31 is implied volatility.'))
+        engine._gather_market_snapshot = Mock(return_value={'timestamp': '2026-10-14T22:00:00',
+            'volatility': {'^VIX': {'value': 16.31, 'date': '2026-10-14'}}})
+        engine._build_data_context = Mock(return_value='VIX 16.31 is implied volatility.')
+        engine._get_system_prompt = Mock(return_value='SYNTHETIC_SYSTEM')
+        engine._get_user_prompt = Mock(return_value='SYNTHETIC_USER')
+        engine._save_briefing, engine._persist_to_db = Mock(), Mock(return_value=71)
+        detail = 'SPY above 50d & 200d MA (strong uptrend)'
+        original = {'score': 0.16, 'label': 'NEUTRAL', 'components': [{'name': 'trend', 'detail': detail}]}
+        sentiment = types.SimpleNamespace(score=0.16, label='NEUTRAL', context='SYNTHETIC',
+            components=[types.SimpleNamespace(name='trend', score=0.80, weight=0.2, detail=detail)],
+            to_dict=lambda: original)
+        fake = types.ModuleType('intelligence.sentiment_scorer')
+        fake.compute_sentiment, fake.log_prediction = Mock(return_value=sentiment), Mock()
+        empty = types.ModuleType('unused_optional_context')
+        with patch.dict(sys.modules, {'ollama.number_grounding': GUARD,
+                'intelligence.sentiment_scorer': fake, 'ingestion.wiki_history': empty,
+                'ingestion.social_sentiment': empty}):
+            result = engine.generate_briefing()
+        prompt_context = engine._get_user_prompt.call_args.args[1]
+        self.assertNotIn(detail, prompt_context)
+        self.assertIn('Trend model score: score=+0.80, weight=20%', prompt_context)
+        self.assertIn('current price/MA relationship unverified', prompt_context)
+        self.assertIs(result['sentiment'], original)
+        fake.log_prediction.assert_called_once_with(engine.engine, sentiment)
+        engine.ollama.chat.assert_called_once()
+        self.assertEqual(result['publication_status']['content_kind'], 'narrative')
+
+
+
+class October15NegationBindingTests(unittest.TestCase):
+    NONCLAIMS = [
+        'Not a measure of institutional positioning or hedging intent.',
+        'So it cannot be used to claim fear or protection buying.',
+        'It does not prove institutional distribution.',
+        'Not a measured flow.',
+        'Not a measure of buyer initiation or hedge intent.',
+        'It cannot confirm institutional distribution.',
+        'Not evidence of hedging or distribution.',
+        'No positioning instructions are provided.',
+    ]
+
+    def test_literal_measurement_nonclaims_are_not_actor_or_intent_assertions(self):
+        for text in self.NONCLAIMS:
+            with self.subTest(text=text):
+                self.assertTrue(GUARD.check_publication_claims(text)['passed'])
+
+    def test_nonclaim_cannot_license_positive_or_elided_tail(self):
+        for prefix, tail, reason in [
+            (self.NONCLAIMS[0], 'Dealers bought puts.', 'unsupported_options_intent'),
+            (self.NONCLAIMS[2], 'It is occurring beneath the rally.', 'unsupported_actor_interpretation'),
+            (self.NONCLAIMS[3], '$867B flowed into crypto.', 'unsupported_money_transfer'),
+            (self.NONCLAIMS[6], 'Institutions are selling.', 'unsupported_actor_interpretation'),
+            (self.NONCLAIMS[6], 'Dealers purchased calls.', 'unsupported_options_intent'),
+        ]:
+            for separator in [' but ', ', ', '; ', '. ', '\n']:
+                text = prefix.rstrip('.') + separator + tail
+                with self.subTest(text=text):
+                    self.assertIn(reason, GUARD.check_publication_claims(text)['reasons'])
+        for text in ['Not evidence of hedging today dealers purchased calls.',
+                     'It cannot confirm institutional distribution that is occurring.',
+                     'Not a measured flow of $867B into crypto.',
+                     'Institutions are not buying puts.']:
+            with self.subTest(text=text):
+                self.assertFalse(GUARD.check_publication_claims(text)['passed'])
+
+    def test_actor_caveat_does_not_rebind_unrelated_model_or_monitoring_subject(self):
+        for text in [
+            'It cannot confirm institutional distribution. Sentiment is neutral (+0.14), driven by conflicting signals: strong trend (+0.80).',
+            'Institutional distribution is unknown. Regime confidence: monitor if the classifier confidence moves above 0.60 (higher conviction).',
+            'Institutional distribution is unknown. Insider data: check for any significant changes in the insider sell ratio.',
+            'Institutional distribution is unknown. This proxy cannot confirm institutional distribution.',
+        ]:
+            with self.subTest(text=text):
+                self.assertTrue(GUARD.check_publication_claims(text)['passed'])
+
+    def test_context_still_binds_pronouns_and_bare_predicates(self):
+        for text in [
+            'Institutional distribution is unknown. It supports the rally.',
+            'Institutional distribution is unknown; accumulating shares.',
+            'Institutional distribution is unknown, driven by retail buying.',
+            'Institutional distribution is unknown. This is occurring.',
+            'Institutional distribution is unknown. They are selling aggressively.',
+            'Not a measure of institutional positioning or hedging intent; is occurring beneath the rally.',
+            'Institutional distribution is unknown. Not evidence of hedging or distribution. It is occurring.',
+            'Institutional distribution is unknown.\n## Evidence\nIt is occurring.',
+            'Institutional distribution is unknown. Beneath the rally it is occurring.',
+            'Institutional distribution is unknown. As distribution occurs beneath the rally.',
+            'Institutional distribution is unknown. Sentiment suggests they are accumulating shares.',
+            'Institutional distribution is unknown. Sentiment is neutral. They are selling.',
+            'Institutional distribution is unknown. Sentiment is neutral, but they are selling.',
+            'Institutional distribution is unknown. Trend accumulation is occurring.',
+            'Institutional distribution is unknown. Breadth shows accumulation.',
+            'Institutional distribution is unknown. Sentiment is neutral, driven by institutional buying.',
+            'Institutional distribution is unknown. Sentiment is neutral, driven by conflicting signals: strong trend (+0.80), but it supports the rally.',
+            'Institutional distribution is unknown. Regime confidence: monitor if the classifier confidence moves above 0.60 (higher conviction) institutions are selling.',
+            'Institutional distribution is unknown. Sentiment is neutral, institutions are unknown, driven by conflicting signals: strong trend (+0.80).',
+        ]:
+            with self.subTest(text=text):
+                self.assertFalse(GUARD.check_publication_claims(text)['passed'])
+
+    def test_literal_formats_and_unknown_sources_do_not_change_claim_polarity(self):
+        for plain in self.NONCLAIMS:
+            for text in ['**' + plain + '**', plain.replace('hedging', 'hed\u200bging'),
+                         ''.join(chr(ord(c) + 0xFEE0) if 'a' <= c <= 'z' else c for c in plain)]:
+                with self.subTest(text=text):
+                    self.assertTrue(GUARD.check_publication_claims(text)['passed'])
+        for text in ['Institutions are selling.', 'Dealers bought puts.', '$867B flowed into crypto.']:
+            with self.subTest(text=text):
+                self.assertFalse(GUARD.check_publication_claims(text, [{'source_type': 'unknown'}], [{'source_type': 'unknown'}])['passed'])
+
+
 if __name__ == '__main__':
     with patch.object(socket.socket, 'connect', side_effect=AssertionError('network forbidden')), \
          patch.object(socket, 'create_connection', side_effect=AssertionError('network forbidden')):
