@@ -4,9 +4,14 @@ from __future__ import annotations
 import unittest
 from datetime import date, timedelta, timezone
 
-from test_selected_source_resolution import (
-    CUTOFF, START, FakeResult, StoredFixture, actual_pipeline, fixture_inputs, load_core,
-)
+if __package__:
+    from .test_selected_source_resolution import (
+        CUTOFF, START, FakeResult, StoredFixture, actual_pipeline, fixture_inputs, load_core,
+    )
+else:
+    from test_selected_source_resolution import (
+        CUTOFF, START, FakeResult, StoredFixture, actual_pipeline, fixture_inputs, load_core,
+    )
 
 
 class SnapshotTests(unittest.TestCase):
