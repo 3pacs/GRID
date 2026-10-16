@@ -4,7 +4,7 @@ Historical53 artifact-layout methods remain exact in offline provenance; this
 file needs only the declared product paths in a normal repository tree.
 """
 from pathlib import Path
-import ast,builtins,contextlib,copy,hashlib,io,json,runpy,sys,types,unittest
+import ast,builtins,contextlib,copy,hashlib,io,json,runpy,sys,tokenize,types,unittest
 from datetime import date,datetime,timezone
 from decimal import Decimal
 from unittest.mock import patch
@@ -18,6 +18,35 @@ def front(text=None):
     return types.SimpleNamespace(**ns)
 def encode(value):return json.dumps(value,sort_keys=True,separators=(',',':')).encode()
 def digest(raw):return hashlib.sha256(raw).hexdigest()
+
+# Version-independent preservation contract: exact ordered names and source lines.
+# The digest is anchored to immutable accepted SEC source, not ast.dump output.
+_ACCEPTED_SEC_NAMES = ('SecOnlyRefused', '_sec_require', '_sec_outer_clock', '_sec_same_outer', '_sec_bound_saved_receipt', '_sec_terminal_parent', '_sec_json', '_sec_canonical', '_sec_read', '_sec_load', '_sec_transport_evidence', '_sec_diagnostics', '_sec_read_saved_receipt', '_sec_owned_stop_proof', 'run_sec_only_job', '_hermes_sec_cli', '_sec_ftd_latest_published_half', '_sec_ftd_published_halves_since')
+_ACCEPTED_SEC_SOURCE_SHA256 = '3963e8caba3b372e8e17044879e1593fa24e600ccc3b0d688fbd615b1660c19c'
+
+def accepted_sec_source_manifest(source):
+    lines=source.splitlines(keepends=True)
+    decorators=[token.start for token in tokenize.generate_tokens(io.StringIO(source).readline)
+                if token.type==tokenize.OP and token.string=='@']
+    rows=[]
+    for node in ast.parse(source).body:
+        if not isinstance(node,(ast.FunctionDef,ast.ClassDef)) or not (
+                node.name.startswith('_sec_') or node.name in
+                ('SecOnlyRefused','run_sec_only_job','_hermes_sec_cli')):
+            continue
+        start=node.lineno
+        if node.decorator_list:
+            first=node.decorator_list[0]
+            # Include the leading @ even for @( followed by a multiline expression.
+            start=max(line for line,column in decorators
+                      if column==node.col_offset and (line,column)<(first.lineno,first.col_offset))
+        rows.append([node.name,''.join(lines[start-1:node.end_lineno])])
+    return {'schema':'hermes-sec-exact-source-v1','nodes':rows}
+
+def accepted_sec_source_digest(source):
+    return digest(json.dumps(accepted_sec_source_manifest(source),
+        separators=(',',':'),ensure_ascii=False).encode('utf-8'))
+
 HEADER='Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market'
 GOOD=(HEADER+'\n20261013|AAPL|10|1|100|B,Q,N\n20261013|MSFT|20|2|200|B,Q,N\n2\n').encode()
 
@@ -470,10 +499,9 @@ class CurrentSecDefaultTests(unittest.TestCase):
         for path,marker,pin in [(OPER,'\nimport argparse\n','d1b169204f2ed57db284acee8993cf338281311204e32f1eef0871601d6c78a5'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
             self.assertEqual(digest(path.read_text().split(marker,1)[1].encode()),pin)
     def test_all_accepted_sec_function_bodies_are_preserved(self):
-        nodes=[ast.dump(n,include_attributes=False) for n in ast.parse(SCHED.read_text()).body
-            if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and (n.name.startswith('_sec_')
-            or n.name in ('SecOnlyRefused','run_sec_only_job','_hermes_sec_cli'))]
-        self.assertEqual(digest(json.dumps(nodes,separators=(',',':')).encode()),'c04a1c9332f8c794970dce0f18ef35157fd8be5a48b6263be4fc18235b73e66b')
+        manifest=accepted_sec_source_manifest(SCHED.read_text())
+        self.assertEqual([row[0] for row in manifest['nodes']],list(_ACCEPTED_SEC_NAMES))
+        self.assertEqual(accepted_sec_source_digest(SCHED.read_text()),_ACCEPTED_SEC_SOURCE_SHA256)
     def test_sec_wrong_source_and_clock_refuse_before_reads(self):
         m=front();selection={'schema':'hermes-sec-only-v1','base':m._SEC_ONLY_BASE,
           'source':'other','module':'ingestion.altdata.sec_xbrl_shares','class':'SECXBRLSharesPuller',
@@ -494,3 +522,41 @@ class CurrentSecDefaultTests(unittest.TestCase):
         with patch.object(sys,'argv',[str(OPER),'--sec-unknown']),patch('os.chdir',side_effect=lambda *a:effects.append('chdir')),patch.object(builtins,'__import__',imp),contextlib.redirect_stdout(io.StringIO()):
             with self.assertRaises(SystemExit) as caught:runpy.run_path(str(OPER),run_name='__main__')
         self.assertEqual(caught.exception.code,2);self.assertEqual(effects,[])
+
+
+class SecPreservationEncodingTests(unittest.TestCase):
+    def test_exact_body_text_and_terminal_newline_are_preserved(self):
+        source="def _sec_fixture(value=1):\n    # exact comment\n    return value + 2\n"
+        self.assertEqual(accepted_sec_source_manifest(source),{
+            'schema':'hermes-sec-exact-source-v1','nodes':[['_sec_fixture',source]]})
+
+    def test_complete_multiline_and_stacked_decorators_are_preserved(self):
+        source="@(\n    wrap('first')\n)\n@other(2)\ndef _sec_fixture():\n    return 1\n"
+        self.assertEqual(accepted_sec_source_manifest(source)['nodes'],[['_sec_fixture',source]])
+
+    def test_body_signature_comment_and_decorator_mutations_change_digest(self):
+        source="@wrap('original')\ndef _sec_fixture(value=1):\n    # original comment\n    return value + 2\n"
+        original=accepted_sec_source_digest(source)
+        for before,after in [("'original'","'changed'"),('value=1','value=3'),
+                             ('original comment','changed comment'),('value + 2','value + 4')]:
+            with self.subTest(before=before):
+                self.assertNotEqual(accepted_sec_source_digest(source.replace(before,after)),original)
+
+    def test_name_order_removal_and_addition_change_digest(self):
+        first="def _sec_first():\n    return 1\n"
+        second="def _sec_second():\n    return 2\n"
+        original=accepted_sec_source_digest(first+second)
+        for changed in [second+first,first,first+second+"class SecOnlyRefused(Exception):\n    pass\n",
+                        (first+second).replace('_sec_first','_sec_renamed')]:
+            with self.subTest(source=changed):
+                self.assertNotEqual(accepted_sec_source_digest(changed),original)
+
+    def test_unselected_source_and_position_do_not_change_protected_frame(self):
+        source="def _sec_fixture():\n    return 1\n"
+        shifted="# outside protected source\n\n"+source+"\ndef ordinary():\n    return 8\n"
+        self.assertEqual(accepted_sec_source_manifest(shifted),accepted_sec_source_manifest(source))
+
+    def test_no_ast_dump_representation_dependency(self):
+        source="class SecOnlyRefused(ValueError):\n    pass\n"
+        with patch.object(ast,'dump',side_effect=AssertionError('version-dependent AST dump forbidden')):
+            self.assertEqual(accepted_sec_source_manifest(source)['nodes'],[['SecOnlyRefused',source]])
