@@ -96,3 +96,107 @@ must run normal frontend build/Vitest and exact-head CI after source review.
 No manual check, UI action, deployment or runtime qualification was executed by
 the source author. Old qualified feature, materialization, scoring and trading
 holds remain unchanged.
+
+
+## Optional bounded stored-source context
+
+The same authenticated analysis route additionally accepts `stored_only=true`
+and `stored_request`, a JSON query string limited to 16 KiB of UTF-8. This mode
+returns before the normal analysis cache, saved-watchlist read, legacy price
+work, yfinance/live-price fallback and all other analysis sections. It never
+invokes resolver persistence or a provider. Ordinary requests without
+`stored_only=true` keep their previous behavior and response, including their
+existing cold-navigation provider/overview side effects. This source change
+adds no client request, view mode, route or automatic selection/fetch.
+
+The closed request has only `selections`, `as_of`, `start_date` and
+`vintage_policy`. `as_of` must be an explicit aware ISO datetime; `start_date`
+a date; observation range is inclusive and at most 252 days; vintage policy is
+FIRST_RELEASE or LATEST_AS_OF. Duplicate JSON object keys, extra fields, invalid
+types, bounds or repeated/unknown source selectors fail with HTTP 400 before
+store/engine access. Shared `store.pit.validate_source_snapshot_request` owns
+selection and policy validation; API parsing does not implement another resolver
+or freshness engine. `scope=ticker` must match the normalized route ticker.
+Global/currency/contract/index/CUSIP context is explicitly labeled and does not
+claim a ticker association.
+
+At most seven unique source keys are supported: fx_rates,
+ag_commodity_futures, finra_short_volume, sec_ftd, nyfed_gscpi, baltic_exchange
+and quiverquant. Explicit selectors carry source_key, scope, ticker_or_cusip,
+series_id, expected_source_name, feature_name and feature_id, with optional
+freshness_policy `{max_age_days: integer 0..252}`. Actual IDs, registry mappings
+and SEC CUSIP are caller inputs; no IDs, aliases or ticker-to-CUSIP linkage are
+guessed. Quiver is a stored event source, not a raw/resolved scalar, and remains
+resolver_unsupported under this scalar read contract. Missing optional bindings
+are unavailable/selection_missing or mapping_missing without a DB read when no
+bound scalar selector exists. An absent stored_request returns
+unavailable/stored_request_missing with null cutoff and no invented clock.
+
+The existing PIT store's bounded read supplies `stored-source-snapshot-v1`,
+original stored value, observation/release/vintage dates, selected actual source,
+conflict metadata, source selection and explicit freshness. Missing policy stays
+unknown/freshness_policy_absent. A source mismatch is not repaired by choosing
+an older expected-source row or promoting raw data. Storage release/vintage
+fields derived from pull time are not provider publication/availability proof.
+PIT selection/retraction rules and explicit range belong to the shared store;
+this display does not recalculate them. Zero stays zero and null is unavailable.
+
+The result is nested at `market_features.stored_source_evidence`, alongside
+rather than inside daily price data. The original daily and intraday schema
+remains intact; stored-only mode has unknown price evidence and explicitly
+unavailable OR/VWAP/proxy. The new context echoes the normalized requested
+ticker/cutoff/range/vintage policy and selectors as `request_binding`. A returned
+snapshot with a different schema/cutoff/range/policy becomes read_failed with
+no value substitution. Store exceptions likewise produce read_failed; no
+cache/provider fallback or exception details are exposed.
+
+The existing Card renders the separate stored-source section only for matching
+envelope, ticker, cutoff/range/policy and selector bindings. Invalid response
+context is visibly unavailable. Source-mismatched or unavailable rows never
+render their supplied scalar, even if a direct constructed DTO populates one.
+It shows original source/series, scope/selection, observation/storage-release/
+vintage dates, requested cutoff, status/reason, declared freshness, conflict and
+lineage limitations. It never labels the data qualified intraday/current/eligible.
+The section lives in the existing whole market_features envelope so actual
+request-generation/ticker/period callback guards also mask pending old context
+and prevent stale cutoff/value reappearance. The underlying view/client stays
+unchanged. No current production screen is claimed to send the new optional mode.
+
+The frontend source baseline includes the separately accepted 15-test postimage
+550fc736 (unmerged f387/2bb dependency), rather than claiming that regression was
+already on main. All 15 tests remain unchanged; new source-context cases append.
+One old backend test's cache-prefix AST locator is shifted past the new early
+branch; all its cache/as-of/nonmutation assertions remain. The ordinary default
+cached response is separately checked for exact equality to its prior decorator.
+
+Offline acceptance must bind actual selected synthetic raw rows through the
+existing finite EntityMap/Resolver and PIT snapshot, execute the actual analysis
+endpoint with inert storage, serialize the result, and render that exact JSON
+through the real Card and production callbacks in both response orders. This
+proves source/consumer coupling under fixtures, not real SQL selection execution,
+DB commit/durability, HTTP/auth transport, provider truth, production route
+activation, browser behavior or live freshness. No live DB/query/cold navigation,
+service, materializer job, provider or publication is authorized by these tests.
+
+
+### Consumer stored-date proof (C1 correction)
+
+A primary stored scalar additionally requires present, strictly typed real
+calendar dates for observation, storage release and vintage. Observation must
+fall inclusively between the declared start date and the cutoff's UTC calendar
+day. Storage release and vintage must not be after that UTC day. Missing,
+invalid/nonexistent or contradictory row dates mask the value with
+unavailable/invalid_date_context while retaining the original string date
+diagnostics and unknown freshness. Invalid typed date diagnostics are displayed
+safely without treating them as dates. Request dates/cutoff must themselves be
+valid; equal offsets representing the same instant use the same UTC day.
+
+These are consistency checks on supplied stored date columns, not an additional
+resolver or source-publication rule. The columns retain day precision: inclusive
+cutoff-day equality is permitted even for a midnight cutoff. No ordering among
+observation/release/vintage is invented beyond their separately stated bounds,
+and no provider publication instant or freshness is inferred. Valid zero and
+null, source/context masking, actual callback ordering and all previous price
+semantics remain unchanged. The C1 finding and original four false-positive
+renderings remain immutable; it is a consumer defect, not evidence of a live
+incident or a PIT source defect.

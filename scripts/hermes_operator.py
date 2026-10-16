@@ -42,6 +42,87 @@ NOTE (hermes/scheduler split, verified 2026-04-13):
 
 from __future__ import annotations
 
+# A selected FINRA workflow is a finite invocation, never a daemon cycle.
+# Its actual entry origin precedes selection parsing, imports and source reads.
+def _hermes_finra_bootstrap(argv, *, entry_t0, clock):
+    if not (type(entry_t0) is float and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    last = entry_t0
+    def check():
+        nonlocal last
+        value = clock()
+        if not (type(value) in (int, float) and value == value
+                and last <= value < entry_t0 + 450):
+            raise ValueError("FINRA_ENTRY_BOUND")
+        last = value
+    try:
+        check()
+        if any(type(a) is not str or a.startswith("--sec-") for a in argv):
+            return 2
+        import runpy
+        from pathlib import Path
+        check()
+        scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+        check()
+        runpy.run_path(str(scheduler), run_name="__hermes_finra_only__",
+                       init_globals={"HERMES_FINRA_ONLY_ARGS": list(argv),
+                                     "HERMES_FINRA_ENTRY_ORIGIN": entry_t0,
+                                     "HERMES_FINRA_CLOCK": clock})
+    except SystemExit:
+        raise
+    except BaseException:
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _finra_sys
+    if any(type(a) is str and a.startswith("--finra-") for a in _finra_sys.argv[1:]):
+        from time import monotonic as _finra_clock
+        try:
+            _finra_origin = _finra_clock()
+        except BaseException:
+            _finra_origin = None
+        raise SystemExit(_hermes_finra_bootstrap(_finra_sys.argv[1:], entry_t0=_finra_origin, clock=_finra_clock))
+
+# SEC-only dispatch is deliberately before chdir, environment/config and heavy
+# imports. Ordinary invocations fall through byte-identical legacy startup.
+def _hermes_sec_bootstrap(argv, *, entry_t0, clock):
+    # The selected branch captures its actual origin before these imports/reads.
+    if not (type(entry_t0) in (int, float) and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    try:
+        before_import = clock()
+        if not (type(before_import) in (int, float) and entry_t0 <= before_import < entry_t0 + 120):
+            return 2
+        import runpy
+        from pathlib import Path
+        now = clock()
+    except BaseException:
+        return 2
+    if not (type(now) in (int, float) and before_import <= now < entry_t0 + 120):
+        return 2
+    scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+    runpy.run_path(str(scheduler), run_name="__hermes_sec_only__",
+                   init_globals={"HERMES_SEC_ONLY_ARGS": list(argv),
+                                 "HERMES_SEC_OUTER_ORIGIN": entry_t0,
+                                 "HERMES_SEC_CLOCK": clock})
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _sec_sys
+    if any(type(a) is str and a.startswith("--sec-") for a in _sec_sys.argv[1:]):
+        from time import monotonic as _sec_clock
+        try:
+            _sec_origin = _sec_clock()  # before runpy/pathlib/selection/source reads
+        except BaseException:
+            _sec_origin = None
+        raise SystemExit(_hermes_sec_bootstrap(_sec_sys.argv[1:], entry_t0=_sec_origin, clock=_sec_clock))
+
+
 import argparse
 import json
 import os

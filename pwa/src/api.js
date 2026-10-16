@@ -8,6 +8,67 @@ import useRealtimeStore from './stores/realtimeStore.js';
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
 const PRELOAD_CONCURRENCY = 4;
 
+// Transport snapshot only: selector/date/freshness policy validation remains
+// owned by the stored-only backend. Never infer a source binding or a cutoff.
+export function snapshotStoredRequest(request) {
+    const fail = () => { throw new Error('stored_request_invalid'); };
+    const copy = (value) => {
+        if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (Array.isArray(value)) return value.map(copy);
+        if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return fail();
+        const result = {};
+        for (const key of Object.keys(value).sort()) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !('value' in descriptor) || key === '__proto__') return fail();
+            result[key] = copy(descriptor.value);
+        }
+        return result;
+    };
+    if (request == null) throw new Error('stored_request_missing');
+    let value;
+    try { value = copy(request); } catch { return fail(); }
+    if (!value || Array.isArray(value) || typeof value !== 'object'
+        || Object.keys(value).some(key => !['selections', 'as_of', 'start_date', 'vintage_policy'].includes(key))
+        || !Object.hasOwn(value, 'selections') || (value.selections !== null && !Array.isArray(value.selections))
+        || typeof value.as_of !== 'string' || typeof value.start_date !== 'string'
+        || typeof value.vintage_policy !== 'string') return fail();
+    const json = JSON.stringify(value);
+    if (new TextEncoder().encode(json).byteLength > 16 * 1024) throw new Error('stored_request_too_large');
+    return { json, value };
+}
+
+// Compare an echoed normalized binding, not data freshness or eligibility.
+// Date normalisation is solely instant equality; retain all six microsecond digits.
+function storedInstantKey(value) {
+    const match = typeof value === 'string' && value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/);
+    if (!match) return null;
+    const seconds = Date.parse(`${match[1]}${match[3]}`);
+    return Number.isFinite(seconds) ? `${new Date(seconds).toISOString().slice(0, 19)}.${(match[2] || '').padEnd(6, '0')}` : null;
+}
+
+export function storedAnalysisMatchesRequest(result, ticker, period, request) {
+    const snapshot = result?.market_features?.stored_source_evidence;
+    const binding = snapshot?.request_binding;
+    if (result?.ticker !== ticker || result?.period !== period || snapshot?.ticker !== ticker
+        || !binding || binding.ticker !== ticker || !storedInstantKey(request.as_of)
+        || storedInstantKey(binding.as_of) !== storedInstantKey(request.as_of)
+        || binding.start_date !== request.start_date || binding.vintage_policy !== request.vintage_policy
+        || !Array.isArray(binding.selections) || binding.selections.length > 7) return false;
+    const supplied = request.selections ?? [];
+    if (supplied.length > 7 || supplied.some(item => !item || typeof item !== 'object')) return false;
+    const fields = ['source_key', 'scope', 'ticker_or_cusip', 'series_id', 'expected_source_name', 'feature_name', 'feature_id'];
+    const seen = new Set();
+    for (const actual of binding.selections) {
+        if (!actual || typeof actual.source_key !== 'string' || seen.has(actual.source_key)) return false;
+        seen.add(actual.source_key);
+        const expected = supplied.find(item => item.source_key === actual.source_key) ?? { source_key: actual.source_key };
+        if (fields.some(key => (actual[key] ?? null) !== (expected[key] ?? null))
+            || JSON.stringify(actual.freshness_policy ?? null) !== JSON.stringify(expected.freshness_policy ?? null)) return false;
+    }
+    return supplied.every(item => seen.has(item.source_key));
+}
+
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
         super(message);
@@ -616,7 +677,13 @@ class GRIDApi {
             method: 'DELETE',
         });
     }
-    async getTickerAnalysis(ticker, period = '3M') {
+    async getTickerAnalysis(ticker, period = '3M', options) {
+        if (options !== undefined) {
+            if (!options || options.storedOnly !== true) throw new Error('stored_mode_invalid');
+            const snapshot = snapshotStoredRequest(options.storedRequest);
+            const query = new URLSearchParams({ period, stored_only: 'true', stored_request: snapshot.json });
+            return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis?${query}`);
+        }
         const qs = period && period !== '3M' ? `?period=${encodeURIComponent(period)}` : '';
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
     }
