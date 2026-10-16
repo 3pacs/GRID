@@ -158,3 +158,74 @@ describe('initial and period request ordering from actual source', () => {
         expect(e.priceLoading).toEqual([true]);
     });
 });
+
+// Couple actual request callbacks to the real Card, not only the stored DTO.
+describe('callback state consumed by the real evidence card', () => {
+    it('renders the selected period in both response orders and rejects late results after cleanup', async () => {
+        const coherentResult = (period, value, source, asOf, reason) => {
+            const rows = [{ as_of: asOf, value }, { as_of: asOf, value: null }];
+            return {
+                ticker: 'SPY', period, options: ['same-ticker-option'],
+                price_history: rows.map(row => ({ date: row.as_of, value: row.value })),
+                price_source: source, availability: { price: 'available' },
+                market_features: {
+                    ...payload().market_features,
+                    daily: {
+                        ...payload().market_features.daily,
+                        source, as_of: asOf, reason, rows, returned_row_count: rows.length,
+                    },
+                },
+            };
+        };
+        const old = coherentResult('3M', 33, 'grid', '2020-01-02', 'old_3M_reason');
+        const selected = coherentResult('1M', 0, 'yfinance', '2021-02-03', 'selected_1M_reason');
+        for (const initialFirst of [true, false]) {
+            const e = deferredAnalysisEnvironment();
+            e.context.beginInitial();
+            const newer = e.context.changePeriod('1M');
+            const card = render(<Card analysis={e.state} ticker="SPY" />);
+            const showState = () => card.rerender(<Card analysis={e.state} ticker="SPY" />);
+            const assertNoOldEvidence = () => {
+                expect(card.queryByText('33')).toBeNull();
+                expect(card.queryByText(/old_3M_reason|Source: grid|2020-01-02/)).toBeNull();
+            };
+            const assertSelectedEvidence = () => {
+                expect(card.getByText(/^Source: yfinance · As of: 2021-02-03 · Cached response$/)).toBeTruthy();
+                expect(card.getByText(/^selected_1M_reason · Returned rows: 2$/)).toBeTruthy();
+                expect(card.getByText(/^Freshness: unknown — freshness_policy_not_supplied$/)).toBeTruthy();
+                expect(card.getByText('0')).toBeTruthy();
+                expect(card.getByText('Unavailable')).toBeTruthy();
+                expect(card.getByText(/latest returned: Unavailable/)).toBeTruthy();
+                assertNoOldEvidence();
+            };
+            if (initialFirst) {
+                e.pending[0].resolve(old); await settleCallbacks(); showState();
+                assertNoOldEvidence();
+                expect(card.getByText(/no matching response/)).toBeTruthy();
+                expect(card.queryByText('0')).toBeNull();
+            }
+            e.pending[1].resolve(selected); await newer; showState();
+            assertSelectedEvidence();
+            if (!initialFirst) {
+                e.pending[0].resolve(old); await settleCallbacks(); showState();
+                assertSelectedEvidence();
+            }
+            card.unmount();
+        }
+        const e = deferredAnalysisEnvironment();
+        const stop = e.context.beginInitial();
+        const newer = e.context.changePeriod('1M');
+        const card = render(<Card analysis={e.state} ticker="SPY" />);
+        stop(); e.context.currentTickerRef.current = 'QQQ';
+        e.pending[0].resolve(old); await settleCallbacks();
+        card.rerender(<Card analysis={e.state} ticker="QQQ" />);
+        expect(card.getByText(/no matching response/)).toBeTruthy();
+        e.pending[1].resolve(selected); await newer;
+        card.rerender(<Card analysis={e.state} ticker="QQQ" />);
+        expect(card.getByText(/no matching response/)).toBeTruthy();
+        expect(card.queryByText(/old_3M_reason|selected_1M_reason|Source: grid|Source: yfinance/)).toBeNull();
+        expect(card.queryByText('33')).toBeNull();
+        expect(card.queryByText('0')).toBeNull();
+        expect(e.state).toBeNull();
+    });
+});
