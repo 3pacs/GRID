@@ -29,6 +29,11 @@ from price_close_contract import (
     SPY_CLOSE_SERIES,
     capture_payload,
     observation_end_utc,
+    daily_capture_payload,
+    daily_capture_boundary,
+    is_daily_policy_capture,
+    raw_capture_payload,
+    series_id_for_interval,
 )
 
 
@@ -380,7 +385,12 @@ class YFinancePuller(BasePuller):
         """Download OHLCV data for a single ticker and insert into raw_series.
 
         Each OHLCV field is stored as a separate series with the naming
-        convention ``YF:{ticker}:{field}`` (e.g. ``YF:^GSPC:close``).
+        convention ``YF:{ticker}:{field}`` for 1d; new non-1d writes use
+        ``YF:{ticker}:{field}:{interval}``. ``series_id_map`` returns the
+        checked field-to-ID mapping. Raw SUCCESS never implies daily finality;
+        ``qualified_rows_inserted`` is the policy-qualified subset of
+        ``raw_rows_inserted``/``rows_inserted``. UNKNOWN/INCOMPLETE values
+        retain explicit provenance and remain excluded from selected closes.
 
         Parameters:
             ticker: Yahoo Finance ticker symbol.
@@ -397,9 +407,9 @@ class YFinancePuller(BasePuller):
             classification consumed by the repair-summary logging in
             scripts/hermes_fixers.py::_retry_source — one of ``"inserted"``
             (rows_inserted > 0), ``"duplicate_only"`` (a non-empty download
-            that inserted 0 rows — every date it returned was already
-            present), ``"no_data"`` (the provider returned nothing for the
-            requested window), or ``"error"`` (invalid ticker or an
+            that inserted 0 rows because the latest raw capture matches or
+            the daily capture is already qualified), ``"no_data"`` (no
+            acceptable raw data or no eligible SPY close), or ``"error"`` (invalid ticker or an
             exception). A "checked" outcome (any of these four) is NOT a
             claim that this ticker's data is current through today — see
             pull_all's docstring.
@@ -412,6 +422,10 @@ class YFinancePuller(BasePuller):
             "errors": [],
             "outcome": "inserted",
         }
+        result.update(interval=interval, series_id_map={}, raw_rows_inserted=0,
+                      qualified_rows_inserted=0, qualification_withheld=0, raw_value_refusals=0,
+                      capture_states_seen=[])
+        result["daily_policy_refusals"] = 0
         if yf_ticker is None:
             result["status"] = "SKIPPED"
             result["outcome"] = "error"
@@ -485,6 +499,8 @@ class YFinancePuller(BasePuller):
                 return result
 
             inserted = 0
+            qualified_inserted = 0
+            capture_states_seen: set[str] = set()
 
             # yfinance's own `end` is exclusive (start="2026-09-10",
             # end="2026-09-11" returns only 09-10 — confirmed against the
@@ -509,7 +525,8 @@ class YFinancePuller(BasePuller):
                     if col_name not in df.columns:
                         continue
 
-                    series_id = f"YF:{yf_ticker}:{field_key}"
+                    series_id = series_id_for_interval(yf_ticker, field_key, interval)
+                    result["series_id_map"][field_key] = series_id
                     selected = df[col_name]
                     # Duplicate-column collapses (e.g. MultiIndex flattening
                     # producing repeated headers) yield a DataFrame instead of
@@ -632,6 +649,7 @@ class YFinancePuller(BasePuller):
                             continue
                         if series_id == SPY_CLOSE_SERIES and interval == "1d":
                             if not math.isfinite(float_val) or float_val <= 0:
+                                result["daily_policy_refusals"] += 1
                                 continue
                             captured_at = _utc_now()
                             # No provisional SPY close and no implicit history
@@ -640,9 +658,11 @@ class YFinancePuller(BasePuller):
                             if obs_date_val < captured_at.date() - timedelta(
                                 days=SPY_CAPTURE_MAX_LOOKBACK_DAYS
                             ):
+                                result["daily_policy_refusals"] += 1
                                 continue
                             marker = capture_payload(obs_date_val, captured_at)
                             if marker is None:
+                                result["daily_policy_refusals"] += 1
                                 continue
                             already_marked = conn.execute(
                                 text(
@@ -672,34 +692,104 @@ class YFinancePuller(BasePuller):
                                  "val": float_val, "payload": json.dumps(marker)},
                             )
                             inserted += 1
+                            qualified_inserted += 1
+                            capture_states_seen.add("POLICY_ELIGIBLE")
                             continue
-                        if obs_date_val in existing_dates:
+                        # Raw acceptance and daily qualification are separate.
+                        # Unsupported sessions/years/intervals remain observable,
+                        # with explicit UNKNOWN/INCOMPLETE provenance. The latest
+                        # interval-specific vintage determines raw idempotency;
+                        # any valid eligible capture retains its once-qualified
+                        # idempotency even when earlier raw vintages exist.
+                        if (not math.isfinite(float_val)
+                                or (float_val < 0 if field_key == "volume" else float_val <= 0)):
+                            result["raw_value_refusals"] += 1
                             continue
-
+                        captured_at = _utc_now()
+                        payload = raw_capture_payload(
+                            yf_ticker, field_key, obs_date_val, captured_at, interval,
+                        )
+                        state = payload["capture_state"]
+                        capture_states_seen.add(state)
+                        if state != "POLICY_ELIGIBLE":
+                            result["qualification_withheld"] += 1
+                        self._file_advisory_lock(conn, series_id, obs_date_val)
+                        marker = daily_capture_payload(
+                            yf_ticker, field_key, obs_date_val, captured_at, interval,
+                        )
+                        if marker is not None:
+                            marked_rows = conn.execute(
+                                text(
+                                    "SELECT raw_payload, pull_timestamp FROM raw_series "
+                                    "WHERE series_id = :sid AND source_id = :src "
+                                    "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                    "AND raw_payload @> CAST(:payload AS jsonb) "
+                                    "AND pull_timestamp >= :period_end"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "payload": json.dumps(marker),
+                                 "period_end": daily_capture_boundary(yf_ticker, obs_date_val)},
+                            ).fetchall()
+                            if any(is_daily_policy_capture(row[0], series_id, obs_date_val, row[1])
+                                   for row in marked_rows):
+                                continue
+                        latest = conn.execute(
+                            text(
+                                "SELECT raw_payload, pull_timestamp, value FROM raw_series "
+                                "WHERE series_id = :sid AND source_id = :src "
+                                "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                "AND raw_payload ->> 'interval' = :interval "
+                                "ORDER BY pull_timestamp DESC, id DESC LIMIT 1"
+                            ),
+                            {"sid": series_id, "src": self.source_id,
+                             "od": obs_date_val, "interval": interval},
+                        ).fetchone()
+                        if latest is not None:
+                            latest_payload = latest[0]
+                            if isinstance(latest_payload, str):
+                                try:
+                                    latest_payload = json.loads(latest_payload)
+                                except (TypeError, ValueError):
+                                    latest_payload = None
+                            if latest_payload == payload and latest[2] is not None and float(latest[2]) == float_val:
+                                continue
                         conn.execute(
                             text(
                                 "INSERT INTO raw_series "
-                                "(series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                                "(series_id, source_id, obs_date, pull_timestamp, "
+                                "value, raw_payload, pull_status) "
+                                "VALUES (:sid, :src, :od, :pulled_at, :val, "
+                                "CAST(:payload AS jsonb), 'SUCCESS')"
                             ),
-                            {
-                                "sid": series_id,
-                                "src": self.source_id,
-                                "od": obs_date_val,
-                                "val": float_val,
-                            },
+                            {"sid": series_id, "src": self.source_id,
+                             "od": obs_date_val, "pulled_at": captured_at,
+                             "val": float_val, "payload": json.dumps(payload)},
                         )
-                        existing_dates.add(obs_date_val)
                         inserted += 1
+                        if state == "POLICY_ELIGIBLE":
+                            qualified_inserted += 1
 
             result["rows_inserted"] = inserted
+            result["raw_rows_inserted"] = inserted
+            result["qualified_rows_inserted"] = qualified_inserted
+            result["capture_states_seen"] = sorted(capture_states_seen)
             # "duplicate-only" is established per logged ticker here: a
-            # non-empty download whose every date was already present
-            # (inserted == 0) is a successful CHECK of that ticker, not
+            # non-empty download whose latest raw captures match or daily
+            # captures already qualify is a successful CHECK of that ticker, not
             # evidence its data is stale — but it is also not evidence any
             # OTHER ticker is current. Do not generalise this per-ticker
             # result into a source- or asset-class-wide freshness claim.
             result["outcome"] = "inserted" if inserted > 0 else "duplicate_only"
+            if result["daily_policy_refusals"]:
+                result["status"] = "PARTIAL"
+                result["errors"].append("Daily captures refused: incomplete or unknown session policy")
+                if inserted == 0:
+                    result["outcome"] = "no_data"
+            if result["raw_value_refusals"]:
+                result["status"] = "PARTIAL"
+                result["errors"].append("Invalid raw numeric captures refused")
+                if inserted == 0:
+                    result["outcome"] = "no_data"
             log.info(
                 "yfinance {t}: checked — inserted {n} rows ({o})",
                 t=yf_ticker, n=inserted, o=result["outcome"],
