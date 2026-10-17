@@ -25,6 +25,8 @@ import time
 import schedule as _sched
 from loguru import logger as log
 
+_ACTOR_NEWS_BATCH_BUDGET_SECONDS = 30.0
+
 
 def run_intelligence_loop() -> None:
     """Background loop: hourly briefings, 4h capital flows, daily wiki + crypto.
@@ -203,22 +205,18 @@ def run_intelligence_loop() -> None:
             )
             puller = ActorNewsPuller(_ge())
             actors = enumerate_sector_map_actors(priority_only=True)[:200]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "gdelt", "wikipedia"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news daily skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "gdelt", "wikipedia"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news daily: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news daily: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news daily failed: {e}", e=str(exc))
@@ -234,22 +232,18 @@ def run_intelligence_loop() -> None:
             puller = ActorNewsPuller(_ge())
             # Skip top-200 (handled daily); sweep the rest.
             actors = enumerate_sector_map_actors(priority_only=False)[200:]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news weekly skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news weekly tail: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news weekly tail: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news weekly tail failed: {e}", e=str(exc))
