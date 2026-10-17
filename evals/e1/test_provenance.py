@@ -608,8 +608,8 @@ def backfill(cur, fid, hist):
 
 def test_reviewed_same_day_exemption_callers_are_pinned():
     """options.py::_push_to_resolved is exempt only while its date provably comes from
-    pull_all's own clock: called only by _pull_ticker, which is called only by pull_all,
-    where today_str is derived from _utc_now()."""
+    pull_all's own clock: called by _pull_ticker's completion callback, with the
+    unmodified enclosing today_str, derived in pull_all from _utc_now()."""
     import ast as _ast
 
     def callers(attr: str) -> set[tuple[str, str]]:
@@ -623,11 +623,26 @@ def test_reviewed_same_day_exemption_callers_are_pinned():
                     found.add((rel, getattr(module.function_of(node), "name", "<module>")))
         return found
 
-    assert callers("_push_to_resolved") == {("ingestion/options.py", "_pull_ticker")}
+    assert callers("_push_to_resolved") == {("ingestion/options.py", "finish")}
     # other pullers have their own _pull_ticker; only options.py's matters here
     assert {c for c in callers("_pull_ticker") if c[0] == "ingestion/options.py"} == {
         ("ingestion/options.py", "pull_all")}
     module = vintage_scan._Module("ingestion/options.py", vintage_scan.sources()["ingestion/options.py"])
+    puller = next(n for n in _ast.walk(module.tree) if isinstance(n, _ast.FunctionDef)
+                  and n.name == "_pull_ticker")
+    finish = next(n for n in puller.body if isinstance(n, _ast.Try)
+                  for n in n.body if isinstance(n, _ast.FunctionDef) and n.name == "finish")
+    resolved = next(n for n in _ast.walk(finish) if isinstance(n, _ast.Call)
+                    and isinstance(n.func, _ast.Attribute) and n.func.attr == "_push_to_resolved")
+    assert isinstance(resolved.args[2], _ast.Name) and resolved.args[2].id == "today_str"
+    assert not any(isinstance(n, (_ast.Assign, _ast.AnnAssign, _ast.AugAssign, _ast.NamedExpr))
+                   and any(isinstance(t, _ast.Name) and t.id == "today_str" and isinstance(t.ctx, _ast.Store)
+                           for t in _ast.walk(n)) for n in _ast.walk(finish))
+    published = next(n for n in _ast.walk(puller) if isinstance(n, _ast.Call)
+                     and isinstance(n.func, _ast.Name) and n.func.id == "publish_bounded")
+    assert isinstance(published.args[3], _ast.Name) and published.args[3].id == "finish"
+    assert not any(isinstance(n, _ast.Call) and isinstance(n.func, _ast.Name)
+                   and n.func.id == "finish" for n in _ast.walk(puller))
     call = next(n for n in _ast.walk(module.tree) if isinstance(n, _ast.Call)
                 and isinstance(n.func, _ast.Attribute) and n.func.attr == "_pull_ticker")
     date_arg = call.args[1]
