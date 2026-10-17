@@ -527,7 +527,7 @@ if __name__ == "__hermes_sec_only__":
 # Selected FINRA reuses the finite owned-worker driver. It never invokes tick,
 # constructs a puller in this process, or delegates retries to this caller.
 _FINRA_SELECTED_BASE = "c4662193a1b526e4ccc149b0394bfc52754e3eec"
-_FINRA_SELECTED_PINS = {"driver": "717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31",
+_FINRA_SELECTED_PINS = {"driver": "4bb5204c2fd45b1714688dda1d892b1192ef7be1217e4d3abc350b42fc27ee68",
                         "producer": "76579df966612c7f215a9f9c27251574ec13488a31c1e40221dbe09a651337f5"}
 _FINRA_SELECTED_USED = False
 _FINRA_SELECTED_CODES = frozenset({

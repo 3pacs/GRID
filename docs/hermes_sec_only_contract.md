@@ -61,11 +61,28 @@ seam without running it during author verification. Default ordinary startup is
 unchanged and Hermes remains off. Native/live receipt flags stay false.
 
 The exact frozen dependency is driver
-`717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31`
+`4bb5204c2fd45b1714688dda1d892b1192ef7be1217e4d3abc350b42fc27ee68`
 and producer
 `76579df966612c7f215a9f9c27251574ec13488a31c1e40221dbe09a651337f5`.
-Its independent source review is pending at this caller freeze. The existing
-FINRA owner retains those source paths; this candidate does not rewrite them.
+This V8 dependency has selected source and synthetic closure: nine focused
+methods and three assertion-sensitive mutants passed in retained slots117-119.
+The existing FINRA owner retains those immutable source paths; this caller
+derivative does not rewrite them. Its caller composition tests are UNRUN and
+no source publication, target adoption or native qualification is inferred.
+
+The source pin is coherent across the selection artifact, admission runtime,
+byte loader and exact driver file. The producer and all closed selection,
+admission, original clock and receipt schemas remain unchanged. The original
+operator entry still captures and forwards its actual450-second origin before
+source reads/imports; no new CLI, runtime flag or authority is introduced.
+
+V8's independent guardian owns its worker and retains original parent/control
+and attempt-packet identities. The guardian must stay outside the dedicated
+single-process worker leaf; worker TERM120/KILL135/reap/bothEOF/close150 remain
+inside the original450-second workflow. Parent-death and hard-interruption
+behavior, target resource placement, API/ABI/TLS/DB cancellation and exclusive
+receipt custody still require their own native qualification. A cooperative
+timeout, synthetic PASS or this source-pin correction supplies none of it.
 
 Admission is closed `finra-selected-workflow-admission-v2`: issued/expires UTC
 are fully specified and at most seven days apart. It contains a workflow UUID,
@@ -95,16 +112,26 @@ observed workflow state; caller workload_success stays false, commit/new_rows/
 durability remain UNKNOWN. These fields do not infer a database commit from
 process cleanup. Known typed transaction observations are labelled separately.
 
-The product test is portable in the eight-path combined current-base preview:
-it uses only repository paths and inline synthetic adapters. Its 26 cases cover
+The retained product test is portable in the combined repository source:
+it uses only repository paths and inline synthetic adapters. Its original26 cases cover
 actual operator/CLI/caller/driver/worker/producer composition, retry exhaustion,
 commit uncertainty, deadlines, identity drift and SEC/default preservation.
 The original 53 artifact-layout cases are preserved byte-identically and run
 separately as offline source/control evidence. They are not claimed as repo CI
-coverage. The preview is a selected-path content tree on base c466219, not a
-published commit or full-repository checkout. Native constructors, process,
+coverage. That historical preview is a selected-path content tree on base
+c466219, not a full-repository checkout. This V8 caller derivative uses the
+captured published9c5e33634edefc811ca2b422ef7abb168970dbf2 four-path capsule;
+no new public commit or deployment is claimed. Native constructors, process,
 transport and DB boundaries are fake in every author test; no provider or SQL
-connection is opened.
+connection is opened. The subsequent six version-independent source-span guard
+regressions and full18-body/decorator guard are preserved unchanged. This V8
+caller derivative adds six UNRUN pin/guardian/receipt coupling cases. The
+original32 cases still use injected process boundaries; the new guardian
+cases additionally execute the actual V8 supervisor and parent unwrap/validator
+when later approved, using only inert handles and synthetic transport/DB.
+They do not execute native guardian_main, fork, PIDFD, signals or cgroup code.
+Their malformed guardian, missing EOF, unknown close and late original deadline
+controls must stay UNKNOWN with no caller retry. No new pass count is claimed.
 
 Remaining execution gates are separately approved source publication/adoption,
 exact action-time target file/package/interpreter/resource identities, existing

@@ -100,3 +100,187 @@ HTTP cleanup is independent for response, connection and budget finalization. _h
 Focused final15 methods pass (9new response/worker transport methods,5selected existing framing/accounting/HTTPS methods,1exact-old witness). Three omission mutants cause three assertion failures and zero errors. Baseline and development failures are preserved uncredited; no historical full suite is rerun. `python3 -I -S -B evidence/run_bounded.py final` is the runnable memory-only command from author-work; all source calls are definitions/AST projections and injected IO. A30+2s child,512MiBAS and1MiB postcapture check bound this verification, not an admitted FINRA job.
 
 This derivative retains historical a94 sourcebase and filedate2026-10-13. Main7e3 is only the ROOT-reported deployed-current release; no current checkout import or canonical deployment is claimed. Current-main source compatibility must be reconciled before any publication/adoption; native ABI, dedicated roles/cgroup identity/runtime window and live provider/DB/commit/durability acceptance remain unqualified. No new CID/marker/window/admission or production activation is supplied.
+
+## V6: independently owned guardian (SOURCE ONLY; every new test UNRUN)
+
+The V5 caller loop could not stop or reap a separate-session worker after the
+caller died. V6 adds a separate-session guardian process in the same pinned
+`finra_occurrence_driver.py`; it owns the worker's Popen/PIDFD, bounded packet,
+stdout/stderr streams, TERM/KILL, wait/reap and independent finalization. This is
+an isolated derivative, not an update to a staged/native package or Hermes.
+
+`NativeRuntime.launch(context, packet_bytes)` consumes the same exclusive attempt
+marker once, opens the original caller PIDFD and private nonblocking control
+pipe, starts only the guardian and installs the guardian handle before queueing
+any packet bytes. The guardian cannot create a worker until `ParentDeathArm`
+checks the exact original-parent relationship/PIDFD and private pipe, original
+monotonic bound, full hash-bound packet and preflight. It rechecks the arm before
+worker spawn. Caller SIGKILL/death makes the original parent PIDFD readable;
+private-pipe EOF also latches cancellation. A hard-stopped but living caller does
+not need to execute a finally: guardian timers continue independently. Guardian
+SIGINT/SIGTERM only latch cancellation; they do not interrupt owned reaping.
+
+The guardian stays OUTSIDE the existing `pids.max=1` worker cgroup. Only its one
+worker joins that exact existing leaf. No cgroup/role/permission creation or
+relaxation is introduced. Guardian's separate control-plane limits are 512 MiB
+RLIMIT_AS, 30 CPU seconds and no core dumps; these are NOT an aggregate RSS or
+charged-memory cap for guardian+worker. Worker cgroup memory/swap/CPU/pids/depth
+requirements and original worker RLIMITs remain unchanged. Any actual package
+qualification must account separately for this additional guardian footprint;
+no resource readiness is inferred from this source implementation.
+
+All times remain the ORIGINAL attempt t0: TERM at t0+120, KILL at t0+135, and
+reap + observed BOTH pipe EOFs + handle/context finalization before t0+150.
+Cancellation may request earlier TERM/KILL but cannot extend any deadline. For a
+selected workflow, attempt end must also fit the original outer450 frame.
+`OwnedWorker(..., stop_request=None)` preserves the default old loop; guardian
+passes its independently pinned arm checker. Caller `GuardianHandle.signal`
+only writes a bounded T/K request; it never sends SIGKILL to the guardian that
+must reap the worker. Lost/malformed/late guardian output or unknown closure is
+terminal UNKNOWN, never a zero-write/retry permission. All commit-attempt and
+aggregate evidence consistency rules from V5 remain unchanged.
+
+Guardian returns one bounded closed `finra-independent-guardian-v1` envelope with
+exact packet SHA, exact Call, actual worker stop proof and the unchanged worker
+receipt. Parent unwraps only this concrete native guardian handle's envelope and
+requires zero exit, reaped, both EOFs and no cancellation before existing child
+validation/accounting promotion. No new raw stderr/exception/DSN export occurs.
+Receipt remains at most the old 1 MiB; envelope overhead can cause refusal rather
+than expanding the cap. Saved PENDING, returned finalization and actual worker
+accounting retain their distinct meanings; cleanup is not durability/PIT proof.
+
+As a secondary fail-closed guard-loss measure, worker preexec sets
+PR_SET_PDEATHSIG(SIGKILL), checks that its direct parent is the same guardian
+before and after arming, then joins the leaf and applies original limits. Failure
+refuses before packet/provider/DB effects. If the guardian itself is SIGKILLed,
+that mechanism aims to stop its worker but cannot prove reaping/EOF afterward;
+parent must retain UNKNOWN. It is not a replacement for independently qualifying
+PIDFD/PDEATHSIG, signal, exec, TLS/DB cancellation and actual OS behavior. Kernel
+stall, unscheduled guardian, interpreter bootstrap/import blocking, hard death of
+both supervisor and guard, PID namespace/privilege interactions, native callback
+latency and actual charged-memory containment are UNQUALIFIED. No claim of a
+mathematical hard real-time guarantee or surviving arbitrary guardian death is
+made. Existing unsupported target facts are not repaired by paper flags.
+
+Native API additions are concrete dormant code: ParentDeathArm, NativeArmIO,
+GuardianHandle, supervise_guarded_worker, guardian_main, private _spawn_worker,
+and closed guardian CLI arguments. No supplied arbitrary PID is signalled.
+Original-parent PIDFD is observation-only; worker signals use its own PIDFD.
+All descriptors have original fstat pins and close independently where eligible.
+The runtime marker remains spent on failed launch; there is no implicit retry.
+
+Prepared F8 tests exercise memory-modeled parent loss, EOF before arm, hard-stop
+original timers, descriptor/clock rebinding, late callbacks, concrete native
+poll method projection, guardian request routing, arm refusal, both EOFs, late
+context close, primary preservation and original outer deadline. Four actual
+source omission mutants are prepared. **UNRUN**: no Python, import, parse,
+compile, test child, native adapter, socket, provider or DB was executed here.
+The frozen V5 tests/assertions remain historical evidence; existing native
+launch fixtures require guardian-aware qualification before any future full
+suite claim. No earlier passing count is credited to this derivative.
+
+Original Hermes selected caller pins driver717041aa; this new driver is NOT
+adopted there. Its original owner must separately update/review a coherent
+caller/dependency capsule after this derivative is accepted. Producer76579,
+legacy parser/SQL/financial math, Caps, Call, selected workflow budget/expiry and
+all frozen/failed/spent artifacts are preserved. Original Claude remains the
+sole possible native operator, with no new native authority from this package.
+
+V6 dependency/once refinement: `ctypes.CDLL(None)` and exported libc `prctl`,
+`select.poll`, PIDFD/pipe/nonblocking/task-list functions are checked by the real
+preflight before any marker/spawn. Availability is not a prctl invocation, ABI
+qualification, or evidence from earlier Python3.10 PIDFD checks. The actual
+PR_SET_PDEATHSIG operation stays in worker preexec, failing before worker effects.
+No such loading/check/operation occurred while authoring this derivative.
+
+The original `.spent` is now written once with its exact packet digest, call ID
+and original-parent PID. Guardian checks that immutable consumed record and then
+exclusively creates `<same-call-id>.guardian.spent` before worker creation. This
+is one additional prospective same-attempt lifecycle marker, not a new call ID,
+reset, retry or reuse of old empty markers. Failed/partial records stay spent.
+A historical V5 empty marker cannot satisfy this new guard claim. Both future
+marker effects require the final native package/receipt-root/authority binding;
+no actual marker or config was created here. Target custody and once-only
+adoption are still unverified. The prepared set is now14 methods plus4 omissions;
+all remain UNRUN. Existing accepted Hermes driver717041aa pin must be reconciled
+by its original owner later, with this derivative's final SHA/API pin. No caller
+path is edited by this three-path source repair.
+
+## V7 retained static corrections F8-1/F8-2 (UNRUN)
+
+The frozen V6 REVISE is retained verbatim. Its first finding identified a valid
+original entry followed by a six-second bootstrap: calling the initial binder
+again falsely refused FRESH_ACTUAL_T0. V7 keeps `bind_live`'s original five-second
+entry gate. `_bind_live_structure` shares only closed packet/hash/Call/Caps/DB/
+runtime/outer-frame validation; it is not a native entry. The separate
+`bind_guardian_packet(..., origin=original_t0, arm=original_arm)` validates the
+same exact canonical bytes, same Call.t0, actual armed original-parent channel,
+original t0+150 end and current monotonic time strictly before original t0+120.
+Guardian invokes this continuation validator, never restarts a timer and still
+requires the original consumed marker plus exclusive guardian claim. It cannot
+create an initial admission, new expiry, fresh Call or new work/cleanup budget.
+Prepared boundaries cover +5, +6, just before +120, expiry at +120, missing/unarmed
+boundary and reset attempt; the actual guardian_main method is projected under
+entirely substituted memory os/signal/runtime bindings to cover its binder call.
+
+The second finding identified a real coupling: LiveHandle.poll delivers queued
+input. After observing TERM/KILL, OwnedWorker now calls cancel_packet BEFORE any
+ordinary poll. LiveHandle's cancellation latch is set before the fallible stdin
+identity/close operation; deliver_packet checks that latch before all callbacks
+or writes, and queue_packet cannot reactivate it. The cancellation state is also
+retained in the owned loop. Both EOF/reap/close obligations and original bounds
+remain. An already dispatched prefix is not rolled back or reported as zero
+network/DB activity. Missing evidence stays UNKNOWN. Closing partial stdin means
+an incomplete hash-bound frame cannot be silently completed by a later poll.
+
+The additional seven tests are prepared, not executed: initial vs continuation
+boundaries; missing/reset/expired arms; actual guardian_main six-second bootstrap
+projection; normal actual LiveHandle delivery; actual queued TERM/KILL with
+parent lost between final arm and returned spawn; partial frame suppression;
+and sticky suppression through close failure/later poll. All fourteen V6 test
+methods and four original omission variants remain text-identical. Two new
+functional omissions target the actual guardian_main binder and owned-loop
+cancel-before-delivery branch. No test/mutant/syntax/AST/compile outcome is claimed.
+The existing parser/SQL/producer/Caps/Call, all spent/failed records, native
+qualification holds and sole OriginalClaude operator are unchanged. Hermes717
+caller integration remains a separate original-owner source gate, not adoption.
+
+## V8 strict Boolean packet guard; actual slot116 failure retained
+
+The actual approved sequence stopped after slot116: F8-focused14 passed,
+original4 omission mutants produced assertion rejections, and F8-v7-focused
+reported6 passing methods and1 assertion failure with0 errors/prohibited events.
+The failing guardian_main projection expected result0 plus exact claim/forwarded/
+write assertions. Slot117 (V7 mutants) remained UNRUN. Those original source,
+quiet log, receipts and static verdict remain unchanged.
+
+Static diagnosis identifies a production predicate defect, not an incomplete
+fake: require rejects every value other than literal True. The old expression
+`type(chunk) is bytes and chunk` evaluates to nonempty bytes for a valid read,
+so guardian_main catches Refused and returns1 before binding/preflight. Empty
+bytes also refuse. The quiet log hides the precise failing assertion, but this
+source branch necessarily rejects the fixture's nonempty packet. No rerun,
+traceback recovery, parser or interpreter was used to establish that fact.
+
+The sole driver change is `type(chunk) is bytes and len(chunk)>0`, producing a
+strict bool and retaining rejection of empty or non-bytes input. Original packet
+size, single-newline/hash binding, initial vs continuation freshness, arm/marker,
+original120/135/150/outer450, cancellation/reap/bothEOF/close and all accounting
+and qualification rules are unchanged. Producer/caller/native package untouched.
+
+All seven original V7 methods and success assertions are text-preserved. The
+fixture byte source points to the existing protected V7 producer76579 input;
+there is no producer/data change or additional V8 input leaf. Two new prepared
+actual-source predicate projections cover nonempty/empty/wrong-type/foreign
+objects and unchanged frame-newline/SHA negatives. One prepared mutant restores
+the defective byte-valued predicate. Every new projection/mutant/outcome is
+UNRUN, including the original whole guardian-main projection against this fix.
+No pass or native readiness is inferred from static repair. Historical statuses
+above and earlier UNRUN source-freeze descriptions apply to their dated packets.
+
+Actual Python starts remain116 against ceiling117; unused117 is NOT a repair-test
+allowance. No interpreter/import/parser/compile/test/native/provider/DB/SSH or
+runtime effect occurred for V8. Same retained reviewer performs static review;
+future test or target actions require their own applicable authority. Hermes717
+pin adoption, target F1–F8 qualification and sole OriginalClaude operator holds
+remain separate and unresolved; old spent calls cannot be reused.

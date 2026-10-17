@@ -560,3 +560,128 @@ class SecPreservationEncodingTests(unittest.TestCase):
         source="class SecOnlyRefused(ValueError):\n    pass\n"
         with patch.object(ast,'dump',side_effect=AssertionError('version-dependent AST dump forbidden')):
             self.assertEqual(accepted_sec_source_manifest(source)['nodes'],[['SecOnlyRefused',source]])
+
+
+class GuardianWorkflowRuntime(WorkflowRuntime):
+    """Synthetic process boundary; actual V8 supervisor and receipt guards run.
+
+    No GuardianHandle constructor/native method or guardian_main is invoked.
+    Parent-death/control watching is an inert arm here, not kernel proof.
+    """
+    def __init__(self,driver, *, guardian_fault=None):
+        super().__init__(driver)
+        self.guardian_fault=guardian_fault
+        self.guardian_events=[];self.guardian_frames=[];self.guardian_handles=[]
+
+    def launch(self,context,bound):
+        packet=json.loads(bound)
+        def spawn(owner,packet_bytes, *, arm):
+            self.guardian_events.append('spawn')
+            return super(GuardianWorkflowRuntime,self).launch(owner,packet_bytes)
+        guard_runtime=types.SimpleNamespace(clock=self.clock,wait=self.wait,
+            _spawn_worker=spawn,
+            close=lambda owner:self.guardian_events.append('guardian_context_closed'))
+        arm=types.SimpleNamespace(armed=True,end=packet['call']['t0']+150,
+                                 clock=self.clock,check=lambda:'NONE')
+        frame=self.driver.supervise_guarded_worker(guard_runtime,context,bound,arm)
+        if self.guardian_fault=='packet':
+            frame['attempt_packet_sha256']='0'*64
+        if self.guardian_fault=='worker_eof':
+            frame['stop']['stderr_eof']=False
+        self.guardian_frames.append(frame)
+        # Only the OS-owned handle boundary is projected. Exact class identity
+        # makes real run_live validate the guardian frame and nested worker.
+        handle=object.__new__(self.driver.GuardianHandle)
+        handle.owner=context;handle.identity=(handle,1)
+        handle.output=bytearray(encode(frame));handle.closed=False
+        handle.poll=lambda:0
+        handle.reap=lambda code:code==0
+        handle.capture_complete=lambda:True
+        handle.signal=lambda kind:False
+        def close():
+            handle.closed=True
+            return self.guardian_fault!='close'
+        handle.close=close
+        self.guardian_handles.append(handle)
+        if self.guardian_fault=='late':
+            self.c.now=460.0
+        return handle
+
+
+class FinraV8CallerCouplingTests(unittest.TestCase):
+    # These six cases are prepared source, UNRUN until a finite allocation.
+    def harness(self,guardian_fault=None):
+        h=FinraCompositionHarness()
+        h.runtime=GuardianWorkflowRuntime(h.driver,guardian_fault=guardian_fault)
+        # Keep the original runtime/clock; use the actual caller-loaded classes.
+        # The real loader still validates and executes the exact pinned bytes.
+        load=h.ns['_sec_load']
+        def bind_runtime(path,raw,expected_sha):
+            module=load(path,raw,expected_sha)
+            h.runtime.driver=module
+            return module
+        h.ns['_sec_load']=bind_runtime
+        return h
+
+    def test_exact_v8_dependency_pin_and_unchanged_profile(self):
+        h=self.harness()
+        self.assertEqual(h.m._FINRA_SELECTED_PINS['driver'],
+            '4bb5204c2fd45b1714688dda1d892b1192ef7be1217e4d3abc350b42fc27ee68')
+        self.assertEqual(digest(h.files[h.driver_path]),h.m._FINRA_SELECTED_PINS['driver'])
+        self.assertEqual(h.m._FINRA_SELECTED_PINS['producer'],
+            '76579df966612c7f215a9f9c27251574ec13488a31c1e40221dbe09a651337f5')
+        self.assertEqual(h.selection['kwargs'],{'trade_date':'2026-10-13',
+            'url':'https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261013.txt',
+            'market_prefix':'CNMS','dry_run':False})
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_actual_v8_guardian_supervisor_receipt_composes_through_caller(self):
+        h=self.harness();r=h.run()
+        self.assertEqual(r['status'],'COMPLETE');self.assertEqual(r['driver_invocations'],1)
+        self.assertEqual(h.constructors,1);self.assertEqual(h.runtime.launches,1)
+        self.assertEqual(h.runtime.guardian_events,['spawn','guardian_context_closed'])
+        self.assertEqual(h.runtime.guardian_frames[0]['schema'],'finra-independent-guardian-v1')
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['reaped'])
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['stdout_eof'])
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['stderr_eof'])
+        self.assertTrue(h.runtime.guardian_handles[0].closed)
+        self.assertEqual(r['workflow']['frame']['origin'],10.)
+        self.assertEqual(r['workflow']['frame']['end'],460.)
+        self.assertEqual(r['workflow']['observed_transaction_ack'],'ACKNOWLEDGED')
+        self.assertEqual(r['workflow']['observed_committed_rows'],2)
+        self.assertFalse(r['native_accepted']);self.assertFalse(r['live_qualified'])
+        self.assertFalse(r['workload_success']);self.assertEqual(r['commit'],'UNKNOWN')
+
+    def test_old_driver_selection_pin_refuses_before_reads_or_constructor(self):
+        h=self.harness()
+        h.selection['artifacts']['driver']['sha256']='717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31'
+        r=h.run()
+        self.assertEqual((r['status'],r['code']),('REFUSED','SOURCE_PIN'))
+        self.assertEqual(h.reads,[]);self.assertEqual(h.constructors,0)
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_old_driver_admission_pin_refuses_before_constructor(self):
+        h=self.harness()
+        h.packet['runtime']['driver_sha256']='717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31'
+        r=h.run()
+        self.assertEqual((r['status'],r['code']),('REFUSED','ADMISSION_BINDING'))
+        self.assertEqual(h.constructors,0);self.assertEqual(h.runtime.events,[])
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_invalid_guardian_identity_or_worker_closure_never_retries(self):
+        for fault in ('packet','worker_eof','close'):
+            with self.subTest(fault=fault):
+                h=self.harness(fault);r=h.run()
+                self.assertEqual(r['status'],'UNKNOWN')
+                self.assertEqual(r['driver_invocations'],1);self.assertEqual(h.runtime.launches,1)
+                self.assertEqual(h.constructors,1);self.assertTrue(h.runtime.spent)
+                self.assertEqual(r['commit'],'UNKNOWN');self.assertFalse(r['workload_success'])
+                self.assertFalse(r['native_accepted']);self.assertFalse(r['live_qualified'])
+
+    def test_guardian_late_original_deadline_stays_unknown(self):
+        h=self.harness('late');r=h.run()
+        self.assertEqual(r['status'],'UNKNOWN');self.assertEqual(r['driver_invocations'],1)
+        self.assertEqual(h.runtime.launches,1);self.assertEqual(h.constructors,1)
+        self.assertTrue(h.runtime.spent);self.assertTrue(h.runtime.guardian_handles[0].closed)
+        self.assertEqual(r['commit'],'UNKNOWN');self.assertFalse(r['native_accepted'])
+

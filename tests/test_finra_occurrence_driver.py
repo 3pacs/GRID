@@ -18,6 +18,7 @@ from datetime import date,datetime,timezone
 from decimal import Decimal
 
 ROOT=Path(__file__).resolve().parents[1]
+SOURCE_TEXT=(ROOT/'scripts/finra_occurrence_driver.py').read_text()  # retained before the effect fence
 _spec=importlib.util.spec_from_file_location("bounded_finra_driver",ROOT/"scripts/finra_occurrence_driver.py")
 d=importlib.util.module_from_spec(_spec);sys.modules[_spec.name]=d;_spec.loader.exec_module(d)
 PRODUCER=(ROOT/'ingestion/altdata/finra_short_volume.py').read_bytes()
@@ -846,6 +847,301 @@ class ReceiptConsistencyPairs(unittest.TestCase):
         r,rt,raw=selected_run();bad=copy.deepcopy(r);bad['attempts'][-1].update(db_started=False,write_bearing=False,commit_attempted=False);bad['db_write_bearing_attempts']=0
         with self.assertRaises(d.Refused):d.validate_selected_result(bad,raw,hashlib.sha256(raw).hexdigest(),10.)
 
+class GuardIO:
+    """Memory only: original parent's kernel event and private pipe model."""
+    def __init__(self):self.dead=False;self.control=b'';self.pins={7:(1,7,1),8:(1,8,2)};self.callback=None
+    def pin(self,fd):return self.pins[fd]
+    def parent_pid(self):return 42
+    def pidfd_pid(self,fd):return 42 if fd==7 else -1
+    def is_pipe(self,fd):return fd==8
+    def events(self,parent,control):
+        if self.callback:self.callback()
+        value=self.control;self.control=b'';return self.dead,value
+
+
+class F8GuardianTests(unittest.TestCase):
+    def arm(self,clock=None,ops=None):
+        clock=clock or Clock();ops=ops or GuardIO()
+        return d.ParentDeathArm(7,8,42,ops=ops,clock=clock,end=160.),clock,ops
+
+    def worker(self,owner,c,*,exit_on=None,eof=True):
+        class H(ParentHandle):
+            def __init__(self):super().__init__(owner,{'binding':packet()['call']},code=None);self.signals=[];self.reaps=[]
+            def signal(self,kind):
+                self.signals.append((kind,c.now))
+                if kind==exit_on:self.code=-15 if kind=='TERM' else -9
+                return True
+            def reap(self,code):self.reaps.append(code);return super().reap(code)
+            def capture_complete(self):return eof
+        return H()
+
+    def test_native_export_absence_is_pre_marker_dependency_refusal(self):
+        names=('pidfd_open','pipe2','set_blocking','scandir','read','write','fstat')
+        exports=types.SimpleNamespace(**{name:(lambda *a:None) for name in names})
+        libc=types.SimpleNamespace(prctl=lambda *a:0)
+        self.assertTrue(d.require_guardian_exports(exports,lambda:None,libc))
+        for name in names:
+            bad=copy.copy(exports);setattr(bad,name,None)
+            with self.subTest(name=name),self.assertRaises(d.Refused):d.require_guardian_exports(bad,lambda:None,libc)
+        for loader in (None,types.SimpleNamespace(prctl=1)):
+            with self.assertRaises(d.Refused):d.require_guardian_exports(exports,lambda:None,loader)
+
+    def test_guard_marker_is_exclusive_even_when_previous_write_failed(self):
+        names=set();written=[];closed=[]
+        def opened(name,flags,mode,*,dir_fd):
+            self.assertTrue(flags & 128);self.assertTrue(flags & 256)
+            self.assertEqual((mode,dir_fd),(0o600,9))
+            if name in names:raise FileExistsError()
+            names.add(name);return 17
+        ops=types.SimpleNamespace(O_WRONLY=1,O_CREAT=64,O_EXCL=128,O_NOFOLLOW=256,
+              open=opened,write=lambda fd,data:(written.append(bytes(data)) or len(data)),
+              fsync=lambda fd:None,close=closed.append)
+        rt=d.NativeRuntime.__new__(d.NativeRuntime);rt.api=types.SimpleNamespace(os=ops);rt.verify_receipt_fd=lambda ctx:None
+        name=packet()['call']['call_id']+'.guardian.spent';ctx={'receipt_fd':9}
+        rt._exclusive_guard_marker(ctx,name,b'fixed-packet-pin')
+        with self.assertRaises(FileExistsError):rt._exclusive_guard_marker(ctx,name,b'fixed-packet-pin')
+        self.assertEqual(written,[b'fixed-packet-pin']);self.assertEqual(closed,[17])
+        # Partial writes stay consumed, not a permission to use another guard.
+        ops.write=lambda fd,data:0;other=packet()['call']['call_id']+'.spent'
+        with self.assertRaises(d.Refused):rt._exclusive_guard_marker(ctx,other,b'pin')
+        with self.assertRaises(FileExistsError):rt._exclusive_guard_marker(ctx,other,b'pin')
+
+    def test_dead_parent_or_pipe_EOF_before_arm_refuses(self):
+        for dead,control in ((True,b''),(False,b'EOF')):
+            ops=GuardIO();ops.dead=dead;ops.control=control
+            with self.subTest(dead=dead),self.assertRaises(d.Refused):self.arm(ops=ops)
+
+    def test_original_parent_death_latches_without_parent_finally(self):
+        arm,c,ops=self.arm();ops.dead=True
+        self.assertEqual(arm.check(),'TERM');ops.dead=False
+        self.assertEqual(arm.check(),'TERM')
+        ops.control=b'K';self.assertEqual(arm.check(),'KILL')
+
+    def test_caller_loss_requests_early_TERM_and_owns_reap_close(self):
+        arm,c,ops=self.arm();owner=object();h=self.worker(owner,c,exit_on='TERM');ops.dead=True
+        stop=d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=arm.check).finish()
+        self.assertEqual(h.signals[0],('TERM',10.));self.assertEqual(len(h.reaps),1)
+        self.assertTrue(h.closed);self.assertTrue(stop['stdout_eof'] and stop['stderr_eof'])
+        self.assertEqual(stop['commit'],'UNKNOWN')
+
+    def test_hard_stopped_caller_does_not_reset_original_timers(self):
+        arm,c,ops=self.arm();owner=object();h=self.worker(owner,c,exit_on='KILL')
+        stop=d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=arm.check).finish()
+        self.assertEqual([v[0] for v in h.signals],['TERM','KILL'])
+        self.assertGreaterEqual(h.signals[0][1],130.);self.assertLess(h.signals[0][1],130.1)
+        self.assertGreaterEqual(h.signals[1][1],145.);self.assertLess(h.signals[1][1],145.1)
+        self.assertLess(c.now,160.);self.assertTrue(stop['reaped']);self.assertTrue(h.closed)
+
+    def test_reused_channel_rebound_clock_and_late_callback_refuse(self):
+        for kind in ('fd','clock','late'):
+            arm,c,ops=self.arm()
+            def change():
+                if kind=='fd':ops.pins[8]=(1,99,2)
+                elif kind=='clock':arm.clock=lambda:10.
+                else:c.now=160.
+            ops.callback=change
+            with self.subTest(kind=kind),self.assertRaises(d.Refused):arm.check()
+
+    def test_native_readonly_parent_poll_method_memory_projection(self):
+        io=d.NativeArmIO.__new__(d.NativeArmIO);calls=[]
+        class Poll:
+            def register(self,fd,mask):calls.append(('register',fd,mask))
+            def poll(self,timeout):self_timeout=timeout;calls.append(('poll',timeout));return [(7,1),(8,16)]
+        io.select=types.SimpleNamespace(poll=Poll,POLLIN=1,POLLHUP=16,POLLERR=8,POLLNVAL=32)
+        io.os=types.SimpleNamespace(read=lambda fd,n:b'')
+        self.assertEqual(io.events(7,8),(True,b'EOF'))
+        self.assertEqual(calls[-1],('poll',0))
+
+    def test_guardian_handle_never_signals_its_guardian_process(self):
+        h=d.GuardianHandle.__new__(d.GuardianHandle);writes=[];h.fd=6;h.control_fd=8
+        h.control_closed=False;h.control_pin=(1,8,2);h.requests=set();h.clock=lambda:10.;h.stop_end=160.
+        h.check_fd=lambda:None
+        h._os=types.SimpleNamespace(fstat=lambda fd:types.SimpleNamespace(st_dev=1,st_ino=fd,st_mode=2),
+                                    write=lambda fd,b:(writes.append((fd,b)) or len(b)))
+        self.assertTrue(h.signal('TERM'));self.assertTrue(h.signal('TERM'));self.assertTrue(h.signal('KILL'))
+        self.assertEqual(writes,[(8,b'T'),(8,b'K')])
+        h.control_pin=(1,99,2)
+        with self.assertRaises(d.Refused):h.signal('TERM')
+
+    def test_unarmed_guard_refuses_before_worker_creation(self):
+        arm,c,ops=self.arm();arm.armed=False;spawn=[];closed=[];owner=object()
+        def create(*args,**kwargs):spawn.append(True);return ParentHandle(owner,{'binding':packet()['call']})
+        rt=types.SimpleNamespace(clock=c,wait=c.wait,_spawn_worker=create,close=lambda ctx:closed.append(ctx))
+        with self.assertRaises(d.Refused):d.supervise_guarded_worker(rt,owner,d.canonical(packet()).encode(),arm)
+        self.assertEqual(spawn,[]);self.assertEqual(len(closed),1)
+
+    def test_actual_guardian_supervision_success_requires_both_EOF(self):
+        for eof in (True,False):
+            arm,c,ops=self.arm();owner=object();h=ParentHandle(owner,{'binding':packet()['call']});closed=[]
+            if not eof:h.capture_complete=lambda:False
+            rt=types.SimpleNamespace(clock=c,wait=c.wait,_spawn_worker=lambda *a,**k:h,close=lambda ctx:closed.append(ctx))
+            if eof:
+                frame=d.supervise_guarded_worker(rt,owner,d.canonical(packet()).encode(),arm)
+                self.assertEqual(frame['schema'],'finra-independent-guardian-v1');self.assertTrue(frame['stop']['reaped'])
+            else:
+                with self.assertRaises(d.Refused):d.supervise_guarded_worker(rt,owner,d.canonical(packet()).encode(),arm)
+            self.assertTrue(h.closed);self.assertEqual(closed,[owner])
+
+    def test_guardian_context_close_late_never_exports_success(self):
+        arm,c,ops=self.arm();owner=object();h=ParentHandle(owner,{'binding':packet()['call']})
+        def close(ctx):c.now=160.
+        rt=types.SimpleNamespace(clock=c,wait=c.wait,_spawn_worker=lambda *a,**k:h,close=close)
+        with self.assertRaises(d.Refused):d.supervise_guarded_worker(rt,owner,d.canonical(packet()).encode(),arm)
+        self.assertTrue(h.closed)
+
+    def test_primary_error_survives_context_close_error(self):
+        arm,c,ops=self.arm();primary=KeyboardInterrupt();seen=[]
+        def spawn(*a,**k):raise primary
+        def close(ctx):seen.append(ctx);raise RuntimeError('SENSITIVE_MUST_NOT_EXPORT')
+        rt=types.SimpleNamespace(clock=c,wait=c.wait,_spawn_worker=spawn,close=close)
+        caught=None
+        try:d.supervise_guarded_worker(rt,object(),d.canonical(packet()).encode(),arm)
+        except BaseException as exc:caught=exc
+        self.assertIs(caught,primary);self.assertEqual(len(seen),1)
+
+    def test_guardian_binds_outer_end_before_spawn(self):
+        arm,c,ops=self.arm();p=packet();p['schema']=d.ATTEMPT_SCHEMA;p['selected_workflow']={'frame':{'end':159.}}
+        spawn=[];rt=types.SimpleNamespace(clock=c,wait=c.wait,_spawn_worker=lambda *a,**k:spawn.append(True),close=lambda ctx:None)
+        with self.assertRaises(d.Refused):d.supervise_guarded_worker(rt,object(),d.canonical(p).encode(),arm)
+        self.assertEqual(spawn,[])
+
+
+class F8RevisionTests(unittest.TestCase):
+    arm=F8GuardianTests.arm
+
+    def test_initial_freshness_and_later_guardian_continuation_are_distinct(self):
+        raw=d.canonical(packet()).encode();digest=hashlib.sha256(raw).hexdigest()
+        self.assertEqual(d.bind_live(raw,digest,14.999)[1].t0,10.)
+        for now in (15.,16.,129.999):
+            c=Clock();c.now=now;arm,_,_=self.arm(clock=c)
+            with self.subTest(now=now):
+                with self.assertRaises(d.Refused):d.bind_live(raw,digest,now)
+                bound,call,caps=d.bind_guardian_packet(raw,digest,now,origin=10.,arm=arm)
+                self.assertEqual(bound,raw);self.assertEqual(call.t0,10.)
+                self.assertEqual((call.t0+caps.work,call.t0+caps.work+caps.stop),(130.,160.))
+
+    def test_continuation_never_accepts_missing_arm_reset_or_work_expiry(self):
+        raw=d.canonical(packet()).encode();digest=hashlib.sha256(raw).hexdigest()
+        for mode in ('missing','unarmed','reset','expired','before_origin'):
+            c=Clock();c.now=130. if mode=='expired' else 16.;arm,_,_=self.arm(clock=c)
+            if mode=='unarmed':arm.armed=False
+            with self.subTest(mode=mode),self.assertRaises(d.Refused):
+                d.bind_guardian_packet(raw,digest,9. if mode=='before_origin' else c.now,
+                                      origin=16. if mode=='reset' else 10.,arm=None if mode=='missing' else arm)
+
+    def test_actual_guardian_main_uses_continuation_after_six_second_bootstrap(self):
+        # Execute the exact guardian_main method AST under memory-only bindings.
+        # No real os/signal/clock/NativeRuntime/NativeArmIO is invoked.
+        c=Clock();c.now=16.;ops=GuardIO();raw=d.canonical(packet()).encode();writes=[];claims=[];forwarded=[]
+        class Scan:
+            def __enter__(self):return iter((object(),))
+            def __exit__(self,*args):return False
+        os_fake=types.SimpleNamespace(scandir=lambda p:Scan(),set_blocking=lambda *a:None,
+            read=lambda fd,n:raw+b'\n',write=lambda fd,data:(writes.append(bytes(data)) or len(data)),close=lambda fd:None)
+        signal_fake=types.SimpleNamespace(SIGINT=2,SIGTERM=15,SIGCHLD=17,SIG_DFL=0,signal=lambda *a:None)
+        rt=types.SimpleNamespace(clock=c,wait=c.wait,native=lambda:types.SimpleNamespace(
+            RLIMIT_AS=1,RLIMIT_CPU=2,RLIMIT_CORE=3,setrlimit=lambda *a:None),
+            preflight=lambda p:object(),_claim_guardian=lambda *a:claims.append(True),close=lambda *a:None)
+        imports={'os':os_fake,'sys':types.SimpleNamespace(),'time':types.SimpleNamespace(),'signal':signal_fake}
+        base=__builtins__ if type(__builtins__) is dict else vars(__builtins__);safe_builtins=dict(base)
+        def only_memory(name,*args,**kwargs):
+            if name not in imports:raise AssertionError('UNEXPECTED_PROJECTED_IMPORT')
+            return imports[name]
+        safe_builtins['__import__']=only_memory
+        ns=dict(d.__dict__);ns.update(__builtins__=safe_builtins,NativeRuntime=lambda:rt,NativeArmIO=lambda:ops)
+        def supervised(runtime,context,data,arm):forwarded.append(json.loads(data)['call']['t0']);return {'synthetic':True}
+        ns['supervise_guarded_worker']=supervised
+        text=getattr(d,'__source_text__',SOURCE_TEXT)
+        method=next(n for n in ast.parse(text).body if isinstance(n,ast.FunctionDef) and n.name=='guardian_main')
+        exec(compile(ast.Module(body=[method],type_ignores=[]),'<memory-guardian-main>','exec'),ns)
+        result=ns['guardian_main'](hashlib.sha256(raw).hexdigest(),7,8,42,10.)
+        self.assertEqual(result,0);self.assertEqual(claims,[True]);self.assertEqual(forwarded,[10.]);self.assertTrue(writes)
+
+    def queued_handle(self,*,partial=False,close_error=False):
+        c=Clock();owner=object();child=Child();os_api=PipeOS();signals=[]
+        def send(fd,kind):signals.append(kind);child.code=-15 if kind==signal.SIGTERM else -9
+        ops=types.SimpleNamespace(os=os_api,child_type=Child,selector=Selector,send=send)
+        h=d.LiveHandle(child,owner,d.Caps().receipt,c,160.,native_ops=ops)
+        h.queue_packet(b'{"synthetic_only":true,"call":"queued"}',130.)
+        if partial:
+            original=os_api.write
+            def prefix(fd,data):return original(fd,data[:3]) if fd==103 else original(fd,data)
+            os_api.write=prefix;h.deliver_packet();os_api.write=original
+        if close_error:
+            def refused_close():raise RuntimeError('SENSITIVE_CLOSE_MUST_NOT_EXPORT')
+            child.stdin.close=refused_close
+        return h,owner,c,os_api,signals
+
+    def test_actual_queued_packet_normal_delivery_remains_supported(self):
+        h,owner,c,os_api,signals=self.queued_handle()
+        stop=d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=lambda:'NONE').finish()
+        self.assertEqual(bytes(os_api.data),b'{"synthetic_only":true,"call":"queued"}\n')
+        self.assertTrue(stop['reaped'] and stop['stdout_eof'] and stop['stderr_eof']);self.assertEqual(signals,[])
+
+    def test_actual_queued_packet_is_suppressed_before_poll_for_TERM_and_KILL(self):
+        for request in ('TERM','KILL'):
+            h,owner,c,os_api,signals=self.queued_handle();arm,_,ops=self.arm(clock=c)
+            # Healthy final arm precedes fake spawn; parent dies during spawn.
+            self.assertEqual(arm.check(),'NONE');ops.dead=True
+            if request=='KILL':ops.control=b'K'
+            stop=d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=arm.check).finish()
+            with self.subTest(request=request):
+                self.assertEqual(bytes(os_api.data),b'');self.assertTrue(h.packet_cancelled)
+                self.assertTrue(h.packet_stdin_closed);self.assertTrue(stop['reaped'] and stop['stdout_eof'] and stop['stderr_eof'])
+
+    def test_partial_frame_never_sends_remaining_bytes_after_cancellation(self):
+        h,owner,c,os_api,signals=self.queued_handle(partial=True);prefix=bytes(os_api.data)
+        self.assertEqual(len(prefix),3)
+        d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=lambda:'TERM').finish()
+        self.assertEqual(bytes(os_api.data),prefix);self.assertEqual(h.packet_offset,3);self.assertTrue(h.packet_cancelled)
+
+    def test_suppression_survives_close_error_and_later_poll_attempt(self):
+        h,owner,c,os_api,signals=self.queued_handle(close_error=True)
+        with self.assertRaises(RuntimeError):d.OwnedWorker(h,owner,c,c.wait,130.,160.,stop_request=lambda:'TERM').finish()
+        self.assertTrue(h.packet_cancelled);self.assertEqual(bytes(os_api.data),b'')
+        h.deliver_packet()  # must return before any descriptor/clock/write callback
+        self.assertEqual(bytes(os_api.data),b'')
+        with self.assertRaises(d.Refused):h.poll()  # closed PIDFD; cannot dispatch
+        self.assertEqual(bytes(os_api.data),b'')
+
+
+class GuardianPacketPredicateTests(unittest.TestCase):
+    def guard_expression(self,reason):
+        # Future synthetic test only: project the exact production predicate,
+        # preserving the strict require contract and without native imports.
+        text=getattr(d,'__source_text__',SOURCE_TEXT)
+        method=next(n for n in ast.parse(text).body if isinstance(n,ast.FunctionDef) and n.name=='guardian_main')
+        calls=[n for n in ast.walk(method) if isinstance(n,ast.Call) and isinstance(n.func,ast.Name) and n.func.id=='require'
+               and len(n.args)==2 and isinstance(n.args[1],ast.Constant) and n.args[1].value==reason]
+        self.assertEqual(len(calls),1)
+        return compile(ast.Expression(body=calls[0].args[0]),'<memory-actual-guardian-predicate>','eval')
+
+    def test_actual_chunk_guard_returns_bool_and_accepts_nonempty_bytes_only(self):
+        code=self.guard_expression('GUARDIAN_PACKET_EOF')
+        class Untouched:
+            def __bool__(self):raise AssertionError('FOREIGN_BOOL_CALLED')
+            def __len__(self):raise AssertionError('FOREIGN_LEN_CALLED')
+        for chunk,expected in ((b'x',True),(b'{"synthetic":true}\n',True),(b'',False),
+                               ('not-bytes',False),(bytearray(b'x'),False),(None,False),(Untouched(),False)):
+            value=eval(code,{'type':type,'bytes':bytes,'len':len,'chunk':chunk})
+            with self.subTest(expected=expected,type=type(chunk).__name__):
+                self.assertIs(type(value),bool);self.assertIs(value,expected)
+                if expected:d.require(value,'SYNTHETIC_CHUNK_GUARD')
+                else:
+                    with self.assertRaises(d.Refused):d.require(value,'SYNTHETIC_CHUNK_GUARD')
+
+    def test_actual_frame_guard_keeps_newline_and_packet_SHA_binding(self):
+        code=self.guard_expression('GUARDIAN_PACKET_PIN');raw=d.canonical(packet()).encode()
+        digest=hashlib.sha256(raw).hexdigest()
+        for data,expected_sha,accepted in ((raw+b'\n',digest,True),(raw,digest,False),
+              (raw+b'\n\n',digest,False),(raw+b'\ntrailing',digest,False),(raw+b'\n','f'*64,False)):
+            result=eval(code,{'data':bytearray(data),'expected_sha':expected_sha,'hashlib':hashlib})
+            self.assertIs(type(result),bool);self.assertIs(result,accepted)
+            if accepted:d.require(result,'SYNTHETIC_FRAME_GUARD')
+            else:
+                with self.assertRaises(d.Refused):d.require(result,'SYNTHETIC_FRAME_GUARD')
+
+
 if __name__=='__main__':
     mode=sys.argv[1] if len(sys.argv)>1 else 'selected'
     argparse.ArgumentParser();events=[]
@@ -855,6 +1151,58 @@ if __name__=='__main__':
     sys.addaudithook(fence)
     class Quiet(unittest.TextTestResult):
         def _exc_info_to_string(self,err,test):return 'ASSERTION_FAILURE' if issubclass(err[0],AssertionError) else 'UNEXPECTED_ERROR '+err[0].__name__
+    if mode=='F8-v8-focused':
+        suite=unittest.TestSuite(unittest.defaultTestLoader.loadTestsFromTestCase(case)
+                                for case in (F8RevisionTests,GuardianPacketPredicateTests))
+        result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(suite)
+        print(json.dumps({'status':'SYNTHETIC_ONLY','methods':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'prohibited_events':events}))
+        raise SystemExit(0 if result.wasSuccessful() and not events else 1)
+    if mode=='F8-v8-mutant':
+        original=d;before="require(type(chunk) is bytes and len(chunk)>0,'GUARDIAN_PACKET_EOF')"
+        after="require(type(chunk) is bytes and chunk,'GUARDIAN_PACKET_EOF')"
+        assert source_text.count(before)==1
+        changed=source_text.replace(before,after,1);module=types.ModuleType('F8_v8_predicate_mutant');sys.modules[module.__name__]=module
+        exec(compile(changed,'<memory-restored-byte-predicate>','exec'),module.__dict__);module.__source_text__=changed;d=module
+        result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(unittest.TestSuite([
+            GuardianPacketPredicateTests('test_actual_chunk_guard_returns_bool_and_accepts_nonempty_bytes_only')]))
+        d=original;detected=bool(result.failures) and not result.errors
+        print(json.dumps({'name':'restore_byte_valued_packet_guard','assertion_failures':len(result.failures),'errors':len(result.errors),'detected':detected,'prohibited_events':events}))
+        raise SystemExit(0 if detected and not events else 1)
+    if mode=='F8-v7-focused':
+        result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(unittest.defaultTestLoader.loadTestsFromTestCase(F8RevisionTests))
+        print(json.dumps({'status':'SYNTHETIC_ONLY','methods':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'prohibited_events':events}))
+        raise SystemExit(0 if result.wasSuccessful() and not events else 1)
+    if mode=='F8-v7-mutants':
+        original=d;outcomes=[]
+        variants=[('repeat_initial_freshness','bound,call,caps=bind_guardian_packet(raw,expected_sha,runtime.clock(),origin=origin,arm=arm)',
+                   'bound,call,caps=bind_live(raw,expected_sha,runtime.clock())','test_actual_guardian_main_uses_continuation_after_six_second_bootstrap'),
+                  ('omit_cancel_before_delivery','                if cancelled:\n','                if False and cancelled:\n','test_actual_queued_packet_is_suppressed_before_poll_for_TERM_and_KILL')]
+        for index,(name,before,after,method) in enumerate(variants):
+            assert source_text.count(before)==1,name
+            changed=source_text.replace(before,after,1);module=types.ModuleType('F8_v7_mutant_'+str(index));sys.modules[module.__name__]=module
+            exec(compile(changed,'<memory-V7-omission>','exec'),module.__dict__);module.__source_text__=changed;d=module
+            result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(unittest.TestSuite([F8RevisionTests(method)]))
+            outcomes.append({'name':name,'assertion_failures':len(result.failures),'errors':len(result.errors),'detected':bool(result.failures) and not result.errors})
+        d=original;print(json.dumps({'mutants':outcomes,'prohibited_events':events}))
+        raise SystemExit(0 if all(x['detected'] for x in outcomes) and not events else 1)
+    if mode=='F8-focused':
+        result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(unittest.defaultTestLoader.loadTestsFromTestCase(F8GuardianTests))
+        print(json.dumps({'status':'SYNTHETIC_ONLY','methods':result.testsRun,'failures':len(result.failures),'errors':len(result.errors),'prohibited_events':events}))
+        raise SystemExit(0 if result.wasSuccessful() and not events else 1)
+    if mode=='F8-mutants':
+        original=d;outcomes=[]
+        for index,(name,before,after,method) in enumerate([
+            ('omit_parent_death','if dead or control in (b"T",b"TK",b"EOF"):','if control in (b"T",b"TK",b"EOF"):','test_original_parent_death_latches_without_parent_finally'),
+            ('omit_cancel_callback','request=self.stop_request() if self.stop_request is not None else "NONE"','request="NONE"','test_caller_loss_requests_early_TERM_and_owns_reap_close'),
+            ('omit_arm_gate','require(arm.armed is True and arm.end==end and same_reader(arm.clock,original_clock),"GUARDIAN_ARM_REQUIRED")','require(True,"GUARDIAN_ARM_REQUIRED")','test_unarmed_guard_refuses_before_worker_creation'),
+            ('omit_both_EOF','                if done:break','                if True:break','test_actual_guardian_supervision_success_requires_both_EOF')]):
+            assert source_text.count(before)==1,name
+            module=types.ModuleType('F8_mutant_'+str(index));sys.modules[module.__name__]=module
+            exec(compile(source_text.replace(before,after,1),'<inert-F8-omission>','exec'),module.__dict__);d=module
+            result=unittest.TextTestRunner(verbosity=2,resultclass=Quiet).run(unittest.TestSuite([F8GuardianTests(method)]))
+            outcomes.append({'name':name,'assertion_failures':len(result.failures),'errors':len(result.errors),'detected':bool(result.failures) and not result.errors})
+        d=original;print(json.dumps({'mutants':outcomes,'prohibited_events':events}))
+        raise SystemExit(0 if all(x['detected'] for x in outcomes) and not events else 1)
     if mode=='FR-mutants':
         original=d;outcomes=[]
         for index,(name,start,end,case,method) in enumerate([
