@@ -413,7 +413,7 @@ jobs:
 
       - name: Upload report artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: grid-bringup-report
           path: /tmp/bringup-artifact/report.md
