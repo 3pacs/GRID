@@ -808,6 +808,183 @@ def write_diary_entry(
     return result
 
 
+_REFERENCE_REPAIR_ID = "yf_close_reference_correction_20261017_v1"
+_REFERENCE_EVIDENCE_AT = datetime(2026, 10, 17, 3, 34, 1, tzinfo=timezone.utc)
+_REFERENCE_APPENDED_AT = datetime(2026, 10, 17, 3, 50, 3, 199022, tzinfo=timezone.utc)
+_REFERENCE_ROWS = {
+    1958031151: ("2026-10-09", 7811.54, 1957381504, "d6c4a75cebeb9254c58c0aabd9865a5d85b2de8ef318cce44b707d6ec088755f"),
+    1958031152: ("2026-10-12", 7807.24, 1957631102, "f0e72ed4c8da249bd9682c6fc5c68167f909234cc3392d7a23c53bfdfb24d83b"),
+    1958031153: ("2026-10-14", 7718.94, 1957833018, "110a9e51aab0a6b956c7beff8b3726229dffe1ea21340da2bc28fec961f99c37"),
+    1958031154: ("2026-10-15", 7744.06, 1957902402, "3c53e7f386262c057f1d3d195e8f52f05db2efffe6a0601d5060aec0707b6b78"),
+}
+_REFERENCE_ORIGINALS = {
+    1957381504: "030b9f10900e488f36bed438a3a8cb681d4a3a0dc9940611e2c74eeb8d5e0e48",
+    1957631102: "cbcde1d46bf3f325cf184f4949d61241d2afbe043c8b6546135e591ee9d8652d",
+    1957797135: "282d8f6ef37b0149c401883119c8e00ce5b2ff5541252a88dfa1a8cf72e6d81b",
+    1957833018: "c16274de7ed32a7f6c8fbb65c5d15f28e9b297261ae955d6c14d49bc2a7f934d",
+    1957902402: "ed35597a1f3b63bf81d2647d300fce0ca1e9f0ba8c258d34e5eba82d922aecb9",
+}
+_REFERENCE_PUBLICATIONS = {
+    date(2026, 10, 14): (14, "acb937ee66b148d9609c2b9fafd2ddbcf259998362be42b11b88fd730cf27c62",
+                          datetime(2026, 10, 14, 22, 34, 55, 125807, tzinfo=timezone.utc)),
+    date(2026, 10, 15): (15, "671c264139652f9eccc6b2c98b18599f47c90db030ac7a94dc2853879ce18ac7",
+                          datetime(2026, 10, 15, 22, 34, 32, 430266, tzinfo=timezone.utc)),
+}
+
+
+def _reference_timestamp(value: Any) -> datetime:
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value[:-1] + "+00:00" if value.endswith("Z") else value)
+    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("reference_as_of must be an offset-aware ISO timestamp")
+    return value.astimezone(timezone.utc)
+
+
+def _reference_snapshot_rows(rows: Any, expected: dict[int, str]) -> dict[int, dict[str, Any]]:
+    """Accept only the exact committed native snapshots, not caller flags."""
+    result = {}
+    for body, digest, db_timezone in rows:
+        # Native receipt hashes use PostgreSQL's UTC to_jsonb serialization.
+        # Refuse another session timezone rather than changing connection state.
+        if db_timezone not in ("UTC", "Etc/UTC"):
+            raise ValueError("utc_snapshot_required")
+        body = json.loads(body) if isinstance(body, str) else body
+        if not isinstance(body, dict):
+            raise ValueError("snapshot_malformed")
+        row_id = body.get("id")
+        if type(row_id) is not int or row_id not in expected or row_id in result or digest != expected[row_id]:
+            raise ValueError("snapshot_membership_or_preimage_changed")
+        result[row_id] = body
+    if set(result) != set(expected):
+        raise ValueError("snapshot_set_incomplete")
+    return result
+
+
+def get_diary_reference_review(
+    engine: Engine, target_date: date, *, reference_as_of: datetime | str,
+) -> dict[str, Any]:
+    """Opt-in historical display only; bounded SELECTs, no ensure_table/writer.
+
+    Original publication fields remain separate from quarantined reference
+    evidence. This never changes a raw/resolved value, narrative or score.
+    """
+    if type(target_date) is not date:
+        raise ValueError("an explicit diary date is required")
+    cutoff = _reference_timestamp(reference_as_of)
+    output: dict[str, Any] = {
+        "date": target_date.isoformat(), "reference_as_of": cutoff.isoformat(),
+        "original": None,
+        "reference": {"status": "unavailable", "reason": "outside_review_scope"},
+        "review_only": True, "scoring_admission": "held",
+    }
+    publication = _REFERENCE_PUBLICATIONS.get(target_date)
+    if publication is None:
+        return output
+    pub_id, pub_hash, published_at = publication
+    if cutoff < published_at:
+        output["reference"]["reason"] = "original_publication_after_as_of"
+        return output
+    try:
+        with engine.connect() as conn:
+            # One bounded statement gives a single PostgreSQL MVCC snapshot
+            # across the publication, original vintages and correction set.
+            # Hashes cover full native records; no connection state is changed.
+            rows = conn.execute(text("""
+                WITH publication AS (
+                    SELECT to_jsonb(d) AS body FROM public.market_diary d
+                    WHERE d.id = :id AND d.date = :date AND d.generated_at <= :as_of
+                    LIMIT 2
+                ), originals AS (
+                    SELECT to_jsonb(r) AS body FROM public.raw_series r
+                    WHERE :reference_visible AND r.id = ANY(CAST(:original_ids AS bigint[]))
+                    ORDER BY r.id LIMIT 6
+                ), corrections AS (
+                    SELECT to_jsonb(r) AS body FROM public.raw_series r
+                    WHERE :reference_visible AND (
+                        r.id = ANY(CAST(:correction_ids AS bigint[]))
+                        OR (r.series_id = :series AND (
+                            r.raw_payload ->> 'repair_id' = :repair
+                            OR r.obs_date = ANY(CAST(:scoped_dates AS date[]))
+                        ))
+                    ) ORDER BY r.id LIMIT 5
+                ), snapshots AS (
+                    SELECT 'publication' AS kind, body FROM publication
+                    UNION ALL SELECT 'originals', body FROM originals
+                    UNION ALL SELECT 'corrections', body FROM corrections
+                )
+                SELECT kind, body, encode(sha256(convert_to(body::text, 'UTF8')), 'hex'),
+                       current_setting('TimeZone') FROM snapshots
+            """), {"id": pub_id, "date": target_date, "as_of": cutoff,
+                     "reference_visible": cutoff >= _REFERENCE_APPENDED_AT and cutoff >= _REFERENCE_EVIDENCE_AT,
+                     "original_ids": list(_REFERENCE_ORIGINALS), "correction_ids": list(_REFERENCE_ROWS),
+                     "series": "CORRECTION:SP500:close", "repair": _REFERENCE_REPAIR_ID,
+                     "scoped_dates": [date(2026, 10, day) for day in (9, 12, 13, 14, 15)]}).fetchall()
+            groups = {"publication": [], "originals": [], "corrections": []}
+            for kind, body, digest, db_timezone in rows:
+                groups[kind].append((body, digest, db_timezone))
+            original = _reference_snapshot_rows(groups["publication"], {pub_id: pub_hash})[pub_id]
+            output["original"] = original
+            if cutoff < _REFERENCE_EVIDENCE_AT or cutoff < _REFERENCE_APPENDED_AT:
+                output["reference"]["reason"] = "reference_not_available_at_as_of"
+                return output
+            originals = _reference_snapshot_rows(groups["originals"], _REFERENCE_ORIGINALS)
+            corrections = _reference_snapshot_rows(groups["corrections"], {key: value[3] for key, value in _REFERENCE_ROWS.items()})
+            for row_id, row in corrections.items():
+                day, value, original_id, _ = _REFERENCE_ROWS[row_id]
+                payload = row.get("raw_payload")
+                if (row.get("source_id") != 1 or row.get("pull_status") != "QUARANTINED"
+                        or row.get("series_id") != "CORRECTION:SP500:close"
+                        or row.get("obs_date") != day or row.get("value") != value
+                        or not isinstance(payload, dict)
+                        or payload.get("repair_id") != _REFERENCE_REPAIR_ID
+                        or payload.get("original_row_id") != original_id
+                        or payload.get("is_yahoo_capture") is not False
+                        or payload.get("yahoo_policy_qualified") is not False
+                        or payload.get("consumption_admission") != "WITHHELD_REFERENCE_EVIDENCE_ONLY"
+                        or _reference_timestamp(row.get("pull_timestamp")) != _REFERENCE_APPENDED_AT
+                        or _reference_timestamp(payload.get("database_appended_at")) != _REFERENCE_APPENDED_AT
+                        or _reference_timestamp(payload.get("public_evidence_observed_at")) != _REFERENCE_EVIDENCE_AT):
+                    raise ValueError("reference_binding_changed")
+                if cutoff < _reference_timestamp(row["pull_timestamp"]):
+                    raise ValueError("reference_not_available_at_as_of")
+            # Full correction hashes also bind all payload lineage and original
+            # snapshot pins; do not infer a fresh receipt from matching values.
+            payload = corrections[1958031151]["raw_payload"]
+            lineage = [p for p in payload["original_publications"] if p["id"] == pub_id]
+            if len(lineage) != 1 or lineage[0]["original_record_sha256"] != pub_hash:
+                raise ValueError("publication_lineage_changed")
+            record = lineage[0]
+            output["reference"] = {
+                "status": "available", "kind": "historical_reference_review",
+                "repair_id": _REFERENCE_REPAIR_ID,
+                "source": payload["benchmark_source"], "url": payload["benchmark_URL"],
+                "basis": payload["basis"], "status_of_stored_rows": "QUARANTINED",
+                "evidence_observed_at": _REFERENCE_EVIDENCE_AT.isoformat(),
+                "database_appended_at": _REFERENCE_APPENDED_AT.isoformat(),
+                "original_publication_at": original["generated_at"],
+                "correction_notice_published_at": None,
+                "original_input_row_receipt_present": False,
+                "lineage_basis": record["lineage_basis"],
+                "sp500": {"obs_date": target_date.isoformat(),
+                          "close": record["counterfactual_reference_close"],
+                          "prior_close": record["counterfactual_reference_prior"],
+                          "change": record["counterfactual_reference_change"]},
+                "correction_rows": [{"id": key, "obs_date": row["obs_date"], "value": row["value"],
+                                     "original_row_id": row["raw_payload"]["original_row_id"]}
+                                    for key, row in sorted(corrections.items())],
+                "oct13_agreement": {"original_row_id": 1957797135,
+                                    "original_value": originals[1957797135]["value"],
+                                    "reference_close": 7805.45, "numeric_correction_appended": False},
+                "scope_note": "S&P 500 reference only; original narrative and other assets remain as published.",
+            }
+            return output
+    except Exception:
+        # No synthesized corrected move on missing/conflicting/corrupt records
+        # or read failure. A verified original, if obtained, stays separate.
+        output["reference"] = {"status": "unavailable", "reason": "reference_integrity_or_read_failure"}
+        return output
+
+
 def get_diary_entry(engine: Engine, target_date: date | None = None) -> dict[str, Any] | None:
     """Retrieve a diary entry for a specific date.
 
