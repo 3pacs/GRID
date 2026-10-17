@@ -7,6 +7,11 @@ daily pull (the plan's evidence: ~821 rows re-inserted daily, multiplying
 the row count ~30x/month). _resolve_signal_date() now anchors gov_contracts
 to a stable quarter-end date so repeat pulls of unchanged data hit the same
 (source_type, source_id, ticker, signal_date, signal_type) key.
+
+QuiverQuant's (Year, Qtr) is the US federal FISCAL quarter, so the anchor is the
+fiscal quarter end (FY Y Q1 = Oct-Dec of Y-1 ... Q4 = Jul-Sep of Y); GD-FIX first
+read it as a calendar quarter (see tests/test_quiverquant_act_keys.py for the
+full four-quarter mapping and the re-date transition).
 """
 
 from __future__ import annotations
@@ -20,12 +25,12 @@ from ingestion.altdata.quiverquant import (
 
 
 def test_gov_contract_period_date_from_year_qtr():
-    assert _gov_contract_period_date({"Year": 2026, "Qtr": 1}) == date(2026, 3, 31)
-    assert _gov_contract_period_date({"Year": 2026, "Qtr": 4}) == date(2026, 12, 31)
+    assert _gov_contract_period_date({"Year": 2026, "Qtr": 1}) == date(2025, 12, 31)
+    assert _gov_contract_period_date({"Year": 2026, "Qtr": 4}) == date(2026, 9, 30)
 
 
 def test_gov_contract_period_date_accepts_lowercase_and_string_keys():
-    assert _gov_contract_period_date({"year": "2025", "qtr": "3"}) == date(2025, 9, 30)
+    assert _gov_contract_period_date({"year": "2025", "qtr": "3"}) == date(2025, 6, 30)
 
 
 def test_gov_contract_period_date_none_when_missing():
@@ -43,7 +48,7 @@ def test_resolve_signal_date_gov_contracts_is_stable_across_repeat_pulls():
     rec = {"Ticker": "LMT", "Year": 2026, "Qtr": 2, "Amount": 5_000_000}
     day1 = _resolve_signal_date(rec, "gov_contracts", today=date(2026, 6, 1))
     day2 = _resolve_signal_date(rec, "gov_contracts", today=date(2026, 6, 2))
-    assert day1 == day2 == date(2026, 6, 30)
+    assert day1 == day2 == date(2026, 3, 31)
 
 
 def test_resolve_signal_date_gov_contracts_falls_back_to_today_without_year_qtr():

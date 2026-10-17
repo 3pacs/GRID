@@ -41,6 +41,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import feed_source_id, feed_source_id_sql
+
 
 # ── Constants ─────────────────────────────────────────────────────────────
 
@@ -178,14 +180,22 @@ MIN_SCORED_SIGNALS: int = 3
 # Events from pullers below this Bayesian trust are not surfaced.
 MIN_EVENT_TRUST: float = 0.02
 
-_IDENTITY_SQL = """
+# QuiverQuant act rows carry ``qq_<endpoint>:<act identity>`` as source_id; when
+# the payload has no person the fallback is the constant feed id, exactly what
+# it was before act keys existed (see ingestion.altdata.quiverquant_identity).
+_QQ_FEED_ID_SQL = feed_source_id_sql("source_id")
+
+_IDENTITY_SQL = f"""
     CASE
         WHEN source_type = 'options_flow' THEN regexp_replace(source_id, '_[0-9.]+$', '')
-        WHEN source_type = 'quiverquant:house' THEN COALESCE(signal_value->>'Representative', source_id)
-        WHEN source_type = 'quiverquant:senate' THEN COALESCE(signal_value->>'Senator', source_id)
-        WHEN source_type = 'quiverquant:insider' THEN COALESCE(signal_value->>'Name', source_id)
+        WHEN source_type = 'quiverquant:house'
+            THEN COALESCE(signal_value->>'Representative', {_QQ_FEED_ID_SQL})
+        WHEN source_type = 'quiverquant:senate'
+            THEN COALESCE(signal_value->>'Senator', {_QQ_FEED_ID_SQL})
+        WHEN source_type = 'quiverquant:insider'
+            THEN COALESCE(signal_value->>'Name', {_QQ_FEED_ID_SQL})
         WHEN source_type = 'quiverquant:lobbying'
-            THEN COALESCE(signal_value->>'Registrant', signal_value->>'Client', source_id)
+            THEN COALESCE(signal_value->>'Registrant', signal_value->>'Client', {_QQ_FEED_ID_SQL})
         ELSE source_id
     END
 """
@@ -329,8 +339,9 @@ def puller_identity(source_type: str, source_id: str, signal_value: Any = None) 
     """The actor behind a signal_sources row (mirrors ``_IDENTITY_SQL``).
 
     options_flow rows are keyed whale_<ticker>_<strike>; the puller is the
-    underlying's options tape. QuiverQuant feeds use one constant source_id
-    per endpoint, so the person is read from signal_value.
+    underlying's options tape. QuiverQuant feeds key source_id by act
+    (``qq_<endpoint>:<identity>``), so the person is read from signal_value;
+    with no person in the payload the constant feed id is returned.
     """
     st = (source_type or "").lower()
     sid = source_id or ""
@@ -353,7 +364,7 @@ def puller_identity(source_type: str, source_id: str, signal_value: Any = None) 
         v = details.get(f) if isinstance(details, dict) else None
         if v:
             return str(v).strip()
-    return sid
+    return feed_source_id(sid)
 
 
 def puller_id_for(source_type: str, source_id: str, signal_value: Any = None) -> str:

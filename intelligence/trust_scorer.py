@@ -30,8 +30,11 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
+
+from ingestion.altdata.quiverquant_identity import feed_source_id, feed_source_id_sql
+from ingestion.altdata import quiverquant_transactions as tx
 
 
 # ── Constants ──────────────────────────────────────────────────────────────
@@ -925,7 +928,7 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
 
     sources_updated: list[dict[str, Any]] = []
 
-    with engine.begin() as conn:
+    with engine.connect() as conn:
         scored_rows = conn.execute(text("""
             SELECT source_type, source_id, outcome, outcome_return, signal_date, ticker
             FROM signal_sources
@@ -933,124 +936,157 @@ def update_trust_scores(engine: Engine) -> dict[str, Any]:
             ORDER BY source_type, source_id, signal_date DESC
         """)).fetchall()
 
-        if not scored_rows:
-            log.info("No scored sources to update trust for")
-            return {"sources": [], "total": 0}
+    if not scored_rows:
+        log.info("No scored sources to update trust for")
+        return {"sources": [], "total": 0}
 
-        rows_by_source: dict[tuple[str, str], list[tuple[Any, Any, Any, Any]]] = {}
-        source_keys: list[tuple[str, str]] = []
-        for src_type, src_id, outcome, ret, sig_date, ticker in scored_rows:
-            key = (src_type, src_id)
-            if key not in rows_by_source:
-                rows_by_source[key] = []
-                source_keys.append(key)
-            rows_by_source[key].append((outcome, ret, sig_date, ticker))
+    rows_by_source: dict[tuple[str, str], list[tuple[Any, Any, Any, Any]]] = {}
+    source_keys: list[tuple[str, str]] = []
+    for src_type, src_id, outcome, ret, sig_date, ticker in scored_rows:
+        # QuiverQuant act rows (qq_<endpoint>:<identity>) are scored as one
+        # feed, exactly as when they shared a constant source_id; trust per
+        # single act would be one outcome with a prior.
+        key = (src_type, feed_source_id(src_id))
+        if key not in rows_by_source:
+            rows_by_source[key] = []
+            source_keys.append(key)
+        rows_by_source[key].append((outcome, ret, sig_date, ticker))
 
-        log.info("Updating trust scores for {n} sources", n=len(source_keys))
+    log.info("Updating trust scores for {n} sources", n=len(source_keys))
 
-        for src_type, src_id in source_keys:
-            rows = rows_by_source.get((src_type, src_id), [])
+    for src_type, src_id in source_keys:
+        rows = rows_by_source.get((src_type, src_id), [])
 
-            if not rows:
-                continue
+        if not rows:
+            continue
 
-            weighted_hits = 0.0
-            weighted_misses = 0.0
-            raw_hits = 0
-            raw_misses = 0
-            hit_returns: list[float] = []
-            ticker_hits: dict[str, int] = {}
-            ticker_totals: dict[str, int] = {}
-            last_signal_date = None
+        weighted_hits = 0.0
+        weighted_misses = 0.0
+        raw_hits = 0
+        raw_misses = 0
+        hit_returns: list[float] = []
+        ticker_hits: dict[str, int] = {}
+        ticker_totals: dict[str, int] = {}
+        last_signal_date = None
 
-            for outcome, ret, sig_date, ticker in rows:
-                sig_dt = sig_date if isinstance(sig_date, date) else sig_date.date()
+        for outcome, ret, sig_date, ticker in rows:
+            sig_dt = sig_date if isinstance(sig_date, date) else sig_date.date()
 
-                if last_signal_date is None:
-                    last_signal_date = sig_dt
+            # Rows of one feed interleave (their source_ids differ per act),
+            # so the newest date is a max, not the first row seen.
+            if last_signal_date is None or sig_dt > last_signal_date:
+                last_signal_date = sig_dt
 
-                # Recency weight: exponential decay from today
-                days_ago = (today - sig_dt).days
-                weight = math.exp(-decay_lambda * days_ago)
+            # Recency weight: exponential decay from today
+            days_ago = (today - sig_dt).days
+            weight = math.exp(-decay_lambda * days_ago)
 
-                ticker_totals[ticker] = ticker_totals.get(ticker, 0) + 1
+            ticker_totals[ticker] = ticker_totals.get(ticker, 0) + 1
 
-                if outcome == "CORRECT":
-                    weighted_hits += weight
-                    raw_hits += 1
-                    ticker_hits[ticker] = ticker_hits.get(ticker, 0) + 1
-                    if ret is not None:
-                        hit_returns.append(float(ret))
-                else:
-                    weighted_misses += weight
-                    raw_misses += 1
+            if outcome == "CORRECT":
+                weighted_hits += weight
+                raw_hits += 1
+                ticker_hits[ticker] = ticker_hits.get(ticker, 0) + 1
+                if ret is not None:
+                    hit_returns.append(float(ret))
+            else:
+                weighted_misses += weight
+                raw_misses += 1
 
-            # Bayesian trust score with informed prior from source_trust_config
-            # Instead of flat Beta(1,1), use the source's base_trust as prior.
-            # Prior strength of 5 pseudo-observations: enough to bias new sources
-            # toward their tier, but quickly overridden by real data.
+        # Bayesian trust score with informed prior from source_trust_config
+        # Instead of flat Beta(1,1), use the source's base_trust as prior.
+        # Prior strength of 5 pseudo-observations: enough to bias new sources
+        # toward their tier, but quickly overridden by real data.
+        try:
+            from intelligence.source_trust_config import get_trust as _get_source_trust
+            base_trust = _get_source_trust(src_type).get("base_trust", 0.5)
+        except Exception:
+            base_trust = 0.5
+        prior_strength = 5.0
+        alpha_prior = base_trust * prior_strength
+        beta_prior = (1.0 - base_trust) * prior_strength
+        trust = (weighted_hits + alpha_prior) / (
+            weighted_hits + weighted_misses + alpha_prior + beta_prior
+        )
+
+        total_signals = raw_hits + raw_misses
+        win_rate = raw_hits / total_signals if total_signals > 0 else 0.0
+        avg_return = sum(hit_returns) / len(hit_returns) if hit_returns else 0.0
+
+        # Best ticker: highest hit rate with at least 2 signals
+        best_ticker = ""
+        best_ticker_rate = 0.0
+        for t, total in ticker_totals.items():
+            if total >= 2:
+                rate = ticker_hits.get(t, 0) / total
+                if rate > best_ticker_rate:
+                    best_ticker_rate = rate
+                    best_ticker = t
+
+        # Average lead time: hours between signal and the move
+        # (approximated as eval_window * 24 / 2 for now; refined when we
+        #  have intraday timestamps)
+        eval_window = EVALUATION_WINDOWS.get(src_type, 7)
+        avg_lead = eval_window * 24.0 / 2.0
+
+        sources_updated.append({
+            "source_type": src_type,
+            "source_id": src_id,
+            "trust_score": round(trust, 4),
+            "hit_count": raw_hits,
+            "miss_count": raw_misses,
+            "total_signals": total_signals,
+            "win_rate": round(win_rate, 4),
+            "avg_lead_time_hours": round(avg_lead, 1),
+            "avg_return_on_hits": round(avg_return, 4),
+            "best_ticker": best_ticker,
+            "last_signal_date": str(last_signal_date) if last_signal_date else "",
+        })
+
+        # Propagate unchanged aggregates to explicit pages. One UPDATE per
+        # short transaction changes at most 50 rows for every source.
+        params = {
+            "keyed_prefix": f"{src_id}:" if src_id.startswith("qq_") else None,
+            "keyed_len": len(src_id) + 1,
+            "ts": round(trust, 4), "hc": raw_hits, "mc": raw_misses,
+            "alt": round(avg_lead, 1), "st": src_type, "si": src_id,
+        }
+        after_id = 0
+        propagated = 0
+        while True:
+            changed = 0
             try:
-                from intelligence.source_trust_config import get_trust as _get_source_trust
-                base_trust = _get_source_trust(src_type).get("base_trust", 0.5)
-            except Exception:
-                base_trust = 0.5
-            prior_strength = 5.0
-            alpha_prior = base_trust * prior_strength
-            beta_prior = (1.0 - base_trust) * prior_strength
-            trust = (weighted_hits + alpha_prior) / (
-                weighted_hits + weighted_misses + alpha_prior + beta_prior
-            )
-
-            total_signals = raw_hits + raw_misses
-            win_rate = raw_hits / total_signals if total_signals > 0 else 0.0
-            avg_return = sum(hit_returns) / len(hit_returns) if hit_returns else 0.0
-
-            # Best ticker: highest hit rate with at least 2 signals
-            best_ticker = ""
-            best_ticker_rate = 0.0
-            for t, total in ticker_totals.items():
-                if total >= 2:
-                    rate = ticker_hits.get(t, 0) / total
-                    if rate > best_ticker_rate:
-                        best_ticker_rate = rate
-                        best_ticker = t
-
-            # Average lead time: hours between signal and the move
-            # (approximated as eval_window * 24 / 2 for now; refined when we
-            #  have intraday timestamps)
-            eval_window = EVALUATION_WINDOWS.get(src_type, 7)
-            avg_lead = eval_window * 24.0 / 2.0
-
-            sources_updated.append({
-                "source_type": src_type,
-                "source_id": src_id,
-                "trust_score": round(trust, 4),
-                "hit_count": raw_hits,
-                "miss_count": raw_misses,
-                "total_signals": total_signals,
-                "win_rate": round(win_rate, 4),
-                "avg_lead_time_hours": round(avg_lead, 1),
-                "avg_return_on_hits": round(avg_return, 4),
-                "best_ticker": best_ticker,
-                "last_signal_date": str(last_signal_date) if last_signal_date else "",
-            })
-
-            # Propagate aggregates to all rows for this source
-            conn.execute(text("""
-                UPDATE signal_sources
-                SET trust_score = :ts,
-                    hit_count = :hc,
-                    miss_count = :mc,
-                    avg_lead_time_hours = :alt
-                WHERE source_type = :st AND source_id = :si
-            """), {
-                "ts": round(trust, 4),
-                "hc": raw_hits,
-                "mc": raw_misses,
-                "alt": round(avg_lead, 1),
-                "st": src_type,
-                "si": src_id,
-            })
+                with tx.write_transaction(engine) as (conn, check):
+                    ids = [row[0] for row in conn.execute(text("""
+                        SELECT id FROM signal_sources
+                        WHERE id > :after_id AND source_type = :st
+                          AND (source_id = :si
+                               OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
+                                   AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
+                        ORDER BY id LIMIT 50
+                    """), {**params, "after_id": after_id}).fetchall()]
+                    if ids:
+                        check()
+                        changed = conn.execute(text("""
+                            UPDATE signal_sources
+                            SET trust_score = :ts, hit_count = :hc, miss_count = :mc,
+                                avg_lead_time_hours = :alt
+                            WHERE id IN :target_ids AND source_type = :st
+                              AND (source_id = :si
+                                   OR (CAST(:keyed_prefix AS TEXT) IS NOT NULL
+                                       AND substr(source_id, 1, :keyed_len) = :keyed_prefix))
+                        """).bindparams(bindparam("target_ids", expanding=True)),
+                            {**params, "target_ids": ids}).rowcount
+            except Exception as exc:
+                if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                    propagated += int(changed)
+                exc.trust_rows_updated = sum(s.get("propagated_rows", 0) for s in sources_updated) + propagated
+                raise
+            if not ids:
+                break
+            propagated += int(changed)
+            after_id = max(ids)
+        sources_updated[-1]["propagated_rows"] = propagated
 
     # Rank by trust score descending
     sources_updated.sort(key=lambda s: -s["trust_score"])
@@ -1198,19 +1234,20 @@ def get_trusted_sources(
 
     with engine.connect() as conn:
         rows = conn.execute(text("""
-            SELECT source_type, source_id,
+            SELECT source_type, {feed_id} AS source_id,
                    trust_score, hit_count, miss_count,
                    avg_lead_time_hours,
                    MAX(signal_date) AS last_signal,
                    COUNT(*) AS total_signals
             FROM signal_sources
             WHERE outcome IN ('CORRECT', 'WRONG')
-            GROUP BY source_type, source_id, trust_score, hit_count,
+            GROUP BY source_type, {feed_id}, trust_score, hit_count,
                      miss_count, avg_lead_time_hours
             HAVING (hit_count + miss_count) >= :min_sig
                AND trust_score >= :min_trust
             ORDER BY trust_score DESC
-        """), {"min_sig": min_signals, "min_trust": min_trust}).fetchall()
+        """.replace("{feed_id}", feed_source_id_sql("source_id"))),
+            {"min_sig": min_signals, "min_trust": min_trust}).fetchall()
 
     results: list[SourceScore] = []
     for rank, r in enumerate(rows, 1):
