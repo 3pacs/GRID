@@ -284,3 +284,25 @@ runtime effect occurred for V8. Same retained reviewer performs static review;
 future test or target actions require their own applicable authority. Hermes717
 pin adoption, target F1–F8 qualification and sole OriginalClaude operator holds
 remain separate and unresolved; old spent calls cannot be reused.
+
+### PR857 CI fixture subject correction (source preparation only)
+
+The retained worker-transport fixtures expected cgroup join, three worker rlimits,
+`api.handle`, and worker partial-handle kill/reap semantics. They now explicitly
+exercise the actual guardian-private `_spawn_worker` body with a real
+`ParentDeathArm` backed by inert `GuardIO`. Its nested ctypes import is projected
+in a private function-globals dictionary; it never loads host libc or calls
+host prctl, and it does not patch process-global modules. The production body,
+arm/type/deadline checks, handle/EOF checks and every original assertion remain.
+
+Separate prepared top-level `NativeRuntime.launch` body projections cover the
+exclusive/fsynced marker, guardian argv/channels and deferred packet, failure
+before child ownership, and partial-owned-guardian cleanup without raw killing
+that guardian. A precreated fake child is deliberately left open when Popen was
+never reached; closing an unlaunched fixture would be false cleanup evidence.
+The lifecycle complete/missing-EOF pair retains its original pipe-closure checks
+against the owned worker route. This is synthetic source coverage, not native
+qualification or full-suite success. These corrections/new cases are UNRUN;
+the actual four CI failures remain preserved. Driver4bb/producer765 and caller
+pins/default behavior are unchanged. Any later validation/CI requires its own
+exact allocation; no service or execution authority is added here.

@@ -395,6 +395,11 @@ class PipeOS(CGOS):
 
 
 def native_fixture(blocked=False,broken=False):
+    """Actual guardian-private worker transport, with inert OS/preexec boundaries.
+
+    These retained tests assert worker cgroup/rlimits/api.handle semantics, not
+    caller guardian bootstrap. The separate PR857 launch cases cover bootstrap.
+    """
     c=Clock();os_api=PipeOS(blocked);child=Child();seen={};limits=[]
     ops=types.SimpleNamespace(os=os_api,child_type=Child,selector=Selector,send=lambda fd,kind:setattr(child,'code',-15 if kind==signal.SIGTERM else -9))
     class CG:
@@ -409,6 +414,24 @@ def native_fixture(blocked=False,broken=False):
     api=types.SimpleNamespace(os=os_api,Popen=launch,setrlimit=lambda *a:limits.append(a),RLIMIT_AS=1,RLIMIT_CPU=2,RLIMIT_CORE=3,handle=handle)
     rt=d.NativeRuntime(native_api=api,clock=c,wait=c.wait,utc=c.utc)
     context={'receipt_fd':500,'receipt_original_fd':500,'receipt_pin':(1,2,1000),'cgroup':CG()}
+    os_api.getppid=lambda:os_api.getpid()
+    # Keep the actual _spawn_worker code and its strict ParentDeathArm guard.
+    # Only the nested ctypes import is memory-projected; no global module patch
+    # or host CDLL/prctl is permitted even when fake Popen invokes preexec_fn.
+    base=__builtins__ if type(__builtins__) is dict else vars(__builtins__)
+    memory_builtins=dict(base);original_import=memory_builtins['__import__']
+    def memory_import(name,*args,**kwargs):
+        if name=='ctypes':
+            return types.SimpleNamespace(CDLL=lambda *a,**k:types.SimpleNamespace(prctl=lambda *a:0))
+        return original_import(name,*args,**kwargs)
+    memory_builtins['__import__']=memory_import
+    worker_globals=dict(d.__dict__,__builtins__=memory_builtins)
+    spawn=types.FunctionType(d.NativeRuntime._spawn_worker.__code__,worker_globals)
+    def launch_worker(owner,raw):
+        arm=d.ParentDeathArm(7,8,42,ops=GuardIO(),clock=c,
+                             end=json.loads(raw)['call']['t0']+150)
+        return spawn(rt,owner,raw,arm=arm)
+    rt.launch=launch_worker
     return rt,context,child,os_api,c,seen,limits
 
 
@@ -1140,6 +1163,75 @@ class GuardianPacketPredicateTests(unittest.TestCase):
             if accepted:d.require(result,'SYNTHETIC_FRAME_GUARD')
             else:
                 with self.assertRaises(d.Refused):d.require(result,'SYNTHETIC_FRAME_GUARD')
+
+
+class PR857GuardianLaunchTests(unittest.TestCase):
+    """Actual caller-launch code; only OS/Popen/GuardianHandle are inert."""
+    def guardian_fixture(self, *, marker_failure=False, partial=False):
+        rt,ctx,child,os_api,c,seen,limits=native_fixture()
+        marker_names=set();synced=[];opened=os_api.open
+        def exclusive(name,flags,mode=0o777,**kwargs):
+            assert flags & os.O_EXCL and flags & os.O_NOFOLLOW
+            if name in marker_names:raise FileExistsError(name)
+            marker_names.add(name);return opened(name,flags,mode,**kwargs)
+        def fsync(fd):
+            synced.append(fd)
+            if marker_failure:raise RuntimeError('SYNTHETIC_MARKER_FSYNC')
+        os_api.open=exclusive;os_api.fsync=fsync
+        os_api.O_CLOEXEC=os.O_CLOEXEC;os_api.O_NONBLOCK=os.O_NONBLOCK
+        os_api.pipe2=lambda flags:(801,802)
+        def popen(argv,**kwargs):
+            seen['launches']=seen.get('launches',0)+1
+            seen.update(argv=argv,kwargs=kwargs);return child
+        rt.api.Popen=popen
+        class Capture:
+            def __init__(self,owned,owner,cap,clock,end,*,control_fd):
+                if partial:raise RuntimeError('PARTIAL_GUARDIAN_HANDLE')
+                self.child,self.owner,self.control_fd=owned,owner,control_fd
+                self.clock,self.end,self.packet=clock,end,None
+                seen['capture']=self
+            def queue_packet(self,raw,deadline):
+                self.packet=raw+b'\n';self.packet_deadline=deadline
+        # The original body/PINS/checks remain intact; only the handle boundary
+        # is projected in a private globals dict, without changing module d.
+        caller_launch=types.FunctionType(d.NativeRuntime.launch.__code__,
+                                         dict(d.__dict__,GuardianHandle=Capture))
+        return rt,ctx,child,os_api,c,seen,marker_names,synced,caller_launch
+
+    def test_marker_guardian_bootstrap_and_deferred_packet_use_original_bounds(self):
+        rt,ctx,child,ops,c,seen,names,synced,launch=self.guardian_fixture()
+        raw=d.canonical(packet()).encode();handle=launch(rt,ctx,raw)
+        self.assertEqual(len(names),1);self.assertEqual(len(synced),1)
+        self.assertEqual(seen['launches'],1);self.assertNotIn('preexec_fn',seen['kwargs'])
+        self.assertEqual(seen['kwargs']['pass_fds'],(700,801))
+        self.assertTrue(seen['kwargs']['start_new_session'])
+        self.assertEqual(seen['argv'][4:6],('/synthetic/driver.py','--guardian'))
+        self.assertEqual(handle.packet,raw+b'\n');self.assertEqual(ops.data,b'')
+        self.assertEqual((handle.end,handle.packet_deadline),(160.,130.))
+        self.assertEqual(handle.control_fd,802)
+        self.assertIn(700,ops.closed);self.assertIn(801,ops.closed)
+        self.assertNotIn(802,ops.closed);self.assertNotIn('joined',seen)
+        self.assertFalse(child.stdin.closed or child.stdout.closed or child.stderr.closed)
+
+    def test_marker_failure_never_owns_or_closes_precreated_unlaunched_child(self):
+        rt,ctx,child,ops,c,seen,names,synced,launch=self.guardian_fixture(marker_failure=True)
+        raw=d.canonical(packet()).encode()
+        with self.assertRaisesRegex(RuntimeError,'SYNTHETIC_MARKER_FSYNC'):launch(rt,ctx,raw)
+        self.assertEqual(seen,{});self.assertEqual(len(names),1)
+        self.assertFalse(child.killed)
+        self.assertFalse(child.stdin.closed or child.stdout.closed or child.stderr.closed)
+        with self.assertRaises(FileExistsError):launch(rt,ctx,raw)
+        self.assertEqual(seen,{});self.assertEqual(len(names),1)
+
+    def test_partial_guardian_handle_closes_only_owned_child_and_original_channels(self):
+        rt,ctx,child,ops,c,seen,names,synced,launch=self.guardian_fixture(partial=True)
+        raw=d.canonical(packet()).encode()
+        with self.assertRaisesRegex(RuntimeError,'PARTIAL_GUARDIAN_HANDLE'):launch(rt,ctx,raw)
+        self.assertEqual(seen['launches'],1);self.assertFalse(child.killed)
+        self.assertTrue(child.stdin.closed and child.stdout.closed and child.stderr.closed)
+        self.assertTrue(all(fd in ops.closed for fd in (700,801,802)))
+        with self.assertRaises(FileExistsError):launch(rt,ctx,raw)
+        self.assertEqual(seen['launches'],1);self.assertEqual(len(names),1)
 
 
 if __name__=='__main__':
