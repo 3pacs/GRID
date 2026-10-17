@@ -82,7 +82,7 @@ pyarrow>=25.0.1
 polars>=1.40.1
 
 # ML model training
-xgboost>=3.2.0
+xgboost>=3.4.1
 
 # TradingAgents multi-agent framework (optional)
 # Install separately when the private TradingAgents package is available.
