@@ -177,6 +177,53 @@ entry is reported "no close for date" rather than a stale value.
 
 Try it first with `python3 scripts/run_market_diary.py --dry-run --json`.
 
+**Schedule: next morning, previous session (05:30Z Tue..Sat).** The timer
+template fires Tue..Sat 05:30 UTC and the service runs
+`run_market_diary.py --previous-session`, which targets the last US trading
+day strictly before today (UTC), skipping weekends and market holidays, and
+logs the chosen date. Reason: yfinance closes are read through
+`read_daily_policy_n`, which only returns policy-eligible captures, and a close
+becomes eligible only after the next New York midnight (04:00Z EDT / 05:00Z
+EST). The old Mon..Fri 22:30Z evening run therefore found no qualified close
+for today and printed "no close for date" for every index. The 05:30Z slot
+depends on the 05:15Z yfinance morning capture in `ingestion/scheduler.py`;
+if that slot moves, move this timer after it. `--date YYYY-MM-DD` still
+overrides and `--previous-session` is off by default.
+
+**Operator steps if the old 22:30Z timer is already installed** (no need to
+reinstall the unit files; use a drop-in override on grid-svr):
+
+```bash
+sudo systemctl edit grid-market-diary.timer
+```
+
+In the editor that opens (creates
+`/etc/systemd/system/grid-market-diary.timer.d/override.conf`), enter the
+blank `OnCalendar=` line first — it clears the inherited schedule — then the
+new value:
+
+```ini
+[Timer]
+OnCalendar=
+OnCalendar=Tue..Sat *-*-* 05:30:00 UTC
+```
+
+The service must also pass the flag, so refresh the service file from the
+template (or add the same change in a
+`grid-market-diary.service.d/override.conf` drop-in that blanks `ExecStart=`
+and re-declares it with `--previous-session`), then:
+
+```bash
+sudo cp deploy/systemd/grid-market-diary.service.template /etc/systemd/system/grid-market-diary.service
+sudo systemctl daemon-reload
+sudo systemctl restart grid-market-diary.timer
+systemctl list-timers grid-market-diary.timer     # NEXT should be a Tue..Sat ~05:30-05:35 UTC slot
+systemctl cat grid-market-diary.timer             # shows the drop-in's OnCalendar lines
+```
+
+On a fresh install, copy the updated `.timer.template` as in the service
+template header instead; no override is needed.
+
 ## `grid-analytics-snapshots` (service + timer) — NOT installed
 
 Daily run of `scripts/run_analytics_snapshots.py`, which refreshes the

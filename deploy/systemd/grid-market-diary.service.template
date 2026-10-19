@@ -28,9 +28,13 @@ WorkingDirectory=/data/grid_v4/grid_release
 # (GRID DB settings) — this file itself still lives in the repo checkout.
 EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
 Environment=PYTHONUNBUFFERED=1
+# --previous-session targets the last completed US trading session (the timer
+# fires at 05:30Z, after the 05:15Z yfinance morning capture; see the timer
+# template). Without it the runner targets today, which has no policy-eligible
+# close yet at that hour.
 # Price sections stay off until GRID_MARKET_DIARY_PRICES_ENABLED=true is set
 # in the env file below, after the operator confirms the YF quarantine ran.
-ExecStart=/usr/bin/flock -n /tmp/grid-market-diary.lock /usr/bin/python3 scripts/run_market_diary.py
+ExecStart=/usr/bin/flock -n /tmp/grid-market-diary.lock /usr/bin/python3 scripts/run_market_diary.py --previous-session
 TimeoutStartSec=10min
 Nice=10
 StandardOutput=journal
