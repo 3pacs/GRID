@@ -267,7 +267,13 @@ def test_endpoint_provenance_shape():
 
 
 def _good_engine():
-    return FakeEngine({t: (10, TODAY, CREATED) for t in mp.TABLE_SPECS})
+    # Endpoints use the real clock, so "fresh" is relative to it (never future-dated).
+    return FakeEngine({t: _good_row(t) for t in mp.TABLE_SPECS})
+
+
+def _good_row(table):
+    row = (10, date.today(), CREATED)
+    return row + (0,) if mp.TABLE_SPECS[table].reports_future else row
 
 
 @pytest.fixture()
@@ -412,3 +418,58 @@ def test_sector_detail_unknown_sector_still_404(api_engine):
     with pytest.raises(HTTPException) as err:
         flows.get_sector_detail("No Such Sector", "t")
     assert err.value.status_code == 404
+
+
+# ── future-dated disclosure dates (statutory_bound rows) ─────────────────
+
+
+def test_congressional_future_rows_are_counted_not_treated_as_fresh():
+    """The newest observation is the newest row dated on/before today; pending
+    statutory-bound rows (disclosure_date = trade + 45 days) are only counted."""
+    engine = FakeEngine({"congressional_trades": (300, TODAY - timedelta(days=1), CREATED, 41)})
+    p = _prov(engine, "congressional_trades")
+    assert p["unavailable"] is False and p["reason"] is None
+    assert p["future_dated_rows"] == 41 and p["row_count"] == 300
+    assert date.fromisoformat(p["max_obs_date"]) <= TODAY
+    assert p["age_days"] == 1
+
+
+def test_future_dated_rows_do_not_hide_an_old_table():
+    engine = FakeEngine({"congressional_trades": (300, TODAY - timedelta(days=12), CREATED, 41)})
+    p = _prov(engine, "congressional_trades")
+    assert (p["unavailable"], p["reason"], p["age_days"]) == (True, "stale", 12)
+    assert p["future_dated_rows"] == 41
+
+
+def test_only_future_dated_rows_is_unavailable_not_fresh():
+    engine = FakeEngine({"congressional_trades": (41, None, CREATED, 41)})
+    p = _prov(engine, "congressional_trades")
+    assert (p["unavailable"], p["reason"]) == (True, "only_future_dated")
+    assert p["max_obs_date"] is None and p["future_dated_rows"] == 41 and p["row_count"] == 41
+
+
+def test_congressional_no_future_rows_reports_zero():
+    engine = FakeEngine({"congressional_trades": (5, TODAY, CREATED, 0)})
+    assert _prov(engine, "congressional_trades")["future_dated_rows"] == 0
+
+
+def test_congressional_sql_filters_future_rows_in_the_database():
+    sql = mp.TABLE_SPECS["congressional_trades"].sql
+    assert "max(disclosure_date) FILTER (WHERE disclosure_date <= CURRENT_DATE)" in sql
+    assert "count(*) FILTER (WHERE disclosure_date > CURRENT_DATE)" in sql
+    assert mp.TABLE_SPECS["congressional_trades"].reports_future is True
+
+
+@pytest.mark.parametrize("days_ahead", [1, 41])
+def test_as_of_never_exceeds_today_for_any_table(days_ahead):
+    """A max date in the future (here on a table with no future handling) is
+    flagged, clamped to today, and never reported as fresh."""
+    engine = FakeEngine({"etf_flows": (50, TODAY + timedelta(days=days_ahead), CREATED)})
+    p = _prov(engine, "etf_flows")
+    assert (p["unavailable"], p["reason"]) == (True, "future_dated")
+    assert date.fromisoformat(p["max_obs_date"]) <= TODAY and p["age_days"] == 0
+
+
+def test_future_dated_rows_field_is_null_where_not_computed():
+    p = _prov(FakeEngine({"etf_flows": (1, TODAY, CREATED)}), "etf_flows")
+    assert p["future_dated_rows"] is None

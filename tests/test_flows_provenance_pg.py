@@ -151,3 +151,24 @@ def test_every_spec_sql_executes_against_its_documented_columns(engine):
     for table in mp.TABLE_SPECS:
         p = mp.table_provenance(engine, table, use_cache=False)
         assert p["reason"] == "empty", (table, p)
+
+
+def test_congressional_future_dated_rows_real_sql(engine):
+    """Real FILTER semantics: statutory-bound rows dated after today are counted,
+    and the newest observation ignores them."""
+    with engine.begin() as conn:
+        conn.execute(text(
+            "CREATE TABLE congressional_trades (disclosure_date DATE, created_at TIMESTAMPTZ)"))
+        conn.execute(text("INSERT INTO congressional_trades VALUES (:a, now()), (:b, now()), (:c, now())"),
+                     {"a": TODAY - timedelta(days=2), "b": TODAY + timedelta(days=20),
+                      "c": TODAY + timedelta(days=41)})
+    p = mp.table_provenance(engine, "congressional_trades")
+    assert p["row_count"] == 3 and p["future_dated_rows"] == 2
+    assert p["max_obs_date"] == (TODAY - timedelta(days=2)).isoformat()
+    assert p["unavailable"] is False and p["age_days"] == 2
+
+    mp.clear_cache()
+    with engine.begin() as conn:
+        conn.execute(text("DELETE FROM congressional_trades WHERE disclosure_date <= :t"), {"t": TODAY})
+    p = mp.table_provenance(engine, "congressional_trades")
+    assert (p["unavailable"], p["reason"], p["future_dated_rows"]) == (True, "only_future_dated", 2)

@@ -64,7 +64,9 @@ _cache: TTLCache = TTLCache(ttl=CACHE_TTL_SECONDS, max_size=64)
 class TableSpec:
     """One table the flows API reads.
 
-    ``sql`` returns exactly ``(row_count, max_obs_date, materialized_at)``;
+    ``sql`` returns ``(row_count, max_obs_date, materialized_at)`` plus, when
+    ``reports_future`` is set, a fourth column: the number of rows whose
+    observation date lies in the future (see ``congressional_trades``);
     ``row_count`` is NULL for tables too large to count on a request path.
     ``source_signal_type`` names the ``signal_sources.source_type`` that feeds
     the table (indexed on ``(source_type, signal_date DESC)``);
@@ -76,6 +78,7 @@ class TableSpec:
     sql: str
     source_signal_type: str | None = None
     source_raw_series_ids: tuple[str, ...] = ()
+    reports_future: bool = False
 
     @property
     def stale_after_days(self) -> int:
@@ -93,8 +96,17 @@ TABLE_SPECS: dict[str, TableSpec] = {
     ),
     "congressional_trades": TableSpec(
         "congressional_trades", "daily",
-        "SELECT count(*), max(disclosure_date), max(created_at) FROM congressional_trades",
+        # disclosure_date can be in the FUTURE by design: when the source gives no
+        # disclosure date, ingestion/altdata/congressional.py::resolve_disclosure_date
+        # returns transaction_date + 45 days ("statutory_bound", the STOCK Act upper
+        # bound; PIT-safe because never earlier than the real filing). The table has
+        # no basis column, so the newest observation is taken over rows dated on or
+        # before today only, and the future-dated rows are counted separately.
+        "SELECT count(*), max(disclosure_date) FILTER (WHERE disclosure_date <= CURRENT_DATE), "
+        "max(created_at), count(*) FILTER (WHERE disclosure_date > CURRENT_DATE) "
+        "FROM congressional_trades",
         source_signal_type="congressional",
+        reports_future=True,
     ),
     "dark_pool_weekly": TableSpec(
         "dark_pool_weekly", "weekly",
@@ -173,6 +185,7 @@ def _unavailable(spec: TableSpec, reason: str, now: datetime, **extra: Any) -> d
         "source_last_ingested": None,
         "age_days": None,
         "stale_after_days": spec.stale_after_days,
+        "future_dated_rows": None,
         "unavailable": True,
         "reason": reason,
     }
@@ -206,7 +219,7 @@ def table_provenance(engine: Any, table: str, *, now: datetime | None = None,
         return {
             "table": table, "row_count": None, "max_obs_date": None, "materialized_at": None,
             "source_last_ingested": None, "age_days": None, "stale_after_days": None,
-            "unavailable": True, "reason": "unknown_table",
+            "future_dated_rows": None, "unavailable": True, "reason": "unknown_table",
         }
     if use_cache:
         cached = _cache.get(table)
@@ -234,7 +247,9 @@ def _probe(engine: Any, spec: TableSpec, now: datetime) -> dict[str, Any]:
         log.warning("provenance: probe of {t} failed: {e}", t=spec.table, e=str(exc))
         return _unavailable(spec, f"error:{type(exc).__name__}", now)
 
-    row_count, max_obs, materialized_at = tuple(row) if row else (0, None, None)
+    row = tuple(row) if row else (0, None, None)
+    row_count, max_obs, materialized_at = row[:3]
+    future_rows = int(row[3] or 0) if spec.reports_future and len(row) > 3 else None
     base = {
         "table": spec.table,
         "row_count": int(row_count) if row_count is not None else None,
@@ -243,11 +258,18 @@ def _probe(engine: Any, spec: TableSpec, now: datetime) -> dict[str, Any]:
         "source_last_ingested": _source_last_ingested(engine, spec),
         "age_days": None,
         "stale_after_days": spec.stale_after_days,
+        "future_dated_rows": future_rows,
         "unavailable": False,
         "reason": None,
     }
-    if (row_count == 0) or max_obs is None:
+    if row_count == 0:
         base.update(unavailable=True, reason="empty")
+        return base
+    if max_obs is None:
+        # Rows exist but none is dated on/before today: every row is a future-dated
+        # (pending) one, which says nothing about how recently the table was synced.
+        reason = "only_future_dated" if future_rows else "empty"
+        base.update(unavailable=True, reason=reason)
         return base
 
     obs_day = max_obs.date() if isinstance(max_obs, datetime) else max_obs
@@ -255,6 +277,12 @@ def _probe(engine: Any, spec: TableSpec, now: datetime) -> dict[str, Any]:
         base.update(unavailable=True, reason="error:bad_date")
         return base
     age = (now.date() - obs_day).days
+    if age < 0:
+        # The as-of date never exceeds today: a future max date would overstate
+        # freshness, so it is flagged instead of reported as current.
+        base.update(max_obs_date=now.date().isoformat(), age_days=0,
+                    unavailable=True, reason="future_dated")
+        return base
     base["age_days"] = age
     if age > spec.stale_after_days:
         base.update(unavailable=True, reason="stale")

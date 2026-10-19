@@ -54,10 +54,11 @@ endpoint's envelope as "that table is fine".
 | Field | Meaning |
 |---|---|
 | `row_count` | `count(*)` of the table; `null` for tables not counted on a request path (`signal_sources`, `options_daily_signals`) |
-| `max_obs_date` | newest value of the table's observation-date column (`trade_date`, `disclosure_date`, `report_date`, `flow_date`, `obs_date`, `signal_date`, `snapshot_date`) |
+| `max_obs_date` | newest value (never later than today) of the table's observation-date column (`trade_date`, `disclosure_date`, `report_date`, `flow_date`, `obs_date`, `signal_date`, `snapshot_date`) |
 | `materialized_at` | `max(created_at)` (`generated_at` for `capital_flow_snapshots`). The materializer upserts, so rows it only updates do not move this; treat it as a **lower bound** on the last sync |
 | `source_last_ingested` | newest ingest time of the feeding rows where cheaply derivable with an indexed bound: `signal_sources.created_at` for `source_type` insider / congressional / darkpool (last 30 days), `raw_series.pull_timestamp` for the FRED junction series (`series_id` and `obs_date` bounded, `SUCCESS` only). `null` when not derivable, or when that lookup failed. It never changes `unavailable` |
-| `age_days` | UTC calendar days between today and `max_obs_date` |
+| `age_days` | UTC calendar days between today and `max_obs_date` (never negative; see "Future-dated dates") |
+| `future_dated_rows` | `congressional_trades` only: number of rows whose `disclosure_date` is after today (pending statutory disclosures); `null` for every other table |
 | `stale_after_days` | the table's threshold |
 | `unavailable`, `reason` | see below |
 | `generated_at` | when the envelope was computed (probes are cached for 30 s) |
@@ -81,6 +82,8 @@ endpoint's envelope as "that table is fine".
 | `empty` | no rows, or no non-null observation date |
 | `missing_table` | the table does not exist |
 | `stale` | `age_days` > `stale_after_days` (`row_count`, `max_obs_date` and the rest are still reported) |
+| `only_future_dated` | `congressional_trades` has rows, but every one is dated after today (pending statutory disclosures), so nothing says how recently the table was synced |
+| `future_dated` | `max_obs_date` is after today on any other table (or from clock skew). `max_obs_date` is reported clamped to today with `age_days` 0, and the table is not called current |
 | `timeout` | a probe exceeded the 5 s `statement_timeout` |
 | `error:<ExceptionName>` | any other failure (the endpoint itself still answers) |
 | `unknown_table` | a table name outside the helper's fixed list |
@@ -108,6 +111,21 @@ Sample, probe timed out:
               "source_last_ingested": null, "age_days": null, "stale_after_days": 3,
               "unavailable": true, "reason": "timeout"}
 ```
+
+## Future-dated dates (`congressional_trades`)
+
+`congressional_trades.disclosure_date` can lie in the future by design. When the source gives no disclosure
+date, `ingestion/altdata/congressional.py::resolve_disclosure_date` returns `transaction_date + 45 days` with
+basis `statutory_bound` (the STOCK Act upper bound; PIT-safe because never earlier than the real filing). The
+table has no basis column, so the envelope cannot tell those rows apart by basis. A `max(disclosure_date)` would
+therefore report a date weeks ahead of today and overstate freshness (a 2026-10-16 receipt showed 2026-11-26).
+
+- `max_obs_date` and `age_days` are computed over rows dated **on or before today** only, so pending rows never
+  make the table look current; a table whose only rows are pending reads `only_future_dated`.
+- `future_dated_rows` counts the pending rows so a UI can say "N pending statutory disclosures". It is a lower
+  bound: a statutory-bound row whose estimated date has already passed is indistinguishable from a reported one.
+- `materialized_at` (`max(created_at)`) still shows when rows were last written, pending or not.
+- For every table, `max_obs_date` never exceeds today; a later value is flagged `future_dated`, not reported fresh.
 
 ## Guarantees and limits
 
