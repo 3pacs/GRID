@@ -413,9 +413,10 @@ def start_tiingo_prices_worker(db_engine: Engine) -> bool:
 #     which is HELD (DAILY_INTEL_HOLD_REASONS) and does not run while
 #     grid-hermes is off; and
 #   * a host systemd unit, grid-flow-materializer.timer (every 30 min, oneshot
-#     from the OLD checkout /home/grid/grid_v4/grid_repo; documented in
-#     docs/handoffs/2026-09-20/fable-hermes-daily-intel-resumable.md, not
-#     tracked under server_setup/). Its state today is UNVERIFIED from source.
+#     from the OLD checkout /home/grid/grid_v4/grid_repo at 5facbdf0, not
+#     tracked under server_setup/). Operator receipt 2026-10-19T06:53Z: it is
+#     ENABLED and ACTIVE (LIVE), last run 06:30:56Z SUCCESS. Until it is
+#     disabled it keeps writing old-semantics rows every 30 minutes.
 # This job (weekdays 23:15 UTC, after the 22:00Z domestic slot, 15 min before
 # the 23:30Z Tiingo slot, outside the 03:30-10:30Z pg_dump window) is a
 # scheduler-native caller, not a claim that it is the only one. The budget
@@ -428,7 +429,8 @@ def start_tiingo_prices_worker(db_engine: Engine) -> bool:
 # pullers) for the whole sync_all, and skips (receipt "SKIPPED: ...") if
 # another holder has it. That only coordinates callers that take the same key.
 # The host timer's old-checkout code takes NO lock, so it must be disabled in
-# the same change window as the scheduler release (see docs/SERVER-SERVICES.md).
+# the same change window as the scheduler release (operator step; see
+# docs/SERVER-SERVICES.md).
 FLOW_MATERIALIZE_SLOT_UTC = "23:15"
 FLOW_MATERIALIZE_JOB = "FlowMaterialize_Daily"
 FLOW_MATERIALIZE_BUDGET_S = 60

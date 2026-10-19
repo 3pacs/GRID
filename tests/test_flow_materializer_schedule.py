@@ -327,7 +327,7 @@ def test_lock_key_is_a_stable_signed_bigint_distinct_from_the_other_pullers() ->
     assert key not in {tiingo_pull._ADVISORY_LOCK_KEY, yfinance_pull._PULL_ALL_ADVISORY_LOCK_KEY}
 
 
-def test_comment_and_docs_name_the_other_callers_and_the_timer_precondition() -> None:
+def test_comment_and_docs_name_the_live_timer_and_the_activation_precondition() -> None:
     import inspect
     from pathlib import Path
 
@@ -335,6 +335,7 @@ def test_comment_and_docs_name_the_other_callers_and_the_timer_precondition() ->
     docs = (Path(__file__).resolve().parents[1] / "docs" / "SERVER-SERVICES.md").read_text()
     for text_ in (src, docs):
         assert "grid-flow-materializer.timer" in text_
-        assert "UNVERIFIED" in text_
+        assert "LIVE" in text_ and "2026-10-19" in text_
+        assert "UNVERIFIED" not in text_
     assert "only caller" not in src.lower().split("daily flow materialization")[1][:1500]
     assert "disable" in docs and "same change window" in docs
