@@ -90,6 +90,15 @@ def test_fresh_week_with_short_volume(engine, short, expected):
     assert as_of == (TODAY - timedelta(days=21)).isoformat()
 
 
+def test_future_dated_week_is_never_the_newest_week(engine):
+    """A report_date after today (bad/early-dated row) must not hide the real latest week."""
+    _dp(engine, TODAY - timedelta(days=21), 300.0)
+    _dp(engine, TODAY + timedelta(days=30), 700.0)
+    signal, as_of, reason = flows._read_dark_pool_signal(engine, TECH, TODAY)
+    assert (signal, reason) == ("accumulation", None)
+    assert as_of == (TODAY - timedelta(days=21)).isoformat()
+
+
 def test_newest_week_is_scoped_to_the_sectors_tickers(engine):
     _dp(engine, TODAY - timedelta(days=7), 700.0, tickers=["JPM"])        # another sector, newer
     _dp(engine, TODAY - timedelta(days=21), 300.0)

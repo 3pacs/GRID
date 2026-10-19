@@ -148,6 +148,14 @@ def test_dark_pool_read_failure_is_unavailable_not_neutral(detail):
     assert m["dark_pool_signal"] is None and m["dark_pool_reason"] == "error"
 
 
+def test_dark_pool_newest_week_is_bounded_to_today_in_sql(detail):
+    """A future-dated report_date must never become 'the newest week'."""
+    engine = _Engine(dark_pool=_dp(TODAY - timedelta(days=14), 300.0))
+    detail(engine)
+    dp = [s for s in engine.sql if "FROM dark_pool_weekly" in s and "ticker, short_volume, total_volume" in s]
+    assert dp and all("report_date <= CURRENT_DATE" in s for s in dp)
+
+
 # ── C: congressional ─────────────────────────────────────────────────────
 
 
