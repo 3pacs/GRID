@@ -154,7 +154,7 @@ def test_every_spec_sql_executes_against_its_documented_columns(engine):
 
 
 def test_congressional_future_dated_rows_real_sql(engine):
-    """Real FILTER semantics: statutory-bound rows dated after today are counted,
+    """Real FILTER semantics: rows dated after today are counted,
     and the newest observation ignores them."""
     with engine.begin() as conn:
         conn.execute(text(

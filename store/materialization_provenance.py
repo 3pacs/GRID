@@ -96,12 +96,11 @@ TABLE_SPECS: dict[str, TableSpec] = {
     ),
     "congressional_trades": TableSpec(
         "congressional_trades", "daily",
-        # disclosure_date can be in the FUTURE by design: when the source gives no
-        # disclosure date, ingestion/altdata/congressional.py::resolve_disclosure_date
-        # returns transaction_date + 45 days ("statutory_bound", the STOCK Act upper
-        # bound; PIT-safe because never earlier than the real filing). The table has
-        # no basis column, so the newest observation is taken over rows dated on or
-        # before today only, and the future-dated rows are counted separately.
+        # disclosure_date can lie in the FUTURE (a 2026-10-16 receipt showed a max
+        # 41 days ahead); the origin of such rows is not established here. A plain
+        # max(disclosure_date) would then report a date ahead of today and overstate
+        # freshness, so the newest observation is taken over rows dated on or before
+        # today only, and the future-dated rows are counted separately.
         "SELECT count(*), max(disclosure_date) FILTER (WHERE disclosure_date <= CURRENT_DATE), "
         "max(created_at), count(*) FILTER (WHERE disclosure_date > CURRENT_DATE) "
         "FROM congressional_trades",
@@ -267,7 +266,7 @@ def _probe(engine: Any, spec: TableSpec, now: datetime) -> dict[str, Any]:
         return base
     if max_obs is None:
         # Rows exist but none is dated on/before today: every row is a future-dated
-        # (pending) one, which says nothing about how recently the table was synced.
+        # future-dated one, which says nothing about how recently the table was synced.
         reason = "only_future_dated" if future_rows else "empty"
         base.update(unavailable=True, reason=reason)
         return base

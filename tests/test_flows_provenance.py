@@ -420,12 +420,12 @@ def test_sector_detail_unknown_sector_still_404(api_engine):
     assert err.value.status_code == 404
 
 
-# ── future-dated disclosure dates (statutory_bound rows) ─────────────────
+# ── future-dated disclosure dates ────────────────────────────────────────
 
 
 def test_congressional_future_rows_are_counted_not_treated_as_fresh():
-    """The newest observation is the newest row dated on/before today; pending
-    statutory-bound rows (disclosure_date = trade + 45 days) are only counted."""
+    """The newest observation is the newest row dated on/before today; future-dated
+    rows are only counted."""
     engine = FakeEngine({"congressional_trades": (300, TODAY - timedelta(days=1), CREATED, 41)})
     p = _prov(engine, "congressional_trades")
     assert p["unavailable"] is False and p["reason"] is None
