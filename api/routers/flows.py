@@ -2398,7 +2398,8 @@ async def get_flow_waterfall(
 ) -> dict:
     """Trace money from a source node through all layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Find starting node
     start_node = None
@@ -2499,7 +2500,8 @@ async def get_flow_orthogonality(_token: str = Depends(require_auth)) -> dict:
     import numpy as np
 
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Collect nodes with numeric values for PCA
     nodes_with_data = []

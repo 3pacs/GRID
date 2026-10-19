@@ -1,4 +1,4 @@
-"""/flows/layers, /flows/layers/{id} and /flows/flow-map-v2 must not block the event loop.
+"""/flows/layers, /layers/{id}, /flow-map-v2, /waterfall and /orthogonality must not block the event loop.
 
 Their handlers are ``async def`` but the flow-map build (``_get_flow_map``:
 TTLCache + ``build_flow_map``, synchronous DB reads) used to run directly on
@@ -57,6 +57,8 @@ def _engine_and_cache(monkeypatch):
     (flows.get_flow_layers, ("t",)),
     (flows.get_flow_map_v2, ("t",)),
     (flows.get_flow_layer_detail, ("fed", "t")),
+    (flows.get_flow_waterfall, ("fed_balance_sheet", "t")),
+    (flows.get_flow_orthogonality, ("t",)),
 ])
 def test_handlers_do_not_build_the_flow_map_on_the_event_loop(handler, args, monkeypatch):
     build_threads: list[int] = []
