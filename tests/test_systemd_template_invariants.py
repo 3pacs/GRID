@@ -62,6 +62,17 @@ EXCLUDED_FROM_RELEASE_TREE_CHECK = {"grid-goal-worker.service.template"}
 BACKUP_WINDOW_START_MIN = 3 * 60 + 30  # 03:30 UTC
 BACKUP_WINDOW_END_MIN = 10 * 60 + 30  # 10:30 UTC
 
+# Reviewed, deliberate in-window timers: {template name: the exact OnCalendar
+# line}. Matching on the exact line keeps the exemption from silently covering
+# a later schedule change. grid-market-diary must run after the 05:15Z yfinance
+# morning capture (closes become policy-eligible at 04:00Z EDT / 05:00Z EST),
+# which is inside 03:30-10:30Z by construction; the owner chose 05:30Z
+# (2026-10-19). The job is a short single-row writer, not a heavy read/write
+# batch, so it overlapping a pg_dump snapshot is accepted.
+BACKUP_WINDOW_EXEMPT = {
+    "grid-market-diary.timer.template": "OnCalendar=Tue..Sat *-*-* 05:30:00 UTC",
+}
+
 ONCALENDAR_UTC_RE = re.compile(
     r"^OnCalendar=(?:(?P<weekday>[A-Za-z.,]+)\s+)?\*-\*-\*\s+"
     r"(?P<hour>\d{2}):(?P<minute>\d{2}):\d{2}\s+UTC\s*$"
@@ -182,6 +193,8 @@ def test_timer_oncalendar_avoids_nightly_backup_window(path: Path) -> None:
         assert m, f"{path.name}: unrecognized UTC OnCalendar syntax: {line!r}"
         minute_of_day = int(m.group("hour")) * 60 + int(m.group("minute"))
         in_window = BACKUP_WINDOW_START_MIN <= minute_of_day < BACKUP_WINDOW_END_MIN
+        if in_window and BACKUP_WINDOW_EXEMPT.get(path.name) == line:
+            continue
         assert not in_window, (
             f"{path.name}: {line!r} fires at {m.group('hour')}:{m.group('minute')} "
             f"UTC, inside the nightly pg_dump window "
