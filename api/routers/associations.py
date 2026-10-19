@@ -619,7 +619,16 @@ async def get_anomalies(
 
     Flags features with current z-score > threshold or breaking
     historical correlation with partner features.
+
+    Like the correlation matrix, the build is synchronous DB/PIT work (plus a
+    possible alert e-mail), so it runs in a worker thread rather than on the
+    event loop.
     """
+    return await asyncio.to_thread(_compute_anomalies, sigma_threshold, days)
+
+
+def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
+    """Blocking body of ``get_anomalies`` (runs in a worker thread)."""
     engine = get_db_engine()
     pit_store = get_pit_store()
 
