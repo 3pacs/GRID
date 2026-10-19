@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -2259,7 +2260,8 @@ def _get_flow_map(engine, as_of=None):
 async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
     """8-layer junction point flow map with edges."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return flow_map.to_dict()
 
 
@@ -2347,7 +2349,8 @@ def _infer_trend(node) -> str:
 async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
     """Summary of all 8 junction point layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return {
         "layers": [layer.to_dict() for layer in flow_map.layers],
         "edges": [edge.to_dict() for edge in flow_map.edges],
@@ -2361,7 +2364,8 @@ async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
 async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_auth)) -> dict:
     """Detailed view of a single junction point layer."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     layer = next(
         (flow_layer for flow_layer in flow_map.layers if flow_layer.id == layer_id),
