@@ -403,6 +403,124 @@ def start_tiingo_prices_worker(db_engine: Engine) -> bool:
     return True
 
 
+# Daily flow materialization (ingestion/flow_materializer.py::sync_all).
+#
+# sync_all turns signal_sources/raw_series into the insider_trades,
+# congressional_trades, dark_pool_weekly, etf_flows and junction_point_readings
+# tables the flows API reads. Its only caller was grid-hermes's daily-intel
+# task, so with grid-hermes off nothing materialized (last run 2026-10-13).
+# This is the Hermes-independent job: weekdays 23:15 UTC, after the 22:00Z
+# domestic slot and 15 min before the 23:30Z Tiingo slot, and well outside the
+# 03:30-10:30Z pg_dump window. The budget matches Hermes's SQL-class task
+# budget (DAILY_INTEL_SQL_TASK_BUDGET_S = 60): sync_all runs on a worker thread
+# so a hung statement can never hold the single-threaded schedule loop.
+FLOW_MATERIALIZE_SLOT_UTC = "23:15"
+FLOW_MATERIALIZE_JOB = "FlowMaterialize_Daily"
+FLOW_MATERIALIZE_BUDGET_S = 60
+_flow_materialize_worker: threading.Thread | None = None
+_flow_materialize_guard = threading.Lock()
+
+
+def _flow_materialize_receipt_text(summary: dict[str, Any]) -> tuple[int, str]:
+    """(total rows, "table=n ...; errors: ...") from a sync_all summary dict."""
+    counts = {
+        k: v for k, v in summary.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    text_ = " ".join(f"{k}={v}" for k, v in counts.items())
+    errors = summary.get("errors") or []
+    if errors:
+        text_ += "; errors: " + "; ".join(
+            f"{e.get('table')}: {str(e.get('error'))[:80]}" for e in errors
+        )
+    return sum(counts.values()), text_
+
+
+def run_flow_materialize_daily(
+    slot: str = FLOW_MATERIALIZE_SLOT_UTC,
+    now_utc: datetime | None = None,
+    budget_s: float = FLOW_MATERIALIZE_BUDGET_S,
+) -> dict[str, Any] | None:
+    """Run flow_materializer.sync_all once, with a pull_log receipt.
+
+    Skipped (returns None) when released more than
+    DOMESTIC_SLOT_MAX_LATE_MINUTES late (lateness evaluated on the UTC clock
+    the slot is registered on) or while the previous run's worker is still
+    alive. Never raises: a sync_all exception, a budget overrun or a failed
+    receipt write is logged and reflected in the returned summary.
+
+    The receipt row (puller_name FlowMaterialize_Daily) carries the status
+    (SUCCESS/PARTIAL/FAILED), the total rows and the per-table counts plus any
+    per-table errors in error_message. A run that outlives ``budget_s`` is
+    receipted FAILED and its worker left to finish on its own; the schedule
+    loop moves on.
+    """
+    global _flow_materialize_worker
+
+    now = now_utc or datetime.now(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} {j} slot: released {m:.0f} min late (limit {lim} min) "
+            "by an earlier job holding the scheduler loop",
+            s=slot, j=FLOW_MATERIALIZE_JOB, m=late.total_seconds() / 60,
+            lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return None
+
+    started_at = datetime.now(timezone.utc)
+    box: dict[str, Any] = {}
+
+    def _work(engine: Engine) -> None:
+        try:
+            from ingestion.flow_materializer import sync_all
+
+            box["summary"] = sync_all(engine)
+        except Exception as exc:  # reported by the caller; never die silently
+            box["error"] = f"{type(exc).__name__}: {exc}"
+
+    with _flow_materialize_guard:
+        if _flow_materialize_worker is not None and _flow_materialize_worker.is_alive():
+            log.warning(
+                "{j}: previous worker still running -- not starting another",
+                j=FLOW_MATERIALIZE_JOB,
+            )
+            return None
+        try:
+            from db import get_engine
+
+            engine = get_engine()
+        except Exception as exc:
+            log.error("{j}: no database engine: {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc))
+            return {"status": "FAILED", "error": str(exc)}
+        worker = threading.Thread(
+            target=_work, args=(engine,), name="flow-materialize", daemon=True,
+        )
+        worker.start()
+        _flow_materialize_worker = worker
+
+    worker.join(budget_s)
+    if worker.is_alive():
+        msg = f"budget exceeded: sync_all still running after {budget_s:g}s"
+        log.warning("{j}: {m}", j=FLOW_MATERIALIZE_JOB, m=msg)
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", 0, msg)
+        return {"status": "FAILED", "error": msg}
+    if "error" in box:
+        log.error("{j} failed: {e}", j=FLOW_MATERIALIZE_JOB, e=box["error"])
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", 0, box["error"])
+        return {"status": "FAILED", "error": box["error"]}
+
+    summary = box["summary"]
+    rows, detail = _flow_materialize_receipt_text(summary)
+    status = summary.get("status") if summary.get("status") in {"SUCCESS", "PARTIAL", "FAILED"} else "FAILED"
+    if status == "SUCCESS":
+        log.info("{j} complete: {d}", j=FLOW_MATERIALIZE_JOB, d=detail)
+    else:
+        log.warning("{j} {s}: {d}", j=FLOW_MATERIALIZE_JOB, s=status, d=detail)
+    _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, status, rows, detail)
+    return summary
+
+
 # Domestic run_daily_pulls slots skip a firing that arrives this late. The
 # schedule library runs a missed job once when the loop regains control, and
 # run_daily_pulls decides "market open" from the calendar date alone -- so a
@@ -1975,6 +2093,13 @@ def start_scheduler() -> None:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )
+
+    # Hermes-independent flow materialization (see FLOW_MATERIALIZE_SLOT_UTC):
+    # weekdays after the 22:00Z slot, outside the 03:30-10:30Z backup window.
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at(FLOW_MATERIALIZE_SLOT_UTC, "UTC").do(
+            run_flow_materialize_daily, slot=FLOW_MATERIALIZE_SLOT_UTC
+        )
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:

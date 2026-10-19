@@ -297,6 +297,10 @@ Not a separate service. Five pullers run inside the scheduler (started by GRID A
 
 All compute deterministic features from pure math — no external APIs needed.
 
+## Flow Materialization (grid-scheduler)
+
+`ingestion/flow_materializer.py::sync_all` (insider_trades, congressional_trades, dark_pool_weekly, etf_flows, junction_point_readings, which the flows API reads) used to run only from grid-hermes's daily-intel `flow_materialize` task, so nothing materialized while grid-hermes was off. `grid-scheduler` now registers `run_flow_materialize_daily` weekdays at 23:15 UTC (after the 22:00Z domestic slot, outside the 03:30-10:30Z backup window). It has the same lateness guard as `run_daily_pulls`, a 60 s budget (the Hermes SQL-task budget) enforced on a worker thread, and writes a `pull_log` receipt (`puller_name = 'FlowMaterialize_Daily'`; status, total rows, per-table counts and per-table errors in `error_message`). Activation needs a grid-scheduler release/restart.
+
 ## Cron Jobs
 
 Installed via `bash scripts/setup_cron.sh`:
