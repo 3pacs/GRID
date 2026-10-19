@@ -6,11 +6,13 @@ gate, the pure SQL builders, a recording fake engine and canned query results.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import sys
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -66,8 +68,16 @@ def test_dry_run_prints_read_only_wrapper_for_every_query(dry_text):
         assert 1 <= int(secs) <= 20
 
 
+def test_dry_run_documents_link4_and_the_accepted_rule(dry_text):
+    assert "Link 4 (local files only, no SQL)" in dry_text
+    assert "accepted = link1 AND link2 AND link3 AND link4" in dry_text
+
+
 def test_dry_run_contains_the_index_friendly_bounds(dry_text):
     assert "obs_date = CAST(:od AS date)" in dry_text            # raw_series vintages (idx_raw_series_lookup)
+    assert "r.series_id = :series AND r.source_id = 2" in dry_text  # link 1 input vintages
+    assert "WHERE fr.name = :feature AND rs.obs_date = CAST(:od AS date)" in dry_text  # link 2 (idx_resolved_series_feature_obs)
+    assert "briefing_date >= CAST(:od AS date) AND briefing_date <= CAST(:od AS date) + 3" in dry_text  # link 3
     assert "pull_status = 'SUCCESS'" in dry_text
     assert "started_at >= CAST(:od AS date)" in dry_text          # pull_log (idx_pull_log_puller)
     assert "started_at <  CAST(:od AS date) + 1" in dry_text
@@ -267,8 +277,9 @@ def test_main_writes_dated_receipt_and_refuses_overwrite(tmp_path, monkeypatch, 
     rec = json.loads(out.read_text())
     assert rec["schema"] == m0.SCHEMA and rec["target_date"] == "2026-10-19"
     assert rec["read_only"] is True and rec["authorized_flag"] is True
-    assert set(rec["hops"]) == {"H1", "H2", "H3", "H4"}
-    assert rec["overall"] in {"PASS", "FAIL", "UNKNOWN"}
+    assert set(rec["context_hops"]) == {"H1", "H2", "H3", "H4"}
+    assert rec["context_overall"] in {"PASS", "FAIL", "UNKNOWN"}
+    assert rec["accepted"] is False and "chain" in rec  # no linked example in the canned results: never accepted
     assert len(rec["queries"]) == len(m0.build_queries(TARGET))
     assert "authorized" not in rec["arguments"]
     # second run must not overwrite
@@ -282,3 +293,158 @@ def test_default_receipt_name_is_dated():
 
 def test_importing_the_script_does_not_import_db_or_config():
     assert "db" not in m0.__dict__ and "config" not in m0.__dict__
+
+
+# ---------------------------------------------------------------- linked chain (decides `accepted`)
+
+OD = "2026-10-19"
+VAL = 7800.1234
+
+
+def _sha(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def _make_capture(tmp_path: Path, *, kind: str = "briefing", receipt_fmt: str = "md", tamper: bool = False):
+    rec = {"id": 4534, "briefing_date": OD, "briefing_type": "hourly", "content": "S&P 500 closed at 7800.12",
+           "created_at": "2026-10-19 22:05:00+00:00",
+           "snapshot_data": {"equities": {"^GSPC": {"date": OD, "value": VAL}}}}
+    diary = {"id": 20, "date": OD, "generated_at": "2026-10-19T22:34:00+00:00", "narrative_model": "oracle",
+             "market_moves": {"indices": {"S&P 500": {"status": "no close for date"}}}}
+    capture = {"records": [{"channel": "market_briefings", "record": rec}], "existing_diary_context": [diary]}
+    cap_bytes = json.dumps(capture).encode()
+    export = _sha(cap_bytes)
+    d = tmp_path / "capture" / export
+    d.mkdir(parents=True)
+    (d / "capture.json").write_bytes(cap_bytes)
+    packet = {"capture_receipt": {"export_sha256": export},
+              "publications": [{"id": "market_briefings:4534", "source": "market_briefings", "text": rec["content"],
+                                "sha256": _sha(rec["content"].encode()), "source_record": rec}],
+              "evidence": [{"id": "market_diary:20:context", "sha256": m0.canonical_sha256(diary)}]}
+    (d / "packet.json").write_text(json.dumps(packet))
+    if tamper:  # retained bytes change after the receipt was written
+        capture["records"][0]["record"]["content"] += "!"
+        (d / "capture.json").write_text(json.dumps(capture))
+    rows = [{"channel": "market_briefings", "id": 4534, "sha256": m0.canonical_sha256(rec)},
+            {"channel": "market_diary", "id": 20, "sha256": m0.canonical_sha256(diary)}]
+    if receipt_fmt == "md":
+        r = tmp_path / "receipt.md"
+        r.write_text(f"| file | bytes | sha256 |\n|---|---|---|\n| capture.json | {len(cap_bytes)} | {export} |\n\n"
+                     f"| id | type | created_at (UTC) | row sha256 |\n|---|---|---|---|\n"
+                     f"| 4534 | hourly | 2026-10-19 22:05:00 | {rows[0]['sha256']} |\n")
+    else:
+        r = tmp_path / "receipt.json"
+        r.write_text(json.dumps({"export_sha256": export, "rows": rows}))
+    return d, r, rec, diary
+
+
+def _chain_results(*, diary_entry=None, resolved_value=VAL, eligible=False, snap_value=VAL):
+    def r(qid, rows):
+        return {"qid": qid, "purpose": qid, "timestamp_kind": "t", "rows": rows, "error": None}
+
+    vint = [{"id": 1, "source_id": 2, "obs_date": OD, "pull_timestamp": "2026-10-19T22:04:00+00:00",
+             "value": VAL, "capture_state": "POLICY_ELIGIBLE" if eligible else "INCOMPLETE"}]
+    return {
+        "H1b": r("H1b", vint),
+        "L2": r("L2", [{"feature_id": 5, "name": "sp500_full", "obs_date": OD, "vintage_date": OD, "value": resolved_value,
+                         "source_priority_used": 2}]),
+        "L3:briefings": r("L3:briefings", [{"id": 4534, "briefing_type": "hourly", "created_at": "2026-10-19T22:05:00+00:00",
+                                            "snapshot_value": {"date": OD, "value": snap_value},
+                                            "publication_status": {"reason": None}, "snapshot_timestamp": "2026-10-19T22:04:30"}]),
+        "H3:diary": r("H3:diary", [{"id": 20, "date": OD, "generated_at": "2026-10-19T22:34:00+00:00",
+                                    "index_entry": diary_entry or {"status": "no close for date"}}]),
+    }
+
+
+def _chain(results, tmp_path, *, kind="briefing", **mk):
+    d, rcp, _, _ = _make_capture(tmp_path, kind=kind, **mk)
+    return m0.evaluate_chain(results, date(2026, 10, 19), series=m0.DEFAULT_SERIES, feature="sp500_full", reasoning=kind,
+                             snapshot_key="^GSPC", diary_label="S&P 500", capture_dir=str(d), capture_receipt=str(rcp))
+
+
+def test_chain_accepts_one_linked_example(tmp_path):
+    out = _chain(_chain_results(), tmp_path)
+    assert out["accepted"] is True and out["blocking_links"] == []
+    links = out["links"]
+    assert links["L1_input_observation"]["capture_state"] == "INCOMPLETE" and links["L1_input_observation"]["raw_series_id"] == 1
+    assert links["L2_materialization_row"]["row_key"] == {"feature_id": 5, "obs_date": OD, "vintage_date": OD}
+    assert links["L3_reasoning_output"]["knowledge_timestamp"] == "2026-10-19T22:05:00+00:00"
+    assert all(links["L4_retained_publication_bytes"]["checks"].values())
+
+
+def test_counts_and_context_pass_but_chain_broken_is_not_accepted(tmp_path):
+    (tmp_path / "some-file.txt").write_text("x")  # folder present and non-empty
+    ctx = m0.evaluate(_canned(), TARGET, max_age_days=5, capture_dir=str(tmp_path))
+    assert all(h["status"] == "PASS" for h in ctx.values())  # every count/existence check is green
+    # briefing snapshot value differs from every input vintage -> link 3 fails, so accepted stays false
+    out = _chain(_chain_results(snap_value=VAL + 1), tmp_path)
+    assert out["accepted"] is False and "L3_reasoning_output" in out["blocking_links"]
+
+
+def test_missing_capture_arguments_make_link4_unknown_not_accepted():
+    out = m0.evaluate_chain(_chain_results(), TARGET, series=m0.DEFAULT_SERIES, feature="sp500_full", reasoning="briefing",
+                            snapshot_key="^GSPC", diary_label="S&P 500", capture_dir=None, capture_receipt=None)
+    assert out["links"]["L4_retained_publication_bytes"]["ok"] is None
+    assert out["accepted"] is False
+
+
+def test_resolved_row_must_equal_the_input_vintage(tmp_path):
+    out = _chain(_chain_results(resolved_value=VAL + 5), tmp_path)
+    assert out["links"]["L2_materialization_row"]["ok"] is False and out["accepted"] is False
+
+
+def test_tampered_retained_bytes_fail_link4(tmp_path):
+    out = _chain(_chain_results(), tmp_path, tamper=True)
+    l4 = out["links"]["L4_retained_publication_bytes"]
+    assert l4["ok"] is False and l4["checks"]["capture_json_sha_equals_directory_name"] is False
+    assert out["accepted"] is False
+
+
+def test_receipt_row_hash_mismatch_fails_link4(tmp_path):
+    d, rcp, _, _ = _make_capture(tmp_path)
+    rcp.write_text(rcp.read_text().replace("| 4534 |", "| 4534 |").replace(m0.parse_capture_receipt(str(rcp))["rows"][("market_briefings", 4534)], "0" * 64))
+    out = m0.evaluate_chain(_chain_results(), TARGET, series=m0.DEFAULT_SERIES, feature="sp500_full", reasoning="briefing",
+                            snapshot_key="^GSPC", diary_label="S&P 500", capture_dir=str(d), capture_receipt=str(rcp))
+    assert out["links"]["L4_retained_publication_bytes"]["checks"]["row_sha_equals_receipt"] is False
+    assert out["accepted"] is False
+
+
+def test_diary_explicit_unavailable_is_accepted_only_with_a_json_receipt_listing_the_diary_row(tmp_path):
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    ok = _chain(_chain_results(), tmp_path / "a", kind="diary", receipt_fmt="json")
+    assert ok["links"]["L3_reasoning_output"]["explicit_unavailable_reason"] == "no close for date"
+    assert ok["accepted"] is True
+    md = _chain(_chain_results(), tmp_path / "b", kind="diary", receipt_fmt="md")
+    assert md["links"]["L3_reasoning_output"]["ok"] is True
+    assert md["links"]["L4_retained_publication_bytes"]["checks"]["row_sha_equals_receipt"] is False
+    assert md["accepted"] is False
+
+
+def test_diary_no_close_although_a_policy_eligible_vintage_existed_fails_link3(tmp_path):
+    out = _chain(_chain_results(eligible=True), tmp_path, kind="diary", receipt_fmt="json")
+    assert out["links"]["L3_reasoning_output"]["ok"] is False and out["accepted"] is False
+
+
+def test_diary_with_close_links_to_the_policy_eligible_vintage(tmp_path):
+    res = _chain_results(eligible=True, diary_entry={"close": round(VAL, 2), "obs_date": OD, "price_basis": "raw_close", "source": "yfinance"})
+    d, rcp, _, diary = _make_capture(tmp_path, receipt_fmt="json")
+    # retained diary entry must equal the DB entry for the db/retained comparison
+    out = m0.evaluate_chain(res, TARGET, series=m0.DEFAULT_SERIES, feature="sp500_full", reasoning="diary",
+                            snapshot_key="^GSPC", diary_label="S&P 500", capture_dir=str(d), capture_receipt=str(rcp))
+    assert out["links"]["L3_reasoning_output"]["ok"] is True
+    assert out["links"]["L1_input_observation"]["selected_as"].startswith("vintage used")
+    assert out["links"]["L4_retained_publication_bytes"]["checks"]["db_index_entry_equals_retained"] is False  # retained says unavailable
+    assert out["accepted"] is False
+
+
+def test_parse_markdown_receipt_matches_the_executor_format(tmp_path):
+    d, rcp, rec, _ = _make_capture(tmp_path)
+    parsed = m0.parse_capture_receipt(str(rcp))
+    assert parsed["format"] == "markdown" and len(parsed["export_sha256"]) == 64
+    assert parsed["rows"][("market_briefings", 4534)] == m0.canonical_sha256(rec)
+
+
+def test_canonical_sha256_matches_the_retained_capture_scheme():
+    # sort_keys + compact separators + ensure_ascii=False
+    assert m0.canonical_sha256({"b": "é", "a": 1}) == _sha('{"a":1,"b":"é"}'.encode("utf-8"))

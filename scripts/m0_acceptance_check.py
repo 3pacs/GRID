@@ -41,6 +41,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -53,6 +54,10 @@ from typing import Any, Callable
 SCHEMA = "m0-acceptance-receipt-v1"
 MAX_STATEMENT_TIMEOUT_S = 20
 DEFAULT_TICKERS = "^GSPC,SPY"
+DEFAULT_SERIES = "YF:^GSPC:close"
+DEFAULT_FEATURE = "sp500_full"  # matrix: ^GSPC -> sp500_full (close basis)
+DEFAULT_SNAPSHOT_KEY = "^GSPC"  # key under market_briefings.snapshot_data->'equities'
+DEFAULT_DIARY_LABEL = "S&P 500"  # key under market_diary.market_moves->'indices'
 DEFAULT_LOOKBACK_DAYS = 60
 DEFAULT_MAX_AGE_DAYS = 5
 RESOLVED_FEATURES = ("spy_full", "xlk_full")
@@ -129,13 +134,33 @@ WHERE puller_name = 'YFinance_Daily'
 ORDER BY started_at LIMIT 20
 """.strip()
 
-SQL_H1_GSPC_VINTAGES = """
+SQL_H1_INPUT_VINTAGES = """
 SELECT r.id, r.source_id, r.obs_date, r.pull_timestamp, r.value,
-       r.raw_payload->>'capture_state' AS capture_state
+       r.raw_payload->>'capture_state'  AS capture_state,
+       r.raw_payload->>'capture_policy' AS capture_policy
 FROM raw_series r
-WHERE r.series_id = 'YF:^GSPC:close' AND r.source_id = 2
+WHERE r.series_id = :series AND r.source_id = 2
   AND r.pull_status = 'SUCCESS' AND r.obs_date = CAST(:od AS date)
 ORDER BY r.pull_timestamp LIMIT 20
+""".strip()
+
+SQL_L2_RESOLVED_ROWS = """
+SELECT fr.id AS feature_id, fr.name, rs.obs_date, rs.vintage_date, rs.release_date, rs.value, rs.source_priority_used
+FROM feature_registry fr
+JOIN resolved_series rs ON rs.feature_id = fr.id
+WHERE fr.name = :feature AND rs.obs_date = CAST(:od AS date)
+ORDER BY rs.vintage_date, rs.id LIMIT 20
+""".strip()
+
+SQL_L3_BRIEFINGS = """
+SELECT id, briefing_type, briefing_date, created_at,
+       snapshot_data->'equities'->CAST(:snapkey AS text) AS snapshot_value,
+       snapshot_data->'publication_status'               AS publication_status,
+       snapshot_data->>'timestamp'                       AS snapshot_timestamp
+FROM market_briefings
+WHERE briefing_date >= CAST(:od AS date) AND briefing_date <= CAST(:od AS date) + 3
+  AND (CAST(:rid AS bigint) IS NULL OR id = CAST(:rid AS bigint))
+ORDER BY created_at LIMIT 60
 """.strip()
 
 SQL_Q2_CENSUS = """
@@ -214,11 +239,12 @@ ORDER BY fr.name LIMIT 10
 """.strip()
 
 SQL_H3_DIARY = """
-SELECT date, generated_at, narrative_model, narrative_fallback,
+SELECT id, date, generated_at, narrative_model, narrative_fallback,
        market_moves->>'prices_enabled' AS prices_enabled,
        market_moves->>'price_basis'    AS price_basis,
        market_moves->>'price_source'   AS price_source,
-       market_moves->'indices'         AS indices
+       market_moves->'indices'         AS indices,
+       market_moves->'indices'->CAST(:label AS text) AS index_entry
 FROM market_diary
 WHERE date = CAST(:od AS date)
 LIMIT 2
@@ -238,6 +264,11 @@ def build_queries(
     *,
     tickers: str = DEFAULT_TICKERS,
     lookback_days: int = DEFAULT_LOOKBACK_DAYS,
+    series: str = DEFAULT_SERIES,
+    feature: str = DEFAULT_FEATURE,
+    snapshot_key: str = DEFAULT_SNAPSHOT_KEY,
+    diary_label: str = DEFAULT_DIARY_LABEL,
+    reasoning_id: int | None = None,
 ) -> list[QuerySpec]:
     """All queries for one run, in execution order. Pure: no I/O."""
     od = target.isoformat()
@@ -248,7 +279,7 @@ def build_queries(
         QuerySpec("Q1a", "H1", "DB clock and read-only proof", SQL_Q1_CLOCK, {}, 5, False, "db clock"),
         QuerySpec("Q1b", "H1", "source_catalog priority / last_pull_at", SQL_Q1_SOURCES, {}, 5, False, ts_ing),
         QuerySpec("H1a", "H1", "pull_log YFinance_Daily rows for the date", SQL_H1_PULL_LOG, {"od": od}, 10, False, ts_ing),
-        QuerySpec("H1b", "H1", "raw_series YF:^GSPC:close vintages for the date", SQL_H1_GSPC_VINTAGES, {"od": od}, 15, True, f"{ts_obs} (obs_date) + {ts_ing} (pull_timestamp)"),
+        QuerySpec("H1b", "H1", f"raw_series input vintages for the date ({series})", SQL_H1_INPUT_VINTAGES, {"od": od, "series": series}, 15, True, f"{ts_obs} (obs_date) + {ts_ing} (pull_timestamp)"),
         QuerySpec("Q2", "H1", "capture-state census for the tickers", SQL_Q2_CENSUS, {"od": od, "tickers": tickers}, 20, True, f"{ts_obs} + {ts_ing}"),
         QuerySpec("Q7", "H1", "source mix (yfinance / TIINGO / 1995) for the tickers", SQL_Q7_SOURCE_MIX, {"since": since, "tickers": tickers}, 20, True, f"{ts_obs} + {ts_ing}"),
     ]
@@ -263,7 +294,9 @@ def build_queries(
         SQL_H2_RESOLVED, {"floor": floor, "features": ",".join(RESOLVED_FEATURES)}, 20, False,
         f"{ts_obs} (obs_date) + {ts_rdr} (vintage_date, date granularity)",
     ))
-    qs.append(QuerySpec("H3:diary", "H3", "market_diary row for the date", SQL_H3_DIARY, {"od": od}, 10, False, f"{ts_rdr} (generated_at)"))
+    qs.append(QuerySpec("L2", "L2", f"resolved_series rows for {feature} at the date", SQL_L2_RESOLVED_ROWS, {"od": od, "feature": feature}, 15, False, f"{ts_obs} (obs_date) + {ts_rdr} (vintage_date, date granularity)"))
+    qs.append(QuerySpec("L3:briefings", "L3", "market_briefings rows (date .. date+3) with the snapshot value", SQL_L3_BRIEFINGS, {"od": od, "snapkey": snapshot_key, "rid": reasoning_id}, 15, False, f"{ts_rdr} (created_at)"))
+    qs.append(QuerySpec("H3:diary", "H3", "market_diary row for the date", SQL_H3_DIARY, {"od": od, "label": diary_label}, 10, False, f"{ts_rdr} (generated_at)"))
     qs.append(QuerySpec("H4:briefings", "H4", "market_briefings rows for the date", SQL_H4_BRIEFINGS, {"od": od}, 10, False, f"{ts_rdr} (created_at)"))
     return qs
 
@@ -301,6 +334,12 @@ def render_dry_run(queries: list[QuerySpec]) -> str:
         out.append(q.sql + ";")
         out.append("ROLLBACK;")
         out.append("")
+    out += [
+        "-- Link 4 (local files only, no SQL): capture.json sha256 == directory name == receipt export sha256;",
+        "-- row sha256 (sort_keys, compact, ensure_ascii=False) == receipt row sha256; packet.json entry text sha256",
+        "-- and source_record match; DB id/created_at/snapshot value equal the retained record.",
+        "-- accepted = link1 AND link2 AND link3 AND link4 for ONE linked example; counts/existence never set it.",
+    ]
     return "\n".join(out)
 
 
@@ -384,8 +423,8 @@ def evaluate(
         "db_read_only": None if not clock else clock[0].get("ro") == "on",
         "pull_log_has_run": None if pl is None else len(pl) > 0,
         "rows_inserted_positive": None if pl is None else sum(int(r.get("rows_inserted") or 0) for r in pl) > 0,
-        "gspc_vintage_present": None if vint is None else len(vint) > 0,
-        "gspc_vintages_have_capture_state": None if vint is None else (len(vint) > 0 and all(v.get("capture_state") for v in vint)),
+        "input_vintage_present": None if vint is None else len(vint) > 0,
+        "input_vintages_have_capture_state": None if vint is None else (len(vint) > 0 and all(v.get("capture_state") for v in vint)),
     }
     hops["H1"] = {
         "name": "ingestion",
@@ -393,7 +432,7 @@ def evaluate(
         "status": _hop_status(h1),
         "evidence": {
             "pull_log": pl,
-            "gspc_vintages": vint,
+            "input_vintages": vint,
             "capture_state_census": _rows(results, "Q2"),
             "source_mix": _rows(results, "Q7"),
             "source_catalog": _rows(results, "Q1b"),
@@ -503,12 +542,287 @@ def evaluate(
     return hops
 
 
+# --------------------------------------------------------------------------
+# Linked chain (decides `accepted`): ONE input observation -> the resolved row it
+# produced -> the reasoning output that used it (or its explicit unavailable
+# reason) -> the retained publication bytes whose sha256 matches the retained
+# capture receipt.  Counts / existence / folder presence (H1..H4 above) are
+# context only and can never set accepted=true.
+# --------------------------------------------------------------------------
+
+MAX_CAPTURE_FILE_BYTES = 256 * 1024 * 1024
+_SHA_RE = r"[0-9a-f]{64}"
+
+
+def canonical_sha256(obj: Any) -> str:
+    """sha256 of the record JSON as the retained capture computes it
+    (sort_keys, compact separators, ensure_ascii=False)."""
+    raw = json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _as_obj(v: Any) -> Any:
+    if isinstance(v, str):
+        try:
+            return json.loads(v)
+        except ValueError:
+            return v
+    return v
+
+
+def _dict(v: Any) -> dict[str, Any]:
+    return v if isinstance(v, dict) else {}
+
+
+def _ts(v: Any) -> datetime | None:
+    if v is None:
+        return None
+    if isinstance(v, datetime):
+        dt = v
+    else:
+        try:
+            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _near(a: Any, b: Any, abs_tol: float) -> bool:
+    try:
+        return abs(float(a) - float(b)) <= max(abs_tol, 1e-9 * abs(float(b)))
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_capture_receipt(path: str) -> dict[str, Any]:
+    """Read the retained capture receipt.
+
+    JSON: {"export_sha256": "...", "rows": [{"channel": "market_briefings"|"market_diary", "id": 4534, "sha256": "..."}]}.
+    Markdown (the executor receipts under grid-diary-*-handoff-*/): the `capture.json` line of the
+    files table gives the export sha256; the `| id | type | created_at | row sha256 |` table gives
+    market_briefings row hashes. A markdown receipt carries no diary row hashes.
+    """
+    if os.path.getsize(path) > MAX_CAPTURE_FILE_BYTES:
+        raise ValueError("receipt too large")
+    with open(path, encoding="utf-8") as fh:
+        text_ = fh.read()
+    rows: dict[tuple[str, int], str] = {}
+    export: str | None = None
+    if path.lower().endswith(".json"):
+        obj = json.loads(text_)
+        export = obj.get("export_sha256")
+        for r in obj.get("rows", []):
+            rows[(str(r["channel"]), int(r["id"]))] = str(r["sha256"])
+        return {"export_sha256": export, "rows": rows, "format": "json"}
+    for line in text_.splitlines():
+        m = re.match(rf"^\|\s*capture\.json\s*\|\s*\d+\s*\|\s*({_SHA_RE})\s*\|", line)
+        if m:
+            export = m.group(1)
+            continue
+        m = re.match(rf"^\|\s*(\d+)\s*\|\s*\w+\s*\|\s*[^|]*\|\s*({_SHA_RE})\s*\|", line)
+        if m:
+            rows[("market_briefings", int(m.group(1)))] = m.group(2)
+    return {"export_sha256": export, "rows": rows, "format": "markdown"}
+
+
+def _read_bytes(path: str) -> bytes:
+    if os.path.getsize(path) > MAX_CAPTURE_FILE_BYTES:
+        raise ValueError(f"{path}: larger than {MAX_CAPTURE_FILE_BYTES} bytes")
+    with open(path, "rb") as fh:
+        return fh.read()
+
+
+def verify_capture(
+    kind: str,
+    row: dict[str, Any] | None,
+    capture_dir: str | None,
+    receipt_path: str | None,
+    *,
+    snapshot_key: str,
+    diary_label: str,
+) -> dict[str, Any]:
+    """Link 4: the retained bytes of the reasoning row match the retained capture receipt. Local files only."""
+    out: dict[str, Any] = {"ok": None, "checks": {}, "reason": None}
+    if row is None:
+        out.update(ok=False, reason="no reasoning row selected (link 3 failed)")
+        return out
+    if not capture_dir or not receipt_path:
+        out.update(reason="--capture-dir and --capture-receipt are both required for link 4")
+        return out
+    try:
+        cap_bytes = _read_bytes(os.path.join(capture_dir, "capture.json"))
+        packet = json.loads(_read_bytes(os.path.join(capture_dir, "packet.json")))
+        capture = json.loads(cap_bytes)
+        receipt = parse_capture_receipt(receipt_path)
+    except (OSError, ValueError, KeyError) as exc:
+        out.update(ok=False, reason=f"cannot read retained capture: {type(exc).__name__}: {str(exc)[:200]}")
+        return out
+
+    export = hashlib.sha256(cap_bytes).hexdigest()
+    ck: dict[str, bool | None] = {
+        "capture_json_sha_equals_directory_name": export == os.path.basename(os.path.normpath(capture_dir)),
+        "capture_json_sha_equals_receipt_export": export == receipt.get("export_sha256"),
+        "packet_export_sha_equals_capture": (packet.get("capture_receipt") or {}).get("export_sha256") == export,
+    }
+    rid = int(row["id"])
+    if kind == "briefing":
+        rec = next((r["record"] for r in capture.get("records", [])
+                    if r.get("channel") == "market_briefings" and int(r["record"]["id"]) == rid), None)
+        pub = next((p for p in packet.get("publications", []) if p.get("id") == f"market_briefings:{rid}"), None)
+        ck["record_present_in_capture"] = rec is not None
+        ck["packet_entry_present"] = pub is not None
+        if rec is not None:
+            row_sha = canonical_sha256(rec)
+            out["row_sha256"] = row_sha
+            ck["row_sha_equals_receipt"] = receipt["rows"].get(("market_briefings", rid)) == row_sha
+            ck["db_id_and_created_at_equal_retained"] = (
+                int(rec["id"]) == rid and _ts(rec.get("created_at")) == _ts(row.get("created_at")))
+            retained_snap = ((rec.get("snapshot_data") or {}).get("equities") or {}).get(snapshot_key)
+            ck["db_snapshot_value_equals_retained"] = _as_obj(row.get("snapshot_value")) == retained_snap
+        if pub is not None:
+            ck["packet_text_sha_matches"] = hashlib.sha256(str(pub.get("text", "")).encode("utf-8")).hexdigest() == pub.get("sha256")
+            ck["packet_source_record_equals_capture"] = (rec is not None and canonical_sha256(pub.get("source_record")) == canonical_sha256(rec))
+    else:
+        rec = next((d for d in capture.get("existing_diary_context", []) if int(d["id"]) == rid), None)
+        ev = next((e for e in packet.get("evidence", []) if e.get("id") == f"market_diary:{rid}:context"), None)
+        ck["record_present_in_capture"] = rec is not None
+        ck["packet_entry_present"] = ev is not None
+        if rec is not None:
+            row_sha = canonical_sha256(rec)
+            out["row_sha256"] = row_sha
+            ck["packet_evidence_sha_equals_row_sha"] = ev is not None and ev.get("sha256") == row_sha
+            # A markdown receipt has no diary rows, so this stays False (not accepted) unless a JSON receipt lists it.
+            ck["row_sha_equals_receipt"] = receipt["rows"].get(("market_diary", rid)) == row_sha
+            ck["db_generated_at_equal_retained"] = _ts(rec.get("generated_at")) == _ts(row.get("generated_at"))
+            ck["db_index_entry_equals_retained"] = _as_obj(row.get("index_entry")) == ((rec.get("market_moves") or {}).get("indices") or {}).get(diary_label)
+    out["checks"] = ck
+    out["receipt_format"] = receipt.get("format")
+    out["ok"] = all(v is True for v in ck.values())
+    return out
+
+
+def evaluate_chain(
+    results: dict[str, dict[str, Any]],
+    target: date,
+    *,
+    series: str,
+    feature: str,
+    reasoning: str,
+    snapshot_key: str,
+    diary_label: str,
+    capture_dir: str | None,
+    capture_receipt: str | None,
+) -> dict[str, Any]:
+    """Build the linked L1..L4 chain for ONE session. Pure apart from reading the capture files."""
+    od = target.isoformat()
+    vint = [dict(v, _ts=_ts(v.get("pull_timestamp"))) for v in (_rows(results, "H1b") or [])]
+    chain: dict[str, dict[str, Any]] = {}
+
+    # ---- L3 first (it decides which input vintage was actually used)
+    used: dict[str, Any] | None = None
+    row: dict[str, Any] | None = None
+    l3: dict[str, Any] = {"kind": reasoning, "ok": None}
+    if reasoning == "briefing":
+        rows = _rows(results, "L3:briefings")
+        if rows is None:
+            l3.update(reason="query failed")
+        else:
+            row = next((r for r in rows
+                        if _dict(_as_obj(r.get("snapshot_value"))).get("date") == od), None)
+            if row is None:
+                l3.update(ok=False, reason=f"no market_briefings row in [{od}, {od}+3d] whose snapshot_data.equities[{snapshot_key}] is dated {od}",
+                          rows_examined=len(rows))
+            else:
+                snap = _dict(_as_obj(row["snapshot_value"]))
+                created = _ts(row.get("created_at"))
+                cands = [v for v in vint if v["_ts"] and created and v["_ts"] <= created and _near(v.get("value"), snap.get("value"), 5e-5)]
+                used = max(cands, key=lambda v: v["_ts"]) if cands else None
+                l3.update(
+                    ok=used is not None, row_id=row["id"], briefing_type=row.get("briefing_type"),
+                    knowledge_timestamp=row.get("created_at"), snapshot_value=snap,
+                    snapshot_timestamp=row.get("snapshot_timestamp"), publication_status=_as_obj(row.get("publication_status")),
+                    reason=None if used else "snapshot value equals no input vintage pulled before the briefing was created",
+                )
+    else:
+        rows = _rows(results, "H3:diary")
+        if rows is None:
+            l3.update(reason="query failed")
+        elif not rows:
+            l3.update(ok=False, reason=f"no market_diary row for {od}")
+        else:
+            row = rows[0]
+            entry = _dict(_as_obj(row.get("index_entry")))
+            gen = _ts(row.get("generated_at"))
+            eligible = [v for v in vint if v["_ts"] and gen and v["_ts"] <= gen and v.get("capture_state") == "POLICY_ELIGIBLE"]
+            l3.update(row_id=row["id"], knowledge_timestamp=row.get("generated_at"), index_entry=entry)
+            if "close" in entry:
+                used = next((v for v in sorted(eligible, key=lambda v: v["_ts"], reverse=True)
+                             if _near(round(float(v["value"]), 2), entry["close"], 0.005)), None)
+                ok = used is not None and entry.get("obs_date") == od
+                l3.update(ok=ok, reason=None if ok else "diary close/obs_date equals no POLICY_ELIGIBLE vintage pulled before generation")
+            elif entry.get("status") == "no close for date":
+                ok = not eligible
+                l3.update(ok=ok, explicit_unavailable_reason=entry["status"],
+                          reason=None if ok else "diary says 'no close for date' although a POLICY_ELIGIBLE vintage existed before generation")
+            else:
+                l3.update(ok=False, reason="diary index entry neither carries a close nor the explicit 'no close for date' reason")
+    chain["L3_reasoning_output"] = l3
+
+    # ---- L1 input observation (the vintage that was used; else the newest vintage)
+    inp = used or (max((v for v in vint if v["_ts"]), key=lambda v: v["_ts"], default=None))
+    chain["L1_input_observation"] = {
+        "ok": None if _rows(results, "H1b") is None else bool(inp and inp.get("capture_state")),
+        "series_id": series, "obs_date": od,
+        "pull_timestamp": inp.get("pull_timestamp") if inp else None,
+        "capture_state": inp.get("capture_state") if inp else None,
+        "value": inp.get("value") if inp else None,
+        "raw_series_id": inp.get("id") if inp else None,
+        "source_id": inp.get("source_id") if inp else None,
+        "selected_as": "vintage used by the reasoning output" if used else "newest vintage (reasoning output did not use one)",
+        "reason": None if inp else "no SUCCESS vintage for the series/date",
+    }
+
+    # ---- L2 materialization row produced from that input
+    rr = _rows(results, "L2")
+    l2: dict[str, Any] = {"table": "resolved_series", "ok": None, "materialized_at_basis": "vintage_date (date granularity; resolved_series has no timestamp)"}
+    if rr is None:
+        l2["reason"] = "query failed"
+    elif not inp:
+        l2.update(ok=False, reason="no input vintage to link")
+    else:
+        pdate = (inp["_ts"].date() if inp.get("_ts") else None)
+        hit = next((r for r in rr
+                    if _near(r.get("value"), inp.get("value"), 1e-9)
+                    and r.get("source_priority_used") == inp.get("source_id")
+                    and pdate is not None and str(r.get("vintage_date"))[:10] >= pdate.isoformat()), None)
+        l2.update(ok=hit is not None, feature=feature, resolved_rows_examined=len(rr),
+                  row_key=None if not hit else {"feature_id": hit.get("feature_id"), "obs_date": str(hit.get("obs_date"))[:10], "vintage_date": str(hit.get("vintage_date"))[:10]},
+                  materialized_at=None if not hit else str(hit.get("vintage_date"))[:10],
+                  reason=None if hit else "no resolved_series row equals the input vintage (value, source, vintage_date >= pull date)")
+    chain["L2_materialization_row"] = l2
+
+    # ---- L4 retained bytes
+    chain["L4_retained_publication_bytes"] = verify_capture(
+        reasoning, row, capture_dir, capture_receipt, snapshot_key=snapshot_key, diary_label=diary_label)
+    order = ["L1_input_observation", "L2_materialization_row", "L3_reasoning_output", "L4_retained_publication_bytes"]
+    chain = {k: chain[k] for k in order}
+    blocking = [k for k, v in chain.items() if v.get("ok") is not True]
+    return {
+        "accepted": not blocking,
+        "blocking_links": blocking,
+        "links": chain,
+        "rule": "accepted only if all four links are true for ONE linked example; counts, row existence and folder presence never set it",
+    }
+
+
+
 def build_receipt(
     target: date,
     hops: dict[str, dict[str, Any]],
     results: dict[str, dict[str, Any]],
     *,
     args_echo: dict[str, Any],
+    chain: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema": SCHEMA,
@@ -518,17 +832,20 @@ def build_receipt(
         "read_only": True,
         "authorized_flag": True,
         "arguments": args_echo,
-        "overall": "PASS" if all(h["status"] == "PASS" for h in hops.values()) else (
+        "accepted": chain["accepted"],
+        "chain": chain,
+        "context_overall": "PASS" if all(h["status"] == "PASS" for h in hops.values()) else (
             "FAIL" if any(h["status"] == "FAIL" for h in hops.values()) else "UNKNOWN"
         ),
-        "hops": hops,
+        "context_hops": hops,
         "queries": [
             {"qid": r["qid"], "purpose": r["purpose"], "timestamp_kind": r["timestamp_kind"], "error": r["error"],
              "row_count": None if r["rows"] is None else len(r["rows"])}
             for r in results.values()
         ],
         "notes": [
-            "Receipt is an observation, not a certification: see proves/does_not_prove on each hop.",
+            "accepted is decided ONLY by the linked chain (one input -> resolved row -> reasoning output -> retained bytes); context_hops/context_overall are counts and existence checks printed for context.",
+            "Receipt is an observation, not a certification: see proves/does_not_prove on each context hop.",
             "Provider observation (obs_date), ingestion (pull_timestamp/created_at) and reader (vintage_date/generated_at) are separate timestamps.",
         ],
     }
@@ -548,9 +865,19 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--tickers", default=DEFAULT_TICKERS, help="comma-separated tickers for H1 census/source mix")
     p.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS, help="H2 window below the target date")
     p.add_argument("--max-age-days", type=int, default=DEFAULT_MAX_AGE_DAYS, help="H2 freshness tolerance vs target date")
-    p.add_argument("--capture-dir", default=None, help="H4: capture folder path to check for presence")
+    p.add_argument("--capture-dir", default=None,
+                   help="retained capture directory capture/<export_sha256>/ (capture.json, packet.json); link 4 and context H4")
+    p.add_argument("--capture-receipt", default=None,
+                   help="retained capture receipt (executor .md or .json) holding the export and row sha256s; link 4")
+    p.add_argument("--series", default=DEFAULT_SERIES, help="link 1: raw_series series_id of the input observation")
+    p.add_argument("--feature", default=DEFAULT_FEATURE, help="link 2: resolved_series feature the series materializes into")
+    p.add_argument("--reasoning", choices=("briefing", "diary"), default="briefing",
+                   help="link 3: which reasoning output to link (market_briefings row or market_diary row)")
+    p.add_argument("--reasoning-id", type=int, default=None, help="link 3: pin the market_briefings.id instead of auto-selecting")
+    p.add_argument("--snapshot-key", default=DEFAULT_SNAPSHOT_KEY, help="briefing snapshot_data.equities key for the series")
+    p.add_argument("--diary-label", default=DEFAULT_DIARY_LABEL, help="diary market_moves.indices label for the series")
     p.add_argument("--out", default=None, help="receipt path (created exclusively; never overwritten)")
-    p.add_argument("--strict", action="store_true", help="exit 1 if the overall result is not PASS")
+    p.add_argument("--strict", action="store_true", help="exit 1 unless accepted is true")
     return p.parse_args(argv)
 
 
@@ -568,7 +895,17 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
         print("error: --tickers has unexpected characters", file=sys.stderr)
         return 2
 
-    queries = build_queries(target, tickers=args.tickers, lookback_days=args.lookback_days)
+    for name, val in (("--series", args.series), ("--feature", args.feature),
+                      ("--snapshot-key", args.snapshot_key), ("--diary-label", args.diary_label)):
+        if not re.fullmatch(r"[\^A-Za-z0-9.=:&\-_ ]{1,80}", val):
+            print(f"error: {name} has unexpected characters", file=sys.stderr)
+            return 2
+
+    queries = build_queries(
+        target, tickers=args.tickers, lookback_days=args.lookback_days, series=args.series,
+        feature=args.feature, snapshot_key=args.snapshot_key, diary_label=args.diary_label,
+        reasoning_id=args.reasoning_id,
+    )
 
     if args.dry_run:
         print(render_dry_run(queries))
@@ -585,9 +922,15 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
     engine = (engine_factory or _open_engine)()
     results = {q.qid: run_query(engine, q) for q in queries}
     hops = evaluate(results, target, max_age_days=args.max_age_days, capture_dir=args.capture_dir)
+    chain = evaluate_chain(
+        results, target, series=args.series, feature=args.feature, reasoning=args.reasoning,
+        snapshot_key=args.snapshot_key, diary_label=args.diary_label,
+        capture_dir=args.capture_dir, capture_receipt=args.capture_receipt,
+    )
     receipt = build_receipt(
         target, hops, results,
         args_echo={k: v for k, v in vars(args).items() if k not in ("authorized",)},
+        chain=chain,
     )
     out = args.out or default_out_path(target)
     try:
@@ -597,8 +940,10 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
     except FileExistsError:
         print(f"error: receipt path already exists, refusing to overwrite: {out}", file=sys.stderr)
         return 2
-    print(f"receipt written: {out} overall={receipt['overall']} " + " ".join(f"{k}={v['status']}" for k, v in hops.items()))
-    return 1 if (args.strict and receipt["overall"] != "PASS") else 0
+    links = " ".join(f"{k.split('_')[0]}={v.get('ok')}" for k, v in chain["links"].items())
+    print(f"receipt written: {out} accepted={chain['accepted']} {links} | context: "
+          + " ".join(f"{k}={v['status']}" for k, v in hops.items()))
+    return 1 if (args.strict and not chain["accepted"]) else 0
 
 
 if __name__ == "__main__":
