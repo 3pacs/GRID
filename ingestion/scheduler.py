@@ -13,6 +13,7 @@ with exponential backoff.
 
 from __future__ import annotations
 
+import hashlib
 import socket
 import threading
 import time
@@ -401,6 +402,198 @@ def start_tiingo_prices_worker(db_engine: Engine) -> bool:
         _tiingo_worker = worker
     log.info("{p}: worker thread started", p=TIINGO_PRICES_JOB)
     return True
+
+
+# Daily flow materialization (ingestion/flow_materializer.py::sync_all).
+#
+# sync_all turns signal_sources/raw_series into the insider_trades,
+# congressional_trades, dark_pool_weekly, etf_flows and junction_point_readings
+# tables the flows API reads. Other sync_all callers that exist in source:
+#   * grid-hermes's daily-intel `flow_materialize` task (scripts/hermes_operator.py),
+#     which is HELD (DAILY_INTEL_HOLD_REASONS) and does not run while
+#     grid-hermes is off; and
+#   * a host systemd unit, grid-flow-materializer.timer (every 30 min, oneshot
+#     from the OLD checkout /home/grid/grid_v4/grid_repo at 5facbdf0, not
+#     tracked under server_setup/). Operator receipt 2026-10-19T06:53Z: it is
+#     ENABLED and ACTIVE (LIVE), last run 06:30:56Z SUCCESS. Until it is
+#     disabled it keeps writing old-semantics rows every 30 minutes.
+# This job (weekdays 23:15 UTC, after the 22:00Z domestic slot, 15 min before
+# the 23:30Z Tiingo slot, outside the 03:30-10:30Z pg_dump window) is a
+# scheduler-native caller, not a claim that it is the only one. The budget
+# matches Hermes's SQL-class task budget (DAILY_INTEL_SQL_TASK_BUDGET_S = 60):
+# sync_all runs on a worker thread so a hung statement can never hold the
+# single-threaded schedule loop.
+#
+# Coordination: the run holds a session-level Postgres advisory lock
+# (FLOW_MATERIALIZE_ADVISORY_LOCK_KEY, same pattern as the yfinance/Tiingo
+# pullers) for the whole sync_all, and skips (receipt "SKIPPED: ...") if
+# another holder has it. That only coordinates callers that take the same key.
+# The host timer's old-checkout code takes NO lock, so it must be disabled in
+# the same change window as the scheduler release (operator step; see
+# docs/SERVER-SERVICES.md).
+FLOW_MATERIALIZE_SLOT_UTC = "23:15"
+FLOW_MATERIALIZE_JOB = "FlowMaterialize_Daily"
+FLOW_MATERIALIZE_BUDGET_S = 60
+FLOW_MATERIALIZE_ADVISORY_LOCK_KEY: int = int.from_bytes(
+    hashlib.sha256(b"grid:flow_materializer:sync_all").digest()[:8], "big", signed=True,
+)
+_flow_materialize_worker: threading.Thread | None = None
+_flow_materialize_guard = threading.Lock()
+
+
+def _try_flow_materialize_lock(engine: Engine) -> Any | None:
+    """Dedicated connection holding the session-level advisory lock, or None.
+
+    The connection must stay open for the whole run: a session-level advisory
+    lock lives on that backend, and Postgres drops it if the process dies.
+    """
+    conn = engine.connect()
+    try:
+        acquired = conn.execute(
+            text("SELECT pg_try_advisory_lock(:key)"),
+            {"key": FLOW_MATERIALIZE_ADVISORY_LOCK_KEY},
+        ).scalar()
+        conn.commit()
+    except Exception:
+        conn.close()
+        raise
+    if not acquired:
+        conn.close()
+        return None
+    return conn
+
+
+def _release_flow_materialize_lock(conn: Any) -> None:
+    try:
+        conn.execute(
+            text("SELECT pg_advisory_unlock(:key)"),
+            {"key": FLOW_MATERIALIZE_ADVISORY_LOCK_KEY},
+        )
+        conn.commit()
+    except Exception as exc:
+        log.warning(
+            "{j}: advisory lock release failed (Postgres releases it when the "
+            "connection closes): {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc),
+        )
+    finally:
+        conn.close()
+
+
+def _flow_materialize_receipt_text(summary: dict[str, Any]) -> tuple[int, str]:
+    """(total rows, "table=n ...; errors: ...") from a sync_all summary dict."""
+    counts = {
+        k: v for k, v in summary.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    text_ = " ".join(f"{k}={v}" for k, v in counts.items())
+    errors = summary.get("errors") or []
+    if errors:
+        text_ += "; errors: " + "; ".join(
+            f"{e.get('table')}: {str(e.get('error'))[:80]}" for e in errors
+        )
+    return sum(counts.values()), text_
+
+
+def run_flow_materialize_daily(
+    slot: str = FLOW_MATERIALIZE_SLOT_UTC,
+    now_utc: datetime | None = None,
+    budget_s: float = FLOW_MATERIALIZE_BUDGET_S,
+) -> dict[str, Any] | None:
+    """Run flow_materializer.sync_all once, with a pull_log receipt.
+
+    Skipped (returns None) when released more than
+    DOMESTIC_SLOT_MAX_LATE_MINUTES late (lateness evaluated on the UTC clock
+    the slot is registered on) or while the previous run's worker is still
+    alive, or when another process holds the advisory lock (receipted as a
+    zero-row "SKIPPED: ..." note). Never raises: a sync_all exception, a budget overrun or a failed
+    receipt write is logged and reflected in the returned summary.
+
+    The receipt row (puller_name FlowMaterialize_Daily) carries the status
+    (SUCCESS/PARTIAL/FAILED), the total rows and the per-table counts plus any
+    per-table errors in error_message. A run that outlives ``budget_s`` is
+    receipted FAILED and its worker left to finish on its own; the schedule
+    loop moves on.
+    """
+    global _flow_materialize_worker
+
+    now = now_utc or datetime.now(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} {j} slot: released {m:.0f} min late (limit {lim} min) "
+            "by an earlier job holding the scheduler loop",
+            s=slot, j=FLOW_MATERIALIZE_JOB, m=late.total_seconds() / 60,
+            lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return None
+
+    started_at = datetime.now(timezone.utc)
+    box: dict[str, Any] = {}
+
+    def _work(engine: Engine) -> None:
+        lock_conn = None
+        try:
+            lock_conn = _try_flow_materialize_lock(engine)
+            if lock_conn is None:
+                box["skipped"] = "another process holds the flow-materialize advisory lock"
+                return
+            from ingestion.flow_materializer import sync_all
+
+            box["summary"] = sync_all(engine)
+        except Exception as exc:  # reported by the caller; never die silently
+            box["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if lock_conn is not None:
+                _release_flow_materialize_lock(lock_conn)
+
+    with _flow_materialize_guard:
+        if _flow_materialize_worker is not None and _flow_materialize_worker.is_alive():
+            log.warning(
+                "{j}: previous worker still running -- not starting another",
+                j=FLOW_MATERIALIZE_JOB,
+            )
+            return None
+        try:
+            from db import get_engine
+
+            engine = get_engine()
+        except Exception as exc:
+            log.warning("{j}: no database engine: {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc))
+            return {"status": "FAILED", "error": str(exc)}
+        worker = threading.Thread(
+            target=_work, args=(engine,), name="flow-materialize", daemon=True,
+        )
+        worker.start()
+        _flow_materialize_worker = worker
+
+    worker.join(budget_s)
+    if worker.is_alive():
+        msg = f"budget exceeded: sync_all still running after {budget_s:g}s"
+        log.warning("{j}: {m}", j=FLOW_MATERIALIZE_JOB, m=msg)
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", 0, msg)
+        return {"status": "FAILED", "error": msg}
+    if "error" in box:
+        log.error("{j} failed: {e}", j=FLOW_MATERIALIZE_JOB, e=box["error"])
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", 0, box["error"])
+        return {"status": "FAILED", "error": box["error"]}
+
+    if "skipped" in box:
+        # pull_log has no SKIPPED status; like PullContext, store it as a
+        # zero-row SUCCESS whose note says SKIPPED.
+        note = f"SKIPPED: {box['skipped']}"
+        log.warning("{j}: {n}", j=FLOW_MATERIALIZE_JOB, n=note)
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "SUCCESS", 0, note)
+        return {"status": "SKIPPED", "reason": box["skipped"]}
+
+    summary = box["summary"]
+    rows, detail = _flow_materialize_receipt_text(summary)
+    status = summary.get("status") if summary.get("status") in {"SUCCESS", "PARTIAL", "FAILED"} else "FAILED"
+    if status == "SUCCESS":
+        log.info("{j} complete: {d}", j=FLOW_MATERIALIZE_JOB, d=detail)
+    else:
+        log.warning("{j} {s}: {d}", j=FLOW_MATERIALIZE_JOB, s=status, d=detail)
+    _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, status, rows, detail)
+    return summary
 
 
 # Domestic run_daily_pulls slots skip a firing that arrives this late. The
@@ -1975,6 +2168,13 @@ def start_scheduler() -> None:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )
+
+    # Hermes-independent flow materialization (see FLOW_MATERIALIZE_SLOT_UTC):
+    # weekdays after the 22:00Z slot, outside the 03:30-10:30Z backup window.
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at(FLOW_MATERIALIZE_SLOT_UTC, "UTC").do(
+            run_flow_materialize_daily, slot=FLOW_MATERIALIZE_SLOT_UTC
+        )
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:
