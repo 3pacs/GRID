@@ -604,6 +604,25 @@ def run_flow_materialize_daily(
 DOMESTIC_SLOT_MAX_LATE_MINUTES = 90
 
 
+def _scheduler_utc_now() -> datetime:
+    """Aware UTC clock for call-time windows (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _routine_yfinance_start(now_utc: datetime | None = None) -> str:
+    """Start date for a scheduled yfinance run: last completed session - overlap.
+
+    ``last_trading_day(utc_today - 1)`` is the most recent session that has
+    ended, so the window always covers it regardless of when the scheduler
+    process started. Manual runs with an explicit start date do not use this.
+    """
+    from ingestion.market_calendar import last_trading_day
+
+    now = (now_utc or _scheduler_utc_now()).astimezone(timezone.utc)
+    last_session = last_trading_day(now.date() - timedelta(days=1))
+    return (last_session - timedelta(days=YFINANCE_WINDOW_OVERLAP_DAYS)).isoformat()
+
+
 def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     """How long after the most recent HH:MM occurrence ``now`` is.
 
@@ -638,6 +657,14 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 #     run is the exchange's official open seen next morning -- it is NOT the
 #     opening-time observation and must not be described or used as one.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
+# Scheduled yfinance runs request a window computed at call time: from
+# YFINANCE_WINDOW_OVERLAP_DAYS before the last completed session, never from the
+# scheduler's start date. pull_ticker downloads [start_date, ...) and the
+# writer can only qualify a date it downloaded, so a window frozen at process
+# start lost every session that ended before a (re)start (found 2026-10-19: a
+# Sat 10-17 start left no live POLICY_ELIGIBLE 10-16 rows for 51 tickers).
+# It is also bounded, instead of regrowing from the start date every run.
+YFINANCE_WINDOW_OVERLAP_DAYS = 3
 
 
 def run_pull_group(
@@ -1655,7 +1682,12 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     if not market_open:
         log.info("Market closed ({d}) — skipping equity pullers", d=today)
     else:
-        _run_equity_pulls(start_date)
+        # Scheduled slots get a call-time yfinance window (see
+        # YFINANCE_WINDOW_OVERLAP_DAYS); a manual run keeps its explicit start.
+        _run_equity_pulls(
+            start_date,
+            yfinance_start=_routine_yfinance_start() if slot is not None else None,
+        )
 
     # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
 
@@ -1777,13 +1809,15 @@ def run_yfinance_morning_slot(
     clock the slot is registered on.
 
     Parameters:
-        start_date: Passed through to the yfinance pull unchanged.
+        start_date: Accepted for registration symmetry but not used: the
+            request window is computed at call time (_routine_yfinance_start),
+            so a scheduler (re)started after the session still captures it.
         slot: The "HH:MM" UTC slot this call was registered for.
         now_utc: Aware UTC clock override (tests).
     """
     from ingestion.market_calendar import is_market_open
 
-    now = now_utc or datetime.now(timezone.utc)
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
     late = _slot_lateness(slot, now)
     if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
         log.warning(
@@ -1793,7 +1827,7 @@ def run_yfinance_morning_slot(
         )
         return
 
-    prior_day = now.astimezone(timezone.utc).date() - timedelta(days=1)
+    prior_day = now.date() - timedelta(days=1)
     if not is_market_open(prior_day):
         log.info(
             "yfinance morning slot: {d} was not a US trading session — nothing to capture",
@@ -1804,7 +1838,7 @@ def run_yfinance_morning_slot(
     log.info(
         "yfinance morning slot: capturing the qualified close for {d}", d=prior_day,
     )
-    _run_yfinance_daily(start_date)
+    _run_yfinance_daily(_routine_yfinance_start(now))
 
 
 def _completed_spy_close_window(
@@ -1851,6 +1885,66 @@ def _pull_completed_spy_close(
     return window[0], result
 
 
+# The one per-item PARTIAL that is the writer's normal path: yfinance_pull
+# refuses a provisional SPY close (and one past the lookback), counts it in
+# daily_policy_refusals and appends this exact error. See _run_yfinance_daily.
+_YF_EXPECTED_REFUSAL = "Daily captures refused: incomplete or unknown session policy"
+
+
+def _is_expected_spy_refusal(item: Any) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("ticker") == "SPY"
+        and item.get("status") == "PARTIAL"
+        and bool(item.get("daily_policy_refusals"))
+        and not item.get("raw_value_refusals")
+        and not item.get("error")
+        and item.get("errors") == [_YF_EXPECTED_REFUSAL]
+    )
+
+
+def _normalize_expected_spy_refusal(results: Any) -> Any:
+    """Treat the expected SPY provisional-close refusal as a clean check.
+
+    Only that single, exactly-matching refusal is normalized (SPY, PARTIAL, the
+    expected error and nothing else, no raw-value refusals); any other error on
+    any item keeps the run PARTIAL. A refusal that wrote nothing becomes
+    ``duplicate_only`` (a checked ticker with no new rows), not ``no_data``.
+    """
+    if not isinstance(results, list):
+        return results
+    return [
+        {**item, "status": "SUCCESS", "errors": [],
+         "outcome": "duplicate_only" if item.get("outcome") == "no_data" else item.get("outcome")}
+        if _is_expected_spy_refusal(item) else item
+        for item in results
+    ]
+
+
+def _log_yfinance_item_issues(results: Any, normalized: Any) -> None:
+    """Log every not-clean item with its error so "N of 70" is reconstructible."""
+    if not isinstance(results, list) or not isinstance(normalized, list):
+        return
+    expected = [r.get("ticker") for r in results if _is_expected_spy_refusal(r)]
+    issues = [
+        (r.get("ticker"), r.get("status"), r.get("outcome"),
+         str((r.get("errors") or [r.get("error") or ""])[0])[:80])
+        for r in normalized
+        if isinstance(r, dict) and (
+            r.get("status") != "SUCCESS" or r.get("errors") or r.get("outcome") in ("no_data", "error"))
+    ]
+    if expected:
+        log.info(
+            "yfinance daily pull — expected provisional-close refusal for {t} "
+            "(counted as a clean check)", t=expected,
+        )
+    if issues:
+        log.warning(
+            "yfinance daily pull — {n} of {total} item(s) not clean: {f}",
+            n=len(issues), total=len(results), f=issues[:30],
+        )
+
+
 def _run_yfinance_daily(start_date: str | date) -> None:
     """YFinance_Daily pull plus the completed-SPY-close check.
 
@@ -1872,13 +1966,16 @@ def _run_yfinance_daily(start_date: str | date) -> None:
         from ingestion.pull_context import PullContext
         with PullContext(engine, "YFinance_Daily") as ctx:
             results = yf_puller.pull_all(start_date=start_date)
-            outcome, total_rows, note = _classify_outcome(results)
+            # The expected SPY provisional-close refusal must not make every
+            # run PARTIAL (and freeze source_catalog.last_pull_at).
+            checked = _normalize_expected_spy_refusal(results)
+            outcome, total_rows, note = _classify_outcome(checked)
             ctx.record_rows(total_rows)
             if outcome in {"FAILED", "PARTIAL"}:
                 ctx.set_status(outcome, note)
             elif outcome in {"SKIPPED", "NO_NEW_DATA"}:
                 ctx.set_note(f"{outcome}: {note}")
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        succeeded = sum(1 for r in checked if r["status"] == "SUCCESS")
         log.info(
             "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
             ok=succeeded,
@@ -1897,16 +1994,7 @@ def _run_yfinance_daily(start_date: str | date) -> None:
         # pull_ticker's own log lines — this is the function actually
         # wired to the 4x/day cron, so this is where an operator/Hermes
         # would look first for "which tickers didn't check cleanly today".
-        failing = [
-            (r.get("ticker"), r.get("outcome"))
-            for r in results
-            if r.get("outcome") in ("no_data", "error")
-        ]
-        if failing:
-            log.warning(
-                "yfinance daily pull — {n} ticker(s) did not check cleanly: {f}",
-                n=len(failing), f=failing[:20],
-            )
+        _log_yfinance_item_issues(results, checked)
         # Cadence checks are logged, but only complete positive-write runs
         # establish source freshness (the same rule as SmartScheduler).
         if outcome == "SUCCESS":
@@ -1936,8 +2024,14 @@ def _run_yfinance_daily(start_date: str | date) -> None:
             log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
 
 
-def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
-    """Equity-hours pullers — only called when market is open."""
+def _run_equity_pulls(
+    start_date: str | date = "1990-01-01", yfinance_start: str | date | None = None,
+) -> None:
+    """Equity-hours pullers — only called when market is open.
+
+    ``start_date`` feeds the date-floored pullers; yfinance uses
+    ``yfinance_start`` when given (scheduled slots), else ``start_date``.
+    """
     from db import get_engine
 
     # FRED pull
@@ -1975,7 +2069,7 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
             log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
 
     # yfinance pull (every slot, including the 13:30 UTC opening observation).
-    _run_yfinance_daily(start_date)
+    _run_yfinance_daily(yfinance_start if yfinance_start is not None else start_date)
 
     # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
     # it wrote backdated resolved_series vintages directly and, on the
