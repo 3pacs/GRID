@@ -1,14 +1,14 @@
 # TEMPLATE — NOT INSTALLED. See grid-yf-latest-vintage.service.template.
-# Daily 06:10Z: after the 05:15Z yfinance morning slot and the 05:30Z market
-# diary (sibling PRs), so the view reflects the morning pull. NOTE: the nightly
-# core pg_dump was observed running 03:33-10:05Z on 2026-09-28; this refresh is
-# read-only and low-priority (Nice/idle IO in the service) but will share disk
-# with it. Keep the jitter small so the 06:10 ordering holds.
+# Daily 10:45Z: after the 05:15Z yfinance morning slot and the 05:30Z market
+# diary, so the view reflects the morning pull. Deliberately OUTSIDE the nightly
+# pg_dump window (grid-pg-backup.timer fires 03:30Z and has run until ~10:05-
+# 10:30Z; tests/test_systemd_template_invariants.py enforces 03:30-10:30Z is
+# free). The diary must not depend on this view: it is refreshed after it.
 [Unit]
 Description=Refresh public.yf_latest_daily_vintage once a day
 
 [Timer]
-OnCalendar=*-*-* 06:10:00 UTC
+OnCalendar=*-*-* 10:45:00 UTC
 RandomizedDelaySec=2min
 Persistent=true
 Unit=grid-yf-latest-vintage.service

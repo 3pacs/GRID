@@ -211,7 +211,7 @@ def test_systemd_templates_present_and_not_installed():
     timer = (d / "grid-yf-latest-vintage.timer.template").read_text()
     assert "TEMPLATE — NOT INSTALLED" in service and "TEMPLATE — NOT INSTALLED" in timer
     assert "scripts/refresh_yf_latest_vintage.py" in service
-    assert "OnCalendar=*-*-* 06:10:00 UTC" in timer
+    assert "OnCalendar=*-*-* 10:45:00 UTC" in timer
     assert "Unit=grid-yf-latest-vintage.service" in timer
 
 

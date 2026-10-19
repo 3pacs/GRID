@@ -52,13 +52,15 @@ seqscan / bitmapscan = off`. It still takes **~100 s per field for 70 tickers,
 * First population is run by the operator, by hand:
   `python3 scripts/refresh_yf_latest_vintage.py` (plain `REFRESH`, since
   `CONCURRENTLY` is refused on an unpopulated view).
-* Afterwards: daily **06:10Z** via the timer template (after the 05:15Z yfinance
+* Afterwards: daily **10:45Z** via the timer template (after the 05:15Z yfinance
   morning slot and the 05:30Z market diary), `REFRESH MATERIALIZED VIEW
   CONCURRENTLY`: readers are never blocked. `statement_timeout` is 1200 s, one
   transaction, the script logs row count and duration and exits 1 on failure.
   `--dry-run` prints the SQL without connecting.
-* The 06:10Z slot overlaps the nightly core `pg_dump` window (03:33–10:05Z
-  observed 2026-09-28): the refresh is read-only and runs at `Nice=10` / idle IO.
+* 10:45Z is deliberately outside the nightly `pg_dump` window (03:30–10:30Z,
+  enforced for all timer templates by `tests/test_systemd_template_invariants.py`).
+  Consequence: the view lags the morning pull until 10:45Z, so the diary and
+  other early consumers must not depend on it.
 
 ## Audit queries it replaces
 
