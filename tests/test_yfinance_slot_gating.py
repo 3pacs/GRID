@@ -4,7 +4,10 @@ The yfinance writer only marks a daily close POLICY_ELIGIBLE once the pull
 happens after the next New York midnight, so the first qualified close for
 session D used to land in the 13:30Z run on D+1. The scheduler now has a 05:15Z
 yfinance-only morning slot. The 13:30Z slot keeps running yfinance: that row is
-the point-in-time opening observation (INCOMPLETE-tagged, not a close).
+the opening-time raw observation and 16:00/20:00/22:00Z are same-day
+snapshots (all with the #853 writer's INCOMPLETE/UNKNOWN labels, none a close).
+The 05:15Z run is the separate completed-close capture; its daily-bar Open is
+the official open seen next morning, not an opening-time observation.
 
 Everything is a local fake: no network, no database, no email.
 """

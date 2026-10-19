@@ -435,9 +435,15 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 #   * run_yfinance_morning_slot captures D's close at 05:15Z on D+1, as soon
 #     as the NY-midnight boundary has passed in both EDT and EST (Saturday
 #     for Friday, Tuesday for a Monday session, ...);
-#   * 13:30Z/16:00Z/20:00Z/22:00Z keep running yfinance. The 13:30Z row is
-#     the point-in-time opening observation (09:30 ET, tagged INCOMPLETE): it
-#     is not a close, and only final-close scoring ignores it.
+#   * 13:30Z is the opening-time raw observation (09:30 ET: what was knowable
+#     then); 16:00Z/20:00Z/22:00Z are same-day snapshots. All of them keep
+#     running yfinance and carry the #853 writer's honest finality labels
+#     (INCOMPLETE for supported US-listed 2026 tickers, UNKNOWN otherwise).
+#     They are not closes; only final-close scoring ignores them.
+#   * 05:15Z is the separate completed-close capture, after the next New York
+#     midnight (POLICY_ELIGIBLE). The daily bar's Open field written by that
+#     run is the exchange's official open seen next morning -- it is NOT the
+#     opening-time observation and must not be described or used as one.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
 
 
@@ -1568,6 +1574,11 @@ def run_yfinance_morning_slot(
     calendar day was a US trading session -- so Friday's close is captured
     on Saturday and Monday's on Tuesday, whether or not today is a session.
     Sunday, and the day after a weekend-adjacent holiday, skip.
+
+    This is the completed-close capture, separate from the 13:30Z opening
+    observation and the 16:00/20:00/22:00Z same-day snapshots. The daily bar's
+    Open it also writes is the exchange's official open seen next morning, not
+    an opening-time observation.
 
     Uses the same lateness guard as run_daily_pulls, evaluated on the UTC
     clock the slot is registered on.
