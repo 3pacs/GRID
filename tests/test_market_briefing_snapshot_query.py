@@ -36,11 +36,12 @@ consistent with how the rest of this file's sibling tests
 from __future__ import annotations
 
 import os
-from datetime import date
+from datetime import date, datetime, timezone
 
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from ollama.market_briefing import MarketBriefingEngine
+from price_close_contract import daily_capture_payload, raw_capture_payload
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────
@@ -256,3 +257,141 @@ def test_gather_market_snapshot_never_raises_when_feature_query_blows_up(tmp_pat
     # The outer try/except in _gather_market_snapshot catches the failure
     # before "features" is ever assigned -- confirm no partial/stale value.
     assert snapshot.get("features") is None
+
+
+# ── YF snapshot values: no in-progress / unmarked same-day vintage ─────────
+#
+# Regression for the briefing reading ``SELECT value, obs_date FROM raw_series
+# ... ORDER BY obs_date DESC LIMIT 1`` for YF series: with several SUCCESS
+# vintages on one obs_date the first-inserted (13:32Z opening-minutes,
+# INCOMPLETE) value was published as the index level (briefings 4576-4579:
+# ^GSPC 7704.36 while the newest pull was 7690.73).
+
+
+def _utc(y, m, d, hh, mm):
+    return datetime(y, m, d, hh, mm, tzinfo=timezone.utc)
+
+
+def _row(obs_date, value, pulled_at, ticker, field="close", *, marked=True):
+    """(obs_date, value, pull_ts, payload) as raw_series would hold it."""
+    if not marked:  # legacy / unmarked capture: no raw_payload at all
+        payload = None
+    else:
+        payload = raw_capture_payload(ticker, field, obs_date, pulled_at, "1d")
+    return (obs_date, value, pulled_at, payload)
+
+
+class _RawSeriesConnection(_FakeConnection):
+    """Serves raw_series rows per series, in insertion order, for each reader shape.
+
+    * store.observations window/latest SQL (``JOIN source_catalog``): rows sorted
+      like the real SQL (obs_date, pull_timestamp DESC), as (obs_date, value,
+      pull_ts, "yfinance"[, payload]). The ``start`` / ``as_of_ts`` bounds are
+      not applied; rows are fixed dates, independent of the wall clock.
+    * the legacy inline ``SELECT value, obs_date ... LIMIT 1``: the max obs_date
+      row that was INSERTED FIRST, which is what Postgres returned live.
+    """
+
+    def __init__(self, series_rows):
+        super().__init__()
+        self.series_rows = series_rows
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        params = params or {}
+        if "FROM raw_series" not in sql:
+            return super().execute(stmt, params)
+        self.executed.append((sql, params))
+        rows = self.series_rows.get(params.get("sid"), [])
+        if "JOIN source_catalog" in sql:
+            ordered = sorted(rows, key=lambda r: (r[0], -r[2].timestamp()))
+            if "LIMIT 1" in sql:
+                newest = sorted(rows, key=lambda r: (r[0], r[2]))[-1:] if rows else []
+                return _FakeResult(one=(newest[0][:3] + ("yfinance",)) if newest else None)
+            return _FakeResult(many=[(d, v, ts, "yfinance", payload) for d, v, ts, payload in ordered])
+        if not rows:
+            return _FakeResult()
+        top = max(r[0] for r in rows)
+        first = next(r for r in rows if r[0] == top)
+        return _FakeResult(one=(first[1], first[0]))
+
+
+def _qualified(ticker, obs_date, value, pulled_at):
+    payload = daily_capture_payload(ticker, "close", obs_date, pulled_at)
+    assert payload is not None, "test setup: pull must be after the label-day boundary"
+    return (obs_date, value, pulled_at, payload)
+
+
+def _gspc_rows():
+    d16, d19 = date(2026, 10, 16), date(2026, 10, 19)
+    return [
+        _row(d16, 7753.2798, _utc(2026, 10, 16, 13, 32), "^GSPC", marked=False),  # unmarked opening-minutes
+        _qualified("^GSPC", d16, 7659.4399, _utc(2026, 10, 19, 3, 52)),
+        _row(d19, 7704.3599, _utc(2026, 10, 19, 13, 32), "^GSPC"),  # INCOMPLETE, inserted first
+        _row(d19, 7690.73, _utc(2026, 10, 19, 20, 4), "^GSPC"),  # INCOMPLETE, newest pull
+    ]
+
+
+def test_snapshot_uses_policy_eligible_close_not_same_day_incomplete_vintage(tmp_path):
+    conn = _RawSeriesConnection({"YF:^GSPC:close": _gspc_rows()})
+    snapshot = _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    gspc = snapshot["equities"]["^GSPC"]
+    assert gspc["value"] == 7659.4399
+    assert gspc["date"] == "2026-10-16"
+    assert gspc["basis"] == "policy_eligible_daily_capture"
+    assert gspc["collected_at"] == "2026-10-19T03:52:00+00:00"
+    assert gspc["source"] == "yfinance"
+
+
+def test_snapshot_withholds_policy_series_with_only_incomplete_captures(tmp_path):
+    d19 = date(2026, 10, 19)
+    conn = _RawSeriesConnection({
+        "YF:^DJI:close": [
+            _row(d19, 46100.0, _utc(2026, 10, 19, 13, 32), "^DJI"),
+            _row(d19, 46210.0, _utc(2026, 10, 19, 20, 4), "^DJI"),
+        ],
+    })
+    snapshot = _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    assert "^DJI" not in snapshot["equities"]  # no value rather than an in-progress one
+
+
+def test_snapshot_labels_sessionless_tickers_and_takes_newest_pull(tmp_path):
+    """^VIX has no daily session policy, so completeness can't be asserted:
+    report the newest pull, labelled, not the first-inserted vintage."""
+    d19 = date(2026, 10, 19)
+    conn = _RawSeriesConnection({
+        "YF:^VIX:close": [
+            _row(d19, 17.1, _utc(2026, 10, 19, 13, 32), "^VIX"),
+            _row(d19, 16.4, _utc(2026, 10, 19, 20, 4), "^VIX"),
+        ],
+    })
+    snapshot = _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    vix = snapshot["volatility"]["^VIX"]
+    assert vix["value"] == 16.4
+    assert vix["basis"] == "unqualified_latest_pull"
+    assert vix["session_finality"] == "unknown"
+    assert vix["collected_at"] == "2026-10-19T20:04:00+00:00"
+
+
+def test_snapshot_basis_reaches_the_briefing_evidence_lines(tmp_path):
+    conn = _RawSeriesConnection({"YF:^GSPC:close": _gspc_rows()})
+    engine = _make_engine(conn, tmp_path)
+    context = engine._build_data_context(engine._gather_market_snapshot())
+
+    line = next(l for l in context.splitlines() if "equities:^GSPC" in l)
+    assert "raw value=7659.4399" in line
+    assert "asof=2026-10-16" in line
+    assert "basis=policy_eligible_daily_capture" in line
+    assert "7704" not in context and "7690" not in context
+
+
+def test_no_bare_obs_date_limit_1_read_remains_for_yf_series(tmp_path):
+    conn = _RawSeriesConnection({"YF:^GSPC:close": _gspc_rows()})
+    _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    for sql, params in conn.executed:
+        if "FROM raw_series" in sql and str(params.get("sid", "")).startswith("YF:"):
+            assert "JOIN source_catalog" in sql, f"YF read bypasses store.observations: {sql!r}"
