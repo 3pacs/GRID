@@ -1591,36 +1591,38 @@ def _attach_conviction(conn: Any, candidates: list[dict[str, Any]]) -> list[dict
         track_record = {"samples": 0}
         confirmation = {"samples": 0, "aligned": 0, "opposed": 0}
         if ticker:
-            options = options_cache.setdefault(ticker, _fetch_options_context(conn, ticker))
+            if ticker not in options_cache:
+                options_cache[ticker] = _fetch_options_context(conn, ticker)
+            options = options_cache[ticker]
             track_key = (ticker, direction, model_name, str(_horizon_days(candidate)), str(calibration.get("regime") or ""))
-            track_record = track_cache.setdefault(
-                track_key,
-                _fetch_track_record(
+            if track_key not in track_cache:
+                track_cache[track_key] = _fetch_track_record(
                     conn,
                     ticker,
                     direction,
                     model_name or None,
                     _horizon_days(candidate),
                     calibration.get("regime"),
-                ),
-            )
+                )
+            track_record = track_cache[track_key]
             scorecard_key = (
                 ",".join(sorted((calibration.get("signal_contributions") or {}).keys())),
                 _horizon_days(candidate),
                 str(calibration.get("regime") or ""),
             )
-            signal_cards = scorecard_cache.setdefault(
-                scorecard_key,
-                _fetch_signal_scorecards(
+            if scorecard_key not in scorecard_cache:
+                scorecard_cache[scorecard_key] = _fetch_signal_scorecards(
                     conn,
                     calibration.get("signal_contributions") or {},
                     _horizon_days(candidate),
                     calibration.get("regime"),
-                ),
-            )
+                )
+            signal_cards = scorecard_cache[scorecard_key]
             track_record = _merge_track_records(track_record, signal_cards)
             confirmation_key = (ticker, direction)
-            confirmation = confirmation_cache.setdefault(confirmation_key, _fetch_signal_confirmation(conn, ticker, direction))
+            if confirmation_key not in confirmation_cache:
+                confirmation_cache[confirmation_key] = _fetch_signal_confirmation(conn, ticker, direction)
+            confirmation = confirmation_cache[confirmation_key]
         candidate = {
             **candidate,
             "conviction": _build_conviction_gate(
