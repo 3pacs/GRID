@@ -7,13 +7,24 @@ Pulls dark pool trading data from FINRA's OTC Transparency API:
 2. Consolidated short interest -- bimonthly short interest reports.
 
 Data sources:
-- ATS volume: https://api.finra.org/data/group/otcMarket/name/weeklyDownloadDetails
+- ATS volume: https://api.finra.org/data/group/otcMarket/name/weeklySummary
 - Short interest: https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest
 
 Series stored:
 - finra.ats_total_volume: Total ATS (dark pool) volume across tracked tickers
 - finra.ats_dark_pct: Dark pool volume as percentage of total volume (DIX proxy)
 - finra.short_interest_total: Consolidated short interest across tracked tickers
+
+ATS request history (2026-10-19): this module used to POST to
+``otcMarket/name/weeklyDownloadDetails`` with ``sortFields`` and failed every
+run with HTTP 400. ``weeklyDownloadDetails`` is not a dataset in FINRA's API
+catalog or its OTC Transparency API spec (v0.4), where the weekly ATS data is
+``otcMarket/name/weeklySummary``. FINRA's Query API docs also say sorting
+needs an EQUAL compareFilter on every partition field (weeklySummary's are
+weekStartDate and tierIdentifier). The ATS request now matches
+``dark_pool.py``, which was fixed for the same 400 on the same dataset:
+``dateRangeFilters`` on weekStartDate plus ``domainFilters`` on
+issueSymbolIdentifier, and no ``sortFields``.
 """
 
 from __future__ import annotations
@@ -26,11 +37,12 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.dark_pool import parse_ats_weekly_records
 from ingestion.base import BasePuller, retry_on_failure
 
 # ---- URLs ----
 _ATS_VOLUME_URL: str = (
-    "https://api.finra.org/data/group/otcMarket/name/weeklyDownloadDetails"
+    "https://api.finra.org/data/group/otcMarket/name/weeklySummary"
 )
 _SHORT_INTEREST_URL: str = (
     "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
@@ -62,6 +74,10 @@ _RATE_LIMIT_DELAY: float = 2.0
 
 # FINRA API pagination
 _PAGE_SIZE: int = 5000
+
+# weeklySummary holds a rolling 12 months (older weeks live in
+# weeklySummaryHistoric), so the ATS fetch window never reaches further back.
+_ATS_WINDOW_DAYS: int = 365
 
 
 class FINRAATSPuller(BasePuller):
@@ -140,19 +156,27 @@ class FINRAATSPuller(BasePuller):
         offset: int = 0,
         limit: int = _PAGE_SIZE,
         tickers: list[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> list[dict[str, Any]]:
-        """Fetch a page of ATS volume data from FINRA API.
+        """Fetch a page of weeklySummary ATS data from the FINRA API.
 
-        The FINRA API accepts JSON POST queries with filtering,
-        pagination, and sorting.
+        Uses the same request shape as ``dark_pool.py``: a
+        ``dateRangeFilters`` on weekStartDate and a ``domainFilters`` on
+        issueSymbolIdentifier, without ``sortFields`` (sorting needs EQUAL
+        compareFilters on every partition key, otherwise FINRA returns 400).
 
         Parameters:
             offset: Pagination offset.
             limit: Page size.
             tickers: List of ticker symbols to filter on.
+            start_date: Start of the weekStartDate range (inclusive).
+                Defaults to ``_ATS_WINDOW_DAYS`` before today.
+            end_date: End of the weekStartDate range (inclusive).
+                Defaults to today.
 
         Returns:
-            List of record dicts from FINRA API.
+            List of record dicts from FINRA API (empty on HTTP 204).
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
@@ -163,11 +187,21 @@ class FINRAATSPuller(BasePuller):
             "Content-Type": "application/json",
         }
 
-        # Build FINRA query -- filter by tracked tickers
+        if end_date is None:
+            end_date = date.today()
+        if start_date is None:
+            start_date = end_date - timedelta(days=_ATS_WINDOW_DAYS)
+
         query: dict[str, Any] = {
             "offset": offset,
             "limit": limit,
-            "sortFields": ["-weekStartDate"],
+            "dateRangeFilters": [
+                {
+                    "fieldName": "weekStartDate",
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                }
+            ],
         }
 
         if tickers:
@@ -184,6 +218,11 @@ class FINRAATSPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+
+        # 204 = No Content (valid response, just no data for this range)
+        if resp.status_code == 204:
+            return []
+
         resp.raise_for_status()
         return resp.json()
 
@@ -191,82 +230,40 @@ class FINRAATSPuller(BasePuller):
         self,
         records: list[dict[str, Any]],
     ) -> dict[date, dict[str, float]]:
-        """Aggregate ATS records by week into volume and dark pct.
+        """Aggregate weeklySummary ATS records by week across tracked tickers.
 
-        Groups records by weekStartDate, sums totalWeeklyShareQuantity
-        (ATS volume) and totalWeeklyTradeCount, and computes dark pool
-        percentage where possible.
+        Per-ticker ATS volume comes from
+        :func:`ingestion.altdata.dark_pool.parse_ats_weekly_records`: ATS
+        rows only (no non-ATS OTC volume), with the symbol-level
+        ``ATS_W_SMBL`` aggregate preferred over summed per-firm rows, never
+        both. Those per-ticker volumes are then summed per week.
+
+        weeklySummary carries no consolidated (exchange + OTC) volume, so
+        ``total_volume`` stays 0 and ``dark_pct`` is 0.0; the caller only
+        stores ``ats_dark_pct`` when ``total_volume`` is positive.
 
         Parameters:
-            records: Raw FINRA ATS records.
+            records: Raw FINRA weeklySummary records.
 
         Returns:
             Dict mapping obs_date to aggregated metrics:
             {date: {'ats_volume': float, 'total_volume': float,
-                     'dark_pct': float, 'raw_records': int}}.
+                     'dark_pct': float, 'raw_records': int}}, where
+            raw_records is the number of tickers contributing that week.
         """
         by_week: dict[date, dict[str, float]] = {}
 
-        for rec in records:
-            # Parse the week start date
-            week_str = rec.get("weekStartDate")
-            if not week_str:
-                continue
-
-            try:
-                obs_date = date.fromisoformat(week_str[:10])
-            except (ValueError, TypeError) as exc:
-                log.warning(
-                    "FINRA ATS: bad date {d}: {e}",
-                    d=week_str,
-                    e=str(exc),
+        for weeks in parse_ats_weekly_records(records).values():
+            for obs_date, metrics in weeks.items():
+                agg = by_week.setdefault(
+                    obs_date,
+                    {"ats_volume": 0.0, "total_volume": 0.0, "raw_records": 0},
                 )
-                continue
+                agg["ats_volume"] += metrics["volume"]
+                agg["raw_records"] += 1
 
-            # Extract volume fields
-            ats_volume = rec.get("totalWeeklyShareQuantity")
-            rec.get("lastUpdateDate")  # not always available
-
-            if ats_volume is None:
-                continue
-
-            try:
-                ats_vol = float(ats_volume)
-            except (ValueError, TypeError):
-                log.warning(
-                    "FINRA ATS: bad volume value {v} for {d}",
-                    v=ats_volume,
-                    d=week_str,
-                )
-                continue
-
-            if obs_date not in by_week:
-                by_week[obs_date] = {
-                    "ats_volume": 0.0,
-                    "total_volume": 0.0,
-                    "raw_records": 0,
-                }
-
-            by_week[obs_date]["ats_volume"] += ats_vol
-            by_week[obs_date]["raw_records"] += 1
-
-            # Some records include totalShareQuantity for overall volume
-            total_qty = rec.get("totalShareQuantity")
-            if total_qty is not None:
-                try:
-                    by_week[obs_date]["total_volume"] += float(total_qty)
-                except (ValueError, TypeError):
-                    pass
-
-        # Compute dark pool percentage
-        for obs_date, agg in by_week.items():
-            if agg["total_volume"] > 0:
-                agg["dark_pct"] = (
-                    agg["ats_volume"] / agg["total_volume"]
-                ) * 100.0
-            else:
-                # Use ATS volume alone -- mark as incomplete
-                agg["dark_pct"] = 0.0
+        for agg in by_week.values():
+            agg["dark_pct"] = 0.0
 
         return by_week
 
@@ -299,6 +296,10 @@ class FINRAATSPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
+        # weeklySummary only holds a rolling 12 months; never ask for more.
+        fetch_end = date.today()
+        fetch_start = max(start_date, fetch_end - timedelta(days=_ATS_WINDOW_DAYS))
+
         # Fetch all pages
         all_records: list[dict[str, Any]] = []
         offset = 0
@@ -309,6 +310,8 @@ class FINRAATSPuller(BasePuller):
                     offset=offset,
                     limit=_PAGE_SIZE,
                     tickers=tickers,
+                    start_date=fetch_start,
+                    end_date=fetch_end,
                 )
 
                 if not page:
