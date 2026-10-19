@@ -230,9 +230,11 @@ class MarketBriefingEngine:
                     "equity_volume": [
                         "YF:^GSPC:volume",
                     ],
+                    # FRED series are stored bare in raw_series (fred.py
+                    # writes the FRED id as series_id), never "FRED:<id>".
+                    # DGS10 is not in FRED_SERIES_LIST, so DGS5 stands in.
                     "rates": [
-                        "FRED:DFF", "FRED:T10Y2Y", "FRED:T10Y3M",
-                        "FRED:DGS10", "FRED:DGS2",
+                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5",
                     ],
                     "credit": [
                         "YF:HYG:close", "YF:LQD:close", "YF:JNK:close",
@@ -248,6 +250,10 @@ class MarketBriefingEngine:
                     "fx": [
                         "YF:UUP:close", "YF:FXE:close", "YF:FXY:close",
                         "YF:EEM:close",
+                    ],
+                    "macro": [
+                        "CPIAUCSL", "PCEPILFE", "UNRATE", "RSAFS", "UMCSENT",
+                        "T5YIE",
                     ],
                 }
 
@@ -531,7 +537,7 @@ class MarketBriefingEngine:
         lines.append(f"## Market Data Snapshot — {snapshot['timestamp']} (assembly time, not an evidence clock)")
         lines.append("")
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
             data = snapshot.get(category, {})
             if data:
                 lines.append(f"### {category.upper()}")
@@ -1158,7 +1164,7 @@ class MarketBriefingEngine:
             "",
         ]
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
             data = snapshot.get(category, {})
             if data:
                 lines.append(f"## {category.replace('_', ' ').title()}")
