@@ -159,14 +159,17 @@ def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any
 
     1. the newest policy-eligible daily capture (``read_daily_policy_n``, the
        reader market_diary uses), labelled ``policy_eligible_daily_capture``;
-    2. only for tickers with no daily session policy at all (VIX family,
-       futures, FX: ``daily_capture_boundary`` is None), the newest pull,
+    2. only for tickers that ``price_close_contract.UNKNOWN_DAILY_TICKERS``
+       lists as having no daily session policy at all, the newest pull,
        labelled ``unqualified_latest_pull`` / ``session_finality=unknown`` so
        the briefing states that completeness is not established;
     3. otherwise ``None``: a policy-supported series with only INCOMPLETE or
-       unmarked captures is withheld rather than reported.
+       unmarked captures is withheld rather than reported, including when its
+       newest label is outside the contract's audited year or on an
+       NYSE-closed day (membership in the sessionless set, not a None
+       ``daily_capture_boundary`` for that one date, decides the fallback).
     """
-    from price_close_contract import daily_capture_boundary
+    import price_close_contract
     from store.observations import read_daily_policy_n, read_latest
 
     qualified = read_daily_policy_n(
@@ -178,7 +181,7 @@ def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any
     else:
         obs = read_latest(conn, sid, source="yfinance", as_of_ts=now)
         ticker = sid.split(":")[1] if sid.count(":") >= 2 else ""
-        if obs is None or daily_capture_boundary(ticker, obs.obs_date) is not None:
+        if obs is None or ticker not in price_close_contract.UNKNOWN_DAILY_TICKERS:
             return None
         basis, finality = "unqualified_latest_pull", "unknown"
     return {

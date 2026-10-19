@@ -38,6 +38,8 @@ from __future__ import annotations
 import os
 from datetime import date, datetime, timezone
 
+import pytest
+
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from ollama.market_briefing import MarketBriefingEngine
@@ -357,9 +359,15 @@ def test_snapshot_withholds_policy_series_with_only_incomplete_captures(tmp_path
     assert "^DJI" not in snapshot["equities"]  # no value rather than an in-progress one
 
 
-def test_snapshot_labels_sessionless_tickers_and_takes_newest_pull(tmp_path):
-    """^VIX has no daily session policy, so completeness can't be asserted:
-    report the newest pull, labelled, not the first-inserted vintage."""
+def test_snapshot_labels_sessionless_tickers_and_takes_newest_pull(tmp_path, monkeypatch):
+    """A ticker with no daily session policy can't have completeness asserted:
+    report the newest pull, labelled, not the first-inserted vintage.
+
+    The sessionless set is pinned here (^VIX stands in) so the test does not
+    depend on which tickers price_close_contract currently leaves unknown.
+    """
+    import price_close_contract
+    monkeypatch.setattr(price_close_contract, "UNKNOWN_DAILY_TICKERS", frozenset({"^VIX"}))
     d19 = date(2026, 10, 19)
     conn = _RawSeriesConnection({
         "YF:^VIX:close": [
@@ -395,3 +403,32 @@ def test_no_bare_obs_date_limit_1_read_remains_for_yf_series(tmp_path):
     for sql, params in conn.executed:
         if "FROM raw_series" in sql and str(params.get("sid", "")).startswith("YF:"):
             assert "JOIN source_catalog" in sql, f"YF read bypasses store.observations: {sql!r}"
+
+
+@pytest.mark.parametrize(
+    "label_date, pulled_at",
+    [
+        (date(2027, 1, 4), _utc(2027, 1, 4, 13, 32)),   # outside the contract's audited year
+        (date(2026, 10, 17), _utc(2026, 10, 17, 13, 32)),  # Saturday: NYSE closed
+    ],
+)
+def test_policy_supported_ticker_with_unqualifiable_label_is_withheld(tmp_path, label_date, pulled_at):
+    """daily_capture_boundary is None for these labels too, but ^GSPC is not a
+    sessionless ticker: an intraday pull must not be served as 'unqualified'."""
+    conn = _RawSeriesConnection({"YF:^GSPC:close": [_row(label_date, 1234.5, pulled_at, "^GSPC")]})
+    snapshot = _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    assert "^GSPC" not in snapshot["equities"]
+
+
+def test_policy_reader_is_called_with_point_in_time_bounds(tmp_path):
+    conn = _RawSeriesConnection({"YF:^GSPC:close": _gspc_rows()})
+    _make_engine(conn, tmp_path)._gather_market_snapshot()
+
+    windows = [p for sql, p in conn.executed
+               if "JOIN source_catalog" in sql and "LIMIT 1" not in sql and p.get("sid") == "YF:^GSPC:close"]
+    assert windows, "expected the policy window read"
+    params = windows[0]
+    assert params["source"] == "yfinance"
+    assert params["as_of_ts"] is not None and params["as_of_ts"].tzinfo is not None
+    assert (params["as_of_ts"].date() - params["start"]).days == 14
