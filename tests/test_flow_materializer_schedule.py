@@ -31,6 +31,9 @@ class _World:
         self.engine = MagicMock(name="engine")
         self.receipts: list[tuple] = []
         self.sync_all = MagicMock(name="sync_all")
+        self.lock_conn = MagicMock(name="lock_conn")
+        self.lock_free = True
+        self.locks_released = 0
 
 
 @pytest.fixture
@@ -48,6 +51,16 @@ def world(monkeypatch: pytest.MonkeyPatch) -> _World:
             (name, status, rows, err)),
     )
     monkeypatch.setattr(sched, "_flow_materialize_worker", None)
+    monkeypatch.setattr(
+        sched, "_try_flow_materialize_lock",
+        lambda engine: w.lock_conn if w.lock_free else None,
+    )
+
+    def _release(conn) -> None:
+        assert conn is w.lock_conn
+        w.locks_released += 1
+
+    monkeypatch.setattr(sched, "_release_flow_materialize_lock", _release)
     return w
 
 
@@ -181,6 +194,9 @@ def test_receipt_row_lands_in_pull_log(monkeypatch) -> None:
     fake_fm.sync_all = lambda _engine: dict(SUCCESS_SUMMARY)
     monkeypatch.setitem(sys.modules, "ingestion.flow_materializer", fake_fm)
     monkeypatch.setattr(sched, "_flow_materialize_worker", None)
+    # SQLite has no advisory locks; the lock is covered by its own tests.
+    monkeypatch.setattr(sched, "_try_flow_materialize_lock", lambda _engine: object())
+    monkeypatch.setattr(sched, "_release_flow_materialize_lock", lambda _conn: None)
 
     sched.run_flow_materialize_daily(now_utc=_at(23, 15))
 
@@ -231,3 +247,94 @@ def test_budget_overrun_is_receipted_failed_and_blocks_a_second_start(world) -> 
     finally:
         release.set()
         sched._flow_materialize_worker.join(5)
+
+
+# ── cross-process advisory lock (review H1) ───────────────────────────────
+
+
+def test_run_is_skipped_and_receipted_when_another_process_holds_the_lock(world) -> None:
+    world.lock_free = False
+
+    out = sched.run_flow_materialize_daily(now_utc=_at(23, 15))
+
+    assert out["status"] == "SKIPPED"
+    world.sync_all.assert_not_called()
+    [(name, status, rows, note)] = world.receipts
+    assert (name, status, rows) == ("FlowMaterialize_Daily", "SUCCESS", 0)  # pull_log has no SKIPPED
+    assert note.startswith("SKIPPED:") and "advisory lock" in note
+    assert world.locks_released == 0  # never acquired, nothing to release
+
+
+def test_lock_is_held_during_sync_all_and_released_after(world) -> None:
+    seen: list[int] = []
+
+    def _sync(_engine):
+        seen.append(world.locks_released)  # still held while sync_all runs
+        return dict(SUCCESS_SUMMARY)
+
+    world.sync_all.side_effect = _sync
+    sched.run_flow_materialize_daily(now_utc=_at(23, 15))
+
+    assert seen == [0]
+    assert world.locks_released == 1
+
+
+def test_lock_is_released_when_sync_all_raises(world) -> None:
+    world.sync_all.side_effect = RuntimeError("db down")
+
+    sched.run_flow_materialize_daily(now_utc=_at(23, 15))
+
+    assert world.locks_released == 1
+
+
+def test_lock_stays_held_through_a_budget_overrun_until_sync_all_ends(world) -> None:
+    release = threading.Event()
+    world.sync_all.side_effect = lambda _engine: release.wait(10) or dict(SUCCESS_SUMMARY)
+
+    try:
+        sched.run_flow_materialize_daily(now_utc=_at(23, 15), budget_s=0.05)
+        assert world.locks_released == 0  # overrun receipted, but the lock is still held
+    finally:
+        release.set()
+        sched._flow_materialize_worker.join(5)
+    assert world.locks_released == 1
+
+
+def test_try_lock_uses_pg_try_advisory_lock_with_the_stable_key() -> None:
+    engine = MagicMock()
+    conn = engine.connect.return_value
+    conn.execute.return_value.scalar.return_value = True
+
+    assert sched._try_flow_materialize_lock(engine) is conn
+    stmt, params = conn.execute.call_args.args
+    assert "pg_try_advisory_lock" in str(stmt)
+    assert params == {"key": sched.FLOW_MATERIALIZE_ADVISORY_LOCK_KEY}
+
+    conn.execute.return_value.scalar.return_value = False
+    assert sched._try_flow_materialize_lock(engine) is None
+    conn.close.assert_called()
+
+
+def test_lock_key_is_a_stable_signed_bigint_distinct_from_the_other_pullers() -> None:
+    import hashlib
+
+    key = sched.FLOW_MATERIALIZE_ADVISORY_LOCK_KEY
+    expected = int.from_bytes(
+        hashlib.sha256(b"grid:flow_materializer:sync_all").digest()[:8], "big", signed=True)
+    assert key == expected  # deterministic across processes (no hash())
+    assert -(1 << 63) <= key < (1 << 63)
+    from ingestion import tiingo_pull, yfinance_pull
+    assert key not in {tiingo_pull._ADVISORY_LOCK_KEY, yfinance_pull._PULL_ALL_ADVISORY_LOCK_KEY}
+
+
+def test_comment_and_docs_name_the_other_callers_and_the_timer_precondition() -> None:
+    import inspect
+    from pathlib import Path
+
+    src = inspect.getsource(sched)
+    docs = (Path(__file__).resolve().parents[1] / "docs" / "SERVER-SERVICES.md").read_text()
+    for text_ in (src, docs):
+        assert "grid-flow-materializer.timer" in text_
+        assert "UNVERIFIED" in text_
+    assert "only caller" not in src.lower().split("daily flow materialization")[1][:1500]
+    assert "disable" in docs and "same change window" in docs
