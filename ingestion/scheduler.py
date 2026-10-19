@@ -430,17 +430,15 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 # The yfinance writer (price_close_contract.daily_capture_payload) tags a
 # same-day bar INCOMPLETE and only marks it POLICY_ELIGIBLE once the pull
 # happens after the next New York midnight (04:00Z EDT / 05:00Z EST). With
-# yfinance in every run_daily_pulls slot, the first qualified close for
-# session D landed in the 13:30Z run on D+1 -- and that same 13:30Z run wrote
-# a useless in-progress (09:30 ET open) bar for ~52 tickers x 6 fields every
-# day. So:
+# yfinance only in the run_daily_pulls slots, the first qualified close for
+# session D was not captured until the 13:30Z run on D+1. So:
 #   * run_yfinance_morning_slot captures D's close at 05:15Z on D+1, as soon
 #     as the NY-midnight boundary has passed in both EDT and EST (Saturday
 #     for Friday, Tuesday for a Monday session, ...);
-#   * the 13:30Z slot keeps every other puller but skips yfinance;
-#   * 16:00/20:00/22:00Z keep running yfinance exactly as before.
+#   * 13:30Z/16:00Z/20:00Z/22:00Z keep running yfinance. The 13:30Z row is
+#     the point-in-time opening observation (09:30 ET, tagged INCOMPLETE): it
+#     is not a close, and only final-close scoring ignores it.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
-YFINANCE_SKIP_SLOTS = frozenset({"13:30"})
 
 
 def run_pull_group(
@@ -1419,9 +1417,9 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
-    Skips if the market is closed (weekend or holiday). Slots in
-    YFINANCE_SKIP_SLOTS (13:30 UTC) run every other puller but not yfinance;
-    the first qualified daily close is captured by run_yfinance_morning_slot.
+    Skips if the market is closed (weekend or holiday). Every slot runs
+    yfinance; the 13:30 UTC one is the opening-time observation, and the
+    first qualified daily close is captured by run_yfinance_morning_slot.
     Handles and logs any exception without crashing the scheduler.
 
     Parameters:
@@ -1458,7 +1456,7 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     if not market_open:
         log.info("Market closed ({d}) — skipping equity pullers", d=today)
     else:
-        _run_equity_pulls(start_date, include_yfinance=slot not in YFINANCE_SKIP_SLOTS)
+        _run_equity_pulls(start_date)
 
     # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
 
@@ -1652,7 +1650,7 @@ def _pull_completed_spy_close(
 def _run_yfinance_daily(start_date: str | date) -> None:
     """YFinance_Daily pull plus the completed-SPY-close check.
 
-    Shared by ``_run_equity_pulls`` (16:00/20:00/22:00 UTC slots) and
+    Shared by ``_run_equity_pulls`` (13:30/16:00/20:00/22:00 UTC slots) and
     ``run_yfinance_morning_slot`` (05:15 UTC). Handles and logs its own
     exceptions so a yfinance failure never aborts the caller.
     """
@@ -1734,15 +1732,8 @@ def _run_yfinance_daily(start_date: str | date) -> None:
             log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
 
 
-def _run_equity_pulls(
-    start_date: str | date = "1990-01-01", include_yfinance: bool = True,
-) -> None:
-    """Equity-hours pullers — only called when market is open.
-
-    ``include_yfinance=False`` runs everything except the YFinance_Daily pull
-    (and the completed-SPY-close check that rides with it); every other
-    puller here is unaffected.
-    """
+def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
+    """Equity-hours pullers — only called when market is open."""
     from db import get_engine
 
     # FRED pull
@@ -1779,12 +1770,8 @@ def _run_equity_pulls(
         except Exception as exc2:
             log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
 
-    # yfinance pull. The 13:30 UTC slot skips it (see YFINANCE_SKIP_SLOTS): a
-    # pull at the 09:30 ET open stores only the in-progress bar.
-    if include_yfinance:
-        _run_yfinance_daily(start_date)
-    else:
-        log.info("yfinance daily pull skipped for this slot (see YFINANCE_SKIP_SLOTS)")
+    # yfinance pull (every slot, including the 13:30 UTC opening observation).
+    _run_yfinance_daily(start_date)
 
     # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
     # it wrote backdated resolved_series vintages directly and, on the
@@ -2055,9 +2042,9 @@ def start_scheduler() -> None:
 
     # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
     # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
-    # yfinance is skipped in the 13:30 slot (mid-bar rows were noise) and runs
-    # in 16:00/20:00/22:00; the qualified prior-day close comes from the 05:15
-    # morning slot registered below.
+    # yfinance runs in every slot. The 13:30 row is a point-in-time opening
+    # observation (INCOMPLETE-tagged, not a close); the qualified prior-day
+    # close comes from the 05:15 morning slot registered below.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
@@ -2070,9 +2057,9 @@ def start_scheduler() -> None:
     # yfinance-only morning slot: first POLICY_ELIGIBLE close for the prior
     # session (see YFINANCE_MORNING_SLOT_UTC). Registered every day; the
     # function itself runs only when the previous day was a US session
-    # (Saturday for Friday, Tuesday for Monday). The 13:30 slot above skips
-    # yfinance (YFINANCE_SKIP_SLOTS). The explicit "UTC" makes it fire at
-    # 05:15Z on a non-UTC host too; the lateness guard uses the same UTC clock.
+    # (Saturday for Friday, Tuesday for Monday). The explicit "UTC" makes it
+    # fire at 05:15Z on a non-UTC host too; the lateness guard uses the same
+    # UTC clock.
     schedule.every().day.at(YFINANCE_MORNING_SLOT_UTC, "UTC").do(
         run_yfinance_morning_slot, start_date=ongoing_start,
         slot=YFINANCE_MORNING_SLOT_UTC,

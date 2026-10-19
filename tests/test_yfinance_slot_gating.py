@@ -2,9 +2,9 @@
 
 The yfinance writer only marks a daily close POLICY_ELIGIBLE once the pull
 happens after the next New York midnight, so the first qualified close for
-session D used to land in the 13:30Z run on D+1 -- which also wrote a useless
-in-progress (09:30 ET) bar for every ticker. The scheduler now has a 05:15Z
-yfinance-only morning slot and the 13:30Z slot skips yfinance.
+session D used to land in the 13:30Z run on D+1. The scheduler now has a 05:15Z
+yfinance-only morning slot. The 13:30Z slot keeps running yfinance: that row is
+the point-in-time opening observation (INCOMPLETE-tagged, not a close).
 
 Everything is a local fake: no network, no database, no email.
 """
@@ -105,22 +105,11 @@ def _open_on_session_day(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sched, "_slot_lateness", lambda slot, now=None: timedelta(0))
 
 
-# ── 13:30 skips yfinance, 16:00 / 20:00 / 22:00 keep it ───────────────────
+# ── every domestic slot (13:30 opening observation included) runs yfinance ──
 
 
-def test_1330_slot_skips_yfinance_but_runs_everything_else(world, monkeypatch) -> None:
-    _open_on_session_day(monkeypatch)
-
-    sched.run_daily_pulls(start_date="2026-10-01", slot="13:30")
-
-    world.yf_puller.pull_all.assert_not_called()
-    world.yf_puller.pull_ticker.assert_not_called()  # no completed-SPY check either
-    _other_equity_pullers_ran(world)
-    _24x7_pullers_ran(world)
-
-
-@pytest.mark.parametrize("slot", ["16:00", "20:00", "22:00"])
-def test_later_slots_still_run_yfinance(world, monkeypatch, slot) -> None:
+@pytest.mark.parametrize("slot", ["13:30", "16:00", "20:00", "22:00"])
+def test_every_domestic_slot_still_runs_yfinance(world, monkeypatch, slot) -> None:
     _open_on_session_day(monkeypatch)
 
     sched.run_daily_pulls(start_date="2026-10-01", slot=slot)
@@ -139,24 +128,22 @@ def test_run_daily_pulls_without_a_slot_still_runs_yfinance(world, monkeypatch) 
     world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-01")
 
 
-def test_run_equity_pulls_defaults_to_including_yfinance(world) -> None:
+def test_run_equity_pulls_runs_yfinance_and_the_other_pullers(world) -> None:
     sched._run_equity_pulls(start_date="2026-10-01")
     world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-01")
     _other_equity_pullers_ran(world)
 
 
-def test_1330_skip_is_forwarded_as_include_yfinance_false(world, monkeypatch) -> None:
-    calls: list[bool] = []
-    monkeypatch.setattr(
-        sched, "_run_equity_pulls",
-        lambda start_date, include_yfinance=True: calls.append(include_yfinance),
-    )
+def test_1330_slot_keeps_the_completed_spy_close_check(world, monkeypatch) -> None:
+    """The 13:30 run is unchanged: pull_all plus the SPY completed-close check
+    (here start_date is after the completed session, so the check fires)."""
     _open_on_session_day(monkeypatch)
+    monkeypatch.setattr(sched, "_pull_completed_spy_close",
+                        lambda puller, start: (date(2026, 10, 16), {"outcome": "inserted", "rows_inserted": 1}))
 
-    for slot in ("13:30", "16:00", "20:00", "22:00"):
-        sched.run_daily_pulls(start_date="2026-10-01", slot=slot)
+    sched.run_daily_pulls(start_date="2026-10-17", slot="13:30")
 
-    assert calls == [False, True, True, True]
+    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-17")
 
 
 # ── 05:15Z morning slot ───────────────────────────────────────────────────
@@ -283,4 +270,4 @@ def test_domestic_slots_are_unchanged_and_the_morning_slot_is_not_one_of_them(mo
     domestic = [j for j in jobs.jobs if j.job_func.func is sched.run_daily_pulls]
     assert len(domestic) == 28
     assert {j.job_func.keywords["slot"] for j in domestic} == {"13:30", "16:00", "20:00", "22:00"}
-    assert sched.YFINANCE_SKIP_SLOTS == frozenset({"13:30"})
+    assert not hasattr(sched, "YFINANCE_SKIP_SLOTS")  # 13:30 keeps yfinance
