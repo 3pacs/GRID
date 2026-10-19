@@ -297,6 +297,74 @@ function canvasDotsCacheKey(center) {
     return cacheKey('canvas-dots', [center || 'all']);
 }
 
+// Demand reads share pending work but never publish after navigation or unmount.
+// API/session caches retain their existing keys and TTLs; no background warming.
+function useDemandRead(context, read, cached, accept) {
+    const entries = useRef(new Map());
+    const current = useRef(context);
+    current.current = context;
+    const lifecycle = useRef({ mounted: false, generation: 0 });
+    const [state, setState] = useState(null);
+    useEffect(() => {
+        lifecycle.current.mounted = true;
+        return () => {
+            lifecycle.current.mounted = false;
+            lifecycle.current.generation += 1;
+        };
+    }, [context]);
+    const request = useCallback(() => {
+        const generation = lifecycle.current.generation;
+        let entry = entries.current.get(context);
+        const publish = (accepted = false) => {
+            if (!lifecycle.current.mounted || lifecycle.current.generation !== generation || current.current !== context) return;
+            setState({ context, ...entry });
+            if (accepted && entry.status === 'ready' && entry.acceptedGeneration !== generation) {
+                entry.acceptedGeneration = generation;
+                accept?.(entry.data);
+            }
+        };
+        if (entry?.promise) {
+            entry.generation = generation;
+            publish();
+            entry.promise.then(() => publish(true));
+            return entry.promise;
+        }
+        entry = { generation, status: 'loading', data: entry?.data ?? cached?.() ?? null, error: null };
+        entries.current.set(context, entry);
+        publish();
+        entry.promise = Promise.resolve().then(() => {
+            const isCurrent = () => lifecycle.current.mounted && lifecycle.current.generation === entry.generation && current.current === context;
+            return isCurrent() ? read(isCurrent) : null;
+        }).then((data) => {
+            if (data != null) entry.data = data;
+            entry.status = data == null ? 'unavailable' : 'ready';
+        }, () => {
+            entry.status = 'error';
+            entry.error = 'The read failed. Try again manually.';
+        }).then(() => {
+            entry.promise = null;
+            publish(true);
+        });
+        return entry.promise;
+    }, [context, read, cached, accept]);
+    return [state?.context === context ? state : { status: 'not-requested', data: null }, request];
+}
+
+function OptionalReadStatus({ label, state, onRetry }) {
+    const messages = {
+        'not-requested': 'Not requested.',
+        loading: 'Loading persisted findings…',
+        unavailable: 'Persisted findings are unavailable.',
+        error: 'Could not load persisted findings.',
+        ready: (Array.isArray(state.data) ? state.data.length === 0 : Array.isArray(state.data?.top_k) && state.data.top_k.length === 0) ? 'No findings returned.' : 'Persisted findings loaded.',
+    };
+    return <div role="status" aria-live="polite" style={{ padding: '8px', color: colors.textMuted, fontSize: '12px' }}>
+        {label}: {messages[state.status]} {state.data != null && 'Source freshness unknown.'}
+        {state.data != null && state.status !== 'ready' && ' Showing previously loaded findings.'}
+        {(state.status === 'error' || state.status === 'unavailable') && <button type="button" onClick={onRetry} aria-label={`Retry ${label}`}>Retry</button>}
+    </div>;
+}
+
 // ── Styles ──
 const S = {
     workspace: {
@@ -723,8 +791,7 @@ export default function GothamCanvas() {
     // Local state
     const [activeTime, setActiveTime] = useState(null);
     const [editingName, setEditingName] = useState(false);
-    const [dots, setDots] = useState([]);         // cross-reference intelligence
-    const [dotsLoading, setDotsLoading] = useState(false);
+    const [dotsCenter, setDotsCenter] = useState('all');
     const [feedExpanded, setFeedExpanded] = useState(false);
     const [showCommunities, setShowCommunities] = useState(false);
     const [detailLoading, setDetailLoading] = useState(false);
@@ -935,36 +1002,29 @@ export default function GothamCanvas() {
         return () => { cancelled = true; };
     }, [getBoardIdFromHash, loadGraph]);
 
-    // ── Connect Dots: fetch cross-reference intelligence ──
-    const connectDots = useCallback(async (center) => {
-        const resolvedCenter = center || 'all';
-        const dotsKey = canvasDotsCacheKey(resolvedCenter);
-        const cachedDots = readSessionCache(dotsKey, DOTS_CACHE_TTL_MS);
-        if (Array.isArray(cachedDots)) {
-            setDots(cachedDots);
-            if (cachedDots.length > 0) setFeedExpanded(true);
-        }
-        setDotsLoading(!cachedDots);
-        try {
-            const data = await api.getCanvasDots(resolvedCenter);
-            if (data && !data.error && data.connections) {
-                writeSessionCache(dotsKey, data.connections);
-                setDots(data.connections);
-                setFeedExpanded(true);
-            }
-        } catch (e) {
-            // silenced
-        } finally {
-            setDotsLoading(false);
-        }
-    }, []);
-
-    // Auto-connect dots when graph loads
+    // ── Optional dots are read only on explicit investigation/feed demand. ──
+    const readDots = useCallback(async () => {
+        const data = await api.getCanvasDots(dotsCenter);
+        if (data?.error) throw new Error('Dots read failed');
+        return Array.isArray(data?.connections) ? data.connections : null;
+    }, [dotsCenter]);
+    const cachedDots = useCallback(() => readSessionCache(canvasDotsCacheKey(dotsCenter), DOTS_CACHE_TTL_MS), [dotsCenter]);
+    const acceptDots = useCallback((data) => writeSessionCache(canvasDotsCacheKey(dotsCenter), data), [dotsCenter]);
+    const [dotsState, requestDots] = useDemandRead(`${boardId || 'global'}:${dotsCenter}`, readDots, cachedDots, acceptDots);
+    const dots = dotsState.data || [];
+    const dotsLoading = dotsState.status === 'loading';
+    const dotsContext = `${boardId || 'global'}:${dotsCenter}`;
+    const [dotsDemand, setDotsDemand] = useState(null);
+    const [dotsRequest, setDotsRequest] = useState(0);
+    const connectDots = useCallback((center) => {
+        setDotsCenter(center || 'all');
+        setDotsDemand(`${boardId || 'global'}:${center || 'all'}`);
+        setFeedExpanded(true);
+        setDotsRequest((n) => n + 1);
+    }, [boardId]);
     useEffect(() => {
-        if (graph.order > 0 && dots.length === 0 && !dotsLoading) {
-            connectDots('all');
-        }
-    }, [graph.order]);
+        if (dotsDemand === dotsContext) requestDots();
+    }, [dotsDemand, dotsContext, dotsRequest, requestDots]);
 
     // ── Expand node handler (double-click) ──
     useEffect(() => {
@@ -1062,7 +1122,8 @@ export default function GothamCanvas() {
                 // and hash track the new center, not the stale one.
                 const cleanQuery = _stripCanvasPrefix(query);
                 setLensActorId(cleanQuery);
-                connectDots(query);
+                setDotsCenter(query);
+                setDotsDemand(false);
             } else {
                 setCanvasStatus({
                     type: 'error',
@@ -1077,32 +1138,29 @@ export default function GothamCanvas() {
         } finally {
             useCanvasStore.getState().setLoading(false);
         }
-    }, [loadGraph, connectDots, setLensActorId]);
+    }, [loadGraph, setLensActorId]);
 
     const handleSearchSubmit = useCallback((e) => {
         if (e.key !== 'Enter' || !searchQuery.trim()) return;
         runSearch(searchQuery);
     }, [searchQuery, runSearch]);
 
-    // ── Sweep verdicts: load the latest persisted long-horizon sweep once ──
-    // 90 d first (the Sunday job), then whatever ran most recently.
-    useEffect(() => {
-        let cancelled = false;
-        (async () => {
-            try {
-                let data = await api.getLatestSweep({ horizonDays: 90 });
-                if (!data || data.error) data = await api.getLatestSweep();
-                if (!cancelled && data && !data.error && Array.isArray(data.top_k)) setSweep(data);
-            } catch (err) {
-                // No sweep yet is normal on a fresh server; the panel explains it.
-            }
-        })();
-        return () => { cancelled = true; };
-    }, [setSweep]);
-
     const verdictsLayerOn = activeLayers instanceof Set
         ? activeLayers.has('verdicts')
         : activeLayers?.verdicts !== false && !!activeLayers?.verdicts;
+
+    // Restored verdict layers demand the same read even when the mobile panel is hidden.
+    const readSweep = useCallback(async (isCurrent) => {
+        let data;
+        try { data = await api.getLatestSweep({ horizonDays: 90 }); } catch { /* latest fallback below */ }
+        if ((!data || data.error) && isCurrent()) data = await api.getLatestSweep();
+        if (data?.error) throw new Error('Sweep read failed');
+        return Array.isArray(data?.top_k) ? data : null;
+    }, []);
+    const [sweepState, requestSweep] = useDemandRead(boardId || 'global', readSweep, null, setSweep);
+    useEffect(() => {
+        if (verdictsLayerOn) requestSweep();
+    }, [verdictsLayerOn, requestSweep]);
 
     const handleSweepPick = useCallback((ticker) => {
         if (!ticker) return;
@@ -1266,7 +1324,7 @@ export default function GothamCanvas() {
                 <button
                     style={S.actionBtn(true)}
                     onClick={() => connectDots(selectedNode?.id || 'all')}
-                    disabled={dotsLoading}
+                    aria-label="Connect dots"
                 >
                     <Zap size={13} />
                     {!isMobile && (dotsLoading ? 'Connecting...' : 'Dots')}
@@ -1366,6 +1424,9 @@ export default function GothamCanvas() {
 
             {/* ══ Main Area (Graph + Panels) ══ */}
             <div style={S.mainArea}>
+                {verdictsLayerOn && <div style={{ position: 'absolute', top: 4, left: 4, zIndex: 101, background: colors.card, maxWidth: '70%' }}>
+                    <OptionalReadStatus label="Sweep verdicts" state={{ ...sweepState, data: sweepState.data ?? sweep }} onRetry={() => requestSweep()} />
+                </div>}
                 {/* Supply + Capital lenses — rendered on top of the graph area */}
                 {lens !== LENS_GRAPH && (
                     <div style={S.lensShell}>
@@ -1536,25 +1597,32 @@ export default function GothamCanvas() {
                 maxHeight: feedExpanded ? (isMobile ? '160px' : '240px') : '36px',
                 minHeight: '36px',
             }}>
-                <div
-                    style={S.intelHeader}
-                    onClick={() => setFeedExpanded(!feedExpanded)}
+                <button
+                    type="button"
+                    aria-label="Connected dots feed"
+                    aria-expanded={feedExpanded}
+                    style={{ ...S.intelHeader, width: '100%', background: 'none', border: 0, textAlign: 'left' }}
+                    onClick={() => {
+                        if (!feedExpanded) { setDotsDemand(dotsContext); setDotsRequest((n) => n + 1); }
+                        setFeedExpanded(!feedExpanded);
+                    }}
                 >
                     <Zap size={13} color={colors.accent} />
                     <span style={S.intelTitle}>CONNECTED DOTS</span>
                     <span style={S.intelCount}>
-                        {dots.length} finding{dots.length !== 1 ? 's' : ''}
+                        {dotsState.status === 'not-requested' ? 'Not requested' : dotsState.data == null ? (dotsLoading ? 'Loading' : 'Unavailable') : `${dots.length} finding${dots.length !== 1 ? 's' : ''}`}
                     </span>
                     {dotsLoading && (
                         <span style={{ fontSize: '10px', color: colors.textMuted, fontFamily: MONO }}>
-                            scanning...
+                            loading...
                         </span>
                     )}
                     <div style={{ flex: 1 }} />
                     {feedExpanded
                         ? <ChevronDown size={14} color={colors.textMuted} />
                         : <ChevronUp size={14} color={colors.textMuted} />}
-                </div>
+                </button>
+                {feedExpanded && <><div style={{ padding: '0 8px', fontSize: '11px', color: colors.textMuted }}>Context: {dotsCenter}</div><OptionalReadStatus label="Connected dots" state={dotsState} onRetry={() => requestDots()} /></>}
 
                 {feedExpanded && dots.length > 0 && (
                     <div style={S.intelBody}>
