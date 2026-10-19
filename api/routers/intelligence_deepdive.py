@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -40,7 +41,7 @@ async def get_levers(
     if cached is not None:
         return cached
 
-    try:
+    def _compute() -> dict[str, Any]:
         from intelligence.global_levers import (
             get_lever_hierarchy,
             find_cross_domain_actors,
@@ -49,11 +50,12 @@ async def get_levers(
         engine = get_db_engine()
         hierarchy = get_lever_hierarchy(engine)
         cross_domain = find_cross_domain_actors(engine)
+        return {**hierarchy, "cross_domain_actors": cross_domain[:20]}
 
-        result = {
-            **hierarchy,
-            "cross_domain_actors": cross_domain[:20],
-        }
+    try:
+        # Sync DB work: run it off the event loop so a slow cache miss cannot
+        # stall every other route.
+        result = await asyncio.to_thread(_compute)
 
         _lever_cache.set(_LEVER_CACHE_KEY, result)
         return result
