@@ -618,6 +618,28 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     return now - slot
 
 
+# yfinance daily-close capture slots (all UTC).
+#
+# The yfinance writer (price_close_contract.daily_capture_payload) tags a
+# same-day bar INCOMPLETE and only marks it POLICY_ELIGIBLE once the pull
+# happens after the next New York midnight (04:00Z EDT / 05:00Z EST). With
+# yfinance only in the run_daily_pulls slots, the first qualified close for
+# session D was not captured until the 13:30Z run on D+1. So:
+#   * run_yfinance_morning_slot captures D's close at 05:15Z on D+1, as soon
+#     as the NY-midnight boundary has passed in both EDT and EST (Saturday
+#     for Friday, Tuesday for a Monday session, ...);
+#   * 13:30Z is the opening-time raw observation (09:30 ET: what was knowable
+#     then); 16:00Z/20:00Z/22:00Z are same-day snapshots. All of them keep
+#     running yfinance and carry the #853 writer's honest finality labels
+#     (INCOMPLETE for supported US-listed 2026 tickers, UNKNOWN otherwise).
+#     They are not closes; only final-close scoring ignores them.
+#   * 05:15Z is the separate completed-close capture, after the next New York
+#     midnight (POLICY_ELIGIBLE). The daily bar's Open field written by that
+#     run is the exchange's official open seen next morning -- it is NOT the
+#     opening-time observation and must not be described or used as one.
+YFINANCE_MORNING_SLOT_UTC = "05:15"
+
+
 def run_pull_group(
     group_name: str,
     db_engine: Engine,
@@ -1594,7 +1616,9 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
-    Skips if the market is closed (weekend or holiday).
+    Skips if the market is closed (weekend or holiday). Every slot runs
+    yfinance; the 13:30 UTC one is the opening-time observation, and the
+    first qualified daily close is captured by run_yfinance_morning_slot.
     Handles and logs any exception without crashing the scheduler.
 
     Parameters:
@@ -1731,6 +1755,58 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     log.info("Daily pulls finished")
 
 
+def run_yfinance_morning_slot(
+    start_date: str | date = "1990-01-01",
+    slot: str = YFINANCE_MORNING_SLOT_UTC,
+    now_utc: datetime | None = None,
+) -> None:
+    """Capture the prior session's qualified daily close (yfinance only).
+
+    Runs every day at 05:15 UTC, which is after the next New York local
+    midnight in both EDT and EST, and pulls only when the PREVIOUS UTC
+    calendar day was a US trading session -- so Friday's close is captured
+    on Saturday and Monday's on Tuesday, whether or not today is a session.
+    Sunday, and the day after a weekend-adjacent holiday, skip.
+
+    This is the completed-close capture, separate from the 13:30Z opening
+    observation and the 16:00/20:00/22:00Z same-day snapshots. The daily bar's
+    Open it also writes is the exchange's official open seen next morning, not
+    an opening-time observation.
+
+    Uses the same lateness guard as run_daily_pulls, evaluated on the UTC
+    clock the slot is registered on.
+
+    Parameters:
+        start_date: Passed through to the yfinance pull unchanged.
+        slot: The "HH:MM" UTC slot this call was registered for.
+        now_utc: Aware UTC clock override (tests).
+    """
+    from ingestion.market_calendar import is_market_open
+
+    now = now_utc or datetime.now(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} yfinance morning slot: released {m:.0f} min late "
+            "(limit {lim} min) by an earlier job holding the scheduler loop",
+            s=slot, m=late.total_seconds() / 60, lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return
+
+    prior_day = now.astimezone(timezone.utc).date() - timedelta(days=1)
+    if not is_market_open(prior_day):
+        log.info(
+            "yfinance morning slot: {d} was not a US trading session — nothing to capture",
+            d=prior_day,
+        )
+        return
+
+    log.info(
+        "yfinance morning slot: capturing the qualified close for {d}", d=prior_day,
+    )
+    _run_yfinance_daily(start_date)
+
+
 def _completed_spy_close_window(
     start_date: str | date, *, now_utc: datetime | None = None,
 ) -> tuple[date, date] | None:
@@ -1775,45 +1851,13 @@ def _pull_completed_spy_close(
     return window[0], result
 
 
-def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
-    """Equity-hours pullers — only called when market is open."""
-    from db import get_engine
+def _run_yfinance_daily(start_date: str | date) -> None:
+    """YFinance_Daily pull plus the completed-SPY-close check.
 
-    # FRED pull
-    try:
-        from config import settings
-        from db import get_engine
-        from ingestion.fred import FREDPuller
-
-        engine = get_engine()
-        fred = FREDPuller(api_key=settings.FRED_API_KEY, db_engine=engine)
-        # Keep FRED's per-series seven-day fetch overlap; existing observation
-        # dates remain deduped, so this does not persist revised values.
-        results = fred.pull_all()
-        total_rows = sum(r["rows_inserted"] for r in results)
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
-        log.info(
-            "FRED daily pull complete — {ok}/{total} series, {rows} acknowledged inserts",
-            ok=succeeded,
-            total=len(results),
-            rows=total_rows,
-        )
-        if any(r.get("commit_outcome_unknown") for r in results):
-            log.warning("FRED daily pull has unknown commit outcomes; insert sum is an acknowledged lower bound")
-    except Exception as exc:
-        log.error("FRED daily pull failed: {err}", err=str(exc))
-        try:
-            from alerts.email import alert_on_failure_with_fix
-            alert_on_failure_with_fix("FRED", str(exc), {
-                "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
-                "fix": "Check FRED_API_KEY in .env",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
-                "file": "grid/ingestion/fred.py",
-            })
-        except Exception as exc2:
-            log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
-
-    # yfinance pull
+    Shared by ``_run_equity_pulls`` (13:30/16:00/20:00/22:00 UTC slots) and
+    ``run_yfinance_morning_slot`` (05:15 UTC). Handles and logs its own
+    exceptions so a yfinance failure never aborts the caller.
+    """
     try:
         from db import get_engine
         from ingestion.yfinance_pull import YFinancePuller
@@ -1890,6 +1934,48 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
             })
         except Exception as exc2:
             log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
+
+
+def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
+    """Equity-hours pullers — only called when market is open."""
+    from db import get_engine
+
+    # FRED pull
+    try:
+        from config import settings
+        from db import get_engine
+        from ingestion.fred import FREDPuller
+
+        engine = get_engine()
+        fred = FREDPuller(api_key=settings.FRED_API_KEY, db_engine=engine)
+        # Keep FRED's per-series seven-day fetch overlap; existing observation
+        # dates remain deduped, so this does not persist revised values.
+        results = fred.pull_all()
+        total_rows = sum(r["rows_inserted"] for r in results)
+        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        log.info(
+            "FRED daily pull complete — {ok}/{total} series, {rows} acknowledged inserts",
+            ok=succeeded,
+            total=len(results),
+            rows=total_rows,
+        )
+        if any(r.get("commit_outcome_unknown") for r in results):
+            log.warning("FRED daily pull has unknown commit outcomes; insert sum is an acknowledged lower bound")
+    except Exception as exc:
+        log.error("FRED daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure_with_fix
+            alert_on_failure_with_fix("FRED", str(exc), {
+                "diagnose": 'curl -s "https://api.stlouisfed.org/fred/series?api_key=$FRED_API_KEY&series_id=DFF&file_type=json" | head -5',
+                "fix": "Check FRED_API_KEY in .env",
+                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.fred import FREDPuller; from config import settings; from db import get_engine; FREDPuller(settings.FRED_API_KEY, get_engine()).pull_all()"',
+                "file": "grid/ingestion/fred.py",
+            })
+        except Exception as exc2:
+            log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
+
+    # yfinance pull (every slot, including the 13:30 UTC opening observation).
+    _run_yfinance_daily(start_date)
 
     # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
     # it wrote backdated resolved_series vintages directly and, on the
@@ -2160,6 +2246,9 @@ def start_scheduler() -> None:
 
     # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
     # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
+    # yfinance runs in every slot. The 13:30 row is a point-in-time opening
+    # observation (INCOMPLETE-tagged, not a close); the qualified prior-day
+    # close comes from the 05:15 morning slot registered below.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
@@ -2175,6 +2264,17 @@ def start_scheduler() -> None:
         getattr(schedule.every(), day).at(FLOW_MATERIALIZE_SLOT_UTC, "UTC").do(
             run_flow_materialize_daily, slot=FLOW_MATERIALIZE_SLOT_UTC
         )
+
+    # yfinance-only morning slot: first POLICY_ELIGIBLE close for the prior
+    # session (see YFINANCE_MORNING_SLOT_UTC). Registered every day; the
+    # function itself runs only when the previous day was a US session
+    # (Saturday for Friday, Tuesday for Monday). The explicit "UTC" makes it
+    # fire at 05:15Z on a non-UTC host too; the lateness guard uses the same
+    # UTC clock.
+    schedule.every().day.at(YFINANCE_MORNING_SLOT_UTC, "UTC").do(
+        run_yfinance_morning_slot, start_date=ongoing_start,
+        slot=YFINANCE_MORNING_SLOT_UTC,
+    )
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:
