@@ -448,3 +448,11 @@ def test_parse_markdown_receipt_matches_the_executor_format(tmp_path):
 def test_canonical_sha256_matches_the_retained_capture_scheme():
     # sort_keys + compact separators + ensure_ascii=False
     assert m0.canonical_sha256({"b": "é", "a": 1}) == _sha('{"a":1,"b":"é"}'.encode("utf-8"))
+
+
+def test_every_sql_binds_exactly_its_declared_parameters():
+    """A literal ':close' inside a text() statement is parsed as a bind parameter; this caught Q2/Q7 failing live."""
+    from sqlalchemy import text
+
+    for spec in m0.build_queries(TARGET, reasoning_id=4534) + m0.build_queries(TARGET):
+        assert set(text(spec.sql)._bindparams) == set(spec.params), spec.qid

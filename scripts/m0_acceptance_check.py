@@ -172,7 +172,7 @@ FROM t LEFT JOIN LATERAL (
          (array_agg(raw_payload->>'capture_policy' ORDER BY pull_timestamp DESC))[1] AS last_policy,
          count(*) FILTER (WHERE raw_payload->>'capture_state' = 'POLICY_ELIGIBLE')    AS n_policy_eligible
   FROM raw_series r
-  WHERE r.series_id = 'YF:' || t.ticker || ':close' AND r.source_id = 2
+  WHERE r.series_id = 'YF:' || t.ticker || ':' || 'close' AND r.source_id = 2
     AND r.pull_status = 'SUCCESS' AND r.obs_date = CAST(:od AS date)) v ON TRUE
 ORDER BY t.ticker LIMIT 80
 """.strip()
@@ -183,7 +183,7 @@ SELECT t.ticker, s.sid AS source_id, x.obs_date, x.pull_timestamp, x.value
 FROM t CROSS JOIN s
 LEFT JOIN LATERAL (
   SELECT r.obs_date, r.pull_timestamp, r.value FROM raw_series r
-  WHERE r.series_id = 'YF:' || t.ticker || ':close' AND r.source_id = s.sid
+  WHERE r.series_id = 'YF:' || t.ticker || ':' || 'close' AND r.source_id = s.sid
     AND r.pull_status = 'SUCCESS' AND r.obs_date >= CAST(:since AS date)
   ORDER BY r.obs_date DESC, r.pull_timestamp DESC LIMIT 1) x ON TRUE
 ORDER BY t.ticker, s.sid LIMIT 220
@@ -779,7 +779,13 @@ def evaluate_chain(
         "raw_series_id": inp.get("id") if inp else None,
         "source_id": inp.get("source_id") if inp else None,
         "selected_as": "vintage used by the reasoning output" if used else "newest vintage (reasoning output did not use one)",
-        "reason": None if inp else "no SUCCESS vintage for the series/date",
+        "reason": (
+            "no SUCCESS vintage for the series/date" if not inp
+            else None if inp.get("capture_state")
+            else "the vintage carries no raw_payload capture_state (unmarked: written before the #853 writer or by another path)"
+        ),
+        "vintages_examined": [
+            {k: v.get(k) for k in ("id", "source_id", "pull_timestamp", "value", "capture_state", "capture_policy")} for v in vint],
     }
 
     # ---- L2 materialization row produced from that input
@@ -796,6 +802,9 @@ def evaluate_chain(
                     and r.get("source_priority_used") == inp.get("source_id")
                     and pdate is not None and str(r.get("vintage_date"))[:10] >= pdate.isoformat()), None)
         l2.update(ok=hit is not None, feature=feature, resolved_rows_examined=len(rr),
+                  resolved_rows=[{k: str(r.get(k)) if k.endswith("date") else r.get(k)
+                                  for k in ("feature_id", "obs_date", "vintage_date", "release_date", "value", "source_priority_used")}
+                                 for r in rr],
                   row_key=None if not hit else {"feature_id": hit.get("feature_id"), "obs_date": str(hit.get("obs_date"))[:10], "vintage_date": str(hit.get("vintage_date"))[:10]},
                   materialized_at=None if not hit else str(hit.get("vintage_date"))[:10],
                   reason=None if hit else "no resolved_series row equals the input vintage (value, source, vintage_date >= pull date)")
