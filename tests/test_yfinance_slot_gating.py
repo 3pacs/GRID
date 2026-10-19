@@ -106,6 +106,9 @@ def _open_on_session_day(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr(mc, "is_market_open", lambda _d: True)
     monkeypatch.setattr(sched, "_slot_lateness", lambda slot, now=None: timedelta(0))
+    # Monday 2026-10-19 13:30Z: the previous session was Friday 10-16 (every day
+    # is "open" under the patch above, so the routine window is Sun 10-18 - 3d).
+    monkeypatch.setattr(sched, "_scheduler_utc_now", lambda: _at(2026, 10, 19, 13, 30))
 
 
 # ── every domestic slot (13:30 opening observation included) runs yfinance ──
@@ -117,7 +120,8 @@ def test_every_domestic_slot_still_runs_yfinance(world, monkeypatch, slot) -> No
 
     sched.run_daily_pulls(start_date="2026-10-01", slot=slot)
 
-    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-01")
+    # yfinance gets the call-time window, not the scheduler's start date.
+    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-15")
     _other_equity_pullers_ran(world)
     _24x7_pullers_ran(world)
 
@@ -138,15 +142,15 @@ def test_run_equity_pulls_runs_yfinance_and_the_other_pullers(world) -> None:
 
 
 def test_1330_slot_keeps_the_completed_spy_close_check(world, monkeypatch) -> None:
-    """The 13:30 run is unchanged: pull_all plus the SPY completed-close check
-    (here start_date is after the completed session, so the check fires)."""
+    """The 13:30 run still calls the completed-SPY-close check with its window."""
     _open_on_session_day(monkeypatch)
+    seen: list = []
     monkeypatch.setattr(sched, "_pull_completed_spy_close",
-                        lambda puller, start: (date(2026, 10, 16), {"outcome": "inserted", "rows_inserted": 1}))
+                        lambda puller, start: seen.append(start) or None)
 
     sched.run_daily_pulls(start_date="2026-10-17", slot="13:30")
 
-    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-17")
+    assert seen == ["2026-10-15"]
 
 
 # ── 05:15Z morning slot ───────────────────────────────────────────────────
@@ -165,7 +169,7 @@ def _at(y: int, m: int, d: int, hh: int = 5, mm: int = 15) -> datetime:
 def test_morning_slot_runs_when_the_previous_day_was_a_session(world, now, label) -> None:
     sched.run_yfinance_morning_slot(start_date="2026-10-01", now_utc=now)
 
-    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-01")
+    world.yf_puller.pull_all.assert_called_once()
 
 
 @pytest.mark.parametrize("now, label", [
@@ -189,17 +193,68 @@ def test_morning_slot_only_runs_yfinance(world) -> None:
         assert not mod.mock_calls, f"{name} must not run in the morning slot"
 
 
-def test_morning_slot_runs_the_completed_spy_close_check(world) -> None:
-    """Scheduler restarted on Saturday: start_date omits Friday, so the SPY
-    close-only fetch for the completed Friday session rides with the pull."""
+def test_morning_slot_window_is_computed_at_call_time_not_from_the_restart_date(world) -> None:
+    """D2 regression: scheduler (re)started Sat 10-17 -> ongoing_start=10-17.
+    The 05:15Z run for Friday 10-16 must still request 10-16 (and an overlap)."""
     sched.run_yfinance_morning_slot(start_date="2026-10-17", now_utc=_at(2026, 10, 17))
 
-    world.yf_puller.pull_all.assert_called_once_with(start_date="2026-10-17")
-    args, kwargs = world.yf_puller.pull_ticker.call_args
-    assert args == ("SPY",)
-    assert kwargs["start_date"] == date(2026, 10, 16)
-    assert kwargs["end_date"] == date(2026, 10, 17)
-    assert kwargs["only_fields"] == frozenset({"close"})
+    [call] = world.yf_puller.pull_all.call_args_list
+    assert call.kwargs["start_date"] <= "2026-10-16"
+    assert call.kwargs["start_date"] == "2026-10-13"  # 10-16 minus 3 overlap days
+    # Friday is inside the main window, so the SPY close-only fetch is not needed.
+    world.yf_puller.pull_ticker.assert_not_called()
+
+
+@pytest.mark.parametrize("slot", ["13:30", "16:00", "20:00", "22:00"])
+def test_domestic_slot_window_is_computed_at_call_time_not_from_the_restart_date(
+    world, monkeypatch, slot,
+) -> None:
+    """D2 regression: ongoing_start=2026-10-17 on Mon 10-19 must still reach
+    back to the last completed session (Fri 10-16) minus the overlap."""
+    import ingestion.market_calendar as mc
+
+    monkeypatch.setattr(sched, "_slot_lateness", lambda s, now=None: timedelta(0))
+    monkeypatch.setattr(sched, "_scheduler_utc_now", lambda: _at(2026, 10, 19, 13, 30))
+    # Weekday calendar (no holidays in range); "today" is always open so the
+    # equity block runs whatever day the suite is executed on.
+    monkeypatch.setattr(mc, "is_market_open", lambda d: d == date.today() or d.weekday() < 5)
+
+    sched.run_daily_pulls(start_date="2026-10-17", slot=slot)
+
+    [call] = world.yf_puller.pull_all.call_args_list
+    assert call.kwargs["start_date"] <= "2026-10-16"
+    assert call.kwargs["start_date"] == "2026-10-13"
+
+
+def test_window_is_bounded_a_long_running_scheduler_does_not_regrow_it(world) -> None:
+    sched.run_yfinance_morning_slot(start_date="2026-01-05", now_utc=_at(2026, 10, 20))
+
+    [call] = world.yf_puller.pull_all.call_args_list
+    assert call.kwargs["start_date"] == "2026-10-16"  # Mon 10-19 session minus 3 days, not 01-05
+
+
+def test_unslotted_manual_runs_keep_their_explicit_start_date(world, monkeypatch) -> None:
+    """--historical / run_full_pipeline pass a deliberate start_date and no slot."""
+    _open_on_session_day(monkeypatch)
+
+    sched.run_daily_pulls(start_date="1990-01-01")
+
+    world.yf_puller.pull_all.assert_called_once_with(start_date="1990-01-01")
+
+
+def test_scheduled_slots_pass_both_the_scheduler_start_and_the_yfinance_window(world, monkeypatch) -> None:
+    calls: list[tuple] = []
+    monkeypatch.setattr(
+        sched, "_run_equity_pulls",
+        lambda start_date, yfinance_start=None: calls.append((start_date, yfinance_start)),
+    )
+    _open_on_session_day(monkeypatch)
+
+    sched.run_daily_pulls(start_date="2026-10-17", slot="16:00")
+    sched.run_daily_pulls(start_date="2026-10-17")
+
+    # Date-floored pullers (FRED, ...) keep start_date; only yfinance gets the window.
+    assert calls == [("2026-10-17", "2026-10-15"), ("2026-10-17", None)]
 
 
 def test_morning_slot_lateness_guard_skips_a_late_release(world) -> None:
@@ -217,13 +272,19 @@ def test_morning_slot_runs_when_released_within_the_lateness_limit(world) -> Non
 
 
 def test_morning_slot_lateness_uses_the_utc_clock(world) -> None:
-    """A non-UTC aware clock is converted: 03:30-04:00 (UTC-4 wall) == 07:30Z."""
-    est = timezone(timedelta(hours=-4))
+    """A non-UTC aware clock is converted before the lateness is computed."""
+    edt = timezone(timedelta(hours=-4))
+    # 03:30 wall (UTC-4) == 07:30Z: 135 min late -> skipped.
     sched.run_yfinance_morning_slot(
-        start_date="2026-10-01", now_utc=datetime(2026, 10, 17, 3, 30, tzinfo=est),
+        start_date="2026-10-01", now_utc=datetime(2026, 10, 17, 3, 30, tzinfo=edt),
     )
-
     world.yf_puller.pull_all.assert_not_called()
+    # 01:30 wall (UTC-4) == 05:30Z: only 15 min late -> runs. Computed on the
+    # wall clock instead, this would be 20h15 after the previous 05:15 and skip.
+    sched.run_yfinance_morning_slot(
+        start_date="2026-10-01", now_utc=datetime(2026, 10, 17, 1, 30, tzinfo=edt),
+    )
+    world.yf_puller.pull_all.assert_called_once()
 
 
 def test_morning_slot_uses_the_shared_lateness_limit() -> None:
@@ -274,3 +335,88 @@ def test_domestic_slots_are_unchanged_and_the_morning_slot_is_not_one_of_them(mo
     assert len(domestic) == 28
     assert {j.job_func.keywords["slot"] for j in domestic} == {"13:30", "16:00", "20:00", "22:00"}
     assert not hasattr(sched, "YFINANCE_SKIP_SLOTS")  # 13:30 keeps yfinance
+
+
+# ── D3: the expected SPY provisional-close refusal is not an item failure ──
+
+REFUSAL = "Daily captures refused: incomplete or unknown session policy"
+
+
+def _items(n_ok: int = 69, spy: dict | None = None) -> list[dict]:
+    items = [
+        {"ticker": f"T{i}", "status": "SUCCESS", "rows_inserted": 5, "errors": [],
+         "outcome": "inserted", "daily_policy_refusals": 0, "raw_value_refusals": 0}
+        for i in range(n_ok)
+    ]
+    items.append(spy or {
+        "ticker": "SPY", "status": "PARTIAL", "rows_inserted": 2, "errors": [REFUSAL],
+        "outcome": "inserted", "daily_policy_refusals": 1, "raw_value_refusals": 0})
+    return items
+
+
+def _daily(world, items: list[dict]):
+    world.yf_puller.pull_all.return_value = items
+    engine = MagicMock()
+    sys.modules["db"].get_engine = lambda: engine
+    sched._run_yfinance_daily("2026-10-13")
+    sql = [str(c.args[0]) for c in engine.begin.return_value.__enter__.return_value.execute.call_args_list]
+    return engine, any("UPDATE source_catalog SET last_pull_at" in q for q in sql)
+
+
+def test_only_the_expected_spy_refusal_counts_as_success_and_advances_last_pull_at(world) -> None:
+    _engine, advanced = _daily(world, _items())
+
+    assert advanced
+
+
+def test_expected_spy_refusal_with_zero_rows_is_still_classified_without_failing(world) -> None:
+    spy = {"ticker": "SPY", "status": "PARTIAL", "rows_inserted": 0, "errors": [REFUSAL],
+           "outcome": "no_data", "daily_policy_refusals": 1, "raw_value_refusals": 0}
+
+    normalized = sched._normalize_expected_spy_refusal(_items(spy=spy))
+
+    assert normalized[-1]["status"] == "SUCCESS" and normalized[-1]["outcome"] == "duplicate_only"
+
+
+@pytest.mark.parametrize("spy", [
+    {"errors": [REFUSAL, "Invalid raw numeric captures refused"], "raw_value_refusals": 1},
+    {"errors": [REFUSAL, "boom"]},
+    {"errors": ["HTTP 500"], "daily_policy_refusals": 0, "outcome": "error", "status": "SKIPPED"},
+    {"ticker": "QQQ"},  # the refusal is only expected for SPY
+])
+def test_any_other_problem_keeps_the_run_partial(world, spy) -> None:
+    base = {"ticker": "SPY", "status": "PARTIAL", "rows_inserted": 2, "errors": [REFUSAL],
+            "outcome": "inserted", "daily_policy_refusals": 1, "raw_value_refusals": 0}
+    _engine, advanced = _daily(world, _items(spy={**base, **spy}))
+
+    assert not advanced
+
+
+def test_another_ticker_failing_alongside_the_refusal_keeps_the_run_partial(world) -> None:
+    items = _items()
+    items[3] = {"ticker": "T3", "status": "SKIPPED", "rows_inserted": 0, "errors": ["HTTP 429"],
+                "outcome": "error", "daily_policy_refusals": 0, "raw_value_refusals": 0}
+
+    _engine, advanced = _daily(world, items)
+
+    assert not advanced
+
+
+def test_per_item_errors_are_logged_so_n_of_70_is_reconstructible(world, monkeypatch) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(sched, "log", log)
+    items = _items()
+    items[3] = {"ticker": "T3", "status": "SKIPPED", "rows_inserted": 0, "errors": ["HTTP 429 rate limited"],
+                "outcome": "error", "daily_policy_refusals": 0, "raw_value_refusals": 0}
+    items[4] = {"ticker": "T4", "status": "SUCCESS", "rows_inserted": 0, "errors": [],
+                "outcome": "no_data", "daily_policy_refusals": 0, "raw_value_refusals": 0}
+
+    _daily(world, items)
+
+    text_ = " ".join(str(c) for c in log.warning.call_args_list)
+    assert "T3" in text_ and "HTTP 429 rate limited" in text_ and "T4" in text_
+    [issue_call] = [c for c in log.warning.call_args_list if "not clean" in c.args[0]]
+    assert (issue_call.kwargs["n"], issue_call.kwargs["total"]) == (2, 70)  # "2 of 70"
+    # The expected SPY refusal is reported separately (info), not as a failure.
+    assert "SPY" not in text_
+    assert any("expected" in str(c) and "SPY" in str(c) for c in log.info.call_args_list)
