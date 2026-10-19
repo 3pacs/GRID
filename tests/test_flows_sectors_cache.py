@@ -57,6 +57,18 @@ def _res(rows=None, one=None):
     return m
 
 
+def _data(result: dict) -> dict:
+    """Response minus the additive ``provenance`` envelope (tests/test_flows_provenance.py)."""
+    return {k: v for k, v in result.items() if k != "provenance"}
+
+
+@pytest.fixture(autouse=True)
+def _stub_provenance(monkeypatch):
+    # The provenance envelope is exercised in tests/test_flows_provenance.py;
+    # here it must not touch a database.
+    monkeypatch.setattr(flows_router, "_provenance", lambda tables: {"generated_at": "fixture"})
+
+
 @pytest.fixture(autouse=True)
 def _clear_caches_and_thread_flag():
     flows_router._sector_cache.clear()
@@ -97,7 +109,9 @@ def test_get_sectors_fresh_cache_hit_never_computes(monkeypatch):
     flows_router._sector_cache.set(flows_router._SECTOR_CACHE_KEY, payload)
 
     result = flows_router.get_sectors("test-token")
-    assert result == payload
+    assert _data(result) == payload
+    assert result["provenance"] == {"generated_at": "fixture"}
+    assert "provenance" not in payload  # the cached payload itself is never mutated
 
 
 def test_get_sectors_falls_back_to_stale_when_fresh_expired(monkeypatch):
@@ -114,7 +128,7 @@ def test_get_sectors_falls_back_to_stale_when_fresh_expired(monkeypatch):
     flows_router._sector_stale_cache.set(flows_router._SECTOR_CACHE_KEY, stale_payload)
 
     result = flows_router.get_sectors("test-token")
-    assert result == stale_payload
+    assert _data(result) == stale_payload
     # Response shape for a real (even if stale) payload is unchanged —
     # no extra flags are injected onto genuine data.
     assert "stale" not in result
@@ -137,7 +151,7 @@ def test_get_sectors_cold_process_returns_explicit_unavailable_without_blocking(
 
     result = flows_router.get_sectors("test-token")
 
-    assert result == {"sectors": {}, "stale": True, "unavailable": True}
+    assert _data(result) == {"sectors": {}, "stale": True, "unavailable": True}
     # The warm loop must still be (lazily) kicked off so the process
     # self-heals for the next request.
     assert warm_calls == [1]
@@ -328,7 +342,7 @@ def test_cold_start_after_snapshot_load_serves_persisted_payload_not_unavailable
 
     result = flows_router.get_sectors("test-token")
 
-    assert result == persisted_payload
+    assert _data(result) == persisted_payload
 
 
 # ── Persisting a successfully computed payload ─────────────────────────────
