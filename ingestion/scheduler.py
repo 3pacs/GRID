@@ -610,7 +610,7 @@ def _scheduler_utc_now() -> datetime:
 
 
 def _routine_yfinance_start(now_utc: datetime | None = None) -> str:
-    """Start date for a scheduled yfinance run: last completed session - overlap.
+    """Start date for a scheduled yfinance run: last completed session - 3 calendar days.
 
     ``last_trading_day(utc_today - 1)`` is the most recent session that has
     ended, so the window always covers it regardless of when the scheduler
@@ -658,7 +658,8 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 #     opening-time observation and must not be described or used as one.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
 # Scheduled yfinance runs request a window computed at call time: from
-# YFINANCE_WINDOW_OVERLAP_DAYS before the last completed session, never from the
+# YFINANCE_WINDOW_OVERLAP_DAYS (3 calendar days, not trading days) before the
+# last completed session, never from the
 # scheduler's start date. pull_ticker downloads [start_date, ...) and the
 # writer can only qualify a date it downloaded, so a window frozen at process
 # start lost every session that ended before a (re)start (found 2026-10-19: a

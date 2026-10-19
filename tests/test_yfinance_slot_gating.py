@@ -200,7 +200,7 @@ def test_morning_slot_window_is_computed_at_call_time_not_from_the_restart_date(
 
     [call] = world.yf_puller.pull_all.call_args_list
     assert call.kwargs["start_date"] <= "2026-10-16"
-    assert call.kwargs["start_date"] == "2026-10-13"  # 10-16 minus 3 overlap days
+    assert call.kwargs["start_date"] == "2026-10-13"  # 10-16 minus 3 calendar days
     # Friday is inside the main window, so the SPY close-only fetch is not needed.
     world.yf_puller.pull_ticker.assert_not_called()
 
@@ -230,7 +230,7 @@ def test_window_is_bounded_a_long_running_scheduler_does_not_regrow_it(world) ->
     sched.run_yfinance_morning_slot(start_date="2026-01-05", now_utc=_at(2026, 10, 20))
 
     [call] = world.yf_puller.pull_all.call_args_list
-    assert call.kwargs["start_date"] == "2026-10-16"  # Mon 10-19 session minus 3 days, not 01-05
+    assert call.kwargs["start_date"] == "2026-10-16"  # Mon 10-19 session minus 3 calendar days, not 01-05
 
 
 def test_unslotted_manual_runs_keep_their_explicit_start_date(world, monkeypatch) -> None:
@@ -420,3 +420,43 @@ def test_per_item_errors_are_logged_so_n_of_70_is_reconstructible(world, monkeyp
     # The expected SPY refusal is reported separately (info), not as a failure.
     assert "SPY" not in text_
     assert any("expected" in str(c) and "SPY" in str(c) for c in log.info.call_args_list)
+
+
+# ── drift guard and the non-None completed-SPY-close path ─────────────────
+
+
+def test_expected_refusal_string_matches_the_one_the_writer_emits() -> None:
+    """If yfinance_pull.py rewords its refusal error, the normalizer would
+    silently stop matching and every run would go PARTIAL again."""
+    from pathlib import Path
+
+    source = (Path(__file__).resolve().parents[1] / "ingestion" / "yfinance_pull.py").read_text()
+    assert f'"{sched._YF_EXPECTED_REFUSAL}"' in source
+    assert sched._YF_EXPECTED_REFUSAL == REFUSAL
+
+
+def test_completed_spy_close_helper_fetches_close_only_for_the_completed_session(world) -> None:
+    """A start_date after the completed session (e.g. a manual caller) still gets
+    the SPY close-only request for the omitted session."""
+    out = sched._pull_completed_spy_close(
+        world.yf_puller, "2026-10-17", now_utc=_at(2026, 10, 17))
+
+    assert out == (date(2026, 10, 16), {"outcome": "inserted", "rows_inserted": 1})
+    args, kwargs = world.yf_puller.pull_ticker.call_args
+    assert args == ("SPY",)
+    assert (kwargs["start_date"], kwargs["end_date"]) == (date(2026, 10, 16), date(2026, 10, 17))
+    assert kwargs["only_fields"] == frozenset({"close"})
+
+
+def test_yfinance_daily_logs_the_completed_spy_close_when_the_helper_returns_one(world, monkeypatch) -> None:
+    log = MagicMock()
+    monkeypatch.setattr(sched, "log", log)
+    monkeypatch.setattr(
+        sched, "_pull_completed_spy_close",
+        lambda puller, start: (date(2026, 10, 16), {"outcome": "inserted", "rows_inserted": 1}),
+    )
+
+    _daily(world, _items())
+
+    assert any("SPY completed-close check" in c.args[0] and c.kwargs["d"] == date(2026, 10, 16)
+               for c in log.info.call_args_list)
