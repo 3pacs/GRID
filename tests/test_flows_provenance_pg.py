@@ -96,8 +96,10 @@ def test_missing_empty_fresh_stale(engine):
     assert (p["unavailable"], p["reason"], p["age_days"]) == (True, "stale", 9)
     assert p["row_count"] == 1                      # what is there is still reported
 
-    _insert(engine, "dark_pool_weekly", "report_date", days_ago=9)
-    assert mp.table_provenance(engine, "dark_pool_weekly")["unavailable"] is False  # weekly: 10 days
+    # Weekly FINRA data: newest week starts ~3 weeks back when the pipeline is healthy.
+    _insert(engine, "dark_pool_weekly", "report_date", days_ago=21)
+    p = mp.table_provenance(engine, "dark_pool_weekly")
+    assert p["unavailable"] is False and p["age_days"] == 21 and p["stale_after_days"] == 35
 
 
 def test_source_last_ingested_from_signal_sources_and_raw_series(engine):

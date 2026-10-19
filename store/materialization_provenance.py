@@ -46,7 +46,14 @@ _SET_TIMEOUT_SQL = "SET LOCAL statement_timeout = 5000"  # keep in step with STA
 CACHE_TTL_SECONDS = 30.0
 
 DAILY_STALE_AFTER_DAYS = 3
-WEEKLY_STALE_AFTER_DAYS = 10
+# dark_pool_weekly is FINRA ATS weekly-summary data (ingestion/altdata/dark_pool.py):
+# report_date is the week's Monday, FINRA publishes ~2 weeks after the week
+# ends, and a new week lands once a week. Healthy newest report_date is thus
+# 7 (week) + 14 (lag) = 21 days old at publication and up to 28 just before the
+# next one; 35 leaves a week of slack. (Tier-2 names lag ~4 weeks, but the
+# table-level max is set by the freshest, Tier-1, week.) A 10-day threshold
+# read a healthy pipeline as stale permanently.
+WEEKLY_STALE_AFTER_DAYS = 35
 
 _SOURCE_LOOKBACK_DAYS = 30
 

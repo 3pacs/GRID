@@ -137,12 +137,28 @@ def test_daily_threshold_is_three_calendar_days(age, unavailable):
     assert p["reason"] == ("stale" if unavailable else None)
 
 
-@pytest.mark.parametrize("age,unavailable", [(9, False), (10, False), (11, True)])
-def test_weekly_threshold_is_ten_calendar_days(age, unavailable):
+@pytest.mark.parametrize("age,unavailable", [
+    (14, False),   # week published this morning, minimum healthy age
+    (21, False),   # typical healthy age: week start + ~2 weeks FINRA lag
+    (28, False),   # just before the next weekly publication
+    (35, False),   # threshold (a week of slack)
+    (36, True),
+])
+def test_weekly_threshold_covers_the_finra_publication_lag(age, unavailable):
     engine = FakeEngine({"dark_pool_weekly": (50, TODAY - timedelta(days=age), CREATED)})
     p = _prov(engine, "dark_pool_weekly")
-    assert p["stale_after_days"] == 10
+    assert p["stale_after_days"] == 35
     assert p["unavailable"] is unavailable
+    assert p["reason"] == ("stale" if unavailable else None)
+
+
+def test_fresh_weekly_row_reads_available():
+    """A healthy dark-pool table (newest week started 3 weeks ago) is available."""
+    monday = TODAY - timedelta(days=TODAY.weekday())
+    newest_week = monday - timedelta(weeks=3)
+    p = _prov(FakeEngine({"dark_pool_weekly": (900, newest_week, CREATED)}), "dark_pool_weekly")
+    assert p["unavailable"] is False and p["reason"] is None
+    assert 14 <= p["age_days"] <= 28
 
 
 def test_stale_reports_age_and_threshold():

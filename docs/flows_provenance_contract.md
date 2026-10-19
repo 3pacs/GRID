@@ -66,7 +66,11 @@ endpoint's envelope as "that table is fine".
 
 - **Daily tables: 3 calendar days** (`insider_trades`, `congressional_trades`, `etf_flows`,
   `junction_point_readings`, `signal_sources`, `options_daily_signals`, `capital_flow_snapshots`).
-- **Weekly tables: 10 calendar days** (`dark_pool_weekly`).
+- **Weekly tables: 35 calendar days** (`dark_pool_weekly`). `report_date` is the Monday of the FINRA reporting
+  week and FINRA publishes about two weeks after the week ends (`ingestion/altdata/dark_pool.py`), so a healthy
+  table's newest `report_date` is about 21 days old at publication and up to about 28 just before the next
+  weekly release; 35 leaves a week of slack. A shorter threshold (the first draft used 10) would flag a healthy
+  pipeline as stale permanently. If the feed ever moves to the longer Tier-2 lag (about 4 weeks), raise it.
 - Age is measured on `max_obs_date`. Event tables with natural lulls (insider trades, disclosures) can read as
   stale over a long holiday weekend; that errs on the side of "do not call it current".
 
