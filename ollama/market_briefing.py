@@ -17,7 +17,7 @@ import math
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -146,6 +146,54 @@ def _publication_guard(role: str, content: str | None, verdict: dict[str, Any] |
     )
 
 
+_YF_SNAPSHOT_LOOKBACK_DAYS = 14
+
+
+def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any] | None:
+    """Latest Yahoo daily value for ``sid`` without serving an in-progress capture.
+
+    ``raw_series`` keeps every pull as a vintage, and a same-day pull taken
+    during the session (INCOMPLETE) or an unmarked legacy opening-minute pull
+    is not a completed-session value. So the read goes through
+    ``store.observations`` (SUCCESS only, newest vintage per date):
+
+    1. the newest policy-eligible daily capture (``read_daily_policy_n``, the
+       reader market_diary uses), labelled ``policy_eligible_daily_capture``;
+    2. only for tickers that ``price_close_contract.UNKNOWN_DAILY_TICKERS``
+       lists as having no daily session policy at all, the newest pull,
+       labelled ``unqualified_latest_pull`` / ``session_finality=unknown`` so
+       the briefing states that completeness is not established;
+    3. otherwise ``None``: a policy-supported series with only INCOMPLETE or
+       unmarked captures is withheld rather than reported, including when its
+       newest label is outside the contract's audited year or on an
+       NYSE-closed day (membership in the sessionless set, not a None
+       ``daily_capture_boundary`` for that one date, decides the fallback).
+    """
+    import price_close_contract
+    from store.observations import read_daily_policy_n, read_latest
+
+    qualified = read_daily_policy_n(
+        conn, sid, 1, source="yfinance",
+        start=now.date() - timedelta(days=_YF_SNAPSHOT_LOOKBACK_DAYS), as_of_ts=now,
+    )
+    if qualified:
+        obs, basis, finality = qualified[0], "policy_eligible_daily_capture", "policy_eligible_not_provider_final"
+    else:
+        obs = read_latest(conn, sid, source="yfinance", as_of_ts=now)
+        ticker = sid.split(":")[1] if sid.count(":") >= 2 else ""
+        if obs is None or ticker not in price_close_contract.UNKNOWN_DAILY_TICKERS:
+            return None
+        basis, finality = "unqualified_latest_pull", "unknown"
+    return {
+        "value": round(obs.value, 4),
+        "date": str(obs.obs_date),
+        "source": obs.source or "yfinance",
+        "basis": basis,
+        "session_finality": finality,
+        "collected_at": obs.pull_timestamp.isoformat() if obs.pull_timestamp else None,
+    }
+
+
 class MarketBriefingEngine:
     """Generates AI-powered market condition briefings using Ollama.
 
@@ -257,20 +305,26 @@ class MarketBriefingEngine:
                     ],
                 }
 
+                now_utc = datetime.now(timezone.utc)
                 for category, series_ids in key_series.items():
                     for sid in series_ids:
+                        # Extract a clean label
+                        parts = sid.split(":")
+                        label = parts[1] if len(parts) > 1 else sid
+                        if sid.startswith("YF:"):
+                            entry = _read_yf_snapshot_value(conn, sid, now_utc)
+                            if entry:
+                                snapshot[category][label] = entry
+                            continue
                         row = conn.execute(
                             text(
                                 "SELECT value, obs_date FROM raw_series "
                                 "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                "ORDER BY obs_date DESC LIMIT 1"
+                                "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                             ),
                             {"sid": sid},
                         ).fetchone()
                         if row:
-                            # Extract a clean label
-                            parts = sid.split(":")
-                            label = parts[1] if len(parts) > 1 else sid
                             snapshot[category][label] = {
                                 "value": round(row[0], 4),
                                 "date": str(row[1]),
