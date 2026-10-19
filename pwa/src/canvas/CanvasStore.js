@@ -52,8 +52,9 @@ const useCanvasStore = create((set, get) => ({
      * loadGraph — imports { nodes, edges } from API into graphology Graph.
      * Clears existing graph and replaces with fresh data.
      */
-    loadGraph: (data) => {
+    loadGraph: (data, { preserveLayout = false } = {}) => {
         const g = new Graph();
+        if (preserveLayout) g.setAttribute('canvasPreserveLayout', true);
         const { nodes = [], edges = [] } = _normalizeGraphPayload(data);
 
         nodes.forEach((node) => {

@@ -3,13 +3,13 @@
  * Core rendering component for the Gotham Canvas.
  *
  * Uses @react-sigma/core for React integration.
- * ForceAtlas2 layout via graphology-layout-forceatlas2 (Web Worker).
+ * ForceAtlas2 runs in bounded scheduled batches with persistent matrix state.
  */
 
 import React, { useEffect, useCallback, useState } from 'react';
 import { SigmaContainer, useRegisterEvents, useSigma, useLoadGraph } from '@react-sigma/core';
 import EdgeCurveProgram from '@sigma/edge-curve';
-import forceAtlas2 from 'graphology-layout-forceatlas2';
+import { startIncrementalLayout } from './incrementalLayout.js';
 import '@react-sigma/core/lib/style.css';
 import useCanvasStore from './CanvasStore.js';
 import CommunityHulls from './CommunityHulls.jsx';
@@ -48,15 +48,6 @@ const FA2_SETTINGS = {
 
 const MAX_LAYOUT_NODES = 900;
 
-function scheduleIdle(callback) {
-    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
-        const id = window.requestIdleCallback(callback, { timeout: 900 });
-        return () => window.cancelIdleCallback?.(id);
-    }
-    const id = window.setTimeout(callback, 80);
-    return () => window.clearTimeout(id);
-}
-
 function layoutIterations(order) {
     if (order > 600) return 80;
     if (order > 300) return 120;
@@ -66,42 +57,45 @@ function layoutIterations(order) {
 /**
  * GraphLoader — loads the graphology Graph from CanvasStore into Sigma.
  */
-function GraphLoader() {
+export function GraphLoader() {
     const loadGraph = useLoadGraph();
     const sigma = useSigma();
     const graph = useCanvasStore((s) => s.graph);
+    const [layout, setLayout] = useState({ phase: 'idle' });
 
     useEffect(() => {
-        if (!graph || graph.order === 0) return;
+        if (!graph || graph.order === 0) { setLayout({ phase: 'idle' }); return; }
 
         loadGraph(graph);
 
-        if (graph.order > MAX_LAYOUT_NODES) {
+        if (graph.getAttribute('canvasPreserveLayout')) {
+            setLayout({ phase: 'saved' });
             sigma.refresh();
             return;
         }
-
-        let cancelled = false;
-        const cancelIdle = scheduleIdle(() => {
-            if (cancelled) return;
-            try {
-                forceAtlas2.assign(graph, {
-                    iterations: layoutIterations(graph.order),
-                    settings: FA2_SETTINGS,
-                });
-                sigma.refresh();
-            } catch (e) {
-                console.warn('ForceAtlas2 layout error:', e);
-            }
+        if (graph.order > MAX_LAYOUT_NODES) {
+            setLayout({ phase: 'skipped' });
+            sigma.refresh();
+            return;
+        }
+        let active = true;
+        setLayout({ phase: 'arranging', completed: 0, total: layoutIterations(graph.order) });
+        const cancel = startIncrementalLayout(graph, {
+            iterations: layoutIterations(graph.order), settings: FA2_SETTINGS,
+            onProgress: (progress) => { if (active) setLayout({ phase: 'arranging', ...progress }); },
+            onComplete: () => { if (active) { sigma.refresh(); setLayout({ phase: 'ready' }); } },
+            onCancel: () => { if (active) setLayout({ phase: 'paused' }); },
+            onError: (error) => {
+                if (active) { console.warn('ForceAtlas2 layout error:', error); setLayout({ phase: 'error' }); }
+            },
         });
-
-        return () => {
-            cancelled = true;
-            cancelIdle?.();
-        };
+        return () => { active = false; cancel(); };
     }, [graph, graph.order, loadGraph, sigma]);
 
-    return null;
+    const message = layout.phase === 'arranging' ? `Arranging graph (${layout.completed}/${layout.total})…`
+        : layout.phase === 'paused' ? 'Layout paused after graph interaction. Current positions retained.'
+        : layout.phase === 'error' ? 'Layout unavailable. Current graph positions retained.' : null;
+    return message ? <div role="status" aria-live="polite" style={{ position: 'absolute', bottom: 8, left: 8, zIndex: 5, color: '#8AA0B8', fontSize: 12 }}>{message}</div> : null;
 }
 
 /**
