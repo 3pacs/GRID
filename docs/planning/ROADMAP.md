@@ -4,11 +4,14 @@
 > https://github.com/3pacs/obsidian-vault/blob/main/05-GRID/00-Dashboard.md and the
 > reconciliation PR https://github.com/3pacs/obsidian-vault/pull/113). This file remains the architecture history (Phases 1–17, V5 vectors)
 > and the promoted mirror per `docs/planning/README.md`; its "Single source of truth" line below is
-> superseded for status. YOU ARE HERE (2026-10-19): price lane repaired at source and DB (PRs #853 live;
-> #858–#861 open, green/reviewed, unmerged); FINRA blocked on a V6 source fix; grid-hermes OFF, so the flow
+> superseded for status. YOU ARE HERE (2026-10-19): price lane repaired in the DB; writer fix #853 merged and live;
+> #858, #860, #861 open on PR branches with green CI (858 and 861 independently reviewed), #859 open with a revision
+> pushed and CI pending — none merged, none deployed; FINRA blocked on a V6 source fix; grid-hermes OFF, so the flow
 > materializer (`ingestion/flow_materializer.py`, Hermes-only binding) has not loaded since 2026-10-13;
 > first visible milestone M0 = a functioning bounded end-to-end slice (ingestion → materialization loads →
-> reasoning with provenance and explicit unavailable inputs → publication retained). September "landed"
+> reasoning with provenance and explicit unavailable inputs → publication retained), accepted only by ONE linked
+> example for a single market session and as-of (input → materialization row → reasoning output or unavailable
+> reason → retained publication bytes with matching hash), with receipts inside that session's completion window. September "landed"
 > marks in `LEVER-PACKAGE.md` and `V5-TRANSFORMATION.md` are source/CI evidence, not October runtime proof
 > (UNVERIFIED until a receipt exists). Execution slices A–D, owners and acceptance evidence live in the vault note.
 
