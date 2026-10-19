@@ -647,14 +647,16 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 #   * run_yfinance_morning_slot captures D's close at 05:15Z on D+1, as soon
 #     as the NY-midnight boundary has passed in both EDT and EST (Saturday
 #     for Friday, Tuesday for a Monday session, ...);
-#   * 13:30Z is the opening-time raw observation (09:30 ET: what was knowable
-#     then); 16:00Z/20:00Z/22:00Z are same-day snapshots. All of them keep
-#     running yfinance and carry the #853 writer's honest finality labels
-#     (INCOMPLETE for supported US-listed 2026 tickers, UNKNOWN otherwise).
-#     They are not closes; only final-close scoring ignores them.
+#   * 13:30Z is a same-day raw capture (09:32 ET in-progress bar,
+#     capture_state INCOMPLETE; its open/close fields are provisional and not
+#     an exchange-opening print); 16:00Z/20:00Z/22:00Z are later same-day
+#     snapshots. All of them keep running yfinance and carry the #853 writer's
+#     honest finality labels (INCOMPLETE for supported US-listed 2026 tickers,
+#     UNKNOWN otherwise). They are not closes; only final-close scoring
+#     ignores them.
 #   * 05:15Z is the separate completed-close capture, after the next New York
 #     midnight (POLICY_ELIGIBLE). The daily bar's Open field written by that
-#     run is the exchange's official open seen next morning -- it is NOT the
+#     run is the exchange's official open seen next morning -- it is NOT an
 #     opening-time observation and must not be described or used as one.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
 # Scheduled yfinance runs request a window computed at call time: from
@@ -1645,8 +1647,9 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
 
     Pulls all configured series from FRED and all tickers from yfinance.
     Skips if the market is closed (weekend or holiday). Every slot runs
-    yfinance; the 13:30 UTC one is the opening-time observation, and the
-    first qualified daily close is captured by run_yfinance_morning_slot.
+    yfinance; the 13:30 UTC one is a same-day raw capture (in-progress,
+    INCOMPLETE, not an exchange-opening print), and the first qualified
+    daily close is captured by run_yfinance_morning_slot.
     Handles and logs any exception without crashing the scheduler.
 
     Parameters:
@@ -1801,10 +1804,11 @@ def run_yfinance_morning_slot(
     on Saturday and Monday's on Tuesday, whether or not today is a session.
     Sunday, and the day after a weekend-adjacent holiday, skip.
 
-    This is the completed-close capture, separate from the 13:30Z opening
-    observation and the 16:00/20:00/22:00Z same-day snapshots. The daily bar's
-    Open it also writes is the exchange's official open seen next morning, not
-    an opening-time observation.
+    This is the completed-close capture, separate from the 13:30Z same-day raw
+    capture (09:32 ET in-progress bar, INCOMPLETE, provisional open/close, not
+    an exchange-opening print) and the 16:00/20:00/22:00Z same-day snapshots.
+    The daily bar's Open it also writes is the exchange's official open seen
+    next morning, not an opening-time observation.
 
     Uses the same lateness guard as run_daily_pulls, evaluated on the UTC
     clock the slot is registered on.
@@ -2069,7 +2073,7 @@ def _run_equity_pulls(
         except Exception as exc2:
             log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
 
-    # yfinance pull (every slot, including the 13:30 UTC opening observation).
+    # yfinance pull (every slot, including the 13:30 UTC same-day raw capture).
     _run_yfinance_daily(yfinance_start if yfinance_start is not None else start_date)
 
     # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
@@ -2341,9 +2345,10 @@ def start_scheduler() -> None:
 
     # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
     # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
-    # yfinance runs in every slot. The 13:30 row is a point-in-time opening
-    # observation (INCOMPLETE-tagged, not a close); the qualified prior-day
-    # close comes from the 05:15 morning slot registered below.
+    # yfinance runs in every slot. The 13:30Z row is a same-day raw capture
+    # (09:32 ET in-progress bar, capture_state INCOMPLETE; provisional
+    # open/close, not an exchange-opening print and not a close); the qualified
+    # prior-day close comes from the 05:15 morning slot registered below.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",

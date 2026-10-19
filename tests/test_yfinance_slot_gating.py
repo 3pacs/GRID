@@ -4,10 +4,12 @@ The yfinance writer only marks a daily close POLICY_ELIGIBLE once the pull
 happens after the next New York midnight, so the first qualified close for
 session D used to land in the 13:30Z run on D+1. The scheduler now has a 05:15Z
 yfinance-only morning slot. The 13:30Z slot keeps running yfinance: that row is
-the opening-time raw observation and 16:00/20:00/22:00Z are same-day
-snapshots (all with the #853 writer's INCOMPLETE/UNKNOWN labels, none a close).
-The 05:15Z run is the separate completed-close capture; its daily-bar Open is
-the official open seen next morning, not an opening-time observation.
+a same-day raw capture (09:32 ET in-progress bar, capture_state INCOMPLETE; its
+open/close fields are provisional and not an exchange-opening print) and
+16:00/20:00/22:00Z are later same-day snapshots (all with the #853 writer's
+INCOMPLETE/UNKNOWN labels, none a close). The 05:15Z run is the separate
+completed-close capture; its daily-bar Open is the official open seen next
+morning, not an opening-time observation.
 
 Everything is a local fake: no network, no database, no email.
 """
@@ -111,7 +113,7 @@ def _open_on_session_day(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(sched, "_scheduler_utc_now", lambda: _at(2026, 10, 19, 13, 30))
 
 
-# ── every domestic slot (13:30 opening observation included) runs yfinance ──
+# ── every domestic slot (13:30Z same-day raw capture included) runs yfinance ──
 
 
 @pytest.mark.parametrize("slot", ["13:30", "16:00", "20:00", "22:00"])
