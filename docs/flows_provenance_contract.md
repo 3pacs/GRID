@@ -58,7 +58,7 @@ endpoint's envelope as "that table is fine".
 | `materialized_at` | `max(created_at)` (`generated_at` for `capital_flow_snapshots`). The materializer upserts, so rows it only updates do not move this; treat it as a **lower bound** on the last sync |
 | `source_last_ingested` | newest ingest time of the feeding rows where cheaply derivable with an indexed bound: `signal_sources.created_at` for `source_type` insider / congressional / darkpool (last 30 days), `raw_series.pull_timestamp` for the FRED junction series (`series_id` and `obs_date` bounded, `SUCCESS` only). `null` when not derivable, or when that lookup failed. It never changes `unavailable` |
 | `age_days` | UTC calendar days between today and `max_obs_date` (never negative; see "Future-dated dates") |
-| `future_dated_rows` | `congressional_trades` only: number of rows whose `disclosure_date` is after today ; `null` for every other table |
+| `future_dated_rows` | `congressional_trades` only: number of rows whose `disclosure_date` is after today; `null` for every other table |
 | `stale_after_days` | the table's threshold |
 | `unavailable`, `reason` | see below |
 | `generated_at` | when the envelope was computed (probes are cached for 30 s) |
