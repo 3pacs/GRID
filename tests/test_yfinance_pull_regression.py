@@ -894,3 +894,50 @@ def test_pull_all_with_should_continue_reports_per_outcome_counts(engine_recordi
     assert result["counts"]["inserted"] == 2
     assert result["counts"]["unattempted"] == 1
     assert sum(result["counts"].values()) == 3
+
+
+@pytest.mark.parametrize("ticker,convention", [
+    ("^VIX", "cboe_vol_index_ny_label_day_2026"),
+    ("DX-Y.NYB", "ice_dxy_ny_label_day_2026"),
+    ("CL=F", "cme_globex_ny_label_day_2026"),
+    ("EURUSD=X", "yahoo_fx_ny_close_label_day_2026"),
+])
+def test_extended_session_classes_write_explicit_convention_marker(
+    engine_recording_inserts, ticker, convention,
+):
+    """VIX/DXY/futures/FX captures after the next NY local midnight carry
+    their own session_convention; earlier same-label captures stay INCOMPLETE."""
+    from ingestion import yfinance_pull
+
+    engine, conn = engine_recording_inserts
+    obs_date = date(2026, 10, 15)
+    frame = pd.DataFrame({"Close": [20.0]}, index=pd.DatetimeIndex([pd.Timestamp(obs_date)]))
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        result.fetchone.return_value = None
+        result.fetchall.return_value = []
+        return result
+
+    conn.execute.side_effect = execute
+    with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
+         patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value=set()), \
+         patch.object(yfinance_pull, "_utc_now", side_effect=[
+             datetime(2026, 10, 16, 3, 59, tzinfo=timezone.utc),  # 23:59 ET on the label day
+             datetime(2026, 10, 16, 4, 0, tzinfo=timezone.utc),   # next NY local midnight
+         ]), \
+         patch.object(yfinance_pull.yf, "download", return_value=frame):
+        puller = yfinance_pull.YFinancePuller(engine)
+        early = puller.pull_ticker(ticker, start_date=obs_date, only_fields=frozenset({"close"}))
+        late = puller.pull_ticker(ticker, start_date=obs_date, only_fields=frozenset({"close"}))
+
+    assert (early["rows_inserted"], early["qualified_rows_inserted"]) == (1, 0)
+    assert (late["rows_inserted"], late["qualified_rows_inserted"]) == (1, 1)
+    payloads = [json.loads(c.args[1]["payload"]) for c in conn.execute.call_args_list
+                if "INSERT INTO raw_series" in str(c.args[0])]
+    assert [p["capture_state"] for p in payloads] == ["INCOMPLETE", "POLICY_ELIGIBLE"]
+    assert "session_convention" not in payloads[0]
+    assert payloads[1]["session_convention"] == convention
+    assert payloads[1]["eligible_after"] == "2026-10-16T04:00:00+00:00"
+    assert payloads[1]["price_basis"] == f"YF:{ticker}:close"
+    assert all(p["provider_certified_final"] is False for p in payloads)

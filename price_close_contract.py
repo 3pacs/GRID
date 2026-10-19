@@ -66,27 +66,49 @@ US_LISTED_DAILY_TICKERS = frozenset({
     "FXI", "EWJ", "EWZ", "EFA", "TIP", "COPX", "SJNK", "BKLN", "ANGL",
 })
 UTC_DAILY_TICKERS = frozenset({"BTC-USD", "ETH-USD"})
-UNKNOWN_DAILY_TICKERS = frozenset({
-    "^VIX", "DX-Y.NYB", "^VIX9D", "^VIX3M", "^VIX6M",
-    "HG=F", "GC=F", "SI=F", "CL=F", "EURUSD=X", "GBPUSD=X", "USDJPY=X",
-    "AUDUSD=X", "USDCHF=X", "USDCAD=X", "NZDUSD=X",
+# Non-NYSE venues whose daily bars end before the next New York local
+# midnight (owner decision 2026-10-19). Cboe volatility indexes settle at
+# 16:15 ET on the NYSE holiday calendar; ICE DX-Y.NYB follows the New York
+# trading day; CME Globex futures (bar labelled by trade date) settle at
+# 17:00 ET; Yahoo FX closes at the New York 17:00 ET convention (the UTC
+# day end at the latest). All finish their label day before 00:00
+# America/New_York of the following date, so the same elapsed NY-label-day
+# boundary is conservative for them. NYSE-closed labels stay UNKNOWN even
+# when these markets trade: is_market_open is a refusal filter.
+CBOE_VOL_INDEX_DAILY_TICKERS = frozenset({"^VIX", "^VIX9D", "^VIX3M", "^VIX6M"})
+ICE_DXY_DAILY_TICKERS = frozenset({"DX-Y.NYB"})
+CME_GLOBEX_DAILY_TICKERS = frozenset({"HG=F", "GC=F", "SI=F", "CL=F"})
+YAHOO_FX_DAILY_TICKERS = frozenset({
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "AUDUSD=X", "USDCHF=X", "USDCAD=X", "NZDUSD=X",
 })
+NY_LABEL_DAY_SESSION_CONVENTIONS: dict[str, str] = {
+    **{t: "us_listed_ny_label_day_2026" for t in US_LISTED_DAILY_TICKERS},
+    **{t: "cboe_vol_index_ny_label_day_2026" for t in CBOE_VOL_INDEX_DAILY_TICKERS},
+    **{t: "ice_dxy_ny_label_day_2026" for t in ICE_DXY_DAILY_TICKERS},
+    **{t: "cme_globex_ny_label_day_2026" for t in CME_GLOBEX_DAILY_TICKERS},
+    **{t: "yahoo_fx_ny_close_label_day_2026" for t in YAHOO_FX_DAILY_TICKERS},
+}
+NY_LABEL_DAY_DAILY_TICKERS = frozenset(NY_LABEL_DAY_SESSION_CONVENTIONS)
+# Every default ticker now has an explicit convention; kept so callers can
+# still partition the universe as supported | unknown.
+UNKNOWN_DAILY_TICKERS: frozenset[str] = frozenset()
 
 
 def daily_capture_boundary(ticker: str, obs_date: date, interval: str = "1d") -> datetime | None:
     """Conservative elapsed-label-day boundary; unsupported sessions are unknown.
 
-    US mappings are deliberately limited to 2026, the audited operational
-    year. Existing standard holiday checks are a refusal filter, not proof
-    of an exhaustive exchange calendar. Waiting until *local midnight*
-    avoids assuming a regular/early exchange close or a fixed DST offset.
+    New York label-day mappings are deliberately limited to 2026, the
+    audited operational year. Existing standard NYSE holiday checks are a
+    refusal filter, not proof of an exhaustive exchange calendar. Waiting
+    until *local midnight* avoids assuming a regular/early exchange close
+    or a fixed DST offset.
     Crypto's explicit UTC-day convention includes weekends and holidays.
     """
     if interval != "1d":
         return None
     if ticker in UTC_DAILY_TICKERS:
         return observation_end_utc(obs_date)
-    if ticker not in US_LISTED_DAILY_TICKERS or obs_date.year != 2026:
+    if ticker not in NY_LABEL_DAY_SESSION_CONVENTIONS or obs_date.year != 2026:
         return None
     from ingestion.market_calendar import is_market_open
     from zoneinfo import ZoneInfo
@@ -108,7 +130,8 @@ def daily_capture_payload(ticker: str, field: str, obs_date: date,
         "price_basis": f"YF:{ticker}:{field}",
         "interval": interval,
         "obs_date": obs_date.isoformat(),
-        "session_convention": "utc_24h" if ticker in UTC_DAILY_TICKERS else "us_listed_ny_label_day_2026",
+        "session_convention": ("utc_24h" if ticker in UTC_DAILY_TICKERS
+                               else NY_LABEL_DAY_SESSION_CONVENTIONS[ticker]),
         "eligible_after": boundary.isoformat(),
         "provider_certified_final": False,
     }
