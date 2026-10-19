@@ -1,3 +1,17 @@
+> **2026-10-19 hierarchy addendum (docs-only, hand-written; re-promotion via OBSIDIAN-2 pending).**
+> The single authority for GRID **delivery status and milestones** is the vault note
+> `05-GRID/00-Dashboard.md` ("GRID canonical execution plan", updated 2026-10-19 — see
+> https://github.com/3pacs/obsidian-vault/blob/main/05-GRID/00-Dashboard.md and the
+> reconciliation PR https://github.com/3pacs/obsidian-vault/pull/113). This file remains the architecture history (Phases 1–17, V5 vectors)
+> and the promoted mirror per `docs/planning/README.md`; its "Single source of truth" line below is
+> superseded for status. YOU ARE HERE (2026-10-19): price lane repaired at source and DB (PRs #853 live;
+> #858–#861 open, green/reviewed, unmerged); FINRA blocked on a V6 source fix; grid-hermes OFF, so the flow
+> materializer (`ingestion/flow_materializer.py`, Hermes-only binding) has not loaded since 2026-10-13;
+> first visible milestone M0 = a functioning bounded end-to-end slice (ingestion → materialization loads →
+> reasoning with provenance and explicit unavailable inputs → publication retained). September "landed"
+> marks in `LEVER-PACKAGE.md` and `V5-TRANSFORMATION.md` are source/CI evidence, not October runtime proof
+> (UNVERIFIED until a receipt exists). Execution slices A–D, owners and acceptance evidence live in the vault note.
+
 # GRID Roadmap — Financial Palantir
 
 > **Single source of truth.** Every session starts here. Updated 2026-03-31 (post-audit).
