@@ -121,6 +121,82 @@ def test_correlation_matrix_empty_registry_shape_is_unchanged(assoc) -> None:
     assert body == {"features": [], "matrix": [], "strong_pairs": []}
 
 
+def _anomaly_matrix() -> pd.DataFrame:
+    """100 days, two features; feat_a ends on a 6-sigma spike."""
+    idx = pd.date_range("2026-06-01", periods=100, freq="D")
+    a = [float(i % 5) for i in range(99)] + [40.0]
+    b = [float((i * 3) % 7) for i in range(100)]
+    matrix = pd.DataFrame({1: a, 2: b}, index=idx)
+    matrix.attrs["excluded_stale"] = {}
+    return matrix
+
+
+def test_anomalies_build_runs_off_the_event_loop_and_loop_stays_responsive(assoc) -> None:
+    threads, started, monkeypatch = assoc
+    app, ping_before_release, release = _app(associations.router)
+    alerts: list[tuple[str, int]] = []
+
+    def build(_pit, _ids, _days):
+        threads["build"] = threading.get_ident()
+        started.set()
+        release.wait(5)
+        return _anomaly_matrix()
+
+    def alert(title, _body):
+        alerts.append((title, threading.get_ident()))
+
+    monkeypatch.setattr(associations, "_build_feature_matrix", build)
+    monkeypatch.setitem(sys.modules, "alerts.email", types.SimpleNamespace(
+        alert_on_discovery_insight=alert))
+
+    with TestClient(app) as client, ThreadPoolExecutor(max_workers=1) as pool:
+        loop_thread = client.portal.call(threading.get_ident)
+        request = pool.submit(client.get, "/api/v1/associations/anomalies?sigma_threshold=2.5")
+        assert started.wait(2)
+        fallback = threading.Timer(3, release.set)
+        fallback.start()
+        try:
+            assert client.get("/ping").json() == {"ok": True}
+            assert ping_before_release == [True]  # served while the build was still blocked
+        finally:
+            release.set()
+            fallback.cancel()
+        response = request.result(timeout=5)
+
+    assert response.status_code == 200
+    assert {threads["engine"], threads["pit"], threads["build"]}.isdisjoint({loop_thread})
+    body = response.json()
+    # Response shape is unchanged.
+    assert set(body) == {"anomalies", "threshold"} and body["threshold"] == 2.5
+    [anomaly] = body["anomalies"]
+    assert anomaly["feature"] == "feat_a" and anomaly["severity"] == "extreme"
+    assert set(anomaly) == {
+        "feature", "current_value", "zscore", "historical_mean", "historical_std",
+        "severity", "broken_correlations",
+    }
+    # The alert e-mail (blocking SMTP) also left the event loop.
+    assert [t for t, _ in alerts] == ["Extreme Anomalies Detected (1)"]
+    assert loop_thread not in {ident for _, ident in alerts}
+
+
+def test_anomalies_short_circuit_shapes_are_unchanged(assoc) -> None:
+    _threads, _started, monkeypatch = assoc
+    app, _ping, _release = _app(associations.router)
+
+    with TestClient(app) as client:
+        monkeypatch.setattr(
+            associations, "_build_feature_matrix",
+            lambda *_a: _fixture_matrix().iloc[:10],  # < 30 rows
+        )
+        assert client.get("/api/v1/associations/anomalies").json() == {
+            "anomalies": [], "message": "Insufficient data"}
+        monkeypatch.setattr(
+            associations, "_get_feature_registry",
+            lambda _e: pd.DataFrame(columns=["id", "name", "family", "description"]),
+        )
+        assert client.get("/api/v1/associations/anomalies").json() == {"anomalies": []}
+
+
 def test_levers_build_runs_off_the_event_loop_and_loop_stays_responsive(monkeypatch) -> None:
     started = threading.Event()
     threads: dict[str, int] = {}
