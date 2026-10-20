@@ -147,41 +147,89 @@ class FullYieldCurvePuller(BasePuller):
         if isinstance(df, pd.DataFrame):
             result = pd.DataFrame()
 
-            # Find date column
+            # Find the observation date. fedfred 3.x (fedfred/helpers.py
+            # ``to_pd_df``) returns the observation date as a DatetimeIndex
+            # named "date" with columns realtime_start/realtime_end/value;
+            # older shapes carry a "date" column. Every assignment below goes
+            # through ``.to_numpy()`` so the value column is positional. The
+            # previous code assigned ``pd.to_numeric(df["value"])`` — a Series
+            # still carrying the DatetimeIndex — onto a frame whose "date"
+            # column had been built from the index and therefore had a fresh
+            # RangeIndex; pandas aligned on index and every value became NaN
+            # (grid-hermes 2026-10-20 04:19:46Z "FRED DGS1: 260 values coerced
+            # to NaN" -> "Invalid FRED observation date or value").
+            idx = df.index
+            if isinstance(idx, pd.DatetimeIndex):
+                result["date"] = pd.Series(idx.to_numpy())
+            elif idx.name in ("date", "Date", "observation_date"):
+                result["date"] = pd.Series(
+                    pd.to_datetime(idx, errors="coerce").to_numpy()
+                )
             for col in ("date", "Date", "observation_date"):
-                if col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce")
+                if "date" not in result.columns and col in df.columns:
+                    result["date"] = pd.to_datetime(df[col], errors="coerce").to_numpy()
                     break
-            if "date" not in result.columns and df.index.name in ("date", "Date"):
-                result["date"] = pd.to_datetime(df.index, errors="coerce")
-            elif "date" not in result.columns:
-                result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+            if "date" not in result.columns:
+                result["date"] = pd.to_datetime(
+                    df.iloc[:, 0], errors="coerce"
+                ).to_numpy()
 
             # Find value column
             for col in ("value", "Value", series_id):
                 if col in df.columns:
-                    result["value"] = pd.to_numeric(df[col], errors="coerce")
+                    result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
                     break
             if "value" not in result.columns:
                 numeric_cols = df.select_dtypes(include=["number"]).columns
                 if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]]
+                    result["value"] = pd.to_numeric(
+                        df[numeric_cols[0]], errors="coerce"
+                    ).to_numpy()
                 else:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
+                    result["value"] = pd.to_numeric(
+                        df.iloc[:, -1], errors="coerce"
+                    ).to_numpy()
 
-            # Log coerced values (ATTENTION.md #13)
-            nan_count = result["value"].isna().sum()
-            if nan_count > 0:
+            # Row-level filtering. FRED publishes "." for dates with no
+            # observation (market holidays on daily series such as DGS1);
+            # fedfred coerces that to NaN before we see it. Those rows are
+            # skipped — never stored as 0 — and one malformed row must not
+            # discard the valid ones. Only a series whose observations are
+            # *entirely* lost in normalisation is a failure
+            # (docs/puller_outcome_contracts.md).
+            total = len(result)
+            kept_dates: list[Any] = []
+            kept_values: list[float] = []
+            missing = 0
+            non_finite = 0
+            for obs_date, value in zip(result["date"], result["value"]):
+                if pd.isna(obs_date) or pd.isna(value):
+                    missing += 1
+                    continue
+                if not math.isfinite(float(value)):
+                    non_finite += 1
+                    continue
+                kept_dates.append(obs_date)
+                kept_values.append(float(value))
+
+            # Log skipped values (ATTENTION.md #13)
+            if missing or non_finite:
                 log.warning(
-                    "FRED {sid}: {n} values coerced to NaN",
+                    "FRED {sid}: skipped {m} missing/unparseable and {nf} "
+                    "non-finite observations; kept {k}/{t}",
                     sid=series_id,
-                    n=nan_count,
+                    m=missing,
+                    nf=non_finite,
+                    k=len(kept_dates),
+                    t=total,
+                )
+            if total > 0 and not kept_dates:
+                raise ValueError(
+                    "Invalid FRED observation date or value: all "
+                    f"{total} observations for {series_id} unusable"
                 )
 
-            normalized = result.dropna(subset=["date", "value"])
-            if len(normalized) != len(df) or any(not math.isfinite(float(v)) for v in normalized["value"]):
-                raise ValueError("Invalid FRED observation date or value")
-            return normalized
+            return pd.DataFrame({"date": kept_dates, "value": kept_values})
 
         raise ValueError("Unsupported FRED response")
 
