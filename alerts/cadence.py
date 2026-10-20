@@ -75,6 +75,7 @@ accident."""
 _METADATA_CADENCE: dict[str, Cadence] = {
     "DAILY": DAILY,
     "REALTIME": DAILY,
+    "INTRADAY": DAILY,  # live source_catalog CHECK allows INTRADAY; explicit, same tier as REALTIME/EOD
     "EOD": DAILY,
     "WEEKLY": WEEKLY,
     "MONTHLY": MONTHLY,
