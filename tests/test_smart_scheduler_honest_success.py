@@ -57,6 +57,8 @@ from ingestion.smart_scheduler import (
         # explicit nothing-to-do -> SKIPPED
         ({"status": "SKIPPED", "skipped_reason": "lock held"}, (OUTCOME_SKIPPED, None)),
         ([{"status": "SKIPPED", "reason": "non-equity-session"}] * 3, (OUTCOME_SKIPPED, 0)),
+        ([{"status": "SKIPPED", "reason": "pre-session", "rows_inserted": 0}] * 3,
+         (OUTCOME_SKIPPED, 0)),
         ([{"status": "SKIPPED", "rows_inserted": 0}] * 2, (OUTCOME_SKIPPED, 0)),
         ([], (OUTCOME_SKIPPED, 0)),
         # every attempted item failed / explicit failure -> FAILED
@@ -240,7 +242,7 @@ def test_options_all_tickers_skipped_is_not_success_and_not_fresh(sched, monkeyp
 
     result = summary["results"][0]
     assert result["status"] == OUTCOME_SKIPPED
-    assert result["reason"] == "no ticker capture completed"
+    assert result["reason"] == "no ticker capture completed: non-equity-session"
     assert (summary["succeeded"], summary["skipped"]) == (0, 1)
     assert _last_pull(sched.engine, "YFINANCE_OPTIONS") is None  # no freshness bump
     assert _pull_log(sched.engine) == []  # not an attempt -> no pull_log row
