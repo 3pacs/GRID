@@ -79,6 +79,21 @@ class EDGARPuller(BasePuller):
     # 13F Institutional Holdings
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pick_value_column(holdings: pd.DataFrame) -> str | None:
+        """Return the infotable's market-value column, or ``None``.
+
+        Case-insensitive, preferring ``Value`` (edgartools 5.x) then
+        ``value`` (4.x / raw XML), mirroring
+        ``ingestion.altdata.sec_13f_live._infotable_df_to_positions``.
+        """
+        cols = {str(c).lower(): c for c in holdings.columns}
+        for name in ("Value", "value"):
+            hit = cols.get(name.lower())
+            if hit is not None:
+                return str(hit)
+        return None
+
     def pull_13f_holdings(
         self,
         cik_list: list[str] | None = None,
@@ -139,14 +154,31 @@ class EDGARPuller(BasePuller):
                             else pd.Timestamp(filing.filing_date).date()
                         )
 
+                        # Resolve the value column case-insensitively:
+                        # edgartools 5.x (5.28.4 on grid-hermes, 5.61.1
+                        # locally) emits ``Value``; 4.x / the raw parser emit
+                        # ``value`` (same rule as sec_13f_live's
+                        # _infotable_df_to_positions). Testing for lowercase
+                        # ``"value"`` only would write TOTAL_VALUE=0.0 and
+                        # TOP5_CONCENTRATION=0.0 as SUCCESS for every filing.
+                        value_col = self._pick_value_column(holdings)
+                        if value_col is None:
+                            log.debug(
+                                "13F infotable for CIK {cik} ({d}) has no value "
+                                "column (columns={cols}); skipping filing",
+                                cik=cik, d=filing_date, cols=list(holdings.columns),
+                            )
+                            processed += 1
+                            continue
+
                         # Compute portfolio metrics
-                        total_value = float(holdings["value"].sum()) if "value" in holdings.columns else 0.0
+                        total_value = float(holdings[value_col].sum())
                         num_positions = len(holdings)
 
                         # Top 5 concentration
-                        if "value" in holdings.columns and total_value > 0:
+                        if total_value > 0:
                             top5_value = float(
-                                holdings.nlargest(5, "value")["value"].sum()
+                                holdings.nlargest(5, value_col)[value_col].sum()
                             )
                             top5_pct = top5_value / total_value
                         else:

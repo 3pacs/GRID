@@ -22,9 +22,12 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
-edgar_lib = pytest.importorskip("edgar")  # ingestion.edgar imports it at module scope
-import ingestion.edgar as edgar_mod  # noqa: E402
-from ingestion.edgar import EDGARPuller  # noqa: E402
+# ingestion.edgar imports edgartools at module scope; skip (not error) when
+# the optional package is absent. importorskip keeps every import at the top
+# with no lint-suppression directives.
+edgar_lib = pytest.importorskip("edgar")
+edgar_mod = pytest.importorskip("ingestion.edgar")
+EDGARPuller = edgar_mod.EDGARPuller
 
 
 def _puller(mock_engine) -> EDGARPuller:
@@ -57,12 +60,42 @@ def test_module_get_filings_rejects_cik_kwarg():
 
 
 class _FakeFiling:
-    def __init__(self, filing_date: str, values: list[float]) -> None:
+    """``infotable`` built with the given column name: ``value`` (edgartools
+    4.x / raw XML) or ``Value`` (5.x) -- or a ready-made DataFrame."""
+
+    def __init__(
+        self,
+        filing_date: str,
+        values: list[float] | None = None,
+        *,
+        value_col: str = "value",
+        infotable: pd.DataFrame | None = None,
+    ) -> None:
         self.filing_date = filing_date  # submissions API gives ISO strings
-        self._values = values
+        self._infotable = (
+            infotable if infotable is not None else pd.DataFrame({value_col: values})
+        )
 
     def obj(self):
-        return MagicMock(infotable=pd.DataFrame({"value": self._values}))
+        return MagicMock(infotable=self._infotable)
+
+
+def _infotable_5x(values: list[int]) -> pd.DataFrame:
+    """The edgartools 5.x ThirteenF.infotable shape, exactly as
+    tests/test_sec_13f_live.py::test_converter_handles_5x_capitalized_columns."""
+    return pd.DataFrame(
+        [
+            {
+                "Issuer": f"ISSUER {i}",
+                "Class": "COM",
+                "Cusip": f"{i:09d}",
+                "Value": v,
+                "SharesPrnAmount": 500,
+                "Type": "Shares",
+            }
+            for i, v in enumerate(values)
+        ]
+    )
 
 
 def test_pull_13f_uses_company_filings_and_writes_metrics(mock_engine, monkeypatch):
@@ -107,6 +140,76 @@ def test_pull_13f_uses_company_filings_and_writes_metrics(mock_engine, monkeypat
     assert by_sid[("13F:0001067983:TOP5_CONCENTRATION", "2026-08-14")] == 0.98
     assert by_sid[("13F:0001067983:TOTAL_VALUE", "2026-05-15")] == 20.0
     assert all(p["src"] == 61 for p in params)
+
+
+def test_pull_13f_reads_5x_capitalized_value_column(mock_engine, monkeypatch):
+    """Review C1: edgartools 5.28.4 (grid-hermes) and 5.61.1 both emit
+    ``Value``; a lowercase-only lookup wrote TOTAL_VALUE=0.0 /
+    TOP5_CONCENTRATION=0.0 as SUCCESS for every filing."""
+
+    class FakeCompany:
+        def __init__(self, cik):
+            pass
+
+        def get_filings(self, **kw):
+            return [
+                _FakeFiling(
+                    "2026-08-14",
+                    infotable=_infotable_5x(
+                        [1_000_000, 300_000, 100_000, 50_000, 30_000, 20_000]
+                    ),
+                )
+            ]
+
+    monkeypatch.setattr(edgar_mod, "Company", FakeCompany)
+    out = _puller(mock_engine).pull_13f_holdings(cik_list=["0001067983"])
+
+    assert out["errors"] == []
+    assert out["rows_inserted"] == 3
+    conn = mock_engine.begin.return_value.__enter__.return_value
+    by_sid = {c.args[1]["sid"]: c.args[1]["val"] for c in conn.execute.call_args_list}
+    assert by_sid["13F:0001067983:TOTAL_VALUE"] == 1_500_000.0
+    assert by_sid["13F:0001067983:NUM_POSITIONS"] == 6.0
+    assert by_sid["13F:0001067983:TOP5_CONCENTRATION"] == round(
+        1_480_000 / 1_500_000, 6
+    )
+    assert by_sid["13F:0001067983:TOTAL_VALUE"] > 0
+    assert by_sid["13F:0001067983:TOP5_CONCENTRATION"] > 0
+
+
+def test_pull_13f_skips_filing_without_value_column(mock_engine, monkeypatch):
+    """No resolvable value column -> skip the filing, never INSERT 0.0 as SUCCESS."""
+
+    class FakeCompany:
+        def __init__(self, cik):
+            pass
+
+        def get_filings(self, **kw):
+            return [
+                _FakeFiling(
+                    "2026-08-14",
+                    infotable=pd.DataFrame({"Issuer": ["X"], "SharesPrnAmount": [1]}),
+                ),
+                _FakeFiling("2026-05-15", [10.0, 10.0], value_col="Value"),
+            ]
+
+    monkeypatch.setattr(edgar_mod, "Company", FakeCompany)
+    out = _puller(mock_engine).pull_13f_holdings(cik_list=["0001067983"])
+
+    assert out["errors"] == []
+    assert out["rows_inserted"] == 3  # only the 2026-05-15 filing
+    conn = mock_engine.begin.return_value.__enter__.return_value
+    dates = {str(c.args[1]["od"]) for c in conn.execute.call_args_list}
+    assert dates == {"2026-05-15"}
+
+
+def test_pick_value_column():
+    pick = EDGARPuller._pick_value_column
+    assert pick(pd.DataFrame({"Value": [1]})) == "Value"
+    assert pick(pd.DataFrame({"value": [1]})) == "value"
+    assert pick(pd.DataFrame({"VALUE": [1]})) == "VALUE"
+    assert pick(pd.DataFrame({"Issuer": ["x"], "SharesPrnAmount": [1]})) is None
+    assert pick(pd.DataFrame()) is None
 
 
 def test_pull_13f_respects_max_filings_per_fund(mock_engine, monkeypatch):
@@ -193,8 +296,10 @@ def test_8k_403_on_non_index_endpoint_is_not_masked(mock_engine, monkeypatch):
     out = _puller(mock_engine).pull_8k_counts(days_back=7)
     assert out["status"] == "PARTIAL"
     assert out["errors"] == [
-        "8-K count pull failed: Client error '403 Forbidden' for url "
-        "'https://data.sec.gov/submissions/CIK0001067983.json'"
+        (
+            "8-K count pull failed: Client error '403 Forbidden' for url "
+            "'https://data.sec.gov/submissions/CIK0001067983.json'"
+        )
     ]
     assert EDGARPuller._PULL_8K_BREAKER is False
 
