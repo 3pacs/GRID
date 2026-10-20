@@ -145,7 +145,7 @@ class AssetRegistryPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://registry.faa.gov",
         "cost_tier": "FREE",
-        "latency_class": "EOD",  # was DAILY: not in source_catalog_latency_class_check
+        "latency_class": "WEEKLY",  # was DAILY (not in constraint); GRID polls weekly (smart_scheduler freq_h 168)
         "pit_available": False,
         "revision_behavior": "RARE",
         "trust_score": "HIGH",

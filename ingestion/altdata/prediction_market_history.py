@@ -77,7 +77,7 @@ class PredictionMarketHistoryPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://github.com/Jon-Becker/prediction-market-analysis",
         "cost_tier": "FREE",
-        "latency_class": "HISTORICAL",
+        "latency_class": "MONTHLY",  # was HISTORICAL (not in constraint); static archive, operator-invoked
         "pit_available": True,
         "revision_behavior": "NEVER",
         "trust_score": "HIGH",

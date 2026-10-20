@@ -13,13 +13,15 @@ class is ``EOD``.
 
 Two layers are pinned here:
 
-1. The pullers that declared ``DAILY`` now declare an allowed value at the
-   source (``TestDailyPullersDeclareAllowedLatencyClass``).
+1. Every puller that declared a non-allowed value at the time of the fix
+   (DAILY / BATCH / HISTORICAL) now declares an allowed one at the source,
+   and the sweep asserts the DECLARED value without patching the logger,
+   so a future "STATIC"-style typo fails loudly in CI
+   (``test_offending_pullers_declare_allowed_latency_class``).
 2. ``_resolve_source_id`` normalises whatever a puller declares before
-   binding it, so a future alias/typo degrades to a WARNING + safe default
-   instead of a CheckViolation that fails the whole pull
-   (``TestResolveSourceIdBindsAllowedLatencyClass`` runs over every
-   puller that declared a non-allowed value at the time of the fix).
+   binding it, so a runtime typo degrades to a WARNING + safe default
+   instead of a CheckViolation that fails the whole pull. This is a safety
+   net, not the fix.
 """
 from __future__ import annotations
 
@@ -59,14 +61,14 @@ _DAILY_PULLERS = [
 ]
 
 # Every BasePuller subclass whose SOURCE_CONFIG["latency_class"] was outside
-# the live constraint when this fix landed (grep of ingestion/ on main
-# 6fc9434a). INTRADAY/QUARTERLY are live-allowed but not in schema.sql;
-# BATCH/HISTORICAL are allowed nowhere and rely on the normaliser fallback.
+# schema.sql's four-value set when this fix landed (grep of ingestion/ on
+# main 6fc9434a). INTRADAY/QUARTERLY are live-allowed but not in schema.sql;
+# DAILY/BATCH/HISTORICAL were allowed nowhere and are now fixed at source.
 _OFFENDING_PULLERS = _DAILY_PULLERS + [
-    ("ingestion.altdata.findkg_puller", "FinDKGPuller"),            # BATCH
-    ("ingestion.altdata.icij_puller", "ICIJPuller"),                # BATCH
-    ("ingestion.altdata.prediction_market_history", "PredictionMarketHistoryPuller"),  # HISTORICAL
-    ("ingestion.altdata.pushshift_reddit", "PushshiftRedditPuller"),  # HISTORICAL
+    ("ingestion.altdata.findkg_puller", "FinDKGPuller"),            # was BATCH -> MONTHLY
+    ("ingestion.altdata.icij_puller", "ICIJPuller"),                # was BATCH -> MONTHLY
+    ("ingestion.altdata.prediction_market_history", "PredictionMarketHistoryPuller"),  # was HISTORICAL -> MONTHLY
+    ("ingestion.altdata.pushshift_reddit", "PushshiftRedditPuller"),  # was HISTORICAL -> ANNUAL
     ("ingestion.altdata.buyback_execution", "BuybackExecutionPuller"),  # QUARTERLY
     ("ingestion.altdata.ais_ground_truth", "AISGroundTruthPuller"),  # INTRADAY
     ("ingestion.altdata.kalshi", "KalshiPuller"),                    # INTRADAY
@@ -102,10 +104,41 @@ def test_daily_pullers_declare_allowed_latency_class(modname, clsname):
     )
 
 
-def test_asset_registries_maps_daily_refresh_to_eod():
+def test_asset_registries_declares_weekly():
+    """GRID polls the FAA registry weekly (smart_scheduler freq_h 168) and
+    alerts/cadence.py reads latency_class for staleness: EOD would map to
+    the 30 h DAILY grace and flag it stale ~5 of 7 days."""
     cls = _load("ingestion.altdata.asset_registries", "AssetRegistryPuller")
     assert cls.SOURCE_NAME == "Asset_Registries"
-    assert cls.SOURCE_CONFIG["latency_class"] == "EOD"
+    assert cls.SOURCE_CONFIG["latency_class"] == "WEEKLY"
+
+
+@pytest.mark.parametrize(
+    ("modname", "clsname"), _OFFENDING_PULLERS, ids=_ids(_OFFENDING_PULLERS)
+)
+def test_offending_pullers_declare_allowed_latency_class(modname, clsname):
+    """Source-level sweep: the DECLARED value must be allowed. No logger
+    patching here on purpose -- a future "STATIC"/"BATCH" must fail CI,
+    not slide through the runtime fallback."""
+    cls = _load(modname, clsname)
+    declared = cls.SOURCE_CONFIG["latency_class"]
+    assert declared in VALID_LATENCY_CLASSES, (
+        f"{clsname}.SOURCE_CONFIG['latency_class']={declared!r} not in constraint"
+    )
+
+
+@pytest.mark.parametrize(
+    ("modname", "clsname"),
+    [("ingestion.altdata.findkg_puller", "FinDKGPuller"),
+     ("ingestion.altdata.icij_puller", "ICIJPuller"),
+     ("ingestion.altdata.prediction_market_history", "PredictionMarketHistoryPuller")],
+)
+def test_batch_archive_pullers_declare_monthly(modname, clsname):
+    assert _load(modname, clsname).SOURCE_CONFIG["latency_class"] == "MONTHLY"
+
+
+def test_pushshift_declares_annual():
+    assert _load("ingestion.altdata.pushshift_reddit", "PushshiftRedditPuller").SOURCE_CONFIG["latency_class"] == "ANNUAL"
 
 
 # ── Defensive normaliser in BasePuller._resolve_source_id ───────────────────
@@ -200,16 +233,19 @@ class TestResolveSourceIdBindsAllowedLatencyClass:
     @pytest.mark.parametrize(
         ("modname", "clsname"), _OFFENDING_PULLERS, ids=_ids(_OFFENDING_PULLERS)
     )
-    def test_every_offending_puller_binds_allowed_value(self, modname, clsname):
-        """Whatever the puller declares, the INSERT must carry an allowed value."""
+    def test_every_offending_puller_binds_declared_value_without_warning(self, modname, clsname):
+        """The INSERT must carry the declared value unchanged and never warn."""
         cls = _load(modname, clsname)
         engine, conn = _auto_create_engine()
-        with patch("ingestion.base.log"):
-            # Call the resolver directly on a bare instance so subclass
-            # __init__ side effects (HTTP sessions, extra tables) stay out.
-            inst = object.__new__(cls)
-            inst.engine = engine
-            inst.SOURCE_NAME = cls.SOURCE_NAME
-            inst.SOURCE_CONFIG = cls.SOURCE_CONFIG
+        # Call the resolver directly on a bare instance so subclass
+        # __init__ side effects (HTTP sessions, extra tables) stay out.
+        inst = object.__new__(cls)
+        inst.engine = engine
+        inst.SOURCE_NAME = cls.SOURCE_NAME
+        inst.SOURCE_CONFIG = cls.SOURCE_CONFIG
+        with patch("ingestion.base.log") as mock_log:
             BasePuller._resolve_source_id(inst)
-        assert _bound_insert_params(conn)["latency"] in VALID_LATENCY_CLASSES
+        bound = _bound_insert_params(conn)["latency"]
+        assert bound == cls.SOURCE_CONFIG["latency_class"]
+        assert bound in VALID_LATENCY_CLASSES
+        mock_log.warning.assert_not_called()

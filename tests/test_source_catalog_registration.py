@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
-from ingestion.base import VALID_LATENCY_CLASSES  # noqa: F401 — single source of truth
+from ingestion.base import VALID_LATENCY_CLASSES  # single source of truth
 
 # Allowed values per schema.sql's source_catalog CHECK constraints.
 # latency_class is imported from ingestion.base (mirrors the LIVE griddb
