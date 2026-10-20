@@ -16,6 +16,7 @@ same helpers run against real tables in tests/test_flows_reader_fixes_pg.py.
 from __future__ import annotations
 
 import datetime as _datetime
+import gc
 import os
 import sys
 import types
@@ -30,15 +31,23 @@ os.environ.setdefault("DB_PASSWORD", "testpass")
 from api.routers import flows  # noqa: E402
 from store.materialization_provenance import WEEKLY_STALE_AFTER_DAYS  # noqa: E402
 
-# Pre-import what get_sector_detail / _build_sector_connections import lazily
-# (flows.py: get_pit_store -> create_engine -> the postgresql dialect and its
-# `ranges`; intelligence.lever_pullers / trust_scorer), so no module runs its
-# own `from datetime import date` for the first time while `_clock` has the
-# `datetime.date` seam patched (review 2026-10-20, Finding 1). Belt: these
-# imports; braces: the teardown rebind in `_clock`.
+# Pre-import what get_sector_detail / _build_sector_connections and the
+# `detail` fixture import lazily, so nothing binds or registers `datetime.date`
+# for the first time while `_clock` has that seam patched (review 2026-10-20,
+# Findings 1 and 7): flows.py get_pit_store -> create_engine -> the postgresql
+# dialect and its `ranges` (module-global `date`); intelligence.lever_pullers /
+# trust_scorer (module-global `date`); analysis.sector_map -> `import yaml`,
+# whose representer registers `add_representer(datetime.date, ...)` keyed by
+# the class at import time (a registry key, which the teardown rebind in
+# `_clock` cannot reach). This list enumerates today's lazy imports; the gc
+# check in test_clock_patch_leaves_no_live_fixed_date_class is what proves it
+# is complete. A patchable clock seam in api/routers/flows.py would remove
+# the process-wide swap altogether (production follow-up, not done here).
 import sqlalchemy.dialects.postgresql  # noqa: E402,F401
 import intelligence.lever_pullers  # noqa: E402,F401
 import intelligence.trust_scorer  # noqa: E402,F401
+import analysis.sector_map  # noqa: E402,F401
+import yaml  # noqa: E402  (already loaded by analysis.sector_map; used by the gc test)
 
 # Import-time default only. Every test re-reads the calendar in `_clock` below:
 # a run whose date changes between collection and this file (the pattern behind
@@ -69,14 +78,17 @@ def _clock(monkeypatch):
 
     monkeypatch.setattr(_datetime, "date", _FixedDate)
     yield today
-    # monkeypatch restores datetime.date, but a module first-imported during the
-    # test bound _FixedDate into its own globals; rebind those to the real date
-    # (`date` is this module's own import, which `_clock` never patches).
+    # monkeypatch restores datetime.date; this additionally undoes the common
+    # `from datetime import date` module-global binding of any module that was
+    # still first-imported during the test. It reaches module globals only
+    # (not registries, class attributes or defaults): the pre-imports above
+    # are the primary containment (`date` here is this module's own import,
+    # which `_clock` never patches).
     _rebind_leaked(_FixedDate, date)
 
 
 def _rebind_leaked(leaked: type, real: type) -> int:
-    """Rebind every module attribute that `is leaked` back to `real`; return the count."""
+    """Rebind every module-global attribute that `is leaked` back to `real`; return the count."""
     n = 0
     for mod in list(sys.modules.values()):
         d = getattr(mod, "__dict__", None)
@@ -271,3 +283,20 @@ def test_response_keeps_existing_sector_metrics_fields(detail):
     m = detail(_Engine())["sector_metrics"]
     assert {"relative_strength_1m", "etf_flow_5d", "dark_pool_signal",
             "congressional_activity", "insider_activity"} <= set(m)
+
+
+# ── the clock patch itself ────────────────────────────────────────────────
+
+
+def test_clock_patch_leaves_no_live_fixed_date_class(detail):
+    """Every earlier test's `_FixedDate` must be garbage by now (nothing kept it:
+    no module global, no registry key such as PyYAML's representers); only this
+    test's own, held by the active `_clock`, may be alive. And PyYAML must still
+    represent the real `date`, i.e. its registry was built before any patch."""
+    detail(_Engine())                       # exercise the lazy-import paths once more
+    gc.collect()
+    live = [o for o in gc.get_objects() if isinstance(o, type) and o.__name__ == "_FixedDate"]
+    assert len(live) == 1 and live[0] is _datetime.date
+    real_date = _datetime.datetime(2026, 1, 1).date()        # the real class, whatever `date` is bound to
+    assert type(real_date) in yaml.SafeDumper.yaml_representers
+    assert yaml.safe_dump({"d": real_date}) == "d: 2026-01-01\n"
