@@ -102,7 +102,12 @@ describe('CrossReference view async data', () => {
         expect(screen.getByText('NO DATA')).toBeInTheDocument();
         expect(screen.getByText('No live cross-reference checks available yet')).toBeInTheDocument();
         expect(screen.queryByText(/planned/i)).not.toBeInTheDocument();
-        expect(screen.getAllByText('GAP').length).toBeGreaterThan(0);
+        // "GAP" is drawn by d3 inside DivergenceMatrix's useEffect, i.e. in React's
+        // post-commit passive-effect task, not in the commit that removed the
+        // skeleton. waitFor above can resolve (MutationObserver on that commit)
+        // before that task runs on a loaded runner (CI run 39387948933, 2026-10-20),
+        // so wait for the effect's output instead of reading it synchronously.
+        expect((await screen.findAllByText('GAP')).length).toBeGreaterThan(0);
     });
 
     it('renders the real payload as a chart and table, not a placeholder', async () => {
