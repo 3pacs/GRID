@@ -133,6 +133,7 @@ class TestActionLoopAbandonmentBySupersession:
         call3 = {"called": False}
 
         class BlockingSrc1Puller:
+            SOURCE_NAME = "src1"
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 started_event.set()
                 block_event.wait(5)
@@ -145,11 +146,13 @@ class TestActionLoopAbandonmentBySupersession:
                 }
 
         class NeverCalledSrc2Puller:
+            SOURCE_NAME = "src2"
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 call2["called"] = True
                 return {"status": "SUCCESS", "stopped_by_budget": False, "results": [], "tickers_not_attempted": []}
 
         class NeverCalledSrc3Puller:
+            SOURCE_NAME = "src3"
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 call3["called"] = True
                 return {"status": "SUCCESS", "stopped_by_budget": False, "results": [], "tickers_not_attempted": []}
@@ -262,6 +265,7 @@ class TestActionLoopAbandonmentByDeadlineAlone:
         call3 = {"called": False}
 
         class SlowSrc1Puller:
+            SOURCE_NAME = "src1"
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 # Long enough that the patched budget has certainly
                 # expired by the time this call returns and the loop
@@ -283,10 +287,14 @@ class TestActionLoopAbandonmentByDeadlineAlone:
                 self._flag["called"] = True
                 return {"status": "SUCCESS", "stopped_by_budget": False, "results": [], "tickers_not_attempted": []}
 
+        src2 = NeverCalledPuller(call2)
+        src2.SOURCE_NAME = "src2"
+        src3 = NeverCalledPuller(call3)
+        src3.SOURCE_NAME = "src3"
         pullers = {
             "src1": SlowSrc1Puller(),
-            "src2": NeverCalledPuller(call2),
-            "src3": NeverCalledPuller(call3),
+            "src2": src2,
+            "src3": src3,
         }
 
         def _resolve(name: str, engine: Any):

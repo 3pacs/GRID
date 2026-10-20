@@ -348,6 +348,8 @@ def _install_retry_puller(monkeypatch, name: str, returns: Any) -> None:
     fake_module = ModuleType(module_name)
 
     class _Puller:
+        SOURCE_NAME = "YFINANCE_OPTIONS" if name == "options" else name
+
         def __init__(self, db_engine=None):
             self.db_engine = db_engine
 
