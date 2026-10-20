@@ -37,6 +37,50 @@ def _get_engine():
     return get_engine()
 
 
+# ── Nullable formatting ─────────────────────────────────────────────────────
+
+MISSING = "N/A"
+
+
+def _fmt(value: Any, spec: str = "", missing: str = MISSING) -> str:
+    """Format a nullable number for the digest; None/NaN render as ``missing``.
+
+    ``options_daily_signals`` columns are nullable and the scanner preserves
+    that (``MispricingOpportunity.iv_atm`` is ``float | None`` since #476),
+    so an f-string such as ``f"{opp.get('iv_atm', 0):.1%}"`` receives
+    ``None`` whenever the key is present with a NULL value — ``dict.get``'s
+    default only covers an *absent* key — and raises ``TypeError:
+    unsupported format string passed to NoneType.__format__``. That took the
+    whole 100x digest down (grid-hermes journal 2026-10-20 04:28:43Z,
+    ``run_cycle:3856``). Route every nullable field through here instead.
+    """
+    if value is None:
+        return missing
+    try:
+        if isinstance(value, float) and value != value:  # NaN
+            return missing
+        return format(value, spec)
+    except (TypeError, ValueError):
+        return missing
+
+
+def _opportunity_summary_line(index: int, opp: dict) -> str:
+    """One line of the LLM sanity-review prompt for a single opportunity.
+
+    Never raises on a missing field: a row with ``iv_atm``/``spot_price``
+    NULL is annotated as ``N/A`` so the LLM can weigh it, rather than
+    aborting the review for every other opportunity in the batch.
+    """
+    thesis = (opp.get("thesis") or "")[:150]
+    return (
+        f"{index}. {opp.get('ticker', '?')} {opp.get('direction', '?')}S — "
+        f"score {_fmt(opp.get('score'), '.1f')}/10, "
+        f"payoff est {_fmt(opp.get('payoff_multiple'), '.0f')}x, "
+        f"spot ${_fmt(opp.get('spot_price'), '.2f')}, "
+        f"IV ATM {_fmt(opp.get('iv_atm'), '.1%')}, thesis: {thesis}"
+    )
+
+
 # ── Data Quality Sanity Checks ──────────────────────────────────────────────
 
 def _sanity_check(opp) -> list[str]:
@@ -121,11 +165,14 @@ def _llm_sanity_review(opportunities: list[dict], engine) -> list[dict]:
     # Batch all opportunities into one prompt for efficiency
     opp_summaries = []
     for i, opp in enumerate(opportunities):
-        opp_summaries.append(
-            f"{i+1}. {opp['ticker']} {opp['direction']}S — score {opp['score']:.1f}/10, "
-            f"payoff est {opp['payoff_multiple']:.0f}x, spot ${opp.get('spot_price', 0):.2f}, "
-            f"IV ATM {opp.get('iv_atm', 0):.1%}, thesis: {opp.get('thesis', '')[:150]}"
-        )
+        try:
+            opp_summaries.append(_opportunity_summary_line(i + 1, opp))
+        except Exception as exc:  # pragma: no cover - defensive; _fmt never raises
+            log.warning(
+                "100x digest: summary for {t} unavailable — {e}",
+                t=opp.get("ticker", "?"), e=str(exc),
+            )
+            opp_summaries.append(f"{i + 1}. {opp.get('ticker', '?')} — summary unavailable (missing fields)")
 
     prompt = f"""You are a senior options strategist reviewing automated scan results.
 For each opportunity below, respond with ONLY a JSON array of verdicts.
@@ -421,10 +468,12 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     """Format a single 100x opportunity as a rich email section."""
     ticker = opp["ticker"]
     direction = opp["direction"]
-    score = opp["score"]
-    thesis = opp.get("thesis", "")
-    payoff = opp.get("payoff_multiple", 0)
-    spot = verification.get("live_spot") or opp.get("spot_price", 0)
+    # Nullable fields: route through _fmt rather than formatting directly —
+    # a present-but-None key (NULL column) would otherwise raise TypeError.
+    score = opp.get("score")
+    thesis = opp.get("thesis") or ""
+    payoff = opp.get("payoff_multiple")
+    spot = verification.get("live_spot") or opp.get("spot_price")
     verified = verification.get("verified", False)
 
     # Header with verification + LLM review badges
@@ -437,15 +486,15 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     llm_badge_text = f"LLM: {llm_verdict}" if llm_verdict != "UNREVIEWED" else ""
 
     # Signal grid
-    signals = opp.get("signals", {})
+    signals = opp.get("signals") or {}
     signal_html = '<div class="signal-grid">'
     signal_items = [
-        ("P/C Ratio", f"{signals.get('pcr', {}).get('raw_value', 'N/A')}", "pcr"),
-        ("IV ATM", f"{opp.get('iv_atm', 0):.1%}" if opp.get('iv_atm') else "N/A", "iv"),
-        ("Max Pain", f"${opp.get('signals', {}).get('max_pain_divergence', {}).get('raw_value', 'N/A')}", "mp"),
-        ("Score", f"{score:.1f}/10", "score"),
-        ("Spot", f"${spot:.2f}" if spot else "N/A", "spot"),
-        ("Payoff Est.", f"{payoff:.0f}x" if payoff else "N/A", "payoff"),
+        ("P/C Ratio", _fmt((signals.get('pcr') or {}).get('raw_value')), "pcr"),
+        ("IV ATM", _fmt(opp.get('iv_atm'), '.1%') if opp.get('iv_atm') else MISSING, "iv"),
+        ("Max Pain", f"${_fmt((signals.get('max_pain_divergence') or {}).get('raw_value'))}", "mp"),
+        ("Score", f"{_fmt(score, '.1f')}/10", "score"),
+        ("Spot", f"${_fmt(spot, '.2f')}" if spot else MISSING, "spot"),
+        ("Payoff Est.", f"{_fmt(payoff, '.0f')}x" if payoff else MISSING, "payoff"),
     ]
     for label, value, _ in signal_items:
         signal_html += f'''
@@ -512,7 +561,7 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
             {f'<span class="verified-badge {llm_badge_cls}">{llm_badge_text}</span>' if llm_badge_text else ''}
         </div>
         <div style="font-size:24px;font-weight:800;color:{"#22C55E" if direction == "CALL" else "#EF4444"};">
-            {payoff:.0f}x
+            {_fmt(payoff, '.0f')}x
         </div>
     </div>
     {signal_html}
@@ -683,7 +732,18 @@ def run_100x_digest(force: bool = False) -> dict[str, Any]:
     )
 
     for i, (opp, v) in enumerate(sorted_opps, 1):
-        sections.append(_format_opportunity_card(opp, v, i))
+        try:
+            sections.append(_format_opportunity_card(opp, v, i))
+        except Exception as exc:
+            # One malformed row must not take the whole digest down — annotate
+            # it in place and keep the remaining cards.
+            ticker = opp.get("ticker", "?")
+            log.warning("100x digest: card for {t} not rendered — {e}", t=ticker, e=str(exc))
+            sections.append(_section_text(
+                f"#{i} — {ticker} {opp.get('direction', '?')}S",
+                f"Card not rendered (missing/invalid fields): {exc}",
+                accent="amber",
+            ))
 
     # Verification summary
     total_corrections = sum(len(v.get("corrections", [])) for v in verifications)
