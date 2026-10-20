@@ -6,6 +6,15 @@ FINRA's API catalog or OTC Transparency API spec, and the request also sent
 ``sortFields`` without the EQUAL partition compareFilters FINRA requires for
 sorting. These tests pin the corrected request (the same shape
 ``dark_pool.py`` uses for the same dataset) and the ATS-only aggregation.
+
+``pull_short_interest`` (``otcMarket/name/consolidatedShortInterest``) had
+the same defect: ``sortFields ["-settlementDate"]`` with no partition filter,
+answered live on 2026-10-20 with HTTP 400 "Sorting is allowed only if all
+partitions keys are specified in EQUAL CompareFilter. Partition keys missing
+or not using EQUAL CompareFilter: settlementDate". The short-interest tests
+pin the corrected request (``dateRangeFilters`` on settlementDate, verified
+200 by one anonymous 1-row probe), 204-as-empty, the segmented window walk,
+and ``pull_all``'s per-sub-pull outcome tagging.
 All HTTP and DB access is mocked.
 """
 
@@ -13,6 +22,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from datetime import date, timedelta
+from itertools import pairwise
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -405,3 +415,290 @@ def test_pagination_page_budget_is_bounded(monkeypatch):
     assert result["status"] == "FAILED"
     assert "page budget" in result["error"]
     assert inserted == []
+
+
+# ── Short interest: request construction ──
+
+# Exact FINRA body from the 2026-10-20 executor receipt (Phase C, short
+# interest): the old request's sortFields on the partition key.
+_SI_400_TEXT = (
+    "Sorting is allowed only if all partitions keys are specified in EQUAL "
+    "CompareFilter. Partition keys missing or not using EQUAL CompareFilter: "
+    "settlementDate"
+)
+
+
+def _si_rec(symbol: str, settlement: str, qty: float) -> dict:
+    return {
+        "symbolCode": symbol,
+        "settlementDate": settlement,
+        "currentShortPositionQuantity": qty,
+        "marketClassCode": "ARCA",
+    }
+
+
+def test_short_interest_url_is_consolidated_short_interest():
+    assert finra_ats._SHORT_INTEREST_URL == (
+        "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
+    )
+
+
+def test_fetch_short_interest_page_uses_daterange_and_domain_filters_without_sort():
+    p = _puller()
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured.update(url=url, json=json, headers=headers)
+        resp = MagicMock(status_code=200)
+        resp.json = list
+        return resp
+
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=fake_post):
+        p._fetch_short_interest_page(
+            offset=5000,
+            limit=100,
+            tickers=["SPY", "QQQ"],
+            start_date=date(2025, 10, 20),
+            end_date=date(2026, 10, 20),
+        )
+
+    body = captured["json"]
+    assert captured["url"] == finra_ats._SHORT_INTEREST_URL
+    assert "sortFields" not in body
+    assert body["dateRangeFilters"] == [
+        {"fieldName": "settlementDate", "startDate": "2025-10-20", "endDate": "2026-10-20"}
+    ]
+    assert body["domainFilters"] == [
+        {"fieldName": "symbolCode", "values": ["SPY", "QQQ"]}
+    ]
+    assert body["offset"] == 5000 and body["limit"] == 100
+    assert captured["headers"]["Content-Type"] == "application/json"
+
+
+def test_fetch_short_interest_page_defaults_to_si_range():
+    p = _puller()
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock(status_code=200)
+        resp.json = list
+        return resp
+
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=fake_post):
+        p._fetch_short_interest_page(tickers=["SPY"])
+
+    drf = captured["json"]["dateRangeFilters"][0]
+    assert drf["fieldName"] == "settlementDate"
+    end = date.fromisoformat(drf["endDate"])
+    start = date.fromisoformat(drf["startDate"])
+    assert end == date.today()
+    assert end - start == timedelta(days=finra_ats._SI_RANGE_DAYS)
+
+
+def test_fetch_short_interest_page_omits_domainfilters_without_tickers():
+    p = _puller()
+    captured: dict = {}
+
+    def fake_post(url, json=None, headers=None, timeout=None):
+        captured["json"] = json
+        resp = MagicMock(status_code=200)
+        resp.json = list
+        return resp
+
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=fake_post):
+        p._fetch_short_interest_page(tickers=None)
+
+    assert "domainFilters" not in captured["json"]
+    assert "sortFields" not in captured["json"]
+
+
+def test_fetch_short_interest_page_handles_204_no_content():
+    p = _puller()
+    resp = MagicMock(status_code=204)
+    with patch("ingestion.altdata.finra_ats.requests.post", return_value=resp):
+        assert p._fetch_short_interest_page(tickers=["SPY"]) == []
+    resp.raise_for_status.assert_not_called()
+    resp.json.assert_not_called()
+
+
+def test_fetch_short_interest_page_does_not_trigger_partition_sort_400():
+    """A FINRA stand-in that 400s exactly like the live API did on sortFields."""
+    p = _puller()
+    record = _si_rec("SPY", "2025-10-31", 108765577)
+
+    def finra(url, json=None, headers=None, timeout=None):
+        if "sortFields" in json:
+            resp = MagicMock(status_code=400)
+            resp.raise_for_status.side_effect = requests.HTTPError(
+                f"400 Client Error: Bad Request for url: {url} :: {_SI_400_TEXT}"
+            )
+            return resp
+        resp = MagicMock(status_code=200)
+        resp.json = lambda: [record]
+        return resp
+
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=finra):
+        page = p._fetch_short_interest_page(
+            tickers=["SPY"],
+            start_date=date(2025, 10, 20),
+            end_date=date(2026, 10, 20),
+        )
+
+    assert page == [record]
+
+
+# ── Short interest: window walk and storage ──
+
+def test_short_interest_segments_cover_window_without_overlap():
+    segs = FINRAATSPuller._short_interest_segments(date(2024, 1, 1), date(2026, 10, 20))
+
+    assert segs[0][0] == date(2024, 1, 1)
+    assert segs[-1][1] == date(2026, 10, 20)
+    assert len(segs) == 3
+    for a, b in segs:
+        assert a <= b
+        assert (b - a).days <= finra_ats._SI_RANGE_DAYS
+    for (_, b1), (a2, _) in pairwise(segs):
+        assert a2 == b1 + timedelta(days=1)
+
+    assert FINRAATSPuller._short_interest_segments(date(2026, 10, 1), date(2026, 10, 20)) == [
+        (date(2026, 10, 1), date(2026, 10, 20))
+    ]
+    assert FINRAATSPuller._short_interest_segments(date(2026, 10, 21), date(2026, 10, 20)) == []
+
+
+def test_pull_short_interest_walks_window_in_segments_and_stores():
+    p = _puller()
+    inserted = _wire_db(p, existing={date(2025, 10, 31)})
+    calls: list[dict] = []
+    rows = [
+        ("SPY", "2025-10-31", 100.0),
+        ("QQQ", "2025-10-31", 50.0),
+        ("SPY", "2026-09-30", 120.0),
+    ]
+
+    def fake_fetch(**kw):
+        calls.append(kw)
+        return [
+            _si_rec(sym, d, q)
+            for sym, d, q in rows
+            if kw["start_date"] <= date.fromisoformat(d) <= kw["end_date"]
+        ]
+
+    p._fetch_short_interest_page = fake_fetch
+    with patch("ingestion.altdata.finra_ats.time.sleep") as slept:
+        result = p.pull_short_interest(start_date="2024-01-01", tickers=["SPY", "QQQ"])
+
+    expected = FINRAATSPuller._short_interest_segments(date(2024, 1, 1), date.today())
+    assert [(c["start_date"], c["end_date"]) for c in calls] == expected
+    assert all(c["tickers"] == ["SPY", "QQQ"] and c["offset"] == 0 for c in calls)
+    # Rate-limit pause between requests only, never before the first.
+    assert slept.call_count == len(calls) - 1
+
+    assert result["status"] == "SUCCESS"
+    assert result["per_feature"] == {"short_interest_total": 1}
+    assert result["rows_inserted"] == 1
+    # 2025-10-31 already stored; 2026-09-30 is new.
+    assert [(r["series_id"], r["obs_date"], r["value"]) for r in inserted] == [
+        ("finra.short_interest_total", date(2026, 9, 30), 120.0)
+    ]
+    payload = inserted[0]["raw_payload"]
+    assert payload["symbols"] == ["SPY"]
+    assert payload["raw_records"] == 1
+    assert payload["source_url"] == finra_ats._SHORT_INTEREST_URL
+
+
+def test_pull_short_interest_paginates_within_a_segment():
+    p = _puller()
+    inserted = _wire_db(p)
+    calls: list[dict] = []
+    today = date.today()
+    d1 = (today - timedelta(days=5)).isoformat()
+    d2 = (today - timedelta(days=3)).isoformat()
+
+    def fake_fetch(**kw):
+        calls.append(kw)
+        if kw["offset"] == 0:
+            return [_si_rec("SPY", d1, 10.0), _si_rec("QQQ", d1, 5.0)]
+        return [_si_rec("SPY", d2, 7.0)]
+
+    p._fetch_short_interest_page = fake_fetch
+    with patch.object(finra_ats, "_PAGE_SIZE", 2), \
+            patch("ingestion.altdata.finra_ats.time.sleep"):
+        result = p.pull_short_interest(start_date=today - timedelta(days=10), tickers=["SPY", "QQQ"])
+
+    assert [c["offset"] for c in calls] == [0, 2]
+    assert all(c["limit"] == 2 for c in calls)
+    assert result["rows_inserted"] == 2
+    assert [(r["obs_date"], r["value"]) for r in inserted] == [
+        (date.fromisoformat(d1), 15.0),
+        (date.fromisoformat(d2), 7.0),
+    ]
+
+
+def test_pull_short_interest_reports_failed_on_partition_400():
+    p = _puller()
+    _wire_db(p)
+
+    def boom(**kw):
+        raise requests.HTTPError(f"400 Client Error: Bad Request :: {_SI_400_TEXT}")
+
+    p._fetch_short_interest_page = boom
+    result = p.pull_short_interest(tickers=["SPY"])
+    assert result["status"] == "FAILED"
+    assert result["rows_inserted"] == 0
+    assert "settlementDate" in result["error"]
+
+
+# ── pull_all: per-sub-pull outcomes ──
+
+def _ok(rows: int, **per_feature) -> dict:
+    return {"status": "SUCCESS", "rows_inserted": rows, "per_feature": per_feature}
+
+
+def _failed(error: str) -> dict:
+    return {"status": "FAILED", "rows_inserted": 0, "error": error}
+
+
+def test_pull_all_tags_sub_pulls_and_scheduler_classifies_per_item():
+    from ingestion.smart_scheduler import (
+        OUTCOME_FAILED,
+        OUTCOME_PARTIAL,
+        OUTCOME_SUCCESS,
+        _classify_outcome,
+    )
+
+    p = _puller()
+    p.pull_ats_volume = lambda **kw: _ok(50, ats_total_volume=50, ats_dark_pct=0)
+    p.pull_short_interest = lambda **kw: _failed(f"400 Client Error :: {_SI_400_TEXT}")
+    with patch("ingestion.altdata.finra_ats.time.sleep"):
+        results = p.pull_all()
+
+    assert [r["source"] for r in results] == ["ats_volume", "short_interest"]
+    assert results[0]["status"] == "SUCCESS" and "error" not in results[0]
+    assert results[1]["error"].startswith("short_interest: 400")
+
+    # The ATS half succeeding must not be reported as a whole-source FAILED,
+    # and the SI half failing must not be hidden behind a SUCCESS.
+    outcome, rows, note = _classify_outcome(results)
+    assert outcome == OUTCOME_PARTIAL
+    assert rows == 50
+    assert "short_interest" in note and "settlementDate" in note
+
+    # Both halves failing is a FAILED run.
+    p.pull_ats_volume = lambda **kw: _failed("boom")
+    with patch("ingestion.altdata.finra_ats.time.sleep"):
+        both_failed = p.pull_all()
+    assert _classify_outcome(both_failed)[0] == OUTCOME_FAILED
+    assert [r["error"] for r in both_failed] == [
+        "ats_volume: boom",
+        f"short_interest: 400 Client Error :: {_SI_400_TEXT}",
+    ]
+
+    # Both halves succeeding is a SUCCESS with the summed row count.
+    p.pull_ats_volume = lambda **kw: _ok(50, ats_total_volume=50, ats_dark_pct=0)
+    p.pull_short_interest = lambda **kw: _ok(12, short_interest_total=12)
+    with patch("ingestion.altdata.finra_ats.time.sleep"):
+        both_ok = p.pull_all()
+    assert _classify_outcome(both_ok)[:2] == (OUTCOME_SUCCESS, 62)

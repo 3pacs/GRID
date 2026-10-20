@@ -25,6 +25,19 @@ weekStartDate and tierIdentifier). The ATS request now matches
 ``dark_pool.py``, which was fixed for the same 400 on the same dataset:
 ``dateRangeFilters`` on weekStartDate plus ``domainFilters`` on
 issueSymbolIdentifier, and no ``sortFields``.
+
+Short interest request history (2026-10-20): ``pull_short_interest`` POSTed
+to ``otcMarket/name/consolidatedShortInterest`` with
+``sortFields ["-settlementDate"]`` and no partition filter, so FINRA answered
+HTTP 400 ("Sorting is allowed only if all partitions keys are specified in
+EQUAL CompareFilter. Partition keys missing or not using EQUAL CompareFilter:
+settlementDate"; executor receipt 2026-10-20 §A/Phase C). settlementDate is
+the dataset's only partition key. The request now uses ``dateRangeFilters``
+on settlementDate (one anonymous 1-row probe on 2026-10-20 returned 200 with
+``record-total: 23`` for SPY over 365 days) plus ``domainFilters`` on
+symbolCode, no ``sortFields``, and HTTP 204 is read as an empty page. The
+pull window is walked in segments of at most ``_SI_RANGE_DAYS`` days, the
+span that probe verified.
 """
 
 from __future__ import annotations
@@ -115,6 +128,13 @@ def _record_total(headers: Any) -> int | None:
     if isinstance(value, str) and value.strip().isdigit():
         return int(value.strip())
     return None
+
+
+# consolidatedShortInterest is bimonthly (~24 settlement dates a year). The
+# pull window is split into settlementDate ranges of at most this many days;
+# a 365-day dateRangeFilters on settlementDate is the request shape verified
+# live on 2026-10-20 (HTTP 200).
+_SI_RANGE_DAYS: int = 365
 
 
 class FINRAATSPuller(BasePuller):
@@ -551,16 +571,29 @@ class FINRAATSPuller(BasePuller):
         offset: int = 0,
         limit: int = _PAGE_SIZE,
         tickers: list[str] | None = None,
+        start_date: date | None = None,
+        end_date: date | None = None,
     ) -> list[dict[str, Any]]:
         """Fetch a page of consolidated short interest data from FINRA.
+
+        settlementDate is the dataset's partition key, so ``sortFields``
+        without an EQUAL compareFilter on it returns HTTP 400 (receipt
+        2026-10-20 §A). The request instead bounds settlementDate with a
+        ``dateRangeFilters`` entry (inclusive on both ends) and filters
+        tickers with ``domainFilters`` on symbolCode; no sorting is asked
+        for, and the caller aggregates by date, so order does not matter.
 
         Parameters:
             offset: Pagination offset.
             limit: Page size.
             tickers: List of ticker symbols to filter on.
+            start_date: Start of the settlementDate range (inclusive).
+                Defaults to ``_SI_RANGE_DAYS`` before ``end_date``.
+            end_date: End of the settlementDate range (inclusive).
+                Defaults to today.
 
         Returns:
-            List of record dicts from FINRA API.
+            List of record dicts from FINRA API (empty on HTTP 204).
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
@@ -571,10 +604,21 @@ class FINRAATSPuller(BasePuller):
             "Content-Type": "application/json",
         }
 
+        if end_date is None:
+            end_date = date.today()
+        if start_date is None:
+            start_date = end_date - timedelta(days=_SI_RANGE_DAYS)
+
         query: dict[str, Any] = {
             "offset": offset,
             "limit": limit,
-            "sortFields": ["-settlementDate"],
+            "dateRangeFilters": [
+                {
+                    "fieldName": "settlementDate",
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                }
+            ],
         }
 
         if tickers:
@@ -591,8 +635,40 @@ class FINRAATSPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+
+        # 204 = No Content (valid response, just no data for this range)
+        if resp.status_code == 204:
+            return []
+
         resp.raise_for_status()
         return resp.json()
+
+    @staticmethod
+    def _short_interest_segments(
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, date]]:
+        """Split [start_date, end_date] into inclusive settlementDate ranges.
+
+        Each range spans at most ``_SI_RANGE_DAYS`` days (end - start), the
+        request span verified live; consecutive ranges do not overlap, so a
+        settlement date is requested exactly once.
+
+        Parameters:
+            start_date: First settlement date wanted (inclusive).
+            end_date: Last settlement date wanted (inclusive).
+
+        Returns:
+            Ordered (segment_start, segment_end) pairs, oldest first; empty
+            when ``start_date`` is after ``end_date``.
+        """
+        segments: list[tuple[date, date]] = []
+        seg_start = start_date
+        while seg_start <= end_date:
+            seg_end = min(seg_start + timedelta(days=_SI_RANGE_DAYS), end_date)
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end + timedelta(days=1)
+        return segments
 
     def _parse_short_interest_records(
         self,
@@ -684,33 +760,49 @@ class FINRAATSPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
-        # Fetch all pages
+        # Walk the window in bounded settlementDate ranges, paginating each.
+        # The per-segment page loop below deliberately mirrors
+        # pull_ats_volume's (stop when a page is shorter than _PAGE_SIZE,
+        # record-total header unread). That short-page assumption is a known
+        # defect owned by the PR #862 pagination fix (FIX-CONTRACT
+        # 2026-10-20); this method inherits it on purpose and is rebased onto
+        # that fix rather than duplicating it here.
+        fetch_end = date.today()
+        segments = self._short_interest_segments(start_date, fetch_end)
         all_records: list[dict[str, Any]] = []
-        offset = 0
+        requests_made = 0
 
         try:
-            while True:
-                page = self._fetch_short_interest_page(
-                    offset=offset,
-                    limit=_PAGE_SIZE,
-                    tickers=tickers,
-                )
+            for seg_start, seg_end in segments:
+                offset = 0
+                while True:
+                    if requests_made:
+                        time.sleep(_RATE_LIMIT_DELAY)
+                    page = self._fetch_short_interest_page(
+                        offset=offset,
+                        limit=_PAGE_SIZE,
+                        tickers=tickers,
+                        start_date=seg_start,
+                        end_date=seg_end,
+                    )
+                    requests_made += 1
 
-                if not page:
-                    break
+                    if not page:
+                        break
 
-                all_records.extend(page)
-                log.debug(
-                    "FINRA SI: fetched page at offset {o}, {n} records",
-                    o=offset,
-                    n=len(page),
-                )
+                    all_records.extend(page)
+                    log.debug(
+                        "FINRA SI: {a}..{b} offset {o}: {n} records",
+                        a=seg_start,
+                        b=seg_end,
+                        o=offset,
+                        n=len(page),
+                    )
 
-                if len(page) < _PAGE_SIZE:
-                    break
+                    if len(page) < _PAGE_SIZE:
+                        break
 
-                offset += _PAGE_SIZE
-                time.sleep(_RATE_LIMIT_DELAY)
+                    offset += _PAGE_SIZE
 
         except Exception as exc:
             log.error("FINRA short interest pull failed: {e}", e=str(exc))
@@ -788,7 +880,11 @@ class FINRAATSPuller(BasePuller):
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
-            List of result dicts (one per data source).
+            List of result dicts, one per sub-pull, each tagged with
+            ``source`` (``"ats_volume"`` or ``"short_interest"``). The
+            scheduler classifies the list per item: both SUCCESS → SUCCESS,
+            one FAILED → PARTIAL (note names the failed sub-pull), both
+            FAILED → FAILED. Neither sub-pull's outcome hides the other's.
         """
         results: list[dict[str, Any]] = []
 
@@ -797,6 +893,7 @@ class FINRAATSPuller(BasePuller):
             days_back=days_back,
             tickers=tickers,
         )
+        ats_result["source"] = "ats_volume"
         results.append(ats_result)
 
         time.sleep(_RATE_LIMIT_DELAY)
@@ -806,12 +903,23 @@ class FINRAATSPuller(BasePuller):
             days_back=days_back,
             tickers=tickers,
         )
+        si_result["source"] = "short_interest"
         results.append(si_result)
+
+        for r in results:
+            if r["status"] != "SUCCESS":
+                r["error"] = f"{r['source']}: {r.get('error', r['status'])}"
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)
+        overall = (
+            "SUCCESS" if succeeded == len(results)
+            else "FAILED" if succeeded == 0
+            else "PARTIAL"
+        )
         log.info(
-            "FINRA ATS pull_all -- {ok}/{total} sources, {rows} rows",
+            "FINRA ATS pull_all -- {status}: {ok}/{total} sub-pulls, {rows} rows",
+            status=overall,
             ok=succeeded,
             total=len(results),
             rows=total_rows,
