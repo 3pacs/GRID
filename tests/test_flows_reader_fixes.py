@@ -30,6 +30,16 @@ os.environ.setdefault("DB_PASSWORD", "testpass")
 from api.routers import flows  # noqa: E402
 from store.materialization_provenance import WEEKLY_STALE_AFTER_DAYS  # noqa: E402
 
+# Pre-import what get_sector_detail / _build_sector_connections import lazily
+# (flows.py: get_pit_store -> create_engine -> the postgresql dialect and its
+# `ranges`; intelligence.lever_pullers / trust_scorer), so no module runs its
+# own `from datetime import date` for the first time while `_clock` has the
+# `datetime.date` seam patched (review 2026-10-20, Finding 1). Belt: these
+# imports; braces: the teardown rebind in `_clock`.
+import sqlalchemy.dialects.postgresql  # noqa: E402,F401
+import intelligence.lever_pullers  # noqa: E402,F401
+import intelligence.trust_scorer  # noqa: E402,F401
+
 # Import-time default only. Every test re-reads the calendar in `_clock` below:
 # a run whose date changes between collection and this file (the pattern behind
 # the 2026-10-20 CI failure in tests/test_flows_provenance_pg.py) must not build
@@ -58,7 +68,25 @@ def _clock(monkeypatch):
             return today
 
     monkeypatch.setattr(_datetime, "date", _FixedDate)
-    return today
+    yield today
+    # monkeypatch restores datetime.date, but a module first-imported during the
+    # test bound _FixedDate into its own globals; rebind those to the real date
+    # (`date` is this module's own import, which `_clock` never patches).
+    _rebind_leaked(_FixedDate, date)
+
+
+def _rebind_leaked(leaked: type, real: type) -> int:
+    """Rebind every module attribute that `is leaked` back to `real`; return the count."""
+    n = 0
+    for mod in list(sys.modules.values()):
+        d = getattr(mod, "__dict__", None)
+        if not isinstance(d, dict):
+            continue
+        for k, v in list(d.items()):
+            if v is leaked:
+                d[k] = real
+                n += 1
+    return n
 
 
 class _Engine:
