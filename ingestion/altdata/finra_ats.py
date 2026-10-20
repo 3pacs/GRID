@@ -7,30 +7,57 @@ Pulls dark pool trading data from FINRA's OTC Transparency API:
 2. Consolidated short interest -- bimonthly short interest reports.
 
 Data sources:
-- ATS volume: https://api.finra.org/data/group/otcMarket/name/weeklyDownloadDetails
+- ATS volume: https://api.finra.org/data/group/otcMarket/name/weeklySummary
 - Short interest: https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest
 
 Series stored:
 - finra.ats_total_volume: Total ATS (dark pool) volume across tracked tickers
 - finra.ats_dark_pct: Dark pool volume as percentage of total volume (DIX proxy)
 - finra.short_interest_total: Consolidated short interest across tracked tickers
+
+ATS request history (2026-10-19): this module used to POST to
+``otcMarket/name/weeklyDownloadDetails`` with ``sortFields`` and failed every
+run with HTTP 400. ``weeklyDownloadDetails`` is not a dataset in FINRA's API
+catalog or its OTC Transparency API spec (v0.4), where the weekly ATS data is
+``otcMarket/name/weeklySummary``. FINRA's Query API docs also say sorting
+needs an EQUAL compareFilter on every partition field (weeklySummary's are
+weekStartDate and tierIdentifier). The ATS request now matches
+``dark_pool.py``, which was fixed for the same 400 on the same dataset:
+``dateRangeFilters`` on weekStartDate plus ``domainFilters`` on
+issueSymbolIdentifier, and no ``sortFields``.
+
+Short interest request history (2026-10-20): ``pull_short_interest`` POSTed
+to ``otcMarket/name/consolidatedShortInterest`` with
+``sortFields ["-settlementDate"]`` and no partition filter, so FINRA answered
+HTTP 400 ("Sorting is allowed only if all partitions keys are specified in
+EQUAL CompareFilter. Partition keys missing or not using EQUAL CompareFilter:
+settlementDate"; executor receipt 2026-10-20 §A/Phase C). settlementDate is
+the dataset's only partition key. The request now uses ``dateRangeFilters``
+on settlementDate (one anonymous 1-row probe on 2026-10-20 returned 200 with
+``record-total: 23`` for SPY over 365 days) plus ``domainFilters`` on
+symbolCode, no ``sortFields``, and HTTP 204 is read as an empty page. The
+pull window is walked in segments of at most ``_SI_RANGE_DAYS`` days, the
+span that probe verified.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from datetime import date, timedelta
-from typing import Any
+from typing import Any, NamedTuple
 
 import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.dark_pool import parse_ats_weekly_records
 from ingestion.base import BasePuller, retry_on_failure
 
 # ---- URLs ----
 _ATS_VOLUME_URL: str = (
-    "https://api.finra.org/data/group/otcMarket/name/weeklyDownloadDetails"
+    "https://api.finra.org/data/group/otcMarket/name/weeklySummary"
 )
 _SHORT_INTEREST_URL: str = (
     "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
@@ -62,6 +89,62 @@ _RATE_LIMIT_DELAY: float = 2.0
 
 # FINRA API pagination
 _PAGE_SIZE: int = 5000
+
+# weeklySummary holds a rolling 12 months (older weeks live in
+# weeklySummaryHistoric), so the ATS fetch window never reaches further back.
+_ATS_WINDOW_DAYS: int = 365
+
+# Upper bound on pages per paginated query (one ATS pull, or one short-interest
+# settlementDate segment). FINRA's synchronous API can return fewer rows than
+# ``limit`` (response-size cap) while more remain, so pages are counted rather
+# than assumed full. FINRA caps ``offset`` at 500,000, i.e. 100 full pages of
+# 5000; a 7-ticker, 12-month weeklySummary pull is ~20k rows.
+_MAX_ATS_PAGES: int = 100
+
+# Response header carrying the total number of matching records.
+_RECORD_TOTAL_HEADER: str = "Record-Total"
+
+
+class _ATSPage(NamedTuple):
+    """One FINRA Query API page plus the server's total match count.
+
+    ``total`` is the validated ``Record-Total`` header, or None when the
+    header is missing or not a non-negative integer. ``total_header`` is the
+    raw header value, or None when the header is absent, so a present but
+    malformed total can be told apart from a missing one.
+    """
+
+    records: Any
+    total: int | None
+    total_header: str | None = None
+
+
+class _ATSPaginationError(RuntimeError):
+    """Coverage of a paginated FINRA query could not be proven."""
+
+
+def _record_total_header(headers: Any) -> str | None:
+    """Raw ``Record-Total`` response header, or None when absent."""
+    try:
+        value = headers.get(_RECORD_TOTAL_HEADER)
+    except AttributeError:
+        return None
+    return value if isinstance(value, str) else None
+
+
+def _record_total(headers: Any) -> int | None:
+    """Validated ``Record-Total`` response header, or None."""
+    value = _record_total_header(headers)
+    if value is not None and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+# consolidatedShortInterest is bimonthly (~24 settlement dates a year). The
+# pull window is split into settlementDate ranges of at most this many days;
+# a 365-day dateRangeFilters on settlementDate is the request shape verified
+# live on 2026-10-20 (HTTP 200).
+_SI_RANGE_DAYS: int = 365
 
 
 class FINRAATSPuller(BasePuller):
@@ -140,19 +223,28 @@ class FINRAATSPuller(BasePuller):
         offset: int = 0,
         limit: int = _PAGE_SIZE,
         tickers: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Fetch a page of ATS volume data from FINRA API.
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> _ATSPage:
+        """Fetch a page of weeklySummary ATS data from the FINRA API.
 
-        The FINRA API accepts JSON POST queries with filtering,
-        pagination, and sorting.
+        Uses the same request shape as ``dark_pool.py``: a
+        ``dateRangeFilters`` on weekStartDate and a ``domainFilters`` on
+        issueSymbolIdentifier, without ``sortFields`` (sorting needs EQUAL
+        compareFilters on every partition key, otherwise FINRA returns 400).
 
         Parameters:
             offset: Pagination offset.
             limit: Page size.
             tickers: List of ticker symbols to filter on.
+            start_date: Start of the weekStartDate range (inclusive).
+                Defaults to ``_ATS_WINDOW_DAYS`` before today.
+            end_date: End of the weekStartDate range (inclusive).
+                Defaults to today.
 
         Returns:
-            List of record dicts from FINRA API.
+            ``_ATSPage``: the page's records (empty on HTTP 204) and the
+            validated ``Record-Total`` header (None if missing/malformed).
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
@@ -163,11 +255,21 @@ class FINRAATSPuller(BasePuller):
             "Content-Type": "application/json",
         }
 
-        # Build FINRA query -- filter by tracked tickers
+        if end_date is None:
+            end_date = date.today()
+        if start_date is None:
+            start_date = end_date - timedelta(days=_ATS_WINDOW_DAYS)
+
         query: dict[str, Any] = {
             "offset": offset,
             "limit": limit,
-            "sortFields": ["-weekStartDate"],
+            "dateRangeFilters": [
+                {
+                    "fieldName": "weekStartDate",
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                }
+            ],
         }
 
         if tickers:
@@ -184,89 +286,166 @@ class FINRAATSPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+
+        total = _record_total(resp.headers)
+        total_header = _record_total_header(resp.headers)
+
+        # 204 = No Content (valid response, just no data for this range)
+        if resp.status_code == 204:
+            return _ATSPage([], total, total_header)
+
         resp.raise_for_status()
-        return resp.json()
+        return _ATSPage(resp.json(), total, total_header)
+
+    def _paginate(
+        self,
+        fetch: Any,
+        label: str,
+        **query: Any,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Fetch every page of one FINRA query, proving coverage.
+
+        ``fetch`` is a page fetcher returning ``_ATSPage`` (records plus the
+        validated ``Record-Total`` header); ``query`` is passed through
+        unchanged with ``offset``/``limit`` added. A short page is not the
+        last page: the offset advances by the rows actually returned and the
+        query is complete only when it reaches ``Record-Total``. Raises
+        ``_ATSPaginationError`` for a non-list body, a non-empty page without
+        a valid total, a total that changes between pages, rows past the
+        total, an empty page before the total, a page identical to ANY
+        earlier page of this query, or more than ``_MAX_ATS_PAGES`` pages.
+        An empty first page is an empty result only when the header is
+        absent (total None) or a valid 0 (total 0); a present but malformed
+        header fails. Sleeps ``_RATE_LIMIT_DELAY`` between pages, never
+        before the first.
+
+        Parameters:
+            fetch: Page fetcher (``_fetch_ats_page`` /
+                ``_fetch_short_interest_page``).
+            label: Dataset name for error messages and logs.
+            **query: Fetcher keyword arguments other than offset/limit.
+
+        Returns:
+            (records, record_total); record_total is None for an empty
+            result reported without a total, 0 for an explicit zero.
+        """
+        records_out: list[dict[str, Any]] = []
+        offset = 0
+        record_total: int | None = None
+        seen_page_shas: set[str] = set()  # at most _MAX_ATS_PAGES entries
+
+        for page_no in range(_MAX_ATS_PAGES):
+            if page_no:
+                time.sleep(_RATE_LIMIT_DELAY)
+            page = fetch(offset=offset, limit=_PAGE_SIZE, **query)
+            records = page.records
+
+            if not isinstance(records, list):
+                raise _ATSPaginationError(
+                    f"{label} body at offset {offset} is not a JSON list"
+                )
+
+            if not records:
+                if offset == 0:
+                    if page.total == 0 or (
+                        page.total is None and page.total_header is None
+                    ):
+                        return records_out, page.total  # empty result
+                    if page.total is None:
+                        raise _ATSPaginationError(
+                            f"{label}: malformed {_RECORD_TOTAL_HEADER} header "
+                            f"{page.total_header!r} on an empty first page"
+                        )
+                raise _ATSPaginationError(
+                    f"{label}: empty page at offset {offset} before "
+                    f"{_RECORD_TOTAL_HEADER} "
+                    f"{record_total if record_total is not None else page.total}"
+                )
+
+            if page.total is None:
+                raise _ATSPaginationError(
+                    f"{label}: missing or malformed {_RECORD_TOTAL_HEADER} header "
+                    f"at offset {offset}; coverage of a {len(records)}-row page "
+                    f"cannot be proven"
+                )
+            if record_total is None:
+                record_total = page.total
+            elif page.total != record_total:
+                raise _ATSPaginationError(
+                    f"{label}: {_RECORD_TOTAL_HEADER} changed from {record_total} "
+                    f"to {page.total} at offset {offset}"
+                )
+            if offset + len(records) > record_total:
+                raise _ATSPaginationError(
+                    f"{label}: {offset + len(records)} rows exceed "
+                    f"{_RECORD_TOTAL_HEADER} {record_total}"
+                )
+
+            page_sha = hashlib.sha256(
+                json.dumps(records, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if page_sha in seen_page_shas:
+                raise _ATSPaginationError(
+                    f"{label}: page at offset {offset} repeats an earlier page"
+                )
+            seen_page_shas.add(page_sha)
+
+            records_out.extend(records)
+            offset += len(records)
+            log.debug(
+                "FINRA {l}: fetched {n} records, {o} of {t}",
+                l=label,
+                n=len(records),
+                o=offset,
+                t=record_total,
+            )
+
+            if offset == record_total:
+                return records_out, record_total
+
+        raise _ATSPaginationError(
+            f"{label}: page budget of {_MAX_ATS_PAGES} pages exhausted at "
+            f"offset {offset} of {record_total}"
+        )
 
     def _parse_ats_records(
         self,
         records: list[dict[str, Any]],
     ) -> dict[date, dict[str, float]]:
-        """Aggregate ATS records by week into volume and dark pct.
+        """Aggregate weeklySummary ATS records by week across tracked tickers.
 
-        Groups records by weekStartDate, sums totalWeeklyShareQuantity
-        (ATS volume) and totalWeeklyTradeCount, and computes dark pool
-        percentage where possible.
+        Per-ticker ATS volume comes from
+        :func:`ingestion.altdata.dark_pool.parse_ats_weekly_records`: ATS
+        rows only (no non-ATS OTC volume), with the symbol-level
+        ``ATS_W_SMBL`` aggregate preferred over summed per-firm rows, never
+        both. Those per-ticker volumes are then summed per week.
+
+        weeklySummary carries no consolidated (exchange + OTC) volume, so
+        ``total_volume`` stays 0 and ``dark_pct`` is 0.0; the caller only
+        stores ``ats_dark_pct`` when ``total_volume`` is positive.
 
         Parameters:
-            records: Raw FINRA ATS records.
+            records: Raw FINRA weeklySummary records.
 
         Returns:
             Dict mapping obs_date to aggregated metrics:
             {date: {'ats_volume': float, 'total_volume': float,
-                     'dark_pct': float, 'raw_records': int}}.
+                     'dark_pct': float, 'raw_records': int}}, where
+            raw_records is the number of tickers contributing that week.
         """
         by_week: dict[date, dict[str, float]] = {}
 
-        for rec in records:
-            # Parse the week start date
-            week_str = rec.get("weekStartDate")
-            if not week_str:
-                continue
-
-            try:
-                obs_date = date.fromisoformat(week_str[:10])
-            except (ValueError, TypeError) as exc:
-                log.warning(
-                    "FINRA ATS: bad date {d}: {e}",
-                    d=week_str,
-                    e=str(exc),
+        for weeks in parse_ats_weekly_records(records).values():
+            for obs_date, metrics in weeks.items():
+                agg = by_week.setdefault(
+                    obs_date,
+                    {"ats_volume": 0.0, "total_volume": 0.0, "raw_records": 0},
                 )
-                continue
+                agg["ats_volume"] += metrics["volume"]
+                agg["raw_records"] += 1
 
-            # Extract volume fields
-            ats_volume = rec.get("totalWeeklyShareQuantity")
-            rec.get("lastUpdateDate")  # not always available
-
-            if ats_volume is None:
-                continue
-
-            try:
-                ats_vol = float(ats_volume)
-            except (ValueError, TypeError):
-                log.warning(
-                    "FINRA ATS: bad volume value {v} for {d}",
-                    v=ats_volume,
-                    d=week_str,
-                )
-                continue
-
-            if obs_date not in by_week:
-                by_week[obs_date] = {
-                    "ats_volume": 0.0,
-                    "total_volume": 0.0,
-                    "raw_records": 0,
-                }
-
-            by_week[obs_date]["ats_volume"] += ats_vol
-            by_week[obs_date]["raw_records"] += 1
-
-            # Some records include totalShareQuantity for overall volume
-            total_qty = rec.get("totalShareQuantity")
-            if total_qty is not None:
-                try:
-                    by_week[obs_date]["total_volume"] += float(total_qty)
-                except (ValueError, TypeError):
-                    pass
-
-        # Compute dark pool percentage
-        for obs_date, agg in by_week.items():
-            if agg["total_volume"] > 0:
-                agg["dark_pct"] = (
-                    agg["ats_volume"] / agg["total_volume"]
-                ) * 100.0
-            else:
-                # Use ATS volume alone -- mark as incomplete
-                agg["dark_pct"] = 0.0
+        for agg in by_week.values():
+            agg["dark_pct"] = 0.0
 
         return by_week
 
@@ -279,7 +458,17 @@ class FINRAATSPuller(BasePuller):
         """Pull ATS dark pool volume data and store ats_total_volume + ats_dark_pct.
 
         Uses _get_existing_dates() for efficient batch deduplication.
-        Paginates through FINRA API to retrieve all matching records.
+
+        Pagination: FINRA's synchronous API may return fewer rows than
+        ``limit`` while more remain, so a short page is not treated as the
+        last one. The offset advances by the rows actually returned, and
+        the pull is complete only when it reaches the ``Record-Total``
+        header. A non-empty page without a valid total, a changing total,
+        rows past the total, an empty page before the total, a repeated
+        page, or more than ``_MAX_ATS_PAGES`` pages all fail the pull, and
+        nothing is stored (incomplete coverage is never written as
+        success). An empty first page (HTTP 204) with no or zero total is
+        an empty result.
 
         Parameters:
             start_date: Earliest observation date to store.
@@ -287,7 +476,8 @@ class FINRAATSPuller(BasePuller):
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
-            dict with status, rows_inserted, per_feature counts.
+            dict with status, rows_inserted, per_feature counts, and the
+            coverage evidence ``records_fetched`` / ``record_total``.
         """
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
@@ -299,34 +489,19 @@ class FINRAATSPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
-        # Fetch all pages
-        all_records: list[dict[str, Any]] = []
-        offset = 0
+        # weeklySummary only holds a rolling 12 months; never ask for more.
+        fetch_end = date.today()
+        fetch_start = max(start_date, fetch_end - timedelta(days=_ATS_WINDOW_DAYS))
 
+        # Fetch all pages; see the docstring for the completion rule.
         try:
-            while True:
-                page = self._fetch_ats_page(
-                    offset=offset,
-                    limit=_PAGE_SIZE,
-                    tickers=tickers,
-                )
-
-                if not page:
-                    break
-
-                all_records.extend(page)
-                log.debug(
-                    "FINRA ATS: fetched page at offset {o}, {n} records",
-                    o=offset,
-                    n=len(page),
-                )
-
-                if len(page) < _PAGE_SIZE:
-                    break
-
-                offset += _PAGE_SIZE
-                time.sleep(_RATE_LIMIT_DELAY)
-
+            all_records, record_total = self._paginate(
+                self._fetch_ats_page,
+                "weeklySummary",
+                tickers=tickers,
+                start_date=fetch_start,
+                end_date=fetch_end,
+            )
         except Exception as exc:
             log.error("FINRA ATS volume pull failed: {e}", e=str(exc))
             return {
@@ -335,9 +510,11 @@ class FINRAATSPuller(BasePuller):
                 "error": str(exc),
             }
 
+        coverage = {"records_fetched": len(all_records), "record_total": record_total}
+
         if not all_records:
             log.warning("FINRA ATS: no records returned from API")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         log.info(
             "FINRA ATS: fetched {n} total records", n=len(all_records)
@@ -347,7 +524,7 @@ class FINRAATSPuller(BasePuller):
         by_week = self._parse_ats_records(all_records)
         if not by_week:
             log.warning("FINRA ATS: no data parsed from records")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         total_inserted = 0
         per_feature: dict[str, int] = {}
@@ -425,6 +602,7 @@ class FINRAATSPuller(BasePuller):
             "status": "SUCCESS",
             "rows_inserted": total_inserted,
             "per_feature": per_feature,
+            **coverage,
         }
 
     # ------------------------------------------------------------------ #
@@ -446,16 +624,30 @@ class FINRAATSPuller(BasePuller):
         offset: int = 0,
         limit: int = _PAGE_SIZE,
         tickers: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> _ATSPage:
         """Fetch a page of consolidated short interest data from FINRA.
+
+        settlementDate is the dataset's partition key, so ``sortFields``
+        without an EQUAL compareFilter on it returns HTTP 400 (receipt
+        2026-10-20 §A). The request instead bounds settlementDate with a
+        ``dateRangeFilters`` entry (inclusive on both ends) and filters
+        tickers with ``domainFilters`` on symbolCode; no sorting is asked
+        for, and the caller aggregates by date, so order does not matter.
 
         Parameters:
             offset: Pagination offset.
             limit: Page size.
             tickers: List of ticker symbols to filter on.
+            start_date: Start of the settlementDate range (inclusive).
+                Defaults to ``_SI_RANGE_DAYS`` before ``end_date``.
+            end_date: End of the settlementDate range (inclusive).
+                Defaults to today.
 
         Returns:
-            List of record dicts from FINRA API.
+            ``_ATSPage``: the page's records (empty on HTTP 204) and the
+            validated ``Record-Total`` header (None if missing/malformed).
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
@@ -466,10 +658,21 @@ class FINRAATSPuller(BasePuller):
             "Content-Type": "application/json",
         }
 
+        if end_date is None:
+            end_date = date.today()
+        if start_date is None:
+            start_date = end_date - timedelta(days=_SI_RANGE_DAYS)
+
         query: dict[str, Any] = {
             "offset": offset,
             "limit": limit,
-            "sortFields": ["-settlementDate"],
+            "dateRangeFilters": [
+                {
+                    "fieldName": "settlementDate",
+                    "startDate": start_date.isoformat(),
+                    "endDate": end_date.isoformat(),
+                }
+            ],
         }
 
         if tickers:
@@ -486,8 +689,43 @@ class FINRAATSPuller(BasePuller):
             headers=headers,
             timeout=_REQUEST_TIMEOUT,
         )
+
+        total = _record_total(resp.headers)
+        total_header = _record_total_header(resp.headers)
+
+        # 204 = No Content (valid response, just no data for this range)
+        if resp.status_code == 204:
+            return _ATSPage([], total, total_header)
+
         resp.raise_for_status()
-        return resp.json()
+        return _ATSPage(resp.json(), total, total_header)
+
+    @staticmethod
+    def _short_interest_segments(
+        start_date: date,
+        end_date: date,
+    ) -> list[tuple[date, date]]:
+        """Split [start_date, end_date] into inclusive settlementDate ranges.
+
+        Each range spans at most ``_SI_RANGE_DAYS`` days (end - start), the
+        request span verified live; consecutive ranges do not overlap, so a
+        settlement date is requested exactly once.
+
+        Parameters:
+            start_date: First settlement date wanted (inclusive).
+            end_date: Last settlement date wanted (inclusive).
+
+        Returns:
+            Ordered (segment_start, segment_end) pairs, oldest first; empty
+            when ``start_date`` is after ``end_date``.
+        """
+        segments: list[tuple[date, date]] = []
+        seg_start = start_date
+        while seg_start <= end_date:
+            seg_end = min(seg_start + timedelta(days=_SI_RANGE_DAYS), end_date)
+            segments.append((seg_start, seg_end))
+            seg_start = seg_end + timedelta(days=1)
+        return segments
 
     def _parse_short_interest_records(
         self,
@@ -559,7 +797,11 @@ class FINRAATSPuller(BasePuller):
     ) -> dict[str, Any]:
         """Pull consolidated short interest and store short_interest_total.
 
-        Uses _get_existing_dates() for efficient batch deduplication.
+        Uses _get_existing_dates() for efficient batch deduplication. Each
+        settlementDate segment is paginated with :meth:`_paginate` (same
+        ``Record-Total`` completion rule as :meth:`pull_ats_volume`); any
+        segment whose coverage cannot be proven fails the whole pull and
+        nothing is stored.
 
         Parameters:
             start_date: Earliest observation date to store.
@@ -567,7 +809,9 @@ class FINRAATSPuller(BasePuller):
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
-            dict with status, rows_inserted, per_feature counts.
+            dict with status, rows_inserted, per_feature counts, and the
+            coverage evidence ``records_fetched`` / ``record_total`` (sum of
+            the segments' totals; None if any empty segment had no total).
         """
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
@@ -579,33 +823,26 @@ class FINRAATSPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
-        # Fetch all pages
+        # Walk the window in bounded settlementDate ranges; each range is
+        # paginated to its Record-Total (see _paginate).
+        fetch_end = date.today()
+        segments = self._short_interest_segments(start_date, fetch_end)
         all_records: list[dict[str, Any]] = []
-        offset = 0
+        segment_totals: list[int | None] = []
 
         try:
-            while True:
-                page = self._fetch_short_interest_page(
-                    offset=offset,
-                    limit=_PAGE_SIZE,
+            for index, (seg_start, seg_end) in enumerate(segments):
+                if index:
+                    time.sleep(_RATE_LIMIT_DELAY)
+                records, seg_total = self._paginate(
+                    self._fetch_short_interest_page,
+                    f"consolidatedShortInterest {seg_start}..{seg_end}",
                     tickers=tickers,
+                    start_date=seg_start,
+                    end_date=seg_end,
                 )
-
-                if not page:
-                    break
-
-                all_records.extend(page)
-                log.debug(
-                    "FINRA SI: fetched page at offset {o}, {n} records",
-                    o=offset,
-                    n=len(page),
-                )
-
-                if len(page) < _PAGE_SIZE:
-                    break
-
-                offset += _PAGE_SIZE
-                time.sleep(_RATE_LIMIT_DELAY)
+                all_records.extend(records)
+                segment_totals.append(seg_total)
 
         except Exception as exc:
             log.error("FINRA short interest pull failed: {e}", e=str(exc))
@@ -615,9 +852,16 @@ class FINRAATSPuller(BasePuller):
                 "error": str(exc),
             }
 
+        # Sum of the segments' totals; None (unknown) if any empty segment
+        # was reported without a Record-Total header.
+        record_total = (
+            None if any(t is None for t in segment_totals) else sum(segment_totals)
+        )
+        coverage = {"records_fetched": len(all_records), "record_total": record_total}
+
         if not all_records:
             log.warning("FINRA SI: no records returned from API")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         log.info(
             "FINRA SI: fetched {n} total records", n=len(all_records)
@@ -627,7 +871,7 @@ class FINRAATSPuller(BasePuller):
         by_date = self._parse_short_interest_records(all_records)
         if not by_date:
             log.warning("FINRA SI: no data parsed from records")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         inserted = 0
         sid = self._series_id("short_interest_total")
@@ -663,6 +907,7 @@ class FINRAATSPuller(BasePuller):
             "status": "SUCCESS",
             "rows_inserted": inserted,
             "per_feature": {"short_interest_total": inserted},
+            **coverage,
         }
 
     # ------------------------------------------------------------------ #
@@ -683,7 +928,11 @@ class FINRAATSPuller(BasePuller):
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
-            List of result dicts (one per data source).
+            List of result dicts, one per sub-pull, each tagged with
+            ``source`` (``"ats_volume"`` or ``"short_interest"``). The
+            scheduler classifies the list per item: both SUCCESS → SUCCESS,
+            one FAILED → PARTIAL (note names the failed sub-pull), both
+            FAILED → FAILED. Neither sub-pull's outcome hides the other's.
         """
         results: list[dict[str, Any]] = []
 
@@ -692,6 +941,7 @@ class FINRAATSPuller(BasePuller):
             days_back=days_back,
             tickers=tickers,
         )
+        ats_result["source"] = "ats_volume"
         results.append(ats_result)
 
         time.sleep(_RATE_LIMIT_DELAY)
@@ -701,12 +951,23 @@ class FINRAATSPuller(BasePuller):
             days_back=days_back,
             tickers=tickers,
         )
+        si_result["source"] = "short_interest"
         results.append(si_result)
+
+        for r in results:
+            if r["status"] != "SUCCESS":
+                r["error"] = f"{r['source']}: {r.get('error', r['status'])}"
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)
+        overall = (
+            "SUCCESS" if succeeded == len(results)
+            else "FAILED" if succeeded == 0
+            else "PARTIAL"
+        )
         log.info(
-            "FINRA ATS pull_all -- {ok}/{total} sources, {rows} rows",
+            "FINRA ATS pull_all -- {status}: {ok}/{total} sub-pulls, {rows} rows",
+            status=overall,
             ok=succeeded,
             total=len(results),
             rows=total_rows,
