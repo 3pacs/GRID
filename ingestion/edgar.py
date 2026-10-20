@@ -9,6 +9,7 @@ Stores results in ``raw_series`` with source 'SEC_EDGAR'.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -78,6 +79,21 @@ class EDGARPuller(BasePuller):
     # 13F Institutional Holdings
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _pick_value_column(holdings: pd.DataFrame) -> str | None:
+        """Return the infotable's market-value column, or ``None``.
+
+        Case-insensitive, preferring ``Value`` (edgartools 5.x) then
+        ``value`` (4.x / raw XML), mirroring
+        ``ingestion.altdata.sec_13f_live._infotable_df_to_positions``.
+        """
+        cols = {str(c).lower(): c for c in holdings.columns}
+        for name in ("Value", "value"):
+            hit = cols.get(name.lower())
+            if hit is not None:
+                return str(hit)
+        return None
+
     def pull_13f_holdings(
         self,
         cik_list: list[str] | None = None,
@@ -106,10 +122,16 @@ class EDGARPuller(BasePuller):
 
         for cik in cik_list:
             try:
-                filings = get_filings(
-                    form="13F-HR",
-                    cik=cik,
-                )
+                # Per-entity lookup via the submissions API, exactly like the
+                # Form 4 path below. edgartools' module-level ``get_filings``
+                # is the quarterly full-index downloader and has never taken a
+                # ``cik`` kwarg (signature: year/quarter/form/amendments/
+                # filing_date/index/priority_sorted_forms), so the original
+                # ``get_filings(form="13F-HR", cik=cik)`` raised TypeError for
+                # every filer -- grid-hermes 2026-10-20 04:20:55Z: "13F pull
+                # failed for CIK 0001067983: get_filings() got an unexpected
+                # keyword argument 'cik'" x75, 0 rows.
+                filings = Company(cik).get_filings(form="13F-HR")
                 if filings is None:
                     continue
 
@@ -132,14 +154,31 @@ class EDGARPuller(BasePuller):
                             else pd.Timestamp(filing.filing_date).date()
                         )
 
+                        # Resolve the value column case-insensitively:
+                        # edgartools 5.x (5.28.4 on grid-hermes, 5.61.1
+                        # locally) emits ``Value``; 4.x / the raw parser emit
+                        # ``value`` (same rule as sec_13f_live's
+                        # _infotable_df_to_positions). Testing for lowercase
+                        # ``"value"`` only would write TOTAL_VALUE=0.0 and
+                        # TOP5_CONCENTRATION=0.0 as SUCCESS for every filing.
+                        value_col = self._pick_value_column(holdings)
+                        if value_col is None:
+                            log.debug(
+                                "13F infotable for CIK {cik} ({d}) has no value "
+                                "column (columns={cols}); skipping filing",
+                                cik=cik, d=filing_date, cols=list(holdings.columns),
+                            )
+                            processed += 1
+                            continue
+
                         # Compute portfolio metrics
-                        total_value = float(holdings["value"].sum()) if "value" in holdings.columns else 0.0
+                        total_value = float(holdings[value_col].sum())
                         num_positions = len(holdings)
 
                         # Top 5 concentration
-                        if "value" in holdings.columns and total_value > 0:
+                        if total_value > 0:
                             top5_value = float(
-                                holdings.nlargest(5, "value")["value"].sum()
+                                holdings.nlargest(5, value_col)[value_col].sum()
                             )
                             top5_pct = top5_value / total_value
                         else:
@@ -338,14 +377,40 @@ class EDGARPuller(BasePuller):
     # 8-K Filing Counts by Sector
     # ------------------------------------------------------------------
 
-    # Process-scoped breaker for the daily 8-K full-index endpoint. Once
-    # SEC's WAF starts returning 403 for our identity (typically because
-    # the daily index isn't yet generated for the current quarter), every
-    # subsequent call within the cycle hits the same wall. Tripping this
-    # once spares us 2 ERROR rows/day until the index appears.
+    # Process-scoped breaker for the daily 8-K full-index endpoint. SEC
+    # answers 403 (not 404) for a full-index path that does not exist yet,
+    # which happens for the first day or two of a new calendar quarter
+    # before ``full-index/<year>/QTR<n>/`` is generated. That case is "no
+    # data yet", so trip the breaker once and stay quiet until the index
+    # appears. A 403 on a *past* quarter's index -- whose files certainly
+    # exist -- or on any other endpoint is an access denial and must stay a
+    # visible failure (grid-hermes 2026-10-20 04:21:55Z returned 403 for
+    # .../full-index/2026/QTR1/form.gz in October and was mislabelled
+    # "index likely not yet generated for current quarter").
     _PULL_8K_BREAKER: bool = False
     _PULL_8K_BREAKER_TS: float = 0.0
     _PULL_8K_BREAKER_TTL_S: int = 6 * 3600  # 6 hours
+    _FULL_INDEX_QTR_RE = re.compile(r"/full-index/(\d{4})/QTR([1-4])/")
+
+    @classmethod
+    def _full_index_403_quarter(cls, err_str: str) -> tuple[int, int] | None:
+        """Return ``(year, quarter)`` named by a full-index URL in ``err_str``.
+
+        ``None`` when the message is not a full-index 403 or names no
+        parseable ``/full-index/<year>/QTR<n>/`` path.
+        """
+        if "403" not in err_str or "full-index" not in err_str:
+            return None
+        m = cls._FULL_INDEX_QTR_RE.search(err_str)
+        if m is None:
+            return None
+        return int(m.group(1)), int(m.group(2))
+
+    @staticmethod
+    def _current_year_quarter(today: date | None = None) -> tuple[int, int]:
+        """Calendar ``(year, quarter)`` for ``today`` (default ``date.today()``)."""
+        today = today or date.today()
+        return today.year, (today.month - 1) // 3 + 1
 
     def pull_8k_counts(
         self,
@@ -436,16 +501,23 @@ class EDGARPuller(BasePuller):
 
         except Exception as exc:
             err_str = str(exc)
-            # SEC full-index 403 (e.g. .../full-index/2026/QTR1/form.gz):
-            # quarter index isn't generated yet OR our UA was WAF-blocked.
-            # Trip the breaker, log ONE warning, retry after the cooldown.
-            if "403" in err_str and "full-index" in err_str:
+            # SEC full-index 403 on the CURRENT calendar quarter
+            # (e.g. .../full-index/2026/QTR4/form.gz on 2026-10-01): the
+            # quarter's index isn't generated yet. That is "no data yet",
+            # not a failure: trip the breaker, log ONE warning, retry after
+            # the cooldown. Any other 403 -- a past quarter's index (which
+            # exists) or a non-index endpoint -- is a real access denial and
+            # falls through to the error path below, unmasked.
+            idx_quarter = self._full_index_403_quarter(err_str)
+            if idx_quarter is not None and idx_quarter == self._current_year_quarter():
                 EDGARPuller._PULL_8K_BREAKER = True
                 EDGARPuller._PULL_8K_BREAKER_TS = _t.time()
                 log.warning(
-                    "EDGAR full-index returned 403 — index likely not yet "
-                    "generated for current quarter. Skipping 8-K count "
+                    "EDGAR full-index returned 403 for the current quarter "
+                    "{y}Q{q} — index not yet generated. Skipping 8-K count "
                     "pull for {h}h. Endpoint: {e}",
+                    y=idx_quarter[0],
+                    q=idx_quarter[1],
                     h=EDGARPuller._PULL_8K_BREAKER_TTL_S // 3600,
                     e=err_str[:200],
                 )
@@ -455,7 +527,14 @@ class EDGARPuller(BasePuller):
                     "errors": [err_str],
                     "status": "SKIPPED",
                 }
-            msg = f"8-K count pull failed: {exc}"
+            if idx_quarter is not None:
+                msg = (
+                    f"8-K count pull failed: EDGAR full-index returned 403 for "
+                    f"past quarter {idx_quarter[0]}Q{idx_quarter[1]} (index exists; "
+                    f"access denied, not a missing index): {exc}"
+                )
+            else:
+                msg = f"8-K count pull failed: {exc}"
             log.error(msg)
             errors.append(msg)
 
