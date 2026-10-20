@@ -13,6 +13,7 @@ import ingestion.options as options
 import ingestion.smart_scheduler as ss
 from scripts import hermes_operator as ho
 from tests.test_options_scheduler_budget import _puller
+from tests.options_publication_protocol import reviewed_function_rows
 
 
 def test_expiration_after_final_capture_is_partial_without_catalog_write(monkeypatch):
@@ -32,7 +33,10 @@ def _catalog_puller(monkeypatch):
     obj.engine.url = "postgresql://offline.invalid/unused"
     obj.source_id = 185
     catalog_engine = MagicMock()
-    conn = catalog_engine.begin.return_value.__enter__.return_value
+    conn = catalog_engine.connect.return_value
+    conn.info = {}
+    conn.execute.return_value.scalar_one.return_value = 0
+    conn.execute.return_value.all.return_value = reviewed_function_rows()
     # Baseline uses the shared engine; repaired code must use bounded connection setup.
     obj.engine.begin.return_value.__enter__.return_value = conn
     factory = MagicMock(return_value=catalog_engine)
@@ -60,7 +64,10 @@ def test_catalog_complete_transaction_commits_once_and_disposes(monkeypatch):
                if str(call.args[0]).startswith("UPDATE source_catalog")]
     assert len(updates) == 1
     assert updates[0].args[1] == {"sid": 185}
-    assert engine.begin.return_value.__exit__.call_args.args == (None, None, None)
+    conn.begin.return_value.commit.assert_called_once_with()
+    conn.begin.return_value.rollback.assert_not_called()
+    conn.close.assert_called_once_with()
+    assert obj._catalog_receipt.commit_ack == "ACKNOWLEDGED"
     engine.dispose.assert_called_once_with()
     # The cooperative local deadline and configured statement limit are sized
     # below the options cleanup margin (900s hard / 840s cooperative). This
@@ -73,7 +80,7 @@ def test_catalog_cancellation_rolls_back_at_each_publication_boundary(monkeypatc
     obj, engine, conn, _factory, _clock = _catalog_puller(monkeypatch)
     live = [True]
     if cancel_at == "connection":
-        engine.begin.return_value.__enter__.side_effect = lambda: (live.__setitem__(0, False), conn)[1]
+        engine.connect.side_effect = lambda: (live.__setitem__(0, False), conn)[1]
 
     def execute(statement, *_args):
         sql = str(statement)
@@ -81,14 +88,19 @@ def test_catalog_cancellation_rolls_back_at_each_publication_boundary(monkeypatc
             live[0] = False
         if cancel_at == "update" and sql.startswith("UPDATE source_catalog"):
             live[0] = False
-        return MagicMock(rowcount=1)
+        result = MagicMock(rowcount=1)
+        result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
+        return result
 
     conn.execute.side_effect = execute
     assert obj._mark_catalog_pulled(should_continue=lambda: live[0]) is False
     statements = [str(call.args[0]) for call in conn.execute.call_args_list]
     assert sum(sql.startswith("UPDATE") for sql in statements) == (cancel_at == "update")
-    # Engine.begin's context receives the cancellation exception, so it rolls back.
-    assert engine.begin.return_value.__exit__.call_args.args[0] is options._OptionsBudgetExpired
+    conn.begin.return_value.rollback.assert_called_once_with()
+    conn.begin.return_value.commit.assert_not_called()
+    assert obj._catalog_receipt.commit_ack == "NOT_COMMITTED"
+    assert obj._catalog_receipt.error == "_OptionsBudgetExpired"
     engine.dispose.assert_called_once_with()
 
 
@@ -99,7 +111,10 @@ def test_catalog_lock_timeout_is_bounded_and_not_success(monkeypatch):
         if str(statement).startswith("UPDATE source_catalog"):
             clock[0] += 3  # simulated PostgreSQL lock_timeout, no real waiting/DB
             raise TimeoutError("offline simulated catalog lock timeout")
-        return MagicMock(rowcount=1)
+        result = MagicMock(rowcount=1)
+        result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
+        return result
 
     conn.execute.side_effect = execute
     assert obj._mark_catalog_pulled() is False
@@ -111,7 +126,9 @@ def test_catalog_lock_timeout_is_bounded_and_not_success(monkeypatch):
     assert "SET LOCAL lock_timeout = '3s'" in statements
     assert "SET LOCAL statement_timeout = '5s'" in statements
     assert "SET LOCAL idle_in_transaction_session_timeout = '5s'" in statements
-    assert engine.begin.return_value.__exit__.call_args.args[0] is TimeoutError
+    conn.begin.return_value.rollback.assert_called_once_with()
+    conn.begin.return_value.commit.assert_not_called()
+    assert obj._catalog_receipt.error == "TimeoutError"
     engine.dispose.assert_called_once_with()
 
 
@@ -121,12 +138,43 @@ def test_catalog_own_transaction_deadline_blocks_update(monkeypatch):
     def execute(statement, *_args):
         if "idle_in_transaction_session_timeout" in str(statement):
             clock[0] += 16
-        return MagicMock(rowcount=1)
+        result = MagicMock(rowcount=1)
+        result.scalar_one.return_value = 0
+        result.all.return_value = reviewed_function_rows()
+        return result
 
     conn.execute.side_effect = execute
     assert obj._mark_catalog_pulled() is False
     assert not any(str(call.args[0]).startswith("UPDATE") for call in conn.execute.call_args_list)
-    assert engine.begin.return_value.__exit__.call_args.args[0] is options._OptionsBudgetExpired
+    conn.begin.return_value.rollback.assert_called_once_with()
+    conn.begin.return_value.commit.assert_not_called()
+    # The publisher now includes lock/closure setup in its 15s deadline and
+    # expires before invoking the catalog callback's separate budget check.
+    assert obj._catalog_receipt.error == "PublicationBudgetExpired"
+
+
+def test_catalog_unknown_commit_ack_stops_without_replay(monkeypatch):
+    obj, engine, conn, factory, _clock = _catalog_puller(monkeypatch)
+    conn.begin.return_value.commit.side_effect = ConnectionError("synthetic lost COMMIT ACK")
+    assert obj._mark_catalog_pulled() is False
+    assert obj._catalog_receipt.commit_ack == "UNKNOWN"
+    conn.begin.return_value.commit.assert_called_once_with()
+    conn.begin.return_value.rollback.assert_not_called()
+    factory.assert_called_once()
+    engine.dispose.assert_called_once_with()
+
+
+@pytest.mark.parametrize("boundary", ["close", "dispose"])
+def test_catalog_post_ack_cleanup_preserves_receipt(monkeypatch, boundary):
+    obj, engine, conn, _factory, _clock = _catalog_puller(monkeypatch)
+    getattr(conn if boundary == "close" else engine, boundary).side_effect = RuntimeError("synthetic cleanup failure")
+    acknowledged_return = obj._mark_catalog_pulled()
+    assert acknowledged_return is (boundary == "dispose")
+    assert obj._catalog_receipt.commit_ack == "ACKNOWLEDGED"
+    assert obj._catalog_receipt.cleanup_failed is True
+    assert obj._catalog_receipt.stop is True
+    conn.begin.return_value.commit.assert_called_once_with()
+    conn.begin.return_value.rollback.assert_not_called()
 
 
 def test_failed_catalog_publication_preserves_writes_without_fresh_success(monkeypatch):
