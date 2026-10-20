@@ -109,24 +109,33 @@ class _ATSPage(NamedTuple):
     """One FINRA Query API page plus the server's total match count.
 
     ``total`` is the validated ``Record-Total`` header, or None when the
-    header is missing or not a non-negative integer.
+    header is missing or not a non-negative integer. ``total_header`` is the
+    raw header value, or None when the header is absent, so a present but
+    malformed total can be told apart from a missing one.
     """
 
     records: Any
     total: int | None
+    total_header: str | None = None
 
 
 class _ATSPaginationError(RuntimeError):
     """Coverage of a paginated FINRA query could not be proven."""
 
 
-def _record_total(headers: Any) -> int | None:
-    """Validated ``Record-Total`` response header, or None."""
+def _record_total_header(headers: Any) -> str | None:
+    """Raw ``Record-Total`` response header, or None when absent."""
     try:
         value = headers.get(_RECORD_TOTAL_HEADER)
     except AttributeError:
         return None
-    if isinstance(value, str) and value.strip().isdigit():
+    return value if isinstance(value, str) else None
+
+
+def _record_total(headers: Any) -> int | None:
+    """Validated ``Record-Total`` response header, or None."""
+    value = _record_total_header(headers)
+    if value is not None and value.strip().isdigit():
         return int(value.strip())
     return None
 
@@ -279,13 +288,14 @@ class FINRAATSPuller(BasePuller):
         )
 
         total = _record_total(resp.headers)
+        total_header = _record_total_header(resp.headers)
 
         # 204 = No Content (valid response, just no data for this range)
         if resp.status_code == 204:
-            return _ATSPage([], total)
+            return _ATSPage([], total, total_header)
 
         resp.raise_for_status()
-        return _ATSPage(resp.json(), total)
+        return _ATSPage(resp.json(), total, total_header)
 
     def _paginate(
         self,
@@ -302,10 +312,12 @@ class FINRAATSPuller(BasePuller):
         query is complete only when it reaches ``Record-Total``. Raises
         ``_ATSPaginationError`` for a non-list body, a non-empty page without
         a valid total, a total that changes between pages, rows past the
-        total, an empty page before the total, a page identical to the
-        previous one, or more than ``_MAX_ATS_PAGES`` pages. An empty first
-        page with no or zero total is an empty result. Sleeps
-        ``_RATE_LIMIT_DELAY`` between pages, never before the first.
+        total, an empty page before the total, a page identical to ANY
+        earlier page of this query, or more than ``_MAX_ATS_PAGES`` pages.
+        An empty first page is an empty result only when the header is
+        absent (total None) or a valid 0 (total 0); a present but malformed
+        header fails. Sleeps ``_RATE_LIMIT_DELAY`` between pages, never
+        before the first.
 
         Parameters:
             fetch: Page fetcher (``_fetch_ats_page`` /
@@ -315,12 +327,12 @@ class FINRAATSPuller(BasePuller):
 
         Returns:
             (records, record_total); record_total is None for an empty
-            result reported without a total.
+            result reported without a total, 0 for an explicit zero.
         """
         records_out: list[dict[str, Any]] = []
         offset = 0
         record_total: int | None = None
-        previous_page_sha: str | None = None
+        seen_page_shas: set[str] = set()  # at most _MAX_ATS_PAGES entries
 
         for page_no in range(_MAX_ATS_PAGES):
             if page_no:
@@ -334,8 +346,16 @@ class FINRAATSPuller(BasePuller):
                 )
 
             if not records:
-                if offset == 0 and page.total in (None, 0):
-                    return records_out, page.total  # empty result
+                if offset == 0:
+                    if page.total == 0 or (
+                        page.total is None and page.total_header is None
+                    ):
+                        return records_out, page.total  # empty result
+                    if page.total is None:
+                        raise _ATSPaginationError(
+                            f"{label}: malformed {_RECORD_TOTAL_HEADER} header "
+                            f"{page.total_header!r} on an empty first page"
+                        )
                 raise _ATSPaginationError(
                     f"{label}: empty page at offset {offset} before "
                     f"{_RECORD_TOTAL_HEADER} "
@@ -364,11 +384,11 @@ class FINRAATSPuller(BasePuller):
             page_sha = hashlib.sha256(
                 json.dumps(records, sort_keys=True, default=str).encode()
             ).hexdigest()
-            if page_sha == previous_page_sha:
+            if page_sha in seen_page_shas:
                 raise _ATSPaginationError(
-                    f"{label}: page at offset {offset} repeats the previous page"
+                    f"{label}: page at offset {offset} repeats an earlier page"
                 )
-            previous_page_sha = page_sha
+            seen_page_shas.add(page_sha)
 
             records_out.extend(records)
             offset += len(records)
@@ -671,13 +691,14 @@ class FINRAATSPuller(BasePuller):
         )
 
         total = _record_total(resp.headers)
+        total_header = _record_total_header(resp.headers)
 
         # 204 = No Content (valid response, just no data for this range)
         if resp.status_code == 204:
-            return _ATSPage([], total)
+            return _ATSPage([], total, total_header)
 
         resp.raise_for_status()
-        return _ATSPage(resp.json(), total)
+        return _ATSPage(resp.json(), total, total_header)
 
     @staticmethod
     def _short_interest_segments(
@@ -790,7 +811,7 @@ class FINRAATSPuller(BasePuller):
         Returns:
             dict with status, rows_inserted, per_feature counts, and the
             coverage evidence ``records_fetched`` / ``record_total`` (sum of
-            the segments' totals).
+            the segments' totals; None if any empty segment had no total).
         """
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
@@ -807,7 +828,7 @@ class FINRAATSPuller(BasePuller):
         fetch_end = date.today()
         segments = self._short_interest_segments(start_date, fetch_end)
         all_records: list[dict[str, Any]] = []
-        record_total = 0
+        segment_totals: list[int | None] = []
 
         try:
             for index, (seg_start, seg_end) in enumerate(segments):
@@ -821,7 +842,7 @@ class FINRAATSPuller(BasePuller):
                     end_date=seg_end,
                 )
                 all_records.extend(records)
-                record_total += seg_total or 0
+                segment_totals.append(seg_total)
 
         except Exception as exc:
             log.error("FINRA short interest pull failed: {e}", e=str(exc))
@@ -831,6 +852,11 @@ class FINRAATSPuller(BasePuller):
                 "error": str(exc),
             }
 
+        # Sum of the segments' totals; None (unknown) if any empty segment
+        # was reported without a Record-Total header.
+        record_total = (
+            None if any(t is None for t in segment_totals) else sum(segment_totals)
+        )
         coverage = {"records_fetched": len(all_records), "record_total": record_total}
 
         if not all_records:

@@ -788,3 +788,111 @@ def test_short_interest_page_budget_is_bounded(monkeypatch):
     assert "page budget" in result["error"]
     assert inserted == []
 
+
+
+# ── Independent-review revision (F1/F2/F3, review 5f6d03cc on dc4594b2) ──
+#
+# F1: a page that repeats ANY earlier page (A, B, A), not only the previous
+#     one, fails before anything is stored.
+# F2: an empty first response with a present but malformed Record-Total fails;
+#     only an absent header (or an explicit 0) is an allowed empty result.
+# F3: an explicit Record-Total of 0 is reported as 0, absence as None.
+
+_A = _rec("SPY", "2026-09-28", "ATS_W_SMBL", 100)
+_B = _rec("QQQ", "2026-10-05", "ATS_W_SMBL", 200)
+_C = _rec("DIA", "2026-10-12", "ATS_W_SMBL", 300)
+
+
+class _ScriptedServer:
+    """Serves a fixed list of (status, body, Record-Total header) responses."""
+
+    def __init__(self, responses):
+        self.responses = responses
+        self.offsets: list[int] = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        self.offsets.append(json["offset"])
+        assert len(self.offsets) <= len(self.responses), "unexpected extra page request"
+        status, body, total = self.responses[len(self.offsets) - 1]
+        return _Resp(status, body, {} if total is None else {"Record-Total": total})
+
+
+def _pull_ats_scripted(responses):
+    server = _ScriptedServer(responses)
+    return (*_pull_with(server), server)
+
+
+def _pull_si_scripted(responses):
+    server = _ScriptedServer(responses)
+    return (*_pull_si_with(server), server)
+
+
+def test_f1_ats_nonconsecutive_repeated_page_fails_before_store():
+    result, inserted, server = _pull_ats_scripted(
+        [(200, [_A], "3"), (200, [_B], "3"), (200, [_A], "3")])
+    assert server.offsets == [0, 1, 2]
+    assert result["status"] == "FAILED"
+    assert "repeats" in result["error"]
+    assert inserted == []
+
+
+def test_f1_ats_distinct_single_row_pages_still_complete():
+    result, inserted, server = _pull_ats_scripted(
+        [(200, [_A], "3"), (200, [_B], "3"), (200, [_C], "3")])
+    assert server.offsets == [0, 1, 2]
+    assert result["status"] == "SUCCESS"
+    assert result["records_fetched"] == result["record_total"] == 3
+    assert len(inserted) == 3
+
+
+@pytest.mark.parametrize("status, body", [(200, []), (204, None)], ids=["200-empty", "204"])
+def test_f2_ats_empty_first_page_with_malformed_total_fails(status, body):
+    result, inserted, _server = _pull_ats_scripted([(status, body, "6k")])
+    assert result["status"] == "FAILED"
+    assert "malformed" in result["error"]
+    assert inserted == []
+
+
+def test_f2_ats_empty_204_without_total_is_still_empty_success():
+    result, inserted, server = _pull_ats_scripted([(204, None, None)])
+    assert server.offsets == [0]
+    assert result["status"] == "SUCCESS"
+    assert result["record_total"] is None
+    assert inserted == []
+
+
+def test_f3_ats_explicit_zero_total_is_retained():
+    result, inserted, _server = _pull_ats_scripted([(204, None, "0")])
+    assert result["status"] == "SUCCESS"
+    assert result["record_total"] == 0
+    assert inserted == []
+
+
+def _si(symbol: str, days_ago: int) -> dict:
+    return _si_rec(symbol, (date.today() - timedelta(days=days_ago)).isoformat(), 10.0)
+
+
+def test_f1_short_interest_nonconsecutive_repeated_page_fails_before_store():
+    a, b = _si("SPY", 40), _si("QQQ", 20)
+    result, inserted, server = _pull_si_scripted(
+        [(200, [a], "3"), (200, [b], "3"), (200, [a], "3")])
+    assert server.offsets == [0, 1, 2]
+    assert result["status"] == "FAILED"
+    assert "repeats" in result["error"]
+    assert inserted == []
+
+
+@pytest.mark.parametrize("status, body", [(200, []), (204, None)], ids=["200-empty", "204"])
+def test_f2_short_interest_empty_segment_with_malformed_total_fails(status, body):
+    result, inserted, _server = _pull_si_scripted([(status, body, "6k")])
+    assert result["status"] == "FAILED"
+    assert "malformed" in result["error"]
+    assert inserted == []
+
+
+@pytest.mark.parametrize("total, expected", [("0", 0), (None, None)], ids=["zero", "absent"])
+def test_f3_short_interest_empty_segment_total_is_reported_exactly(total, expected):
+    result, inserted, _server = _pull_si_scripted([(204, None, total)])
+    assert result["status"] == "SUCCESS"
+    assert result["record_total"] == expected
+    assert inserted == []
