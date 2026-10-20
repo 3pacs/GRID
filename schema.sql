@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS source_catalog (
     name              TEXT NOT NULL UNIQUE,
     base_url          TEXT NOT NULL,
     cost_tier         TEXT NOT NULL CHECK (cost_tier IN ('FREE', 'LOW', 'PAID')),
-    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'EOD', 'WEEKLY', 'MONTHLY')),
+    -- Seven values mirror the live griddb source_catalog_latency_class_check
+    -- (widened out-of-band before 2026-10-20; re-read 2026-10-20). Readers:
+    -- alerts/cadence.py _METADATA_CADENCE; pinned by tests/test_schema_latency_class_constraint.py.
+    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'INTRADAY', 'EOD', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'ANNUAL')),
     pit_available     BOOLEAN NOT NULL DEFAULT FALSE,
     revision_behavior TEXT NOT NULL CHECK (revision_behavior IN ('NEVER', 'RARE', 'FREQUENT')),
     trust_score       TEXT NOT NULL CHECK (trust_score IN ('HIGH', 'MED', 'LOW')),
