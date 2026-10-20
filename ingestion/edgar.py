@@ -9,6 +9,7 @@ Stores results in ``raw_series`` with source 'SEC_EDGAR'.
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -106,10 +107,16 @@ class EDGARPuller(BasePuller):
 
         for cik in cik_list:
             try:
-                filings = get_filings(
-                    form="13F-HR",
-                    cik=cik,
-                )
+                # Per-entity lookup via the submissions API, exactly like the
+                # Form 4 path below. edgartools' module-level ``get_filings``
+                # is the quarterly full-index downloader and has never taken a
+                # ``cik`` kwarg (signature: year/quarter/form/amendments/
+                # filing_date/index/priority_sorted_forms), so the original
+                # ``get_filings(form="13F-HR", cik=cik)`` raised TypeError for
+                # every filer -- grid-hermes 2026-10-20 04:20:55Z: "13F pull
+                # failed for CIK 0001067983: get_filings() got an unexpected
+                # keyword argument 'cik'" x75, 0 rows.
+                filings = Company(cik).get_filings(form="13F-HR")
                 if filings is None:
                     continue
 
@@ -338,14 +345,40 @@ class EDGARPuller(BasePuller):
     # 8-K Filing Counts by Sector
     # ------------------------------------------------------------------
 
-    # Process-scoped breaker for the daily 8-K full-index endpoint. Once
-    # SEC's WAF starts returning 403 for our identity (typically because
-    # the daily index isn't yet generated for the current quarter), every
-    # subsequent call within the cycle hits the same wall. Tripping this
-    # once spares us 2 ERROR rows/day until the index appears.
+    # Process-scoped breaker for the daily 8-K full-index endpoint. SEC
+    # answers 403 (not 404) for a full-index path that does not exist yet,
+    # which happens for the first day or two of a new calendar quarter
+    # before ``full-index/<year>/QTR<n>/`` is generated. That case is "no
+    # data yet", so trip the breaker once and stay quiet until the index
+    # appears. A 403 on a *past* quarter's index -- whose files certainly
+    # exist -- or on any other endpoint is an access denial and must stay a
+    # visible failure (grid-hermes 2026-10-20 04:21:55Z returned 403 for
+    # .../full-index/2026/QTR1/form.gz in October and was mislabelled
+    # "index likely not yet generated for current quarter").
     _PULL_8K_BREAKER: bool = False
     _PULL_8K_BREAKER_TS: float = 0.0
     _PULL_8K_BREAKER_TTL_S: int = 6 * 3600  # 6 hours
+    _FULL_INDEX_QTR_RE = re.compile(r"/full-index/(\d{4})/QTR([1-4])/")
+
+    @classmethod
+    def _full_index_403_quarter(cls, err_str: str) -> tuple[int, int] | None:
+        """Return ``(year, quarter)`` named by a full-index URL in ``err_str``.
+
+        ``None`` when the message is not a full-index 403 or names no
+        parseable ``/full-index/<year>/QTR<n>/`` path.
+        """
+        if "403" not in err_str or "full-index" not in err_str:
+            return None
+        m = cls._FULL_INDEX_QTR_RE.search(err_str)
+        if m is None:
+            return None
+        return int(m.group(1)), int(m.group(2))
+
+    @staticmethod
+    def _current_year_quarter(today: date | None = None) -> tuple[int, int]:
+        """Calendar ``(year, quarter)`` for ``today`` (default ``date.today()``)."""
+        today = today or date.today()
+        return today.year, (today.month - 1) // 3 + 1
 
     def pull_8k_counts(
         self,
@@ -436,16 +469,23 @@ class EDGARPuller(BasePuller):
 
         except Exception as exc:
             err_str = str(exc)
-            # SEC full-index 403 (e.g. .../full-index/2026/QTR1/form.gz):
-            # quarter index isn't generated yet OR our UA was WAF-blocked.
-            # Trip the breaker, log ONE warning, retry after the cooldown.
-            if "403" in err_str and "full-index" in err_str:
+            # SEC full-index 403 on the CURRENT calendar quarter
+            # (e.g. .../full-index/2026/QTR4/form.gz on 2026-10-01): the
+            # quarter's index isn't generated yet. That is "no data yet",
+            # not a failure: trip the breaker, log ONE warning, retry after
+            # the cooldown. Any other 403 -- a past quarter's index (which
+            # exists) or a non-index endpoint -- is a real access denial and
+            # falls through to the error path below, unmasked.
+            idx_quarter = self._full_index_403_quarter(err_str)
+            if idx_quarter is not None and idx_quarter == self._current_year_quarter():
                 EDGARPuller._PULL_8K_BREAKER = True
                 EDGARPuller._PULL_8K_BREAKER_TS = _t.time()
                 log.warning(
-                    "EDGAR full-index returned 403 — index likely not yet "
-                    "generated for current quarter. Skipping 8-K count "
+                    "EDGAR full-index returned 403 for the current quarter "
+                    "{y}Q{q} — index not yet generated. Skipping 8-K count "
                     "pull for {h}h. Endpoint: {e}",
+                    y=idx_quarter[0],
+                    q=idx_quarter[1],
                     h=EDGARPuller._PULL_8K_BREAKER_TTL_S // 3600,
                     e=err_str[:200],
                 )
@@ -455,7 +495,14 @@ class EDGARPuller(BasePuller):
                     "errors": [err_str],
                     "status": "SKIPPED",
                 }
-            msg = f"8-K count pull failed: {exc}"
+            if idx_quarter is not None:
+                msg = (
+                    f"8-K count pull failed: EDGAR full-index returned 403 for "
+                    f"past quarter {idx_quarter[0]}Q{idx_quarter[1]} (index exists; "
+                    f"access denied, not a missing index): {exc}"
+                )
+            else:
+                msg = f"8-K count pull failed: {exc}"
             log.error(msg)
             errors.append(msg)
 
