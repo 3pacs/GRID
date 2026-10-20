@@ -3853,13 +3853,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
             else:
                 log.info("[DRY RUN] Would run 100x digest")
     except Exception as exc:
-        # Name the innermost frame so the journal line is diagnosable on its
-        # own (2026-10-20 04:28:43Z carried only the TypeError text).
-        tb = exc.__traceback__
-        while tb is not None and tb.tb_next is not None:
-            tb = tb.tb_next
-        site = f"{tb.tb_frame.f_code.co_filename.rsplit('/', 1)[-1]}:{tb.tb_lineno}" if tb else "?"
-        log.warning("100x digest failed at {site}: {e}", site=site, e=str(exc))
+        log.warning("100x digest failed: {e}", e=str(exc))
 
     # 7c-ii. Solana top-volume universe snapshot (every 4 hours)
     try:
