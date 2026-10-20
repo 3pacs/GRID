@@ -15,6 +15,7 @@ same helpers run against real tables in tests/test_flows_reader_fixes_pg.py.
 
 from __future__ import annotations
 
+import datetime as _datetime
 import os
 import sys
 import types
@@ -29,8 +30,35 @@ os.environ.setdefault("DB_PASSWORD", "testpass")
 from api.routers import flows  # noqa: E402
 from store.materialization_provenance import WEEKLY_STALE_AFTER_DAYS  # noqa: E402
 
+# Import-time default only. Every test re-reads the calendar in `_clock` below:
+# a run whose date changes between collection and this file (the pattern behind
+# the 2026-10-20 CI failure in tests/test_flows_provenance_pg.py) must not build
+# rows from a stale TODAY while get_sector_detail reads a newer date.today().
 TODAY = date.today()
 TICKERS = ["AAPL", "AMD", "AMZN", "GOOGL", "META", "MSFT", "NVDA", "PLTR", "TSLA"]
+
+
+@pytest.fixture(autouse=True)
+def _clock(monkeypatch):
+    """One calendar day per test, shared by the fixture rows and the code under test.
+
+    get_sector_detail does ``from datetime import date`` inside the function and
+    calls ``date.today()`` at call time (no ``today=`` seam, and no ``flows.date``
+    attribute to patch), so the seam it reads is the ``datetime`` module's ``date``
+    attribute. Pin that to a subclass whose today() is this test's day; the
+    boundary test (exactly WEEKLY_STALE_AFTER_DAYS old) would otherwise flip
+    across a date change.
+    """
+    today = date.today()
+    monkeypatch.setattr(sys.modules[__name__], "TODAY", today)
+
+    class _FixedDate(date):
+        @classmethod
+        def today(cls):
+            return today
+
+    monkeypatch.setattr(_datetime, "date", _FixedDate)
+    return today
 
 
 class _Engine:
