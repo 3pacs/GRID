@@ -8,7 +8,7 @@ import json
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -20,6 +20,17 @@ from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
+
+
+def _today() -> date:
+    """Host-local calendar day the flows reads use (``date.today()``, unchanged).
+
+    One module-level seam: tests pin a day with
+    ``monkeypatch.setattr(flows, "_today", lambda: day)`` instead of swapping
+    ``datetime.date`` process-wide (review 2026-10-20, Judgement 4).
+    """
+    return date.today()
+
 
 # Tables each provenance-carrying endpoint actually reads (see
 # docs/flows_provenance_contract.md). Provenance describes materialization
@@ -114,7 +125,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
     val_map: dict[str, float] = {}
     try:
         from api.dependencies import get_pit_store
-        from datetime import date, timedelta
+        from datetime import timedelta
 
         pit = get_pit_store()
 
@@ -128,7 +139,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
         feature_ids = [name_to_id[n] for n in needed_features if n in name_to_id]
 
         if feature_ids:
-            today = date.today()
+            today = _today()
             hist = pit.get_feature_matrix(
                 feature_ids=feature_ids,
                 start_date=today - timedelta(days=504),
@@ -184,8 +195,8 @@ def _compute_sectors_payload() -> dict[str, Any]:
     price_map: dict[str, float] = {}
     change_30d_map: dict[str, float] = {}
     try:
-        from datetime import date, timedelta
-        today = date.today()
+        from datetime import timedelta
+        today = _today()
         d30 = today - timedelta(days=30)
         # Bound the "latest price" scan too — without this, DISTINCT ON
         # over series_id IN (...) has to sort the *entire* history of every
@@ -599,7 +610,7 @@ def get_sector_detail(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return detailed subsector breakdown with per-actor price data and options."""
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     from analysis.sector_map import SECTOR_MAP
 
@@ -609,7 +620,7 @@ def get_sector_detail(
         raise HTTPException(status_code=404, detail=f"Sector '{sector_name}' not found")
 
     engine = get_db_engine()
-    today = date.today()
+    today = _today()
     lookback_30 = today - timedelta(days=30)
     lookback_504 = today - timedelta(days=504)
 
@@ -1240,14 +1251,14 @@ def _build_sector_connections(
     All DB queries are parameterized, wrapped in try/except, and
     gracefully degrade if tables are missing.
     """
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     cache_key = f"{sector_name}"
     cached = _sector_connections_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    today = date.today()
+    today = _today()
 
     ticker_set = set(sector_tickers)
 
@@ -1708,7 +1719,7 @@ def get_sankey_data(
     from analysis.sector_map import SECTOR_MAP
 
     engine = get_db_engine()
-    today = date.fromisoformat(as_of) if as_of else date.today()
+    today = date.fromisoformat(as_of) if as_of else _today()
 
     # Build nodes and links from sector map + live data
     nodes = []
@@ -2796,13 +2807,12 @@ async def get_cds_history(
 ) -> dict:
     """Historical spread data for a CDS proxy series."""
     from intelligence.cds_tracker import CDS_SERIES, _get_spread_history
-    from datetime import date
 
     if series_key not in CDS_SERIES:
         return {"error": f"Unknown series: {series_key}", "available": list(CDS_SERIES.keys())}
 
     cfg = CDS_SERIES[series_key]
-    history = _get_spread_history(get_db_engine(), cfg["id"], date.today(), lookback_days=days)
+    history = _get_spread_history(get_db_engine(), cfg["id"], _today(), lookback_days=days)
 
     return {
         "series_key": series_key,
