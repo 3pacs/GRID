@@ -18,9 +18,12 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock
 
+from ingestion.base import VALID_LATENCY_CLASSES  # noqa: F401 — single source of truth
+
 # Allowed values per schema.sql's source_catalog CHECK constraints.
+# latency_class is imported from ingestion.base (mirrors the LIVE griddb
+# constraint, which is wider than schema.sql:19 — see that comment).
 VALID_COST_TIERS = {"FREE", "LOW", "PAID"}
-VALID_LATENCY_CLASSES = {"REALTIME", "EOD", "WEEKLY", "MONTHLY"}
 VALID_REVISION_BEHAVIORS = {"NEVER", "RARE", "FREQUENT"}
 VALID_TRUST_SCORES = {"HIGH", "MED", "LOW"}
 
