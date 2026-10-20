@@ -25,6 +25,7 @@ from datetime import date, timedelta
 from itertools import pairwise
 from unittest.mock import MagicMock, patch
 
+import pytest
 import requests
 
 from ingestion.altdata import finra_ats
@@ -515,9 +516,11 @@ def test_fetch_short_interest_page_omits_domainfilters_without_tickers():
 
 def test_fetch_short_interest_page_handles_204_no_content():
     p = _puller()
-    resp = MagicMock(status_code=204)
+    resp = MagicMock(status_code=204, headers={})
     with patch("ingestion.altdata.finra_ats.requests.post", return_value=resp):
-        assert p._fetch_short_interest_page(tickers=["SPY"]) == []
+        page = p._fetch_short_interest_page(tickers=["SPY"])
+    assert page.records == []
+    assert page.total is None
     resp.raise_for_status.assert_not_called()
     resp.json.assert_not_called()
 
@@ -534,7 +537,7 @@ def test_fetch_short_interest_page_does_not_trigger_partition_sort_400():
                 f"400 Client Error: Bad Request for url: {url} :: {_SI_400_TEXT}"
             )
             return resp
-        resp = MagicMock(status_code=200)
+        resp = MagicMock(status_code=200, headers={"Record-Total": "1"})
         resp.json = lambda: [record]
         return resp
 
@@ -545,7 +548,8 @@ def test_fetch_short_interest_page_does_not_trigger_partition_sort_400():
             end_date=date(2026, 10, 20),
         )
 
-    assert page == [record]
+    assert page.records == [record]
+    assert page.total == 1
 
 
 # ── Short interest: window walk and storage ──
@@ -580,11 +584,12 @@ def test_pull_short_interest_walks_window_in_segments_and_stores():
 
     def fake_fetch(**kw):
         calls.append(kw)
-        return [
+        page = [
             _si_rec(sym, d, q)
             for sym, d, q in rows
             if kw["start_date"] <= date.fromisoformat(d) <= kw["end_date"]
         ]
+        return finra_ats._ATSPage(page, len(page))
 
     p._fetch_short_interest_page = fake_fetch
     with patch("ingestion.altdata.finra_ats.time.sleep") as slept:
@@ -620,8 +625,8 @@ def test_pull_short_interest_paginates_within_a_segment():
     def fake_fetch(**kw):
         calls.append(kw)
         if kw["offset"] == 0:
-            return [_si_rec("SPY", d1, 10.0), _si_rec("QQQ", d1, 5.0)]
-        return [_si_rec("SPY", d2, 7.0)]
+            return finra_ats._ATSPage([_si_rec("SPY", d1, 10.0), _si_rec("QQQ", d1, 5.0)], 3)
+        return finra_ats._ATSPage([_si_rec("SPY", d2, 7.0)], 3)
 
     p._fetch_short_interest_page = fake_fetch
     with patch.object(finra_ats, "_PAGE_SIZE", 2), \
@@ -702,3 +707,84 @@ def test_pull_all_tags_sub_pulls_and_scheduler_classifies_per_item():
     with patch("ingestion.altdata.finra_ats.time.sleep"):
         both_ok = p.pull_all()
     assert _classify_outcome(both_ok)[:2] == (OUTCOME_SUCCESS, 62)
+
+
+# ── Short interest: Record-Total pagination (same rule as pull_ats_volume) ──
+
+def _si_settlement_records(dates: int, per_date: int = 100) -> list[dict]:
+    """``dates`` settlement dates (within the last year) x ``per_date`` symbols."""
+    first = date.today() - timedelta(days=300)
+    return [
+        _si_rec(f"S{t:03d}", (first + timedelta(days=4 * d)).isoformat(), 1.0)
+        for d in range(dates)
+        for t in range(per_date)
+    ]
+
+
+def _pull_si_with(server: _FinraServer):
+    p = _puller()
+    inserted = _wire_db(p)
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=server.post), \
+            patch("ingestion.altdata.finra_ats.time.sleep"):
+        # One settlementDate segment: start inside the last _SI_RANGE_DAYS.
+        result = p.pull_short_interest(start_date=date.today() - timedelta(days=330),
+                                       tickers=["SPY"])
+    return result, inserted
+
+
+def test_short_interest_capped_short_page_continues_to_record_total():
+    server = _FinraServer(_si_settlement_records(60), cap=3000)  # 6000 rows, limit 5000
+    result, inserted = _pull_si_with(server)
+    assert server.offsets == [0, 3000]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 60  # one short_interest_total row per date
+    assert result.get("records_fetched") == 6000
+    assert result.get("record_total") == 6000
+    assert len(inserted) == 60
+
+
+def test_short_interest_partial_final_page_under_cap():
+    server = _FinraServer(_si_settlement_records(70), cap=3000)
+    result, _ = _pull_si_with(server)
+    assert server.offsets == [0, 3000, 6000]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 70
+
+
+def test_short_interest_empty_segment_is_success_with_no_rows():
+    server = _FinraServer([], cap=5000, totals=lambda call: None)
+    result, inserted = _pull_si_with(server)
+    assert server.offsets == [0]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 0
+    assert inserted == []
+
+
+@pytest.mark.parametrize("server_kwargs, fragment", [
+    ({"totals": lambda call: None}, "Record-Total"),
+    ({"totals": lambda call: "6k"}, "Record-Total"),
+    ({"totals": lambda call: "6000" if call == 0 else "6500"}, "changed"),
+    ({"totals": lambda call: "2000"}, "exceed"),
+    ({"empty_at": 3000, "empty_status": 204}, "empty page"),
+    ({"empty_at": 3000, "empty_status": 200}, "empty page"),
+    ({"ignore_offset": True}, "repeats"),
+], ids=["missing-total", "malformed-total", "changing-total", "total-below-rows",
+        "premature-204", "no-progress-200", "repeated-page"])
+def test_short_interest_unproven_coverage_fails_and_stores_nothing(server_kwargs, fragment):
+    server = _FinraServer(_si_settlement_records(60), cap=3000, **server_kwargs)
+    result, inserted = _pull_si_with(server)
+    assert result["status"] == "FAILED"
+    assert fragment in result["error"]
+    assert "consolidatedShortInterest" in result["error"]
+    assert inserted == []
+
+
+def test_short_interest_page_budget_is_bounded(monkeypatch):
+    monkeypatch.setattr(finra_ats, "_MAX_ATS_PAGES", 2, raising=False)
+    server = _FinraServer(_si_settlement_records(60), cap=1000)
+    result, inserted = _pull_si_with(server)
+    assert len(server.offsets) <= 2
+    assert result["status"] == "FAILED"
+    assert "page budget" in result["error"]
+    assert inserted == []
+

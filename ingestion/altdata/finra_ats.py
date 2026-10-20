@@ -94,10 +94,11 @@ _PAGE_SIZE: int = 5000
 # weeklySummaryHistoric), so the ATS fetch window never reaches further back.
 _ATS_WINDOW_DAYS: int = 365
 
-# Upper bound on weeklySummary pages per pull. FINRA's synchronous API can
-# return fewer rows than ``limit`` (response-size cap) while more remain, so
-# pages are counted rather than assumed full. FINRA caps ``offset`` at 500,000,
-# i.e. 100 full pages of 5000; a 7-ticker, 12-month pull is ~20k rows.
+# Upper bound on pages per paginated query (one ATS pull, or one short-interest
+# settlementDate segment). FINRA's synchronous API can return fewer rows than
+# ``limit`` (response-size cap) while more remain, so pages are counted rather
+# than assumed full. FINRA caps ``offset`` at 500,000, i.e. 100 full pages of
+# 5000; a 7-ticker, 12-month weeklySummary pull is ~20k rows.
 _MAX_ATS_PAGES: int = 100
 
 # Response header carrying the total number of matching records.
@@ -105,7 +106,7 @@ _RECORD_TOTAL_HEADER: str = "Record-Total"
 
 
 class _ATSPage(NamedTuple):
-    """One weeklySummary page plus the server's total match count.
+    """One FINRA Query API page plus the server's total match count.
 
     ``total`` is the validated ``Record-Total`` header, or None when the
     header is missing or not a non-negative integer.
@@ -116,7 +117,7 @@ class _ATSPage(NamedTuple):
 
 
 class _ATSPaginationError(RuntimeError):
-    """Coverage of a paginated weeklySummary pull could not be proven."""
+    """Coverage of a paginated FINRA query could not be proven."""
 
 
 def _record_total(headers: Any) -> int | None:
@@ -286,6 +287,107 @@ class FINRAATSPuller(BasePuller):
         resp.raise_for_status()
         return _ATSPage(resp.json(), total)
 
+    def _paginate(
+        self,
+        fetch: Any,
+        label: str,
+        **query: Any,
+    ) -> tuple[list[dict[str, Any]], int | None]:
+        """Fetch every page of one FINRA query, proving coverage.
+
+        ``fetch`` is a page fetcher returning ``_ATSPage`` (records plus the
+        validated ``Record-Total`` header); ``query`` is passed through
+        unchanged with ``offset``/``limit`` added. A short page is not the
+        last page: the offset advances by the rows actually returned and the
+        query is complete only when it reaches ``Record-Total``. Raises
+        ``_ATSPaginationError`` for a non-list body, a non-empty page without
+        a valid total, a total that changes between pages, rows past the
+        total, an empty page before the total, a page identical to the
+        previous one, or more than ``_MAX_ATS_PAGES`` pages. An empty first
+        page with no or zero total is an empty result. Sleeps
+        ``_RATE_LIMIT_DELAY`` between pages, never before the first.
+
+        Parameters:
+            fetch: Page fetcher (``_fetch_ats_page`` /
+                ``_fetch_short_interest_page``).
+            label: Dataset name for error messages and logs.
+            **query: Fetcher keyword arguments other than offset/limit.
+
+        Returns:
+            (records, record_total); record_total is None for an empty
+            result reported without a total.
+        """
+        records_out: list[dict[str, Any]] = []
+        offset = 0
+        record_total: int | None = None
+        previous_page_sha: str | None = None
+
+        for page_no in range(_MAX_ATS_PAGES):
+            if page_no:
+                time.sleep(_RATE_LIMIT_DELAY)
+            page = fetch(offset=offset, limit=_PAGE_SIZE, **query)
+            records = page.records
+
+            if not isinstance(records, list):
+                raise _ATSPaginationError(
+                    f"{label} body at offset {offset} is not a JSON list"
+                )
+
+            if not records:
+                if offset == 0 and page.total in (None, 0):
+                    return records_out, page.total  # empty result
+                raise _ATSPaginationError(
+                    f"{label}: empty page at offset {offset} before "
+                    f"{_RECORD_TOTAL_HEADER} "
+                    f"{record_total if record_total is not None else page.total}"
+                )
+
+            if page.total is None:
+                raise _ATSPaginationError(
+                    f"{label}: missing or malformed {_RECORD_TOTAL_HEADER} header "
+                    f"at offset {offset}; coverage of a {len(records)}-row page "
+                    f"cannot be proven"
+                )
+            if record_total is None:
+                record_total = page.total
+            elif page.total != record_total:
+                raise _ATSPaginationError(
+                    f"{label}: {_RECORD_TOTAL_HEADER} changed from {record_total} "
+                    f"to {page.total} at offset {offset}"
+                )
+            if offset + len(records) > record_total:
+                raise _ATSPaginationError(
+                    f"{label}: {offset + len(records)} rows exceed "
+                    f"{_RECORD_TOTAL_HEADER} {record_total}"
+                )
+
+            page_sha = hashlib.sha256(
+                json.dumps(records, sort_keys=True, default=str).encode()
+            ).hexdigest()
+            if page_sha == previous_page_sha:
+                raise _ATSPaginationError(
+                    f"{label}: page at offset {offset} repeats the previous page"
+                )
+            previous_page_sha = page_sha
+
+            records_out.extend(records)
+            offset += len(records)
+            log.debug(
+                "FINRA {l}: fetched {n} records, {o} of {t}",
+                l=label,
+                n=len(records),
+                o=offset,
+                t=record_total,
+            )
+
+            if offset == record_total:
+                return records_out, record_total
+
+        raise _ATSPaginationError(
+            f"{label}: page budget of {_MAX_ATS_PAGES} pages exhausted at "
+            f"offset {offset} of {record_total}"
+        )
+
     def _parse_ats_records(
         self,
         records: list[dict[str, Any]],
@@ -372,83 +474,14 @@ class FINRAATSPuller(BasePuller):
         fetch_start = max(start_date, fetch_end - timedelta(days=_ATS_WINDOW_DAYS))
 
         # Fetch all pages; see the docstring for the completion rule.
-        all_records: list[dict[str, Any]] = []
-        offset = 0
-        record_total: int | None = None
-        previous_page_sha: str | None = None
-
         try:
-            for _ in range(_MAX_ATS_PAGES):
-                page = self._fetch_ats_page(
-                    offset=offset,
-                    limit=_PAGE_SIZE,
-                    tickers=tickers,
-                    start_date=fetch_start,
-                    end_date=fetch_end,
-                )
-                records = page.records
-
-                if not isinstance(records, list):
-                    raise _ATSPaginationError(
-                        f"weeklySummary body at offset {offset} is not a JSON list"
-                    )
-
-                if not records:
-                    if offset == 0 and page.total in (None, 0):
-                        break  # empty result for this window
-                    raise _ATSPaginationError(
-                        f"empty page at offset {offset} before "
-                        f"{_RECORD_TOTAL_HEADER} "
-                        f"{record_total if record_total is not None else page.total}"
-                    )
-
-                if page.total is None:
-                    raise _ATSPaginationError(
-                        f"missing or malformed {_RECORD_TOTAL_HEADER} header at "
-                        f"offset {offset}; coverage of a {len(records)}-row page "
-                        f"cannot be proven"
-                    )
-                if record_total is None:
-                    record_total = page.total
-                elif page.total != record_total:
-                    raise _ATSPaginationError(
-                        f"{_RECORD_TOTAL_HEADER} changed from {record_total} to "
-                        f"{page.total} at offset {offset}"
-                    )
-                if offset + len(records) > record_total:
-                    raise _ATSPaginationError(
-                        f"{offset + len(records)} rows exceed "
-                        f"{_RECORD_TOTAL_HEADER} {record_total}"
-                    )
-
-                page_sha = hashlib.sha256(
-                    json.dumps(records, sort_keys=True, default=str).encode()
-                ).hexdigest()
-                if page_sha == previous_page_sha:
-                    raise _ATSPaginationError(
-                        f"page at offset {offset} repeats the previous page"
-                    )
-                previous_page_sha = page_sha
-
-                all_records.extend(records)
-                offset += len(records)
-                log.debug(
-                    "FINRA ATS: fetched {n} records, {o} of {t}",
-                    n=len(records),
-                    o=offset,
-                    t=record_total,
-                )
-
-                if offset == record_total:
-                    break
-
-                time.sleep(_RATE_LIMIT_DELAY)
-            else:
-                raise _ATSPaginationError(
-                    f"page budget of {_MAX_ATS_PAGES} pages exhausted at "
-                    f"offset {offset} of {record_total}"
-                )
-
+            all_records, record_total = self._paginate(
+                self._fetch_ats_page,
+                "weeklySummary",
+                tickers=tickers,
+                start_date=fetch_start,
+                end_date=fetch_end,
+            )
         except Exception as exc:
             log.error("FINRA ATS volume pull failed: {e}", e=str(exc))
             return {
@@ -573,7 +606,7 @@ class FINRAATSPuller(BasePuller):
         tickers: list[str] | None = None,
         start_date: date | None = None,
         end_date: date | None = None,
-    ) -> list[dict[str, Any]]:
+    ) -> _ATSPage:
         """Fetch a page of consolidated short interest data from FINRA.
 
         settlementDate is the dataset's partition key, so ``sortFields``
@@ -593,7 +626,8 @@ class FINRAATSPuller(BasePuller):
                 Defaults to today.
 
         Returns:
-            List of record dicts from FINRA API (empty on HTTP 204).
+            ``_ATSPage``: the page's records (empty on HTTP 204) and the
+            validated ``Record-Total`` header (None if missing/malformed).
 
         Raises:
             requests.RequestException: On HTTP errors after retries.
@@ -636,12 +670,14 @@ class FINRAATSPuller(BasePuller):
             timeout=_REQUEST_TIMEOUT,
         )
 
+        total = _record_total(resp.headers)
+
         # 204 = No Content (valid response, just no data for this range)
         if resp.status_code == 204:
-            return []
+            return _ATSPage([], total)
 
         resp.raise_for_status()
-        return resp.json()
+        return _ATSPage(resp.json(), total)
 
     @staticmethod
     def _short_interest_segments(
@@ -740,7 +776,11 @@ class FINRAATSPuller(BasePuller):
     ) -> dict[str, Any]:
         """Pull consolidated short interest and store short_interest_total.
 
-        Uses _get_existing_dates() for efficient batch deduplication.
+        Uses _get_existing_dates() for efficient batch deduplication. Each
+        settlementDate segment is paginated with :meth:`_paginate` (same
+        ``Record-Total`` completion rule as :meth:`pull_ats_volume`); any
+        segment whose coverage cannot be proven fails the whole pull and
+        nothing is stored.
 
         Parameters:
             start_date: Earliest observation date to store.
@@ -748,7 +788,9 @@ class FINRAATSPuller(BasePuller):
             tickers: Ticker symbols to track (default: TRACKED_TICKERS).
 
         Returns:
-            dict with status, rows_inserted, per_feature counts.
+            dict with status, rows_inserted, per_feature counts, and the
+            coverage evidence ``records_fetched`` / ``record_total`` (sum of
+            the segments' totals).
         """
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
@@ -760,49 +802,26 @@ class FINRAATSPuller(BasePuller):
         if tickers is None:
             tickers = TRACKED_TICKERS
 
-        # Walk the window in bounded settlementDate ranges, paginating each.
-        # The per-segment page loop below deliberately mirrors
-        # pull_ats_volume's (stop when a page is shorter than _PAGE_SIZE,
-        # record-total header unread). That short-page assumption is a known
-        # defect owned by the PR #862 pagination fix (FIX-CONTRACT
-        # 2026-10-20); this method inherits it on purpose and is rebased onto
-        # that fix rather than duplicating it here.
+        # Walk the window in bounded settlementDate ranges; each range is
+        # paginated to its Record-Total (see _paginate).
         fetch_end = date.today()
         segments = self._short_interest_segments(start_date, fetch_end)
         all_records: list[dict[str, Any]] = []
-        requests_made = 0
+        record_total = 0
 
         try:
-            for seg_start, seg_end in segments:
-                offset = 0
-                while True:
-                    if requests_made:
-                        time.sleep(_RATE_LIMIT_DELAY)
-                    page = self._fetch_short_interest_page(
-                        offset=offset,
-                        limit=_PAGE_SIZE,
-                        tickers=tickers,
-                        start_date=seg_start,
-                        end_date=seg_end,
-                    )
-                    requests_made += 1
-
-                    if not page:
-                        break
-
-                    all_records.extend(page)
-                    log.debug(
-                        "FINRA SI: {a}..{b} offset {o}: {n} records",
-                        a=seg_start,
-                        b=seg_end,
-                        o=offset,
-                        n=len(page),
-                    )
-
-                    if len(page) < _PAGE_SIZE:
-                        break
-
-                    offset += _PAGE_SIZE
+            for index, (seg_start, seg_end) in enumerate(segments):
+                if index:
+                    time.sleep(_RATE_LIMIT_DELAY)
+                records, seg_total = self._paginate(
+                    self._fetch_short_interest_page,
+                    f"consolidatedShortInterest {seg_start}..{seg_end}",
+                    tickers=tickers,
+                    start_date=seg_start,
+                    end_date=seg_end,
+                )
+                all_records.extend(records)
+                record_total += seg_total or 0
 
         except Exception as exc:
             log.error("FINRA short interest pull failed: {e}", e=str(exc))
@@ -812,9 +831,11 @@ class FINRAATSPuller(BasePuller):
                 "error": str(exc),
             }
 
+        coverage = {"records_fetched": len(all_records), "record_total": record_total}
+
         if not all_records:
             log.warning("FINRA SI: no records returned from API")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         log.info(
             "FINRA SI: fetched {n} total records", n=len(all_records)
@@ -824,7 +845,7 @@ class FINRAATSPuller(BasePuller):
         by_date = self._parse_short_interest_records(all_records)
         if not by_date:
             log.warning("FINRA SI: no data parsed from records")
-            return {"status": "SUCCESS", "rows_inserted": 0}
+            return {"status": "SUCCESS", "rows_inserted": 0, **coverage}
 
         inserted = 0
         sid = self._series_id("short_interest_total")
@@ -860,6 +881,7 @@ class FINRAATSPuller(BasePuller):
             "status": "SUCCESS",
             "rows_inserted": inserted,
             "per_feature": {"short_interest_total": inserted},
+            **coverage,
         }
 
     # ------------------------------------------------------------------ #
