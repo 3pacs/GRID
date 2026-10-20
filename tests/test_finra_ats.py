@@ -102,10 +102,37 @@ def test_fetch_ats_page_defaults_to_rolling_window():
 
 def test_fetch_ats_page_handles_204_no_content():
     p = _puller()
-    resp = MagicMock(status_code=204)
+    resp = MagicMock(status_code=204, headers={})
     with patch("ingestion.altdata.finra_ats.requests.post", return_value=resp):
-        assert p._fetch_ats_page(tickers=["SPY"]) == []
+        page = p._fetch_ats_page(tickers=["SPY"])
+    assert page.records == []
+    assert page.total is None
     resp.raise_for_status.assert_not_called()
+
+
+def test_fetch_ats_page_returns_validated_record_total():
+    p = _puller()
+    for header, expected in (({"Record-Total": "20176"}, 20176),
+                             ({"record-total": " 7 "}, None),  # plain dict: exact name only
+                             ({"Record-Total": "6k"}, None),
+                             ({"Record-Total": "-1"}, None),
+                             ({}, None)):
+        resp = MagicMock(status_code=200, headers=header)
+        resp.json = list
+        with patch("ingestion.altdata.finra_ats.requests.post", return_value=resp):
+            page = p._fetch_ats_page(tickers=["SPY"])
+        assert page.records == []
+        assert page.total == expected, header
+
+
+def test_fetch_ats_page_reads_total_case_insensitively_from_requests_headers():
+    from requests.structures import CaseInsensitiveDict
+
+    p = _puller()
+    resp = MagicMock(status_code=200, headers=CaseInsensitiveDict({"record-total": "20176"}))
+    resp.json = list
+    with patch("ingestion.altdata.finra_ats.requests.post", return_value=resp):
+        assert p._fetch_ats_page(tickers=["SPY"]).total == 20176
 
 
 # ── Parsing ──
@@ -174,16 +201,16 @@ def test_pull_ats_volume_clamps_window_and_stores_volume_only():
 
     def fake_fetch(**kw):
         calls.append(kw)
-        return [
+        return finra_ats._ATSPage([
             _rec("SPY", "2026-09-28", "ATS_W_SMBL", 1000),
             _rec("SPY", "2026-10-05", "ATS_W_SMBL", 700),
             _rec("SPY", "2026-10-05", "OTC_W_SMBL", 5000),
-        ]
+        ], 3)
 
     p._fetch_ats_page = fake_fetch
     result = p.pull_ats_volume(start_date="2020-01-01", tickers=["SPY"])
 
-    assert len(calls) == 1  # short page -> no second request
+    assert len(calls) == 1  # Record-Total 3 reached -> no second request
     assert calls[0]["end_date"] == date.today()
     assert calls[0]["start_date"] == date.today() - timedelta(days=finra_ats._ATS_WINDOW_DAYS)
     assert calls[0]["tickers"] == ["SPY"]
@@ -211,3 +238,170 @@ def test_pull_ats_volume_reports_failed_on_http_error():
     assert result["status"] == "FAILED"
     assert result["rows_inserted"] == 0
     assert "400" in result["error"]
+
+
+# ── pull_ats_volume pagination (HTTP-level fake; no network, no DB) ──
+#
+# FINRA's synchronous Query API can return fewer rows than ``limit`` while
+# more remain (response-size cap), and reports the full match count in the
+# ``Record-Total`` response header. A short page is therefore not the last
+# page; only offset == Record-Total proves complete coverage.
+
+class _Resp:
+    def __init__(self, status_code: int, body: list | None, headers: dict):
+        self.status_code = status_code
+        self._body = body
+        self.headers = headers
+
+    def json(self):
+        return self._body
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise requests.HTTPError(f"{self.status_code} Client Error")
+
+
+class _FinraServer:
+    """Fake weeklySummary: serves records[offset:offset + min(limit, cap)]."""
+
+    def __init__(self, records, cap, *, totals=None, ignore_offset=False,
+                 empty_at=None, empty_status=204):
+        self.records = records
+        self.cap = cap
+        self.totals = totals  # callable(call_index) -> header value | None
+        self.ignore_offset = ignore_offset
+        self.empty_at = empty_at
+        self.empty_status = empty_status
+        self.offsets: list[int] = []
+
+    def post(self, url, json=None, headers=None, timeout=None):
+        offset, limit = json["offset"], json["limit"]
+        call = len(self.offsets)
+        self.offsets.append(offset)
+        total = self.totals(call) if self.totals else str(len(self.records))
+        hdrs = {} if total is None else {"Record-Total": total}
+        if offset == self.empty_at:
+            return _Resp(self.empty_status, [] if self.empty_status == 200 else None, hdrs)
+        start = 0 if self.ignore_offset else offset
+        page = self.records[start:start + min(limit, self.cap)]
+        if not page:
+            return _Resp(204, None, hdrs)
+        return _Resp(200, page, hdrs)
+
+
+def _weekly_records(weeks: int, per_week: int = 100) -> list[dict]:
+    """``weeks`` distinct weeks x ``per_week`` tickers, ordered by week."""
+    first = date(2025, 1, 6)
+    return [
+        _rec(f"T{t:03d}", (first + timedelta(weeks=w)).isoformat(), "ATS_W_SMBL", 1)
+        for w in range(weeks)
+        for t in range(per_week)
+    ]
+
+
+def _pull_with(server: _FinraServer):
+    p = _puller()
+    inserted = _wire_db(p)
+    with patch("ingestion.altdata.finra_ats.requests.post", side_effect=server.post), \
+            patch("ingestion.altdata.finra_ats.time.sleep"):
+        result = p.pull_ats_volume(start_date="2020-01-01", tickers=["SPY"])
+    return result, inserted
+
+
+def test_pagination_capped_short_page_continues_to_record_total():
+    server = _FinraServer(_weekly_records(60), cap=3000)  # 6000 rows, limit 5000
+    result, inserted = _pull_with(server)
+    assert server.offsets == [0, 3000]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 60  # one ats_total_volume row per week
+    assert result.get("records_fetched") == 6000
+    assert result.get("record_total") == 6000
+    assert len(inserted) == 60
+
+
+def test_pagination_exact_total_stops_without_extra_request():
+    server = _FinraServer(_weekly_records(100), cap=5000)  # 10000 rows
+    result, _ = _pull_with(server)
+    assert server.offsets == [0, 5000]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 100
+
+
+def test_pagination_partial_final_page_under_cap():
+    server = _FinraServer(_weekly_records(70), cap=3000)  # 3000 + 3000 + 1000
+    result, _ = _pull_with(server)
+    assert server.offsets == [0, 3000, 6000]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 70
+
+
+def test_pagination_204_on_empty_dataset_is_success_with_no_rows():
+    server = _FinraServer([], cap=5000, totals=lambda call: None)
+    result, inserted = _pull_with(server)
+    assert server.offsets == [0]
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 0
+    assert inserted == []
+
+
+def test_pagination_premature_204_fails_and_stores_nothing():
+    server = _FinraServer(_weekly_records(60), cap=3000, empty_at=3000, empty_status=204)
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert inserted == []
+
+
+def test_pagination_no_progress_empty_200_fails_and_stores_nothing():
+    server = _FinraServer(_weekly_records(60), cap=3000, empty_at=3000, empty_status=200)
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert inserted == []
+
+
+def test_pagination_missing_total_on_short_page_fails():
+    server = _FinraServer(_weekly_records(60), cap=3000, totals=lambda call: None)
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert "Record-Total" in result["error"]
+    assert inserted == []
+
+
+def test_pagination_malformed_total_fails():
+    server = _FinraServer(_weekly_records(60), cap=3000, totals=lambda call: "6k")
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert "Record-Total" in result["error"]
+    assert inserted == []
+
+
+def test_pagination_changing_total_fails():
+    server = _FinraServer(_weekly_records(60), cap=3000,
+                          totals=lambda call: "6000" if call == 0 else "6500")
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert inserted == []
+
+
+def test_pagination_total_below_rows_returned_fails():
+    server = _FinraServer(_weekly_records(60), cap=3000, totals=lambda call: "2000")
+    result, inserted = _pull_with(server)
+    assert result["status"] == "FAILED"
+    assert inserted == []
+
+
+def test_pagination_repeated_page_fails():
+    server = _FinraServer(_weekly_records(60), cap=3000, ignore_offset=True)
+    result, inserted = _pull_with(server)
+    assert server.offsets[:2] == [0, 3000]
+    assert result["status"] == "FAILED"
+    assert inserted == []
+
+
+def test_pagination_page_budget_is_bounded(monkeypatch):
+    monkeypatch.setattr(finra_ats, "_MAX_ATS_PAGES", 2, raising=False)
+    server = _FinraServer(_weekly_records(60), cap=1000)  # needs 6 pages
+    result, inserted = _pull_with(server)
+    assert len(server.offsets) <= 2
+    assert result["status"] == "FAILED"
+    assert "page budget" in result["error"]
+    assert inserted == []
