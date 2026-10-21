@@ -948,6 +948,7 @@ export default function Options({ selectedTicker = '' }) {
     }, [activeTab]);
 
     useEffect(() => {
+        if (typeof selectedTicker !== 'string') return;
         const nextTicker = selectedTicker.trim().toUpperCase();
         if (!nextTicker) return;
         setActiveTab('Dealer Flow');
