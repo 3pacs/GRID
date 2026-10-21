@@ -120,7 +120,7 @@ describe('Options route nullable selected ticker', () => {
         expect(screen.queryByText('options Error')).toBeNull();
         expect(screen.getByText('Gamma Watch · experimental public context')).toBeTruthy();
         expect(screen.getByText(/^SPY 600 ·/)).toBeTruthy();
-        expect(api.get).toHaveBeenCalledExactlyOnceWith('/api/v1/gamma-watch/state');
+        expect(api.get).toHaveBeenCalledExactlyOnceWith('/api/v1/gamma-watch/state', { signal: expect.any(AbortSignal) });
         assertNoDealerRequests();
     });
 });

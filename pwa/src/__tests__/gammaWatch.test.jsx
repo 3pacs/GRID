@@ -48,10 +48,12 @@ it('ages public source and bridge receipts out even while a subsequent request h
     expect(screen.queryByText(/^Delayed levels:.*flip 0/)).toBeNull();
     expect(screen.getByRole('status').textContent).toContain(`browser receipt ${received}`);
     await act(async () => { await vi.advanceTimersByTimeAsync(6000); });
-    expect(screen.getByRole('status').textContent).toContain('stale');
+    expect(screen.getByRole('status').textContent).toContain('Request timed out; collector status unknown');
+    expect(screen.queryByText(/^SPY 600 ·/)).toBeNull();
+    expect(screen.queryByText(/^Delayed levels:.*flip 0/)).toBeNull();
     expect(screen.queryByText('$TICK_PRIVATE')).toBeNull();
     expect(document.body.textContent).not.toContain('987654');
-    expect(api.get.mock.calls).toEqual([['/api/v1/gamma-watch/state'], ['/api/v1/gamma-watch/state']]);
+    expect(api.get.mock.calls).toEqual([['/api/v1/gamma-watch/state', { signal: expect.any(AbortSignal) }], ['/api/v1/gamma-watch/state', { signal: expect.any(AbortSignal) }]]);
 });
 
 it('clears old public data when the bridge fails', async () => {
@@ -68,8 +70,8 @@ it('clears old public data when the bridge fails', async () => {
     expect(screen.queryByRole('heading', { name: 'Gamma Watch · experimental public context' })).toBeNull();
     expect(screen.queryByText(/^SPY 600 ·/)).toBeNull();
     expect(screen.queryByText(/^Delayed levels:.*flip 0/)).toBeNull();
-    expect(screen.getByText('Collector unavailable; no cached substitute.')).toBeTruthy();
+    expect(screen.getByText('Request failed; collector status unknown. No cached substitute.')).toBeTruthy();
     expect(screen.queryByText('$TICK_PRIVATE')).toBeNull();
     expect(document.body.textContent).not.toContain('987654');
-    expect(api.get.mock.calls).toEqual([['/api/v1/gamma-watch/state'], ['/api/v1/gamma-watch/state']]);
+    expect(api.get.mock.calls).toEqual([['/api/v1/gamma-watch/state', { signal: expect.any(AbortSignal) }], ['/api/v1/gamma-watch/state', { signal: expect.any(AbortSignal) }]]);
 });

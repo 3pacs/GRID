@@ -105,8 +105,8 @@ class GRIDApi {
     }
 
     /** Public GET helper — delegates to _fetch. */
-    async get(path) {
-        return this._fetch(path);
+    async get(path, options) {
+        return this._fetch(path, options);
     }
 
     /** Public POST helper — delegates to _fetch. */
@@ -185,6 +185,9 @@ class GRIDApi {
     }
 
     async _fetch(path, options = {}) {
+        const gammaState = path === '/api/v1/gamma-watch/state';
+        const callerAborted = () => options.signal?.aborted;
+        const cancelled = () => ({ error: true, status: 0, code: 'request_aborted' });
         const {
             gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
             gridForce = false,
@@ -237,12 +240,18 @@ class GRIDApi {
                 return { error: true, status: 0, message: networkErr.message || 'Network error' };
             }
 
+            if (gammaState && callerAborted()) return cancelled();
+
             if (!response.ok) {
                 const body = await response.text().catch(() => '');
+                if (gammaState && callerAborted()) return cancelled();
                 let message = response.statusText;
+                let collectorUnavailable = false;
                 try {
                     const parsed = JSON.parse(body);
                     message = parsed.detail || parsed.message || message;
+                    collectorUnavailable = gammaState && response.status === 503
+                        && parsed.status === 'unavailable' && parsed.data === null;
                 } catch (_) {
                     if (body) message = body;
                 }
@@ -256,11 +265,13 @@ class GRIDApi {
                     window.location.hash = '#/login';
                 }
 
-                return { error: true, status: response.status, message };
+                return { error: true, status: response.status, message,
+                    ...(collectorUnavailable ? { code: 'collector_unavailable' } : {}) };
             }
 
             try {
                 const data = await response.json();
+                if (gammaState && callerAborted()) return cancelled();
                 if (method !== 'GET') {
                     this.clearCache();
                 } else if (cacheable && !timedOut && !data?.error) {
