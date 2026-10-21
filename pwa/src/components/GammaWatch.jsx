@@ -19,22 +19,57 @@ export default function GammaWatch() {
     useEffect(() => {
         let stopped = false;
         let timer;
+        let deadline;
+        let controller;
         const load = async () => {
+            let poll = true;
+            controller = new AbortController();
             try {
-                const result = await api.get('/api/v1/gamma-watch/state');
+                // Transport deadline only; source and display freshness gates below
+                // remain independent. Bound headers and body consumption together.
+                const result = await Promise.race([
+                    api.get('/api/v1/gamma-watch/state', { signal: controller.signal }),
+                    new Promise(resolve => {
+                        deadline = setTimeout(() => {
+                            resolve({ code: 'request_timeout' });
+                            controller.abort();
+                        }, 15000);
+                    }),
+                ]);
                 if (!stopped) {
+                    if (result?.code === 'request_timeout') {
+                        poll = false; setData(null);
+                        setError('Request timed out; collector status unknown. No cached substitute.');
+                        return;
+                    }
+                    if (result?.status === 'unavailable' || result?.code === 'collector_unavailable') {
+                        setData(null); setError('Collector unavailable; no cached substitute.');
+                        return;
+                    }
+                    if (result?.status !== 'available') {
+                        poll = false; setData(null);
+                        setError('Request failed; collector status unknown. No cached substitute.');
+                        return;
+                    }
                     const receivedAt = Date.now();
                     setNow(receivedAt);
                     setData(result.status === 'available' ? { envelope: result, receivedAt } : null);
                     setError(result.status === 'available' ? '' : 'Collector unavailable');
                 }
             } catch {
-                if (!stopped) { setData(null); setError('Collector unavailable; no cached substitute.'); }
-            } finally { if (!stopped) timer = setTimeout(load, 5000); }
+                poll = false;
+                if (!stopped) { setData(null); setError('Request failed; collector status unknown. No cached substitute.'); }
+            } finally {
+                clearTimeout(deadline);
+                if (!stopped && poll) timer = setTimeout(load, 5000);
+            }
         };
         load();
         const clock = setInterval(() => setNow(Date.now()), 1000);
-        return () => { stopped = true; clearTimeout(timer); clearInterval(clock); };
+        return () => {
+            stopped = true; controller?.abort();
+            clearTimeout(deadline); clearTimeout(timer); clearInterval(clock);
+        };
     }, []);
     if (!data) return <section style={box} role="status">{error || 'Connecting to Gamma Watch…'}</section>;
     const browserFresh = clockValid && now >= data.receivedAt && now - data.receivedAt <= 15000;

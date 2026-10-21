@@ -92,7 +92,7 @@ describe('Gamma Watch public schema and actual effect contract', () => {
         expect(container.textContent).toContain('Official published history · 1 sources');
         expect(container.textContent).toContain('60% equity: $0.01m');
         expect(container.textContent).toContain('Sector context · delayed-unqualified');
-        expect(api.get.mock.calls).toEqual([[statePath]]);
+        expect(api.get.mock.calls).toEqual([[statePath, { signal: expect.any(AbortSignal) }]]);
     });
 
     it('serializes one state-only request and starts the existing 5s delay after completion', async () => {
@@ -109,7 +109,7 @@ describe('Gamma Watch public schema and actual effect contract', () => {
         await advance(10000); // A pending request cannot overlap with another poll.
         expect(api.get).toHaveBeenCalledTimes(2);
         await settle(second, envelope(publicFrame(Date.now() / 1000)));
-        expect(api.get.mock.calls).toEqual([[statePath], [statePath]]);
+        expect(api.get.mock.calls).toEqual([[statePath, { signal: expect.any(AbortSignal) }], [statePath, { signal: expect.any(AbortSignal) }]]);
     });
 
     it('ignores a late response after unmount and leaves no refresh or display timer', async () => {
@@ -120,7 +120,7 @@ describe('Gamma Watch public schema and actual effect contract', () => {
         await advance(60000);
         expect(container.textContent).toBe('');
         expect(vi.getTimerCount()).toBe(0);
-        expect(api.get.mock.calls).toEqual([[statePath]]);
+        expect(api.get.mock.calls).toEqual([[statePath, { signal: expect.any(AbortSignal) }]]);
     });
 
     it('withholds a genuinely future server clock at the actual local response time', async () => {
@@ -179,7 +179,7 @@ describe('Gamma Watch public schema and actual effect contract', () => {
         expect(priceLine()).not.toBeNull();
         expect(container.textContent).not.toMatch(/PRIVATE_SENTINEL|998877|998878/);
         expect(screen.getByRole('heading', { name: 'Private capabilities' })).not.toBeNull();
-        expect(api.get.mock.calls).toEqual([[statePath]]);
+        expect(api.get.mock.calls).toEqual([[statePath, { signal: expect.any(AbortSignal) }]]);
     });
 
     it('clears cached display values on an actual mocked API rejection', async () => {
@@ -189,7 +189,7 @@ describe('Gamma Watch public schema and actual effect contract', () => {
         api.get.mockReturnValueOnce(next.promise);
         await advance(5000);
         await act(async () => { next.reject(new Error('PRIVATE_SENTINEL')); await next.promise.catch(() => {}); });
-        expect(screen.getByRole('status').textContent).toBe('Collector unavailable; no cached substitute.');
+        expect(screen.getByRole('status').textContent).toBe('Request failed; collector status unknown. No cached substitute.');
         expect(priceLine()).toBeNull();
         expect(document.body.textContent).not.toContain('PRIVATE_SENTINEL');
     });
