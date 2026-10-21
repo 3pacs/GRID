@@ -1,13 +1,21 @@
 """Bridge provenance, failure and read-only pagination contracts; no live services."""
 import json
 import sqlite3
+import time
+import urllib.error
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+import pytest
 from fastapi import FastAPI, Response
 from fastapi.testclient import TestClient
 
 from api.auth import require_auth
 from api.routers import gamma_watch as gw
+
+# A real gex-screen/2 frame (the v4 gex-watch candidate's PublicProjection over
+# the live state at 2026-10-21T02:55Z); its ``served_at`` is epoch seconds.
+V4_FRAME = Path(__file__).parent / "fixtures" / "gex_screen_v2" / "v4_candidate_projection_20261021T0255Z.json"
 
 
 def client():
@@ -91,3 +99,91 @@ def test_archive_size_cap_keeps_cursor_progress(monkeypatch, tmp_path):
     r = gw.get_archive(Response(), stream='samples', after=0, limit=4)
     assert len(r['records']) == 1
     assert r['next_after'] == 1
+
+
+def _v4_frame(served_at) -> dict:
+    frame = json.loads(V4_FRAME.read_text(encoding="utf-8"))
+    assert frame["schema"] == "gex-screen/2"
+    assert isinstance(frame["served_at"], float)  # the shape that used to raise AttributeError
+    return dict(frame, served_at=served_at)
+
+
+def test_epoch_served_at_from_gex_screen_v2_frame_is_available(monkeypatch):
+    frame = _v4_frame(time.time())
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: frame)
+    r = client().get("/api/v1/gamma-watch/state")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "available"
+    assert r.json()["data"]["served_at"] == pytest.approx(frame["served_at"])
+    assert r.json()["data"]["delayed_gex"] == frame["delayed_gex"]
+
+
+def test_integer_epoch_served_at_is_available(monkeypatch):
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: {"served_at": int(time.time())})
+    assert client().get("/api/v1/gamma-watch/state").status_code == 200
+
+
+def test_iso_served_at_with_z_suffix_still_available(monkeypatch):
+    served = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: {"served_at": served})
+    r = client().get("/api/v1/gamma-watch/state")
+    assert r.status_code == 200
+    assert r.json()["data"]["served_at"] == served
+
+
+@pytest.mark.parametrize("payload", [
+    {},                                              # served_at missing
+    {"served_at": None},
+    {"served_at": "soon"},
+    {"served_at": True},
+    {"served_at": "2026-10-21T02:55:46"},           # naive: no offset
+    {"served_at": 1e300},                            # fromtimestamp overflow
+    {"served_at": [1792551346.0]},
+])
+def test_served_at_missing_or_invalid_is_503_not_exception(monkeypatch, payload):
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: payload)
+    r = client().get("/api/v1/gamma-watch/state")
+    assert r.status_code == 503
+    body = r.json()
+    assert body["status"] == "unavailable" and body["data"] is None
+    assert body["reason"] == gw.UNAVAILABLE_REASON
+
+
+def test_stale_epoch_served_at_fails_closed(monkeypatch):
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: _v4_frame(time.time() - 60))
+    assert client().get("/api/v1/gamma-watch/state").status_code == 503
+    monkeypatch.setattr(gw, "_read_upstream", lambda path: _v4_frame(time.time() + 30))
+    assert client().get("/api/v1/gamma-watch/state").status_code == 503
+
+
+def _http_error(code: int):
+    def fail(path):
+        raise urllib.error.HTTPError(gw.UPSTREAM + path, code, "nope", {}, None)
+    return fail
+
+
+def test_journal_route_404_reports_route_not_served(monkeypatch):
+    # The v4 collector removes /api/journal and /api/contracts.
+    monkeypatch.setattr(gw, "_read_upstream", _http_error(404))
+    c = client()
+    for route in ("/api/v1/gamma-watch/journal?since=0", "/api/v1/gamma-watch/contracts?symbol=SPY"):
+        r = c.get(route)
+        assert r.status_code == 503, route
+        assert r.json()["reason"] == "route not served by collector"
+        assert r.json()["data"] is None
+
+
+def test_other_upstream_http_errors_keep_the_generic_reason(monkeypatch):
+    monkeypatch.setattr(gw, "_read_upstream", _http_error(500))
+    r = client().get("/api/v1/gamma-watch/state")
+    assert r.status_code == 503
+    assert r.json()["reason"] == gw.UNAVAILABLE_REASON
+
+
+def test_served_at_parser_contract():
+    assert gw._parse_served_at(0) == datetime(1970, 1, 1, tzinfo=timezone.utc)
+    assert gw._parse_served_at("2026-10-21T02:55:46Z") == datetime(2026, 10, 21, 2, 55, 46, tzinfo=timezone.utc)
+    assert gw._parse_served_at("2026-10-21T02:55:46.017389+00:00").tzinfo is not None
+    for bad in (None, True, float("nan"), float("inf"), "", "2026-10-21", object()):
+        with pytest.raises((ValueError, TypeError)):
+            gw._parse_served_at(bad)
