@@ -38,31 +38,31 @@ def _utc_day() -> date:
 
 
 def _verified_gex_profile(profile: dict[str, Any]) -> bool:
-    """Require a completed, dated SPY chain/close pair at API edges.
+    """Require the current completed SPY chain/close contract at API edges."""
+    from ollama.dealer_flow_briefing import valid_spy_gex_profile
 
-    The pair is verified against the chain's own day (the engine resolves the
-    default day to the latest completed capture and reports
-    ``chain_age_seconds``); whether that age is acceptable is the caller's
-    decision. The dealer-flow briefing keeps its stricter same-day contract
-    via ``valid_spy_gex_profile``.
-    """
-    from ollama.dealer_flow_briefing import dated_spy_gex_profile
-
-    if not isinstance(profile, dict):
-        return False
-    try:
-        chain_day = date.fromisoformat(profile["chain_snap_date"])
-    except (KeyError, TypeError, ValueError):
-        return False
-    return dated_spy_gex_profile(profile, chain_day)
+    return valid_spy_gex_profile(profile, _utc_day())
 
 
 def _chain_age_fields(profile: dict[str, Any]) -> dict[str, Any]:
-    """Age and default-day marker the engine attaches to a profile."""
+    """Read cutoff, age and marker the opt-in latest-completed read attaches."""
     return {
         "chain_age_seconds": profile.get("chain_age_seconds"),
+        "chain_read_cutoff": profile.get("chain_read_cutoff"),
         "default_resolution": profile.get("default_resolution"),
     }
+
+
+def _read_profile(engine_gex: Any, ticker: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only /gex and /walls: no day and no batch -> latest completed capture.
+
+    Only these two read surfaces opt in. Every other caller of
+    ``compute_gex_profile`` (regime, vanna-charm, flow narrative, chat, risk,
+    recommendations, briefing) keeps the unchanged UTC-day default.
+    """
+    if not args:
+        return engine_gex.compute_latest_completed_gex_profile(ticker)
+    return engine_gex.compute_gex_profile(ticker, **args)
 
 
 def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
@@ -123,7 +123,7 @@ def get_overview() -> dict[str, Any]:
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
 def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[str, Any] | None:
-    """Default: the engine resolves the latest completed capture. Replay needs an explicit day+batch."""
+    """Default ({}): latest completed capture (read routes only). Replay needs an explicit day+batch."""
     if capture_batch_id is None:
         return {"snap_date": snap_date} if snap_date is not None else {}
     if snap_date is None:
@@ -160,7 +160,7 @@ async def get_gex(
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
+        result = _read_profile(engine_gex, ticker.upper(), args)
         if capture_batch_id is not None and isinstance(result, dict):
             result = {**result, "replayed_batch": True}
         return result
@@ -249,7 +249,6 @@ async def get_regime() -> dict[str, Any]:
 
         return {
             **_gex_provenance(spy),
-            **_chain_age_fields(spy),
             "regime": regime,
             "interpretation": interpretations.get(regime, "Unable to determine regime."),
             "gex_aggregate": spy.get("gex_aggregate"),
@@ -292,7 +291,7 @@ async def get_walls(
         return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper(), **args)
+        result = _read_profile(engine_gex, ticker.upper(), args)
         if result.get("error"):
             return {
                 **{k: result[k] for k in ("available", "status", "reason", "source")
@@ -386,7 +385,6 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
 
         return {
             **_gex_provenance(result),
-            **_chain_age_fields(result),
             "ticker": ticker.upper(),
             "spot": spot,
             "vanna_exposure": vanna,

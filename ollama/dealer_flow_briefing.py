@@ -33,25 +33,7 @@ def _utc_day() -> date:
 
 
 def valid_spy_gex_profile(profile: Any, briefing_date: date) -> bool:
-    """Validate the dated source pair before saving or serving a narrative.
-
-    The briefing contract pins the chain day to ``briefing_date`` **and** to
-    the current UTC day: a narrative is only ever written or served on the
-    day of its chain. API edges that serve an older completed capture use
-    :func:`dated_spy_gex_profile` against the resolved chain day and expose
-    the age instead.
-    """
-    return briefing_date == _utc_day() and dated_spy_gex_profile(profile, briefing_date)
-
-
-def dated_spy_gex_profile(profile: Any, chain_day: date) -> bool:
-    """Structural and dated-pair contract for a SPY profile whose chain is ``chain_day``.
-
-    Checks the source/basis labels, the registered batch provenance, the
-    prior-close receipt ordering and that every chain clock falls on
-    ``chain_day`` (a trading day). It does not decide whether ``chain_day`` is
-    recent enough; the caller does.
-    """
+    """Validate the dated source pair before saving or serving a narrative."""
     if not isinstance(profile, dict):
         return False
     spot = profile.get("spot")
@@ -89,7 +71,7 @@ def dated_spy_gex_profile(profile: Any, chain_day: date) -> bool:
     )):
         return False
     return (
-        chain_date == chain_day
+        chain_date == briefing_date == _utc_day()
         and is_market_open(chain_date)
         and profile.get("snap_date") == chain_date.isoformat()
         and 1 <= (chain_date - spot_date).days <= 4
