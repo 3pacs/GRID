@@ -465,7 +465,9 @@ class WalkForwardBacktest:
         # able to read the very series it's trying to predict.
         features = matrix.drop(columns=[target_col])
 
-        target_returns = target.pct_change()
+        # fill_method=None: a missing close must stay missing, not be padded
+        # into a 0.0 return (pandas < 3 pads by default; pandas 3 does not).
+        target_returns = target.pct_change(fill_method=None)
         n_total = int(len(target_returns))
         valid_returns = target_returns.dropna()
         n_missing = n_total - int(len(valid_returns))
@@ -581,7 +583,7 @@ class WalkForwardBacktest:
                 t=target_col,
             )
 
-        returns = matrix[target_col].pct_change().dropna()
+        returns = matrix[target_col].pct_change(fill_method=None).dropna()
         if returns.empty:
             return {"return": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
 
