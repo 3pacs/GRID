@@ -1395,6 +1395,24 @@ class _FunctionPuller:
         return self._fn(**call_kwargs)
 
 
+def _retry_target_matches(source_name: str, puller: Any) -> bool:
+    """Match the requested catalog to an existing explicit writer declaration.
+
+    Registry keys select routes; provider/class names and positive row counts
+    do not prove a different requested dataset. Options' existing short route
+    is the sole special case: its capture writer owns YFINANCE_OPTIONS.
+    This declaration check is not native commit or provider-asof evidence.
+    """
+    declared = getattr(puller, "SOURCE_NAME", None)
+    if not isinstance(declared, str) or not declared:
+        return False
+    # Catalog UPDATE compares LOWER(name), not normalized registry keys.
+    # Spaces/dashes/underscores may name distinct catalog rows.
+    requested = source_name.lower()
+    target = declared.lower()
+    return requested == target or (requested == "options" and target == "yfinance_options")
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -1410,24 +1428,16 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
 
     from scripts.hermes_operator import _SOURCE_REGISTRY
 
-    # 1. Direct registry match
+    # Preserve direct precedence and explicit aliases. A map entry only
+    # selects a candidate: its class must declare this exact catalog below.
+    # Fuzzy prefix guesses provide no target-specific routing authority.
     entry = _SOURCE_REGISTRY.get(source_lower)
-
-    # 2. Catalog name mapping
     if entry is None:
         mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
         if mapped:
             entry = _SOURCE_REGISTRY.get(mapped)
-
-    # 3. Fuzzy prefix match
     if entry is None:
-        for key, val in _SOURCE_REGISTRY.items():
-            if source_lower.startswith(key) or key.startswith(source_lower):
-                entry = val
-                break
-
-    if entry is None:
-        raise ValueError(f"No puller registered for source: {source_name}")
+        raise ValueError("No explicit dataset handler registered for requested source")
 
     # Honor registry-level skip flag — entries that are catalogued for the
     # wiring audit but not yet wrapped for the standard _resolve_puller calling
@@ -1437,17 +1447,15 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
             f"Source {source_name} registered but skipped at runtime: {entry['skip_runtime']}"
         )
 
+    # Function-only entries lack a declared catalog contract in this registry.
+    # Refuse before importing/invoking them; do not invent a target argument.
+    if "cls" not in entry:
+        raise ValueError("Retry handler has no explicit catalog identity contract")
+
     mod = importlib.import_module(entry["mod"])
-
-    if "fn" in entry and "cls" not in entry:
-        fn = getattr(mod, entry["fn"])
-        return (
-            _FunctionPuller(fn, engine),
-            "run",
-            dict(entry.get("pull_kwargs", {})),
-        )
-
     cls = getattr(mod, entry["cls"])
+    if not _retry_target_matches(source_name, cls):
+        raise ValueError("Retry handler catalog identity does not match requested source")
 
     # Build constructor kwargs
     ctor_kwargs: dict[str, Any] = {"db_engine": engine}
@@ -1642,6 +1650,7 @@ def _retry_source(
         puller, method, kwargs = _resolve_puller(source_name, engine)
         kwargs = dict(kwargs)
         pull_fn = getattr(puller, method)
+        expected_catalog = getattr(puller, "SOURCE_NAME", None)
 
         # Registry kwargs may be plain values OR zero-arg callables (e.g.
         # FINRA's "anchor_date": _finra_short_volume_trade_date, which must
@@ -1697,6 +1706,13 @@ def _retry_source(
 
             kwargs["should_continue"] = _combined_should_continue
 
+        # Dynamic kwargs retain their call-time behavior, but cannot change
+        # which catalog the already-resolved writer is allowed to represent.
+        if (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        ):
+            raise ValueError("Retry handler catalog identity changed before dispatch")
         raw_result = pull_fn(**kwargs)
         # Fake-success fix (2026-09-29, follow-up to PR #727 review): a
         # non-dict return used to become {"status": "ok"} unconditionally,
@@ -1711,6 +1727,18 @@ def _retry_source(
 
         outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
         result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        # Keep failures, unknown counts and no-new-data under the unchanged
+        # classifier. A positive result from a rebound writer is not recovery.
+        identity_changed = (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        )
+        if identity_changed:
+            outcome = "FAILED"
+            # A reported count from another target is not this target's count.
+            outcome_rows = None
+            result["status"] = "FAILED"
+            outcome_note = "Retry handler catalog identity changed during dispatch"
         result.update(outcome=outcome, rows_inserted=outcome_rows)
         not_fresh = outcome in _NOT_FRESH_OUTCOMES
         if not_fresh:
@@ -1741,6 +1769,11 @@ def _retry_source(
                 "reason": "superseded" if superseded else "deadline_passed",
                 "tickers_attempted": attempted_n,
             }
+
+        if identity_changed:
+            # Unrelated output cannot clear this target's backlog or publish
+            # its check summary. The abandonment decision above still wins.
+            return result
 
         # Per-ticker outcome summary — only present for pullers whose result
         # carries the yfinance-shaped "results"/"counts" (Check 1a). Freshness

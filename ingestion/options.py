@@ -47,6 +47,17 @@ MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
 # limits and a local transaction deadline fit inside the scheduler's 60s margin.
 CATALOG_PUBLICATION_SECONDS = 15
 _EQUITY_TZ = ZoneInfo("America/New_York")
+# Regular equity session open, America/New_York wall clock. Before this instant
+# on a session day Yahoo's quote still carries the PREVIOUS session's
+# ``regularMarketTime`` (there has been no regular-session print yet), so
+# ``_regular_market_time`` cannot date a chain to today and every ticker
+# would otherwise end as FAILED "incomplete options chain response" -- the
+# grid-hermes 2026-10-20 04:00:49Z smart:options run (00:00:49 ET, 0/211
+# tickers, pull_log "no ticker succeeded"). That is not a provider failure:
+# it is "no session quote yet", the same nothing-to-capture truth as a
+# closed day, so it is reported as SKIPPED without contacting the provider.
+# A stale quote served AFTER the open stays FAILED (provider defect).
+REGULAR_SESSION_OPEN_ET = (9, 30)
 DEFAULT_CAPTURE_SOURCE = "options_puller"
 
 
@@ -87,7 +98,10 @@ class OptionsPullResults(list[dict[str, Any]]):
         ok = statuses.count("SUCCESS")
         deferred = statuses.count("DEFERRED")
         if not self or all(s == "SKIPPED" for s in statuses):
+            reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
             status, note = "SKIPPED", "no ticker capture completed"
+            if reasons:
+                note = f"{note}: {', '.join(reasons)}"
         elif not ok and not deferred:
             status, note = "FAILED", "no ticker succeeded"
         elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
@@ -109,6 +123,12 @@ class OptionsPullResults(list[dict[str, Any]]):
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def _before_regular_open(now: datetime) -> bool:
+    """True before the regular equity session opens on ``now``'s ET day."""
+    local = now.astimezone(_EQUITY_TZ)
+    return (local.hour, local.minute) < REGULAR_SESSION_OPEN_ET
 
 
 def _regular_market_time(quote: Any, session_day: date) -> datetime | None:
@@ -368,6 +388,15 @@ class OptionsPuller(BasePuller):
                 {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                  "reason": "non-equity-session"} for ticker in tickers
             ], full_universe=full_universe)
+        if _before_regular_open(now):
+            log.info(
+                "Options pull skipped: {day} session has not opened yet ({et} ET)",
+                day=today_str, et=now.astimezone(_EQUITY_TZ).strftime("%H:%M"),
+            )
+            return OptionsPullResults([
+                {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                 "reason": "pre-session"} for ticker in tickers
+            ], full_universe=full_universe)
 
         self._yahoo = YahooOptionsClient()
         if not self._yahoo.is_available:
@@ -485,6 +514,9 @@ class OptionsPuller(BasePuller):
                     or now.astimezone(_EQUITY_TZ).date() != session_day):
                 return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "non-equity-session or UTC date mismatch"}
+            if _before_regular_open(now):
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                        "reason": "pre-session"}
             capture_clock = time.monotonic()
             # Force a 64-bit PostgreSQL transaction ID for each capture. It is
             # allocated in database order, survives rollback, and needs no

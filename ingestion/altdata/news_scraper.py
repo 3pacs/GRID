@@ -17,6 +17,12 @@ Each article produces:
 
 Deduplication: SHA-256 hash of (title + source) prevents storing the same
 story twice. Rate limiting: max 1 request per source per 10 minutes.
+
+Honest outcomes (2026-09-29 classifier): ``pull_all`` returns an envelope
+with an explicit ``status`` and the committed ``rows_inserted`` count, so a
+single dead feed classifies as PARTIAL with the real count instead of
+FAILED "puller did not report committed write count". A feed entry may carry
+``"disabled": "<reason>"``; it is then reported, never fetched.
 """
 
 from __future__ import annotations
@@ -49,7 +55,15 @@ RSS_FEEDS: dict[str, dict[str, str]] = {
         "label": "MarketWatch Top Stories",
     },
     "yahoo_finance": {
-        "url": "https://finance.yahoo.com/news/rssindex",
+        # https://finance.yahoo.com/news/rssindex and /rss/topstories both
+        # return 404 (grid-hermes journal 2026-10-20 03:24:54Z; anonymous
+        # probe 2026-10-20 05:01Z). The per-symbol headline feed is the
+        # endpoint Yahoo still serves anonymously (200, application/xml,
+        # 20 items in the same probe). Keep the probed basket verbatim.
+        "url": (
+            "https://feeds.finance.yahoo.com/rss/2.0/headline"
+            "?s=SPY,QQQ,AAPL,MSFT,NVDA&region=US&lang=en-US"
+        ),
         "label": "Yahoo Finance",
     },
     "bloomberg": {
@@ -65,6 +79,22 @@ RSS_FEEDS: dict[str, dict[str, str]] = {
         "label": "SEC EDGAR 8-K Filings",
     },
 }
+
+
+class FeedFetchError(RuntimeError):
+    """One RSS feed could not be fetched or parsed.
+
+    Raised by ``_fetch_feed`` instead of returning an empty list, so that
+    ``pull_all`` can tell a dead feed (coverage gap -> PARTIAL) apart from a
+    feed that simply had no new stories (a clean, complete check).
+    """
+
+    def __init__(self, source_key: str, label: str, detail: str) -> None:
+        super().__init__(f"{source_key}: {detail}")
+        self.source_key = source_key
+        self.label = label
+        self.detail = detail
+
 
 # ── Ticker Detection ─────────────────────────────────────────────────────
 
@@ -178,7 +208,7 @@ class NewsScraperPuller(BasePuller):
 
     SOURCE_NAME: str = "NewsScraperRSS"
     SOURCE_CONFIG: dict[str, Any] = {
-        "base_url": "https://finance.yahoo.com/news/rssindex",
+        "base_url": "https://feeds.finance.yahoo.com/rss/2.0/headline",
         "cost_tier": "FREE",
         "latency_class": "INTRADAY",
         "pit_available": False,
@@ -338,11 +368,20 @@ class NewsScraperPuller(BasePuller):
             source_key: Key into RSS_FEEDS dict.
 
         Returns:
-            List of parsed articles (not yet sentiment-scored).
+            List of parsed articles (not yet sentiment-scored). Empty when
+            the feed is rate-limited or disabled, or had no new stories.
+
+        Raises:
+            FeedFetchError: unknown feed key, HTTP failure, or unparseable
+                body. Callers decide whether that is PARTIAL or FAILED.
         """
         feed_config = RSS_FEEDS.get(source_key)
         if not feed_config:
-            log.warning("Unknown feed source: {s}", s=source_key)
+            raise FeedFetchError(source_key, source_key, "unknown feed source")
+
+        label = feed_config["label"]
+        if feed_config.get("disabled"):
+            log.debug("Feed disabled: {s} ({r})", s=label, r=feed_config["disabled"])
             return []
 
         if self._rate_limited(source_key):
@@ -350,7 +389,6 @@ class NewsScraperPuller(BasePuller):
             return []
 
         url = feed_config["url"]
-        label = feed_config["label"]
 
         try:
             resp = self._session.get(url, timeout=_REQUEST_TIMEOUT)
@@ -358,7 +396,7 @@ class NewsScraperPuller(BasePuller):
         except requests.RequestException as exc:
             log.warning("Failed to fetch {s}: {e}", s=label, e=str(exc))
             self._mark_fetched(source_key)
-            return []
+            raise FeedFetchError(source_key, label, str(exc)) from exc
 
         self._mark_fetched(source_key)
 
@@ -367,7 +405,7 @@ class NewsScraperPuller(BasePuller):
             root = ElementTree.fromstring(resp.content)
         except ElementTree.ParseError as exc:
             log.warning("RSS parse error for {s}: {e}", s=label, e=str(exc))
-            return []
+            raise FeedFetchError(source_key, label, f"RSS parse error: {exc}") from exc
 
         # Handle both RSS 2.0 (<item>) and Atom (<entry>) feeds
         namespaces = {
@@ -658,51 +696,73 @@ class NewsScraperPuller(BasePuller):
 
     # ── Storage ──────────────────────────────────────────────────────────
 
-    def _store_articles(self, articles: list[NewsArticle]) -> int:
+    def _store_articles(self, articles: list[NewsArticle]) -> tuple[int, int]:
         """Store scored articles in news_articles table and raw_series.
+
+        Every statement runs under its own SAVEPOINT: on PostgreSQL a failed
+        statement otherwise aborts the whole transaction, so every later
+        article in the batch would fail too and the final COMMIT would roll
+        back rows this method had already counted. Counts come from the
+        statements' affected-row counts, so an ``ON CONFLICT DO NOTHING``
+        no-op is not counted as a write.
 
         Parameters:
             articles: Scored articles to store.
 
         Returns:
-            Number of rows inserted.
+            ``(articles_inserted, raw_series_inserted)`` -- rows the
+            transaction committed, which is what the scheduler's write
+            contract needs.
         """
         if not articles:
-            return 0
+            return 0, 0
 
         inserted = 0
+        raw_rows = 0
         today = date.today()
 
         with self.engine.begin() as conn:
             for art in articles:
                 # Store in news_articles table
                 try:
-                    conn.execute(
-                        text(
-                            "INSERT INTO news_articles "
-                            "(dedup_hash, title, source, url, published_at, summary, "
-                            "tickers, sentiment, confidence, llm_summary) "
-                            "VALUES (:hash, :title, :src, :url, :pub, :summary, "
-                            ":tickers, :sentiment, :conf, :llm_sum) "
-                            "ON CONFLICT (dedup_hash) DO NOTHING"
-                        ),
-                        {
-                            "hash": art.dedup_hash,
-                            "title": art.title,
-                            "src": art.source,
-                            "url": art.url,
-                            "pub": art.published,
-                            "summary": art.summary,
-                            "tickers": art.tickers,
-                            "sentiment": art.sentiment,
-                            "conf": art.confidence,
-                            "llm_sum": art.llm_summary,
-                        },
-                    )
-                    inserted += 1
-                    self._seen_hashes.add(art.dedup_hash)
+                    with conn.begin_nested():
+                        result = conn.execute(
+                            text(
+                                "INSERT INTO news_articles "
+                                "(dedup_hash, title, source, url, published_at, summary, "
+                                "tickers, sentiment, confidence, llm_summary) "
+                                "VALUES (:hash, :title, :src, :url, :pub, :summary, "
+                                ":tickers, :sentiment, :conf, :llm_sum) "
+                                "ON CONFLICT (dedup_hash) DO NOTHING"
+                            ),
+                            {
+                                "hash": art.dedup_hash,
+                                "title": art.title,
+                                "src": art.source,
+                                "url": art.url,
+                                "pub": art.published,
+                                "summary": art.summary,
+                                "tickers": art.tickers,
+                                "sentiment": art.sentiment,
+                                "conf": art.confidence,
+                                "llm_sum": art.llm_summary,
+                            },
+                        )
                 except Exception as exc:
-                    log.debug("Failed to store article: {e}", e=str(exc))
+                    log.warning(
+                        "Failed to store article from {src}: {e}",
+                        src=art.source, e=str(exc),
+                    )
+                    continue
+                affected = result.rowcount
+                if affected is None or affected < 0:
+                    # Driver gave no count: fall back to the pre-existing
+                    # optimistic count rather than reporting unknown.
+                    affected = 1
+                inserted += affected
+                self._seen_hashes.add(art.dedup_hash)
+                if not affected:
+                    # Already on file (dedup race) -- no derived rows either.
                     continue
 
                 # Store in raw_series per ticker
@@ -716,21 +776,23 @@ class NewsScraperPuller(BasePuller):
                 for ticker in tickers_to_store:
                     series_id = f"NEWS:{art.source}:{ticker}:{art.sentiment}"
                     try:
-                        if not self._row_exists(series_id, today, conn):
-                            self._insert_raw(
-                                conn=conn,
-                                series_id=series_id,
-                                obs_date=today,
-                                value=sentiment_value * art.confidence,
-                                raw_payload={
-                                    "title": art.title,
-                                    "url": art.url,
-                                    "sentiment": art.sentiment,
-                                    "confidence": art.confidence,
-                                    "llm_summary": art.llm_summary,
-                                    "tickers": art.tickers,
-                                },
-                            )
+                        with conn.begin_nested():
+                            if not self._row_exists(series_id, today, conn):
+                                self._insert_raw(
+                                    conn=conn,
+                                    series_id=series_id,
+                                    obs_date=today,
+                                    value=sentiment_value * art.confidence,
+                                    raw_payload={
+                                        "title": art.title,
+                                        "url": art.url,
+                                        "sentiment": art.sentiment,
+                                        "confidence": art.confidence,
+                                        "llm_summary": art.llm_summary,
+                                        "tickers": art.tickers,
+                                    },
+                                )
+                                raw_rows += 1
                     except Exception as exc:
                         log.debug(
                             "Failed to store raw_series for {sid}: {e}",
@@ -740,7 +802,7 @@ class NewsScraperPuller(BasePuller):
                 # Emit to signal_sources for trust scoring
                 self._emit_signal(conn, art, today)
 
-        return inserted
+        return inserted, raw_rows
 
     def _emit_signal(
         self,
@@ -758,30 +820,33 @@ class NewsScraperPuller(BasePuller):
         if not article.tickers:
             return
 
+        stmt = text(
+            "INSERT INTO signal_sources "
+            "(source_type, source_name, ticker, direction, confidence, "
+            "signal_date, metadata) "
+            "VALUES ('news', :name, :ticker, :direction, :conf, "
+            ":sig_date, :meta) "
+            "ON CONFLICT DO NOTHING"
+        )
         for ticker in article.tickers[:3]:  # Limit signals per article
             try:
-                conn.execute(
-                    text(
-                        "INSERT INTO signal_sources "
-                        "(source_type, source_name, ticker, direction, confidence, "
-                        "signal_date, metadata) "
-                        "VALUES ('news', :name, :ticker, :direction, :conf, "
-                        ":sig_date, :meta) "
-                        "ON CONFLICT DO NOTHING"
-                    ),
-                    {
-                        "name": f"news_{article.source}",
-                        "ticker": ticker,
-                        "direction": article.sentiment.lower(),
-                        "conf": article.confidence,
-                        "sig_date": obs_date,
-                        "meta": json.dumps({
-                            "title": article.title[:200],
-                            "url": article.url,
-                            "llm_summary": article.llm_summary[:200],
-                        }),
-                    },
-                )
+                # SAVEPOINT: a missing table must not abort the article batch.
+                with conn.begin_nested():
+                    conn.execute(
+                        stmt,
+                        {
+                            "name": f"news_{article.source}",
+                            "ticker": ticker,
+                            "direction": article.sentiment.lower(),
+                            "conf": article.confidence,
+                            "sig_date": obs_date,
+                            "meta": json.dumps({
+                                "title": article.title[:200],
+                                "url": article.url,
+                                "llm_summary": article.llm_summary[:200],
+                            }),
+                        },
+                    )
             except Exception:
                 # signal_sources table may not exist yet — not critical
                 pass
@@ -815,21 +880,25 @@ class NewsScraperPuller(BasePuller):
         self,
         articles: list[NewsArticle],
         target_date: date,
-    ) -> None:
+    ) -> int:
         """Compute and store daily aggregate features from scraped articles.
 
         Parameters:
             articles: All articles scraped in this pull.
             target_date: Observation date.
+
+        Returns:
+            Number of raw_series aggregate rows written.
         """
         if not articles:
-            return
+            return 0
 
         total = len(articles)
         bullish = sum(1 for a in articles if a.sentiment == "BULLISH")
         bearish = sum(1 for a in articles if a.sentiment == "BEARISH")
         avg_conf = sum(a.confidence for a in articles) / total
 
+        written = 0
         with self.engine.begin() as conn:
             for series_id, value in [
                 ("news_volume_daily", float(total)),
@@ -844,6 +913,8 @@ class NewsScraperPuller(BasePuller):
                         obs_date=target_date,
                         value=value,
                     )
+                    written += 1
+        return written
 
     # ── Public Pull Methods ──────────────────────────────────────────────
 
@@ -888,24 +959,52 @@ class NewsScraperPuller(BasePuller):
         bounded even when the LLM node is saturated.
 
         Returns:
-            Summary dict with per-source article counts and totals.
+            Envelope for ``smart_scheduler._classify_outcome``:
+
+            * ``status`` -- ``SUCCESS`` when every enabled feed was checked,
+              ``PARTIAL`` when some feeds failed or were rate-limited but
+              others were checked, ``FAILED`` when no feed was checked and
+              nothing was written. A SUCCESS with ``rows_inserted == 0`` is
+              the classifier's NO_NEW_DATA, never freshness.
+            * ``rows_inserted`` -- rows the transactions committed
+              (news_articles + raw_series article rows + daily aggregates).
+            * ``error`` / ``errors`` -- per-feed failure detail, or None.
+            * ``feeds_*`` counts and ``feeds_disabled`` reasons, plus the
+              legacy per-source article summary.
         """
         self._ensure_features()
         today = date.today()
 
         all_articles: list[NewsArticle] = []
         source_counts: dict[str, int] = {}
+        errors: list[str] = []
+        feeds_disabled: dict[str, str] = {}
+        rate_limited: list[str] = []
+        feeds_succeeded = 0
+        articles_inserted = 0
+        raw_series_inserted = 0
 
-        for source_key in RSS_FEEDS:
+        for source_key, feed_config in RSS_FEEDS.items():
+            if feed_config.get("disabled"):
+                feeds_disabled[source_key] = str(feed_config["disabled"])
+                source_counts[source_key] = 0
+                continue
+            if self._rate_limited(source_key):
+                rate_limited.append(source_key)
+                source_counts[source_key] = 0
+                continue
             try:
                 articles = self.pull_source(
                     source_key,
                     use_llm=use_llm,
                     max_articles=max_articles_per_source,
                 )
-                stored = self._store_articles(articles)
+                stored, raw_rows = self._store_articles(articles)
                 source_counts[source_key] = stored
+                articles_inserted += stored
+                raw_series_inserted += raw_rows
                 all_articles.extend(articles)
+                feeds_succeeded += 1
                 log.info(
                     "News {src}: {n} articles scored, {s} stored",
                     src=source_key, n=len(articles), s=stored,
@@ -913,12 +1012,39 @@ class NewsScraperPuller(BasePuller):
             except Exception as exc:
                 log.warning("News pull failed for {src}: {e}", src=source_key, e=str(exc))
                 source_counts[source_key] = 0
+                detail = exc.detail if isinstance(exc, FeedFetchError) else str(exc)
+                errors.append(f"{source_key}: {detail}")
 
             if pause_seconds > 0:
                 time.sleep(pause_seconds)  # Brief pause between sources
 
-        # Store daily aggregates
-        self._store_daily_aggregates(all_articles, today)
+        # Store daily aggregates. Article rows are already committed; a
+        # failure here is a coverage gap on top of them, not a lost run.
+        aggregates_inserted = 0
+        try:
+            aggregates_inserted = self._store_daily_aggregates(all_articles, today)
+        except Exception as exc:
+            log.warning("News daily aggregates failed: {e}", e=str(exc))
+            errors.append(f"daily_aggregates: {exc}")
+
+        rows_inserted = articles_inserted + raw_series_inserted + aggregates_inserted
+        feeds_attempted = len(RSS_FEEDS) - len(feeds_disabled) - len(rate_limited)
+        feeds_failed = feeds_attempted - feeds_succeeded
+        if rate_limited:
+            errors.append(f"rate-limited, not checked: {', '.join(rate_limited)}")
+
+        if not errors:
+            status = "SUCCESS"
+        elif feeds_succeeded == 0 and rows_inserted == 0:
+            status = "FAILED"
+        else:
+            status = "PARTIAL"
+        error = None
+        if errors:
+            error = (
+                f"{feeds_succeeded} of {feeds_attempted} feeds checked, "
+                f"{rows_inserted} rows written: " + "; ".join(errors)
+            )
 
         total = len(all_articles)
         bullish = sum(1 for a in all_articles if a.sentiment == "BULLISH")
@@ -926,6 +1052,17 @@ class NewsScraperPuller(BasePuller):
         neutral = total - bullish - bearish
 
         summary = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "articles_inserted": articles_inserted,
+            "raw_series_inserted": raw_series_inserted + aggregates_inserted,
+            "feeds_attempted": feeds_attempted,
+            "feeds_succeeded": feeds_succeeded,
+            "feeds_failed": feeds_failed,
+            "feeds_rate_limited": rate_limited,
+            "feeds_disabled": feeds_disabled,
+            "error": error,
+            "errors": errors or None,
             "date": today.isoformat(),
             "total_articles": total,
             "sentiment_breakdown": {
@@ -940,8 +1077,10 @@ class NewsScraperPuller(BasePuller):
         }
 
         log.info(
-            "News scraper complete — {n} articles: {b} bullish, {br} bearish, {ne} neutral",
-            n=total, b=bullish, br=bearish, ne=neutral,
+            "News scraper {st} — {n} articles ({b} bullish, {br} bearish, {ne} neutral), "
+            "{rows} rows committed, {ok}/{att} feeds checked",
+            st=status, n=total, b=bullish, br=bearish, ne=neutral,
+            rows=rows_inserted, ok=feeds_succeeded, att=feeds_attempted,
         )
         return summary
 

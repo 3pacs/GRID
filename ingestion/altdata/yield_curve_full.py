@@ -13,6 +13,7 @@ real rates, and term premium that are critical for regime classification.
 from __future__ import annotations
 
 import time
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -136,47 +137,101 @@ class FullYieldCurvePuller(BasePuller):
             observation_end=str(end_date),
         )
 
-        if df is None or (hasattr(df, "empty") and df.empty):
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Unsupported FRED response")
+        if df.empty:
+            if not any(c in df.columns for c in ("date", "Date", "observation_date")) or not any(c in df.columns for c in ("value", "Value", series_id)):
+                raise ValueError("Empty FRED response lacks required columns")
             return pd.DataFrame(columns=["date", "value"])
 
         if isinstance(df, pd.DataFrame):
             result = pd.DataFrame()
 
-            # Find date column
+            # Find the observation date. fedfred 3.x (fedfred/helpers.py
+            # ``to_pd_df``) returns the observation date as a DatetimeIndex
+            # named "date" with columns realtime_start/realtime_end/value;
+            # older shapes carry a "date" column. Every assignment below goes
+            # through ``.to_numpy()`` so the value column is positional. The
+            # previous code assigned ``pd.to_numeric(df["value"])`` — a Series
+            # still carrying the DatetimeIndex — onto a frame whose "date"
+            # column had been built from the index and therefore had a fresh
+            # RangeIndex; pandas aligned on index and every value became NaN
+            # (grid-hermes 2026-10-20 04:19:46Z "FRED DGS1: 260 values coerced
+            # to NaN" -> "Invalid FRED observation date or value").
+            idx = df.index
+            if isinstance(idx, pd.DatetimeIndex):
+                result["date"] = pd.Series(idx.to_numpy())
+            elif idx.name in ("date", "Date", "observation_date"):
+                result["date"] = pd.Series(
+                    pd.to_datetime(idx, errors="coerce").to_numpy()
+                )
             for col in ("date", "Date", "observation_date"):
-                if col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce")
+                if "date" not in result.columns and col in df.columns:
+                    result["date"] = pd.to_datetime(df[col], errors="coerce").to_numpy()
                     break
-            if "date" not in result.columns and df.index.name in ("date", "Date"):
-                result["date"] = pd.to_datetime(df.index, errors="coerce")
-            elif "date" not in result.columns:
-                result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
+            if "date" not in result.columns:
+                result["date"] = pd.to_datetime(
+                    df.iloc[:, 0], errors="coerce"
+                ).to_numpy()
 
             # Find value column
             for col in ("value", "Value", series_id):
                 if col in df.columns:
-                    result["value"] = pd.to_numeric(df[col], errors="coerce")
+                    result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
                     break
             if "value" not in result.columns:
                 numeric_cols = df.select_dtypes(include=["number"]).columns
                 if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]]
+                    result["value"] = pd.to_numeric(
+                        df[numeric_cols[0]], errors="coerce"
+                    ).to_numpy()
                 else:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
+                    result["value"] = pd.to_numeric(
+                        df.iloc[:, -1], errors="coerce"
+                    ).to_numpy()
 
-            # Log coerced values (ATTENTION.md #13)
-            nan_count = result["value"].isna().sum()
-            if nan_count > 0:
+            # Row-level filtering. FRED publishes "." for dates with no
+            # observation (market holidays on daily series such as DGS1);
+            # fedfred coerces that to NaN before we see it. Those rows are
+            # skipped — never stored as 0 — and one malformed row must not
+            # discard the valid ones. Only a series whose observations are
+            # *entirely* lost in normalisation is a failure
+            # (docs/puller_outcome_contracts.md).
+            total = len(result)
+            kept_dates: list[Any] = []
+            kept_values: list[float] = []
+            missing = 0
+            non_finite = 0
+            for obs_date, value in zip(result["date"], result["value"]):
+                if pd.isna(obs_date) or pd.isna(value):
+                    missing += 1
+                    continue
+                if not math.isfinite(float(value)):
+                    non_finite += 1
+                    continue
+                kept_dates.append(obs_date)
+                kept_values.append(float(value))
+
+            # Log skipped values (ATTENTION.md #13)
+            if missing or non_finite:
                 log.warning(
-                    "FRED {sid}: {n} values coerced to NaN",
+                    "FRED {sid}: skipped {m} missing/unparseable and {nf} "
+                    "non-finite observations; kept {k}/{t}",
                     sid=series_id,
-                    n=nan_count,
+                    m=missing,
+                    nf=non_finite,
+                    k=len(kept_dates),
+                    t=total,
+                )
+            if total > 0 and not kept_dates:
+                raise ValueError(
+                    "Invalid FRED observation date or value: all "
+                    f"{total} observations for {series_id} unusable"
                 )
 
-            result = result.dropna(subset=["date", "value"])
-            return result
+            return pd.DataFrame({"date": kept_dates, "value": kept_values})
 
-        return pd.DataFrame(columns=["date", "value"])
+        raise ValueError("Unsupported FRED response")
 
     def _pull_raw_series(
         self,
@@ -198,15 +253,21 @@ class FullYieldCurvePuller(BasePuller):
         """
         rows_inserted = 0
 
+        transaction_started = False
         try:
             df = self._fetch_fred_series(fred_id, start_date, end_date)
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError("Unsupported normalized FRED response")
+            if "date" not in df.columns or "value" not in df.columns:
+                raise ValueError("Malformed normalized FRED columns")
             if df.empty:
                 return {
                     "feature": feature_name,
-                    "status": "NO_DATA",
+                    "status": "NO_NEW_DATA",
                     "rows_inserted": 0,
                 }
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 for _, row in df.iterrows():
                     obs_date = row["date"].date()
@@ -215,14 +276,18 @@ class FullYieldCurvePuller(BasePuller):
                     if self._row_exists(feature_name, obs_date, conn):
                         continue
 
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=feature_name,
                         obs_date=obs_date,
                         value=value,
                         raw_payload={"fred_series": fred_id},
+                        return_result=True,
                     )
-                    rows_inserted += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    rows_inserted += affected
 
             log.info(
                 "YieldCurve {feat} ({fid}) — {n} rows inserted",
@@ -235,7 +300,7 @@ class FullYieldCurvePuller(BasePuller):
             return {
                 "feature": feature_name,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": "fedfred not installed",
             }
         except Exception as exc:
@@ -245,7 +310,7 @@ class FullYieldCurvePuller(BasePuller):
             return {
                 "feature": feature_name,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": str(exc),
             }
 
@@ -302,14 +367,18 @@ class FullYieldCurvePuller(BasePuller):
             for obs_date in sorted(set(y30.keys()) & set(y5.keys())):
                 spread = y30[obs_date] - y5[obs_date]
                 if not self._row_exists("yc_5s30s_spread", obs_date, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id="yc_5s30s_spread",
                         obs_date=obs_date,
                         value=spread,
                         raw_payload={"y30": y30[obs_date], "y5": y5[obs_date]},
+                        return_result=True,
                     )
-                    spread_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    spread_rows += affected
             results.append({
                 "feature": "yc_5s30s_spread",
                 "status": "SUCCESS",
@@ -322,7 +391,7 @@ class FullYieldCurvePuller(BasePuller):
             for obs_date in common_dates:
                 butterfly = 2.0 * y5[obs_date] - (y2[obs_date] + y10[obs_date])
                 if not self._row_exists("yc_butterfly_2_5_10", obs_date, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id="yc_butterfly_2_5_10",
                         obs_date=obs_date,
@@ -332,8 +401,12 @@ class FullYieldCurvePuller(BasePuller):
                             "y5": y5[obs_date],
                             "y10": y10[obs_date],
                         },
+                        return_result=True,
                     )
-                    butterfly_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    butterfly_rows += affected
             results.append({
                 "feature": "yc_butterfly_2_5_10",
                 "status": "SUCCESS",
@@ -419,7 +492,10 @@ class FullYieldCurvePuller(BasePuller):
                 "Yield curve derived computation failed: {e}", e=str(exc)
             )
 
-        total_rows = sum(r["rows_inserted"] for r in results)
+            results.append({"feature": "derived_features", "status": "FAILED",
+                            "rows_inserted": None, "error": str(exc)})
+
+        total_rows = (None if any(r.get("rows_inserted") is None for r in results) else sum(r["rows_inserted"] for r in results))
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
             "FullYieldCurve pull_all — {ok}/{total} features, {rows} rows",

@@ -112,7 +112,6 @@ export default function FlowSankey8({ width: propWidth, height: propHeight }) {
         };
         allResolved.push(resolved);
         nodeById[resolved.id] = resolved;
-        globalIdx++;
       }
     }
 

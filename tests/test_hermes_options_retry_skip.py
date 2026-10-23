@@ -59,7 +59,8 @@ def test_empty_or_unavailable_observation_keeps_retry_and_actual_outcome(monkeyp
     engine, observed, _factory, active = observation
     if unavailable:
         observed.connect.side_effect = RuntimeError("synthetic observation failure")
-    puller = SimpleNamespace(pull=MagicMock(return_value={"status": "PARTIAL", "rows_inserted": 3}))
+    puller = SimpleNamespace(SOURCE_NAME="YFINANCE_OPTIONS",
+                             pull=MagicMock(return_value={"status": "PARTIAL", "rows_inserted": 3}))
     resolve = MagicMock(return_value=(puller, "pull", {}))
     monkeypatch.setattr(hf, "_resolve_puller", resolve)
     result = hf._retry_source("yfinance_options", engine)
@@ -75,7 +76,8 @@ def test_empty_or_unavailable_observation_keeps_retry_and_actual_outcome(monkeyp
 
 def test_non_options_retry_never_observes_options(monkeypatch, observation):
     engine, _observed, factory, _active = observation
-    puller = SimpleNamespace(pull=lambda: {"status": "PARTIAL", "rows_inserted": 1})
+    puller = SimpleNamespace(SOURCE_NAME="other_source",
+                             pull=lambda: {"status": "PARTIAL", "rows_inserted": 1})
     monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (puller, "pull", {}))
     assert hf._retry_source("other_source", engine)["rows_inserted"] == 1
     factory.assert_not_called()

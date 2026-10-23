@@ -193,21 +193,17 @@ class FedLiquidityPuller(BasePuller):
             raise ImportError("fedfred library required for FedLiquidityPuller")
 
         fred = FredAPI(self._api_key)
-        try:
-            df = fred.get_series_observations(
-                series_id,
-                observation_start=str(start_date),
-                observation_end=str(end_date),
-            )
-        except KeyError as exc:
-            # fedfred.helpers.to_pd_df crashes with KeyError('date') when
-            # the observations list is empty (monthly/quarterly series
-            # polled on a day with no new data). Treat as "no new data".
-            if str(exc) == "'date'":
-                return pd.DataFrame(columns=["date", "value"])
-            raise
+        df = fred.get_series_observations(
+            series_id,
+            observation_start=str(start_date),
+            observation_end=str(end_date),
+        )
 
-        if df is None or (hasattr(df, "empty") and df.empty):
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Unsupported FRED response")
+        if df.empty:
+            if not any(c in df.columns for c in ("date", "Date", "observation_date")) or not any(c in df.columns for c in ("value", "Value", series_id)):
+                raise ValueError("Empty FRED response lacks required columns")
             return pd.DataFrame(columns=["date", "value"])
 
         if isinstance(df, pd.DataFrame):
@@ -238,7 +234,7 @@ class FedLiquidityPuller(BasePuller):
                     sid=series_id,
                     cols=list(df.columns),
                 )
-                return pd.DataFrame(columns=["date", "value"])
+                raise ValueError("Missing required FRED date/value column")
 
             # Find value column
             _val_col_names = ("value", "Value", series_id)
@@ -253,7 +249,7 @@ class FedLiquidityPuller(BasePuller):
                     sid=series_id,
                     cols=list(df.columns),
                 )
-                return pd.DataFrame(columns=["date", "value"])
+                raise ValueError("Missing required FRED date/value column")
 
             # Log coerced values (ATTENTION.md #13)
             nan_count = result["value"].isna().sum()
@@ -264,10 +260,12 @@ class FedLiquidityPuller(BasePuller):
                     n=nan_count,
                 )
 
-            result = result.dropna(subset=["date", "value"])
-            return result
+            normalized = result.dropna(subset=["date", "value"])
+            if len(normalized) != len(df) or any(not math.isfinite(float(v)) for v in normalized["value"]):
+                raise ValueError("Invalid FRED observation date or value")
+            return normalized
 
-        return pd.DataFrame(columns=["date", "value"])
+        raise ValueError("Unsupported FRED response")
 
     def _pull_raw_series(
         self,
@@ -287,12 +285,17 @@ class FedLiquidityPuller(BasePuller):
         """
         rows_inserted = 0
 
+        transaction_started = False
         try:
             df = self._fetch_fred_series(series_id, start_date, end_date)
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError("Unsupported normalized FRED response")
+            if "date" not in df.columns or "value" not in df.columns:
+                raise ValueError("Malformed normalized FRED columns")
             if df.empty:
                 return {
                     "series": series_id,
-                    "status": "NO_DATA",
+                    "status": "NO_NEW_DATA",
                     "rows_inserted": 0,
                 }
             if "date" not in df.columns or "value" not in df.columns:
@@ -308,6 +311,7 @@ class FedLiquidityPuller(BasePuller):
                     "error": f"Malformed dataframe columns: {list(df.columns)}",
                 }
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 existing_dates = self._get_existing_dates(series_id, conn)
                 for _, row in df.iterrows():
@@ -318,7 +322,7 @@ class FedLiquidityPuller(BasePuller):
                             sid=series_id,
                             d=row.get("date"),
                         )
-                        continue
+                        raise ValueError("Invalid normalized observation date")
 
                     value = pd.to_numeric(row.get("value"), errors="coerce")
                     if pd.isna(value):
@@ -328,7 +332,7 @@ class FedLiquidityPuller(BasePuller):
                             v=row.get("value"),
                             d=row_date.date(),
                         )
-                        continue
+                        raise ValueError("Invalid normalized observation value")
 
                     obs_date = row_date.date()
                     value = float(value)
@@ -336,15 +340,19 @@ class FedLiquidityPuller(BasePuller):
                     if obs_date in existing_dates:
                         continue
 
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=series_id,
                         obs_date=obs_date,
                         value=value,
                         raw_payload={"fred_series": series_id},
+                        return_result=True,
                     )
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
                     existing_dates.add(obs_date)
-                    rows_inserted += 1
+                    rows_inserted += affected
 
             log.info(
                 "FedLiquidity {sid} — {n} rows inserted",
@@ -356,7 +364,7 @@ class FedLiquidityPuller(BasePuller):
             return {
                 "series": series_id,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": "fedfred not installed",
             }
         except Exception as exc:
@@ -368,7 +376,7 @@ class FedLiquidityPuller(BasePuller):
             return {
                 "series": series_id,
                 "status": "SKIPPED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": str(exc),
             }
 
@@ -480,7 +488,7 @@ class FedLiquidityPuller(BasePuller):
                     continue
                 sid = "COMPUTED:fed_net_liquidity"
                 if not self._row_exists(sid, d, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=sid,
                         obs_date=d,
@@ -492,8 +500,12 @@ class FedLiquidityPuller(BasePuller):
                             "rrpontsyd_millions": (rrp[d] * RRPONTSYD_TO_MILLIONS) if d in rrp else None,
                             "units": "millions_usd",
                         },
+                        return_result=True,
                     )
-                    nl_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    nl_rows += affected
             results.append({
                 "feature": "COMPUTED:fed_net_liquidity",
                 "status": "SUCCESS",
@@ -516,14 +528,18 @@ class FedLiquidityPuller(BasePuller):
                     chg = net_liq[d] - prev_val
                     sid = "COMPUTED:fed_net_liquidity_change_1w"
                     if not self._row_exists(sid, d, conn):
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=sid,
                             obs_date=d,
                             value=chg,
                             raw_payload={"current": net_liq[d], "prev_1w": prev_val},
+                            return_result=True,
                         )
-                        chg_1w_rows += 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        chg_1w_rows += affected
             results.append({
                 "feature": "COMPUTED:fed_net_liquidity_change_1w",
                 "status": "SUCCESS",
@@ -545,14 +561,18 @@ class FedLiquidityPuller(BasePuller):
                     chg = net_liq[d] - prev_val
                     sid = "COMPUTED:fed_net_liquidity_change_1m"
                     if not self._row_exists(sid, d, conn):
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=sid,
                             obs_date=d,
                             value=chg,
                             raw_payload={"current": net_liq[d], "prev_1m": prev_val},
+                            return_result=True,
                         )
-                        chg_1m_rows += 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        chg_1m_rows += affected
             results.append({
                 "feature": "COMPUTED:fed_net_liquidity_change_1m",
                 "status": "SUCCESS",
@@ -575,14 +595,18 @@ class FedLiquidityPuller(BasePuller):
                 pct = val / rrp_peak
                 sid = "COMPUTED:reverse_repo_pct_of_peak"
                 if not self._row_exists(sid, d, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=sid,
                         obs_date=d,
                         value=pct,
                         raw_payload={"rrp": val, "peak": rrp_peak},
+                        return_result=True,
                     )
-                    rrp_pct_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    rrp_pct_rows += affected
             results.append({
                 "feature": "COMPUTED:reverse_repo_pct_of_peak",
                 "status": "SUCCESS",
@@ -606,7 +630,7 @@ class FedLiquidityPuller(BasePuller):
                     drawdown = wtregen[d] - prev_val
                     sid = "COMPUTED:tga_drawdown"
                     if not self._row_exists(sid, d, conn):
-                        self._insert_raw(
+                        insert_result = self._insert_raw(
                             conn=conn,
                             series_id=sid,
                             obs_date=d,
@@ -615,8 +639,12 @@ class FedLiquidityPuller(BasePuller):
                                 "tga_current": wtregen[d],
                                 "tga_30d_ago": prev_val,
                             },
+                            return_result=True,
                         )
-                        tga_dd_rows += 1
+                        affected = getattr(insert_result, "rowcount", None)
+                        if type(affected) is not int or affected < 0:
+                            raise ValueError("Unknown affected row count")
+                        tga_dd_rows += affected
             results.append({
                 "feature": "COMPUTED:tga_drawdown",
                 "status": "SUCCESS",
@@ -696,10 +724,11 @@ class FedLiquidityPuller(BasePuller):
             results.append({
                 "feature": "derived_features",
                 "status": "FAILED",
+                "rows_inserted": None,
                 "error": str(exc),
             })
 
-        total_inserted = sum(r.get("rows_inserted", 0) for r in results)
+        total_inserted = (None if any(r.get("rows_inserted") is None for r in results) else sum(r["rows_inserted"] for r in results))
         ok = sum(1 for r in results if r.get("status") == "SUCCESS")
         log.info(
             "FedLiquidity pull complete — {ok}/{total} succeeded, "

@@ -356,6 +356,22 @@ def test_outcome_is_duplicate_only_when_all_dates_already_exist(engine_recording
     from ingestion import yfinance_pull
 
     engine, conn = engine_recording_inserts
+    from price_close_contract import daily_capture_payload
+
+    captured_at = datetime(2026, 9, 12, 5, tzinfo=timezone.utc)
+    marker = daily_capture_payload("SPY", "open", date(2026, 9, 11), captured_at)
+
+    def execute(statement, params=None):
+        response = MagicMock()
+        response.fetchall.return_value = (
+            [(marker, captured_at)]
+            if "SELECT raw_payload, pull_timestamp FROM raw_series" in str(statement)
+            else []
+        )
+        response.fetchone.return_value = None
+        return response
+
+    conn.execute.side_effect = execute
     frame = pd.DataFrame(
         {"Open": [87.35]},
         index=pd.DatetimeIndex([pd.Timestamp("2026-09-11")], name="Date"),
@@ -363,6 +379,7 @@ def test_outcome_is_duplicate_only_when_all_dates_already_exist(engine_recording
 
     with patch.object(yfinance_pull.YFinancePuller, "_resolve_source_id", return_value=2), \
          patch.object(yfinance_pull.YFinancePuller, "_get_existing_dates", return_value={date(2026, 9, 11)}), \
+         patch.object(yfinance_pull, "_utc_now", return_value=captured_at), \
          patch.object(yfinance_pull.yf, "download", return_value=frame):
         puller = yfinance_pull.YFinancePuller(engine)
         result = puller.pull_ticker("SPY", start_date="2026-09-11")

@@ -25,14 +25,28 @@ left returns no row -- never a zero and never another feature's value.
 from __future__ import annotations
 
 import os
+import math
+import time as monotonic_time
 from contextlib import contextmanager
 from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from typing import Generator
 
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+from normalization.entity_map import SELECTED_QUERY_TIMEOUT_MS, validate_selected_request
+
+
+def validate_source_snapshot_request(
+    selections: list[dict] | None, *, as_of: datetime, start_date: date,
+    vintage_policy: str = "LATEST_AS_OF",
+) -> dict:
+    """Pure pre-connection validation shared with the explicit stored-only API."""
+    return validate_selected_request(selections, as_of=as_of, start_date=start_date,
+                                     vintage_policy=vintage_policy)
 
 
 def retraction_cutoff(as_of: date | datetime) -> datetime:
@@ -105,6 +119,162 @@ class PITStore:
         """
         self.engine = db_engine
         log.info("PITStore initialised")
+
+    def get_source_snapshot(
+        self, selections: list[dict] | None, *, as_of: datetime, start_date: date,
+        vintage_policy: str = "LATEST_AS_OF",
+    ) -> dict:
+        """At most seven provenance-bearing, day-storage snapshots; no fallback.
+
+        No engine is touched for missing bindings or unsupported event storage.
+        Bound queries are read-only, have a shared five-second deadline, select
+        registry entries exactly, and return at most one resolved row per source.
+        This does not certify provider publication time, raw-row lineage, freshness
+        or durability. In particular release/vintage dates have only day precision.
+        """
+        request = validate_source_snapshot_request(selections, as_of=as_of, start_date=start_date,
+                                                  vintage_policy=vintage_policy)
+        cutoff = request["as_of"]
+        deadline = monotonic_time.monotonic() + SELECTED_QUERY_TIMEOUT_MS / 1000
+
+        def remaining_timeout_ms() -> int:
+            # Zero disables PostgreSQL statement_timeout. Refuse even a positive
+            # sub-millisecond remainder rather than accidentally granting zero.
+            remaining = int((deadline - monotonic_time.monotonic()) * 1000)
+            if remaining <= 0:
+                raise ValueError("snapshot deadline exceeded")
+            return min(SELECTED_QUERY_TIMEOUT_MS, remaining)
+
+        def prepare_query(conn: Connection) -> None:
+            conn.execute(text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+                         {"timeout_ms": str(remaining_timeout_ms())})
+            # Configuration itself can consume the last budget. Do not start a
+            # data query after detecting expiry, even if configuration succeeded.
+            remaining_timeout_ms()
+
+        output = {"schema": "stored-source-snapshot-v1", "as_of": cutoff.isoformat(),
+                  "start_date": start_date.isoformat(), "vintage_policy": vintage_policy,
+                  "selections": []}
+        direction = "ASC" if vintage_policy == "FIRST_RELEASE" else "DESC"
+        for selection in request["selections"]:
+            row = {k: selection.get(k) for k in
+                   ("source_key", "scope", "ticker_or_cusip", "series_id", "feature_id",
+                    "feature_name", "expected_source_name")}
+            row.update({"status": "unavailable", "reason": "selection_missing", "value": None,
+                        "obs_date": None, "release_date": None, "vintage_date": None,
+                        "actual_source": None, "conflict_flag": None, "conflict_detail": None,
+                        "conflict_detail_truncated": False,
+                        "freshness": {"status": "unknown", "reason": "max_no_observation"},
+                        "storage_clock": "pull_date_not_provider_publication",
+                        "lineage": "resolved_source_not_raw_row"})
+            output["selections"].append(row)
+            if selection["source_key"] == "quiverquant":
+                row["reason"] = "resolver_unsupported"
+                continue
+            if selection.get("series_id") is None or selection.get("expected_source_name") is None:
+                continue
+            if selection.get("feature_id") is None:
+                row["reason"] = "mapping_missing"
+                continue
+            try:
+                remaining_timeout_ms()
+                with self.engine.begin() as conn:
+                    # Pool/connection acquisition is not cancellable here. If it
+                    # returns too late, issue no setup or data SQL on its behalf.
+                    remaining_timeout_ms()
+                    conn.execute(text("SET TRANSACTION READ ONLY"))
+                    prepare_query(conn)
+                    registry = conn.execute(text("""
+                        SELECT id, name FROM feature_registry
+                        WHERE id = :feature_id AND name = :feature_name LIMIT 2
+                    """), {"feature_id": selection["feature_id"],
+                            "feature_name": selection["feature_name"]}).fetchall()
+                    remaining_timeout_ms()
+                    if len(registry) != 1 or tuple(registry[0]) != (
+                            selection["feature_id"], selection["feature_name"]):
+                        row["reason"] = "mapping_missing"
+                        continue
+                    prepare_query(conn)
+                    # direction is one of two validated literals, never caller SQL.
+                    result = conn.execute(text("""
+                        WITH eligible AS (
+                            SELECT rs.feature_id, rs.obs_date, rs.release_date, rs.vintage_date,
+                                   rs.value, rs.source_priority_used, sc.name AS source_name,
+                                   rs.conflict_flag,
+                                   LEFT(CAST(rs.conflict_detail AS text), 2048) AS conflict_detail,
+                                   LENGTH(CAST(rs.conflict_detail AS text)) > 2048 AS detail_truncated,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY rs.feature_id, rs.obs_date
+                                       ORDER BY rs.vintage_date """ + direction + """, rs.id DESC
+                                   ) AS vintage_rank
+                            FROM resolved_series rs
+                            JOIN feature_registry fr ON fr.id = rs.feature_id AND fr.name = :feature_name
+                            LEFT JOIN source_catalog sc ON sc.id = rs.source_priority_used
+                            WHERE rs.feature_id = :feature_id
+                              AND rs.obs_date >= :start_date AND rs.obs_date <= :as_of_date
+                              AND rs.release_date <= :as_of_date AND rs.vintage_date <= :as_of_date
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM resolved_series_retractions rr
+                                  WHERE rr.feature_id = rs.feature_id AND rr.obs_date = rs.obs_date
+                                    AND rr.vintage_date = rs.vintage_date
+                                    AND rr.retracted_at <= :as_of
+                              )
+                        )
+                        SELECT feature_id, obs_date, release_date, vintage_date, value,
+                               source_priority_used, source_name, conflict_flag,
+                               conflict_detail, detail_truncated
+                        FROM eligible WHERE vintage_rank = 1
+                        ORDER BY obs_date DESC LIMIT 1
+                    """), {"feature_id": selection["feature_id"],
+                            "feature_name": selection["feature_name"], "start_date": start_date,
+                            "as_of_date": cutoff.date(), "as_of": cutoff}).mappings().all()
+                    remaining_timeout_ms()
+                remaining_timeout_ms()
+                if not result:
+                    row["reason"] = "no_resolved_row"
+                    continue
+                if len(result) != 1:
+                    raise ValueError("snapshot exceeded one-row cap")
+                candidate = dict(result[0])
+                if candidate.get("feature_id") != selection["feature_id"]:
+                    raise ValueError("snapshot feature mismatch")
+                observed = candidate.get("obs_date")
+                released, vintage = candidate.get("release_date"), candidate.get("vintage_date")
+                if (any(type(d) is not date for d in (observed, released, vintage)) or
+                        not start_date <= observed <= cutoff.date() or
+                        released > cutoff.date() or vintage > cutoff.date()):
+                    raise ValueError("snapshot storage clock mismatch")
+                row.update({"obs_date": observed.isoformat(), "release_date": released.isoformat(),
+                            "vintage_date": vintage.isoformat()})
+                actual_id = candidate.get("source_priority_used")
+                actual_name = candidate.get("source_name")
+                if type(actual_id) is int and actual_id > 0 and type(actual_name) is str:
+                    row["actual_source"] = {"id": actual_id, "name": actual_name}
+                if row["actual_source"] is None or actual_name != selection["expected_source_name"]:
+                    row["reason"] = "source_mismatch"
+                    continue
+                value = candidate.get("value")
+                try:
+                    valid = type(value) in (int, float, Decimal) and math.isfinite(float(value))
+                except (ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    row["reason"] = "invalid_value"
+                    continue
+                row.update({"status": "available", "reason": "resolved_observation",
+                            "value": float(value), "conflict_flag": candidate.get("conflict_flag"),
+                            "conflict_detail": candidate.get("conflict_detail"),
+                            "conflict_detail_truncated": bool(candidate.get("detail_truncated"))})
+                policy = selection.get("freshness_policy")
+                if policy is None:
+                    row["freshness"] = {"status": "unknown", "reason": "freshness_policy_absent"}
+                else:
+                    stale = (cutoff.date() - observed).days > policy["max_age_days"]
+                    row["freshness"] = {"status": "stale" if stale else "fresh",
+                                        "reason": "exceeds_declared_age" if stale else "within_declared_age"}
+            except Exception:
+                row.update({"status": "unavailable", "reason": "read_failed", "value": None})
+        return output
 
     def get_pit(
         self,

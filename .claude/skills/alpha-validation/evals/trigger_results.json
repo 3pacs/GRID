@@ -1,22 +1,22 @@
 {
   "skill_name": "alpha-validation",
-  "description": "Validate GRID predictions against the Prediction Causation Standard (levers vs conditions). Use before logging any prediction to the immutable journal, when reviewing model output quality, debugging why a backtest prediction failed, or running post-mortems on failed trades. Rejects predictions built on conditions alone.",
+  "description": "Validate a finished GRID prediction (LEVER / CONDITION / THESIS / INVALIDATION) against the Prediction Causation Standard before it goes into the immutable journal. Use when a drafted prediction or thesis needs checking, when reviewing model output quality, when debugging why a backtest prediction failed, or when running post-mortems on failed trades. Rejects predictions built on conditions alone. Finding the named actors and evidence behind a lever is actor-network-query, not this skill.",
   "results": [
     {
       "query": "Before I log this to the journal: 'BTC bearish this weekend because volume is thin'. Is it ready?",
       "should_trigger": true,
-      "trigger_rate": 0.3333333333333333,
-      "triggers": 1,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Go through yesterday's failed XLF short and tell me whether the original thesis was structurally sound or we just got unlucky.",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "here's a draft: LEVER / CONDITION / THESIS / INVALIDATION for ETH after the ETF approval, can you tear it apart before it goes in the log",
@@ -29,10 +29,10 @@
     {
       "query": "my thesis says 'smart money is accumulating and sentiment is turning, so equities up, probability 1.3'. what's wrong with it?",
       "should_trigger": true,
-      "trigger_rate": 0.0,
-      "triggers": 0,
+      "trigger_rate": 1.0,
+      "triggers": 3,
       "runs": 3,
-      "pass": false
+      "pass": true
     },
     {
       "query": "Who are the specific actors that control the crude oil supply valve? Pull from the sector networks.",
@@ -69,7 +69,7 @@
   ],
   "summary": {
     "total": 8,
-    "passed": 4,
-    "failed": 4
+    "passed": 7,
+    "failed": 1
   }
 }

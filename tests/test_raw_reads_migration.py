@@ -37,7 +37,7 @@ TODAY = date.today()
 T0 = datetime(2026, 1, 1, 6, 0, 0)
 
 
-def _engine(rows):
+def _engine(rows, *, preserve_capture_offsets=False):
     engine = create_engine("sqlite://")
     md = MetaData()
     source_catalog = Table(
@@ -50,7 +50,7 @@ def _engine(rows):
         Column("series_id", String, nullable=False),
         Column("source_id", String, nullable=False),
         Column("obs_date", Date, nullable=False),
-        Column("pull_timestamp", DateTime, nullable=False),
+        Column("pull_timestamp", Text if preserve_capture_offsets else DateTime, nullable=False),
         Column("value", Float, nullable=False),
         Column("raw_payload", Text),
         Column("pull_status", String, nullable=False),
@@ -179,9 +179,55 @@ def test_sentiment_momentum_uses_distinct_dates_not_rows():
     assert "5d=+4.03%" in comp.detail
 
 
+def test_sentiment_reads_are_bounded_by_a_start_date(monkeypatch):
+    """Every price read passes a start bound (no full-history scan)."""
+    from intelligence import sentiment_scorer
+
+    seen = []
+    real = sentiment_scorer.read_latest_n
+
+    def spy(conn, series_id, n, **kw):
+        seen.append((series_id, n, kw.get("start")))
+        return real(conn, series_id, n, **kw)
+
+    monkeypatch.setattr(sentiment_scorer, "read_latest_n", spy)
+    engine = _engine(_daily("YF:^GSPC:close", 30))
+    sentiment_scorer._score_momentum(engine)
+    sentiment_scorer._score_trend(engine)
+    sentiment_scorer._score_breadth(engine)
+    sentiment_scorer._score_credit_spread(engine)
+
+    assert seen and all(start is not None for _, _, start in seen)
+    today = sentiment_scorer.datetime.now(sentiment_scorer.timezone.utc).date()
+    for _, n, start in seen:
+        assert (today - start).days >= n  # window always spans >= n calendar days
+
+
+def test_sentiment_trend_still_sees_200_sessions_inside_the_bound():
+    from intelligence.sentiment_scorer import _recent_closes
+
+    sid = "YF:^GSPC:close"
+    engine = _engine(_daily(sid, 220))
+    with engine.connect() as conn:
+        assert len(_recent_closes(conn, sid, 200)) == 200
+
+
+def test_sentiment_bound_excludes_closes_older_than_the_window():
+    from intelligence.sentiment_scorer import _recent_closes
+
+    sid = "YF:HYG:close"
+    rows = _daily(sid, 3) + [_row(sid, TODAY - timedelta(days=400), 50.0, h=500)]
+    with _engine(rows).connect() as conn:
+        got = _recent_closes(conn, sid, 21)
+    assert len(got) == 3 and 50.0 not in [o.value for o in got]
+
+
 # ── market diary ─────────────────────────────────────────────────────────
 
 def test_market_diary_index_moves_skip_failed_zero(monkeypatch):
+    import json
+    from datetime import timezone
+    from price_close_contract import daily_capture_payload
     from intelligence import market_diary
     from intelligence.market_diary import _gather_market_moves
 
@@ -191,16 +237,32 @@ def test_market_diary_index_moves_skip_failed_zero(monkeypatch):
     # is still exercised.
     monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
 
+    # Fix this function's fixture day; other raw-reader tests keep module TODAY.
+    TODAY = date(2026, 9, 25)  # Friday; the three price labels are supported sessions.
     sid = "YF:^GSPC:close"
     # A real close exists for TODAY (5020) alongside a same-day FAILED zero
     # (e.g. an earlier failed attempt superseded by a later successful
-    # pull) -- read_latest_n excludes FAILED regardless of pull_timestamp,
+    # pull) -- the policy-selected reader excludes FAILED regardless of pull_timestamp,
     # so the real close must still win and obs_date must still equal
     # target_date (Wave 3 §4.1 fix #2: a stale/failed close must never be
     # reported as today's move).
-    rows = _daily(sid, 3, start_value=5000.0, step=10.0, days_back=0)
-    rows.append(_row(sid, TODAY, 0.0, status="FAILED", h=50))
-    moves = _gather_market_moves(_engine(rows), TODAY)
+    rows = [_row(sid, TODAY - timedelta(days=2 - i), 5000.0 + i * 10.0) for i in range(3)]
+    for row in rows:
+        d = row["obs_date"]
+        captured_at = datetime(d.year, d.month, d.day, 6, tzinfo=timezone.utc) + timedelta(days=2)
+        row["pull_timestamp"] = captured_at.isoformat(sep=" ")
+        row["raw_payload"] = json.dumps(daily_capture_payload("^GSPC", "close", d, captured_at))
+    failed = _row(sid, TODAY, 0.0, status="FAILED", h=50)
+    failed_at = datetime(2026, 9, 29, 6, tzinfo=timezone.utc)
+    failed["pull_timestamp"] = failed_at.isoformat(sep=" ")
+    # Otherwise eligible: only FAILED status must exclude this newer zero.
+    failed["raw_payload"] = json.dumps(daily_capture_payload("^GSPC", "close", TODAY, failed_at))
+    monkeypatch.setitem(
+        sqlite3.adapters, (datetime, sqlite3.PrepareProtocol),
+        lambda d: d.isoformat(sep=" "),
+    )
+    rows.append(failed)
+    moves = _gather_market_moves(_engine(rows, preserve_capture_offsets=True), TODAY)
 
     sp = moves["indices"].get("S&P 500")
     assert sp is not None

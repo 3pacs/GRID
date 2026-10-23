@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import date, datetime
+import json
+
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 from sqlalchemy import text
 
 from api.auth import require_auth
-from api.dependencies import get_db_engine
+from api.dependencies import get_db_engine, get_pit_store
+from store.pit import PITStore, validate_source_snapshot_request
 from api.routers.watchlist_helpers import (
     _fetch_live_price,
     _get_analysis_cached,
@@ -52,11 +56,168 @@ def _build_watchlist_item(ticker_upper: str, item: Any) -> tuple[dict[str, Any],
     }, False
 
 
+def _attach_market_evidence(analysis: dict[str, Any]) -> dict[str, Any]:
+    """Display existing response evidence without new reads or qualification."""
+    history = analysis.get("price_history")
+    rows = (
+        [
+            {"as_of": row.get("date"), "value": row.get("value")}
+            for row in history
+            if isinstance(row, dict)
+        ]
+        if isinstance(history, list)
+        else []
+    )
+    live = analysis.get("live_price")
+    if not rows and isinstance(live, dict) and "price" in live:
+        rows = [{"as_of": live.get("as_of"), "value": live.get("price")}]
+    availability = analysis.get("availability")
+    declared = availability.get("price") if isinstance(availability, dict) else None
+    negative = declared in ("unavailable", "failed", "stale", "unknown")
+    status = declared if negative else "observed" if rows else "unknown"
+    reason = (
+        "price_section_" + declared
+        if negative
+        else "existing_scalar_evidence"
+        if rows
+        else "no_returned_price_rows"
+    )
+    narrative = analysis.get("briefing")
+    # Only a supplied receipt; never fetch or invent a latest briefing.
+    receipt = (
+        {
+            "status": narrative.get("status"),
+            "reason": narrative.get("reason"),
+            "as_of": narrative.get("as_of"),
+        }
+        if isinstance(narrative, dict)
+        else None
+    )
+    return {
+        **analysis,
+        "market_features": {
+            "schema": "watchlist-existing-evidence-v1",
+            "ticker": analysis.get("ticker"),
+            "daily": {
+                "status": status,
+                "reason": reason,
+                "source": analysis.get("price_source"),
+                "section_availability": declared,
+                "rows": rows,
+                "returned_row_count": len(rows),
+                "as_of": rows[-1]["as_of"] if rows else None,
+                "freshness": {
+                    "status": "stale" if declared == "stale" else "unknown",
+                    "reason": "declared_price_section_stale"
+                    if declared == "stale"
+                    else "freshness_policy_not_supplied",
+                },
+                "served_from_cache": analysis.get("_cached") is True,
+                "representation": "existing_scalar_not_qualified_intraday",
+            },
+            "intraday": {
+                "status": "unavailable",
+                "reason": "qualified_intraday_result_absent",
+                "opening_range": None,
+                "trade_vwap": None,
+                "hlc3_volume_proxy": None,
+            },
+            "briefing_receipt": receipt,
+        },
+    }
+
+
+def _stored_source_analysis(ticker: str, period: str, request: str | None) -> dict:
+    """Stored-only read: never enter legacy cache, price or provider paths."""
+    result = _attach_market_evidence({"ticker": ticker, "period": period})
+    if request is None:
+        snapshot = {
+            "schema": "stored-source-snapshot-v1", "as_of": None,
+            "start_date": None, "vintage_policy": None, "selections": [],
+            "status": "unavailable", "reason": "stored_request_missing",
+        }
+    else:
+        def unique_object(pairs):
+            obj = {}
+            for key, value in pairs:
+                if key in obj:
+                    raise ValueError("Duplicate request key")
+                obj[key] = value
+            return obj
+
+        try:
+            if type(request) is not str or len(request.encode("utf-8")) > 16384:
+                raise ValueError("Stored request size/type")
+            parsed = json.loads(request, object_pairs_hook=unique_object)
+            allowed = {"selections", "as_of", "start_date", "vintage_policy"}
+            if type(parsed) is not dict or set(parsed) - allowed:
+                raise ValueError("Stored request keys")
+            if type(parsed.get("as_of")) is not str or type(parsed.get("start_date")) is not str:
+                raise ValueError("Explicit cutoff and range required")
+            normalized = validate_source_snapshot_request(
+                parsed.get("selections"),
+                as_of=datetime.fromisoformat(parsed["as_of"]),
+                start_date=date.fromisoformat(parsed["start_date"]),
+                vintage_policy=parsed.get("vintage_policy", "LATEST_AS_OF"),
+            )
+            if any(
+                item.get("scope") == "ticker" and item.get("ticker_or_cusip") != ticker
+                for item in normalized["selections"]
+            ):
+                raise ValueError("Ticker selection does not match route")
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            raise HTTPException(status_code=400, detail="invalid_stored_request") from None
+
+        # Pure validation precedes store/engine access. Missing bindings and the
+        # unsupported event source can be represented without opening a DB path.
+        bound = any(
+            item["source_key"] != "quiverquant" and all(
+                item.get(key) is not None
+                for key in ("series_id", "expected_source_name", "feature_name", "feature_id")
+            )
+            for item in normalized["selections"]
+        )
+        try:
+            store = get_pit_store() if bound else PITStore(None)
+            snapshot = store.get_source_snapshot(**normalized)
+            if (snapshot.get("schema") != "stored-source-snapshot-v1"
+                or snapshot.get("as_of") != normalized["as_of"].isoformat()
+                or snapshot.get("start_date") != normalized["start_date"].isoformat()
+                or snapshot.get("vintage_policy") != normalized["vintage_policy"]):
+                raise ValueError("Mismatched snapshot request context")
+        except Exception:
+            # Do not substitute cache/provider/raw values on a failed read.
+            snapshot = {
+                "schema": "stored-source-snapshot-v1",
+                "as_of": normalized["as_of"].isoformat(),
+                "start_date": normalized["start_date"].isoformat(),
+                "vintage_policy": normalized["vintage_policy"],
+                "selections": [], "status": "unavailable", "reason": "read_failed",
+            }
+    # Keep this context in the existing guarded response envelope: initial and
+    # period callbacks already mask/replace market_features as one unit.
+    binding = {
+        "ticker": ticker, "as_of": None, "start_date": None,
+        "vintage_policy": None, "selections": [],
+    } if request is None else {
+        "ticker": ticker, "as_of": normalized["as_of"].isoformat(),
+        "start_date": normalized["start_date"].isoformat(),
+        "vintage_policy": normalized["vintage_policy"],
+        "selections": normalized["selections"],
+    }
+    result["market_features"]["stored_source_evidence"] = {
+        **snapshot, "ticker": ticker, "request_binding": binding,
+    }
+    return result
+
+
 @router.get("/{ticker}/analysis")
 def get_ticker_analysis(
     ticker: str,
     period: str = Query(default="3M", pattern=r"^(1W|1M|3M|6M|1Y)$"),
     _token: str = Depends(require_auth),
+    stored_only: bool = False,
+    stored_request: str | None = Query(default=None),
 ) -> dict:
     """Comprehensive analysis page for a watchlist ticker.
 
@@ -70,11 +231,13 @@ def get_ticker_analysis(
         period: 1W | 1M | 3M | 6M | 1Y (default 3M) — controls price_history window.
     """
     ticker_upper = ticker.strip().upper()
+    if stored_only:
+        return _stored_source_analysis(ticker_upper, period, stored_request)
 
     # Return cached data instantly if fresh
     cached = _get_analysis_cached(ticker_upper, period)
     if cached is not None:
-        return {**cached, "_cached": True}
+        return _attach_market_evidence({**cached, "_cached": True})
 
     engine = get_db_engine()
     ticker_lower = ticker_upper.lower()
@@ -314,4 +477,4 @@ def get_ticker_analysis(
     if all(status == "available" for status in analysis["availability"].values()):
         _set_analysis_cache(ticker_upper, period, analysis)
 
-    return analysis
+    return _attach_market_evidence(analysis)

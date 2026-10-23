@@ -57,7 +57,7 @@ import re
 import math
 import unicodedata
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Literal
 
 from loguru import logger as log
@@ -65,15 +65,237 @@ from loguru import logger as log
 NumberKind = Literal["dollar", "percent", "decimal", "integer", "ratio"]
 
 
-PUBLICATION_EVIDENCE_RULES = (
-    "Correlation and structural flow edges are model proxies, not measured money transfers. "
-    "Stock changes are not transaction flows. Unknown sources cannot support transfer claims. "
-    "Put/call ratios measure relative contracts, not buyer initiation, opening/closing, "
-    "hedging intent, protection purchases or signed dealer gamma. "
-    "VIX measures implied volatility; do not substitute it for realized volatility. "
-    "Narrative text is commentary, never authoritative evidence for those claims. "
-    "Do not invent causal predictions or action thresholds."
-)
+PUBLICATION_EVIDENCE_RULES = 'Correlation and structural flow edges are model proxies, not measured money transfers. Stock changes are not transaction flows. Unknown sources cannot support transfer claims. Put/call ratios measure relative contracts, not buyer initiation, opening/closing, hedging intent, protection purchases or signed dealer gamma. VIX measures implied volatility; do not substitute it for realized volatility. Narrative text is commentary, never authoritative evidence for those claims. Price moves, insider/congressional ratios and confidence do not establish institutional distribution, accumulation, retail positioning or an actor-driven trend. Distinguish explicit unverified hypotheses/caveats from source-reported holdings facts. Do not invent causal predictions or action thresholds. VIX tenor comparisons require compatible observation dates. A single regime record does not establish a trend. Classifier confidence, thesis conviction and sentiment are distinct model outputs, not calibrated outcome probabilities. Narrative text is commentary, never authoritative evidence for those claims. Do not invent causal predictions or action thresholds.'
+
+PUBLICATION_EVIDENCE_RULES += ' Signal counts do not identify informed exits or institutional conviction. Order-book depth, gamma-driven market moves and tail-risk valuation require their own measurements; those measurements are not supplied here.'
+
+def publication_context_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Limits of the current latest-only collector; prose cannot add evidence.
+
+    Observation dates describe the readings, not release/ingest times. Matching
+    dates are necessary for this daily context's curve comparison, not proof of
+    simultaneous intraday quotes. The snapshot calendar date bounds eligible
+    observations; no maximum age or regime ordering is inferred.
+    """
+    volatility = snapshot.get("volatility") or {}
+    try:
+        # The collector constructs this frame timestamp before reading data.
+        # Use its calendar cutoff, never a date asserted by generated prose.
+        cutoff = datetime.fromisoformat(snapshot.get("timestamp")).date()
+    except (TypeError, ValueError):
+        cutoff = None
+    dates = {}
+    for ticker in ("^VIX", "^VIX3M", "^VIX9D"):
+        info = volatility.get(ticker) or volatility.get(ticker[1:]) or {}
+        try:
+            observation = date.fromisoformat(info.get("date", ""))
+            if cutoff is None or observation > cutoff:
+                raise ValueError("Observation is not eligible at the snapshot cutoff")
+            value = info.get("value")
+            valid = not isinstance(value, bool) and isinstance(value, (float, int))
+            if not valid or not math.isfinite(value) or value < 0:
+                raise ValueError("Invalid volatility reading")
+            dates[ticker] = observation.isoformat()
+        except (TypeError, ValueError, OverflowError):
+            dates[ticker] = None
+    return {
+        "regime_timestamp": (snapshot.get("latest_regime") or {}).get("timestamp"),
+        "snapshot_cutoff_date": cutoff.isoformat() if cutoff else None,
+        "snapshot_cutoff_basis": "collector_snapshot_timestamp_calendar_date",
+        "regime_comparator_available": False,  # Collector supplies only LIMIT 1.
+        "vix_observation_dates": dates,
+        "vix_dates_compatible": all(dates.values()) and len(set(dates.values())) == 1,
+    }
+
+
+def _publication_normalized(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text)
+    normalized = "".join(c for c in normalized if unicodedata.category(c) not in {"Cf", "Mn"})
+    normalized = re.sub(r"</?[a-zA-Z][^>]*>", "", normalized)
+    return re.sub(r"[*_`~]+", "", normalized).lower()
+
+
+def _strip_publication_disclosures(text: str) -> str:
+    """Remove fixed statements of measurement limits, never asserted activity.
+
+    'Investors are not buying puts' still asserts an unobserved participant side.
+    Removing 'does not measure hedging intent' is narrower and keeps trailing
+    positive claims visible to the existing clause-level check.
+    """
+    return re.sub(
+        r"\b(?:hedging intent (?:is )?(?:unmeasured|unavailable)|"
+        r"(?:the )?(?:put/call ratio|aggregate pcr|pcr) does not "
+        r"(?:measure|establish|identify|reflect) "
+        r"(?:hedging intent|dealer side|dealer inventory|(?:signed )?dealer gamma|downside protection purchases)|"
+        r"(?:we )?cannot infer (?:signed )?dealer (?:gamma|inventory|side)(?: or inventory)? from aggregate pcr|"
+        r"no dealer inventory is supplied in this snapshot|"
+        r"signed dealer gamma cannot be inferred from aggregate pcr|"
+        r"no regime improvement can be inferred without a comparator|"
+        r"a regime transition cannot be inferred from one record|"
+        r"does not predict a crash)\b",
+        "", text,
+    )
+
+
+def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Omit specific unsupported sentences, retaining other descriptive prose.
+
+    A bounded lexical check for frozen-audit defects, not a general fact verifier.
+    It grants no permission from narrative disclaimers, calibration adjectives,
+    comparator booleans or engine recommendations. This collector supplies no
+    historical comparator, calibrated forecasts or validated positioning policy.
+    """
+    facts = publication_context_facts(snapshot)
+    violations = []
+    reasons_seen: set[str] = set()
+    # Preserve original formatting and decimal numbers. Newlines also bound
+    # markdown headings/lists; a direction label is checked independently.
+    segments = re.split(r"(\n+|(?<=[.!?])\s+|,\s*(?:while|whereas|but|however|and|yet|although)\s+|\s+and\s+(?=vix(?:\s*(?:9d|3m))?\s+(?:is|was)\s+(?:unavailable|missing|unmeasured)\b)|;\s*|\s*\|\s*)", text, flags=re.IGNORECASE)
+    state = (snapshot.get("latest_regime") or {}).get("state")
+    state_label = _publication_normalized(state).strip() if isinstance(state, str) else None
+    pipe_regime_context = False
+    regime_metadata_context = False
+    vix_clause_context = False
+    confidence_forecast_context = False
+    for index in range(0, len(segments), 2):
+        if index == 0 or "|" not in segments[index - 1]:
+            pipe_regime_context = False
+        if index == 0 or not re.search(r"[|\n]", segments[index - 1]):
+            regime_metadata_context = False
+        if index == 0 or not re.search(r"[;,]", segments[index - 1]):
+            vix_clause_context = False
+        if index == 0 or not re.match(r",\s*(?:while|whereas|but|however|and|yet|although)\s+", segments[index - 1], flags=re.IGNORECASE):
+            confidence_forecast_context = False
+        original = segments[index]
+        normalized = _strip_publication_disclosures(_publication_normalized(original))
+        if re.search(r"\b(?:regime|fragile)\b|\bstate\s*:", normalized) or (
+            state_label and normalized.strip() == state_label
+        ):
+            pipe_regime_context = True
+            regime_metadata_context = True
+        if re.match(r"^\s*#+\s", normalized):
+            regime_metadata_context = bool(re.match(r"^\s*#+\s+(?:latest )?regime\b", normalized))
+        # Strip only fixed disclosures, never arbitrary text after a negation.
+        # A trailing positive assertion in the same sentence remains checked.
+        for disclosure in (
+            r"\blower classifier confidence does not establish stability\b",
+            r"\b(?:the )?regime trend is unmeasured\b",
+            r"\bcontemporaneous (?:vix )?term structure is unavailable\b",
+            r"\bdealer inventory is unmeasured\b",
+            r"\bpcr does not establish dealer side\b",
+            r"\bnot a calibrated outcome probability\b",
+        ):
+            normalized = re.sub(disclosure, "", normalized)
+        reasons: set[str] = set()
+        trend = r"\b(?:worsen\w*|deteriorat\w*|improv\w*|stabili[sz]\w*|transitioning|shifting|remained|unchanged)\b"
+        if (re.search(r"\b(?:regime|fragile)\b|\bstate\s*:|^\s*(?:the\s+)?conditions\b|\bmarket conditions\b", normalized) and re.search(trend, normalized)) or re.search(
+            r"\bdirection(?: of travel)?\s*(?::|-|is|=)\s*(?:\w+\s+){0,2}"
+            r"(?:worsen\w*|deteriorat\w*|improv\w*|stable)\b", normalized
+        ):
+            reasons.add("missing_regime_comparator")
+        if regime_metadata_context and re.search(
+            r"^\s*trend\s*(?::|-|is|=)\s*(?:stable\b|" + trend + ")", normalized
+        ):
+            reasons.add("missing_regime_comparator")
+        if index > 0 and "|" in segments[index - 1] and pipe_regime_context and re.search(
+            r"^\s*(?:trend\s*(?::|-|is|=)\s*)?(?:stable\b|" + trend + ")", normalized
+        ):
+            reasons.add("missing_regime_comparator")
+        if re.search(
+            r"\bconfidence\b.*(?:\b(?:indicat\w*|impli\w*|means?|proves?|signals?|confirms?|suggests?|establish\w*|shows?|demonstrat\w*)\b|=>|=)"
+            r".*\b(?:stability|stable|transitional state)\b|"
+            r"\b(?:stability|stable)\b.*\b(?:because|due to)\b.*\bconfidence\b", normalized
+        ):
+            reasons.add("confidence_is_not_stability")
+        tenor_text = re.sub(r"\b(?:(?:9|nine)[- ]days? vix|vix\s*(?:9|nine)[- ]days?|9d[- ]+vix)\b", "vix9d", normalized)
+        tenor_text = re.sub(r"\b(?:(?:3|three)[- ]months? vix|vix\s*(?:3|three)[- ]months?|3m[- ]+vix)\b", "vix3m", tenor_text)
+        tenors = {"^" + t.upper().replace(" ", "") for t in re.findall(r"\bvix(?:\s*(?:9d|3m))?\b", tenor_text)}
+        curve_words = re.search(r"\b(?:contango|backwardation|term structure|volatility (?:curve|slope))\b", normalized)
+        implicit_vix_curve = (
+            vix_clause_context and curve_words
+            and not re.search(r"\b(?:treasury|yield|bond|credit|commodit\w*|oil|gold)\b", normalized)
+        )
+        curve = curve_words and (bool(tenors) or implicit_vix_curve)
+        if tenors:
+            vix_clause_context = True
+        comparison = len(tenors) > 1 and re.search(
+            r"[<>]|\b(?:above|below|higher|lower|versus|vs|exceeds|outpaces|surpasses|spread|slope)\b", normalized
+        )
+        # A full curve assertion needs the collector's complete three-tenor
+        # evidence even when the same clause also names a compatible pair.
+        required = set(facts["vix_observation_dates"]) if curve else (
+            tenors if len(tenors) > 1 else set(facts["vix_observation_dates"])
+        )
+        dates = [facts["vix_observation_dates"][t] for t in required]
+        compatible = all(dates) and len(set(dates)) == 1
+        if compatible and all(facts["vix_observation_dates"].values()) and not facts["vix_dates_compatible"]:
+            # A dated subset remains descriptive evidence. Without its date,
+            # do not promote two older matching tenors into the current curve
+            # when the supplied third tenor has a different observation date.
+            compatible = dates[0] in normalized
+        if (curve or comparison) and not compatible:
+            reasons.add("incompatible_vix_observation_dates")
+        if any(facts["vix_observation_dates"][t] is None for t in tenors) and extract_numeric_mentions(
+            tenor_text, include_small_integers=True
+        ):
+            reasons.add("ineligible_vix_observation")
+        quantity = re.search(r"\d+(?:\.\d+)?\s*(?:%|percent)?", normalized)
+        if quantity and re.search(r"\bconfidence\b", normalized):
+            confidence_forecast_context = True
+        if re.search(
+            r"\b(?:markets?|equities|stocks|spy|qqq|dvn|vix|regime)\s+will\s+"
+            r"(?:rise|fall|rally|plunge|surge|dump|crash)\b", normalized
+        ):
+            reasons.add("unsupported_directional_forecast")
+        if re.search(
+            r"\b(?:we|i|grid|(?:the )?model)\s+(?:forecast|predict)\w*\b.*"
+            r"\b(?:recession|crash|rally|plunge|surge|dump)\b", normalized
+        ):
+            reasons.add("unsupported_outcome_forecast")
+        if re.search(r"\bhigh[- ]probability\b", normalized) or (
+            quantity and re.search(r"\b(?:probabilit\w*|chance|odds|likelihood)\b", normalized)
+        ) or re.search(r"\b(?:bull|base|bear) case\s*[:(-]?\s*\d+\s*%", normalized) or (
+            confidence_forecast_context
+            and re.search(r"\b(?:predict\w*|forecast\w*|will (?:rise|fall|rally|plunge|surge|dump)|crash|recession|reversal)\b", normalized)
+        ):
+            reasons.add("uncalibrated_outcome_probability")
+        non_options_dealer_description = (
+            re.search(r"\b(?:treasur(?:y|ies)|commodit(?:y|ies)|corporate bonds?)\b", normalized)
+            and not re.search(r"\b(?:pcr|put/call|gamma|options?)\b", normalized)
+        )
+        if not non_options_dealer_description and re.search(r"\b(?:dealers?|market makers?)\b", normalized) and re.search(
+            r"\b(?:long|short|gamma|inventory|position\w*|buy\w*|sell\w*|hedg\w*|suppress\w*)\b", normalized
+        ):
+            reasons.add("aggregate_pcr_does_not_identify_dealer_side")
+        if re.search(
+            r"(?:^|\b(?:then|you|should|must|immediately)\s+|[,—:]\s*)"
+            r"(?:exit|short|buy|sell|reduce|increase|tighten|hedge|avoid|hold|liquidate|trim|close|cut|dump|unwind)\s+"
+            r"(?:all\s+|your\s+|the\s+)?(?:(?:equity|equities|portfolio|net|gross|leveraged|directional|long|short)\s+){0,3}(?:positions?|exposure|risk|stops|shares|equities|stocks|bonds|puts|calls|spy|qqq|dvn|long|short)\b|"
+            r"\b(?:exit all|tighten stops|do not (?:initiate|add|chase)|reduce exposure|stay (?:flat|defensive))\b|"
+            r"\bwatch for\b.*\b(?:above|below|trigger)\b.*\d", normalized
+        ):
+            reasons.add("unsupported_positioning_instruction")
+        # This is a publication-owned defect, using the existing registry's
+        # exact ticker match; no security-master or resolver mutation.
+        if "dvn" in normalized:
+            from analysis.market_universe import search_company
+            canonical = [c for c in search_company("DVN") if c["ticker"] == "DVN"]
+            if canonical and canonical[0]["sector"] == "Energy" and re.search(
+                r"\b(?:biotech\w*|technology|tech)\s+(?:names|basket|stocks|tickers|(?:convergence )?signals|puts)"
+                r"\s*(?:(?:for|like|including|such as)\s*)?[:(\[]?\s*(?:[a-z]{1,6}\s*,\s*)*dvn\b|"
+                r"\bdvn(?:'s\s+|\s+(?:is|as|belongs to)\s+|,\s*)"
+                r"(?:a\s+)?(?:leading\s+)?(?:biotech\w*|technology|tech|healthcare|pharma)\b", normalized
+            ):
+                reasons.add("dvn_sector_misclassification")
+        if reasons:
+            violations.append({"segment_index": index // 2, "reasons": sorted(reasons)})
+            reasons_seen.update(reasons)
+            segments[index] = "[Claim omitted: " + ", ".join(sorted(reasons)) + ".]"
+    return "".join(segments), {
+        "passed": not violations, "reasons": sorted(reasons_seen),
+        "omitted_segments": violations, "context_facts": facts,
+        "scope": "bounded_publication_context_v1",
+    }
 
 
 def flow_evidence_kind(edge: dict[str, Any]) -> str:
@@ -145,7 +367,132 @@ def _reported_flow_clause_supported(clause: str, reported: list[dict[str, Any]])
     )
 
 
-def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+def _actor_clause_nonclaim(clause: str) -> bool:
+    """Only whole bounded caveats/hypotheses; never a permission-bearing adjective."""
+    actor = r"(?:institutional|retail)"
+    subject = actor + r"\s+(?:distribution|accumulation|positioning|ownership|buying|selling|conviction|sentiment)"
+    if re.fullmatch(subject + r"\s+(?:is|remains)\s+(?:unmeasured|unknown|unverified|unavailable|not established(?: by these data)?)", clause):
+        return True
+    if re.fullmatch(r"(?:prices|ratios) alone cannot establish\s+" + subject, clause):
+        return True
+    if re.fullmatch(
+            r"hypothesis:\s*" + subject
+            + r"\s+(?:may|might|could)\s+(?:be occurring|occur|explain (?:the |a )?(?:rally|move|uptrend|decline))"
+            + r"(?:\s+\(unverified\))?", clause):
+        return True
+    return False
+
+
+def _actor_clause_supported(clause: str, evidence: list[dict[str, Any]]) -> bool:
+    """Narrow attributed holdings direction; never permission for distribution causality.
+
+    References/type are declared provenance, not verification of filing truth.
+    No narrative text, confidence, price/ratio or generic transfer receipt qualifies.
+    """
+    match = re.fullmatch(
+        r"\s*(?P<source>[\w:/.-]+) source-reported (?P<actor>institutional|retail) "
+        r"holdings (?P<direction>increased|decreased|unchanged) for "
+        r"(?P<instrument>[\w:/.^-]+) over the reported interval\s*", clause)
+    if match is None:
+        return False
+    for record in evidence:
+        if not isinstance(record, dict) or record.get("source_type") not in (
+                "ownership_filing", "position_report", "broker_classified_transactions"):
+            continue
+        if not all(isinstance(record.get(key), str) and record[key].strip()
+                   for key in ("source_id", "receipt_id", "actor", "instrument")):
+            continue
+        if (record["source_id"].lower() != match["source"]
+                or record["actor"].lower() != match["actor"]
+                or record["instrument"].lower() != match["instrument"]
+                or record.get("measure") != "holdings"
+                or record.get("direction") != match["direction"]):
+            continue
+        try:
+            start = datetime.fromisoformat(record["interval_start"])
+            end = datetime.fromisoformat(record["interval_end"])
+            if start.utcoffset() is None or end.utcoffset() is None or end <= start:
+                continue
+        except (KeyError, TypeError, ValueError):
+            continue
+        return True
+    return False
+
+
+def _publication_structure_reasons(clause: str, context: set[str]) -> set[str]:
+    """Reject bounded proxy-to-motive/depth/mechanism upgrades, not the nouns.
+
+    Current inputs contain no order-book, informed-investor identification,
+    dealer exposure or independently valued tail distribution. Their labels or
+    a narrative flag cannot authenticate those measurements. Context carries
+    only to reject a subsequent elided assertion, never to grant permission.
+    """
+    actor = bool(re.search(r"\b(?:informed participants?|insiders?|congressional (?:activity|traders?))\b", clause))
+    book = bool(re.search(r"\b(?:bids?|bid depth|order[- ]book(?: depth)?)\b", clause))
+    gamma = bool(re.search(r"\bgamma\b", clause))
+    tail = bool(re.search(r"\btail[\s\u2010-\u2015-]+risk\b", clause))
+    context.update(k for k, present in (("actor", actor), ("book", book), ("gamma", gamma), ("tail", tail)) if present)
+    subject = (r"(?:bid depth|order[- ]book depth|informed participant exits|insider distribution|"
+               r"gamma[- ]driven moves|gamma exposure|tail risk mispricing)")
+    if re.fullmatch(subject + r"\s+(?:is|are|remains?)\s+(?:unknown|unmeasured|unverified|unavailable|not established)", clause.strip()):
+        return set()
+    if re.fullmatch(r"(?:prices|counts|pcr|ratios|vix|these data)(?: alone)?\s+(?:cannot|do not|does not) establish\s+" + subject, clause.strip()):
+        return set()
+    if re.fullmatch(r"hypothesis:\s*(?:informed participants (?:may|might|could) be exiting|gamma[- ]driven moves (?:may|might|could) occur)(?:\s+\(unverified\))?", clause.strip()):
+        return set()
+    pronoun = bool(re.match(r"^\s*(?:(?:but|and|however|yet|whereas)\s+)?(?:it|they|this|that|these|those|is|are)\b", clause))
+    reasons: set[str] = set()
+    if (actor or pronoun and "actor" in context) and re.search(
+        r"\b(?:exit\w*|distribut\w*|accumulat\w*|dump\w*|offload\w*|conviction|leading indicator|predict\w*|occur\w*)\b", clause
+    ):
+        reasons.add("unsupported_informed_actor")
+    if (book or pronoun and "book" in context) and re.search(
+        r"\b(?:robust|thin|weak|deep|strong|absent|shallow)\b", clause
+    ):
+        reasons.add("unsupported_bid_depth")
+    if re.search(r"\bgamma[\s\u2010-\u2015-]+driven\b", clause) or (
+        pronoun and "gamma" in context and re.search(r"\b(?:occur\w*|happening)\b", clause)
+    ) or (
+        (gamma or pronoun and "gamma" in context)
+        and re.search(r"\b(?:driv\w*|caus\w*|amplif\w*)\b.*\b(?:moves?|volatil\w*|decline|rally|risk)\b", clause)
+    ):
+        reasons.add("unsupported_gamma_mechanism")
+    if (tail or pronoun and "tail" in context) and re.search(r"\b(?:under|over)[- ]?pric\w*|\bmispric\w*", clause):
+        reasons.add("unsupported_tail_risk_valuation")
+    return reasons
+
+
+def _publication_inference_nonclaim(clause: str) -> bool:
+    """Whole measurement denials only, never a denial of observed activity.
+
+    No amounts, causal tails or free-form descriptions enter this grammar.
+    In particular, 'institutions are not buying puts' still asserts actor side.
+    """
+    target = (r"(?:institutional (?:distribution|positioning)|hedg(?:e|ing) intent|"
+              r"hedging|distribution|buyer initiation|fear|protection buying)")
+    targets = target + r"(?:\s+or\s+" + target + r"){0,3}"
+    return bool(
+        re.fullmatch(r"not (?:a measure|evidence) of\s+" + targets, clause)
+        or re.fullmatch(r"(?:it|this proxy)\s+(?:does not|cannot) (?:prove|confirm)\s+" + targets, clause)
+        or re.fullmatch(r"so it cannot be used to claim\s+" + targets, clause)
+        or clause in {"not a measured flow", "no positioning instructions are provided"}
+    )
+
+
+def _publication_explicit_nonactor_subject(clause: str) -> bool:
+    """Whole bounded model/count observations; never erase an actor referent."""
+    number = r"[+-]?\d+(?:\.\d+)?"
+    return bool(
+        re.fullmatch(r"sentiment is (?:neutral|bullish|bearish)(?: \(" + number + r"\))?", clause)
+        or re.fullmatch(
+            r"regime confidence: monitor if the classifier confidence moves above " + number
+            + r" \(higher conviction\)(?: or below " + number + r" \(lower conviction\))?", clause)
+        or clause == "insider data: check for any significant changes in the insider sell ratio"
+        or clause == "a shift toward buys could invalidate the negative insider signal"
+    )
+
+
+def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None = None, actor_evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Bounded lexical gate for known publication failures, before writes/TTS.
 
     Fail closed on protected claims. No broad flag such as has_measured_flow,
@@ -153,25 +500,67 @@ def check_publication_claims(text: str, flow_edges: list[dict[str, Any]] | None 
     must identify its structured source and direction with a matching amount.
     This is deliberately conservative, not a complete natural-language verifier.
     """
-    normalized = unicodedata.normalize("NFKC", text)
-    normalized = "".join(c for c in normalized if unicodedata.category(c) != "Cf")
-    normalized = re.sub(r"[*_`]+", "", normalized).lower()
+    normalized = _strip_publication_disclosures(_publication_normalized(text))
     reasons: set[str] = set()
     reported = [e for e in (flow_edges or []) if flow_evidence_kind(e) == "reported_flow"]
     # Bind each clause independently. Decimal dots are never boundaries.
     # Commas in numbers are thousands separators, not clause separators.
-    sentences = re.split(r"[.!?]+(?:\s+|$)|[;\n]+|,(?!\d)\s*|\s+(?:and|while|but|whereas|however)\s+", normalized)
-    for sentence in sentences:
+    sentences = re.split(r"([.!?]+(?:\s+|$)|[;\n]+|,(?!\d)\s*|\s+(?:and|while|but|whereas|however)\s+)", normalized)
+    flow_clause_context = False
+    actor_context = False
+    sentiment_subject = False
+    structure_context: set[str] = set()
+    for index in range(0, len(sentences), 2):
+        if index == 0 or re.search(r"[.!?\n]", sentences[index - 1]):
+            flow_clause_context = False
+            sentiment_subject = False
+        sentence = sentences[index]
         # Remove only fixed nonclaim phrases, never a whole sentence containing
         # an unmeasured/unavailable adjective (which can precede a false claim).
-        sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? unavailable|(?:money )?flow engine)\b", "", sentence)
-        if re.search(r"\b(?:hedg\w*|(?:buy\w*|purchas\w*|sell\w*|writ\w*)\s+(?:[\w'-]+\s+){0,5}(?:downside\s+protection|puts?|calls?)|(?:puts?|calls?)\s+(?:buy\w*|purchas\w*|sell\w*)|downside\s+protection|signed\s+(?:dealer\s+)?gamma)\b", sentence):
+        sentence = re.sub(r"\b(?:transfer amount (?:unmeasured|unavailable)|(?:unmeasured|unavailable) transfer amount|hedging intent unmeasured|realized vol(?:atility)? (?:is )?(?:unavailable|unmeasured)|hedge funds?|inflation hedge|(?:operating|free) cash flows?|(?:money )?flow engine)\b", "", sentence)
+        if not sentence.strip():
+            continue
+        # A model observation never erases an earlier protected actor. Its
+        # exception applies only to this whole bounded clause, not later prose.
+        actor_explicit = bool(re.search(
+            r"\b(?:institution(?:al|s)?|retail|smart money|professional investors)\b", sentence))
+        inference_nonclaim = _publication_inference_nonclaim(sentence.strip())
+        actor_context = actor_context or actor_explicit
+        model_nonclaim = _publication_explicit_nonactor_subject(sentence.strip())
+        # The observed score is the grammatical subject of this one comma
+        # continuation. No free-form 'driven by' clause receives permission.
+        sentiment_continuation = sentiment_subject and index > 0 and sentences[index - 1].startswith(',') and bool(re.fullmatch(
+            r"driven by conflicting signals: strong trend \([+-]?\d+(?:\.\d+)?\)", sentence.strip()))
+        sentiment_subject = bool(re.fullmatch(
+            r"sentiment is (?:neutral|bullish|bearish)(?: \([+-]?\d+(?:\.\d+)?\))?", sentence.strip()))
+        if inference_nonclaim:
+            # A denial can still be the antecedent of a later unsupported
+            # assertion. It grants no permission to a following amount/claim.
+            flow_clause_context = flow_clause_context or bool(re.search(r"\bflow\b", sentence))
+            continue
+        reasons.update(_publication_structure_reasons(sentence, structure_context))
+        if (actor_context
+                and re.search(r"\b(?:distribut\w*|accumulat\w*|occur\w*|sell\w*|sold|buy\w*|bought|dump\w*|offload\w*|unload\w*|led|driv\w*|driven|fuel\w*|support\w*|position\w*|holdings|ownership|own\w*|exposur\w*|bid\w*|conviction|euphori\w*|exit\w*)\b", sentence)
+                and not _actor_clause_nonclaim(sentence.strip())
+                and not model_nonclaim and not sentiment_continuation
+                and not _actor_clause_supported(sentence.strip(), actor_evidence if isinstance(actor_evidence, list) else [])):
+            reasons.add("unsupported_actor_interpretation")
+        commercial_hedge_subject = (
+            re.search(r"\b(?:fuel (?:costs?|prices?)|inflation|currency fluctuations?|foreign exchange|interest rates?)\b", sentence)
+            and not re.search(r"\b(?:pcr|put/call|puts?|calls?|options?|dealers?|protection)\b", sentence)
+        )
+        options_sentence = re.sub(r"\bhedg\w*\b", "", sentence) if commercial_hedge_subject else sentence
+        if re.search(r"\b(?:hedg\w*|(?:buy\w*|bought|purchas\w*|sell\w*|writ\w*)\s+(?:[\w'-]+\s+){0,5}(?:downside\s+protection|puts?|calls?)|(?:puts?|calls?)\s+(?:buy\w*|bought|purchas\w*|sell\w*)|downside\s+protection|signed\s+(?:dealer\s+)?gamma)\b", options_sentence):
             reasons.add("unsupported_options_intent")
         if re.search(r"\breali[sz]ed\s+vol(?:atility)?\b", sentence):
             reasons.add("unsupported_realized_volatility")
-        if _DOLLAR_RE.fullmatch(sentence.strip()) or re.search(r"\b(?:(?:in|out)?flows?|flowed|transfer(?:red|s)?|wired|money\s+(?:is\s+)?flowing|capital\s+(?:moved|rotat\w*|flight)|(?:moved|poured|rotated|drained|siphoned)\s+(?:directly\s+)?(?:from|into|out))\b", sentence):
+        flow_claim = re.search(r"\b(?:(?:in|out)?flows?|flowed|transfer(?:red|s)?|wired|money\s+(?:is\s+)?flowing|capital\s+(?:moved|rotat\w*|flight)|(?:moved|poured|rotated|drained|siphoned)\s+(?:directly\s+)?(?:from|into|out))\b", sentence)
+        # An isolated currency price is not a transfer. An additional amount
+        # in the same flow statement still needs its own source receipt.
+        if flow_claim or (flow_clause_context and _DOLLAR_RE.fullmatch(sentence.strip())):
             if not _reported_flow_clause_supported(sentence.strip(), reported):
                 reasons.add("unsupported_money_transfer")
+        flow_clause_context = bool(flow_claim) or flow_clause_context
     return {"passed": not reasons, "reasons": sorted(reasons), "scope": "bounded_publication_claims_v1"}
 
 # ── Configuration ────────────────────────────────────────────────────────
@@ -329,7 +718,7 @@ def _decimal_places(mantissa: str) -> int:
     return 0
 
 
-def extract_numeric_mentions(text: str) -> list[NumericMention]:
+def extract_numeric_mentions(text: str, *, include_small_integers: bool = False) -> list[NumericMention]:
     """Extract numeric claims from text: decimals, percents, $ amounts, ratios.
 
     Deliberately ignores (never extracts):
@@ -346,6 +735,11 @@ def extract_numeric_mentions(text: str) -> list[NumericMention]:
       and unmarked. A bare integer of 3+ digits (or 4+ outside the year
       window) *is* extracted, since it can only plausibly be a real
       quantity (e.g. an index level, an OI count) at that magnitude.
+
+    The publication VIX eligibility check opts into small integers so reading
+    eligibility does not depend on the writer's reporting verb. Date/time/year
+    and list-label exclusions remain; ordinary numeric grounding keeps its
+    existing default policy.
 
     Returns mentions in left-to-right (start offset) order. Overlapping
     matches are resolved by pattern priority: $ > % > ratio (Nx) > decimal
@@ -413,7 +807,7 @@ def extract_numeric_mentions(text: str) -> list[NumericMention]:
 
     for m in _BARE_INT_RE.finditer(text):
         digits = m.group(1).lstrip("+-")
-        if len(digits) <= 2:
+        if len(digits) <= 2 and not include_small_integers:
             continue
         value = _to_float(m.group(1))
         if len(digits) == 4 and _YEAR_MIN <= abs(int(value)) <= _YEAR_MAX:

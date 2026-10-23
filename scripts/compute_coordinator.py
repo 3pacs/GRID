@@ -21,12 +21,16 @@ Run: uvicorn scripts.compute_coordinator:app --host 0.0.0.0 --port 8100
 import os
 import sys
 import json
+import threading
+import time
+from contextlib import contextmanager
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 import psycopg2
+import psycopg2.errors
 import psycopg2.extras
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -119,6 +123,15 @@ class JobResult(BaseModel):
 
 # ── Database ───────────────────────────────────────────────────
 
+APPLICATION_NAME = "grid-coordinator"
+
+# /stats is polled by compute_job_producer with a 15 s HTTP timeout; a scan that
+# outlives the client only adds load, so cap the query at the same budget.
+STATS_STATEMENT_TIMEOUT_MS = 15000
+# Bound a hung connect too; /stats holds its single-flight lock while connecting.
+DB_CONNECT_TIMEOUT_SECONDS = 10
+
+
 def get_conn():
     return psycopg2.connect(
         host=settings.DB_HOST,
@@ -126,12 +139,42 @@ def get_conn():
         dbname=settings.DB_NAME,
         user=settings.DB_USER,
         password=settings.DB_PASSWORD,
+        application_name=APPLICATION_NAME,
+        connect_timeout=DB_CONNECT_TIMEOUT_SECONDS,
     )
 
 
-def init_tables():
+@contextmanager
+def db_conn(autocommit: bool = False) -> Iterator[Any]:
+    """Yield a connection that is rolled back on error and always closed.
+
+    Without this, an exception (a statement_timeout cancel, an HTTPException
+    from transition_job) skipped ``conn.close()``: the server session sat
+    ``idle in transaction (aborted)`` until idle_in_transaction_session_timeout
+    and the client socket leaked until garbage collection.
+    """
     conn = get_conn()
-    conn.autocommit = True
+    try:
+        conn.autocommit = autocommit
+        yield conn
+    except BaseException:
+        if not conn.autocommit:
+            try:
+                conn.rollback()
+            except Exception as exc:
+                log.warning("Coordinator rollback failed: {e}", e=exc)
+        raise
+    finally:
+        conn.close()
+
+
+def init_tables():
+    with db_conn(autocommit=True) as conn:
+        _create_tables(conn)
+    log.info("Compute coordinator tables initialized")
+
+
+def _create_tables(conn: Any) -> None:
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS compute_workers (
@@ -196,8 +239,6 @@ def init_tables():
         );
         CREATE INDEX IF NOT EXISTS idx_compute_state_log_job ON compute_state_log (job_id);
     """)
-    conn.close()
-    log.info("Compute coordinator tables initialized")
 
 
 # ── State Machine ──────────────────────────────────────────────
@@ -685,53 +726,50 @@ async def health():
 
 @app.post("/workers/register")
 def register_worker(w: WorkerRegister):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "INSERT INTO compute_workers (hostname,tailscale_ip,cpu_cores,ram_gb,gpu_model,"
-        "gpu_vram_gb,has_ollama,has_docker,max_concurrent) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (hostname) DO UPDATE SET tailscale_ip=EXCLUDED.tailscale_ip, "
-        "cpu_cores=EXCLUDED.cpu_cores, ram_gb=EXCLUDED.ram_gb, gpu_model=EXCLUDED.gpu_model, "
-        "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
-        "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
-        "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
-        "RETURNING *",
-        (w.hostname, w.tailscale_ip, w.cpu_cores, w.ram_gb, w.gpu_model,
-         w.gpu_vram_gb, w.has_ollama, w.has_docker, w.max_concurrent),
-    )
-    worker = dict(cur.fetchone())
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "INSERT INTO compute_workers (hostname,tailscale_ip,cpu_cores,ram_gb,gpu_model,"
+            "gpu_vram_gb,has_ollama,has_docker,max_concurrent) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+            "ON CONFLICT (hostname) DO UPDATE SET tailscale_ip=EXCLUDED.tailscale_ip, "
+            "cpu_cores=EXCLUDED.cpu_cores, ram_gb=EXCLUDED.ram_gb, gpu_model=EXCLUDED.gpu_model, "
+            "gpu_vram_gb=EXCLUDED.gpu_vram_gb, has_ollama=EXCLUDED.has_ollama, "
+            "has_docker=EXCLUDED.has_docker, max_concurrent=EXCLUDED.max_concurrent, "
+            "active_jobs=0, last_heartbeat=NOW(), state='IDLE' "
+            "RETURNING *",
+            (w.hostname, w.tailscale_ip, w.cpu_cores, w.ram_gb, w.gpu_model,
+             w.gpu_vram_gb, w.has_ollama, w.has_docker, w.max_concurrent),
+        )
+        worker = dict(cur.fetchone())
     log.info("Worker registered: {h} ({ip})", h=w.hostname, ip=w.tailscale_ip)
     return worker
 
 
 @app.get("/workers")
 def list_workers():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM compute_workers ORDER BY id")
-    workers = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return workers
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM compute_workers ORDER BY id")
+        return [dict(r) for r in cur.fetchall()]
 
 
 @app.post("/workers/{worker_id}/heartbeat")
 def worker_heartbeat(worker_id: int, active_jobs: Optional[int] = None):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-    if active_jobs is None:
-        cur.execute(worker_heartbeat_update_sql(), (worker_id,))
-    else:
-        cur.execute(worker_heartbeat_with_active_jobs_update_sql(), (active_jobs, active_jobs, worker_id))
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        cur = conn.cursor()
+        if active_jobs is None:
+            cur.execute(worker_heartbeat_update_sql(), (worker_id,))
+        else:
+            cur.execute(worker_heartbeat_with_active_jobs_update_sql(), (active_jobs, active_jobs, worker_id))
     return {"status": "ok"}
 
 
 @app.post("/jobs")
-async def create_job(job: JobCreate):
+def create_job(job: JobCreate):
+    # Plain ``def`` so FastAPI runs it in the threadpool: the blocking psycopg2
+    # calls below used to run on the event loop and stall every other request
+    # whenever the database was slow.
     if job.tenant == "boogerbots":
         raise HTTPException(
             400,
@@ -739,23 +777,21 @@ async def create_job(job: JobCreate):
             "submission is enabled",
         )
     db_priority = db_priority_value(job.priority)
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "INSERT INTO compute_jobs (job_type,name,description,params,priority,"
-        "timeout_seconds,requires_gpu,requires_ollama,state) "
-        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'CREATED') RETURNING *",
-        (job.job_type.value, job.name, job.description, json.dumps(job.params),
-         db_priority, job.timeout_seconds, job.requires_gpu, job.requires_ollama),
-    )
-    created = dict(cur.fetchone())
+    with db_conn(autocommit=True) as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "INSERT INTO compute_jobs (job_type,name,description,params,priority,"
+            "timeout_seconds,requires_gpu,requires_ollama,state) "
+            "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,'CREATED') RETURNING *",
+            (job.job_type.value, job.name, job.description, json.dumps(job.params),
+             db_priority, job.timeout_seconds, job.requires_gpu, job.requires_ollama),
+        )
+        created = dict(cur.fetchone())
 
-    # Auto-queue
-    transition_job(cur, created["id"], JobState.QUEUED, "auto-queued on creation")
-    cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (created["id"],))
-    result = dict(cur.fetchone())
-    conn.close()
+        # Auto-queue
+        transition_job(cur, created["id"], JobState.QUEUED, "auto-queued on creation")
+        cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (created["id"],))
+        result = dict(cur.fetchone())
     log.info("Job created: #{id} {name} ({type})", id=result["id"], name=job.name, type=job.job_type.value)
     return result
 
@@ -781,8 +817,6 @@ async def dry_run_job(payload: dict):
 
 @app.get("/jobs")
 def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit: int = 50):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
     query = "SELECT * FROM compute_jobs WHERE TRUE"
     params = []
     if state:
@@ -793,19 +827,18 @@ def list_jobs(state: Optional[str] = None, job_type: Optional[str] = None, limit
         params.append(job_type)
     query += " ORDER BY priority DESC, created_at ASC LIMIT %s"
     params.append(limit)
-    cur.execute(query, params)
-    jobs = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return jobs
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(query, params)
+        return [dict(r) for r in cur.fetchall()]
 
 
 @app.get("/jobs/{job_id}")
 def get_job(job_id: int):
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
-    row = cur.fetchone()
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM compute_jobs WHERE id=%s", (job_id,))
+        row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Job not found")
     return dict(row)
@@ -814,32 +847,28 @@ def get_job(job_id: int):
 @app.get("/metadata/compute-inputs")
 def compute_inputs(model_limit: int = 16, feature_limit: int = 20):
     """Return coordinator-DB-valid IDs for external job producers."""
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    cur.execute(
-        "SELECT id FROM model_registry "
-        "WHERE feature_set IS NOT NULL AND cardinality(feature_set) > 0 "
-        "ORDER BY id LIMIT %s",
-        (model_limit,),
-    )
-    model_ids = [int(row["id"]) for row in cur.fetchall()]
-    cur.execute(
-        "SELECT id FROM feature_registry "
-        "WHERE model_eligible=TRUE ORDER BY id LIMIT %s",
-        (feature_limit,),
-    )
-    feature_ids = [int(row["id"]) for row in cur.fetchall()]
-    conn.close()
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute(
+            "SELECT id FROM model_registry "
+            "WHERE feature_set IS NOT NULL AND cardinality(feature_set) > 0 "
+            "ORDER BY id LIMIT %s",
+            (model_limit,),
+        )
+        model_ids = [int(row["id"]) for row in cur.fetchall()]
+        cur.execute(
+            "SELECT id FROM feature_registry "
+            "WHERE model_eligible=TRUE ORDER BY id LIMIT %s",
+            (feature_limit,),
+        )
+        feature_ids = [int(row["id"]) for row in cur.fetchall()]
     return {"model_ids": model_ids, "feature_ids": feature_ids}
 
 
 @app.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: int):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-    transition_job(cur, job_id, JobState.CANCELLED, "cancelled by operator")
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        transition_job(conn.cursor(), job_id, JobState.CANCELLED, "cancelled by operator")
     return {"status": "cancelled", "job_id": job_id}
 
 
@@ -857,11 +886,8 @@ def claim_job(
         job_type: Only claim jobs of this type (e.g. HUMAN_LLM_QUERY).
         exclude_types: Comma-separated job types to skip (e.g. HUMAN_LLM_QUERY).
     """
-    conn = get_conn()
-    conn.autocommit = False
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    try:
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
             "SELECT active_jobs,max_concurrent FROM compute_workers WHERE id=%s FOR UPDATE",
             (worker_id,),
@@ -917,21 +943,14 @@ def claim_job(
         conn.commit()
         log.info("Job #{id} claimed by worker {w}", id=job_id, w=worker_id)
         return job
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 @app.post("/jobs/{job_id}/start")
 def start_job(job_id: int, worker_id: int):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-    transition_job(cur, job_id, JobState.IN_PROGRESS, "worker started execution", worker_id)
-    cur.execute(worker_heartbeat_update_sql(), (worker_id,))
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        cur = conn.cursor()
+        transition_job(cur, job_id, JobState.IN_PROGRESS, "worker started execution", worker_id)
+        cur.execute(worker_heartbeat_update_sql(), (worker_id,))
     return {"status": "started", "job_id": job_id}
 
 
@@ -955,11 +974,8 @@ def completion_already_recorded(cur, job_id: int) -> str | None:
 
 @app.post("/jobs/{job_id}/complete")
 def complete_job(job_id: int, result: JobResult):
-    conn = get_conn()
-    conn.autocommit = False
-    cur = conn.cursor()
-
-    try:
+    with db_conn() as conn:
+        cur = conn.cursor()
         recorded = completion_already_recorded(cur, job_id)
         if recorded:
             conn.rollback()
@@ -987,53 +1003,148 @@ def complete_job(job_id: int, result: JobResult):
         conn.commit()
         log.info("Job #{id} completed by worker {w}", id=job_id, w=result.worker_id)
         return {"status": "completed" if not result.error else "failed", "job_id": job_id}
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 @app.post("/jobs/{job_id}/validate")
 def validate_job(job_id: int):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-    transition_job(cur, job_id, JobState.VALID, "validated by operator")
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        transition_job(conn.cursor(), job_id, JobState.VALID, "validated by operator")
     return {"status": "valid", "job_id": job_id}
 
 
 @app.post("/jobs/{job_id}/assimilate")
 def assimilate_job(job_id: int):
-    conn = get_conn()
-    conn.autocommit = True
-    cur = conn.cursor()
-    transition_job(cur, job_id, JobState.ASSIMILATED, "results assimilated into GRID")
-    conn.close()
+    with db_conn(autocommit=True) as conn:
+        transition_job(conn.cursor(), job_id, JobState.ASSIMILATED, "results assimilated into GRID")
     return {"status": "assimilated", "job_id": job_id}
 
 
-@app.get("/stats")
-def coordinator_stats():
-    conn = get_conn()
-    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+ACTIVE_JOB_STATES = (
+    JobState.CREATED.value,
+    JobState.QUEUED.value,
+    JobState.DISPATCHED.value,
+    JobState.IN_PROGRESS.value,
+)
+STATS_CACHE_TTL_SECONDS = 30.0
 
-    cur.execute("SELECT state, count(*) as count FROM compute_jobs GROUP BY state")
-    job_states = {r["state"]: r["count"] for r in cur.fetchall()}
 
-    cur.execute("SELECT count(*) as total, count(*) FILTER (WHERE state='IDLE') as idle, "
-                "count(*) FILTER (WHERE state='BUSY') as busy FROM compute_workers")
-    workers = dict(cur.fetchone())
+class _StatsCache:
+    """Single-flight, short-TTL cache for the full-table /stats aggregate.
 
-    cur.execute("SELECT job_type, count(*) as count FROM compute_jobs GROUP BY job_type")
-    by_type = {r["job_type"]: r["count"] for r in cur.fetchall()}
+    ``compute_jobs`` holds tens of millions of rows. Uncached, every poller
+    started its own full scan; on a cold cache those scans overlapped and ran
+    into statement_timeout together. Now at most one scan runs at a time,
+    concurrent callers reuse its result, and a failed scan falls back to the
+    last good answer (flagged ``stale``) instead of an error. A failure also
+    backs off for one TTL, so callers queued behind a failing scan don't each
+    retry it in turn.
+    """
 
-    conn.close()
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.value: Optional[dict] = None
+        self.stored_at = 0.0
+        self.failed_at: Optional[float] = None
+
+    def fresh(self) -> Optional[dict]:
+        if self.value is not None and time.monotonic() - self.stored_at < STATS_CACHE_TTL_SECONDS:
+            return self.value
+        return None
+
+    def recently_failed(self) -> bool:
+        return self.failed_at is not None and time.monotonic() - self.failed_at < STATS_CACHE_TTL_SECONDS
+
+    def store(self, value: dict) -> None:
+        self.value = value
+        self.stored_at = time.monotonic()
+        self.failed_at = None
+
+    def mark_failed(self) -> None:
+        self.failed_at = time.monotonic()
+
+    def stale_or_unavailable(self) -> dict:
+        if self.value is not None:
+            return {**self.value, "stale": True}
+        raise HTTPException(503, "Coordinator stats unavailable: database too slow, retry later")
+
+
+_stats_cache = _StatsCache()
+
+
+def _set_local_statement_timeout(cur: Any, timeout_ms: int) -> None:
+    # set_config(..., is_local => true) scopes the limit to this transaction.
+    cur.execute("SELECT set_config('statement_timeout', %s, true)", (str(int(timeout_ms)),))
+
+
+def _query_full_stats() -> dict[str, Any]:
+    with db_conn() as conn:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        _set_local_statement_timeout(cur, STATS_STATEMENT_TIMEOUT_MS)
+        # One scan for both breakdowns (previously two full scans per call).
+        cur.execute("SELECT state, job_type, count(*) AS count FROM compute_jobs GROUP BY state, job_type")
+        job_states: dict[str, int] = {}
+        by_type: dict[str, int] = {}
+        for r in cur.fetchall():
+            job_states[r["state"]] = job_states.get(r["state"], 0) + int(r["count"])
+            by_type[r["job_type"]] = by_type.get(r["job_type"], 0) + int(r["count"])
+
+        cur.execute("SELECT count(*) as total, count(*) FILTER (WHERE state='IDLE') as idle, "
+                    "count(*) FILTER (WHERE state='BUSY') as busy FROM compute_workers")
+        workers = dict(cur.fetchone())
     return {
         "job_states": job_states,
         "workers": workers,
         "jobs_by_type": by_type,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
+
+
+@app.get("/stats")
+def coordinator_stats() -> dict[str, Any]:
+    cached = _stats_cache.fresh()
+    if cached is not None:
+        return cached
+    with _stats_cache.lock:
+        cached = _stats_cache.fresh()  # another caller may have refreshed while we waited
+        if cached is not None:
+            return cached
+        if _stats_cache.recently_failed():
+            # Don't queue a fresh scan behind one that just failed.
+            return _stats_cache.stale_or_unavailable()
+        try:
+            value = _query_full_stats()
+        except psycopg2.OperationalError as exc:
+            # QueryCanceled (statement_timeout) plus restart-time errors such as
+            # AdminShutdown and connection refused are all OperationalError.
+            _stats_cache.mark_failed()
+            log.warning("Coordinator /stats scan failed ({e}); serving stale result or 503",
+                        e=type(exc).__name__)
+            return _stats_cache.stale_or_unavailable()
+        _stats_cache.store(value)
+        return value
+
+
+@app.get("/stats/queue")
+def coordinator_queue_stats() -> dict[str, Any]:
+    """Counts for the active (non-terminal) job states only.
+
+    Uses the ``state`` index over the small active slice of ``compute_jobs``,
+    so job producers can poll queue depth without a full-table scan.
+    """
+    try:
+        with db_conn() as conn:
+            cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            _set_local_statement_timeout(cur, STATS_STATEMENT_TIMEOUT_MS)
+            cur.execute(
+                "SELECT state, count(*) AS count FROM compute_jobs WHERE state = ANY(%s) GROUP BY state",
+                (list(ACTIVE_JOB_STATES),),
+            )
+            counts = {r["state"]: int(r["count"]) for r in cur.fetchall()}
+    except psycopg2.OperationalError as exc:
+        log.warning("Coordinator /stats/queue query failed: {e}", e=type(exc).__name__)
+        raise HTTPException(503, "Coordinator queue stats unavailable, retry later")
+    return {
+        "job_states": {state: counts.get(state, 0) for state in ACTIVE_JOB_STATES},
         "timestamp": datetime.utcnow().isoformat(),
     }
 

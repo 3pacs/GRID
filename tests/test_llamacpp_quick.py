@@ -241,3 +241,33 @@ class TestLlamacppReasoningResponses:
 
         client = LlamaCppClient(base_url="http://localhost:8081", model="Qwen3-32B-Q4_K_M")
         assert client.chat([{"role": "user", "content": "x"}], num_predict=8) is None
+
+
+class TestLlamacppDefaultFactory:
+    """`_create_llamacpp_client` must honour LLAMACPP_TIMEOUT_SECONDS."""
+
+    @patch("llamacpp.client.requests")
+    def test_factory_passes_configured_timeout(self, mock_requests: object) -> None:
+        from unittest.mock import MagicMock
+
+        ok = MagicMock()
+        ok.status_code = 200
+        ok.json.return_value = {"default_generation_settings": {"n_ctx": 8192}}
+        mock_requests.get.return_value = ok  # type: ignore[attr-defined]
+
+        from llm.router import _create_llamacpp_client
+
+        settings = type(
+            "S",
+            (),
+            {
+                "LLAMACPP_ENABLED": True,
+                "LLAMACPP_BASE_URL": "http://localhost:8086",
+                "LLAMACPP_CHAT_MODEL": "Qwen3.8-27B-Q4_K_M",
+                "LLAMACPP_TIMEOUT_SECONDS": 300,
+            },
+        )()
+
+        client = _create_llamacpp_client(settings)
+        assert client is not None
+        assert client.timeout == 300

@@ -286,6 +286,7 @@ def read_latest_n(
     n: int,
     *,
     source: str | None = None,
+    start: date | None = None,
     as_of: date | None = None,
     as_of_ts: datetime | None = None,
 ) -> list[Observation]:
@@ -297,12 +298,18 @@ def read_latest_n(
 
     ``source`` restricts the read to one puller's rows (see :func:`read_window`);
     without it, raises :class:`MixedSourceError` on a mixed-source series_id.
+
+    ``start`` (optional) bounds the scan to ``obs_date >= start``. Without it
+    every accepted vintage back to the first observation is fetched and
+    collapsed in Python only to keep ``n`` rows -- ~2M rows for a long YF
+    series. Pass it whenever the caller knows how far back ``n`` dates can
+    be; fewer than ``n`` dates inside the bound returns fewer rows.
     """
     rows = conn.execute(
         text(_WINDOW_SQL),
         {
             "sid": series_id, "ok": SUCCESS, "source": source,
-            "start": None, "as_of": as_of, "as_of_ts": as_of_ts,
+            "start": start, "as_of": as_of, "as_of_ts": as_of_ts,
         },
     ).fetchall()
     if source is None:
@@ -479,3 +486,38 @@ def read_window_known_at(
     if source is None:
         _raise_if_mixed(series_id, sorted(known_sources))
     return out
+
+
+
+def read_daily_policy_n(
+    conn: Any, series_id: str, n: int, *, start: date,
+    source: str = "yfinance", as_of: date | None = None,
+    as_of_ts: datetime | None = None,
+) -> list[Observation]:
+    """Newest daily capture-policy observations, newest first.
+
+    Raw SUCCESS rows without validated policy provenance remain available
+    through the existing raw readers. They are not completed-session evidence.
+    Filtering occurs before vintage collapse and count. A PIT cutoff applies
+    before policy selection, so a later eligible capture cannot repair a past
+    as-of view. This does not assert provider-certified finality.
+    """
+    import json
+    from price_close_contract import is_daily_policy_capture
+    if source.lower() != "yfinance" or not series_id.startswith("YF:"):
+        raise ValueError("daily capture selection requires an explicit yfinance series")
+    sql = _WINDOW_SQL.replace("r.pull_timestamp, sc.name", "r.pull_timestamp, sc.name, r.raw_payload")
+    rows = conn.execute(text(sql), {
+        "sid": series_id, "ok": SUCCESS, "source": source,
+        "start": start, "as_of": as_of, "as_of_ts": as_of_ts,
+    }).fetchall()
+    qualified = []
+    for d, value, ts, name, payload in rows:
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except (TypeError, ValueError):
+                continue
+        if is_daily_policy_capture(payload, series_id, _coerce_date(d), _coerce_ts(ts)):
+            qualified.append((d, value, ts, name))
+    return list(reversed(_dedup_latest_vintage(qualified, series_id)))[:max(0, int(n))]

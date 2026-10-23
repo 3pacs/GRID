@@ -21,6 +21,7 @@ def test_slow_money_map_leaves_event_loop_responsive(monkeypatch):
         return {"layers": [], "source": "fixture"}
     monkeypatch.setitem(sys.modules, "analysis.money_flow", types.SimpleNamespace(build_flow_map=build))
     monkeypatch.setattr(flows, "get_db_engine", lambda: object())
+    monkeypatch.setattr(flows, "_provenance", lambda tables: {"generated_at": "fixture"})
     monkeypatch.setattr(flows, "_money_map_cache", flows.TTLCache(ttl=900, max_size=1))
     app = FastAPI()
     app.include_router(flows.router)
@@ -40,5 +41,6 @@ def test_slow_money_map_leaves_event_loop_responsive(monkeypatch):
         finally:
             release.set()
             fallback.cancel()
-        assert request.result(timeout=3).json() == {"layers": [], "source": "fixture"}
-        assert client.get("/api/v1/flows/money-map").json() == {"layers": [], "source": "fixture"}
+        expected = {"layers": [], "source": "fixture", "provenance": {"generated_at": "fixture"}}
+        assert request.result(timeout=3).json() == expected
+        assert client.get("/api/v1/flows/money-map").json() == expected

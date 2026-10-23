@@ -1,0 +1,113 @@
+{
+  "schema": "synthetic-numeric-session-v1",
+  "synthetic_only": true,
+  "instrument": "TEST:SPY",
+  "source": "synthetic-price",
+  "tool": "fixture",
+  "field": "ohlcv",
+  "adapter_version": "fixture-v1",
+  "session": {
+    "exchange": "TEST:X",
+    "session_id": "synthetic:2026-01-05",
+    "timezone_id": "UTC",
+    "open_at": "2026-01-05T14:30:00+00:00",
+    "close_at": "2026-01-05T14:32:00+00:00",
+    "calendar_id": "synthetic-calendar",
+    "calendar_version": "v1",
+    "convention": "regular"
+  },
+  "basis": {
+    "price_currency": "USD",
+    "volume_unit": "shares",
+    "notional_unit": "USD",
+    "adjustment": "raw",
+    "basis_id": "synthetic-trades",
+    "basis_version": "v1",
+    "notional_basis": "trade"
+  },
+  "references": {
+    "adjustment": {"evidence_id": "adjustment:1", "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "available_at": "2026-01-05T13:00:00+00:00", "recorded_at": "2026-01-05T13:00:01+00:00"},
+    "calendar": {"evidence_id": "calendar:1", "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "available_at": "2026-01-04T12:00:00+00:00", "recorded_at": "2026-01-04T12:00:01+00:00"},
+    "grid": {"evidence_id": "grid:1", "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc", "available_at": "2026-01-05T13:01:00+00:00", "recorded_at": "2026-01-05T13:01:01+00:00"},
+    "notional": {"evidence_id": "notional:1", "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", "available_at": "2026-01-05T14:32:00+00:00", "recorded_at": "2026-01-05T14:32:01+00:00"}
+  },
+  "bars": [
+    {"start": "2026-01-05T14:30:00+00:00", "end": "2026-01-05T14:31:00+00:00", "open": "10.00000000000000000000000000000000000000000000000001", "high": "11", "low": "9", "close": "10", "volume": 100, "trade_notional": "1000", "evidence_id": "bar:1", "evidence_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "revision_id": "revision:1", "interval_seconds": 60},
+    {"start": "2026-01-05T14:31:00+00:00", "end": "2026-01-05T14:32:00+00:00", "open": "12", "high": "13", "low": "11", "close": "12", "volume": 300, "trade_notional": "3600", "evidence_id": "bar:2", "evidence_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff", "revision_id": "revision:2", "interval_seconds": 60}
+  ],
+  "held_original_P01": {"highs": ["102", "104", "103"], "lows": ["99", "100", "98"], "computed_outputs": null},
+  "held_original_P02": {"volumes": [100, 300], "supplied_notionals": ["1000", "3600"], "computed_outputs": null},
+  "limits": "Caller-supplied synthetic contract facts only. No calculated OR/VWAP outputs, live providers, executions or economic truth claims.",
+  "math_cases": {
+  "opening_range_5": {
+    "minutes": 5,
+    "interval_seconds": [
+      60,
+      120,
+      120
+    ],
+    "highs": [
+      "102",
+      "104",
+      "103"
+    ],
+    "lows": [
+      "99",
+      "100",
+      "98"
+    ],
+    "expected_high": "104",
+    "expected_low": "98"
+  },
+  "trade_vwap": {
+    "volumes": [
+      100,
+      300
+    ],
+    "supplied_notionals": [
+      "1000",
+      "3600"
+    ],
+    "expected_ratio": [
+      23,
+      2
+    ]
+  },
+  "proxy_vwap": {
+    "highs": [
+      "11",
+      "14"
+    ],
+    "lows": [
+      "9",
+      "10"
+    ],
+    "closes": [
+      "10",
+      "12"
+    ],
+    "volumes": [
+      100,
+      300
+    ],
+    "expected_ratio": [
+      23,
+      2
+    ]
+  },
+  "nonterminating_trade_vwap": {
+    "volumes": [
+      1,
+      2
+    ],
+    "supplied_notionals": [
+      "1",
+      "0"
+    ],
+    "expected_ratio": [
+      1,
+      3
+    ]
+  }
+}
+}

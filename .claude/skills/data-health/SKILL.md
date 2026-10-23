@@ -26,7 +26,7 @@ GRID ingests from multiple categories:
 - `ingestion/altdata/wage_tracker.py` — Atlanta Fed Wage Growth Tracker
 - `ingestion/altdata/h8_bank_balance.py` — Fed H.8 commercial bank assets and liabilities
 
-### International Central Banks
+### International (`ingestion/international/`, `ingestion/trade/`)
 - `ingestion/international/ecb.py` — European Central Bank (rates, FX, economic indicators)
 - `ingestion/international/jquants.py` — Japan Exchange Group (Japanese equities and market structure)
 - `ingestion/international/edinet.py` — Japanese EDINET corporate disclosures
@@ -130,7 +130,8 @@ Should return JSON:
     "features_registered": true,
     "recent_data": true,
     "pool_healthy": true,
-    "thread_ingestion": true,
+    "api_keys_configured": 31,
+    "api_keys_total": 37,
     "disk_percent": 45.2,
     "llm_available": true
   },
@@ -140,7 +141,9 @@ Should return JSON:
 
 For authenticated comprehensive per-source pipeline health:
 ```bash
-curl -H "Authorization: Bearer $GRID_TOKEN" https://grid.stepdad.finance/api/v1/system/pipeline-health
+curl -H "Authorization: Bearer <jwt>" https://grid.stepdad.finance/api/v1/system/pipeline-health
+# Per-family GREEN/YELLOW/RED plus stale_sources (same auth):
+curl -H "Authorization: Bearer <jwt>" https://grid.stepdad.finance/api/v1/system/freshness
 ```
 
 Should return JSON:
@@ -152,14 +155,16 @@ Should return JSON:
       "status": "healthy",
       "freshness": "green",
       "last_pull": "2026-03-28T16:00:00Z",
-      "recent_rows": 150
+      "rows_last_pull": 150,
+      "next_scheduled": "2026-03-29T16:00:00Z"
     },
     {
       "name": "DarkPool",
       "status": "stale",
       "freshness": "yellow",
       "last_pull": "2026-03-23T17:00:00Z",
-      "recent_rows": 0
+      "rows_last_pull": 0,
+      "next_scheduled": null
     }
   ],
   "summary": {
@@ -173,38 +178,40 @@ Should return JSON:
 
 ## API Key Validation
 
-Per CLAUDE.md and ATTENTION.md #7, only `FRED_API_KEY` is validated at startup. Other sources may fail silently.
+Only `FRED_API_KEY` and `DB_PASSWORD` are validated at startup (field validators in `config.py`). Other sources may fail silently.
 
 ### Validated at Startup
-- `FRED_API_KEY` — Required for FRED data. Checked in `config.py:87-92`
+- `FRED_API_KEY` — Required for FRED data. Checked by the `_check_fred_key` field validator in `config.py` (empty is allowed only when `ENVIRONMENT=development`); `DB_PASSWORD` gets the same treatment
 
 ### NOT Validated (Will Fail Silently)
 - `KOSIS_API_KEY` — Korean statistics (if missing, HTTP 401 returns empty results)
 - `COMTRADE_API_KEY` — UN trade data (fails at query time)
-- `JQUANTS_API_KEY` — Japanese market data (returns 401)
-- `USDA_API_KEY` — Agriculture data (rate limit errors)
-- `NOAA_API_KEY` — Weather/climate data
+- `JQUANTS_EMAIL` / `JQUANTS_PASSWORD` — Japanese market data (returns 401)
+- `USDA_NASS_API_KEY` — Agriculture data (rate limit errors)
+- `NOAA_TOKEN` — Weather/climate data
 - `EIA_API_KEY` — Energy Information Administration (oil, gas, renewables)
+
+These are the names `config.py` declares; `GET /api/v1/system/api-keys` (JWT required) reports which are set.
 
 ### How to Check API Key Status
 
 ```python
-from config import FRED_API_KEY, KOSIS_API_KEY, COMTRADE_API_KEY, JQUANTS_API_KEY, USDA_API_KEY, NOAA_API_KEY, EIA_API_KEY
+from config import settings
 from loguru import log
 
-# Startup checks
-if not FRED_API_KEY:
+# Startup checks (config.py already raises for FRED_API_KEY outside development)
+if not settings.FRED_API_KEY:
     log.critical("FRED_API_KEY is missing — system cannot operate")
     exit(1)
 
 # Silent failures — log warnings
 api_keys = {
-    "KOSIS": KOSIS_API_KEY,
-    "COMTRADE": COMTRADE_API_KEY,
-    "JQUANTS": JQUANTS_API_KEY,
-    "USDA": USDA_API_KEY,
-    "NOAA": NOAA_API_KEY,
-    "EIA": EIA_API_KEY,
+    "KOSIS": settings.KOSIS_API_KEY,
+    "COMTRADE": settings.COMTRADE_API_KEY,
+    "JQUANTS": settings.JQUANTS_EMAIL and settings.JQUANTS_PASSWORD,
+    "USDA_NASS": settings.USDA_NASS_API_KEY,
+    "NOAA": settings.NOAA_TOKEN,
+    "EIA": settings.EIA_API_KEY,
 }
 
 for key_name, key_value in api_keys.items():
@@ -216,7 +223,7 @@ for key_name, key_value in api_keys.items():
 
 ## NaN and Data Quality Issues
 
-### ATTENTION.md #13: Silent NaN Conversion
+### Silent NaN Conversion
 
 Every ingestion module uses `pd.to_numeric(errors="coerce")` to handle bad data:
 
@@ -255,7 +262,7 @@ if coerced_count > 0:
     log.warning(f"Coerced {coerced_count} non-numeric values to NaN for {series_name}")
 ```
 
-### ATTENTION.md #14: Inconsistent NaN Handling
+### Inconsistent NaN Handling
 
 Different modules use different strategies for NaN:
 - `discovery/orthogonality.py:156` — `ffill(limit=5)`
@@ -269,9 +276,9 @@ Different modules use different strategies for NaN:
 Check each feature-engineering module:
 
 ```bash
-grep -n "ffill\|dropna\|fillna" grid/features/*.py
-grep -n "ffill\|dropna\|fillna" grid/discovery/*.py
-grep -n "ffill\|dropna\|fillna" grid/inference/*.py
+grep -n "ffill\|dropna\|fillna" features/*.py
+grep -n "ffill\|dropna\|fillna" discovery/*.py
+grep -n "ffill\|dropna\|fillna" inference/*.py
 ```
 
 Expected patterns (document existing strategy):
@@ -341,9 +348,9 @@ API KEY STATUS
 - FRED_API_KEY: ✓ Validated
 - KOSIS_API_KEY: ✗ Missing
 - COMTRADE_API_KEY: ✗ Missing
-- JQUANTS_API_KEY: ✓ Present
-- USDA_API_KEY: ✓ Present
-- NOAA_API_KEY: ✗ Missing
+- JQUANTS_EMAIL/JQUANTS_PASSWORD: ✓ Present
+- USDA_NASS_API_KEY: ✓ Present
+- NOAA_TOKEN: ✗ Missing
 - EIA_API_KEY: ✓ Present
 
 INGESTION SCHEDULER STATUS
@@ -362,28 +369,23 @@ Monitor dark_pool and congressional ingestion — both are overdue. Check logs f
 
 ## Scheduler Pattern (ingestion/scheduler.py)
 
-GRID uses `ingestion/scheduler.py` (NOT `scheduler_v2.py` which is deprecated per ATTENTION.md #39) to manage ingestion cadence.
+GRID uses `ingestion/scheduler.py` to manage ingestion cadence (the old
+`scheduler_v2.py` no longer exists). There is no `INGESTION_JOBS` list: pullers are
+grouped (`_get_pullers_for_group("daily")`, `"crypto"`, ...) and run through
+`run_pull_group()`, with `_should_run(key, period)` gating repeats. Hermes step 3
+runs only the due or stale pullers through `ingestion/smart_scheduler.py`
+(SmartScheduler), which tracks per-source frequency and cooldowns.
 
 ### Checking Scheduler Status
 
-```python
-from ingestion.scheduler import INGESTION_JOBS
+The live view is the pipeline-health route, which lists every source with its
+`status` (healthy/stale/broken), `last_pull`, `rows_last_pull` and `next_scheduled`:
 
-for job in INGESTION_JOBS:
-    print(f"{job.name}: {job.schedule} (next run: {job.next_run_time})")
+```bash
+curl -H "Authorization: Bearer <jwt>" http://localhost:8000/api/v1/system/pipeline-health
 ```
 
-### Expected Schedules
-
-| Source | Frequency | Module | Next Run |
-|---|---|---|---|
-| FRED | Daily 16:00 UTC | fred.py | 2026-03-31 16:00 |
-| BLS | Monthly 8:30 UTC (release day) | bls.py | 2026-04-04 08:30 |
-| ECB | Daily 13:00 UTC | ecb.py | 2026-03-31 13:00 |
-| crypto | Every 5 min | crypto.py | 2026-03-30 09:05 |
-| dark_pool | Weekly Wednesday 17:00 UTC | dark_pool.py | 2026-04-02 17:00 |
-| congressional | Daily 18:00 UTC (scrapes House.gov, Senate.gov) | congressional.py | 2026-03-31 18:00 |
-| GDELT | Every 4 hours | gdelt.py | 2026-03-30 10:00 |
+Whether the Hermes daemon itself ran a given step is `hermes-operations`.
 
 ## Debugging Common Issues
 
@@ -468,7 +470,7 @@ Before deploying new or modified sources:
 ## See Also
 
 - `CLAUDE.md` — Architecture overview
-- `ATTENTION.md` — 64-item audit checklist (items #7, #13, #14, #25, #39 directly relevant)
+- `ATTENTION.md` — now a stub; the numbered audit items this skill used to cite no longer exist there
 - `ingestion/scheduler.py` — Authoritative scheduler (not scheduler_v2.py)
 - `normalization/resolver.py` — Multi-source conflict resolution
 - `store/pit.py` — Point-in-time data queries

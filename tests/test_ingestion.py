@@ -337,7 +337,7 @@ class TestAltDataPullers:
 
         assert result[date(2026, 4, 10)] == 3.0
 
-    def test_fed_liquidity_missing_layout_returns_empty_frame(self, monkeypatch):
+    def test_fed_liquidity_missing_layout_is_not_clean_empty(self, monkeypatch):
         import sys
 
         from ingestion.altdata.fed_liquidity import FedLiquidityPuller
@@ -354,12 +354,16 @@ class TestAltDataPullers:
         puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
         puller._api_key = "test"
 
-        result = puller._fetch_fred_series("H8B1023NCBCMG", date(2026, 1, 1), date(2026, 1, 2))
+        with pytest.raises(ValueError, match="Missing required FRED date/value column"):
+            puller._fetch_fred_series("H8B1023NCBCMG", date(2026, 1, 1), date(2026, 1, 2))
+        puller.engine = MagicMock()
+        result = puller._pull_raw_series("H8B1023NCBCMG", date(2026, 1, 1), date(2026, 1, 2))
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] == 0
+        assert "Missing required FRED date/value column" in result["error"]
+        puller.engine.begin.assert_not_called()
 
-        assert list(result.columns) == ["date", "value"]
-        assert result.empty
-
-    def test_fed_liquidity_empty_observations_key_error_returns_empty_frame(
+    def test_fed_liquidity_upstream_key_error_is_not_clean_empty(
         self, monkeypatch
     ):
         import sys
@@ -378,14 +382,14 @@ class TestAltDataPullers:
         puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
         puller._api_key = "test"
 
-        result = puller._fetch_fred_series(
-            "TOTRESNS",
-            date(2026, 1, 1),
-            date(2026, 1, 2),
-        )
-
-        assert list(result.columns) == ["date", "value"]
-        assert result.empty
+        with pytest.raises(KeyError, match="date"):
+            puller._fetch_fred_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        puller.engine = MagicMock()
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] == 0
+        assert "date" in result["error"]
+        puller.engine.begin.assert_not_called()
 
     @pytest.mark.parametrize(
         ("frame", "series_id"),
@@ -394,7 +398,7 @@ class TestAltDataPullers:
             (pd.DataFrame({"value": [1.23]}), "RRPONTSYD"),
         ],
     )
-    def test_fed_liquidity_missing_date_or_value_columns_returns_empty_frame(
+    def test_fed_liquidity_missing_date_or_value_columns_refuse(
         self, monkeypatch, frame, series_id
     ):
         import sys
@@ -413,10 +417,37 @@ class TestAltDataPullers:
         puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
         puller._api_key = "test"
 
-        result = puller._fetch_fred_series(series_id, date(2026, 1, 1), date(2026, 1, 2))
+        with pytest.raises(ValueError, match="Missing required FRED date/value column"):
+            puller._fetch_fred_series(series_id, date(2026, 1, 1), date(2026, 1, 2))
+        puller.engine = MagicMock()
+        result = puller._pull_raw_series(series_id, date(2026, 1, 1), date(2026, 1, 2))
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] == 0
+        assert "Missing required FRED date/value column" in result["error"]
+        puller.engine.begin.assert_not_called()
 
-        assert list(result.columns) == ["date", "value"]
-        assert result.empty
+    def test_fed_liquidity_valid_empty_is_clean_no_new_data(self, monkeypatch):
+        import sys
+
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        class _FakeFred:
+            def __init__(self, _api_key):
+                pass
+
+            def get_series_observations(self, *_args, **_kwargs):
+                return pd.DataFrame(columns=["date", "value"])
+
+        monkeypatch.setitem(sys.modules, "fedfred", SimpleNamespace(FredAPI=_FakeFred))
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller._api_key = "test"
+        puller.engine = MagicMock()
+        frame = puller._fetch_fred_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        assert list(frame.columns) == ["date", "value"]
+        assert frame.empty
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        assert result == {"series": "TOTRESNS", "status": "NO_NEW_DATA", "rows_inserted": 0}
+        puller.engine.begin.assert_not_called()
 
     def test_fed_liquidity_prefers_observation_index_over_realtime_date(self, monkeypatch):
         import sys
@@ -468,15 +499,17 @@ class TestAltDataPullers:
             )
         )
         puller._get_existing_dates = MagicMock(return_value=set())
-        puller._insert_raw = MagicMock()
+        puller._insert_raw = MagicMock(return_value=SimpleNamespace(rowcount=1))
 
         result = puller._pull_raw_series("RRPONTSYD", date(2026, 1, 1), date(2026, 1, 2))
 
         assert result["status"] == "SUCCESS"
         assert result["rows_inserted"] == 1
         puller._insert_raw.assert_called_once()
+        assert puller._insert_raw.call_args.kwargs["return_result"] is True
+        assert puller._insert_raw.call_args.kwargs["obs_date"] == date(2026, 1, 1)
 
-    def test_fed_liquidity_pull_raw_skips_bad_row_dates(self):
+    def test_fed_liquidity_pull_raw_bad_date_cannot_claim_committed_success(self):
         from ingestion.altdata.fed_liquidity import FedLiquidityPuller
 
         mock_engine = MagicMock()
@@ -496,13 +529,56 @@ class TestAltDataPullers:
             )
         )
         puller._get_existing_dates = MagicMock(return_value=set())
-        puller._insert_raw = MagicMock()
+        puller._insert_raw = MagicMock(return_value=SimpleNamespace(rowcount=1))
 
         result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
 
-        assert result["status"] == "SUCCESS"
-        assert result["rows_inserted"] == 1
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] is None
+        assert "Invalid normalized observation date" in result["error"]
         puller._insert_raw.assert_called_once()
+        assert puller._insert_raw.call_args.kwargs["return_result"] is True
+        mock_engine.begin.return_value.__exit__.assert_called_once()
+        assert mock_engine.begin.return_value.__exit__.call_args.args[0] is ValueError
+        assert isinstance(mock_engine.begin.return_value.__exit__.call_args.args[1], ValueError)
+
+    @pytest.mark.parametrize("rowcount", [None, -1, True, "1"])
+    def test_fed_liquidity_unknown_affected_count_cannot_succeed(self, rowcount):
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller.source_id = 1
+        puller.engine = MagicMock()
+        puller.engine.begin.return_value.__exit__.return_value = False
+        puller._fetch_fred_series = MagicMock(return_value=pd.DataFrame({
+            "date": ["2026-01-01"], "value": [1.0]}))
+        puller._get_existing_dates = MagicMock(return_value=set())
+        puller._insert_raw = MagicMock(return_value=SimpleNamespace(rowcount=rowcount))
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] is None
+        assert result["error"] == "Unknown affected row count"
+        puller._insert_raw.assert_called_once()
+        assert puller._insert_raw.call_args.kwargs["return_result"] is True
+        assert puller.engine.begin.return_value.__exit__.call_args.args[0] is ValueError
+
+    def test_fed_liquidity_commit_ack_failure_cannot_succeed(self):
+        from ingestion.altdata.fed_liquidity import FedLiquidityPuller
+
+        puller = FedLiquidityPuller.__new__(FedLiquidityPuller)
+        puller.source_id = 1
+        puller.engine = MagicMock()
+        puller.engine.begin.return_value.__exit__.side_effect = RuntimeError("COMMIT_ACK_LOST")
+        puller._fetch_fred_series = MagicMock(return_value=pd.DataFrame({
+            "date": ["2026-01-01"], "value": [1.0]}))
+        puller._get_existing_dates = MagicMock(return_value=set())
+        puller._insert_raw = MagicMock(return_value=SimpleNamespace(rowcount=1))
+        result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
+        assert result["status"] == "SKIPPED"
+        assert result["rows_inserted"] is None
+        assert result["error"] == "COMMIT_ACK_LOST"
+        puller._insert_raw.assert_called_once()
+        assert puller.engine.begin.return_value.__exit__.call_args.args[0] is None
 
     def test_fed_liquidity_pull_raw_skips_malformed_dataframe(self):
         from ingestion.altdata.fed_liquidity import FedLiquidityPuller
@@ -518,7 +594,8 @@ class TestAltDataPullers:
         result = puller._pull_raw_series("TOTRESNS", date(2026, 1, 1), date(2026, 1, 2))
 
         assert result["status"] == "SKIPPED"
-        assert "Malformed dataframe" in result["error"]
+        assert "Malformed normalized FRED columns" in result["error"]
+        assert result["rows_inserted"] == 0
         mock_engine.begin.assert_not_called()
 
     def test_prediction_odds_caps_market_scan_to_scheduler_budget(self, monkeypatch):
@@ -586,19 +663,38 @@ class TestYFinancePuller:
         assert result["ticker"] == "^GSPC"
 
     def test_yfinance_pull_skips_existing_success_dates(self):
-        """Existing SUCCESS rows should be skipped before insert."""
+        """Matching typed latest raw captures are idempotent, including UNKNOWN."""
         import sys
+        from datetime import datetime, timedelta, timezone
+        from price_close_contract import raw_capture_payload
 
         mock_yf_module = MagicMock()
         sys.modules.setdefault("yfinance", mock_yf_module)
 
-        mock_engine, _, execute_calls = _make_raw_series_engine(
+        mock_engine, mock_conn, execute_calls = _make_raw_series_engine(
             source_id=2,
             existing_dates={
                 "YF:^GSPC:close": {date(2024, 1, 3)},
                 "YF:^GSPC:volume": {date(2024, 1, 3)},
             },
         )
+
+        captured_at = datetime(2026, 10, 16, 12, tzinfo=timezone.utc)
+        latest_values = {"YF:^GSPC:close": 102.0, "YF:^GSPC:volume": 1100000.0}
+        original_execute = mock_conn.execute.side_effect
+
+        def execute_with_latest_raw(sql, params=None):
+            result = original_execute(sql, params)
+            if ("SELECT raw_payload, pull_timestamp, value FROM raw_series" in str(sql)
+                    and params["od"] == date(2024, 1, 3)):
+                field = params["sid"].rsplit(":", 1)[1]
+                payload = raw_capture_payload("^GSPC", field, params["od"], captured_at, "1d")
+                result.fetchone.return_value = (
+                    payload, captured_at - timedelta(hours=1), latest_values[params["sid"]],
+                )
+            return result
+
+        mock_conn.execute.side_effect = execute_with_latest_raw
 
         dates = pd.to_datetime(["2024-01-02", "2024-01-03"])
         mock_df = pd.DataFrame(
@@ -609,7 +705,8 @@ class TestYFinancePuller:
             index=dates,
         )
 
-        with patch("ingestion.yfinance_pull.yf") as mock_yf:
+        with patch("ingestion.yfinance_pull.yf") as mock_yf, \
+             patch("ingestion.yfinance_pull._utc_now", return_value=captured_at):
             mock_yf.download.return_value = mock_df
 
             from ingestion.yfinance_pull import YFinancePuller
@@ -623,6 +720,30 @@ class TestYFinancePuller:
         assert result["rows_inserted"] == 2
         assert len(insert_sql) == 2
         assert all("ON CONFLICT" not in sql for sql in insert_sql)
+
+    def test_yfinance_unmarked_existing_dates_do_not_suppress_typed_capture(self):
+        """An existing date without matching raw provenance cannot block a vintage."""
+        from datetime import datetime, timezone
+        from ingestion.yfinance_pull import YFinancePuller
+
+        mock_engine, _, calls = _make_raw_series_engine(
+            source_id=2,
+            existing_dates={
+                "YF:^GSPC:close": {date(2024, 1, 3)},
+                "YF:^GSPC:volume": {date(2024, 1, 3)},
+            },
+        )
+        frame = pd.DataFrame(
+            {"Close": [101.0, 102.0], "Volume": [1000000, 1100000]},
+            index=pd.to_datetime(["2024-01-02", "2024-01-03"]),
+        )
+        with patch("ingestion.yfinance_pull.yf") as mock_yf, \
+             patch("ingestion.yfinance_pull._utc_now", return_value=datetime(2026, 10, 16, 12, tzinfo=timezone.utc)):
+            mock_yf.download.return_value = frame
+            result = YFinancePuller(db_engine=mock_engine).pull_ticker("^GSPC", "2024-01-01")
+        assert result["rows_inserted"] == 4
+        assert result["qualified_rows_inserted"] == 0
+        assert len([sql for sql, _ in calls if "INSERT INTO raw_series" in sql]) == 4
 
     def test_yfinance_invalid_ticker_is_skipped_before_network(self):
         from ingestion.yfinance_pull import YFinancePuller

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
@@ -19,6 +20,40 @@ from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
+
+# Tables each provenance-carrying endpoint actually reads (see
+# docs/flows_provenance_contract.md). Provenance describes materialization
+# state of these tables, not the truth of the values served.
+_PROV_SECTORS = ("options_daily_signals",)
+_PROV_SECTOR_DETAIL = (
+    "insider_trades", "congressional_trades", "dark_pool_weekly", "etf_flows",
+    "options_daily_signals",
+)
+_PROV_SANKEY = ("capital_flow_snapshots", "options_daily_signals")
+_PROV_MONEY_MAP = ("signal_sources", "options_daily_signals")
+_PROV_COMPANY = ("signal_sources",)
+_PROV_JUNCTION_POINTS = ("junction_point_readings",)
+
+
+def _provenance(tables: tuple[str, ...]) -> dict[str, Any]:
+    """Read-only provenance envelope; never raises (see store.materialization_provenance)."""
+    from store.materialization_provenance import endpoint_provenance
+
+    try:
+        return endpoint_provenance(get_db_engine(), tables)
+    except Exception as exc:  # noqa: BLE001 - the envelope must not break the endpoint
+        log.warning("Flows: provenance unavailable: {e}", e=str(exc))
+        return {
+            **{t: {"table": t, "unavailable": True, "reason": f"error:{type(exc).__name__}"} for t in tables},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _with_provenance(payload: dict[str, Any], tables: tuple[str, ...]) -> dict[str, Any]:
+    """Shallow copy of ``payload`` plus ``provenance``; cached payloads stay untouched."""
+    out = dict(payload)
+    out["provenance"] = _provenance(tables)
+    return out
 
 
 _SECTOR_CACHE_TTL: float = 300.0  # 5 minutes — "fresh" window
@@ -469,13 +504,13 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
     cached = _sector_cache.get(_SECTOR_CACHE_KEY)
     if cached is not None:
-        return cached
+        return _with_provenance(cached, _PROV_SECTORS)
 
     stale = _sector_stale_cache.get(_SECTOR_CACHE_KEY)
     if stale is not None:
-        return stale
+        return _with_provenance(stale, _PROV_SECTORS)
 
-    return {"sectors": {}, "stale": True, "unavailable": True}
+    return _with_provenance({"sectors": {}, "stale": True, "unavailable": True}, _PROV_SECTORS)
 
 
 @router.get("/sectors/{sector_name}/detail")
@@ -936,6 +971,7 @@ def get_sector_detail(
             "narrative": narrative,
         },
         "connections": connections,
+        "provenance": _provenance(_PROV_SECTOR_DETAIL),
     }
 
 
@@ -1606,7 +1642,7 @@ def get_sankey_data(
     cache_key = as_of or "today"
     cached = _sankey_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return _with_provenance(cached, _PROV_SANKEY)
 
     from datetime import date, timedelta
     from analysis.sector_map import SECTOR_MAP
@@ -1852,7 +1888,7 @@ def get_sankey_data(
     }
 
     _sankey_cache.set(cache_key, result)
-    return result
+    return _with_provenance(result, _PROV_SANKEY)
 
 
 def _apply_physics_scores(engine, today, setups: list) -> None:
@@ -2092,7 +2128,7 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     cached = _money_map_cache.get("money_map")
     if cached is not None:
         log.debug("Money map cache hit")
-        return cached
+        return _with_provenance(cached, _PROV_MONEY_MAP)
 
     from analysis.money_flow import build_flow_map
     engine = get_db_engine()
@@ -2100,7 +2136,7 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
     _money_map_cache.set("money_map", result)
 
-    return result
+    return _with_provenance(result, _PROV_MONEY_MAP)
 
 
 # ── Company drill-down endpoint ───────────────────────────────────────
@@ -2118,8 +2154,14 @@ async def get_company_drill(
     """
     from analysis.money_flow import get_company_drill as _get_company_drill
 
+    from starlette.concurrency import run_in_threadpool
+
     engine = get_db_engine()
-    return _get_company_drill(engine, ticker)
+    result = _get_company_drill(engine, ticker)
+    if not isinstance(result, dict):
+        return result
+    # The probes are blocking (<= 5 s each): keep them off the event loop.
+    return await run_in_threadpool(_with_provenance, result, _PROV_COMPANY)
 
 
 # ── Aggregated dollar flow endpoint ─────────────────────────────────────
@@ -2218,7 +2260,8 @@ def _get_flow_map(engine, as_of=None):
 async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
     """8-layer junction point flow map with edges."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return flow_map.to_dict()
 
 
@@ -2280,6 +2323,7 @@ def get_junction_points(_token: str = Depends(require_auth)) -> dict:
         "layer_summaries": layer_summaries,
         "total_layers": len(flow_map.layers),
         "total_junction_points": len(junction_points),
+        "provenance": _provenance(_PROV_JUNCTION_POINTS),
     }
 
 
@@ -2305,7 +2349,8 @@ def _infer_trend(node) -> str:
 async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
     """Summary of all 8 junction point layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return {
         "layers": [layer.to_dict() for layer in flow_map.layers],
         "edges": [edge.to_dict() for edge in flow_map.edges],
@@ -2319,7 +2364,8 @@ async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
 async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_auth)) -> dict:
     """Detailed view of a single junction point layer."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     layer = next(
         (flow_layer for flow_layer in flow_map.layers if flow_layer.id == layer_id),
@@ -2352,7 +2398,8 @@ async def get_flow_waterfall(
 ) -> dict:
     """Trace money from a source node through all layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Find starting node
     start_node = None
@@ -2453,7 +2500,8 @@ async def get_flow_orthogonality(_token: str = Depends(require_auth)) -> dict:
     import numpy as np
 
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Collect nodes with numeric values for PCA
     nodes_with_data = []
