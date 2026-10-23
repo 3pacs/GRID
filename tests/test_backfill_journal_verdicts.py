@@ -2,64 +2,114 @@
 
 Background (griddb, measured 2026-10-23): the scorer read SPY from
 ``resolved_series`` joined on ``feature_registry.name = 'sp500'``, whose last
-``obs_date`` is 2026-03-24, while ``raw_series`` ``YF:^GSPC:close`` kept
-updating. Every decision after March therefore had no forward close and was
-written ``INSUFFICIENT_DATA`` about 16 hours after it was made -- permanently,
-because ``DecisionJournal.record_outcome`` refuses a second write. 170 of the
-174 decisions in the trailing 45 days were frozen that way.
+``obs_date`` is 2026-03-24, so every decision after March had no forward
+close and was written ``INSUFFICIENT_DATA`` about 16 hours after it was
+made -- permanently, because ``DecisionJournal.record_outcome`` refuses a
+second write. 170 of the 174 decisions in the trailing 45 days were frozen.
 
-These tests run the scorer against an in-memory SQLite ``raw_series`` shaped
-like production (same columns and ``source_catalog`` FK as
-``tests/test_store_observations.py``) so the SUCCESS-only / latest-vintage
-semantics come from ``store/observations.py`` itself, not a mock. The
-journal is a fake that records ``record_outcome`` calls.
+The scorer now reads completed-close captures through
+``store.observations.read_daily_policy_n``. These tests run it against an
+in-memory ``raw_series`` whose payloads are produced by
+``price_close_contract`` itself, so what counts as a completed close is
+decided by the contract, not by the test. The journal is a fake that records
+``record_outcome`` calls and refuses a second write like the real one.
+
+Calendar used throughout (2026): Fri 10-16, Mon 10-19 .. Fri 10-23,
+Mon 10-26, Tue 10-27; Thanksgiving Thu 11-26.
 """
 
 from __future__ import annotations
 
 import re
-import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from unittest.mock import MagicMock
 
 import pytest
-from sqlalchemy import (
-    Column,
-    Date,
-    DateTime,
-    Float,
-    ForeignKey,
-    Integer,
-    MetaData,
-    String,
-    Table,
-    Text,
-    create_engine,
-)
 
+import price_close_contract as contract
 import scripts.backfill_journal_verdicts as bjv
-
-sqlite3.register_adapter(date, lambda d: d.isoformat())
-sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "backfill_journal_verdicts.py"
+UTC = timezone.utc
 
-YFINANCE_SRC = 1
-TIINGO_SRC = 2
-T0 = datetime(2026, 10, 1, 22, 0, 0)  # noqa: DTZ001 -- naive UTC, as raw_series stores pull_timestamp
 
-# Trading days around the scenario dates (2026-10-12 is Columbus Day: NYSE open).
-#   Mon 2026-10-19, Tue 10-20, Wed 10-21, Thu 10-22, Fri 10-23, Mon 10-26
+def at(d: date, hh: int, mm: int = 0) -> datetime:
+    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=UTC)
+
+
+def next_morning(d: date) -> datetime:
+    """The 06:02Z re-pull the day after ``d``: when a close becomes a completed capture."""
+    return at(d + timedelta(days=1), 6, 2)
+
+
+def same_evening(d: date) -> datetime:
+    """The 22:02Z pull on ``d`` itself: provisional, the label day has not elapsed."""
+    return at(d, 22, 2)
+
+
+class Result:
+    def __init__(self, rows=()):
+        self.rows = list(rows)
+
+    def fetchall(self):
+        return self.rows
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+
+class MemoryDB:
+    """An in-memory ``raw_series`` that answers ``store.observations``' window SQL."""
+
+    def __init__(self):
+        self.rows: list[dict] = []
+        self.calls: list[tuple[str, dict]] = []
+
+    def connect(self):
+        return self
+
+    def begin(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def add(self, series_id, obs_date, value, pulled_at, *, payload, status="SUCCESS", source="yfinance"):
+        self.rows.append({
+            "sid": series_id, "od": obs_date, "val": value, "pulled_at": pulled_at,
+            "payload": payload, "status": status, "src": source,
+        })
+
+    def execute(self, stmt, params=None):
+        sql = str(stmt)
+        p = params or {}
+        self.calls.append((sql, dict(p)))
+        if "SELECT r.obs_date" not in sql:
+            raise AssertionError("unmodeled SQL: " + sql)
+        rows = [
+            r for r in self.rows
+            if r["sid"] == p["sid"] and r["status"] == p["ok"]
+            and (p.get("source") is None or r["src"].lower() == p["source"].lower())
+            and (p.get("start") is None or r["od"] >= p["start"])
+            and (p.get("as_of") is None or r["od"] <= p["as_of"])
+            and (p.get("as_of_ts") is None or r["pulled_at"] <= p["as_of_ts"])
+        ]
+        rows.sort(key=lambda r: (r["od"], -r["pulled_at"].timestamp()))  # obs ASC, pull DESC
+        if "r.raw_payload" in sql:
+            return Result([(r["od"], r["val"], r["pulled_at"], r["src"], r["payload"]) for r in rows])
+        return Result([(r["od"], r["val"], r["pulled_at"], r["src"]) for r in rows])
 
 
 class FakeJournal:
     """Records record_outcome calls; refuses a second write like the real one."""
 
-    def __init__(self, db_engine=None):
+    def __init__(self, prewritten=()):
         self.calls: list[dict] = []
-        self._written: set[int] = set()
+        self._written: set[int] = set(prewritten)
 
     def record_outcome(self, decision_id, outcome_value, verdict, annotation=None):
         if decision_id in self._written:
@@ -72,341 +122,338 @@ class FakeJournal:
         return True
 
 
-@pytest.fixture()
-def db():
-    """In-memory engine with production-shaped raw_series, source_catalog, decision_journal."""
-    engine = create_engine("sqlite://")
-    md = MetaData()
-    Table(
-        "source_catalog", md,
-        Column("id", Integer, primary_key=True),
-        Column("name", String, nullable=False),
-    )
-    Table(
-        "raw_series", md,
-        Column("series_id", String, nullable=False),
-        Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
-        Column("obs_date", Date, nullable=False),
-        Column("pull_timestamp", DateTime, nullable=False),
-        Column("value", Float, nullable=False),
-        Column("raw_payload", Text),
-        Column("pull_status", String, nullable=False),
-    )
-    Table(
-        "decision_journal", md,
-        Column("id", Integer, primary_key=True),
-        Column("decision_timestamp", DateTime, nullable=False),
-        Column("inferred_state", String, nullable=False),
-        Column("grid_recommendation", String, nullable=False),
-        Column("action_taken", String, nullable=False),
-        Column("outcome_recorded_at", DateTime),
-    )
-    md.create_all(engine)
-    with engine.begin() as c:
-        c.execute(md.tables["source_catalog"].insert(), [
-            {"id": YFINANCE_SRC, "name": "yfinance"},
-            {"id": TIINGO_SRC, "name": "tiingo"},
-        ])
-    return engine, md
-
-
-def _price_rows(series_id, closes, *, status="SUCCESS", source_id=YFINANCE_SRC, ts_offset_h=0):
-    return [
-        {
-            "series_id": series_id, "source_id": source_id, "obs_date": d,
-            "pull_timestamp": T0 + timedelta(days=i, hours=ts_offset_h),
-            "value": v, "raw_payload": "{}", "pull_status": status,
+def _payload(bench: bjv.Benchmark, obs_date: date, pulled_at: datetime) -> dict:
+    """Exactly what the yfinance puller writes for this series at this pull time."""
+    if bench.series_id == contract.SPY_CLOSE_SERIES:
+        marker = contract.capture_payload(obs_date, pulled_at)
+        return marker or {  # unmarked provisional row
+            "price_basis": contract.SPY_CLOSE_SERIES, "interval": "1d",
+            "obs_date": obs_date.isoformat(), "provider_certified_final": False,
         }
-        for i, (d, v) in enumerate(closes)
-    ]
+    ticker = bench.series_id.split(":")[1]
+    return contract.raw_capture_payload(ticker, "close", obs_date, pulled_at, "1d")
 
 
-def _insert_prices(db, rows):
-    engine, md = db
-    with engine.begin() as c:
-        c.execute(md.tables["raw_series"].insert(), rows)
+def add_close(db, benchmark, obs_date, value, pulled_at, status="SUCCESS"):
+    bench = bjv.BENCHMARKS[benchmark]
+    db.add(bench.series_id, obs_date, value, pulled_at, payload=_payload(bench, obs_date, pulled_at), status=status)
 
 
-def _insert_decisions(db, decisions):
-    engine, md = db
-    with engine.begin() as c:
-        c.execute(md.tables["decision_journal"].insert(), [
-            {
-                "id": i, "decision_timestamp": datetime.combine(d, datetime.min.time()) + timedelta(hours=14),
-                "inferred_state": state, "grid_recommendation": rec,
-                "action_taken": action, "outcome_recorded_at": None,
-            }
-            for i, (d, state, rec, action) in enumerate(decisions, start=1)
-        ])
+def add_completed(db, benchmark, closes: dict[date, float]):
+    for d, v in closes.items():
+        add_close(db, benchmark, d, v, next_morning(d))
+
+
+def add_provisional(db, benchmark, closes: dict[date, float]):
+    for d, v in closes.items():
+        add_close(db, benchmark, d, v, same_evening(d))
+
+
+SPY_CLOSES = {
+    date(2026, 10, 16): 670.0, date(2026, 10, 19): 680.0, date(2026, 10, 20): 684.0,
+    date(2026, 10, 21): 686.0, date(2026, 10, 22): 690.0, date(2026, 10, 23): 695.0,
+}
+
+
+def ret(a: float, b: float) -> float:
+    return (b - a) / a
 
 
 @pytest.fixture()
-def run_scorer(db, monkeypatch):
-    """Run ``bjv.run`` against the fixture engine with a fake journal; returns (counts, journal)."""
-    engine, _ = db
-    journal = FakeJournal()
-    monkeypatch.setattr(bjv, "get_engine", lambda: engine)
-    monkeypatch.setattr(bjv, "DecisionJournal", lambda db_engine=None: journal)
+def scorer(monkeypatch):
+    """Run ``bjv.run`` with an in-memory raw_series, given decisions and a fake journal."""
 
-    def _run(today: date, dry_run: bool = False):
-        return bjv.run(dry_run=dry_run, today=today), journal
+    def _run(db, decisions, evaluated_at, *, dry_run=False, journal=None):
+        journal = journal or FakeJournal()
+        monkeypatch.setattr(bjv, "get_engine", lambda: db)
+        monkeypatch.setattr(bjv, "DecisionJournal", lambda db_engine=None: journal)
+        monkeypatch.setattr(bjv, "_fetch_unscored", lambda engine: [tuple(d) for d in decisions])
+        return bjv.run(dry_run=dry_run, evaluated_at=evaluated_at), journal
 
     return _run
 
 
-# ── Price loading goes through store.observations ───────────────────────────
+GROWTH = ("GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")
 
 
-def test_benchmark_prices_come_from_raw_series_success_rows_latest_vintage(db):
-    engine, _ = db
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 19), 6800.0),
-        (date(2026, 10, 20), 6810.0),
-    ]))
-    # Revision re-pull: a second vintage for 10-20 pulled later wins.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [(date(2026, 10, 20), 6812.0)], ts_offset_h=48))
-    # A FAILED zero marker dated today and a PARTIAL row are not observations.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [(date(2026, 10, 22), 0.0)], status="FAILED"))
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [(date(2026, 10, 21), 6700.0)], status="PARTIAL"))
-    # Tiingo writes the same series_id; the scorer names yfinance explicitly.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [(date(2026, 10, 21), 9999.0)], source_id=TIINGO_SRC))
-
-    prices = bjv._load_sp500_prices(engine, start=date(2026, 10, 1), as_of=date(2026, 10, 22))
-
-    assert prices == {date(2026, 10, 19): 6800.0, date(2026, 10, 20): 6812.0}
-    assert all(isinstance(k, date) for k in prices)
-    assert all(isinstance(v, float) for v in prices.values())
+# ── Entry: the last completed close known when the decision was made ────────
 
 
-def test_benchmark_read_is_bounded_by_start_and_as_of(db):
-    engine, _ = db
-    _insert_prices(db, _price_rows("YF:IWM:close", [
-        (date(2026, 9, 1), 200.0), (date(2026, 10, 19), 210.0), (date(2026, 10, 23), 211.0),
-    ]))
-    prices = bjv._load_benchmark_prices(engine, "iwm", start=date(2026, 10, 1), as_of=date(2026, 10, 22))
-    assert prices == {date(2026, 10, 19): 210.0}
+def test_same_day_decision_before_the_close_enters_on_the_previous_session(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", SPY_CLOSES)
+    add_provisional(db, "sp500", {d: v + 0.5 for d, v in SPY_CLOSES.items()})  # same-evening pulls
+
+    # Tuesday 14:00Z, mid-session: Tuesday's close is pulled at 22:02Z and
+    # becomes a completed capture at 06:02Z Wednesday -- it did not exist.
+    counts, journal = scorer(db, [(1, at(date(2026, 10, 20), 14), *GROWTH)], at(date(2026, 10, 23), 6, 45))
+
+    assert counts["HELPED"] == 1 and counts["pending"] == 0
+    call = journal.calls[0]
+    assert call["outcome_value"] == pytest.approx(ret(680.0, 690.0), abs=1e-6)   # 10-19 -> 10-22
+    assert call["annotation"].startswith("AGGRESSIVE correct: SPY +1.47%")
+    assert (
+        "| basis YF:SPY:close (spy_close_v1): entry 2026-10-19 close 680.0000 known at "
+        "2026-10-20T14:00Z, exit session 2026-10-22 close 690.0000, vintages as of 2026-10-23T06:45Z"
+    ) in call["annotation"]
 
 
-def test_every_scoring_benchmark_has_an_explicit_yfinance_series():
-    for benchmark in set(bjv.INDIVIDUAL_STATE_BENCHMARKS.values()) | {"sp500", "vix"}:
-        series_id, source = bjv.BENCHMARK_RAW_SERIES[benchmark]
-        assert series_id.startswith("YF:") and series_id.endswith(":close")
-        assert source == "yfinance"
-    assert bjv.BENCHMARK_RAW_SERIES["sp500"] == ("YF:^GSPC:close", "yfinance")
+def test_decision_after_the_morning_repull_enters_on_that_close(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", SPY_CLOSES)
+
+    # Wednesday 07:00Z: Tuesday's close became a completed capture at 06:02Z.
+    decision = (1, at(date(2026, 10, 21), 7), *GROWTH)
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 23), 6, 45))
+    assert counts["pending"] == 1 and journal.calls == []   # exit session 10-23 not captured yet
+
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 24), 6, 45))
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(684.0, 695.0), abs=1e-6)  # 10-20 -> 10-23
 
 
-def test_unmapped_benchmark_is_unavailable_without_touching_the_database():
-    engine = MagicMock()
-    assert bjv._load_benchmark_prices(engine, "no-such-benchmark") == {}
-    engine.connect.assert_not_called()
+def test_entry_skips_a_provisional_capture_and_uses_the_last_completed_one(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {d: v for d, v in SPY_CLOSES.items() if d != date(2026, 10, 19)})
+    add_provisional(db, "sp500", {date(2026, 10, 19): 680.0})   # never re-pulled
+
+    counts, journal = scorer(db, [(1, at(date(2026, 10, 20), 14), *GROWTH)], at(date(2026, 10, 23), 6, 45))
+
+    # Entry falls back to Friday 10-16 (4 days: still within ENTRY_MAX_AGE_DAYS);
+    # the exit is then the third session after 10-16, i.e. 10-21.
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(670.0, 686.0), abs=1e-6)
+    assert "entry 2026-10-16 close 670.0000" in journal.calls[0]["annotation"]
+    assert "exit session 2026-10-21" in journal.calls[0]["annotation"]
 
 
-def test_database_error_propagates_instead_of_reading_as_no_data():
-    engine = MagicMock()
-    engine.connect.side_effect = RuntimeError("connection refused")
-    with pytest.raises(RuntimeError):
-        bjv._load_benchmark_prices(engine, "sp500")
+def test_entry_older_than_max_age_is_insufficient_data_at_once(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {date(2026, 10, 16): 670.0, date(2026, 10, 19): 680.0})
 
+    counts, journal = scorer(db, [(1, at(date(2026, 10, 27), 14), *GROWTH)], at(date(2026, 10, 28), 6, 45))
 
-# ── Window-pending rule ─────────────────────────────────────────────────────
-
-
-def test_trading_days_after_counts_weekdays_only():
-    assert bjv._trading_days_after(date(2026, 10, 16), date(2026, 10, 19)) == 1   # Fri -> Mon
-    assert bjv._trading_days_after(date(2026, 10, 19), date(2026, 10, 22)) == 3   # Mon -> Thu
-    assert bjv._trading_days_after(date(2026, 10, 19), date(2026, 10, 23)) == 4
-    assert bjv._trading_days_after(date(2026, 10, 22), date(2026, 10, 22)) == 0
-    assert bjv._trading_days_after(date(2026, 10, 22), date(2026, 10, 19)) == 0
-
-
-def test_window_pending_until_window_days_have_elapsed():
-    prices = {date(2026, 10, 19): 1.0}
-    decision = date(2026, 10, 19)
-    assert bjv._window_pending(prices, decision, today=date(2026, 10, 19))
-    assert bjv._window_pending(prices, decision, today=date(2026, 10, 22))        # 3 trading days
-    # 4th trading day after: window elapsed; feed is at the decision date so still pending.
-    assert bjv._window_pending(prices, decision, today=date(2026, 10, 23))
-
-
-def test_window_pending_when_feed_lags_within_a_window_of_the_decision():
-    prices = {date(2026, 10, 19): 1.0}
-    assert bjv._window_pending(prices, date(2026, 10, 22), today=date(2026, 11, 20))      # 3 days behind
-    assert not bjv._window_pending(prices, date(2026, 10, 23), today=date(2026, 11, 20))  # 4 days behind
-
-
-def test_window_not_pending_when_elapsed_and_no_feed():
-    assert bjv._window_pending({}, date(2026, 10, 19), today=date(2026, 10, 22))
-    assert not bjv._window_pending({}, date(2026, 10, 19), today=date(2026, 10, 23))
-
-
-# ── run(): skip vs write ────────────────────────────────────────────────────
-
-
-def test_decision_inside_window_is_skipped_not_written(db, run_scorer):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 16), 6790.0), (date(2026, 10, 19), 6800.0),
-        (date(2026, 10, 20), 6810.0), (date(2026, 10, 21), 6820.0),
-    ]))
-    _insert_decisions(db, [(date(2026, 10, 21), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
-
-    counts, journal = run_scorer(today=date(2026, 10, 22))
-
-    assert journal.calls == []
-    assert counts["pending"] == 1
-    assert counts["INSUFFICIENT_DATA"] == 0
-    assert counts["scored"] == 0
-
-
-def test_same_decision_is_scored_once_the_forward_close_exists(db, run_scorer):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 19), 6800.0), (date(2026, 10, 20), 6810.0),
-        (date(2026, 10, 21), 6820.0), (date(2026, 10, 22), 6900.0),
-    ]))
-    _insert_decisions(db, [(date(2026, 10, 21), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
-
-    counts, journal = run_scorer(today=date(2026, 10, 23))
-
-    assert counts["pending"] == 0
-    assert counts["HELPED"] == 1 and counts["scored"] == 1
-    assert len(journal.calls) == 1
-    assert journal.calls[0]["verdict"] == "HELPED"
-    assert journal.calls[0]["outcome_value"] == pytest.approx((6900.0 - 6820.0) / 6820.0, abs=1e-6)
-
-
-def test_decision_past_window_with_no_data_gets_insufficient_data(db, run_scorer):
-    # Feed stopped on 10-01; decision on 10-09 is 6 trading days later; scored on 10-22.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 9, 30), 6700.0), (date(2026, 10, 1), 6710.0),
-    ]))
-    _insert_decisions(db, [(date(2026, 10, 9), "FRAGILE", "DEFENSIVE", "AUTO_DEFENSIVE")])
-
-    counts, journal = run_scorer(today=date(2026, 10, 22))
-
-    assert counts["pending"] == 0
-    assert counts["INSUFFICIENT_DATA"] == 1
-    assert len(journal.calls) == 1
-    assert journal.calls[0]["verdict"] == "INSUFFICIENT_DATA"
-    assert journal.calls[0]["annotation"] == "No forward SPY data available for scoring window"
-
-
-def test_decision_near_a_lagging_feed_stays_pending_after_the_window(db, run_scorer):
-    # Feed last at 10-19; decision 10-21 is 2 trading days past it. Even weeks
-    # later it is left for the feed to catch up rather than frozen.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 16), 6790.0), (date(2026, 10, 19), 6800.0),
-    ]))
-    _insert_decisions(db, [(date(2026, 10, 21), "NEUTRAL", "BALANCED", "AUTO_BALANCED")])
-
-    counts, journal = run_scorer(today=date(2026, 11, 20))
-
-    assert journal.calls == []
-    assert counts["pending"] == 1
-
-
-def test_failed_zero_rows_never_become_an_entry_or_exit_price(db, run_scorer):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 19), 6800.0), (date(2026, 10, 20), 6810.0),
-    ]))
-    # The puller's failure markers for the window dates: value 0, FAILED.
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 21), 0.0), (date(2026, 10, 22), 0.0),
-    ], status="FAILED"))
-    _insert_decisions(db, [(date(2026, 10, 20), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
-
-    counts, journal = run_scorer(today=date(2026, 10, 22))
-
-    # No SUCCESS close after 10-20 -> no forward return; window open -> pending.
-    assert journal.calls == []
-    assert counts["pending"] == 1
-
-
-def test_individual_pick_inside_window_is_pending_and_benchmark_read_once(db, run_scorer, monkeypatch):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 19), 6800.0), (date(2026, 10, 20), 6810.0), (date(2026, 10, 21), 6820.0),
-    ]))
-    _insert_prices(db, _price_rows("YF:IWM:close", [
-        (date(2026, 10, 19), 210.0), (date(2026, 10, 20), 211.0), (date(2026, 10, 21), 212.0),
-    ]))
-    _insert_decisions(db, [
-        (date(2026, 10, 21), "EQUITY_VALUE", "AGGRESSIVE", "AUTO_AGGRESSIVE"),
-        (date(2026, 10, 19), "EQUITY_VALUE", "AGGRESSIVE", "AUTO_AGGRESSIVE"),
-    ])
-    loads: list[str] = []
-    real_load = bjv._load_benchmark_prices
-    monkeypatch.setattr(
-        bjv, "_load_benchmark_prices",
-        lambda engine, name, start=None, as_of=None: (loads.append(name), real_load(engine, name, start=start, as_of=as_of))[1],
+    assert counts["INSUFFICIENT_DATA"] == 1 and counts["pending"] == 0
+    assert journal.calls[0]["outcome_value"] == 0.0
+    assert journal.calls[0]["annotation"] == (
+        "No forward SPY data available for scoring window "
+        "(no completed YF:SPY:close close known at 2026-10-27T14:00Z within 4d)"
     )
 
-    counts, journal = run_scorer(today=date(2026, 10, 22))
 
-    assert counts["pending"] == 1
+def test_late_revision_keeps_the_entry_vintage_known_at_decision_time(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {date(2026, 10, 19): 680.0, date(2026, 10, 20): 684.0, date(2026, 10, 21): 686.0})
+    add_close(db, "sp500", date(2026, 10, 19), 681.0, at(date(2026, 10, 21), 6, 2))   # re-pull after the decision
+    add_close(db, "sp500", date(2026, 10, 22), 690.0, at(date(2026, 10, 23), 6, 2))
+    add_close(db, "sp500", date(2026, 10, 22), 691.0, at(date(2026, 10, 23), 6, 30))  # exit revised
+    decision = (1, at(date(2026, 10, 20), 14), *GROWTH)
+
+    # Entry is the vintage GRID had at 14:00Z Tuesday (680, not 681); the exit is
+    # the latest vintage known at evaluation time.
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 23), 6, 45))
     assert counts["HELPED"] == 1
-    assert journal.calls[0]["annotation"].startswith("EQUITY_VALUE AGGRESSIVE correct: iwm")
-    assert loads.count("iwm") == 1, "benchmark must be preloaded once per run, not per row"
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(680.0, 691.0), abs=1e-6)
+
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 23), 6, 10))
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(680.0, 690.0), abs=1e-6)
 
 
-def test_individual_pick_with_unmapped_benchmark_is_insufficient_data(db, run_scorer, monkeypatch):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 19), 6800.0), (date(2026, 10, 20), 6810.0),
-    ]))
-    monkeypatch.setitem(bjv.INDIVIDUAL_STATE_BENCHMARKS, "CRYPTO_CORE", "no-such-benchmark")
-    _insert_decisions(db, [(date(2026, 10, 19), "CRYPTO_CORE", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
+# ── Exit: the exact session, never a provisional capture, never a shifted label
 
-    counts, journal = run_scorer(today=date(2026, 10, 20))
 
-    assert counts["pending"] == 0
+def test_exit_never_uses_provisional_failed_or_quarantined_rows(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {d: v for d, v in SPY_CLOSES.items() if d != date(2026, 10, 22)})
+    add_provisional(db, "sp500", {date(2026, 10, 22): 690.0})                       # label day not elapsed
+    add_close(db, "sp500", date(2026, 10, 22), 0.0, next_morning(date(2026, 10, 22)), status="FAILED")
+    add_close(db, "sp500", date(2026, 10, 22), 690.0, next_morning(date(2026, 10, 22)), status="QUARANTINED")
+    add_close(db, "sp500", date(2026, 10, 22), 690.0, next_morning(date(2026, 10, 22)), status="PARTIAL")
+    decision = (1, at(date(2026, 10, 20), 7), *GROWTH)   # entry 10-19, exit session 10-22
+
+    # Within the puller's catch-up window: deferred, not scored on the
+    # provisional 10-22 row and not shifted to the completed 10-23 close.
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 24), 6, 45))
+    assert counts["pending"] == 1 and journal.calls == []
+
+    # Past the window with the feed demonstrably alive after the gap: a gap.
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 27), 6, 45))
     assert counts["INSUFFICIENT_DATA"] == 1
-    assert journal.calls[0]["annotation"] == "No benchmark data for no-such-benchmark"
+    assert journal.calls[0]["annotation"] == (
+        "No forward SPY data available for scoring window "
+        "(no completed YF:SPY:close close for session 2026-10-22; feed resumed at 2026-10-23)"
+    )
 
 
-def test_benchmark_cache_is_cleared_each_run(db, run_scorer):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [(date(2026, 10, 19), 6800.0)]))
-    _insert_decisions(db, [(date(2026, 10, 19), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
-    bjv._benchmark_cache["iwm"] = {date(2000, 1, 1): 1.0}
+def test_monday_is_not_scored_with_friday_when_the_exit_session_is_missing(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {d: v for d, v in SPY_CLOSES.items() if d != date(2026, 10, 22)})
+    decision = (1, at(date(2026, 10, 20), 7), *GROWTH)   # entry Mon 10-19, exit Thu 10-22 (absent)
 
-    run_scorer(today=date(2026, 10, 20))
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 24), 6, 45))
+    assert counts["pending"] == 1 and journal.calls == []
 
-    assert "iwm" not in bjv._benchmark_cache
-    assert set(bjv._benchmark_cache) == {"sp500", "vix"}
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 27), 6, 45))
+    assert journal.calls[0]["verdict"] == "INSUFFICIENT_DATA"
+    assert journal.calls[0]["outcome_value"] == 0.0
 
 
-def test_dry_run_writes_nothing_and_still_counts_pending(db, run_scorer):
-    _insert_prices(db, _price_rows("YF:^GSPC:close", [
-        (date(2026, 10, 16), 6790.0), (date(2026, 10, 19), 6800.0), (date(2026, 10, 20), 6700.0),
-    ]))
-    _insert_decisions(db, [
-        (date(2026, 10, 19), "FRAGILE", "DEFENSIVE", "AUTO_DEFENSIVE"),
-        (date(2026, 10, 20), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE"),
-    ])
+def test_stalled_feed_stays_pending_rather_than_frozen(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", {date(2026, 10, 19): 680.0, date(2026, 10, 20): 684.0, date(2026, 10, 21): 686.0})
+    decision = (1, at(date(2026, 10, 20), 7), *GROWTH)   # exit session 10-22, nothing after
 
-    counts, journal = run_scorer(today=date(2026, 10, 21), dry_run=True)
+    counts, journal = scorer(db, [decision], at(date(2026, 11, 5), 6, 45))
+
+    assert counts["pending"] == 1 and journal.calls == []
+
+
+def test_equity_exit_skips_the_thanksgiving_holiday(scorer):
+    closes = {
+        date(2026, 11, 24): 700.0, date(2026, 11, 25): 702.0,
+        date(2026, 11, 27): 704.0, date(2026, 11, 30): 706.0, date(2026, 12, 1): 710.0,
+    }
+    db = MemoryDB()
+    add_completed(db, "sp500", closes)
+    # Decision on the holiday itself: entry is Wednesday's close (completed at
+    # 06:02Z Thursday); the three sessions after it are Fri, Mon, Tue.
+    counts, journal = scorer(db, [(1, at(date(2026, 11, 26), 12), *GROWTH)], at(date(2026, 12, 2), 6, 45))
+
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(702.0, 710.0), abs=1e-6)
+    assert "entry 2026-11-25 close 702.0000" in journal.calls[0]["annotation"]
+    assert "exit session 2026-12-01 close 710.0000" in journal.calls[0]["annotation"]
+
+
+def test_btc_exit_counts_utc_calendar_days_including_the_weekend(scorer):
+    closes = {date(2026, 10, 22): 81000.0, date(2026, 10, 23): 82000.0,
+              date(2026, 10, 24): 83000.0, date(2026, 10, 25): 84000.0}
+    db = MemoryDB()
+    add_completed(db, "btc", closes)
+
+    counts, journal = scorer(
+        db, [(1, at(date(2026, 10, 23), 12), "CRYPTO_CORE", "AGGRESSIVE", "AUTO_AGGRESSIVE")],
+        at(date(2026, 10, 26), 6, 45),
+    )
+
+    assert counts["HELPED"] == 1
+    call = journal.calls[0]
+    assert call["outcome_value"] == pytest.approx(ret(81000.0, 84000.0), abs=1e-6)   # 10-22 -> Sun 10-25
+    assert call["annotation"].startswith("CRYPTO_CORE AGGRESSIVE correct: btc +3.70%")
+    assert "basis YF:BTC-USD:close (yf_daily_capture_v1): entry 2026-10-22" in call["annotation"]
+    assert "exit session 2026-10-25" in call["annotation"]
+
+
+def test_individual_pick_uses_its_own_benchmark_series(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", SPY_CLOSES)
+    add_completed(db, "iwm", {date(2026, 10, 19): 210.0, date(2026, 10, 20): 211.0,
+                              date(2026, 10, 21): 212.0, date(2026, 10, 22): 208.0})
+
+    counts, journal = scorer(
+        db, [(1, at(date(2026, 10, 20), 7), "EQUITY_VALUE", "AGGRESSIVE", "AUTO_AGGRESSIVE")],
+        at(date(2026, 10, 23), 6, 45),
+    )
+
+    assert counts["HARMED"] == 1
+    assert journal.calls[0]["annotation"].startswith("EQUITY_VALUE AGGRESSIVE wrong: iwm -0.95%")
+    assert "basis YF:IWM:close" in journal.calls[0]["annotation"]
+    assert all(c[1]["sid"] == "YF:IWM:close" for c in db.calls)
+
+
+def test_unmapped_benchmark_is_insufficient_data_without_a_read(scorer, monkeypatch):
+    db = MemoryDB()
+    monkeypatch.setitem(bjv.INDIVIDUAL_STATE_BENCHMARKS, "CRYPTO_AI", "no-such-benchmark")
+
+    counts, journal = scorer(
+        db, [(1, at(date(2026, 10, 20), 7), "CRYPTO_AI", "AGGRESSIVE", "AUTO_AGGRESSIVE")],
+        at(date(2026, 10, 23), 6, 45),
+    )
+
+    assert counts["INSUFFICIENT_DATA"] == 1
+    assert journal.calls[0]["annotation"] == (
+        "No benchmark data for no-such-benchmark "
+        "(no completed-close series mapped for benchmark no-such-benchmark)"
+    )
+    assert db.calls == []
+
+
+# ── Journal interaction ──────────────────────────────────────────────────────
+
+
+def test_dry_run_writes_nothing_and_still_counts_pending(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", SPY_CLOSES)
+    decisions = [(1, at(date(2026, 10, 20), 14), *GROWTH), (2, at(date(2026, 10, 22), 14), *GROWTH)]
+
+    counts, journal = scorer(db, decisions, at(date(2026, 10, 23), 6, 45), dry_run=True)
 
     assert journal.calls == []
     assert counts["HELPED"] == 1 and counts["pending"] == 1 and counts["scored"] == 1
 
 
-def test_no_spy_data_aborts_without_writing(db, run_scorer):
-    _insert_decisions(db, [(date(2026, 10, 19), "GROWTH", "AGGRESSIVE", "AUTO_AGGRESSIVE")])
-    counts, journal = run_scorer(today=date(2026, 10, 22))
-    assert counts == {"error": "no SPY data"}
-    assert journal.calls == []
+def test_journal_refusal_is_counted_as_skipped(scorer):
+    db = MemoryDB()
+    add_completed(db, "sp500", SPY_CLOSES)
 
-
-# ── Source guards ───────────────────────────────────────────────────────────
-
-
-def test_resolved_series_read_is_gone():
-    src = SCRIPT.read_text(encoding="utf-8")
-    code = "\n".join(
-        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    counts, journal = scorer(
+        db, [(7, at(date(2026, 10, 20), 14), *GROWTH)], at(date(2026, 10, 23), 6, 45),
+        journal=FakeJournal(prewritten={7}),
     )
-    # Strip the module docstring: it names the old tables to explain the bug.
-    body = code.split('"""', 2)[2]
-    assert not re.search(r"\bFROM\s+resolved_series\b", body, re.IGNORECASE)
-    assert "feature_registry" not in body
-    assert "from store.observations import read_window" in src
-    assert "read_window(conn, series_id, source=source" in src
+
+    assert counts["skipped"] == 1 and counts["scored"] == 0 and journal.calls == []
+
+
+def test_no_unscored_rows_is_a_noop(scorer):
+    counts, journal = scorer(MemoryDB(), [], at(date(2026, 10, 23), 6, 45))
+    assert counts["scored"] == 0 and counts["pending"] == 0 and journal.calls == []
+
+
+# ── Declared basis and source guards ─────────────────────────────────────────
+
+
+def test_every_benchmark_is_a_contract_eligible_completed_close_series():
+    assert set(bjv.BENCHMARKS) == {"sp500", "iwm", "hyg", "btc"}
+    assert bjv.BENCHMARKS["sp500"].series_id == contract.SPY_CLOSE_SERIES
+    assert bjv.BENCHMARKS["sp500"].contract == contract.SPY_CLOSE_CONTRACT
+    for name in ("iwm", "hyg"):
+        ticker = bjv.BENCHMARKS[name].series_id.split(":")[1]
+        assert ticker in contract.US_LISTED_DAILY_TICKERS
+        assert bjv.BENCHMARKS[name].sessions == bjv.US_LISTED_SESSIONS
+    assert "BTC-USD" in contract.UTC_DAILY_TICKERS
+    assert bjv.BENCHMARKS["btc"].sessions == bjv.UTC_24H_SESSIONS
+    for bench in bjv.BENCHMARKS.values():
+        assert bench.source == "yfinance"
+    # VIX is not a completed-close series under the contract and is not scored against.
+    assert "vix" not in bjv.BENCHMARKS and "^VIX" in contract.UNKNOWN_DAILY_TICKERS
+    assert set(bjv.INDIVIDUAL_STATE_BENCHMARKS.values()) <= set(bjv.BENCHMARKS)
+
+
+def test_decision_timestamps_are_normalised_to_utc():
+    assert bjv._as_utc(datetime(2026, 10, 20, 14, 0)) == at(date(2026, 10, 20), 14)   # noqa: DTZ001 -- naive = UTC
+    assert bjv._as_utc(datetime(2026, 10, 20, 7, 0, tzinfo=timezone(timedelta(hours=-7)))) == at(date(2026, 10, 20), 14)
+    assert bjv._as_utc("2026-10-20 14:00:00") == at(date(2026, 10, 20), 14)
+    assert bjv._as_utc(date(2026, 10, 20)) == at(date(2026, 10, 20), 0)
+
+
+def test_sessions_follow_the_declared_calendars():
+    assert bjv._sessions_after(date(2026, 10, 19), 3, bjv.US_LISTED_SESSIONS) == [
+        date(2026, 10, 20), date(2026, 10, 21), date(2026, 10, 22)]
+    assert bjv._sessions_after(date(2026, 10, 22), 3, bjv.US_LISTED_SESSIONS) == [
+        date(2026, 10, 23), date(2026, 10, 26), date(2026, 10, 27)]           # weekend skipped
+    assert bjv._sessions_after(date(2026, 10, 22), 3, bjv.UTC_24H_SESSIONS) == [
+        date(2026, 10, 23), date(2026, 10, 24), date(2026, 10, 25)]           # weekend counted
+
+
+def test_old_resolved_series_read_is_gone_and_reads_are_completed_closes_only():
+    src = SCRIPT.read_text(encoding="utf-8")
+    body = src.split('"""', 2)[2]   # past the module docstring, which explains the old bug
+    code = "\n".join(line for line in body.splitlines() if not line.lstrip().startswith("#"))
+    assert not re.search(r"\bFROM\s+resolved_series\b", code, re.IGNORECASE)
+    assert "feature_registry" not in code
+    assert "from store.observations import Observation, read_daily_policy_n" in src
+    assert "read_window(" not in code
 
 
 def test_scheduler_registration_is_unchanged():

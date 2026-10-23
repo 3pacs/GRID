@@ -8,35 +8,52 @@ Scoring logic:
   HARMED if SPY rallied (missed upside), NEUTRAL if flat.
 - CRISIS/CAPITAL_PRESERVATION: same as FRAGILE but with higher threshold.
 - NEUTRAL/BALANCED: NEUTRAL unless SPY moved > 1% (then score directionally).
-- FLYWHEEL/individual picks: marked INSUFFICIENT_DATA (no per-ticker scoring yet).
+- FLYWHEEL/individual picks: scored against their own benchmark
+  (INDIVIDUAL_STATE_BENCHMARKS), INSUFFICIENT_DATA when none is mapped.
 
 Uses the immutability-safe record_outcome() method from DecisionJournal.
-Only scores decisions with at least 1 trading day of forward SPY data.
 
-Price source
-------------
-Benchmarks are read from ``raw_series`` through ``store/observations.py``
-(``pull_status = 'SUCCESS'`` only, latest vintage per ``obs_date``, one
-explicit ``source_catalog`` name per series). They used to come from
-``resolved_series`` joined on ``feature_registry.name``, whose ``sp500`` row
-stopped at 2026-03-24 while ``YF:^GSPC:close`` kept updating; every decision
-after that date was then scored ``INSUFFICIENT_DATA`` -- permanently, because
-the journal is immutable. Measured on griddb 2026-10-23: 170 of the 174
-decisions in the trailing 45 days were frozen that way.
+Price basis (declared; see price_close_contract.py)
+---------------------------------------------------
+Every close is a *completed-close capture* read through
+``store.observations.read_daily_policy_n``: a ``raw_series`` ``SUCCESS`` row
+whose payload carries the capture policy for its series (``spy_close_v1`` for
+``YF:SPY:close``, ``yf_daily_capture_v1`` for the other benchmarks) and whose
+pull happened after the label day ended. Provisional captures (``INCOMPLETE``,
+``UNKNOWN``, unmarked rows, FAILED/PARTIAL/QUARANTINED pulls) are never an
+entry or an exit. Values are yfinance raw daily closes (``YF:<ticker>:close``,
+unadjusted); no corporate-action adjustment is applied.
 
-Pending windows
----------------
-A decision whose forward window has not elapsed yet is *not* written. It is
-counted as ``pending`` and rescored on a later run, once the closes it needs
-exist. ``INSUFFICIENT_DATA`` is only recorded when the window has fully
-elapsed in wall-clock terms and the price feed is not merely lagging behind
-the decision (see :func:`_window_pending`).
+* **Entry** -- the newest completed close whose pull timestamp is at or before
+  the decision timestamp (point-in-time: the close GRID actually had when the
+  decision was logged; a later re-pull of that date is ignored), at most
+  ``ENTRY_MAX_AGE_DAYS`` calendar days before the decision.
+* **Exit** -- the close labelled exactly ``SCORING_WINDOW_DAYS`` sessions
+  after the entry session: NYSE sessions (``ingestion.market_calendar``) for
+  US-listed benchmarks, UTC calendar days for BTC. Its value is the latest
+  vintage known at evaluation time (``evaluated_at``, one instant per run).
+* **Deferral** -- when the exit session's close is not captured yet the row
+  is left unscored (``pending``) and rescored on a later run. A missing exit
+  close is deferred while the puller can still catch it up
+  (``GAP_GRACE_DAYS``); after that, if the feed has a later completed close,
+  the session is a gap and the row is INSUFFICIENT_DATA; if the feed has
+  nothing later either, the row stays pending (a stalled feed is not proof
+  that the close never existed, and the verdict cannot be revised once
+  written). Never shift to the next available label.
+
+History: the scorer read SPY from ``resolved_series`` joined on
+``feature_registry.name = 'sp500'``, whose last row is 2026-03-24, so every
+later decision was written INSUFFICIENT_DATA ~16 h after it was made --
+permanently (measured on griddb 2026-10-23: 170 of the 174 decisions in the
+trailing 45 days). VIX was loaded and never used; it is not a completed-close
+series under the contract and is no longer read.
 """
 
 from __future__ import annotations
 
 import sys
-from datetime import date, datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 # Add project root to path
@@ -46,17 +63,29 @@ from loguru import logger as log
 from sqlalchemy import text
 
 from db import get_engine
-from ingestion.market_calendar import trading_days_between
+from ingestion.market_calendar import is_market_open
 from journal.log import DecisionJournal
-from store.observations import read_window
+from price_close_contract import (
+    DAILY_CAPTURE_CONTRACT,
+    SPY_CAPTURE_MAX_LOOKBACK_DAYS,
+    SPY_CLOSE_CONTRACT,
+    SPY_CLOSE_SERIES,
+    SPY_ENTRY_MAX_AGE_DAYS,
+)
+from store.observations import Observation, read_daily_policy_n
 
 # Thresholds for scoring
 FLAT_THRESHOLD = 0.001       # < 0.1% = flat
 STRONG_MOVE_THRESHOLD = 0.01 # > 1% = strong move (for NEUTRAL scoring)
-SCORING_WINDOW_DAYS = 3      # look 1-3 trading days ahead
+SCORING_WINDOW_DAYS = 3      # exit = the close 3 sessions after the entry session
 
-# Calendar days of price history read before the earliest unscored decision,
-# so _get_forward_return can find an entry close on or before it.
+# Entry must be a completed close at most this many calendar days before the
+# decision (price_close_contract.SPY_ENTRY_RULE companion constant).
+ENTRY_MAX_AGE_DAYS = SPY_ENTRY_MAX_AGE_DAYS
+# A missing exit close is deferred for as long as the puller's operational
+# catch-up can still land it; after that it is a gap.
+GAP_GRACE_DAYS = SPY_CAPTURE_MAX_LOOKBACK_DAYS
+# Calendar days of history searched for the entry close.
 PRICE_HISTORY_BUFFER_DAYS = 14
 
 # Regimes that imply bullish positioning
@@ -74,160 +103,170 @@ INDIVIDUAL_STATE_BENCHMARKS = {
     "CRYPTO_AI": "btc",           # Crypto AI → Bitcoin (no direct ETF)
 }
 INDIVIDUAL_STATES = set(INDIVIDUAL_STATE_BENCHMARKS.keys())
+REGIME_BENCHMARK = "sp500"
 
-# Benchmark name -> (raw_series.series_id, source_catalog.name). Every read
-# names its source explicitly because ``YF:*`` ids are written by more than
-# one puller (store.observations.MixedSourceError). A benchmark absent from
-# this table has no live series and is reported as unavailable (an empty
-# price dict) -- it is never read from another table.
-BENCHMARK_RAW_SERIES: dict[str, tuple[str, str]] = {
-    "sp500": ("YF:^GSPC:close", "yfinance"),
-    "vix": ("YF:^VIX:close", "yfinance"),
-    "iwm": ("YF:IWM:close", "yfinance"),
-    "hyg": ("YF:HYG:close", "yfinance"),
-    "btc": ("YF:BTC-USD:close", "yfinance"),
+US_LISTED_SESSIONS = "us_listed"   # NYSE sessions per ingestion.market_calendar
+UTC_24H_SESSIONS = "utc_24h"       # every UTC calendar day (crypto)
+
+
+@dataclass(frozen=True)
+class Benchmark:
+    """A benchmark's completed-close series and its session calendar."""
+
+    series_id: str
+    source: str
+    contract: str   # price_contract_version its completed captures carry
+    sessions: str   # US_LISTED_SESSIONS or UTC_24H_SESSIONS
+
+
+# A benchmark absent from this table has no completed-close series and is
+# scored INSUFFICIENT_DATA; it is never read from another table. The source
+# is explicit because ``YF:*`` ids are written by more than one puller
+# (store.observations.MixedSourceError). ``sp500`` is YF:SPY:close rather
+# than YF:^GSPC:close: SPY carries the dedicated, year-unbounded
+# ``spy_close_v1`` capture contract, while the generic ``yf_daily_capture_v1``
+# boundary for US-listed tickers is audited for 2026 only
+# (price_close_contract.daily_capture_boundary).
+BENCHMARKS: dict[str, Benchmark] = {
+    "sp500": Benchmark(SPY_CLOSE_SERIES, "yfinance", SPY_CLOSE_CONTRACT, US_LISTED_SESSIONS),
+    "iwm": Benchmark("YF:IWM:close", "yfinance", DAILY_CAPTURE_CONTRACT, US_LISTED_SESSIONS),
+    "hyg": Benchmark("YF:HYG:close", "yfinance", DAILY_CAPTURE_CONTRACT, US_LISTED_SESSIONS),
+    "btc": Benchmark("YF:BTC-USD:close", "yfinance", DAILY_CAPTURE_CONTRACT, UTC_24H_SESSIONS),
 }
 
 
-def _load_benchmark_prices(
-    engine,
-    series_name: str,
-    start: date | None = None,
-    as_of: date | None = None,
-) -> dict[date, float]:
-    """Load a benchmark's daily closes keyed by date from ``raw_series``.
+def _as_utc(value: datetime | date | str) -> datetime:
+    """A decision timestamp as an aware UTC datetime.
 
-    Reads through :func:`store.observations.read_window`: SUCCESS rows only,
-    one value per ``obs_date`` (latest vintage), bounded to ``[start, as_of]``.
-    An unmapped benchmark name returns ``{}`` without touching the database.
-    A database error propagates -- a failed read must abort the run rather
-    than silently score decisions as INSUFFICIENT_DATA.
+    Naive datetimes are taken as UTC (griddb runs Etc/UTC); a bare date is
+    the start of that UTC day; ISO strings (SQLite) are parsed.
     """
-    mapping = BENCHMARK_RAW_SERIES.get(series_name)
-    if mapping is None:
-        log.warning("No raw series mapped for benchmark {b}; unavailable", b=series_name)
-        return {}
-    series_id, source = mapping
-    with engine.connect() as conn:
-        observations = read_window(conn, series_id, source=source, start=start, as_of=as_of)
-    return {o.obs_date: o.value for o in observations}
+    if isinstance(value, str):
+        value = datetime.fromisoformat(value)
+    if isinstance(value, datetime):
+        return value.astimezone(timezone.utc) if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return datetime.combine(value, time.min, timezone.utc)
 
 
-def _load_sp500_prices(
-    engine, start: date | None = None, as_of: date | None = None,
-) -> dict[date, float]:
-    """Load SP500 daily prices keyed by date."""
-    return _load_benchmark_prices(engine, "sp500", start=start, as_of=as_of)
+def _is_session(d: date, sessions: str) -> bool:
+    return True if sessions == UTC_24H_SESSIONS else is_market_open(d)
 
 
-def _load_vix_prices(
-    engine, start: date | None = None, as_of: date | None = None,
-) -> dict[date, float]:
-    """Load VIX daily values keyed by date."""
-    return _load_benchmark_prices(engine, "vix", start=start, as_of=as_of)
+def _sessions_after(start: date, n: int, sessions: str) -> list[date]:
+    """The ``n`` session dates strictly after ``start`` in calendar order."""
+    out: list[date] = []
+    d = start
+    while len(out) < n:
+        d += timedelta(days=1)
+        if _is_session(d, sessions):
+            out.append(d)
+    return out
 
 
-def _get_forward_return(
-    prices: dict[date, float],
-    decision_date: date,
+def _entry_close(conn, bench: Benchmark, decision_ts: datetime) -> Observation | None:
+    """Newest completed close known at ``decision_ts``, or None when too old / absent."""
+    decision_date = decision_ts.date()
+    known = read_daily_policy_n(
+        conn, bench.series_id, 1,
+        start=decision_date - timedelta(days=PRICE_HISTORY_BUFFER_DAYS),
+        source=bench.source, as_of=decision_date, as_of_ts=decision_ts,
+    )
+    if not known:
+        return None
+    entry = known[0]
+    if (decision_date - entry.obs_date).days > ENTRY_MAX_AGE_DAYS:
+        return None
+    return entry
+
+
+def _closes_after(
+    conn, bench: Benchmark, entry_date: date, evaluated_at: datetime,
+) -> dict[date, Observation]:
+    """Completed closes after ``entry_date`` as known at ``evaluated_at`` (latest vintage)."""
+    rows = read_daily_policy_n(
+        conn, bench.series_id, 10_000,
+        start=entry_date + timedelta(days=1),
+        source=bench.source, as_of=evaluated_at.date(), as_of_ts=evaluated_at,
+    )
+    return {o.obs_date: o for o in rows}
+
+
+@dataclass(frozen=True)
+class ForwardOutcome:
+    """What the benchmark did after a decision, or why that is not known yet."""
+
+    status: str                 # "scored" | "pending" | "missing"
+    forward_return: float | None
+    entry: Observation | None
+    exit_session: date | None
+    exit: Observation | None
+    reason: str
+
+
+def _forward_outcome(
+    conn, bench: Benchmark, decision_ts: datetime, evaluated_at: datetime,
     window_days: int = SCORING_WINDOW_DAYS,
-) -> float | None:
-    """Get the forward return from decision_date over the next window_days trading days.
-
-    Returns the return as a decimal (e.g. 0.01 = +1%), or None if insufficient data.
-    """
-    # Find the closest price on or before decision_date
-    sorted_dates = sorted(prices.keys())
-    entry_price = None
-    for d in sorted_dates:
-        if d <= decision_date:
-            entry_price = prices[d]
-            entry_date = d
-        else:
-            break
-
-    if entry_price is None:
-        return None
-
-    # Find the price window_days trading days later
-    future_dates = [d for d in sorted_dates if d > entry_date]
-    if not future_dates:
-        return None
-
-    # Use the closest available date up to window_days ahead
-    exit_date = None
-    for d in future_dates[:window_days]:
-        exit_date = d
-
-    if exit_date is None:
-        return None
-
-    exit_price = prices[exit_date]
-    return (exit_price - entry_price) / entry_price
+) -> ForwardOutcome:
+    """Apply the declared entry/exit/deferral rules (module docstring)."""
+    entry = _entry_close(conn, bench, decision_ts)
+    if entry is None:
+        return ForwardOutcome(
+            "missing", None, None, None, None,
+            f"no completed {bench.series_id} close known at "
+            f"{decision_ts:%Y-%m-%dT%H:%MZ} within {ENTRY_MAX_AGE_DAYS}d",
+        )
+    exit_session = _sessions_after(entry.obs_date, window_days, bench.sessions)[-1]
+    later = _closes_after(conn, bench, entry.obs_date, evaluated_at)
+    exit_obs = later.get(exit_session)
+    if exit_obs is not None:
+        fwd = (exit_obs.value - entry.value) / entry.value
+        return ForwardOutcome("scored", fwd, entry, exit_session, exit_obs, "")
+    if evaluated_at.date() <= exit_session + timedelta(days=GAP_GRACE_DAYS):
+        return ForwardOutcome(
+            "pending", None, entry, exit_session, None,
+            f"completed close for session {exit_session} not captured yet",
+        )
+    resumed = sorted(d for d in later if d > exit_session)
+    if resumed:
+        return ForwardOutcome(
+            "missing", None, entry, exit_session, None,
+            f"no completed {bench.series_id} close for session {exit_session}; "
+            f"feed resumed at {resumed[0]}",
+        )
+    return ForwardOutcome(
+        "pending", None, entry, exit_session, None,
+        f"feed has no completed {bench.series_id} close after session {exit_session} (stalled)",
+    )
 
 
-def _trading_days_after(start: date, end: date) -> int:
-    """Number of US trading days in ``(start, end]``; 0 when ``end <= start``."""
-    if end <= start:
-        return 0
-    return len(trading_days_between(start + timedelta(days=1), end))
-
-
-def _window_pending(
-    prices: dict[date, float],
-    decision_date: date,
-    today: date,
-    window_days: int = SCORING_WINDOW_DAYS,
-) -> bool:
-    """True when forward closes for ``decision_date`` may still arrive.
-
-    Called only after :func:`_get_forward_return` found no forward close.
-    The window is pending -- so the decision is skipped, not written --
-    while either holds:
-
-    * fewer than or exactly ``window_days`` trading days have elapsed after
-      ``decision_date`` as of ``today`` (the window has not elapsed yet; the
-      last close it needs is pulled the evening of the ``window_days``-th
-      trading day and seen by the next morning's run);
-    * the latest available close is on or before ``decision_date`` and
-      within ``window_days`` trading days of it (the feed has not caught up
-      to the decision yet).
-
-    Only when neither holds -- the window has elapsed and the feed was
-    already more than a window behind when the decision was made -- is the
-    data treated as genuinely missing and INSUFFICIENT_DATA recorded.
-    """
-    if _trading_days_after(decision_date, today) <= window_days:
-        return True
-    latest_close = max(prices) if prices else None
-    if latest_close is not None and latest_close <= decision_date:
-        return _trading_days_after(latest_close, decision_date) <= window_days
-    return False
-
-
-# Module-level cache for benchmark prices
-_benchmark_cache: dict[str, dict[date, float]] = {}
+def _basis(bench: Benchmark, outcome: ForwardOutcome, decision_ts: datetime, evaluated_at: datetime) -> str:
+    """Provenance suffix recorded with every scored verdict."""
+    entry, exit_obs = outcome.entry, outcome.exit
+    assert entry is not None and exit_obs is not None
+    return (
+        f"basis {bench.series_id} ({bench.contract}): entry {entry.obs_date} close "
+        f"{entry.value:.4f} known at {decision_ts:%Y-%m-%dT%H:%MZ}, exit session "
+        f"{outcome.exit_session} close {exit_obs.value:.4f}, vintages as of "
+        f"{evaluated_at:%Y-%m-%dT%H:%MZ}"
+    )
 
 
 def _score_decision(
     inferred_state: str,
     grid_recommendation: str,
     action_taken: str,
-    spy_return: float | None,
-    engine=None,
-    decision_date: date | None = None,
+    forward_return: float | None,
+    benchmark_name: str = REGIME_BENCHMARK,
 ) -> tuple[str, float, str]:
     """Score a decision based on regime and forward return.
 
-    Returns (verdict, outcome_value, annotation).
+    ``forward_return`` is the benchmark's return over the scoring window
+    (``None`` when unavailable); for individual picks it is the return of
+    ``benchmark_name``. Returns (verdict, outcome_value, annotation).
     """
     # Individual strategy picks — score against strategy-specific benchmark
-    if inferred_state in INDIVIDUAL_STATES and engine is not None and decision_date is not None:
-        benchmark_name = INDIVIDUAL_STATE_BENCHMARKS[inferred_state]
-        if benchmark_name not in _benchmark_cache:
-            _benchmark_cache[benchmark_name] = _load_benchmark_prices(engine, benchmark_name)
-        bench_prices = _benchmark_cache[benchmark_name]
-        bench_return = _get_forward_return(bench_prices, decision_date)
+    if inferred_state in INDIVIDUAL_STATES:
+        bench_return = forward_return
         if bench_return is not None:
             pct = bench_return * 100
             posture = grid_recommendation
@@ -248,9 +287,7 @@ def _score_decision(
             return "NEUTRAL", round(bench_return, 6), f"{inferred_state} balanced: {benchmark_name} {pct:+.2f}%"
         return ("INSUFFICIENT_DATA", 0.0, f"No benchmark data for {benchmark_name}")
 
-    if inferred_state in INDIVIDUAL_STATES:
-        return ("INSUFFICIENT_DATA", 0.0, f"Individual pick ({inferred_state}) — no engine for benchmark lookup")
-
+    spy_return = forward_return
     if spy_return is None:
         return (
             "INSUFFICIENT_DATA",
@@ -310,139 +347,107 @@ def _fetch_unscored(engine) -> list:
         )).fetchall()
 
 
-def _decision_date(decision_ts) -> date:
-    """UTC calendar date of a ``decision_timestamp`` (datetime, date or ISO string)."""
-    if isinstance(decision_ts, datetime):
-        return decision_ts.date()
-    if isinstance(decision_ts, date):
-        return decision_ts
-    return date.fromisoformat(str(decision_ts)[:10])
-
-
-def run(dry_run: bool = False, today: date | None = None) -> dict:
+def run(dry_run: bool = False, evaluated_at: datetime | None = None) -> dict:
     """Backfill verdicts for all unscored decision_journal entries.
 
     Args:
         dry_run: If True, print what would be done without writing.
-        today: The date the run is evaluated at (defaults to ``date.today()``).
-            Decisions whose scoring window has not elapsed by this date are
-            left unscored (``pending``) instead of written as INSUFFICIENT_DATA.
+        evaluated_at: The instant the run evaluates at (default: now, UTC).
+            It is the vintage cutoff for exit closes and the clock for the
+            pending/gap rules; one value is used for the whole run.
 
     Returns:
         Dict with counts of entries by verdict, plus ``pending`` (left for a
         later run), ``skipped`` (journal refused the write) and ``scored``
         (rows written, or that would be written under ``dry_run``).
     """
-    # griddb runs Etc/UTC and decision_timestamp is UTC; evaluate the run on the UTC date.
-    today = today or datetime.now(timezone.utc).date()
+    evaluated_at = _as_utc(evaluated_at) if evaluated_at else datetime.now(timezone.utc)
     engine = get_engine()
     journal = DecisionJournal(db_engine=engine)
 
-    # Get all unscored entries first: they bound how much price history is read.
     rows = _fetch_unscored(engine)
-    log.info("Found {n} unscored entries to evaluate", n=len(rows))
-
-    start = None
-    if rows:
-        start = min(_decision_date(r[1]) for r in rows) - timedelta(days=PRICE_HISTORY_BUFFER_DAYS)
-
-    # Load market data for scoring. The cache is per run: in the scheduler
-    # process this module stays imported for days, and yesterday's closes
-    # must not be reused.
-    _benchmark_cache.clear()
-    spy_prices = _load_sp500_prices(engine, start=start, as_of=today)
-    vix_prices = _load_vix_prices(engine, start=start, as_of=today)
-    _benchmark_cache["sp500"] = spy_prices
-    _benchmark_cache["vix"] = vix_prices
-    log.info("Loaded {n} SPY prices, {m} VIX prices", n=len(spy_prices), m=len(vix_prices))
-
-    if not spy_prices:
-        log.error("No SPY price data available -- cannot score decisions")
-        return {"error": "no SPY data"}
-
-    for state in {r[2] for r in rows} & INDIVIDUAL_STATES:
-        benchmark = INDIVIDUAL_STATE_BENCHMARKS[state]
-        if benchmark not in _benchmark_cache:
-            _benchmark_cache[benchmark] = _load_benchmark_prices(
-                engine, benchmark, start=start, as_of=today,
-            )
+    log.info("Found {n} unscored entries to evaluate (as of {t})", n=len(rows), t=evaluated_at.isoformat())
 
     counts = {
         "HELPED": 0, "HARMED": 0, "NEUTRAL": 0, "INSUFFICIENT_DATA": 0,
         "pending": 0, "skipped": 0,
     }
+    stalled: set[str] = set()
 
-    for row in rows:
-        entry_id = row[0]
-        decision_ts = row[1]
-        inferred_state = row[2]
-        grid_rec = row[3]
-        action_taken = row[4]
+    with engine.connect() as conn:
+        for row in rows:
+            entry_id = row[0]
+            decision_ts = _as_utc(row[1])
+            inferred_state = row[2]
+            grid_rec = row[3]
+            action_taken = row[4]
 
-        decision_date = _decision_date(decision_ts)
+            benchmark_name = INDIVIDUAL_STATE_BENCHMARKS.get(inferred_state, REGIME_BENCHMARK)
+            bench = BENCHMARKS.get(benchmark_name)
+            if bench is None:
+                outcome = ForwardOutcome(
+                    "missing", None, None, None, None,
+                    f"no completed-close series mapped for benchmark {benchmark_name}",
+                )
+            else:
+                outcome = _forward_outcome(conn, bench, decision_ts, evaluated_at)
 
-        # Get forward return
-        spy_return = _get_forward_return(spy_prices, decision_date)
+            # Leave the row for a later run while its outcome can still
+            # arrive -- an INSUFFICIENT_DATA verdict cannot be revised.
+            if outcome.status == "pending":
+                counts["pending"] += 1
+                if "stalled" in outcome.reason and bench is not None:
+                    stalled.add(bench.series_id)
+                log.debug(
+                    "Pending id={id} at={t} state={s}: {r}",
+                    id=entry_id, t=decision_ts.isoformat(), s=inferred_state, r=outcome.reason,
+                )
+                continue
 
-        # Which series this row is scored against, and whether it has a
-        # forward close yet. Without one, leave the row for a later run
-        # while the window is still open -- an INSUFFICIENT_DATA verdict
-        # cannot be revised once written.
-        if inferred_state in INDIVIDUAL_STATES:
-            benchmark = INDIVIDUAL_STATE_BENCHMARKS[inferred_state]
-            scoring_prices = _benchmark_cache.get(benchmark, {})
-            has_forward = _get_forward_return(scoring_prices, decision_date) is not None
-            can_pend = benchmark in BENCHMARK_RAW_SERIES  # unmapped never arrives
-        else:
-            scoring_prices = spy_prices
-            has_forward = spy_return is not None
-            can_pend = True
-
-        if not has_forward and can_pend and _window_pending(scoring_prices, decision_date, today):
-            counts["pending"] += 1
-            log.debug(
-                "Pending id={id} date={d} state={s}: scoring window not elapsed",
-                id=entry_id, d=decision_date, s=inferred_state,
+            verdict, outcome_value, annotation = _score_decision(
+                inferred_state, grid_rec, action_taken, outcome.forward_return,
+                benchmark_name=benchmark_name,
             )
-            continue
+            if outcome.status == "scored" and bench is not None:
+                annotation = f"{annotation} | {_basis(bench, outcome, decision_ts, evaluated_at)}"
+            else:
+                annotation = f"{annotation} ({outcome.reason})"
 
-        verdict, outcome_value, annotation = _score_decision(
-            inferred_state, grid_rec, action_taken, spy_return,
-            engine=engine, decision_date=decision_date,
-        )
+            if dry_run:
+                log.info(
+                    "[DRY RUN] id={id} at={t} state={s} rec={r} -> {v} ({a})",
+                    id=entry_id, t=decision_ts.isoformat(), s=inferred_state,
+                    r=grid_rec, v=verdict, a=annotation,
+                )
+                counts[verdict] += 1
+                continue
 
-        if dry_run:
-            log.info(
-                "[DRY RUN] id={id} date={d} state={s} rec={r} -> {v} ({a})",
-                id=entry_id, d=decision_date, s=inferred_state,
-                r=grid_rec, v=verdict, a=annotation,
-            )
-            counts[verdict] += 1
-            continue
-
-        try:
-            journal.record_outcome(
-                decision_id=entry_id,
-                outcome_value=outcome_value,
-                verdict=verdict,
-                annotation=annotation,
-            )
-            counts[verdict] += 1
-            log.debug(
-                "Scored id={id}: {v} (outcome={ov:.4f})",
-                id=entry_id, v=verdict, ov=outcome_value,
-            )
-        except ValueError as exc:
-            log.warning("Could not score id={id}: {e}", id=entry_id, e=str(exc))
-            counts["skipped"] += 1
+            try:
+                journal.record_outcome(
+                    decision_id=entry_id,
+                    outcome_value=outcome_value,
+                    verdict=verdict,
+                    annotation=annotation,
+                )
+                counts[verdict] += 1
+                log.debug(
+                    "Scored id={id}: {v} (outcome={ov:.4f})",
+                    id=entry_id, v=verdict, ov=outcome_value,
+                )
+            except ValueError as exc:
+                log.warning("Could not score id={id}: {e}", id=entry_id, e=str(exc))
+                counts["skipped"] += 1
 
     counts["scored"] = sum(counts[v] for v in ("HELPED", "HARMED", "NEUTRAL", "INSUFFICIENT_DATA"))
-    if counts["INSUFFICIENT_DATA"]:
-        latest = max(spy_prices)
+    if stalled:
         log.warning(
-            "{n} decisions recorded INSUFFICIENT_DATA with the SPY feed last at {d}; "
-            "those verdicts are permanent",
-            n=counts["INSUFFICIENT_DATA"], d=latest,
+            "Completed-close feed stalled for {s}: decisions stay pending until it resumes",
+            s=sorted(stalled),
+        )
+    if counts["INSUFFICIENT_DATA"]:
+        log.warning(
+            "{n} decisions recorded INSUFFICIENT_DATA; those verdicts are permanent",
+            n=counts["INSUFFICIENT_DATA"],
         )
     log.info("=== BACKFILL COMPLETE ===")
     log.info("Results: {c}", c=counts)
