@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import sys
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -32,8 +33,22 @@ pytestmark = [
 from store import materialization_provenance as mp  # noqa: E402
 
 UTC = timezone.utc
+# Import-time defaults only. Every test re-reads the clock in `_clock` below: a
+# run that crosses 00:00Z between collection and this file (the 2026-10-20 CI
+# run, collected 23:5x, reached it at 00:07Z) must not see a stale TODAY.
 NOW = datetime.now(UTC)
 TODAY = NOW.date()
+
+
+@pytest.fixture(autouse=True)
+def _clock(monkeypatch):
+    """One instant per test, shared by the fixture rows and the code under test."""
+    now = datetime.now(UTC)
+    this = sys.modules[__name__]
+    monkeypatch.setattr(this, "NOW", now)
+    monkeypatch.setattr(this, "TODAY", now.date())
+    monkeypatch.setattr(mp, "_now_utc", lambda: now)
+    return now
 
 
 @contextmanager
@@ -70,7 +85,8 @@ def engine():
     mp.clear_cache()
 
 
-def _insert(engine, table, col, days_ago, n=1, created=NOW):
+def _insert(engine, table, col, days_ago, n=1, created=None):
+    created = NOW if created is None else created      # NOW is per-test (see `_clock`)
     with engine.begin() as conn:
         for _ in range(n):
             conn.execute(text(f"INSERT INTO {table} VALUES ('X', :d, :c)"),  # test-only literal identifiers
