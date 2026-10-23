@@ -117,6 +117,15 @@ def test_intelligence_loop_registers_expected_jobs(monkeypatch):
     assert jobs_by_name["_actor_news_weekly_tail"]["at"] == "04:00"
     assert jobs_by_name["_fci_compute_6h"]["interval"] == 6
     assert jobs_by_name["_credit_novelty_daily"]["at"] == "04:30"
+    # 2026-10-23: sentiment_predictions had no scoring caller (205 rows, all
+    # PENDING); the closer runs daily after the 06:45 journal-verdicts job.
+    assert jobs_by_name["_sentiment_outcomes_daily"] == {
+        "interval": 1,
+        "unit": "day",
+        "day": None,
+        "at": "06:50",
+        "func": "_sentiment_outcomes_daily",
+    }
 
 
 def test_wave3_held_writer_jobs_default_off(monkeypatch):
@@ -273,6 +282,61 @@ def test_taiwan_daily_logs_zero_row_pull_as_failure(monkeypatch):
     assert len(warnings) == 1
     assert "status=FAILED" in warnings[0]
     assert "0 rows" in warnings[0]
+
+
+def test_sentiment_outcomes_daily_scores_without_logging_a_prediction(monkeypatch):
+    """The closer only scores: it must call ``score_past_predictions`` with
+    the DB engine and never compute or log a new prediction (the hourly
+    briefing owns that; ``run_sentiment_cycle`` would do both)."""
+    import db
+    from intelligence import sentiment_scorer
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    engine = object()
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+    calls: list[object] = []
+
+    def _fake_score(eng):
+        calls.append(eng)
+        return {"scored": 1, "correct": 0, "accuracy": 0.0, "results": []}
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("closer must not compute or log a prediction")
+
+    monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _fake_score)
+    monkeypatch.setattr(sentiment_scorer, "compute_sentiment", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "log_prediction", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "run_sentiment_cycle", _forbidden)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert calls == [engine]
+    assert infos == ["sentiment outcomes daily: scored=1 correct=0 accuracy=0.0"]
+
+
+def test_sentiment_outcomes_daily_logs_failure_as_warning(monkeypatch):
+    import db
+    from intelligence import sentiment_scorer
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+
+    def _boom(_eng):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _boom)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert warnings == ["sentiment outcomes daily failed: db down"]
 
 
 def test_lme_warehouse_job_default_off(monkeypatch):

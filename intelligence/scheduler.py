@@ -314,6 +314,38 @@ def run_intelligence_loop() -> None:
 
     _sched.every().day.at("06:45").do(_journal_verdicts_daily)
 
+    def _sentiment_outcomes_daily() -> None:
+        """Close the sentiment-prediction loop on a schedule (2026-10-23).
+
+        ``_hourly_briefing`` logs one ``sentiment_predictions`` row per UTC
+        day (``intelligence/sentiment_scorer.py::log_prediction``), but
+        ``score_past_predictions`` -- the step that fills ``realized_return``
+        / ``outcome`` / ``scored_at`` -- had no live caller. The only one in
+        the tree is ``scripts/grid_cron.sh sentiment``, and the crontab never
+        installed it (docs/planning/LEVER-PACKAGE.md, T3). Measured on
+        griddb 2026-10-23: 205 rows since 2026-04-02, every one ``PENDING``.
+
+        Scores only. It does not compute or log a prediction -- the hourly
+        briefing already did that -- so the ``scores -> weights`` loop in
+        ``score_past_predictions`` is the only side effect. Runs 06:50 UTC:
+        after the 22:02Z close pull the scorer reads, after the 06:45
+        journal-verdicts closer, before the 07:00 options job.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.sentiment_scorer import score_past_predictions
+            summary = score_past_predictions(_ge())
+            log.info(
+                "sentiment outcomes daily: scored={s} correct={c} accuracy={a}{m}",
+                s=summary.get("scored", 0), c=summary.get("correct", 0),
+                a=summary.get("accuracy"),
+                m=(" " + str(summary.get("message") or summary.get("error") or "")).rstrip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sentiment outcomes daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:50").do(_sentiment_outcomes_daily)
+
     def _trial_outcomes_daily() -> None:
         """Score what each trial readout actually did (2026-09-10).
 
