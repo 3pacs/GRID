@@ -115,6 +115,15 @@ async def simulate_weights(
     return {"ok": True, "result": result}
 
 
+def _utc_today() -> date:
+    """Today in UTC: reading timestamps are UTC, so their age must be too.
+
+    ``_utc_today()`` is the host's local date and lags UTC by a day every
+    evening west of Greenwich, which made ``staleness_days`` one short.
+    """
+    return datetime.now(timezone.utc).date()
+
+
 def _regime_data_as_of(engine, reading_date: date | None) -> date | None:
     """Return ``regime_history.data_as_of`` for the row describing ``reading_date``.
 
@@ -213,7 +222,7 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     if ts is not None:
         reading_date = ts.date() if isinstance(ts, datetime) else ts
         as_of_date = reading_date.isoformat()
-        staleness_days = (date.today() - reading_date).days
+        staleness_days = (_utc_today() - reading_date).days
 
     # The reading's own date says when it was computed, not how old the data
     # behind it is. Those are the same number only while the pipeline is
@@ -221,7 +230,7 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     data_as_of_date = _regime_data_as_of(engine, reading_date)
     data_as_of = data_as_of_date.isoformat() if data_as_of_date else ""
     data_staleness_days = (
-        (date.today() - data_as_of_date).days if data_as_of_date else None
+        (_utc_today() - data_as_of_date).days if data_as_of_date else None
     )
 
     return RegimeCurrentResponse(

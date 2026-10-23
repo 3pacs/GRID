@@ -382,6 +382,48 @@ class TestSchedulerRegistration:
 
 
 class TestStalenessFields:
+    def test_staleness_is_measured_on_the_utc_date_not_the_local_clock(self):
+        """The reading timestamp is UTC; its age must not depend on the host TZ.
+
+        Between 17:00 and 24:00 America/Los_Angeles the local date is one day
+        behind UTC, which made ``staleness_days`` 164 for a reading exactly 165
+        days old. The router must take "today" from the UTC clock.
+        """
+        from api.routers import regime as regime_router
+
+        class _LocalClockADayBehind(date):
+            @classmethod
+            def today(cls):
+                return date(2026, 10, 22)  # what date.today() says late in the PT evening
+
+        reading_ts = datetime(2026, 5, 11, 23, 30, tzinfo=timezone.utc)  # 165 days before 2026-10-23
+        engine = MagicMock()
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        prod = MagicMock()
+        prod.fetchone.return_value = (7, "stress_index", "1.0")
+        latest = MagicMock()
+        latest.fetchone.return_value = (
+            "FRAGILE", 0.72, 0.1, {}, "DEFENSIVE", "NEUTRAL", reading_ts,
+        )
+        history = MagicMock()
+        history.fetchone.return_value = (date(2026, 10, 20),)
+        conn.execute.side_effect = [prod, latest, history]
+        engine.connect.return_value = conn
+
+        with (
+            patch.object(regime_router, "get_db_engine", return_value=engine),
+            patch.object(regime_router, "date", _LocalClockADayBehind),
+            patch.object(regime_router, "_utc_today", return_value=date(2026, 10, 23)),
+        ):
+            resp = regime_router.get_current(_token="t")
+
+        assert resp.as_of_date == "2026-05-11"
+        assert resp.staleness_days == 165
+        assert resp.data_as_of == "2026-10-20"
+        assert resp.data_staleness_days == 3
+
     def test_regime_current_carries_as_of_date_and_age(self):
         from api.routers import regime as regime_router
 
