@@ -17,13 +17,14 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import date
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 os.environ.setdefault("DB_PASSWORD", "test-password")
 
 from ollama.market_briefing import MarketBriefingEngine
+from price_close_contract import daily_capture_payload
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────
@@ -59,6 +60,17 @@ class _FakeConnection:
         self.executed.append(sql)
         params = params or {}
 
+        if "FROM raw_series r" in sql and "JOIN source_catalog" in sql:
+            # store.observations readers: YF snapshot values are read as
+            # policy-eligible captures (obs_date, value, pull_ts, source, payload).
+            sid = params.get("sid")
+            row = self.row_by_sid.get(sid)
+            if row is None:
+                return _FakeResult()
+            value, d = row
+            ts = datetime.combine(d + timedelta(days=2), datetime.min.time(), timezone.utc)
+            payload = daily_capture_payload(sid.split(":")[1], sid.split(":")[2], d, ts)
+            return _FakeResult(one=(d, value, ts, "yfinance"), many=[(d, value, ts, "yfinance", payload)])
         if "FROM raw_series" in sql:
             return _FakeResult(one=self.row_by_sid.get(params.get("sid")))
         if "FROM resolved_series" in sql and "feature_registry" in sql:

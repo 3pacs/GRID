@@ -1,19 +1,32 @@
 > **2026-10-19 hierarchy addendum (docs-only, hand-written; re-promotion via OBSIDIAN-2 pending).**
-> The single authority for GRID **delivery status and milestones** is the vault note
-> `05-GRID/00-Dashboard.md` ("GRID canonical execution plan", updated 2026-10-19 — see
-> https://github.com/3pacs/obsidian-vault/blob/main/05-GRID/00-Dashboard.md and the
-> reconciliation PR https://github.com/3pacs/obsidian-vault/pull/113). This file remains the architecture history (Phases 1–17, V5 vectors)
-> and the promoted mirror per `docs/planning/README.md`; its "Single source of truth" line below is
-> superseded for status. YOU ARE HERE (2026-10-19): price lane repaired in the DB; writer fix #853 merged and live;
-> #858, #860, #861 open on PR branches with green CI (858 and 861 independently reviewed), #859 open with a revision
-> pushed and CI pending — none merged, none deployed; FINRA blocked on a V6 source fix; grid-hermes OFF, so the flow
-> materializer (`ingestion/flow_materializer.py`, Hermes-only binding) has not loaded since 2026-10-13;
-> first visible milestone M0 = a functioning bounded end-to-end slice (ingestion → materialization loads →
-> reasoning with provenance and explicit unavailable inputs → publication retained), accepted only by ONE linked
-> example for a single market session and as-of (input → materialization row → reasoning output or unavailable
-> reason → retained publication bytes with matching hash), with receipts inside that session's completion window. September "landed"
-> marks in `LEVER-PACKAGE.md` and `V5-TRANSFORMATION.md` are source/CI evidence, not October runtime proof
-> (UNVERIFIED until a receipt exists). Execution slices A–D, owners and acceptance evidence live in the vault note.
+> Source provenance checked on 2026-10-23.
+> Per `docs/planning/README.md`, the vault is the source of truth for planning and `docs/`
+> is the source of truth for execution artifacts. The planning reference for GRID **delivery
+> status and milestones** is `05-GRID/00-Dashboard.md` ("GRID canonical execution plan").
+> The date above identifies this addendum, not a published vault-note update: the note at
+> [vault commit `4cdbfda`](https://github.com/3pacs/obsidian-vault/blob/4cdbfda15e2b7fbe56e297938df953a0134fdc5a/05-GRID/00-Dashboard.md)
+> declares `updated: '2026-10-05'`. The 2026-10-19 reconciliation is proposed in
+> [vault PR #113](https://github.com/3pacs/obsidian-vault/pull/113), which is open and unmerged
+> at [head `64dd9a7`](https://github.com/3pacs/obsidian-vault/blob/64dd9a72f29bf0555bfd021a74b783061999d985/05-GRID/00-Dashboard.md).
+> This file remains the architecture history (Phases 1–17, V5 vectors) and promoted mirror
+> per `docs/planning/README.md`; its "Single source of truth" line below is superseded for status.
+>
+> **Historical 2026-10-19 reconciliation claims — not current runtime acceptance:** the
+> addendum reported the price lane repaired in the DB and writer fix #853 merged and live;
+> #858, #860, #861 open on PR branches with green CI (858 and 861 independently reviewed),
+> #859 open with a revision pushed and CI pending — none of those four merged or deployed;
+> FINRA blocked on a V6 source fix; and grid-hermes OFF, with the Hermes-only flow-materializer
+> binding reported not loaded since 2026-10-13. These are retained historical assertions,
+> not verification of present service, ingestion, materialization or recovery state.
+> The proposed first visible milestone M0 was a functioning bounded end-to-end slice
+> (ingestion → materialization loads → reasoning with provenance and explicit unavailable inputs →
+> publication retained), accepted only by ONE linked example for a single market session and as-of
+> (input → materialization row → reasoning output or unavailable reason → retained publication bytes
+> with matching hash), with receipts inside that session's completion window. September "landed"
+> marks in `LEVER-PACKAGE.md` and `V5-TRANSFORMATION.md` are source/CI evidence, not October runtime
+> proof (UNVERIFIED until a receipt exists). The A–D execution slices, owners and acceptance bar
+> belong to the proposed reconciliation; consult the vault planning source and linked execution
+> receipts for subsequent status. Re-promotion remains OBSIDIAN-2's job.
 
 # GRID Roadmap — Financial Palantir
 
