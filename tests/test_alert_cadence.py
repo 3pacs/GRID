@@ -211,3 +211,12 @@ class TestDailyBusinessDayAwareGrace:
     def test_computed_holiday_set_matches_known_dates(self, year, expected):
         holidays = cadence._us_market_holidays(year)
         assert {d.isoformat() for d in holidays} == expected
+
+
+def test_annual_latency_class_maps_to_quarterly_not_default_daily():
+    """ANNUAL is in the live source_catalog CHECK (pushshift_reddit declares it);
+    without a key it fell to DEFAULT_CADENCE (DAILY) and would flag a yearly
+    archive stale after 30 h."""
+    from alerts.cadence import QUARTERLY, cadence_for_source
+
+    assert cadence_for_source("pushshift_reddit", latency_class="ANNUAL") is QUARTERLY
