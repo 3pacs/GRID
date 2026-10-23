@@ -862,11 +862,24 @@ def log_prediction(engine: Engine, result: SentimentResult) -> int | None:
 
 # ── Self-scoring loop ────────────────────────────────────────────────────
 
-def score_past_predictions(engine: Engine) -> dict[str, Any]:
+def score_past_predictions(
+    engine: Engine, *, update_weights: bool = True
+) -> dict[str, Any]:
     """Score pending predictions whose evaluation window has passed.
 
-    Compares predicted sentiment direction vs realized SPY 5-day return.
-    Updates weights based on component-level accuracy.
+    Compares predicted sentiment direction vs realized SPY 5-day return and
+    records ``realized_return`` / ``outcome`` / ``scored_at`` on each row.
+
+    ``update_weights`` (default True) keeps the historical contract of
+    ``run_sentiment_cycle`` and ``scripts/grid_cron.sh sentiment``: once at
+    least 3 predictions are scored in one call, ``_update_weights`` runs and
+    may insert a new ``sentiment_weights`` version that later
+    ``compute_sentiment`` calls consume. ``update_weights=False`` is the
+    outcome-only path for the scheduled closer in ``intelligence/scheduler.py``:
+    outcomes are recorded, no weight row is ever inserted. The returned
+    ``weight_promotion`` says which happened: ``"disabled"``, ``"not_due"``
+    (fewer than 3 scored) or ``"attempted"`` (``_update_weights`` ran; it
+    still needs >= 10 scored rows in history to insert).
 
     Returns summary of scoring results.
     """
@@ -887,7 +900,11 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
             ), {"window": EVALUATION_WINDOW_DAYS}).fetchall()
 
             if not pending:
-                return {"scored": 0, "message": "No predictions ready to score"}
+                return {
+                    "scored": 0,
+                    "message": "No predictions ready to score",
+                    "weight_promotion": "disabled" if not update_weights else "not_due",
+                }
 
             for pred in pending:
                 pred_id, pred_date, pred_score, pred_label, comp_json, weight_json = pred
@@ -944,14 +961,22 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
         log.warning("Scoring failed: {e}", e=e)
         return {"scored": 0, "error": str(e)}
 
-    # Update weights if we have enough scored predictions
-    if scored >= 3:
+    # Learned-weight promotion is coupled to scoring only on the default
+    # path. The scheduled outcome closer passes update_weights=False, so
+    # recording outcomes never inserts a sentiment_weights row unless the
+    # operator enabled promotion (config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION).
+    if not update_weights:
+        weight_promotion = "disabled"
+    elif scored >= 3:
         _update_weights(engine)
+        weight_promotion = "attempted"
+    else:
+        weight_promotion = "not_due"
 
     accuracy = (correct / scored * 100) if scored > 0 else 0
     log.info(
-        "Scored {n} predictions: {c}/{n} correct ({a:.0f}%)",
-        n=scored, c=correct, a=accuracy,
+        "Scored {n} predictions: {c}/{n} correct ({a:.0f}%), weight_promotion={w}",
+        n=scored, c=correct, a=accuracy, w=weight_promotion,
     )
 
     return {
@@ -959,6 +984,7 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
         "correct": correct,
         "accuracy": round(accuracy, 1),
         "results": results,
+        "weight_promotion": weight_promotion,
     }
 
 

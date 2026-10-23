@@ -28,6 +28,9 @@ FLAGS = [
     # Same default-off gate (2026-09-29): LME warehouse job, whose LME URLs
     # sit behind a Cloudflare managed challenge.
     "GRID_ENABLE_LME_WAREHOUSE_JOB",
+    # Same default-off gate (PR #903 source review, 2026-10-23): learned
+    # sentiment_weights promotion from the daily outcome closer.
+    "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
 ]
 
 

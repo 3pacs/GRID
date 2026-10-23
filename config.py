@@ -514,6 +514,18 @@ class Settings(BaseSettings):
     # in a reviewed change.
     GRID_ENABLE_LME_WAREHOUSE_JOB: bool = False
 
+    # Sentiment learned-weight promotion (source review on PR #903,
+    # 2026-10-23). The daily `_sentiment_outcomes_daily` closer in
+    # intelligence/scheduler.py records outcomes on sentiment_predictions
+    # through `score_past_predictions(update_weights=False)`; the Bayesian
+    # `_update_weights` step, which inserts a new sentiment_weights version
+    # that every later compute_sentiment() consumes, is a model/weight-
+    # registry write in the same held category as the Wave 3 flags above.
+    # It stays off for the scheduled closer until this flag is set in a
+    # reviewed change. The historical run_sentiment_cycle / grid_cron.sh
+    # contract (scoring followed by promotion) is unchanged by this flag.
+    GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -530,6 +542,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
+        "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
         mode="before",
     )
     @classmethod

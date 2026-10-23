@@ -284,26 +284,22 @@ def test_taiwan_daily_logs_zero_row_pull_as_failure(monkeypatch):
     assert "0 rows" in warnings[0]
 
 
-def test_sentiment_outcomes_daily_scores_without_logging_a_prediction(monkeypatch):
-    """The closer only scores: it must call ``score_past_predictions`` with
-    the DB engine and never compute or log a new prediction (the hourly
-    briefing owns that; ``run_sentiment_cycle`` would do both)."""
+def test_sentiment_outcomes_daily_records_outcomes_without_promoting_weights(monkeypatch):
+    """The closer runs the real ``score_past_predictions`` on an eligible
+    backlog (scripted connection, no database): outcomes are recorded, no
+    ``sentiment_weights`` row is inserted or read, and no prediction is
+    computed or logged (the hourly briefing owns that)."""
     import db
     from intelligence import sentiment_scorer
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
 
     fake_schedule = _run_loop_with_settings(monkeypatch, object())
-    engine = object()
+    engine, conn = make_scoring_engine(scored_history())
     monkeypatch.setattr(db, "get_engine", lambda: engine)
-    calls: list[object] = []
-
-    def _fake_score(eng):
-        calls.append(eng)
-        return {"scored": 1, "correct": 0, "accuracy": 0.0, "results": []}
 
     def _forbidden(*_args, **_kwargs):
         raise AssertionError("closer must not compute or log a prediction")
 
-    monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _fake_score)
     monkeypatch.setattr(sentiment_scorer, "compute_sentiment", _forbidden)
     monkeypatch.setattr(sentiment_scorer, "log_prediction", _forbidden)
     monkeypatch.setattr(sentiment_scorer, "run_sentiment_cycle", _forbidden)
@@ -314,8 +310,44 @@ def test_sentiment_outcomes_daily_scores_without_logging_a_prediction(monkeypatc
 
     fake_schedule.callbacks["_sentiment_outcomes_daily"]()
 
-    assert calls == [engine]
-    assert infos == ["sentiment outcomes daily: scored=1 correct=0 accuracy=0.0"]
+    assert {u["id"]: u["outcome"] for u in conn.updates} == {
+        196: "WRONG", 195: "CORRECT", 194: "NEUTRAL_CORRECT",
+    }
+    assert conn.weight_inserts == []
+    # The idempotent CREATE TABLE IF NOT EXISTS bootstrap names the table;
+    # no read (_load_weights) or write of sentiment_weights may follow.
+    touched = [
+        sql for sql, _ in conn.executed
+        if "sentiment_weights" in sql and not sql.startswith("CREATE TABLE")
+    ]
+    assert touched == []
+    assert infos[-1] == (
+        "sentiment outcomes daily: scored=3 correct=2 accuracy=66.7 weight_promotion=disabled"
+    )
+
+
+def test_sentiment_outcomes_daily_promotes_weights_only_when_flag_set(monkeypatch):
+    """Operator decision: GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=true re-couples
+    weight promotion to the closer; the same backlog then inserts a
+    sentiment_weights version."""
+    import db
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=True)
+    )
+    engine, conn = make_scoring_engine(scored_history())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert len(conn.updates) == 3
+    assert len(conn.weight_inserts) == 1
+    assert infos[-1].endswith("weight_promotion=attempted")
 
 
 def test_sentiment_outcomes_daily_logs_failure_as_warning(monkeypatch):
@@ -325,7 +357,7 @@ def test_sentiment_outcomes_daily_logs_failure_as_warning(monkeypatch):
     fake_schedule = _run_loop_with_settings(monkeypatch, object())
     monkeypatch.setattr(db, "get_engine", lambda: object())
 
-    def _boom(_eng):
+    def _boom(_eng, **_kwargs):
         raise RuntimeError("db down")
 
     monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _boom)

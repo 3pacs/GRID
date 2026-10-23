@@ -325,20 +325,25 @@ def run_intelligence_loop() -> None:
         installed it (docs/planning/LEVER-PACKAGE.md, T3). Measured on
         griddb 2026-10-23: 205 rows since 2026-04-02, every one ``PENDING``.
 
-        Scores only. It does not compute or log a prediction -- the hourly
-        briefing already did that -- so the ``scores -> weights`` loop in
-        ``score_past_predictions`` is the only side effect. Runs 06:50 UTC:
-        after the 22:02Z close pull the scorer reads, after the 06:45
+        Outcome-only. It does not compute or log a prediction -- the hourly
+        briefing already did that -- and it passes ``update_weights=False``,
+        so recording outcomes never inserts a ``sentiment_weights`` version.
+        Learned-weight promotion for this closer is an operator decision:
+        ``config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION`` (default off, same
+        held-writer semantics as the Wave 3 flags). Runs 06:50 UTC: after
+        the 22:02Z close pull the scorer reads, after the 06:45
         journal-verdicts closer, before the 07:00 options job.
         """
         try:
             from db import get_engine as _ge
             from intelligence.sentiment_scorer import score_past_predictions
-            summary = score_past_predictions(_ge())
+            promote = bool(getattr(_s, "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION", False))
+            summary = score_past_predictions(_ge(), update_weights=promote)
             log.info(
-                "sentiment outcomes daily: scored={s} correct={c} accuracy={a}{m}",
+                "sentiment outcomes daily: scored={s} correct={c} accuracy={a} "
+                "weight_promotion={w}{m}",
                 s=summary.get("scored", 0), c=summary.get("correct", 0),
-                a=summary.get("accuracy"),
+                a=summary.get("accuracy"), w=summary.get("weight_promotion"),
                 m=(" " + str(summary.get("message") or summary.get("error") or "")).rstrip(),
             )
         except Exception as exc:  # noqa: BLE001
