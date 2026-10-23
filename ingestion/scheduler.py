@@ -13,6 +13,7 @@ with exponential backoff.
 
 from __future__ import annotations
 
+import hashlib
 import socket
 import threading
 import time
@@ -403,12 +404,247 @@ def start_tiingo_prices_worker(db_engine: Engine) -> bool:
     return True
 
 
+# Daily flow materialization (ingestion/flow_materializer.py::sync_all).
+#
+# sync_all turns signal_sources/raw_series into the insider_trades,
+# congressional_trades, dark_pool_weekly, etf_flows and junction_point_readings
+# tables the flows API reads. Other sync_all callers that exist in source:
+#   * grid-hermes's daily-intel `flow_materialize` task (scripts/hermes_operator.py),
+#     which is HELD (DAILY_INTEL_HOLD_REASONS) and does not run while
+#     grid-hermes is off; and
+#   * a host systemd unit, grid-flow-materializer.timer (every 30 min, oneshot
+#     from the OLD checkout /home/grid/grid_v4/grid_repo at 5facbdf0, not
+#     tracked under server_setup/). Operator receipt 2026-10-19T06:53Z: it is
+#     ENABLED and ACTIVE (LIVE), last run 06:30:56Z SUCCESS. Until it is
+#     disabled it keeps writing old-semantics rows every 30 minutes.
+# This job (weekdays 23:15 UTC, after the 22:00Z domestic slot, 15 min before
+# the 23:30Z Tiingo slot, outside the 03:30-10:30Z pg_dump window) is a
+# scheduler-native caller, not a claim that it is the only one. The budget
+# matches Hermes's SQL-class task budget (DAILY_INTEL_SQL_TASK_BUDGET_S = 60):
+# sync_all runs on a worker thread so a hung statement can never hold the
+# single-threaded schedule loop.
+#
+# Coordination: the run holds a session-level Postgres advisory lock
+# (FLOW_MATERIALIZE_ADVISORY_LOCK_KEY, same pattern as the yfinance/Tiingo
+# pullers) for the whole sync_all, and skips (receipt "SKIPPED: ...") if
+# another holder has it. That only coordinates callers that take the same key.
+# The host timer's old-checkout code takes NO lock, so it must be disabled in
+# the same change window as the scheduler release (operator step; see
+# docs/SERVER-SERVICES.md).
+FLOW_MATERIALIZE_SLOT_UTC = "23:15"
+FLOW_MATERIALIZE_JOB = "FlowMaterialize_Daily"
+FLOW_MATERIALIZE_BUDGET_S = 60
+FLOW_MATERIALIZE_ADVISORY_LOCK_KEY: int = int.from_bytes(
+    hashlib.sha256(b"grid:flow_materializer:sync_all").digest()[:8], "big", signed=True,
+)
+_flow_materialize_worker: threading.Thread | None = None
+_flow_materialize_guard = threading.Lock()
+
+
+def _discard_flow_materialize_lock_connection(conn: Any) -> None:
+    """Discard an uncertain lock backend before the caller closes its wrapper."""
+    try:
+        conn.invalidate()
+    except Exception as exc:
+        log.error(
+            "{j}: backend invalidation failed; attempting pool detach before "
+            "close: {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc),
+        )
+        try:
+            conn.detach()
+        except Exception as detach_exc:
+            log.error(
+                "{j}: pool detach also failed; physical backend discard is "
+                "unconfirmed and the advisory lock may remain held: {e}",
+                j=FLOW_MATERIALIZE_JOB, e=str(detach_exc),
+            )
+
+
+def _try_flow_materialize_lock(engine: Engine) -> Any | None:
+    """Dedicated connection holding the session-level advisory lock, or None.
+
+    The connection must stay open for the whole run: a session-level advisory
+    lock lives on that backend, and Postgres drops it if the process dies.
+    """
+    conn = engine.connect()
+    try:
+        acquired = conn.execute(
+            text("SELECT pg_try_advisory_lock(:key)"),
+            {"key": FLOW_MATERIALIZE_ADVISORY_LOCK_KEY},
+        ).scalar()
+        conn.commit()
+    except Exception:
+        try:
+            _discard_flow_materialize_lock_connection(conn)
+        finally:
+            conn.close()
+        raise
+    if not acquired:
+        conn.close()
+        return None
+    return conn
+
+
+def _release_flow_materialize_lock(conn: Any) -> None:
+    try:
+        conn.execute(
+            text("SELECT pg_advisory_unlock(:key)"),
+            {"key": FLOW_MATERIALIZE_ADVISORY_LOCK_KEY},
+        )
+        conn.commit()
+    except Exception as exc:
+        log.warning(
+            "{j}: advisory lock release failed; attempting backend discard "
+            "before close: {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc),
+        )
+        _discard_flow_materialize_lock_connection(conn)
+    finally:
+        conn.close()
+
+
+def _flow_materialize_receipt_text(summary: dict[str, Any]) -> tuple[int, str]:
+    """(total rows, "table=n ...; errors: ...") from a sync_all summary dict."""
+    counts = {
+        k: v for k, v in summary.items()
+        if isinstance(v, int) and not isinstance(v, bool)
+    }
+    text_ = " ".join(f"{k}={v}" for k, v in counts.items())
+    errors = summary.get("errors") or []
+    if errors:
+        text_ += "; errors: " + "; ".join(
+            f"{e.get('table')}: {str(e.get('error'))[:80]}" for e in errors
+        )
+    return sum(counts.values()), text_
+
+
+def run_flow_materialize_daily(
+    slot: str = FLOW_MATERIALIZE_SLOT_UTC,
+    now_utc: datetime | None = None,
+    budget_s: float = FLOW_MATERIALIZE_BUDGET_S,
+) -> dict[str, Any] | None:
+    """Run flow_materializer.sync_all once, with a pull_log receipt.
+
+    Skipped (returns None) when released more than
+    DOMESTIC_SLOT_MAX_LATE_MINUTES late (lateness evaluated on the UTC clock
+    the slot is registered on) or while the previous run's worker is still
+    alive, or when another process holds the advisory lock (receipted as a
+    zero-row "SKIPPED: ..." note). Never raises: a sync_all exception, a budget overrun or a failed
+    receipt write is logged and reflected in the returned summary.
+
+    The receipt row (puller_name FlowMaterialize_Daily) carries the status
+    (SUCCESS/PARTIAL/FAILED), the total rows and the per-table counts plus any
+    per-table errors in error_message. A run that outlives ``budget_s`` is
+    receipted FAILED with unknown rows and its worker left to finish on its
+    own; the schedule loop moves on. A worker exception also has unknown
+    rows because earlier table transactions may already have committed.
+    """
+    global _flow_materialize_worker
+
+    now = now_utc or datetime.now(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} {j} slot: released {m:.0f} min late (limit {lim} min) "
+            "by an earlier job holding the scheduler loop",
+            s=slot, j=FLOW_MATERIALIZE_JOB, m=late.total_seconds() / 60,
+            lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return None
+
+    started_at = datetime.now(timezone.utc)
+    box: dict[str, Any] = {}
+
+    def _work(engine: Engine) -> None:
+        lock_conn = None
+        try:
+            lock_conn = _try_flow_materialize_lock(engine)
+            if lock_conn is None:
+                box["skipped"] = "another process holds the flow-materialize advisory lock"
+                return
+            from ingestion.flow_materializer import sync_all
+
+            box["summary"] = sync_all(engine)
+        except Exception as exc:  # reported by the caller; never die silently
+            box["error"] = f"{type(exc).__name__}: {exc}"
+        finally:
+            if lock_conn is not None:
+                _release_flow_materialize_lock(lock_conn)
+
+    with _flow_materialize_guard:
+        if _flow_materialize_worker is not None and _flow_materialize_worker.is_alive():
+            log.warning(
+                "{j}: previous worker still running -- not starting another",
+                j=FLOW_MATERIALIZE_JOB,
+            )
+            return None
+        try:
+            from db import get_engine
+
+            engine = get_engine()
+        except Exception as exc:
+            log.warning("{j}: no database engine: {e}", j=FLOW_MATERIALIZE_JOB, e=str(exc))
+            return {"status": "FAILED", "error": str(exc)}
+        worker = threading.Thread(
+            target=_work, args=(engine,), name="flow-materialize", daemon=True,
+        )
+        worker.start()
+        _flow_materialize_worker = worker
+
+    worker.join(budget_s)
+    if worker.is_alive():
+        msg = f"budget exceeded: sync_all still running after {budget_s:g}s"
+        log.warning("{j}: {m}", j=FLOW_MATERIALIZE_JOB, m=msg)
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", None, msg)
+        return {"status": "FAILED", "error": msg}
+    if "error" in box:
+        log.error("{j} failed: {e}", j=FLOW_MATERIALIZE_JOB, e=box["error"])
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "FAILED", None, box["error"])
+        return {"status": "FAILED", "error": box["error"]}
+
+    if "skipped" in box:
+        # pull_log has no SKIPPED status; like PullContext, store it as a
+        # zero-row SUCCESS whose note says SKIPPED.
+        note = f"SKIPPED: {box['skipped']}"
+        log.warning("{j}: {n}", j=FLOW_MATERIALIZE_JOB, n=note)
+        _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, "SUCCESS", 0, note)
+        return {"status": "SKIPPED", "reason": box["skipped"]}
+
+    summary = box["summary"]
+    rows, detail = _flow_materialize_receipt_text(summary)
+    status = summary.get("status") if summary.get("status") in {"SUCCESS", "PARTIAL", "FAILED"} else "FAILED"
+    if status == "SUCCESS":
+        log.info("{j} complete: {d}", j=FLOW_MATERIALIZE_JOB, d=detail)
+    else:
+        log.warning("{j} {s}: {d}", j=FLOW_MATERIALIZE_JOB, s=status, d=detail)
+    _write_job_pull_log(engine, FLOW_MATERIALIZE_JOB, None, started_at, status, rows, detail)
+    return summary
+
+
 # Domestic run_daily_pulls slots skip a firing that arrives this late. The
 # schedule library runs a missed job once when the loop regains control, and
 # run_daily_pulls decides "market open" from the calendar date alone -- so a
 # 22:00 slot released at 07:30 the next morning ran the equity/options pulls
 # pre-market as that new day's pull. A skip is logged; the next slot runs.
 DOMESTIC_SLOT_MAX_LATE_MINUTES = 90
+
+
+def _scheduler_utc_now() -> datetime:
+    """Aware UTC clock for call-time windows (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _routine_yfinance_start(now_utc: datetime | None = None) -> str:
+    """Start date for a scheduled yfinance run: last completed session - 3 calendar days.
+
+    ``last_trading_day(utc_today - 1)`` is the most recent session that has
+    ended, so the window always covers it regardless of when the scheduler
+    process started. Manual runs with an explicit start date do not use this.
+    """
+    from ingestion.market_calendar import last_trading_day
+
+    now = (now_utc or _scheduler_utc_now()).astimezone(timezone.utc)
+    last_session = last_trading_day(now.date() - timedelta(days=1))
+    return (last_session - timedelta(days=YFINANCE_WINDOW_OVERLAP_DAYS)).isoformat()
 
 
 def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
@@ -423,6 +659,31 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
     if slot > now:
         slot -= timedelta(days=1)
     return now - slot
+
+
+# yfinance daily-close capture slots (all UTC).
+#
+# Generic supported US-listed daily captures become POLICY_ELIGIBLE after the
+# next New York midnight (04:00Z EDT / 05:00Z EST). SPY close preserves its
+# separate post-UTC-day-end contract. Eligibility is not provider finality.
+#   * 05:15Z targets the previous UTC day's US session, including Friday on
+#     Saturday, after both generic New York-midnight boundaries have elapsed.
+#   * 13:30Z is 09:30 EDT / 08:30 EST. It and 16:00Z/20:00Z/22:00Z retain raw
+#     snapshots; no slot promises an exchange-opening print or provider-final
+#     close. Supported same-day US-listed bars are INCOMPLETE; unsupported
+#     policy is UNKNOWN. Raw history and qualified-close selection differ.
+#   * The daily-bar Open returned next morning is a later observation of the
+#     provider's daily field, not an opening-time observation or certification.
+YFINANCE_MORNING_SLOT_UTC = "05:15"
+# Scheduled yfinance runs request a window computed at call time: from
+# YFINANCE_WINDOW_OVERLAP_DAYS (3 calendar days, not trading days) before the
+# last completed session, never from the
+# scheduler's start date. pull_ticker downloads [start_date, ...) and the
+# writer can only qualify a date it downloaded, so a window frozen at process
+# start lost every session that ended before a (re)start (found 2026-10-19: a
+# Sat 10-17 start left no live POLICY_ELIGIBLE 10-16 rows for 51 tickers).
+# It is also bounded, instead of regrowing from the start date every run.
+YFINANCE_WINDOW_OVERLAP_DAYS = 3
 
 
 def run_pull_group(
@@ -1401,7 +1662,10 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     """Execute daily FRED and yfinance data pulls.
 
     Pulls all configured series from FRED and all tickers from yfinance.
-    Skips if the market is closed (weekend or holiday).
+    Skips if the market is closed (weekend or holiday). Every slot runs
+    yfinance; the 13:30 UTC one is a same-day raw capture (in-progress,
+    INCOMPLETE, not an exchange-opening print). The morning slot separately
+    targets the prior session after the supported policy boundaries.
     Handles and logs any exception without crashing the scheduler.
 
     Parameters:
@@ -1438,7 +1702,13 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     if not market_open:
         log.info("Market closed ({d}) — skipping equity pullers", d=today)
     else:
-        _run_equity_pulls(start_date)
+        # Scheduled slots get a call-time yfinance window (see
+        # YFINANCE_WINDOW_OVERLAP_DAYS); a manual run keeps its explicit start.
+        _run_equity_pulls(
+            start_date,
+            yfinance_start=_routine_yfinance_start() if slot is not None else None,
+            yfinance_slot=slot,
+        )
 
     # --- 24/7 pullers (crypto, OSINT, sentiment — always run) ---
 
@@ -1538,6 +1808,65 @@ def run_daily_pulls(start_date: str | date = "1990-01-01", slot: str | None = No
     log.info("Daily pulls finished")
 
 
+def run_yfinance_morning_slot(
+    start_date: str | date = "1990-01-01",
+    slot: str = YFINANCE_MORNING_SLOT_UTC,
+    now_utc: datetime | None = None,
+) -> None:
+    """Capture the prior session's qualified daily close (yfinance only).
+
+    Runs every day at 05:15 UTC, which is after the next New York local
+    midnight in both EDT and EST, and pulls only when the PREVIOUS UTC
+    calendar day was a US trading session -- so Friday's close is captured
+    on Saturday and Monday's on Tuesday, whether or not today is a session.
+    Sunday, and the day after a weekend-adjacent holiday, skip.
+
+    This is the completed-close capture, separate from the 13:30Z same-day raw
+    snapshot (09:30 EDT / 08:30 EST, with no opening-print promise) and the
+    16:00/20:00/22:00Z same-day snapshots. The daily-bar Open returned next
+    morning is a later provider observation, not an opening-time observation.
+    Generic US-listed policy waits for New York midnight; SPY close retains
+    its UTC-day exception. Neither policy certifies provider finality.
+
+    Uses the same lateness guard as run_daily_pulls, evaluated on the UTC
+    clock the slot is registered on.
+
+    Parameters:
+        start_date: Accepted for registration symmetry but not used: the
+            request window is computed at call time (_routine_yfinance_start),
+            so a scheduler (re)started after the session still captures it.
+        slot: The "HH:MM" UTC slot this call was registered for.
+        now_utc: Aware UTC clock override (tests).
+    """
+    from ingestion.market_calendar import is_market_open
+
+    now = (now_utc or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    late = _slot_lateness(slot, now)
+    if late > timedelta(minutes=DOMESTIC_SLOT_MAX_LATE_MINUTES):
+        log.warning(
+            "Skipping the {s} yfinance morning slot: released {m:.0f} min late "
+            "(limit {lim} min) by an earlier job holding the scheduler loop",
+            s=slot, m=late.total_seconds() / 60, lim=DOMESTIC_SLOT_MAX_LATE_MINUTES,
+        )
+        return
+
+    prior_day = now.date() - timedelta(days=1)
+    if not is_market_open(prior_day):
+        log.info(
+            "yfinance morning slot: {d} was not a US trading session — nothing to capture",
+            d=prior_day,
+        )
+        return
+
+    log.info(
+        "yfinance morning slot: capturing the qualified close for {d}", d=prior_day,
+    )
+    _run_yfinance_daily(
+        _routine_yfinance_start(now), slot=slot,
+        purpose="completed_session_capture", target_session=prior_day,
+    )
+
+
 def _completed_spy_close_window(
     start_date: str | date, *, now_utc: datetime | None = None,
 ) -> tuple[date, date] | None:
@@ -1582,8 +1911,199 @@ def _pull_completed_spy_close(
     return window[0], result
 
 
-def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
-    """Equity-hours pullers — only called when market is open."""
+# The one per-item PARTIAL that is the writer's normal path: yfinance_pull
+# refuses a provisional SPY close (and one past the lookback), counts it in
+# daily_policy_refusals and appends this exact error. See _run_yfinance_daily.
+_YF_EXPECTED_REFUSAL = "Daily captures refused: incomplete or unknown session policy"
+
+
+def _is_expected_spy_refusal(item: Any) -> bool:
+    return (
+        isinstance(item, dict)
+        and item.get("ticker") == "SPY"
+        and item.get("status") == "PARTIAL"
+        and bool(item.get("daily_policy_refusals"))
+        and not item.get("raw_value_refusals")
+        and not item.get("error")
+        and item.get("errors") == [_YF_EXPECTED_REFUSAL]
+    )
+
+
+def _normalize_expected_spy_refusal(results: Any) -> Any:
+    """Treat the expected SPY provisional-close refusal as a clean check.
+
+    Only that single, exactly-matching refusal is normalized (SPY, PARTIAL, the
+    expected error and nothing else, no raw-value refusals); any other error on
+    any item keeps the run PARTIAL. A refusal that wrote nothing becomes
+    ``duplicate_only`` (a checked ticker with no new rows), not ``no_data``.
+    """
+    if not isinstance(results, list):
+        return results
+    return [
+        {**item, "status": "SUCCESS", "errors": [],
+         "outcome": "duplicate_only" if item.get("outcome") == "no_data" else item.get("outcome")}
+        if _is_expected_spy_refusal(item) else item
+        for item in results
+    ]
+
+
+def _log_yfinance_item_issues(results: Any, normalized: Any) -> None:
+    """Log every not-clean item with its error so "N of 70" is reconstructible."""
+    if not isinstance(results, list) or not isinstance(normalized, list):
+        return
+    expected = [r.get("ticker") for r in results if _is_expected_spy_refusal(r)]
+    issues = [
+        (r.get("ticker"), r.get("status"), r.get("outcome"),
+         str((r.get("errors") or [r.get("error") or ""])[0])[:80])
+        for r in normalized
+        if isinstance(r, dict) and (
+            r.get("status") != "SUCCESS" or r.get("errors") or r.get("outcome") in ("no_data", "error"))
+    ]
+    if expected:
+        log.info(
+            "yfinance daily pull — expected provisional-close refusal for {t} "
+            "(counted as a clean check)", t=expected,
+        )
+    if issues:
+        log.warning(
+            "yfinance daily pull — {n} of {total} item(s) not clean: {f}",
+            n=len(issues), total=len(results), f=issues[:30],
+        )
+
+
+def _run_yfinance_daily(
+    start_date: str | date, *, slot: str | None = None,
+    purpose: str = "manual", target_session: date | None = None,
+) -> None:
+    """YFinance_Daily pull plus the completed-SPY-close check.
+
+    Shared by ``_run_equity_pulls`` (13:30/16:00/20:00/22:00 UTC slots) and
+    ``run_yfinance_morning_slot`` (05:15 UTC). Handles and logs its own
+    exceptions so a yfinance failure never aborts the caller.
+    """
+    try:
+        from db import get_engine
+        from ingestion.yfinance_pull import YFinancePuller
+
+        engine = get_engine()
+        yf_puller = YFinancePuller(db_engine=engine)
+        # results is the plain list[dict] shape (should_continue not passed
+        # here) — each item now also carries an "outcome" key (Check 1a,
+        # fable-hermes-repair-bound follow-up review, 2026-09-19):
+        # "inserted" | "duplicate_only" | "no_data" | "error".
+        from ingestion.smart_scheduler import _classify_outcome
+        from ingestion.pull_context import PullContext
+        # Target attribution describes intent, not proof of a qualified raw row.
+        attribution = (
+            f"slot_utc={slot or 'manual'}; purpose={purpose}; "
+            f"target_session={target_session.isoformat() if target_session else 'unspecified'}"
+        )
+        with PullContext(engine, "YFinance_Daily") as ctx:
+            results = yf_puller.pull_all(start_date=start_date)
+            # The expected SPY provisional-close refusal must not make every
+            # run PARTIAL (and freeze source_catalog.last_pull_at).
+            checked = _normalize_expected_spy_refusal(results)
+            outcome, total_rows, note = _classify_outcome(checked)
+            ctx.record_rows(total_rows)
+            # Keep the classification marker first: PullContext uses it for
+            # NO_NEW_DATA/SKIPPED events. Preserve the original detail as well.
+            receipt_note = (
+                f"{outcome}: {note}; {attribution}" if note
+                else f"{outcome}: {attribution}"
+            )
+            if outcome in {"FAILED", "PARTIAL"}:
+                ctx.set_status(outcome, receipt_note)
+            else:
+                ctx.set_note(receipt_note)
+        succeeded = sum(1 for r in checked if r["status"] == "SUCCESS")
+        log.info(
+            "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
+            ok=succeeded,
+            total=len(results),
+            rows=total_rows,
+        )
+        fallback_started = datetime.now(timezone.utc)
+        fallback_attribution = (
+            f"slot_utc={slot or 'manual'}; purpose=completed_spy_close_fallback"
+        )
+        try:
+            completed_spy = _pull_completed_spy_close(yf_puller, start_date)
+        except Exception as exc:
+            _write_job_pull_log(
+                engine, "YFinance_Completed_SPY_Close", None, fallback_started,
+                "FAILED", None,
+                f"FAILED: {fallback_attribution}; target_session=unknown; "
+                f"{type(exc).__name__}: {exc}",
+            )
+            raise
+        if completed_spy is not None:
+            completed_day, spy_result = completed_spy
+            fallback_outcome, fallback_rows, fallback_note = _classify_outcome(spy_result)
+            # This is the fallback's reported write outcome, not a qualified-
+            # close attestation. It never changes the main outcome or freshness.
+            detail = fallback_note or spy_result.get("outcome", "")
+            _write_job_pull_log(
+                engine, "YFinance_Completed_SPY_Close", None, fallback_started,
+                fallback_outcome if fallback_outcome in {"FAILED", "PARTIAL"} else "SUCCESS",
+                fallback_rows,
+                f"{fallback_outcome}: {fallback_attribution}; "
+                f"target_session={completed_day.isoformat()}; {detail}",
+            )
+            log.info(
+                "SPY completed-close check for {d}: outcome={o}, rows={n}",
+                d=completed_day, o=spy_result["outcome"],
+                n=spy_result["rows_inserted"],
+            )
+        else:
+            _write_job_pull_log(
+                engine, "YFinance_Completed_SPY_Close", None, fallback_started,
+                "SUCCESS", 0,
+                "SKIPPED: no omitted completed session within the capture lookback; "
+                f"{fallback_attribution}; target_session=not_requested",
+            )
+        # Surface per-ticker failures here too instead of only in
+        # pull_ticker's own log lines — this is the function actually
+        # wired to the 4x/day cron, so this is where an operator/Hermes
+        # would look first for "which tickers didn't check cleanly today".
+        _log_yfinance_item_issues(results, checked)
+        # Cadence checks are logged, but only complete positive-write runs
+        # establish source freshness (the same rule as SmartScheduler).
+        if outcome == "SUCCESS":
+            try:
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE source_catalog SET last_pull_at = NOW() "
+                        "WHERE LOWER(name) = LOWER(:name)"
+                    ), {"name": "yfinance"})
+            except Exception:
+                pass
+        else:
+            log.warning(
+                "yfinance daily pull: {o} — last_pull_at NOT advanced", o=outcome,
+            )
+    except Exception as exc:
+        log.error("yfinance daily pull failed: {err}", err=str(exc))
+        try:
+            from alerts.email import alert_on_failure_with_fix
+            alert_on_failure_with_fix("yfinance", str(exc), {
+                "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
+                "fix": "pip install --upgrade yfinance",
+                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
+                "file": "grid/ingestion/yfinance_pull.py",
+            })
+        except Exception as exc2:
+            log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
+
+
+def _run_equity_pulls(
+    start_date: str | date = "1990-01-01", yfinance_start: str | date | None = None,
+    yfinance_slot: str | None = None,
+) -> None:
+    """Equity-hours pullers — only called when market is open.
+
+    ``start_date`` feeds the date-floored pullers; yfinance uses
+    ``yfinance_start`` when given (scheduled slots), else ``start_date``.
+    """
     from db import get_engine
 
     # FRED pull
@@ -1620,83 +2140,13 @@ def _run_equity_pulls(start_date: str | date = "1990-01-01") -> None:
         except Exception as exc2:
             log.debug("Scheduler: FRED alert send failed: {e}", e=str(exc2))
 
-    # yfinance pull
-    try:
-        from db import get_engine
-        from ingestion.yfinance_pull import YFinancePuller
-
-        engine = get_engine()
-        yf_puller = YFinancePuller(db_engine=engine)
-        # results is the plain list[dict] shape (should_continue not passed
-        # here) — each item now also carries an "outcome" key (Check 1a,
-        # fable-hermes-repair-bound follow-up review, 2026-09-19):
-        # "inserted" | "duplicate_only" | "no_data" | "error".
-        from ingestion.smart_scheduler import _classify_outcome
-        from ingestion.pull_context import PullContext
-        with PullContext(engine, "YFinance_Daily") as ctx:
-            results = yf_puller.pull_all(start_date=start_date)
-            outcome, total_rows, note = _classify_outcome(results)
-            ctx.record_rows(total_rows)
-            if outcome in {"FAILED", "PARTIAL"}:
-                ctx.set_status(outcome, note)
-            elif outcome in {"SKIPPED", "NO_NEW_DATA"}:
-                ctx.set_note(f"{outcome}: {note}")
-        succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
-        log.info(
-            "yfinance daily pull complete — {ok}/{total} tickers checked, {rows} rows",
-            ok=succeeded,
-            total=len(results),
-            rows=total_rows,
-        )
-        completed_spy = _pull_completed_spy_close(yf_puller, start_date)
-        if completed_spy is not None:
-            completed_day, spy_result = completed_spy
-            log.info(
-                "SPY completed-close check for {d}: outcome={o}, rows={n}",
-                d=completed_day, o=spy_result["outcome"],
-                n=spy_result["rows_inserted"],
-            )
-        # Surface per-ticker failures here too instead of only in
-        # pull_ticker's own log lines — this is the function actually
-        # wired to the 4x/day cron, so this is where an operator/Hermes
-        # would look first for "which tickers didn't check cleanly today".
-        failing = [
-            (r.get("ticker"), r.get("outcome"))
-            for r in results
-            if r.get("outcome") in ("no_data", "error")
-        ]
-        if failing:
-            log.warning(
-                "yfinance daily pull — {n} ticker(s) did not check cleanly: {f}",
-                n=len(failing), f=failing[:20],
-            )
-        # Cadence checks are logged, but only complete positive-write runs
-        # establish source freshness (the same rule as SmartScheduler).
-        if outcome == "SUCCESS":
-            try:
-                with engine.begin() as conn:
-                    conn.execute(text(
-                        "UPDATE source_catalog SET last_pull_at = NOW() "
-                        "WHERE LOWER(name) = LOWER(:name)"
-                    ), {"name": "yfinance"})
-            except Exception:
-                pass
-        else:
-            log.warning(
-                "yfinance daily pull: {o} — last_pull_at NOT advanced", o=outcome,
-            )
-    except Exception as exc:
-        log.error("yfinance daily pull failed: {err}", err=str(exc))
-        try:
-            from alerts.email import alert_on_failure_with_fix
-            alert_on_failure_with_fix("yfinance", str(exc), {
-                "diagnose": "python -c \"import yfinance; print(yfinance.Ticker('SPY').info.get('regularMarketPrice'))\"",
-                "fix": "pip install --upgrade yfinance",
-                "retry": 'cd /data/grid_v4/grid_repo/grid && python -c "from ingestion.yfinance_pull import YFinancePuller; from db import get_engine; YFinancePuller(get_engine()).pull_all()"',
-                "file": "grid/ingestion/yfinance_pull.py",
-            })
-        except Exception as exc2:
-            log.debug("Scheduler: yfinance alert send failed: {e}", e=str(exc2))
+    # yfinance pull (every slot, including the 13:30 UTC same-day raw capture).
+    _run_yfinance_daily(
+        yfinance_start if yfinance_start is not None else start_date,
+        slot=yfinance_slot,
+        purpose="same_day_raw_snapshot" if yfinance_slot is not None else "manual",
+        target_session=_scheduler_utc_now().date() if yfinance_slot is not None else None,
+    )
 
     # The stale-price auto-fallback (ingestion/price_fallback.py) is retired:
     # it wrote backdated resolved_series vintages directly and, on the
@@ -1965,8 +2415,10 @@ def start_scheduler() -> None:
 
     # --- Domestic schedules ---
 
-    # Daily pulls: open (9:30 ET), midday (12 ET), close (4 PM ET), post-close (6 PM ET)
-    # Times are UTC — EDT offset (UTC-4). Shift +1h in winter (EST).
+    # Domestic clock slots stay fixed: 13:30/16:00/20:00/22:00 on the UTC host.
+    # 13:30 UTC is 09:30 EDT / 08:30 EST; there is no seasonal clock shift here.
+    # yfinance runs in every slot as raw snapshots, without an opening-print
+    # promise. The 05:15 morning slot targets the prior session separately.
     # Weekdays: full pull (equity + 24/7). Weekends: 24/7 only (market gate skips equity).
     # Each slot is lateness-guarded (see DOMESTIC_SLOT_MAX_LATE_MINUTES).
     for day in ["monday", "tuesday", "wednesday", "thursday", "friday",
@@ -1975,6 +2427,24 @@ def start_scheduler() -> None:
             getattr(schedule.every(), day).at(utc_time).do(
                 run_daily_pulls, start_date=ongoing_start, slot=utc_time
             )
+
+    # Hermes-independent flow materialization (see FLOW_MATERIALIZE_SLOT_UTC):
+    # weekdays after the 22:00Z slot, outside the 03:30-10:30Z backup window.
+    for day in ["monday", "tuesday", "wednesday", "thursday", "friday"]:
+        getattr(schedule.every(), day).at(FLOW_MATERIALIZE_SLOT_UTC, "UTC").do(
+            run_flow_materialize_daily, slot=FLOW_MATERIALIZE_SLOT_UTC
+        )
+
+    # yfinance-only morning slot: targets a POLICY_ELIGIBLE close for the prior
+    # session (see YFINANCE_MORNING_SLOT_UTC). Registered every day; the
+    # function itself runs only when the previous day was a US session
+    # (Saturday for Friday, Tuesday for Monday). The explicit "UTC" makes it
+    # fire at 05:15Z on a non-UTC host too; the lateness guard uses the same
+    # UTC clock.
+    schedule.every().day.at(YFINANCE_MORNING_SLOT_UTC, "UTC").do(
+        run_yfinance_morning_slot, start_date=ongoing_start,
+        slot=YFINANCE_MORNING_SLOT_UTC,
+    )
 
     # Monthly BLS pull on the 5th (idempotent — won't re-run if already done this month)
     def _monthly_check() -> None:
