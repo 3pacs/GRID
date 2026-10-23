@@ -29,9 +29,21 @@ unadjusted); no corporate-action adjustment is applied.
   decision was logged; a later re-pull of that date is ignored), at most
   ``ENTRY_MAX_AGE_DAYS`` calendar days before the decision.
 * **Exit** -- the close labelled exactly ``SCORING_WINDOW_DAYS`` sessions
-  after the entry session: NYSE sessions (``ingestion.market_calendar``) for
-  US-listed benchmarks, UTC calendar days for BTC. Its value is the latest
-  vintage known at evaluation time (``evaluated_at``, one instant per run).
+  after the decision's *anchor session*: the last session whose close had
+  become capturable at the decision instant (the contract's own capture
+  boundary -- UTC day end for SPY and BTC, the next New York midnight for
+  other US-listed tickers). Sessions are NYSE sessions
+  (``ingestion.market_calendar``) for US-listed benchmarks and UTC calendar
+  days for BTC. Anchoring to the decision rather than to the entry label
+  means the horizon always ends after the decision, even when the entry is
+  stale (a feed four days behind must not score a window that closed before
+  the decision was made). The exit value is the latest vintage known at
+  evaluation time (``evaluated_at``, one instant per run).
+* **Evidence** -- every scored annotation records the series, contract and
+  source, the entry label/value/pull timestamp and the decision instant it
+  was known at, the anchor session, the exit label/value/pull timestamp and
+  the full-precision evaluation cutoff, so the exact vintages selected can
+  be reconstructed from the journal alone.
 * **Deferral** -- when the exit session's close is not captured yet the row
   is left unscored (``pending``) and rescored on a later run. A missing exit
   close is deferred while the puller can still catch it up
@@ -71,6 +83,8 @@ from price_close_contract import (
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_SERIES,
     SPY_ENTRY_MAX_AGE_DAYS,
+    daily_capture_boundary,
+    observation_end_utc,
 )
 from store.observations import Observation, read_daily_policy_n
 
@@ -163,6 +177,31 @@ def _sessions_after(start: date, n: int, sessions: str) -> list[date]:
     return out
 
 
+def _capture_boundary(bench: Benchmark, session: date) -> datetime | None:
+    """UTC instant after which a capture of ``session``'s close is a completed close.
+
+    The contract's own boundary: UTC day end for ``YF:SPY:close``
+    (``spy_close_v1``) and BTC, the following New York midnight for other
+    US-listed tickers. ``None`` when ``session`` is not a session the
+    contract knows (weekend, NYSE holiday, unsupported year).
+    """
+    if bench.series_id == SPY_CLOSE_SERIES:
+        return observation_end_utc(session) if is_market_open(session) else None
+    ticker = bench.series_id.split(":")[1]
+    return daily_capture_boundary(ticker, session, "1d")
+
+
+def _anchor_session(bench: Benchmark, decision_ts: datetime) -> date | None:
+    """The last session whose close had become capturable by ``decision_ts``."""
+    d = decision_ts.date()
+    for _ in range(PRICE_HISTORY_BUFFER_DAYS):
+        boundary = _capture_boundary(bench, d)
+        if boundary is not None and boundary <= decision_ts:
+            return d
+        d -= timedelta(days=1)
+    return None
+
+
 def _entry_close(conn, bench: Benchmark, decision_ts: datetime) -> Observation | None:
     """Newest completed close known at ``decision_ts``, or None when too old / absent."""
     decision_date = decision_ts.date()
@@ -198,6 +237,7 @@ class ForwardOutcome:
     status: str                 # "scored" | "pending" | "missing"
     forward_return: float | None
     entry: Observation | None
+    anchor: date | None
     exit_session: date | None
     exit: Observation | None
     reason: str
@@ -208,46 +248,66 @@ def _forward_outcome(
     window_days: int = SCORING_WINDOW_DAYS,
 ) -> ForwardOutcome:
     """Apply the declared entry/exit/deferral rules (module docstring)."""
+    anchor = _anchor_session(bench, decision_ts)
+    if anchor is None:
+        return ForwardOutcome(
+            "missing", None, None, None, None, None,
+            f"no capturable {bench.series_id} session before {decision_ts.isoformat()}",
+        )
     entry = _entry_close(conn, bench, decision_ts)
     if entry is None:
         return ForwardOutcome(
-            "missing", None, None, None, None,
+            "missing", None, None, anchor, None, None,
             f"no completed {bench.series_id} close known at "
-            f"{decision_ts:%Y-%m-%dT%H:%MZ} within {ENTRY_MAX_AGE_DAYS}d",
+            f"{decision_ts.isoformat()} within {ENTRY_MAX_AGE_DAYS}d",
         )
-    exit_session = _sessions_after(entry.obs_date, window_days, bench.sessions)[-1]
+    # A completed close known at the decision has a label at or before the
+    # anchor, so the window [entry label, exit session] always ends after
+    # the decision: the exit is forward of it by construction.
+    exit_session = _sessions_after(anchor, window_days, bench.sessions)[-1]
     later = _closes_after(conn, bench, entry.obs_date, evaluated_at)
     exit_obs = later.get(exit_session)
     if exit_obs is not None:
         fwd = (exit_obs.value - entry.value) / entry.value
-        return ForwardOutcome("scored", fwd, entry, exit_session, exit_obs, "")
+        return ForwardOutcome("scored", fwd, entry, anchor, exit_session, exit_obs, "")
     if evaluated_at.date() <= exit_session + timedelta(days=GAP_GRACE_DAYS):
         return ForwardOutcome(
-            "pending", None, entry, exit_session, None,
+            "pending", None, entry, anchor, exit_session, None,
             f"completed close for session {exit_session} not captured yet",
         )
     resumed = sorted(d for d in later if d > exit_session)
     if resumed:
         return ForwardOutcome(
-            "missing", None, entry, exit_session, None,
+            "missing", None, entry, anchor, exit_session, None,
             f"no completed {bench.series_id} close for session {exit_session}; "
             f"feed resumed at {resumed[0]}",
         )
     return ForwardOutcome(
-        "pending", None, entry, exit_session, None,
+        "pending", None, entry, anchor, exit_session, None,
         f"feed has no completed {bench.series_id} close after session {exit_session} (stalled)",
     )
 
 
+def _iso(ts: datetime | None) -> str:
+    return ts.isoformat() if ts is not None else "unknown"
+
+
 def _basis(bench: Benchmark, outcome: ForwardOutcome, decision_ts: datetime, evaluated_at: datetime) -> str:
-    """Provenance suffix recorded with every scored verdict."""
+    """Provenance suffix recorded with every scored verdict.
+
+    Full precision throughout: values as stored (``repr``), the selected
+    entry and exit captures' pull timestamps, the decision instant the entry
+    was known at, the anchor session and the exact evaluation cutoff -- so
+    which vintage was selected can be reconstructed from the journal alone.
+    """
     entry, exit_obs = outcome.entry, outcome.exit
     assert entry is not None and exit_obs is not None
     return (
-        f"basis {bench.series_id} ({bench.contract}): entry {entry.obs_date} close "
-        f"{entry.value:.4f} known at {decision_ts:%Y-%m-%dT%H:%MZ}, exit session "
-        f"{outcome.exit_session} close {exit_obs.value:.4f}, vintages as of "
-        f"{evaluated_at:%Y-%m-%dT%H:%MZ}"
+        f"basis {bench.series_id} ({bench.contract}, source {bench.source}): "
+        f"entry {entry.obs_date} close {entry.value!r} pulled {_iso(entry.pull_timestamp)} "
+        f"known_at {_iso(decision_ts)}; anchor session {outcome.anchor}; "
+        f"exit session {exit_obs.obs_date} close {exit_obs.value!r} pulled {_iso(exit_obs.pull_timestamp)}; "
+        f"evaluated_at {_iso(evaluated_at)}"
     )
 
 
@@ -386,7 +446,7 @@ def run(dry_run: bool = False, evaluated_at: datetime | None = None) -> dict:
             bench = BENCHMARKS.get(benchmark_name)
             if bench is None:
                 outcome = ForwardOutcome(
-                    "missing", None, None, None, None,
+                    "missing", None, None, None, None, None,
                     f"no completed-close series mapped for benchmark {benchmark_name}",
                 )
             else:

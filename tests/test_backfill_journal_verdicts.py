@@ -34,8 +34,8 @@ SCRIPT = ROOT / "scripts" / "backfill_journal_verdicts.py"
 UTC = timezone.utc
 
 
-def at(d: date, hh: int, mm: int = 0) -> datetime:
-    return datetime(d.year, d.month, d.day, hh, mm, tzinfo=UTC)
+def at(d: date, hh: int, mm: int = 0, ss: int = 0) -> datetime:
+    return datetime(d.year, d.month, d.day, hh, mm, ss, tzinfo=UTC)
 
 
 def next_morning(d: date) -> datetime:
@@ -192,10 +192,13 @@ def test_same_day_decision_before_the_close_enters_on_the_previous_session(score
     call = journal.calls[0]
     assert call["outcome_value"] == pytest.approx(ret(680.0, 690.0), abs=1e-6)   # 10-19 -> 10-22
     assert call["annotation"].startswith("AGGRESSIVE correct: SPY +1.47%")
-    assert (
-        "| basis YF:SPY:close (spy_close_v1): entry 2026-10-19 close 680.0000 known at "
-        "2026-10-20T14:00Z, exit session 2026-10-22 close 690.0000, vintages as of 2026-10-23T06:45Z"
-    ) in call["annotation"]
+    assert call["annotation"].endswith(
+        "| basis YF:SPY:close (spy_close_v1, source yfinance): "
+        "entry 2026-10-19 close 680.0 pulled 2026-10-20T06:02:00+00:00 known_at 2026-10-20T14:00:00+00:00; "
+        "anchor session 2026-10-19; "
+        "exit session 2026-10-22 close 690.0 pulled 2026-10-23T06:02:00+00:00; "
+        "evaluated_at 2026-10-23T06:45:00+00:00"
+    )
 
 
 def test_decision_after_the_morning_repull_enters_on_that_close(scorer):
@@ -219,12 +222,13 @@ def test_entry_skips_a_provisional_capture_and_uses_the_last_completed_one(score
 
     counts, journal = scorer(db, [(1, at(date(2026, 10, 20), 14), *GROWTH)], at(date(2026, 10, 23), 6, 45))
 
-    # Entry falls back to Friday 10-16 (4 days: still within ENTRY_MAX_AGE_DAYS);
-    # the exit is then the third session after 10-16, i.e. 10-21.
+    # Entry falls back to Friday 10-16 (4 days: still within ENTRY_MAX_AGE_DAYS).
+    # The horizon is anchored to the decision's session (Monday 10-19), not
+    # to the stale entry label, so the exit is still Thursday 10-22.
     assert counts["HELPED"] == 1
-    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(670.0, 686.0), abs=1e-6)
-    assert "entry 2026-10-16 close 670.0000" in journal.calls[0]["annotation"]
-    assert "exit session 2026-10-21" in journal.calls[0]["annotation"]
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(670.0, 690.0), abs=1e-6)
+    assert "entry 2026-10-16 close 670.0 pulled 2026-10-17T06:02:00+00:00" in journal.calls[0]["annotation"]
+    assert "anchor session 2026-10-19; exit session 2026-10-22" in journal.calls[0]["annotation"]
 
 
 def test_entry_older_than_max_age_is_insufficient_data_at_once(scorer):
@@ -237,7 +241,7 @@ def test_entry_older_than_max_age_is_insufficient_data_at_once(scorer):
     assert journal.calls[0]["outcome_value"] == 0.0
     assert journal.calls[0]["annotation"] == (
         "No forward SPY data available for scoring window "
-        "(no completed YF:SPY:close close known at 2026-10-27T14:00Z within 4d)"
+        "(no completed YF:SPY:close close known at 2026-10-27T14:00:00+00:00 within 4d)"
     )
 
 
@@ -322,8 +326,8 @@ def test_equity_exit_skips_the_thanksgiving_holiday(scorer):
 
     assert counts["HELPED"] == 1
     assert journal.calls[0]["outcome_value"] == pytest.approx(ret(702.0, 710.0), abs=1e-6)
-    assert "entry 2026-11-25 close 702.0000" in journal.calls[0]["annotation"]
-    assert "exit session 2026-12-01 close 710.0000" in journal.calls[0]["annotation"]
+    assert "entry 2026-11-25 close 702.0 pulled 2026-11-26T06:02:00+00:00" in journal.calls[0]["annotation"]
+    assert "anchor session 2026-11-25; exit session 2026-12-01 close 710.0" in journal.calls[0]["annotation"]
 
 
 def test_btc_exit_counts_utc_calendar_days_including_the_weekend(scorer):
@@ -341,8 +345,82 @@ def test_btc_exit_counts_utc_calendar_days_including_the_weekend(scorer):
     call = journal.calls[0]
     assert call["outcome_value"] == pytest.approx(ret(81000.0, 84000.0), abs=1e-6)   # 10-22 -> Sun 10-25
     assert call["annotation"].startswith("CRYPTO_CORE AGGRESSIVE correct: btc +3.70%")
-    assert "basis YF:BTC-USD:close (yf_daily_capture_v1): entry 2026-10-22" in call["annotation"]
-    assert "exit session 2026-10-25" in call["annotation"]
+    assert "basis YF:BTC-USD:close (yf_daily_capture_v1, source yfinance): entry 2026-10-22" in call["annotation"]
+    assert "anchor session 2026-10-22; exit session 2026-10-25" in call["annotation"]
+
+
+def test_stale_btc_entry_never_scores_a_window_that_closed_before_the_decision(scorer):
+    """Review P1: entry four days stale, exit three days after it -- all pre-decision.
+
+    Decision Friday 2026-10-23T14:00Z; the newest completed BTC close known is
+    Oct 19 (feed stale), and Oct 22's close is captured late on Oct 24. The
+    old rule (exit = entry + 3 days) would score Oct 19 -> Oct 22, a period
+    that ended before the decision. The horizon is anchored to the decision's
+    last capturable session (Oct 22), so the exit is Oct 25.
+    """
+    db = MemoryDB()
+    add_completed(db, "btc", {date(2026, 10, 16): 80000.0, date(2026, 10, 17): 80500.0,
+                              date(2026, 10, 18): 80800.0, date(2026, 10, 19): 81000.0})
+    add_close(db, "btc", date(2026, 10, 22), 83000.0, at(date(2026, 10, 24), 10))   # late capture
+    decision = (1, at(date(2026, 10, 23), 14), "CRYPTO_CORE", "AGGRESSIVE", "AUTO_AGGRESSIVE")
+
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 25), 6, 45))
+    assert counts["pending"] == 1 and journal.calls == []          # not Oct 19 -> Oct 22
+
+    add_close(db, "btc", date(2026, 10, 25), 84000.0, next_morning(date(2026, 10, 25)))
+    counts, journal = scorer(db, [decision], at(date(2026, 10, 26), 6, 45))
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(81000.0, 84000.0), abs=1e-6)
+    assert "entry 2026-10-19 close 81000.0" in journal.calls[0]["annotation"]
+    assert "anchor session 2026-10-22; exit session 2026-10-25" in journal.calls[0]["annotation"]
+
+
+def test_stale_equity_entry_is_anchored_to_the_decision_session_across_the_holiday(scorer):
+    """A weekend decision after Thanksgiving with the feed three sessions behind."""
+    db = MemoryDB()
+    add_completed(db, "sp500", {date(2026, 11, 24): 700.0, date(2026, 11, 25): 702.0})
+    # Decision Sunday 2026-11-29 12:00Z: entry is Wed 11-25 (4 days, still
+    # allowed); the last capturable session is Fri 11-27, so the exit is the
+    # third session after it: Mon 11-30, Tue 12-01, Wed 12-02 -- not Tue
+    # 12-01, which is what entry + 3 sessions would give.
+    decision = (1, at(date(2026, 11, 29), 12), *GROWTH)
+    # The feed catches up only on Monday: Friday's close is captured after the decision.
+    add_close(db, "sp500", date(2026, 11, 27), 704.0, at(date(2026, 11, 30), 10))
+    add_completed(db, "sp500", {date(2026, 11, 30): 706.0, date(2026, 12, 1): 708.0})
+
+    counts, journal = scorer(db, [decision], at(date(2026, 12, 2), 6, 45))
+    assert counts["pending"] == 1 and journal.calls == []          # 12-02 not captured yet
+
+    add_completed(db, "sp500", {date(2026, 12, 2): 712.0})
+    counts, journal = scorer(db, [decision], at(date(2026, 12, 3), 6, 45))
+    assert counts["HELPED"] == 1
+    assert journal.calls[0]["outcome_value"] == pytest.approx(ret(702.0, 712.0), abs=1e-6)
+    assert "anchor session 2026-11-27; exit session 2026-12-02 close 712.0" in journal.calls[0]["annotation"]
+
+
+def test_annotation_records_the_exact_vintages_selected_at_sub_minute_precision(scorer):
+    """Review P2: an evaluation at 06:45:45 selecting a 06:45:30 re-pull must say so."""
+    db = MemoryDB()
+    add_completed(db, "sp500", {date(2026, 10, 19): 680.0, date(2026, 10, 20): 684.0, date(2026, 10, 21): 686.0})
+    add_close(db, "sp500", date(2026, 10, 22), 690.0, at(date(2026, 10, 23), 6, 2, 0))
+    add_close(db, "sp500", date(2026, 10, 22), 690.25, at(date(2026, 10, 23), 6, 45, 30))   # re-pull
+    decision = (1, at(date(2026, 10, 20), 14, 0, 7), *GROWTH)
+
+    _, early = scorer(db, [decision], at(date(2026, 10, 23), 6, 45, 15))
+    _, late = scorer(db, [decision], at(date(2026, 10, 23), 6, 45, 45))
+
+    assert early.calls[0]["outcome_value"] == pytest.approx(ret(680.0, 690.0), abs=1e-6)
+    assert late.calls[0]["outcome_value"] == pytest.approx(ret(680.0, 690.25), abs=1e-6)
+    assert early.calls[0]["annotation"].endswith(
+        "entry 2026-10-19 close 680.0 pulled 2026-10-20T06:02:00+00:00 known_at 2026-10-20T14:00:07+00:00; "
+        "anchor session 2026-10-19; "
+        "exit session 2026-10-22 close 690.0 pulled 2026-10-23T06:02:00+00:00; "
+        "evaluated_at 2026-10-23T06:45:15+00:00"
+    )
+    assert late.calls[0]["annotation"].endswith(
+        "exit session 2026-10-22 close 690.25 pulled 2026-10-23T06:45:30+00:00; "
+        "evaluated_at 2026-10-23T06:45:45+00:00"
+    )
 
 
 def test_individual_pick_uses_its_own_benchmark_series(scorer):
