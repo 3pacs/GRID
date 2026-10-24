@@ -24,10 +24,12 @@ The 16 defaults that were previously UNKNOWN now qualify under the **same** elap
 
 | Class | Tickers | Venue session | `session_convention` |
 | --- | --- | --- | --- |
-| Cboe volatility indexes | ^VIX, ^VIX9D, ^VIX3M, ^VIX6M | Settle 16:15 ET; NYSE holiday calendar | `cboe_vol_index_ny_label_day_2026` |
+| Cboe volatility indexes | ^VIX, ^VIX9D, ^VIX3M, ^VIX6M | Spot-index RTH calculation/dissemination ends 16:15 ET; NYSE calendar used as a refusal filter | `cboe_vol_index_ny_label_day_2026` |
 | ICE US Dollar Index | DX-Y.NYB | Daily bar follows the New York trading day, ending by about 17:00 ET (like FX) | `ice_dxy_ny_label_day_2026` |
-| CME Globex futures | HG=F, GC=F, SI=F, CL=F | Bar labelled by trade date; settles 17:00 ET | `cme_globex_ny_label_day_2026` |
+| CME Globex futures | HG=F, GC=F, SI=F, CL=F | Bar labelled by trade date; electronic session ends 17:00 ET; settlement times vary by product | `cme_globex_ny_label_day_2026` |
 | Yahoo FX pairs | EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCHF=X, USDCAD=X, NZDUSD=X | New York 17:00 ET close convention (at the latest the UTC day end) | `yahoo_fx_ny_close_label_day_2026` |
+
+These are session-label references, not a claim that Yahoo's Close is an exchange settlement price or that the provider certified the bar as final.
 
 Every one of these label days ends before 00:00 America/New_York of the following date (04:00/05:00 UTC), so waiting for that boundary is conservative for each class. Even if a Yahoo FX bar followed the UTC day instead of the 17:00 ET convention, it would still end before the boundary. All other rules stay as they are: the 2026 qualification bound, `provider_certified_final=false`, INCOMPLETE before the boundary, interval isolation, and exact marker validation in `is_daily_policy_capture` (a marker that carries another class's `session_convention`, another ticker's `price_basis`, a different `eligible_after`, or an explicit UNKNOWN/INCOMPLETE state is rejected). `UNKNOWN_DAILY_TICKERS` still exists but is now empty, so the default universe is still partitioned as supported | unknown.
 

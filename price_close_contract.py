@@ -67,14 +67,16 @@ US_LISTED_DAILY_TICKERS = frozenset({
 })
 UTC_DAILY_TICKERS = frozenset({"BTC-USD", "ETH-USD"})
 # Non-NYSE venues whose daily bars end before the next New York local
-# midnight (owner decision 2026-10-19). Cboe volatility indexes settle at
-# 16:15 ET on the NYSE holiday calendar; ICE DX-Y.NYB follows the New York
-# trading day; CME Globex futures (bar labelled by trade date) settle at
-# 17:00 ET; Yahoo FX closes at the New York 17:00 ET convention (the UTC
-# day end at the latest). All finish their label day before 00:00
-# America/New_York of the following date, so the same elapsed NY-label-day
-# boundary is conservative for them. NYSE-closed labels stay UNKNOWN even
-# when these markets trade: is_market_open is a refusal filter.
+# midnight (owner decision 2026-10-19). Cboe spot-volatility indexes end RTH
+# calculation/dissemination at 16:15 ET; ICE DX-Y.NYB follows the New York
+# trading day; CME Globex futures (bar labelled by trade date) end their
+# electronic session at 17:00 ET; Yahoo FX closes at the New York 17:00 ET
+# convention (the UTC day end at the latest). Settlement times vary by
+# product; this policy does not equate Yahoo Close with exchange settlement.
+# All finish their label day before 00:00 America/New_York of the following
+# date, so the same elapsed NY-label-day boundary is conservative for them.
+# NYSE-closed labels stay UNKNOWN even when these markets trade:
+# is_market_open is a refusal filter.
 CBOE_VOL_INDEX_DAILY_TICKERS = frozenset({"^VIX", "^VIX9D", "^VIX3M", "^VIX6M"})
 ICE_DXY_DAILY_TICKERS = frozenset({"DX-Y.NYB"})
 CME_GLOBEX_DAILY_TICKERS = frozenset({"HG=F", "GC=F", "SI=F", "CL=F"})
