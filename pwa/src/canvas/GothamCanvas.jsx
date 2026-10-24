@@ -959,7 +959,7 @@ export default function GothamCanvas() {
                             activeLayers: new Set(board.filters?.layers || ['financial', 'insider']),
                             timeRange: board.filters?.timeRange || { start: null, end: null },
                         });
-                        loadGraph(graphState);
+                        loadGraph(graphState, { preserveLayout: true });
                         return;
                     } else if (!cancelled) {
                         setCanvasStatus({
