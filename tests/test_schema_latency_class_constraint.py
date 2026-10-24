@@ -1,22 +1,9 @@
-"""Pin schema.sql's source_catalog latency_class CHECK to the live set.
+"""Pin the composed schema.sql source_catalog CHECK to its shared constant.
 
-Closes C4 of CLAUDE-REVIEW-ASSET-REGISTRIES-LATENCY-c3fdffb4-20261020: the
-live griddb constraint ``source_catalog_latency_class_check`` was widened
-out-of-band to seven values (re-read 2026-10-20, with live rows in every one
-of the seven classes) while ``schema.sql`` still declared four. A fresh
-database gets this constraint from ``schema.sql`` alone (``python db.py`` ->
-``db.apply_schema``; the alembic baseline ``7e4dfecce247`` is a no-op), so
-``schema.sql`` is the only in-repo artefact that has to match production.
-
-Parses the constraint out of the ``CREATE TABLE source_catalog`` block --
-no database -- and checks it against:
-
-  * ``ingestion.base.VALID_LATENCY_CLASSES`` when that constant exists
-    (added by PR #880, ``claude/asset-registries-latency-class-20261020``);
-    until it merges, a local literal mirroring the live constraint stands in.
-    Follow-up once #880 is on main: drop ``_LIVE_CONSTRAINT_SET`` here and
-    assert against the constant unconditionally.
-  * the seed rows ``schema.sql`` itself inserts into ``source_catalog``.
+This composition requires PR #880's VALID_LATENCY_CLASSES unconditionally;
+missing imports or dependency errors must fail collection rather than use a
+stand-in set. Schema and seed checks are source-only and do not establish
+an installed database's constraint state.
 """
 
 from __future__ import annotations
@@ -26,15 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from ingestion.base import VALID_LATENCY_CLASSES
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_SQL = REPO_ROOT / "schema.sql"
-
-# Verbatim from griddb on 2026-10-20 (pg_get_constraintdef):
-#   CHECK ((latency_class = ANY (ARRAY['REALTIME','INTRADAY','EOD','WEEKLY',
-#                                      'MONTHLY','QUARTERLY','ANNUAL'])))
-_LIVE_CONSTRAINT_SET = frozenset(
-    {"REALTIME", "INTRADAY", "EOD", "WEEKLY", "MONTHLY", "QUARTERLY", "ANNUAL"}
-)
 
 _SOURCE_CATALOG_BLOCK = re.compile(
     r"CREATE TABLE IF NOT EXISTS source_catalog\s*\((?P<body>.*?)\n\);",
@@ -57,24 +39,9 @@ def _schema_latency_class_values() -> frozenset[str]:
     return frozenset(re.findall(r"'([A-Z]+)'", check.group("values")))
 
 
-def _expected_set() -> frozenset[str]:
-    try:
-        from ingestion.base import VALID_LATENCY_CLASSES  # PR #880
-    except ImportError:
-        return _LIVE_CONSTRAINT_SET
-    return frozenset(VALID_LATENCY_CLASSES)
-
-
 @pytest.mark.unit
-def test_schema_sql_latency_class_check_matches_live_constraint():
-    assert _schema_latency_class_values() == _expected_set()
-
-
-@pytest.mark.unit
-def test_local_literal_matches_live_constraint_until_880_merges():
-    """Guards the stand-in literal itself; once #880 merges this also proves
-    the two in-repo sets agree and the literal can be removed."""
-    assert _expected_set() == _LIVE_CONSTRAINT_SET
+def test_schema_sql_latency_class_check_matches_shared_constant():
+    assert _schema_latency_class_values() == frozenset(VALID_LATENCY_CLASSES)
 
 
 @pytest.mark.unit
