@@ -266,15 +266,48 @@ class YahooOptionsClient:
                 log.warning("Yahoo options {t}: HTTP {s}", t=ticker, s=resp.status_code)
                 return None
             data = resp.json()
-            result = data["optionChain"]["result"][0]
-            quote = result.get("quote", {})
-            options = result.get("options", [{}])[0]
+            chain = data.get("optionChain") if isinstance(data, dict) else None
+            if isinstance(chain, dict) and chain.get("error") is not None:
+                # A present, non-null provider error is a failed fetch even
+                # when residual result data rides along: an explicit empty
+                # chain beside an error is not measured zero coverage. The
+                # error body is not logged. An absent key or ``"error": null``
+                # is the normal successful shape and stays accepted.
+                log.warning("Yahoo options {t}: provider error in chain response", t=ticker)
+                return None
+            results = chain.get("result") if isinstance(chain, dict) else None
+            if not isinstance(results, list) or not results:
+                log.warning("Yahoo options {t}: no chain result", t=ticker)
+                return None
+            result = results[0]
+            if not isinstance(result, dict):
+                log.warning("Yahoo options {t}: malformed chain result", t=ticker)
+                return None
+            options_list = result.get("options")
+            if options_list == []:
+                # Explicit empty page: Yahoo lists the expiry but serves no
+                # contracts for it (thin names). The chain as served, not a
+                # transport failure (it used to raise IndexError here and
+                # return None like a failed fetch).
+                calls: list[Any] = []
+                puts: list[Any] = []
+            elif (isinstance(options_list, list) and isinstance(options_list[0], dict)
+                    and isinstance(options_list[0].get("calls"), list)
+                    and isinstance(options_list[0].get("puts"), list)):
+                calls = options_list[0]["calls"]
+                puts = options_list[0]["puts"]
+            else:
+                # Missing, null or non-list ``options``, or an element without
+                # both sides as lists: not a chain. Fail closed like a failed
+                # fetch; an explicit ``[]`` is the only accepted empty shape.
+                log.warning("Yahoo options {t}: malformed chain page", t=ticker)
+                return None
             return {
                 "expirations": result.get("expirationDates", []),
                 "strikes": result.get("strikes", []),
-                "calls": options.get("calls", []),
-                "puts": options.get("puts", []),
-                "quote": quote,
+                "calls": calls,
+                "puts": puts,
+                "quote": result.get("quote", {}),
             }
         except Exception as exc:
             log.warning("Yahoo options {t} failed: {e}", t=ticker, e=str(exc))
@@ -550,6 +583,12 @@ class OptionsPuller(BasePuller):
             snap_count = 0
             batch_id = str(uuid4())
             complete = True
+            failed_fetches = 0
+            undated_quotes = 0
+            empty_expiries = 0
+            # Quote time of every accepted page, empty or not, so the publish
+            # check below bounds pages that contribute no rows as well.
+            page_times: list[datetime] = []
             snapshot_rows: list[dict[str, Any]] = []
 
             # Per-expiry IV data for term structure
@@ -574,23 +613,33 @@ class OptionsPuller(BasePuller):
                     time.sleep(0.2)
                 if not chain_data:
                     complete = False
+                    failed_fetches += 1
                     continue
                 provider_regular_market_at = _regular_market_time(chain_data.get("quote"), session_day)
                 if provider_regular_market_at is None:
                     complete = False
+                    undated_quotes += 1
                     break
-                if not chain_data.get("calls") or not chain_data.get("puts"):
-                    complete = False
+                page_times.append(provider_regular_market_at)
+                if not chain_data["calls"] and not chain_data["puts"]:
+                    # Dated page whose sides are both explicitly empty lists
+                    # (get_options admits no other empty shape): Yahoo lists
+                    # the expiry but serves nothing for it (thin catalyst names,
+                    # grid-hermes 2026-10-22: 416 tickers/day FAILED here). That
+                    # is the chain as served, not a partial response, so it adds
+                    # no rows and does not fail the ticker. An explicitly empty
+                    # side beside a served one is likewise stored as served; the
+                    # empty side is zero, which is what a dated GEX batch should
+                    # sum. Failed or malformed fetches, missing sides, undated or
+                    # future quotes and the capture budget still fail closed.
+                    empty_expiries += 1
 
                 exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
 
                 for opt_type, raw_list in [("call", chain_data.get("calls", [])),
                                            ("put", chain_data.get("puts", []))]:
-                    if not raw_list:
-                        continue
-
                     rows_for_df = []
-                    for opt in raw_list:
+                    for opt in raw_list or []:
                         strike = opt.get("strike")
                         if strike is None:
                             continue
@@ -644,8 +693,14 @@ class OptionsPuller(BasePuller):
                     expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
 
             _check_budget(should_continue)
-            if not complete or not snap_count or time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
-                raise ValueError("incomplete options chain response")
+            timed_out = time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS
+            if not complete or not snap_count or timed_out:
+                raise ValueError(
+                    "incomplete options chain response: "
+                    f"{failed_fetches} failed expiry fetch(es), {undated_quotes} undated quote(s), "
+                    f"{empty_expiries} empty of {len(selected_expirations)} expiries, "
+                    f"{snap_count} contracts, timed_out={timed_out}"
+                )
 
             # Provider availability begins after the final response. Sample
             # the database clock before waiting for the short publish lock.
@@ -654,11 +709,14 @@ class OptionsPuller(BasePuller):
                 conn.execute(text("SET LOCAL lock_timeout = '5s'"))
                 conn.execute(text("SET LOCAL statement_timeout = '30s'"))
                 completed_at = conn.execute(text("SELECT clock_timestamp()")).fetchone()[0]
+                # Every accepted page is bounded by the publish clock, not only
+                # the pages that produced rows: an empty page used to carry a
+                # future quote time past this check unnoticed.
                 if (completed_at.astimezone(timezone.utc).date() != session_day
                         or completed_at.astimezone(_EQUITY_TZ).date() != session_day
                         or capture_started_at.astimezone(timezone.utc).date() != session_day
                         or capture_started_at.astimezone(_EQUITY_TZ).date() != session_day
-                        or any(row["provider_regular_market_at"] > completed_at for row in snapshot_rows)):
+                        or any(page_time > completed_at for page_time in page_times)):
                     raise ValueError("options capture crossed session date or quote time is future")
                 conn.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),

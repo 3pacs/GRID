@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -814,3 +815,487 @@ class TestConditionalActorEvidencePrompt:
         assert result["publication_claim_guard"]["passed"]
         assert result["publication_status"]["source_evidence_status"] == "unknown"
         assert not list(tmp_path.glob("*.md"))
+
+
+# October 18 source proposal. All cases are UNRUN until a new finite allocation.
+# Fixture names map the diagnosis's proposed keys onto existing snapshot records;
+# complete synthetic declarations are not claims about historical source adoption.
+def _basis_snapshot(kind):
+    snapshot = _empty_snapshot()
+    snapshot.update(timestamp="2026-10-17T00:00:00", date="2026-10-17")
+    observation = {"value": 7753.2798, "date": "2026-10-16", "session_finality": None}
+    pcr = {"value": 2.5302, "date": "2026-10-16", "source": "spy_pcr",
+           "measure": "put_open_interest/call_open_interest", "expiry_scope": "all"}
+
+    def typed(instrument, measure, unit, value, observed="2026-10-16"):
+        return {"instrument": instrument, "measure": measure, "unit": unit, "value": value,
+                "date": observed, "source_id": "fixture_source", "receipt_id": "fixture_receipt",
+                "population": instrument, "expiry_scope": "all" if instrument == "SPY" else "not_applicable"}
+
+    if kind.startswith("close"):
+        if kind == "close_final":
+            observation = typed("^GSPC", "session_close", "index_points", 7659.44)
+            observation["session_finality"] = "source_reported_final"
+        if kind == "close_boolean":
+            observation.update(value=7659.44, session_finality="unknown", has_verified_close=True)
+        snapshot["equities"] = {"^GSPC": observation}
+    if kind.startswith("oi"):
+        if kind == "oi_pair":
+            pcr = typed("SPY", "put_open_interest/call_open_interest", "ratio", 2.5302)
+            pcr["previous"] = typed("SPY", "put_open_interest/call_open_interest", "ratio", 2.4, "2026-10-15")
+        if kind == "oi_incompatible":
+            pcr = typed("SPY", "oi_pcr", "ratio", 2.5302)
+            pcr["previous"] = typed("SPY", "volume_pcr", "ratio", 2.4, "2026-10-15")
+            pcr["same_population"] = True
+        snapshot["options"] = {"spy_put_call": pcr}
+        if kind == "oi_cross":
+            snapshot["features"] = {"other_population": {"value": 0.67}}
+    if kind == "hyg":
+        snapshot["credit"] = {"HYG": {"value": 77.04, "date": "2026-10-16", "measure": "ETF_price"}}
+    if kind == "proxy":
+        reading = typed("HYG/LQD", "price_relative_proxy", "percent", -0.56)
+        reading["previous"] = typed("HYG/LQD", "price_relative_proxy", "percent", 0.0, "2026-10-15")
+        snapshot["credit"] = {"HYG/LQD": reading}
+    if kind.startswith("oas"):
+        reading = typed("OAS_FIXTURE", "oas", "basis_points", 323, "2026-10-15")
+        if kind == "oas_pair":
+            reading["previous"] = typed("OAS_FIXTURE", "oas", "basis_points", 325, "2026-10-14")
+        snapshot["credit"] = {"OAS_FIXTURE": reading}
+    if kind.startswith("counts"):
+        snapshot["insider_counts"] = {"buys": 0 if kind == "counts_zero" else 114, "sells": 568,
+                                      "window": None, "universe": None, "provenance": "quoted counts only"}
+        if kind == "counts_incompatible":
+            snapshot["insider_counts"].update(window_buy="A", window_sell="B", universe_buy="X", universe_sell="Y")
+    return snapshot
+
+
+_BASIS_CASES = [
+    ("F1-P1", "close", "Source observation for the S&P 500 is 7753.28, dated October 16; final session close is unknown.", set()),
+    ("F1-N1", "close", "The S&P 500 closed at 7,753.28 on October 16.", {"unestablished_session_close_finality"}),
+    ("F1-P2", "close_final", "Fixture source reports a final October 16 S&P 500 session close of 7659.44; independent verification is unavailable.", set()),
+    ("F1-N2", "close_boolean", "Finality is unknown, but it closed at 7659.44.", {"unestablished_session_close_finality"}),
+    ("F2-P1", "oi", "SPY put/call open interest is 2.53 for October 16; traded volume and initiation are unmeasured.", set()),
+    ("F2-N1", "oi", "A sharp rise in relative put contract volume (SPY P/C ratio 2.53).", {"open_interest_is_not_traded_volume", "missing_compatible_options_comparator"}),
+    ("F2-P2", "oi_pair", "Source-reported SPY put/call open-interest ratio rose from 2.40 to 2.53 between the two supplied dates; motives remain unknown.", set()),
+    ("F2-N2", "oi_incompatible", "The SPY ratio rose from 2.40 to 2.53.", {"missing_compatible_options_comparator"}),
+    ("F2-P3", "oi", "Aggregate put/call open interest does not identify buyer initiation, hedging intent or participant motives.", set()),
+    ("F2-N3", "oi", "Participants are not pricing in immediate crisis but are positioning for potential future stress.", {"unsupported_options_participant_intent"}),
+    ("F2-P4", "oi_cross", "These are different measurement bases and cannot be directly compared.", set()),
+    ("F2-N4", "oi_cross", "The different bases are unknown, but the ratio fell from 2.53 to 0.67 and proves defensive positioning.", {"missing_compatible_options_comparator", "unsupported_options_participant_intent"}),
+    ("F3-P1", "hyg", "The dated HYG price observation is 77.04; a measured credit spread is unavailable.", set()),
+    ("F3-N1", "hyg", "Credit spreads (HYG 77.04) and the 10Y-2Y spread (+0.35%) remain stable.", {"unestablished_credit_spread_basis", "missing_compatible_credit_comparator"}),
+    ("F3-P2", "proxy", "The supplied HYG/LQD price-relative proxy changed -0.56%; it is not a measured OAS series.", set()),
+    ("F3-N2", "proxy", "Credit OAS tightened 0.56% because HYG/LQD fell.", {"unestablished_credit_spread_basis", "missing_compatible_credit_comparator"}),
+    ("F3-P3", "oas_pair", "Fixture source reports OAS of 323bp for October 15 versus 325bp October 14; Friday spread is unavailable.", set()),
+    ("F3-N3", "oas", "Friday credit spreads remain stable at 323bp.", {"unestablished_credit_spread_basis", "missing_compatible_credit_comparator"}),
+    ("F4-P1", "counts", "On the quoted counts alone, buy share is approximately 17% of 682 buys plus sells; source window and aggregation recipe remain unknown.", set()),
+    ("F4-N1", "counts", "17% buy/sell ratio (114 buys vs. 568 sells).", {"insider_ratio_denominator_mismatch"}),
+    ("F4-P2", "counts", "On these quoted counts, buys divided by sells is approximately 20.07%, with the aggregation recipe unverified.", set()),
+    ("F4-N2", "counts", "The buy share of all transactions is 20.07%.", {"insider_ratio_denominator_mismatch", "unestablished_insider_population"}),
+    ("F4-P3", "counts", "The quoted insider sell-to-buy ratio is about 5:1; the source window remains unverified.", set()),
+    ("F4-N3", "counts_zero", "The sell-to-buy ratio is 5:1.", {"insider_ratio_denominator_mismatch"}),
+    ("F4-P4", "empty", "The source reports a ratio of 0.17; its denominator and aggregation window are unavailable.", set()),
+    ("F4-N4", "counts_incompatible", "These counts prove a 17% market-wide buy share.", {"unestablished_insider_population"}),
+]
+
+
+def _generate_basis(response, snapshot, context="Synthetic data with unknown source freshness."):
+    import types
+    from unittest.mock import Mock, patch
+    engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+    engine.engine = object()
+    engine.ollama = types.SimpleNamespace(chat=Mock(return_value=response))
+    engine._gather_market_snapshot = Mock(return_value=snapshot)
+    engine._build_data_context = Mock(return_value=context)
+    engine._save_briefing = Mock()
+    engine._persist_to_db = Mock()
+    optional = types.ModuleType("disabled_optional_context")
+    with patch.dict(__import__("sys").modules, {
+            "ingestion.wiki_history": optional, "ingestion.social_sentiment": optional,
+            "intelligence.sentiment_scorer": optional}):
+        result = engine.generate_briefing(save=True)
+    return engine, result
+
+
+@pytest.mark.parametrize("vector,kind,text,reasons", _BASIS_CASES, ids=[case[0] for case in _BASIS_CASES])
+def test_four_basis_vectors_real_guard_and_generation(vector, kind, text, reasons):
+    import hashlib
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot(kind)
+    preserved = deepcopy(snapshot)
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert snapshot == preserved
+    assert reasons <= set(guard["reasons"])
+    assert guard["passed"] is (not reasons)
+    if reasons:
+        assert "[Claim omitted:" in annotated
+        for omission in guard["omitted_segments"]:
+            original = text[omission["start"]:omission["end"]]
+            assert original and original != "[Claim omitted:]"
+            assert omission["span_binding"] == "unmodified_context_guard_input"
+        if vector == "F4-N1":
+            assert "114 buys / 568 sells" in annotated
+    else:
+        assert annotated == text
+    engine, result = _generate_basis(text, deepcopy(snapshot))
+    assert reasons <= set(result["publication_context_guard"]["reasons"])
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+    assert result["publication_status"]["content_kind"] == "narrative"
+    assert result["publication_claim_guard"]["passed"]
+    diagnostics = result["publication_stage_diagnostics"]
+    assert diagnostics["roles"]["candidate"]["digest"]["sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert diagnostics["roles"]["emitted"]["digest"]["sha256"] == hashlib.sha256(result["content"].encode()).hexdigest()
+    assert result["publication_context_guard"]["input_digest"]["sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert result["snapshot"]["publication_stage_diagnostics"] == diagnostics
+    engine.ollama.chat.assert_called_once()
+    engine._save_briefing.assert_called_once_with(result)
+    engine._persist_to_db.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize("vector", ["DG-P1", "DG-N1"])
+def test_stage_diagnostics_keep_context_warning_and_fallback_origin(vector):
+    from ollama.number_grounding import check_numbers_grounded
+    snapshot = _basis_snapshot("empty")
+    snapshot["features"] = {"aapl": {"value": 251.64}}
+    engine, result = _generate_basis(None, snapshot, context="feature_selected=1.23")
+    assert result["publication_status"]["content_kind"] == "data_summary"
+    assert result["publication_status"]["reason"] == "model_unavailable"
+    assert "251.64" in result["grounding"]["ungrounded_values"]
+    assert "251.64 [unverified]" in result["content"]
+    diagnostics = result["publication_stage_diagnostics"]
+    assert diagnostics["roles"]["candidate"]["digest"]["sha256"] is None
+    stage = diagnostics["roles"]["grounding_input"]
+    mentions = [entry for entry in stage["numeric_mentions"]
+                if any(match["path"] == "features.aapl.value" for match in entry["snapshot_matches"])]
+    assert mentions
+    assert all(not entry["generation_context_numeric_match"] for entry in mentions)
+    assert all(entry["retained_snapshot_presence"] == "present" for entry in mentions)
+    assert all(any(match["displayed_fallback_origin"] for match in entry["snapshot_matches"]) for entry in mentions)
+    assert all(entry["source_truth"] == entry["freshness"] == "unknown" for entry in mentions)
+    assert not diagnostics["snapshot_presence_is_grounding_permission"]
+    assert diagnostics["numeric_pool"] == "original_generation_data_context_only"
+    engine._persist_to_db.assert_called_once_with(result)
+    # Same existing matcher, unchanged warning denominator for the displayed input.
+    raw_summary = engine._generate_fallback_briefing(snapshot, reason="model_unavailable")
+    before = check_numbers_grounded(raw_summary, "feature_selected=1.23")
+    assert before.total_numbers == result["grounding"]["total_numbers"]
+    assert len(before.ungrounded) == result["grounding"]["ungrounded_count"]
+
+
+@pytest.mark.parametrize("vector,text,omitted", [
+    ("DG-P2", "HYG observed price 77.04", False),
+    ("DG-N2", "Credit spreads are 77.04", True),
+])
+def test_numeric_match_cannot_grant_semantic_basis(vector, text, omitted):
+    from ollama.number_grounding import check_numbers_grounded
+    assert not check_numbers_grounded(text, "HYG price=77.04").ungrounded
+    _, result = _generate_basis(text, _basis_snapshot("hyg"), context="HYG price=77.04")
+    candidate = result["publication_stage_diagnostics"]["roles"]["candidate"]
+    assert candidate["numeric_mentions"]
+    assert all(entry["generation_context_numeric_match"] for entry in candidate["numeric_mentions"])
+    assert all(not entry["semantic_authority_from_numeric_match"] for entry in candidate["numeric_mentions"])
+    assert all(entry["source_truth"] == entry["freshness"] == "unknown" for entry in candidate["numeric_mentions"])
+    assert ("unestablished_credit_spread_basis" in result["publication_context_guard"]["reasons"]) is omitted
+    assert ("Claim omitted" in result["content"]) is omitted
+
+
+@pytest.mark.parametrize("key,value", [
+    ("unit", None), ("unit", "USD"), ("unit", True), ("receipt_id", None),
+    ("source_id", None), ("source_id", "unknown"), ("receipt_id", "unavailable"),
+    ("session_finality", True), ("date", "2026-10-18"),
+])
+def test_close_permission_requires_typed_bound_fields(key, value):
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot("close_final")
+    snapshot["equities"]["^GSPC"][key] = value
+    text = _BASIS_CASES[2][2]
+    _, guard = annotate_publication_context(text, snapshot)
+    assert "unestablished_session_close_finality" in guard["reasons"]
+
+
+@pytest.mark.parametrize("key,value", [
+    ("instrument", "QQQ"), ("measure", "volume_pcr"), ("unit", None),
+    ("population", "other"), ("expiry_scope", "front_month"),
+    ("receipt_id", None), ("date", "2026-10-16"), ("value", True),
+])
+def test_options_comparator_rejects_mismatches_and_type_confusion(key, value):
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot("oi_pair")
+    snapshot["options"]["spy_put_call"]["previous"][key] = value
+    snapshot["options"]["spy_put_call"]["same_population"] = True
+    _, guard = annotate_publication_context(_BASIS_CASES[6][2], snapshot)
+    assert "missing_compatible_options_comparator" in guard["reasons"]
+
+
+def test_omission_spans_and_caveats_cannot_hide_trailing_assertions():
+    from ollama.number_grounding import annotate_publication_context
+    text = ("The S&P 500 closed at 7753.28 on October 16. Useful dated observation remains. "
+            "Credit basis is unknown, but credit spreads are 77.04.")
+    snapshot = _basis_snapshot("close")
+    snapshot["credit"] = _basis_snapshot("hyg")["credit"]
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert "Useful dated observation remains." in annotated
+    assert {"unestablished_session_close_finality", "unestablished_credit_spread_basis"} <= set(guard["reasons"])
+    originals = [text[item["start"]:item["end"]] for item in guard["omitted_segments"]]
+    assert originals == ["The S&P 500 closed at 7753.28 on October 16.", "credit spreads are 77.04."]
+
+
+def test_credit_formatter_keeps_price_basis_and_unknown_denominator():
+    engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+    rendered = engine._format_evidence_value("credit", "HYG", {"value": 77.04, "date": "2026-10-16"})
+    assert "raw value=77.04" in rendered
+    assert "ETF price; not a measured credit spread or OAS" in rendered
+    assert "unit=unknown" in rendered
+    assert "denominator=unknown" in rendered
+    assert "window=unknown" in rendered
+    assert "universe=unknown" in rendered
+    assert "freshness=unknown" in rendered
+
+
+def test_colocated_counts_do_not_require_invented_snapshot_aggregate():
+    from ollama.number_grounding import annotate_publication_context
+    text = "17% buy/sell ratio (114 buys vs. 568 sells)."
+    snapshot = _basis_snapshot("empty")
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert guard["reasons"] == ["insider_ratio_denominator_mismatch"]
+    assert "114 buys / 568 sells" in annotated
+    assert "aggregation recipe, window and universe unknown" in annotated
+    assert "insider_counts" not in snapshot
+
+
+@pytest.mark.parametrize("unit", [None, "unknown", "USD", True])
+def test_equal_but_wrong_options_units_cannot_grant_trend(unit):
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot("oi_pair")
+    record = snapshot["options"]["spy_put_call"]
+    record["unit"] = record["previous"]["unit"] = unit
+    _, guard = annotate_publication_context(_BASIS_CASES[6][2], snapshot)
+    assert "missing_compatible_options_comparator" in guard["reasons"]
+
+
+def test_rejected_candidate_remains_separate_from_displayed_fallback():
+    import hashlib
+    text = "Institutions are buying puts to hedge. Private narrative sentinel."
+    snapshot = _basis_snapshot("hyg")
+    snapshot["features"] = {"aapl": {"value": 251.64}}
+    _, result = _generate_basis(text, snapshot, context="feature_selected=1.23")
+    assert result["publication_status"]["reason"] == "claim_guard_withheld"
+    assert result["publication_claim_guard"]["rejected_candidate"] == text
+    assert "Private narrative sentinel" not in result["content"]
+    roles = result["publication_stage_diagnostics"]["roles"]
+    assert roles["candidate"]["digest"]["sha256"] == hashlib.sha256(text.encode()).hexdigest()
+    assert roles["candidate"]["digest"] != roles["emitted"]["digest"]
+    assert "text" not in roles["candidate"]
+    assert result["publication_context_guard"]["fallback"]["input_role"] == "data_summary"
+
+
+# Same-author FB-01/FB-02 correction vectors: source proposals, ALL UNRUN.
+@pytest.mark.parametrize("vector,text,mismatch", [
+    ("FB01-P-share", "On the quoted counts, buy share is approximately 17%.", False),
+    ("FB01-P-plus", "On the quoted counts, buy share is approximately +17%.", False),
+    ("FB01-P-spaced-plus", "On the quoted counts, buy share is approximately + 17%.", False),
+    ("FB01-N-later", "On the quoted counts, buy share is approximately 17% and buy share is 99%.", True),
+    ("FB01-N-inherited", "On the quoted counts, buy share is approximately 17% and 99%.", True),
+    ("FB01-N-minus", "On the quoted counts, buy share is approximately -17%.", True),
+    ("FB01-N-spaced-minus", "On the quoted counts, buy share is approximately - 17%.", True),
+    ("FB01-N-unicode-minus", "On the quoted counts, buy share is approximately −17%.", True),
+    ("FB01-N-adjacent-minus", "On the quoted counts, buy share is approximately-17%.", True),
+    ("FB01-N-double-sign", "On the quoted counts, buy share is approximately --17%.", True),
+    ("FB01-N-mixed-sign", "On the quoted counts, buy share is approximately +-17%.", True),
+    ("FB01-N-malformed-decimal", "On the quoted counts, buy share is approximately 17..5%.", True),
+    ("FB01-N-colon-denominator", "On the quoted counts, sell-to-buy ratio is 5:2.", True),
+    ("FB01-N-zero-colon-denominator", "On the quoted counts, sell-to-buy ratio is 5:0.", True),
+    ("FB01-N-signed-colon-denominator", "On the quoted counts, sell-to-buy ratio is 5:- 1.", True),
+    ("FB01-P-two-denominators", "On the quoted counts, buy share is 17% and buy/sell ratio is 20.07%.", False),
+    ("FB01-P-prefix", "On the quoted counts, 17% buy share and 20.07% buy/sell ratio.", False),
+    ("FB01-N-second-denominator", "On the quoted counts, buy share is 17% and buy/sell ratio is 17%.", True),
+    ("FB01-P-inverse", "On the quoted counts, sell-to-buy ratio is about 5:1 and buy share is 17%.", False),
+    ("FB01-N-second-inverse", "On the quoted counts, sell-to-buy ratio is 5:1 and sell-to-buy ratio is 99:1.", True),
+    ("FB01-N-signed-inverse", "On the quoted counts, sell-to-buy ratio is -5:1.", True),
+    ("FB01-N-mixed-units", "On the quoted counts, buy share is 17% and buy/sell ratio is 0.17:1.", True),
+])
+def test_review_fb01_each_signed_ratio_assertion(vector, text, mismatch):
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot("counts")
+    preserved = deepcopy(snapshot)
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert snapshot == preserved
+    assert ("insider_ratio_denominator_mismatch" in guard["reasons"]) is mismatch
+    assert guard["passed"] is (not mismatch)
+    if not mismatch:
+        assert annotated == text
+    engine, result = _generate_basis(text, deepcopy(snapshot))
+    assert ("insider_ratio_denominator_mismatch" in result["publication_context_guard"]["reasons"]) is mismatch
+    assert ("Claim omitted" in result["content"]) is mismatch
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+    engine._save_briefing.assert_called_once_with(result)
+    engine._persist_to_db.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize("kind,text,reason", [
+    ("oi_pair", _BASIS_CASES[6][2], "missing_compatible_options_comparator"),
+    ("proxy", _BASIS_CASES[14][2], "missing_compatible_credit_comparator"),
+    ("oas_pair", _BASIS_CASES[16][2], "unestablished_credit_spread_basis"),
+])
+@pytest.mark.parametrize("key,current,previous", [
+    ("population", "unknown", "unknown"),
+    ("population", " UNKNOWN ", " UNKNOWN "),
+    ("population", "unknown_population", "unknown_population"),
+    ("population", "not_applicable", "not_applicable"),
+    ("population", "unavailable", "unavailable"),
+    ("population", True, True),
+    ("instrument", "unknown", "unknown"),
+    ("window", "daily", "rolling_30_days"),
+    ("universe", "all_contracts", "subset_only"),
+    ("denominator", "call_open_interest", "call_volume"),
+    ("basis", "official_close", "intraday"),
+    ("price_basis", "adjusted", "unadjusted"),
+    ("window", "unknown", "unknown"),
+    ("universe", None, None),
+    ("denominator", True, True),
+])
+def test_review_fb02_unknown_or_conflicting_comparison_metadata(kind, text, reason, key, current, previous):
+    from ollama.number_grounding import annotate_publication_context, publication_context_facts
+    snapshot = _basis_snapshot(kind)
+    record = (snapshot["options"]["spy_put_call"] if kind == "oi_pair"
+              else next(iter(snapshot["credit"].values())))
+    record[key] = current
+    record["previous"][key] = previous
+    record["same_population"] = True
+    preserved = deepcopy(snapshot)
+    facts = publication_context_facts(snapshot)
+    assert facts["measurement_basis"][0]["comparator_available"] is False
+    assert snapshot == preserved
+    _, guard = annotate_publication_context(text, snapshot)
+    assert reason in guard["reasons"]
+    engine, result = _generate_basis(text, deepcopy(snapshot))
+    assert reason in result["publication_context_guard"]["reasons"]
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+    engine._persist_to_db.assert_called_once_with(result)
+
+
+@pytest.mark.parametrize("kind,text", [
+    ("oi_pair", _BASIS_CASES[6][2]),
+    ("proxy", _BASIS_CASES[14][2]),
+    ("oas_pair", _BASIS_CASES[16][2]),
+])
+def test_review_fb02_complete_compatible_metadata_control(kind, text):
+    from ollama.number_grounding import annotate_publication_context, publication_context_facts
+    snapshot = _basis_snapshot(kind)
+    record = (snapshot["options"]["spy_put_call"] if kind == "oi_pair"
+              else next(iter(snapshot["credit"].values())))
+    for item in (record, record["previous"]):
+        item.update(window="same_daily_observation", universe="declared_same_population",
+                    denominator="same_declared_measure", basis="same_observation_basis",
+                    price_basis="same_price_basis")
+    facts = publication_context_facts(snapshot)
+    assert facts["measurement_basis"][0]["comparator_available"] is True
+    assert facts["measurement_basis"][0]["source_truth"] == "unknown"
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert guard["passed"]
+    assert annotated == text
+    _, result = _generate_basis(text, snapshot)
+    assert result["publication_context_guard"]["passed"]
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+
+
+def test_review_fb02_one_sided_metadata_is_not_compatible():
+    from ollama.number_grounding import annotate_publication_context, publication_context_facts
+    snapshot = _basis_snapshot("oi_pair")
+    snapshot["options"]["spy_put_call"]["window"] = "daily"
+    facts = publication_context_facts(snapshot)
+    record = facts["measurement_basis"][0]
+    assert not record["comparator_available"]
+    assert record["window"] == "daily"
+    assert record["comparator"]["window"] is None
+    _, guard = annotate_publication_context(_BASIS_CASES[6][2], snapshot)
+    assert "missing_compatible_options_comparator" in guard["reasons"]
+
+
+@pytest.mark.parametrize("kind,text", [
+    ("oi_pair", "SPY put/call open interest is 2.53 for October 16; traded volume and initiation are unmeasured."),
+    ("oas_pair", "Fixture source reports OAS of 323bp for October 15; independent verification is unavailable."),
+])
+def test_review_fb02_unknown_scope_does_not_erase_single_dated_level(kind, text):
+    from ollama.number_grounding import annotate_publication_context
+    snapshot = _basis_snapshot(kind)
+    record = (snapshot["options"]["spy_put_call"] if kind == "oi_pair"
+              else next(iter(snapshot["credit"].values())))
+    for item in (record, record["previous"]):
+        item["population"] = "unknown"
+    record["window"], record["previous"]["window"] = "daily", "rolling_30_days"
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert guard["passed"]
+    assert annotated == text
+    _, result = _generate_basis(text, snapshot)
+    assert result["publication_context_guard"]["passed"]
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+
+
+# V3 residual FB-01 complete-lexeme source vectors, all UNRUN.
+@pytest.mark.parametrize("vector,label,token,counts,mismatch", [
+    ("FB01-V3-P-plain", "buy share", "17%", (114, 568), False),
+    ("FB01-V3-P-signed", "buy share", "+ 17%", (114, 568), False),
+    ("FB01-V3-P-parenthesized", "buy share", "(17%)", (114, 568), False),
+    ("FB01-V3-N-grouped-suffix", "buy share", "1,017%", (114, 568), True),
+    ("FB01-V3-N-many-groups", "buy share", "1,000,017%", (114, 568), True),
+    ("FB01-V3-N-grouped-negative", "buy share", "-1,017%", (114, 568), True),
+    ("FB01-V3-N-short-group", "buy share", "1,17%", (114, 568), True),
+    ("FB01-V3-N-long-group", "buy share", "1,0017%", (114, 568), True),
+    ("FB01-V3-N-double-comma", "buy share", "1,,017%", (114, 568), True),
+    ("FB01-V3-N-group-space", "buy share", "1, 017%", (114, 568), True),
+    ("FB01-V3-N-space-group", "buy share", "1 017%", (114, 568), True),
+    ("FB01-V3-N-narrow-space-group", "buy share", "1\u202f017%", (114, 568), True),
+    ("FB01-V3-N-apostrophe-group", "buy share", "1'017%", (114, 568), True),
+    ("FB01-V3-N-middle-dot", "buy share", "1·017%", (114, 568), True),
+    ("FB01-V3-N-arabic-comma", "buy share", "1،017%", (114, 568), True),
+    ("FB01-V3-N-exponent", "buy share", "1e017%", (114, 568), True),
+    ("FB01-V3-N-signed-exponent", "buy share", "1e+017%", (114, 568), True),
+    ("FB01-V3-N-prefix-word", "buy share", "prefix017%", (114, 568), True),
+    ("FB01-V3-N-fraction-prefix", "buy share", "1/017%", (114, 568), True),
+    ("FB01-V3-N-percent-suffix", "buy share", "17%017", (114, 568), True),
+    ("FB01-V3-N-percent-word", "buy share", "17%word", (114, 568), True),
+    ("FB01-V3-P-large-grouped", "buy/sell ratio", "1,000%", (1000, 100), False),
+    ("FB01-V3-P-large-plain", "buy/sell ratio", "1000%", (1000, 100), False),
+    ("FB01-V3-P-grouped-decimal", "buy/sell ratio", "1,017.00%", (1017, 100), False),
+    ("FB01-V3-N-malformed-large-group", "buy/sell ratio", "10,00%", (1000, 100), True),
+    ("FB01-V3-P-grouped-inverse", "sell-to-buy ratio", "1,000:1", (1, 1000), False),
+    ("FB01-V3-P-inverse", "sell-to-buy ratio", "5:1", (114, 568), False),
+    ("FB01-V3-N-inverse-numerator", "sell-to-buy ratio", "1,005:1", (114, 568), True),
+    ("FB01-V3-N-inverse-denominator", "sell-to-buy ratio", "5:1,017", (114, 568), True),
+    ("FB01-V3-N-inverse-denominator-word", "sell-to-buy ratio", "5:1word", (114, 568), True),
+    ("FB01-V3-N-inverse-malformed", "sell-to-buy ratio", "5:x1", (114, 568), True),
+])
+def test_review_v3_complete_numeric_lexeme(vector, label, token, counts, mismatch):
+    from ollama.number_grounding import annotate_publication_context
+    text = f"On the quoted counts, {label} is {token}."
+    snapshot = _basis_snapshot("counts")
+    snapshot["insider_counts"].update(buys=counts[0], sells=counts[1])
+    original = deepcopy(snapshot)
+    annotated, guard = annotate_publication_context(text, snapshot)
+    assert snapshot == original
+    assert ("insider_ratio_denominator_mismatch" in guard["reasons"]) is mismatch
+    assert guard["passed"] is (not mismatch)
+    if not mismatch:
+        assert annotated == text
+    engine, result = _generate_basis(text, deepcopy(snapshot))
+    assert ("insider_ratio_denominator_mismatch" in result["publication_context_guard"]["reasons"]) is mismatch
+    assert ("Claim omitted" in result["content"]) is mismatch
+    assert result["publication_status"]["source_evidence_status"] == "unknown"
+    engine._save_briefing.assert_called_once_with(result)
+    engine._persist_to_db.assert_called_once_with(result)
+
+
+def test_review_v3_valid_first_token_cannot_hide_grouped_later_token():
+    from ollama.number_grounding import annotate_publication_context
+    text = "On the quoted counts, buy share is 17% and buy share is 1,017%."
+    _, guard = annotate_publication_context(text, _basis_snapshot("counts"))
+    assert "insider_ratio_denominator_mismatch" in guard["reasons"]
+
+
+def test_review_v3_unknown_ratio_without_numeric_unit_remains_nonclaim():
+    from ollama.number_grounding import annotate_publication_context
+    text = "The source-reported buy/sell ratio is unavailable."
+    annotated, guard = annotate_publication_context(text, _basis_snapshot("empty"))
+    assert guard["passed"]
+    assert annotated == text

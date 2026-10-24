@@ -105,7 +105,266 @@ def publication_context_facts(snapshot: dict[str, Any]) -> dict[str, Any]:
         "regime_comparator_available": False,  # Collector supplies only LIMIT 1.
         "vix_observation_dates": dates,
         "vix_dates_compatible": all(dates.values()) and len(set(dates.values())) == 1,
+        "measurement_basis": _publication_measurement_facts(snapshot, cutoff),
     }
+
+
+def _publication_measurement_facts(snapshot: dict[str, Any], cutoff: date | None) -> list[dict[str, Any]]:
+    """Describe supplied observations; only complete typed pairs permit trends.
+
+    No lookup, aggregation, inferred finality or broad 'verified' flag. Previous
+    observations must be explicitly supplied on the same record, with their own
+    dates and source receipts. Metadata is a declaration, never truth/PIT proof.
+    """
+    records = []
+    fields = ("instrument", "measure", "unit", "population", "expiry_scope",
+              "source_id", "receipt_id", "session_finality", "denominator",
+              "window", "universe", "basis", "price_basis")
+    optional_scope = ("basis", "price_basis", "denominator", "window", "universe")
+    unknown = {"unknown", "unavailable", "none", "null", "missing", "unmeasured",
+               "unspecified", "unverified", "n/a", "na", "not available", "not supplied", "-"}
+
+    def observation(info: Any, path: str, instrument: str) -> dict[str, Any]:
+        info = info if isinstance(info, dict) else {}
+        record = {key: info[key].strip() if type(info.get(key)) is str and info[key].strip()
+                  else None for key in fields}
+        for key in fields:
+            if record[key] and (record[key].casefold() in unknown or re.match(
+                    r"^(?:unknown|unavailable|missing|unmeasured|unspecified)(?:\b|_)",
+                    record[key], flags=re.IGNORECASE)):
+                record[key] = None
+        if record["population"] and record["population"].casefold() == "not_applicable":
+            record["population"] = None
+        # A known snapshot key binds an absent instrument, not an explicitly
+        # unknown or malformed one. Keep optional-field presence so equal nulls
+        # cannot turn supplied unknown comparison metadata into permission.
+        if "instrument" not in info:
+            record["instrument"] = instrument
+        record["comparison_metadata_supplied"] = [key for key in optional_scope if key in info]
+        value = info.get("value")
+        try:
+            valid = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            valid = False
+        record["value"] = value if valid else None
+        try:
+            observed = date.fromisoformat(info.get("date", ""))
+            eligible = cutoff is not None and observed <= cutoff
+        except (TypeError, ValueError):
+            observed, eligible = None, False
+        record.update(path=path, date=observed.isoformat() if observed else None,
+                      eligible=eligible, source_truth="unknown", freshness="unknown")
+        return record
+
+    for category in ("equities", "options", "credit"):
+        data = snapshot.get(category)
+        for name, info in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(info, dict):
+                continue
+            instrument = "SPY" if category == "options" and name == "spy_put_call" else str(name)
+            record = observation(info, f"{category}.{name}", instrument)
+            previous = observation(info.get("previous"), f"{category}.{name}.previous", instrument)
+            required = ("instrument", "measure", "unit", "population", "expiry_scope")
+            record["comparator"] = previous
+            record["comparator_available"] = bool(
+                record["eligible"] and previous["eligible"]
+                and record["value"] is not None and previous["value"] is not None
+                and previous["date"] < record["date"]
+                and all(record[key] is not None and record[key] == previous[key] for key in required)
+                and all(item[key] is not None for item in (record, previous)
+                        for key in ("source_id", "receipt_id"))
+                and record["source_id"] == previous["source_id"]
+                and all(record[key] is not None and record[key] == previous[key]
+                        for key in optional_scope
+                        if key in record["comparison_metadata_supplied"]
+                        or key in previous["comparison_metadata_supplied"])
+            )
+            records.append(record)
+    return records
+
+
+def _publication_basis_reasons(text: str, snapshot: dict[str, Any], facts: dict[str, Any]) -> set[str]:
+    """Bound the four retained basis defects within the existing context gate.
+
+    This is deliberately not a natural-language fact verifier. Permissions use
+    exact attributed forms and typed observations, not a disclaimer elsewhere.
+    """
+    normalized = _publication_normalized(text).strip()
+    reasons: set[str] = set()
+    records = facts["measurement_basis"]
+    # Remove only literal disclosures. Any assertion after them remains visible.
+    probe = normalized
+    for disclosure in (
+        r"\bfinal (?:session )?close is unknown\b",
+        r"\ba measured credit spread is unavailable\b",
+        r"\bit is not a measured oas series\b",
+        r"\bnot a measured credit spread or oas\b",
+        r"\bfriday spread is unavailable\b",
+        r"\btraded volume and initiation are unmeasured\b",
+        r"\baggregate put/call open interest does not identify buyer initiation, hedging intent or participant motives\b",
+        r"\bthese are different measurement bases and cannot be directly compared\b",
+    ):
+        probe = re.sub(disclosure, "", probe)
+
+    def number(value: float) -> str:
+        return re.escape(f"{value:.2f}")
+
+    def date_label(value: str) -> str:
+        day = date.fromisoformat(value)
+        return day.strftime("%B").lower() + " " + str(day.day)
+
+    def attributed(record: dict[str, Any]) -> str:
+        source = re.escape(record["source_id"].lower().replace("_", " "))
+        return rf"{source} reports"
+
+    close_claim = re.search(r"\b(?:closed at|(?:final|session) (?:session )?close(?: of| at| was| is))\b", probe)
+    equity_records = [r for r in records if r["path"].startswith("equities.")]
+    if close_claim and (re.search(r"\bs&p\s*500\b|\bgspc\b", probe) or
+                        (len(equity_records) == 1 and re.search(r"\bit closed at\b", probe))):
+        supported = False
+        for record in equity_records:
+            if not (record["instrument"] == "^GSPC" and record["eligible"]
+                    and record["value"] is not None and record["value"] >= 0 and record["measure"] == "session_close"
+                    and record["unit"] == "index_points"
+                    and record["session_finality"] == "source_reported_final"
+                    and record["source_id"] and record["receipt_id"]):
+                continue
+            grammar = (attributed(record) + r" a final " + re.escape(date_label(record["date"]))
+                       + r" s&p 500 session close of " + number(record["value"]) + r"\.?\s*")
+            supported = supported or bool(re.fullmatch(grammar, normalized))
+        if not supported:
+            reasons.add("unestablished_session_close_finality")
+
+    pcr = [r for r in records if r["path"] == "options.spy_put_call"]
+    options_context = ((bool(pcr) and re.search(r"\b(?:spy|p/c|pcr|put|call|ratio|participants)\b", probe))
+                       or re.search(r"\bspy\b.*\b(?:p/c|pcr|put|call|ratio)\b", probe))
+    change = re.search(r"\b(?:rise|rose|risen|rising|fell|fall|fallen|falling|increas\w*|decreas\w*|stable|unchanged|tighten\w*|widen\w*|changed)\b", probe)
+    if options_context:
+        if re.search(r"\b(?:put|call|contract)\s+volume\b|\bvolume (?:put/call|pcr)\b", probe):
+            reasons.add("open_interest_is_not_traded_volume")
+        if change and re.search(r"\b(?:spy|p/c|pcr|put|call|ratio)\b", probe):
+            supported = False
+            for record in pcr:
+                if not (record["comparator_available"] and record["instrument"] == "SPY"
+                        and record["unit"] == "ratio" and record["expiry_scope"] == "all"
+                        and record["value"] >= 0 and record["comparator"]["value"] >= 0
+                        and record["measure"] == "put_open_interest/call_open_interest"):
+                    continue
+                previous = record["comparator"]
+                if record["value"] == previous["value"]:
+                    continue
+                direction = "rose" if record["value"] > previous["value"] else "fell"
+                grammar = (r"source-reported spy put/call open-interest ratio " + direction
+                           + " from " + number(previous["value"]) + " to " + number(record["value"])
+                           + r" between the two supplied dates\.?\s*")
+                supported = supported or bool(re.fullmatch(grammar, normalized))
+            if not supported:
+                reasons.add("missing_compatible_options_comparator")
+        if re.search(r"\bparticipants\b.*\b(?:positioning|pricing in)\b|\bproves? defensive positioning\b", probe):
+            reasons.add("unsupported_options_participant_intent")
+
+    credit = [r for r in records if r["path"].startswith("credit.")]
+    spread_claim = re.search(r"\b(?:credit spreads?|credit oas|oas|spread stability)\b", probe)
+    if spread_claim or (credit and change and re.search(r"\bhyg(?:/lqd)?\b|\bprice-relative proxy\b", probe)):
+        supported = False
+        for record in credit:
+            if not (record["eligible"] and record["value"] is not None
+                    and record["source_id"] and record["receipt_id"]):
+                continue
+            if record["measure"] == "oas" and record["unit"] == "basis_points":
+                grammar = (attributed(record) + " oas of " + re.escape(f"{record['value']:g}")
+                           + "bp for " + re.escape(date_label(record["date"])))
+                if record["comparator_available"]:
+                    previous = record["comparator"]
+                    grammar += (" versus " + re.escape(f"{previous['value']:g}") + "bp "
+                                + re.escape(date_label(previous["date"])))
+                supported = supported or bool(re.fullmatch(grammar + r"\.?\s*", normalized))
+            if (not spread_claim and record["measure"] == "price_relative_proxy"
+                    and record["instrument"] == "HYG/LQD" and record["unit"] == "percent"
+                    and record["comparator_available"]):
+                grammar = (r"the supplied hyg/lqd price-relative proxy changed "
+                           + number(record["value"] - record["comparator"]["value"]) + r"%\.?\s*")
+                supported = supported or bool(re.fullmatch(grammar, normalized))
+        if not supported:
+            if spread_claim:
+                reasons.add("unestablished_credit_spread_basis")
+            if change:
+                reasons.add("missing_compatible_credit_comparator")
+
+    # Quoted arithmetic is checked only against co-located or explicitly supplied
+    # counts. It does not authenticate a recipe, universe, window or transaction.
+    count_match = re.search(r"\b(\d+) buys?\s+(?:vs\.?|versus|and|/)\s+(\d+) sells?\b", probe)
+    supplied = snapshot.get("insider_counts")
+    supplied = supplied if isinstance(supplied, dict) else {}
+    counts = (int(count_match[1]), int(count_match[2])) if count_match else (supplied.get("buys"), supplied.get("sells"))
+    valid_counts = all(type(v) is int and 0 <= v <= 10**12 for v in counts)
+    ratio_claim = re.search(r"\b(?:buy(?:/sell|-to-sell)|sell(?:/buy|-to-buy)) ratio\b|\bbuy share\b|\bbuys divided by sells\b", probe)
+    if ratio_claim:
+        incompatible = any(supplied.get(key + "_buy") != supplied.get(key + "_sell")
+                           for key in ("window", "universe")
+                           if key + "_buy" in supplied or key + "_sell" in supplied)
+        if incompatible or re.search(r"\b(?:market-wide|all transactions)\b", probe):
+            reasons.add("unestablished_insider_population")
+        label_pattern = (r"(?P<sell_buy>\bsell(?:/buy|-to-buy) ratio\b)|"
+                         r"(?P<buy_sell>\bbuy(?:/sell|-to-sell) ratio\b|\bbuys divided by sells\b)|"
+                         r"(?P<buy_share>\bbuy share\b)")
+        # Consume the entire adjacent atom before a unit, then validate its
+        # numeric grammar. A malformed/grouped/exponent atom cannot restart at
+        # a convenient suffix. Spaced numeric prefixes are rejected below.
+        token_pattern = r"(?P<shown>(?:[+\-−]\s*)*[^\s%:]+)\s*(?P<unit>%|:\s*(?:[+\-−]\s*)*\d+(?:\.\d+)?\b)"
+        denominator_kind = None
+        for assertion in re.split(r",(?!\s*\d)\s*|\s+(?:and|but|while|whereas|however)\s+", probe):
+            labels = {match.lastgroup for match in re.finditer(label_pattern, assertion)}
+            if labels:
+                # Multiple different labels without a clause boundary are
+                # ambiguous, not permission to choose whichever fits a token.
+                denominator_kind = next(iter(labels)) if len(labels) == 1 else None
+                if denominator_kind is None:
+                    reasons.add("insider_ratio_denominator_mismatch")
+            if denominator_kind is None:
+                continue
+            tokens = list(re.finditer(token_pattern, assertion))
+            if any(not any(token.start() <= marker.start() < token.end() for token in tokens)
+                   for marker in re.finditer(r"%|:\s*(?:[+\-−]\s*)*[\d.]+|(?<=[\d.,])\s*:\s*\S+", assertion)):
+                reasons.add("insider_ratio_denominator_mismatch")
+            for token in tokens:
+                if not valid_counts:
+                    reasons.add("unknown_insider_denominator")
+                    continue
+                # Opening prose brackets are permitted; digits or punctuation
+                # already attached to the atom are never stripped away.
+                shown = re.sub(r"\s+", "", token["shown"].lstrip("([").replace("−", "-"))
+                prefix = assertion[:token.start()]
+                # A prose comma is not a numeric prefix. A numeric/sign atom
+                # before commas or whitespace must still not restart here.
+                if re.search(r"[\d.'’+\-−/][\s,]*\s+$", prefix):
+                    reasons.add("insider_ratio_denominator_mismatch")
+                    continue
+                if not re.fullmatch(r"[+\-]?(?:\d+(?:\.\d*)?|\.\d+|[1-9]\d{0,2}(?:,\d{3})+(?:\.\d*)?)", shown):
+                    reasons.add("insider_ratio_denominator_mismatch")
+                    continue
+                shown = shown.replace(",", "")
+                remainder = assertion[token.end():]
+                if remainder and not re.match(r"(?:\s|[)\]]|[.!?](?:\s|$))", remainder):
+                    reasons.add("insider_ratio_denominator_mismatch")
+                    continue
+                if token["unit"] != "%" and not re.fullmatch(r":\s*1", token["unit"]):
+                    # Only the declared x:1 ratio form is in this bounded
+                    # publication contract; other denominators need a label.
+                    reasons.add("insider_ratio_denominator_mismatch")
+                    continue
+                buys, sells = counts
+                numerator, denominator = ((sells, buys) if denominator_kind == "sell_buy"
+                                          else (buys, buys + sells) if denominator_kind == "buy_share"
+                                          else (buys, sells))
+                expected = ((100 if token["unit"] == "%" else 1) * numerator / denominator
+                            if denominator else None)
+                # Preserve sign and displayed precision. This arithmetic check
+                # does not alter the existing numeric extraction or matcher.
+                decimals = len(shown.partition(".")[2])
+                if expected is None or round(expected, decimals) != float(shown):
+                    reasons.add("insider_ratio_denominator_mismatch")
+    return reasons
 
 
 def _publication_normalized(text: str) -> str:
@@ -130,6 +389,7 @@ def _strip_publication_disclosures(text: str) -> str:
         r"(?:we )?cannot infer (?:signed )?dealer (?:gamma|inventory|side)(?: or inventory)? from aggregate pcr|"
         r"no dealer inventory is supplied in this snapshot|"
         r"signed dealer gamma cannot be inferred from aggregate pcr|"
+        r"aggregate put/call open interest does not identify buyer initiation, hedging intent or participant motives|"
         r"no regime improvement can be inferred without a comparator|"
         r"a regime transition cannot be inferred from one record|"
         r"does not predict a crash)\b",
@@ -150,7 +410,8 @@ def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[s
     reasons_seen: set[str] = set()
     # Preserve original formatting and decimal numbers. Newlines also bound
     # markdown headings/lists; a direction label is checked independently.
-    segments = re.split(r"(\n+|(?<=[.!?])\s+|,\s*(?:while|whereas|but|however|and|yet|although)\s+|\s+and\s+(?=vix(?:\s*(?:9d|3m))?\s+(?:is|was)\s+(?:unavailable|missing|unmeasured)\b)|;\s*|\s*\|\s*)", text, flags=re.IGNORECASE)
+    segments = re.split(r"(\n+|(?<=[.!?])(?<!vs\.)\s+|,\s*(?:while|whereas|but|however|and|yet|although)\s+|\s+and\s+(?=vix(?:\s*(?:9d|3m))?\s+(?:is|was)\s+(?:unavailable|missing|unmeasured)\b)|;\s*|\s*\|\s*)", text, flags=re.IGNORECASE)
+    original_segments = tuple(segments)
     state = (snapshot.get("latest_regime") or {}).get("state")
     state_label = _publication_normalized(state).strip() if isinstance(state, str) else None
     pipe_regime_context = False
@@ -186,7 +447,7 @@ def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[s
             r"\bnot a calibrated outcome probability\b",
         ):
             normalized = re.sub(disclosure, "", normalized)
-        reasons: set[str] = set()
+        reasons: set[str] = _publication_basis_reasons(original, snapshot, facts)
         trend = r"\b(?:worsen\w*|deteriorat\w*|improv\w*|stabili[sz]\w*|transitioning|shifting|remained|unchanged)\b"
         if (re.search(r"\b(?:regime|fragile)\b|\bstate\s*:|^\s*(?:the\s+)?conditions\b|\bmarket conditions\b", normalized) and re.search(trend, normalized)) or re.search(
             r"\bdirection(?: of travel)?\s*(?::|-|is|=)\s*(?:\w+\s+){0,2}"
@@ -288,9 +549,20 @@ def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[s
             ):
                 reasons.add("dvn_sector_misclassification")
         if reasons:
-            violations.append({"segment_index": index // 2, "reasons": sorted(reasons)})
+            # Bind offsets to the unmodified input, before replacements change
+            # lengths. The digest/role is supplied by the briefing caller.
+            start = sum(len(part) for part in original_segments[:index])
+            violations.append({"segment_index": index // 2, "reasons": sorted(reasons),
+                               "start": start, "end": start + len(original),
+                               "span_binding": "unmodified_context_guard_input"})
             reasons_seen.update(reasons)
             segments[index] = "[Claim omitted: " + ", ".join(sorted(reasons)) + ".]"
+            if "insider_ratio_denominator_mismatch" in reasons:
+                quoted = re.search(r"\b(\d+) buys?\s+(?:vs\.?|versus|and|/)\s+(\d+) sells?\b",
+                                   _publication_normalized(original))
+                if quoted:
+                    segments[index] += (f" [Quoted counts only: {int(quoted[1])} buys / {int(quoted[2])} sells; "
+                                        "aggregation recipe, window and universe unknown.]")
     return "".join(segments), {
         "passed": not violations, "reasons": sorted(reasons_seen),
         "omitted_segments": violations, "context_facts": facts,
