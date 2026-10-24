@@ -602,13 +602,18 @@ def _inspect_source(engine: Any, source_name: str) -> dict[str, Any]:
         failures = conn.execute(
             sa_text(
                 "SELECT COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON sc.id = rs.source_id "
-                "WHERE LOWER(sc.name) = LOWER(:source) "
-                "AND rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                "       MAX(last_fail) AS last_fail, "
+                "       MAX(CASE WHEN failure_rank = 1 THEN last_error END) AS last_error "
+                "FROM ("
+                " SELECT rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (ORDER BY rs.pull_timestamp DESC, "
+                "                           rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON sc.id = rs.source_id "
+                " WHERE LOWER(sc.name) = LOWER(:source) "
+                " AND rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed"
             ),
             {"source": source_name},
         ).fetchone()
@@ -1890,14 +1895,19 @@ def diagnose_and_fix_pulls(
     with engine.connect() as conn:
         failed = conn.execute(
             text(
-                "SELECT sc.name, COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON rs.source_id = sc.id "
-                "WHERE rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours' "
-                "GROUP BY sc.name "
+                "SELECT name, fail_count, last_fail, last_error "
+                "FROM ("
+                " SELECT sc.name, COUNT(*) OVER (PARTITION BY sc.name) AS fail_count, "
+                "        rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (PARTITION BY sc.name "
+                "          ORDER BY rs.pull_timestamp DESC, "
+                "                   rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON rs.source_id = sc.id "
+                " WHERE rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed "
+                "WHERE failure_rank = 1 "
                 "ORDER BY fail_count DESC"
             )
         ).fetchall()

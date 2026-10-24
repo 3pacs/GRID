@@ -82,7 +82,10 @@ pyarrow>=25.0.1
 polars>=1.40.1
 
 # ML model training
-xgboost>=3.2.0
+# XGBoost 3.4.1 requires Python >=3.12; retain the compatible baseline
+# for GRID's Python 3.11 CI without changing the interpreter baseline.
+xgboost>=3.2.0; python_version < "3.12"
+xgboost>=3.4.1; python_version >= "3.12"
 
 # TradingAgents multi-agent framework (optional)
 # Install separately when the private TradingAgents package is available.
