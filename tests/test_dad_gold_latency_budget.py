@@ -52,52 +52,25 @@ def _reset_inflight():
     dad._FINVIZ_MEMORY_CACHE.clear()
 
 
-def test_live_finviz_refresh_is_reused_without_writes_and_newer_stored_row_wins():
-    from datetime import datetime, timedelta, timezone
-
-    missing = {"fields": {}, "field_count": 0, "latest_pull": None, "latest_obs_date": None}
-    with patch.object(dad, "_read_finviz_rows", return_value=missing) as read, \
-         patch.object(dad, "_fetch_finviz_snapshot", return_value={"Price": "123.45"}) as fetch, \
+def test_legacy_refresh_reads_sec_without_live_provider_or_writes():
+    profile = {"source": "SEC EDGAR/XBRL", "status": "unavailable", "fields": {},
+               "refresh_available": False, "rows_inserted": 0}
+    with patch("api.dad_sec_fundamentals.read_sec_profile", return_value=profile) as read, \
+         patch.object(dad, "_fetch_finviz_snapshot", side_effect=AssertionError("retired provider")), \
          patch.object(dad, "_store_finviz_snapshot", side_effect=AssertionError("GET must not persist")):
-        first = dad._get_finviz_profile(None, "COLD", refresh=True, persist_refresh=False)
-        second = dad._get_finviz_profile(None, "COLD", persist_refresh=False)
-        assert first["source"] == "live-readonly"
-        assert second["source"] == "live-memory"
-        assert second["fields"]["price"]["parsed"] == 123.45
-        assert fetch.call_count == 1
+        for persist in (False, True):
+            result = dad._get_finviz_profile(None, "COLD", refresh=True, persist_refresh=persist)
+            assert result == profile
         assert read.call_count == 2
 
-        created, remembered = dad._FINVIZ_MEMORY_CACHE["COLD"]
-        dad._FINVIZ_MEMORY_CACHE["COLD"] = (created - timedelta(minutes=2), remembered)
-        stored = {
-            "fields": {"price": {"field": "price", "label": "Price", "group": "market",
-                                 "raw_value": "200", "parsed": 200.0, "numeric_value": 200.0}},
-            "field_count": 1, "latest_pull": datetime.now(timezone.utc) - timedelta(minutes=1),
-            "latest_obs_date": datetime.now(timezone.utc).date(),
-        }
-        read.return_value = stored
-        newer = dad._get_finviz_profile(None, "COLD", persist_refresh=False)
-        assert newer["source"] == "postgres"
-        assert newer["fields"]["price"]["parsed"] == 200.0
 
-
-def test_unrecognized_live_finviz_fields_keep_stale_stored_snapshot():
-    from datetime import datetime, timedelta, timezone
-
-    old = datetime.now(timezone.utc) - timedelta(days=3)
-    stored = {
-        "fields": {"price": {"field": "price", "label": "Price", "group": "market",
-                             "raw_value": "88", "parsed": 88.0, "numeric_value": 88.0}},
-        "field_count": 1, "latest_pull": old, "latest_obs_date": old.date(),
-    }
-    with patch.object(dad, "_read_finviz_rows", return_value=stored), \
-         patch.object(dad, "_fetch_finviz_snapshot", return_value={"Unknown label": "x"}), \
-         patch.object(dad, "_store_finviz_snapshot", side_effect=AssertionError("GET must not persist")):
-        result = dad._get_finviz_profile(None, "STALE", refresh=True, persist_refresh=False)
-    assert result["status"] == "stale"
-    assert result["source"] == "postgres"
-    assert result["fields"]["price"]["parsed"] == 88.0
-    assert result["error"] == "no recognized Finviz snapshot fields"
+def test_retired_snapshot_cannot_resurrect_source_catalog():
+    with pytest.raises(RuntimeError, match="retired"):
+        dad._ensure_finviz_source_id(MagicMock())
+    with pytest.raises(RuntimeError, match="retired"):
+        dad._store_finviz_snapshot(MagicMock(), "AAPL", {"Price": "123"})
+    with pytest.raises(RuntimeError, match="retired"):
+        dad._fetch_finviz_snapshot("AAPL")
 
 
 # --- warm cache -------------------------------------------------------------
