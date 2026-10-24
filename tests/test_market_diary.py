@@ -470,6 +470,57 @@ def test_policy_reader_sqlite_preserves_offsets_and_exact_pit_cutoff(diary_engin
     assert equal[0].pull_timestamp == cutoff and equal[0].pull_timestamp.utcoffset() is not None
 
 
+def test_fresh_pair_returns_vix_pair_from_two_qualified_rows(diary_engine):
+    """^VIX qualifies under the Cboe NY-label-day policy (2026-10-19 owner decision)."""
+    from intelligence import market_diary
+
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    rows = [_price_row("YF:^VIX:close", prior, 16.0), _price_row("YF:^VIX:close", target, 17.0, ts_offset_h=24)]
+    assert all(json.loads(r["raw_payload"])["session_convention"] == "cboe_vol_index_ny_label_day_2026" for r in rows)
+    _insert_prices(diary_engine, rows)
+    with diary_engine.connect() as conn:
+        pair = market_diary._fresh_pair(conn, "YF:^VIX:close", target)
+    assert pair is not None
+    assert [o.value for o in pair] == [17.0, 16.0]
+    assert [o.obs_date for o in pair] == [target, prior]
+
+
+def test_gather_market_moves_reports_vix_gold_and_oil_when_qualified(diary_engine, monkeypatch):
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    rows = []
+    for sid, before, after in [("YF:^VIX:close", 16.0, 17.0), ("YF:GC=F:close", 2000.0, 2030.0),
+                               ("YF:CL=F:close", 70.0, 68.6)]:
+        rows += [_price_row(sid, prior, before), _price_row(sid, target, after, ts_offset_h=24)]
+    _insert_prices(diary_engine, rows)
+
+    moves = market_diary._gather_market_moves(diary_engine, target)
+    vix = moves["indices"]["VIX"]
+    assert vix["close"] == 17.0 and vix["change_pct"] == pytest.approx(6.25)
+    notable = {n["asset"]: n for n in moves["notable"]}
+    assert notable["Gold"]["change_pct"] == pytest.approx(1.5)
+    assert notable["Crude Oil"]["change_pct"] == pytest.approx(-2.0)
+    assert "Gold" not in moves.get("notable_no_close", [])
+
+
+def test_nyse_holiday_label_for_futures_is_still_withheld(diary_engine, monkeypatch):
+    """Labor Day: CME trades, NYSE is closed, so the label stays UNKNOWN."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 7)
+    rows = [_price_row("YF:GC=F:close", date(2026, 9, 4), 2000.0),
+            _price_row("YF:GC=F:close", target, 2030.0, ts_offset_h=24)]
+    assert rows[-1]["raw_payload"] == "null"
+    _insert_prices(diary_engine, rows)
+    with diary_engine.connect() as conn:
+        assert market_diary._fresh_pair(conn, "YF:GC=F:close", target) is None
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Wave 3 §4.1 fix #1: pre-open thesis verdict, no look-ahead
 # ──────────────────────────────────────────────────────────────────────
