@@ -16,9 +16,26 @@ Each new generic payload declares `raw_capture_contract=yf_raw_capture_v2`, `pri
 
 Explicit UNKNOWN or INCOMPLETE state rejects selection even if a contradictory payload includes otherwise valid marker fields. Genuine existing V1/SPY markers without a capture-state field remain compatible. Legacy unmarked data stays raw UNKNOWN; it is never retroactively certified from SUCCESS, date, value or a late database timestamp alone.
 
-The 52 explicit US-listed default instruments keep V1's conservative post-America/New_York-label-day policy, standard holiday/weekend checks and **2026 qualification bound**. Their observation dates after 2026 continue to ingest as raw UNKNOWN. BTC-USD and ETH-USD retain their separate UTC 24-hour daily convention. The 16 other defaults remain UNKNOWN for qualification: ^VIX, DX-Y.NYB, ^VIX9D, ^VIX3M, ^VIX6M; HG=F, GC=F, SI=F, CL=F; EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCHF=X, USDCAD=X, NZDUSD=X. Arbitrary tickers such as AAPL also ingest as raw UNKNOWN until a separately supported policy exists. No New York calendar is inferred from ticker spelling. All six fields follow these rules.
+The 52 explicit US-listed default instruments keep V1's conservative post-America/New_York-label-day policy, standard holiday/weekend checks and **2026 qualification bound**. Their observation dates after 2026 continue to ingest as raw UNKNOWN. BTC-USD and ETH-USD retain their separate UTC 24-hour daily convention. Arbitrary tickers such as AAPL ingest as raw UNKNOWN until a separately supported policy exists. No New York calendar is inferred from ticker spelling; every eligible ticker is listed explicitly in `price_close_contract.py`. All six fields follow these rules.
 
-The standard calendar module does not prove exceptional-closure coverage or implement half-day close times. Waiting until local midnight avoids assuming regular versus early close times and handles DST through ZoneInfo, but remains an elapsed-label-day capture policy. Broader qualified-calendar coverage is a separate owner policy choice. No such extension is made here.
+### VIX, DXY, futures and FX (owner decision, 2026-10-19)
+
+The 16 defaults that were previously UNKNOWN now qualify under the **same** elapsed New-York-label-day boundary as the US-listed set, each class with its own explicit `session_convention` in the marker:
+
+| Class | Tickers | Venue session | `session_convention` |
+| --- | --- | --- | --- |
+| Cboe volatility indexes | ^VIX, ^VIX9D, ^VIX3M, ^VIX6M | Settle 16:15 ET; NYSE holiday calendar | `cboe_vol_index_ny_label_day_2026` |
+| ICE US Dollar Index | DX-Y.NYB | Daily bar follows the New York trading day, ending by about 17:00 ET (like FX) | `ice_dxy_ny_label_day_2026` |
+| CME Globex futures | HG=F, GC=F, SI=F, CL=F | Bar labelled by trade date; settles 17:00 ET | `cme_globex_ny_label_day_2026` |
+| Yahoo FX pairs | EURUSD=X, GBPUSD=X, USDJPY=X, AUDUSD=X, USDCHF=X, USDCAD=X, NZDUSD=X | New York 17:00 ET close convention (at the latest the UTC day end) | `yahoo_fx_ny_close_label_day_2026` |
+
+Every one of these label days ends before 00:00 America/New_York of the following date (04:00/05:00 UTC), so waiting for that boundary is conservative for each class. Even if a Yahoo FX bar followed the UTC day instead of the 17:00 ET convention, it would still end before the boundary. All other rules stay as they are: the 2026 qualification bound, `provider_certified_final=false`, INCOMPLETE before the boundary, interval isolation, and exact marker validation in `is_daily_policy_capture` (a marker that carries another class's `session_convention`, another ticker's `price_basis`, a different `eligible_after`, or an explicit UNKNOWN/INCOMPLETE state is rejected). `UNKNOWN_DAILY_TICKERS` still exists but is now empty, so the default universe is still partitioned as supported | unknown.
+
+`ingestion.market_calendar.is_market_open` remains a **refusal filter, never a certification**. A label date on which NYSE is closed (weekends, Good Friday, MLK Day, Labor Day, Thanksgiving, Christmas and so on) stays raw UNKNOWN for these classes, even though FX and Globex futures may trade or post an abbreviated session that day. Those bars ingest as raw history but do not count as qualified closes.
+
+Evidence: after the 2026-10-19 historical repair, the yfinance ^VIX daily close matched FRED `VIXCLS` within 5 bp on 114 of 114 dates (median difference 0.000 %), compared with 2 of 106 for the earlier same-day captures (repair phase-2 receipt, `grid-yfinance-close-audit-20261019`). In the original audit, all 8 ^VIX captures taken after the label day already matched `VIXCLS` exactly. No in-database reference was available for ^VIX9D/3M/6M, DXY, futures or FX. Those classes qualify because their documented sessions end before the boundary, not because of a per-ticker reference match.
+
+The standard calendar module does not prove exceptional-closure coverage or implement half-day close times. Waiting until local midnight avoids assuming regular versus early close times and handles DST through ZoneInfo, but remains an elapsed-label-day capture policy.
 
 SPY **daily close only** retains the exact original `spy_close_v1` payload, post-UTC-day-end threshold, four-day capture lookback and scoring contract. It does not acquire generic provisional/raw fallback. Its incomplete/expired refusal remains PARTIAL/no_data. Other SPY fields use the generic rules; non-daily SPY close writes use the isolated non-daily identifier.
 
@@ -40,7 +57,7 @@ Otherwise, the latest SUCCESS vintage for the exact source/series/date and expli
 
 ## Diary and compatibility boundaries
 
-V2 leaves the V1 diary selection, current timestamp cutoff, exact target-date check, lookback/age gates, scoring withholding and default-off operator flag unchanged. It introduces no raw/UNKNOWN substitution, historical promotion or new display feature. Futures/VIX and old unmarked history can therefore remain unavailable as qualified diary closes even while raw ingestion continues. Two suitable qualified observation dates may be needed for a pair. No diary was run.
+V2 leaves the V1 diary selection, current timestamp cutoff, exact target-date check, lookback/age gates, scoring withholding and default-off operator flag unchanged. It introduces no raw/UNKNOWN substitution, historical promotion or new display feature. Old unmarked history can therefore remain unavailable as qualified diary closes even while raw ingestion continues. Since the 2026-10-19 extension, newly captured post-boundary ^VIX, GC=F and CL=F closes qualify and can supply diary VIX/gold/oil lines, but only once the release that carries this contract is deployed. Rows captured before that release keep their original raw UNKNOWN payloads; they are never promoted retroactively. Two suitable qualified observation dates may be needed for a pair. No diary was run.
 
 ## Tests and original fixture amendment
 
