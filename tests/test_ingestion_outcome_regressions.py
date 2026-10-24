@@ -132,17 +132,11 @@ def test_smart_and_direct_keep_partial_rows_in_log(sched, monkeypatch):
      {"ticker": "QQQ", "status": "PARTIAL", "rows_inserted": 0, "outcome": "error"}],
 ])
 def test_actual_daily_yfinance_block_does_not_bump_on_zero_or_failure(monkeypatch, items):
-    # Execute the exact yfinance try block from _run_equity_pulls, with
-    # every reachable engine/provider mocked. Other feed blocks are excluded.
-    import ast
-    import inspect
+    # Execute the shared yfinance entry point with every reachable
+    # engine/provider mocked. Other equity feed blocks are excluded.
     from types import ModuleType
     import db
 
-    tree = ast.parse(inspect.getsource(scheduler._run_equity_pulls))
-    block = next(n for n in tree.body[0].body if isinstance(n, ast.Try)
-                 and any(isinstance(v, ast.ImportFrom) and v.module == "ingestion.yfinance_pull"
-                         for v in ast.walk(n)))
     engine = MagicMock()
     conn = MagicMock()
     engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
@@ -160,13 +154,12 @@ def test_actual_daily_yfinance_block_does_not_bump_on_zero_or_failure(monkeypatc
 
     fake_yf.YFinancePuller = YFinancePuller
     monkeypatch.setitem(sys.modules, "ingestion.yfinance_pull", fake_yf)
-    exec(compile(ast.Module(body=[block], type_ignores=[]), "daily-yfinance-block", "exec"),
-         scheduler.__dict__, {"start_date": "2026-09-28"})
+    scheduler._run_yfinance_daily("2026-09-28")
     bumped = any("last_pull_at" in str(call.args[0]) for call in conn.execute.call_args_list)
     assert bumped == (ss._classify_outcome(items)[0] == "SUCCESS")
     terminal = [call.kwargs if call.kwargs else call.args[1]
                 for call in conn.execute.call_args_list if "UPDATE pull_log SET" in str(call.args[0])]
-    assert len(terminal) == 1  # the try block executed through durable accounting
+    assert len(terminal) == 1  # the shared helper executed through durable accounting
     assert terminal[0]["rows"] == sum(i["rows_inserted"] for i in items)
 
 
