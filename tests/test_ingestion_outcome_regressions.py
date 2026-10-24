@@ -132,14 +132,14 @@ def test_smart_and_direct_keep_partial_rows_in_log(sched, monkeypatch):
      {"ticker": "QQQ", "status": "PARTIAL", "rows_inserted": 0, "outcome": "error"}],
 ])
 def test_actual_daily_yfinance_block_does_not_bump_on_zero_or_failure(monkeypatch, items):
-    # Execute the exact yfinance try block from _run_equity_pulls, with
+    # Execute the exact yfinance try block from _run_yfinance_daily, with
     # every reachable engine/provider mocked. Other feed blocks are excluded.
     import ast
     import inspect
     from types import ModuleType
     import db
 
-    tree = ast.parse(inspect.getsource(scheduler._run_equity_pulls))
+    tree = ast.parse(inspect.getsource(scheduler._run_yfinance_daily))
     block = next(n for n in tree.body[0].body if isinstance(n, ast.Try)
                  and any(isinstance(v, ast.ImportFrom) and v.module == "ingestion.yfinance_pull"
                          for v in ast.walk(n)))
