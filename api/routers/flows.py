@@ -8,7 +8,7 @@ import json
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -20,6 +20,17 @@ from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
+
+
+def _today() -> date:
+    """Host-local calendar day the flows reads use (``date.today()``, unchanged).
+
+    One module-level seam: tests pin a day with
+    ``monkeypatch.setattr(flows, "_today", lambda: day)`` instead of swapping
+    ``datetime.date`` process-wide (review 2026-10-20, Judgement 4).
+    """
+    return date.today()
+
 
 # Tables each provenance-carrying endpoint actually reads (see
 # docs/flows_provenance_contract.md). Provenance describes materialization
@@ -114,7 +125,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
     val_map: dict[str, float] = {}
     try:
         from api.dependencies import get_pit_store
-        from datetime import date, timedelta
+        from datetime import timedelta
 
         pit = get_pit_store()
 
@@ -128,7 +139,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
         feature_ids = [name_to_id[n] for n in needed_features if n in name_to_id]
 
         if feature_ids:
-            today = date.today()
+            today = _today()
             hist = pit.get_feature_matrix(
                 feature_ids=feature_ids,
                 start_date=today - timedelta(days=504),
@@ -184,8 +195,8 @@ def _compute_sectors_payload() -> dict[str, Any]:
     price_map: dict[str, float] = {}
     change_30d_map: dict[str, float] = {}
     try:
-        from datetime import date, timedelta
-        today = date.today()
+        from datetime import timedelta
+        today = _today()
         d30 = today - timedelta(days=30)
         # Bound the "latest price" scan too — without this, DISTINCT ON
         # over series_id IN (...) has to sort the *entire* history of every
@@ -513,13 +524,93 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
     return _with_provenance({"sectors": {}, "stale": True, "unavailable": True}, _PROV_SECTORS)
 
 
+def _read_congressional_activity(engine: Any, tickers: list[str], today: Any) -> list[dict]:
+    """Recent congressional trades for ``tickers``, never future-dated.
+
+    ``congressional_trades.disclosure_date`` can lie in the future (a 2026-10-19
+    read showed rows dated 2026-11-22..26). A trade that has not been disclosed
+    yet must not be listed as recent: the query is bounded to
+    ``disclosure_date <= CURRENT_DATE`` (the same clock the provenance envelope
+    uses) and any future row is dropped again here. How many exist is reported
+    by ``provenance.congressional_trades.future_dated_rows``, not by this list.
+    """
+    from datetime import timedelta
+
+    if not tickers:
+        return []
+    placeholders = ", ".join(f":t{i}" for i in range(len(tickers)))
+    params = {f"t{i}": t for i, t in enumerate(tickers)}
+    params["d60"] = today - timedelta(days=60)
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT ticker, disclosure_date, representative, transaction_type, amount "
+            "FROM congressional_trades "
+            "WHERE ticker IN (" + placeholders + ") AND disclosure_date >= :d60 "
+            "AND disclosure_date <= CURRENT_DATE "
+            "ORDER BY disclosure_date DESC LIMIT 20"
+        ), params).fetchall()
+    return [
+        {"ticker": r[0], "date": str(r[1]) if r[1] else None,
+         "representative": r[2], "type": r[3], "amount": r[4]}
+        for r in rows
+        if not (r[1] is not None and hasattr(r[1], "toordinal") and r[1] > today)
+    ]
+
+
+def _read_dark_pool_signal(
+    engine: Any, tickers: list[str], today: Any,
+) -> tuple[str | None, str | None, str | None]:
+    """``(signal, as_of, reason)`` from the sector's newest dark-pool week.
+
+    A directional signal is only returned from real short-volume data in a week
+    no older than the table's staleness threshold. Otherwise ``signal`` is
+    ``None`` (rendered as "--", never as "neutral") and ``reason`` says why:
+    ``no_rows`` | ``stale`` | ``no_short_volume``. ``short_volume`` NULL is *not*
+    zero: the old code summed it as 0, so a week with total volume and no short
+    volume gave ratio 0 and "accumulation" (2026-10-19, rows dated 2026-03-09).
+    """
+    from store.materialization_provenance import WEEKLY_STALE_AFTER_DAYS
+
+    if not tickers:
+        return None, None, "no_rows"
+    placeholders = ", ".join(f":t{i}" for i in range(len(tickers)))
+    params = {f"t{i}": t for i, t in enumerate(tickers)}
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT ticker, short_volume, total_volume, report_date "
+            "FROM dark_pool_weekly "
+            "WHERE ticker IN (" + placeholders + ") "
+            "AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly "
+            "WHERE ticker IN (" + placeholders + ") AND report_date <= CURRENT_DATE)"
+        ), params).fetchall()
+    if not rows:
+        return None, None, "no_rows"
+    report_date = rows[0][3]
+    as_of = report_date.isoformat() if hasattr(report_date, "isoformat") else (
+        str(report_date) if report_date is not None else None)
+    if hasattr(report_date, "toordinal") and (today - report_date).days > WEEKLY_STALE_AFTER_DAYS:
+        return None, as_of, "stale"
+    usable = [r for r in rows if r[1] is not None and r[2] is not None and float(r[2]) > 0]
+    if not usable:
+        return None, as_of, "no_short_volume"
+    total_short = sum(float(r[1]) for r in usable)
+    total_vol = sum(float(r[2]) for r in usable)
+    ratio = total_short / total_vol
+    signal = (
+        "accumulation" if ratio < 0.40
+        else "distribution" if ratio > 0.55
+        else "neutral"
+    )
+    return signal, as_of, None
+
+
 @router.get("/sectors/{sector_name}/detail")
 def get_sector_detail(
     sector_name: str,
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return detailed subsector breakdown with per-actor price data and options."""
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     from analysis.sector_map import SECTOR_MAP
 
@@ -529,7 +620,7 @@ def get_sector_detail(
         raise HTTPException(status_code=404, detail=f"Sector '{sector_name}' not found")
 
     engine = get_db_engine()
-    today = date.today()
+    today = _today()
     lookback_30 = today - timedelta(days=30)
     lookback_504 = today - timedelta(days=504)
 
@@ -775,7 +866,10 @@ def get_sector_detail(
 
     insider_activity: list[dict] = []
     congressional_activity: list[dict] = []
-    dark_pool_signal = "neutral"
+    # None, never "neutral", when there is no usable dark-pool reading.
+    dark_pool_signal: str | None = None
+    dark_pool_as_of: str | None = None
+    dark_pool_reason: str | None = "no_rows"
     etf_flow_5d: float | None = None
 
     # Each query runs independently so one missing table doesn't kill the rest
@@ -802,40 +896,15 @@ def get_sector_detail(
             log.warning("insider_trades query failed (non-fatal): {e}", e=str(exc))
 
         try:
-            with engine.connect() as conn:
-                params = {**ticker_params, "d60": today - timedelta(days=60)}
-                cong_rows = conn.execute(text(
-                    "SELECT ticker, disclosure_date, representative, transaction_type, amount "
-                    "FROM congressional_trades "
-                    "WHERE ticker IN (" + placeholders + ") AND disclosure_date >= :d60 "
-                    "ORDER BY disclosure_date DESC LIMIT 20"
-                ), params).fetchall()
-                for r in cong_rows:
-                    congressional_activity.append({
-                        "ticker": r[0], "date": str(r[1]) if r[1] else None,
-                        "representative": r[2], "type": r[3], "amount": r[4],
-                    })
+            congressional_activity = _read_congressional_activity(engine, sector_tickers, today)
         except Exception as exc:
             log.warning("congressional_trades query failed (non-fatal): {e}", e=str(exc))
 
         try:
-            with engine.connect() as conn:
-                dp_rows = conn.execute(text(
-                    "SELECT ticker, short_volume, total_volume "
-                    "FROM dark_pool_weekly "
-                    "WHERE ticker IN (" + placeholders + ") "
-                    "AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly)"
-                ), ticker_params).fetchall()
-                total_short = sum(float(r[1] or 0) for r in dp_rows)
-                total_vol = sum(float(r[2] or 0) for r in dp_rows)
-                if total_vol > 0:
-                    ratio = total_short / total_vol
-                    dark_pool_signal = (
-                        "accumulation" if ratio < 0.40
-                        else "distribution" if ratio > 0.55
-                        else "neutral"
-                    )
+            dark_pool_signal, dark_pool_as_of, dark_pool_reason = _read_dark_pool_signal(
+                engine, sector_tickers, today)
         except Exception as exc:
+            dark_pool_reason = "error"
             log.warning("dark_pool_weekly query failed (non-fatal): {e}", e=str(exc))
 
     try:
@@ -904,7 +973,7 @@ def get_sector_detail(
                 f"In 2-3 sentences, summarize the investment narrative for the {sector_name} sector. "
                 f"Subsector breakdown: {'; '.join(sector_summary_parts)}. "
                 f"ETF {etf_ticker} 30d change: {'+' if (etf_change or 0) >= 0 else ''}{((etf_change or 0) * 100):.1f}%. "
-                f"Dark pool signal: {dark_pool_signal}."
+                f"Dark pool signal: {dark_pool_signal or 'unavailable'}."
             )
             client = get_client()
             resp = client.generate(prompt=prompt, temperature=0.3)
@@ -962,6 +1031,8 @@ def get_sector_detail(
             "relative_strength_1m": relative_strength_1m,
             "etf_flow_5d": etf_flow_5d,
             "dark_pool_signal": dark_pool_signal,
+            "dark_pool_as_of": dark_pool_as_of,
+            "dark_pool_reason": dark_pool_reason,
             "congressional_activity": congressional_activity,
             "insider_activity": insider_activity,
         },
@@ -1180,14 +1251,14 @@ def _build_sector_connections(
     All DB queries are parameterized, wrapped in try/except, and
     gracefully degrade if tables are missing.
     """
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     cache_key = f"{sector_name}"
     cached = _sector_connections_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    today = date.today()
+    today = _today()
 
     ticker_set = set(sector_tickers)
 
@@ -1422,7 +1493,7 @@ def _build_sector_connections(
                     text(
                         "SELECT ticker, disclosure_date FROM congressional_trades "
                         "WHERE ticker IN (" + placeholders + ") "
-                        "AND disclosure_date >= :d60"
+                        "AND disclosure_date >= :d60 AND disclosure_date <= CURRENT_DATE"
                     ),
                     params,
                 ).fetchall()
@@ -1459,7 +1530,7 @@ def _build_sector_connections(
                         "SELECT ticker, SUM(short_volume) AS sv, SUM(total_volume) AS tv "
                         "FROM dark_pool_weekly "
                         "WHERE ticker IN (" + placeholders + ") "
-                        "AND report_date >= :d14 "
+                        "AND report_date >= :d14 AND short_volume IS NOT NULL "
                         "GROUP BY ticker"
                     ),
                     params,
@@ -1648,7 +1719,7 @@ def get_sankey_data(
     from analysis.sector_map import SECTOR_MAP
 
     engine = get_db_engine()
-    today = date.fromisoformat(as_of) if as_of else date.today()
+    today = date.fromisoformat(as_of) if as_of else _today()
 
     # Build nodes and links from sector map + live data
     nodes = []
@@ -2736,13 +2807,12 @@ async def get_cds_history(
 ) -> dict:
     """Historical spread data for a CDS proxy series."""
     from intelligence.cds_tracker import CDS_SERIES, _get_spread_history
-    from datetime import date
 
     if series_key not in CDS_SERIES:
         return {"error": f"Unknown series: {series_key}", "available": list(CDS_SERIES.keys())}
 
     cfg = CDS_SERIES[series_key]
-    history = _get_spread_history(get_db_engine(), cfg["id"], date.today(), lookback_days=days)
+    history = _get_spread_history(get_db_engine(), cfg["id"], _today(), lookback_days=days)
 
     return {
         "series_key": series_key,
