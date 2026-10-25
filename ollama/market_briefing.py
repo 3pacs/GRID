@@ -47,6 +47,93 @@ def _publication_digest(value: str | None) -> PublicationTextDigest:
         return PublicationTextDigest(None, None, None, "capture_failed")
 
 
+def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str, Any],
+                                 *, narrative_span: tuple[int, int] | None = None) -> dict[str, Any]:
+    """Present declared metadata for displayed numeric feature candidates only.
+
+    This post-grounding appendix is data, never an evidence producer, verifier,
+    freshness classifier, selector, or an additional grounding pool.
+    """
+    features = snapshot.get("features")
+    features = features if isinstance(features, dict) else {}
+    mentions = diagnostics.get("roles", {}).get("emitted", {}).get("numeric_mentions", [])
+    paths = {"features." + key + ".value": key for key in features if type(key) is str}
+    valid_span = (isinstance(narrative_span, tuple) and len(narrative_span) == 2
+                  and all(type(offset) is int for offset in narrative_span)
+                  and 0 <= narrative_span[0] <= narrative_span[1])
+    mappings = []
+    for mention in mentions:
+        start, end = mention.get("start"), mention.get("end")
+        if type(start) is not int or type(end) is not int or start < 0 or end <= start:
+            continue
+        if not valid_span or not (narrative_span[0] <= start < end <= narrative_span[1]):
+            continue
+        matched = sorted({match.get("path") for match in mention.get("snapshot_matches", [])
+                          if isinstance(match, dict) and match.get("path") in paths})
+        if matched:
+            mappings.append({"start": start, "end": end, "feature_paths": matched,
+                             "attribution": "ambiguous_candidates" if len(matched) > 1 else "candidate_only",
+                             "numeric_context_match": mention.get("generation_context_numeric_match") is True})
+    selected = sorted({path for mapping in mappings for path in mapping["feature_paths"]})
+
+    def declaration(value):
+        return value if type(value) is str and value.strip() else "unknown"
+
+    def declared_date(value):
+        if type(value) is not str:
+            return "unknown"
+        try:
+            return date.fromisoformat(value).isoformat()
+        except ValueError:
+            return "unknown"
+
+    records = []
+    for path in selected:
+        key = paths[path]
+        info = features[key] if isinstance(features[key], dict) else {}
+        value = info.get("value")
+        try:
+            finite = type(value) in (int, float) and math.isfinite(value)
+        except OverflowError:
+            finite = False
+        policy = info.get("selection_policy")
+        policy = policy if type(policy) is str and policy in ("fixed_reference_date", "latest_available") else "unknown"
+        records.append({
+            "feature_key": key, "path": path, "raw_value": value if finite else None,
+            "observation_date": declared_date(info.get("obs_date") or info.get("date")),
+            "baseline_date": declared_date(info.get("baseline_date")),
+            "selection_policy": policy, "policy_status": "declared_only" if policy != "unknown" else "unknown",
+            "source_id": declaration(info.get("source_id") or info.get("source")),
+            "receipt_id": declaration(info.get("receipt_id")), "unit": declaration(info.get("unit")),
+            "available_at": declaration(info.get("available_at")),
+            "collected_at": declaration(info.get("collected_at") or info.get("pull_timestamp")),
+            "vintage_date": declaration(info.get("vintage_date")),
+            "basis": declaration(info.get("basis") or info.get("price_basis")),
+            "measure": declaration(info.get("measure")),
+            "verification_state": "unknown",
+            "unverified_flag": info.get("unverified") if type(info.get("unverified")) is bool else None,
+            "flag_scope": "upstream_declaration_only",
+            "source_truth": "unknown", "freshness": "unknown",
+        })
+    payload = {"schema": "grid.publication_evidence_footer.v1", "records": records,
+               "mentions": mappings, "scope": "displayed_narrative_before_evidence_appendix",
+               "narrative_span": list(narrative_span) if valid_span else None,
+               "span_binding": "final_displayed_text",
+               "matching_is_source_verification": False,
+               "snapshot_presence_is_grounding_permission": False}
+    # JSON is a data block. Escape fence/HTML delimiters even inside declared
+    # identifiers; do not let metadata create markdown instructions or HTML.
+    encoded = json.dumps(payload, sort_keys=True, ensure_ascii=True, allow_nan=False)
+    encoded = encoded.replace("`", "\\u0060").replace("<", "\\u003c").replace(">", "\\u003e")
+    payload["rendered_text"] = (
+        "\n\n---\n### Feature evidence declarations\n"
+        "Declared metadata only; provider truth and freshness remain unknown. "
+        "Equal-value matches are candidates, not unique attribution.\n"
+        "```json\n" + encoded + "\n```\n"
+    ) if records else ""
+    return payload
+
+
 def _publication_stage_diagnostics(candidate: str | None, grounding_input: str,
                                    emitted: str, data_context: str,
                                    snapshot: dict[str, Any], fallback: str | None) -> dict[str, Any]:
@@ -1061,7 +1148,9 @@ class MarketBriefingEngine:
         # handed to the LLM above. Catches invented figures with no basis
         # at all (the 2026-09-23 "P/C ratio of 8.96" incident) that a
         # prompt instruction alone did not stop. See ollama/number_grounding.py.
-        from ollama.number_grounding import check_numbers_grounded
+        from ollama.number_grounding import (
+            check_numbers_grounded, _annotate_inline, _BANNER_TEMPLATE, _FOOTER_TEMPLATE,
+        )
 
         grounding_input = content
         grounding = check_numbers_grounded(content, data_context)
@@ -1079,7 +1168,33 @@ class MarketBriefingEngine:
         if "fallback" in context_guard:
             context_guard["fallback"]["input_role"] = "data_summary"
             context_guard["fallback"]["input_digest"] = asdict(_publication_digest(fallback_source_text))
+        # Bind only retained narrative, excluding generated banner and numeric
+        # warning footer. Use the unchanged guard's actual layout primitives;
+        # a future incompatible layout fails closed for appendix selection.
+        retained_narrative = _annotate_inline(grounding_input, list(grounding.ungrounded))
+        warning_prefix = (_BANNER_TEMPLATE.format(
+            ungrounded=len(grounding.ungrounded), total=grounding.total_numbers,
+            ratio=grounding.ungrounded_ratio,
+        ) if grounding.banner_triggered else "")
+        warning_suffix = (_FOOTER_TEMPLATE.format(values=", ".join(
+            dict.fromkeys(mention.raw for mention in grounding.ungrounded)
+        )) if grounding.ungrounded else "")
+        narrative_span = ((len(warning_prefix), len(warning_prefix) + len(retained_narrative))
+                          if content == warning_prefix + retained_narrative + warning_suffix else None)
+        evidence_footer = _publication_evidence_footer(
+            snapshot, stage_diagnostics, narrative_span=narrative_span,
+        )
+        if evidence_footer["rendered_text"]:
+            content += evidence_footer["rendered_text"]
+            # Receipt/emitted digest binds all displayed text. Matching and
+            # numeric warnings still use only the original generation context.
+            stage_diagnostics = _publication_stage_diagnostics(
+                candidate, grounding_input, content, data_context, snapshot, fallback_source_text,
+            )
+        grounding_stats["checked_scope"] = "narrative_before_evidence_appendix"
+        grounding_stats["publication_evidence_footer"] = evidence_footer
         snapshot["publication_stage_diagnostics"] = stage_diagnostics
+        snapshot["publication_evidence_footer"] = evidence_footer
 
         result = {
             "content": content,
@@ -1092,6 +1207,7 @@ class MarketBriefingEngine:
             "publication_context_guard": context_guard,
             "publication_status": publication_status,
             "publication_stage_diagnostics": stage_diagnostics,
+            "publication_evidence_footer": evidence_footer,
         }
 
         if save:
