@@ -283,6 +283,112 @@ def test_non_session_never_initializes_provider_or_publishes(
     assert puller.engine.rows == []
 
 
+# grid-hermes 2026-10-20 04:00:49Z (00:00:49 ET, session day 2026-10-20):
+# the non-session gate had correctly fired one minute earlier (03:59:28Z was
+# still 2026-10-19 ET) but at midnight ET the UTC and ET dates agree, the
+# provider was contacted, every quote still carried 2026-10-19's
+# regularMarketTime, and all 211 tickers ended FAILED "incomplete options
+# chain response" -> pull_log smart:options FAILED "no ticker succeeded"
+# (rows 9730 and the 30-min cooldown retry 9737). A session that has not
+# opened yet is nothing-to-capture, not a failure.
+HERMES_0400Z = datetime(2026, 10, 20, 4, 0, 49, tzinfo=timezone.utc)
+
+
+class _PriorSessionYahoo(_Yahoo):
+    """Provider double that replays the midnight-ET journal: quotes dated yesterday."""
+
+    is_available = True
+
+    def __init__(self) -> None:
+        super().__init__([int((HERMES_0400Z + timedelta(days=10)).timestamp())], [100.0])
+
+    def get_options(self, ticker: str, expiry: int | None = None) -> dict | None:
+        page = super().get_options(ticker, expiry)
+        assert page is not None
+        page["quote"]["regularMarketTime"] = int(
+            datetime(2026, 10, 19, 20, tzinfo=timezone.utc).timestamp()  # 16:00 ET 10-19
+        )
+        return page
+
+
+def test_hermes_0400z_pre_open_run_is_skipped_not_failed(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    yahoo = _PriorSessionYahoo()
+    monkeypatch.setattr(options, "_utc_now", lambda: HERMES_0400Z)
+    monkeypatch.setattr(options, "YahooOptionsClient", lambda: yahoo)
+    monkeypatch.setattr(options, "catalyst_options_universe", lambda *_a, **_k: ["ABCL"])
+
+    result = puller.pull_all(capture_source="smart_scheduler")
+
+    summary = result.summary
+    assert summary["status"] == "SKIPPED"  # main: FAILED "no ticker succeeded"
+    assert summary["error"] is None
+    assert yahoo.calls == 0  # never contacted the provider before the open
+    assert {r["status"] for r in result} == {"SKIPPED"}
+    assert {r["reason"] for r in result} == {"pre-session"}
+    assert len(result) == len(options.EQUITY_TICKERS) + 1
+    assert summary["reason"] == "no ticker capture completed: pre-session"
+    assert summary["scope"] == "full_universe"
+    assert puller.engine.rows == []
+
+
+@pytest.mark.parametrize("now", [
+    HERMES_0400Z,
+    datetime(2026, 10, 20, 13, 29, tzinfo=timezone.utc),   # 09:29 EDT
+    datetime(2026, 12, 1, 14, 29, tzinfo=timezone.utc),    # 09:29 EST
+])
+def test_pre_open_session_day_skips_without_provider(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    monkeypatch.setattr(options, "_utc_now", lambda: now)
+    monkeypatch.setattr(options, "YahooOptionsClient",
+                        lambda: pytest.fail("pre-open must not contact provider"))
+    result = puller.pull_all(tickers=["SPY", "QQQ"], max_expirations=6)
+    assert result == [
+        {"ticker": "SPY", "status": "SKIPPED", "rows_inserted": 0, "reason": "pre-session"},
+        {"ticker": "QQQ", "status": "SKIPPED", "rows_inserted": 0, "reason": "pre-session"},
+    ]
+    assert result.summary["status"] == "SKIPPED"
+    assert puller.engine.rows == []
+
+
+@pytest.mark.parametrize("now", [
+    datetime(2026, 10, 20, 13, 30, tzinfo=timezone.utc),   # 09:30 EDT: open
+    datetime(2026, 12, 1, 14, 30, tzinfo=timezone.utc),    # 09:30 EST: open
+    datetime(2026, 10, 20, 22, 13, tzinfo=timezone.utc),   # 18:13 ET after-hours capture
+])
+def test_open_and_after_hours_still_reach_the_provider(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    contacted: list[str] = []
+
+    class _Unavailable:
+        is_available = False
+
+        def __init__(self) -> None:
+            contacted.append("yes")
+
+    monkeypatch.setattr(options, "_utc_now", lambda: now)
+    monkeypatch.setattr(options, "YahooOptionsClient", _Unavailable)
+    result = puller.pull_all(tickers=["SPY"], max_expirations=6)
+    assert contacted == ["yes"]
+    assert result[0]["error"] == "Yahoo auth failed"  # provider path, not the gate
+
+
+def test_pull_ticker_direct_pre_open_is_skipped(
+    puller: options.OptionsPuller, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    yahoo = _PriorSessionYahoo()
+    puller._yahoo = yahoo
+    monkeypatch.setattr(options, "_utc_now", lambda: HERMES_0400Z)
+    result = puller._pull_ticker("SPY", HERMES_0400Z.date().isoformat())
+    assert result == {"ticker": "SPY", "status": "SKIPPED", "rows_inserted": 0,
+                      "reason": "pre-session"}
+    assert yahoo.calls == 0
+    assert puller.engine.rows == []
+
+
 @pytest.mark.parametrize("reported", [
     None,
     int((SESSION_NOW - timedelta(days=1)).timestamp()),

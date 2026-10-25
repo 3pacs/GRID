@@ -159,19 +159,14 @@ def test_grid_decision_stack_uses_workbook_grid_and_fundamentals():
         },
         "source_freshness": [
             {"source": "yfinance", "state": "fresh"},
-            {"source": "finviz_fundamentals", "state": "fresh"},
+            {"source": "SEC_EDGAR_Fundamentals", "state": "fresh"},
         ],
     }
     finviz = {
-        "status": "ready",
-        "field_count": 5,
-        "freshness": {"state": "fresh", "label": "fresh"},
-        "fields": {
-            "forward_pe": {"parsed": 22.0},
-            "roe": {"parsed": 19.0},
-            "debt_equity": {"parsed": 0.4},
-            "profit_margin": {"parsed": 16.0},
-        },
+        "status": "ready", "source": "SEC EDGAR/XBRL", "field_count": 1,
+        "freshness": {"state": "fresh", "label": "Filed 2026-06-01"},
+        "fields": {"revenue": {"parsed": 100}},
+        "unavailable_fields": {"forward_pe": None, "roe": None},
     }
     decision = _grid_decision_stack(
         summary,
@@ -184,4 +179,6 @@ def test_grid_decision_stack_uses_workbook_grid_and_fundamentals():
 
     assert decision["score"] >= 45
     assert decision["stance"] in {"Deep review first", "Watchlist with checks"}
-    assert any(card["source"] == "Finviz fundamentals" for card in decision["cards"])
+    card = next(card for card in decision["cards"] if card["source"] == "SEC EDGAR/XBRL reported fundamentals")
+    assert card["state"] == "missing" and card["points"] == 0
+    assert any("unavailable from SEC" in blocker for blocker in decision["blockers"])

@@ -61,7 +61,13 @@ def world(monkeypatch: pytest.MonkeyPatch) -> _World:
         w.locks_released += 1
 
     monkeypatch.setattr(sched, "_release_flow_materialize_lock", _release)
-    return w
+    yield w
+    # Every worker started through this fixture belongs to this test. Timeout
+    # cases release their own Event in finally before this finite cleanup.
+    worker = sched._flow_materialize_worker
+    if worker is not None:
+        worker.join(1)
+        assert not worker.is_alive(), "owned flow test worker did not finish"
 
 
 SUCCESS_SUMMARY = {
@@ -182,29 +188,32 @@ def test_unknown_summary_status_is_receipted_failed(world) -> None:
 def test_receipt_row_lands_in_pull_log(monkeypatch) -> None:
     engine = create_engine("sqlite://", poolclass=StaticPool,
                            connect_args={"check_same_thread": False})
-    with engine.begin() as conn:
-        conn.execute(text(
-            "CREATE TABLE pull_log (id INTEGER PRIMARY KEY, puller_name TEXT, "
-            "source_id INTEGER, started_at TEXT, completed_at TEXT, status TEXT, "
-            "rows_inserted INTEGER, error_message TEXT, node_name TEXT)"))
-    fake_db = ModuleType("db")
-    fake_db.get_engine = lambda: engine
-    monkeypatch.setitem(sys.modules, "db", fake_db)
-    fake_fm = ModuleType("ingestion.flow_materializer")
-    fake_fm.sync_all = lambda _engine: dict(SUCCESS_SUMMARY)
-    monkeypatch.setitem(sys.modules, "ingestion.flow_materializer", fake_fm)
-    monkeypatch.setattr(sched, "_flow_materialize_worker", None)
-    # SQLite has no advisory locks; the lock is covered by its own tests.
-    monkeypatch.setattr(sched, "_try_flow_materialize_lock", lambda _engine: object())
-    monkeypatch.setattr(sched, "_release_flow_materialize_lock", lambda _conn: None)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(
+                "CREATE TABLE pull_log (id INTEGER PRIMARY KEY, puller_name TEXT, "
+                "source_id INTEGER, started_at TEXT, completed_at TEXT, status TEXT, "
+                "rows_inserted INTEGER, error_message TEXT, node_name TEXT)"))
+        fake_db = ModuleType("db")
+        fake_db.get_engine = lambda: engine
+        monkeypatch.setitem(sys.modules, "db", fake_db)
+        fake_fm = ModuleType("ingestion.flow_materializer")
+        fake_fm.sync_all = lambda _engine: dict(SUCCESS_SUMMARY)
+        monkeypatch.setitem(sys.modules, "ingestion.flow_materializer", fake_fm)
+        monkeypatch.setattr(sched, "_flow_materialize_worker", None)
+        # SQLite has no advisory locks; the lock is covered by its own tests.
+        monkeypatch.setattr(sched, "_try_flow_materialize_lock", lambda _engine: object())
+        monkeypatch.setattr(sched, "_release_flow_materialize_lock", lambda _conn: None)
 
-    sched.run_flow_materialize_daily(now_utc=_at(23, 15))
+        sched.run_flow_materialize_daily(now_utc=_at(23, 15))
 
-    with engine.connect() as conn:
-        row = conn.execute(text(
-            "SELECT puller_name, status, rows_inserted, error_message FROM pull_log")).one()
-    assert row[:3] == ("FlowMaterialize_Daily", "SUCCESS", 26)
-    assert "etf_flows=7" in row[3]
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT puller_name, status, rows_inserted, error_message FROM pull_log")).one()
+        assert row[:3] == ("FlowMaterialize_Daily", "SUCCESS", 26)
+        assert "etf_flows=7" in row[3]
+    finally:
+        engine.dispose()
 
 
 # ── failures are logged, not raised ───────────────────────────────────────
@@ -218,7 +227,8 @@ def test_sync_all_exception_is_logged_and_receipted_not_raised(world, monkeypatc
     out = sched.run_flow_materialize_daily(now_utc=_at(23, 15))
 
     assert out == {"status": "FAILED", "error": "RuntimeError: db down"}
-    assert world.receipts == [("FlowMaterialize_Daily", "FAILED", 0, "RuntimeError: db down")]
+    # The worker may have committed earlier tables before raising.
+    assert world.receipts == [("FlowMaterialize_Daily", "FAILED", None, "RuntimeError: db down")]
     assert log.error.called
 
 
@@ -235,18 +245,27 @@ def test_missing_engine_is_logged_not_raised(world, monkeypatch) -> None:
 
 def test_budget_overrun_is_receipted_failed_and_blocks_a_second_start(world) -> None:
     release = threading.Event()
-    world.sync_all.side_effect = lambda _engine: release.wait(10) or dict(SUCCESS_SUMMARY)
+    started = threading.Event()
+
+    def _sync(_engine):
+        started.set()
+        assert release.wait(2), "owned flow test release deadline"
+        return dict(SUCCESS_SUMMARY)
+
+    world.sync_all.side_effect = _sync
 
     try:
         out = sched.run_flow_materialize_daily(now_utc=_at(23, 15), budget_s=0.05)
+        assert started.wait(1), "owned flow test worker did not start"
         assert out["status"] == "FAILED" and "budget exceeded" in out["error"]
-        assert world.receipts[0][:3] == ("FlowMaterialize_Daily", "FAILED", 0)
+        assert world.receipts[0][:3] == ("FlowMaterialize_Daily", "FAILED", None)
         # The worker is still alive: the next slot must not stack another run.
         assert sched.run_flow_materialize_daily(now_utc=_at(23, 15), budget_s=0.05) is None
         assert world.sync_all.call_count == 1
     finally:
         release.set()
-        sched._flow_materialize_worker.join(5)
+        sched._flow_materialize_worker.join(1)
+        assert not sched._flow_materialize_worker.is_alive()
 
 
 # ── cross-process advisory lock (review H1) ───────────────────────────────
@@ -289,14 +308,23 @@ def test_lock_is_released_when_sync_all_raises(world) -> None:
 
 def test_lock_stays_held_through_a_budget_overrun_until_sync_all_ends(world) -> None:
     release = threading.Event()
-    world.sync_all.side_effect = lambda _engine: release.wait(10) or dict(SUCCESS_SUMMARY)
+    started = threading.Event()
+
+    def _sync(_engine):
+        started.set()
+        assert release.wait(2), "owned flow test release deadline"
+        return dict(SUCCESS_SUMMARY)
+
+    world.sync_all.side_effect = _sync
 
     try:
         sched.run_flow_materialize_daily(now_utc=_at(23, 15), budget_s=0.05)
+        assert started.wait(1), "owned flow test worker did not start"
         assert world.locks_released == 0  # overrun receipted, but the lock is still held
     finally:
         release.set()
-        sched._flow_materialize_worker.join(5)
+        sched._flow_materialize_worker.join(1)
+        assert not sched._flow_materialize_worker.is_alive()
     assert world.locks_released == 1
 
 

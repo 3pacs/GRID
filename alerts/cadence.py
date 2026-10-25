@@ -75,11 +75,13 @@ accident."""
 _METADATA_CADENCE: dict[str, Cadence] = {
     "DAILY": DAILY,
     "REALTIME": DAILY,
+    "INTRADAY": DAILY,  # live source_catalog CHECK allows INTRADAY; explicit, same tier as REALTIME/EOD
     "EOD": DAILY,
     "WEEKLY": WEEKLY,
     "MONTHLY": MONTHLY,
     "QUARTERLY": QUARTERLY,
     "BIANNUAL": QUARTERLY,  # coarsest supported tier; still far tighter than "never flag"
+    "ANNUAL": QUARTERLY,  # live source_catalog CHECK allows ANNUAL; coarsest tier (was falling to DAILY)
 }
 
 # Explicit per-source cadence, from GRID-STALE-SOURCES-AUDIT-20260929.md

@@ -16,8 +16,8 @@ import hashlib
 import math
 import time
 import uuid
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from dataclasses import asdict, dataclass
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -45,6 +45,70 @@ def _publication_digest(value: str | None) -> PublicationTextDigest:
         return PublicationTextDigest(hashlib.sha256(raw).hexdigest(), len(value), len(raw), "full_in_memory")
     except Exception:
         return PublicationTextDigest(None, None, None, "capture_failed")
+
+
+def _publication_stage_diagnostics(candidate: str | None, grounding_input: str,
+                                   emitted: str, data_context: str,
+                                   snapshot: dict[str, Any], fallback: str | None) -> dict[str, Any]:
+    """Trace existing numeric/context scopes without adding evidence to the pool.
+
+    Digests and offsets bind each exact stage. Snapshot presence is only a
+    diagnostic use of the SAME numeric matcher, never authority for semantics,
+    source truth, freshness, PIT, or the existing grounding result.
+    """
+    from ollama.number_grounding import _is_grounded, extract_numeric_mentions
+
+    context_pool = extract_numeric_mentions(data_context or "")
+    observations = []
+    for category in ("equities", "equity_volume", "rates", "credit", "volatility",
+                     "commodities", "fx", "macro", "features", "options"):
+        data = snapshot.get(category)
+        for name, info in (data.items() if isinstance(data, dict) else []):
+            if not isinstance(info, dict):
+                continue
+            value = info.get("value")
+            try:
+                finite = type(value) in (int, float) and math.isfinite(value)
+            except OverflowError:
+                finite = False
+            if not finite:
+                continue
+            metadata = {key: info.get(key) if type(info.get(key)) is str else "unknown"
+                        for key in ("measure", "unit", "basis", "denominator", "window", "universe")}
+            metadata["comparator"] = "declared_previous_only; see context guard" if isinstance(info.get("previous"), dict) else "unknown"
+            observations.append((f"{category}.{name}.value",
+                                 extract_numeric_mentions(str(value), include_small_integers=True), metadata,
+                                 f"- {category}:{name}: raw value={value}"))
+
+    roles = {}
+    for role, text in (("candidate", candidate), ("grounding_input", grounding_input), ("emitted", emitted)):
+        digest = asdict(_publication_digest(text))
+        if not isinstance(text, str):
+            roles[role] = {"digest": digest, "numeric_mentions": [], "availability": "unknown"}
+            continue
+        entries = []
+        for mention in extract_numeric_mentions(text):
+            matches = []
+            for path, pool, metadata, display in observations:
+                if _is_grounded(mention, pool):
+                    matches.append({"path": path, "semantic_metadata": metadata,
+                                    "displayed_fallback_origin": bool(
+                                        role != "candidate" and fallback is not None and display in fallback)})
+            entries.append({"start": mention.start, "end": mention.end,
+                            "generation_context_numeric_match": _is_grounded(mention, context_pool),
+                            "retained_snapshot_presence": "present" if matches else "unknown",
+                            "snapshot_matches": matches,
+                            "source_truth": "unknown", "freshness": "unknown",
+                            "semantic_authority_from_numeric_match": False})
+        roles[role] = {"digest": digest, "numeric_mentions": entries,
+                       "availability": "full_in_memory", "span_binding": role}
+    return {"schema": "grid.publication_stage_diagnostics.v1", "roles": roles,
+            "generation_context_digest": asdict(_publication_digest(data_context)),
+            "numeric_pool": "original_generation_data_context_only",
+            "snapshot_presence_is_grounding_permission": False,
+            "retained_snapshot_scan_scope": "numeric value fields in declared market/feature/options categories; unmatched is UNKNOWN",
+            "source_truth": "unknown", "freshness": "unknown",
+            "scope": "current_invocation_only; no historical producer adoption proof"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,6 +210,54 @@ def _publication_guard(role: str, content: str | None, verdict: dict[str, Any] |
     )
 
 
+_YF_SNAPSHOT_LOOKBACK_DAYS = 14
+
+
+def _read_yf_snapshot_value(conn: Any, sid: str, now: datetime) -> dict[str, Any] | None:
+    """Latest Yahoo daily value for ``sid`` without serving an in-progress capture.
+
+    ``raw_series`` keeps every pull as a vintage, and a same-day pull taken
+    during the session (INCOMPLETE) or an unmarked legacy opening-minute pull
+    is not a completed-session value. So the read goes through
+    ``store.observations`` (SUCCESS only, newest vintage per date):
+
+    1. the newest policy-eligible daily capture (``read_daily_policy_n``, the
+       reader market_diary uses), labelled ``policy_eligible_daily_capture``;
+    2. only for tickers that ``price_close_contract.UNKNOWN_DAILY_TICKERS``
+       lists as having no daily session policy at all, the newest pull,
+       labelled ``unqualified_latest_pull`` / ``session_finality=unknown`` so
+       the briefing states that completeness is not established;
+    3. otherwise ``None``: a policy-supported series with only INCOMPLETE or
+       unmarked captures is withheld rather than reported, including when its
+       newest label is outside the contract's audited year or on an
+       NYSE-closed day (membership in the sessionless set, not a None
+       ``daily_capture_boundary`` for that one date, decides the fallback).
+    """
+    import price_close_contract
+    from store.observations import read_daily_policy_n, read_latest
+
+    qualified = read_daily_policy_n(
+        conn, sid, 1, source="yfinance",
+        start=now.date() - timedelta(days=_YF_SNAPSHOT_LOOKBACK_DAYS), as_of_ts=now,
+    )
+    if qualified:
+        obs, basis, finality = qualified[0], "policy_eligible_daily_capture", "policy_eligible_not_provider_final"
+    else:
+        obs = read_latest(conn, sid, source="yfinance", as_of_ts=now)
+        ticker = sid.split(":")[1] if sid.count(":") >= 2 else ""
+        if obs is None or ticker not in price_close_contract.UNKNOWN_DAILY_TICKERS:
+            return None
+        basis, finality = "unqualified_latest_pull", "unknown"
+    return {
+        "value": round(obs.value, 4),
+        "date": str(obs.obs_date),
+        "source": obs.source or "yfinance",
+        "basis": basis,
+        "session_finality": finality,
+        "collected_at": obs.pull_timestamp.isoformat() if obs.pull_timestamp else None,
+    }
+
+
 class MarketBriefingEngine:
     """Generates AI-powered market condition briefings using Ollama.
 
@@ -230,9 +342,11 @@ class MarketBriefingEngine:
                     "equity_volume": [
                         "YF:^GSPC:volume",
                     ],
+                    # FRED series are stored bare in raw_series (fred.py
+                    # writes the FRED id as series_id), never "FRED:<id>".
+                    # DGS10 is not in FRED_SERIES_LIST, so DGS5 stands in.
                     "rates": [
-                        "FRED:DFF", "FRED:T10Y2Y", "FRED:T10Y3M",
-                        "FRED:DGS10", "FRED:DGS2",
+                        "DFF", "T10Y2Y", "T10Y3M", "DGS2", "DGS5",
                     ],
                     "credit": [
                         "YF:HYG:close", "YF:LQD:close", "YF:JNK:close",
@@ -249,22 +363,32 @@ class MarketBriefingEngine:
                         "YF:UUP:close", "YF:FXE:close", "YF:FXY:close",
                         "YF:EEM:close",
                     ],
+                    "macro": [
+                        "CPIAUCSL", "PCEPILFE", "UNRATE", "RSAFS", "UMCSENT",
+                        "T5YIE",
+                    ],
                 }
 
+                now_utc = datetime.now(timezone.utc)
                 for category, series_ids in key_series.items():
                     for sid in series_ids:
+                        # Extract a clean label
+                        parts = sid.split(":")
+                        label = parts[1] if len(parts) > 1 else sid
+                        if sid.startswith("YF:"):
+                            entry = _read_yf_snapshot_value(conn, sid, now_utc)
+                            if entry:
+                                snapshot[category][label] = entry
+                            continue
                         row = conn.execute(
                             text(
                                 "SELECT value, obs_date FROM raw_series "
                                 "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                                "ORDER BY obs_date DESC LIMIT 1"
+                                "ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1"
                             ),
                             {"sid": sid},
                         ).fetchone()
                         if row:
-                            # Extract a clean label
-                            parts = sid.split(":")
-                            label = parts[1] if len(parts) > 1 else sid
                             snapshot[category][label] = {
                                 "value": round(row[0], 4),
                                 "date": str(row[1]),
@@ -495,6 +619,11 @@ class MarketBriefingEngine:
                  f"vintage={info.get('vintage_date') or 'unknown'}",
                  f"basis={info.get('price_basis') or info.get('basis') or 'unknown'}",
                  f"session_finality={info.get('session_finality') if info.get('session_finality') not in (None, '') else 'unknown'}"]
+        parts.append(f"measure={info.get('measure') or 'unknown'}")
+        if category == "credit" and name.upper() in {"HYG", "LQD", "JNK", "EMB"}:
+            parts.append("collector observation=ETF price; not a measured credit spread or OAS")
+        parts.extend(f"{key}={info.get(key) if type(info.get(key)) is str else 'unknown'}"
+                     for key in ("denominator", "window", "universe"))
         if category == "features":
             normalization = info.get("normalization")
             if isinstance(normalization, dict):
@@ -531,7 +660,7 @@ class MarketBriefingEngine:
         lines.append(f"## Market Data Snapshot — {snapshot['timestamp']} (assembly time, not an evidence clock)")
         lines.append("")
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
             data = snapshot.get(category, {})
             if data:
                 lines.append(f"### {category.upper()}")
@@ -572,6 +701,20 @@ class MarketBriefingEngine:
                      "directional score. Neither measures market-wide certainty or calibrated outcome probability.")
         lines.append("- Aggregate PCR does not identify dealer side, inventory or causal exposure. "
                      "No validated positioning policy or action threshold is supplied.")
+        lines.append("- One SPY OI level supplies neither traded volume nor a temporal rise. "
+                     "A trend needs compatible instrument/measure/unit/population/expiry/date records "
+                     "with source receipts; it still cannot identify participant motives.")
+        lines.append("- Credit ETF prices and HYG/LQD price-relative proxies are not measured spreads. "
+                     "Stability needs a compatible dated comparator. Insider buy share uses buys/(buys+sells); "
+                     "buy/sell uses buys/sells, sell/buy uses sells/buys. Missing counts, denominator, "
+                     "recipe, universe or window remain unknown; do not reconstruct market-wide aggregates.")
+        # Surface already supplied typed observations/comparators, never invent
+        # an evidence producer or turn these declarations into verified truth.
+        declared = [record for record in facts["measurement_basis"]
+                    if record["source_id"] and record["receipt_id"]]
+        if declared:
+            lines.append("Supplied measurement declarations (data only; source truth/PIT unknown): "
+                         + json.dumps(declared, sort_keys=True, ensure_ascii=True))
         lines.append("")
 
         # Feature values — select most informative via orthogonality
@@ -822,6 +965,7 @@ class MarketBriefingEngine:
         candidate_guard = None
         fallback_guards: list[PublicationGuardReceipt] = []
         grounding_input = None
+        fallback_source_text = None
         ungrounded_count = None
         file_ack = database_ack = "not_requested" if not save else "not_attempted"
         row_reference = None
@@ -871,6 +1015,7 @@ class MarketBriefingEngine:
         if content is None:
             publication_status.update(content_kind="data_summary", reason="model_unavailable")
             content = self._generate_fallback_briefing(snapshot, reason="model_unavailable")
+            fallback_source_text = content
             log.warning("Model response unavailable — using fallback briefing")
 
         from ollama.number_grounding import annotate_publication_context, check_publication_claims
@@ -890,6 +1035,7 @@ class MarketBriefingEngine:
             # intact with a numeric footnote. Only future generations change.
             publication_status.update(content_kind="data_summary", reason="claim_guard_withheld")
             summary = self._generate_fallback_briefing(snapshot, reason="claim_guard_withheld")
+            fallback_source_text = summary
             summary_guard = check_publication_claims(summary, actor_evidence=snapshot.get("actor_evidence"))
             if receipt_callback is not None:
                 fallback_guards.append(_publication_guard("DATA_SUMMARY", summary, summary_guard))
@@ -923,6 +1069,17 @@ class MarketBriefingEngine:
         grounding_stats = grounding.to_dict()
         ungrounded_count = grounding_stats.get("ungrounded_count")
         snapshot["grounding"] = grounding_stats
+        stage_diagnostics = _publication_stage_diagnostics(
+            candidate, grounding_input, content, data_context, snapshot, fallback_source_text,
+        )
+        # The context omission offsets refer to its original unmodified stage,
+        # not to final numeric annotations or the replaced candidate.
+        context_guard["input_role"] = "candidate" if candidate is not None else "data_summary"
+        context_guard["input_digest"] = asdict(_publication_digest(candidate if candidate is not None else fallback_source_text))
+        if "fallback" in context_guard:
+            context_guard["fallback"]["input_role"] = "data_summary"
+            context_guard["fallback"]["input_digest"] = asdict(_publication_digest(fallback_source_text))
+        snapshot["publication_stage_diagnostics"] = stage_diagnostics
 
         result = {
             "content": content,
@@ -934,6 +1091,7 @@ class MarketBriefingEngine:
             "publication_claim_guard": claim_guard,
             "publication_context_guard": context_guard,
             "publication_status": publication_status,
+            "publication_stage_diagnostics": stage_diagnostics,
         }
 
         if save:
@@ -1158,7 +1316,7 @@ class MarketBriefingEngine:
             "",
         ]
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx"]:
+        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
             data = snapshot.get(category, {})
             if data:
                 lines.append(f"## {category.replace('_', ' ').title()}")
