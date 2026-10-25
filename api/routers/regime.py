@@ -115,6 +115,31 @@ async def simulate_weights(
     return {"ok": True, "result": result}
 
 
+def _utc_today() -> date:
+    """The current UTC calendar date.
+
+    Reading timestamps are stored in UTC, so their age is measured against the
+    UTC date -- never ``date.today()``, the host's local date, which lags UTC by
+    a day every evening west of Greenwich and made ``staleness_days`` one short.
+    """
+    return datetime.now(timezone.utc).date()
+
+
+def _utc_date(value: datetime | date) -> date:
+    """UTC calendar date of a stored timestamp or date.
+
+    An offset-aware datetime is converted to UTC before its date is taken
+    (``2026-10-22T17:30:00-07:00`` is ``2026-10-23``); a naive datetime is
+    taken as UTC (griddb runs Etc/UTC and the engine sets no session
+    TimeZone); a plain ``date`` is returned unchanged.
+    """
+    if isinstance(value, datetime):
+        if value.tzinfo is not None:
+            value = value.astimezone(timezone.utc)
+        return value.date()
+    return value
+
+
 def _regime_data_as_of(engine, reading_date: date | None) -> date | None:
     """Return ``regime_history.data_as_of`` for the row describing ``reading_date``.
 
@@ -139,8 +164,7 @@ def _regime_data_as_of(engine, reading_date: date | None) -> date | None:
         return None
     if row is None or row[0] is None:
         return None
-    value = row[0]
-    return value.date() if isinstance(value, datetime) else value
+    return _utc_date(row[0])
 
 
 @router.get("/current", response_model=RegimeCurrentResponse)
@@ -209,11 +233,12 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     as_of_date = ""
     staleness_days: int | None = None
     reading_date: date | None = None
+    today = _utc_today()  # one value per response: both ages share it
     ts = latest[6]
     if ts is not None:
-        reading_date = ts.date() if isinstance(ts, datetime) else ts
+        reading_date = _utc_date(ts)
         as_of_date = reading_date.isoformat()
-        staleness_days = (date.today() - reading_date).days
+        staleness_days = (today - reading_date).days
 
     # The reading's own date says when it was computed, not how old the data
     # behind it is. Those are the same number only while the pipeline is
@@ -221,7 +246,7 @@ def get_current(_token: str = Depends(require_auth)) -> RegimeCurrentResponse:
     data_as_of_date = _regime_data_as_of(engine, reading_date)
     data_as_of = data_as_of_date.isoformat() if data_as_of_date else ""
     data_staleness_days = (
-        (date.today() - data_as_of_date).days if data_as_of_date else None
+        (today - data_as_of_date).days if data_as_of_date else None
     )
 
     return RegimeCurrentResponse(

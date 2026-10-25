@@ -31,7 +31,8 @@ def isolated(path, names=None, extra=None):
     module = types.ModuleType('_publication_test_' + path.replace('/', '_').replace('.', '_'))
     sys.modules[module.__name__] = module
     module.__dict__.update({'log': Mock(), 'Any': object, 'math': math, 'json': json,
-                            'dataclass': dataclasses.dataclass, 'hashlib': hashlib, 'uuid': uuid,
+                            'dataclass': dataclasses.dataclass, 'asdict': dataclasses.asdict,
+                            'hashlib': hashlib, 'uuid': uuid,
                             'datetime': datetime, 'date': date, 'timezone': timezone,
                             'text': str, 'RRPONTSYD_TO_MILLIONS': 1000.0,
                             'DEFAULT_ACCURACY': 0.5, 'BRIEFING_DURATION_TARGET': 'one minute'})
@@ -50,7 +51,7 @@ AUDIO = isolated('intelligence/audio_briefing.py',
                   'check_publication_claims': GUARD.check_publication_claims,
                   'PUBLICATION_EVIDENCE_RULES': GUARD.PUBLICATION_EVIDENCE_RULES})
 MARKET = isolated('ollama/market_briefing.py', [
-    'MarketBriefingEngine', 'PublicationTextDigest', '_publication_digest',
+    'MarketBriefingEngine', 'PublicationTextDigest', '_publication_digest', '_publication_stage_diagnostics',
     'PublicationGuardReceipt', 'PublicationReceipt', '_publication_call_binding', '_publication_guard',
 ])
 
@@ -1179,6 +1180,22 @@ class PublicationReceiptConsumerTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertIs(result['publication_receipt'], events[0])
         return result, events[0], e, transport, writes
+
+    def test_shared_loader_stage_diagnostics_uses_real_helper_and_asdict(self):
+        self.assertIs(self.market._publication_stage_diagnostics.__globals__, self.market.__dict__)
+        self.assertIs(self.market.asdict, dataclasses.asdict)
+        text = 'SPY price 123.45.'
+        diagnostics = self.market._publication_stage_diagnostics(
+            text, text, text, text,
+            {'equities': {'SPY': {'value': 123.45}}}, None)
+        self.assertEqual(diagnostics['schema'], 'grid.publication_stage_diagnostics.v1')
+        for role in ('candidate', 'grounding_input', 'emitted'):
+            stage = diagnostics['roles'][role]
+            self.assertEqual(stage['digest']['sha256'], self.api.sha(text))
+            self.assertTrue(stage['numeric_mentions'])
+            self.assertTrue(stage['numeric_mentions'][0]['generation_context_numeric_match'])
+        self.assertFalse(diagnostics['snapshot_presence_is_grounding_permission'])
+        self.assertEqual(diagnostics['source_truth'], 'unknown')
 
     def test_bound_supported_clients_full_request_no_durability_claim(self):
         for kind in ['ollama', 'llamacpp']:
