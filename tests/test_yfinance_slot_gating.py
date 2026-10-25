@@ -596,19 +596,31 @@ def test_fallback_receipt_keeps_its_outcome_separate_from_main_freshness(
     assert "purpose=completed_spy_close_fallback; target_session=2026-10-16" in args[6]
 
 
-def test_fallback_exception_gets_its_own_failure_receipt_and_keeps_existing_handling(world, monkeypatch) -> None:
-    _, fallback_receipt = _capture_yfinance_receipts(monkeypatch)
+def test_fallback_exception_withholds_unqualified_receipt_and_keeps_existing_handling(world, monkeypatch) -> None:
+    contexts, fallback_receipt = _capture_yfinance_receipts(monkeypatch)
+    log = MagicMock()
+    monkeypatch.setattr(sched, "log", log)
     helper = MagicMock(side_effect=RuntimeError("synthetic fallback failure"))
     monkeypatch.setattr(sched, "_pull_completed_spy_close", helper)
 
     _, advanced = _daily(world, _items())
 
-    helper.assert_called_once()
+    helper.assert_called_once_with(world.yf_puller, "2026-10-13")
+    [(name, ctx)] = contexts
+    assert name == "YFinance_Daily"
+    ctx.record_rows.assert_called_once_with(347)  # main rows only
+    ctx.set_status.assert_not_called()  # fallback failure does not rewrite the main outcome
+    ctx.set_note.assert_called_once()
+    assert ctx.set_note.call_args.args[0].startswith("SUCCESS:")
     assert not advanced  # existing outer exception handler precedes freshness
-    args = fallback_receipt.call_args.args
-    assert args[4:6] == ("FAILED", None)  # exception does not prove zero committed writes
-    assert "RuntimeError: synthetic fallback failure" in args[6]
-    assert "purpose=completed_spy_close_fallback; target_session=unknown" in args[6]
+    # Unknown failed writes get neither an unqualified NULL receipt nor a fabricated zero/SUCCESS.
+    fallback_receipt.assert_not_called()
+    log.error.assert_called_once_with(
+        "yfinance daily pull failed: {err}", err="synthetic fallback failure",
+    )
+    alert = world.modules["alerts.email"].alert_on_failure_with_fix
+    alert.assert_called_once()
+    assert alert.call_args.args[:2] == ("yfinance", "synthetic fallback failure")
 
 
 def test_fallback_receipt_database_failure_does_not_change_fetch_or_freshness(world, monkeypatch) -> None:
