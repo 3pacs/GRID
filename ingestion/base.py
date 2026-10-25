@@ -31,6 +31,23 @@ _NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 410, 422, 451})
 # pullers run on a tight cycle; we'd rather skip than block.
 _MAX_RETRY_AFTER_SECONDS = 30.0
 
+# Shared declared-schema latency classes, aligned with merged PR #881 schema.sql.
+# Installed database compatibility remains a separate qualified assessment;
+# this normalizer does not migrate constraints or repair existing rows.
+VALID_LATENCY_CLASSES = frozenset(
+    {"REALTIME", "INTRADAY", "EOD", "WEEKLY", "MONTHLY", "QUARTERLY", "ANNUAL"}
+)
+DEFAULT_LATENCY_CLASS = "EOD"
+# Common puller spellings that are NOT in the constraint. Unknown values
+# (e.g. BATCH, HISTORICAL, STATIC) fall back to DEFAULT_LATENCY_CLASS with a
+# WARNING instead of raising CheckViolation and failing the whole pull.
+_LATENCY_CLASS_ALIASES = {
+    "DAILY": "EOD",
+    "HOURLY": "INTRADAY",
+    "YEARLY": "ANNUAL",
+    "ANNUALLY": "ANNUAL",
+}
+
 _VALID_REVISION_BEHAVIORS = frozenset({"NEVER", "RARE", "FREQUENT", "OVERWRITE"})
 _REVISION_BEHAVIOR_ALIASES = {
     "RARELY": "RARE",
@@ -52,6 +69,30 @@ def _normalize_revision_behavior(value: Any) -> str:
         v=value,
     )
     return "NEVER"
+
+
+def _normalize_latency_class(value: Any) -> str:
+    """Normalize puller SOURCE_CONFIG latency_class to a constraint-safe value.
+
+    Returns the value unchanged when it is already allowed, maps known
+    aliases (``DAILY`` -> ``EOD``), and otherwise logs a WARNING and returns
+    ``DEFAULT_LATENCY_CLASS`` so auto-create never trips
+    ``source_catalog_latency_class_check`` (grid-hermes journal,
+    2026-10-20 03:24:42Z: Asset_Registries declared ``DAILY``).
+    """
+    normalized = str(value or "").strip().upper()
+    normalized = _LATENCY_CLASS_ALIASES.get(normalized, normalized)
+    if normalized in VALID_LATENCY_CLASSES:
+        return normalized
+
+    log.warning(
+        "Unknown latency_class {v!r}; using {d} for source_catalog "
+        "(allowed: {allowed})",
+        v=value,
+        d=DEFAULT_LATENCY_CLASS,
+        allowed=sorted(VALID_LATENCY_CLASSES),
+    )
+    return DEFAULT_LATENCY_CLASS
 
 
 def _http_status_from_exc(exc: BaseException) -> int | None:
@@ -362,7 +403,9 @@ class BasePuller:
                     "name": self.SOURCE_NAME,
                     "url": self.SOURCE_CONFIG.get("base_url", ""),
                     "cost": self.SOURCE_CONFIG.get("cost_tier", "FREE"),
-                    "latency": self.SOURCE_CONFIG.get("latency_class", "EOD"),
+                    "latency": _normalize_latency_class(
+                        self.SOURCE_CONFIG.get("latency_class", DEFAULT_LATENCY_CLASS)
+                    ),
                     "pit": self.SOURCE_CONFIG.get("pit_available", False),
                     "rev": _normalize_revision_behavior(
                         self.SOURCE_CONFIG.get("revision_behavior", "NEVER")

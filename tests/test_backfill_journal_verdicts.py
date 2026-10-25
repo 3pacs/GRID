@@ -503,8 +503,19 @@ def test_every_benchmark_is_a_contract_eligible_completed_close_series():
     assert bjv.BENCHMARKS["btc"].sessions == bjv.UTC_24H_SESSIONS
     for bench in bjv.BENCHMARKS.values():
         assert bench.source == "yfinance"
-    # VIX is not a completed-close series under the contract and is not scored against.
-    assert "vix" not in bjv.BENCHMARKS and "^VIX" in contract.UNKNOWN_DAILY_TICKERS
+    # Capture qualification does not select a journal scoring benchmark.
+    assert "vix" not in bjv.BENCHMARKS
+    assert all(bench.series_id != "YF:^VIX:close" for bench in bjv.BENCHMARKS.values())
+    obs_date = date(2026, 10, 19)
+    pulled_at = next_morning(obs_date)
+    payload = contract.raw_capture_payload("^VIX", "close", obs_date, pulled_at, "1d")
+    assert payload["capture_state"] == "POLICY_ELIGIBLE"
+    assert payload["session_convention"] == "cboe_vol_index_ny_label_day_2026"
+    db = MemoryDB()
+    db.add("YF:^VIX:close", obs_date, 18.5, pulled_at, payload=payload)
+    assert [o.value for o in bjv.read_daily_policy_n(
+        db, "YF:^VIX:close", 1, start=obs_date, source="yfinance", as_of_ts=pulled_at,
+    )] == [18.5]
     assert set(bjv.INDIVIDUAL_STATE_BENCHMARKS.values()) <= set(bjv.BENCHMARKS)
 
 
