@@ -391,8 +391,8 @@ def test_sector_detail_adds_provenance_without_changing_fields(api_engine, monke
                 "sector_metrics", "intelligence", "connections"):
         assert key in out
     assert set(out["sector_metrics"]) == {
-        "relative_strength_1m", "etf_flow_5d", "dark_pool_signal",
-        "congressional_activity", "insider_activity",
+        "relative_strength_1m", "etf_flow_5d", "dark_pool_signal", "dark_pool_as_of",
+        "dark_pool_reason", "congressional_activity", "insider_activity",
     }
     _assert_envelope(out, flows._PROV_SECTOR_DETAIL)
 
