@@ -2015,16 +2015,7 @@ def _run_yfinance_daily(
         fallback_attribution = (
             f"slot_utc={slot or 'manual'}; purpose=completed_spy_close_fallback"
         )
-        try:
-            completed_spy = _pull_completed_spy_close(yf_puller, start_date)
-        except Exception as exc:
-            _write_job_pull_log(
-                engine, "YFinance_Completed_SPY_Close", None, fallback_started,
-                "FAILED", None,
-                f"FAILED: {fallback_attribution}; target_session=unknown; "
-                f"{type(exc).__name__}: {exc}",
-            )
-            raise
+        completed_spy = _pull_completed_spy_close(yf_puller, start_date)
         if completed_spy is not None:
             completed_day, spy_result = completed_spy
             fallback_outcome, fallback_rows, fallback_note = _classify_outcome(spy_result)
