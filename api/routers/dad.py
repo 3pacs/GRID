@@ -148,7 +148,7 @@ FINVIZ_MEMORY_CACHE_MAX_ENTRIES = 512
 DAD_CACHE_VERSION = "dad-ticker-v2"
 DEFAULT_CHART_POINTS = 220
 MAX_CHART_POINTS = 800
-FINVIZ_SOURCE_NAME = "finviz_fundamentals"
+FINVIZ_SOURCE_NAME = "SEC_EDGAR_Fundamentals"  # Legacy wire key; actual source is SEC.
 FINVIZ_BASE_URL = "https://finviz.com/quote.ashx"
 
 FINVIZ_FIELD_MAP: dict[str, tuple[str, str, str]] = {
@@ -345,7 +345,11 @@ def _compact_finviz(finviz: dict[str, Any], *, include_fields: bool = False) -> 
         "field_count": finviz.get("field_count", 0),
         "rows_inserted": finviz.get("rows_inserted", 0),
         "live_refresh_requested": finviz.get("live_refresh_requested", False),
-        "refresh_available": finviz.get("refresh_available", True),
+        "refresh_available": finviz.get("refresh_available", False),
+        "latest_filed_date": finviz.get("latest_filed_date"),
+        "source_name": finviz.get("source_name"),
+        "unavailable_fields": finviz.get("unavailable_fields", {}),
+        "provenance": finviz.get("provenance"),
         "stats": finviz.get("stats", []),
         "error": finviz.get("error"),
     }
@@ -599,27 +603,7 @@ def _read_summary_cache(
 
 
 def _ensure_finviz_source_id(engine: Any) -> int:
-    with engine.connect() as conn:
-        row = conn.execute(
-            text("SELECT id FROM source_catalog WHERE name = :name"),
-            {"name": FINVIZ_SOURCE_NAME},
-        ).fetchone()
-        if row:
-            return int(row[0])
-
-    with engine.begin() as conn:
-        row = conn.execute(
-            text(
-                "INSERT INTO source_catalog "
-                "(name, base_url, cost_tier, latency_class, pit_available, "
-                "revision_behavior, trust_score, priority_rank, active) "
-                "VALUES (:name, :url, 'FREE', 'EOD', FALSE, 'NEVER', 'MED', 45, TRUE) "
-                "ON CONFLICT (name) DO UPDATE SET active = TRUE "
-                "RETURNING id"
-            ),
-            {"name": FINVIZ_SOURCE_NAME, "url": FINVIZ_BASE_URL},
-        ).fetchone()
-        return int(row[0])
+    raise RuntimeError("Finviz retired; no source reactivation is permitted")
 
 
 def _parse_finviz_snapshot_html(html: str) -> dict[str, str]:
@@ -652,26 +636,7 @@ def _parse_finviz_snapshot_html(html: str) -> dict[str, str]:
 
 
 def _fetch_finviz_snapshot(ticker: str) -> dict[str, str]:
-    import requests
-
-    response = requests.get(
-        FINVIZ_BASE_URL,
-        params={"t": ticker},
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml",
-        },
-        timeout=8,
-    )
-    response.raise_for_status()
-    pairs = _parse_finviz_snapshot_html(response.text)
-    if not pairs:
-        raise RuntimeError("no Finviz snapshot table parsed")
-    return pairs
+    raise RuntimeError("Finviz retired; use stored SEC EDGAR fundamentals")
 
 
 def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
@@ -731,60 +696,7 @@ def _read_finviz_rows(engine: Any, ticker: str) -> dict[str, Any]:
 
 
 def _store_finviz_snapshot(engine: Any, ticker: str, pairs: dict[str, str]) -> int:
-    source_id = _ensure_finviz_source_id(engine)
-    today = date.today()
-    now = datetime.now(timezone.utc)
-    inserted = 0
-
-    with engine.begin() as conn:
-        for finviz_label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
-            raw_value = pairs.get(finviz_label)
-            parsed = _parse_finviz_value(raw_value)
-            if raw_value is None or parsed is None:
-                continue
-
-            numeric_value = parsed if isinstance(parsed, (int, float)) else 0.0
-            payload = {
-                "ticker": ticker,
-                "field": field_id,
-                "label": display_label,
-                "group": group,
-                "finviz_label": finviz_label,
-                "raw_value": raw_value,
-                "parsed": parsed,
-                "source_url": f"{FINVIZ_BASE_URL}?t={ticker}",
-                "scraped_at": now.isoformat(),
-            }
-            result = conn.execute(
-                text(
-                    "INSERT INTO raw_series "
-                    "(series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status) "
-                    "SELECT :series_id, :source_id, :obs_date, :pull_timestamp, :value, :payload, 'SUCCESS' "
-                    "WHERE NOT EXISTS ("
-                    "  SELECT 1 FROM raw_series "
-                    "  WHERE source_id = :source_id "
-                    "  AND series_id = :series_id "
-                    "  AND obs_date = :obs_date "
-                    "  AND pull_status = 'SUCCESS'"
-                    ")"
-                ),
-                {
-                    "series_id": f"finviz.{ticker}.{field_id}",
-                    "source_id": source_id,
-                    "obs_date": today,
-                    "pull_timestamp": now,
-                    "value": float(numeric_value),
-                    "payload": json.dumps(payload),
-                },
-            )
-            inserted += int(result.rowcount or 0)
-
-        conn.execute(
-            text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :source_id"),
-            {"source_id": source_id},
-        )
-
-    return inserted
+    raise RuntimeError("Finviz retired; no Finviz snapshot writes are permitted")
 
 
 def _finviz_stat_cards(fields: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
@@ -826,76 +738,10 @@ def _remember_finviz_profile(ticker: str, stored: dict[str, Any]) -> None:
 def _get_finviz_profile(
     engine: Any, ticker: str, *, refresh: bool = False, persist_refresh: bool = True
 ) -> dict[str, Any]:
-    stored = _read_finviz_rows(engine, ticker)
-    from_memory = False
-    if not persist_refresh:
-        with _FINVIZ_MEMORY_CACHE_LOCK:
-            remembered = _FINVIZ_MEMORY_CACHE.get(ticker)
-        if remembered:
-            created, memory_stored = remembered
-            stored_pull = _as_utc(stored.get("latest_pull"))
-            if (datetime.now(timezone.utc) - created).total_seconds() <= 24 * 3600 and (
-                stored_pull is None or created > stored_pull
-            ):
-                stored = copy.deepcopy(memory_stored)
-                from_memory = True
-    freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-    scraped = False
-    scrape_error: str | None = None
+    """Legacy client contract backed by stored, dated SEC filings only."""
+    from api.dad_sec_fundamentals import read_sec_profile
 
-    if refresh and freshness["state"] in {"missing", "aging", "stale"}:
-        try:
-            pairs = _fetch_finviz_snapshot(ticker)
-            if persist_refresh:
-                inserted = _store_finviz_snapshot(engine, ticker, pairs)
-                stored = _read_finviz_rows(engine, ticker)
-                freshness = _freshness_state(stored.get("latest_pull"), stale_hours=24)
-                stored["rows_inserted"] = inserted
-            else:
-                now = datetime.now(timezone.utc)
-                live_fields = {}
-                for label, (field_id, display_label, group) in FINVIZ_FIELD_MAP.items():
-                    raw_value = pairs.get(label)
-                    parsed = _parse_finviz_value(raw_value)
-                    if raw_value is None or parsed is None:
-                        continue
-                    live_fields[field_id] = {
-                        "field": field_id, "label": display_label, "group": group,
-                        "raw_value": raw_value, "parsed": parsed,
-                        "numeric_value": float(parsed) if isinstance(parsed, (int, float)) else 0.0,
-                        "obs_date": date.today().isoformat(), "pull_timestamp": now.isoformat(),
-                    }
-                if not live_fields:
-                    raise RuntimeError("no recognized Finviz snapshot fields")
-                stored = {"fields": live_fields, "field_count": len(live_fields),
-                          "latest_pull": now, "latest_obs_date": date.today(), "rows_inserted": 0}
-                freshness = _freshness_state(now, stale_hours=24)
-                _remember_finviz_profile(ticker, stored)
-            scraped = True
-        except Exception as exc:
-            scrape_error = str(exc)
-            log.debug("Finviz live scrape failed for {t}: {e}", t=ticker, e=scrape_error)
-
-    fields = stored.get("fields", {})
-    status = "ready" if fields else "unavailable"
-    if fields and freshness["state"] in {"aging", "stale"}:
-        status = "stale"
-
-    return {
-        "status": status,
-        "source": (("postgres+live" if persist_refresh else "live-readonly") if scraped
-                   else "live-memory" if from_memory else "postgres"),
-        "freshness": freshness,
-        "latest_pull": stored.get("latest_pull").isoformat() if stored.get("latest_pull") else None,
-        "latest_obs_date": str(stored.get("latest_obs_date")) if stored.get("latest_obs_date") else None,
-        "field_count": stored.get("field_count", 0),
-        "rows_inserted": stored.get("rows_inserted", 0),
-        "live_refresh_requested": refresh,
-        "refresh_available": True,
-        "stats": _finviz_stat_cards(fields),
-        "fields": fields,
-        "error": scrape_error,
-    }
+    return read_sec_profile(engine, ticker, refresh=refresh)
 
 
 def _gold_from_summary(summary: dict[str, Any] | None) -> dict[str, Any]:
@@ -1389,41 +1235,15 @@ def _grid_decision_stack(
         ),
     })
 
-    finviz_points = 0.0
-    forward_pe = _num_field(finviz, "forward_pe") or _num_field(finviz, "pe_ratio")
-    roe = _num_field(finviz, "roe")
-    debt_eq = _num_field(finviz, "debt_equity")
-    margin = _num_field(finviz, "profit_margin") or _num_field(finviz, "operating_margin")
-    eps_5y = _num_field(finviz, "eps_next_5y")
-    if finviz.get("status") in {"ready", "stale"}:
-        if forward_pe and 0 < forward_pe <= 35:
-            finviz_points += 5
-            reasons.append(f"Finviz valuation is reviewable: forward/ttm P/E {forward_pe:g}.")
-        elif forward_pe and forward_pe > 60:
-            finviz_points -= 4
-            blockers.append(f"Finviz valuation is rich: P/E {forward_pe:g}.")
-        if roe and roe >= 15:
-            finviz_points += 5
-        if margin and margin >= 10:
-            finviz_points += 4
-        if eps_5y and eps_5y >= 10:
-            finviz_points += 3
-        if debt_eq is not None and 0 <= debt_eq <= 1:
-            finviz_points += 4
-        elif debt_eq and debt_eq > 2:
-            finviz_points -= 4
-            blockers.append(f"Finviz debt/equity is elevated at {debt_eq:g}.")
-    else:
-        blockers.append("Finviz fundamentals are not in GRID for this ticker yet.")
-    if finviz.get("freshness", {}).get("state") == "stale":
-        finviz_points -= 5
-        blockers.append("Finviz fundamentals are stale; refresh before making the call.")
-    score += finviz_points
+    # Filed SEC facts are useful evidence, but they do not supply the old
+    # live valuation, return-ratio or forecast inputs. Do not award fabricated
+    # zero/neutral quality points or score fiscal-period EPS as TTM earnings.
+    blockers.append("Current valuation and forecast inputs are unavailable from SEC filed facts.")
     cards.append({
-        "source": "Finviz fundamentals",
-        "state": "strong" if finviz_points >= 12 else "watch" if finviz_points > 0 else "missing" if finviz.get("status") == "unavailable" else "caution",
-        "points": round(finviz_points, 1),
-        "detail": f"{finviz.get('field_count', 0)} fields, {finviz.get('freshness', {}).get('label', 'unknown')}",
+        "source": "SEC EDGAR/XBRL reported fundamentals",
+        "state": "missing",
+        "points": 0.0,
+        "detail": f"{finviz.get('field_count', 0)} reported fields; valuation/forecast scoring unavailable",
     })
 
     options_points = 0.0
@@ -1768,7 +1588,7 @@ def _response_risks_and_actions(
         next_actions.insert(0, "Try the company name or related ticker if this was renamed, delisted, or crypto-like.")
 
     if grid_payload["finviz"].get("status") in {"unavailable", "stale"}:
-        next_actions.append("Use Refresh Finviz to populate or update cached fundamentals for this ticker.")
+        next_actions.append("SEC reported fundamentals are populated by the scheduled SEC source; live valuation inputs are unavailable.")
     for blocker in decision_stack.get("blockers", []):
         if blocker not in risks:
             risks.append(blocker)
@@ -2304,7 +2124,7 @@ def get_dad_ticker_gold(
     ticker: str,
     refresh_finviz: bool = Query(
         default=False,
-        description="Fetch current Finviz fields for this response without storing a snapshot.",
+        description="Legacy parameter: re-read stored SEC facts without provider calls or writes.",
     ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2353,7 +2173,7 @@ def get_dad_ticker_finviz(
     refresh_finviz: bool = Query(False),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
-    """Return stored Finviz rows or live refreshed fields without persisting a GET."""
+    """Return stored SEC filed facts through the legacy route; no live refresh or writes."""
     ticker_upper = _normalize_ticker(ticker)
     if not ticker_upper:
         return {"ticker": "", "status": "invalid", "message": "Enter a ticker symbol."}
@@ -2422,7 +2242,7 @@ def _get_dad_ticker_gold_legacy(
     ticker: str,
     refresh_finviz: bool = Query(
         default=False,
-        description="Explicitly refresh the ticker's Finviz snapshot before returning cached rows.",
+        description="Legacy parameter: re-read stored SEC facts without provider calls or writes.",
     ),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
@@ -2470,7 +2290,7 @@ def _get_dad_ticker_gold_legacy(
             ],
             "next_actions": [
                 "Run the workbook DuckDB extraction and set GRID_DAD_STOCK_RESEARCH_DB if the path differs.",
-                "Use Refresh Finviz when you need to populate or update cached fundamentals for this ticker.",
+                "SEC reported fundamentals are populated by the scheduled SEC source; live valuation inputs are unavailable.",
                 "Use the GRID decision stack as a temporary market/fundamental view.",
             ],
         }
@@ -2497,7 +2317,7 @@ def _get_dad_ticker_gold_legacy(
             "risks": ["DuckDB is missing from the Python environment.", *missing_decision.get("blockers", [])],
             "next_actions": [
                 "Install GRID requirements so duckdb is available.",
-                "Use Refresh Finviz when you need to populate or update cached fundamentals for this ticker.",
+                "SEC reported fundamentals are populated by the scheduled SEC source; live valuation inputs are unavailable.",
                 "Use the GRID decision stack as a temporary market/fundamental view.",
             ],
         }
@@ -2583,7 +2403,7 @@ def _get_dad_ticker_gold_legacy(
             "risks": [str(exc), *missing_decision.get("blockers", [])],
             "next_actions": [
                 "Wait for extraction to finish, then refresh this ticker.",
-                "Use Refresh Finviz when you need to populate or update cached fundamentals for this ticker.",
+                "SEC reported fundamentals are populated by the scheduled SEC source; live valuation inputs are unavailable.",
                 "Use the GRID decision stack as a temporary market/fundamental view.",
             ],
         }
@@ -2631,7 +2451,7 @@ def _get_dad_ticker_gold_legacy(
     else:
         next_actions.insert(0, "Try the company name or related ticker if this was renamed, delisted, or crypto-like.")
     if grid_payload["finviz"].get("status") in {"unavailable", "stale"}:
-        next_actions.append("Use Refresh Finviz to populate or update cached fundamentals for this ticker.")
+        next_actions.append("SEC reported fundamentals are populated by the scheduled SEC source; live valuation inputs are unavailable.")
 
     gold = _gold_from_summary(summary)
     decision_stack = _grid_decision_stack(

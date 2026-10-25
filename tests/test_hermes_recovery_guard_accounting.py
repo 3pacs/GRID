@@ -51,6 +51,7 @@ def test_real_guard_does_not_change_cooldowns_or_claim_recovery(monkeypatch, rea
         monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: pytest.fail("live retry constructed a puller"))
     else:
         class Superseded:
+            SOURCE_NAME = source
             def pull(self):
                 active[source] = owner
                 return {"status": "SUCCESS", "rows_inserted": 6}
@@ -75,6 +76,7 @@ def test_completed_retry_keeps_true_recovery_cadence_and_failure_accounting(
     source, state, engine, active = _setup(monkeypatch)
 
     class Completed:
+        SOURCE_NAME = source
         def pull(self):
             return {"status": outcome, "rows_inserted": rows}
     monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (Completed(), "pull", {}))

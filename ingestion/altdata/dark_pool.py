@@ -65,6 +65,84 @@ _ATS_AGG_SUMMARY_CODE: str = "ATS_W_SMBL"        # one aggregate row / week
 _ATS_FIRM_SUMMARY_CODE: str = "ATS_W_SMBL_FIRM"  # per-firm rows (sum = agg)
 
 
+def parse_ats_weekly_records(
+    records: list[dict[str, Any]],
+) -> dict[str, dict[date, dict[str, float]]]:
+    """Parse FINRA weeklySummary records into per-ticker ATS volume.
+
+    Keeps only ATS (dark pool) rows and, for each ticker/week, uses the
+    symbol-level aggregate (``ATS_W_SMBL``) when present, otherwise sums
+    the per-firm rows (``ATS_W_SMBL_FIRM``). It never mixes the two (which
+    would double-count) and never includes non-ATS OTC volume. Shared with
+    ``finra_ats.py``, which reads the same dataset.
+
+    Parameters:
+        records: Raw FINRA weekly summary records.
+
+    Returns:
+        Nested dict: {ticker: {obs_date: {'volume': float, 'trades': float}}}.
+    """
+    # Stage rows separately by summary level so we can prefer the
+    # aggregate and only fall back to firm-sums where the aggregate is
+    # missing — keyed by (ticker, obs_date).
+    agg: dict[tuple[str, date], dict[str, float]] = {}
+    firm_sum: dict[tuple[str, date], dict[str, float]] = {}
+
+    for rec in records:
+        summary_code = (rec.get("summaryTypeCode") or "").strip()
+        if summary_code == _ATS_AGG_SUMMARY_CODE:
+            bucket = agg
+        elif summary_code == _ATS_FIRM_SUMMARY_CODE:
+            bucket = firm_sum
+        else:
+            # OTC_* (non-ATS) or any future code — not dark pool.
+            continue
+
+        ticker = (rec.get("issueSymbolIdentifier") or "").strip().upper()
+        if not ticker:
+            continue
+
+        week_str = rec.get("weekStartDate")
+        if not week_str:
+            continue
+        try:
+            obs_date = date.fromisoformat(week_str[:10])
+        except (ValueError, TypeError) as exc:
+            log.warning(
+                "DarkPool: bad date {d}: {e}", d=week_str, e=str(exc)
+            )
+            continue
+
+        volume = rec.get("totalWeeklyShareQuantity")
+        trades = rec.get("totalWeeklyTradeCount")
+        if volume is None and trades is None:
+            continue
+
+        key = (ticker, obs_date)
+        slot = bucket.setdefault(key, {"volume": 0.0, "trades": 0.0})
+        if volume is not None:
+            try:
+                slot["volume"] += float(volume)
+            except (ValueError, TypeError):
+                pass
+        if trades is not None:
+            try:
+                slot["trades"] += float(trades)
+            except (ValueError, TypeError):
+                pass
+
+    # Merge: aggregate wins; firm-sum only fills gaps the aggregate misses.
+    by_ticker: dict[str, dict[date, dict[str, float]]] = {}
+    for source in (firm_sum, agg):  # agg applied last so it overrides
+        for (ticker, obs_date), metrics in source.items():
+            by_ticker.setdefault(ticker, {})[obs_date] = {
+                "volume": metrics["volume"],
+                "trades": metrics["trades"],
+            }
+
+    return by_ticker
+
+
 class DarkPoolPuller(BasePuller):
     """Pulls FINRA dark pool transparency data per ticker.
 
@@ -197,78 +275,8 @@ class DarkPoolPuller(BasePuller):
         self,
         records: list[dict[str, Any]],
     ) -> dict[str, dict[date, dict[str, float]]]:
-        """Parse FINRA weekly summary records into per-ticker ATS volume.
-
-        Keeps only ATS (dark pool) rows and, for each ticker/week, uses the
-        symbol-level aggregate (``ATS_W_SMBL``) when present, otherwise sums
-        the per-firm rows (``ATS_W_SMBL_FIRM``). It never mixes the two (which
-        would double-count) and never includes non-ATS OTC volume.
-
-        Parameters:
-            records: Raw FINRA weekly summary records.
-
-        Returns:
-            Nested dict: {ticker: {obs_date: {'volume': float, 'trades': float}}}.
-        """
-        # Stage rows separately by summary level so we can prefer the
-        # aggregate and only fall back to firm-sums where the aggregate is
-        # missing — keyed by (ticker, obs_date).
-        agg: dict[tuple[str, date], dict[str, float]] = {}
-        firm_sum: dict[tuple[str, date], dict[str, float]] = {}
-
-        for rec in records:
-            summary_code = (rec.get("summaryTypeCode") or "").strip()
-            if summary_code == _ATS_AGG_SUMMARY_CODE:
-                bucket = agg
-            elif summary_code == _ATS_FIRM_SUMMARY_CODE:
-                bucket = firm_sum
-            else:
-                # OTC_* (non-ATS) or any future code — not dark pool.
-                continue
-
-            ticker = (rec.get("issueSymbolIdentifier") or "").strip().upper()
-            if not ticker:
-                continue
-
-            week_str = rec.get("weekStartDate")
-            if not week_str:
-                continue
-            try:
-                obs_date = date.fromisoformat(week_str[:10])
-            except (ValueError, TypeError) as exc:
-                log.warning(
-                    "DarkPool: bad date {d}: {e}", d=week_str, e=str(exc)
-                )
-                continue
-
-            volume = rec.get("totalWeeklyShareQuantity")
-            trades = rec.get("totalWeeklyTradeCount")
-            if volume is None and trades is None:
-                continue
-
-            key = (ticker, obs_date)
-            slot = bucket.setdefault(key, {"volume": 0.0, "trades": 0.0})
-            if volume is not None:
-                try:
-                    slot["volume"] += float(volume)
-                except (ValueError, TypeError):
-                    pass
-            if trades is not None:
-                try:
-                    slot["trades"] += float(trades)
-                except (ValueError, TypeError):
-                    pass
-
-        # Merge: aggregate wins; firm-sum only fills gaps the aggregate misses.
-        by_ticker: dict[str, dict[date, dict[str, float]]] = {}
-        for source in (firm_sum, agg):  # agg applied last so it overrides
-            for (ticker, obs_date), metrics in source.items():
-                by_ticker.setdefault(ticker, {})[obs_date] = {
-                    "volume": metrics["volume"],
-                    "trades": metrics["trades"],
-                }
-
-        return by_ticker
+        """Parse FINRA weekly summary records -- see :func:`parse_ats_weekly_records`."""
+        return parse_ats_weekly_records(records)
 
     # ------------------------------------------------------------------ #
     # Volume spike detection
