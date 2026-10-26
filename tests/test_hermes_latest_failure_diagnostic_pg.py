@@ -17,6 +17,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "scripts/hermes_fixers.py"
+HEALTH = ROOT / "scripts/hermes_health.py"
 
 SOURCE_CATALOG_TEMP_DDL = "CREATE TEMP TABLE source_catalog (\n    id                SERIAL PRIMARY KEY,\n    name              TEXT NOT NULL UNIQUE,\n    base_url          TEXT NOT NULL,\n    cost_tier         TEXT NOT NULL CHECK (cost_tier IN ('FREE', 'LOW', 'PAID')),\n    -- Seven values mirror the live griddb source_catalog_latency_class_check\n    -- (widened out-of-band before 2026-10-20; re-read 2026-10-20). Readers:\n    -- alerts/cadence.py _METADATA_CADENCE; pinned by tests/test_schema_latency_class_constraint.py.\n    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'INTRADAY', 'EOD', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'ANNUAL')),\n    pit_available     BOOLEAN NOT NULL DEFAULT FALSE,\n    revision_behavior TEXT NOT NULL CHECK (revision_behavior IN ('NEVER', 'RARE', 'FREQUENT')),\n    trust_score       TEXT NOT NULL CHECK (trust_score IN ('HIGH', 'MED', 'LOW')),\n    priority_rank     INTEGER NOT NULL,\n    active            BOOLEAN NOT NULL DEFAULT TRUE,\n    last_pull_at      TIMESTAMPTZ,\n    uptime_score      DOUBLE PRECISION NOT NULL DEFAULT 1.0,\n    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()\n) ON COMMIT DROP;"
 RAW_SERIES_TEMP_DDL = "CREATE TEMP TABLE raw_series (\n    id                BIGSERIAL PRIMARY KEY,\n    series_id         TEXT NOT NULL,\n    source_id         INTEGER NOT NULL REFERENCES source_catalog(id),\n    obs_date          DATE NOT NULL,\n    pull_timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    value             DOUBLE PRECISION NOT NULL,\n    raw_payload       JSONB,\n    -- QUARANTINED: a once-accepted row later found untrustworthy. It is not an\n    -- observation (readers take SUCCESS only) and not a pull failure. Pullers\n    -- never write it. Production got it via\n    -- migrations/versions/raw_series_quarantined_20260926.py (added NOT VALID,\n    -- same constraint name raw_series_pull_status_check).\n    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED', 'QUARANTINED'))\n) ON COMMIT DROP;"
@@ -123,15 +124,25 @@ class _OneConnection:
     def __init__(self, conn):
         self.conn = conn
         self.queries = []
+        self.probes = []
         self.rows = None
+        self.value = None
     def connect(self):
         return contextlib.nullcontext(self)
-    def execute(self, statement):
+    def execute(self, statement, params=None):
+        if params is not None:
+            # Only the optional-relation probe is parameterized; it runs natively.
+            assert str(statement) == "SELECT to_regclass(:relation) IS NOT NULL"
+            self.probes.append(params["relation"])
+            self.value = self.conn.execute(statement, params).scalar()
+            return self
         self.queries.append(str(statement))
         self.rows = self.conn.execute(statement).fetchall()
         return self
     def fetchall(self):
         return self.rows
+    def scalar(self):
+        return self.value
 
 
 def _diagnose(conn):
@@ -143,8 +154,12 @@ def _diagnose(conn):
         if isinstance(node, ast.FunctionDef) and node.name in projected
     }
     assert set(functions) == set(projected), "MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY"
+    # The optional-relation probe is the actual hermes_health helper.
+    probe = [n for n in ast.parse(HEALTH.read_bytes()).body
+             if isinstance(n, ast.FunctionDef) and n.name == "_relation_exists"]
+    assert len(probe) == 1, "MISSING_RELATION_PROBE"
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, *(functions[name] for name in projected)], type_ignores=[]))
+    module = ast.fix_missing_locations(ast.Module(body=[future, *probe, *(functions[name] for name in projected)], type_ignores=[]))
     log = _Log()
     namespace = {"log": log, "json": json, "re": re}
     exec(compile(module, str(SOURCE), "exec"), namespace)
@@ -153,6 +168,7 @@ def _diagnose(conn):
     result = namespace["diagnose_and_fix_pulls"](
         engine, hermes_available=False, state=object(), dry_run=True)
     assert len(engine.queries) == 1
+    assert engine.probes == ["pull_log"]
     return engine.rows, result, log.records
 
 
@@ -271,9 +287,63 @@ def test_native_window_is_pushed_into_both_union_legs(latest_failure_pg_connecti
     statement = next(
         node.value for node in ast.walk(fn)
         if isinstance(node, ast.Constant) and isinstance(node.value, str)
-        and node.value.startswith("SELECT name, fail_count")
+        and node.value.startswith("SELECT name, fail_count") and "FROM pull_log" in node.value
     )
     plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + statement)))
     assert "raw_series" in plan and "pull_log" in plan
     # The 24h predicate must filter each leg's scan, not only the appended result.
     assert plan.count("now() - '24:00:00'::interval") >= 2
+
+
+def test_native_missing_pull_log_still_diagnoses_raw_failure(latest_failure_pg_connection):
+    # 2026-10-26 review F1: naming a missing pull_log raised before diagnosis.
+    from sqlalchemy import text
+    conn, now = latest_failure_pg_connection
+    conn.execute(text("DROP TABLE pull_log"))
+    sid = _source(conn, "SYNTH_SOURCE_A")
+    _failure(conn, sid, now - timedelta(hours=1), {"error": "RAW_ONLY"})
+    rows, result, logs = _diagnose(conn)
+    assert [tuple(r[:3]) for r in rows] == [("SYNTH_SOURCE_A", 1, now - timedelta(hours=1))]
+    assert json.loads(rows[0][3]) == {"error": "RAW_ONLY"}
+    assert result["pull_log_failures"] is None and result["retried"] == 0
+    expected = ("pull_log relation not found; diagnosing raw_series failures only "
+                "(pull_log failures UNKNOWN)")
+    assert ("WARNING", expected) in logs
+    # The probe did not abort the transaction: the same connection still runs.
+    assert conn.execute(text("SELECT 1")).scalar_one() == 1
+
+
+def test_native_missing_pull_log_without_raw_failure_is_not_all_clear(latest_failure_pg_connection):
+    from sqlalchemy import text
+    conn, _ = latest_failure_pg_connection
+    conn.execute(text("DROP TABLE pull_log"))
+    rows, result, logs = _diagnose(conn)
+    assert rows == [] and result["pull_log_failures"] is None
+    assert ("INFO", "No failed pulls in last 24h") not in logs
+    assert ("INFO", "No failed raw_series pulls in last 24h (pull_log not checked)") in logs
+
+
+def test_native_present_empty_pull_log_is_read_without_unknown_marker(latest_failure_pg_connection):
+    conn, now = latest_failure_pg_connection
+    sid = _source(conn, "SYNTH_SOURCE_A")
+    _failure(conn, sid, now - timedelta(hours=1), {"error": "RAW_ONLY"})
+    rows, result, logs = _diagnose(conn)
+    assert [tuple(r[:2]) for r in rows] == [("SYNTH_SOURCE_A", 1)]
+    assert "pull_log_failures" not in result
+    assert not any("pull_log relation not found" in message for _, message in logs)
+
+
+def test_native_raw_only_statement_window_and_relations(latest_failure_pg_connection):
+    from sqlalchemy import text
+    conn, _ = latest_failure_pg_connection
+    conn.execute(text("DROP TABLE pull_log"))
+    tree = ast.parse(SOURCE.read_bytes())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "diagnose_and_fix_pulls")
+    statement = next(
+        node.value for node in ast.walk(fn)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value.startswith("SELECT name, fail_count") and "pull_log" not in node.value
+    )
+    plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + statement)))
+    assert "raw_series" in plan and "pull_log" not in plan
+    assert "now() - '24:00:00'::interval" in plan

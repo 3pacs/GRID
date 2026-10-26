@@ -13,6 +13,7 @@ import unittest
 
 ROOT=Path(__file__).resolve().parents[1]
 SOURCE=ROOT/'scripts/hermes_fixers.py'
+HEALTH=ROOT/'scripts/hermes_health.py'
 NOW=dt.datetime(2026,10,21,21,tzinfo=dt.timezone.utc)
 WINDOW=(NOW-dt.timedelta(hours=24)).isoformat()
 
@@ -30,15 +31,27 @@ def projection(path):
  functions={n.name:n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in projected}
  if set(functions)!=set(projected):raise AssertionError('MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY')
 
+ # The optional-relation probe is the actual hermes_health helper.
+ health=ast.parse(HEALTH.read_bytes())
+ probe=[n for n in health.body if isinstance(n,ast.FunctionDef) and n.name=='_relation_exists']
+ if len(probe)!=1:raise AssertionError('MISSING_RELATION_PROBE')
  future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
- mod=ast.fix_missing_locations(ast.Module(body=[future,*(functions[name] for name in projected)],type_ignores=[]))
+ mod=ast.fix_missing_locations(ast.Module(body=[future,*probe,*(functions[name] for name in projected)],type_ignores=[]))
  log=Log();ns={'log':log,'json':json,'re':re};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
 
+PROBE='SELECT to_regclass(:relation) IS NOT NULL'
+
 class Adapter:
- def __init__(self,db):self.db=db;self.raw_queries=[];self.adapted_queries=[];self.rows=None
+ def __init__(self,db):self.db=db;self.raw_queries=[];self.adapted_queries=[];self.probes=[];self.rows=None;self.value=None
  def connect(self):return contextlib.nullcontext(self)
- def execute(self,query):
+ def execute(self,query,params=None):
+  if query==PROBE:
+   # Sole dialect substitution for to_regclass: SQLite's catalog lookup.
+   self.probes.append(params['relation'])
+   self.value=self.db.execute("SELECT COUNT(*)>0 FROM sqlite_master WHERE type='table' AND name=?",(params['relation'],)).fetchone()[0]
+   return self
+  if params is not None:raise AssertionError('UNEXPECTED_PARAMS')
   self.raw_queries.append(query)
   if not isinstance(query,str) or not query.startswith('SELECT '):raise AssertionError('SELECT_ONLY_INERT_FIXTURE')
   # Sole dialect substitutions: TEXT fixture already represents payload::text;
@@ -51,12 +64,15 @@ class Adapter:
   self.rows=[(x[0],x[1],dt.datetime.fromisoformat(x[2]) if x[2] else None,x[3]) for x in raw]
   return self
  def fetchall(self):return self.rows
+ def scalar(self):return self.value
 
 def plrow(name='synth_job',source=None,hours=1,error='PL_SYNTH',status='FAILED',completed=True):
  stamp=(NOW-dt.timedelta(hours=hours)).isoformat()
  return (name,source,stamp,stamp if completed else None,status,error)
 
-def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None,pull_log=()):
+PULL_LOG_DDL='CREATE TABLE pull_log(puller_name TEXT,source_id INTEGER,started_at TEXT,completed_at TEXT,status TEXT,error_message TEXT)'
+
+def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None,pull_log=(),pull_log_ddl=PULL_LOG_DDL):
  fn,log=projection(source or SOURCE)
  db=sqlite3.connect(':memory:')
  try:
@@ -64,8 +80,10 @@ def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None,pull_log=())
   db.execute('CREATE TABLE raw_series(source_id INTEGER,pull_status TEXT,pull_timestamp TEXT,raw_payload TEXT)')
   db.executemany('INSERT INTO source_catalog VALUES(?,?)',catalog)
   db.executemany('INSERT INTO raw_series VALUES(?,?,?,?)',rows)
-  db.execute('CREATE TABLE pull_log(puller_name TEXT,source_id INTEGER,started_at TEXT,completed_at TEXT,status TEXT,error_message TEXT)')
-  db.executemany('INSERT INTO pull_log VALUES(?,?,?,?,?,?)',pull_log)
+  if pull_log_ddl is not None:
+   db.execute(pull_log_ddl)
+   db.executemany('INSERT INTO pull_log VALUES(?,?,?,?,?,?)',pull_log)
+  elif pull_log:raise AssertionError('ROWS_WITHOUT_PULL_LOG')
   adapter=Adapter(db);fake=types.ModuleType('sqlalchemy');fake.text=lambda text:text
   previous=sys.modules.get('sqlalchemy');sys.modules['sqlalchemy']=fake
   try:result=fn(adapter,hermes_available=False,state=object(),dry_run=True)
@@ -175,6 +193,56 @@ class PullLogFailureTests(unittest.TestCase):
   _,result,_=exercise([],catalog=((1,'FRED'),),pull_log=[plrow('fred',source=1,error='HTTP 429 Too Many Requests')])
   self.assertEqual(result['fix_actions'],{'fred':'CHECK_KEY'})
   self.assertEqual(result['retried'],0)
+
+class MissingPullLogTests(unittest.TestCase):
+ # 2026-10-26 review F1: the repair query named pull_log unconditionally, so a
+ # DB without it (supported by check_db_health) raised before diagnosing the
+ # raw_series failures it handled before #913.
+ def test_missing_pull_log_still_diagnoses_raw_series_failure(self):
+  a,result,logs=exercise([row(source=1,hours=1,error='RAW_ONLY')],pull_log_ddl=None)
+  self.assertEqual(a.probes,['pull_log'])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=1),'RAW_ONLY')])
+  self.assertEqual(len(a.raw_queries),1)
+  self.assertNotIn('pull_log',a.raw_queries[0])
+  self.assertIsNone(result['pull_log_failures'])
+  self.assertIn(('WARNING','pull_log relation not found; diagnosing raw_series failures only (pull_log failures UNKNOWN)'),logs)
+  warning=[text for level,text in logs if level=='WARNING' and text.startswith('Failed sources')]
+  self.assertEqual(len(warning),1);self.assertIn('RAW_ONLY',warning[0])
+
+ def test_missing_pull_log_keeps_raw_window_and_classifier_guards(self):
+  a,result,_=exercise([row(source=1,hours=1,error='HTTP 429 Too Many Requests'),
+                       row(source=2,hours=24,error='BOUNDARY_EXCLUDED')],
+                      catalog=((1,'FRED'),(2,'SYNTH_B')),pull_log_ddl=None)
+  self.assertEqual([r[0] for r in a.rows],['FRED'])
+  self.assertEqual(result['fix_actions'],{'fred':'CHECK_KEY'})
+  self.assertEqual(result['retried'],0)
+
+ def test_missing_pull_log_and_no_raw_failure_is_not_reported_as_no_failed_pulls(self):
+  a,result,logs=exercise([],pull_log_ddl=None)
+  self.assertEqual(a.rows,[])
+  self.assertIsNone(result['pull_log_failures'])
+  self.assertNotIn(('INFO','No failed pulls in last 24h'),logs)
+  self.assertIn(('INFO','No failed raw_series pulls in last 24h (pull_log not checked)'),logs)
+
+ def test_present_empty_pull_log_reads_both_tables_without_unknown_marker(self):
+  a,result,logs=exercise([row(source=1,hours=1,error='RAW_ONLY')])
+  self.assertEqual(a.probes,['pull_log'])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=1),'RAW_ONLY')])
+  self.assertEqual(len(a.raw_queries),1);self.assertIn('FROM pull_log',a.raw_queries[0])
+  self.assertNotIn('pull_log_failures',result)
+  self.assertFalse(any('pull_log relation not found' in text for _,text in logs))
+
+ def test_populated_pull_log_is_still_merged_when_present(self):
+  a,result,_=exercise([row(source=1,hours=3,error='RAW_OLDER')],
+                      pull_log=[plrow('repo_market',source=1,hours=1,error='PL_NEWER')])
+  self.assertEqual(a.rows,[('SYNTH_A',2,NOW-dt.timedelta(hours=1),'PL_NEWER')])
+  self.assertNotIn('pull_log_failures',result)
+
+ def test_query_failure_after_probe_propagates_not_read_as_no_failures(self):
+  # pull_log resolves but the statement fails: the error must surface (the
+  # operator records it), never become "no failed pulls" or a raw-only result.
+  with self.assertRaises(sqlite3.OperationalError):
+   exercise([row(source=1,hours=1)],pull_log_ddl='CREATE TABLE pull_log(puller_name TEXT,source_id INTEGER,started_at TEXT,completed_at TEXT,status TEXT)')
 
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('--source',type=Path,default=SOURCE)

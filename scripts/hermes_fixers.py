@@ -32,6 +32,7 @@ from scripts.hermes_health import (
     export_issues,
     resolve_source_issues,
     _ensure_issues_table,
+    _relation_exists,
 )
 
 # These constants are duplicated here to avoid circular imports
@@ -1956,38 +1957,79 @@ def diagnose_and_fix_pulls(
     # Reading raw_series alone reported "No failed pulls" while those sources
     # failed every cycle (grid-hermes journal 2026-10-26). The one window
     # predicate is pushed down into both UNION ALL legs by PostgreSQL.
+    #
+    # pull_log is optional (check_db_health reports its counts as unknown when
+    # it is absent). Resolve it before running the query: PostgreSQL rejects a
+    # statement naming a missing relation, and catching that error would leave
+    # the transaction aborted. Without pull_log the raw_series failures are
+    # still diagnosed, and the coverage gap is reported, not read as zero.
     with engine.connect() as conn:
-        failed = conn.execute(
-            text(
-                "SELECT name, fail_count, last_fail, last_error "
-                "FROM ("
-                " SELECT name, COUNT(*) OVER (PARTITION BY name) AS fail_count, "
-                "        failed_at AS last_fail, error AS last_error, "
-                "        ROW_NUMBER() OVER (PARTITION BY name "
-                "          ORDER BY failed_at DESC, error DESC NULLS LAST) AS failure_rank "
-                " FROM ("
-                "  SELECT sc.name AS name, rs.pull_timestamp AS failed_at, "
-                "         rs.raw_payload::text AS error "
-                "  FROM raw_series rs "
-                "  JOIN source_catalog sc ON rs.source_id = sc.id "
-                "  WHERE rs.pull_status = 'FAILED' "
-                "  UNION ALL "
-                "  SELECT COALESCE(sc.name, pl.puller_name) AS name, "
-                "         COALESCE(pl.completed_at, pl.started_at) AS failed_at, "
-                "         pl.error_message AS error "
-                "  FROM pull_log pl "
-                "  LEFT JOIN source_catalog sc ON pl.source_id = sc.id "
-                "  WHERE pl.status IN ('FAILED', 'PARTIAL')"
-                " ) AS failures "
-                " WHERE failed_at > NOW() - INTERVAL '24 hours'"
-                ") AS latest_failed "
-                "WHERE failure_rank = 1 "
-                "ORDER BY fail_count DESC"
-            )
-        ).fetchall()
+        pull_log_available = _relation_exists(conn, "pull_log")
+        if pull_log_available:
+            failed = conn.execute(
+                text(
+                    "SELECT name, fail_count, last_fail, last_error "
+                    "FROM ("
+                    " SELECT name, COUNT(*) OVER (PARTITION BY name) AS fail_count, "
+                    "        failed_at AS last_fail, error AS last_error, "
+                    "        ROW_NUMBER() OVER (PARTITION BY name "
+                    "          ORDER BY failed_at DESC, error DESC NULLS LAST) AS failure_rank "
+                    " FROM ("
+                    "  SELECT sc.name AS name, rs.pull_timestamp AS failed_at, "
+                    "         rs.raw_payload::text AS error "
+                    "  FROM raw_series rs "
+                    "  JOIN source_catalog sc ON rs.source_id = sc.id "
+                    "  WHERE rs.pull_status = 'FAILED' "
+                    "  UNION ALL "
+                    "  SELECT COALESCE(sc.name, pl.puller_name) AS name, "
+                    "         COALESCE(pl.completed_at, pl.started_at) AS failed_at, "
+                    "         pl.error_message AS error "
+                    "  FROM pull_log pl "
+                    "  LEFT JOIN source_catalog sc ON pl.source_id = sc.id "
+                    "  WHERE pl.status IN ('FAILED', 'PARTIAL')"
+                    " ) AS failures "
+                    " WHERE failed_at > NOW() - INTERVAL '24 hours'"
+                    ") AS latest_failed "
+                    "WHERE failure_rank = 1 "
+                    "ORDER BY fail_count DESC"
+                )
+            ).fetchall()
+        else:
+            failed = conn.execute(
+                text(
+                    "SELECT name, fail_count, last_fail, last_error "
+                    "FROM ("
+                    " SELECT name, COUNT(*) OVER (PARTITION BY name) AS fail_count, "
+                    "        failed_at AS last_fail, error AS last_error, "
+                    "        ROW_NUMBER() OVER (PARTITION BY name "
+                    "          ORDER BY failed_at DESC, error DESC NULLS LAST) AS failure_rank "
+                    " FROM ("
+                    "  SELECT sc.name AS name, rs.pull_timestamp AS failed_at, "
+                    "         rs.raw_payload::text AS error "
+                    "  FROM raw_series rs "
+                    "  JOIN source_catalog sc ON rs.source_id = sc.id "
+                    "  WHERE rs.pull_status = 'FAILED'"
+                    " ) AS failures "
+                    " WHERE failed_at > NOW() - INTERVAL '24 hours'"
+                    ") AS latest_failed "
+                    "WHERE failure_rank = 1 "
+                    "ORDER BY fail_count DESC"
+                )
+            ).fetchall()
+
+    if not pull_log_available:
+        # Partial coverage: pull_log failures are unknown, not zero.
+        result["pull_log_failures"] = None
+        log.warning(
+            "pull_log relation not found; diagnosing raw_series failures only "
+            "(pull_log failures UNKNOWN)"
+        )
 
     if not failed:
-        log.info("No failed pulls in last 24h")
+        if pull_log_available:
+            log.info("No failed pulls in last 24h")
+        else:
+            log.info("No failed raw_series pulls in last 24h (pull_log not checked)")
         return result
 
     failed_info = [
