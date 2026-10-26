@@ -181,7 +181,7 @@ class IntrinsicValueEngine:
                     text("""
                         SELECT value, obs_date
                         FROM raw_series
-                        WHERE series_id = :sid AND obs_date <= :as_of
+                        WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                         ORDER BY obs_date DESC, pull_timestamp DESC
                         LIMIT 1
                     """),
@@ -209,7 +209,7 @@ class IntrinsicValueEngine:
                     text("""
                         SELECT value, obs_date
                         FROM raw_series
-                        WHERE series_id = :sid AND obs_date <= :as_of
+                        WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                         ORDER BY obs_date DESC, pull_timestamp DESC
                         LIMIT 1
                     """),

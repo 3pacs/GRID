@@ -75,4 +75,42 @@ describe('Models view async data', () => {
         });
         expect(screen.queryByText('model registry unavailable')).not.toBeInTheDocument();
     });
+
+    // Item #19 (Wave 3 triage report): a PRODUCTION row created from a
+    // PASSED hypothesis (hypothesis_id set) is autoresearch lineage, not an
+    // actively maintained model — the view must say so, with the row's own
+    // date, rather than presenting it as current.
+    it('shows an autoresearch-lineage banner when a PRODUCTION model has a hypothesis_id', async () => {
+        storeState.productionModels = {
+            REGIME: {
+                id: 42, name: 'regime-autoresearch-v1', version: '1',
+                hypothesis_id: 7, created_at: '2026-03-25T00:00:00Z',
+            },
+        };
+        api.getModels.mockResolvedValue({ models: [] });
+        api.getProductionModels.mockResolvedValue({ models: storeState.productionModels });
+
+        render(<Models />);
+
+        await waitFor(() => expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument());
+
+        const banner = screen.getByTestId('models-autoresearch-banner');
+        expect(banner.textContent).toContain('regime-autoresearch-v1');
+        expect(banner.textContent).toContain('2026-03-25');
+        expect(banner.textContent).toContain('not an actively');
+    });
+
+    it('does not show the autoresearch banner when no PRODUCTION model has a hypothesis_id', async () => {
+        storeState.productionModels = {
+            REGIME: { id: 9, name: 'regime-maintained', version: '2', hypothesis_id: null, created_at: '2026-09-01T00:00:00Z' },
+        };
+        api.getModels.mockResolvedValue({ models: [] });
+        api.getProductionModels.mockResolvedValue({ models: storeState.productionModels });
+
+        render(<Models />);
+
+        await waitFor(() => expect(screen.queryByTestId('loading-skeleton')).not.toBeInTheDocument());
+
+        expect(screen.queryByTestId('models-autoresearch-banner')).not.toBeInTheDocument();
+    });
 });

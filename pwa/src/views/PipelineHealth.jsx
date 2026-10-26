@@ -28,6 +28,28 @@ const FRESHNESS_BG = {
     red: colors.redBg,
 };
 
+// Human text for store/availability_fields.py's stale_reason enum. Client-side
+// only — the backend never sends free-text here, so this is the one place
+// that decides what the operator reads (never render backend exception text).
+const STALE_REASON_TEXT = {
+    never_configured: 'never configured — no pull on record',
+    fetch_failed: 'fetch failed',
+    stale: 'stale',
+    rate_limited: 'rate limited',
+    not_published_yet: 'not published yet',
+    parser_error: 'parser error',
+    empty_source: 'source returned no data',
+    partial_history: 'partial history',
+    materializer_failed: 'materializer failed',
+    consumer_query_mismatch: 'query/schema mismatch',
+    unknown: 'unknown reason',
+};
+
+function staleReasonText(reason) {
+    if (!reason) return null;
+    return STALE_REASON_TEXT[reason] || 'unknown reason';
+}
+
 // ── Styles ─────────────────────────────────────────────────────────
 
 const s = {
@@ -369,8 +391,12 @@ export default function PipelineHealth() {
         );
     }
 
-    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {} } = data || {};
+    const { summary = {}, coverage = {}, recent_errors = [], resolver_status = {}, availability, stale_reason, daily_audit } = data || {};
     const byFamily = coverage.by_family || {};
+    const isUnavailable = availability === 'unavailable';
+    const dailyAudit = daily_audit || {};
+    const auditUnavailable = dailyAudit.availability === 'unavailable';
+    const auditBuckets = dailyAudit.buckets || [];
 
     const freshnessPct = (src) => {
         if (src.freshness === 'green') return 100;
@@ -383,22 +409,69 @@ export default function PipelineHealth() {
             <div style={s.title}>PIPELINE HEALTH</div>
 
             {/* ── Summary Bar ────────────────────────────────────── */}
-            <div style={s.summaryBar}>
-                <div style={s.summaryTile(colors.text)}>
-                    <div style={s.summaryNum}>{summary.total_sources || 0}</div>
-                    <div style={s.summaryLabel}>Total Sources</div>
+            {isUnavailable ? (
+                <div style={{ ...s.card, borderColor: colors.red, color: colors.red, marginBottom: '20px' }}>
+                    Pipeline health unavailable: {staleReasonText(stale_reason) || 'unknown reason'}
                 </div>
-                <div style={s.summaryTile(colors.green)}>
-                    <div style={{ ...s.summaryNum, color: colors.green }}>{summary.healthy || 0}</div>
-                    <div style={s.summaryLabel}>Healthy</div>
+            ) : (
+                <div style={s.summaryBar}>
+                    <div style={s.summaryTile(colors.text)}>
+                        <div style={s.summaryNum}>{summary.total_sources || 0}</div>
+                        <div style={s.summaryLabel}>Total Sources</div>
+                    </div>
+                    <div style={s.summaryTile(colors.green)}>
+                        <div style={{ ...s.summaryNum, color: colors.green }}>{summary.healthy || 0}</div>
+                        <div style={s.summaryLabel}>Healthy</div>
+                    </div>
+                    <div style={s.summaryTile(colors.yellow)}>
+                        <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.stale || 0}</div>
+                        <div style={s.summaryLabel}>Stale</div>
+                    </div>
+                    <div style={s.summaryTile(colors.red)}>
+                        <div style={{ ...s.summaryNum, color: colors.red }}>{summary.broken || 0}</div>
+                        <div style={s.summaryLabel}>Broken</div>
+                    </div>
                 </div>
-                <div style={s.summaryTile(colors.yellow)}>
-                    <div style={{ ...s.summaryNum, color: colors.yellow }}>{summary.stale || 0}</div>
-                    <div style={s.summaryLabel}>Stale</div>
-                </div>
-                <div style={s.summaryTile(colors.red)}>
-                    <div style={{ ...s.summaryNum, color: colors.red }}>{summary.broken || 0}</div>
-                    <div style={s.summaryLabel}>Broken</div>
+            )}
+
+            {/* ── Daily Freshness Audit ──────────────────────────── */}
+            <div style={s.section}>
+                <div style={s.sectionTitle}>DAILY FRESHNESS AUDIT</div>
+                <div style={s.card}>
+                    {auditUnavailable ? (
+                        <div style={{ color: colors.red }}>
+                            Audit unavailable: {staleReasonText(dailyAudit.stale_reason) || 'unknown reason'}
+                            {dailyAudit.audited_at && (
+                                <span style={{ color: colors.textMuted }}>
+                                    {' '}(last run {timeAgo(dailyAudit.audited_at)}, {auditBuckets.reduce((n, b) => n + b.ticker_count, 0)} tickers)
+                                </span>
+                            )}
+                        </div>
+                    ) : dailyAudit.audited_at ? (
+                        <>
+                            <div style={{ fontSize: '11px', color: colors.textMuted, marginBottom: '10px' }}>
+                                As of {timeAgo(dailyAudit.audited_at)} · {dailyAudit.total_tickers} tickers
+                                {dailyAudit.source_tables?.length > 0 && ` · ${dailyAudit.source_tables.join(', ')}`}
+                            </div>
+                            <div style={s.resolverGrid}>
+                                {auditBuckets.map((b) => (
+                                    <div key={b.bucket} style={s.resolverItem}>
+                                        <div style={{
+                                            ...s.resolverValue,
+                                            color: b.bucket === 'FRESH' ? colors.green
+                                                : b.bucket === 'STALE_7_30' ? colors.yellow
+                                                : colors.red,
+                                        }}>
+                                            {b.ticker_count}
+                                        </div>
+                                        <div style={s.resolverLabel}>{b.bucket}</div>
+                                    </div>
+                                ))}
+                            </div>
+                        </>
+                    ) : (
+                        <div style={{ color: colors.textMuted }}>No audit data.</div>
+                    )}
                 </div>
             </div>
 
@@ -440,6 +513,7 @@ export default function PipelineHealth() {
                                     <th style={s.th} onClick={() => handleSort('freshness')}>
                                         Freshness{sortArrow('freshness')}
                                     </th>
+                                    <th style={s.th}>Reason</th>
                                     <th style={s.th}>Error</th>
                                 </tr>
                             </thead>
@@ -475,6 +549,9 @@ export default function PipelineHealth() {
                                                 )} />
                                             </div>
                                         </td>
+                                        <td style={{ ...s.td, color: colors.textDim }}>
+                                            {staleReasonText(src.field_record?.stale_reason) || '-'}
+                                        </td>
                                         <td style={s.td}>
                                             {src.error ? (
                                                 <span style={s.errorText} title={src.error}>
@@ -486,7 +563,7 @@ export default function PipelineHealth() {
                                 ))}
                                 {filteredSources.length === 0 && (
                                     <tr>
-                                        <td colSpan={7} style={{ ...s.td, textAlign: 'center', color: colors.textMuted }}>
+                                        <td colSpan={8} style={{ ...s.td, textAlign: 'center', color: colors.textMuted }}>
                                             No sources match filter
                                         </td>
                                     </tr>

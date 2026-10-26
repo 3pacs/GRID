@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from oracle.entry_price_policy import NULL_WRITE_POLICY, entry_price_score_note
+
 import os
 _USE_SIGNAL_REGISTRY = os.getenv("GRID_SIGNAL_REGISTRY", "0") == "1"
 
@@ -618,9 +620,9 @@ class OracleEngine:
                     prediction_type TEXT NOT NULL,
                     direction TEXT NOT NULL,
                     target_price DOUBLE PRECISION,
-                    entry_price DOUBLE PRECISION NOT NULL,
+                    entry_price DOUBLE PRECISION,
                     expiry DATE NOT NULL,
-                    confidence DOUBLE PRECISION NOT NULL,
+                    confidence DOUBLE PRECISION,
                     expected_move_pct DOUBLE PRECISION,
                     signal_strength DOUBLE PRECISION,
                     coherence DOUBLE PRECISION,
@@ -636,13 +638,32 @@ class OracleEngine:
                     pnl_pct DOUBLE PRECISION,
                     scored_at TIMESTAMPTZ,
                     score_notes TEXT,
-                    dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
+                    dedup_keep BOOLEAN NOT NULL DEFAULT TRUE,
+                    null_write_policy TEXT
                 )
             """))
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS dedup_keep BOOLEAN NOT NULL DEFAULT TRUE
             """))
+            # Historical-NULL provenance boundary (oracle_pred_nullable_0918):
+            # NULL here means "predates the policy, or provenance unknown";
+            # oracle.entry_price_policy.NULL_WRITE_POLICY means "this row's
+            # entry_price/confidence NULL is the honest-measurement policy's
+            # NULL." Both writers stamp it at INSERT, never on UPDATE.
+            conn.execute(text("""
+                ALTER TABLE oracle_predictions
+                ADD COLUMN IF NOT EXISTS null_write_policy TEXT
+            """))
+            # D-H11 / D-M32: `confidence` and `entry_price` are NULL when
+            # nothing measured them. Both writers already bind None
+            # (`_store_predictions` for a ticker with no spot, `oracle/publish.py`
+            # for an unsupplied confidence). The CREATE above carries the
+            # nullable shape for a fresh database; an existing table is
+            # relaxed by alembic revision ``oracle_pred_nullable_0918`` at
+            # deploy time, NOT here: ALTER COLUMN takes ACCESS EXCLUSIVE on
+            # the table every time this bootstrap runs.
+            # tests/test_oracle_predictions_schema_parity.py keeps the two in step.
             conn.execute(text("""
                 ALTER TABLE oracle_predictions
                 ADD COLUMN IF NOT EXISTS horizon_days INTEGER
@@ -1813,13 +1834,34 @@ class OracleEngine:
         """
         today = date.today()
         scored = 0
-        results = {"hits": 0, "misses": 0, "partials": 0, "total": 0}
+        results = {
+            "hits": 0,
+            "misses": 0,
+            "partials": 0,
+            "total": 0,
+            # Rows closed as 'no_data' because their entry price was NULL
+            # AND the row is stamped as written under the honest-NULL policy
+            # (null_write_policy == NULL_WRITE_POLICY). Reported, never
+            # folded into misses and never left out of the tally altogether.
+            "unscorable_entry_price": 0,
+            # Legacy pending rows (non-null 0/negative entry_price, written
+            # before the column was nullable) that the historical-write
+            # hold left untouched this run.
+            "held_legacy_entry_price": 0,
+            # entry_price IS NULL but null_write_policy does NOT prove it --
+            # unmarked provenance. The nullable schema alone does not
+            # establish this is an honest-policy NULL (item (a)'s whole
+            # point); held rather than closed, same as a legacy row. Should
+            # be structurally impossible on today's writers (both stamp
+            # every INSERT) -- a nonzero count here is itself a finding.
+            "held_unmarked_null_entry_price": 0,
+        }
 
         with self.engine.begin() as conn:
             # Get pending predictions past expiry
             rows = conn.execute(text("""
                 SELECT id, ticker, direction, target_price, entry_price, expiry,
-                       confidence, expected_move_pct, model_name
+                       confidence, expected_move_pct, model_name, null_write_policy
                 FROM oracle_predictions
                 WHERE verdict = 'pending' AND expiry <= :today
                 ORDER BY expiry
@@ -1828,7 +1870,58 @@ class OracleEngine:
             # no_data rows are already final - exclude from scoring loop
             rows = [r for r in rows if r[2] != "NONE"]
             for r in rows:
-                pred_id, ticker, direction, target, entry, expiry, conf, expected, model = r
+                pred_id, ticker, direction, target, entry, expiry, conf, expected, model, policy = r
+
+                # An entry price that cannot be divided by is settled here,
+                # BEFORE the division below. NULL is not a zero entry and a
+                # zero entry is not a 0% move: `(actual - entry) / entry`
+                # raises TypeError on the first and ZeroDivisionError on the
+                # second. The price is never repaired or invented.
+                #
+                # Historical-write hold: a non-null invalid entry_price (0 or
+                # negative) can only be a legacy row written before
+                # oracle_pred_nullable_0918 made the column nullable -- the
+                # new publish path writes NULL, never 0, when nothing was
+                # measured. Historical rescoring/repair is on hold, so that
+                # row is left exactly as it is: not updated, closed, rescored
+                # or re-labelled. Only a NULL entry_price whose
+                # null_write_policy PROVES it was written under the honest
+                # policy (item (a)'s provenance boundary -- a bare NULL
+                # entry_price is not enough on its own) is closed to
+                # 'no_data' here, carrying the reason it could not be scored
+                # so it stops sitting 'pending' forever and the reason
+                # survives in score_notes. Same contract and same strings as
+                # scripts/score_oracle_trades.py.
+                entry_note = entry_price_score_note(entry)
+                if entry_note is not None:
+                    if entry is None and policy == NULL_WRITE_POLICY:
+                        conn.execute(text("""
+                            UPDATE oracle_predictions
+                            SET verdict = 'no_data',
+                                score_notes = :notes,
+                                scored_at = NOW()
+                            WHERE id = :id
+                        """), {"notes": entry_note, "id": pred_id})
+                        results["unscorable_entry_price"] += 1
+                    elif entry is None:
+                        log.warning(
+                            "score_expired_predictions: pending row {id} has "
+                            "entry_price IS NULL but null_write_policy={p!r} "
+                            "does not prove the honest-NULL policy -- held, "
+                            "not closed (should be structurally impossible; "
+                            "investigate the writer that produced this row)",
+                            id=pred_id, p=policy,
+                        )
+                        results["held_unmarked_null_entry_price"] += 1
+                    else:
+                        log.debug(
+                            "score_expired_predictions: legacy pending row "
+                            "{id} held (entry_price={e!r}, historical-write "
+                            "hold — never updated/closed/rescored)",
+                            id=pred_id, e=entry,
+                        )
+                        results["held_legacy_entry_price"] += 1
+                    continue
 
                 # Get actual price at expiry
                 actual = self._get_price_at_date(ticker, expiry)
@@ -2355,9 +2448,9 @@ class OracleEngine:
                     (id, ticker, prediction_type, direction, target_price, entry_price,
                      expiry, confidence, expected_move_pct, signal_strength, coherence,
                      model_name, model_version, signals, anti_signals, flow_context, model_weights,
-                     horizon_days)
+                     horizon_days, null_write_policy)
                     VALUES (:id, :t, :pt, :d, :tp, :ep, :exp, :conf, :em, :ss, :coh,
-                            :mn, :mv, :sig, :anti, :fc, :mw, :hd)
+                            :mn, :mv, :sig, :anti, :fc, :mw, :hd, :nwp)
                     ON CONFLICT (
                         ticker, direction, expiry, prediction_type,
                         (COALESCE(model_version, '')),
@@ -2386,6 +2479,7 @@ class OracleEngine:
                     "fc": json.dumps(p.flow_context, default=str),
                     "mw": json.dumps(p.model_weights, default=str),
                     "hd": int(p.horizon_days) if p.horizon_days is not None else None,
+                    "nwp": NULL_WRITE_POLICY,
                 })
                 written += 1
                 try:

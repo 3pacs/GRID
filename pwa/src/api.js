@@ -7,6 +7,68 @@ import useRealtimeStore from './stores/realtimeStore.js';
 
 const DEFAULT_GET_CACHE_TTL_MS = 60_000;
 const PRELOAD_CONCURRENCY = 4;
+const SURFACER_TIMEOUT_MS = 30_000;
+
+// Transport snapshot only: selector/date/freshness policy validation remains
+// owned by the stored-only backend. Never infer a source binding or a cutoff.
+export function snapshotStoredRequest(request) {
+    const fail = () => { throw new Error('stored_request_invalid'); };
+    const copy = (value) => {
+        if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
+        if (typeof value === 'number' && Number.isFinite(value)) return value;
+        if (Array.isArray(value)) return value.map(copy);
+        if (!value || typeof value !== 'object' || Object.getPrototypeOf(value) !== Object.prototype) return fail();
+        const result = {};
+        for (const key of Object.keys(value).sort()) {
+            const descriptor = Object.getOwnPropertyDescriptor(value, key);
+            if (!descriptor || !('value' in descriptor) || key === '__proto__') return fail();
+            result[key] = copy(descriptor.value);
+        }
+        return result;
+    };
+    if (request == null) throw new Error('stored_request_missing');
+    let value;
+    try { value = copy(request); } catch { return fail(); }
+    if (!value || Array.isArray(value) || typeof value !== 'object'
+        || Object.keys(value).some(key => !['selections', 'as_of', 'start_date', 'vintage_policy'].includes(key))
+        || !Object.hasOwn(value, 'selections') || (value.selections !== null && !Array.isArray(value.selections))
+        || typeof value.as_of !== 'string' || typeof value.start_date !== 'string'
+        || typeof value.vintage_policy !== 'string') return fail();
+    const json = JSON.stringify(value);
+    if (new TextEncoder().encode(json).byteLength > 16 * 1024) throw new Error('stored_request_too_large');
+    return { json, value };
+}
+
+// Compare an echoed normalized binding, not data freshness or eligibility.
+// Date normalisation is solely instant equality; retain all six microsecond digits.
+function storedInstantKey(value) {
+    const match = typeof value === 'string' && value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,6}))?(Z|[+-]\d{2}:\d{2})$/);
+    if (!match) return null;
+    const seconds = Date.parse(`${match[1]}${match[3]}`);
+    return Number.isFinite(seconds) ? `${new Date(seconds).toISOString().slice(0, 19)}.${(match[2] || '').padEnd(6, '0')}` : null;
+}
+
+export function storedAnalysisMatchesRequest(result, ticker, period, request) {
+    const snapshot = result?.market_features?.stored_source_evidence;
+    const binding = snapshot?.request_binding;
+    if (result?.ticker !== ticker || result?.period !== period || snapshot?.ticker !== ticker
+        || !binding || binding.ticker !== ticker || !storedInstantKey(request.as_of)
+        || storedInstantKey(binding.as_of) !== storedInstantKey(request.as_of)
+        || binding.start_date !== request.start_date || binding.vintage_policy !== request.vintage_policy
+        || !Array.isArray(binding.selections) || binding.selections.length > 7) return false;
+    const supplied = request.selections ?? [];
+    if (supplied.length > 7 || supplied.some(item => !item || typeof item !== 'object')) return false;
+    const fields = ['source_key', 'scope', 'ticker_or_cusip', 'series_id', 'expected_source_name', 'feature_name', 'feature_id'];
+    const seen = new Set();
+    for (const actual of binding.selections) {
+        if (!actual || typeof actual.source_key !== 'string' || seen.has(actual.source_key)) return false;
+        seen.add(actual.source_key);
+        const expected = supplied.find(item => item.source_key === actual.source_key) ?? { source_key: actual.source_key };
+        if (fields.some(key => (actual[key] ?? null) !== (expected[key] ?? null))
+            || JSON.stringify(actual.freshness_policy ?? null) !== JSON.stringify(expected.freshness_policy ?? null)) return false;
+    }
+    return supplied.every(item => seen.has(item.source_key));
+}
 
 class GRIDApiError extends Error {
     constructor(status, message, detail) {
@@ -43,8 +105,8 @@ class GRIDApi {
     }
 
     /** Public GET helper — delegates to _fetch. */
-    async get(path) {
-        return this._fetch(path);
+    async get(path, options) {
+        return this._fetch(path, options);
     }
 
     /** Public POST helper — delegates to _fetch. */
@@ -61,6 +123,7 @@ class GRIDApi {
         if (!path.startsWith('/api/v1/')) return false;
         if (
             path.startsWith('/api/v1/auth/')
+            || path.startsWith('/api/v1/gamma-watch/')
             || path.startsWith('/api/v1/realtime/')
             || path.startsWith('/api/v1/chat/')
             || path.startsWith('/api/v1/alerts')
@@ -122,6 +185,9 @@ class GRIDApi {
     }
 
     async _fetch(path, options = {}) {
+        const gammaState = path === '/api/v1/gamma-watch/state';
+        const callerAborted = () => options.signal?.aborted;
+        const cancelled = () => ({ error: true, status: 0, code: 'request_aborted' });
         const {
             gridTtlMs = DEFAULT_GET_CACHE_TTL_MS,
             gridForce = false,
@@ -149,30 +215,49 @@ class GRIDApi {
             headers['Authorization'] = `Bearer ${this.token}`;
         }
 
-        const request = (async () => {
+        // Apply to every candidates caller, including preloads, so a shared
+        // in-flight request cannot leave Surfacer waiting indefinitely.
+        const bounded = method === 'GET' && path.split('?')[0] === '/api/v1/surfacer/candidates';
+        const controller = bounded ? new AbortController() : null;
+        const callerSignal = fetchOptions.signal;
+        const forwardAbort = () => controller.abort(callerSignal.reason);
+        if (controller && callerSignal) {
+            if (callerSignal.aborted) forwardAbort();
+            else callerSignal.addEventListener('abort', forwardAbort, { once: true });
+        }
+        let timedOut = false;
+        let timer;
+        const work = (async () => {
             let response;
             try {
                 response = await fetch(`${this.baseUrl}${path}`, {
                     ...fetchOptions,
                     headers,
+                    ...(controller ? { signal: controller.signal } : {}),
                 });
             } catch (networkErr) {
                 // Network error (offline, CORS, DNS) — return error object, don't throw
                 return { error: true, status: 0, message: networkErr.message || 'Network error' };
             }
 
+            if (gammaState && callerAborted()) return cancelled();
+
             if (!response.ok) {
                 const body = await response.text().catch(() => '');
+                if (gammaState && callerAborted()) return cancelled();
                 let message = response.statusText;
+                let collectorUnavailable = false;
                 try {
                     const parsed = JSON.parse(body);
                     message = parsed.detail || parsed.message || message;
+                    collectorUnavailable = gammaState && response.status === 503
+                        && parsed.status === 'unavailable' && parsed.data === null;
                 } catch (_) {
                     if (body) message = body;
                 }
 
                 // Only treat 401 as session expiry for non-auth endpoints
-                if (response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
+                if (!timedOut && response.status === 401 && !path.startsWith('/api/v1/auth/login') && !path.startsWith('/api/v1/auth/register')) {
                     this.token = null;
                     if (typeof window.dispatchEvent === 'function') {
                         window.dispatchEvent(new Event('grid:auth-expired'));
@@ -180,14 +265,16 @@ class GRIDApi {
                     window.location.hash = '#/login';
                 }
 
-                return { error: true, status: response.status, message };
+                return { error: true, status: response.status, message,
+                    ...(collectorUnavailable ? { code: 'collector_unavailable' } : {}) };
             }
 
             try {
                 const data = await response.json();
+                if (gammaState && callerAborted()) return cancelled();
                 if (method !== 'GET') {
                     this.clearCache();
-                } else if (cacheable && !data?.error) {
+                } else if (cacheable && !timedOut && !data?.error) {
                     this._cache.set(cacheKey, {
                         value: data,
                         expiresAt: Date.now() + gridTtlMs,
@@ -199,14 +286,29 @@ class GRIDApi {
             }
         })();
 
-        if (cacheable && !gridForce && !gridPreload) {
+        // Race the entire operation, including text/json consumption. An
+        // aborted transport may settle late; it must never populate the cache.
+        const request = bounded ? Promise.race([
+            work,
+            new Promise(resolve => {
+                timer = setTimeout(() => {
+                    timedOut = true;
+                    resolve({ error: true, status: 0, code: 'request_timeout', message: 'Surfacer took too long to load. Please retry.' });
+                    controller.abort();
+                }, SURFACER_TIMEOUT_MS);
+            }),
+        ]) : work;
+
+        if (cacheable && !gridForce && (!gridPreload || bounded)) {
             this._inflight.set(cacheKey, request);
         }
 
         try {
             return await request;
         } finally {
-            if (cacheable) {
+            clearTimeout(timer);
+            callerSignal?.removeEventListener('abort', forwardAbort);
+            if (cacheable && this._inflight.get(cacheKey) === request) {
                 this._inflight.delete(cacheKey);
             }
         }
@@ -367,6 +469,61 @@ class GRIDApi {
         return this._fetch(`/api/v1/dad/ticker/${encodeURIComponent(ticker)}/options?${params.toString()}`);
     }
 
+    /**
+     * Exchange the Bearer session for a short-lived, single-use stream ticket.
+     * EventSource cannot send headers, and the session JWT must never travel in
+     * a URL (it lands in proxy/access logs). Returns the ticket or null.
+     */
+    async createStreamTicket(path) {
+        const token = this.token;
+        if (!token) return null;
+        try {
+            const response = await fetch(`${this.baseUrl}/api/v1/auth/stream-ticket`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({ path }),
+            });
+            if (!response.ok) return null;
+            const data = await response.json();
+            return typeof data?.ticket === 'string' ? data.ticket : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    /**
+     * Open a ticket-authenticated EventSource. Returns a handle with close()
+     * synchronously; the EventSource opens once the ticket arrives. If no
+     * ticket can be obtained, onTicketError fires and nothing is opened.
+     */
+    openTicketedEventSource(path, params = null, { onOpen = null, onTicketError = null, relative = false } = {}) {
+        let closed = false;
+        let source = null;
+        const handle = {
+            get source() { return source; },
+            close() {
+                closed = true;
+                source?.close();
+            },
+        };
+        this.createStreamTicket(path).then(ticket => {
+            if (closed) return;
+            if (!ticket) {
+                onTicketError?.({ type: 'ticket', message: 'Stream authorization failed' });
+                return;
+            }
+            const query = new URLSearchParams(params || undefined);
+            query.set('ticket', ticket);
+            const base = relative ? '' : this.baseUrl;
+            source = new EventSource(`${base}${path}?${query.toString()}`);
+            onOpen?.(source);
+        });
+        return handle;
+    }
+
     streamDadTickerGold(ticker, {
         refreshFinviz = false,
         onEvent = null,
@@ -375,35 +532,37 @@ class GRIDApi {
     } = {}) {
         const params = new URLSearchParams();
         if (refreshFinviz) params.set('refresh_finviz', 'true');
-        if (this.token) params.set('token', this.token);
-        const suffix = params.toString() ? `?${params.toString()}` : '';
-        const source = new EventSource(`${this.baseUrl}/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream${suffix}`);
+        const path = `/api/v1/dad/ticker/${encodeURIComponent(ticker)}/gold/stream`;
         const eventNames = ['start', 'compact', 'evidence', 'chart', 'finviz', 'options', 'done'];
-        const handleNamedEvent = (name, event) => {
-            let payload = {};
-            try {
-                payload = event?.data ? JSON.parse(event.data) : {};
-            } catch (_) {
-                payload = { raw: event?.data || '' };
-            }
-            onEvent?.(name, payload);
-            if (name === 'done') {
-                onDone?.(payload);
-                source.close();
-            }
-        };
+        return this.openTicketedEventSource(path, params, {
+            onTicketError: event => onError?.(event),
+            onOpen: source => {
+                const handleNamedEvent = (name, event) => {
+                    let payload = {};
+                    try {
+                        payload = event?.data ? JSON.parse(event.data) : {};
+                    } catch (_) {
+                        payload = { raw: event?.data || '' };
+                    }
+                    onEvent?.(name, payload);
+                    if (name === 'done') {
+                        onDone?.(payload);
+                        source.close();
+                    }
+                };
 
-        eventNames.forEach(name => {
-            source.addEventListener(name, event => handleNamedEvent(name, event));
+                eventNames.forEach(name => {
+                    source.addEventListener(name, event => handleNamedEvent(name, event));
+                });
+                source.addEventListener('error', event => {
+                    if (event?.data) {
+                        handleNamedEvent('error', event);
+                    } else {
+                        onError?.(event);
+                    }
+                });
+            },
         });
-        source.addEventListener('error', event => {
-            if (event?.data) {
-                handleNamedEvent('error', event);
-            } else {
-                onError?.(event);
-            }
-        });
-        return source;
     }
 
     async _fetchForm(path, form) {
@@ -558,7 +717,13 @@ class GRIDApi {
             method: 'DELETE',
         });
     }
-    async getTickerAnalysis(ticker, period = '3M') {
+    async getTickerAnalysis(ticker, period = '3M', options) {
+        if (options !== undefined) {
+            if (!options || options.storedOnly !== true) throw new Error('stored_mode_invalid');
+            const snapshot = snapshotStoredRequest(options.storedRequest);
+            const query = new URLSearchParams({ period, stored_only: 'true', stored_request: snapshot.json });
+            return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis?${query}`);
+        }
         const qs = period && period !== '3M' ? `?period=${encodeURIComponent(period)}` : '';
         return this._fetch(`/api/v1/watchlist/${encodeURIComponent(ticker)}/analysis${qs}`);
     }
@@ -612,6 +777,15 @@ class GRIDApi {
     async getFreshness() { return this._fetch('/api/v1/system/freshness'); }
     async getHealth() { return this._fetch('/api/v1/system/health'); }
     async getPipelineHealth() { return this._fetch('/api/v1/system/pipeline-health'); }
+
+    // God view (G8): read-only, point-in-time pillar summary. asOf is an ISO
+    // date or an offset-qualified ISO datetime; omitted means server now.
+    async getGodViewLatest({ asOf = null } = {}) {
+        const params = new URLSearchParams();
+        if (asOf) params.set('as_of', asOf);
+        const qs = params.toString();
+        return this._fetch(`/api/v1/godview/latest${qs ? `?${qs}` : ''}`);
+    }
     async getArchitecture() { return this._fetch('/api/v1/system/architecture'); }
 
     // Signals
@@ -774,8 +948,9 @@ class GRIDApi {
     async getFlowLayerDetail(layerId) { return this._fetch(`/api/v1/flows/layers/${encodeURIComponent(layerId)}`); }
     async getFlowWaterfall(source = 'fed') { return this._fetch(`/api/v1/flows/waterfall?source=${encodeURIComponent(source)}`); }
     async getFlowOrthogonality() { return this._fetch('/api/v1/flows/orthogonality'); }
+    /** Paid call (Imagen) — POST only, gated server-side behind GRID_ALLOW_PAID_LLM. */
     async generateFlowImage(type, style = 'dark') {
-        return this._fetch(`/api/v1/flows/generate-image/${encodeURIComponent(type)}?style=${style}`);
+        return this._fetch(`/api/v1/flows/generate-image/${encodeURIComponent(type)}?style=${style}`, { method: 'POST' });
     }
     async getCdsDashboard() { return this._fetch('/api/v1/flows/cds'); }
     async getCdsHistory(seriesKey, days = 365) {
@@ -783,14 +958,34 @@ class GRIDApi {
     }
 
     // Audio Briefing (flow-engine powered, OpenAI TTS)
-    async getFlowBriefing(audio = true) {
-        return this._fetch(`/api/v1/flows/briefing?audio=${audio}`);
+    /** Latest saved briefing, read-only: {status: 'SUCCESS'|'not_generated', briefing}. */
+    async getFlowBriefing() {
+        return this._fetch('/api/v1/flows/briefing');
     }
-    getFlowBriefingAudioUrl(filename = null) {
+    /** Explicitly generate a new briefing (LLM script + optional TTS). */
+    async generateFlowBriefing(audio = true) {
+        return this._fetch(`/api/v1/flows/briefing?audio=${audio ? 'true' : 'false'}`, { method: 'POST' });
+    }
+    /**
+     * Fetch a briefing MP3 with the Authorization header and return an object
+     * URL for <audio src>. The session token never goes in the URL. Callers
+     * own the returned URL and should URL.revokeObjectURL it when done.
+     */
+    async loadFlowBriefingAudio(filename = null) {
         const path = filename
             ? `/api/v1/flows/briefing/audio/${encodeURIComponent(filename)}`
             : '/api/v1/flows/briefing/audio';
-        return `${this.baseUrl}${path}?token=${encodeURIComponent(this.token || '')}`;
+        const headers = this.token ? { Authorization: `Bearer ${this.token}` } : {};
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, { headers });
+            if (!response.ok) return null;
+            const type = response.headers?.get?.('content-type') || '';
+            if (!type.startsWith('audio/')) return null;
+            const blob = await response.blob();
+            return URL.createObjectURL(blob);
+        } catch (_) {
+            return null;
+        }
     }
     async listFlowBriefings() {
         return this._fetch('/api/v1/flows/briefing/list');

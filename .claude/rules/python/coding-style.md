@@ -5,7 +5,7 @@ paths:
 ---
 # Python Coding Style
 
-> Python-specific layer. General coding-style guidance lives in the `coding-standards` skill.
+> Python-specific layer. Frontend conventions live in `.claude/rules/frontend.md`.
 
 ## Standards
 

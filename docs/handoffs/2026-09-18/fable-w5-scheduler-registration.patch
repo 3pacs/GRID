@@ -1,0 +1,43 @@
+diff --git a/ingestion/scheduler.py b/ingestion/scheduler.py
+index 33450cd1..ac457814 100644
+--- a/ingestion/scheduler.py
++++ b/ingestion/scheduler.py
+@@ -679,6 +679,38 @@ def _get_pullers_for_group(
+             pullers.append(("EIA_Energy", EIAPuller(db_engine), "pull", {}))
+         except Exception as exc:
+             log.warning("EIA puller init failed: {err}", err=str(exc))
++        # LME warehouse stocks + cancelled-warrant ratio (daily, CAT-51).
++        # LMEWarehousePuller.pull() only fetches/parses -- it does not write
++        # to raw_series on its own (see save_to_db()). Every other entry in
++        # this `pullers` list assumes `getattr(puller, method)(**kwargs)`
++        # both fetches AND writes, so a bare `(LMEWarehousePuller(db_engine),
++        # "pull", {})` entry would run "successfully" every day while
++        # writing zero rows -- silently, since the run loop below only logs
++        # whatever the call returns. This thin adapter calls save_to_db()
++        # too, matching what every other puller's own method already does.
++        try:
++            from ingestion.altdata.lme_warehouse import LMEWarehousePuller
++
++            class _LMEWarehouseSchedulerAdapter:
++                """Fetch-then-save shim -- see comment above."""
++
++                def __init__(self, engine: Engine) -> None:
++                    self._puller = LMEWarehousePuller(engine)
++
++                def pull(self) -> dict[str, Any]:
++                    snapshots = self._puller.pull()
++                    inserted = self._puller.save_to_db(snapshots)
++                    return {
++                        "fetched": len(snapshots),
++                        "inserted": inserted,
++                        "source": self._puller._last_source,
++                    }
++
++            pullers.append(
++                ("LME_Warehouse", _LMEWarehouseSchedulerAdapter(db_engine), "pull", {})
++            )
++        except Exception as exc:
++            log.warning("LME warehouse puller init failed: {err}", err=str(exc))
+         # NOAA space weather — planetary K-index (daily)
+         try:
+             from ingestion.physical.noaa_space_weather import NOAASpaceWeatherPuller

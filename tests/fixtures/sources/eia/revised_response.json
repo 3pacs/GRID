@@ -1,0 +1,35 @@
+{
+  "response": {
+    "warnings": [],
+    "total": "3",
+    "dateFormat": "YYYY-MM-DD",
+    "frequency": "daily",
+    "data": [
+      {
+        "period": "2026-09-14",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "70.1000",
+        "units": "$/BBL"
+      },
+      {
+        "period": "2026-09-15",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "70.5000",
+        "units": "$/BBL"
+      },
+      {
+        "period": "2026-09-16",
+        "series": "RBRTE",
+        "series-description": "Europe Brent Spot Price FOB, Daily",
+        "value": "70.3000",
+        "units": "$/BBL"
+      }
+    ]
+  },
+  "request": {
+    "command": "/v2/petroleum/pri/spt/data/",
+    "params": {"facets": {"series": ["RBRTE"]}}
+  }
+}

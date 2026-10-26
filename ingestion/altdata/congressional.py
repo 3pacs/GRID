@@ -56,12 +56,69 @@ AMOUNT_RANGES: dict[str, tuple[int, int]] = {
     "J": (50_000_001, 999_999_999),
 }
 
+# STOCK Act members must disclose within 45 days of a trade. When a source
+# doesn't carry an actual disclosure/filing timestamp, this statutory bound
+# is a defensible lower-bound estimate of when the trade became public —
+# unlike copying the transaction date, which would assert a same-day
+# disclosure the source never claimed (GD-FIX: "disclosure_date equals
+# transaction_date on all 636 April-May rows" was exactly that fabrication).
+DISCLOSURE_STATUTORY_LAG_DAYS: int = 45
+
+
+def _parse_iso_date(value: Any) -> date | None:
+    """Parse the leading ``YYYY-MM-DD`` of a value, or None."""
+    if not value:
+        return None
+    try:
+        return date.fromisoformat(str(value)[:10])
+    except (ValueError, TypeError):
+        return None
+
+
+def resolve_disclosure_date(
+    transaction_date: date,
+    disclosure_date_str: str | None,
+    last_modified_str: str | None = None,
+) -> tuple[date, str]:
+    """Resolve the best-defensible disclosure date and its basis.
+
+    Parameters:
+        transaction_date: The trade's transaction date (never used as the
+            disclosure date itself — see module docstring above).
+        disclosure_date_str: A disclosure/filing date string from the
+            source, if any (e.g. QuiverQuant's ``DisclosureDate``).
+        last_modified_str: QuiverQuant's ``last_modified`` stamp, if any.
+            A record can only be edited after it was published, so a
+            stamp on/after the trade is an upper bound on the disclosure
+            (same rule as people_events ``congress_from_qq``). It can be
+            later than the real disclosure, never earlier — PIT-safe.
+
+    Returns:
+        ``(disclosure_date, basis)`` where ``basis`` is ``"reported"`` when
+        the source gave a real disclosure date, ``"qq_last_modified"`` when
+        the QuiverQuant edit stamp bounds it, or ``"statutory_bound"`` when
+        it is estimated from the 45-day STOCK Act deadline.
+    """
+    parsed = _parse_iso_date(disclosure_date_str)
+    if parsed is not None and parsed >= transaction_date:
+        return parsed, "reported"
+    modified = _parse_iso_date(last_modified_str)
+    if modified is not None and modified >= transaction_date:
+        return modified, "qq_last_modified"
+    return (
+        transaction_date + timedelta(days=DISCLOSURE_STATUTORY_LAG_DAYS),
+        "statutory_bound",
+    )
+
+
 # Normalise transaction types
 _TXN_NORMALIZE: dict[str, str] = {
     "purchase": "BUY",
     "sale": "SELL",
     "sale_full": "SELL",
     "sale_partial": "SELL",
+    "sale (full)": "SELL",
+    "sale (partial)": "SELL",
     "exchange": "EXCHANGE",
     "buy": "BUY",
     "sell": "SELL",
@@ -120,29 +177,34 @@ def _normalize_txn_type(raw_type: str) -> str:
     return _TXN_NORMALIZE.get(raw_type.strip().lower(), raw_type.strip().upper())
 
 
+_BAND_BY_LOWER: dict[int, tuple[int, int]] = {lo: (lo, hi) for lo, hi in AMOUNT_RANGES.values()}
+
+
 def _midpoint_amount(amount_range: str) -> float:
     """Get the midpoint dollar value from an amount range code or string.
 
     Parameters:
-        amount_range: Either a code ('A'-'J') or a string like '$1,001 - $15,000'.
+        amount_range: A code ('A'-'J'), a string like '$1,001 - $15,000',
+            or a bare band lower bound like QuiverQuant's ``Amount``
+            ('1001.0'), which is mapped to its disclosure band.
 
     Returns:
-        Midpoint dollar value as float.
+        Midpoint dollar value as float (0.0 if unparseable).
     """
+    amount_range = str(amount_range or "").strip()
     # Try coded range first
     if amount_range.upper() in AMOUNT_RANGES:
         lo, hi = AMOUNT_RANGES[amount_range.upper()]
         return (lo + hi) / 2.0
 
-    # Try parsing dollar range string
-    nums = re.findall(r"[\d,]+", amount_range.replace(",", ""))
+    # Decimal-aware: "1001.0" is one number, not 1001 and 0.
+    nums = re.findall(r"\d+(?:\.\d+)?", amount_range.replace(",", ""))
     if len(nums) >= 2:
-        try:
-            lo = float(nums[0].replace(",", ""))
-            hi = float(nums[1].replace(",", ""))
-            return (lo + hi) / 2.0
-        except ValueError:
-            pass
+        return (float(nums[0]) + float(nums[1])) / 2.0
+    if len(nums) == 1:
+        band = _BAND_BY_LOWER.get(int(float(nums[0])))
+        if band is not None:
+            return (band[0] + band[1]) / 2.0
 
     return 0.0
 
@@ -301,7 +363,9 @@ class CongressionalTradingPuller(BasePuller):
             member = rec.get("Representative") or rec.get("Name") or ""
             ticker = rec.get("Ticker") or ""
             txn_type = rec.get("Transaction") or rec.get("Type") or ""
-            amount = rec.get("Amount") or rec.get("Range") or ""
+            # "Range" is the disclosed band ("$1,001 - $15,000"); "Amount" is
+            # only its lower bound ("1001.0"), so prefer Range.
+            amount = rec.get("Range") or rec.get("Amount") or ""
 
             if not member or not ticker or not txn_type:
                 continue
@@ -312,17 +376,23 @@ class CongressionalTradingPuller(BasePuller):
                 chamber = "SENATE"
 
             txn_date_str = rec.get("TransactionDate") or rec.get("Date") or ""
-            disc_date_str = rec.get("DisclosureDate") or rec.get("FilingDate") or ""
+            disc_date_str = (
+                rec.get("DisclosureDate") or rec.get("ReportDate") or rec.get("FilingDate") or ""
+            )
 
             try:
                 txn_date = date.fromisoformat(txn_date_str[:10])
             except (ValueError, TypeError):
                 continue
 
-            try:
-                disc_date = date.fromisoformat(disc_date_str[:10]) if disc_date_str else txn_date
-            except (ValueError, TypeError):
-                disc_date = txn_date
+            # GD-FIX: QuiverQuant's congress-trading endpoint does not
+            # reliably carry a DisclosureDate/FilingDate field. Falling back
+            # to the transaction date (the old behaviour) fabricated a
+            # same-day disclosure; resolve_disclosure_date() instead uses the
+            # last_modified stamp, then the 45-day statutory bound, and says so.
+            disc_date, disc_basis = resolve_disclosure_date(
+                txn_date, disc_date_str, rec.get("last_modified") or rec.get("LastModified")
+            )
 
             trades.append({
                 "member_name": member.strip(),
@@ -337,6 +407,7 @@ class CongressionalTradingPuller(BasePuller):
                 "amount_midpoint": _midpoint_amount(str(amount)),
                 "transaction_date": txn_date,
                 "disclosure_date": disc_date,
+                "disclosure_basis": disc_basis,
             })
 
         return trades
@@ -439,6 +510,7 @@ class CongressionalTradingPuller(BasePuller):
                     "amount_range": trade["amount_range"],
                     "amount_midpoint": trade["amount_midpoint"],
                     "disclosure_date": trade["disclosure_date"].isoformat(),
+                    "disclosure_basis": trade.get("disclosure_basis", "reported"),
                     "disclosure_lag_days": (
                         trade["disclosure_date"] - trade["transaction_date"]
                     ).days,
@@ -533,6 +605,7 @@ class CongressionalTradingPuller(BasePuller):
                         "transaction_type": trade["transaction_type"],
                         "amount_range": trade["amount_range"],
                         "disclosure_date": trade["disclosure_date"].isoformat(),
+                        "disclosure_basis": trade.get("disclosure_basis", "reported"),
                         "transaction_date": trade["transaction_date"].isoformat(),
                     },
                 )

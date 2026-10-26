@@ -40,6 +40,13 @@ class Actor:
     data_sources: list[str] = field(default_factory=list)
     credibility: str = "inferred"  # 'hard_data', 'public_record', 'rumor', 'inferred'
 
+    # Provenance (intelligence/actors/provenance.py) -- a claim about where the
+    # CURRENT row content came from, distinct from `credibility` above. The raw
+    # stored value; callers pass it to actor_source()/stamp_actor_node() to get
+    # the wire "source" label rather than guessing from the static seed list.
+    provenance: str = "unknown"
+    provenance_as_of: str | None = None
+
 
 @dataclass
 class WealthFlow:

@@ -24,6 +24,10 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+class PullLogPersistenceError(RuntimeError):
+    """A required pull_log start or finish could not be durably recorded."""
+
+
 class PullContext:
     """Context manager that wraps puller execution with accountability.
 
@@ -37,20 +41,43 @@ class PullContext:
         puller_name: str,
         source_id: int | None = None,
         node_name: str = "grid-svr",
+        require_persisted_log: bool = False,
     ) -> None:
         self._engine = engine
         self._puller_name = puller_name
         self._source_id = source_id
         self._node_name = node_name
+        self._require_persisted_log = require_persisted_log
         self._log_id: int | None = None
-        self._rows_inserted: int = 0
+        self._rows_inserted: int | None = 0
         self._rows_expected: int | None = None
         self._features_affected: list[int] = []
+        self._note: str | None = None
+        self._reported_status: str | None = None
         self._started_at = datetime.now(timezone.utc)
 
-    def record_rows(self, count: int) -> None:
+    def record_rows(self, count: int | None) -> None:
         """Record number of rows inserted during this pull."""
-        self._rows_inserted += count
+        if count is None or self._rows_inserted is None:
+            self._rows_inserted = None
+        else:
+            self._rows_inserted += count
+
+    def set_note(self, note: str) -> None:
+        """Annotate a run that ends SUCCESS without being a fresh pull.
+
+        pull_log's CHECK constraint has no SKIPPED / NO_NEW_DATA status, so
+        such a run is stored as SUCCESS with its honest row count and this
+        note in error_message (e.g. ``"SKIPPED: all 40 items skipped"``).
+        """
+        self._note = note
+
+    def set_status(self, status: str, note: str | None = None) -> None:
+        """Preserve a puller's terminal status without losing committed rows."""
+        if status not in {"SUCCESS", "PARTIAL", "FAILED"}:
+            raise ValueError(f"Unsupported pull_log status: {status}")
+        self._reported_status = status
+        self._note = note
 
     def set_expected(self, count: int) -> None:
         """Set expected row count for partial detection."""
@@ -61,7 +88,7 @@ class PullContext:
         self._features_affected.extend(feature_ids)
 
     @property
-    def rows_inserted(self) -> int:
+    def rows_inserted(self) -> int | None:
         return self._rows_inserted
 
     def __enter__(self) -> "PullContext":
@@ -84,9 +111,21 @@ class PullContext:
                 row = result.fetchone()
                 self._log_id = row[0] if row else None
         except Exception as exc:
+            if self._require_persisted_log:
+                log.error(
+                    "PullContext: required pull_log start failed for {p} ({kind})",
+                    p=self._puller_name, kind=type(exc).__name__,
+                )
+                raise PullLogPersistenceError(
+                    f"pull_log start unavailable for {self._puller_name}"
+                ) from exc
             log.warning(
                 "PullContext: failed to create pull_log entry for {p}: {e}",
                 p=self._puller_name, e=str(exc),
+            )
+        if self._require_persisted_log and self._log_id is None:
+            raise PullLogPersistenceError(
+                f"pull_log start returned no id for {self._puller_name}"
             )
         return self
 
@@ -100,7 +139,12 @@ class PullContext:
                 "Pull FAILED: {p} — {e}",
                 p=self._puller_name, e=error_msg,
             )
-        elif self._rows_expected and self._rows_inserted < self._rows_expected * 0.5:
+        elif self._reported_status in {"PARTIAL", "FAILED"}:
+            status = self._reported_status
+            error_msg = self._note
+            log.warning("Pull {s}: {p} — {r} rows ({e})", s=status,
+                        p=self._puller_name, r=self._rows_inserted, e=error_msg)
+        elif self._rows_expected and self._rows_inserted is not None and self._rows_inserted < self._rows_expected * 0.5:
             status = "PARTIAL"
             error_msg = (
                 f"Expected ~{self._rows_expected} rows, got {self._rows_inserted}"
@@ -111,11 +155,12 @@ class PullContext:
             )
         else:
             status = "SUCCESS"
-            error_msg = None
-            log.info(
-                "Pull SUCCESS: {p} — {r} rows",
-                p=self._puller_name, r=self._rows_inserted,
-            )
+            error_msg = self._note
+            if not self._require_persisted_log:
+                log.info(
+                    "Pull SUCCESS: {p} — {r} rows",
+                    p=self._puller_name, r=self._rows_inserted,
+                )
 
         # ── Sanity checks on row counts ───────────────────────────────
         self._sanity_check_row_counts(status)
@@ -123,7 +168,7 @@ class PullContext:
         if self._log_id is not None:
             try:
                 with self._engine.begin() as conn:
-                    conn.execute(
+                    result = conn.execute(
                         text("""
                             UPDATE pull_log SET
                                 completed_at = :completed,
@@ -133,6 +178,7 @@ class PullContext:
                                 error_message = :error,
                                 features_affected = :features
                             WHERE id = :id
+                            RETURNING id
                         """),
                         {
                             "completed": now,
@@ -144,16 +190,39 @@ class PullContext:
                             "id": self._log_id,
                         },
                     )
+                    if self._require_persisted_log and result.fetchone() is None:
+                        raise PullLogPersistenceError(
+                            f"pull_log finish matched no row for {self._puller_name}"
+                        )
             except Exception as db_exc:
+                if self._require_persisted_log:
+                    log.error(
+                        "PullContext: required pull_log finish failed for {p} ({kind})",
+                        p=self._puller_name, kind=type(db_exc).__name__,
+                    )
+                    raise PullLogPersistenceError(
+                        f"pull_log finish unavailable for {self._puller_name}"
+                    ) from db_exc
                 log.warning(
                     "PullContext: failed to update pull_log for {p}: {e}",
                     p=self._puller_name, e=str(db_exc),
                 )
 
+        if self._require_persisted_log and status == "SUCCESS":
+            log.info(
+                "Pull SUCCESS: {p} — {r} rows (pull_log committed)",
+                p=self._puller_name, r=self._rows_inserted,
+            )
+
         # Emit event for bus integration (best-effort)
         try:
+            event_status = status
+            if status == "SUCCESS" and self._note:
+                marker = self._note.split(":", 1)[0]
+                if marker in {"NO_NEW_DATA", "SKIPPED"}:
+                    event_status = marker
             _emit_pull_event(
-                self._engine, self._puller_name, status,
+                self._engine, self._puller_name, event_status,
                 self._rows_inserted, self._features_affected, self._node_name,
             )
         except Exception as exc:
@@ -172,6 +241,8 @@ class PullContext:
 
         Never raises — all warnings are log-only.
         """
+        if self._rows_inserted is None:
+            return
         try:
             with self._engine.connect() as conn:
                 # Get the last 20 successful pulls for this puller
@@ -254,7 +325,7 @@ def _emit_pull_event(
     engine: Engine,
     puller_name: str,
     status: str,
-    rows: int,
+    rows: int | None,
     features: list[int],
     node: str,
 ) -> None:

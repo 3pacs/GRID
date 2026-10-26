@@ -492,7 +492,9 @@ function _nodeMatchesKeys(id, attrs, keys) {
 // Mobile-friendly: nothing huge, everything readable.
 function _nodeSize(node) {
     const type = node.type || 'actor';
-    const inf = Math.min(node.influence || 0.3, 1.0); // clamp to 0-1
+    // influence is null for an unscored actor; an unknown score must not be
+    // drawn as a mid-range one, so unscored actors get the minimum radius.
+    const inf = node.influence == null ? 0 : Math.min(node.influence, 1.0);
     switch (type) {
         case 'actor':
             // Range: 4-12px. Sovereign/high-influence actors are bigger.
@@ -500,8 +502,9 @@ function _nodeSize(node) {
         case 'ticker':
             return 6; // fixed medium
         case 'signal':
-            // Smaller, scale by confidence
-            return Math.max(3, Math.min(7, (node.confidence || 0.5) * 6 + 2));
+            // Scale by the provenance class score when the row has one; an
+            // unknown provenance draws at the minimum size rather than mid.
+            return Math.max(3, Math.min(7, (node.source_class_score ?? 0) * 6 + 2));
         case 'event':
             return 5;
         default:
@@ -534,7 +537,8 @@ function _nodeAttributes(node, id) {
     const nodeType = node.type || node.nodeType || node.node_type || data.type || 'actor';
     const tier = node.tier || data.tier || 'individual';
     const category = node.category || data.category || null;
-    const influence = node.influence || data.influence || data.influence_score || 0.3;
+    // null means "unscored"; do not substitute a mid-range 0.3.
+    const influence = node.influence ?? data.influence ?? data.influence_score ?? null;
     const label = node.label || node.name || data.label || data.name || id;
     const graphDepth = Number(
         node.graphDepth ?? node.graph_depth ?? data.graphDepth ?? data.graph_depth ?? 0
@@ -558,7 +562,8 @@ function _nodeAttributes(node, id) {
         entityId: node.entityId || node.entity_id || data.entityId || data.entity_id,
         ticker: node.ticker || data.ticker,
         direction: node.direction || data.direction,
-        confidence: node.confidence || data.confidence,
+        source_class: node.source_class || data.source_class,
+        source_class_score: node.source_class_score ?? data.source_class_score ?? null,
         magnitude: node.magnitude || data.magnitude,
         source_type: node.source_type || data.source_type || data.sourceType,
         data: {

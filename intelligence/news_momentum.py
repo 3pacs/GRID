@@ -354,6 +354,7 @@ class DivergenceDetector:
                         SELECT obs_date, value
                         FROM raw_series
                         WHERE series_id = :sid
+                          AND pull_status = 'SUCCESS'
                           AND obs_date >= CURRENT_DATE - :days
                         ORDER BY obs_date ASC
                     """),
@@ -367,6 +368,7 @@ class DivergenceDetector:
                             SELECT obs_date, value
                             FROM raw_series
                             WHERE series_id LIKE :pattern
+                              AND pull_status = 'SUCCESS'
                               AND obs_date >= CURRENT_DATE - :days
                             ORDER BY obs_date ASC
                             LIMIT 20

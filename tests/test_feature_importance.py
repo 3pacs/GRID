@@ -123,10 +123,10 @@ class TestPermutationImportance:
         )
         assert result == {}
 
-    def test_returns_zeros_when_no_variance(
+    def test_returns_empty_when_no_variance(
         self, tracker, model_info, feature_names_map,
     ):
-        """When all scores are identical, importance should be 0 for all."""
+        """A constant model score makes importance unmeasurable: no fabricated 0.0s."""
         # Constant feature matrix => zero variance
         dates = pd.date_range(end=date(2025, 6, 1), periods=50, freq="B")
         constant_matrix = pd.DataFrame(
@@ -142,8 +142,8 @@ class TestPermutationImportance:
             model_id=1, as_of_date=date(2025, 6, 1),
         )
 
-        for score in result.values():
-            assert score == 0.0
+        assert result == {}
+        tracker._persist_importance.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -262,10 +262,10 @@ class TestRollingStability:
             assert info["std_importance"] >= 0.0
             assert 0.0 <= info["stability_score"] <= 1.0
 
-    def test_returns_zeros_when_series_too_short(
+    def test_returns_none_when_series_too_short(
         self, tracker, feature_names_map,
     ):
-        """Features with fewer rows than the window should get zero scores."""
+        """Features with fewer rows than the window are unmeasured (None), not 0.0."""
         short_dates = pd.date_range(end=date(2025, 5, 30), periods=3, freq="B")
         short_matrix = pd.DataFrame(
             {1: [1.0, 2.0, 3.0], 2: [4.0, 5.0, 6.0], 3: [7.0, 8.0, 9.0]},
@@ -280,8 +280,10 @@ class TestRollingStability:
             window=63,
         )
 
+        assert result
         for info in result.values():
-            assert info["stability_score"] == 0.0
+            assert info["stability_score"] is None
+            assert info["mean_importance"] is None
 
     def test_stable_feature_scores_higher(self, tracker, feature_names_map):
         """A constant feature should have higher stability than a volatile one."""

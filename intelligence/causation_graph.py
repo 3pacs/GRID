@@ -64,6 +64,7 @@ def trace_causal_chain(
     ticker: str,
     end_date: str | None = None,
     max_hops: int = 5,
+    persist: bool = True,
 ) -> list[CausalChain]:
     """Trace multi-hop causal chains backward from price moves or trades.
 
@@ -76,11 +77,14 @@ def trace_causal_chain(
         ticker: Stock ticker symbol.
         end_date: ISO date string to anchor the chain (default: today).
         max_hops: Maximum number of backward hops.
+        persist: When True (default), ensure the causal tables and store the
+            traced chains. GET routes pass False so reads never write.
 
     Returns:
         List of CausalChain instances, longest first, with confidence scoring.
     """
-    ensure_table(engine)
+    if persist:
+        ensure_table(engine)
     ticker = ticker.strip().upper()
 
     if end_date:
@@ -170,8 +174,8 @@ def trace_causal_chain(
     # Sort by hops descending, then confidence descending
     chains.sort(key=lambda c: (-c.total_hops, -c.confidence))
 
-    # Persist chains
-    if chains:
+    # Persist chains (explicit writers only; read paths pass persist=False)
+    if chains and persist:
         _store_chains(engine, chains)
 
     log.info(
@@ -182,17 +186,21 @@ def trace_causal_chain(
     return chains
 
 
-def find_longest_chains(engine: Engine, days: int = 180) -> list[CausalChain]:
+def find_longest_chains(
+    engine: Engine, days: int = 180, persist: bool = True,
+) -> list[CausalChain]:
     """Find the longest traceable causal chains across all tickers.
 
     Parameters:
         engine: SQLAlchemy engine.
         days: How far back to search for tickers with activity.
+        persist: Passed to :func:`trace_causal_chain`; False keeps it read-only.
 
     Returns:
         List of CausalChain instances, sorted longest and highest confidence first.
     """
-    ensure_table(engine)
+    if persist:
+        ensure_table(engine)
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
@@ -219,7 +227,7 @@ def find_longest_chains(engine: Engine, days: int = 180) -> list[CausalChain]:
     for row in rows:
         ticker = row[0]
         try:
-            chains = trace_causal_chain(engine, ticker, max_hops=5)
+            chains = trace_causal_chain(engine, ticker, max_hops=5, persist=persist)
             all_chains.extend(chains)
         except Exception as exc:
             log.debug("Chain trace for {t} failed: {e}", t=ticker, e=str(exc))
@@ -296,8 +304,11 @@ def detect_chain_in_progress(engine: Engine) -> list[dict]:
     Returns:
         List of dicts describing active chain patterns, with predictions
         about what might happen next.
+
+    Read-only (served by a GET): no ``ensure_table`` DDL. A missing
+    ``causal_chains`` table only means no historical match, which
+    ``_match_historical_chain`` already treats as None.
     """
-    ensure_table(engine)
     today = date.today()
     cutoff_recent = today - timedelta(days=30)
     cutoff_historical = today - timedelta(days=365)

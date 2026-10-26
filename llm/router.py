@@ -531,9 +531,13 @@ def _create_llamacpp_client(settings: Any) -> Any:
         return None
     try:
         from llamacpp.client import LlamaCppClient
+        # Honour LLAMACPP_TIMEOUT_SECONDS like llamacpp.client.get_client();
+        # without it the client fell back to its 120 s default and the
+        # configured 300 s was silently ignored on every router path.
         return LlamaCppClient(
             base_url=settings.LLAMACPP_BASE_URL,
             model=settings.LLAMACPP_CHAT_MODEL,
+            timeout=getattr(settings, "LLAMACPP_TIMEOUT_SECONDS", 120),
         )
     except Exception as exc:
         log.debug("llama.cpp client init failed: {e}", e=str(exc))

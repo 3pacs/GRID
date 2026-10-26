@@ -1,0 +1,41 @@
+diff --git a/outputs/storage_maintenance/storage_maintenance_latest.md b/outputs/storage_maintenance/storage_maintenance_latest.md
+index 6d68e880..3f1ea7e5 100644
+--- a/outputs/storage_maintenance/storage_maintenance_latest.md
++++ b/outputs/storage_maintenance/storage_maintenance_latest.md
+@@ -1,20 +1,21 @@
+-# GRID Storage Maintenance — 2026-09-11T13:11:13.240737+00:00
++# GRID Storage Maintenance — 2026-09-26T05:00:44.708194+00:00
+ 
+-- Status: `ok`
++- Status: `ingest_gap`
+ - Target: `grid-svr-data`
+ - Cold storage root: `/mirror`
+ 
+ ## Filesystems
+ 
+-- `/data` exists=True used=2976.365GiB free=8110.451GiB use_pct=26.8
+-- `/mirror` exists=True used=9210.808GiB free=7485.359GiB use_pct=55.2
++- `/data` exists=True used=3012.237GiB free=8074.579GiB use_pct=27.2
++- `/mirror` exists=True used=14107.145GiB free=2589.022GiB use_pct=84.5
+ 
+ ## GDELT
+ 
+-- Ingest status: `tables_populated`
++- Ingest status: `tables_empty`
+ - State counts: `{"v1_events.done": 4848, "v1_gkg.done": 9470, "v2_english.done": 1149248, "v2_translation.done": 1133693}`
+ - Directory file counts: `{"parser_root": 755, "v1_events": 4848, "v1_gkg": 9468, "v2_english": 1149248, "v2_translation": 1133693}`
+-- DB tables: `{"gdelt_daily_summary": {"exists": true, "rows": 1878}, "gdelt_events": {"exists": true, "rows": 87887709}}`
++- DB tables: `{"error": "(psycopg2.errors.QueryCanceled) canceling statement due to statement timeout\n\n[SQL: SELECT COUNT(*) FROM gdelt_events]\n(Background on this error at: https://sqlalche.me/e/20/e3q8)"}`
++- Recommendation: Run a bounded GDELT parser smoke before any archive cleanup.
+ - Recommendation: scripts/parse_gdelt.py only reads /data/grid/bulk/gdelt; /data/gdelt/v1/events has more files and needs parser coverage or a curated ingest symlink.
+ - Recommendation: GDELT v2 English/translation archives are massive; keep them on /mirror after parser/index coverage is proven.
+ 
+@@ -48,7 +49,7 @@
+ 
+ ## Ingest Plan
+ 
+-- No immediate ingest plan generated.
++- `run_gdelt_parser_smoke`: python3 scripts/parse_gdelt.py
+ 
+ ## Cleanup Plan
+ 

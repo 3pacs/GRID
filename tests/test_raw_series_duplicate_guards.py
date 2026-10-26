@@ -205,7 +205,8 @@ def test_cftc_cot_skips_duplicate_success_rows():
 
     record = {
         "report_date_as_yyyy_mm_dd": "2026-04-07",
-        "market_and_exchange_names": "S&P 500 - CHICAGO MERCANTILE EXCHANGE",
+        "market_and_exchange_names": "E-MINI S&P 500 - CHICAGO MERCANTILE EXCHANGE",
+        "cftc_contract_market_code": "13874A",
         "comm_positions_long_all": "10",
         "comm_positions_short_all": "4",
         "noncomm_positions_long_all": "7",
@@ -214,9 +215,9 @@ def test_cftc_cot_skips_duplicate_success_rows():
     }
 
     with patch.object(cftc_cot, "_RATE_LIMIT_DELAY", 0.0), patch.object(
-        puller, "_fetch_cot_data", return_value=[record, record]
+        puller, "_fetch_market", return_value=[record, record]
     ):
-        result = puller.pull_contract("SP500", start_date="2026-01-01")
+        result = puller.pull_market("13874A", start_date="2026-01-01")
 
     assert result["rows_inserted"] == 6
     assert len(inserted_rows) == 6

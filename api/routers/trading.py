@@ -51,10 +51,12 @@ class RobinhoodTradeRequest(BaseModel):
     ticker: str
     direction: str = "LONG"  # LONG buys; SHORT sells held quantity (spot)
     size_usd: float
+    idempotency_key: str | None = None  # repeat -> status="duplicate", not resubmitted
 
 
 class RobinhoodCloseRequest(BaseModel):
     ticker: str
+    idempotency_key: str | None = None
 
 
 class TradeRequest(BaseModel):
@@ -489,16 +491,27 @@ async def robinhood_orders(
     return {"orders": orders, "count": len(orders)}
 
 
+#: Result statuses that mean "the connector made a deliberate decision, not
+#: a client error" — a guard block, a wallet gate, or a recognized replay.
+#: These come back 200 with the reason in the body, never a 400.
+_NON_ERROR_STATUSES = ("rejected", "blocked", "duplicate")
+
+
 @router.post("/robinhood/trade")
 async def robinhood_trade(
     req: RobinhoodTradeRequest,
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Market order sized in USD; returns status dry_run until live trading is enabled."""
+    """Sized in USD (a marketable limit order by default; see
+    ROBINHOOD_USE_LIMIT_ORDERS) — returns status dry_run until live trading
+    is enabled. A repeated ``idempotency_key`` comes back status="duplicate"
+    rather than resubmitted; a tripped guard (drawdown, daily loss, order
+    rate, wallet, stale quote, wide spread) comes back status="blocked"."""
     result = _get_robinhood().open_position(
         ticker=req.ticker, direction=req.direction, size_usd=req.size_usd,
+        client_order_id=req.idempotency_key,
     )
-    if "error" in result and result.get("status") != "rejected":
+    if "error" in result and result.get("status") not in _NON_ERROR_STATUSES:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 
@@ -509,8 +522,8 @@ async def robinhood_close(
     _token: str = Depends(require_auth),
 ) -> dict:
     """Sell the whole tradable holding of a ticker."""
-    result = _get_robinhood().close_position(ticker=req.ticker)
-    if "error" in result and result.get("status") != "rejected":
+    result = _get_robinhood().close_position(ticker=req.ticker, client_order_id=req.idempotency_key)
+    if "error" in result and result.get("status") not in _NON_ERROR_STATUSES:
         raise HTTPException(status_code=400, detail=result["error"])
     return result
 

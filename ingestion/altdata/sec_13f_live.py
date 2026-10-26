@@ -39,11 +39,13 @@ from __future__ import annotations
 import csv
 import glob
 import os
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import date
-from typing import Any
+from datetime import datetime as _datetime
+from typing import Any, Callable, TypeVar
 
 import requests
 from loguru import logger as log
@@ -83,81 +85,113 @@ def _ensure_identity() -> None:
     set_identity(_EDGAR_IDENTITY)
     _identity_set = True
 
-# ── Filer universe ────────────────────────────────────────────────────────────
-# Curated set of ~35 high-signal 13F filers. CIKs are the canonical SEC
-# Central Index Keys. We keep a human-friendly short key for CLI
-# selection (``--filers berkshire_hathaway``) plus the pretty display name
-# stored in ``institutional_holdings.holder_name``.
+
+# ── edgartools HTTP/2 deadlock guard ─────────────────────────────────────────
 #
-# CIKs for the original 20 come from
-# ``scripts/populate_institutional_holdings.py`` so the new rows merge
-# cleanly with the curated bootstrap rows on the
-# (holder_name, ticker, report_date) unique index.
+# edgartools's HTTP layer (httpxthrottlecache) auto-enables HTTP/2 whenever the
+# optional `h2` package happens to be importable -- no opt-in required
+# (httpxthrottlecache/httpxclientmanager.py: `HTTP2 = importlib.util.find_spec
+# ("h2") is not None`, used as the default for httpx_params["http2"]). That
+# HTTP/2 path deadlocked repeatedly in prod fetching 13F infotables:
+# faulthandler showed the main thread permanently blocked in
+# httpcore/_sync/http2.py:131 acquiring a stream-allocation lock that takes no
+# timeout of its own (pyrate_limiter's asyncio rate-limit bucket thread was
+# still alive, so it was not a process-wide hang -- just this one call, forever).
+#
+# edgartools's public `configure_http()` has no `http2` parameter, so there is
+# no supported way to ask for HTTP/1.1. We flip the same private knob
+# `configure_http()` itself mutates (`edgar.httpclient.HTTP_MGR.httpx_params`)
+# and recreate the client the same way it does when a setting changes.
+_http1_forced: bool = False
 
 
-@dataclass(frozen=True)
-class Filer:
-    """Metadata for a tracked 13F filer.
+def _ensure_http1_transport() -> None:
+    """Force edgartools's shared HTTP client onto HTTP/1.1, once per process.
 
-    Attributes:
-        key: Short slug used in CLI selection and logs.
-        cik: SEC Central Index Key (unpadded string form).
-        display_name: Human-friendly holder name stored in the DB.
+    HTTP/1.1 has no stream-multiplexing lock, so the httpcore deadlock class
+    described above cannot occur on this transport.
     """
+    global _http1_forced
+    if _http1_forced:
+        return
+    from edgar import httpclient as _edgar_httpclient
 
-    key: str
-    cik: str
-    display_name: str
+    _edgar_httpclient.HTTP_MGR.httpx_params["http2"] = False
+    if _edgar_httpclient.HTTP_MGR._client is not None:
+        _edgar_httpclient.HTTP_MGR._client.close()
+        _edgar_httpclient.HTTP_MGR._client = None
+    _http1_forced = True
 
 
-FILERS: tuple[Filer, ...] = (
-    # ── From populate_institutional_holdings.py bootstrap ─────────────
-    Filer("berkshire_hathaway",   "1067983", "Berkshire Hathaway"),
-    Filer("pershing_square",      "1336528", "Pershing Square Capital"),
-    Filer("trian",                "1345471", "Trian Fund Management"),
-    Filer("3g_capital",           "1421669", "3G Capital"),
-    Filer("bridgewater",          "1350694", "Bridgewater Associates"),
-    Filer("elliott_management",   "1791786", "Elliott Investment Management"),
-    Filer("icahn_enterprises",    "921669",  "Icahn Enterprises"),
-    Filer("valueact",             "1418814", "ValueAct Capital"),
-    Filer("third_point",          "1159159", "Third Point"),
-    Filer("starboard_value",      "1517137", "Starboard Value"),
-    Filer("jana_partners",        "1027451", "Jana Partners"),
-    Filer("soros_fund",           "1029160", "Soros Fund Management"),
-    # ── New additions (big hedge funds + family offices + LPs) ────────
-    Filer("renaissance",          "1037389", "Renaissance Technologies"),
-    Filer("two_sigma",            "1649339", "Two Sigma Investments"),
-    Filer("citadel",              "1423053", "Citadel Advisors"),
-    Filer("millennium",           "1273087", "Millennium Management"),
-    Filer("point72",              "1603466", "Point72 Asset Management"),
-    Filer("tiger_global",         "1167483", "Tiger Global Management"),
-    Filer("coatue",               "1135730", "Coatue Management"),
-    Filer("viking_global",        "1103804", "Viking Global Investors"),
-    Filer("de_shaw",              "1009207", "D.E. Shaw"),
-    Filer("baupost",              "1061165", "Baupost Group"),
-    Filer("aqr",                  "1167557", "AQR Capital Management"),
-    Filer("lone_pine",            "1061768", "Lone Pine Capital"),
-    Filer("appaloosa",            "1656456", "Appaloosa Management"),
-    # ── Index / active large cap sponsors ─────────────────────────────
-    Filer("sequoia_capital",      "1607841", "Sequoia Capital (SC US TTGP)"),
-    Filer("altimeter",            "1541617", "Altimeter Capital"),
-    Filer("baillie_gifford",      "1088875", "Baillie Gifford"),
-    Filer("t_rowe_price",         "1897612", "T. Rowe Price Investment Mgmt"),
-    Filer("capital_research",     "1422848", "Capital Research Global"),
-    Filer("wellington",           "902219",  "Wellington Management"),
-    Filer("geode_capital",        "1214717", "Geode Capital Management"),
-    Filer("blackrock",            "2012383", "BlackRock Inc"),
-    Filer("vanguard",             "102909",  "Vanguard Group"),
-    Filer("state_street",         "93751",   "State Street"),
+_T = TypeVar("_T")
+
+# Hard ceiling on the whole edgartools attempt (resolve + fetch + parse), not
+# just one HTTP request. Belt-and-suspenders alongside _ensure_http1_transport:
+# httpcore's lock.acquire() that deadlocked in prod takes no timeout of its
+# own, so no request-level timeout (edgartools's or httpx's default) can ever
+# catch it -- disabling HTTP/2 removes that specific lock, but nothing rules
+# out edgartools hanging some other way in the future, so every attempt is
+# still capped from the outside.
+_EDGARTOOLS_FETCH_TIMEOUT: float = 45.0
+
+
+def _call_with_timeout(fn: Callable[..., _T], *args: Any, timeout: float, **kwargs: Any) -> _T:
+    """Run ``fn(*args, **kwargs)`` with a hard wall-clock timeout.
+
+    A genuine deadlock (like the httpcore lock above) never raises, so
+    ``except Exception`` around a direct call cannot catch it -- there is
+    nothing to catch, the call just never returns. Running it on a daemon
+    thread and bounding it with ``Thread.join(timeout=)`` is the only way to
+    cap a call we cannot make well-behaved from the outside: on timeout we
+    raise ``TimeoutError`` (the caller treats this exactly like any other
+    edgartools failure) and abandon the thread. It is daemonic, so a thread
+    that stays stuck forever never blocks process exit.
+    """
+    result: list[_T] = []
+    error: list[BaseException] = []
+
+    def _run() -> None:
+        try:
+            result.append(fn(*args, **kwargs))
+        except BaseException as exc:  # noqa: BLE001 - re-raised on the caller's thread below
+            error.append(exc)
+
+    thread = threading.Thread(target=_run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        name = getattr(fn, "__name__", repr(fn))
+        raise TimeoutError(f"{name} did not return within {timeout}s")
+    if error:
+        raise error[0]
+    return result[0]
+
+
+# ── Filer universe ────────────────────────────────────────────────────────────
+#
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; **corrected**
+# 2026-09-28 by the coordinator after an initial cut of this remediation
+# shrank the tracked universe from ~50 filers to this module's original 35 --
+# see ``ingestion/altdata/verified_13f_filers.py``'s module docstring for the
+# full story). The single verified 13F filer-CIK map now lives in
+# ``ingestion/altdata/verified_13f_filers`` -- built from the **union** of
+# this module's original 35-entry list plus ``ingestion/edgar.py`` and
+# ``ingestion/altdata/institutional_flows.py``'s old independent lists,
+# every CIK checked against SEC's own registrant data. ``Filer``, ``FILERS``,
+# ``filer_by_key`` and ``filer_by_cik`` are re-exported here (not a second
+# copy) so existing callers (``SEC13FLiveIngestor.run()``,
+# ``scripts/run_sec_13f_live.py``) keep working unchanged. This module has no
+# reason of its own to run a *smaller* subset than the verified list --
+# ``SEC13FLiveIngestor.run()`` already supports a per-call ``limit=`` for
+# rate/testing purposes, so ``FILERS`` here is the full verified set, not an
+# independently curated subset.
+from ingestion.altdata.verified_13f_filers import (  # noqa: E402
+    DROPPED_FILERS as DROPPED_FILERS,
+    Filer as Filer,
+    VERIFIED_FILERS as FILERS,
+    filer_by_cik as filer_by_cik,
+    filer_by_key as filer_by_key,
 )
-
-
-def filer_by_key(key: str) -> Filer | None:
-    """Look up a filer by its short slug."""
-    for f in FILERS:
-        if f.key == key:
-            return f
-    return None
 
 
 # ── CUSIP -> ticker resolution ───────────────────────────────────────────────
@@ -357,14 +391,26 @@ class LatestFiling:
     form: str
 
 
-def find_latest_13f(cik: str) -> LatestFiling | None:
-    """Locate the most recent 13F-HR (or amendment) for a CIK.
+def list_recent_13f_filings(cik: str) -> list[LatestFiling]:
+    """List every 13F-HR / 13F-HR/A filing in a CIK's ``recent`` submissions.
 
-    We look at the ``filings.recent`` block of the submissions index and
-    pick the newest row whose form is ``13F-HR`` or ``13F-HR/A`` with the
-    latest ``filingDate``. Amendments supersede originals for the same
-    ``reportDate``, which matches our upsert semantics (amendments will
-    overwrite the base row via ON CONFLICT DO UPDATE).
+    The SEC submissions endpoint's ``filings.recent`` block holds up to
+    ~1000 of the filer's most recent filings *of any form type*. Because
+    quarterly 13F filers rarely file anything else, this block in practice
+    covers many years of 13F history — which is what makes it safe to use
+    for catch-up: a caller that has gone stale for one or more quarters
+    (see ``SEC13FLiveIngestor._process_filer``) can diff this list against
+    what is already on file and backfill exactly the missing quarters,
+    bounded by whatever this endpoint returns (never an unbounded crawl).
+
+    Amendments supersede originals for the same ``reportDate`` — when two
+    entries share a ``reportDate`` we keep only the one with the latest
+    ``filingDate``, matching our upsert semantics (``ON CONFLICT DO
+    UPDATE`` on ``(holder_name, ticker, report_date)``).
+
+    Returns:
+        Filings sorted newest ``report_date`` first. Empty list if the
+        CIK has no 13F-HR filings in the recent window.
     """
     url = _EDGAR_SUBMISSIONS_URL.format(cik=cik.zfill(10))
     data = _get_json(url)
@@ -374,7 +420,7 @@ def find_latest_13f(cik: str) -> LatestFiling | None:
     filing_dates: list[str] = recent.get("filingDate", [])
     report_dates: list[str] = recent.get("reportDate", [])
 
-    best: LatestFiling | None = None
+    by_report_date: dict[date, LatestFiling] = {}
     for i, form in enumerate(forms):
         if form not in ("13F-HR", "13F-HR/A"):
             continue
@@ -384,10 +430,21 @@ def find_latest_13f(cik: str) -> LatestFiling | None:
         except (ValueError, IndexError):
             continue
         cand = LatestFiling(accession=accessions[i], filing_date=fd, report_date=rd, form=form)
-        if best is None or cand.filing_date > best.filing_date:
-            best = cand
+        existing = by_report_date.get(rd)
+        if existing is None or cand.filing_date > existing.filing_date:
+            by_report_date[rd] = cand
 
-    return best
+    return sorted(by_report_date.values(), key=lambda f: f.report_date, reverse=True)
+
+
+def find_latest_13f(cik: str) -> LatestFiling | None:
+    """Locate the most recent 13F-HR (or amendment) for a CIK.
+
+    Thin convenience wrapper over :func:`list_recent_13f_filings` for
+    callers that only care about the single newest filing.
+    """
+    filings = list_recent_13f_filings(cik)
+    return filings[0] if filings else None
 
 
 def _infotable_df_to_positions(df: Any) -> list[dict[str, Any]]:
@@ -458,6 +515,7 @@ def _fetch_infotable_edgartools(filing: LatestFiling) -> list[dict[str, Any]]:
     failure so the caller can fall back to the raw path.
     """
     _ensure_identity()
+    _ensure_http1_transport()
     from edgar import find
 
     resolved = find(filing.accession)
@@ -472,13 +530,18 @@ def fetch_infotable(cik: str, filing: LatestFiling) -> list[dict[str, Any]]:
     """Download and parse the infotable for a specific 13F filing.
 
     Primary path uses edgartools, which resolves the filing and parses the
-    structured positions table for us. If edgartools is unavailable or
-    errors (e.g. an API change or transient resolution failure), we fall
-    back to the raw-HTTP path in :func:`_fetch_infotable_raw`, so a live
-    pull never loses data over a library hiccup.
+    structured positions table for us. If edgartools is unavailable, errors
+    (e.g. an API change or transient resolution failure), or does not return
+    within ``_EDGARTOOLS_FETCH_TIMEOUT`` seconds (it deadlocked repeatedly in
+    prod on an httpcore HTTP/2 lock -- see ``_ensure_http1_transport`` /
+    ``_call_with_timeout``), we fall back to the raw-HTTP path in
+    :func:`_fetch_infotable_raw`, so a live pull never loses data or hangs
+    forever over a library hiccup.
     """
     try:
-        positions = _fetch_infotable_edgartools(filing)
+        positions = _call_with_timeout(
+            _fetch_infotable_edgartools, filing, timeout=_EDGARTOOLS_FETCH_TIMEOUT
+        )
         if positions:
             return positions
         log.debug(
@@ -574,15 +637,58 @@ _UPSERT_SQL = text(
 )
 
 
+# GD0 §6 item 4 coordinator fix (2026-09-28): scoped by ``cik``, not
+# ``holder_name``. The unique index that guards ``_UPSERT_SQL`` is
+# ``(holder_name, ticker, report_date)`` -- it has no idea two different
+# strings are "the same filer." Scoping continuity by ``holder_name`` meant
+# that the moment ``verified_13f_filers.py`` corrected a filer's
+# ``display_name`` (almost every one of them -- e.g. "Citadel Advisors" ->
+# "Citadel Advisors LLC"), this query would find zero rows for the new
+# name, ``_process_filer`` would treat every historical quarter as
+# never-seen, and the next run would re-pull and INSERT full duplicate
+# history for that filer under the new name (1M+ rows at risk across the
+# 72-filer map). ``cik`` is stable across a relabel -- that is the whole
+# point of GD1's identifier work -- so continuity must key on it.
+_KNOWN_REPORT_DATES_SQL = text(
+    """
+    SELECT DISTINCT report_date FROM institutional_holdings
+    WHERE cik = :cik AND source = 'sec_13f_live'
+    """
+)
+
+
+# Rename-collision guard for ``_upsert_positions`` (same fix, write side).
+# Even with continuity keyed on ``cik``, a write must never be allowed to
+# create a *second* holder_name key for a ``(cik, report_date)`` that
+# already has rows under a different name -- that unique index still can't
+# see the two names are the same filer, so it would duplicate the
+# underlying 13F fact instead of updating it. This is the defensive
+# backstop for cases _known_report_dates can't cover on its own (e.g. a
+# caller passing an explicit ``filers=`` override, or a partially-applied
+# historical backfill from before this fix shipped).
+_EXISTING_HOLDER_NAMES_SQL = text(
+    """
+    SELECT DISTINCT holder_name FROM institutional_holdings
+    WHERE cik = :cik AND report_date = :report_date AND source = 'sec_13f_live'
+    """
+)
+
+
 @dataclass
 class FilerResult:
     """Outcome of processing a single filer.
 
     Attributes:
         filer: Filer metadata.
-        status: ``ok``, ``no_filing``, ``no_positions``, or ``error``.
-        filing: The resolved filing (if any).
-        positions_total: Total positions parsed from the filing.
+        status: ``ok``, ``up_to_date``, ``no_filing``, ``no_positions``, or
+            ``error``. ``up_to_date`` means 13F-HR filings exist for this
+            filer but every ``report_date`` is already on file — the
+            common case once the writer is running on a steady cadence.
+        filing: The newest filing considered (if any).
+        filings_processed: Number of *new* filings upserted this run (can
+            be more than one right after a stale period — see
+            ``_process_filer``'s catch-up behavior).
+        positions_total: Total positions parsed across processed filings.
         positions_matched: Positions successfully resolved to a ticker.
         rows_written: Rows upserted into ``institutional_holdings``.
         error: Error string (if status == ``error``).
@@ -591,6 +697,7 @@ class FilerResult:
     filer: Filer
     status: str
     filing: LatestFiling | None = None
+    filings_processed: int = 0
     positions_total: int = 0
     positions_matched: int = 0
     rows_written: int = 0
@@ -657,45 +764,127 @@ class SEC13FLiveIngestor:
         )
         return results
 
+    def _known_report_dates(self, filer: Filer) -> set[date]:
+        """``report_date``s already on file for this filer's ``sec_13f_live`` rows.
+
+        Scoped to ``source = 'sec_13f_live'`` so the hand-curated
+        ``sec_13f_curated`` bootstrap rows (different provenance, no
+        ``filed_date`` guarantee) never mask a quarter this writer hasn't
+        actually ingested yet.
+
+        Scoped to ``cik``, not ``holder_name`` (GD0 §6 item 4 coordinator
+        fix, 2026-09-28): ``institutional_holdings``'s unique index is
+        ``(holder_name, ticker, report_date)``, so keying continuity on the
+        display name means any correction to that name (verified_13f_filers
+        .py corrected almost every one of them) makes every historical
+        quarter look never-seen, triggering a full re-pull that INSERTs
+        duplicate rows under the new name instead of recognizing them as
+        already on file. ``cik`` doesn't change when a display name is
+        corrected, so it is the right continuity key.
+        """
+        with self._engine.connect() as conn:
+            rows = conn.execute(
+                _KNOWN_REPORT_DATES_SQL, {"cik": filer.cik}
+            )
+            known: set[date] = set()
+            for (value,) in rows:
+                # Postgres (production) returns a native ``date``. SQLite
+                # (unit tests, and the module's ``if __name__`` demo) can
+                # hand back an ISO string for a raw-``text()`` DATE column
+                # since there is no real DATE type to coerce through —
+                # normalize both to ``date`` so the ``not in known`` check
+                # in ``_process_filer`` actually matches.
+                if isinstance(value, _datetime):
+                    known.add(value.date())
+                elif isinstance(value, date):
+                    known.add(value)
+                elif isinstance(value, str):
+                    known.add(date.fromisoformat(value[:10]))
+            return known
+
     def _process_filer(self, filer: Filer, verbose: bool = False) -> FilerResult:
-        """Process a single filer end-to-end."""
+        """Process a single filer end-to-end.
+
+        Fetches every 13F-HR/13F-HR/A filing EDGAR's ``recent`` submissions
+        window has for this CIK (see :func:`list_recent_13f_filings`) and
+        upserts whichever ``report_date``s are not already in
+        ``institutional_holdings`` for this filer. This makes the writer
+        self-healing after any gap (e.g. the 2026-04-12 -> 2026-09
+        outage): the first run after a gap silently backfills every missed
+        quarter still inside EDGAR's recent window instead of jumping
+        straight to the newest quarter and leaving the skipped ones
+        permanently missing.
+        """
         log.info("13F: {k} (CIK={c})", k=filer.key, c=filer.cik)
 
-        filing = find_latest_13f(filer.cik)
-        if filing is None:
+        filings = list_recent_13f_filings(filer.cik)
+        if not filings:
             log.warning("No 13F-HR found for {k}", k=filer.key)
             return FilerResult(filer=filer, status="no_filing")
 
-        log.info(
-            "  -> latest {form} filed={f} report={r} accession={a}",
-            form=filing.form, f=filing.filing_date,
-            r=filing.report_date, a=filing.accession,
-        )
-        time.sleep(_EDGAR_RATE_DELAY)
+        known = self._known_report_dates(filer)
+        new_filings = [f for f in filings if f.report_date not in known]
+        if not new_filings:
+            return FilerResult(filer=filer, status="up_to_date", filing=filings[0])
 
-        positions = fetch_infotable(filer.cik, filing)
-        if not positions:
-            return FilerResult(filer=filer, status="no_positions", filing=filing)
+        # Oldest-first so a multi-quarter catch-up ingests (and logs) in
+        # chronological order — easier to audit than newest-first.
+        new_filings.sort(key=lambda f: f.report_date)
 
-        matched: list[tuple[dict[str, Any], str]] = []
-        for pos in positions:
-            ticker = self._cusip_map.lookup(pos.get("cusip", ""))
-            if ticker:
-                matched.append((pos, ticker))
-
-        if verbose:
+        positions_total = 0
+        positions_matched = 0
+        rows_written = 0
+        last_filing = filings[0]
+        for filing in new_filings:
             log.info(
-                "  -> {n} positions, {m} resolved to ticker",
-                n=len(positions), m=len(matched),
+                "  -> new {form} filed={f} report={r} accession={a}",
+                form=filing.form, f=filing.filing_date,
+                r=filing.report_date, a=filing.accession,
+            )
+            # Unconditional: EDGAR rate-limits per-second across *all*
+            # requests, not just infotable-to-infotable gaps. Without this,
+            # the first fetch_infotable per filer fires immediately after
+            # the submissions request that list_recent_13f_filings() just
+            # made, with no delay between them.
+            time.sleep(_EDGAR_RATE_DELAY)
+
+            positions = fetch_infotable(filer.cik, filing)
+            positions_total += len(positions)
+            if not positions:
+                continue
+
+            matched: list[tuple[dict[str, Any], str]] = []
+            for pos in positions:
+                ticker = self._cusip_map.lookup(pos.get("cusip", ""))
+                if ticker:
+                    matched.append((pos, ticker))
+            positions_matched += len(matched)
+
+            if verbose:
+                log.info(
+                    "  -> {n} positions, {m} resolved to ticker",
+                    n=len(positions), m=len(matched),
+                )
+
+            rows_written += self._upsert_positions(filer, filing, matched)
+            last_filing = filing
+
+        if rows_written == 0:
+            return FilerResult(
+                filer=filer,
+                status="no_positions",
+                filing=last_filing,
+                filings_processed=len(new_filings),
+                positions_total=positions_total,
             )
 
-        rows_written = self._upsert_positions(filer, filing, matched)
         return FilerResult(
             filer=filer,
             status="ok",
-            filing=filing,
-            positions_total=len(positions),
-            positions_matched=len(matched),
+            filing=last_filing,
+            filings_processed=len(new_filings),
+            positions_total=positions_total,
+            positions_matched=positions_matched,
             rows_written=rows_written,
         )
 
@@ -711,6 +900,22 @@ class SEC13FLiveIngestor:
         (e.g. one row per share class). We aggregate shares and value
         before writing so the ``(holder_name, ticker, report_date)``
         unique index is satisfied.
+
+        Rename-collision guard (GD0 §6 item 4 coordinator fix, 2026-09-28):
+        before writing, checks whether this ``(cik, report_date)`` already
+        has rows under a *different* ``holder_name``. If so, refuses to
+        write under ``filer.display_name`` and logs a clear error instead
+        -- writing anyway would create a second holder_name key for the
+        same underlying 13F fact (the unique index can't see that the two
+        names are the same filer), i.e. a silent duplicate. This needs no
+        migration: it's a read-before-write check against the existing
+        schema, chosen over adding a new column/constraint because GD1's
+        identifier work already establishes ``cik`` as the stable key and
+        this problem is exactly "two labels, one cik" -- the fix belongs in
+        the write path that creates labels, not in a new piece of schema.
+        The one-time relabel (``relabel_13f_holders.sh``) is what clears
+        this guard for existing mislabeled rows; new report_dates for a
+        filer with no existing rows are never blocked by it.
         """
         agg: dict[str, dict[str, Any]] = {}
         for pos, ticker in matched:
@@ -727,6 +932,29 @@ class SEC13FLiveIngestor:
             bucket["value_usd"] += int(pos.get("value") or 0)
 
         if not agg:
+            return 0
+
+        with self._engine.connect() as conn:
+            existing_names = {
+                row[0]
+                for row in conn.execute(
+                    _EXISTING_HOLDER_NAMES_SQL,
+                    {"cik": filer.cik, "report_date": filing.report_date},
+                )
+                if row[0] is not None
+            }
+        conflicting = existing_names - {filer.display_name}
+        if conflicting:
+            log.error(
+                "13F rename collision: CIK={c} report_date={r} already has "
+                "institutional_holdings rows under {old} but the verified "
+                "filer map says {new!r}. Refusing to write under the new "
+                "name -- run the one-time relabel "
+                "(grid-svr:/home/grid/backups/gd0_decisions_20260928/"
+                "relabel_13f_holders.sh) first, then re-run this filer.",
+                c=filer.cik, r=filing.report_date,
+                old=sorted(conflicting), new=filer.display_name,
+            )
             return 0
 
         rows_written = 0
@@ -770,6 +998,7 @@ def run(engine: Engine | None = None, **kwargs: Any) -> dict[str, Any]:
 
     summary = {
         "filers_ok": sum(1 for r in results if r.status == "ok"),
+        "filers_up_to_date": sum(1 for r in results if r.status == "up_to_date"),
         "filers_total": len(results),
         "rows_written": sum(r.rows_written for r in results),
         "positions_total": sum(r.positions_total for r in results),

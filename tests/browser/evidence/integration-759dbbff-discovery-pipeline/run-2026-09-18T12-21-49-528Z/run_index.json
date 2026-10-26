@@ -1,0 +1,145 @@
+{
+  "tree_label": "integration-759dbbff-discovery-pipeline",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+  "generated_at": "2026-09-18T12:22:56.602Z",
+  "results": [
+    {
+      "tree_label": "integration-759dbbff-discovery-pipeline",
+      "harness_commit": "e074369efe234b6b0b7edb65557f6cf5b31c3d17",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "759dbbffdf84bed27ac2baf9513122e2dd43b949",
+      "role": "admin",
+      "scenario": "healthy",
+      "started_at": "2026-09-18T12:21:56.375Z",
+      "journeys": {
+        "discovery": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 9,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T12:22:14.449Z"
+    },
+    {
+      "tree_label": "integration-759dbbff-discovery-pipeline",
+      "harness_commit": "e074369efe234b6b0b7edb65557f6cf5b31c3d17",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "759dbbffdf84bed27ac2baf9513122e2dd43b949",
+      "role": "admin",
+      "scenario": "partial",
+      "started_at": "2026-09-18T12:22:19.620Z",
+      "journeys": {
+        "discovery": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T12:22:35.551Z"
+    },
+    {
+      "tree_label": "integration-759dbbff-discovery-pipeline",
+      "harness_commit": "e074369efe234b6b0b7edb65557f6cf5b31c3d17",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "759dbbffdf84bed27ac2baf9513122e2dd43b949",
+      "role": "admin",
+      "scenario": "empty",
+      "started_at": "2026-09-18T12:22:39.213Z",
+      "journeys": {
+        "discovery": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T12:22:55.713Z"
+    }
+  ]
+}

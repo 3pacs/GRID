@@ -1,0 +1,6 @@
+{"t":1789754494185,"type":"debug","text":"[vite] connecting..."}
+{"t":1789754494205,"type":"debug","text":"[vite] connected."}
+{"t":1789754494645,"type":"info","text":"%cDownload the React DevTools for a better development experience: https://react.dev/link/react-devtools font-weight:bold"}
+{"t":1789754494737,"type":"warn","text":"<meta name=\"apple-mobile-web-app-capable\" content=\"yes\"> is deprecated. Please include <meta name=\"mobile-web-app-capable\" content=\"yes\">"}
+{"t":1789754494858,"type":"log","text":"Service Worker registered: http://localhost:5175/"}
+{"t":1789754494861,"type":"verbose","text":"[DOM] Password forms should have (optionally hidden) username fields for accessibility: (More info: https://goo.gl/9p2vKq) %o"}

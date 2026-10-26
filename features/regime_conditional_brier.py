@@ -594,6 +594,9 @@ _BOOTSTRAP_QUERY = text(
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE
+      -- A prediction that stated no confidence has no probability to score
+      -- for reliability; it is excluded, never replayed at a default.
+      AND confidence IS NOT NULL
     ORDER BY created_at ASC
     """
 )
@@ -742,8 +745,15 @@ def bootstrap_from_oracle_predictions(
             if verdict not in ("hit", "miss", "partial"):
                 skipped += 1
                 continue
+            raw_confidence = row_dict.get("confidence")
+            if raw_confidence is None:
+                # Coercing an unstated confidence to zero turned it into a
+                # stated 0% forecast and scored it. Not measurable, not
+                # replayed.
+                skipped += 1
+                continue
             try:
-                confidence = float(row_dict.get("confidence") or 0.0)
+                confidence = float(raw_confidence)
             except (TypeError, ValueError):
                 skipped += 1
                 continue

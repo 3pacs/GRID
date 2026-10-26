@@ -15,8 +15,9 @@ Resolve raw_series into resolved_series. Use direct SQL for bulk, Python resolve
 Use raw psycopg2 to bypass SQLAlchemy colon-escaping issues:
 
 ```python
+import os
 import psycopg2
-conn = psycopg2.connect("dbname=griddb user=grid password=gridmaster2026 host=localhost")
+conn = psycopg2.connect(f"dbname=griddb user=grid password={os.environ['GRID_DB_PASSWORD']} host=localhost")
 cur = conn.cursor()
 cur.execute("""
     INSERT INTO resolved_series (feature_id, obs_date, release_date, vintage_date, value, source_priority_used, conflict_flag)

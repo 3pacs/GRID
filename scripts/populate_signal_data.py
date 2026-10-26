@@ -49,6 +49,7 @@ def populate_from_whale_flows(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'WHALE:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -80,6 +81,7 @@ def populate_from_gov_contracts(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'GOV_CONTRACT:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -112,6 +114,7 @@ def populate_from_legislation(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'LEGISLATION:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -180,6 +183,7 @@ def populate_from_social(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'SOCIAL:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -215,6 +219,7 @@ def populate_from_congressional_raw(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'qq:congress:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -250,6 +255,7 @@ def populate_from_lobbying(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'qq:lobbying:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -283,6 +289,7 @@ def populate_from_insider(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'qq:insider:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 
@@ -317,6 +324,7 @@ def populate_from_news(engine) -> int:
             SELECT series_id, obs_date, value, raw_payload
             FROM raw_series
             WHERE series_id LIKE 'NEWS:%'
+              AND pull_status = 'SUCCESS'
             ORDER BY obs_date
         """)).fetchall()
 

@@ -1,0 +1,16 @@
+{
+  "response": {
+    "warnings": [],
+    "total": "2",
+    "dateFormat": "YYYY-MM-DD",
+    "frequency": "daily",
+    "data": [
+      {"period": "2026-09-16", "series": "RWTC", "value": "63.10", "units": "$/BBL"},
+      {"period": "2026-09-16", "series": "RWTC", "value": "63.55", "units": "$/BBL"}
+    ]
+  },
+  "request": {
+    "command": "/v2/petroleum/pri/spt/data/",
+    "params": {"facets": {"series": ["RWTC"]}}
+  }
+}

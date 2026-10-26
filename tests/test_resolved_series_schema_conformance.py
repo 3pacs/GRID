@@ -53,8 +53,10 @@ GUARDED_MODULES = (
 MODULES_REQUIRING_SQL = (
     "normalization/resolver.py",
     "scripts/hermes_fixers.py",
-    "ingestion/scheduler.py",
 )
+# ingestion/scheduler.py stays guarded but no longer yields resolved_series
+# SQL: its only literal was the stale-price lookup feeding the retired
+# PriceFallback writer (E1-V7 / DATA-FIX DFa), removed with it.
 
 # scripts/hermes_operator.py is the exception, and deliberately so: since the
 # b0a02b4 statement was removed it carries no resolved_series SQL at all, and
@@ -62,6 +64,20 @@ MODULES_REQUIRING_SQL = (
 # INSERT reappearing in the cycle is the exact shape of the regression. It
 # stays in GUARDED_MODULES so anything added there is checked on arrival.
 MODULE_REQUIRING_NO_SQL = "scripts/hermes_operator.py"
+
+# PR #683 (feat/resolved-series-retractions-20260927, approved and queued,
+# not yet merged to main) adds resolved_series_retractions -- an FK from it
+# to a retracted resolved_series row is exactly the kind of thing this
+# guard should keep catching typos in, so it stays a narrow, named
+# allowlist rather than a relaxed check. fix/pre-retraction-and-
+# 679-followups-20260927 pre-empts the FK violation #683's review found in
+# scripts/hermes_fixers.py's dedup delete, checking for the table at
+# runtime (to_regclass) so the SQL literal is safe to reference ahead of
+# the migration. Once #683 merges, schema.sql gains a real CREATE TABLE for
+# it and this entry becomes redundant (harmless to leave, since
+# _declared_tables() would then find it there too) -- remove it then if
+# noticed.
+_PENDING_MIGRATION_TABLES = frozenset({"resolved_series_retractions"})
 
 # Words that can follow a table name but are not an alias.
 _NOT_AN_ALIAS = {
@@ -128,13 +144,14 @@ def _unique_index_columns(table: str) -> set[tuple[str, ...]]:
 
 
 def _declared_tables() -> set[str]:
-    """Every table name declared in schema.sql or in a .sql migration."""
+    """Every table name declared in schema.sql or in a .sql migration, plus
+    _PENDING_MIGRATION_TABLES (see its comment)."""
     sources = [SCHEMA_PATH.read_text()]
     migrations = REPO_ROOT / "migrations"
     if migrations.is_dir():
         for path in migrations.rglob("*.sql"):
             sources.append(path.read_text(errors="replace"))
-    names: set[str] = set()
+    names: set[str] = set(_PENDING_MIGRATION_TABLES)
     for text in sources:
         for match in re.finditer(
             r"CREATE TABLE(?:\s+IF NOT EXISTS)?\s+([\w.]+)", text, re.I,

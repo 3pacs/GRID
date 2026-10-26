@@ -247,6 +247,7 @@ def discover_patterns(
     engine: Engine,
     min_occurrences: int = 3,
     max_sequence_length: int = 4,
+    persist: bool = True,
 ) -> list[Pattern]:
     """Scan all event sequences across watchlist tickers to find recurring
     2-, 3-, and 4-event sequences.
@@ -259,6 +260,13 @@ def discover_patterns(
     engine : SQLAlchemy engine
     min_occurrences : minimum times a full sequence must appear
     max_sequence_length : longest sequence to search for (2, 3, or 4)
+    persist : When True (default), ensure ``event_patterns`` and upsert the
+        discovered patterns into it. Read paths (``GET intelligence/patterns``)
+        pass False -- item #23, Wave 3 triage report: this GET used to write
+        on every call, which is the write-on-GET bug class already fixed
+        elsewhere via this same ``persist=False`` idiom (see
+        ``intelligence/forensics.py::analyze_move`` and
+        ``intelligence/causation_graph.py``/``causation_scoring.py``).
 
     Returns
     -------
@@ -266,7 +274,8 @@ def discover_patterns(
     """
     from intelligence.event_sequence import build_sequence
 
-    _ensure_tables(engine)
+    if persist:
+        _ensure_tables(engine)
     tickers = _get_watchlist_tickers(engine)
 
     if not tickers:
@@ -460,8 +469,9 @@ def discover_patterns(
     # Sort by confidence * abs(return) -- the money sort
     patterns.sort(key=lambda p: -(p.confidence * abs(p.avg_return_after or 0.0001)))
 
-    # Persist
-    _store_patterns(engine, patterns)
+    # Persist (explicit writers only; read paths pass persist=False)
+    if persist:
+        _store_patterns(engine, patterns)
 
     log.info(
         "Pattern discovery complete: {n} patterns found ({a} actionable)",

@@ -1,0 +1,10 @@
+{"ts":"2026-09-18T10:39:52.556Z","role":"contributor","scenario":"empty","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:39:52.999Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/alerts","status":200}
+{"ts":"2026-09-18T10:39:53.183Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":200}
+{"ts":"2026-09-18T10:39:54.049Z","role":"contributor","scenario":"empty","method":"POST","url":"http://localhost:5174/api/v1/chat/compose","status":200}
+{"ts":"2026-09-18T10:39:54.151Z","role":"contributor","scenario":"empty","method":"POST","url":"http://localhost:5174/api/v1/chat/ask/stream","status":200}
+{"ts":"2026-09-18T10:39:54.178Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/watchlist/TEST1/quote","status":200}
+{"ts":"2026-09-18T10:39:54.181Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/watchlist/?","status":200}
+{"ts":"2026-09-18T10:39:54.182Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/regime/current","status":200}
+{"ts":"2026-09-18T10:39:54.184Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/physics/momentum?lookback_days=63","status":200}
+{"ts":"2026-09-18T10:39:54.185Z","role":"contributor","scenario":"empty","method":"GET","url":"http://localhost:5174/api/v1/flows/sectors","status":200}

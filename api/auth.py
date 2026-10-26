@@ -10,13 +10,20 @@ Supports:
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+import re
+import secrets
 import shelve
 import tempfile
+import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import unquote
 
 import psycopg2
 import psycopg2.extras
@@ -32,6 +39,8 @@ from api.schemas.auth import (
     LoginRequest,
     LoginResponse,
     RegisterRequest,
+    StreamTicketRequest,
+    StreamTicketResponse,
     TokenVerifyResponse,
     UserResponse,
 )
@@ -132,8 +141,6 @@ def _ensure_users_table() -> None:
 
 # Lazy initialization — safe for multi-worker uvicorn.
 # Tables are created on first use, not on import.
-import threading
-
 _init_lock = threading.Lock()
 _tables_initialized = False
 
@@ -223,13 +230,16 @@ async def require_auth(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> str:
-    """FastAPI dependency: require valid JWT. Returns the token."""
-    token = None
+    """FastAPI dependency: require valid JWT. Returns the token.
 
-    if credentials:
-        token = credentials.credentials
-    else:
-        token = request.query_params.get("token")
+    The JWT is accepted only from the ``Authorization: Bearer`` header. A
+    ``?token=`` query parameter is deliberately NOT accepted: URLs land in
+    proxy, tunnel and access logs, so a long-lived session JWT must never
+    travel in one. Browser APIs that cannot set headers (``EventSource``)
+    use a short-lived single-use stream ticket instead — see
+    :func:`issue_stream_ticket` and :func:`require_stream_auth`.
+    """
+    token = credentials.credentials if credentials else None
 
     if not token or not verify_token(token):
         raise HTTPException(
@@ -250,11 +260,8 @@ def require_role(*roles: str) -> Callable:
         request: Request,
         credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
     ) -> str:
-        token = None
-        if credentials:
-            token = credentials.credentials
-        else:
-            token = request.query_params.get("token")
+        # Header only — see require_auth for why query-param tokens are refused.
+        token = credentials.credentials if credentials else None
 
         if not token:
             raise HTTPException(
@@ -278,6 +285,141 @@ def require_role(*roles: str) -> Callable:
         return token
 
     return _check_role
+
+
+# ── Stream tickets (EventSource auth without a JWT in the URL) ─────────
+#
+# ``EventSource`` cannot send an Authorization header, so the browser used to
+# put the long-lived session JWT in ``?token=``, where it lands in tunnel,
+# proxy and access logs. Instead the client POSTs (with its Bearer header) for
+# a ticket that is:
+#   * short-lived  — STREAM_TICKET_TTL_SECONDS, never beyond the parent JWT;
+#   * path-bound   — valid only for the one stream path it was issued for;
+#   * single-use   — its jti is burned on first redemption;
+#   * not a session token — signed with a key *derived* from GRID_JWT_SECRET,
+#     so ``verify_token``/``require_auth`` reject it outright.
+# Replay protection is an in-process, bounded jti set. grid-api runs a single
+# uvicorn worker (server_setup/grid-api.service); with N workers a ticket
+# could be redeemed at most once per worker inside its 60-second life.
+
+STREAM_TICKET_TTL_SECONDS = 60
+_STREAM_TICKET_TYPE = "stream_ticket"
+_STREAM_TICKET_MAX_OUTSTANDING = 4096
+_STREAM_TICKET_PATHS = (
+    re.compile(r"^/api/v1/dad/ticker/[^/]{1,32}/gold/stream$"),
+    re.compile(r"^/api/v1/events/stream$"),
+)
+_redeemed_stream_tickets: "OrderedDict[str, float]" = OrderedDict()
+_stream_ticket_lock = threading.Lock()
+
+
+def _stream_ticket_key() -> bytes:
+    """HMAC key for stream tickets, derived from (never equal to) the JWT secret."""
+    _, jwt_secret, _ = _get_settings()
+    return hmac.new(
+        jwt_secret.encode("utf-8"), b"grid-stream-ticket-v1", hashlib.sha256,
+    ).digest()
+
+
+def normalize_stream_path(path: str) -> Optional[str]:
+    """Return the decoded stream path if it is ticketable, else None."""
+    if not isinstance(path, str) or len(path) > 256:
+        return None
+    decoded = unquote(path.split("?", 1)[0])
+    if any(p.match(decoded) for p in _STREAM_TICKET_PATHS):
+        return decoded
+    return None
+
+
+def issue_stream_ticket(session_token: str, path: str) -> dict:
+    """Mint a single-use ticket for ``path`` on behalf of a verified session JWT."""
+    stream_path = normalize_stream_path(path)
+    if stream_path is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Path is not a ticketable stream",
+        )
+    parent = decode_token(session_token)
+    if not parent:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired token",
+        )
+    now = int(time.time())
+    exp = now + STREAM_TICKET_TTL_SECONDS
+    parent_exp = parent.get("exp")
+    if isinstance(parent_exp, (int, float)):
+        exp = min(exp, int(parent_exp))
+    payload = {
+        "typ": _STREAM_TICKET_TYPE,
+        "sub": parent.get("sub", "operator"),
+        "role": parent.get("role", "contributor"),
+        "path": stream_path,
+        "jti": secrets.token_urlsafe(16),
+        "iat": now,
+        "exp": exp,
+    }
+    ticket = jwt.encode(payload, _stream_ticket_key(), algorithm="HS256")
+    return {"ticket": ticket, "expires_in": max(0, exp - now), "path": stream_path}
+
+
+def _burn_stream_ticket(jti: str, exp: float) -> bool:
+    """Record ``jti`` as used. Returns False if it was already redeemed."""
+    now = time.time()
+    with _stream_ticket_lock:
+        for old_jti, old_exp in list(_redeemed_stream_tickets.items()):
+            if old_exp > now:
+                break
+            del _redeemed_stream_tickets[old_jti]
+        if jti in _redeemed_stream_tickets:
+            return False
+        if len(_redeemed_stream_tickets) >= _STREAM_TICKET_MAX_OUTSTANDING:
+            # Fail closed rather than forget an unexpired jti (replay window).
+            log.warning("Stream ticket replay cache full; refusing redemption")
+            return False
+        _redeemed_stream_tickets[jti] = float(exp)
+        return True
+
+
+def redeem_stream_ticket(ticket: str, path: str) -> Optional[dict]:
+    """Validate a stream ticket for ``path`` and burn it. Returns claims or None."""
+    try:
+        claims = jwt.decode(ticket, _stream_ticket_key(), algorithms=["HS256"])
+    except JWTError:
+        return None
+    if claims.get("typ") != _STREAM_TICKET_TYPE:
+        return None
+    if claims.get("path") != unquote(path):
+        return None
+    jti = claims.get("jti")
+    if not isinstance(jti, str) or not jti:
+        return None
+    if not _burn_stream_ticket(jti, float(claims.get("exp", 0))):
+        return None
+    return claims
+
+
+async def require_stream_auth(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> str:
+    """Auth for SSE routes: a Bearer header, or a single-use ``?ticket=``.
+
+    Session JWTs are never read from the query string. Header callers
+    (curl, scripts) keep working; browsers use :func:`issue_stream_ticket`.
+    """
+    if credentials:
+        if verify_token(credentials.credentials):
+            return credentials.credentials
+    else:
+        ticket = request.query_params.get("ticket")
+        if ticket and redeem_stream_ticket(ticket, request.url.path):
+            return ticket
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Invalid or expired token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
 
 
 # ── User Lookup ───────────────────────────────────────────────
@@ -557,6 +699,15 @@ async def register(body: RegisterRequest, request: Request) -> LoginResponse:
 async def logout(_token: str = Depends(require_auth)) -> dict:
     """Log out (token expiry handles invalidation)."""
     return {"status": "ok"}
+
+
+@router.post("/stream-ticket", response_model=StreamTicketResponse)
+async def create_stream_ticket(
+    body: StreamTicketRequest,
+    token: str = Depends(require_auth),
+) -> StreamTicketResponse:
+    """Exchange the Bearer session for a 60 s, single-use, path-bound SSE ticket."""
+    return StreamTicketResponse(**issue_stream_ticket(token, body.path))
 
 
 @router.get("/verify", response_model=TokenVerifyResponse)

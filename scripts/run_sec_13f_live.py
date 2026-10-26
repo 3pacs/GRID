@@ -80,6 +80,8 @@ def main() -> int:
     results = ingestor.run(filers=filters, limit=args.limit, verbose=args.verbose)
 
     ok = sum(1 for r in results if r.status == "ok")
+    current = sum(1 for r in results if r.status == "up_to_date")
+    errors = sum(1 for r in results if r.status == "error")
     rows = sum(r.rows_written for r in results)
     total_pos = sum(r.positions_total for r in results)
     match_pos = sum(r.positions_matched for r in results)
@@ -87,7 +89,7 @@ def main() -> int:
 
     print()
     print("SEC 13F live ingest summary:")
-    print(f"  filers ok   : {ok}/{len(results)}")
+    print(f"  filers ok/current: {ok}/{current} of {len(results)}")
     print(f"  rows written: {rows}")
     print(f"  positions   : {match_pos}/{total_pos} matched ({coverage:.1f}% CUSIP coverage)")
 
@@ -95,6 +97,7 @@ def main() -> int:
     for r in results:
         tag = {
             "ok": "OK  ",
+            "up_to_date": "CURR",
             "no_filing": "NOFL",
             "no_positions": "NOPO",
             "error": "ERR ",
@@ -106,7 +109,10 @@ def main() -> int:
             + (f"  error={r.error}" if r.error else "")
         )
 
-    if not ok:
+    # Fail the run only if every single filer errored — "up_to_date" (no new
+    # filing since last run) is the expected steady-state outcome, not a
+    # failure, and must not make a cron/scheduler wrapper treat this as red.
+    if errors and not (ok or current):
         return 1
     return 0
 

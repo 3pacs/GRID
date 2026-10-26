@@ -16,6 +16,13 @@ These rules apply when working with data ingestion, normalization, or query code
 - `DISTINCT ON` in pit.py is PostgreSQL-specific — this system will never work on SQLite or MySQL
 - Vintage policies (FIRST_RELEASE vs LATEST_AS_OF) produce different values for the same query — always specify which you intend
 
+## Reading `raw_series` directly
+
+- `raw_series` is a pull *log*: several pullers write `pull_status='FAILED', value=0, obs_date=today` on failure, and every re-pull appends another vintage for the same `obs_date`. A read by `obs_date` alone returns `0` on failure days and an arbitrary vintage on revision days (measured 2026-09-17: WALCL/T10Y2Y/RRPONTSYD/WTREGEN/BAMLH0A0HYM2 all had FAILED zeros in the trailing 90 days).
+- Analytical code MUST read through `store/observations.py` (`read_latest`, `read_latest_n`, `read_window`): `SUCCESS` only, one row per `obs_date` (latest `pull_timestamp`), optional `as_of` / `as_of_ts` for point-in-time reads, and provenance on every `Observation`.
+- `tests/test_raw_series_read_guard.py` freezes the legacy unfiltered reads; it fails on any new one. Migrating a file lowers its baseline entry.
+- Series ids are stored as the puller wrote them: FRED series are bare (`T10Y2Y`, `WALCL`), not `FRED:T10Y2Y`. Check the id exists before reading it (a wrong id reads as "no data", which then masks the real value).
+
 ## Ingestion Modules
 
 - Each data source gets its own module in `ingestion/` (or subdirectory: `international/`, `altdata/`, `trade/`, `physical/`)

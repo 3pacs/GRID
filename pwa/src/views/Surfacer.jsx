@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     Activity,
     AlertTriangle,
@@ -908,19 +908,32 @@ function OperatorBrief({ brief, loading, onSelectCandidate }) {
 }
 
 function ScoreBars({ parts }) {
-    const rows = Object.entries(parts || {});
+    const entries = Object.entries(parts || {}).filter(([label]) => !label.endsWith('_basis'));
+    // A null part means the backend has no value for it. Draw nothing rather
+    // than a zero-width bar that reads as a measured zero.
+    const rows = entries.filter(([, value]) => value !== null && value !== undefined && Number.isFinite(Number(value)));
+    const unavailable = entries
+        .filter(([, value]) => value === null || value === undefined || !Number.isFinite(Number(value)))
+        .map(([label]) => label.replace(/_/g, ' '));
     if (!rows.length) {
         return <div style={styles.noteBox}>No score anatomy available yet.</div>;
     }
-    return rows.map(([label, value]) => (
-        <div key={label} style={styles.barRow}>
-            <div style={styles.barLabel}>{label.replace('_', ' ')}</div>
-            <div style={styles.barOuter}>
-                <div style={styles.barValue(value, label.includes('penalty'))} />
-            </div>
-            <div style={styles.barNumber}>{Math.round(Number(value) || 0)}</div>
-        </div>
-    ));
+    return (
+        <>
+            {rows.map(([label, value]) => (
+                <div key={label} style={styles.barRow}>
+                    <div style={styles.barLabel}>{label.replace(/_/g, ' ')}</div>
+                    <div style={styles.barOuter}>
+                        <div style={styles.barValue(value, label.includes('penalty'))} />
+                    </div>
+                    <div style={styles.barNumber}>{Math.round(Number(value))}</div>
+                </div>
+            ))}
+            {unavailable.length ? (
+                <div style={styles.noteBox}>Unavailable: {unavailable.join(', ')}</div>
+            ) : null}
+        </>
+    );
 }
 
 function CandidateCard({ candidate, active, onSelect }) {
@@ -960,18 +973,29 @@ export default function Surfacer() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
 
+    const loadInFlight = useRef(false);
     const load = useCallback(async () => {
+        if (loadInFlight.current) return;
+        loadInFlight.current = true;
         setLoading(true);
         setError('');
-        const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false&queue_missing_data=false');
-        if (data?.error) {
-            setError(data.message || 'Surfacer failed to load.');
+        try {
+            const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false&queue_missing_data=false');
+            if (data?.error || data?.status === 'degraded') {
+                // Never present a failed read as an actionable market brief.
+                setError(data?.message || (typeof data?.error === 'string' ? data.error : '') || 'Surfacer failed to load.');
+                setPayload({ candidates: [], meta: {} });
+            } else {
+                setPayload(data);
+                setSelectedId(current => current || data?.candidates?.[0]?.id || '');
+            }
+        } catch {
+            setError('Surfacer failed to load. Please retry.');
             setPayload({ candidates: [], meta: {} });
-        } else {
-            setPayload(data);
-            setSelectedId(current => current || data?.candidates?.[0]?.id || '');
+        } finally {
+            loadInFlight.current = false;
+            setLoading(false);
         }
-        setLoading(false);
     }, []);
 
     useEffect(() => {
@@ -1051,7 +1075,7 @@ export default function Surfacer() {
                 </div>
                 <button type="button" className="surfacer-refresh" style={styles.button} onClick={load} disabled={loading}>
                     <RefreshCw size={15} />
-                    {loading ? 'Loading' : 'Refresh'}
+                    {loading ? 'Loading' : error ? 'Retry' : 'Refresh'}
                 </button>
             </div>
 
@@ -1065,6 +1089,17 @@ export default function Surfacer() {
                 <Kpi label="Avg Score" value={meta.average_conviction ?? 0} />
                 <Kpi label="Main Source" value={formatSource(topSource)} />
             </div>
+
+            {/* Item #21 (Wave 3 triage report): every conviction "history"/
+                calibration gate below is downstream of the broken Hermes
+                signal meter — never let the hit-rate/Brier percentages
+                baked into a gate's detail text read as a trustworthy,
+                live track record. */}
+            {meta.calibration_note ? (
+                <div className="surfacer-calibration-note" style={styles.noteBox}>
+                    {meta.calibration_note}
+                </div>
+            ) : null}
 
             {thesis ? (
                 <section className="surfacer-thesis" style={styles.thesisStrip}>
@@ -1132,7 +1167,11 @@ export default function Surfacer() {
                             <div style={styles.chipRow}>
                                 <span style={styles.chip(convictionTone(selected.conviction?.label))}>{selected.conviction?.label || 'research'}</span>
                                 <span style={styles.chip(scoreTone(selected.direction))}>{selected.direction}</span>
-                                <span style={styles.chip()}>{Math.round((selected.confidence || 0) * 100)}% confidence</span>
+                                <span style={styles.chip()}>
+                                    {selected.confidence === null || selected.confidence === undefined
+                                        ? 'confidence unknown'
+                                        : `${Math.round(selected.confidence * 100)}% confidence`}
+                                </span>
                                 <span style={styles.chip()}>{selected.horizon}</span>
                             </div>
 

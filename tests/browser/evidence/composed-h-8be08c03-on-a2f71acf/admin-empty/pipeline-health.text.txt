@@ -1,0 +1,44 @@
+PIPELINE HEALTH
+0
+TOTAL SOURCES
+0
+HEALTHY
+0
+STALE
+0
+BROKEN
+SOURCE STATUS
+All (0)
+Healthy (0)
+Stale (0)
+Broken (0)
+STATUS ▲	SOURCE	TYPE	LAST PULL	ROWS	FRESHNESS	ERROR
+No sources match filter
+RESOLVER STATUS
+0
+Pending
+0
+Resolved (24h)
+never
+Last Run
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

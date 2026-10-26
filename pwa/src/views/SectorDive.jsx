@@ -165,7 +165,9 @@ function SectorHealthGauge({ health }) {
     const ringRef = useRef(null);
     const [showTip, setShowTip] = useState(false);
     const score = health?.score ?? null;
-    const trend = health?.trend_30d || 'stable';
+    // null when the health payload is unavailable; never default to a
+    // 'stable' reading the backend did not report.
+    const trend = health?.trend_30d ?? null;
     const components = health?.components || {};
     const color = HEALTH_COLOR(score);
 
@@ -269,7 +271,7 @@ function SectorHealthGauge({ health }) {
                             {TREND_ARROW[trend] || '\u2192'}
                         </span>
                         <span style={{ fontFamily: mono, fontSize: '11px', color: colors.text }}>
-                            {trend}
+                            {trend ?? 'unavailable'}
                         </span>
                     </div>
                 </div>
@@ -734,13 +736,15 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
                     value={fmtUSD(metrics.etf_flow_5d)}
                     color={metrics.etf_flow_5d == null ? colors.textMuted : (metrics.etf_flow_5d >= 0 ? colors.green : colors.red)}
                 />
-                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || 'neutral'} color={
+                {/* A missing signal or activity list renders '--', never a
+                    'neutral' reading or a count of 0 the backend did not send. */}
+                <MetricCard label="Dark Pool Signal" value={metrics.dark_pool_signal || '--'} color={
                     metrics.dark_pool_signal === 'accumulation' ? colors.green
                     : metrics.dark_pool_signal === 'distribution' ? colors.red
-                    : colors.textDim
-                } />
-                <MetricCard label="Insider Trades (30d)" value={String((metrics.insider_activity || []).length)} color={colors.text} />
-                <MetricCard label="Congressional (60d)" value={String((metrics.congressional_activity || []).length)} color={colors.text} />
+                    : metrics.dark_pool_signal ? colors.textDim : colors.textMuted
+                } note={darkPoolNote(metrics, data?.provenance?.dark_pool_weekly)} />
+                <MetricCard label="Insider Trades (30d)" value={Array.isArray(metrics.insider_activity) ? String(metrics.insider_activity.length) : '--'} color={Array.isArray(metrics.insider_activity) ? colors.text : colors.textMuted} />
+                <MetricCard label="Congressional (60d)" value={Array.isArray(metrics.congressional_activity) ? String(metrics.congressional_activity.length) : '--'} color={Array.isArray(metrics.congressional_activity) ? colors.text : colors.textMuted} note={congressionalNote(data?.provenance?.congressional_trades)} />
             </div>
 
             {/* ═══ SUBSECTOR TREEMAP ═══ */}
@@ -872,6 +876,7 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
                                             <span style={{ color: colors.textMuted, marginLeft: '6px' }}>{t.representative}</span>
                                         </div>
                                         <div>
+                                            <span style={{ color: colors.textMuted, marginRight: '8px' }}>{t.date || '--'}</span>
                                             <span style={{ color: colors.textDim }}>{t.type} {t.amount || ''}</span>
                                         </div>
                                     </div>
@@ -972,13 +977,54 @@ export default function SectorDive({ sector: sectorProp, onBack }) {
 
 // ── Sub-components ───────────────────────────────────────────────────
 
-function MetricCard({ label, value, color }) {
+function MetricCard({ label, value, color, note }) {
     return (
         <div style={shared.metric}>
             <div style={{ ...shared.metricValue, fontSize: '15px', color: color || '#E8F0F8' }}>{value}</div>
             <div style={shared.metricLabel}>{label}</div>
+            {note && (
+                <div data-testid={`note-${label}`} style={{ fontSize: '9px', color: '#8A9BB0', fontFamily: mono, marginTop: '2px' }}>
+                    {note}
+                </div>
+            )}
         </div>
     );
+}
+
+// The flows API's `provenance.<table>` envelope (store/materialization_provenance.py)
+// describes materialization state, not data truth. When a table is unavailable
+// the reason and age are shown next to the figure it feeds, e.g. "table stale 224d".
+function provenanceNote(p) {
+    if (!p || !p.unavailable) return null;
+    const age = p.age_days != null ? ` ${p.age_days}d` : '';
+    return `table ${p.reason || 'unavailable'}${age}`;
+}
+
+const DARK_POOL_REASON = {
+    stale: 'week too old for a signal',
+    no_short_volume: 'no short volume reported',
+    no_rows: 'no weekly rows',
+    error: 'read failed',
+};
+
+function darkPoolNote(metrics, prov) {
+    const parts = [];
+    if (!metrics.dark_pool_signal && metrics.dark_pool_reason) {
+        parts.push(DARK_POOL_REASON[metrics.dark_pool_reason] || metrics.dark_pool_reason);
+    }
+    if (metrics.dark_pool_as_of) parts.push(`week of ${metrics.dark_pool_as_of}`);
+    const table = provenanceNote(prov);
+    if (table) parts.push(table);
+    return parts.length ? parts.join(' · ') : null;
+}
+
+function congressionalNote(prov) {
+    if (!prov) return null;
+    const parts = [];
+    const table = provenanceNote(prov);
+    if (table) parts.push(table);
+    if (prov.future_dated_rows > 0) parts.push(`${prov.future_dated_rows} future-dated not shown`);
+    return parts.length ? parts.join(' · ') : null;
 }
 
 // ── Edge type metadata (colors + labels) ─────────────────────────────

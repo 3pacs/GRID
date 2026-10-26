@@ -1,6 +1,6 @@
 ---
 name: tiingo-integration
-description: Use the Tiingo Pro API for price data, news, and fundamentals in GRID. Use when adding new tickers, backfilling historical data for new features, setting up news-sentiment signals, debugging Tiingo API issues, or planning bandwidth usage (40GB/month Pro tier).
+description: Use when calling the Tiingo API, pulling or backfilling Tiingo prices or news, adding new tickers to Tiingo pulls, or planning bandwidth (40GB/month Pro tier); for resolving raw_series into resolved_series use resolver-patterns.
 ---
 
 # tiingo-integration

@@ -40,6 +40,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.verified_13f_filers import VERIFIED_FILERS
 from ingestion.base import BasePuller, retry_on_failure
 
 # yfinance logs expected missing/delisted ticker misses at ERROR internally.
@@ -86,60 +87,18 @@ _EDGAR_HEADERS: dict[str, str] = {
     "Accept": "application/json",
 }
 
-# Top institutional filers by AUM (CIK numbers)
-# These are the managers whose 13F filings move markets.
-TOP_13F_FILERS: dict[str, str] = {
-    "1067983": "Berkshire Hathaway",
-    "1350694": "Bridgewater Associates",
-    "1037389": "Renaissance Technologies",
-    "1423053": "Citadel Advisors",
-    "1536411": "Millennium Management",
-    "1061768": "D.E. Shaw",
-    "1336528": "Baupost Group",
-    "1649339": "Two Sigma Investments",
-    "1167483": "Elliott Management",
-    "1364742": "Viking Global Investors",
-    "1037529": "Appaloosa Management",
-    "1159159": "Third Point",
-    "1535392": "Point72 Asset Management",
-    "1336326": "Greenlight Capital",
-    "1040280": "Tiger Global Management",
-    "1009207": "Marshall Wace",
-    "1582243": "Coatue Management",
-    "1484148": "Lone Pine Capital",
-    "1027451": "Jana Partners",
-    "1510387": "Pershing Square Capital",
-    "1044316": "BlackRock",
-    "1395250": "Vanguard Group",
-    "1166559": "State Street Global Advisors",
-    "1169819": "JPMorgan Investment Mgmt",
-    "1633907": "AQR Capital Management",
-    "1534067": "Balyasny Asset Management",
-    "1544012": "Sculptor Capital (Och-Ziff)",
-    "1608050": "Farallon Capital",
-    "1056831": "SAC Capital (now Point72)",
-    "1602119": "Whale Rock Capital",
-    "1352575": "Soros Fund Management",
-    "1697748": "Maverick Capital",
-    "1006438": "Canyon Capital",
-    "1345197": "ValueAct Capital",
-    "1040971": "Druckenmiller (Duquesne)",
-    "1103804": "Capital Group",
-    "1105497": "T. Rowe Price",
-    "1091439": "Fidelity Management & Research",
-    "1510085": "Temasek Holdings",
-    "1599901": "GIC Private Limited",
-    "1632420": "Norges Bank Investment Mgmt",
-    "1004244": "Wellington Management",
-    "1533444": "Ares Management",
-    "1106500": "Man Group",
-    "1359842": "Two Sigma Advisers",
-    "1085392": "Magnetar Capital",
-    "1079114": "Tudor Investment Corp",
-    "1050470": "Paulson & Co",
-    "1595082": "Winton Group",
-    "1699161": "ExodusPoint Capital",
-}
+# Top institutional filers by AUM (CIK numbers).
+#
+# GD0 §1.3 / §6 item 4 (owner decision, adopted 2026-09-28; corrected
+# 2026-09-28 -- see ``ingestion/altdata/verified_13f_filers.py``'s module
+# docstring): this module used to carry its own hardcoded ``CIK -> fund
+# name`` dict that disagreed with both ``ingestion/edgar.py`` and
+# ``ingestion/altdata/sec_13f_live.py`` on the *same* CIK for different
+# funds (e.g. CIK 1167483 was "Elliott Management" here, "Eton Park
+# Capital" in edgar.py, and "Tiger Global Management" -- SEC's verified
+# registrant name -- in sec_13f_live.py). This is now a derived view over
+# the single verified map, not a second copy that can drift out of sync.
+TOP_13F_FILERS: dict[str, str] = {f.cik: f.display_name for f in VERIFIED_FILERS}
 
 # Rate limit between EDGAR API calls (SEC is strict: 10 req/sec max)
 _EDGAR_RATE_DELAY: float = 0.15

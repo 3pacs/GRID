@@ -1,13 +1,28 @@
 # OPEX Waterfall Playbook
 
-> The short-term tape is written by ~$2T of structured-product hedging flows,
-> because that is where dealers are forced to transact predictably. The rest
-> of the $14T alternative-asset pool (crypto, metals, hedge funds) does not
-> set the short-term tape because nobody in those pools is mechanically
-> forced to buy or sell at a specific time for a specific reason.
+> The short-term tape is written by structured-product hedging flows —
+> rough, unsourced estimates put the pool at ~$2T, against a ~$14T
+> alternative-asset universe (crypto, metals, hedge funds) — because that
+> smaller pool is where dealers are forced to transact predictably. Neither
+> figure is measured anywhere in GRID; treat them as order-of-magnitude
+> color, not inputs to size anything.
 >
 > The entire discipline below exists to keep us on the right side of the
 > waterfall when dealer positioning flips from rubber band to slingshot.
+
+## Sign Convention
+
+GRID's dealer-gamma engine (`physics/dealer_gamma.py`) independently models
+dealers as net LONG calls and net SHORT puts. This is an assumed sign
+convention, not SqueezeMetrics-sourced data. Dealer positioning is
+**modeled, not observed**; no feed tells us what dealers actually hold.
+Under this convention:
+
+- **GEX > 0** at spot: dealers long gamma (dampening / pinning)
+- **GEX < 0** at spot: dealers short gamma (amplifying)
+- **A gamma flip is a modeled zero crossing, not a direction rule.** Either
+  side may have either sign, and a chain can cross zero more than once. Use
+  modeled GEX at the verified reference spot for the regime label.
 
 ## Core Principle
 
@@ -57,14 +72,19 @@ tripped simultaneously fires `alerts/waterfall_watch.py`.
 - A new rubber band gets installed at new strike levels for the next quarter
 
 ### JHEQX + buffer ETF roll (last business day of Mar/Jun/Sep/Dec)
-- JPMorgan Hedged Equity Fund (~$20B) always does the same trade:
+- JPMorgan Hedged Equity Fund (~$18B; JHEQX alone — the sister JPMorgan
+  Hedged Equity funds reset in other months, so don't add them into this
+  window's size) always does the same trade:
     - Buys SPX put spread ~5% OTM
     - Sells SPX call ~3–5% OTM
     - Same quarterly expiry forward
 - The **sold call strike** becomes a natural ceiling for the next quarter
 - The **bought put strike** becomes a softer floor
-- Innovator / First Trust / Global X buffer suites roll around the same window
-  for another ~$80–100B of forced collar flow
+- Innovator / First Trust / Global X buffer (defined-outcome) ETFs total
+  roughly ~$85–89B industry-wide, but many series reset monthly rather than
+  quarterly — only the quarterly-reset series actually roll in this window,
+  so the forced flow landing on any single quarterly date is a fraction of
+  the total pool, not the whole ~$85–89B
 
 ### FOMC statement days
 - Vol crush immediately after the release
@@ -146,7 +166,8 @@ Every short-vol or pinning trade must carry a written invalidation at entry:
 
 ```
 INVALIDATION:
-  - SPY closes below gamma flip level for 2 consecutive sessions, OR
+  - Recomputed modeled GEX at verified SPY reference spot is negative
+    for 2 consecutive sessions, OR
   - VIX term structure inverts (1M > 3M), OR
   - Realized 5d vol exceeds implied 5d vol by > 20%, OR
   - Waterfall score reaches 3+ of 5 tripped conditions
@@ -170,7 +191,13 @@ dealer-hedging forced flows, and only that.**
 
 ## References
 
-- Cem Karsan — SqueezeMetrics and [[Dealer Gamma|dealer gamma]] framework
+- SqueezeMetrics — its December 2017 "Gamma Exposure" (GEX) white paper and
+  the DIX index; the public GEX convention this playbook and
+  `physics/dealer_gamma.py` follow
+- Cem Karsan (Kai Volatility Advisors / Kai Wealth) — widely cited
+  dealer-flow commentary (gamma, vanna, charm); a separate firm from
+  SqueezeMetrics. Who first used the "rubber band / slingshot" phrasing is
+  unverified.
 - Kris Sidial — tail vol, long-volatility strategy
 - JP Morgan Hedged Equity Fund prospectus — JHEQX roll mechanics
 - SpotGamma / Menthor Q — daily gamma flip publication

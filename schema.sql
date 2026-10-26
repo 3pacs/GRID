@@ -16,7 +16,10 @@ CREATE TABLE IF NOT EXISTS source_catalog (
     name              TEXT NOT NULL UNIQUE,
     base_url          TEXT NOT NULL,
     cost_tier         TEXT NOT NULL CHECK (cost_tier IN ('FREE', 'LOW', 'PAID')),
-    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'EOD', 'WEEKLY', 'MONTHLY')),
+    -- Seven values mirror the live griddb source_catalog_latency_class_check
+    -- (widened out-of-band before 2026-10-20; re-read 2026-10-20). Readers:
+    -- alerts/cadence.py _METADATA_CADENCE; pinned by tests/test_schema_latency_class_constraint.py.
+    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'INTRADAY', 'EOD', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'ANNUAL')),
     pit_available     BOOLEAN NOT NULL DEFAULT FALSE,
     revision_behavior TEXT NOT NULL CHECK (revision_behavior IN ('NEVER', 'RARE', 'FREQUENT')),
     trust_score       TEXT NOT NULL CHECK (trust_score IN ('HIGH', 'MED', 'LOW')),
@@ -43,7 +46,12 @@ CREATE TABLE IF NOT EXISTS raw_series (
     pull_timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     value             DOUBLE PRECISION NOT NULL,
     raw_payload       JSONB,
-    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED'))
+    -- QUARANTINED: a once-accepted row later found untrustworthy. It is not an
+    -- observation (readers take SUCCESS only) and not a pull failure. Pullers
+    -- never write it. Production got it via
+    -- migrations/versions/raw_series_quarantined_20260926.py (added NOT VALID,
+    -- same constraint name raw_series_pull_status_check).
+    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED', 'QUARANTINED'))
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_raw_series_composite
@@ -159,6 +167,53 @@ CREATE INDEX IF NOT EXISTS idx_resolved_series_pit_latest
 
 CREATE INDEX IF NOT EXISTS idx_resolved_series_conflict
     ON resolved_series (conflict_flag) WHERE conflict_flag = TRUE;
+
+-- ============================================================
+-- TABLE: resolved_series_retractions
+-- Append-only point-in-time retractions of resolved_series rows
+-- (migrations/versions/resolved_retractions_20260927.py). A retracted row is
+-- hidden from PIT reads with as_of_ts >= retracted_at (a date as_of: the whole
+-- UTC day of the retraction) and stays visible to earlier as_of, so replays
+-- for as_of dates before the retraction's UTC date are reproduced exactly.
+-- Nothing is deleted from resolved_series.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS resolved_series_retractions (
+    id            BIGSERIAL PRIMARY KEY,
+    feature_id    INTEGER NOT NULL,
+    obs_date      DATE NOT NULL,
+    vintage_date  DATE NOT NULL,
+    retracted_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    reason        TEXT NOT NULL CHECK (btrim(reason) <> ''),
+    run_tag       TEXT NOT NULL CHECK (btrim(run_tag) <> ''),
+    CONSTRAINT uq_resolved_series_retractions_key
+        UNIQUE (feature_id, obs_date, vintage_date) INCLUDE (retracted_at),
+    CONSTRAINT fk_resolved_series_retractions_row
+        FOREIGN KEY (feature_id, obs_date, vintage_date)
+        REFERENCES resolved_series (feature_id, obs_date, vintage_date)
+);
+
+CREATE OR REPLACE FUNCTION resolved_series_retractions_guard()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        IF NEW.retracted_at < now() THEN
+            RAISE EXCEPTION
+                'resolved_series_retractions: retracted_at % is before now() %; '
+                'a retraction cannot be backdated into already-served history',
+                NEW.retracted_at, now();
+        END IF;
+        RETURN NEW;
+    END IF;
+    RAISE EXCEPTION
+        'resolved_series_retractions is append-only (% refused)', TG_OP;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_resolved_series_retractions_guard ON resolved_series_retractions;
+CREATE TRIGGER trg_resolved_series_retractions_guard
+    BEFORE INSERT OR UPDATE OR DELETE ON resolved_series_retractions
+    FOR EACH ROW
+    EXECUTE FUNCTION resolved_series_retractions_guard();
 
 -- ============================================================
 -- TABLE: hypothesis_registry
@@ -667,29 +722,110 @@ CREATE INDEX IF NOT EXISTS idx_agent_runs_journal
     ON agent_runs (decision_journal_id);
 
 -- ============================================================
--- TABLE: options_snapshots
--- Raw options chain snapshots per ticker/expiry/strike.
+-- TABLE: options_snapshots_all  (append-only; migration options_append_only_20260930)
+-- Every options chain capture batch, one row per contract per batch; rows
+-- are immutable. options_capture_batches registers each complete batch and
+-- the options_snapshots VIEW shows the latest complete batch per ticker/day
+-- (what the old delete-then-insert table held).
+-- Fresh installs only: the whole block is skipped when options_snapshots
+-- already exists (table before the migration, view after it), so running
+-- this file against an existing database never races the migration.
 -- ============================================================
-CREATE TABLE IF NOT EXISTS options_snapshots (
-    id              BIGSERIAL PRIMARY KEY,
-    ticker          TEXT NOT NULL,
-    snap_date       DATE NOT NULL,
-    expiry          DATE NOT NULL,
-    opt_type        TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
-    strike          DOUBLE PRECISION NOT NULL,
-    last_price      DOUBLE PRECISION,
-    bid             DOUBLE PRECISION,
-    ask             DOUBLE PRECISION,
-    volume          INTEGER,
-    open_interest   INTEGER,
-    implied_vol     DOUBLE PRECISION,
-    in_the_money    BOOLEAN,
-    created_at      TIMESTAMPTZ DEFAULT NOW(),
-    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
-);
-
-CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
-    ON options_snapshots (ticker, snap_date);
+DO $options_store$
+BEGIN
+IF to_regclass('options_snapshots') IS NULL THEN
+    CREATE TABLE options_snapshots_all (
+        id              BIGSERIAL PRIMARY KEY,
+        ticker          TEXT NOT NULL,
+        snap_date       DATE NOT NULL,
+        expiry          DATE NOT NULL,
+        opt_type        TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
+        strike          DOUBLE PRECISION NOT NULL,
+        last_price      DOUBLE PRECISION,
+        bid             DOUBLE PRECISION,
+        ask             DOUBLE PRECISION,
+        volume          INTEGER,
+        open_interest   INTEGER,
+        implied_vol     DOUBLE PRECISION,
+        in_the_money    BOOLEAN,
+        created_at      TIMESTAMPTZ DEFAULT NOW(),
+        capture_batch_id TEXT,
+        capture_ordinal BIGINT,
+        capture_started_at TIMESTAMPTZ,
+        capture_completed_at TIMESTAMPTZ,
+        provider_regular_market_at TIMESTAMPTZ
+    );
+    CREATE INDEX idx_opts_snap_ticker_date ON options_snapshots_all (ticker, snap_date);
+    CREATE UNIQUE INDEX options_snapshots_all_batch_contract_key
+        ON options_snapshots_all (capture_batch_id, expiry, opt_type, strike)
+        WHERE capture_batch_id IS NOT NULL;
+    CREATE TABLE options_capture_batches (
+        capture_batch_id     TEXT PRIMARY KEY,
+        ticker               TEXT NOT NULL,
+        snap_date            DATE NOT NULL,
+        capture_ordinal      BIGINT NOT NULL CHECK (capture_ordinal > 0),
+        capture_started_at   TIMESTAMPTZ NOT NULL,
+        capture_completed_at TIMESTAMPTZ NOT NULL,
+        row_count            INTEGER NOT NULL CHECK (row_count > 0),
+        spot_price           DOUBLE PRECISION,
+        capture_source       TEXT NOT NULL,
+        backfilled           BOOLEAN NOT NULL DEFAULT false,
+        registered_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+        CHECK (capture_started_at <= capture_completed_at),
+        CONSTRAINT options_capture_batches_identity_key
+            UNIQUE (capture_batch_id, capture_ordinal, ticker, snap_date),
+        CONSTRAINT options_capture_batches_day_ordinal_key
+            UNIQUE (ticker, snap_date, capture_ordinal)
+    );
+    ALTER TABLE options_snapshots_all
+        ADD CONSTRAINT options_snapshots_all_batch_required CHECK (
+            capture_batch_id IS NOT NULL AND capture_ordinal IS NOT NULL
+            AND capture_started_at IS NOT NULL
+            AND capture_completed_at IS NOT NULL
+            AND provider_regular_market_at IS NOT NULL
+        ) NOT VALID;
+    ALTER TABLE options_snapshots_all
+        ADD CONSTRAINT options_snapshots_all_batch_fk
+        FOREIGN KEY (capture_batch_id, capture_ordinal, ticker, snap_date)
+        REFERENCES options_capture_batches
+            (capture_batch_id, capture_ordinal, ticker, snap_date)
+        NOT VALID;
+    CREATE FUNCTION options_capture_append_only_guard() RETURNS trigger
+    LANGUAGE plpgsql AS $guard$
+    BEGIN
+        RAISE EXCEPTION 'options capture history is append-only: % on % refused',
+            TG_OP, TG_TABLE_NAME USING ERRCODE = 'restrict_violation';
+    END
+    $guard$;
+    CREATE TRIGGER options_snapshots_all_no_row_mutation
+        BEFORE UPDATE OR DELETE ON options_snapshots_all
+        FOR EACH ROW EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_snapshots_all_no_truncate
+        BEFORE TRUNCATE ON options_snapshots_all
+        FOR EACH STATEMENT EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_capture_batches_no_row_mutation
+        BEFORE UPDATE OR DELETE ON options_capture_batches
+        FOR EACH ROW EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE TRIGGER options_capture_batches_no_truncate
+        BEFORE TRUNCATE ON options_capture_batches
+        FOR EACH STATEMENT EXECUTE FUNCTION options_capture_append_only_guard();
+    CREATE VIEW options_snapshots AS
+    SELECT s.id, s.ticker, s.snap_date, s.expiry, s.opt_type, s.strike,
+           s.last_price, s.bid, s.ask, s.volume, s.open_interest,
+           s.implied_vol, s.in_the_money, s.created_at,
+           s.capture_batch_id, s.capture_ordinal, s.capture_started_at,
+           s.capture_completed_at, s.provider_regular_market_at
+    FROM options_snapshots_all s
+    WHERE NOT EXISTS (
+        SELECT 1 FROM options_capture_batches b
+        WHERE b.ticker = s.ticker
+          AND b.snap_date = s.snap_date
+          AND b.capture_batch_id IS DISTINCT FROM s.capture_batch_id
+          AND b.capture_ordinal >= COALESCE(s.capture_ordinal, 0)
+    );
+END IF;
+END
+$options_store$;
 
 -- ============================================================
 -- TABLE: options_daily_signals
@@ -1112,6 +1248,24 @@ CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
 -- AstroGrid may read from shared GRID inputs, but it writes only here.
 -- ============================================================
 CREATE SCHEMA IF NOT EXISTS astrogrid;
+
+-- New SPY close evidence only. Legacy resolved rows have no receipt and are
+-- deliberately not promoted or backfilled.
+CREATE TABLE IF NOT EXISTS astrogrid.price_close_receipt (
+    id                  BIGSERIAL PRIMARY KEY,
+    contract_version    TEXT NOT NULL CHECK (contract_version = 'spy_close_v1'),
+    raw_series_id       BIGINT NOT NULL UNIQUE REFERENCES raw_series(id),
+    resolved_series_id  BIGINT NOT NULL UNIQUE REFERENCES resolved_series(id),
+    feature_id          INTEGER NOT NULL REFERENCES feature_registry(id),
+    obs_date            DATE NOT NULL,
+    price_basis         TEXT NOT NULL CHECK (price_basis = 'YF:SPY:close'),
+    available_at        TIMESTAMPTZ NOT NULL,
+    value               DOUBLE PRECISION NOT NULL CHECK (value > 0 AND value < 'Infinity'::float8),
+    created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (contract_version, feature_id, obs_date)
+);
+CREATE INDEX IF NOT EXISTS idx_price_close_receipt_available
+    ON astrogrid.price_close_receipt (feature_id, obs_date, available_at);
 
 CREATE TABLE IF NOT EXISTS astrogrid.grid_input_allowlist (
     id            BIGSERIAL PRIMARY KEY,
@@ -1762,3 +1916,59 @@ CREATE TABLE IF NOT EXISTS ref_verification_log (
 CREATE INDEX IF NOT EXISTS idx_ref_log_url ON ref_verification_log(url);
 CREATE INDEX IF NOT EXISTS idx_ref_log_classification ON ref_verification_log(classification);
 CREATE INDEX IF NOT EXISTS idx_ref_log_checked_at ON ref_verification_log(checked_at);
+
+-- ---------------------------------------------------------------------------
+-- market_briefings: written by ollama/market_briefing.py (which also creates it
+-- lazily at runtime). Declared here because the Alembic revision
+-- god_view_market_tables_20260918 builds the materialized view
+-- market_god_view_daily on top of it, so a fresh install that applies
+-- schema.sql and then runs `alembic upgrade head` must already have it.
+-- DDL identical to ollama/market_briefing.py; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_briefings (
+    id              SERIAL PRIMARY KEY,
+    briefing_type   TEXT NOT NULL,
+    briefing_date   DATE NOT NULL,
+    content         TEXT NOT NULL,
+    sentiment_score REAL,
+    sentiment_label TEXT,
+    sentiment_data  JSONB,
+    snapshot_data   JSONB,
+    created_at      TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_date
+    ON market_briefings (briefing_date DESC);
+CREATE INDEX IF NOT EXISTS idx_market_briefings_type
+    ON market_briefings (briefing_type, briefing_date DESC);
+
+-- ---------------------------------------------------------------------------
+-- insider_trades: normally created by revision f1a2b3c4d5e6_capital_flow_tables
+-- (and lazily by ingestion/flow_materializer.py). Declared here too because a
+-- database built from schema.sql and stamped at a later revision skips that
+-- revision, and the god-view materialized view (revision
+-- god_view_market_tables_20260918) reads insider_trades. DDL identical to the
+-- revision; idempotent.
+-- ---------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS insider_trades (
+    id              BIGSERIAL PRIMARY KEY,
+    ticker          TEXT NOT NULL,
+    trade_date      DATE NOT NULL,
+    insider_name    TEXT NOT NULL,
+    insider_title   TEXT,
+    trade_type      TEXT NOT NULL,
+    shares          NUMERIC,
+    value           NUMERIC,
+    price_per_share NUMERIC,
+    filing_date     DATE,
+    is_cluster_buy  BOOLEAN DEFAULT FALSE,
+    signal_source_id INTEGER,
+    created_at      TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (ticker, trade_date, insider_name, trade_type)
+);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_ticker_date
+    ON insider_trades (ticker, trade_date DESC);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_value
+    ON insider_trades (value DESC NULLS LAST);
+CREATE INDEX IF NOT EXISTS ix_insider_trades_cluster_buy
+    ON insider_trades (is_cluster_buy)
+    WHERE is_cluster_buy = TRUE;

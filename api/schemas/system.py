@@ -83,12 +83,61 @@ class StaleSource(BaseModel):
     source: str
     last_pull: str | None = None
     stale: bool = True
+    # Contract addition (store/availability_fields.py::FieldRecord.to_dict()).
+    # Carries availability/provenance/stale_reason/ingested_at for this
+    # source's freshness fact so a page's staleness text always traces back
+    # to a record instead of being recomputed ad hoc. None for responses
+    # built before this field existed.
+    field_record: dict[str, Any] | None = None
+
+
+class FreshnessAuditBucket(BaseModel):
+    bucket: str
+    ticker_count: int
+
+
+class DailyFreshnessAudit(BaseModel):
+    """Snapshot of the pre-computed `data_freshness_audit` table.
+
+    `grid-data-freshness-check.timer` refreshes this table once daily
+    (05:00 UTC) via `scripts/freshness_audit_universe.sql`. Reading it here
+    is a fixed-size, indexed lookup (audited_at DESC / bucket) regardless of
+    how large the underlying `ticker_metrics_daily` table grows — unlike a
+    live lateral scan over `raw_series`/`resolved_series`, this can never
+    time out the request.
+
+    `availability` is "unavailable" whenever the *audit itself* is missing
+    (no rows ever written) or stale (its own daily run did not complete
+    within the last 48h — twice the timer's cadence). This is a genuinely
+    separate signal from "available" per-source/per-family data above: an
+    old audit answers a different question ("was the pipeline healthy as of
+    last night") than a live query, so it must never be presented as if it
+    were current.
+    """
+    audited_at: str | None = None
+    total_tickers: int = 0
+    buckets: list[FreshnessAuditBucket] = []
+    source_tables: list[str] = []
+    availability: str = "available"
+    stale_reason: str | None = None
+    field_record: dict[str, Any] | None = None
 
 
 class FreshnessResponse(BaseModel):
     families: list[FamilyFreshness]
     overall_status: str  # GREEN, YELLOW, RED
     stale_sources: list[StaleSource] = []
+    # Contract addition: whole-response availability. "available" (default,
+    # preserves prior behaviour) unless the underlying queries failed, in
+    # which case this is "unavailable" and stale_reason names the category —
+    # never silently returned as empty families/stale_sources with no signal.
+    availability: str = "available"
+    stale_reason: str | None = None
+    # The daily data_freshness_audit snapshot (see DailyFreshnessAudit). Its
+    # own availability/stale_reason are independent of the fields above —
+    # this can be "unavailable" while the live family query above succeeds,
+    # and vice versa.
+    daily_audit: DailyFreshnessAudit = DailyFreshnessAudit()
 
 
 class HermesTaskStatus(BaseModel):
@@ -128,6 +177,12 @@ class PipelineSourceStatus(BaseModel):
     freshness: str = "red"  # green, yellow, red
     series_count: int | None = None
     error: str | None = None
+    # Contract addition (store/availability_fields.py::FieldRecord.to_dict()).
+    # Restates this source's status as a per-field record: availability
+    # (available/unavailable), provenance (measured, when we have a real
+    # last-pull timestamp), ingested_at, and stale_reason. None for
+    # responses built before this field existed.
+    field_record: dict[str, Any] | None = None
 
 
 class PipelineSummary(BaseModel):
@@ -161,3 +216,15 @@ class PipelineHealthResponse(BaseModel):
     coverage: dict[str, Any] = {}
     recent_errors: list[PipelineError] = []
     resolver_status: ResolverStatus = ResolverStatus()
+    # Contract addition: whole-response availability. "available" (default,
+    # preserves prior behaviour) unless the pipeline-health query itself
+    # failed, in which case this is "unavailable" and stale_reason names the
+    # failure category. Previously an exception here produced a plain 200
+    # with every list empty and no signal that the *computation* — not the
+    # pipeline — was what failed; a client could not tell "0 sources exist"
+    # from "we could not compute this".
+    availability: str = "available"
+    stale_reason: str | None = None
+    # The daily data_freshness_audit snapshot (see DailyFreshnessAudit),
+    # independent of the availability/stale_reason above.
+    daily_audit: DailyFreshnessAudit = DailyFreshnessAudit()

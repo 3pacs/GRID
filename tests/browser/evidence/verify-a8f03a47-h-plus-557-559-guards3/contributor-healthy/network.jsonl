@@ -1,0 +1,5 @@
+{"ts":"2026-09-18T10:20:46.705Z","role":"contributor","scenario":"healthy","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:20:47.345Z","role":"contributor","scenario":"healthy","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":200}
+{"ts":"2026-09-18T10:24:53.260Z","role":"contributor","scenario":"healthy","method":"POST","url":"http://localhost:5174/api/v1/auth/login","status":200}
+{"ts":"2026-09-18T10:24:53.572Z","role":"contributor","scenario":"healthy","method":"GET","url":"http://localhost:5174/api/v1/alerts","status":200}
+{"ts":"2026-09-18T10:24:53.598Z","role":"contributor","scenario":"healthy","method":"GET","url":"http://localhost:5174/api/v1/ten-year-portfolio/weekly?capital=1000000&years=10","status":200}

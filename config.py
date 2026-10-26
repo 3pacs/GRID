@@ -9,12 +9,13 @@ non-development environments.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
 from dotenv import load_dotenv
 from loguru import logger as log
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 
 # Load .env from the project root (same directory as this file)
@@ -66,6 +67,30 @@ class Settings(BaseSettings):
     USDA_NASS_API_KEY: str = ""
     NOAA_TOKEN: str = ""
     EIA_API_KEY: str = ""
+    # Public v2 API base (documented at https://www.eia.gov/opendata/documentation.php).
+    # Not a secret -- the key itself is EIA_API_KEY above.
+    EIA_BASE_URL: str = "https://api.eia.gov/v2/"
+
+    # FINRA Daily Short Sale Volume (Reg SHO daily files) -- public CDN, no
+    # key required. Documented at
+    # https://www.finra.org/finra-data/browse-catalog/short-sale-volume-data/daily-short-sale-volume-files
+    # (naming convention "<MarketPrefix>shvol<YYYYMMDD>.txt", e.g.
+    # CNMSshvol20260917.txt). Not a secret -- just the CDN base path.
+    FINRA_SHORT_VOLUME_BASE_URL: str = "https://cdn.finra.org/equity/regsho/daily/"
+
+    # SEC requires a descriptive User-Agent with contact info on every
+    # request (https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data
+    # and SEC's general fair-access guidance) -- generic/default UAs get
+    # throttled or blocked. Deliberately NO default value here: sec_ftd.py's
+    # SECFTDPuller fails closed with a clear error if this is unset rather
+    # than silently sending an unidentified request.
+    SEC_USER_AGENT: str = ""
+    # Reddit Data API, application-only OAuth (free tier). Owner registers a
+    # "script" app at reddit.com/prefs/apps; see ingestion/altdata/reddit_oauth.py.
+    # Empty = Reddit pullers report FAILED "not configured" and send nothing.
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
@@ -250,12 +275,45 @@ class Settings(BaseSettings):
     OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
 
-    # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
-    # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
-    # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
-    KOKORO_TTS_BASE_URL: str = "http://koala:8091"
-    KOKORO_TTS_ENABLED: bool = True
-    KOKORO_TTS_VOICE: str = "af_sarah"
+    # Local Kokoro TTS for the on-demand audio briefing
+    # (intelligence/audio_briefing.py). Kokoro-FastAPI, OpenAI-compatible
+    # ``POST /v1/audio/speech`` returning MP3. Verified 2026-10-01Z: gridz4
+    # (HP Z4 G4) runs it as the docker container ``kokoro-tts-cpu``
+    # (ghcr.io/remsky/kokoro-fastapi-cpu) on :8880 with 67 voices; grid-svr
+    # reaches it at http://gridz4:8880. The old koala:8091 server has been
+    # offline since ~2026-07-25. Empty URL = not configured: the briefing is
+    # text-only and says so. Paid TTS is never a fallback for a local failure.
+    GRID_KOKORO_URL: str = ""
+    GRID_KOKORO_VOICE: str = "af_heart"
+    # Read timeout for one synthesis. ~24s measured for a 234-word script on
+    # gridz4 CPU; 60s leaves headroom while staying well inside the ~100s
+    # Cloudflare origin limit once LLM script time is added.
+    GRID_KOKORO_TIMEOUT_SECONDS: float = Field(60.0, gt=0, le=600)
+    # Writable directory for briefing MP3 + JSON sidecars. Empty = automatic:
+    # /data/grid_v4/briefings when running from an immutable release
+    # (grid_release.releases/<sha>), else <checkout>/outputs/briefings.
+    GRID_BRIEFING_DIR: str = ""
+
+    @field_validator("GRID_KOKORO_TIMEOUT_SECONDS", mode="before")
+    @classmethod
+    def _coerce_blank_kokoro_timeout(cls, v: object) -> object:
+        """Blank, non-finite or out-of-range (<=0, >600) values keep the 60s
+        default instead of crashing grid-api startup over an optional
+        feature; non-numeric garbage still raises so a real typo is seen."""
+        if isinstance(v, str):
+            if not v.strip():
+                return 60.0
+            try:
+                num = float(v)
+            except ValueError:
+                return v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            num = float(v)
+        else:
+            return v
+        if not math.isfinite(num) or num <= 0 or num > 600:
+            return 60.0
+        return num
 
     # koala card 1 — whisper.cpp Vulkan transcription server (port 8092).
     # whisper-large-v3-turbo model, runs on GTX TITAN X via Vulkan backend.
@@ -409,6 +467,65 @@ class Settings(BaseSettings):
     CIRCUIT_BREAKER_THRESHOLD: int = 3       # consecutive failures before halting
     CIRCUIT_BREAKER_COOLDOWN_HOURS: int = 24  # hours before probation
 
+    # Wave 3 held-writer jobs (owner decision 2026-09-28, see
+    # GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md §6 "Held-category writers
+    # still running in grid-intelligence"). These three `intelligence/
+    # scheduler.py` jobs kept running unattended in the same held categories
+    # Hermes already refuses to schedule (model/weight-registry writes,
+    # unvalidated hypothesis discovery, paper trading on hypothesis-derived
+    # strategies). Each defaults OFF; `intelligence/scheduler.py` never
+    # registers the job with `schedule` unless its flag is explicitly set,
+    # so it is not dispatched, not attempted, and never timed — mirroring
+    # the DAILY_INTEL_INITIAL_ALLOWLIST "held" semantics in
+    # scripts/hermes_operator.py. Re-enabling one is a reviewed code/config
+    # change, not a runtime toggle on the server.
+    #
+    # - GRID_ENABLE_SCANNER_WEIGHTS_JOB gates the weekly
+    #   `_options_tracker` -> `trading.options_tracker.run_improvement_cycle`
+    #   job, which writes `scanner_weights` (last observed write 2026-09-25).
+    # - GRID_ENABLE_BULK_HYPOTHESIS_JOB gates the nightly (02:45)
+    #   `_nightly_research` -> `analysis.research_agent.run_full_research`
+    #   job, which built 77,261 hypotheses a night and was failing to insert
+    #   them into `hypothesis_registry`.
+    # - GRID_ENABLE_LEGACY_PAPER_TRADING_JOB gates the hourly
+    #   `_paper_trading_signals` -> `trading.signal_executor.execute_signals`
+    #   job, which trades `hypothesis_registry`-derived strategies on
+    #   contaminated `*_full` resolved features with no future-date bound.
+    GRID_ENABLE_SCANNER_WEIGHTS_JOB: bool = False
+    GRID_ENABLE_BULK_HYPOTHESIS_JOB: bool = False
+    GRID_ENABLE_LEGACY_PAPER_TRADING_JOB: bool = False
+
+    # Taiwan Strait OSINT job (owner decision 2026-09-29, GRID-STALE-SOURCES-
+    # AUDIT-20260929.md §2D / §5 row 5). `intelligence/scheduler.py`'s daily
+    # 23:30 `_taiwan_strait_osint_daily` -> `run_taiwan_strait_puller` job
+    # scrapes Taiwan MND pages that now 404; until 2026-09-29 it then wrote
+    # zero-count placeholder "seed" rows into raw_series as SUCCESS. The
+    # puller no longer writes placeholders, and the job stays unregistered
+    # (same semantics as the Wave 3 flags above) until the scraper has a
+    # working MND endpoint and this flag is set in a reviewed change.
+    GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB: bool = False
+
+    # LME warehouse job (2026-09-29, GRID-DEAD-FEEDS-FIX-20260929.md). Both
+    # LME URLs answer HTTP 403 with a Cloudflare managed challenge
+    # ("cf-mitigated: challenge") to any non-browser client; there is no
+    # free programmatic LME endpoint and GRID does not bypass bot checks.
+    # The daily 09:00 `_lme_warehouse_daily` job therefore stays
+    # unregistered until a legitimate endpoint exists and this flag is set
+    # in a reviewed change.
+    GRID_ENABLE_LME_WAREHOUSE_JOB: bool = False
+
+    # Sentiment learned-weight promotion (source review on PR #903,
+    # 2026-10-23). The daily `_sentiment_outcomes_daily` closer in
+    # intelligence/scheduler.py records outcomes on sentiment_predictions
+    # through `score_past_predictions(update_weights=False)`; the Bayesian
+    # `_update_weights` step, which inserts a new sentiment_weights version
+    # that every later compute_sentiment() consumes, is a model/weight-
+    # registry write in the same held category as the Wave 3 flags above.
+    # It stays off for the scheduled closer until this flag is set in a
+    # reviewed change. The historical run_sentiment_cycle / grid_cron.sh
+    # contract (scoring followed by promotion) is unchanged by this flag.
+    GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -417,6 +534,42 @@ class Settings(BaseSettings):
     # opt in; the Hermes bridge (intelligence/hermes/config.py) reads os.getenv
     # directly and already honoured it.
     GRID_ALLOW_PAID_LLM: bool = False
+
+    @field_validator(
+        "GRID_ALLOW_PAID_LLM",
+        "GRID_ENABLE_SCANNER_WEIGHTS_JOB",
+        "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
+        "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
+        "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
+        "GRID_ENABLE_LME_WAREHOUSE_JOB",
+        "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        mode="before",
+    )
+    @classmethod
+    def _coerce_blank_bool_flag(cls, v: object) -> object:
+        """Treat a blank/whitespace env value as False instead of raising.
+
+        Pydantic's built-in bool coercion accepts "0"/"false"/"no"/"off"
+        (and the true-ish equivalents) but rejects "" outright with a
+        ValidationError -- so e.g. ``GRID_ALLOW_PAID_LLM=`` (present but
+        empty, e.g. a templated .env line, or a shell var substituted in
+        unset) would crash the whole app at startup instead of leaving the
+        gate closed, which is exactly the fail-safe every flag on this
+        validator exists to guarantee (originally #699 for
+        GRID_ALLOW_PAID_LLM; extended here to the Wave 3 held-writer job
+        flags, which are default-off gates of the same shape). Anything
+        else (including an already-bool value, or genuine garbage like
+        "maybe") is passed through unchanged for pydantic's own validator
+        to handle -- so a real typo still raises instead of silently
+        resolving to a boolean.
+        """
+        if isinstance(v, str):
+            s = v.strip().lower()
+            if s in ("", "0", "false", "no", "off"):
+                return False
+            if s in ("1", "true", "yes", "on"):
+                return True
+        return v
 
     # Gemma 4 main server is disabled until a live port-8080 Gemma service is restored.
     # The Gemma micro endpoints below remain separate and active.
@@ -499,7 +652,13 @@ class Settings(BaseSettings):
     HERMES_Z4_URL: str = "http://gridz4:8080"  # gridz4 llama.cpp node, GTX 1080/P1000
 
     # Autoresearch (self-improvement loop)
-    AUTORESEARCH_ENABLED: bool = True
+    # Dead flag until now — nothing in the codebase read it, so it never
+    # gated anything (verified 2026-09-19: grep found only this
+    # declaration). Default OFF so a deployment never activates research
+    # on its own; enable with env AUTORESEARCH_ENABLED=true under explicit
+    # operator authorisation. See scripts/hermes_fixers.py::
+    # maybe_run_autoresearch and scripts/hermes_operator.py's cycle-6 gate.
+    AUTORESEARCH_ENABLED: bool = False
     AUTORESEARCH_CRON: str = "0 2 * * 1-5"   # weekdays 2 AM
     AUTORESEARCH_MAX_ITER: int = 5
     AUTORESEARCH_LAYER: str = "REGIME"
@@ -526,8 +685,66 @@ class Settings(BaseSettings):
     ROBINHOOD_PRIVATE_KEY_B64: str = ""      # base64 Ed25519 seed; server .env only
     ROBINHOOD_LIVE_TRADING: bool = False     # Must be True to send orders
     ROBINHOOD_MAX_POSITION_USD: float = 100.0
+    # Total wallet capital scripts/live_rotation_trader.py sizes rotation
+    # weights against (both venues — Hyperliquid and Robinhood). Default
+    # 100.0 matches the previous hardcoded TOTAL_CAPITAL constant, so this
+    # is a no-op until an operator raises it.
+    ROBINHOOD_ROTATION_CAPITAL_USD: float = 100.0
     ROBINHOOD_MAX_DRAWDOWN_PCT: float = 0.20
     ROBINHOOD_BASE_URL: str = "https://trading.robinhood.com"
+
+    # Robinhood brakes (fix/robinhood-live-guards-20260924): every limit here
+    # reads/writes the persisted state in trading_risk_state / trading_order_log
+    # (trading/robinhood_risk_store.py) so it survives restarts, unlike the old
+    # in-memory drawdown high-water mark.
+    #   * Daily loss cap blocks new BUYS once today's loss from start-of-day
+    #     equity reaches this fraction; sells/closes stay allowed so a position
+    #     can still be de-risked.
+    ROBINHOOD_MAX_DAILY_LOSS_PCT: float = 0.05
+    #   * Order-rate cap: max new positions opened per UTC day.
+    ROBINHOOD_MAX_ORDERS_PER_DAY: int = 6
+    #   * Reject a quote older than this many seconds, measured from
+    #     Robinhood's own `timestamp` field. A quote WITHOUT a venue timestamp
+    #     is rejected (fail closed) -- GRID's local fetch time is never used
+    #     as a stand-in. A one-sided quote (bid or ask missing/0) is rejected
+    #     by the spread guard rather than scored as a 0bps spread.
+    ROBINHOOD_MAX_QUOTE_AGE_S: float = 30.0
+    #   * Reject an order whose (ask-bid)/mid spread exceeds this many basis
+    #     points. MEASURED, not assumed: a read-only quote pull through the
+    #     deployed connector (DRY_RUN) on 2026-09-24 14:23Z found Robinhood's
+    #     own spread-inclusive executable gap ((ask-bid)/mid, i.e.
+    #     ask_inclusive_of_buy_spread vs bid_inclusive_of_sell_spread) running
+    #     ~188-190bps as NORMAL pricing: BTC 188.7bps, ETH 189.7bps,
+    #     SOL 187.8bps. That matches Robinhood's own published crypto fee of
+    #     ~95bps per side (2 x 95 = 190). A round trip (buy then immediately
+    #     sell) costs ~1.9% before any other fee. An earlier default of 50bps
+    #     was an unverified assumption ("BTC/ETH typically trade inside
+    #     5-10bps") that does not hold for Robinhood's retail crypto product
+    #     and would have blocked every single order. 250bps leaves headroom
+    #     above the ~190bps normal range so the guard still catches genuinely
+    #     abnormal widening (a flash move, an illiquid pair) rather than
+    #     normal Robinhood pricing.
+    ROBINHOOD_MAX_SPREAD_BPS: float = 250.0
+    #   * Marketable limit orders instead of market orders when True (see
+    #     trading/robinhood.py — Robinhood's Crypto Trading API supports
+    #     type=limit with time_in_force="gtc", its only documented value).
+    #     False keeps market orders behind the same stale-quote/spread guards.
+    ROBINHOOD_USE_LIMIT_ORDERS: bool = True
+    #   * Slippage added past the touch price so a marketable limit still
+    #     crosses the spread and fills like a market order: buy at
+    #     ask*(1+slip), sell at bid*(1-slip).
+    ROBINHOOD_LIMIT_SLIPPAGE_BPS: float = 25.0
+    #   * Robinhood crypto limit orders only support time_in_force="gtc" (no
+    #     IOC/FOK), so a marketable limit that doesn't fill immediately would
+    #     otherwise rest indefinitely. RobinhoodCryptoTrader.reconcile_stale_orders()
+    #     cancels our own open orders older than this many seconds — wire it
+    #     into a periodic job before ROBINHOOD_LIVE_TRADING is ever set True.
+    ROBINHOOD_LIMIT_CANCEL_AFTER_S: float = 15.0
+    #   * Email (alerts/email.py, gated by ALERT_EMAIL_ENABLED) fires on every
+    #     LIVE order and every guard trip unconditionally. A dry-run order that
+    #     passed every guard only alerts when this is also True — off by
+    #     default so a normal dry-run cycle doesn't spam the inbox.
+    ROBINHOOD_ALERT_ON_DRY_RUN: bool = False
 
     # Solana trading (AutoHedge-derived 4-agent pipeline)
     JUPITER_API_KEY: str = ""              # Unlocks Jupiter rate limits

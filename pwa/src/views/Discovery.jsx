@@ -26,124 +26,195 @@ const jobStatusColors = {
 
 const HYPO_STATES = ['ALL', 'CANDIDATE', 'TESTING', 'PASSED', 'FAILED', 'KILLED', 'PROMOTED'];
 
-function TestedHypotheses() {
-    const { addNotification } = useStore();
-    const [results, setResults] = useState([]);
-    const [verdictFilter, setVerdictFilter] = useState('');
+async function loadAuditResult(type) {
+    try {
+        const response = await api.getResults(type);
+        if (!response || response.error || !Object.hasOwn(response, 'result')) {
+            return { status: 'unavailable', result: null };
+        }
+        if (response.result === null) return { status: 'empty', result: null };
+        if (typeof response.result !== 'object' || response.result.error) {
+            return { status: 'unavailable', result: null };
+        }
+        return { status: 'available', result: response.result };
+    } catch {
+        return { status: 'unavailable', result: null };
+    }
+}
+
+function resultTime(result) {
+    if (result?.as_of_date) return `As of ${result.as_of_date}`;
+    const timestamp = result?.completed_at || result?.generated_at || result?.timestamp;
+    return timestamp ? `Result time: ${timestamp}` : 'Result time unknown';
+}
+
+const researchRunStatusColors = {
+    started: { bg: '#1A6EBF22', color: '#1A6EBF' },
+    running: { bg: '#1A6EBF22', color: '#1A6EBF' },
+    ok: { bg: '#22C55E22', color: '#22C55E' },
+    failed: { bg: '#EF444422', color: '#EF4444' },
+    timeout: { bg: '#F59E0B22', color: '#F59E0B' },
+    abandoned: { bg: '#5A708022', color: '#5A7080' },
+};
+
+// GRID W4c — reads GET /api/v1/snapshots/research/latest (api/routers/snapshots.py),
+// which wraps scripts/research_status.py::latest_research_run_result. Self-contained
+// fetch/render, same pattern as TestedHypotheses() below: it must not block or be
+// blocked by the main Discovery data load, since a research-run event may not exist
+// at all (a healthy "no data yet" state, not an error).
+//
+// Uses api.get() — the existing generic request helper other views already call for
+// ad-hoc endpoints with no dedicated api.js method (see AttentionRadar.jsx,
+// GeoFlows.jsx, InfluenceNetwork.jsx, Surfacer.jsx, TPS.jsx, Timeline.jsx,
+// Valuation.jsx) — rather than adding a new named method to api.js, which is claimed
+// by another lane in this branch.
+export function ResearchRunPanel() {
+    const [data, setData] = useState(null);
     const [loaded, setLoaded] = useState(false);
 
-    useEffect(() => { loadResults(); }, [verdictFilter]);
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            let result;
+            try {
+                result = await api.get('/api/v1/snapshots/research/latest');
+            } catch (err) {
+                result = { status: 'unavailable', reason: err?.message || 'request failed' };
+            }
+            if (!cancelled) {
+                setData(result);
+                setLoaded(true);
+            }
+        })();
+        return () => { cancelled = true; };
+    }, []);
 
-    const loadResults = async () => {
-        try {
-            const params = {};
-            if (verdictFilter) params.verdict = verdictFilter;
-            const data = await api.getHypothesisResults(params);
-            setResults(data.results || []);
-        } catch { /* fallback: no results endpoint yet */ }
-        setLoaded(true);
-    };
+    if (!loaded) return null;
 
-    if (!loaded || results.length === 0) return null;
+    if (!data || data.status === 'no_runs') {
+        return (
+            <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+                <div style={shared.sectionTitle}>RESEARCH RUN</div>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>
+                    No research run recorded yet.
+                </div>
+            </div>
+        );
+    }
 
-    const verdicts = ['', 'PASSED', 'FAILED', 'TESTING'];
+    if (data.status === 'unavailable') {
+        return (
+            <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+                <div style={shared.sectionTitle}>RESEARCH RUN</div>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.sm }}>
+                    Research status unavailable: {data.reason || 'unknown reason'}
+                </div>
+            </div>
+        );
+    }
+
+    const sc = researchRunStatusColors[data.status] || researchRunStatusColors.abandoned;
+    const reasons = [
+        ...(data.skip_reasons || []),
+        ...(data.failure_reasons || []),
+    ];
+
+    return (
+        <div style={{ ...shared.cardGradient, marginBottom: tokens.space.xl }}>
+            <div style={shared.sectionTitle}>RESEARCH RUN</div>
+            <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center', flexWrap: 'wrap', marginBottom: tokens.space.sm }}>
+                <span style={{
+                    fontSize: tokens.fontSize.xs, fontWeight: 600,
+                    padding: '3px 10px', borderRadius: tokens.radius.sm,
+                    fontFamily: "'JetBrains Mono', monospace",
+                    background: sc.bg, color: sc.color,
+                }}>
+                    {String(data.status || '').toUpperCase()}
+                </span>
+                {data.phase && (
+                    <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                        phase: {data.phase}
+                    </span>
+                )}
+                {data.run_id && (
+                    <span style={{
+                        fontSize: tokens.fontSize.xs, color: colors.textDim,
+                        fontFamily: "'JetBrains Mono', monospace",
+                    }}>
+                        {data.run_id}
+                    </span>
+                )}
+            </div>
+            <div style={{
+                display: 'flex', gap: tokens.space.md, flexWrap: 'wrap',
+                fontSize: tokens.fontSize.xs, color: colors.textMuted, marginBottom: tokens.space.xs,
+            }}>
+                <span>iterations: {data.iterations ?? data.iteration ?? '—'}</span>
+                <span>duration: {data.duration_s != null ? `${data.duration_s}s` : '—'}</span>
+                <span>eval version: {data.inputs?.evaluation_version ?? '—'}</span>
+                <span>sha: {data.code_sha ? data.code_sha.substring(0, 8) : '—'}</span>
+            </div>
+            {data.error && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.red, marginBottom: tokens.space.xs }}>
+                    {data.error}
+                </div>
+            )}
+            {reasons.length > 0 && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
+                    reasons: {reasons.join(', ')}
+                </div>
+            )}
+            {data.latest_hypothesis && (
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textDim, marginTop: tokens.space.xs }}>
+                    latest hypothesis ({data.latest_hypothesis.state}): {data.latest_hypothesis.statement}
+                </div>
+            )}
+        </div>
+    );
+}
+
+// Item #20 (Wave 3 triage report): hypothesis_registry/validation_results
+// are noise-generator output (41,521 rows, 2,040 "PASSED", no trial
+// ledger, FDR correction or holdout — autoresearch is paused and Hermes
+// hypothesis scoring/discovery/review are held). This must never render a
+// PASSED verdict or a correlation/Sharpe number as a validated finding, or
+// offer to act on one (the previous version showed "Strong relationship
+// confirmed — consider promoting to feature" and a Promote button driven
+// purely by |correlation| > 0.4). Show the honest "research lane off"
+// state instead — count only, no per-hypothesis metrics, no promote action.
+function TestedHypotheses() {
+    const [summary, setSummary] = useState(null);
+    const [loaded, setLoaded] = useState(false);
+
+    useEffect(() => {
+        (async () => {
+            try {
+                const data = await api.getHypothesisResults({});
+                setSummary({ count: data.count || 0, note: data.note || null });
+            } catch { /* fallback: no results endpoint yet */ }
+            setLoaded(true);
+        })();
+    }, []);
+
+    if (!loaded || !summary) return null;
 
     return (
         <div style={{ marginBottom: tokens.space.xl }}>
             <div style={shared.sectionTitle}>TESTED HYPOTHESES</div>
-            <div style={{ display: 'flex', gap: '4px', marginBottom: tokens.space.md, overflowX: 'auto' }}>
-                {verdicts.map(v => {
-                    const isActive = verdictFilter === v;
-                    const sc = v ? (hypoStateColors[v] || hypoStateColors.KILLED) : null;
-                    return (
-                        <button key={v || 'ALL'} onClick={() => setVerdictFilter(v)}
-                            style={{
-                                padding: '6px 12px', borderRadius: tokens.radius.sm,
-                                border: `1px solid ${isActive ? (sc?.color || colors.accent) : colors.border}`,
-                                background: isActive ? (sc?.bg || colors.accentGlow) : 'transparent',
-                                color: isActive ? (sc?.color || colors.accent) : colors.textMuted,
-                                fontSize: tokens.fontSize.sm, cursor: 'pointer', whiteSpace: 'nowrap',
-                                fontFamily: "'JetBrains Mono', monospace",
-                            }}>
-                            {v || 'ALL'}
-                        </button>
-                    );
-                })}
+            <div style={{
+                ...shared.card, borderLeft: `3px solid ${colors.textMuted}`,
+                color: colors.textMuted, fontSize: tokens.fontSize.sm, lineHeight: 1.6,
+            }}>
+                <div style={{ fontWeight: 700, marginBottom: '4px', color: colors.text }}>
+                    RESEARCH LANE OFF
+                </div>
+                <div>
+                    {summary.count} tested hypotheses on record, but autoresearch is paused and
+                    Hermes hypothesis scoring/discovery/review are held. There is no trial ledger,
+                    FDR correction or out-of-sample holdout behind any PASSED verdict — none of
+                    these are validated findings, and this view will not act on them.
+                </div>
             </div>
-            {results.map((h, i) => {
-                const sc = hypoStateColors[h.state] || hypoStateColors.KILLED;
-                const corrColor = h.correlation != null
-                    ? (Math.abs(h.correlation) > 0.5 ? colors.green : colors.textMuted)
-                    : colors.textMuted;
-                return (
-                    <div key={h.id || i} style={{ ...shared.card, minHeight: '52px' }}>
-                        <div style={{
-                            fontSize: tokens.fontSize.md, color: colors.text,
-                            marginBottom: '6px', lineHeight: '1.4',
-                        }}>
-                            {h.statement}
-                        </div>
-                        <div style={{ display: 'flex', gap: tokens.space.sm, alignItems: 'center', flexWrap: 'wrap' }}>
-                            <span style={{
-                                fontSize: tokens.fontSize.xs, fontWeight: 600,
-                                padding: '3px 10px', borderRadius: tokens.radius.sm,
-                                fontFamily: "'JetBrains Mono', monospace",
-                                background: sc.bg, color: sc.color,
-                            }}>{h.state}</span>
-                            {h.correlation != null && (
-                                <span style={{
-                                    fontSize: tokens.fontSize.xs, color: corrColor,
-                                    fontFamily: "'JetBrains Mono', monospace",
-                                }}>r={h.correlation >= 0 ? '+' : ''}{h.correlation.toFixed(3)}</span>
-                            )}
-                            {h.optimal_lag != null && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    lag {h.optimal_lag}d
-                                </span>
-                            )}
-                            {h.r_squared != null && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    R²={h.r_squared.toFixed(3)}
-                                </span>
-                            )}
-                            {h.layer && (
-                                <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    {h.layer}
-                                </span>
-                            )}
-                        </div>
-                        {/* Interpretation */}
-                        {h.correlation != null && (
-                            <div style={{ fontSize: '10px', color: colors.textDim, marginTop: '4px' }}>
-                                {Math.abs(h.correlation) > 0.7
-                                    ? 'Strong relationship confirmed — consider promoting to feature'
-                                    : Math.abs(h.correlation) > 0.4
-                                    ? 'Moderate relationship — may be conditionally useful'
-                                    : 'Weak relationship — likely noise'}
-                            </div>
-                        )}
-                        {h.state === 'PASSED' && h.correlation != null && Math.abs(h.correlation) > 0.4 && (
-                            <button onClick={async (e) => {
-                                e.stopPropagation();
-                                try {
-                                    const result = await api.promoteHypothesis(h.id);
-                                    addNotification('success', `Promoted: ${result.feature_name}`);
-                                    loadResults();
-                                } catch (err) {
-                                    addNotification('error', err.message || 'Promote failed');
-                                }
-                            }} style={{
-                                marginTop: '6px', background: colors.accent + '20',
-                                border: `1px solid ${colors.accent}40`, borderRadius: '4px',
-                                padding: '4px 10px', fontSize: '10px', color: colors.accent,
-                                cursor: 'pointer', fontFamily: "'JetBrains Mono', monospace",
-                            }}>
-                                Promote to Feature
-                            </button>
-                        )}
-                    </div>
-                );
-            })}
         </div>
     );
 }
@@ -152,6 +223,8 @@ export default function Discovery({ focusHypothesis = '' }) {
     const { jobs, hypotheses, setJobs, setHypotheses, addNotification } = useStore();
     const [orthoResult, setOrthoResult] = useState(null);
     const [clusterResult, setClusterResult] = useState(null);
+    const [orthoStatus, setOrthoStatus] = useState('loading');
+    const [clusterStatus, setClusterStatus] = useState('loading');
     const [nComponents, setNComponents] = useState(3);
     const [hypoFilter, setHypoFilter] = useState('ALL');
     const [hypoQuery, setHypoQuery] = useState(focusHypothesis || '');
@@ -162,15 +235,22 @@ export default function Discovery({ focusHypothesis = '' }) {
     useEffect(() => { setHypoQuery(focusHypothesis || ''); }, [focusHypothesis]);
 
     const { loading, error, refetch: loadData } = useAsyncData(async () => {
+        setOrthoStatus('loading');
+        setClusterStatus('loading');
+        setOrthoResult(null);
+        setClusterResult(null);
         try {
-            const [j, ortho, cluster] = await Promise.all([
-                api.getJobs(),
-                api.getResults('orthogonality').catch(() => null),
-                api.getResults('clustering').catch(() => null),
+            await Promise.all([
+                api.getJobs().then((j) => setJobs(j.jobs || [])),
+                loadAuditResult('orthogonality').then((ortho) => {
+                    setOrthoResult(ortho.result);
+                    setOrthoStatus(ortho.status);
+                }),
+                loadAuditResult('clustering').then((cluster) => {
+                    setClusterResult(cluster.result);
+                    setClusterStatus(cluster.status);
+                }),
             ]);
-            setJobs(j.jobs || []);
-            if (ortho?.result) setOrthoResult(ortho.result);
-            if (cluster?.result) setClusterResult(cluster.result);
         } finally {
             await loadHypotheses();
         }
@@ -229,7 +309,9 @@ export default function Discovery({ focusHypothesis = '' }) {
                 <ViewHelp id="discovery" />
             </div>
 
-            {loading && !jobs.length && !orthoResult && !clusterResult ? (
+            <ResearchRunPanel />
+
+            {loading && !jobs.length && orthoStatus === 'loading' && clusterStatus === 'loading' ? (
                 <LoadingSkeleton variant="card" count={3} />
             ) : error ? (
                 <ErrorState error={error} onRetry={loadData} title="Discovery data unavailable" />
@@ -285,7 +367,8 @@ export default function Discovery({ focusHypothesis = '' }) {
                                         fontSize: tokens.fontSize.xs, color: colors.textMuted,
                                         marginLeft: tokens.space.sm,
                                     }}>
-                                        {j.started?.substring(11, 19)}
+                                        {j.started ? `Started: ${j.started}` : 'Start time unknown'}
+                                        {j.finished ? ` · Finished: ${j.finished}` : ''}
                                     </span>
                                 </div>
                                 <span style={{
@@ -302,9 +385,13 @@ export default function Discovery({ focusHypothesis = '' }) {
                 </div>
             )}
 
-            {orthoResult && !orthoResult.error && (
-                <div style={shared.cardGradient}>
-                    <div style={shared.sectionTitle}>ORTHOGONALITY</div>
+            <div style={shared.cardGradient}>
+                <div style={shared.sectionTitle}>ORTHOGONALITY</div>
+                {orthoStatus === 'loading' && <div>Loading orthogonality result...</div>}
+                {orthoStatus === 'empty' && <div>No completed orthogonality audit found.</div>}
+                {orthoStatus === 'unavailable' && <div>Orthogonality result unavailable.</div>}
+                {orthoStatus === 'available' && orthoResult && <>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(orthoResult)}</div>
                     {[
                         { label: 'Features analyzed', value: orthoResult.n_features_analyzed },
                         { label: 'True dimensionality', value: orthoResult.true_dimensionality, accent: true },
@@ -327,12 +414,16 @@ export default function Discovery({ focusHypothesis = '' }) {
                             </span>
                         </div>
                     ))}
-                </div>
-            )}
+                </>}
+            </div>
 
-            {clusterResult && !clusterResult.error && (
-                <div style={shared.cardGradient}>
-                    <div style={shared.sectionTitle}>CLUSTERING</div>
+            <div style={shared.cardGradient}>
+                <div style={shared.sectionTitle}>CLUSTERING</div>
+                {clusterStatus === 'loading' && <div>Loading clustering result...</div>}
+                {clusterStatus === 'empty' && <div>No completed clustering run found.</div>}
+                {clusterStatus === 'unavailable' && <div>Clustering result unavailable.</div>}
+                {clusterStatus === 'available' && clusterResult && <>
+                <div style={{ color: colors.textMuted, fontSize: tokens.fontSize.xs }}>{resultTime(clusterResult)}</div>
                     {[
                         { label: 'Best k', value: clusterResult.best_k, accent: true },
                         { label: 'PCA components', value: clusterResult.pca_components_used },
@@ -355,14 +446,18 @@ export default function Discovery({ focusHypothesis = '' }) {
                             </span>
                         </div>
                     ))}
-                </div>
-            )}
+                </>}
+            </div>
 
             {/* ═══ TESTED HYPOTHESES (RESULTS) ═══ */}
             <TestedHypotheses />
 
             <div style={{ marginBottom: tokens.space.xl }}>
                 <div style={shared.sectionTitle}>HYPOTHESES</div>
+                <div style={{ fontSize: tokens.fontSize.xs, color: colors.textDim, marginBottom: tokens.space.sm }}>
+                    Raw registry browse — research lane off (see above); state badges reflect
+                    registry rows only, not validated findings.
+                </div>
                 <div style={{
                     ...shared.tabs, marginBottom: tokens.space.md,
                 }}>
@@ -441,7 +536,7 @@ export default function Discovery({ focusHypothesis = '' }) {
                                     {h.state}
                                 </span>
                                 <span style={{ fontSize: tokens.fontSize.xs, color: colors.textMuted }}>
-                                    {h.created_at?.substring(0, 10)}
+                                    {h.created_at ? `Created: ${h.created_at}` : 'Creation time unknown'}
                                 </span>
                             </div>
                         </div>

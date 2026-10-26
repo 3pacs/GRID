@@ -1,0 +1,55 @@
+Portfolio
+Watchlist as portfolio -- estimated from equal-weight allocation
+Portfolio Value
+--
+estimated
+1D P&L
+--
+--
+1M P&L (est)
+--
+Positions
+1
+SECTOR ALLOCATION
+ALLOCATION
+Technology
+100.0%
+RISK METRICS
+Top-3 Concentration
+100.0%
+high concentration
+Beta (Weighted)
+--
+moderate
+Sector Diversification
+0%
+concentrated
+POSITIONS
+TICKER	PRICE	1D CHG	WEIGHT ▼	1D P&L	SECTOR
+TEST1Test One Corp	100.00	+0.00%	100.0%	--	Technology
+OPTIONS P&L
+No options recommendations tracked yet.
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

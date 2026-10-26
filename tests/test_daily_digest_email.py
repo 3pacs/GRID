@@ -483,3 +483,191 @@ def test_data_freshness_ignores_a_failed_only_source(monkeypatch) -> None:
     result = email_mod.daily_digest(dry_run=True)
 
     assert "Active Sources (24h)" not in result["section_titles"]
+
+
+# Current-main consolidation controls. These use only synthetic rows/transports.
+def test_digest_raw_read_guard_has_no_permissive_allowance() -> None:
+    import runpy
+    from pathlib import Path
+
+    guard = runpy.run_path(str(Path(__file__).with_name("test_raw_series_read_guard.py")))
+    assert "alerts/email.py" not in guard["LEGACY_UNFILTERED_READS"]
+    assert guard["_unfiltered_reads"]().get("alerts/email.py", 0) == 0
+
+
+def test_push_wrapper_forwards_confidence_and_preserves_legacy_call(monkeypatch) -> None:
+    import alerts.push_notify as push
+
+    sent, pushed = [], []
+    monkeypatch.setattr(email_mod, "_send", lambda subject, sections: sent.append(sections))
+    outcomes = iter((0, 3, 0))
+    def fake_push(*args):
+        pushed.append(args)
+        return next(outcomes)
+    monkeypatch.setattr(push, "notify_trade_recommendation", fake_push)
+    # Register these assignments with monkeypatch before the integration hook
+    # replaces them, so the real functions are restored after this test.
+    for name in ("alert_on_regime_change", "alert_on_100x_opportunity", "alert_on_failure"):
+        monkeypatch.setattr(email_mod, name, getattr(email_mod, name))
+    push.integrate_with_email_alerts()
+
+    assert email_mod.alert_on_100x_opportunity("SYN", 8.0, "CALL", "synthetic") is None
+    assert "HEURISTIC CONFIDENCE: UNKNOWN" in sent[-1][0]["body"]
+    assert email_mod.alert_on_100x_opportunity(
+        "SYN", 8.0, "CALL", "synthetic", confidence="HIGH",
+    ) is None
+    assert "heuristic confidence: HIGH" in sent[-1][0]["body"]
+    assert email_mod.alert_on_100x_opportunity(
+        "SYN", 8.0, "CALL", "synthetic", confidence="LOW",
+    ) is None
+    assert "HEURISTIC CONFIDENCE: LOW" in sent[-1][0]["body"]
+    assert pushed == [("SYN", "CALL")] * 3
+
+
+def test_push_wrapper_preserves_failure_without_sending_push(monkeypatch) -> None:
+    import alerts.push_notify as push
+
+    pushed = []
+    def fail(*a, **kw):
+        raise RuntimeError("synthetic email failure")
+    for name in ("alert_on_regime_change", "alert_on_100x_opportunity", "alert_on_failure"):
+        monkeypatch.setattr(email_mod, name, getattr(email_mod, name))
+    monkeypatch.setattr(email_mod, "alert_on_100x_opportunity", fail)
+    monkeypatch.setattr(push, "notify_trade_recommendation", lambda *a: pushed.append(a))
+    push.integrate_with_email_alerts()
+    try:
+        email_mod.alert_on_100x_opportunity("SYN", 8.0, "CALL", "synthetic", confidence="HIGH")
+    except RuntimeError as exc:
+        assert str(exc) == "synthetic email failure"
+    else:
+        raise AssertionError("existing email failure must still propagate")
+    assert pushed == []
+
+
+def test_push_wrapper_keeps_email_before_push_failure(monkeypatch) -> None:
+    import alerts.push_notify as push
+
+    sent = []
+    monkeypatch.setattr(email_mod, "_send", lambda subject, sections: sent.append(sections))
+    for name in ("alert_on_regime_change", "alert_on_100x_opportunity", "alert_on_failure"):
+        monkeypatch.setattr(email_mod, name, getattr(email_mod, name))
+    def fail_push(*args):
+        raise RuntimeError("synthetic push failure")
+    monkeypatch.setattr(push, "notify_trade_recommendation", fail_push)
+    push.integrate_with_email_alerts()
+    try:
+        email_mod.alert_on_100x_opportunity("SYN", 8.0, "CALL", "synthetic", confidence="HIGH")
+    except RuntimeError as exc:
+        assert str(exc) == "synthetic push failure"
+    else:
+        raise AssertionError("existing push failure must still propagate")
+    assert len(sent) == 1
+    assert "heuristic confidence: HIGH" in sent[0][0]["body"]
+
+
+_DIGEST_CUTOFF = datetime(2026, 10, 26, 0, 0, 0, tzinfo=timezone.utc)
+
+
+def _bounded_digest(monkeypatch, *, journals=(), options=(), pulls=()):
+    """Predicate-aware fake for the four direct digest queries.
+
+    Assert real SQL clauses and bound parameters before applying those
+    clauses to synthetic records. This is not a PostgreSQL engine proof.
+    A second wall-clock read deliberately crosses into the next day.
+    """
+    trace = []
+    class Clock(datetime):
+        calls = 0
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            return _DIGEST_CUTOFF if cls.calls == 1 else _DIGEST_CUTOFF + timedelta(days=1)
+    monkeypatch.setattr(email_mod, "datetime", Clock)
+
+    class Conn:
+        def execute(self, clause, params):
+            sql = str(clause)
+            trace.append((sql, params))
+            assert "NOW()" not in sql and "CURRENT_DATE" not in sql
+            if "inferred_state" in sql:
+                assert "decision_timestamp <= :as_of OR decision_timestamp IS NULL" in sql
+                assert params == {"as_of": _DIGEST_CUTOFF}
+                eligible = [row for row in journals if row[3] is None or row[3] <= params["as_of"]]
+                eligible.sort(key=lambda row: (row[3] is None, row[3] or _DIGEST_CUTOFF), reverse=True)
+                return _FakeResult(one=eligible[0] if eligible else None)
+            if "COUNT(*)" in sql:
+                assert "decision_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours'" in sql
+                assert "AND decision_timestamp <= :as_of" in sql
+                assert params == {"as_of": _DIGEST_CUTOFF}
+                lower = params["as_of"] - timedelta(hours=24)
+                return _FakeResult(one=(sum(row[3] is not None and lower <= row[3] <= params["as_of"] for row in journals),))
+            if "options_mispricing_scans" in sql:
+                assert "scan_date >= :as_of_date - 3" in sql
+                assert "AND scan_date <= :as_of_date" in sql
+                assert params == {"as_of_date": _DIGEST_CUTOFF.date()}
+                lower = params["as_of_date"] - timedelta(days=3)
+                eligible = [row for at, row in options if lower <= at <= params["as_of_date"]]
+                return _FakeResult(many=sorted(eligible, key=lambda row: row[2], reverse=True)[:5])
+            if "raw_series" in sql:
+                assert "pull_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours'" in sql
+                assert "AND pull_timestamp <= :as_of" in sql
+                assert "AND pull_status = 'SUCCESS'" in sql
+                assert params == {"as_of": _DIGEST_CUTOFF}
+                lower = params["as_of"] - timedelta(hours=24)
+                eligible = [(name, at) for name, at, status in pulls if status == "SUCCESS" and lower <= at <= params["as_of"]]
+                return _FakeResult(one=(len({name for name, _at in eligible}), max((at for _name, at in eligible), default=None)))
+            raise AssertionError("unexpected digest SQL")
+        def __enter__(self):
+            return self
+        def __exit__(self, *_exc):
+            return False
+    monkeypatch.setattr("db.get_engine", lambda: type("Engine", (), {"connect": lambda self: Conn()})(), raising=False)
+    monkeypatch.setattr("intelligence.long_plays.load_latest_board", lambda engine: None, raising=False)
+    result = email_mod.daily_digest(dry_run=True)
+    assert result["degraded"] == []
+    assert result["timestamp"] == _DIGEST_CUTOFF.isoformat()
+    assert len(trace) == 4
+    assert Clock.calls == 1, "all windows and age checks must share one clock capture"
+    return {section["title"]: section["body"] for section in result["section_bodies"]}
+
+
+def test_digest_timestamp_windows_include_before_and_at_but_exclude_after(monkeypatch) -> None:
+    delta = timedelta(microseconds=1)
+    for at, included in (
+        (_DIGEST_CUTOFF - timedelta(hours=24) - delta, False),
+        (_DIGEST_CUTOFF - timedelta(hours=24), True),
+        (_DIGEST_CUTOFF - delta, True),
+        (_DIGEST_CUTOFF, True),
+        (_DIGEST_CUTOFF + delta, False),
+    ):
+        sections = _bounded_digest(monkeypatch,
+            journals=[("SYNTHETIC", 0.8, "HOLD", at)],
+            pulls=[("synthetic-source", at, "SUCCESS"), ("failed-source", _DIGEST_CUTOFF, "FAILED")])
+        expected = email_mod._section_kpi("Decisions (24h)", str(int(included)))
+        assert sections["Decisions (24h)"] == expected["body"]
+        assert ("Active Sources (24h)" in sections) is included
+
+
+def test_digest_options_keep_declared_calendar_window_and_exclude_future_day(monkeypatch) -> None:
+    for offset, included in ((-4, False), (-3, True), (-1, True), (0, True), (1, False)):
+        at = _DIGEST_CUTOFF.date() + timedelta(days=offset)
+        sections = _bounded_digest(monkeypatch,
+            options=[(at, ("SYN", "CALL", 8.0, 120.0, "synthetic", "HIGH"))])
+        assert ("100x Opportunity — SYN" in sections) is included
+
+
+def test_digest_latest_regime_ignores_future_poison_and_keeps_boundary_row(monkeypatch) -> None:
+    sections = _bounded_digest(monkeypatch, journals=[
+        ("BEFORE", 0.8, "HOLD", _DIGEST_CUTOFF - timedelta(microseconds=1)),
+        ("BOUNDARY", 0.8, "HOLD", _DIGEST_CUTOFF),
+        ("FUTURE_POISON", 0.8, "HOLD", _DIGEST_CUTOFF + timedelta(microseconds=1)),
+    ])
+    body = sections["Regime State"]
+    assert "BOUNDARY" in body
+    assert "FUTURE_POISON" not in body and "BEFORE" not in body
+
+
+def test_digest_latest_regime_keeps_missing_timestamp_unverified(monkeypatch) -> None:
+    sections = _bounded_digest(monkeypatch, journals=[("SYNTHETIC", 0.8, "HOLD", None)])
+    assert "Regime State — unverified" in sections
+    assert "no timestamp" in sections["Regime State — unverified"]

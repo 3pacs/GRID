@@ -1,0 +1,113 @@
+[32m2026-09-18 11:31:28[0m | [1mINFO    [0m | [36mconfig[0m:[36m<module>[0m:[36m767[0m — [1mGitSink attached — errors land in .server-logs/errors.jsonl (push_enabled=False)[0m
+[32m2026-09-18 11:31:28[0m | [1mINFO    [0m | [36mconfig[0m:[36m<module>[0m:[36m777[0m — [1mGRID config loaded — environment=development, db=127.0.0.1:55432/griddb_fable_20260918_1740[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36m<module>[0m:[36m459[0m — [1mContagion sector matrix router loaded[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36m<module>[0m:[36m467[0m — [1mLLM task queue router loaded[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36msubnet.semantic_scorer[0m:[36m<module>[0m:[36m60[0m — [1mSemanticScorer using TF-IDF backend (sklearn)[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36m<module>[0m:[36m475[0m — [1mDistributed compute router loaded[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36m<module>[0m:[36m484[0m — [1mMobile mining router loaded[0m
+INFO:     Started server process [20400]
+INFO:     Waiting for application startup.
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36mlifespan[0m:[36m54[0m — [1mGRID API starting — environment=development[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36magents.progress[0m:[36mregister_broadcast[0m:[36m30[0m — [1mAgent progress broadcast registered[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36mlifespan[0m:[36m66[0m — [1mAgent WebSocket progress broadcast registered[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36malerts.push_notify[0m:[36mintegrate_with_email_alerts[0m:[36m552[0m — [1mPush notifications integrated with email alert system[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mdb[0m:[36mget_engine[0m:[36m253[0m — [1mCreating SQLAlchemy engine — postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mdb[0m:[36mget_engine[0m:[36m253[0m — [1mCreating SQLAlchemy engine — postgresql://fable_test_20260918_1740:***@127.0.0.1:55432/griddb_fable_20260918_1740[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mdb[0m:[36mget_engine[0m:[36m348[0m — [1mSQLAlchemy engine created — pool_size=20, max_overflow=30[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mdb[0m:[36mget_engine[0m:[36m348[0m — [1mSQLAlchemy engine created — pool_size=20, max_overflow=30[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36mlifespan[0m:[36m111[0m — [1mContracts dispatcher + retry scheduler started[0m
+[32m2026-09-18 11:31:39[0m | [1mINFO    [0m | [36mapi.main[0m:[36mlifespan[0m:[36m129[0m — [1mGRID API accepting requests — background subsystems launching in thread[0m
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://127.0.0.1:8010 (Press CTRL+C to quit)
+[32m2026-09-18 11:31:40[0m | [1mINFO    [0m | [36mdb[0m:[36mhealth_check[0m:[36m543[0m — [1mDatabase health check passed[0m
+[32m2026-09-18 11:31:40[0m | [1mINFO    [0m | [36mapi.main[0m:[36m_sync_deferred_startup[0m:[36m153[0m — [1mDatabase: connected[0m
+[32m2026-09-18 11:31:40[0m | [33m[1mWARNING [0m | [36mcontracts.retry_scheduler[0m:[36m_loop[0m:[36m52[0m — [33m[1mretry scheduler loop error: (psycopg2.errors.UndefinedTable) relation "contracts_dead_letter" does not exist
+LINE 5:         FROM contracts_dead_letter
+                     ^
+
+[SQL: 
+        SELECT id, event_id, contract_type, payload, consumer,
+               error_type, error_detail, retry_count, next_retry_at,
+               failed_at, correlation_id
+        FROM contracts_dead_letter
+        WHERE resolved_at IS NULL
+          AND next_retry_at IS NOT NULL
+          AND next_retry_at <= %(now)s
+        ORDER BY next_retry_at
+        LIMIT %(limit)s
+        ]
+[parameters: {'now': datetime.datetime(2026, 9, 18, 18, 31, 39, 679005, tzinfo=datetime.timezone.utc), 'limit': 100}]
+(Background on this error at: https://sqlalche.me/e/20/f405)[0m
+[32m2026-09-18 11:31:40[0m | [33m[1mWARNING [0m | [36mapi.main[0m:[36m_sync_deferred_startup[0m:[36m167[0m — [33m[1moracle_models migration skipped: (psycopg2.errors.UndefinedTable) relation "oracle_models" does not exist
+
+[SQL: ALTER TABLE oracle_models ADD COLUMN IF NOT EXISTS signal_sources JSONB]
+(Background on this error at: https://sqlalche.me/e/20/f405)[0m
+[32m2026-09-18 11:31:40[0m | [1mINFO    [0m | [36mapi.main[0m:[36m_sync_deferred_startup[0m:[36m177[0m — [1mSpider graph engine bridge: warmer thread started[0m
+[32m2026-09-18 11:31:40[0m | [1mINFO    [0m | [36mapi.main[0m:[36m_sync_deferred_startup[0m:[36m184[0m — [1mPre-warming intelligence dashboard cache...[0m
+[32m2026-09-18 11:31:41[0m | [33m[1mWARNING [0m | [36mintelligence.spider.graph_engine[0m:[36mload_from_db[0m:[36m327[0m — [33m[1mGraph actor load succeeded but actor_connections could not load; continuing with actor-only stats: (psycopg2.errors.UndefinedTable) relation "actor_connections" does not exist
+LINE 9:                     FROM actor_connections
+                                 ^
+
+[SQL: 
+                    SELECT actor_a, actor_b, relationship, strength, evidence,
+                           CASE
+                               WHEN evidence::text LIKE '%%hard_data%%' THEN 1
+                               WHEN evidence::text LIKE '%%public_record%%' THEN 2
+                               WHEN evidence::text LIKE '%%inferred%%' THEN 3
+                               ELSE 4
+                           END AS confidence_tier
+                    FROM actor_connections
+                    ORDER BY strength DESC NULLS LAST
+                 LIMIT %(limit)s]
+[parameters: {'limit': 500000}]
+(Background on this error at: https://sqlalche.me/e/20/f405)[0m
+[32m2026-09-18 11:31:41[0m | [1mINFO    [0m | [36mintelligence.spider.graph_engine[0m:[36mload_from_db[0m:[36m335[0m — [1mGraph loaded from DB: 486 actors (limit=50000), 0 connections (limit=500000)[0m
+[32m2026-09-18 11:31:41[0m | [1mINFO    [0m | [36mapi.routers.intelligence_spider[0m:[36m_get_or_load_graph[0m:[36m154[0m — [1mSpider bridge: full graph loaded (486 actors, 0 edges in 748ms)[0m
+[32m2026-09-18 11:31:41[0m | [1mINFO    [0m | [36mintelligence.trust_scorer[0m:[36mload_trust_scores_cached[0m:[36m1140[0m — [1mload_trust_scores_cached: cache empty, signal fallback[0m
+[32m2026-09-18 11:31:42[0m | [33m[1mWARNING [0m | [36mapi.routers.intelligence_risk[0m:[36m_build_dashboard_snapshot[0m:[36m571[0m — [33m[1mDashboard trust cache miss — falling back to live recompute (slow). Run flows/refresh_trust_scores.py to repopulate.[0m
+[32m2026-09-18 11:31:43[0m | [1mINFO    [0m | [36mintelligence.trust_scorer[0m:[36mupdate_trust_scores[0m:[36m937[0m — [1mNo scored sources to update trust for[0m
+[32m2026-09-18 11:31:43[0m | [1mINFO    [0m | [36mevents.bus[0m:[36mstart[0m:[36m160[0m — [1mEvent bus connected — listening on 22 PG channels[0m
+[32m2026-09-18 11:31:44[0m | [1mINFO    [0m | [36mintelligence.lever_pullers[0m:[36midentify_lever_pullers[0m:[36m665[0m — [1mNo scored sources found for lever puller identification[0m
+[32m2026-09-18 11:31:44[0m | [1mINFO    [0m | [36mintelligence.lever_pullers[0m:[36mget_active_lever_events[0m:[36m1327[0m — [1mFound 0 active lever events in the last 14 days[0m
+[32m2026-09-18 11:31:45[0m | [1mINFO    [0m | [36mintelligence.lever_pullers[0m:[36mfind_lever_convergence[0m:[36m1623[0m — [1mNo lever convergence events detected[0m
+[32m2026-09-18 11:31:45[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mrun_all_checks[0m:[36m1632[0m — [1mCross-reference engine: starting all checks[0m
+[32m2026-09-18 11:31:48[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_gdp_vs_physical[0m:[36m486[0m — [1mGDP vs Physical (US): 4 checks, 0 red flags[0m
+[32m2026-09-18 11:31:51[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_gdp_vs_physical[0m:[36m486[0m — [1mGDP vs Physical (CN): 3 checks, 0 red flags[0m
+[32m2026-09-18 11:31:53[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_gdp_vs_physical[0m:[36m486[0m — [1mGDP vs Physical (EU): 3 checks, 0 red flags[0m
+[32m2026-09-18 11:31:54[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_trade_bilateral[0m:[36m661[0m — [1mTrade bilateral: 0 checks, 0 red flags[0m
+[32m2026-09-18 11:31:57[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_inflation_vs_inputs[0m:[36m782[0m — [1mInflation vs inputs: 4 checks, 0 red flags[0m
+[32m2026-09-18 11:32:00[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_central_bank_actions_vs_words[0m:[36m904[0m — [1mCentral bank actions vs words: 5 checks, 0 red flags[0m
+INFO:     127.0.0.1:52737 - "POST /api/v1/auth/login HTTP/1.1" 200 OK
+[32m2026-09-18 11:32:03[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_employment_reality[0m:[36m1027[0m — [1mEmployment reality: 5 checks, 0 red flags[0m
+[32m2026-09-18 11:32:04[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_liquidity_reality[0m:[36m1366[0m — [1mFed Liquidity reality: 4 checks, 0 red flags[0m
+[32m2026-09-18 11:32:06[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mcheck_credit_housing[0m:[36m1479[0m — [1mCredit & Housing reality: 4 checks, 0 red flags[0m
+[32m2026-09-18 11:32:06[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mensure_tables[0m:[36m116[0m — [1mcross_reference_checks table ensured[0m
+[32m2026-09-18 11:32:07[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36m_persist_checks[0m:[36m1258[0m — [1mPersisted 32 cross-reference checks[0m
+[32m2026-09-18 11:32:07[0m | [1mINFO    [0m | [36mintelligence.cross_reference[0m:[36mrun_all_checks[0m:[36m1734[0m — [1mCross-reference engine complete: 32 checks, 0 red flags[0m
+[32m2026-09-18 11:32:09[0m | [1mINFO    [0m | [36mapi.main[0m:[36m_sync_deferred_startup[0m:[36m187[0m — [1mDashboard cache warmed — confidence=0.925[0m
+[32m2026-09-18 11:32:10[0m | [33m[1mWARNING [0m | [36mcontracts.retry_scheduler[0m:[36m_loop[0m:[36m52[0m — [33m[1mretry scheduler loop error: (psycopg2.errors.UndefinedTable) relation "contracts_dead_letter" does not exist
+LINE 5:         FROM contracts_dead_letter
+                     ^
+
+[SQL: 
+        SELECT id, event_id, contract_type, payload, consumer,
+               error_type, error_detail, retry_count, next_retry_at,
+               failed_at, correlation_id
+        FROM contracts_dead_letter
+        WHERE resolved_at IS NULL
+          AND next_retry_at IS NOT NULL
+          AND next_retry_at <= %(now)s
+        ORDER BY next_retry_at
+        LIMIT %(limit)s
+        ]
+[parameters: {'now': datetime.datetime(2026, 9, 18, 18, 32, 10, 695883, tzinfo=datetime.timezone.utc), 'limit': 100}]
+(Background on this error at: https://sqlalche.me/e/20/f405)[0m
+INFO:     127.0.0.1:55876 - "GET /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=false HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55877 - "GET /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=false HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55878 - "GET /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55879 - "GET /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=true HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55880 - "GET /api/v1/godview/pillars/fed_net_liquidity?as_of=2023-02-21 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55881 - "GET /api/v1/godview/pillars/fed_net_liquidity?as_of=2023-02-21 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55882 - "GET /api/v1/godview/pillars/commodity_warehouses?as_of=2023-02-21 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:55883 - "GET /api/v1/godview/pillars/commodity_warehouses?as_of=2023-02-21 HTTP/1.1" 200 OK
+INFO:     127.0.0.1:56298 - "GET /api/v1/godview/pillars/commodity_warehouses?as_of=2023-02-21 HTTP/1.1" 200 OK

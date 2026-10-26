@@ -12,7 +12,9 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react';
 import useAuthStore from '../stores/authStore.js';
+import { api } from '../api.js';
 
+const EVENTS_PATH = '/api/v1/events/stream';
 const RECONNECT_DELAY_MS = 3000;
 const MAX_RECONNECT_DELAY_MS = 30000;
 
@@ -33,26 +35,7 @@ export function useEventStream(options = {}) {
     const token = useAuthStore(s => s.token);
     const isAuthenticated = useAuthStore(s => s.isAuthenticated);
 
-    const connect = useCallback(() => {
-        if (!token || !mountedRef.current) return;
-
-        // Close existing connection
-        if (sourceRef.current) {
-            sourceRef.current.close();
-        }
-
-        let url = `/api/v1/events/stream`;
-        if (channels && channels.length > 0) {
-            url += `?channels=${channels.join(',')}`;
-        }
-
-        // EventSource doesn't support Authorization headers natively,
-        // so we pass the token as a query param (same pattern as WebSocket).
-        url += `${url.includes('?') ? '&' : '?'}token=${encodeURIComponent(token)}`;
-
-        const source = new EventSource(url);
-        sourceRef.current = source;
-
+    const attach = (source, scheduleReconnect) => {
         source.onopen = () => {
             if (!mountedRef.current) return;
             setConnected(true);
@@ -79,13 +62,42 @@ export function useEventStream(options = {}) {
             if (!mountedRef.current) return;
             setConnected(false);
             source.close();
-            // Reconnect with backoff
+            // Reconnect with backoff (connect() mints a fresh ticket; the old
+            // one was single-use).
+            scheduleReconnect();
+        };
+    };
+
+    const connect = useCallback(() => {
+        if (!token || !mountedRef.current) return;
+
+        // Close existing connection
+        if (sourceRef.current) {
+            sourceRef.current.close();
+        }
+
+        const scheduleReconnect = () => {
             const delay = delayRef.current;
             delayRef.current = Math.min(delay * 2, MAX_RECONNECT_DELAY_MS);
             reconnectTimer.current = setTimeout(() => {
                 if (mountedRef.current && token) connect();
             }, delay);
         };
+
+        const params = channels && channels.length > 0 ? { channels: channels.join(',') } : null;
+
+        // EventSource cannot send an Authorization header. Never put the
+        // session JWT in the URL (it lands in proxy/access logs): exchange it
+        // for a 60 s single-use stream ticket, fetched fresh on every connect.
+        sourceRef.current = api.openTicketedEventSource(EVENTS_PATH, params, {
+            relative: true,
+            onTicketError: () => {
+                if (!mountedRef.current) return;
+                setConnected(false);
+                scheduleReconnect();
+            },
+            onOpen: source => attach(source, scheduleReconnect),
+        });
     }, [token, channels, onEvent]);
 
     useEffect(() => {

@@ -19,10 +19,36 @@ Usage:
         --base-url http://127.0.0.1:8000 \\
         --release-dir /data/grid_v4/grid_release \\
         --json /tmp/dad_smoke.json \\
+        --mode non-mutating \\
         [--budget-ms 5000] [--strict]
 
-Exit codes: 0 nothing broken, 1 something broken AND --strict was passed,
-2 something is blocked (regardless of --strict; blocked takes priority).
+--mode non-mutating (the default, and the only mode dad-smoke.yml /
+deploy.yml ever pass): every HTTP request the script makes must be GET,
+except an explicit, code-reviewed allow-list of POSTs proven not to write
+anything (see NON_MUTATING_POST_ALLOWLIST). /chat/compose and
+/chat/ask/stream are NOT on that list — see NON_MUTATING_EXCLUDED_ENDPOINTS
+for the file:line proof — so alert-creation/composer smoke does not run in
+this mode. GET /api/v1/alerts is separately blocked outright (see
+NON_MUTATING_GET_BLOCKLIST): its handler runs CREATE TABLE IF NOT EXISTS as
+a side effect, so even a read against it is refused. A before/after active-
+alerts count, read directly via SQL (never HTTP — see
+step_alerts_db_count), is checked instead and must be unchanged.
+
+--mode mutating: also exercises the composer/alert-creation path. Requires
+BOTH the `SMOKE_ALLOW_MUTATIONS=1` environment variable AND
+`--i-accept-production-writes`; refuses to start (no network calls at all)
+if either is missing. No workflow in this repository invokes it — it is a
+manually-gated CLI escape hatch, meant to be run by hand against an isolated
+target only.
+
+Exit codes: 0 nothing broken, 1 something broken AND --strict was passed (or
+the non-mutating guard caught an actual mutation, regardless of --strict),
+2 something is blocked — a genuine environment blockage (no token, release
+dir missing, journalctl unavailable, a DB query failed) — regardless of
+--strict; blocked takes priority unless the run was already forced to 1 by a
+caught mutation. A step that is intentionally not run because of --mode
+(currently: composer, skipped under --mode=non-mutating) is graded
+"skipped", not "blocked" — it never raises the exit code.
 """
 
 from __future__ import annotations
@@ -58,7 +84,87 @@ DEFAULT_BASE_URL = "http://127.0.0.1:8000"
 DEFAULT_RELEASE_DIR = "/data/grid_v4/grid_release"
 DEFAULT_BUDGET_MS = 5000
 
-_STATUS_RANK = {"broken": 0, "blocked": 1, "degraded": 2, "ok": 3}
+_STATUS_RANK = {"broken": 0, "blocked": 1, "degraded": 2, "ok": 3, "skipped": 3}
+
+
+# ── Non-mutating guard ───────────────────────────────────────────────────
+# On the 2026-09-18 deploy, the default (only) plan sent "tell me when NVDA
+# drops 5 percent" to /chat/compose. The composer's fast deterministic alert
+# path (api/routers/chat.py:2144-2178) classified it as a real alert and
+# persisted it via api/routers/price_alerts.py:148-154
+# (`INSERT INTO sd_price_alerts ...`). Routine, unattended deploy smoke must
+# never be able to do that again — see MODE_NON_MUTATING below.
+
+MODE_NON_MUTATING = "non-mutating"
+MODE_MUTATING = "mutating"
+VALID_MODES = (MODE_NON_MUTATING, MODE_MUTATING)
+
+# Endpoints proven, by reading the FastAPI handler end to end, not to write
+# anything for ANY input they accept. Empty on purpose: every non-GET
+# endpoint this script calls was examined for this fix and turned out to
+# have a live write path — see NON_MUTATING_EXCLUDED_ENDPOINTS below. Add an
+# endpoint here only after doing the same reading and citing the handler
+# lines that prove it, for every branch, not just the smoke script's own
+# prompt.
+NON_MUTATING_POST_ALLOWLIST: frozenset[str] = frozenset()
+
+# Endpoints deliberately kept OFF the allow-list above, with the proof each
+# was excluded on. Kept as a real mapping (not just a comment) so it's
+# importable from tests and so a future widen of the allow-list without
+# updating this citation is at least visible in a diff.
+NON_MUTATING_EXCLUDED_ENDPOINTS: dict[str, str] = {
+    "/api/v1/chat/compose": (
+        "api/routers/chat.py:2144-2178 (deterministic alert path) and "
+        "chat.py:2227-2244 (LLM-planner alert path) both call "
+        "api/routers/price_alerts.create_alert_record, which INSERTs into "
+        "sd_price_alerts at price_alerts.py:148-154. chat.py:2185-2197 and "
+        "chat.py:2248-2261 separately INSERT into sd_capability_requests via "
+        "_log_capability_gap (chat.py:2497-2519), which also spawns a "
+        "background thread that iMessages and emails the operator "
+        "(_email_capability_gap, chat.py:2322-2342, using scripts/notify.py's "
+        "smtplib send). Which branch fires depends on the planner LLM's own "
+        "non-deterministic read of the prompt (chat.py:2227 "
+        "`raw.get(\"alert\")`), so no prompt text can be proven to keep this "
+        "endpoint read-only — it is excluded regardless of what the default "
+        "plan asks it."
+    ),
+    "/api/v1/chat/ask/stream": (
+        "api/routers/chat.py:2740-2775 has no DB write in the handler itself "
+        "(_build_context_block runs with include_research=False, "
+        "chat.py:2757-2759, which skips the one gatherer that writes — "
+        "_research_chain's DB insert at chat.py:1647). It does make a real "
+        "local-or-paid LLM call every time (_stream_verdict, chat.py:2679-"
+        "2737). Routine, unattended deploy smoke should not depend on or pay "
+        "for an LLM call, and it shares its whole prompt/planner surface "
+        "with /chat/compose, so it stays out of the default plan too."
+    ),
+}
+
+# Paths whose GET handler executes DDL as a side effect — the HTTP verb is
+# GET (so the allow/deny logic above would let it through), but the
+# underlying database operation is schema-mutating, not read-only, so it is
+# blocked unconditionally in non-mutating mode too. Checked BEFORE the
+# method check in Client.request() below, so it applies to every verb on
+# these paths, not just GET.
+NON_MUTATING_GET_BLOCKLIST: frozenset[str] = frozenset({"/api/v1/alerts"})
+
+NON_MUTATING_GET_BLOCKLIST_REASONS: dict[str, str] = {
+    "/api/v1/alerts": (
+        "api/routers/price_alerts.py:186-201 list_alerts() calls "
+        "ensure_alerts_table(engine) at line 194, which runs `CREATE TABLE "
+        "IF NOT EXISTS sd_price_alerts` (price_alerts.py:55-57) on every "
+        "call — a DDL statement, even though the HTTP verb is GET. Neither "
+        "the before/after alert-count invariant (step_alerts_db_count) nor "
+        "any other non-mutating step may call this endpoint; the invariant "
+        "instead runs a direct, read-only `SELECT count(*) FROM "
+        "sd_price_alerts WHERE active` (same connection style as "
+        "step_freshness), never DDL, never HTTP."
+    ),
+}
+
+
+class MutationBlocked(RuntimeError):
+    """Raised by Client.request() when --mode=non-mutating would be violated."""
 
 
 # ── Redaction ─────────────────────────────────────────────────────────────
@@ -99,7 +205,7 @@ def redact_secrets(text: str) -> str:
 @dataclass
 class StepResult:
     name: str
-    status: str  # ok | degraded | broken | blocked
+    status: str  # ok | degraded | broken | blocked | skipped
     latency_ms: float | None = None
     note: str = ""
     data: dict[str, Any] = field(default_factory=dict)
@@ -138,6 +244,104 @@ def compose_branch(payload: dict[str, Any]) -> str:
     if payload.get("spoken_reply") is not None:
         return "normal"
     return "error"
+
+
+# Keys that mean a /chat/compose call was NOT read-only. `alert_created`
+# means create_alert_record already INSERTed into sd_price_alerts
+# (api/routers/price_alerts.py:148-154). `cannot_fulfill` means
+# _log_capability_gap already INSERTed into sd_capability_requests and fired
+# an iMessage + email to the operator (api/routers/chat.py:2497-2519,
+# :2322-2342). Either one is a mutation marker.
+_MUTATION_MARKER_KEYS = ("alert_created", "cannot_fulfill")
+
+
+def compose_mutation_markers(payload: dict[str, Any]) -> list[str]:
+    """Return the mutation-marker keys present-and-truthy in a compose
+    response (or in a compose sub-step's recorded `data`, which step_composer
+    fills with the same key names — see NON_MUTATING_EXCLUDED_ENDPOINTS for
+    the file:line proof of what each marker means)."""
+    if not isinstance(payload, dict):
+        return []
+    return [k for k in _MUTATION_MARKER_KEYS if payload.get(k)]
+
+
+def check_alerts_invariant(
+    mode: str, before_count: int | None, after_count: int | None
+) -> tuple[bool, str]:
+    """The direct-SQL active-alerts count (step_alerts_db_count — a pure
+    `SELECT count(*) FROM sd_price_alerts WHERE active`, never GET
+    /api/v1/alerts, see NON_MUTATING_GET_BLOCKLIST) must be unchanged across
+    a --mode=non-mutating run. Not enforced for --mode=mutating, where
+    mutation is the explicit point of the run."""
+    if mode != MODE_NON_MUTATING:
+        return True, f"invariant not enforced outside --mode={MODE_NON_MUTATING}"
+    if before_count is None or after_count is None:
+        return True, (
+            "alerts count unavailable (release dir missing, DB unreachable, "
+            "or the table doesn't exist yet) — cannot check, not graded as "
+            "a violation"
+        )
+    if before_count != after_count:
+        return False, f"active alerts count changed: {before_count} -> {after_count}"
+    return True, f"alerts count unchanged ({before_count})"
+
+
+def evaluate_mutation_guard(
+    mode: str,
+    before_count: int | None,
+    after_count: int | None,
+    compose_payloads: Iterable[dict[str, Any]] = (),
+) -> StepResult:
+    """Combine the alert-count invariant with any mutation marker seen in a
+    compose response into one StepResult. A "broken" result here always
+    forces a non-zero exit code in run(), regardless of --strict — a caught
+    mutation is not an operational blip, it is exactly the regression this
+    guard exists to catch."""
+    if mode != MODE_NON_MUTATING:
+        return StepResult(
+            "mutation_guard", "ok", None,
+            f"invariant not enforced outside --mode={MODE_NON_MUTATING}", {"markers": []},
+        )
+    markers: list[str] = []
+    for payload in compose_payloads:
+        markers.extend(compose_mutation_markers(payload))
+    markers = sorted(set(markers))
+    if markers:
+        return StepResult(
+            "mutation_guard", "broken", None,
+            f"compose response carried mutation marker(s): {markers}", {"markers": markers},
+        )
+    ok, reason = check_alerts_invariant(mode, before_count, after_count)
+    return StepResult("mutation_guard", "ok" if ok else "broken", None, reason, {"markers": []})
+
+
+def validate_mode(mode: str, *, env: dict[str, str], accept_flag: bool) -> str | None:
+    """Return an error message if `mode` may not run at all, else None.
+
+    --mode=mutating requires BOTH the SMOKE_ALLOW_MUTATIONS=1 environment
+    variable AND --i-accept-production-writes on the command line; either
+    alone refuses to start, before any network call is made.
+    --mode=non-mutating (the default, and the only mode dad-smoke.yml /
+    deploy.yml ever pass) never needs a gate.
+    """
+    if mode == MODE_NON_MUTATING:
+        return None
+    if mode != MODE_MUTATING:
+        return f"unknown --mode {mode!r} (expected one of {VALID_MODES})"
+    allow_env = env.get("SMOKE_ALLOW_MUTATIONS") == "1"
+    if allow_env and accept_flag:
+        return None
+    missing = []
+    if not allow_env:
+        missing.append("SMOKE_ALLOW_MUTATIONS=1 (environment)")
+    if not accept_flag:
+        missing.append("--i-accept-production-writes")
+    return (
+        "--mode=mutating refused to start: missing " + " and ".join(missing) + ". "
+        "No workflow in this repository invokes --mode=mutating; run it by "
+        "hand against an isolated target only. It is never invoked from the "
+        "routine deploy path."
+    )
 
 
 def _parse_as_of(as_of: Any) -> datetime | None:
@@ -309,11 +513,19 @@ def worst_status(statuses: Iterable[str]) -> str:
 
 
 class Client:
-    """Thin requests wrapper: base URL, optional bearer token, timing."""
+    """Thin requests wrapper: base URL, optional bearer token, timing.
 
-    def __init__(self, base_url: str, token: str | None = None):
+    `mode` enforces the non-mutating guard: in MODE_NON_MUTATING (the
+    default), any request that is not a GET and not on
+    NON_MUTATING_POST_ALLOWLIST raises MutationBlocked instead of going out
+    over the network. MODE_MUTATING disables the guard — only reachable via
+    run()'s own validate_mode() gate, never from dad-smoke.yml/deploy.yml.
+    """
+
+    def __init__(self, base_url: str, token: str | None = None, mode: str = MODE_NON_MUTATING):
         self.base_url = base_url.rstrip("/")
         self.token = token
+        self.mode = mode
 
     def _headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
         h = {}
@@ -333,6 +545,14 @@ class Client:
         stream: bool = False,
     ):
         import requests
+
+        if self.mode == MODE_NON_MUTATING:
+            if path in NON_MUTATING_GET_BLOCKLIST:
+                reason = NON_MUTATING_GET_BLOCKLIST_REASONS.get(path, "handler executes DDL as a side effect")
+                raise MutationBlocked(f"{method} {path} blocked in --mode={MODE_NON_MUTATING}: {reason}")
+            if method.upper() != "GET" and path not in NON_MUTATING_POST_ALLOWLIST:
+                reason = NON_MUTATING_EXCLUDED_ENDPOINTS.get(path, "not on NON_MUTATING_POST_ALLOWLIST")
+                raise MutationBlocked(f"{method} {path} blocked in --mode={MODE_NON_MUTATING}: {reason}")
 
         url = path if path.startswith("http") else f"{self.base_url}{path}"
         t0 = time.perf_counter()
@@ -490,9 +710,75 @@ def mint_contributor_token(release_dir: str) -> tuple[str | None, str]:
                 del sys.modules[mod_name]
 
 
-def step_composer(client: Client, budget_ms: int) -> StepResult:
+def step_alerts_db_count(release_dir: str, label: str) -> StepResult:
+    """Direct, read-only alert count for the before/after mutation-detection
+    invariant — deliberately NOT via GET /api/v1/alerts, whose handler runs
+    `CREATE TABLE IF NOT EXISTS sd_price_alerts` as a side effect on every
+    call (api/routers/price_alerts.py:186-201, :55-57 — see
+    NON_MUTATING_GET_BLOCKLIST, which blocks that endpoint outright in
+    non-mutating mode regardless of what any step tries to do).
+
+    Reuses step_freshness's direct-DB connection style (same sys.path/cwd
+    dance, same `db.get_engine()`) to run a single, pure
+    `SELECT count(*) FROM sd_price_alerts WHERE active` — no DDL, no HTTP,
+    no owner filter (this counts every active alert in the table, not just
+    the smoke user's, so it is a strictly stronger invariant: it also
+    catches a write made under a different owner). Called once before and
+    once after the rest of the plan; evaluate_mutation_guard() diffs the
+    two counts. Runs in both modes — it never touches the HTTP client or
+    the non-mutating guard at all, so it is unaffected by --mode."""
+    original_cwd = os.getcwd()
+    original_path = list(sys.path)
+    for mod_name in list(sys.modules):
+        if mod_name in ("config", "db") or mod_name.startswith("api."):
+            del sys.modules[mod_name]
+    try:
+        release_path = Path(release_dir)
+        if not release_path.is_dir():
+            return StepResult(f"alerts_count:{label}", "blocked", None, f"release dir not found: {release_dir}")
+        os.chdir(release_path)
+        sys.path.insert(0, str(release_path))
+        try:
+            from dotenv import load_dotenv  # type: ignore
+
+            load_dotenv(release_path / ".env")
+        except Exception:
+            pass
+        from db import get_engine  # type: ignore
+        from sqlalchemy import text  # type: ignore
+
+        engine = get_engine()
+        with engine.connect() as conn:
+            row = conn.execute(text("SELECT count(*) FROM sd_price_alerts WHERE active")).fetchone()
+        count = int(row[0]) if row and row[0] is not None else None
+        status = "ok" if count is not None else "broken"
+        return StepResult(f"alerts_count:{label}", status, None, f"count={count}", {"count": count})
+    except Exception as exc:
+        # Table missing, DB unreachable, etc. — not enforced as a violation;
+        # check_alerts_invariant treats a missing count as "cannot check",
+        # the same way step_freshness treats a query failure as "blocked".
+        return StepResult(f"alerts_count:{label}", "blocked", None, f"alerts count query failed: {exc}")
+    finally:
+        os.chdir(original_cwd)
+        sys.path[:] = original_path
+        for mod_name in list(sys.modules):
+            if mod_name in ("config", "db") or mod_name.startswith("api."):
+                del sys.modules[mod_name]
+
+
+def step_composer(client: Client, budget_ms: int, mode: str = MODE_NON_MUTATING) -> StepResult:
     if not client.token:
         return StepResult("composer", "blocked", None, "no token (auth blocked) — skipped, not graded as broken")
+
+    if mode != MODE_MUTATING:
+        return StepResult(
+            "composer", "skipped", None,
+            f"skipped in --mode={MODE_NON_MUTATING}: /chat/compose and /chat/ask/stream "
+            "can persist state and/or spend a real LLM call (see "
+            "NON_MUTATING_EXCLUDED_ENDPOINTS); alert-creation/composer smoke only "
+            "runs via --mode=mutating, run by hand against an isolated target — "
+            "no workflow in this repository invokes it",
+        )
 
     sub: list[StepResult] = []
     llm_timeout_s = max(budget_ms * 10, 65_000) / 1000
@@ -525,7 +811,18 @@ def step_composer(client: Client, budget_ms: int) -> StepResult:
         note = f"branch={branch} widgets={len(payload.get('widgets', []))} reply_len={reply_len}"
         if invalid:
             note += f" invalid_widget_types={invalid}"
-        sub.append(StepResult(f"compose:{q[:24]}", status, ms, note, {"branch": branch, "reply_len": reply_len}))
+        sub.append(StepResult(
+            f"compose:{q[:24]}", status, ms, note,
+            {
+                "branch": branch,
+                "reply_len": reply_len,
+                # Mirrors compose_mutation_markers()'s key names so run()
+                # can feed these sub-step `data` dicts straight into
+                # evaluate_mutation_guard() without reparsing the response.
+                "alert_created": bool(payload.get("alert_created")),
+                "cannot_fulfill": bool(payload.get("cannot_fulfill")),
+            },
+        ))
 
     # ask/stream — time to first token + total, capped at 120s.
     try:
@@ -623,16 +920,10 @@ def step_widget_data(client: Client, budget_ms: int) -> StepResult:
     except Exception as exc:
         sub.append(StepResult("flows/sectors", "broken", None, f"request failed: {exc}"))
 
-    try:
-        resp, ms = client.request("GET", "/api/v1/alerts", timeout_s=timeout_s)
-        if resp.status_code != 200:
-            sub.append(StepResult("alerts", "broken", ms, f"HTTP {resp.status_code}"))
-        else:
-            payload = resp.json()
-            count = len(payload.get("alerts", [])) if isinstance(payload, dict) else 0
-            sub.append(StepResult("alerts", "ok", ms, f"count={count}"))
-    except Exception as exc:
-        sub.append(StepResult("alerts", "broken", None, f"request failed: {exc}"))
+    # No GET /api/v1/alerts substep here on purpose — that handler runs
+    # CREATE TABLE IF NOT EXISTS as a side effect (see
+    # NON_MUTATING_GET_BLOCKLIST); the alert count check lives entirely in
+    # step_alerts_db_count's direct, read-only SQL instead.
 
     for section in DAD_TICKER_SECTIONS:
         try:
@@ -821,6 +1112,7 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
     lines.append("")
     lines.append(f"- base_url: `{meta.get('base_url')}`")
     lines.append(f"- release_dir: `{meta.get('release_dir')}`")
+    lines.append(f"- mode: `{meta.get('mode', MODE_NON_MUTATING)}`")
     lines.append(f"- generated_at: {meta.get('generated_at')}")
     lines.append("")
 
@@ -828,6 +1120,7 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
     degraded = [s for s in steps if s.status == "degraded"]
     broken = [s for s in steps if s.status == "broken"]
     blocked = [s for s in steps if s.status == "blocked"]
+    skipped = [s for s in steps if s.status == "skipped"]
 
     lines.append("## Summary")
     lines.append("")
@@ -835,6 +1128,7 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
     lines.append(f"- **Degraded** ({len(degraded)}): {', '.join(s.name for s in degraded) or 'none'}")
     lines.append(f"- **Broken** ({len(broken)}): {', '.join(s.name for s in broken) or 'none'}")
     lines.append(f"- **Blocked** ({len(blocked)}): {', '.join(s.name for s in blocked) or 'none'}")
+    lines.append(f"- **Skipped by mode** ({len(skipped)}): {', '.join(s.name for s in skipped) or 'none'}")
     lines.append("")
 
     lines.append("## Evidence")
@@ -875,6 +1169,13 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
             lines.append(f"- **{s.name}**: {redact_secrets(s.note)}")
         lines.append("")
 
+    if skipped:
+        lines.append("## Skipped by mode")
+        lines.append("")
+        for s in skipped:
+            lines.append(f"- **{s.name}**: {redact_secrets(s.note)}")
+        lines.append("")
+
     problems = broken + degraded
     problems.sort(key=lambda s: _STATUS_RANK.get(s.status, 99))
     lines.append("## Top problems")
@@ -893,7 +1194,25 @@ def render_report(steps: list[StepResult], meta: dict[str, Any]) -> str:
 
 
 def run(args: argparse.Namespace) -> tuple[int, str, dict[str, Any]]:
-    client = Client(args.base_url)
+    # getattr defaults keep this backward-compatible with any caller (or
+    # test) building an argparse.Namespace by hand without these two fields.
+    mode = getattr(args, "mode", MODE_NON_MUTATING)
+    accept_flag = getattr(args, "i_accept_production_writes", False)
+
+    meta = {
+        "base_url": args.base_url,
+        "release_dir": args.release_dir,
+        "mode": mode,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    mode_error = validate_mode(mode, env=os.environ, accept_flag=accept_flag)
+    if mode_error:
+        report = f"# Dad Path Smoke Report\n\nBLOCKED before any request was made: {mode_error}\n"
+        result = {"meta": meta, "steps": [], "exit_code": 2, "mode_error": mode_error}
+        return 2, report, result
+
+    client = Client(args.base_url, mode=mode)
 
     steps: list[StepResult] = []
     steps.append(step_health(client, args.budget_ms))
@@ -906,22 +1225,44 @@ def run(args: argparse.Namespace) -> tuple[int, str, dict[str, Any]]:
     else:
         steps.append(StepResult("auth", "blocked", None, auth_note))
 
-    steps.append(step_composer(client, args.budget_ms))
+    before_alerts = step_alerts_db_count(args.release_dir, "before")
+    steps.append(before_alerts)
+
+    steps.append(step_composer(client, args.budget_ms, mode))
     steps.append(step_widget_data(client, args.budget_ms))
+
+    after_alerts = step_alerts_db_count(args.release_dir, "after")
+    steps.append(after_alerts)
+
+    compose_step = next((s for s in steps if s.name == "composer"), None)
+    compose_payloads = (
+        [
+            sub.get("data", {})
+            for sub in compose_step.data.get("substeps", [])
+            if sub.get("name", "").startswith("compose:")
+        ]
+        if compose_step is not None
+        else []
+    )
+    mutation_guard = evaluate_mutation_guard(
+        mode, before_alerts.data.get("count"), after_alerts.data.get("count"), compose_payloads,
+    )
+    steps.append(mutation_guard)
+
     steps.append(step_freshness(args.release_dir))
     steps.append(step_logs())
     steps.append(step_deploy_tree(args.release_dir))
 
-    meta = {
-        "base_url": args.base_url,
-        "release_dir": args.release_dir,
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-    }
+    meta["generated_at"] = datetime.now(timezone.utc).isoformat()
     report = render_report(steps, meta)
 
     has_broken = any(s.status == "broken" for s in steps)
     has_blocked = any(s.status == "blocked" for s in steps)
-    if has_blocked:
+    mutation_violation = mutation_guard.status == "broken"
+    if mutation_violation:
+        # A caught mutation always fails the run, --strict or not.
+        exit_code = 1
+    elif has_blocked:
         exit_code = 2
     elif has_broken and args.strict:
         exit_code = 1
@@ -943,6 +1284,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", default=None, help="Path to write the structured JSON result.")
     parser.add_argument("--budget-ms", type=int, default=DEFAULT_BUDGET_MS)
     parser.add_argument("--strict", action="store_true")
+    parser.add_argument(
+        "--mode", choices=list(VALID_MODES), default=MODE_NON_MUTATING,
+        help=(
+            "non-mutating (default): every request is GET except a proven-safe "
+            "POST allow-list (currently empty — /chat/compose and "
+            "/chat/ask/stream are excluded, see NON_MUTATING_EXCLUDED_ENDPOINTS "
+            "in this file). mutating: also exercises composer/alert-creation "
+            "smoke; requires SMOKE_ALLOW_MUTATIONS=1 and "
+            "--i-accept-production-writes, and must target an isolated "
+            "environment. No workflow in this repository invokes this mode — "
+            "run it by hand only."
+        ),
+    )
+    parser.add_argument(
+        "--i-accept-production-writes", action="store_true",
+        dest="i_accept_production_writes",
+        help="Required (together with SMOKE_ALLOW_MUTATIONS=1) to run --mode=mutating.",
+    )
     args = parser.parse_args(argv)
 
     exit_code, report, result = run(args)

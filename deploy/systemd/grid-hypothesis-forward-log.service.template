@@ -1,0 +1,74 @@
+# TEMPLATE — NOT INSTALLED BY ANY CODE PATH, CI JOB OR DEPLOY WORKFLOW.
+# Installing this unit (and its .timer) is the S10 forward-log activation
+# step (owner approval 2026-09-28). Read
+# docs/paper_log/hypothesis-forward-v1-preregistration.md first: its rules
+# are frozen once the first record is ever written to the log.
+#
+# This replaces the crontab + git-archive form proposed in
+# deploy/paper_log/hypothesis_forward_v1.sh (that script and its header
+# comment are superseded by this unit for grid-svr; kept for reference /
+# other hosts). Runs from the deployed release tree
+# /data/grid_v4/grid_release (the same tree grid-api runs from), as `grid`,
+# with the repo `.env`. Paths follow grid-analytics-snapshots /
+# grid-godview-* (see deploy/systemd/README.md).
+#
+# What each run does: opens a NullPool, read-only DB connection
+# (default_transaction_read_only=on, statement timeout <= 60s), reads only
+# through the latest-vintage adapter (store/observations.py via
+# analysis/research_real_panel.py), appends due prediction/outcome/verdict
+# records to the hash-chained, append-only JSONL log, then rewrites
+# STATUS.md. No orders, no weights, no promotion — every record carries
+# promotion_allowed: false. On an empty log it writes the header record
+# only (safe with zero admitted candidates).
+#
+# Install:
+#   sudo cp deploy/systemd/grid-hypothesis-forward-log.service.template /etc/systemd/system/grid-hypothesis-forward-log.service
+#   sudo cp deploy/systemd/grid-hypothesis-forward-log.timer.template   /etc/systemd/system/grid-hypothesis-forward-log.timer
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now grid-hypothesis-forward-log.timer   # enable the TIMER only; let the job fire on its own schedule
+#
+# Verify without running anything (read-only, no DB, writes nothing):
+#   cd /data/grid_v4/grid_release
+#   PYTHONPATH=/data/grid_v4/grid_release /usr/bin/python3 -m scripts.research_forward_log status --log-dir /tmp/some-throwaway-dir
+#
+# Uninstall: `sudo systemctl disable --now grid-hypothesis-forward-log.timer`.
+# Never delete the JSONL log at LOG_DIR below — it is the permanent
+# research record (archive it first if v1 is ever abandoned; see the
+# pre-registration's Integrity section).
+[Unit]
+Description=GRID hypothesis-loop forward log v1 (S10) — daily append-only run
+Documentation=file:///data/grid_v4/grid_release/deploy/systemd/README.md
+After=network-online.target postgresql.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=grid
+Group=grid
+# Current deployed release (same tree grid-api runs from).
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# scripts.research_forward_log is imported as a module (python -m); this
+# pins the package root explicitly so `-m` resolves it regardless of how
+# systemd sets up the child's working directory.
+Environment=PYTHONPATH=/data/grid_v4/grid_release
+
+# flock -n: a run still going when the timer fires again is skipped, not
+# doubled or queued — same pattern as the rest of grid-svr's scheduled
+# jobs. LOG_DIR is a persistent path outside the per-commit release tree
+# (releases rotate under /data/grid_v4/grid_release.releases/<sha>/; this
+# path does not), matching deploy/paper_log/hypothesis_forward_v1.sh's
+# default HYPOTHESIS_FORWARD_LOG_DIR.
+ExecStart=/usr/bin/flock -n /tmp/grid-hypothesis-forward-log.lock \
+    /usr/bin/python3 -m scripts.research_forward_log run --log-dir /data/grid/paper_log/hypothesis_forward_v1
+
+TimeoutStartSec=10min
+TimeoutStopSec=60
+Nice=10
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

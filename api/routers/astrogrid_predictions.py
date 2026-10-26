@@ -8,6 +8,7 @@ from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
 from loguru import logger as log
+from price_close_contract import SPY_CLOSE_CONTRACT
 
 from api.auth import require_auth, verify_token
 from api.dependencies import get_astrogrid_store, get_db_engine
@@ -259,6 +260,9 @@ async def create_prediction(
     prediction_payload["feature_family_summary"]["question_intent"] = question_intent
     prediction_payload["feature_family_summary"]["target_group"] = target_group
     prediction_payload["prediction_id"] = str(uuid4())
+    if (req.as_of_ts is None and target_symbols == ["SPY"]
+            and req.live_or_local == "live" and scoring_class == "liquid_market"):
+        prediction_payload["price_contract_version"] = SPY_CLOSE_CONTRACT
 
     if req.publish_oracle:
         try:

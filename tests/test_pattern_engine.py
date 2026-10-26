@@ -235,6 +235,70 @@ class TestDiscoverPatterns:
         # At minimum, we verify the function runs without error
         assert isinstance(result, list)
 
+    @patch("intelligence.pattern_engine._store_patterns")
+    @patch("intelligence.pattern_engine._ensure_tables")
+    @patch("intelligence.pattern_engine._get_watchlist_tickers")
+    def test_persist_false_never_ensures_tables_or_stores(
+        self, mock_tickers, mock_tables, mock_store,
+    ):
+        """Item #23 (Wave 3 triage report): GET intelligence/patterns is a
+        write-on-GET bug fixed by discover_patterns(..., persist=False) --
+        this must skip BOTH the event_patterns DDL and the upsert, matching
+        the persist=False idiom in intelligence/forensics.py."""
+        mock_tickers.return_value = []  # no tickers -> empty result, fast path
+
+        result = discover_patterns(engine=MagicMock(), min_occurrences=3, persist=False)
+
+        assert result == []
+        mock_tables.assert_not_called()
+        mock_store.assert_not_called()
+
+    @patch("intelligence.pattern_engine._store_patterns")
+    @patch("intelligence.pattern_engine._get_price_after")
+    @patch("intelligence.pattern_engine._ensure_tables")
+    @patch("intelligence.pattern_engine._get_watchlist_tickers")
+    @patch("intelligence.event_sequence.build_sequence")
+    def test_persist_false_finds_patterns_but_does_not_store_them(
+        self, mock_build, mock_tickers, mock_tables, mock_price, mock_store,
+    ):
+        mock_tickers.return_value = ["NVDA"]
+        now = datetime.now(timezone.utc)
+        events = []
+        for i in range(3):
+            base = now - timedelta(days=30 * (3 - i))
+            ev_a = MagicMock()
+            ev_a.event_type = "insider"
+            ev_a.direction = "bearish"
+            ev_a.timestamp = base.isoformat()
+            events.append(ev_a)
+            ev_b = MagicMock()
+            ev_b.event_type = "price_move"
+            ev_b.direction = "bearish"
+            ev_b.timestamp = (base + timedelta(hours=48)).isoformat()
+            events.append(ev_b)
+        mock_build.return_value = events
+        mock_price.return_value = -0.025
+
+        result = discover_patterns(engine=MagicMock(), min_occurrences=3, persist=False)
+
+        assert len(result) >= 1
+        mock_tables.assert_not_called()
+        mock_store.assert_not_called()
+
+    @patch("intelligence.pattern_engine._store_patterns")
+    @patch("intelligence.pattern_engine._ensure_tables")
+    @patch("intelligence.pattern_engine._get_watchlist_tickers")
+    def test_persist_defaults_to_true_and_still_ensures_tables(
+        self, mock_tickers, mock_tables, mock_store,
+    ):
+        """Explicit writers (persist=True, the default) keep the old
+        behavior -- only the read path (the GET router) opts out."""
+        mock_tickers.return_value = []
+
+        discover_patterns(engine=MagicMock(), min_occurrences=3)
+
+        mock_tables.assert_called_once()
+
 
 # ── match_active_patterns Tests ──────────────────────────────────────────
 

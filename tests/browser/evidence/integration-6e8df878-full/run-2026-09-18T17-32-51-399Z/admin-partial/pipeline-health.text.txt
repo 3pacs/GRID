@@ -1,0 +1,56 @@
+PIPELINE HEALTH
+3
+TOTAL SOURCES
+1
+HEALTHY
+1
+STALE
+1
+BROKEN
+SOURCE STATUS
+All (3)
+Healthy (1)
+Stale (1)
+Broken (1)
+STATUS ▲	SOURCE	TYPE	LAST PULL	ROWS	FRESHNESS	REASON	ERROR
+broken	test_puller_never_configured	ALTDATA	never	-	
+	never configured — no pull on record	no API key / puller never set up for this environment
+stale	test_puller_finviz	ALTDATA	10d ago	0	
+	stale	last successful pull was 7 days ago
+healthy	test_puller_fred	MACRO	3d ago	12	
+	-	
+RESOLVER STATUS
+0
+Pending
+4
+Resolved (24h)
+3d ago
+Last Run
+RECENT ERRORS (1)
+3d ago
+test_puller_finviz
+stale (>24h since last SUCCESS row)
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

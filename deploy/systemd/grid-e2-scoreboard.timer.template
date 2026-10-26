@@ -1,0 +1,21 @@
+# TEMPLATE — NOT INSTALLED. See grid-e2-scoreboard.service.template.
+# Twice a day, both outside the nightly pg_dump window (03:30-10:30 UTC):
+#   15:00 UTC  after the GEX pre-open record (08:45 ET) and before the US
+#              close: E2 ingests the day's GEX predictions BEFORE their
+#              outcomes exist, so its own off-host-anchored ledger witnesses
+#              them ahead of the outcome (ingest_timing=before_outcome);
+#   23:15 UTC  after the GEX post-close record (16:30 ET = 20:30 UTC in summer,
+#              21:30 UTC in winter) and after the S10 run (11:30 UTC): resolve,
+#              score, snapshot.
+[Unit]
+Description=Run the GRID E2 forward scoreboard twice a day
+
+[Timer]
+OnCalendar=*-*-* 15:00:00 UTC
+OnCalendar=*-*-* 23:15:00 UTC
+RandomizedDelaySec=2min
+Persistent=true
+Unit=grid-e2-scoreboard.service
+
+[Install]
+WantedBy=timers.target

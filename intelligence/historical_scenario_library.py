@@ -671,6 +671,9 @@ def _load_candidate_predictions(
             "WHERE verdict IN ('hit', 'miss', 'partial') "
             "  AND created_at IS NOT NULL "
             "  AND expiry IS NOT NULL "
+            # An analogue is matched and ranked on its confidence; a row
+            # that stated none is excluded rather than matched as a 0.0.
+            "  AND confidence IS NOT NULL "
         )
         params: dict[str, Any] = {}
         if ticker:
@@ -692,6 +695,7 @@ def _load_candidate_predictions(
                 "WHERE verdict IN ('hit', 'miss', 'partial') "
                 "  AND created_at IS NOT NULL "
                 "  AND expiry IS NOT NULL "
+                "  AND confidence IS NOT NULL "
             )
             params = {}
             if ticker:
@@ -723,6 +727,11 @@ def _load_candidate_predictions(
         if h is None or h != int(horizon_days):
             continue
 
+        if _coerce_float(conf) is None:
+            # Belt and braces behind the two loaders above: `or 0.0` below
+            # would rank an unstated confidence as a measured zero.
+            continue
+
         cand_dir = _canonical_direction(signals)
         if want_dir is not None and cand_dir != want_dir:
             continue
@@ -736,7 +745,7 @@ def _load_candidate_predictions(
             "ticker": str(tkr or ""),
             "created_at": created,
             "created_date": created_date,
-            "confidence": _coerce_float(conf) or 0.0,
+            "confidence": _coerce_float(conf),
             "verdict": str(verdict or "").lower(),
             "direction": cand_dir,
             "horizon_days": int(h),

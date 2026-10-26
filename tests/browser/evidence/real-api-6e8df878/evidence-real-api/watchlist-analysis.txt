@@ -1,0 +1,36 @@
+Back
+TEST1
+TEST1 · STOCK
+Loading chart data...
+PRICE
+1W
+1M
+3M
+6M
+1Y
+No price data for this period
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+[TEST1]
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

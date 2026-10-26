@@ -5,19 +5,99 @@ The most critical correctness component in the entire system. Enforces strict
 no-lookahead constraints ensuring that no data with ``release_date > as_of_date``
 is ever returned.  Supports both FIRST_RELEASE and LATEST_AS_OF vintage policies
 for backtesting and live inference.
+
+Retractions (``resolved_series_retractions``,
+migrations/versions/resolved_retractions_20260927.py): a resolved row that was
+found to hold a wrong value with no clean replacement is retracted by its key
+``(feature_id, obs_date, vintage_date)`` at ``retracted_at``. Every query here
+excludes it when ``as_of`` is on or after the retraction (for a date ``as_of``:
+the retraction happened by the end of that UTC day, the same day-level
+convention as ``release_date <= as_of``). Because the comparison is at day
+level, a retraction at 15:00 UTC on day D already hides the row for
+``as_of = D``, including for a read made earlier that day. Replays are
+reproduced exactly only for ``as_of`` dates *before* the retraction's UTC
+date; ``as_of = D`` can differ depending on when it ran (the resolver's own
+same-day vintages behave the same way).
+The vintage policy then picks among the remaining vintages; a cell with none
+left returns no row -- never a zero and never another feature's value.
 """
 
 from __future__ import annotations
 
 import os
+import math
+import time as monotonic_time
 from contextlib import contextmanager
-from datetime import date
+from datetime import date, datetime, time, timezone
+from decimal import Decimal
 from typing import Generator
 
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Connection, Engine
+
+from normalization.entity_map import SELECTED_QUERY_TIMEOUT_MS, validate_selected_request
+
+
+def validate_source_snapshot_request(
+    selections: list[dict] | None, *, as_of: datetime, start_date: date,
+    vintage_policy: str = "LATEST_AS_OF",
+) -> dict:
+    """Pure pre-connection validation shared with the explicit stored-only API."""
+    return validate_selected_request(selections, as_of=as_of, start_date=start_date,
+                                     vintage_policy=vintage_policy)
+
+
+def retraction_cutoff(as_of: date | datetime) -> datetime:
+    """Inclusive ``retracted_at`` cutoff for a point-in-time read.
+
+    A row retracted at ``retracted_at`` is hidden from a read when
+    ``retracted_at <= retraction_cutoff(as_of)``.
+
+    * ``datetime`` (``as_of_ts``): the instant itself. A naive value is taken
+      as UTC (the database time zone is ``Etc/UTC``).
+    * ``date``: the last microsecond of that UTC day -- "known by the end of
+      the day", matching ``release_date <= as_of``.
+
+    Pass the result as a bind parameter; never interpolate it into SQL.
+    """
+    if isinstance(as_of, datetime):
+        return as_of if as_of.tzinfo is not None else as_of.replace(tzinfo=timezone.utc)
+    return datetime.combine(as_of, time.max, tzinfo=timezone.utc)
+
+
+def retractions_table_exists(engine: Engine) -> bool:
+    """True if ``resolved_series_retractions`` exists (PR #683's migration).
+
+    A caller that writes derived rows into ``resolved_series`` from inputs
+    read across *all* vintages (no PIT, no retraction filter) can silently
+    compute from a contaminated or since-retracted vintage that is still
+    kept as superseded history -- see
+    ``GRID-RERESOLVE-PLAN-20260927``, "DERIVED FEATURES". Any writer that
+    switches its reads to ``get_pit(..., "LATEST_AS_OF")`` should call this
+    first and refuse to run entirely when it returns ``False``, rather than
+    silently falling back to an unfiltered read.
+
+    Runs on its own connection so a failure here (missing table, or any
+    other error) can never poison a caller's outer transaction; any
+    failure is treated as "table absent". Unqualified (relies on
+    ``search_path``), matching how every other query against
+    ``resolved_series_retractions`` in this codebase addresses it -- a
+    hardcoded ``public.`` prefix would silently miss the table on a
+    non-default search_path (e.g. a test's scratch schema).
+    """
+    try:
+        with engine.connect() as conn:
+            with conn.begin():
+                return bool(
+                    conn.execute(
+                        text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                        {"table_name": "resolved_series_retractions"},
+                    ).scalar()
+                )
+    except Exception:
+        return False
 
 
 class PITStore:
@@ -40,6 +120,162 @@ class PITStore:
         self.engine = db_engine
         log.info("PITStore initialised")
 
+    def get_source_snapshot(
+        self, selections: list[dict] | None, *, as_of: datetime, start_date: date,
+        vintage_policy: str = "LATEST_AS_OF",
+    ) -> dict:
+        """At most seven provenance-bearing, day-storage snapshots; no fallback.
+
+        No engine is touched for missing bindings or unsupported event storage.
+        Bound queries are read-only, have a shared five-second deadline, select
+        registry entries exactly, and return at most one resolved row per source.
+        This does not certify provider publication time, raw-row lineage, freshness
+        or durability. In particular release/vintage dates have only day precision.
+        """
+        request = validate_source_snapshot_request(selections, as_of=as_of, start_date=start_date,
+                                                  vintage_policy=vintage_policy)
+        cutoff = request["as_of"]
+        deadline = monotonic_time.monotonic() + SELECTED_QUERY_TIMEOUT_MS / 1000
+
+        def remaining_timeout_ms() -> int:
+            # Zero disables PostgreSQL statement_timeout. Refuse even a positive
+            # sub-millisecond remainder rather than accidentally granting zero.
+            remaining = int((deadline - monotonic_time.monotonic()) * 1000)
+            if remaining <= 0:
+                raise ValueError("snapshot deadline exceeded")
+            return min(SELECTED_QUERY_TIMEOUT_MS, remaining)
+
+        def prepare_query(conn: Connection) -> None:
+            conn.execute(text("SELECT set_config('statement_timeout', :timeout_ms, true)"),
+                         {"timeout_ms": str(remaining_timeout_ms())})
+            # Configuration itself can consume the last budget. Do not start a
+            # data query after detecting expiry, even if configuration succeeded.
+            remaining_timeout_ms()
+
+        output = {"schema": "stored-source-snapshot-v1", "as_of": cutoff.isoformat(),
+                  "start_date": start_date.isoformat(), "vintage_policy": vintage_policy,
+                  "selections": []}
+        direction = "ASC" if vintage_policy == "FIRST_RELEASE" else "DESC"
+        for selection in request["selections"]:
+            row = {k: selection.get(k) for k in
+                   ("source_key", "scope", "ticker_or_cusip", "series_id", "feature_id",
+                    "feature_name", "expected_source_name")}
+            row.update({"status": "unavailable", "reason": "selection_missing", "value": None,
+                        "obs_date": None, "release_date": None, "vintage_date": None,
+                        "actual_source": None, "conflict_flag": None, "conflict_detail": None,
+                        "conflict_detail_truncated": False,
+                        "freshness": {"status": "unknown", "reason": "max_no_observation"},
+                        "storage_clock": "pull_date_not_provider_publication",
+                        "lineage": "resolved_source_not_raw_row"})
+            output["selections"].append(row)
+            if selection["source_key"] == "quiverquant":
+                row["reason"] = "resolver_unsupported"
+                continue
+            if selection.get("series_id") is None or selection.get("expected_source_name") is None:
+                continue
+            if selection.get("feature_id") is None:
+                row["reason"] = "mapping_missing"
+                continue
+            try:
+                remaining_timeout_ms()
+                with self.engine.begin() as conn:
+                    # Pool/connection acquisition is not cancellable here. If it
+                    # returns too late, issue no setup or data SQL on its behalf.
+                    remaining_timeout_ms()
+                    conn.execute(text("SET TRANSACTION READ ONLY"))
+                    prepare_query(conn)
+                    registry = conn.execute(text("""
+                        SELECT id, name FROM feature_registry
+                        WHERE id = :feature_id AND name = :feature_name LIMIT 2
+                    """), {"feature_id": selection["feature_id"],
+                            "feature_name": selection["feature_name"]}).fetchall()
+                    remaining_timeout_ms()
+                    if len(registry) != 1 or tuple(registry[0]) != (
+                            selection["feature_id"], selection["feature_name"]):
+                        row["reason"] = "mapping_missing"
+                        continue
+                    prepare_query(conn)
+                    # direction is one of two validated literals, never caller SQL.
+                    result = conn.execute(text("""
+                        WITH eligible AS (
+                            SELECT rs.feature_id, rs.obs_date, rs.release_date, rs.vintage_date,
+                                   rs.value, rs.source_priority_used, sc.name AS source_name,
+                                   rs.conflict_flag,
+                                   LEFT(CAST(rs.conflict_detail AS text), 2048) AS conflict_detail,
+                                   LENGTH(CAST(rs.conflict_detail AS text)) > 2048 AS detail_truncated,
+                                   ROW_NUMBER() OVER (
+                                       PARTITION BY rs.feature_id, rs.obs_date
+                                       ORDER BY rs.vintage_date """ + direction + """, rs.id DESC
+                                   ) AS vintage_rank
+                            FROM resolved_series rs
+                            JOIN feature_registry fr ON fr.id = rs.feature_id AND fr.name = :feature_name
+                            LEFT JOIN source_catalog sc ON sc.id = rs.source_priority_used
+                            WHERE rs.feature_id = :feature_id
+                              AND rs.obs_date >= :start_date AND rs.obs_date <= :as_of_date
+                              AND rs.release_date <= :as_of_date AND rs.vintage_date <= :as_of_date
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM resolved_series_retractions rr
+                                  WHERE rr.feature_id = rs.feature_id AND rr.obs_date = rs.obs_date
+                                    AND rr.vintage_date = rs.vintage_date
+                                    AND rr.retracted_at <= :as_of
+                              )
+                        )
+                        SELECT feature_id, obs_date, release_date, vintage_date, value,
+                               source_priority_used, source_name, conflict_flag,
+                               conflict_detail, detail_truncated
+                        FROM eligible WHERE vintage_rank = 1
+                        ORDER BY obs_date DESC LIMIT 1
+                    """), {"feature_id": selection["feature_id"],
+                            "feature_name": selection["feature_name"], "start_date": start_date,
+                            "as_of_date": cutoff.date(), "as_of": cutoff}).mappings().all()
+                    remaining_timeout_ms()
+                remaining_timeout_ms()
+                if not result:
+                    row["reason"] = "no_resolved_row"
+                    continue
+                if len(result) != 1:
+                    raise ValueError("snapshot exceeded one-row cap")
+                candidate = dict(result[0])
+                if candidate.get("feature_id") != selection["feature_id"]:
+                    raise ValueError("snapshot feature mismatch")
+                observed = candidate.get("obs_date")
+                released, vintage = candidate.get("release_date"), candidate.get("vintage_date")
+                if (any(type(d) is not date for d in (observed, released, vintage)) or
+                        not start_date <= observed <= cutoff.date() or
+                        released > cutoff.date() or vintage > cutoff.date()):
+                    raise ValueError("snapshot storage clock mismatch")
+                row.update({"obs_date": observed.isoformat(), "release_date": released.isoformat(),
+                            "vintage_date": vintage.isoformat()})
+                actual_id = candidate.get("source_priority_used")
+                actual_name = candidate.get("source_name")
+                if type(actual_id) is int and actual_id > 0 and type(actual_name) is str:
+                    row["actual_source"] = {"id": actual_id, "name": actual_name}
+                if row["actual_source"] is None or actual_name != selection["expected_source_name"]:
+                    row["reason"] = "source_mismatch"
+                    continue
+                value = candidate.get("value")
+                try:
+                    valid = type(value) in (int, float, Decimal) and math.isfinite(float(value))
+                except (ValueError, OverflowError):
+                    valid = False
+                if not valid:
+                    row["reason"] = "invalid_value"
+                    continue
+                row.update({"status": "available", "reason": "resolved_observation",
+                            "value": float(value), "conflict_flag": candidate.get("conflict_flag"),
+                            "conflict_detail": candidate.get("conflict_detail"),
+                            "conflict_detail_truncated": bool(candidate.get("detail_truncated"))})
+                policy = selection.get("freshness_policy")
+                if policy is None:
+                    row["freshness"] = {"status": "unknown", "reason": "freshness_policy_absent"}
+                else:
+                    stale = (cutoff.date() - observed).days > policy["max_age_days"]
+                    row["freshness"] = {"status": "stale" if stale else "fresh",
+                                        "reason": "exceeds_declared_age" if stale else "within_declared_age"}
+            except Exception:
+                row.update({"status": "unavailable", "reason": "read_failed", "value": None})
+        return output
+
     def get_pit(
         self,
         feature_ids: list[int],
@@ -54,6 +290,12 @@ class PITStore:
             FIRST_RELEASE  — earliest vintage_date per (feature_id, obs_date).
             LATEST_AS_OF   — latest vintage_date per (feature_id, obs_date)
                              where release_date <= as_of_date.
+        HARD CONSTRAINT 4: rows retracted in resolved_series_retractions by
+            the end of as_of_date are excluded *before* the vintage policy
+            picks a row. as_of dates before the retraction's UTC date
+            still see them (a retraction at any time on day D hides the row
+            for as_of = D). A cell whose every vintage is retracted returns
+            no row.
 
         Parameters:
             feature_ids: List of feature_registry IDs to query.
@@ -93,31 +335,49 @@ class PITStore:
             # For each (feature_id, obs_date), return the row with the
             # MINIMUM vintage_date, provided release_date <= as_of_date.
             query = text("""
-                SELECT DISTINCT ON (feature_id, obs_date)
-                    feature_id, obs_date, value, release_date, vintage_date
-                FROM resolved_series
-                WHERE feature_id = ANY(:fids)
-                  AND obs_date <= :aod
-                  AND release_date <= :aod
-                ORDER BY feature_id, obs_date, vintage_date ASC
+                SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
+                    rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
+                FROM resolved_series rs
+                WHERE rs.feature_id = ANY(:fids)
+                  AND rs.obs_date <= :aod
+                  AND rs.release_date <= :aod
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolved_series_retractions rr
+                      WHERE rr.feature_id = rs.feature_id
+                        AND rr.obs_date = rs.obs_date
+                        AND rr.vintage_date = rs.vintage_date
+                        AND rr.retracted_at <= :retraction_cutoff
+                  )
+                ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date ASC
             """)
         else:
             # LATEST_AS_OF: for each (feature_id, obs_date), return the row
             # with the MAXIMUM vintage_date where release_date <= as_of_date.
             query = text("""
-                SELECT DISTINCT ON (feature_id, obs_date)
-                    feature_id, obs_date, value, release_date, vintage_date
-                FROM resolved_series
-                WHERE feature_id = ANY(:fids)
-                  AND obs_date <= :aod
-                  AND release_date <= :aod
-                ORDER BY feature_id, obs_date, vintage_date DESC
+                SELECT DISTINCT ON (rs.feature_id, rs.obs_date)
+                    rs.feature_id, rs.obs_date, rs.value, rs.release_date, rs.vintage_date
+                FROM resolved_series rs
+                WHERE rs.feature_id = ANY(:fids)
+                  AND rs.obs_date <= :aod
+                  AND rs.release_date <= :aod
+                  AND NOT EXISTS (
+                      SELECT 1 FROM resolved_series_retractions rr
+                      WHERE rr.feature_id = rs.feature_id
+                        AND rr.obs_date = rs.obs_date
+                        AND rr.vintage_date = rs.vintage_date
+                        AND rr.retracted_at <= :retraction_cutoff
+                  )
+                ORDER BY rs.feature_id, rs.obs_date, rs.vintage_date DESC
             """)
 
         with self.engine.connect() as conn:
             rows = conn.execute(
                 query,
-                {"fids": feature_ids, "aod": as_of_date},
+                {
+                    "fids": feature_ids,
+                    "aod": as_of_date,
+                    "retraction_cutoff": retraction_cutoff(as_of_date),
+                },
             ).fetchall()
 
         df = pd.DataFrame(

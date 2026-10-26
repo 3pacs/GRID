@@ -4,6 +4,7 @@ import os
 from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 os.environ.setdefault("ENVIRONMENT", "development")
@@ -18,13 +19,13 @@ _TEST_HASH = _pwd_ctx.hash(_TEST_PASSWORD)
 os.environ.setdefault("GRID_MASTER_PASSWORD_HASH", _TEST_HASH)
 
 from api.auth import create_token
+from api.main import app
 from api.routers.astrogrid import (
     AstrogridPredictionRequest,
     _infer_question_intent,
     _infer_target_group,
     _infer_target_symbols,
 )
-from api.main import app
 from store.astrogrid import AstroGridStore, _build_historical_regime_lookup
 
 client = TestClient(app)
@@ -127,7 +128,10 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
         raise AssertionError(f"Unexpected SQL executed: {sql_text}")
 
     mock_conn.execute.side_effect = _execute_side_effect
-    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 105.0, 100.0, 101.0])
+    store._lookup_symbol_price = MagicMock(side_effect=[
+        {"status": "ok", "price": 100.0}, {"status": "ok", "price": 105.0},
+    ])
+    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 101.0])
     store._load_price_path = MagicMock(return_value=[(date(2026, 2, 1), 100.0), (date(2026, 3, 29), 105.0)])
 
     summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
@@ -139,7 +143,8 @@ def test_score_predictions_prefers_mature_as_of_dates(mock_engine) -> None:
     assert "pr.as_of_ts::date" in str(captured["sql"])
     assert "THEN 30" in str(captured["sql"])
     assert "ELSE 7" in str(captured["sql"])
-    assert "ORDER BY pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
+    assert "price_close_contract'->>'version'" in str(captured["sql"])
+    assert "pr.as_of_ts ASC, pr.created_at ASC" in str(captured["sql"])
     assert captured["params"]["evaluation_date"] == date(2026, 3, 29)
 
 
@@ -182,7 +187,10 @@ def test_score_predictions_uses_historical_regime_context(mock_engine) -> None:
         raise AssertionError(f"Unexpected SQL executed: {sql_text}")
 
     mock_conn.execute.side_effect = _execute_side_effect
-    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 105.0, 100.0, 101.0])
+    store._lookup_symbol_price = MagicMock(side_effect=[
+        {"status": "ok", "price": 100.0}, {"status": "ok", "price": 105.0},
+    ])
+    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 101.0])
     store._load_price_path = MagicMock(return_value=[(date(2026, 2, 1), 100.0), (date(2026, 3, 29), 105.0)])
 
     summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
@@ -237,7 +245,10 @@ def test_score_predictions_falls_back_to_earliest_regime_history(mock_engine) ->
         raise AssertionError(f"Unexpected SQL executed: {sql_text}")
 
     mock_conn.execute.side_effect = _execute_side_effect
-    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 105.0, 100.0, 101.0])
+    store._lookup_symbol_price = MagicMock(side_effect=[
+        {"status": "ok", "price": 100.0}, {"status": "ok", "price": 105.0},
+    ])
+    store._get_symbol_price_at_date = MagicMock(side_effect=[100.0, 101.0])
     store._load_price_path = MagicMock(return_value=[(date(2024, 2, 1), 100.0), (date(2024, 3, 1), 105.0)])
 
     summary = store.score_predictions(as_of_date=date(2026, 3, 29), limit=200)
@@ -257,7 +268,7 @@ def test_get_symbol_price_at_date_prefers_canonical_feature(mock_engine) -> None
         sql_text = str(statement)
         result = MagicMock()
         if "FROM feature_registry fr" in sql_text and "JOIN resolved_series rs" in sql_text:
-            result.fetchone.return_value = (123.45,)
+            result.fetchone.return_value = (123.45, date(2026, 3, 29), date(2026, 3, 30))
             return result
         raise AssertionError(f"Unexpected SQL executed: {sql_text}")
 
@@ -266,6 +277,377 @@ def test_get_symbol_price_at_date_prefers_canonical_feature(mock_engine) -> None
     price = store._get_symbol_price_at_date("BTC", date(2026, 3, 29))
 
     assert price == 123.45
+
+
+@pytest.mark.parametrize(
+    ("symbol", "feature"),
+    [("BTC", "btc_full"), ("ETH", "eth_full")],
+)
+def test_crypto_price_rejects_stale_canonical_row_without_substitution(
+    mock_engine, symbol: str, feature: str,
+) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (65000.0, date(2026, 7, 10), date(2026, 7, 11))
+
+    observation = store._lookup_symbol_price(symbol, date(2026, 9, 22))
+
+    assert observation == {
+        "status": "stale_canonical_price",
+        "price": None,
+        "feature": feature,
+        "target_date": "2026-09-22",
+        "latest_obs_date": "2026-07-10",
+        "latest_release_date": "2026-07-11",
+        "max_age_days": 0,
+    }
+    assert conn.execute.call_count == 1
+    statement, params = conn.execute.call_args.args
+    assert "FROM feature_registry fr" in str(statement)
+    assert "raw_series" not in str(statement)
+    assert params["feature_name"] == feature
+
+
+def test_crypto_price_missing_canonical_row_is_unscored(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = None
+
+    observation = store._lookup_symbol_price("BTC", date(2026, 9, 22))
+
+    assert observation["status"] == "missing_canonical_price"
+    assert observation["price"] is None
+    assert observation["feature"] == "btc_full"
+    assert conn.execute.call_count == 1
+
+
+def test_spy_current_canonical_price_passes_exchange_age_guard(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (681.25, date(2026, 9, 22), date(2026, 9, 23))
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 23)):
+        observation = store._lookup_symbol_price("SPY", date(2026, 9, 22))
+
+    assert observation["status"] == "ok"
+    assert observation["price"] == 681.25
+    assert observation["feature"] == "spy_full"
+    assert observation["max_age_days"] == 0
+
+
+def test_spy_weekend_close_is_valid_but_a_missing_weekday_close_is_not(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (680.0, date(2026, 9, 18), date(2026, 9, 19))
+
+    sunday = store._lookup_symbol_price("SPY", date(2026, 9, 20))
+    monday = store._lookup_symbol_price("SPY", date(2026, 9, 21))
+
+    assert sunday["status"] == "ok"
+    assert sunday["max_age_days"] == 2
+    assert monday["status"] == "stale_canonical_price"
+    assert monday["max_age_days"] == 0
+    assert monday["latest_obs_date"] == "2026-09-18"
+
+
+@pytest.mark.parametrize(
+    ("symbol", "target_date", "value"),
+    [
+        ("SPY", date(2026, 9, 21), 680.0),  # Monday before US close
+        ("SPY", date(2026, 9, 18), 679.0),  # Friday before US close
+        ("BTC", date(2026, 9, 22), 65000.0),  # UTC day still open
+        ("ETH", date(2026, 9, 22), 3200.0),
+    ],
+)
+def test_same_utc_day_price_is_unscored_even_with_matching_observation_date(
+    mock_engine, symbol: str, target_date: date, value: float,
+) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (value, target_date, target_date)
+
+    with patch("store.astrogrid._utc_today", return_value=target_date):
+        observation = store._lookup_symbol_price(symbol, target_date)
+
+    assert observation["status"] == "open_observation_day"
+    assert observation["price"] is None
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, float("nan"), float("inf"), float("-inf"), "bad"])
+def test_invalid_canonical_price_is_unscored(mock_engine, value) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (value, date(2026, 9, 21), date(2026, 9, 22))
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 23)):
+        observation = store._lookup_symbol_price("SPY", date(2026, 9, 21))
+
+    assert observation["status"] == "invalid_canonical_price"
+    assert observation["price"] is None
+
+
+def test_excursion_path_omits_invalid_canonical_prices(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchall.return_value = [
+        (date(2026, 9, 1), 680.0),
+        (date(2026, 9, 2), None),
+        (date(2026, 9, 3), float("nan")),
+        (date(2026, 9, 4), float("inf")),
+        (date(2026, 9, 5), 0.0),
+        (date(2026, 9, 6), -1.0),
+        (date(2026, 9, 7), 681.0),
+    ]
+
+    path = store._load_price_path("SPY", date(2026, 9, 1), date(2026, 9, 7))
+
+    assert path == [(date(2026, 9, 1), 680.0), (date(2026, 9, 7), 681.0)]
+
+
+def test_future_evaluation_date_rejected_before_price_query(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 22)):
+        observation = store._lookup_symbol_price("BTC", date(2026, 9, 23))
+
+    assert observation["status"] == "future_evaluation_date"
+    mock_engine.connect.assert_not_called()
+
+
+def test_future_release_date_is_unscored(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (681.25, date(2026, 9, 21), date(2026, 9, 24))
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 23)):
+        observation = store._lookup_symbol_price("SPY", date(2026, 9, 21))
+
+    assert observation["status"] == "future_release_date"
+    assert observation["latest_release_date"] == "2026-09-24"
+
+
+def test_weekday_without_same_day_close_is_unscored(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.connect.return_value.__enter__.return_value
+    conn.execute.return_value.fetchone.return_value = (680.0, date(2026, 9, 4), date(2026, 9, 5))
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 8)):
+        observation = store._lookup_symbol_price("SPY", date(2026, 9, 7))
+
+    assert observation["status"] == "stale_canonical_price"
+    assert observation["max_age_days"] == 0
+
+
+@pytest.mark.parametrize(
+    ("symbol", "row", "expected_reason", "expected_phase"),
+    [
+        ("BTC", (65000.0, date(2026, 7, 10), date(2026, 7, 11)), "stale_canonical_price", "outcome"),
+        ("ETH", (3200.0, date(2026, 7, 10), date(2026, 7, 11)), "stale_canonical_price", "outcome"),
+        ("BTC", None, "missing_canonical_price", "entry"),
+    ],
+)
+def test_score_predictions_reports_unscored_without_price_write(
+    mock_engine, symbol: str, row, expected_reason: str, expected_phase: str,
+) -> None:
+    store = AstroGridStore(mock_engine)
+    score_conn = mock_engine.begin.return_value.__enter__.return_value
+    price_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__.return_value = price_conn
+    price_conn.execute.return_value.fetchone.return_value = row
+    prediction = (
+        1, f"pred-{symbol.lower()}", datetime(2026, 7, 10, tzinfo=timezone.utc),
+        "swing", "liquid_market", f'["{symbol}"]', "buy", "setup", "invalidate",
+        "{}", "{}", "{}", "question", None,
+    )
+
+    def execute_score(statement, params=None):
+        if "FROM astrogrid.prediction_run pr" in str(statement):
+            result = MagicMock()
+            result.fetchall.return_value = [prediction]
+            return result
+        raise AssertionError(f"Unexpected score write: {statement}")
+
+    score_conn.execute.side_effect = execute_score
+
+    summary = store.score_predictions(as_of_date=date(2026, 9, 22))
+
+    assert summary["scored"] == 0
+    assert summary["skipped_no_price"] == 1
+    assert summary["unscored"][0]["status"] == "unscored"
+    assert summary["unscored"][0]["reason"] == expected_reason
+    assert summary["unscored"][0]["phase"] == expected_phase
+    assert summary["unscored"][0]["feature"] == f"{symbol.lower()}_full"
+
+
+def test_score_predictions_does_not_write_same_day_spy_outcome(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    score_conn = mock_engine.begin.return_value.__enter__.return_value
+    price_conn = MagicMock()
+    mock_engine.connect.return_value.__enter__.return_value = price_conn
+    prediction = (
+        1, "pred-spy", datetime(2026, 9, 1, tzinfo=timezone.utc),
+        "swing", "liquid_market", '["SPY"]', "buy", "setup", "invalidate",
+        "{}", "{}", "{}", "question", None,
+    )
+
+    def execute_score(statement, params=None):
+        if "FROM astrogrid.prediction_run pr" in str(statement):
+            result = MagicMock()
+            result.fetchall.return_value = [prediction]
+            return result
+        raise AssertionError(f"Unexpected score write: {statement}")
+
+    def execute_price(statement, params):
+        result = MagicMock()
+        day = params["target_date"]
+        result.fetchone.return_value = (680.0, day, day)
+        return result
+
+    score_conn.execute.side_effect = execute_score
+    price_conn.execute.side_effect = execute_price
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 22)):
+        summary = store.score_predictions(as_of_date=date(2026, 9, 22))
+
+    assert summary["scored"] == 0
+    assert summary["unscored"][0]["reason"] == "missing_entry_anchor"
+    assert summary["unscored"][0]["phase"] == "entry"
+    assert summary["unscored"][0]["feature"] == "spy_full"
+
+
+def test_spy_contract_scores_only_frozen_entry_and_declared_outcome(mock_engine) -> None:
+    from price_close_contract import SPY_CLOSE_CONTRACT, SPY_ENTRY_RULE, SPY_OUTCOME_RULE
+
+    store = AstroGridStore(mock_engine)
+    created = datetime(2026, 9, 1, 15, tzinfo=timezone.utc)
+    cutoff = datetime(2026, 9, 22, 15, tzinfo=timezone.utc)
+    entry = {
+        "receipt_id": 10, "raw_series_id": 20, "resolved_series_id": 30,
+        "obs_date": date(2026, 8, 31), "price": 680.0,
+        "available_at": datetime(2026, 9, 1, 0, 30, tzinfo=timezone.utc),
+    }
+    outcome = {
+        "receipt_id": 11, "raw_series_id": 21, "resolved_series_id": 31,
+        "obs_date": date(2026, 9, 8), "price": 700.0,
+        "available_at": datetime(2026, 9, 9, 0, 30, tzinfo=timezone.utc),
+    }
+    anchor = {
+        "version": SPY_CLOSE_CONTRACT, "entry_rule": SPY_ENTRY_RULE,
+        "outcome_rule": SPY_OUTCOME_RULE, "basis": "YF:SPY:close",
+        "symbol": "SPY", "entry_receipt_id": 10,
+        "entry_raw_series_id": 20, "entry_resolved_series_id": 30,
+        "entry_obs_date": "2026-08-31", "entry_price": 680.0,
+        "entry_available_at": entry["available_at"].isoformat(),
+    }
+    store._verified_spy_receipt = MagicMock(side_effect=[entry, outcome])
+    score = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="spy-contract", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": anchor},
+        mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=created, prediction_created_at=created,
+        declared_horizon="swing", score_cutoff=cutoff,
+    )
+
+    assert "unscored" not in score
+    assert score["realized_return"] == round(20 / 680, 6)
+    assert score["benchmark_return"] is None
+    assert score["max_favorable_excursion"] is None
+    assert score["raw_payload"]["price_close_evidence"]["outcome_receipt_id"] == 11
+    assert score["raw_payload"]["price_close_evidence"]["outcome_target_date"] == "2026-09-08"
+    assert store._verified_spy_receipt.call_args_list[0].kwargs["cutoff"] == created
+    assert store._verified_spy_receipt.call_args_list[1].kwargs["cutoff"] == cutoff
+
+    store._verified_spy_receipt.reset_mock(side_effect=True)
+    store._verified_spy_receipt.side_effect = [entry, None]
+    missing = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="spy-contract", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": anchor},
+        mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=created, prediction_created_at=created,
+        declared_horizon="swing", score_cutoff=cutoff,
+    )
+    assert missing["unscored"]["reason"] == "missing_verified_outcome"
+
+
+def test_spy_contract_rejects_backdated_prediction_even_with_anchor(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    store._verified_spy_receipt = MagicMock()
+    result = store._build_prediction_score(
+        conn=MagicMock(), prediction_id="backdated", call="buy SPY",
+        setup="", invalidation="", market_overlay={"price_close_contract": {
+            "version": "spy_close_v1", "entry_rule": "last_verified_close_available_at_creation_v1",
+            "outcome_rule": "first_verified_close_on_or_after_horizon_within_4d_v1",
+            "basis": "YF:SPY:close", "symbol": "SPY",
+        }}, mystical_payload={}, grid_payload={}, target_symbols=["SPY"],
+        start_date=date(2026, 9, 1), evaluation_date=date(2026, 9, 22),
+        prediction_as_of_ts=datetime(2026, 8, 1, tzinfo=timezone.utc),
+        prediction_created_at=datetime(2026, 9, 1, tzinfo=timezone.utc),
+        declared_horizon="swing", score_cutoff=datetime(2026, 9, 22, tzinfo=timezone.utc),
+    )
+    assert result["unscored"]["reason"] == "invalid_entry_anchor"
+    store._verified_spy_receipt.assert_not_called()
+
+
+def test_spy_entry_anchor_is_created_by_store_and_backdated_input_cannot_get_one(mock_engine) -> None:
+    import json
+
+    store = AstroGridStore(mock_engine)
+    store.ensure_lens_set = MagicMock(return_value=None)
+    store.save_prediction_stub_postmortem = MagicMock()
+    store.get_prediction = MagicMock(return_value={"prediction_id": "spy-new"})
+    created = datetime(2026, 9, 1, 15, tzinfo=timezone.utc)
+    receipt = {
+        "receipt_id": 10, "raw_series_id": 20, "resolved_series_id": 30,
+        "obs_date": date(2026, 8, 31), "price": 680.0,
+        "available_at": datetime(2026, 9, 1, 0, 30, tzinfo=timezone.utc),
+    }
+    store._verified_spy_receipt = MagicMock(return_value=receipt)
+    conn = mock_engine.begin.return_value.__enter__.return_value
+    inserted = []
+
+    def execute(statement, params=None):
+        result = MagicMock()
+        if "SELECT NOW()" in str(statement):
+            result.scalar_one.return_value = created
+        elif "INSERT INTO astrogrid.prediction_run" in str(statement):
+            inserted.append(dict(params))
+            result.fetchone.return_value = (42,)
+        else:
+            raise AssertionError(str(statement))
+        return result
+
+    conn.execute.side_effect = execute
+    payload = {
+        "prediction_id": "spy-new", "as_of_ts": created.isoformat(),
+        "price_contract_version": "spy_close_v1", "target_symbols": ["SPY"],
+        "scoring_class": "liquid_market", "live_or_local": "live",
+        "market_overlay_snapshot": {"price_close_contract": {"forged": True}},
+    }
+    assert store.save_prediction(payload) == {"prediction_id": "spy-new"}
+    anchor = json.loads(inserted[0]["market_overlay_snapshot"])["price_close_contract"]
+    assert anchor["entry_receipt_id"] == 10
+    assert "forged" not in anchor
+    assert store._verified_spy_receipt.call_args.kwargs["cutoff"] == created
+
+    store._verified_spy_receipt.reset_mock()
+    payload["as_of_ts"] = datetime(2026, 8, 1, tzinfo=timezone.utc).isoformat()
+    assert store.save_prediction(payload) == {"prediction_id": "spy-new"}
+    assert "price_close_contract" not in json.loads(inserted[1]["market_overlay_snapshot"])
+    store._verified_spy_receipt.assert_not_called()
+
+
+def test_score_predictions_default_evaluation_day_uses_utc(mock_engine) -> None:
+    store = AstroGridStore(mock_engine)
+    conn = mock_engine.begin.return_value.__enter__.return_value
+    conn.execute.return_value.fetchall.return_value = []
+
+    with patch("store.astrogrid._utc_today", return_value=date(2026, 9, 23)):
+        summary = store.score_predictions()
+
+    assert summary["evaluation_date"] == "2026-09-23"
+    assert conn.execute.call_args.args[1]["evaluation_date"] == date(2026, 9, 23)
 
 
 def test_run_learning_loop_retries_backtest_with_scored_date_range() -> None:

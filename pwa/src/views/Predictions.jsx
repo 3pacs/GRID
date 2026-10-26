@@ -352,10 +352,18 @@ function CalibrationChart({ buckets }) {
 
 // ── Prediction Card ───────────────────────────────────────────────────────
 
-function PredictionCard({ pred }) {
+export function PredictionCard({ pred }) {
     const [expanded, setExpanded] = useState(false);
     const isCall = pred.direction === 'CALL' || pred.direction === 'LONG';
-    const confPct = Math.round((pred.confidence || 0) * 100);
+    // D-H11: a prediction that stated no confidence has none to render. `|| 0`
+    // printed "0%" and drew an empty bar, which reads as a measured
+    // no-confidence call. It reads "unscored" — the same word
+    // components/ConfidenceMeter.jsx uses for an unmeasured confidence — and a
+    // genuine measured 0 still renders "0%". The check is `== null`, never
+    // falsiness, because 0 is a measurement.
+    const confPct = pred.confidence == null
+        ? null
+        : Math.round(pred.confidence * 100);
     const signals = pred.signals || [];
     const antiSignals = pred.anti_signals || [];
     const bullSignals = signals.filter(s => s.direction === 'bullish');
@@ -386,22 +394,38 @@ function PredictionCard({ pred }) {
                 </div>
                 <div style={{ textAlign: 'right' }}>
                     <div style={{
-                        fontSize: '16px', fontWeight: 800, fontFamily: mono,
-                        color: confPct > 60 ? colors.green : confPct > 30 ? colors.yellow : colors.textMuted,
-                    }}>
-                        {confPct}%
+                        fontSize: confPct == null ? '12px' : '16px',
+                        fontWeight: 800, fontFamily: mono,
+                        color: confPct == null ? colors.textMuted
+                            : confPct > 60 ? colors.green
+                            : confPct > 30 ? colors.yellow : colors.textMuted,
+                    }} title={confPct == null ? 'No confidence was stated for this prediction' : undefined}>
+                        {confPct == null ? 'unscored' : `${confPct}%`}
                     </div>
                     <div style={{ fontSize: '9px', color: colors.textMuted, letterSpacing: '1px' }}>CONF</div>
                 </div>
             </div>
 
-            <div style={s.confBar}>
-                <div style={s.confFill(confPct)} />
-            </div>
+            {/* An unscored prediction gets a hatched track, not a 0%-wide fill:
+                an empty bar is how a measured 0% confidence looks. */}
+            {confPct == null ? (
+                <div style={{ ...s.confBar, background: 'repeating-linear-gradient(45deg, #1A2840 0 4px, #0D1520 4px 8px)' }}
+                    title="No confidence was stated for this prediction" />
+            ) : (
+                <div style={s.confBar}>
+                    <div style={s.confFill(confPct)} />
+                </div>
+            )}
 
             <div style={s.predMeta}>
                 <div style={s.predMetric}>
-                    <div style={s.predMetricVal}>${pred.entry_price?.toFixed(2) || '---'}</div>
+                    {/* D-M32: entry_price is null when no spot was measured at
+                        publish time. `x?.toFixed(2) || '---'` never fired for the
+                        old 0.0 (not nullish) and printed "$0.00"; an explicit
+                        null check also keeps the "$" off the empty case. */}
+                    <div style={s.predMetricVal}>
+                        {pred.entry_price == null ? '---' : `$${pred.entry_price.toFixed(2)}`}
+                    </div>
                     <div style={s.predMetricLbl}>ENTRY</div>
                 </div>
                 <div style={s.predMetric}>

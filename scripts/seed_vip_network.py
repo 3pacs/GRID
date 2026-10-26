@@ -1539,7 +1539,7 @@ def get_companies():
         ("corp_CIEN", "Ciena Corp", "CIEN", "Technology", 8000000000, "US", "Gary Smith"),
         ("corp_LITE", "Lumentum Holdings", "LITE", "Technology", 5000000000, "US", "Alan Lowe"),
         ("corp_VIAV", "Viavi Solutions", "VIAV", "Technology", 2500000000, "US", "Oleg Khaykin"),
-        ("corp_PSTG", "Pure Storage", "PSTG", "Technology", 18000000000, "US", "Charlie Giancarlo"),
+        ("corp_PSTG", "Everpure", "P", "Technology", 18000000000, "US", "Charlie Giancarlo"),
         ("corp_CDAY", "Ceridian HCM", "CDAY", "Technology", 10000000000, "US", "David Ossip"),
         ("corp_EXPE", "Expedia Group", "EXPE", "Technology", 20000000000, "US", "Peter Kern"),
         ("corp_ABNB2", "Airbnb Inc", "ABNB", "Technology", 90000000000, "US", "Brian Chesky"),

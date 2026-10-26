@@ -7,13 +7,17 @@ using latest available prices from raw_series, and closes trades open > 7 days.
 
 from __future__ import annotations
 
+import os
 import sys
 from datetime import date
 
 from loguru import logger as log
 from sqlalchemy import create_engine, text
 
-DB_URL = "postgresql://grid:gridmaster2026@localhost:5432/griddb"
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import settings  # noqa: E402
+
+DB_URL = settings.DB_URL
 
 # Mapping from paper_trades ticker to raw_series series_id
 # Paper trades use e.g. "xlv_full" -> YF series uses "YF:XLV:close"

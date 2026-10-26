@@ -20,6 +20,7 @@ from intelligence.forensics import (
     _direction_label,
     _event_aligns,
     _safe_float,
+    analyze_move,
     find_significant_moves,
     load_forensic_reports,
     _generate_narrative,
@@ -158,7 +159,7 @@ class TestFindSignificantMoves:
 class TestNarrativeFallback:
     @patch("intelligence.forensics._get_llm_narrative", return_value=None)
     def test_rule_based_narrative(self, mock_llm):
-        narrative = _generate_narrative(
+        narrative, used_llm = _generate_narrative(
             ticker="TSLA",
             move_date="2026-02-01",
             move_pct=0.04,
@@ -170,10 +171,28 @@ class TestNarrativeFallback:
             avg_lead=72.0,
             pattern_match=None,
         )
+        assert used_llm is False
         assert "TSLA" in narrative
         assert "up" in narrative
         assert "Elon Musk" in narrative
         assert "$500,000" in narrative
+
+    @patch("intelligence.forensics._get_llm_narrative", return_value="LLM-written narrative.")
+    def test_llm_narrative_reports_used_llm_true(self, mock_llm):
+        narrative, used_llm = _generate_narrative(
+            ticker="TSLA",
+            move_date="2026-02-01",
+            move_pct=0.04,
+            move_dir="up",
+            preceding=[],
+            aligned_count=0,
+            key_actors=[],
+            total_flow=0,
+            avg_lead=0,
+            pattern_match=None,
+        )
+        assert used_llm is True
+        assert narrative == "LLM-written narrative."
 
 
 # ── load_forensic_reports ─────────────────────────────────────────────────
@@ -183,3 +202,52 @@ class TestLoadForensicReports:
     def test_empty_result(self, mock_engine):
         reports = load_forensic_reports(mock_engine, "NVDA", days=90)
         assert reports == []
+
+
+# ── analyze_move honesty labeling (Wave 3 #9) ────────────────────────────
+# GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md: "label 'LLM narrative,
+# generated <ts>'" — the narrative text itself was unlabelled and undated.
+
+
+class TestAnalyzeMoveNarrativeLabel:
+    def _mock_move(self):
+        return [{"date": "2026-09-20", "close": 100.0, "pct_change": 0.05, "direction": "up"}]
+
+    @patch("intelligence.forensics._store_report")
+    @patch("intelligence.event_sequence.find_recurring_patterns", return_value=[])
+    @patch("intelligence.event_sequence._get_price_series", return_value=[])
+    @patch("intelligence.event_sequence.build_sequence", return_value=[])
+    @patch("intelligence.forensics._get_llm_narrative", return_value=None)
+    @patch("intelligence.forensics._get_price_moves")
+    def test_rule_based_fallback_is_labelled_honestly(
+        self, mock_prices, mock_llm, mock_build_seq, mock_price_series,
+        mock_patterns, mock_store,
+    ):
+        mock_prices.return_value = self._mock_move()
+
+        report = analyze_move(MagicMock(), "AAA", "2026-09-20", persist=False)
+
+        assert report is not None
+        assert report.generated_at  # non-empty ISO timestamp
+        assert report.narrative_label.startswith("Rule-based narrative (LLM unavailable)")
+        assert report.generated_at in report.narrative_label
+        mock_store.assert_not_called()  # persist=False
+
+    @patch("intelligence.forensics._store_report")
+    @patch("intelligence.event_sequence.find_recurring_patterns", return_value=[])
+    @patch("intelligence.event_sequence._get_price_series", return_value=[])
+    @patch("intelligence.event_sequence.build_sequence", return_value=[])
+    @patch("intelligence.forensics._get_llm_narrative", return_value="A local LLM narrative.")
+    @patch("intelligence.forensics._get_price_moves")
+    def test_llm_narrative_is_labelled_as_llm(
+        self, mock_prices, mock_llm, mock_build_seq, mock_price_series,
+        mock_patterns, mock_store,
+    ):
+        mock_prices.return_value = self._mock_move()
+
+        report = analyze_move(MagicMock(), "AAA", "2026-09-20", persist=False)
+
+        assert report is not None
+        assert report.narrative == "A local LLM narrative."
+        assert report.narrative_label.startswith("LLM narrative (local), generated")
+        assert report.generated_at in report.narrative_label

@@ -997,7 +997,14 @@ function LagExplorerTab() {
 }
 
 // ---------- Main Component ----------
-export default function AssociationsLegacy() {
+// This is the classic tab-based correlation/clustering UI. It is superseded
+// by the card-feed view in Associations.jsx (see that file's header comment)
+// and deliberately kept off the drawer/tab nav in routes.js + app.jsx --
+// reachable only by direct link or the "classic view" pointer the new view
+// offers. The route stays live (same backend data, same tabs) for anyone
+// who lands here directly; this banner is the honest label the board asked
+// for instead of silently pretending it is still the primary view.
+export default function AssociationsLegacy({ onBack }) {
     const [tab, setTab] = useState('heatmap');
     const { isMobile } = useDevice();
 
@@ -1014,7 +1021,32 @@ export default function AssociationsLegacy() {
 
     return (
         <div style={s.container}>
-            <div style={s.title}>ASSOCIATIONS</div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', flexWrap: 'wrap', gap: tokens.space.sm }}>
+                <div style={s.title}>ASSOCIATIONS &mdash; CLASSIC VIEW</div>
+                {onBack && (
+                    <button
+                        onClick={onBack}
+                        style={{
+                            ...shared.buttonSmall,
+                            background: colors.card, border: `1px solid ${colors.border}`,
+                            color: colors.textMuted,
+                        }}
+                    >
+                        &larr; Back to Associations
+                    </button>
+                )}
+            </div>
+            <div style={{
+                fontSize: tokens.fontSize.xs, color: colors.textMuted,
+                background: `${colors.accent}11`, border: `1px solid ${colors.accent}33`,
+                borderRadius: tokens.radius.sm, padding: '8px 12px', marginBottom: tokens.space.md,
+                lineHeight: 1.5,
+            }}>
+                This tab layout is the older correlation/clustering UI. It is superseded by the
+                prioritized insight feed on the Associations page — this view stays available for
+                anyone who wants the classic matrix/table layout, but is no longer linked from
+                the main navigation.
+            </div>
             <div style={s.tabs}>
                 {TABS.map(t => (
                     <button key={t.id} onClick={() => setTab(t.id)} style={s.tab(tab === t.id)}>

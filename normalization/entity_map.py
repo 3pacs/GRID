@@ -10,11 +10,139 @@ from __future__ import annotations
 
 import difflib
 import re
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+SELECTED_SOURCE_NAMES = {
+    "fx_rates": "yfinance",
+    "ag_commodity_futures": "YFINANCE_COMMODITY_FUTURES",
+    "finra_short_volume": "FINRA_SHORT_VOLUME",
+    "sec_ftd": "SEC_FTD",
+    "nyfed_gscpi": "NYFED_GSCPI",
+    "baltic_exchange": "Baltic_Exchange",
+    "quiverquant": "quiverquant",
+}
+SELECTED_ROW_CAP = 4096
+SELECTED_QUERY_TIMEOUT_MS = 5000
+
+
+def validate_selected_request(
+    selections: list[dict] | None, *, as_of: datetime, start_date: date,
+    vintage_policy: str = "LATEST_AS_OF",
+) -> dict:
+    """Validate a finite caller-declared selection without reading or registering.
+
+    Names and IDs are expectations, not evidence that a registry row exists.
+    The selected mapper verifies them against separately supplied registry rows.
+    """
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be an aware datetime")
+    cutoff = as_of.astimezone(timezone.utc)
+    if type(start_date) is not date or not 0 <= (cutoff.date() - start_date).days <= 251:
+        raise ValueError("observation range must contain 1..252 UTC dates")
+    if type(vintage_policy) is not str or vintage_policy not in ("FIRST_RELEASE", "LATEST_AS_OF"):
+        raise ValueError("invalid vintage_policy")
+    if selections is None:
+        selections = []
+    if type(selections) is not list or len(selections) > 7:
+        raise ValueError("at most seven selections are allowed")
+    allowed = {"source_key", "scope", "ticker_or_cusip", "series_id",
+               "expected_source_name", "feature_name", "feature_id", "freshness_policy"}
+    scopes = {"ticker", "cusip", "global", "currency", "contract", "index"}
+    selected = {}
+    feature_ids = set()
+    for original in selections:
+        if type(original) is not dict or set(original) - allowed:
+            raise ValueError("invalid selection fields")
+        row = dict(original)
+        key = row.get("source_key")
+        if type(key) is not str or key not in SELECTED_SOURCE_NAMES or key in selected:
+            raise ValueError("source_key must be unique and closed")
+        for field in ("scope", "ticker_or_cusip", "series_id", "expected_source_name", "feature_name"):
+            value = row.get(field)
+            if value is not None and (type(value) is not str or not value or
+                                      value != value.strip() or len(value) > 128 or
+                                      any(ord(c) < 32 for c in value)):
+                raise ValueError("invalid selection string")
+        if row.get("scope") is not None and row["scope"] not in scopes:
+            raise ValueError("invalid selection scope")
+        if row.get("expected_source_name") not in (None, SELECTED_SOURCE_NAMES[key]):
+            raise ValueError("source name does not match source_key")
+        fid = row.get("feature_id")
+        if fid is not None and (type(fid) is not int or not 0 < fid <= 2**63 - 1):
+            raise ValueError("feature_id must be a positive integer")
+        if (fid is None) != (row.get("feature_name") is None):
+            raise ValueError("feature name and ID must be supplied together")
+        if fid is not None:
+            if fid in feature_ids:
+                raise ValueError("selected feature bindings must be distinct")
+            feature_ids.add(fid)
+        if all(row.get(f) is not None for f in
+               ("series_id", "expected_source_name", "feature_name", "feature_id")):
+            if row.get("scope") not in scopes:
+                raise ValueError("bound selection needs an explicit scope")
+            if row["scope"] != "global" and row.get("ticker_or_cusip") is None:
+                raise ValueError("bound scope needs an explicit identity")
+        sid = row.get("series_id")
+        patterns = {
+            "fx_rates": r"FX:[A-Z]{3}:close",
+            "ag_commodity_futures": r"YF:[A-Z0-9^=._-]{1,32}:close",
+            "finra_short_volume": r"finra:short_volume:[A-Z0-9.-]{1,32}",
+            "sec_ftd": r"sec:ftd_balance:[A-Z0-9]{9}",
+            "nyfed_gscpi": r"NYFED:gscpi",
+            "baltic_exchange": r"baltic\.(?:bdi|capesize|panamax|supramax|handysize)",
+        }
+        if sid is not None and key in patterns and not re.fullmatch(patterns[key], sid):
+            raise ValueError("series namespace does not match source_key")
+        expected_scopes = {"fx_rates": "currency", "ag_commodity_futures": "contract",
+                           "finra_short_volume": "ticker", "sec_ftd": "cusip",
+                           "nyfed_gscpi": "global", "baltic_exchange": "index",
+                           "quiverquant": "ticker"}
+        if row.get("scope") is not None and row["scope"] != expected_scopes[key]:
+            raise ValueError("scope does not match source family")
+        if sid is not None and row.get("ticker_or_cusip") is not None:
+            identities = {"fx_rates": sid.split(":")[1] if key == "fx_rates" else None,
+                          "ag_commodity_futures": sid.split(":")[1] if key == "ag_commodity_futures" else None,
+                          "finra_short_volume": sid.rsplit(":", 1)[-1],
+                          "sec_ftd": sid.rsplit(":", 1)[-1],
+                          "baltic_exchange": sid.rsplit(".", 1)[-1].upper()}
+            if key in identities and identities[key] != row["ticker_or_cusip"]:
+                raise ValueError("declared identity does not match selected series")
+        policy = row.get("freshness_policy")
+        if policy is not None:
+            if (type(policy) is not dict or set(policy) != {"max_age_days"} or
+                    type(policy["max_age_days"]) is not int or
+                    not 0 <= policy["max_age_days"] <= 252):
+                raise ValueError("invalid declared freshness policy")
+            row["freshness_policy"] = dict(policy)
+        selected[key] = row
+    return {"selections": [selected.get(k, {"source_key": k}) for k in SELECTED_SOURCE_NAMES],
+            "as_of": cutoff, "start_date": start_date, "vintage_policy": vintage_policy}
+
+
+def canonical_feature_name(series_id: str) -> str:
+    """Convert a raw series id into the canonical ``feature_registry.name``.
+
+    Centralised here so every auto-registration code path normalizes the
+    same way. A raw dotted id (``ephemeris.tithi_index``) and its
+    underscore form (``ephemeris_tithi_index``) MUST resolve to the same
+    feature_registry row — never two. Any code that mints a new
+    feature_registry row from a raw series_id should call this first (or
+    use ``EntityMap.ensure_canonical_feature``) rather than inserting the
+    raw series_id as ``name`` directly.
+
+    See the 2026-03-29 ephemeris duplication (F8 investigation,
+    docs/... GRID-FUTURE-DATED-ROWS-20260927.md): feature_ids 27734-27739
+    (canonical, underscore) and 27740-27745 (duplicate, raw dotted) were
+    created 10 minutes apart because the writer did not normalize first.
+    """
+    return series_id.strip().replace(".", "_")
+
 
 # Hardcoded seed mappings: raw series_id -> feature_registry.name
 SEED_MAPPINGS: dict[str, str] = {
@@ -249,11 +377,11 @@ SEED_MAPPINGS: dict[str, str] = {
     "baltic.panamax": "baltic.panamax",
     "baltic.supramax": "baltic.supramax",
 
-    # ── CFTC COT positioning series (pattern: cftc.{CONTRACT}.{metric}) ───
-    # Major contracts: SP500, DJIA, NASDAQ, NOTE10Y, NOTE5Y, NOTE2Y,
-    # EURODOLLAR, GOLD, SILVER, CRUDE_OIL, NATGAS, COPPER, CORN,
-    # SOYBEANS, WHEAT, VIX
-    # (These use dynamic series_id like cftc.SP500.net_speculative)
+    # ── CFTC COT positioning series (pattern: cftc.{MARKET_CODE}.{metric}) ─
+    # Keyed by cftc_contract_market_code, e.g. cftc.13874A.net_speculative
+    # (E-mini S&P 500). Registry: ingestion/altdata/cftc_markets.py.
+    # Legacy name-matched ids (cftc.SP500.*, cftc.GOLD.* ...) mixed several
+    # markets per id; they are frozen history, not mapped to features.
 
     # ── Comtrade series (puller writes labels directly as series_id) ───────
     "us_exports_total": "us_exports_total",
@@ -702,6 +830,29 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CG:bittensor:close": "tao_chain_market_cap",
     "CG:bittensor:volume": "tao_chain_total_volume",
 
+    # CoinGecko live USD spot quotes (ingestion/coingecko.py writes
+    # CG:<coingecko id>:usd to raw_series; E1-V6). These are the *_usd_full
+    # features the puller used to write into resolved_series directly, now
+    # reached through the resolver. The value is the FIRST spot quote GRID
+    # stored for that UTC quote day -- not a daily close, whatever the legacy
+    # feature_registry description says. BTC, ETH and SOL are deliberately
+    # NOT mapped: btc_usd_full / eth_usd_full / sol_usd_full are fed by the
+    # yfinance daily close (YF:BTC-USD:close, YF:ETH-USD:close,
+    # YF:SOL-USD:close above), and a spot quote from a second series would race
+    # it for the same (feature, obs_date, vintage_date) key (the resolver
+    # inserts ON CONFLICT DO NOTHING, so first writer wins).
+    # tests/test_e1_registry_writer_fixes.py keeps every CG target single-fed.
+    # CG:bitcoin:usd stays in raw_series (thesis_scorer reads it directly).
+    **{f"CG:{cg_id}:usd": f"{ticker}_usd_full" for ticker, cg_id in (
+        ("bnb", "binancecoin"), ("xrp", "ripple"),
+        ("tao", "bittensor"), ("doge", "dogecoin"), ("ada", "cardano"),
+        ("avax", "avalanche-2"), ("link", "chainlink"), ("dot", "polkadot"),
+        ("matic", "matic-network"), ("uni", "uniswap"), ("aave", "aave"),
+        ("mkr", "maker"), ("snx", "havven"), ("crv", "curve-dao-token"),
+        ("shib", "shiba-inu"), ("ltc", "litecoin"), ("atom", "cosmos"),
+        ("near", "near"),
+    )},
+
     # DeFi (DeFiLlama + DexScreener)
     "DEFILLAMA:solana_dex_volume": "dex_sol_volume_24h",
     "DEFILLAMA:solana_tvl": "dex_sol_liquidity",
@@ -1023,6 +1174,38 @@ class EntityMap:
             including misses (None), so a repeated miss costs no lookup.
     """
 
+    @classmethod
+    def for_selected_bindings(cls, selections: list[dict], registry_rows: list[dict]) -> EntityMap:
+        """An inert mapper over at most seven independently read registry rows.
+
+        No constructor, database, static-map mutation, fuzzy fallback, registration
+        or freshness query runs here. A caller expectation earns a mapping only
+        when both its name and ID match an actual supplied registry row.
+        """
+        if type(selections) is not list or len(selections) > 7:
+            raise ValueError("selected mapping exceeds seven selectors")
+        if type(registry_rows) is not list or len(registry_rows) > 7:
+            raise ValueError("selected registry exceeds seven rows")
+        registry = {}
+        names = set()
+        for row in registry_rows:
+            if (type(row) is not dict or type(row.get("id")) is not int or
+                    row["id"] <= 0 or type(row.get("name")) is not str or
+                    row["id"] in registry or row["name"] in names):
+                raise ValueError("ambiguous selected registry")
+            registry[row["id"]] = row["name"]
+            names.add(row["name"])
+        obj = cls.__new__(cls)
+        obj._selected_bindings = {}
+        for row in selections:
+            sid = row.get("series_id")
+            fid = row.get("feature_id")
+            if sid is not None and fid is not None and registry.get(fid) == row.get("feature_name"):
+                if sid in obj._selected_bindings and obj._selected_bindings[sid] != fid:
+                    raise ValueError("one series cannot bind two features")
+                obj._selected_bindings[sid] = fid
+        return obj
+
     def __init__(self, db_engine: Engine) -> None:
         """Initialise the entity mapper.
 
@@ -1099,6 +1282,8 @@ class EntityMap:
         Returns:
             int: The feature_registry.id if a mapping exists, None otherwise.
         """
+        if hasattr(self, "_selected_bindings"):
+            return self._selected_bindings.get(series_id)
         feature_name = SEED_MAPPINGS.get(series_id)
         if feature_name is None:
             pattern_id = self._resolve_by_pattern(series_id)
@@ -1139,6 +1324,76 @@ class EntityMap:
         count = self._miss_counts.get(series_id, 0) + 1
         self._miss_counts[series_id] = count
         return count
+
+    def ensure_canonical_feature(
+        self,
+        series_id: str,
+        *,
+        family: str = "alternative",
+        description: str | None = None,
+        eligible_from_date: date | None = None,
+        model_eligible: bool = True,
+    ) -> int:
+        """Look up or create the feature_registry row for a raw series_id,
+        always under its canonical name.
+
+        This is the guarded path for auto-registration: it never inserts
+        the raw ``series_id`` as ``name`` directly, so a dotted raw id
+        (``ephemeris.tithi_index``) can never mint a second,
+        un-normalized feature_registry row alongside the canonical
+        underscore id (``ephemeris_tithi_index``). Any ingestion/backfill
+        code that currently does its own
+        ``INSERT INTO feature_registry (name, ...) VALUES (:series_id, ...)``
+        from a raw series_id should call this instead.
+
+        Parameters:
+            series_id: Raw series identifier as produced by a puller
+                (may contain dots, e.g. ``ephemeris.tithi_index``).
+            family: feature_registry.family for a newly-created row.
+            description: feature_registry.description; defaults to the
+                canonical name with underscores replaced by spaces.
+            eligible_from_date: feature_registry.eligible_from_date;
+                defaults to 2000-01-01.
+            model_eligible: feature_registry.model_eligible for a new row.
+
+        Returns:
+            int: feature_registry.id for the canonical name (existing or
+            newly created).
+        """
+        canonical_name = canonical_feature_name(series_id)
+
+        feature_id = self._feature_cache.get(canonical_name)
+        if feature_id is not None:
+            return feature_id
+
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(
+                    "INSERT INTO feature_registry "
+                    "(name, family, description, transformation, "
+                    "transformation_version, lag_days, normalization, "
+                    "missing_data_policy, eligible_from_date, model_eligible) "
+                    "VALUES (:name, :family, :description, 'RAW', 1, 0, "
+                    "'ZSCORE', 'FORWARD_FILL', :eligible_from_date, "
+                    ":model_eligible) "
+                    "ON CONFLICT (name) DO NOTHING"
+                ),
+                {
+                    "name": canonical_name,
+                    "family": family,
+                    "description": description or canonical_name.replace("_", " "),
+                    "eligible_from_date": eligible_from_date or date(2000, 1, 1),
+                    "model_eligible": model_eligible,
+                },
+            )
+            row = conn.execute(
+                text("SELECT id FROM feature_registry WHERE name = :name"),
+                {"name": canonical_name},
+            ).fetchone()
+
+        feature_id = row[0]
+        self._feature_cache[canonical_name] = feature_id
+        return feature_id
 
     def missing_feature_report(self) -> dict[str, Any]:
         """Summarise every lookup this instance could not resolve.

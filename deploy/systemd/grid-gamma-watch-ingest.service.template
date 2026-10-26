@@ -1,0 +1,19 @@
+# DESIGN ONLY. NOT INSTALLED. No writer implemented; activation fails closed.
+[Unit]
+Description=GRID Gamma Watch ingestion (disabled design)
+After=network.target postgresql.service
+# Deliberately unsatisfied without a separately approved deployment decision.
+ConditionPathExists=/etc/grid/approvals/gamma-watch-ingest
+
+[Service]
+Type=oneshot
+User=grid
+WorkingDirectory=/data/grid_v4/grid_release
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=GRID_ENABLE_GAMMA_WATCH_INGEST_JOB=false
+ExecStart=/usr/bin/python3 scripts/run_gamma_watch_ingest.py
+TimeoutStartSec=60
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+# No [Install] section. Do not install or start this design template.

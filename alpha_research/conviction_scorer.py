@@ -29,6 +29,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from alpha_research.data.split_adjuster import adjust_splits
+from store.pit import retraction_cutoff
 
 
 @dataclass(frozen=True)
@@ -67,9 +68,17 @@ def _load_latest(
         WHERE fr.name = :n
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
+          AND NOT EXISTS (
+              SELECT 1 FROM resolved_series_retractions rr
+              WHERE rr.feature_id = rs.feature_id
+                AND rr.obs_date = rs.obs_date
+                AND rr.vintage_date = rs.vintage_date
+                AND rr.retracted_at <= :retraction_cutoff
+          )
         ORDER BY rs.obs_date DESC, rs.release_date DESC, rs.vintage_date DESC
         LIMIT 1
-    """), {"n": feature_name, "as_of": as_of}).fetchone()
+    """), {"n": feature_name, "as_of": as_of,
+           "retraction_cutoff": retraction_cutoff(as_of)}).fetchone()
     return float(row[0]) if row else None
 
 
@@ -90,6 +99,7 @@ def _load_raw_latest(
             SELECT value FROM raw_series
             WHERE series_id >= :lo AND series_id < :hi
               AND source_id = :s
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :as_of
               AND pull_timestamp::date <= :as_of
             ORDER BY obs_date DESC, pull_timestamp DESC
@@ -99,6 +109,7 @@ def _load_raw_latest(
         row = conn.execute(text("""
             SELECT value FROM raw_series
             WHERE series_id >= :lo AND series_id < :hi
+              AND pull_status = 'SUCCESS'
               AND obs_date <= :as_of
               AND pull_timestamp::date <= :as_of
             ORDER BY obs_date DESC, pull_timestamp DESC
@@ -119,6 +130,7 @@ def _load_raw_series(
     rows = conn.execute(text("""
         SELECT obs_date, value FROM raw_series
         WHERE series_id = :s
+          AND pull_status = 'SUCCESS'
           AND obs_date >= :d
           AND obs_date <= :as_of
           AND pull_timestamp::date <= :as_of
@@ -142,8 +154,16 @@ def _load_price(
         WHERE fr.name = :n
           AND rs.obs_date <= :as_of
           AND rs.release_date <= :as_of
+          AND NOT EXISTS (
+              SELECT 1 FROM resolved_series_retractions rr
+              WHERE rr.feature_id = rs.feature_id
+                AND rr.obs_date = rs.obs_date
+                AND rr.vintage_date = rs.vintage_date
+                AND rr.retracted_at <= :retraction_cutoff
+          )
         ORDER BY rs.obs_date, rs.release_date, rs.vintage_date
-    """), {"n": feat, "as_of": as_of}).fetchall()
+    """), {"n": feat, "as_of": as_of,
+           "retraction_cutoff": retraction_cutoff(as_of)}).fetchall()
     if not rows:
         return pd.Series(dtype=float)
     s = pd.Series([r[1] for r in rows], index=pd.to_datetime([r[0] for r in rows]))

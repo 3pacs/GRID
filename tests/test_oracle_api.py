@@ -130,15 +130,18 @@ class TestGetPredictionsPaginationEnvelope:
         from api.routers import oracle as mod
 
         # total=100, offset=0, limit=10 → (0+10) < 100 ⇒ has_more=True.
-        # Build a single result row with the 23 columns the SELECT projects.
-        # Use verdict='hit' (non-'pending') so the tracking-pnl branch at
-        # oracle.py:124 stays inert and we only need the count + select
-        # results queued on the conn.execute side_effect.
+        # Build a single result row with the 24 columns the SELECT projects
+        # (23 plus null_write_policy — the historical-NULL provenance
+        # boundary stamp, packet 2a item (a)). Use verdict='hit'
+        # (non-'pending') so the tracking-pnl branch at oracle.py:124 stays
+        # inert and we only need the count + select results queued on the
+        # conn.execute side_effect.
         now = datetime(2026, 5, 19, tzinfo=timezone.utc)
         fake_row = (
             "pred-1", now, "AAPL", "options", "CALL", 200.0, 180.0,
             "2026-06-19", 0.7, 5.0, 0.6, 0.8, "model-a", "v1",
             [], [], {}, "hit", 210.0, 16.6, 16.6, now, "scored",
+            "oracle_pred_nullable_0918",
         )
         with patch.object(mod, "get_db_engine",
                           return_value=self._patched_engine(total=100, rows=[fake_row])):
@@ -153,16 +156,20 @@ class TestGetPredictionsPaginationEnvelope:
         assert result["has_more"] is True
         assert len(result["predictions"]) == 1
         assert result["predictions"][0]["ticker"] == "AAPL"
+        assert result["predictions"][0]["null_write_policy"] == "oracle_pred_nullable_0918"
 
     def test_has_more_false_on_last_page(self):
         from api.routers import oracle as mod
 
         # total=20, offset=10, limit=10 → (10+10) < 20 is False, last page.
+        # 24 columns — see the comment in test_has_more_true_when_more_
+        # pages_exist above.
         now = datetime(2026, 5, 19, tzinfo=timezone.utc)
         fake_row = (
             "pred-2", now, "NVDA", "options", "PUT", 100.0, 120.0,
             "2026-06-19", 0.55, -3.0, 0.4, 0.7, "model-b", "v1",
             [], [], {}, "miss", 130.0, 8.3, -8.3, now, "scored",
+            None,
         )
         with patch.object(mod, "get_db_engine",
                           return_value=self._patched_engine(total=20, rows=[fake_row])):
@@ -175,3 +182,4 @@ class TestGetPredictionsPaginationEnvelope:
         assert result["limit"] == 10
         assert result["offset"] == 10
         assert result["has_more"] is False
+        assert result["predictions"][0]["null_write_policy"] is None

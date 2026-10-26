@@ -57,6 +57,8 @@ function normalizeLessons(payload) {
 export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMobile = false }) {
     const [lessons, setLessons] = useState([]);
     const [generatedAt, setGeneratedAt] = useState(null);
+    const [label, setLabel] = useState(null);
+    const [note, setNote] = useState(null);
     const [loading, setLoading] = useState(false);
     const [refreshing, setRefreshing] = useState(false);
     const [error, setError] = useState(null);
@@ -78,6 +80,8 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
             } else {
                 setLessons(normalizeLessons(result));
                 setGeneratedAt(result?.generated_at || null);
+                setLabel(result?.label || null);
+                setNote(result?.note || null);
             }
         } catch (err) {
             if (mountedRef.current) {
@@ -128,7 +132,8 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
                         letterSpacing: '1.5px', color: colors.textMuted,
                     }}>LESSONS LEARNED</span>
                     {generatedAt && (
-                        <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
+                        <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}
+                            title={label || undefined}>
                             {timeAgo(generatedAt)}
                         </span>
                     )}
@@ -155,6 +160,13 @@ export default function LessonsWidget({ n = DEFAULT_N, days = DEFAULT_DAYS, isMo
                     {refreshing ? 'Regenerating' : 'Refresh'}
                 </button>
             </div>
+
+            {label && !error && !isBusy && (
+                <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim,
+                    marginBottom: '8px', fontStyle: 'italic' }}>
+                    {label}
+                </div>
+            )}
 
             {/* Body */}
             {error ? (

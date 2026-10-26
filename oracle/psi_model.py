@@ -115,6 +115,7 @@ def _load_latest_value(engine: Engine, feature_name: str) -> float | None:
                 FROM resolved_series rs
                 JOIN feature_registry fr ON rs.feature_id = fr.id
                 WHERE fr.name = :name
+                AND rs.obs_date <= CURRENT_DATE
                 ORDER BY rs.obs_date DESC
                 LIMIT 1
             """),

@@ -105,9 +105,10 @@ def _gather_celestial_state(engine: Engine) -> dict[str, Any]:
                     "  OR LOWER(fr.name) LIKE '%rahu%' OR LOWER(fr.name) LIKE '%dasha%' "
                     "  OR LOWER(fr.name) LIKE '%eclipse%' OR LOWER(fr.name) LIKE '%celestial%' "
                     ") "
+                    "AND rs.obs_date <= CURRENT_DATE "
                     "AND rs.obs_date = ("
                     "  SELECT MAX(obs_date) FROM resolved_series "
-                    "  WHERE feature_id = rs.feature_id"
+                    "  WHERE feature_id = rs.feature_id AND obs_date <= CURRENT_DATE"
                     ") "
                     "ORDER BY fr.name"
                 )

@@ -1,0 +1,19 @@
+# TEMPLATE — NOT INSTALLED. See grid-dollar-flows.service.template.
+# Daily, well after the morning Form 4 / QuiverQuant / dark-pool pulls
+# (~04:00 and ~06:35 UTC) and after grid-flow-materializer's 30-min cadence.
+# Placed OUTSIDE the nightly core pg_dump window (observed 03:33-10:05Z on
+# 2026-09-28 — the "~03:30-08:10Z" estimate in
+# feedback-grid-migration-backup-window.md undersold it) — 30 minutes after
+# grid-causal-links.timer (also moved off its old 07:40 UTC slot in this
+# same PR for the same reason; see #712 review).
+[Unit]
+Description=Run the GRID dollar-flows normalizer once a day
+
+[Timer]
+OnCalendar=*-*-* 11:45:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=grid-dollar-flows.service
+
+[Install]
+WantedBy=timers.target

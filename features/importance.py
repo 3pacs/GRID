@@ -532,6 +532,7 @@ class FeatureImportanceTracker:
         model_id: int,
         as_of_date: date,
         n_repeats: int = 10,
+        persist: bool = True,
     ) -> dict[str, float]:
         """Compute permutation importance for all features in a model.
 
@@ -543,9 +544,14 @@ class FeatureImportanceTracker:
             model_id: Model registry ID.
             as_of_date: Decision date for PIT-correct data access.
             n_repeats: Number of shuffle repetitions (default 10).
+            persist: Append the scores to ``feature_importance_log``. The
+                scheduled analytics job passes False (it only publishes a
+                snapshot; the log is a learning-loop table).
 
         Returns:
             dict of feature_name -> importance_score (0-1 normalised).
+            Empty when importance cannot be measured (no model, no data,
+            or a constant model score).
         """
         log.info(
             "Computing permutation importance -- model={m}, as_of={d}, repeats={r}",
@@ -582,11 +588,10 @@ class FeatureImportanceTracker:
         baseline_var = baseline_scores.var()
 
         if baseline_var == 0 or np.isnan(baseline_var):
+            # A constant score means importance is unmeasurable, not zero:
+            # report nothing rather than a row of fabricated 0.0 scores.
             log.warning("Baseline score variance is zero; cannot measure importance")
-            return {
-                feature_names.get(fid, f"feature_{fid}"): 0.0
-                for fid in feature_ids
-            }
+            return {}
 
         importance_raw: dict[str, float] = {}
         rng = np.random.default_rng(seed=42)
@@ -619,7 +624,8 @@ class FeatureImportanceTracker:
         }
 
         # Persist to feature_importance_log
-        self._persist_importance(model_id, feature_names, importance, as_of_date, "permutation")
+        if persist:
+            self._persist_importance(model_id, feature_names, importance, as_of_date, "permutation")
 
         log.info(
             "Permutation importance computed -- {n} features, top={t}",
@@ -775,10 +781,11 @@ class FeatureImportanceTracker:
 
             series = matrix[fid].dropna()
             if len(series) < window:
+                # Not enough history to measure: unknown, not "unstable".
                 results[fname] = {
-                    "mean_importance": 0.0,
-                    "std_importance": 0.0,
-                    "stability_score": 0.0,
+                    "mean_importance": None,
+                    "std_importance": None,
+                    "stability_score": None,
                 }
                 continue
 
@@ -794,9 +801,9 @@ class FeatureImportanceTracker:
 
             if rolling_zscore.empty:
                 results[fname] = {
-                    "mean_importance": 0.0,
-                    "std_importance": 0.0,
-                    "stability_score": 0.0,
+                    "mean_importance": None,
+                    "std_importance": None,
+                    "stability_score": None,
                 }
                 continue
 
@@ -823,6 +830,7 @@ class FeatureImportanceTracker:
         self,
         model_id: int,
         as_of_date: date | None = None,
+        persist: bool = True,
     ) -> dict[str, Any]:
         """Generate a complete feature importance report.
 
@@ -832,10 +840,17 @@ class FeatureImportanceTracker:
         Parameters:
             model_id: Model registry ID.
             as_of_date: Decision date (default: today).
+            persist: Forwarded to ``compute_permutation_importance``.
 
         Returns:
             dict with keys: model_id, as_of_date, permutation_importance,
             regime_correlation, rolling_stability, summary.
+
+            A component that could not be measured for a feature is None in
+            its summary row (never 0.0 / p=1.0), and ``composite_score`` is
+            the weighted mean of the components that were measured
+            (weights 0.5 permutation, 0.3 |regime corr|, 0.2 stability,
+            renormalised); it is None when none were.
         """
         if as_of_date is None:
             as_of_date = date.today()
@@ -854,7 +869,7 @@ class FeatureImportanceTracker:
             return {"error": f"Model {model_id} has no features"}
 
         perm_importance = self.compute_permutation_importance(
-            model_id, as_of_date
+            model_id, as_of_date, persist=persist,
         )
         regime_corr = self.compute_regime_correlation(
             feature_ids, as_of_date
@@ -869,30 +884,41 @@ class FeatureImportanceTracker:
 
         for fid in feature_ids:
             fname = feature_names.get(fid, f"feature_{fid}")
-            perm_score = perm_importance.get(fname, 0.0)
-            corr_info = regime_corr.get(fname, {})
-            stab_info = stability.get(fname, {})
+            perm_score = perm_importance.get(fname)
+            corr_info = regime_corr.get(fname) or {}
+            stab_info = stability.get(fname) or {}
 
-            # Composite score: weighted average of normalised metrics
-            corr_abs = abs(corr_info.get("correlation", 0.0))
-            stab_score = stab_info.get("stability_score", 0.0)
-            composite = round(
-                0.5 * perm_score + 0.3 * corr_abs + 0.2 * stab_score, 6
-            )
+            corr_val = corr_info.get("correlation")
+            stab_score = stab_info.get("stability_score")
+            components = [
+                (0.5, perm_score),
+                (0.3, abs(corr_val) if corr_val is not None else None),
+                (0.2, stab_score),
+            ]
+            measured = [(w, v) for w, v in components if v is not None]
+            if measured:
+                total_w = sum(w for w, _ in measured)
+                composite = round(sum(w * v for w, v in measured) / total_w, 6)
+            else:
+                composite = None
 
             summary.append({
                 "feature_name": fname,
                 "feature_id": fid,
                 "permutation_importance": perm_score,
-                "regime_correlation": corr_info.get("correlation", 0.0),
-                "regime_p_value": corr_info.get("p_value", 1.0),
-                "regime_lead_days": corr_info.get("lead_days", 0),
+                "regime_correlation": corr_val,
+                "regime_p_value": corr_info.get("p_value"),
+                "regime_lead_days": corr_info.get("lead_days"),
                 "stability_score": stab_score,
                 "composite_score": composite,
+                "components_measured": len(measured),
             })
 
-        # Sort by composite score descending
-        summary.sort(key=lambda x: x["composite_score"], reverse=True)
+        # Sort by composite score descending; unmeasured rows last
+        summary.sort(
+            key=lambda x: (x["composite_score"] is not None, x["composite_score"] or 0.0),
+            reverse=True,
+        )
 
         report: dict[str, Any] = {
             "model_id": model_id,

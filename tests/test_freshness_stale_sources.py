@@ -65,7 +65,14 @@ def test_freshness_returns_stale_sources_rows(mock_engine):
         resp = client.get("/api/v1/system/freshness", headers=_auth_header())
     assert resp.status_code == 200
     data = resp.json()
-    assert data["stale_sources"] == [
+    # Compare on the fields this test originally pinned; `field_record` is
+    # an additive contract field (store/availability_fields.py) checked in
+    # tests/test_pipeline_health_contract.py, not this regression guard.
+    trimmed = [
+        {k: row[k] for k in ("source", "last_pull", "stale")}
+        for row in data["stale_sources"]
+    ]
+    assert trimmed == [
         {
             "source": "fred:UNRATE",
             "last_pull": stale_dt.isoformat(),
@@ -77,3 +84,4 @@ def test_freshness_returns_stale_sources_rows(mock_engine):
             "stale": True,
         },
     ]
+    assert all("field_record" in row for row in data["stale_sources"])

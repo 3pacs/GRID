@@ -409,6 +409,7 @@ for _label, _module_path, _required in [
     ("options", "api.routers.options", False),
     ("celestial", "api.routers.celestial", False),
     ("derivatives", "api.routers.derivatives", False),
+    ("gamma_watch", "api.routers.gamma_watch", False),
     ("watchlist", "api.routers.watchlist", False),
     ("associations", "api.routers.associations", False),
     ("strategy", "api.routers.strategy", False),
@@ -465,6 +466,8 @@ for _label, _module_path, _required in [
     ("ten_year_portfolio", "api.routers.ten_year_portfolio", False),
     ("dad", "api.routers.dad", False),
     ("price_alerts", "api.routers.price_alerts", False),
+    ("godview", "api.routers.godview", False),
+    ("evals_e2", "api.routers.evals_e2", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

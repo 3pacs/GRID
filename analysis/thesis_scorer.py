@@ -50,6 +50,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
+
 
 # ── Constants ───────────────────────────────────────────────────────────
 
@@ -111,11 +113,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
     """Fed net liquidity: balance sheet minus TGA minus reverse repo.
 
     Logic: 30-day change in net liquidity.
-    - Change > +$100B → strong bullish (+60 to +80)
-    - Change > +$50B  → moderate bullish (+30 to +50)
-    - Change -$50B to +$50B → neutral (-20 to +20)
-    - Change < -$50B  → moderate bearish (-30 to -50)
-    - Change < -$100B → strong bearish (-60 to -80)
+    Existing arithmetic compares millions to 50/100, i.e. $50M/$100M.
+    These bands are preserved here; recalibration requires a separate review.
 
     Score scales linearly within bands.  Confidence from data freshness
     and historical accuracy.
@@ -143,7 +142,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
                     0, 0, "no data", "", "No Fed balance sheet data available.",
                     status="no_data", historical_accuracy=accuracy)
 
-            net_liq = float(bs[0]) - (float(rr[0]) if rr else 0) - (float(tga[0]) if tga else 0)
+            # RRPONTSYD is billions; WALCL/WTREGEN are millions
+            net_liq = float(bs[0]) - (float(rr[0]) * RRPONTSYD_TO_MILLIONS if rr else 0) - (float(tga[0]) if tga else 0)
             pull_ts = bs[1] if bs[1] else datetime.now(timezone.utc)
             age_hours = (datetime.now(timezone.utc) - pull_ts.replace(tzinfo=timezone.utc)).total_seconds() / 3600 if hasattr(pull_ts, 'replace') else None
 
@@ -169,11 +169,12 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
 
             if not bs_30:
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 20, f"${net_liq:,.0f}B current",
+                    0, 20, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
                     "need 30d history", "Current net liquidity known but no 30-day baseline.",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
-            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
+            # RRPONTSYD is billions; WALCL/WTREGEN are millions
+            net_liq_30 = float(bs_30[0]) - (float(rr_30[0]) * RRPONTSYD_TO_MILLIONS if rr_30 else 0) - (float(tga_30[0]) if tga_30 else 0)
             change = net_liq - net_liq_30
 
             # Score: linear scale within bands
@@ -197,11 +198,12 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             return _verdict(
                 "fed_liquidity", "Fed Net Liquidity",
                 score, confidence,
-                data_point=f"${change:+,.0f}B 30d change (current ${net_liq:,.0f}B)",
-                threshold="bearish < -$50B, bullish > +$50B, strong at ±$100B",
+                data_point=(f"{format_liquidity_usd(change, unit='millions_usd', signed=True)} "
+                            f"30d change (current {format_liquidity_usd(net_liq, unit='millions_usd')})"),
+                threshold="current scoring bands: bearish < -$50M, bullish > +$50M, strong at ±$100M",
                 reasoning=(
-                    f"Net liquidity {'rose' if change > 0 else 'fell'} "
-                    f"${abs(change):,.0f}B over 30 days. "
+                    f"Net liquidity {'rose' if change > 0 else 'fell' if change < 0 else 'was unchanged by'} "
+                    f"{format_liquidity_usd(abs(change), unit='millions_usd')} over 30 days. "
                     f"{'Expanding liquidity supports risk assets.' if change > 50 else 'Contracting liquidity pressures risk assets.' if change < -50 else 'Liquidity roughly flat — no strong directional signal.'}"
                 ),
                 data_age_hours=age_hours,
@@ -516,7 +518,7 @@ def _score_supply_chain(engine: Engine, accuracy: float) -> dict:
             for sid in _SC_SERIES:
                 recent = conn.execute(text(
                     "SELECT value, obs_date FROM raw_series "
-                    "WHERE series_id = :sid "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
 
@@ -525,7 +527,7 @@ def _score_supply_chain(engine: Engine, accuracy: float) -> dict:
 
                 prior = conn.execute(text(
                     "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                     "AND obs_date <= CURRENT_DATE - 90 "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
@@ -1128,6 +1130,7 @@ def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text(
                     "SELECT COUNT(DISTINCT series_id) FROM raw_series "
                     "WHERE series_id LIKE 'crucix.%' "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= CURRENT_DATE - 1 "
                     "AND value IS NOT NULL AND value != 0"
                 )).fetchone()
@@ -1141,6 +1144,7 @@ def _score_geopolitical_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text(
                     "SELECT COUNT(*) FROM raw_series "
                     "WHERE series_id LIKE 'gdelt_tension_%' "
+                    "AND pull_status = 'SUCCESS' "
                     "AND obs_date >= CURRENT_DATE - 1"
                 )).fetchone()
                 gdelt_events = r[0] if r else 0
@@ -1313,6 +1317,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 SELECT value, obs_date FROM raw_series
                 WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
                                     'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                AND pull_status = 'SUCCESS'
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()
 
@@ -1320,6 +1325,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 SELECT value FROM raw_series
                 WHERE series_id IN ('coingecko:bitcoin:usd', 'YF:BTC-USD:close',
                                     'binance:BTCUSDT:close', 'CG:bitcoin:usd')
+                AND pull_status = 'SUCCESS'
                 AND obs_date <= CURRENT_DATE - 30
                 ORDER BY obs_date DESC LIMIT 1
             """)).fetchone()
@@ -1348,6 +1354,7 @@ def _score_crypto_risk(engine: Engine, accuracy: float) -> dict:
                 r = conn.execute(text("""
                     SELECT value FROM raw_series
                     WHERE series_id LIKE 'defillama%tvl%'
+                    AND pull_status = 'SUCCESS'
                     ORDER BY obs_date DESC LIMIT 1
                 """)).fetchone()
                 if r:
@@ -1422,16 +1429,23 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
     - VIX net long spike → fear hedging, contrarian bullish (+30)
 
     Data is weekly (Tuesday snapshot, Friday release).
+
+    Reads only the code-keyed ids (``cftc.<cftc_contract_market_code>.*``);
+    the legacy ``cftc.SP500.*`` etc. mixed several markets under one id.
+    With no code-keyed rows the verdict is ``no_data``.
     """
-    KEY_CONTRACTS = ["SP500", "GOLD", "CRUDE_OIL", "VIX"]
+    from ingestion.altdata.cftc_markets import series_id_for_root
+
+    # root -> display name; identity is the market code behind the root
+    KEY_CONTRACTS = {"ES": "E-mini S&P", "GC": "Gold", "CL": "WTI", "VX": "VIX"}
     try:
         with engine.connect() as conn:
             scores = []
             details = []
             oldest_date = None
 
-            for contract in KEY_CONTRACTS:
-                sid = f"cftc.{contract}.net_speculative"
+            for root, contract in KEY_CONTRACTS.items():
+                sid = series_id_for_root(root, "net_speculative")
                 cur = conn.execute(text(
                     "SELECT value, obs_date FROM raw_series "
                     "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
@@ -1452,11 +1466,11 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                 obs = cur[1]
                 if oldest_date is None or (obs and obs < oldest_date):
                     oldest_date = obs
-                prev = float(prior[0]) if prior else 0.0
-                momentum = val - prev
+                # No prior observation -> momentum unknown (never "val - 0").
+                momentum = val - float(prior[0]) if prior else None
 
                 # VIX is contrarian: net long VIX = fear = bullish for equities
-                if contract == "VIX":
+                if root == "VX":
                     if val > 50000:
                         s = 30  # extreme fear → contrarian bullish
                     elif val > 20000:
@@ -1467,7 +1481,7 @@ def _score_cftc_positioning(engine: Engine, accuracy: float) -> dict:
                         s = 0
                 else:
                     # SP500/Gold/Crude: net long = bullish, momentum matters
-                    if val > 100000 and momentum > 0:
+                    if val > 100000 and momentum is not None and momentum > 0:
                         s = 60
                     elif val > 50000:
                         s = 30
@@ -2068,7 +2082,8 @@ def _score_crucix_osint(engine: Engine, accuracy: float) -> dict:
             def _latest(sid: str) -> float | None:
                 r = conn.execute(text(
                     "SELECT value FROM raw_series "
-                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - 3 "
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= CURRENT_DATE - 3 "
                     "ORDER BY obs_date DESC LIMIT 1"
                 ), {"sid": sid}).fetchone()
                 return float(r[0]) if r and r[0] is not None else None
@@ -2263,7 +2278,8 @@ def _score_gdelt_geopolitical(engine: Engine, accuracy: float) -> dict:
                 """Average of recent values (GDELT can have multiple per day)."""
                 r = conn.execute(text(
                     "SELECT AVG(value) FROM raw_series "
-                    "WHERE series_id = :sid AND obs_date >= CURRENT_DATE - :d"
+                    "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
+                    "AND obs_date >= CURRENT_DATE - :d"
                 ), {"sid": sid, "d": days}).fetchone()
                 return float(r[0]) if r and r[0] is not None else None
 

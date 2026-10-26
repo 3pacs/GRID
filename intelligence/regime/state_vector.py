@@ -3,7 +3,42 @@ State vector construction for the regime-matched analog engine.
 
 Each state vector captures the macro environment at a point in time across
 24 dimensions — VIX, rates, spreads, employment, liquidity, momentum, and
-cross-reference divergence scores. All queries are PIT-correct (no look-ahead).
+cross-reference divergence scores.
+
+Availability contract (``as_of`` = end of that UTC day)
+--------------------------------------------------------------------
+* **Macro inputs** are read with ``store.observations.read_window_known_at``:
+  an observation is visible at ``as_of`` only if it was pulled by then, or —
+  for history backfilled long after the fact (every FRED row on griddb was
+  pulled on or after 2026-03-24) — if its declared, conservative
+  :data:`PUBLICATION_LAGS` entry says it was published by then. The
+  observation date alone never makes a value visible. Modeled dates delay
+  eligibility but values remain revised vintage as of backfill (2026-03-24),
+  not first-release/ALFRED values. Documented UNRATE shutdown dates override
+  the ordinary lag; other exceptional release delays remain unmodeled.
+  ``store.pit.PITStore`` cannot serve these reads: ``resolved_series``'s
+  ``release_date`` for them is (almost always) the backfill pull date, so
+  it returns little or no history before 2026-03.
+* **Normalisation** (z-scores of the ``raw`` dims) uses mean/std over the
+  same PIT-visible series in a rolling :data:`NORM_LOOKBACK_DAYS` window
+  ending at ``as_of`` — the 10,000-day window the original design used,
+  anchored at ``as_of`` instead of the run date. No process-level cache: a
+  vector no longer uses run-date normalization. Later insertion of previously
+  absent historical observations can still change modeled historical vectors.
+* **SPY** momentum/RSI keep their basis order (``spy_full`` via ``store.pit``
+  where PIT-visible, i.e. ``release_date <= as_of``, else raw
+  ``YF:SPY:close``). The raw fallback is read with the same
+  ``read_window_known_at`` rule as the macro inputs (E1-V1): a close is
+  visible if it was pulled by ``as_of`` (latest such vintage) or, for
+  backfilled history, by :data:`SPY_CLOSE_LAG` — the close of session ``d``
+  is public once ``d``'s session ends, i.e. by the end of UTC day ``d``
+  (earliest pulled vintage). A re-pull or restatement after ``as_of`` never
+  changes a past vector.
+* **Insider sentiment** counts a Form 4 row only if it was known by the end
+  of ``as_of`` (E1-V2): pulled by then, or filed by then under VS1's
+  convention (``analysis.panel_insider_density.filing_known_at``: filing date
+  22:00 America/New_York). ``INSIDER:*`` rows are dated by *transaction*
+  date, so ``obs_date <= as_of`` alone admits filings made after ``as_of``.
 
 State vectors are cached in the `regime_state_vectors` table.
 """
@@ -11,15 +46,23 @@ State vectors are cached in the `regime_state_vectors` table.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from store.observations import (
+    MixedSourceError,
+    PublicationLag,
+    read_window_known_at,
+)
 
 
 # ── Dimension specification ──────────────────────────────────────────────
@@ -79,6 +122,133 @@ DIM_NAMES = [d.name for d in STATE_DIMENSIONS]
 DIM_WEIGHTS = np.array([d.weight for d in STATE_DIMENSIONS], dtype=np.float64)
 
 
+# ── Publication lags (modeled availability) ──────────────────────────────
+#
+# Used only where GRID has no pull evidence for an observation (backfilled
+# history); a value pulled by ``as_of`` is visible from its pull date. Each
+# lag is deliberately late — at or beyond the latest normal release date —
+# because an early lag is look-ahead and a late one only costs freshness.
+# "First pull" figures are the observed obs->first-pull lags for the dates
+# GRID ingested live (griddb, read-only, 2026-09-29).
+#
+# UNRATE shutdown exceptions below use official BLS release dates. Other
+# series/delays still use modeled lags; this is not a complete release calendar.
+# Revised history uses earliest GRID vintage (backfilled >=2026-03-24), not
+# the historical first published value. Only actual vintage data can fix that.
+_NEXT_BUSINESS_DAY = PublicationLag(
+    1, "business",
+    "next business day; same lag as analysis.research_real_panel.PUBLICATIONS "
+    "(FRB_H15 / FRED_H15_SPREAD / ICE_BOFA / CBOE_VIX, reviewer-verified)",
+)
+
+PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
+    # Daily market/rates series, posted to FRED the next business day
+    'VIXCLS': _NEXT_BUSINESS_DAY,
+    'T10Y2Y': _NEXT_BUSINESS_DAY,
+    'T5YIE': _NEXT_BUSINESS_DAY,
+    'DFF': _NEXT_BUSINESS_DAY,
+    'BAMLH0A0HYM2': _NEXT_BUSINESS_DAY,
+    'BAMLC0A0CM': _NEXT_BUSINESS_DAY,
+    # Monthly, dated the 1st of the reference month
+    'UNRATE': PublicationLag(
+        42, "calendar",
+        "BLS Employment Situation: conservative ordinary release-date proxy; "
+        "documented shutdown dates override it; revised vintage as of backfill 2026-03-24",
+        release_overrides=(
+            # https://www.bls.gov/schedule/2013/home.htm
+            (date(2013, 9, 1), date(2013, 10, 22)),
+            (date(2013, 10, 1), date(2013, 11, 8)),
+            # https://www.bls.gov/news.release/archives/empsit_11202025.htm
+            (date(2025, 9, 1), date(2025, 11, 20)),
+            # https://www.bls.gov/news.release/archives/empsit_12162025.htm
+            (date(2025, 11, 1), date(2025, 12, 16)),
+        ),
+        # CPS October data were not collected and will not be reconstructed.
+        # https://www.bls.gov/cps/methods/2025-federal-government-shutdown-impact-cps.htm
+        unpublished_dates=frozenset({date(2025, 10, 1)}),
+    ),
+    'INDPRO': PublicationLag(
+        50, "calendar",
+        "Fed G.17 industrial production, ~15th-18th of the next month; first pull 44-46d",
+    ),
+    'TCU': PublicationLag(
+        50, "calendar",
+        "Fed G.17 capacity utilisation, ~15th-18th of the next month; first pull 44-46d",
+    ),
+    'M2SL': PublicationLag(
+        60, "calendar",
+        "Fed H.6 money stock, ~4th Tuesday of the next month; first pull 51-55d",
+    ),
+    'UMCSENT': PublicationLag(
+        60, "calendar",
+        "UMich sentiment as posted to FRED (delayed vs the survey's own release); "
+        "first pull 52-57d",
+    ),
+    # Weekly, dated the Saturday week-end
+    'ICSA': PublicationLag(
+        6, "calendar",
+        "DOL weekly claims, following Thursday (Friday after a holiday); first pull 5d",
+    ),
+    # Computed by GRID itself: known when GRID computed it, never earlier
+    'COMPUTED:fed_net_liquidity': None,
+    'COMPUTED:fed_net_liquidity_change_1m': None,
+}
+
+# Raw ``YF:SPY:close`` fallback (E1-V1). A daily close is public when its
+# session ends (16:00 America/New_York = 20:00/21:00 UTC), so the close dated
+# ``d`` is known by the end of UTC day ``d``: lag 0 business days. Used only
+# where GRID has no pull by ``as_of`` (every close before 2026-04-09 on griddb
+# was backfilled then); the value is the earliest pulled vintage, as for the
+# macro inputs above. A wrong early vintage (e.g. a mis-adjusted close, #642)
+# is therefore not repaired by re-pulling: mark it QUARANTINED.
+SPY_CLOSE_LAG = PublicationLag(
+    0, "business",
+    "US equity close: public at the end of its own session (16:00 ET), i.e. by "
+    "the end of that UTC day; earliest pulled vintage for backfilled history",
+)
+
+# Rolling window for the z-score mean/std, ending at as_of (see module doc).
+NORM_LOOKBACK_DAYS = 10000
+# Window the dimension transforms read (unchanged).
+VALUE_LOOKBACK_DAYS = 2520
+
+# ── Cadence-aware staleness (GRID-STALE-SOURCES-AUDIT-20260929.md §4) ────
+#
+# The old rule flagged a dimension stale when its latest obs was >30 days
+# old, for every dimension regardless of publication cadence. FRED's
+# monthly macro series carry obs_date = the 1st of the reference month but
+# are published 4-8 weeks later, so a monthly dimension is *always* >30
+# days old, even the same day GRID picks up its newest release (the audit
+# measured a 4-minute-to-~51-hour GRID pickup lag across all five monthly
+# series it checked -- the flag was 100% a false positive, never a real
+# gap). These are the only monthly series among STATE_DIMENSIONS today;
+# QUARTERLY_FRED_SERIES starts empty and is ready for one, same pattern.
+MONTHLY_FRED_SERIES: frozenset[str] = frozenset({
+    "UNRATE", "INDPRO", "TCU", "M2SL", "UMCSENT",
+})
+QUARTERLY_FRED_SERIES: frozenset[str] = frozenset()
+
+DEFAULT_STALE_DAYS = 30
+# ~70 days safely covers a monthly series' worst-case release lag (4-8
+# weeks) plus GRID's own pickup delay, while still catching a release
+# that's genuinely been missed (the next one is always <45 days away) --
+# this is the audit's own suggested fix (§4: "monthly = stale only if obs
+# is more than ~70 days old").
+MONTHLY_STALE_DAYS = 70
+# Same logic one tier out: a quarterly series can be published 1-3 months
+# after quarter-end, so give it a proportionally larger window.
+QUARTERLY_STALE_DAYS = 160
+
+
+def _stale_threshold_days(series_id: str) -> int:
+    """Cadence-aware staleness threshold, in days, for one series_id."""
+    if series_id in MONTHLY_FRED_SERIES:
+        return MONTHLY_STALE_DAYS
+    if series_id in QUARTERLY_FRED_SERIES:
+        return QUARTERLY_STALE_DAYS
+    return DEFAULT_STALE_DAYS
+
+
 # ── State Vector ─────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -87,7 +257,15 @@ class StateVector:
     as_of_date: date
     values: tuple[float | None, ...]    # one per dimension, None = missing
     completeness: float                 # fraction of non-null dims
-    stale_dimensions: tuple[str, ...]   # dims with data >30d old
+    stale_dimensions: tuple[str, ...]   # usable non-derived dims beyond their cadence threshold
+    # Which SPY price series fed the momentum/RSI dimensions: "spy_full"
+    # (the resolved, post re-resolve feature) or the raw "YF:SPY:close"
+    # fallback, or None when neither was available (see _fetch_spy_prices).
+    price_basis: str | None = None
+    # True when this vector was served from regime_state_vectors rather
+    # than freshly computed. GET routes (persist=False) return cached=False
+    # for an in-memory computation that was never written.
+    cached: bool = False
 
     @property
     def array(self) -> np.ndarray:
@@ -105,51 +283,138 @@ class StateVector:
             'dimensions': {DIM_NAMES[i]: self.values[i] for i in range(len(self.values))},
             'completeness': self.completeness,
             'stale_dimensions': list(self.stale_dimensions),
+            'price_basis': self.price_basis,
+            'cached': self.cached,
         }
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────
 
-def _fetch_series(engine: Engine, series_id: str, as_of: date, lookback_days: int = 2520) -> pd.Series:
-    """Fetch series values up to as_of date (PIT-correct)."""
+def _fetch_series(
+    engine: Engine, series_id: str, as_of: date, lookback_days: int = VALUE_LOOKBACK_DAYS,
+) -> pd.Series:
+    """Macro series values known by the end of ``as_of`` (point-in-time).
+
+    Goes through ``store.observations.read_window_known_at``: SUCCESS-only,
+    one value per ``obs_date``, and an observation is included only if it was
+    pulled by ``as_of`` (latest such vintage) or, for backfilled history, its
+    :data:`PUBLICATION_LAGS` entry puts its release on or before ``as_of``
+    (earliest pulled vintage). A series not in :data:`PUBLICATION_LAGS` gets
+    no modeled path (pull evidence only). A series_id whose selected rows
+    span more than one source (``store.observations.MixedSourceError``)
+    degrades to an empty series rather than silently mixing sources; the
+    caller already treats a short or empty series as "dimension unavailable".
+    """
     cutoff = as_of - timedelta(days=lookback_days)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT obs_date, value FROM raw_series "
-                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of "
-                "ORDER BY obs_date"
-            ),
-            {"sid": series_id, "cutoff": cutoff, "as_of": as_of},
-        ).fetchall()
-    if not rows:
+    try:
+        with engine.connect() as conn:
+            obs = read_window_known_at(
+                conn, series_id, as_of=as_of, lag=PUBLICATION_LAGS.get(series_id), start=cutoff,
+            )
+    except MixedSourceError as exc:
+        log.warning("state_vector: {sid} is mixed-source, skipping: {e}", sid=series_id, e=str(exc))
+        return pd.Series(dtype=float)
+    if not obs:
         return pd.Series(dtype=float)
     return pd.Series(
-        {r[0]: float(r[1]) for r in rows},
+        {o.obs_date: o.value for o in obs},
         dtype=float,
     ).sort_index()
 
 
-def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> pd.Series:
-    """Fetch SPY close prices for momentum/RSI computation."""
+class _AsOfReader:
+    """Per-as_of memo with separate normalization and accepted compute reads.
+
+    Mixed-source validation is bounded by each read. A different source outside
+    the 2520-day compute window must not make an otherwise accepted value vanish.
+    Values and stale age share one cached compute input; normalization uses its
+    distinct 10000-day window. No memo is shared across dates or calls.
+    """
+
+    def __init__(self, engine: Engine, as_of: date) -> None:
+        self.engine = engine
+        self.as_of = as_of
+        self._full: dict[str, pd.Series] = {}
+        self._windows: dict[str, pd.Series] = {}
+
+    def full(self, series_id: str) -> pd.Series:
+        if series_id not in self._full:
+            self._full[series_id] = _fetch_series(
+                self.engine, series_id, self.as_of, lookback_days=NORM_LOOKBACK_DAYS,
+            )
+        return self._full[series_id]
+
+    def window(self, series_id: str) -> pd.Series:
+        if series_id not in self._windows:
+            self._windows[series_id] = _fetch_series(
+                self.engine, series_id, self.as_of, lookback_days=VALUE_LOOKBACK_DAYS,
+            )
+        return self._windows[series_id]
+
+
+def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
+    """Best-effort PIT read of the resolved ``spy_full`` feature.
+
+    Mirrors ``alpha_research.realized_alpha.resolve_spy_feature`` +
+    ``load_price_path`` (the re-resolve's own PIT reader, through
+    ``store.pit.PITStore`` — ``LATEST_AS_OF``, retraction-aware). Returns
+    ``None`` — never raises — when ``feature_registry``/``resolved_series``
+    aren't there yet (the re-resolve hasn't landed) or the query fails for
+    any other reason, so the caller can degrade to the raw YF series
+    instead of crashing or assuming infra state this module can't verify.
+    """
+    try:
+        from alpha_research.realized_alpha import load_price_path, resolve_spy_feature
+
+        feature_id, _name = resolve_spy_feature(engine)
+        series = load_price_path(engine, feature_id, cutoff, as_of, as_of)
+    except Exception as exc:
+        log.debug("state_vector: resolved spy_full unavailable ({e}); falling back to raw YF series", e=str(exc))
+        return None
+    if series is None or series.empty:
+        return None
+    idx = [d.date() if hasattr(d, "date") else d for d in series.index]
+    return pd.Series(series.to_numpy(dtype=float), index=idx, dtype=float).sort_index()
+
+
+def _fetch_spy_prices(engine: Engine, as_of: date, lookback_days: int = 504) -> tuple[pd.Series, str | None]:
+    """SPY close series for momentum/RSI computation, PIT-correct.
+
+    Prefers the resolved ``spy_full`` feature (the post re-resolve price
+    basis, with retractions honoured, ``release_date <= as_of``) so
+    momentum/RSI agree with the rest of the platform. Falls back to the raw
+    ``YF:SPY:close`` observation series when the resolved feature isn't
+    available at ``as_of``: SUCCESS-only, ``source="yfinance"`` per
+    ``store.observations``'s mixed-source rule, and point-in-time through
+    ``read_window_known_at`` with :data:`SPY_CLOSE_LAG` — a close pulled by
+    ``as_of`` (latest such vintage), or a backfilled close whose session
+    ended by ``as_of`` (earliest pulled vintage). A vintage pulled after
+    ``as_of`` (a re-pull, a basis change, a repaired contamination) never
+    replaces what a past read saw (E1-V1). Returns ``(empty series, None)``
+    — an honest "unavailable", not a crash or a silent stale read — when
+    neither path has data.
+
+    Returns ``(prices, price_basis)`` where ``price_basis`` is
+    ``"spy_full"``, ``"YF:SPY:close"``, or ``None``.
+    """
     cutoff = as_of - timedelta(days=lookback_days)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT obs_date, value FROM raw_series "
-                "WHERE series_id = 'YF:SPY:close' AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of "
-                "ORDER BY obs_date"
-            ),
-            {"cutoff": cutoff, "as_of": as_of},
-        ).fetchall()
-    if not rows:
-        return pd.Series(dtype=float)
-    return pd.Series(
-        {r[0]: float(r[1]) for r in rows},
-        dtype=float,
-    ).sort_index()
+
+    resolved = _fetch_resolved_spy_full(engine, as_of, cutoff)
+    if resolved is not None and not resolved.empty:
+        return resolved, "spy_full"
+
+    try:
+        with engine.connect() as conn:
+            obs = read_window_known_at(
+                conn, "YF:SPY:close", as_of=as_of, lag=SPY_CLOSE_LAG, source="yfinance", start=cutoff,
+            )
+    except Exception as exc:
+        log.debug("state_vector: raw SPY:close fallback failed: {e}", e=str(exc))
+        return pd.Series(dtype=float), None
+    if not obs:
+        return pd.Series(dtype=float), None
+    series = pd.Series({o.obs_date: o.value for o in obs}, dtype=float).sort_index()
+    return series, "YF:SPY:close"
 
 
 def _percentile_rank(series: pd.Series, window: int) -> float | None:
@@ -237,27 +502,174 @@ def _get_crossref_score(engine: Engine, as_of: date) -> float | None:
     return float(row[0]) if row[0] is not None else None
 
 
-def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
-    """Net insider sentiment from SEC Form 4 filings (30d window)."""
-    cutoff = as_of - timedelta(days=30)
-    with engine.connect() as conn:
-        row = conn.execute(
-            text(
-                "SELECT "
-                "  SUM(CASE WHEN series_id LIKE :buy_pat THEN value ELSE 0 END), "
-                "  SUM(CASE WHEN series_id LIKE :sell_pat THEN value ELSE 0 END) "
-                "FROM raw_series "
-                "WHERE series_id LIKE :insider_pat "
-                "AND pull_status = 'SUCCESS' "
-                "AND obs_date >= :cutoff AND obs_date <= :as_of"
-            ),
-            {"buy_pat": "%:BUY", "sell_pat": "%:SELL", "insider_pat": "INSIDER:%",
-             "cutoff": cutoff, "as_of": as_of},
-        ).fetchone()
-    if row is None:
+# ── Insider sentiment (Form 4), point-in-time ────────────────────────────
+#
+# ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}`` rows are dated by the
+# *transaction* date (ingestion/altdata/insider_filings.py); the filing date
+# rides in ``raw_payload.filing_date``. A Form 4 is due two business days
+# after the trade and late filers take weeks or years, so ``obs_date <=
+# as_of`` alone counts filings nobody could see at ``as_of`` (E1-V2; on
+# griddb every pre-2026 INSIDER row was filed and pulled in 2026).
+#
+# A row is known by the end of ``as_of`` (UTC) if it was pulled by then, or
+# if it was filed by then under VS1's convention
+# (``analysis.panel_insider_density.filing_known_at``: filing date 22:00
+# America/New_York, the Reg S-T 13(a)(4) dissemination cutoff). The
+# convention is restated here rather than imported so the API path does not
+# import the research harness; ``tests/test_regime_insider_known_at.py``
+# pins the two to each other.
+_FORM4_KNOWN_AT_LOCAL = time(22, 0)
+_NEW_YORK = ZoneInfo("America/New_York")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}")
+_SEC_DATE = re.compile(r"^\d{2}-[A-Za-z]{3}-\d{4}$")
+
+# One round trip per call (PR #713 review: ~1,548 distinct INSIDER:* series
+# are active in a 30-day window; the per-series loop this replaced made one
+# query each). SUCCESS-only and bounded to [cutoff, as_of] by transaction
+# date; availability, vintage choice and the mixed-source rule are applied
+# in Python by ``_insider_known_rows`` so they stay portable and testable.
+# The filing date is read from the JSON payload with each dialect's own
+# accessor (``raw_payload`` is JSONB on Postgres, JSON text on SQLite).
+_INSIDER_ROWS_SQL_PG = text(
+    "SELECT series_id, obs_date, value, pull_timestamp, source_id,"
+    "       raw_payload->>'filing_date' AS filing_date"
+    "  FROM raw_series"
+    " WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
+    "   AND obs_date >= :cutoff AND obs_date <= :as_of"
+)
+_INSIDER_ROWS_SQL_SQLITE = text(
+    "SELECT series_id, obs_date, value, pull_timestamp, source_id,"
+    "       json_extract(raw_payload, '$.filing_date') AS filing_date"
+    "  FROM raw_series"
+    " WHERE series_id LIKE :insider_pat AND pull_status = 'SUCCESS'"
+    "   AND obs_date >= :cutoff AND obs_date <= :as_of"
+)
+
+
+def _form4_known_at(filing_date: Any) -> datetime | None:
+    """UTC instant a Form 4 filed on ``filing_date`` is public (VS1 convention).
+
+    Accepts a ``date``/``datetime`` or the ISO (``YYYY-MM-DD[...]``) and SEC
+    data-set (``DD-MON-YYYY``) strings VS1's ``parse_dates`` accepts.
+    ``None`` when there is no usable filing date: such a row is visible only
+    through its pull.
+    """
+    if filing_date is None:
         return None
-    buy_vol = float(row[0] or 0)
-    sell_vol = float(row[1] or 0)
+    if isinstance(filing_date, datetime):
+        d = filing_date.date()
+    elif isinstance(filing_date, date):
+        d = filing_date
+    else:
+        s = str(filing_date).strip()
+        try:
+            if _ISO_DATE.match(s):
+                d = date.fromisoformat(s[:10])
+            elif _SEC_DATE.match(s):
+                d = datetime.strptime(s.upper(), "%d-%b-%Y").date()
+            else:
+                return None
+        except ValueError:
+            return None
+    local = datetime.combine(d, _FORM4_KNOWN_AT_LOCAL, tzinfo=_NEW_YORK)
+    return local.astimezone(timezone.utc)
+
+
+def _pulled_at_utc(pull_ts: Any) -> datetime | None:
+    """``pull_timestamp`` as an aware UTC datetime (naive = UTC, as griddb runs Etc/UTC)."""
+    if pull_ts is None:
+        return None
+    if not isinstance(pull_ts, datetime):
+        try:
+            pull_ts = datetime.fromisoformat(str(pull_ts))
+        except ValueError:
+            return None
+    if pull_ts.tzinfo is None:
+        return pull_ts.replace(tzinfo=timezone.utc)
+    return pull_ts.astimezone(timezone.utc)
+
+
+def _insider_known_rows(rows: list[tuple], as_of: date) -> list[tuple[str, float]]:
+    """``(series_id, value)`` per ``(series_id, obs_date)`` known by the end of ``as_of``.
+
+    ``rows`` are ``(series_id, obs_date, value, pull_timestamp, source_id,
+    filing_date)``. A vintage is visible if it was pulled, or filed
+    (:func:`_form4_known_at`), before 00:00 UTC of ``as_of + 1``. Per
+    ``(series_id, obs_date)``: the latest vintage pulled by then; otherwise
+    the earliest-pulled vintage visible through its filing date (the same
+    pulled-else-earliest rule as ``store.observations.read_window_known_at``).
+    A series_id whose known vintages (every vintage pulled by ``as_of``, or
+    the earliest-pulled ones of a filing-visible date) span more than one
+    source is dropped entirely (fail closed, as ``MixedSourceError``); a
+    second source re-pulling a filing after ``as_of`` cannot drop a series
+    from a past read.
+    """
+    end = datetime.combine(as_of + timedelta(days=1), time(0), tzinfo=timezone.utc)
+    never = datetime.max.replace(tzinfo=timezone.utc)
+    # (series_id, obs_date) -> [(pulled_by_end, pulled_at, value, source_id)]
+    groups: dict[tuple[str, str], list[tuple[bool, datetime, float, Any]]] = {}
+    sources: dict[str, set] = {}
+    filed: dict[Any, datetime | None] = {}  # a few hundred distinct filing dates per window
+    for series_id, obs_date, value, pull_ts, source_id, filing_date in rows:
+        if value is None:
+            continue
+        pulled_at = _pulled_at_utc(pull_ts)
+        pulled = pulled_at is not None and pulled_at < end
+        if filing_date not in filed:
+            filed[filing_date] = _form4_known_at(filing_date)
+        filed_at = filed[filing_date]
+        if not pulled and not (filed_at is not None and filed_at < end):
+            continue  # not public at as_of
+        key = (str(series_id), str(obs_date)[:10])
+        groups.setdefault(key, []).append((pulled, pulled_at or never, float(value), source_id))
+
+    chosen: dict[tuple[str, str], float] = {}
+    for key, vintages in groups.items():
+        proven = [v for v in vintages if v[0]]
+        if proven:
+            pick = max(proven, key=lambda v: (v[1], v[2]))  # latest pulled by as_of
+            known = proven  # every vintage pulled by as_of
+        else:
+            pick = min(vintages, key=lambda v: (v[1], v[2]))  # earliest vintage filed by as_of
+            known = [v for v in vintages if v[1] == pick[1]]  # sources tied at that pull
+        chosen[key] = pick[2]
+        # As in read_window_known_at: only the vintages a past read actually
+        # rests on take part in the mixed-source check, so a second source
+        # re-pulling an already-public filing after as_of cannot drop the series.
+        sources.setdefault(key[0], set()).update(v[3] for v in known)
+
+    return [(sid, value) for (sid, _obs), value in sorted(chosen.items()) if len(sources[sid]) <= 1]
+
+
+def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
+    """Net insider sentiment from SEC Form 4 filings (30d window), PIT.
+
+    One query reads every ``INSIDER:{ticker}:{insider_name}:{BUY|SELL}``
+    row with a transaction date in ``[as_of - 30d, as_of]`` (SUCCESS-only);
+    :func:`_insider_known_rows` keeps only filings known by the end of
+    ``as_of`` (pulled or filed by then, see the section comment), collapses
+    vintages and drops mixed-source series; the result is summed by the
+    ``:BUY``/``:SELL`` suffix. A filing made or pulled after ``as_of`` never
+    changes a past value (E1-V2).
+    """
+    cutoff = as_of - timedelta(days=30)
+    try:
+        with engine.connect() as conn:
+            sql = _INSIDER_ROWS_SQL_PG if conn.dialect.name == "postgresql" else _INSIDER_ROWS_SQL_SQLITE
+            rows = conn.execute(
+                sql, {"insider_pat": "INSIDER:%", "cutoff": cutoff, "as_of": as_of},
+            ).fetchall()
+    except Exception as exc:
+        log.debug("insider sentiment: batched read failed: {e}", e=str(exc))
+        return None
+
+    buy_vol = 0.0
+    sell_vol = 0.0
+    for series_id, value in _insider_known_rows([tuple(r) for r in rows], as_of):
+        if series_id.endswith(":BUY"):
+            buy_vol += value
+        elif series_id.endswith(":SELL"):
+            sell_vol += value
     total = buy_vol + sell_vol
     if total == 0:
         return None
@@ -266,29 +678,30 @@ def _get_insider_sentiment(engine: Engine, as_of: date) -> float | None:
 
 # ── Normalization stats ──────────────────────────────────────────────────
 
-_NORM_CACHE: dict[str, tuple[float, float]] | None = None
+def _get_normalization_stats(
+    engine: Engine, as_of: date, reader: _AsOfReader | None = None,
+) -> dict[str, tuple[float, float]]:
+    """Mean and std for each series z-scored in the state vector, as of ``as_of``.
 
-
-def _get_normalization_stats(engine: Engine) -> dict[str, tuple[float, float]]:
-    """Compute mean and std for each series used in state vectors.
-
-    Used to z-score normalize dimensions so they're comparable.
-    Cached after first computation.
+    Point-in-time: computed only from observations known by the end of
+    ``as_of`` (the same known-at read as the dimension values), over a
+    rolling :data:`NORM_LOOKBACK_DAYS` window ending at ``as_of``. This keeps
+    the original design's 10,000-day window but anchors it at ``as_of``
+    instead of the run date (``date.today()``), so a historical row's
+    z-scores no longer depend on data after ``as_of`` or on when the job
+    ran. Rolling rather than expanding because that is what the original
+    lookback was; for any as_of before ~2017 it spans all GRID history
+    (from 1990) anyway.
     """
-    global _NORM_CACHE
-    if _NORM_CACHE is not None:
-        return _NORM_CACHE
-
+    reader = reader or _AsOfReader(engine, as_of)
     stats: dict[str, tuple[float, float]] = {}
     for dim in STATE_DIMENSIONS:
-        if dim.series_id.startswith('DERIVED:'):
+        if dim.series_id.startswith('DERIVED:') or dim.series_id in stats:
             continue
-        series = _fetch_series(engine, dim.series_id, date.today(), lookback_days=10000)
+        series = reader.full(dim.series_id)
         if len(series) < 20:
             continue
         stats[dim.series_id] = (float(series.mean()), float(series.std()))
-
-    _NORM_CACHE = stats
     return stats
 
 
@@ -302,34 +715,37 @@ def _zscore_normalize(value: float | None, mean: float, std: float) -> float | N
 # ── Main computation ─────────────────────────────────────────────────────
 
 def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVector:
-    """Compute the macro state vector at a specific date (PIT-correct).
+    """Compute the macro state vector at a specific date with availability bounds.
 
-    Each dimension is fetched from the database, transformed, and z-score
-    normalized against its full history.
+    Each macro dimension is read point-in-time (only observations known by
+    the end of ``as_of``, see :func:`_fetch_series`), transformed, and the
+    ``raw`` ones z-scored against PIT stats as of ``as_of``
+    (:func:`_get_normalization_stats`). Backfilled values remain revised vintages,
+    not historically known first releases. The nightly job
+    (``get_or_compute_state_vector``) and ``compute_state_vector_series``
+    both call this and get the same vector for the same ``as_of``.
     """
     if as_of is None:
         as_of = date.today()
 
-    norm_stats = _get_normalization_stats(engine)
-    spy_prices = _fetch_spy_prices(engine, as_of)
+    reader = _AsOfReader(engine, as_of)
+    norm_stats = _get_normalization_stats(engine, as_of, reader)
+    spy_prices, price_basis = _fetch_spy_prices(engine, as_of)
     values: list[float | None] = []
     stale: list[str] = []
 
     for dim in STATE_DIMENSIONS:
         try:
-            val = _compute_dimension(engine, dim, as_of, norm_stats, spy_prices)
+            # Same accepted 2520-day series drives value and stale age.
+            series = None
+            if not dim.series_id.startswith('DERIVED:'):
+                series = reader.window(dim.series_id)
+            val = _compute_dimension(reader, dim, as_of, norm_stats, spy_prices, series=series)
+            if val is not None and series is not None and not series.empty:
+                days_stale = (as_of - series.index[-1]).days
+                if days_stale > _stale_threshold_days(dim.series_id):
+                    stale.append(dim.name)
             values.append(val)
-
-            # Check staleness for non-derived series
-            if not dim.series_id.startswith('DERIVED:') and val is not None:
-                series = _fetch_series(engine, dim.series_id, as_of, lookback_days=60)
-                if len(series) > 0:
-                    latest_date = series.index[-1]
-                    if hasattr(latest_date, 'date'):
-                        latest_date = latest_date
-                    days_stale = (as_of - latest_date).days if isinstance(latest_date, date) else 30
-                    if days_stale > 30:
-                        stale.append(dim.name)
         except Exception as exc:
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))
             values.append(None)
@@ -342,21 +758,28 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         values=tuple(values),
         completeness=completeness,
         stale_dimensions=tuple(stale),
+        price_basis=price_basis,
+        cached=False,
     )
 
 
 def _compute_dimension(
-    engine: Engine,
+    reader: _AsOfReader,
     dim: DimensionSpec,
     as_of: date,
     norm_stats: dict[str, tuple[float, float]],
     spy_prices: pd.Series,
+    *,
+    series: pd.Series | None = None,
 ) -> float | None:
-    """Compute a single dimension value."""
+    """Compute a dimension, reusing its accepted input when supplied."""
+    if not isinstance(reader, _AsOfReader):
+        reader = _AsOfReader(reader, as_of)
+    engine = reader.engine
 
     # ── Derived dimensions (computed from other series) ──
     if dim.series_id == 'DERIVED:T5YIE':
-        series = _fetch_series(engine, 'T5YIE', as_of)
+        series = reader.window('T5YIE')
         if series.empty:
             return None
         val = float(series.iloc[-1])
@@ -371,8 +794,8 @@ def _compute_dimension(
         return (rsi_val - 50.0) / 25.0 if rsi_val is not None else None  # normalize to ~[-2, 2]
 
     if dim.series_id == 'DERIVED:REAL_FF':
-        dff = _fetch_series(engine, 'DFF', as_of)
-        t5yie = _fetch_series(engine, 'T5YIE', as_of)
+        dff = reader.window('DFF')
+        t5yie = reader.window('T5YIE')
         if dff.empty or t5yie.empty:
             return None
         return float(dff.iloc[-1] - t5yie.iloc[-1])
@@ -384,7 +807,8 @@ def _compute_dimension(
         return _get_insider_sentiment(engine, as_of)
 
     # ── Standard series dimensions ──
-    series = _fetch_series(engine, dim.series_id, as_of)
+    if series is None:
+        series = reader.window(dim.series_id)
     if series.empty or len(series) < dim.min_history:
         return None
 
@@ -436,7 +860,7 @@ def compute_state_vector_series(
     while current <= end:
         try:
             sv = compute_state_vector(engine, current)
-            if sv.completeness >= 0.4:  # at least 40% of dims populated
+            if sv.completeness >= MIN_CACHE_COMPLETENESS:
                 vectors.append(sv)
             computed += 1
             if computed % 100 == 0:
@@ -474,9 +898,20 @@ def _ensure_cache_table(engine: Engine) -> None:
 
 
 def cache_state_vector(engine: Engine, sv: StateVector) -> None:
-    """Store a state vector in the cache table."""
+    """Store a state vector in the cache table.
+
+    The only callers of this function are the nightly job
+    (``scripts/run_regime_state_vectors.py``) and, indirectly,
+    ``get_or_compute_state_vector(..., persist=True)`` — never a GET route.
+    ``price_basis`` rides along inside the existing ``vector`` JSONB column
+    under a reserved key rather than a new column, so no migration is
+    needed and the 1,927 pre-existing rows (computed before this field
+    existed) are read back with ``price_basis=None``, unchanged.
+    """
     _ensure_cache_table(engine)
     dim_dict = {DIM_NAMES[i]: sv.values[i] for i in range(len(sv.values))}
+    if sv.price_basis is not None:
+        dim_dict["__price_basis__"] = sv.price_basis
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -495,64 +930,131 @@ def cache_state_vector(engine: Engine, sv: StateVector) -> None:
         )
 
 
-def load_cached_vectors(engine: Engine, min_completeness: float = 0.4) -> list[StateVector]:
-    """Load all cached state vectors from the database."""
-    _ensure_cache_table(engine)
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT as_of_date, vector, completeness, stale_dims "
-                "FROM regime_state_vectors "
-                "WHERE completeness >= :mc "
-                "ORDER BY as_of_date"
-            ),
-            {"mc": min_completeness},
-        ).fetchall()
+# Minimum completeness for a vector to be cached, and for a cached row to be
+# served instead of recomputed. Same floor load_cached_vectors() and
+# compute_state_vector_series() already apply when building the library.
+MIN_CACHE_COMPLETENESS = 0.4
 
-    vectors: list[StateVector] = []
-    for row in rows:
-        dt, vec_json, comp, stale = row
-        vec_dict = vec_json if isinstance(vec_json, dict) else json.loads(vec_json)
-        values = tuple(vec_dict.get(name) for name in DIM_NAMES)
-        vectors.append(StateVector(
-            as_of_date=dt,
-            values=values,
-            completeness=comp,
-            stale_dimensions=tuple(stale or []),
-        ))
-    return vectors
+
+def _row_to_state_vector(row: tuple, *, cached: bool) -> StateVector:
+    dt, vec_json, comp, stale = row
+    vec_dict = vec_json if isinstance(vec_json, dict) else json.loads(vec_json)
+    values = tuple(vec_dict.get(name) for name in DIM_NAMES)
+    return StateVector(
+        as_of_date=dt,
+        values=values,
+        completeness=comp,
+        stale_dimensions=tuple(stale or []),
+        price_basis=vec_dict.get("__price_basis__"),
+        cached=cached,
+    )
+
+
+def load_cached_vectors(engine: Engine, min_completeness: float = MIN_CACHE_COMPLETENESS) -> list[StateVector]:
+    """Load all cached state vectors from the database. Read-only.
+
+    Deliberately does not call ``_ensure_cache_table`` — this is a GET-path
+    reader (``/regime/history`` and the analog library build). A missing
+    table means "no vectors yet", not "create it now"; it degrades to an
+    empty list rather than issuing DDL. Excludes any future-dated row
+    defensively, even if one exists (it never should — see
+    ``get_or_compute_state_vector``).
+    """
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT as_of_date, vector, completeness, stale_dims "
+                    "FROM regime_state_vectors "
+                    "WHERE completeness >= :mc AND as_of_date <= :today "
+                    "ORDER BY as_of_date"
+                ),
+                {"mc": min_completeness, "today": date.today()},
+            ).fetchall()
+    except Exception as exc:
+        log.debug("load_cached_vectors: cache table unavailable: {e}", e=str(exc))
+        return []
+
+    return [_row_to_state_vector(row, cached=True) for row in rows]
+
+
+def _read_cached_row(engine: Engine, as_of: date, today: date) -> tuple | None:
+    """Best-effort read of one cached row for ``as_of``, or ``None``.
+
+    Never issues DDL: a missing table (or any other read failure) is
+    treated as "no cached row", not created. ``as_of_date <= :today`` is a
+    defensive belt-and-suspenders filter — the caller already refuses to
+    cache or serve a future ``as_of`` — so a future-dated row can never be
+    served even if one somehow ended up in the table.
+    """
+    try:
+        with engine.connect() as conn:
+            return conn.execute(
+                text(
+                    "SELECT as_of_date, vector, completeness, stale_dims "
+                    "FROM regime_state_vectors "
+                    "WHERE as_of_date = :dt AND as_of_date <= :today"
+                ),
+                {"dt": as_of, "today": today},
+            ).fetchone()
+    except Exception as exc:
+        log.debug("state_vector: cache read unavailable: {e}", e=str(exc))
+        return None
 
 
 def get_or_compute_state_vector(
     engine: Engine,
     as_of: date | None = None,
     force_recompute: bool = False,
+    persist: bool = True,
 ) -> StateVector:
-    """Get from cache or compute fresh."""
+    """Get from cache, or compute fresh.
+
+    persist: True (default) is the nightly job's contract
+        (``scripts/run_regime_state_vectors.py``) — it may ensure the cache
+        table exists and, if the computed vector clears
+        ``MIN_CACHE_COMPLETENESS``, write it. GET-triggered callers (the
+        ``/regime`` and ``/regime/analogs`` routes) MUST pass
+        ``persist=False``: with that, this function issues no DDL and calls
+        ``cache_state_vector`` under no circumstance. A cache hit is still
+        served (``cached=True``); a miss is computed in memory and returned
+        with ``cached=False`` — never written.
+
+    A future ``as_of`` (no observations exist yet) is always computed in
+    memory only, regardless of ``persist`` — it is never read from or
+    written to the cache.
+    """
+    today = date.today()
     if as_of is None:
-        as_of = date.today()
+        as_of = today
+
+    if as_of > today:
+        log.warning(
+            "state_vector: as_of {d} is in the future — computing in memory only, never cached",
+            d=as_of,
+        )
+        return compute_state_vector(engine, as_of)
 
     if not force_recompute:
-        _ensure_cache_table(engine)
-        with engine.connect() as conn:
-            row = conn.execute(
-                text(
-                    "SELECT as_of_date, vector, completeness, stale_dims "
-                    "FROM regime_state_vectors WHERE as_of_date = :dt"
-                ),
-                {"dt": as_of},
-            ).fetchone()
-        if row is not None:
-            vec_dict = row[1] if isinstance(row[1], dict) else json.loads(row[1])
-            values = tuple(vec_dict.get(name) for name in DIM_NAMES)
-            return StateVector(
-                as_of_date=row[0],
-                values=values,
-                completeness=row[2],
-                stale_dimensions=tuple(row[3] or []),
-            )
+        if persist:
+            _ensure_cache_table(engine)
+        row = _read_cached_row(engine, as_of, today)
+        if row is not None and row[2] is not None and row[2] >= MIN_CACHE_COMPLETENESS:
+            return _row_to_state_vector(row, cached=True)
 
     sv = compute_state_vector(engine, as_of)
+    # Never pin a mostly-empty vector (e.g. every dimension query timed out)
+    # as the day's cached state: it would be served for the rest of the day
+    # instead of being recomputed, and load_cached_vectors() filters it out
+    # of the analog library anyway.
+    if sv.completeness < MIN_CACHE_COMPLETENESS:
+        log.warning(
+            "State vector for {d} only {c:.0%} complete — not cached",
+            d=as_of, c=sv.completeness,
+        )
+        return sv
+    if not persist:
+        return sv
     try:
         cache_state_vector(engine, sv)
     except Exception as exc:

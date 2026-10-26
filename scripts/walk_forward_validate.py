@@ -948,6 +948,10 @@ _WALK_QUERY_LIMITED = text(
         WHERE verdict IN ('hit', 'miss', 'partial')
           AND created_at >= NOW() - (:days || ' days')::interval
           AND dedup_keep = TRUE
+          -- The replay's whole subject is whether a stated confidence held
+          -- up. A row that stated none is excluded, not replayed as a
+          -- stated zero.
+          AND confidence IS NOT NULL
         ORDER BY created_at DESC
         LIMIT :lim
     ) recent
@@ -963,6 +967,7 @@ _WALK_QUERY = text(
     WHERE verdict IN ('hit', 'miss', 'partial')
       AND created_at >= NOW() - (:days || ' days')::interval
       AND dedup_keep = TRUE
+      AND confidence IS NOT NULL
     ORDER BY created_at ASC
     """
 )

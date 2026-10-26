@@ -24,14 +24,17 @@ env:
   # vitest 5 both included) in both places -- this pin is about keeping CI
   # and the deploy build on the same version, not the safety check itself.
   NODE_VERSION: "22.23.2"
-  # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
+  # Non-empty -> target any self-hosted runner labelled `tests` (alien x3,
+  # threadripper); empty/unset -> ubuntu-latest. Every `tests` runner must
+  # provide the persistent PostgreSQL 15 + TimescaleDB the reset step expects
+  # (see docs/SERVER-SERVICES.md, "Alien Runner" / "Threadripper Runner").
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
-  ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}
+  ON_SELF_HOSTED: ${{ vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -47,11 +50,11 @@ jobs:
           cache: pip
 
       # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
-      # Postgres container. alien keeps a persistent PostgreSQL 15 +
-      # TimescaleDB service (see docs/SERVER-SERVICES.md, "Alien Runner")
+      # Postgres container. Self-hosted `tests` runners keep a persistent
+      # PostgreSQL 15 + TimescaleDB service (see docs/SERVER-SERVICES.md)
       # that the next step resets instead of pulling+starting a container.
       - name: Start ephemeral Postgres (hosted runner)
-        if: env.ON_ALIEN != 'true'
+        if: env.ON_SELF_HOSTED != 'true'
         run: |
           docker run -d --name grid-test-pg \
             -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
@@ -61,8 +64,8 @@ jobs:
             sleep 1
           done
 
-      - name: Reset persistent Postgres (alien)
-        if: env.ON_ALIEN == 'true'
+      - name: Reset persistent Postgres (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
         env:
           PGPASSWORD: testpass
         run: |
@@ -77,6 +80,8 @@ jobs:
       - name: Run tests
         env:
           DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          # Explicit opt-in for the isolated briefing route PostgreSQL test.
+          GRID_BRIEFING_ROUTE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
           # config.py now rejects an empty DB_PASSWORD unconditionally (see
           # the 2026-09-13 incident) — must match the postgres service
           # password above so Settings() construction doesn't fail collection.
@@ -104,7 +109,7 @@ jobs:
             exit "$collection_status"
           fi
 
-          # -n auto: one worker per core (24 on alien, 4 on ubuntu-latest).
+          # -n auto: one worker per core (24 on alien, 32 on threadripper, 4 on ubuntu-latest).
           # --dist loadgroup honours the xdist_group markers tests/conftest.py
           # assigns: every test that can reach a live PostgreSQL shares one
           # group and so runs serially on a single worker, and every other test
@@ -127,6 +132,686 @@ jobs:
           echo "::endgroup::"
           exit "$pytest_status"
 
+      - name: Pipeline health PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_PIPELINE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_pipeline_health_pg.py -q -rA
+
+      # people_events (GD2, migrations/versions/people_events_20260927.py):
+      # proves the real upgrade/downgrade and CHECK constraints against
+      # PostgreSQL (test_people_events_migration_pg.py) and the upsert/read
+      # store contract -- known_at LEAST() merge, PIT known_at <= as_of
+      # filtering, dedup-key collision merging -- against a real database.
+      # people_events_v2_20261001 (test_people_events_v2_migration_pg.py):
+      # TEXT security_id FK, append-only guards, revision log, one current
+      # version per key, run log honesty, writer idempotency/supersession.
+      # `-m "not unit"` excludes test_people_events_store.py's PeopleEvent
+      # validation tests (pure-Python, already covered by the main suite
+      # above) and keeps only its DB-backed contract tests. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: People events PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_people_events_migration_pg.py tests/test_people_events_store.py tests/test_people_events_v2_migration_pg.py -m "not unit" -q -rA | tee /tmp/grid-people-events-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-people-events-pg.txt; then
+            echo "::error::People events PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # GD5 people-density look-ahead canary (tests/test_people_density_lookahead.py,
+      # acceptance test 13 of the GD5 slice): on a real people_events table
+      # built from the migration DDL, load_events never returns a row known
+      # after as_of and appending such rows changes no density feature (A, C,
+      # S, D_self, D_peer); a leak self-test proves the canary trips when the
+      # store filters on event_time. E1-style fixture: GRID_TEST_DB_URL only,
+      # E1_REQUIRE_PG=1 so an unreachable PostgreSQL fails; a skip fails this step.
+      - name: People density look-ahead canary (PostgreSQL)
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_people_density_lookahead.py -q -rA | tee /tmp/grid-people-density-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-people-density-pg.txt; then
+            echo "::error::People density look-ahead canary was skipped"
+            exit 1
+          fi
+
+      # GEM append-only options capture (options_append_only_20260930):
+      # proves on real PostgreSQL that two same-day capture batches both
+      # survive, the options_snapshots view (every default reader, including
+      # the frozen GEX-levels v1 paper log) shows only the latest complete
+      # batch, UPDATE/DELETE/TRUNCATE are refused, an earlier batch replays
+      # end to end, and downgrade refuses to collapse batches. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: Options append-only capture PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_options_append_only_pg.py -q -rA | tee /tmp/grid-options-append-only-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-options-append-only-pg.txt; then
+            echo "::error::Options append-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # fix/cap-future-dated-reads-20260927: the general "Run tests" step
+      # above leaves GRID_TEST_DB_URL unset, so tests/test_future_dated_reads_guard.py
+      # would silently skip there. REQUIRE_FUTURE_DATED_READS_PG makes a
+      # missing DB URL a hard failure instead of a skip (same mechanism as
+      # REQUIRE_PIPELINE_PG below), so this step can't go green without
+      # actually running all 10 look-ahead guard tests.
+      - name: Future-dated reads guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_FUTURE_DATED_READS_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_future_dated_reads_guard.py -q -rA
+
+      # tests/test_get_side_effects_readonly_pg.py: the general "Run tests"
+      # step above uses -n auto/--dist loadgroup and doesn't surface
+      # per-file skip/pass results in its tail -300 log, so a silent skip
+      # there (no PostgreSQL reachable) would never be caught. This step
+      # reruns the same file on its own and fails if any test skipped --
+      # thesis/causation/forensics/watchlist GETs are SELECT-only, and
+      # (added for Wave 3 W3.2, PR #713) GET /regime and /regime/analogs
+      # never call cache_state_vector or create regime_state_vectors.
+      - name: GET side-effects read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_get_side_effects_readonly_pg.py -q -rA | tee /tmp/grid-get-side-effects-readonly-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-get-side-effects-readonly-pg.txt; then
+            echo "::error::GET side-effects read-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      - name: Watchlist edge PostgreSQL identity contract
+        env:
+          GRID_WATCHLIST_EDGE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+        run: python -m pytest tests/test_watchlist_edge_readonly_pg.py -q -rA
+
+      - name: Watchlist overview read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_overview_readonly_pg.py -q -rA
+
+      - name: Watchlist analysis and flow PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_analysis_derivatives_readonly_pg.py -q -rA
+
+      - name: Watchlist options recommendations PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_options_readonly_pg.py -q -rA
+
+      # The general suite leaves GRID_TEST_DB_URL unset. Gate both producer
+      # and resolver contracts against the isolated disposable PG schemas.
+      # test_spy_binance_composition_pg.py proves the two policies resolve
+      # correctly TOGETHER in one Resolver.resolve_pending() call -- the
+      # actual composition question this branch exists to answer -- and was
+      # added after this step was first written; it was never in this list
+      # and so never actually ran in CI despite CI reporting green.
+      - name: SPY and Binance close PostgreSQL contracts
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_spy_price_receipt_pg.py tests/test_binance_canonical_close_pg.py tests/test_spy_binance_composition_pg.py -q -rA
+
+      - name: Binance forward cadence and scheduler pull logging
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_binance_forward_cadence.py tests/test_spy_completed_close_schedule.py tests/test_scheduler_pull_logging.py -q -rA
+
+      # SmartScheduler honest outcomes (2026-09-29, PR #727 review follow-up):
+      # proves the pull_log rows (under production's pull_log_status_check,
+      # which has no SKIPPED/NO_NEW_DATA status) and the
+      # source_catalog.last_pull_at bumps SmartScheduler writes for skipped,
+      # partial, all-failed, zero-row and raising runs. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: SmartScheduler honest pull_log PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_smart_scheduler_honest_success_pg.py -q -rA | tee /tmp/grid-smart-honest-pg.txt
+          # Anchored to pytest's -rA skip-summary line: the scheduler's own
+          # log output legitimately contains the word SKIPPED.
+          if grep -qE "^SKIPPED \[" /tmp/grid-smart-honest-pg.txt; then
+            echo "::error::SmartScheduler honest pull_log PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      - name: Portfolio GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_watchlist_portfolio_pg.py -q -rA
+
+      # God view G2 (migrations/versions/godview_writers_20260926.py): runs the
+      # real upgrade/downgrade in a throwaway schema on top of the real
+      # god_view_market_tables_20260918 tables and matview -- legacy rows kept,
+      # matview still refreshes, receipt/modeled/ledger guards enforced,
+      # downgrade refused once writer rows exist, otherwise exact restore.
+      - name: God view G2 schema migration PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_godview_schema_migration_pg.py -q -rA | tee /tmp/grid-godview-g2-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-godview-g2-pg.txt; then
+            echo "::error::God view G2 PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # God view G3 (godview/fed_liquidity.py): stacked on the G2 schema
+      # above. Proves B1 (RRP stored in millions, matching production's own
+      # convention), B2 (delta/peak history never reads a legacy row), B3
+      # (a legacy provenance-NULL row is never updated or displaced), plus
+      # arithmetic, missing-input skip, the H.4.1 publication-lag PIT gate
+      # (with its federal-holiday shift), and idempotent upsert. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it -- see
+      # the "SPY and Binance close" step's own comment above for the
+      # false-green trap a *_pg.py file left off this list falls into.
+      - name: Godview Fed liquidity writer PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_fed_liquidity_writer_pg.py -q -rA | tee /tmp/grid-godview-g3-pg.txt
+          # Anchored to pytest's own -rA skip-summary line ("SKIPPED [1]
+          # path:line: reason"), never a bare "SKIPPED" substring -- the
+          # writer's own loguru output legitimately logs
+          # "godview.fed_liquidity SKIPPED obs_date=... reason=..." for a
+          # row it declined to write (missing input, legacy-row block,
+          # before its PIT release), which is expected application
+          # behaviour, not a skipped test.
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g3-pg.txt; then
+            echo "::error::Godview Fed liquidity writer PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # God view G4 (godview/cftc_positioning.py) + G7 runner
+      # (scripts/run_godview_writers.py), on the G2 schema: code-keyed ids
+      # only, all legs from one market code, PIT windows (a later report never
+      # changes an earlier row), before-release gate, non-Tuesday report dates
+      # skipped explicitly, legacy rows never touched (partial status), ledger
+      # rows, and the runner's dry run rolling back rows and ledger alike. A
+      # skip must fail this step (same anchored grep as G3's step).
+      - name: Godview CFTC positioning writer and runner PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_cftc_positioning_writer_pg.py -q -rA | tee /tmp/grid-godview-g4-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g4-pg.txt; then
+            echo "::error::Godview CFTC positioning writer PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # God view G6 (migrations/versions/godview_view_v2_20260927.py): the
+      # legacy matview replaced by a PIT plain view on the real G2 schema;
+      # rows join a day only once released and acquired, legacy rows never
+      # appear, stale flags, downgrade restores the matview, and the upgrade
+      # refuses (rolls back) when something depends on the matview. A skip
+      # must fail this step.
+      - name: Godview G6 view PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_godview_view_pg.py -q -rA | tee /tmp/grid-godview-g6-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g6-pg.txt; then
+            echo "::error::Godview G6 view PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # God view G8 API (api/routers/godview.py + godview/read_model.py), on
+      # the real G2 schema: pre-G2 = schema_not_migrated, legacy rows never
+      # served, PIT by available_at / finished_at, stale / partial / ledger
+      # reasons, modeled GEX label, the G3 writer's rows round-tripping, and
+      # every statement the API issues being a SELECT. A skip must fail this
+      # step (same anchored grep as G3's step).
+      - name: Godview API read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/godview/test_godview_api_readonly_pg.py -q -rA | tee /tmp/grid-godview-g8-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-godview-g8-pg.txt; then
+            echo "::error::Godview API read-only PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      - name: Snapshot GET PostgreSQL read contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_snapshots_readonly_pg.py -q -rA
+
+      - name: Dad gold read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_gold_readonly_pg.py -q -rA
+
+      - name: Dad ticker detail read-only PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_dad_ticker_detail_readonly_pg.py -q -rA
+
+      # Robinhood guards (fix/robinhood-live-guards-20260924): proves the
+      # persisted drawdown/daily-loss/order-rate state and the idempotent
+      # order log actually work against real Postgres (trading_risk_state /
+      # trading_order_log — migrations/versions/robinhood_guards_20260924.py),
+      # not just against InMemoryRiskStore's Python-only logic
+      # (tests/test_robinhood_risk_store.py, part of the main run above).
+      - name: Robinhood risk store PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_robinhood_risk_store_pg.py -q -rA
+
+      # raw_series pull_status = 'QUARANTINED'
+      # (migrations/versions/raw_series_quarantined_20260926.py): runs the
+      # real upgrade/downgrade in a throwaway schema -- NOT VALID constraint
+      # under the original name, scoped timeouts, downgrade refused while
+      # QUARANTINED rows exist -- and proves check_db_health counts them
+      # neither as failed pulls nor as the latest successful pull.
+      - name: raw_series QUARANTINED status migration PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_raw_series_quarantined_migration_pg.py -q -rA | tee /tmp/grid-quarantine-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-quarantine-pg.txt; then
+            echo "::error::raw_series QUARANTINED PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Cadence-aware stale-sources signal (GRID-STALE-SOURCES-AUDIT-20260929.md
+      # / fix/cadence-aware-source-staleness): proves check_db_health's
+      # LATERAL top-1-per-source freshness read (index-backed by
+      # idx_raw_series_status_source_pull, never a raw_series scan) and the
+      # alerts.cadence classification actually work against real Postgres --
+      # weekly-within-cadence, writer-never-bumps-catalog read from
+      # raw_series, a genuinely broken source still flagged, never-pulled,
+      # inactive exclusion, and the update_frequency opportunistic-read
+      # fallback (via to_regclass, so it's correct inside this step's
+      # throwaway schema too, not just the public schema).
+      - name: Cadence-aware stale sources PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_hermes_health_stale_sources_pg.py -q -rA | tee /tmp/grid-stale-sources-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-stale-sources-pg.txt; then
+            echo "::error::Cadence-aware stale sources PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # security_master (migrations/versions/security_master_20260927.py, GD1):
+      # runs the real upgrade/downgrade in a throwaway schema -- proves all
+      # three tables (security_master, security_identifiers,
+      # security_sector_membership) land with their expected columns, the
+      # child tables' FK onto security_master.entity_id actually cascades on
+      # delete, the JSONB columns (provenance, conflict_detail x2) round-trip
+      # real JSON, the three partial indexes exist with their documented
+      # predicates, and downgrade cleanly drops all three tables.
+      - name: security_master schema migration PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_security_master_migration_pg.py -q -rA | tee /tmp/grid-security-master-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-security-master-pg.txt; then
+            echo "::error::security_master schema PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # security_master all-issuers seed loader (scripts/apply_security_master_seed.py):
+      # runs the real batched INSERT ... ON CONFLICT DO NOTHING and the printed rollback
+      # SQL against a throwaway schema -- proves types and NULLs round-trip, an existing
+      # row is never rewritten, a second apply inserts nothing, and the rollback aborts
+      # when people_events or security_sector_membership reference the seeded entities.
+      - name: security_master seed loader PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_apply_security_master_seed_pg.py -q -rA | tee /tmp/grid-security-master-seed-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-security-master-seed-pg.txt; then
+            echo "::error::security_master seed loader PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Slice N2 causal-link persistence
+      # (migrations/versions/causal_links_provenance_20260927.py,
+      # intelligence/causal_links.py, scripts/run_causal_links.py): additive
+      # migration on the legacy table + downgrade, writer refuses without it,
+      # only events public before the trade day are persisted, idempotent
+      # re-runs keep first_run_id, and the Timeline/Why GETs are SELECT-only
+      # with an as-of label.
+      - name: Causal-link writer and readers PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_causal_links_pg.py -q -rA | tee /tmp/grid-causal-links-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-causal-links-pg.txt; then
+            echo "::error::causal-link PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # resolved_series retractions
+      # (migrations/versions/resolved_retractions_20260927.py): runs the real
+      # upgrade/downgrade in a throwaway schema and proves the PIT semantics
+      # end to end -- a retracted row is hidden from as_of on/after the
+      # retraction and visible before it, LATEST_AS_OF/FIRST_RELEASE pick the
+      # remaining vintages (none left -> no row), store/pit.py and the migrated
+      # direct readers honour it, and the table is append-only/FK-pinned.
+      - name: resolved_series retractions PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_resolved_series_retractions_pg.py -q -rA | tee /tmp/grid-retractions-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-retractions-pg.txt; then
+            echo "::error::resolved_series retractions PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Derived-feature writers PIT fix (GRID-RERESOLVE-PLAN-20260927,
+      # "DERIVED FEATURES"): scripts/compute_derived_features.py and
+      # scripts/fill_missing_features.py::compute_derived_features now read
+      # every input through store.pit.PITStore's LATEST_AS_OF (retraction-
+      # aware since PR #683) instead of an unfiltered all-vintage read, the
+      # first writer stamps new resolved_series rows at computation time
+      # instead of backdating to obs_date, neither ever overwrites an
+      # existing vintage, and both refuse to run at all when
+      # resolved_series_retractions does not exist. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Derived-feature writers PIT PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_derived_feature_writers_pit_20260927_pg.py -q -rA | tee /tmp/grid-derived-features-pit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-derived-features-pit-pg.txt; then
+            echo "::error::Derived-feature writers PIT PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # Analytics snapshots job (scripts/run_analytics_snapshots.py): the
+      # readiness gate (G1-G5), sector-restricted clustering eligibility
+      # (CAST(:restrict AS INTEGER[])), global-vs-sector snapshot reads,
+      # correlation-matrix fail-closed ids, options scan summary, and one
+      # gated end-to-end write — against a disposable schema.
+      - name: Analytics snapshots job PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_analytics_snapshots_pg.py -q -rA | tee /tmp/grid-analytics-snapshots-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-analytics-snapshots-pg.txt; then
+            echo "::error::Analytics snapshots PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # GRID-YF-CLOSE-REPAIR-20260926 / coordinator review of PR #672:
+      # proves ingestion/yfinance_pull.py's cross-process advisory lock
+      # (pg_try_advisory_lock/pg_advisory_unlock) actually blocks a second,
+      # independent connection while the first holds it — the guard a
+      # same-process threading.Lock cannot provide, and the reason
+      # grid-scheduler and grid-hermes (two separate systemd units that
+      # both call pull_all()) can't race each other's writes.
+      - name: YFinance pull_all advisory lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_YFINANCE_LOCK_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_yfinance_pull_all_advisory_lock_pg.py -q -rA
+
+      # Stale-sources audit 2026-09-29: ingestion/tiingo_pull.py's set-based
+      # insert must keep the per-row statement's dedupe contract on real
+      # PostgreSQL (unnest/array casts), and pull_incremental must skip
+      # while another connection holds the Tiingo prices advisory lock.
+      - name: Tiingo prices set-based insert and advisory lock PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_TIINGO_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: python -m pytest tests/test_tiingo_prices_pg.py -q -rA
+
+      # PR #688 review (2026-09-27): resolved_series' real unique index is
+      # (feature_id, obs_date, vintage_date), so rows sharing
+      # (feature_id, obs_date) are always distinct vintages that
+      # store/pit.py's FIRST_RELEASE/LATEST_AS_OF policies read -- never
+      # true duplicates. intelligence/resolution_audit.py and
+      # scripts/hermes_fixers.py no longer delete any resolved_series row
+      # in their "dedup"/data-quality paths at all; this proves against
+      # real Postgres that a multi-vintage group survives both functions
+      # completely intact, whether or not PR #683's
+      # resolved_series_retractions exists.
+      - name: resolved_series dedup retraction-guard PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_dedup_retraction_guard_pg.py -q -rA | tee /tmp/grid-dedup-retraction-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-dedup-retraction-pg.txt; then
+            echo "::error::resolved_series dedup retraction-guard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # E1 integrity gates (evals/e1, GRID-EVALS-SELF-IMPROVING-ENGINE-PLAN
+      # milestone M1): look-ahead canary (append-future determinism + planted
+      # future-leak on store.observations, store.pit, the regime state vector
+      # and the VS1 panel builders), honest success over every SmartScheduler
+      # registry entry, raw_series provenance / one meaning per source, and
+      # byte-identical reruns of the VS1 ledger and the real-panel scan. The
+      # suite is hash-pinned (evals/e1/MANIFEST.sha256, checked first); known
+      # violations on main are strict, named xfails (evals/e1/known_violations.py).
+      # Not under tests/, so the general run above never collects it. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E1 integrity gates
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m evals.e1.manifest --check
+          python -m pytest evals/e1 -q -rA --durations=10 | tee /tmp/grid-e1-gates.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-e1-gates.txt; then
+            echo "::error::E1 integrity gates: a gate was skipped"
+            exit 1
+          fi
+
+      # E1-V3/V4/V6 writer fixes against production's DDL (schema.sql
+      # verbatim): bls / wiki_history registry entry points, the four repaired
+      # raw_series writers (append-only, pull_status set, no non-schema
+      # columns) and coingecko's raw_series provenance through the real
+      # resolver. A skip (PostgreSQL unreachable) must fail this step.
+      - name: E1 writer provenance PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e1_writer_provenance_pg.py -q -rA | tee /tmp/grid-e1-writers-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-e1-writers-pg.txt; then
+            echo "::error::E1 writer provenance PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
+      # point-in-time against real SQL (no close before its pull or its
+      # session close, no revision pulled after the run instant, one named
+      # source), a full board run resolves only once the exit close is
+      # observable, and the price session is server-enforced read-only.
+      # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E2 forward scoreboard price resolution PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_price_resolver_pg.py -q -rA | tee /tmp/grid-e2-prices-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-prices-pg.txt; then
+            echo "::error::E2 forward scoreboard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # E2 witness sync (scripts/e2_witness_sync.sh): commits only the E2
+      # anchor folder of its dedicated vault clone, refuses anything but a
+      # pure append, never the GEX mirror's clone. The general run above
+      # cannot show a skip (bash/git/flock missing), so this reruns the
+      # file on its own and fails if any test skipped.
+      - name: E2 witness sync contract
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_witness_sync.py -q -rA | tee /tmp/grid-e2-witness-sync.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-witness-sync.txt; then
+            echo "::error::E2 witness sync contract was skipped"
+            exit 1
+          fi
+
+      # scripts/audit_backdated_vintages.py (DATA-FIX DFa): exact per-feature
+      # counts of backdated resolved_series vintages on a real PostgreSQL
+      # schema, read-only transactions, DB-window refusal. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Backdated vintages audit PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BACKDATED_AUDIT_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_audit_backdated_vintages_pg.py -q -rA | tee /tmp/grid-backdated-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-backdated-audit-pg.txt; then
+            echo "::error::Backdated vintages audit PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
@@ -137,12 +822,12 @@ jobs:
           fi
 
       - name: Stop ephemeral Postgres (hosted runner)
-        if: always() && env.ON_ALIEN != 'true'
+        if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -183,7 +868,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
 
     steps:
@@ -196,7 +881,9 @@ jobs:
           cache: pip
 
       - name: Install linters
-        run: pip install ruff bandit
+        # The backlink check imports loguru; Alien has it installed persistently,
+        # but the supported ubuntu-latest fallback starts from a clean image.
+        run: pip install ruff bandit 'loguru>=0.7.2'
 
       # Style and unused-import noise across a 700+ module tree: too much to
       # gate on today, so this stays advisory and reports without failing.
@@ -227,3 +914,36 @@ jobs:
 
       - name: Security scan (medium audit)
         run: bandit -r api/ store/ intelligence/ -ll --exit-zero
+
+      # Failure-injection proof for scripts/deploy_release_swap.sh: a failed
+      # build/migration must never leave the live release directory
+      # half-updated. Runs entirely inside its own temp sandbox -- no
+      # database, no grid-svr, no production path is touched. See
+      # tests/deploy/test_deploy_release_swap.sh's own header for what each
+      # case proves.
+      - name: Deploy pipeline — atomic release swap (failure injection)
+        run: bash tests/deploy/test_deploy_release_swap.sh
+
+      - name: Deploy pipeline — immutable runtime preservation
+        run: bash tests/deploy/test_runtime_preservation.sh
+
+      # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
+      # the resolved-cwd + independent-SHA check every "verify running the
+      # deployed tree" step in deploy.yml now shares. Added after the
+      # 2026-09-22 incident where the grid-api verify step's literal
+      # `$cwd = $DEPLOY_PATH` comparison could never pass again once
+      # deploy_release_swap.sh made $DEPLOY_PATH a symlink -- it failed a
+      # genuinely healthy deploy. See
+      # tests/deploy/test_deploy_verify_release_tree.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — release-tree verification (failure injection)
+        run: bash tests/deploy/test_deploy_verify_release_tree.sh
+
+      # Failure-injection proof for scripts/deploy_pin_candidate_sha.sh:
+      # `main` advancing during a build must not change the commit a
+      # candidate is built from, or -- via the real
+      # scripts/deploy_release_swap.sh -- the commit that ends up live. See
+      # tests/deploy/test_deploy_pin_candidate_sha.sh's own header for what
+      # each case proves.
+      - name: Deploy pipeline — build-time exact-SHA pinning (failure injection)
+        run: bash tests/deploy/test_deploy_pin_candidate_sha.sh

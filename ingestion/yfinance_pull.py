@@ -7,10 +7,15 @@ and stores each field as a separate entry in ``raw_series``.
 
 from __future__ import annotations
 
+import hashlib
+import inspect
+import json
 import logging
+import math
 import re
-from datetime import date
-from typing import Any
+import threading
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable
 
 import pandas as pd
 import yfinance as yf
@@ -19,11 +24,121 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller
+from price_close_contract import (
+    SPY_CAPTURE_MAX_LOOKBACK_DAYS,
+    SPY_CLOSE_SERIES,
+    capture_payload,
+    observation_end_utc,
+    daily_capture_payload,
+    daily_capture_boundary,
+    is_daily_policy_capture,
+    raw_capture_payload,
+    series_id_for_interval,
+)
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+# GRID-YF-CLOSE-REPAIR-20260926 root-cause fix: the smart scheduler
+# (ingestion/smart_scheduler.py) runs YFinancePuller.pull_all in a daemon
+# thread bounded by a thread-join timeout. If that budget is exceeded the
+# thread is *orphaned* (left running, never killed — see
+# SmartScheduler._run_puller's docstring) while the NEXT scheduler tick can
+# start a fresh pull_all() call in the same process. Two concurrent
+# pull_all() runs against an old, thread-unsafe yfinance version (fixed in
+# 1.7.0, see the module-level timeout note above) was the confirmed
+# mechanism by which one ticker's frame got written under another ticker's
+# series_id. This lock makes pull_all single-flight at the PROCESS level —
+# a non-blocking acquire — so a second concurrent call (whether from an
+# orphaned thread or an ordinary double-invocation) skips its run entirely
+# rather than racing the first one. It is a plain (non-reentrant)
+# threading.Lock at module scope, not an instance attribute, because a new
+# YFinancePuller instance is constructed for every scheduled call
+# (SmartScheduler._build_puller_instance) — the lock must survive across
+# instances and threads for the life of the process.
+_PULL_ALL_LOCK = threading.Lock()
+
+
+def _stable_advisory_lock_key(name: str) -> int:
+    """Deterministic signed-64-bit key for pg_try_advisory_lock/unlock.
+
+    Python's built-in ``hash()`` is randomised per process
+    (``PYTHONHASHSEED``) — two different processes would compute two
+    different keys for the same name, which is useless for a lock they need
+    to agree on. sha256 is deterministic across processes, interpreters, and
+    restarts, which is exactly the property this needs.
+    """
+    digest = hashlib.sha256(name.encode("utf-8")).digest()[:8]
+    value = int.from_bytes(digest, byteorder="big", signed=False)
+    # pg_try_advisory_lock takes a signed bigint; wrap the top half of the
+    # unsigned range into negative territory rather than truncating bits.
+    return value - (1 << 64) if value >= (1 << 63) else value
+
+
+# Cross-process single-flight guard (coordinator review of PR #672,
+# 2026-09-26): _PULL_ALL_LOCK above only protects against two concurrent
+# calls INSIDE ONE PROCESS. It does nothing across processes, and two
+# separate, independently-deployed processes both call pull_all():
+#   - grid-scheduler (systemd unit `python3 -m ingestion.scheduler`) ->
+#     run_daily_pulls() -> pull_all(), 4x/day (ingestion/scheduler.py).
+#   - grid-hermes (systemd unit, scripts/hermes_operator.py) ->
+#     ingestion/smart_scheduler.py's SmartScheduler -> pull_all(), every 4h.
+# A session-level Postgres advisory lock is visible across every backend
+# connection to the same database regardless of which OS process opened it,
+# which makes it the actual cross-process guard the thread lock cannot be.
+# Session-level (pg_advisory_lock/pg_advisory_unlock), not transaction-level
+# (pg_advisory_xact_lock): pull_all's body opens and commits many of its own
+# short transactions per ticker (self.engine.begin() in pull_ticker), and a
+# transaction-scoped lock would release after the first one instead of
+# covering the whole run. If the holding process crashes outright (no chance
+# to run the `finally` unlock), Postgres releases every session-level
+# advisory lock held by that backend connection when the connection itself
+# drops — which is also what stops an orphaned SmartScheduler thread from
+# starving this lock forever, unlike _PULL_ALL_LOCK (an orphaned thread
+# keeps holding that one, in-process, until it happens to finish).
+_PULL_ALL_ADVISORY_LOCK_KEY: int = _stable_advisory_lock_key("grid:yfinance:pull_all")
+
+# Wrong-instrument sanity guard (GRID-YF-CLOSE-REPAIR-20260926, fix #4):
+# refuse to write a series' freshly downloaded values if they disagree
+# wildly with that exact series' own existing recent SUCCESS values on the
+# dates where both exist. A different instrument's price series will almost
+# always fail this cheaply, even when everything else about the response
+# (columns, dtypes, dates) looks well-formed.
+_WILD_RATIO_LOW = 0.5
+_WILD_RATIO_HIGH = 2.0
+# Below this many overlapping dates, a ratio is too noisy to judge (a single
+# stale or off-by-one-day existing row could otherwise trip the guard).
+_WILD_RATIO_MIN_OVERLAP = 3
+# How far back to compare — see _median_ratio_vs_existing's docstring for
+# why this must stay bounded (a full-history pull_all call would otherwise
+# make this guard's own lookup scan ~1.15M rows per field on a heavily
+# contaminated series like YF:SPY:close; measured via EXPLAIN ANALYZE on
+# grid-svr, 2026-09-26).
+_WILD_RATIO_LOOKBACK_DAYS = 30
 
 # yfinance logs missing/delisted symbols at ERROR level internally. The puller
 # already downgrades those outcomes to PARTIAL/SKIPPED, so keep the third-party
 # logger from polluting production error scans.
 logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+
+# fable-hermes-repair-bound follow-up (2026-09-19), review Check 2a: one
+# yf.download() call cannot be interrupted by should_continue — that is only
+# polled between tickers (see pull_all below). If the installed yfinance
+# version's yf.download() accepts a `timeout` kwarg, pull_ticker passes a
+# bounded one (_YF_DOWNLOAD_TIMEOUT_SECONDS) so a single hung HTTP call can't
+# run indefinitely. Checked via inspect.signature (not a version-string
+# comparison) so this stays correct across yfinance upgrades. requirements.txt
+# pins yfinance>=1.5.1; the environment this was verified against has 1.7.0,
+# whose yf.download() already accepts and defaults `timeout=10` — this module
+# passes an explicit, slightly larger bound instead of relying on that
+# upstream default, so the behavior doesn't silently change if yfinance drops
+# or alters its own default in a future version.
+try:
+    _YF_DOWNLOAD_ACCEPTS_TIMEOUT = "timeout" in inspect.signature(yf.download).parameters
+except (TypeError, ValueError):
+    _YF_DOWNLOAD_ACCEPTS_TIMEOUT = False
+_YF_DOWNLOAD_TIMEOUT_SECONDS = 30
 
 # Default tickers to pull
 YF_TICKER_LIST: list[str] = [
@@ -111,26 +226,193 @@ class YFinancePuller(BasePuller):
         super().__init__(db_engine)
         log.info("YFinancePuller initialised — source_id={sid}", sid=self.source_id)
 
+    def _try_acquire_pg_advisory_lock(self) -> Any | None:
+        """Try to take the cross-process advisory lock for pull_all.
+
+        Returns the open ``Connection`` holding the lock (pass it to
+        :meth:`_release_pg_advisory_lock` when done), or ``None`` if another
+        process already holds it.
+
+        Deliberately does NOT use ``with self.engine.connect() as conn:``.
+        A session-level advisory lock lives on the specific physical backend
+        connection that took it — exiting a context manager (or otherwise
+        closing/returning the connection to the pool) releases the lock
+        immediately, even though the caller still believes it holds it. The
+        returned connection must stay open, unreturned to the pool, for the
+        entire pull_all() run.
+        """
+        conn = self.engine.connect()
+        try:
+            acquired = conn.execute(
+                text("SELECT pg_try_advisory_lock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            ).scalar()
+            # pg_try_advisory_lock is session-scoped, not transaction-scoped
+            # — it is unaffected by commit/rollback. Close out the implicit
+            # transaction SQLAlchemy auto-began for that SELECT so this
+            # connection doesn't sit "idle in transaction" for the whole run.
+            conn.commit()
+        except Exception:
+            conn.close()
+            raise
+        if not acquired:
+            conn.close()
+            return None
+        return conn
+
+    def _release_pg_advisory_lock(self, conn: Any) -> None:
+        """Release the cross-process advisory lock and close its connection.
+
+        Explicit ``pg_advisory_unlock`` before ``close()`` matters: without
+        it, the connection pool could eventually hand this same physical
+        backend connection to unrelated work while it still holds the lock
+        (a normal ``close()`` returns the connection to the pool; it does
+        not itself run ``pg_advisory_unlock``). Crash safety is separate and
+        already covered — see the module-level comment on
+        ``_PULL_ALL_ADVISORY_LOCK_KEY``: if the process dies outright,
+        Postgres releases the lock when that backend connection drops.
+        """
+        try:
+            conn.execute(
+                text("SELECT pg_advisory_unlock(:key)"),
+                {"key": _PULL_ALL_ADVISORY_LOCK_KEY},
+            )
+            conn.commit()
+        except Exception as exc:
+            log.warning(
+                "yfinance pull_all: failed to release the advisory lock "
+                "cleanly (Postgres will still release it when this "
+                "connection closes/drops): {e}",
+                e=str(exc),
+            )
+        finally:
+            conn.close()
+
+    def _median_ratio_vs_existing(
+        self,
+        series_id: str,
+        values_by_date: dict[date, float],
+        conn: Any,
+    ) -> tuple[float | None, int]:
+        """Compare freshly downloaded values to this series' own RECENT history.
+
+        Looks up existing SUCCESS rows for ``series_id`` within the last
+        ``_WILD_RATIO_LOOKBACK_DAYS`` days (see that constant — bounded
+        deliberately, not to the full min/max of ``values_by_date``) and
+        returns the median of new/old ratios plus how many dates overlapped.
+        Zero or near-zero existing values are excluded (division is
+        meaningless there). Returns ``(None, overlap_count)`` when there
+        isn't enough overlap to judge — callers must treat ``None`` as "no
+        opinion", never as "safe".
+
+        Why bounded to a recent window rather than the request's full date
+        range: ``values_by_date`` comes from whatever ``start_date`` this
+        call happened to request, which for a deliberate full-history
+        backfill (``pull_all``'s own 1990-01-01 default; see that method's
+        docstring) spans 35+ years. Measured via EXPLAIN ANALYZE on
+        grid-svr (2026-09-26): the same query unbounded over a heavily
+        contaminated series (YF:SPY:close, ~1.15M SUCCESS rows across all
+        its wrong-instrument batches — see GRID-YF-CLOSE-REPAIR-20260926)
+        took ~1.5s and read ~150MB of buffers, inside the same DB
+        transaction as the pending inserts, on EVERY field of EVERY ticker.
+        A short recent window is also literally what this guard is meant to
+        check against — "that series' existing RECENT SUCCESS values" — not
+        an ability to judge decades-old history on every call.
+
+        Parameters:
+            series_id: The raw_series series identifier being written.
+            values_by_date: Freshly downloaded {obs_date: value} pairs.
+            conn: Active database connection (used inside the same
+                transaction as the pending inserts).
+        """
+        if not values_by_date:
+            return None, 0
+
+        recent_floor = date.today() - timedelta(days=_WILD_RATIO_LOOKBACK_DAYS)
+        windowed = {d: v for d, v in values_by_date.items() if d >= recent_floor}
+        if not windowed:
+            return None, 0
+
+        rows = conn.execute(
+            text(
+                "SELECT obs_date, value FROM raw_series "
+                "WHERE series_id = :sid AND source_id = :src "
+                "AND pull_status = 'SUCCESS' "
+                "AND obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {
+                "sid": series_id,
+                "src": self.source_id,
+                "start_date": max(min(windowed), recent_floor),
+                "end_date": max(windowed),
+            },
+        ).fetchall()
+        existing: dict[date, float] = {}
+        for row in rows:
+            try:
+                existing[row[0]] = float(row[1])
+            except (TypeError, ValueError):
+                continue
+
+        ratios: list[float] = []
+        for obs_date_val, new_val in windowed.items():
+            old_val = existing.get(obs_date_val)
+            if old_val is None or old_val == 0 or new_val == 0:
+                continue
+            ratios.append(new_val / old_val)
+
+        if len(ratios) < _WILD_RATIO_MIN_OVERLAP:
+            return None, len(ratios)
+
+        ratios.sort()
+        mid = len(ratios) // 2
+        median = (
+            ratios[mid]
+            if len(ratios) % 2 == 1
+            else (ratios[mid - 1] + ratios[mid]) / 2
+        )
+        return median, len(ratios)
+
     def pull_ticker(
         self,
         ticker: str,
         start_date: str | date,
         end_date: str | date | None = None,
         interval: str = "1d",
+        *,
+        only_fields: frozenset[str] | None = None,
     ) -> dict[str, Any]:
         """Download OHLCV data for a single ticker and insert into raw_series.
 
         Each OHLCV field is stored as a separate series with the naming
-        convention ``YF:{ticker}:{field}`` (e.g. ``YF:^GSPC:close``).
+        convention ``YF:{ticker}:{field}`` for 1d; new non-1d writes use
+        ``YF:{ticker}:{field}:{interval}``. ``series_id_map`` returns the
+        checked field-to-ID mapping. Raw SUCCESS never implies daily finality;
+        ``qualified_rows_inserted`` is the policy-qualified subset of
+        ``raw_rows_inserted``/``rows_inserted``. UNKNOWN/INCOMPLETE values
+        retain explicit provenance and remain excluded from selected closes.
 
         Parameters:
             ticker: Yahoo Finance ticker symbol.
             start_date: Earliest date to download.
             end_date: Latest date (default: today).
             interval: Data frequency ('1d', '1wk', '1mo').
+            only_fields: Optional field keys to persist from the bounded
+                download. The scheduled completed-SPY-close request uses
+                ``frozenset({'close'})`` so it cannot write other OHLCV fields.
 
         Returns:
-            dict: Result with keys ``ticker``, ``rows_inserted``, ``status``, ``errors``.
+            dict: Result with keys ``ticker``, ``rows_inserted``, ``status``,
+            ``errors``, and ``outcome``. ``outcome`` is the per-ticker
+            classification consumed by the repair-summary logging in
+            scripts/hermes_fixers.py::_retry_source — one of ``"inserted"``
+            (rows_inserted > 0), ``"duplicate_only"`` (a non-empty download
+            that inserted 0 rows because the latest raw capture matches or
+            the daily capture is already qualified), ``"no_data"`` (no
+            acceptable raw data or no eligible SPY close), or ``"error"`` (invalid ticker or an
+            exception). A "checked" outcome (any of these four) is NOT a
+            claim that this ticker's data is current through today — see
+            pull_all's docstring.
         """
         yf_ticker = _normalize_yahoo_ticker(ticker)
         result: dict[str, Any] = {
@@ -138,9 +420,15 @@ class YFinancePuller(BasePuller):
             "rows_inserted": 0,
             "status": "SUCCESS",
             "errors": [],
+            "outcome": "inserted",
         }
+        result.update(interval=interval, series_id_map={}, raw_rows_inserted=0,
+                      qualified_rows_inserted=0, qualification_withheld=0, raw_value_refusals=0,
+                      capture_states_seen=[])
+        result["daily_policy_refusals"] = 0
         if yf_ticker is None:
             result["status"] = "SKIPPED"
+            result["outcome"] = "error"
             result["errors"].append("Invalid Yahoo ticker")
             log.warning("yfinance {t}: invalid ticker; skipping", t=ticker)
             return result
@@ -148,17 +436,48 @@ class YFinancePuller(BasePuller):
         log.info("Pulling yfinance ticker {t} from {sd}", t=yf_ticker, sd=start_date)
 
         try:
+            download_kwargs: dict[str, Any] = {
+                "start": str(start_date),
+                "end": str(end_date) if end_date else None,
+                "interval": interval,
+                "progress": False,
+            }
+            if _YF_DOWNLOAD_ACCEPTS_TIMEOUT:
+                download_kwargs["timeout"] = _YF_DOWNLOAD_TIMEOUT_SECONDS
+            # auto_adjust is passed literally at the call site (not via the
+            # kwargs dict) so tests/test_yfinance_auto_adjust_explicit.py can
+            # verify the basis statically.
             df: pd.DataFrame = yf.download(
-                yf_ticker,
-                start=str(start_date),
-                end=str(end_date) if end_date else None,
-                interval=interval,
-                progress=False,
-                auto_adjust=False,
+                yf_ticker, auto_adjust=False, **download_kwargs
             )
 
-            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker)
+            # yfinance >=0.2.31 returns MultiIndex columns (field, ticker).
+            # Wrong-instrument guard (GRID-YF-CLOSE-REPAIR-20260926, fix #3):
+            # verify every ticker-level entry matches what we asked for
+            # BEFORE dropping that level. A mismatch means the frame yfinance
+            # returned belongs (wholly or partly) to a different instrument
+            # — the confirmed mechanism behind the April 2026 SPY/QQQ/BTC/ETH
+            # contamination (donor tickers like CL=F, GBPUSD=X, another
+            # crypto). Fail closed for the whole ticker rather than silently
+            # writing data that isn't this ticker's.
             if isinstance(df.columns, pd.MultiIndex):
+                ticker_level = df.columns.get_level_values(-1)
+                unexpected = sorted(
+                    {str(t) for t in ticker_level if str(t) != yf_ticker}
+                )
+                if unexpected:
+                    log.warning(
+                        "yfinance {t}: downloaded frame contains other "
+                        "ticker column(s) {u} — refusing to write "
+                        "(wrong-instrument guard)",
+                        t=yf_ticker, u=unexpected,
+                    )
+                    result["status"] = "SKIPPED"
+                    result["outcome"] = "error"
+                    result["errors"].append(
+                        f"Wrong-instrument frame: unexpected ticker column(s) {unexpected}"
+                    )
+                    return result
                 df.columns = df.columns.get_level_values(0)
 
             # Drop any rows where the index is not a valid datetime
@@ -175,10 +494,13 @@ class YFinancePuller(BasePuller):
             if df is None or df.empty:
                 log.warning("yfinance returned no data for {t}", t=yf_ticker)
                 result["status"] = "PARTIAL"
+                result["outcome"] = "no_data"
                 result["errors"].append("No data returned")
                 return result
 
             inserted = 0
+            qualified_inserted = 0
+            capture_states_seen: set[str] = set()
 
             # yfinance's own `end` is exclusive (start="2026-09-10",
             # end="2026-09-11" returns only 09-10 — confirmed against the
@@ -194,26 +516,37 @@ class YFinancePuller(BasePuller):
                 if end_date
                 else None
             )
+            requested_start_bound = pd.Timestamp(start_date).date()
 
             with self.engine.begin() as conn:
                 for col_name, field_key in _FIELD_MAP.items():
+                    if only_fields is not None and field_key not in only_fields:
+                        continue
                     if col_name not in df.columns:
                         continue
 
-                    series_id = f"YF:{yf_ticker}:{field_key}"
+                    series_id = series_id_for_interval(yf_ticker, field_key, interval)
+                    result["series_id_map"][field_key] = series_id
                     selected = df[col_name]
                     # Duplicate-column collapses (e.g. MultiIndex flattening
                     # producing repeated headers) yield a DataFrame instead of
                     # a Series, whose .items() iterates column names rather
                     # than the DatetimeIndex — which leaks strings like "Open"
-                    # into obs_date and poisons the insert.
+                    # into obs_date and poisons the insert. Fix #3
+                    # (GRID-YF-CLOSE-REPAIR-20260926): we can't tell which
+                    # duplicate column is correct, so fail closed for this
+                    # field instead of silently guessing via the first one.
                     if isinstance(selected, pd.DataFrame):
                         log.warning(
                             "yfinance {t}: column {c} resolved to DataFrame "
-                            "({n} duplicates); taking first column",
+                            "({n} duplicate columns) — refusing to guess; "
+                            "skipping this field",
                             t=yf_ticker, c=col_name, n=selected.shape[1],
                         )
-                        selected = selected.iloc[:, 0]
+                        result["errors"].append(
+                            f"{field_key}: ambiguous duplicate columns — skipped"
+                        )
+                        continue
                     col_data = selected.dropna()
                     # Bounded to the same window this call already requested
                     # from yfinance: col_data can only contain dates inside
@@ -225,9 +558,50 @@ class YFinancePuller(BasePuller):
                     existing_dates = self._get_existing_dates(
                         series_id,
                         conn,
-                        start_date=pd.Timestamp(start_date).date(),
+                        start_date=requested_start_bound,
                         end_date=existing_end_bound,
                     )
+
+                    # Wrong-instrument sanity guard (fix #4,
+                    # GRID-YF-CLOSE-REPAIR-20260926): before writing anything
+                    # for this series, compare the freshly downloaded values
+                    # to this exact series' own existing recent SUCCESS
+                    # values on the dates where both exist. A median ratio
+                    # far from 1 — outside [0.5, 2] — means this download
+                    # disagrees wildly with the series' own history, which is
+                    # cheap, strong evidence of a wrong-instrument frame
+                    # (donor tickers off by 0.4x-30x+ per the incident
+                    # writeup) rather than a normal revision. Refuse the
+                    # whole field's writes rather than trying to salvage
+                    # individual dates.
+                    guard_values_by_date: dict[date, float] = {}
+                    for dt_idx, raw_value in col_data.items():
+                        parsed = pd.to_datetime(dt_idx, errors="coerce")
+                        if pd.isna(parsed):
+                            continue
+                        try:
+                            guard_values_by_date[parsed.date()] = float(raw_value)
+                        except (TypeError, ValueError):
+                            continue
+                    median_ratio, overlap_n = self._median_ratio_vs_existing(
+                        series_id, guard_values_by_date, conn,
+                    )
+                    if median_ratio is not None and not (
+                        _WILD_RATIO_LOW <= median_ratio <= _WILD_RATIO_HIGH
+                    ):
+                        log.warning(
+                            "yfinance {t}:{f}: refusing write — median ratio "
+                            "{r:.3f} vs {n} overlapping existing SUCCESS "
+                            "dates is outside [{lo},{hi}] (wrong-instrument "
+                            "guard)",
+                            t=yf_ticker, f=field_key, r=median_ratio,
+                            n=overlap_n, lo=_WILD_RATIO_LOW, hi=_WILD_RATIO_HIGH,
+                        )
+                        result["errors"].append(
+                            f"{field_key}: wild median ratio {median_ratio:.3f} "
+                            f"vs {overlap_n} existing dates — refused"
+                        )
+                        continue
 
                     for dt_idx, value in col_data.items():
                         # Defensive: reject any index entry that isn't a real
@@ -264,27 +638,162 @@ class YFinancePuller(BasePuller):
                             continue
 
                         obs_date_val = dt_parsed.date()
-                        if obs_date_val in existing_dates:
+                        # The close-only scheduled request is for exactly one
+                        # completed session. Do not trust a provider response
+                        # to obey the requested one-day bounds.
+                        if only_fields is not None and (
+                            obs_date_val < requested_start_bound
+                            or (existing_end_bound is not None
+                                and obs_date_val > existing_end_bound)
+                        ):
                             continue
-
+                        if series_id == SPY_CLOSE_SERIES and interval == "1d":
+                            if not math.isfinite(float_val) or float_val <= 0:
+                                result["raw_value_refusals"] += 1
+                                continue
+                            captured_at = _utc_now()
+                            # No provisional SPY close and no implicit history
+                            # backfill. A later pull may append one marked row
+                            # even if an older unmarked row exists.
+                            if obs_date_val < captured_at.date() - timedelta(
+                                days=SPY_CAPTURE_MAX_LOOKBACK_DAYS
+                            ):
+                                result["daily_policy_refusals"] += 1
+                                continue
+                            marker = capture_payload(obs_date_val, captured_at)
+                            if marker is None:
+                                result["daily_policy_refusals"] += 1
+                                continue
+                            already_marked = conn.execute(
+                                text(
+                                    "SELECT 1 FROM raw_series "
+                                    "WHERE series_id = :sid AND source_id = :src "
+                                    "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                    "AND raw_payload @> CAST(:payload AS jsonb) "
+                                    "AND pull_timestamp >= :period_end "
+                                    "LIMIT 1"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "payload": json.dumps(marker),
+                                 "period_end": observation_end_utc(obs_date_val)},
+                            ).fetchone()
+                            if already_marked:
+                                continue
+                            conn.execute(
+                                text(
+                                    "INSERT INTO raw_series "
+                                    "(series_id, source_id, obs_date, pull_timestamp, "
+                                    "value, raw_payload, pull_status) "
+                                    "VALUES (:sid, :src, :od, :pulled_at, :val, "
+                                    "CAST(:payload AS jsonb), 'SUCCESS')"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "pulled_at": captured_at,
+                                 "val": float_val, "payload": json.dumps(marker)},
+                            )
+                            inserted += 1
+                            qualified_inserted += 1
+                            capture_states_seen.add("POLICY_ELIGIBLE")
+                            continue
+                        # Raw acceptance and daily qualification are separate.
+                        # Unsupported sessions/years/intervals remain observable,
+                        # with explicit UNKNOWN/INCOMPLETE provenance. The latest
+                        # interval-specific vintage determines raw idempotency;
+                        # any valid eligible capture retains its once-qualified
+                        # idempotency even when earlier raw vintages exist.
+                        if (not math.isfinite(float_val)
+                                or (float_val < 0 if field_key == "volume" else float_val <= 0)):
+                            result["raw_value_refusals"] += 1
+                            continue
+                        captured_at = _utc_now()
+                        payload = raw_capture_payload(
+                            yf_ticker, field_key, obs_date_val, captured_at, interval,
+                        )
+                        state = payload["capture_state"]
+                        capture_states_seen.add(state)
+                        if state != "POLICY_ELIGIBLE":
+                            result["qualification_withheld"] += 1
+                        self._file_advisory_lock(conn, series_id, obs_date_val)
+                        marker = daily_capture_payload(
+                            yf_ticker, field_key, obs_date_val, captured_at, interval,
+                        )
+                        if marker is not None:
+                            marked_rows = conn.execute(
+                                text(
+                                    "SELECT raw_payload, pull_timestamp FROM raw_series "
+                                    "WHERE series_id = :sid AND source_id = :src "
+                                    "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                    "AND raw_payload @> CAST(:payload AS jsonb) "
+                                    "AND pull_timestamp >= :period_end"
+                                ),
+                                {"sid": series_id, "src": self.source_id,
+                                 "od": obs_date_val, "payload": json.dumps(marker),
+                                 "period_end": daily_capture_boundary(yf_ticker, obs_date_val)},
+                            ).fetchall()
+                            if any(is_daily_policy_capture(row[0], series_id, obs_date_val, row[1])
+                                   for row in marked_rows):
+                                continue
+                        latest = conn.execute(
+                            text(
+                                "SELECT raw_payload, pull_timestamp, value FROM raw_series "
+                                "WHERE series_id = :sid AND source_id = :src "
+                                "AND obs_date = :od AND pull_status = 'SUCCESS' "
+                                "AND raw_payload ->> 'interval' = :interval "
+                                "ORDER BY pull_timestamp DESC, id DESC LIMIT 1"
+                            ),
+                            {"sid": series_id, "src": self.source_id,
+                             "od": obs_date_val, "interval": interval},
+                        ).fetchone()
+                        if latest is not None:
+                            latest_payload = latest[0]
+                            if isinstance(latest_payload, str):
+                                try:
+                                    latest_payload = json.loads(latest_payload)
+                                except (TypeError, ValueError):
+                                    latest_payload = None
+                            if latest_payload == payload and latest[2] is not None and float(latest[2]) == float_val:
+                                continue
                         conn.execute(
                             text(
                                 "INSERT INTO raw_series "
-                                "(series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                                "(series_id, source_id, obs_date, pull_timestamp, "
+                                "value, raw_payload, pull_status) "
+                                "VALUES (:sid, :src, :od, :pulled_at, :val, "
+                                "CAST(:payload AS jsonb), 'SUCCESS')"
                             ),
-                            {
-                                "sid": series_id,
-                                "src": self.source_id,
-                                "od": obs_date_val,
-                                "val": float_val,
-                            },
+                            {"sid": series_id, "src": self.source_id,
+                             "od": obs_date_val, "pulled_at": captured_at,
+                             "val": float_val, "payload": json.dumps(payload)},
                         )
-                        existing_dates.add(obs_date_val)
                         inserted += 1
+                        if state == "POLICY_ELIGIBLE":
+                            qualified_inserted += 1
 
             result["rows_inserted"] = inserted
-            log.info("yfinance {t}: inserted {n} rows", t=yf_ticker, n=inserted)
+            result["raw_rows_inserted"] = inserted
+            result["qualified_rows_inserted"] = qualified_inserted
+            result["capture_states_seen"] = sorted(capture_states_seen)
+            # "duplicate-only" is established per logged ticker here: a
+            # non-empty download whose latest raw captures match or daily
+            # captures already qualify is a successful CHECK of that ticker, not
+            # evidence its data is stale — but it is also not evidence any
+            # OTHER ticker is current. Do not generalise this per-ticker
+            # result into a source- or asset-class-wide freshness claim.
+            result["outcome"] = "inserted" if inserted > 0 else "duplicate_only"
+            if result["daily_policy_refusals"]:
+                result["status"] = "PARTIAL"
+                result["errors"].append("Daily captures refused: incomplete or unknown session policy")
+                if inserted == 0:
+                    result["outcome"] = "no_data"
+            if result["raw_value_refusals"]:
+                result["status"] = "PARTIAL"
+                result["errors"].append("Invalid raw numeric captures refused")
+                if inserted == 0:
+                    result["outcome"] = "no_data"
+            log.info(
+                "yfinance {t}: checked — inserted {n} rows ({o})",
+                t=yf_ticker, n=inserted, o=result["outcome"],
+            )
 
         except Exception as exc:
             log.warning(
@@ -293,6 +802,7 @@ class YFinancePuller(BasePuller):
                 err=str(exc),
             )
             result["status"] = "SKIPPED"
+            result["outcome"] = "error"
             result["errors"].append(str(exc))
 
         return result
@@ -301,38 +811,173 @@ class YFinancePuller(BasePuller):
         self,
         ticker_list: list[str] | None = None,
         start_date: str | date = "1990-01-01",
-    ) -> list[dict[str, Any]]:
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """Pull multiple tickers sequentially.
 
         Never stops on a single-ticker failure — logs and continues.
 
+        IMPORTANT — freshness semantics: a "checked" ticker (any of the four
+        outcomes below) means this call attempted the pull and got an
+        answer from the provider. It does NOT mean the ticker's data is
+        current through today, and it does NOT mean any OTHER ticker in
+        ``ticker_list`` is current — each ticker's outcome only describes
+        that ticker. Callers that advance ``source_catalog.last_pull_at``
+        (scripts/hermes_fixers.py::_retry_source, ingestion/scheduler.py)
+        are recording "this source was checked at this time", never "every
+        symbol of this source is current" — see those callers' own
+        docstrings/comments.
+
         Parameters:
             ticker_list: List of Yahoo Finance ticker symbols.
                          Defaults to YF_TICKER_LIST.
-            start_date: Earliest observation date.
+            start_date: Earliest observation date. Callers doing a bounded
+                        repair (scripts/hermes_fixers.py::_retry_source)
+                        always pass a recent date here — this method's own
+                        default ("1990-01-01") is for deliberate, explicitly
+                        authorised full-history backfills only (see
+                        REPAIR_LOOKBACK_DAYS in hermes_fixers.py).
+            should_continue: Optional cooperative-budget check, polled
+                        between tickers. When it returns False, the pull
+                        stops before the next ticker and this method
+                        returns a dict (not the usual list) describing a
+                        partial run — see Returns below. Ordinary callers
+                        that never pass this keep getting the plain
+                        list[dict] they always got. Note this is only
+                        checked BETWEEN tickers — one in-flight provider download
+                        call cannot itself be interrupted this way; see
+                        pull_ticker's own timeout handling and
+                        _run_with_timeout in scripts/hermes_operator.py for
+                        the outer bound on that case.
 
         Returns:
-            list[dict]: One result dict per ticker.
+            - should_continue is None (default, all existing callers):
+              list[dict], one result dict per ticker, unchanged (each dict
+              now also carries an "outcome" key — see pull_ticker).
+            - should_continue is given and the budget ran out before every
+              ticker was attempted: a dict — {"status": "PARTIAL",
+              "stopped_by_budget": True, "results": [...per-ticker results
+              attempted so far...], "tickers_not_attempted": [...],
+              "counts": {"inserted": int, "duplicate_only": int,
+              "no_data": int, "error": int, "unattempted": int}}.
+              "unattempted" counts tickers never reached because the budget
+              ran out — those are NOT checked, and must not be treated as
+              "ok" by anything reading this result.
+            - should_continue is given and every ticker was attempted: the
+              same dict shape with "status": "SUCCESS",
+              "stopped_by_budget": False, "tickers_not_attempted": [],
+              "counts": {..., "unattempted": 0}.
+            - a previous pull_all() call is still active — EITHER in this
+              same process (in-process single-flight guard, fix #1) OR in a
+              different process against the same database (cross-process
+              advisory lock — grid-scheduler and grid-hermes both call
+              pull_all independently; see the module comment on
+              ``_PULL_ALL_ADVISORY_LOCK_KEY``): this call makes NO attempt
+              at all — not even the first ticker — and returns immediately.
+              should_continue is None: an empty list ``[]`` (zero tickers
+              checked; distinguishable from a real run only by being empty,
+              since a real run over an empty ticker_list is degenerate and
+              not a supported input). should_continue given: the usual dict
+              shape with "status": "SKIPPED", "stopped_by_budget": True (so
+              callers like scripts/hermes_fixers.py::_retry_source that gate
+              "mark this source freshly checked" on `stopped_by_budget`
+              correctly do NOT advance last_pull_at), "tickers_not_attempted"
+              equal to the full requested ticker_list, "counts" all-zero
+              except "unattempted", and "skipped_reason" naming which guard
+              (in-process vs cross-process) skipped the run.
         """
         if ticker_list is None:
             ticker_list = YF_TICKER_LIST
 
-        log.info(
-            "Starting yfinance bulk pull — {n} tickers from {sd}",
-            n=len(ticker_list),
-            sd=start_date,
-        )
-        results: list[dict[str, Any]] = []
-        for ticker in ticker_list:
-            res = self.pull_ticker(ticker, start_date)
-            results.append(res)
+        def _skip_result(reason: str) -> list[dict[str, Any]] | dict[str, Any]:
+            log.warning(
+                "yfinance pull_all: {reason} — skipping this run entirely "
+                "(no tickers attempted)",
+                reason=reason,
+            )
+            if should_continue is None:
+                return []
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0,
+                      "error": 0, "unattempted": len(ticker_list)}
+            return {
+                "status": "SKIPPED",
+                "stopped_by_budget": True,
+                "results": [],
+                "tickers_not_attempted": list(ticker_list),
+                "counts": counts,
+                "skipped_reason": reason,
+            }
 
-        log.info(
-            "yfinance bulk pull complete — {ok}/{total} succeeded",
-            ok=sum(1 for r in results if r["status"] == "SUCCESS"),
-            total=len(results),
-        )
-        return results
+        # In-process single-flight guard (fix #1): non-blocking acquire so a
+        # second concurrent pull_all() call IN THIS PROCESS — most commonly
+        # the scheduler's next tick finding an earlier orphaned/still-running
+        # call — skips its run rather than racing the in-flight one. Cheap
+        # (no DB round-trip), so it stays as the first check. See the module
+        # docstring on _PULL_ALL_LOCK for why this must be module-level, not
+        # an instance attribute.
+        if not _PULL_ALL_LOCK.acquire(blocking=False):
+            return _skip_result("pull_all already running in this process")
+
+        pg_lock_conn = None
+        try:
+            # Cross-process single-flight guard: _PULL_ALL_LOCK above cannot
+            # see a concurrent pull_all() running in a DIFFERENT process
+            # (grid-scheduler vs grid-hermes — see _PULL_ALL_ADVISORY_LOCK_KEY's
+            # comment). A Postgres session-level advisory lock can.
+            pg_lock_conn = self._try_acquire_pg_advisory_lock()
+            if pg_lock_conn is None:
+                return _skip_result(
+                    "another process holds the cross-process advisory lock"
+                )
+
+            log.info(
+                "Starting yfinance bulk pull — checking {n} tickers from {sd}",
+                n=len(ticker_list),
+                sd=start_date,
+            )
+            results: list[dict[str, Any]] = []
+            stopped_by_budget = False
+            for idx, ticker in enumerate(ticker_list):
+                if should_continue is not None and not should_continue():
+                    log.warning(
+                        "yfinance bulk pull: budget exhausted after {n}/{total} "
+                        "tickers — stopping",
+                        n=idx, total=len(ticker_list),
+                    )
+                    stopped_by_budget = True
+                    break
+                res = self.pull_ticker(ticker, start_date)
+                results.append(res)
+
+            log.info(
+                "yfinance bulk pull complete — {ok}/{total} checked successfully",
+                ok=sum(1 for r in results if r["status"] == "SUCCESS"),
+                total=len(results),
+            )
+
+            if should_continue is None:
+                return results
+
+            not_attempted = ticker_list[len(results):]
+            counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+            for r in results:
+                outcome = r.get("outcome")
+                if outcome in counts:
+                    counts[outcome] += 1
+                else:
+                    counts["error"] += 1
+            counts["unattempted"] = len(not_attempted)
+            return {
+                "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+                "stopped_by_budget": stopped_by_budget,
+                "results": results,
+                "tickers_not_attempted": not_attempted,
+                "counts": counts,
+            }
+        finally:
+            if pg_lock_conn is not None:
+                self._release_pg_advisory_lock(pg_lock_conn)
+            _PULL_ALL_LOCK.release()
 
 
 if __name__ == "__main__":

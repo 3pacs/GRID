@@ -95,8 +95,58 @@ def _is_fresh(ts: datetime | None) -> bool:
     return (datetime.now(timezone.utc) - ts) < _CACHE_TTL
 
 
+def _date_range_label(iso_timestamps: list[str | None]) -> str | None:
+    """Format the min..max date of ``iso_timestamps`` as "YYYY-MM-DD to YYYY-MM-DD".
+
+    Returns a single date (no "to") when every timestamp falls on the same
+    day, or None if nothing parseable was given.
+    """
+    parsed: list[datetime] = []
+    for ts in iso_timestamps:
+        if not ts:
+            continue
+        try:
+            parsed.append(datetime.fromisoformat(str(ts).replace("Z", "+00:00")))
+        except (ValueError, TypeError):
+            continue
+    if not parsed:
+        return None
+    lo, hi = min(parsed).date(), max(parsed).date()
+    if lo == hi:
+        return lo.isoformat()
+    return f"{lo.isoformat()} to {hi.isoformat()}"
+
+
+def _cached_label(lessons: Any) -> str | None:
+    """Best-effort label for a cached row.
+
+    Rows written before the Wave 3 #6 fix have no ``label`` key -- fall back
+    to a count-only label (no date range) rather than showing nothing.
+    """
+    if isinstance(lessons, dict):
+        if lessons.get("label"):
+            return lessons["label"]
+        count = lessons.get("count")
+        if isinstance(count, int) and count > 0:
+            return _lessons_label(count, None)
+    return None
+
+
+def _lessons_label(count: int, date_range: str | None) -> str:
+    """The honest, non-committal label the report asked for: "LLM summary of
+    N postmortems dated X-Y" (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #6)."""
+    if date_range:
+        return f"LLM summary of {count} postmortems dated {date_range}"
+    return f"LLM summary of {count} postmortems"
+
+
 def _generate(engine, n: int, days: int) -> Any:
-    """Run the LLM lessons synthesis from the most recent n postmortems."""
+    """Run the LLM lessons synthesis from the most recent n postmortems.
+
+    Never calls the LLM when the source window is empty (Wave 3 #6) — a
+    "summary" synthesized from zero rows would read as a fabricated generic
+    answer, not an honest one. Returns ``count: 0`` and no ``label`` instead.
+    """
     from intelligence.postmortem import (
         load_postmortems,
         generate_lessons_learned,
@@ -105,7 +155,11 @@ def _generate(engine, n: int, days: int) -> Any:
 
     records = load_postmortems(engine, days=days)
     if not records:
-        return {"text": f"No post-mortems found in the last {days} days.", "count": 0}
+        return {
+            "text": f"No post-mortems found in the last {days} days.",
+            "count": 0,
+            "label": None,
+        }
 
     records = records[: int(n)] if n and n > 0 else records
 
@@ -139,10 +193,19 @@ def _generate(engine, n: int, days: int) -> Any:
             continue
 
     if not pms:
-        return {"text": "No hydrated post-mortems available for synthesis.", "count": 0}
+        return {
+            "text": "No hydrated post-mortems available for synthesis.",
+            "count": 0,
+            "label": None,
+        }
 
     text_out = generate_lessons_learned(engine, pms)
-    return {"text": text_out, "count": len(pms)}
+    date_range = _date_range_label([r.get("generated_at") for r in records[: len(pms)]])
+    return {
+        "text": text_out,
+        "count": len(pms),
+        "label": _lessons_label(len(pms), date_range),
+    }
 
 
 @router.get("/postmortem-lessons")
@@ -169,18 +232,11 @@ async def get_postmortem_lessons(
                     "n": cached["n"],
                     "days": cached["days"],
                     "cached": True,
+                    "label": _cached_label(cached["lessons"]),
                 }
 
     try:
         payload = _generate(engine, n=n, days=days)
-        gen_at = _write_cache(engine, payload, n=n, days=days)
-        return {
-            "lessons": payload,
-            "generated_at": gen_at,
-            "n": int(n),
-            "days": int(days),
-            "cached": False,
-        }
     except Exception as exc:
         log.warning("postmortem-lessons synthesis failed: {e}", e=str(exc))
         cached = _read_cache(engine)
@@ -192,5 +248,45 @@ async def get_postmortem_lessons(
                 "days": cached["days"],
                 "cached": True,
                 "error": str(exc),
+                "label": _cached_label(cached["lessons"]),
             }
         return {"lessons": None, "generated_at": None, "error": str(exc), "cached": False}
+
+    if not payload.get("count"):
+        # Wave 3 #6: the source window is empty. Never regenerate a
+        # fabricated-sounding "summary" from zero postmortems, and never let
+        # that empty result overwrite a still-useful prior cache before its
+        # TTL — the cache row age (e.g. "09-24") already tells the operator
+        # nobody has opened the dashboard recently; wiping it on an empty
+        # window would instead read as "nothing was ever learned."
+        note = f"no postmortems in the last {days} days"
+        cached = _read_cache(engine)
+        if cached:
+            return {
+                "lessons": cached["lessons"],
+                "generated_at": cached["generated_at"],
+                "n": cached["n"],
+                "days": cached["days"],
+                "cached": True,
+                "note": note,
+                "label": _cached_label(cached["lessons"]),
+            }
+        return {
+            "lessons": {"lessons": [], "text": payload.get("text"), "count": 0},
+            "generated_at": None,
+            "n": int(n),
+            "days": int(days),
+            "cached": False,
+            "note": note,
+            "label": None,
+        }
+
+    gen_at = _write_cache(engine, payload, n=n, days=days)
+    return {
+        "lessons": payload,
+        "generated_at": gen_at,
+        "n": int(n),
+        "days": int(days),
+        "cached": False,
+        "label": payload.get("label"),
+    }

@@ -91,7 +91,7 @@ class PushshiftRedditPuller(BasePuller):
     SOURCE_CONFIG = {
         "base_url": "https://academictorrents.com/",
         "cost_tier": "FREE",
-        "latency_class": "HISTORICAL",
+        "latency_class": "ANNUAL",  # was HISTORICAL (not in constraint); manual backfill of yearly dumps
         "pit_available": True,
         "revision_behavior": "NEVER",
         "trust_score": "MED",

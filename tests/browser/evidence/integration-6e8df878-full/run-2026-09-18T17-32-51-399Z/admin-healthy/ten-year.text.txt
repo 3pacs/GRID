@@ -1,0 +1,113 @@
+GRID WEEKLY QUERY
+10-Year Compounder
+
+$1M model portfolio built from long-term up-and-right charts, weekly rank checks, and Nasdaq-relative strength.
+
+CAPITAL
+Run weekly
+Dad Chartist
+DAD METHOD ORACLE
+Plan room for the $1M 10-year mandate
+Heartbeat 10:33:42 AM
+Preloaded prompt
+Export model
+Choose workbook
+Analyze
+Export plan
+Monte Carlo
+P10
+$900,000
+P50
+$1,400,000
+P90
+$2,100,000
+ABOVE START
+78%
+
+8.0% expected return proxy, 22.0% annual volatility.
+
+Ready checklist
+Upload workbook
+Extract methodology signals without returning holdings.
+Run weekly query
+Score Dad Chartist and Frontier Infrastructure boards.
+Review Monte Carlo
+Compare p10, p50, p90, and probability above start.
+Export packet
+Download the Excel plan for review.
+API setup
+SCHWAB / THINKORSWIM APP KEY
+OAUTH CALLBACK
+DATA MODE
+Private local import
+Paper model only
+Manual CSV review
+Save setup
+Planner chat
+Oracle heartbeat is live. The $1M 10-year prompt, Monte Carlo ranges, workbook intake, exports, and API checklist are staged on this page.
+TOP CHART
+TEST1
+INVESTED
+$1,000,000
+CASH
+$0
+MAX NAME
+10%
+10-YEAR CHART CHECK
+TEST1 vs Nasdaq
+TEST1: n/a
+QQQ: n/a
+TEST1
+QQQ
+Dad Chartist
+
+Synthetic fixture profile.
+
+Existing names can be held until rank 20 unless the chart breaks.
+
+AS OF
+2026-09-15
+BENCHMARK
+QQQ 12.0% CAGR
+UNIVERSE
+1 ranked
+Research screen, not financial advice. The first version uses GRID Yahoo price history and chart-quality rules; fundamentals can be added next.
+WEEKLY BUY OR HOLD LIST
+Dad Chartist allocation
+Hold buffer: rank 20
+TICKER	SCORE	10Y CAGR	VS QQQ	TREND	DRAWDOWN	TARGET	SHARES
+
+1
+TEST1
+	0.6	8.0%	—	—	—	$1,000,000	10,000
+SECOND CANDIDATE LIST
+Frontier Infrastructure
+0 ranked from 0 candidates
+
+AI, compute, uranium, metals, and supercomputer candidates are ranked separately from the core compounder allocation.
+
+TICKER	THEME	SCORE	YEARS	CAGR	VS QQQ	TREND	DRAWDOWN
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

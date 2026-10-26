@@ -10,19 +10,23 @@ Falls back to yfinance if the direct API fails.
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, timezone
-from typing import Any
+from typing import Any, Callable
+from uuid import uuid4
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
 import requests
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from sqlalchemy.pool import NullPool
 
 from ingestion.base import BasePuller
-
+from ingestion.market_calendar import is_market_open
 
 # Tickers with listed equity options
 EQUITY_TICKERS: list[str] = [
@@ -38,6 +42,111 @@ EQUITY_TICKERS: list[str] = [
 
 # Maximum expirations to pull per ticker
 MAX_EXPIRATIONS = 12
+MAX_CAPTURE_SECONDS = 120  # each in-flight Yahoo request also has a 15s timeout
+# Final catalog publication has no provider work. Short connection/statement
+# limits and a local transaction deadline fit inside the scheduler's 60s margin.
+CATALOG_PUBLICATION_SECONDS = 15
+_EQUITY_TZ = ZoneInfo("America/New_York")
+# Regular equity session open, America/New_York wall clock. Before this instant
+# on a session day Yahoo's quote still carries the PREVIOUS session's
+# ``regularMarketTime`` (there has been no regular-session print yet), so
+# ``_regular_market_time`` cannot date a chain to today and every ticker
+# would otherwise end as FAILED "incomplete options chain response" -- the
+# grid-hermes 2026-10-20 04:00:49Z smart:options run (00:00:49 ET, 0/211
+# tickers, pull_log "no ticker succeeded"). That is not a provider failure:
+# it is "no session quote yet", the same nothing-to-capture truth as a
+# closed day, so it is reported as SKIPPED without contacting the provider.
+# A stale quote served AFTER the open stays FAILED (provider defect).
+REGULAR_SESSION_OPEN_ET = (9, 30)
+DEFAULT_CAPTURE_SOURCE = "options_puller"
+
+
+class _OptionsBudgetExpired(Exception):
+    """Stop a capture without publishing an incomplete chain."""
+
+
+def _check_budget(should_continue: Callable[[], bool] | None) -> None:
+    if should_continue is not None and not should_continue():
+        raise _OptionsBudgetExpired
+
+
+def _affected_rows(result: Any) -> int | None:
+    count = getattr(result, "rowcount", None)
+    return count if isinstance(count, int) and not isinstance(count, bool) and count >= 0 else None
+
+
+class OptionsPullResults(list[dict[str, Any]]):
+    """Per-ticker list, with the source-wide outcome available to wrappers.
+
+    GEM can still iterate/serialize this as a list. Wrappers must classify
+    ``summary`` rather than infer source freshness from one successful item.
+    Explicit ticker lists, reduced expiry caps and omitted catalyst tickers
+    are subsets even if every requested ticker succeeded.
+    """
+
+    def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
+        super().__init__(items)
+        self.full_universe = full_universe
+        self.publication_error: str | None = None
+
+    @property
+    def summary(self) -> dict[str, Any]:
+        statuses = [r.get("status") for r in self]
+        counts = [r.get("rows_inserted") for r in self]
+        known_rows = all(isinstance(n, int) and not isinstance(n, bool) and n >= 0 for n in counts)
+        rows = sum(counts) if known_rows else None
+        ok = statuses.count("SUCCESS")
+        deferred = statuses.count("DEFERRED")
+        if not self or all(s == "SKIPPED" for s in statuses):
+            reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
+            status, note = "SKIPPED", "no ticker capture completed"
+            if reasons:
+                note = f"{note}: {', '.join(reasons)}"
+        elif not ok and not deferred:
+            status, note = "FAILED", "no ticker succeeded"
+        elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
+            status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
+        elif not rows:
+            status, note = "NO_NEW_DATA", "run completed, 0 rows written"
+        else:
+            status, note = "SUCCESS", "full default universe captured"
+        return {
+            "status": status, "rows_inserted": rows,
+            "scope": "full_universe" if self.full_universe else "subset",
+            "tickers_total": len(self), "tickers_ok": ok,
+            "tickers_deferred": deferred,
+            "snapshots": sum(r.get("snapshots", 0) for r in self),
+            "error": note if status in ("PARTIAL", "FAILED") else None,
+            "reason": note,
+        }
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _before_regular_open(now: datetime) -> bool:
+    """True before the regular equity session opens on ``now``'s ET day."""
+    local = now.astimezone(_EQUITY_TZ)
+    return (local.hour, local.minute) < REGULAR_SESSION_OPEN_ET
+
+
+def _regular_market_time(quote: Any, session_day: date) -> datetime | None:
+    """Read Yahoo's *reported quote time*, not an options-chain revision time."""
+    if not isinstance(quote, dict):
+        return None
+    raw = quote.get("regularMarketTime")
+    if (not isinstance(raw, (int, float)) or isinstance(raw, bool)
+            or not math.isfinite(raw)):
+        return None
+    try:
+        reported = datetime.fromtimestamp(raw, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+    if (reported.date() != session_day
+            or reported.astimezone(_EQUITY_TZ).date() != session_day):
+        return None
+    return reported
 
 # Catalyst-universe coverage (2026-09-10).
 #
@@ -74,12 +183,14 @@ def catalyst_options_universe(
     *,
     horizon_days: int = CATALYST_UNIVERSE_HORIZON_DAYS,
     max_tickers: int = CATALYST_UNIVERSE_MAX_TICKERS,
+    require_complete: bool = False,
 ) -> list[str]:
     """Tickers with a dated catalyst inside ``horizon_days``.
 
     Bounded on both sides and capped, because this list drives an outbound
-    fetch loop. Never raises — a missing ``catalyst_calendar`` just means no
-    extra coverage this cycle.
+    fetch loop. Routine callers retain the empty-list fallback. A source-wide
+    capture sets require_complete so lookup failure cannot masquerade as a
+    complete run of the smaller hand-listed universe.
     """
     try:
         with engine.connect() as conn:
@@ -87,8 +198,10 @@ def catalyst_options_universe(
                 _CATALYST_UNIVERSE_SQL,
                 {"horizon_days": int(horizon_days), "max_tickers": int(max_tickers)},
             ).fetchall()
-    except Exception as exc:  # noqa: BLE001
-        log.warning("options: catalyst universe unavailable: {e}", e=str(exc))
+    except Exception:  # noqa: BLE001
+        log.warning("options: catalyst universe unavailable")
+        if require_complete:
+            raise RuntimeError("options catalyst universe unavailable") from None
         return []
     return [str(r[0]).strip().upper() for r in rows if r[0] and str(r[0]).strip()]
 
@@ -153,15 +266,48 @@ class YahooOptionsClient:
                 log.warning("Yahoo options {t}: HTTP {s}", t=ticker, s=resp.status_code)
                 return None
             data = resp.json()
-            result = data["optionChain"]["result"][0]
-            quote = result.get("quote", {})
-            options = result.get("options", [{}])[0]
+            chain = data.get("optionChain") if isinstance(data, dict) else None
+            if isinstance(chain, dict) and chain.get("error") is not None:
+                # A present, non-null provider error is a failed fetch even
+                # when residual result data rides along: an explicit empty
+                # chain beside an error is not measured zero coverage. The
+                # error body is not logged. An absent key or ``"error": null``
+                # is the normal successful shape and stays accepted.
+                log.warning("Yahoo options {t}: provider error in chain response", t=ticker)
+                return None
+            results = chain.get("result") if isinstance(chain, dict) else None
+            if not isinstance(results, list) or not results:
+                log.warning("Yahoo options {t}: no chain result", t=ticker)
+                return None
+            result = results[0]
+            if not isinstance(result, dict):
+                log.warning("Yahoo options {t}: malformed chain result", t=ticker)
+                return None
+            options_list = result.get("options")
+            if options_list == []:
+                # Explicit empty page: Yahoo lists the expiry but serves no
+                # contracts for it (thin names). The chain as served, not a
+                # transport failure (it used to raise IndexError here and
+                # return None like a failed fetch).
+                calls: list[Any] = []
+                puts: list[Any] = []
+            elif (isinstance(options_list, list) and isinstance(options_list[0], dict)
+                    and isinstance(options_list[0].get("calls"), list)
+                    and isinstance(options_list[0].get("puts"), list)):
+                calls = options_list[0]["calls"]
+                puts = options_list[0]["puts"]
+            else:
+                # Missing, null or non-list ``options``, or an element without
+                # both sides as lists: not a chain. Fail closed like a failed
+                # fetch; an explicit ``[]`` is the only accepted empty shape.
+                log.warning("Yahoo options {t}: malformed chain page", t=ticker)
+                return None
             return {
                 "expirations": result.get("expirationDates", []),
                 "strikes": result.get("strikes", []),
-                "calls": options.get("calls", []),
-                "puts": options.get("puts", []),
-                "quote": quote,
+                "calls": calls,
+                "puts": puts,
+                "quote": result.get("quote", {}),
             }
         except Exception as exc:
             log.warning("Yahoo options {t} failed: {e}", t=ticker, e=str(exc))
@@ -184,29 +330,14 @@ class OptionsPuller(BasePuller):
     def _ensure_tables(self) -> None:
         """Create options tables if they don't exist."""
         with self.engine.begin() as conn:
-            conn.execute(text("""
-                CREATE TABLE IF NOT EXISTS options_snapshots (
-                    id           BIGSERIAL PRIMARY KEY,
-                    ticker       TEXT NOT NULL,
-                    snap_date    DATE NOT NULL,
-                    expiry       DATE NOT NULL,
-                    opt_type     TEXT NOT NULL CHECK (opt_type IN ('call', 'put')),
-                    strike       DOUBLE PRECISION NOT NULL,
-                    last_price   DOUBLE PRECISION,
-                    bid          DOUBLE PRECISION,
-                    ask          DOUBLE PRECISION,
-                    volume       INTEGER,
-                    open_interest INTEGER,
-                    implied_vol  DOUBLE PRECISION,
-                    in_the_money BOOLEAN,
-                    created_at   TIMESTAMPTZ DEFAULT NOW(),
-                    UNIQUE (ticker, snap_date, expiry, opt_type, strike)
-                )
-            """))
-            conn.execute(text("""
-                CREATE INDEX IF NOT EXISTS idx_opts_snap_ticker_date
-                ON options_snapshots (ticker, snap_date)
-            """))
+            # The chain store is migration-owned since
+            # options_append_only_20260930: ``options_snapshots_all`` keeps
+            # every capture batch, ``options_capture_batches`` registers the
+            # complete ones, and ``options_snapshots`` is a *view* of the
+            # latest complete batch per ticker/day. DDL against that name
+            # (CREATE INDEX ... ON options_snapshots) would fail on the view,
+            # so this method no longer touches it; a database without the
+            # migration makes every capture fail closed at publication.
             conn.execute(text("""
                 CREATE TABLE IF NOT EXISTS options_daily_signals (
                     id              BIGSERIAL PRIMARY KEY,
@@ -238,7 +369,10 @@ class OptionsPuller(BasePuller):
         tickers: list[str] | None = None,
         *,
         include_catalyst_universe: bool = True,
-    ) -> list[dict[str, Any]]:
+        max_expirations: int = MAX_EXPIRATIONS,
+        should_continue: Callable[[], bool] | None = None,
+        capture_source: str = DEFAULT_CAPTURE_SOURCE,
+    ) -> OptionsPullResults:
         """Pull options chains for all tickers and compute signals.
 
         Parameters:
@@ -249,31 +383,84 @@ class OptionsPuller(BasePuller):
                 ``catalyst_options_universe``). On by default: without it the
                 sub-$2B names the Long Plays board gates on have no chain and
                 no IV surface, which is the state measured on 2026-09-10.
+            max_expirations: Limit the nearest complete expiries per ticker.
+                The default preserves the scheduler's existing 12-expiry cap;
+                the legacy GEM timer used six.
+            should_continue: Deadline check between tickers, expirations and
+                publication statements. Cancellation rolls back the current
+                ticker and reports it and the remaining tickers as DEFERRED.
+            capture_source: Writer label recorded on each registered batch
+                in ``options_capture_batches`` (e.g. "gem_daily").
 
         Returns:
-            list[dict]: Per-ticker results with status and row counts.
+            OptionsPullResults: List-compatible results with a source-wide
+                summary. Only a complete default-universe SUCCESS bumps the
+                catalog; explicit scopes such as GEM never do.
         """
-        self._yahoo = YahooOptionsClient()
-        if not self._yahoo.is_available:
-            log.error("Yahoo options client unavailable — cannot pull options")
-            return [{"ticker": "N/A", "status": "FAILED", "error": "Yahoo auth failed"}]
+        if (not isinstance(max_expirations, int) or isinstance(max_expirations, bool)
+                or not 1 <= max_expirations <= MAX_EXPIRATIONS):
+            raise ValueError(f"max_expirations must be between 1 and {MAX_EXPIRATIONS}")
 
+        full_universe = tickers is None and include_catalyst_universe and max_expirations == MAX_EXPIRATIONS
         if tickers is None:
             tickers = list(EQUITY_TICKERS)
             if include_catalyst_universe:
-                extra = [t for t in catalyst_options_universe(self.engine) if t not in set(tickers)]
+                extra = [t for t in catalyst_options_universe(self.engine, require_complete=True) if t not in set(tickers)]
                 if extra:
                     log.info(
                         "options: +{n} catalyst-universe tickers beyond the {b} hand-listed",
                         n=len(extra), b=len(tickers),
                     )
                     tickers = tickers + extra
-        today_str = date.today().isoformat()
+        now = _utc_now()
+        today = now.date()
+        today_str = today.isoformat()
+        if not is_market_open(today) or now.astimezone(_EQUITY_TZ).date() != today:
+            log.info("Options pull skipped: {day} is not a scheduled equity session", day=today_str)
+            return OptionsPullResults([
+                {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                 "reason": "non-equity-session"} for ticker in tickers
+            ], full_universe=full_universe)
+        if _before_regular_open(now):
+            log.info(
+                "Options pull skipped: {day} session has not opened yet ({et} ET)",
+                day=today_str, et=now.astimezone(_EQUITY_TZ).strftime("%H:%M"),
+            )
+            return OptionsPullResults([
+                {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                 "reason": "pre-session"} for ticker in tickers
+            ], full_universe=full_universe)
+
+        self._yahoo = YahooOptionsClient()
+        if not self._yahoo.is_available:
+            log.error("Yahoo options client unavailable — cannot pull options")
+            return OptionsPullResults([
+                {"ticker": "N/A", "status": "FAILED", "rows_inserted": 0, "error": "Yahoo auth failed"}
+            ], full_universe=full_universe)
         results: list[dict[str, Any]] = []
 
-        for ticker in tickers:
-            result = self._pull_ticker(ticker, today_str)
+        for idx, ticker in enumerate(tickers):
+            if should_continue is not None and not should_continue():
+                results.extend(
+                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
+                    for t in tickers[idx:]
+                )
+                break
+            ticker_kwargs: dict[str, Any] = {
+                "max_expirations": max_expirations, "should_continue": should_continue,
+            }
+            if capture_source != DEFAULT_CAPTURE_SOURCE:
+                # Only non-default writers pass a label; the default call
+                # shape stays what existing wrappers and doubles expect.
+                ticker_kwargs["capture_source"] = capture_source
+            result = self._pull_ticker(ticker, today_str, **ticker_kwargs)
             results.append(result)
+            if result["status"] == "DEFERRED":
+                results.extend(
+                    {"ticker": t, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
+                    for t in tickers[idx + 1:]
+                )
+                break
             time.sleep(0.3)  # rate limit
 
         total_snaps = sum(r.get("snapshots", 0) for r in results)
@@ -282,32 +469,127 @@ class OptionsPuller(BasePuller):
             "Options pull complete — {ok}/{total} tickers, {snaps} snapshots",
             ok=succeeded, total=len(tickers), snaps=total_snaps,
         )
-        return results
+        outcome = OptionsPullResults(results, full_universe=full_universe)
+        if outcome.summary["status"] == "SUCCESS":
+            if should_continue is not None and not should_continue():
+                outcome.publication_error = "time budget expired before catalog publication"
+            elif not self._mark_catalog_pulled(should_continue=should_continue):
+                outcome.publication_error = "catalog publication deferred or failed"
+        return outcome
 
-    def _pull_ticker(self, ticker: str, today_str: str) -> dict[str, Any]:
+    def _mark_catalog_pulled(self, *, should_continue: Callable[[], bool] | None = None) -> bool:
+        """Publish complete-source freshness, or roll back on cancellation.
+
+        Use a short-lived connection to avoid the shared pool's 30s checkout
+        wait, with a 5s database connection timeout configured explicitly.
+        PostgreSQL 14 has no transaction_timeout; check the local deadline at
+        each boundary, configure 5s statement limits, and check immediately
+        before commit. An in-progress durable COMMIT/WAL wait is not bounded
+        by that cooperative check or an absolute 5s wall-clock guarantee.
+        """
+        publication_deadline = time.monotonic() + CATALOG_PUBLICATION_SECONDS
+        catalog_engine = None
+
+        def check_publication_budget() -> None:
+            _check_budget(should_continue)
+            if time.monotonic() >= publication_deadline:
+                raise _OptionsBudgetExpired
+
+        try:
+            check_publication_budget()
+            catalog_engine = create_engine(
+                self.engine.url,
+                poolclass=NullPool,
+                connect_args={
+                    "connect_timeout": 5,
+                    "options": "-c statement_timeout=5000 -c lock_timeout=3000 "
+                               "-c idle_in_transaction_session_timeout=5000",
+                },
+            )
+            check_publication_budget()
+            with catalog_engine.begin() as conn:
+                check_publication_budget()
+                conn.execute(text("SET LOCAL lock_timeout = '3s'"))
+                check_publication_budget()
+                conn.execute(text("SET LOCAL statement_timeout = '5s'"))
+                check_publication_budget()
+                conn.execute(text("SET LOCAL idle_in_transaction_session_timeout = '5s'"))
+                check_publication_budget()
+                conn.execute(
+                    text("UPDATE source_catalog SET last_pull_at = NOW() WHERE id = :sid"),
+                    {"sid": self.source_id},
+                )
+                # A callback that expires during UPDATE must roll back that
+                # update rather than allow context-manager exit to commit it.
+                check_publication_budget()
+            return True
+        except _OptionsBudgetExpired:
+            log.info("options: source_catalog freshness publication deferred by budget")
+            return False
+        except Exception:  # best effort; never emit connection/credential text
+            log.warning("options: source_catalog freshness update failed")
+            return False
+        finally:
+            if catalog_engine is not None:
+                catalog_engine.dispose()
+
+    def _pull_ticker(
+        self, ticker: str, today_str: str, *, max_expirations: int = MAX_EXPIRATIONS,
+        should_continue: Callable[[], bool] | None = None,
+        capture_source: str = DEFAULT_CAPTURE_SOURCE,
+    ) -> dict[str, Any]:
         """Pull options chain for a single ticker and compute signals."""
         try:
-            # Fetch first page to get expirations and spot price
+            _check_budget(should_continue)
+            session_day = date.fromisoformat(today_str)
+            now = _utc_now()
+            if (session_day != now.date() or not is_market_open(session_day)
+                    or now.astimezone(_EQUITY_TZ).date() != session_day):
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                        "reason": "non-equity-session or UTC date mismatch"}
+            if _before_regular_open(now):
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                        "reason": "pre-session"}
+            capture_clock = time.monotonic()
+            # Force a 64-bit PostgreSQL transaction ID for each capture. It is
+            # allocated in database order, survives rollback, and needs no
+            # separate sequence grant for a runtime role. This transaction
+            # ends before any provider request.
+            with self.engine.begin() as conn:
+                capture_ordinal, capture_started_at = conn.execute(
+                    text("SELECT txid_current(), clock_timestamp()"),
+                ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
-                return {"ticker": ticker, "status": "FAILED", "error": "no data from Yahoo"}
+                return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from Yahoo"}
 
             quote = first.get("quote", {})
-            spot_price = quote.get("regularMarketPrice") or quote.get("regularMarketPreviousClose")
-            if not spot_price:
-                log.warning("{t}: no spot price available", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "reason": "no spot price"}
+            spot_price = quote.get("regularMarketPrice")
+            if (not isinstance(spot_price, (int, float)) or isinstance(spot_price, bool)
+                    or not math.isfinite(spot_price) or spot_price <= 0):
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                        "reason": "no dated regular-market price"}
 
             expirations = first.get("expirations", [])
             if not expirations:
                 log.warning("{t}: no options expirations", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "reason": "no expirations"}
+                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": "no expirations"}
+            selected_expirations = expirations[:max_expirations]
 
             total_call_oi = 0
             total_put_oi = 0
             total_call_vol = 0
             total_put_vol = 0
             snap_count = 0
+            batch_id = str(uuid4())
+            complete = True
+            failed_fetches = 0
+            undated_quotes = 0
+            empty_expiries = 0
+            # Quote time of every accepted page, empty or not, so the publish
+            # check below bounds pages that contribute no rows as well.
+            page_times: list[datetime] = []
+            snapshot_rows: list[dict[str, Any]] = []
 
             # Per-expiry IV data for term structure
             expiry_ivs: list[tuple[str, float]] = []
@@ -318,101 +600,218 @@ class OptionsPuller(BasePuller):
             near_calls_df = pd.DataFrame()
             near_puts_df = pd.DataFrame()
 
-            with self.engine.begin() as conn:
-                for i, exp_ts in enumerate(expirations[:MAX_EXPIRATIONS]):
-                    # Use data from first request for first expiry, fetch rest
-                    if i == 0:
-                        chain_data = first
-                    else:
-                        chain_data = self._yahoo.get_options(ticker, exp_ts)
-                        time.sleep(0.2)
-                    if not chain_data:
-                        continue
+            for i, exp_ts in enumerate(selected_expirations):
+                _check_budget(should_continue)
+                if time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS:
+                    complete = False
+                    break
+                # Use data from first request for first expiry, fetch rest
+                if i == 0:
+                    chain_data = first
+                else:
+                    chain_data = self._yahoo.get_options(ticker, exp_ts)
+                    time.sleep(0.2)
+                if not chain_data:
+                    complete = False
+                    failed_fetches += 1
+                    continue
+                provider_regular_market_at = _regular_market_time(chain_data.get("quote"), session_day)
+                if provider_regular_market_at is None:
+                    complete = False
+                    undated_quotes += 1
+                    break
+                page_times.append(provider_regular_market_at)
+                if not chain_data["calls"] and not chain_data["puts"]:
+                    # Dated page whose sides are both explicitly empty lists
+                    # (get_options admits no other empty shape): Yahoo lists
+                    # the expiry but serves nothing for it (thin catalyst names,
+                    # grid-hermes 2026-10-22: 416 tickers/day FAILED here). That
+                    # is the chain as served, not a partial response, so it adds
+                    # no rows and does not fail the ticker. An explicitly empty
+                    # side beside a served one is likewise stored as served; the
+                    # empty side is zero, which is what a dated GEX batch should
+                    # sum. Failed or malformed fetches, missing sides, undated or
+                    # future quotes and the capture budget still fail closed.
+                    empty_expiries += 1
 
-                    exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
+                exp_date = datetime.utcfromtimestamp(exp_ts).strftime("%Y-%m-%d")
 
-                    for opt_type, raw_list in [("call", chain_data.get("calls", [])),
-                                               ("put", chain_data.get("puts", []))]:
-                        if not raw_list:
+                for opt_type, raw_list in [("call", chain_data.get("calls", [])),
+                                           ("put", chain_data.get("puts", []))]:
+                    rows_for_df = []
+                    for opt in raw_list or []:
+                        strike = opt.get("strike")
+                        if strike is None:
                             continue
+                        vol = opt.get("volume", 0) or 0
+                        oi = opt.get("openInterest", 0) or 0
+                        iv = opt.get("impliedVolatility")
+                        last_price = opt.get("lastPrice")
+                        bid = opt.get("bid")
+                        ask = opt.get("ask")
+                        itm = opt.get("inTheMoney", False)
 
-                        rows_for_df = []
-                        for opt in raw_list:
-                            strike = opt.get("strike")
-                            if strike is None:
-                                continue
-                            vol = opt.get("volume", 0) or 0
-                            oi = opt.get("openInterest", 0) or 0
-                            iv = opt.get("impliedVolatility")
-                            last_price = opt.get("lastPrice")
-                            bid = opt.get("bid")
-                            ask = opt.get("ask")
-                            itm = opt.get("inTheMoney", False)
+                        snapshot_rows.append({
+                            "ticker": ticker, "snap_date": today_str,
+                            "expiry": exp_date, "opt_type": opt_type,
+                            "strike": strike, "last_price": last_price,
+                            "bid": bid, "ask": ask, "volume": vol,
+                            "oi": oi, "iv": iv, "itm": itm,
+                            "batch_id": batch_id,
+                            "provider_regular_market_at": provider_regular_market_at,
+                        })
+                        snap_count += 1
+                        rows_for_df.append({
+                            "strike": strike, "volume": vol,
+                            "openInterest": oi, "impliedVolatility": iv,
+                            "lastPrice": last_price, "bid": bid, "ask": ask,
+                            "inTheMoney": itm,
+                        })
 
-                            conn.execute(
-                                text(
-                                    "INSERT INTO options_snapshots "
-                                    "(ticker, snap_date, expiry, opt_type, strike, "
-                                    "last_price, bid, ask, volume, open_interest, "
-                                    "implied_vol, in_the_money) "
-                                    "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
-                                    ":last_price, :bid, :ask, :volume, :oi, :iv, :itm) "
-                                    "ON CONFLICT DO NOTHING"
-                                ),
-                                {
-                                    "ticker": ticker, "snap_date": today_str,
-                                    "expiry": exp_date, "opt_type": opt_type,
-                                    "strike": strike, "last_price": last_price,
-                                    "bid": bid, "ask": ask, "volume": vol,
-                                    "oi": oi, "iv": iv, "itm": itm,
-                                },
-                            )
-                            snap_count += 1
-                            rows_for_df.append({
-                                "strike": strike, "volume": vol,
-                                "openInterest": oi, "impliedVolatility": iv,
-                                "lastPrice": last_price, "bid": bid, "ask": ask,
-                                "inTheMoney": itm,
-                            })
+                    df = pd.DataFrame(rows_for_df) if rows_for_df else pd.DataFrame()
+                    if opt_type == "call":
+                        total_call_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                        total_call_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                        all_calls_dfs.append(df)
+                        if i == 0:
+                            near_calls_df = df
+                    else:
+                        total_put_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
+                        total_put_vol += df["volume"].fillna(0).sum() if not df.empty else 0
+                        all_puts_dfs.append(df)
+                        if i == 0:
+                            near_puts_df = df
 
-                        df = pd.DataFrame(rows_for_df) if rows_for_df else pd.DataFrame()
-                        if opt_type == "call":
-                            total_call_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
-                            total_call_vol += df["volume"].fillna(0).sum() if not df.empty else 0
-                            all_calls_dfs.append(df)
-                            if i == 0:
-                                near_calls_df = df
-                        else:
-                            total_put_oi += df["openInterest"].fillna(0).sum() if not df.empty else 0
-                            total_put_vol += df["volume"].fillna(0).sum() if not df.empty else 0
-                            all_puts_dfs.append(df)
-                            if i == 0:
-                                near_puts_df = df
+                # ATM IV for this expiry
+                all_opts = chain_data.get("calls", []) + chain_data.get("puts", [])
+                atm_ivs = [
+                    o["impliedVolatility"] for o in all_opts
+                    if o.get("impliedVolatility") and o.get("strike")
+                    and spot_price * 0.97 <= o["strike"] <= spot_price * 1.03
+                ]
+                if atm_ivs:
+                    expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
 
-                    # ATM IV for this expiry
-                    all_opts = chain_data.get("calls", []) + chain_data.get("puts", [])
-                    atm_ivs = [
-                        o["impliedVolatility"] for o in all_opts
-                        if o.get("impliedVolatility") and o.get("strike")
-                        and spot_price * 0.97 <= o["strike"] <= spot_price * 1.03
-                    ]
-                    if atm_ivs:
-                        expiry_ivs.append((exp_date, float(np.mean(atm_ivs))))
+            _check_budget(should_continue)
+            timed_out = time.monotonic() - capture_clock >= MAX_CAPTURE_SECONDS
+            if not complete or not snap_count or timed_out:
+                raise ValueError(
+                    "incomplete options chain response: "
+                    f"{failed_fetches} failed expiry fetch(es), {undated_quotes} undated quote(s), "
+                    f"{empty_expiries} empty of {len(selected_expirations)} expiries, "
+                    f"{snap_count} contracts, timed_out={timed_out}"
+                )
+
+            # Provider availability begins after the final response. Sample
+            # the database clock before waiting for the short publish lock.
+            publish_clock = time.monotonic()
+            with self.engine.begin() as conn:
+                conn.execute(text("SET LOCAL lock_timeout = '5s'"))
+                conn.execute(text("SET LOCAL statement_timeout = '30s'"))
+                completed_at = conn.execute(text("SELECT clock_timestamp()")).fetchone()[0]
+                # Every accepted page is bounded by the publish clock, not only
+                # the pages that produced rows: an empty page used to carry a
+                # future quote time past this check unnoticed.
+                if (completed_at.astimezone(timezone.utc).date() != session_day
+                        or completed_at.astimezone(_EQUITY_TZ).date() != session_day
+                        or capture_started_at.astimezone(timezone.utc).date() != session_day
+                        or capture_started_at.astimezone(_EQUITY_TZ).date() != session_day
+                        or any(page_time > completed_at for page_time in page_times)):
+                    raise ValueError("options capture crossed session date or quote time is future")
+                conn.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:ticker), hashtext(:snap_date))"),
+                    {"ticker": ticker, "snap_date": today_str},
+                )
+                latest = conn.execute(
+                    text("""SELECT MAX(capture_ordinal) FROM options_capture_batches
+                             WHERE ticker = :ticker AND snap_date = :snap_date"""),
+                    {"ticker": ticker, "snap_date": today_str},
+                ).fetchone()
+                # Append-only (options_append_only_20260930): nothing deletes
+                # or replaces an earlier batch. Every complete capture is
+                # registered and kept; readers of the ``options_snapshots``
+                # view see the highest-ordinal batch, and any earlier batch
+                # stays replayable by capture_batch_id. An older-started
+                # capture that commits after a newer one is still kept, but
+                # it does not overwrite the newer batch's daily signals.
+                is_latest = not (latest and latest[0] is not None and latest[0] > capture_ordinal)
+
+                # One row per contract per batch. A provider page that repeats
+                # a contract keeps its first quote; the unique batch key then
+                # makes any further conflict a hard failure, never a silent
+                # partial batch.
+                unique_rows: dict[tuple, dict[str, Any]] = {}
+                for row in snapshot_rows:
+                    unique_rows.setdefault((row["expiry"], row["opt_type"], float(row["strike"])), row)
+                batch_rows = list(unique_rows.values())
+
+                _check_budget(should_continue)
+                conn.execute(
+                    text(
+                        "INSERT INTO options_capture_batches "
+                        "(capture_batch_id, ticker, snap_date, capture_ordinal, "
+                        "capture_started_at, capture_completed_at, row_count, "
+                        "spot_price, capture_source) "
+                        "VALUES (:batch_id, :ticker, :snap_date, :ordinal, "
+                        ":started_at, :completed_at, :row_count, :spot, :source)"
+                    ),
+                    {"batch_id": batch_id, "ticker": ticker, "snap_date": today_str,
+                     "ordinal": capture_ordinal, "started_at": capture_started_at,
+                     "completed_at": completed_at, "row_count": len(batch_rows),
+                     "spot": float(spot_price), "source": capture_source},
+                )
+                snapshots_inserted = 0
+                rows_known = True
+                for row in batch_rows:
+                    _check_budget(should_continue)
+                    written = conn.execute(
+                        text(
+                            "INSERT INTO options_snapshots_all "
+                            "(ticker, snap_date, expiry, opt_type, strike, "
+                            "last_price, bid, ask, volume, open_interest, "
+                            "implied_vol, in_the_money, capture_batch_id, "
+                            "capture_ordinal, capture_started_at, capture_completed_at, "
+                            "provider_regular_market_at) "
+                            "VALUES (:ticker, :snap_date, :expiry, :opt_type, :strike, "
+                            ":last_price, :bid, :ask, :volume, :oi, :iv, :itm, "
+                            ":batch_id, :ordinal, :started_at, :completed_at, "
+                            ":provider_regular_market_at)"
+                        ),
+                        {**row, "ordinal": capture_ordinal,
+                         "started_at": capture_started_at, "completed_at": completed_at},
+                    )
+                    count = _affected_rows(written)
+                    rows_known = rows_known and count is not None
+                    snapshots_inserted += count or 0
+                if not rows_known or snapshots_inserted != len(batch_rows):
+                    # Roll back the header and every row: a batch is complete
+                    # or absent, never partial.
+                    raise ValueError("options batch insert count mismatch")
+
+                if not is_latest:
+                    log.info("{t}: older overlapping options capture kept as batch {b}; "
+                             "newer batch keeps the daily signals", t=ticker, b=batch_id)
+                    return {"ticker": ticker, "status": "SUCCESS",
+                            "snapshots": snap_count, "snapshots_inserted": snapshots_inserted,
+                            "rows_inserted": snapshots_inserted,
+                            "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
+                            "latest_batch": False}
 
                 # Compute signals from nearest LIQUID expiration
                 # Skip expiries within 2 days (near-worthless, garbage data)
                 today_ts = datetime.now(timezone.utc).timestamp()
                 min_dte_seconds = 2 * 86400  # 2 days
-                liquid_expirations = [e for e in expirations if e - today_ts >= min_dte_seconds]
+                liquid_expirations = [e for e in selected_expirations
+                                      if e - today_ts >= min_dte_seconds]
                 if not liquid_expirations:
-                    liquid_expirations = expirations  # Fallback
+                    liquid_expirations = selected_expirations  # Fallback within captured chain
                 near_expiry = datetime.utcfromtimestamp(liquid_expirations[0]).strftime("%Y-%m-%d")
 
                 # If the nearest expiry was skipped, rebuild near_calls/puts from the correct expiry
-                if liquid_expirations[0] != expirations[0]:
+                if liquid_expirations[0] != selected_expirations[0]:
                     # Find which index in our pulled chains matches the liquid expiry
                     liquid_idx = None
-                    for ci, e in enumerate(expirations[:MAX_EXPIRATIONS]):
+                    for ci, e in enumerate(selected_expirations):
                         if e == liquid_expirations[0]:
                             liquid_idx = ci
                             break
@@ -444,7 +843,8 @@ class OptionsPuller(BasePuller):
                 oi_conc = _compute_oi_concentration(near_calls_df, near_puts_df, total_oi)
 
                 # Insert daily signals
-                conn.execute(
+                _check_budget(should_continue)
+                signal_write = conn.execute(
                     text(
                         "INSERT INTO options_daily_signals "
                         "(ticker, signal_date, put_call_ratio, max_pain, iv_skew, "
@@ -478,7 +878,7 @@ class OptionsPuller(BasePuller):
                 )
 
                 # Push to resolved_series for PIT access
-                self._push_to_resolved(conn, ticker, today_str, {
+                resolved_inserted = self._push_to_resolved(conn, ticker, today_str, {
                     "pcr": ("sentiment", f"{ticker} Put/Call Ratio", put_call_ratio),
                     "max_pain": ("sentiment", f"{ticker} Max Pain Strike", max_pain),
                     "iv_skew": ("vol", f"{ticker} IV Skew (OTM/ATM)", iv_skew),
@@ -489,11 +889,20 @@ class OptionsPuller(BasePuller):
                     "iv_25d_call": ("vol", f"{ticker} 25-Delta Call IV", iv_25d_call),
                     "term_slope": ("vol", f"{ticker} IV Term Structure Slope", term_slope),
                     "oi_conc": ("sentiment", f"{ticker} OI Concentration", oi_conc),
-                })
+                }, should_continue=should_continue)
+                _check_budget(should_continue)
+                signals_written = _affected_rows(signal_write)
+                rows_inserted = (
+                    snapshots_inserted + signals_written + resolved_inserted
+                    if rows_known and signals_written is not None and resolved_inserted is not None else None
+                )
 
             log.info(
-                "{t}: {n} snaps, PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
+                "{t}: {n} snaps, capture={capture:.1f}s, publish={publish:.1f}s, "
+                "PCR={pcr}, MaxPain={mp}, OI={oi}, IV_ATM={iv}",
                 t=ticker, n=snap_count,
+                capture=publish_clock - capture_clock,
+                publish=time.monotonic() - publish_clock,
                 pcr=f"{put_call_ratio:.2f}" if put_call_ratio else "N/A",
                 mp=f"${max_pain:,.0f}" if max_pain else "N/A",
                 oi=f"{total_oi:,}",
@@ -501,7 +910,10 @@ class OptionsPuller(BasePuller):
             )
             return {
                 "ticker": ticker, "status": "SUCCESS",
-                "snapshots": snap_count, "rows_inserted": snap_count,
+                "snapshots": snap_count, "snapshots_inserted": snapshots_inserted if rows_known else None,
+                "rows_inserted": rows_inserted,
+                "capture_batch_id": batch_id, "capture_ordinal": capture_ordinal,
+                "latest_batch": True,
                 "signals": {
                     "put_call_ratio": put_call_ratio,
                     "max_pain": max_pain,
@@ -511,6 +923,8 @@ class OptionsPuller(BasePuller):
                 },
             }
 
+        except _OptionsBudgetExpired:
+            return {"ticker": ticker, "status": "DEFERRED", "rows_inserted": 0, "reason": "time budget"}
         except Exception as e:
             log.error("{t}: {e}", t=ticker, e=e)
             return {"ticker": ticker, "status": "FAILED", "error": str(e), "rows_inserted": 0}
@@ -521,10 +935,15 @@ class OptionsPuller(BasePuller):
         ticker: str,
         today_str: str,
         signals: dict[str, tuple[str, str, Any]],
-    ) -> None:
+        *,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> int | None:
         """Push computed signals to feature_registry + resolved_series."""
         prefix = ticker.lower().replace("-", "_")
+        inserted = 0
+        known = True
         for suffix, (family, desc, val) in signals.items():
+            _check_budget(should_continue)
             if val is None:
                 continue
             feat_name = f"{prefix}_{suffix}"
@@ -560,7 +979,8 @@ class OptionsPuller(BasePuller):
                     continue
                 fid = fid_row[0]
 
-            conn.execute(
+            _check_budget(should_continue)
+            written = conn.execute(
                 text(
                     "INSERT INTO resolved_series "
                     "(feature_id, obs_date, release_date, vintage_date, value, "
@@ -573,6 +993,10 @@ class OptionsPuller(BasePuller):
                     "vd": today_str, "val": float(val), "src": self.source_id,
                 },
             )
+            count = _affected_rows(written)
+            known = known and count is not None
+            inserted += count or 0
+        return inserted if known else None
 
 
 # ---------------------------------------------------------------------------

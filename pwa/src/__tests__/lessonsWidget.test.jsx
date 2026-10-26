@@ -110,6 +110,22 @@ describe('LessonsWidget', () => {
         expect(await screen.findByText(/No post-mortem lessons in the last 14 days/i)).toBeInTheDocument();
     });
 
+    it('shows the honesty label ("LLM summary of N postmortems dated X-Y")', async () => {
+        // Wave 3 #6 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md): the backend
+        // now returns a `label` describing exactly what was summarized —
+        // the widget must surface it, not just a relative timestamp.
+        api.getPostmortemLessons.mockResolvedValue({
+            lessons: ['Cover the puts before earnings.'],
+            generated_at: new Date().toISOString(),
+            label: 'LLM summary of 5 postmortems dated 2026-09-14 to 2026-09-18',
+        });
+
+        render(<LessonsWidget />);
+
+        expect(await screen.findByText(/LLM summary of 5 postmortems dated 2026-09-14 to 2026-09-18/))
+            .toBeInTheDocument();
+    });
+
     it('tolerates a legacy LLM blob (string lessons) by splitting into bullets', async () => {
         api.getPostmortemLessons.mockResolvedValue({
             lessons: '- First bullet\n- Second bullet\n* Third bullet',

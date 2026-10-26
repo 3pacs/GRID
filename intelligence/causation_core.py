@@ -2,8 +2,8 @@
 GRID Intelligence — Causal Connection Engine (core module).
 
 Data classes, schema, constants, and primary entry points:
-  find_causes              — all probable causes for a single action
-  batch_find_causes        — run find_causes for all recent signal_sources
+  find_causes              — public events knowable before a single action
+  batch_find_causes        — the same for all recent trades (intelligence.causal_links)
   get_suspicious_trades    — trades where the cause is likely non-public info
   generate_causal_narrative — LLM or rule-based "why is everyone trading X?"
 """
@@ -35,8 +35,17 @@ class CausalLink:
     cause_type: str          # 'contract', 'legislation', 'earnings',
                              # 'insider_knowledge', 'rebalancing', 'unknown'
     evidence: list[dict]
-    probability: float       # 0-1
+    probability: float       # 0-1 heuristic strength (see score_method); not a calibrated probability
     lead_time_days: float    # how far before the action did the cause occur
+    # Point-in-time fields, set by intelligence.causal_links (slice N2). The
+    # multi-hop chain code in causation_graph still builds links without them.
+    event_date: str | None = None
+    event_known_at: str | None = None
+    event_known_at_basis: str | None = None
+    action_known_at: str | None = None
+    known_at: str | None = None
+    score_method: str | None = None
+    edge_key: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

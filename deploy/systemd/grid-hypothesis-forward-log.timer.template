@@ -1,0 +1,19 @@
+# TEMPLATE — NOT INSTALLED. See grid-hypothesis-forward-log.service.template.
+# Daily, safely after the nightly encrypted pg_dump
+# (grid-pg-backup.timer fires 03:30 UTC and has taken until ~10:05-10:30
+# UTC on recent runs; grid-analytics-snapshots.timer was moved off 07:15
+# UTC for the same reason — see its timer.d/override.conf on grid-svr).
+# Well after the pg_dump window closes; the job itself is a light,
+# read-only, short-statement-timeout query, not the batch scan
+# grid-analytics-snapshots runs.
+[Unit]
+Description=Run the GRID hypothesis-loop forward log (S10) once a day
+
+[Timer]
+OnCalendar=*-*-* 11:30:00 UTC
+RandomizedDelaySec=5min
+Persistent=true
+Unit=grid-hypothesis-forward-log.service
+
+[Install]
+WantedBy=timers.target

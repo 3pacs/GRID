@@ -770,7 +770,8 @@ class OptionsRecommender:
             entry_price, spot, strike, direction, gex_profile,
         )
 
-        # Stop loss from gamma flip point
+        # Conservative premium stop; the nearest modeled flip is not a
+        # directional or observed dealer-flow invalidation.
         stop_loss = self._compute_stop_loss(
             entry_price, spot, strike, direction, gex_profile,
         )
@@ -1117,34 +1118,12 @@ class OptionsRecommender:
         direction: str,
         gex_profile: dict,
     ) -> float:
-        """Set stop from gamma flip point.
+        """Use the existing 50% premium stop until a validated stop model exists.
 
-        If GEX data available: gamma flip represents the regime change point.
-        When spot crosses gamma flip, dealer flows reverse -> our thesis breaks.
-        Otherwise: use 50% of entry as stop.
+        A nearest zero crossing cannot establish the direction of modeled
+        GEX on either side, much less a realized dealer hedge reversal.
+        Keep the signature for existing recommendation callers.
         """
-        if not gex_profile:
-            return entry_price * 0.50
-
-        gamma_flip = gex_profile.get("gamma_flip")
-        if gamma_flip is None:
-            return entry_price * 0.50
-
-        if direction == "CALL":
-            # For calls: if spot drops below gamma flip, thesis is broken
-            if gamma_flip < spot:
-                # Estimate how much the option loses if spot drops to gamma flip
-                drop_pct = (spot - gamma_flip) / spot
-                # Option loses roughly delta * drop_pct * spot
-                option_loss_pct = min(0.70, drop_pct * 3.0)  # amplified by leverage
-                return entry_price * (1 - option_loss_pct)
-        else:
-            # For puts: if spot rallies above gamma flip, thesis breaks
-            if gamma_flip > spot:
-                rally_pct = (gamma_flip - spot) / spot
-                option_loss_pct = min(0.70, rally_pct * 3.0)
-                return entry_price * (1 - option_loss_pct)
-
         return entry_price * 0.50
 
     # ── Kelly and Probability ────────────────────────────────────────

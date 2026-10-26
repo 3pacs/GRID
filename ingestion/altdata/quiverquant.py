@@ -188,6 +188,78 @@ def _insider_signal_type(rec: dict[str, Any]) -> str:
     return "insider_buy" if "buy" in txn or "purchase" in txn else "insider_sell"
 
 
+# Calendar-quarter end dates. gov_contracts records carry a fiscal (Year,
+# Qtr) pair for a quarterly aggregate, not a per-event date, so this maps
+# the quarter to a stable marker for that period rather than to "today".
+_QUARTER_END_MONTH_DAY: dict[int, tuple[int, int]] = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
+
+
+def _gov_contract_period_date(rec: dict) -> date | None:
+    """Resolve a stable period-end date for a gov_contracts quarterly record.
+
+    Parameters:
+        rec: A raw QuiverQuant ``/live/govcontracts`` record.
+
+    Returns:
+        The quarter-end date for the record's (Year, Qtr), or ``None`` when
+        those fields aren't present/parseable.
+    """
+    year = rec.get("Year") or rec.get("year")
+    qtr = rec.get("Qtr") or rec.get("qtr") or rec.get("Quarter") or rec.get("quarter")
+    try:
+        year = int(year)
+        qtr = int(qtr)
+    except (TypeError, ValueError):
+        return None
+    month_day = _QUARTER_END_MONTH_DAY.get(qtr)
+    if month_day is None:
+        return None
+    month, day = month_day
+    try:
+        return date(year, month, day)
+    except ValueError:
+        return None
+
+
+def _resolve_signal_date(rec: dict, endpoint_key: str, today: date) -> date:
+    """Resolve the signal_date to store for one QuiverQuant record.
+
+    GD-FIX: gov_contracts records have no per-event date — only a (Year,
+    Qtr) pair describing the aggregate's fiscal quarter — so the old
+    fallback of ``signal_date = today`` meant the same ~821 quarterly rows
+    were re-inserted under a new date every single daily pull (the plan's
+    evidence: the row count multiplying about 30x/month). Anchoring
+    signal_date to the quarter's own end date instead means a re-pull of
+    unchanged data hits the same (source_type, source_id, ticker,
+    signal_date, signal_type) key and updates in place via the existing
+    ON CONFLICT clause, rather than inserting a new row.
+
+    Parameters:
+        rec: The raw record from the endpoint.
+        endpoint_key: The QuiverQuant endpoint key (e.g. ``"gov_contracts"``).
+        today: Today's date (injected for testability).
+
+    Returns:
+        The date to store as ``signal_date``.
+    """
+    if endpoint_key == "gov_contracts":
+        period_date = _gov_contract_period_date(rec)
+        if period_date is not None:
+            return period_date
+
+    date_str = rec.get("Date") or rec.get("date") or rec.get("ReportDate") or ""
+    if date_str:
+        try:
+            if isinstance(date_str, str):
+                return datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
+            if isinstance(date_str, (int, float)):
+                return datetime.fromtimestamp(date_str / 1000).date()
+            return date_str
+        except (ValueError, TypeError):
+            return today
+    return today
+
+
 def _store_signals(
     engine: Engine,
     records: list[dict],
@@ -209,20 +281,11 @@ def _store_signals(
             if not ticker:
                 continue
 
-            # Parse date — many QQ endpoints return current-day data without a date
-            date_str = rec.get("Date") or rec.get("date") or rec.get("ReportDate") or ""
-            if date_str:
-                try:
-                    if isinstance(date_str, str):
-                        signal_date = datetime.fromisoformat(date_str.replace("Z", "+00:00")).date()
-                    elif isinstance(date_str, (int, float)):
-                        signal_date = datetime.fromtimestamp(date_str / 1000).date()
-                    else:
-                        signal_date = date_str
-                except (ValueError, TypeError):
-                    signal_date = today
-            else:
-                signal_date = today
+            # Parse date — many QQ endpoints return current-day data without
+            # a date. gov_contracts is special-cased (see docstring on
+            # _resolve_signal_date): it gets a stable quarter-end marker
+            # instead of "today" so re-pulls dedupe instead of piling up.
+            signal_date = _resolve_signal_date(rec, endpoint_key, today)
 
             # Build signal_value as proper JSON
             signal_value = {k: v for k, v in rec.items()

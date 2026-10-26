@@ -16,9 +16,10 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
+import numpy as np
 from loguru import logger as log
 from sqlalchemy import text
 
@@ -39,6 +40,16 @@ PAPER_CAPITAL = 10_000.0
 STRATEGY_ID = "adaptive_rotation_live"
 MAX_DRAWDOWN_LIMIT = 0.20
 RISK_LIMIT_PCT = 0.05
+
+# A daily-close price puller runs Mon-Fri (see PULL_SCHEDULE_YFINANCE in
+# .env.example). Under normal operation the newest resolved_series row for a
+# liquid, actively-pulled ticker is 0-1 trading days old. A gap of more than
+# STALE_PRICE_MAX_TRADING_DAYS means the puller missed several consecutive
+# days, not that the market is quiet — VERIFIED FACT 5 found 19 of 23 closed
+# trades matched their entry price to the penny because a stale row was read
+# as "today's price". 3 trading days tolerates one missed pull without
+# masking a multi-day outage.
+STALE_PRICE_MAX_TRADING_DAYS = 3
 
 
 def _get_or_create_wallet(wm: WalletManager) -> str:
@@ -65,18 +76,56 @@ def _get_or_create_wallet(wm: WalletManager) -> str:
 
 
 def _get_latest_price(engine, ticker: str) -> float | None:
-    """Get the latest close price for a ticker from resolved_series."""
+    """Get the latest close price for a ticker from resolved_series.
+
+    Refuses (returns None) a price whose obs_date is more than
+    STALE_PRICE_MAX_TRADING_DAYS trading days old — see VERIFIED FACT 5: a
+    stale resolved_series row read as "the market" produced fake flat closes
+    (entry == exit to the penny) that the strategy's auto-kill was then
+    computed on.
+    """
     with engine.connect() as conn:
         row = conn.execute(text(
-            "SELECT rs.value FROM resolved_series rs "
+            "SELECT rs.value, rs.obs_date FROM resolved_series rs "
             "JOIN feature_registry fr ON rs.feature_id = fr.id "
             "WHERE fr.name = :name "
             "ORDER BY rs.obs_date DESC, rs.vintage_date DESC LIMIT 1"
         ), {"name": f"{ticker.lower()}_full"}).fetchone()
 
-    if row and row[0] and float(row[0]) > 0:
-        return float(row[0])
-    return None
+    if not row or not row[0] or float(row[0]) <= 0:
+        return None
+
+    obs_date = row[1]
+    if isinstance(obs_date, datetime):
+        obs_date = obs_date.date()
+    if obs_date is None:
+        return None
+
+    # np.busday_count counts Mon-Fri (weekdays), not a true market-holiday
+    # calendar, so a holiday inside the window is counted as a "trading day"
+    # — that makes this a slight OVER-estimate of real trading days elapsed,
+    # i.e. it fails toward flagging staleness sooner, not later.
+    stale_days = int(np.busday_count(obs_date, date.today()))
+    if stale_days > STALE_PRICE_MAX_TRADING_DAYS:
+        log.warning(
+            "Stale price for {t}: latest resolved_series obs_date={d} is "
+            "~{n} trading day(s) old (limit {lim}) — refusing to use it",
+            t=ticker, d=obs_date, n=stale_days, lim=STALE_PRICE_MAX_TRADING_DAYS,
+        )
+        return None
+
+    return float(row[0])
+
+
+def _get_strategy_status(engine) -> tuple[str | None, str | None]:
+    """Return (status, kill_reason) for STRATEGY_ID; (None, None) if no row yet."""
+    with engine.connect() as conn:
+        row = conn.execute(text(
+            "SELECT status, kill_reason FROM paper_strategies WHERE id = :id"
+        ), {"id": STRATEGY_ID}).fetchone()
+    if not row:
+        return None, None
+    return row[0], row[1]
 
 
 def _get_open_positions(engine) -> dict[str, dict]:
@@ -129,6 +178,22 @@ def run_paper_trading(engine) -> dict:
     wallet_id = _get_or_create_wallet(wm)
     _ensure_strategy(engine)
 
+    # Check the STRATEGY's own status up front. This is separate from the
+    # wallet risk check below: paper_strategies.status is flipped ACTIVE ->
+    # KILLED by PaperTradingEngine._check_kill(); open_trade() then silently
+    # no-ops (-1) for a non-ACTIVE strategy. adaptive_rotation_live has been
+    # KILLED since 2026-05-27, so without this check every run reported
+    # "OK, 0 trades opened" — indistinguishable from a genuinely quiet day
+    # (VERIFIED FACT 5). Reactivating the strategy is the operator's call;
+    # this just makes the block visible instead of silent.
+    strategy_status, kill_reason = _get_strategy_status(engine)
+    if strategy_status and strategy_status != "ACTIVE":
+        reason = f"paper_strategies.{STRATEGY_ID}.status={strategy_status}"
+        if kill_reason:
+            reason += f" ({kill_reason})"
+        log.warning("Rotation paper strategy BLOCKED — {r}", r=reason)
+        return {"status": "BLOCKED", "reason": reason, "date": str(date.today())}
+
     # Check wallet health
     risk = wm.check_risk(wallet_id)
     if risk.get("status") == "KILLED":
@@ -151,6 +216,18 @@ def run_paper_trading(engine) -> dict:
     regime = rotation.regime
     stopped = rotation.stopped_tickers
 
+    if not regime.available:
+        log.warning(
+            "Rotation regime unavailable ({r}) — skipping trading for {d}",
+            r=regime.reason, d=today,
+        )
+        return {
+            "status": "BLOCKED",
+            "date": str(today),
+            "reason": regime.reason,
+            "regime": regime.label,
+        }
+
     log.info("Regime: {l} (SPY trend={t}, VIX z={v:.2f})",
              l=regime.label, t=regime.spy_trend, v=regime.vix_zscore)
     log.info("Target weights: {w}", w={k: f"{v:.1%}" for k, v in target_weights.items()})
@@ -164,6 +241,7 @@ def run_paper_trading(engine) -> dict:
 
     trades_opened = 0
     trades_closed = 0
+    trades_failed = 0
 
     # Close positions not in target or stopped
     tickers_to_close = set(current_positions.keys()) - set(target_weights.keys())
@@ -217,16 +295,27 @@ def run_paper_trading(engine) -> dict:
             trades_opened += 1
             log.info("Opened LONG {t} @ {p:.2f} (weight={w:.1%})",
                      t=ticker, p=entry_price, w=weight)
+        else:
+            # open_trade() returns -1 (and already logs its own reason) when
+            # paper_strategies.status isn't ACTIVE, or the insert otherwise
+            # failed. The up-front status check above should catch the
+            # common case; this is the defensive net for anything else that
+            # yields -1 — it must be counted, not silently skipped
+            # (VERIFIED FACT 5).
+            trades_failed += 1
+            log.warning("Failed to open {t}: open_trade() returned {id}",
+                        t=ticker, id=trade_id)
 
     # Summary
     final_wallet = wm.get_wallet(wallet_id)
     summary = {
-        "status": "OK",
+        "status": "OK" if trades_failed == 0 else "PARTIAL",
         "date": str(today),
         "regime": regime.label,
         "target_weights": target_weights,
         "trades_opened": trades_opened,
         "trades_closed": trades_closed,
+        "trades_failed": trades_failed,
         "wallet_capital": final_wallet["current_capital"],
         "wallet_pnl": final_wallet["total_pnl"],
         "wallet_drawdown": final_wallet["max_drawdown"],
@@ -241,6 +330,8 @@ def run_paper_trading(engine) -> dict:
     log.info("  Regime:       {r}", r=regime.label)
     log.info("  Opened:       {n} trades", n=trades_opened)
     log.info("  Closed:       {n} trades", n=trades_closed)
+    if trades_failed:
+        log.warning("  Failed:       {n} trades (see warnings above)", n=trades_failed)
     log.info("  Capital:      ${c:,.2f}", c=final_wallet["current_capital"])
     log.info("  Total P&L:    ${p:+,.2f}", p=final_wallet["total_pnl"])
     log.info("  Max Drawdown: {d:.2%}", d=final_wallet["max_drawdown"])

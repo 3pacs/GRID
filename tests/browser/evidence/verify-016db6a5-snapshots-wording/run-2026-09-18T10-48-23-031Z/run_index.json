@@ -1,0 +1,45 @@
+{
+  "tree_label": "verify-016db6a5-snapshots-wording",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+  "generated_at": "2026-09-18T10:48:41.074Z",
+  "results": [
+    {
+      "tree_label": "verify-016db6a5-snapshots-wording",
+      "harness_commit": "a6b9b25133c24e8ddcd93c64837d3f1fb585bc5e",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-verify/pwa",
+      "pwa_commit": "016db6a5852006423f64f592bf1d966d614f4db4",
+      "role": "admin",
+      "scenario": "empty",
+      "started_at": "2026-09-18T10:48:27.835Z",
+      "journeys": {
+        "snapshots": {
+          "crashed": false,
+          "console_errors": 16,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/snapshots/history/clustering",
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T10:48:40.162Z"
+    }
+  ]
+}

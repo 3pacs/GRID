@@ -1,0 +1,12 @@
+=== /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=false -> HTTP 200 ===
+{"available":true,"status":"partial","pillar":"cftc_positioning","as_of":"2023-02-21","include_inferred":false,"coverage":0.0,"contracts_with_data":0,"contracts_expected":4,"stale_reason":null,"generation_id":"6c281b06-d8b7-40de-9754-c49dc83f1ebc","generation_published_at":"2026-09-18T18:28:40.586558+00:00","contracts"
+
+=== /api/v1/godview/pillars/cftc?as_of=2023-02-21&include_inferred=true -> HTTP 200 ===
+{"available":true,"status":"partial","pillar":"cftc_positioning","as_of":"2023-02-21","include_inferred":true,"coverage":0.25,"contracts_with_data":1,"contracts_expected":4,"stale_reason":null,"generation_id":"6c281b06-d8b7-40de-9754-c49dc83f1ebc","generation_published_at":"2026-09-18T18:28:40.586558+00:00","contracts"
+
+=== /api/v1/godview/pillars/fed_net_liquidity?as_of=2023-02-21 -> HTTP 200 ===
+{"available":true,"status":"partial","pillar":"fed_net_liquidity","as_of":"2023-02-21","include_inferred":false,"coverage":0.0,"stale_reason":null,"generation_id":"5b1750c4-7020-4acd-974a-6e8884f5ce6e","generation_published_at":"2026-09-18T18:29:02.868406+00:00","fields":{}}
+
+=== /api/v1/godview/pillars/commodity_warehouses?as_of=2023-02-21 -> HTTP 200 ===
+{"lme":{"available":true,"status":"partial","pillar":"commodity_warehouses","as_of":"2023-02-21","coverage":0.0,"metals_with_data":0,"metals_expected":6,"metals":["copper","aluminum","zinc","nickel","lead","tin"],"generation_id":"8edd205a-8015-404a-a231-42c418067a90","generation_published_at":"2026-09-18T18:29:07.11219
+

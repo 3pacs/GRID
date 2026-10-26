@@ -216,6 +216,19 @@ export const routes = [
         nav: 'drawer',
         desc: 'Sector & asset heatmap',
     },
+    /*
+     * God view (G9): Fed net liquidity, CFTC positioning and modeled SPY
+     * dealer gamma, each with its own availability state and provenance.
+     */
+    {
+        id: 'god-view',
+        label: 'God View',
+        icon: Eye,
+        component: './views/GodView.jsx',
+        group: 'markets',
+        nav: 'drawer',
+        desc: 'Fed liquidity, CFTC positioning and modeled dealer gamma, point in time',
+    },
     {
         id: 'options',
         label: 'Options',
@@ -641,6 +654,7 @@ const MAIN_DRAWER_SECTION_IDS = {
         'regime',
         'signals',
         'heatmap',
+        'god-view',
         'options',
         'flows',
         'earnings',

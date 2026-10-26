@@ -14,6 +14,8 @@ Endpoints:
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, Query
 from loguru import logger as log
@@ -27,15 +29,63 @@ router = APIRouter(prefix="/api/v1/briefing", tags=["briefing"])
 
 @router.get("/sentiment")
 async def get_current_sentiment(_token: str = Depends(require_auth)) -> dict:
-    """Compute and return current market sentiment score with full breakdown."""
+    """Return the latest persisted sentiment prediction without mutating state.
+
+    Sentiment computation and prediction logging belong to the scheduled scorer.
+    Calling that scorer from a GET previously ran its table-creation bootstrap,
+    making an apparently read-only route capable of DDL.  The product surface
+    instead exposes the latest persisted prediction with its source timestamp.
+    """
     try:
-        from intelligence.sentiment_scorer import compute_sentiment
         engine = get_engine()
-        result = compute_sentiment(engine)
-        return result.to_dict()
+        with engine.connect() as conn:
+            row = conn.execute(text(
+                "SELECT score, label, components, weights, weights_version, "
+                "prediction_date, created_at "
+                "FROM sentiment_predictions "
+                "ORDER BY prediction_date DESC, created_at DESC LIMIT 1"
+            )).fetchone()
+
+        if not row:
+            return {
+                "error": "No persisted sentiment prediction found",
+                "available": False,
+                "source": "latest_precomputed_prediction",
+            }
+
+        components = row[2]
+        if isinstance(components, str):
+            components = json.loads(components)
+        weights = row[3]
+        if isinstance(weights, str):
+            weights = json.loads(weights)
+
+        return {
+            "score": round(float(row[0]), 4),
+            "label": row[1],
+            "components": components,
+            "weights": weights,
+            "weights_version": row[4],
+            "prediction_date": str(row[5]),
+            # ``timestamp`` remains for existing readers; the explicit fields
+            # distinguish prediction provenance from this response time.
+            "timestamp": str(row[6]),
+            "created_at": str(row[6]),
+            "served_at": datetime.now(timezone.utc).isoformat(),
+            "available": True,
+            "source": "latest_precomputed_prediction",
+            "context": (
+                "Latest persisted sentiment prediction "
+                f"for {row[5]} (created {row[6]})."
+            ),
+        }
     except Exception as e:
-        log.warning("Sentiment computation failed: {e}", e=e)
-        return {"error": str(e)}
+        log.warning("Failed to fetch persisted sentiment: {e}", e=e)
+        return {
+            "error": "Persisted sentiment is temporarily unavailable",
+            "available": False,
+            "source": "latest_precomputed_prediction",
+        }
 
 
 @router.get("/latest")

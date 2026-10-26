@@ -10,6 +10,14 @@ from intelligence.hypothesis_engine import (
     Hypothesis,
     KILL_REASONS,
 )
+from intelligence import hypothesis_engine
+
+
+@pytest.fixture(autouse=True)
+def _scoring_unheld(monkeypatch):
+    # These tests pin kill/scoring behaviour when enabled; the production
+    # hold is covered by tests/test_hypothesis_scoring_hold.py.
+    monkeypatch.setattr(hypothesis_engine, "ACTIVE_HYPOTHESIS_SCORING_HELD", False)
 
 
 @pytest.fixture

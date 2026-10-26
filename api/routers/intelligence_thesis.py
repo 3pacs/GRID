@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 
 from api.auth import require_auth
@@ -18,6 +18,29 @@ from api.lf_helpers import (
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(tags=["intelligence"])
+
+
+def _postmortems_as_of(postmortems: list[dict[str, Any]]) -> dict[str, Any]:
+    """Honest freshness label for a list of thesis postmortems.
+
+    Item #16 (Wave 3 triage report): thesis scoring/postmortems are held
+    (``intelligence.thesis_tracker.THESIS_SCORING_HELD``) because of a
+    look-ahead bug, and nothing has scored a new outcome since 2026-04-17
+    in practice. Callers must never present this list as live — every
+    response using it carries ``as_of`` (the newest ``generated_at`` in the
+    data, or ``None`` if there is none) plus a `note` explaining why.
+    """
+    newest = max((pm.get("generated_at") for pm in postmortems if pm.get("generated_at")), default=None)
+    return {
+        "as_of": newest,
+        "note": (
+            f"most recent postmortem generated {newest}; scoring is held "
+            "(look-ahead bug, item #16) — this is a frozen historical "
+            "record, not a live feed"
+            if newest else
+            "no postmortems on record; scoring is held (look-ahead bug, item #16)"
+        ),
+    }
 
 
 # ── Unified Thesis Endpoint ───────────────────────────────────────────────
@@ -38,7 +61,9 @@ async def get_unified_thesis(
     supply chain, prediction markets, and trust convergence into a single
     directional view with conviction, key drivers, risk factors, and narrative.
 
-    Cached for 10 minutes.
+    Cached for 10 minutes. Read-only: the ``thesis_snapshots`` row that
+    accuracy tracking needs is written by the Hermes trust cycle
+    (``scripts/hermes_operator.py``), never by this GET.
     """
     import asyncio
 
@@ -47,15 +72,10 @@ async def get_unified_thesis(
         return cached
 
     def _build_thesis():
-        from analysis.thesis_scorer import score_thesis, snapshot_thesis, _build_narrative
+        from analysis.thesis_scorer import score_thesis, _build_narrative
 
         engine = get_db_engine()
         thesis = score_thesis(engine)
-
-        try:
-            snapshot_thesis(engine, thesis)
-        except Exception as e:
-            log.warning("Thesis: snapshot failed: {e}", e=str(e))
 
         thesis["overall_direction"] = thesis["direction"]
         thesis["bullish_score"] = thesis["bull_pct"]
@@ -182,6 +202,7 @@ async def get_thesis_postmortems_endpoint(
             "count": len(postmortems),
             "root_cause_counts": root_cause_counts,
             "days": days,
+            **_postmortems_as_of(postmortems),
         }
     except Exception as exc:
         log.warning("Thesis postmortems failed: {e}", e=str(exc))
@@ -302,8 +323,11 @@ async def get_research_archive(
     try:
         from intelligence.thesis_tracker import load_thesis_postmortems
         pms = load_thesis_postmortems(engine, days=days)
+        as_of = _postmortems_as_of(pms)
         archive["postmortems"] = pms
         archive["postmortem_count"] = len(pms)
+        archive["postmortem_as_of"] = as_of["as_of"]
+        archive["postmortem_note"] = as_of["note"]
     except Exception as exc:
         archive["postmortems"] = []
         archive["postmortem_count"] = 0
@@ -479,6 +503,8 @@ async def run_daily_investigation(
 @router.get("/diary")
 async def get_diary(
     date: str | None = Query(None, description="Date in YYYY-MM-DD format"),
+    reference_overlay: bool = Query(False, description="Review original diary alongside fixed historical S&P reference evidence"),
+    reference_as_of: str | None = Query(None, description="Required offset-aware ISO timestamp for the opt-in reference review"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Retrieve a market diary entry by date.
@@ -486,6 +512,19 @@ async def get_diary(
     If no date is provided, returns the most recent entry.
     """
     from datetime import date as date_type
+
+    if reference_overlay is True:
+        if not date or not isinstance(reference_as_of, str):
+            raise HTTPException(status_code=400, detail="Reference review requires an explicit date and aware reference_as_of")
+        try:
+            from intelligence.market_diary import get_diary_reference_review
+
+            target = date_type.fromisoformat(date)
+            return get_diary_reference_review(
+                get_db_engine(), target, reference_as_of=reference_as_of,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         from intelligence.market_diary import get_diary_entry, list_diary_entries

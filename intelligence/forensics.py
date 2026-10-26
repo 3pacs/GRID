@@ -49,6 +49,13 @@ class ForensicReport:
     narrative: str                       # LLM or rule-based explanation
     pattern_match: dict | None           # if this matches a known recurring pattern
     confidence: float
+    # Wave 3 #9 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md): the narrative
+    # text itself was unlabelled. generated_at + narrative_label let callers
+    # show "LLM narrative (local), generated <ts>" instead of implying a
+    # live/verified feed. Default "" so historical DB rows without these
+    # (loaded via load_forensic_reports) still deserialize cleanly.
+    generated_at: str = ""
+    narrative_label: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -193,6 +200,7 @@ def analyze_move(
     ticker: str,
     move_date: str,
     lookback_days: int = 14,
+    persist: bool = True,
 ) -> ForensicReport | None:
     """Generate a full forensic report for a specific price move.
 
@@ -205,11 +213,14 @@ def analyze_move(
         ticker: Stock ticker symbol.
         move_date: Date of the move (YYYY-MM-DD).
         lookback_days: How many days before the move to scan.
+        persist: When True (default), ensure ``forensic_reports`` and store
+            the report. Read paths (the forensics GET summary) pass False.
 
     Returns:
         ForensicReport or None if the move date has no price data.
     """
-    _ensure_tables(engine)
+    if persist:
+        _ensure_tables(engine)
     ticker = ticker.upper()
     target_date = _parse_date(move_date)
 
@@ -353,7 +364,7 @@ def analyze_move(
     ]
 
     # ── Generate narrative ────────────────────────────────────────────
-    narrative = _generate_narrative(
+    narrative, narrative_used_llm = _generate_narrative(
         ticker=ticker,
         move_date=str(target_date),
         move_pct=move_pct,
@@ -364,6 +375,12 @@ def analyze_move(
         total_flow=total_flow,
         avg_lead=avg_lead,
         pattern_match=pattern_match,
+    )
+    generated_at = datetime.now(timezone.utc).isoformat()
+    narrative_label = (
+        f"LLM narrative (local), generated {generated_at}"
+        if narrative_used_llm
+        else f"Rule-based narrative (LLM unavailable), generated {generated_at}"
     )
 
     # ── Confidence scoring ────────────────────────────────────────────
@@ -389,10 +406,13 @@ def analyze_move(
         narrative=narrative,
         pattern_match=pattern_match,
         confidence=round(confidence, 3),
+        generated_at=generated_at,
+        narrative_label=narrative_label,
     )
 
-    # Persist
-    _store_report(engine, report)
+    # Persist (explicit writers only; read paths pass persist=False)
+    if persist:
+        _store_report(engine, report)
 
     log.info(
         "Forensic report for {t} on {d}: {dir} {pct:.2f}%, "
@@ -456,6 +476,7 @@ def batch_forensics(
     ticker: str,
     days: int = 90,
     threshold: float = 0.015,
+    persist: bool = True,
 ) -> list[ForensicReport]:
     """Find all significant moves and generate forensic reports for each.
 
@@ -464,6 +485,7 @@ def batch_forensics(
         ticker: Stock ticker symbol.
         days: Lookback window for finding moves.
         threshold: Minimum absolute daily return for significance.
+        persist: Passed to :func:`analyze_move`; False keeps it read-only.
 
     Returns:
         List of ForensicReport instances, ordered most recent first.
@@ -473,7 +495,7 @@ def batch_forensics(
 
     for move in moves:
         try:
-            report = analyze_move(engine, ticker, move["date"])
+            report = analyze_move(engine, ticker, move["date"], persist=persist)
             if report:
                 reports.append(report)
         except Exception as exc:
@@ -500,6 +522,10 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
 
     Falls back to rule-based summary if LLM is unavailable.
 
+    Read-only: it is served by ``GET /intelligence/forensics/{ticker}``, so the
+    per-move reports it builds are never stored (``persist=False``). Storing
+    reports is ``POST /forensics/{ticker}/analyze`` or the batch scripts.
+
     Args:
         engine: SQLAlchemy engine.
         ticker: Stock ticker symbol.
@@ -509,7 +535,7 @@ def generate_forensic_summary(engine: Engine, ticker: str, days: int = 90) -> st
         Formatted summary string.
     """
     ticker = ticker.upper()
-    reports = batch_forensics(engine, ticker, days=days)
+    reports = batch_forensics(engine, ticker, days=days, persist=False)
 
     if not reports:
         return f"No significant moves found for {ticker} in the last {days} days."
@@ -649,8 +675,10 @@ def load_forensic_reports(
 
     Returns:
         List of forensic report dicts.
+
+    Read-only: no ``_ensure_tables`` DDL on this GET path; the writer
+    (:func:`analyze_move` with ``persist=True``) creates the table.
     """
-    _ensure_tables(engine)
     cutoff = date.today() - timedelta(days=days)
 
     with engine.connect() as conn:
@@ -665,6 +693,7 @@ def load_forensic_reports(
 
     results: list[dict[str, Any]] = []
     for r in rows:
+        created_at = r[9].isoformat() if hasattr(r[9], "isoformat") else (str(r[9]) if r[9] else None)
         results.append({
             "ticker": r[0],
             "move_date": str(r[1]),
@@ -676,6 +705,13 @@ def load_forensic_reports(
             "pattern_match": r[7] if isinstance(r[7], (dict, type(None))) else json.loads(r[7] or "null"),
             "confidence": _safe_float(r[8]),
             "created_at": str(r[9]) if r[9] else None,
+            # Wave 3 #9: whether the stored narrative came from the LLM or
+            # the rule-based fallback isn't persisted (no schema change in
+            # this fix), so this historical-read label stays deliberately
+            # non-committal about which one it was — still honest, just less
+            # precise than the fresh POST /analyze response.
+            "generated_at": created_at,
+            "narrative_label": f"Forensic narrative, generated {created_at}" if created_at else "",
         })
 
     return results
@@ -696,10 +732,13 @@ def _generate_narrative(
     total_flow: float,
     avg_lead: float,
     pattern_match: dict | None,
-) -> str:
+) -> tuple[str, bool]:
     """Generate a narrative explanation for the move.
 
-    Tries LLM first, falls back to rule-based template.
+    Tries LLM first, falls back to rule-based template. Returns
+    ``(narrative, used_llm)`` so the caller can label the source honestly
+    (Wave 3 #9) instead of presenting a rule-based fallback as an LLM
+    narrative.
     """
     # Try LLM
     llm_narrative = _get_llm_narrative(
@@ -715,7 +754,7 @@ def _generate_narrative(
         pattern_match=pattern_match,
     )
     if llm_narrative:
-        return llm_narrative
+        return llm_narrative, True
 
     # Rule-based fallback
     pct_str = f"{abs(move_pct) * 100:.1f}%"
@@ -749,7 +788,7 @@ def _generate_narrative(
         occ = pattern_match.get("occurrences", "?")
         lines.append(f"This matches a recurring pattern ({pat}, seen {occ} times).")
 
-    return " ".join(lines)
+    return " ".join(lines), False
 
 
 def _get_llm_narrative(

@@ -505,7 +505,7 @@ export function App() {
             return <SectorDive sector={selectedSector} onBack={() => navigateBack('money-flow')} />;
         }
         if (activeView === 'associations-legacy') {
-            return <AssociationsLegacy />;
+            return <AssociationsLegacy onBack={() => navigateBack('associations')} />;
         }
 
         const Component = routeComponents[activeView] || extraRouteComponents[activeView];

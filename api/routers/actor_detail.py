@@ -241,7 +241,7 @@ def _ticker_signals(engine: Any, ticker: str) -> dict[str, Any]:
             if _table_exists(conn, "options_daily_signals"):
                 row = conn.execute(text(
                     "SELECT put_call_ratio, iv_atm FROM options_daily_signals "
-                    "WHERE ticker = :t "
+                    "WHERE ticker = :t AND signal_date <= CURRENT_DATE "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ), {"t": ticker}).fetchone()
                 if row:

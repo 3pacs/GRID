@@ -1,0 +1,102 @@
+{
+  "captured_date": "2026-09-28",
+  "normalization": "CRLF to LF and single final newline; no runtime behavior edits",
+  "files": [
+    {
+      "path": "broker.py",
+      "captured_sha256": "03c21a06ad7a6ef45fe3cb58394b181b4002f3f277359fbc646da9a34d33eaa9",
+      "repository_lf_sha256": "3cec70fb5ae551b1aee6ae8b81cd1b47fbf22e2c3a373c0679e1cbbfe606272b",
+      "source": "grid-svr"
+    },
+    {
+      "path": "contracts.json",
+      "captured_sha256": "653d59efe6154b12e0725fb2ac35962165128baa06cd22f779549c86017a7ccd",
+      "repository_lf_sha256": "a794de1c7414152f088a4f5d647ede4173df8b2afd67d1ec2d59bb7bf2abc0c4",
+      "source": "grid-svr"
+    },
+    {
+      "path": "index.html",
+      "captured_sha256": "1a1365122bab739e982bed95b994e6b9302a4f926b61c0a18424c13dce5fa0b8",
+      "repository_lf_sha256": "81b5e80627abfdd267e9c019141e25a5b32696e0b62d1e4b0297c058ba3c7e6f",
+      "source": "grid-svr"
+    },
+    {
+      "path": "journal.py",
+      "captured_sha256": "aa6f1a597f32759db20a156d43e127bfed281d051794685ae0fec27780a7f75f",
+      "repository_lf_sha256": "aa6f1a597f32759db20a156d43e127bfed281d051794685ae0fec27780a7f75f",
+      "source": "grid-svr"
+    },
+    {
+      "path": "pressure.py",
+      "captured_sha256": "8f47b62a3d27b7601b24f49c14753a5204a60bcb2a459ec6aa66f9f660e70dd0",
+      "repository_lf_sha256": "d2242837eceac2885f093570edda52725dfe34fdb02e43c5d929471e074fcc33",
+      "source": "grid-svr"
+    },
+    {
+      "path": "scenarios.py",
+      "captured_sha256": "0a253d4a73fa8a7ff6f31a8a8a3b39eaffbd7a6d60679bb59573d684211c08a5",
+      "repository_lf_sha256": "0a253d4a73fa8a7ff6f31a8a8a3b39eaffbd7a6d60679bb59573d684211c08a5",
+      "source": "grid-svr"
+    },
+    {
+      "path": "sectors.py",
+      "captured_sha256": "baa634eb8f222fc1d15cec69f9b4d9fb2062d5e4535f1cc65b5f7efa6659bae0",
+      "repository_lf_sha256": "baa634eb8f222fc1d15cec69f9b4d9fb2062d5e4535f1cc65b5f7efa6659bae0",
+      "source": "grid-svr"
+    },
+    {
+      "path": "server.py",
+      "captured_sha256": "44fc0b85c619a0c1f22486383d2266c6fa0371925cd81fd5fa0964d95e37305f",
+      "repository_lf_sha256": "842eee588edfe70e69fa4307fc78f527ebe72bbb24722561ac16db57237b2936",
+      "source": "grid-svr"
+    },
+    {
+      "path": "structural.py",
+      "captured_sha256": "1bec111c35c7acf18f50520d026f0855ae8b9180fc65478bb185d1bf233021ee",
+      "repository_lf_sha256": "1bec111c35c7acf18f50520d026f0855ae8b9180fc65478bb185d1bf233021ee",
+      "source": "grid-svr"
+    },
+    {
+      "path": "windows/options/rtd-collector.cs",
+      "captured_sha256": "a2b459c1fbb14c91bef537b5e202882eb20ece79364dcf5897f3e13a292833a8",
+      "repository_lf_sha256": "71296b514e53918f84338bc1c779002a873c85abfe80c44bb31a083702c735ed",
+      "source": "anik"
+    },
+    {
+      "path": "windows/options/run-rtd-collector.ps1",
+      "captured_sha256": "dae272ac9d4227ad078d8fd71fa9eff92e33eaf03210ae69025627b5eb3879e1",
+      "repository_lf_sha256": "dae272ac9d4227ad078d8fd71fa9eff92e33eaf03210ae69025627b5eb3879e1",
+      "source": "anik"
+    },
+    {
+      "path": "windows/options/topics.json",
+      "captured_sha256": "6da5753085664c3e0a0bf04c4485f82d9d1a419d3611dff027df6a23293c5431",
+      "repository_lf_sha256": "564dbdb205066f394f57ac2dc4a1a794574898785d068d0cacdf9e61af935e04",
+      "source": "anik"
+    },
+    {
+      "path": "windows/structural/run-structural.ps1",
+      "captured_sha256": "fd2a721bd9542b143b13e88b37a82bb6c25d9ad03aeb849915a9151fc6d5a00b",
+      "repository_lf_sha256": "3bc8ac7d318259bcf463a1f9db89c7f666c2b692154e4154672b5d02690b934e",
+      "source": "anik"
+    },
+    {
+      "path": "windows/structural/start-structural.ps1",
+      "captured_sha256": "192960ca5417ea0142e069420e91074f8dec162c2cb6950f117907af62f784fc",
+      "repository_lf_sha256": "d55af3c191ed68d90695acfb2c9f9036594ecd18f9d596dbe6387d4586644867",
+      "source": "anik"
+    },
+    {
+      "path": "windows/structural/structural-collector.cs",
+      "captured_sha256": "33132d27f46329dc42d5e0733908fbee9921e868816f073442b1a561fecc877e",
+      "repository_lf_sha256": "b01ea3f237069e20a24b7fa1b2222ea6afbe502cf47fda8ca86b28feb60bab57",
+      "source": "anik"
+    },
+    {
+      "path": "windows/structural/topics.json",
+      "captured_sha256": "c312b83013284c6a8a8ad43bf9c3d82608f996ce2ee6dc663292939cb6b59cdb",
+      "repository_lf_sha256": "d52040c0aa3a99f244f9f36f3686a7e0150dec4af21060a62b14053b72e27a0e",
+      "source": "anik"
+    }
+  ]
+}

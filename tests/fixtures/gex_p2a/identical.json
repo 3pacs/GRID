@@ -1,0 +1,19 @@
+{
+  "schema": "gex-p2a-v1",
+  "packet_id": "8c2a2d9f-b3be-40f2-8676-173a68a2f87a",
+  "source": "synthetic-fixture-not-market-data",
+  "basis": "unadjusted",
+  "calendar_version": "synthetic-explicit-UTC-expiries-v1",
+  "availability_basis": "grid_svr_pull_receipt",
+  "available_at": "2026-09-28T15:00:00Z",
+  "valuation_at": "2026-09-28T15:00:00Z",
+  "r": 0.04,
+  "q": 0.012,
+  "spots": [760, 765, 770],
+  "rows": [
+    {"underlying":"SPY","expiry":"2026-09-28T20:00:00Z","strike":765,"side":"call","iv":0.2,"iv_origin":"direct","oi":1234,"oi_as_of":null,"multiplier":100,"deliverable":"standard_shares"},
+    {"underlying":"SPY","expiry":"2026-09-28T20:00:00Z","strike":765,"side":"put","iv":0.23,"iv_origin":"direct","oi":1400,"oi_as_of":null,"multiplier":100,"deliverable":"standard_shares"},
+    {"underlying":"SPY","expiry":"2026-10-16T20:00:00Z","strike":765,"side":"call","iv":0.3,"iv_origin":"direct","oi":2100,"oi_as_of":null,"multiplier":100,"deliverable":"standard_shares"},
+    {"underlying":"SPY","expiry":"2026-10-16T20:00:00Z","strike":760,"side":"put","iv":0.19,"iv_origin":"direct","oi":0,"oi_as_of":null,"multiplier":100,"deliverable":"standard_shares"}
+  ]
+}

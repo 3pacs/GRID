@@ -41,6 +41,10 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+# CFTC COT ids are keyed by cftc_contract_market_code (cftc.<code>.<metric>);
+# the legacy cftc.SP500/GOLD/CRUDE_OIL/NATGAS ids mixed several markets.
+from ingestion.altdata.cftc_markets import series_id_for_root as _cftc_sid
+
 
 # ══════════════════════════════════════════════════════════════════════════
 # THE GLOBAL LEVER HIERARCHY
@@ -1844,15 +1848,15 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
             # ── Capital Allocation: CFTC positioning, insider clusters ──
             cftc_sp = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'cftc.SP500.net_speculative' AND pull_status = 'SUCCESS' "
+                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 1"
-            )).fetchone()
+            ), {"sid": _cftc_sid("ES", "net_speculative")}).fetchone()
 
             cftc_gold = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'cftc.GOLD.net_speculative' AND pull_status = 'SUCCESS' "
+                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 1"
-            )).fetchone()
+            ), {"sid": _cftc_sid("GC", "net_speculative")}).fetchone()
 
             insider_count = conn.execute(text(
                 "SELECT COUNT(*) FROM signal_sources "
@@ -1866,7 +1870,7 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
                 val = float(cftc_sp[0])
                 direction = "net long" if val > 0 else "net short"
                 cap_metrics.append({
-                    "label": "S&P 500 Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "label": "E-mini S&P 500 Futures (COT)", "value": f"{val:+,.0f} ({direction})",
                     "date": str(cftc_sp[1]),
                 })
                 cap_status_parts.append(f"S&P futures {direction} {abs(val):,.0f} contracts")
@@ -1875,7 +1879,7 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
                 val = float(cftc_gold[0])
                 direction = "net long" if val > 0 else "net short"
                 cap_metrics.append({
-                    "label": "Gold Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "label": "COMEX Gold Futures (COT)", "value": f"{val:+,.0f} ({direction})",
                     "date": str(cftc_gold[1]),
                 })
 
@@ -1935,15 +1939,15 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
             # ── Energy: crude oil positioning ──
             cftc_oil = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'cftc.CRUDE_OIL.net_speculative' AND pull_status = 'SUCCESS' "
+                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 1"
-            )).fetchone()
+            ), {"sid": _cftc_sid("CL", "net_speculative")}).fetchone()
 
             cftc_natgas = conn.execute(text(
                 "SELECT value, obs_date FROM raw_series "
-                "WHERE series_id = 'cftc.NATGAS.net_speculative' AND pull_status = 'SUCCESS' "
+                "WHERE series_id = :sid AND pull_status = 'SUCCESS' "
                 "ORDER BY obs_date DESC LIMIT 1"
-            )).fetchone()
+            ), {"sid": _cftc_sid("NG", "net_speculative")}).fetchone()
 
             energy_metrics = []
             energy_status_parts = []
@@ -1951,7 +1955,7 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
                 val = float(cftc_oil[0])
                 direction = "net long" if val > 0 else "net short"
                 energy_metrics.append({
-                    "label": "Crude Oil Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "label": "WTI Crude Futures, NYMEX (COT)", "value": f"{val:+,.0f} ({direction})",
                     "date": str(cftc_oil[1]),
                 })
                 energy_status_parts.append(f"crude oil futures {direction}")
@@ -1960,7 +1964,7 @@ def _fetch_live_lever_data(engine: Engine) -> dict[str, dict[str, Any]]:
                 val = float(cftc_natgas[0])
                 direction = "net long" if val > 0 else "net short"
                 energy_metrics.append({
-                    "label": "Natural Gas Futures (COT)", "value": f"{val:+,.0f} ({direction})",
+                    "label": "Henry Hub Natural Gas Futures (COT)", "value": f"{val:+,.0f} ({direction})",
                     "date": str(cftc_natgas[1]),
                 })
 

@@ -1,5 +1,5 @@
 import React from 'react';
-import { render, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import Dashboard from '../views/Dashboard.jsx';
 import { api } from '../api.js';
@@ -25,8 +25,9 @@ vi.mock('../api.js', () => ({
         refreshWatchlistPrices: vi.fn(),
         getWatchlistEnriched: vi.fn(),
         listFlowBriefings: vi.fn(),
-        getFlowBriefingAudioUrl: vi.fn((name) => `/audio/${name}`),
+        loadFlowBriefingAudio: vi.fn(async (name) => `blob:/audio/${name}`),
         getPostmortemLessons: vi.fn(),
+        generateFlowBriefing: vi.fn(),
     },
 }));
 
@@ -69,7 +70,7 @@ describe('Dashboard watchlist loading', () => {
         api.refreshWatchlistPrices.mockReset();
         api.getWatchlistEnriched.mockReset();
         api.listFlowBriefings.mockReset();
-        api.getFlowBriefingAudioUrl.mockClear();
+        api.loadFlowBriefingAudio.mockClear();
 
         api.getCurrent.mockResolvedValue({ state: 'NEUTRAL', confidence: 0.5 });
         api.getStatus.mockResolvedValue({ database: { connected: true } });
@@ -82,6 +83,7 @@ describe('Dashboard watchlist loading', () => {
         api.listFlowBriefings.mockResolvedValue({ briefings: [] });
         api.getPostmortemLessons.mockReset();
         api.getPostmortemLessons.mockResolvedValue({ lessons: [], generated_at: null });
+        api.generateFlowBriefing.mockReset();
     });
 
     it('uses cached watchlist prices on mount and avoids the refresh endpoint', async () => {
@@ -92,5 +94,122 @@ describe('Dashboard watchlist loading', () => {
         });
 
         expect(api.refreshWatchlistPrices).not.toHaveBeenCalled();
+    });
+
+    it('labels the PULSE row with the live price source (Wave 3 #11)', async () => {
+        api.getWatchlistPrices.mockResolvedValue({
+            prices: { SPY: { price: 500, pct_1d: 0.01, source: 'yfinance', updated_at: '2026-09-28T12:00:00Z' } },
+            fresh: true, cached: true, source: 'yfinance',
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        await waitFor(() => {
+            expect(screen.getByText('PULSE')).toBeInTheDocument();
+        });
+        const pulseLabel = screen.getByText('PULSE');
+        expect(pulseLabel.title).toMatch(/yfinance/i);
+    });
+
+    it('renders a text-only on-demand briefing when no audio was made (paid TTS disabled)', async () => {
+        // Wave 3 W3.4 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5): with
+        // GRID_ALLOW_PAID_LLM unset, audio_briefing.py returns script_text
+        // with no audio_path. The Dashboard button must show that text
+        // instead of silently reporting a failure.
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning. GRID Intelligence briefing for today.',
+                audio_path: null,
+                provider: 'local',
+                briefing_date: '2026-09-28',
+                generated_at: '2026-09-28T12:00:00Z',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        const btn = await screen.findByRole('button', { name: 'Generate on request' });
+        fireEvent.click(btn);
+
+        await waitFor(() => {
+            expect(screen.getByTestId('text-briefing')).toBeInTheDocument();
+        });
+        const textBriefing = screen.getByTestId('text-briefing');
+        expect(within(textBriefing).getByText(/GRID Intelligence briefing for today/)).toBeInTheDocument();
+        expect(within(textBriefing).getByText(/\(local\)/)).toBeInTheDocument();
+    });
+
+    it('says the local TTS is unavailable when Kokoro did not answer (never a fake success)', async () => {
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning. GRID Intelligence briefing for today.',
+                audio_path: null,
+                audio_status: 'unavailable',
+                audio_note: 'Local TTS unavailable: Kokoro at http://gridz4:8880 is unreachable (ConnectionError). Text-only briefing; no audio was made and no paid TTS was tried.',
+                provider: 'local',
+                briefing_date: '2026-10-01',
+                generated_at: '2026-10-01T12:00:00Z',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByText(/Local TTS unavailable: Kokoro/)).toBeInTheDocument();
+        });
+        expect(screen.getByTestId('text-briefing')).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: /play briefing/i })).not.toBeInTheDocument();
+    });
+
+    it('labels an older saved recording as previous when the new briefing has no audio', async () => {
+        api.listFlowBriefings.mockResolvedValue({
+            briefings: [{ filename: 'briefing_2026-04-07_20260407_060040.mp3', briefing_date: '2026-04-07' }],
+        });
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning.',
+                audio_path: null,
+                audio_status: 'unavailable',
+                audio_note: 'Local TTS unavailable: Kokoro TTS is unreachable (ConnectionError).',
+                provider: 'local',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        await screen.findByRole('button', { name: 'Load and play briefing' });
+        expect(screen.queryByTestId('previous-recording')).not.toBeInTheDocument();
+
+        fireEvent.click(screen.getByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByTestId('previous-recording')).toHaveTextContent(/Previous recording \(2026-04-07\)/);
+        });
+    });
+
+    it('shows the not-configured note inside a text-only briefing', async () => {
+        api.generateFlowBriefing.mockResolvedValue({
+            status: 'SUCCESS',
+            briefing: {
+                script_text: 'Good morning.',
+                audio_path: null,
+                audio_status: 'not_configured',
+                audio_note: 'Text-only briefing: local TTS is not configured (set GRID_KOKORO_URL to a Kokoro server). Paid TTS stays off.',
+                provider: 'local',
+            },
+        });
+
+        render(<Dashboard onNavigate={vi.fn()} />);
+
+        fireEvent.click(await screen.findByRole('button', { name: 'Generate on request' }));
+
+        await waitFor(() => {
+            expect(screen.getByTestId('text-briefing-note')).toHaveTextContent(/GRID_KOKORO_URL/);
+        });
     });
 });

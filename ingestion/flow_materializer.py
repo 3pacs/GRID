@@ -9,7 +9,8 @@ of data already stored in signal_sources (JSONB) and raw_series.
 
 This module provides idempotent sync functions that read from the
 source tables, parse the JSON payloads, and upsert into the
-query-friendly target tables using ON CONFLICT DO UPDATE.
+query-friendly target tables using ON CONFLICT DO UPDATE
+(congressional_trades is instead rebuilt atomically; see its sync).
 
 Entry point: sync_all(engine) runs all materializers and returns a
 summary dict with row counts per table plus any errors encountered.
@@ -22,9 +23,17 @@ from datetime import date, timedelta
 from typing import Any
 
 from loguru import logger as log
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import OperationalError
+
+from ingestion.altdata.congressional import (
+    _midpoint_amount,
+    _normalize_member_name,
+    _normalize_ticker,
+    _normalize_txn_type,
+    resolve_disclosure_date,
+)
 
 # ── Amount range mapping (mirrors congressional.py / dollar_flows.py) ────
 
@@ -70,11 +79,16 @@ _DDL_STATEMENTS: list[str] = [
         value       DOUBLE PRECISION,
         price_per_share DOUBLE PRECISION,
         insider_title TEXT,
+        filing_date DATE,
         is_cluster_buy BOOLEAN DEFAULT FALSE,
         created_at  TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE (ticker, trade_date, insider_name, trade_type)
     )
     """,
+    # GD-FIX: filing_date already exists in prod (revision f1a2b3c4d5e6) but
+    # was missing from this lazy-create fallback, so a database bootstrapped
+    # from this file alone (fresh dev/test DB) would not have the column.
+    "ALTER TABLE insider_trades ADD COLUMN IF NOT EXISTS filing_date DATE",
     "CREATE INDEX IF NOT EXISTS idx_insider_trades_ticker ON insider_trades (ticker, trade_date DESC)",
     "CREATE INDEX IF NOT EXISTS idx_insider_trades_value ON insider_trades (value DESC NULLS LAST)",
     """
@@ -89,10 +103,19 @@ _DDL_STATEMENTS: list[str] = [
         chamber           TEXT,
         party             TEXT,
         state             TEXT,
+        committee         TEXT,
         created_at        TIMESTAMPTZ DEFAULT NOW(),
         UNIQUE (ticker, disclosure_date, representative, transaction_type)
     )
     """,
+    # GD-FIX: committee already exists in prod (revision f1a2b3c4d5e6) but
+    # this fallback never declared it, and sync_congressional_trades never
+    # selected it either (see below) — "Committee is always empty".
+    "ALTER TABLE congressional_trades ADD COLUMN IF NOT EXISTS committee TEXT",
+    # transaction_date / signal_source_id exist in prod (revision f1a2b3c4d5e6)
+    # but this fallback never declared them and the sync never filled them.
+    "ALTER TABLE congressional_trades ADD COLUMN IF NOT EXISTS transaction_date DATE",
+    "ALTER TABLE congressional_trades ADD COLUMN IF NOT EXISTS signal_source_id INTEGER",
     "CREATE INDEX IF NOT EXISTS idx_congressional_ticker ON congressional_trades (ticker, disclosure_date DESC)",
     """
     CREATE TABLE IF NOT EXISTS dark_pool_weekly (
@@ -197,30 +220,93 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
         return default
 
 
+def _parse_filing_date(raw: Any, fallback: Any = None) -> Any:
+    """Parse an insider-filing ``filing_date`` string into a ``date``.
+
+    Never falls back to the transaction date: a missing or unparseable
+    filing date means we do not know when the filing became public, and
+    copying the trade date would fabricate a same-day disclosure that the
+    source never asserted (GD-FIX).
+
+    Parameters:
+        raw: The ``filing_date`` value from a parsed ``signal_value`` dict
+            (expected to be an ISO-ish date string, or empty/missing).
+        fallback: Value to return when ``raw`` is missing or unparseable
+            (defaults to ``None`` — leave the column NULL).
+
+    Returns:
+        A ``date`` on success, otherwise ``fallback``.
+    """
+    if not raw:
+        return fallback
+    try:
+        return date.fromisoformat(str(raw)[:10])
+    except (ValueError, TypeError):
+        return fallback
+
+
+def _cluster_windows_from_rows(
+    rows: list[tuple[str, Any, Any]],
+) -> dict[str, list[tuple[date, date]]]:
+    """Build per-ticker cluster-buy date windows from CLUSTER_BUY signal rows.
+
+    ``insider_filings.py::_detect_cluster_buys`` already does the honest
+    work of finding multiple *distinct* insiders buying the same ticker
+    within a window, and emits one CLUSTER_BUY row per detected cluster
+    (source_id ``cluster_<ticker>``, signal_date = the cluster's last buy,
+    signal_value carrying ``window_days``). Materializing that real signal
+    is what makes ``insider_trades.is_cluster_buy`` mean what its name says,
+    instead of the ``is_unusual_size`` flag it was mislabelled with (GD-FIX).
+
+    Parameters:
+        rows: ``(ticker, signal_date, signal_value)`` tuples for
+            ``signal_type = 'CLUSTER_BUY'`` rows.
+
+    Returns:
+        Map of ticker -> list of ``(window_start, window_end)`` date ranges.
+    """
+    windows: dict[str, list[tuple[date, date]]] = {}
+    for ticker, signal_date, signal_value in rows:
+        sv = _parse_signal_value(signal_value)
+        window_days = sv.get("window_days")
+        try:
+            window_days = int(window_days) if window_days is not None else 0
+        except (ValueError, TypeError):
+            window_days = 0
+        if not ticker or signal_date is None:
+            continue
+        window_start = signal_date - timedelta(days=max(window_days, 0))
+        windows.setdefault(ticker, []).append((window_start, signal_date))
+    return windows
+
+
+def _is_in_cluster_window(
+    ticker: str,
+    trade_date: Any,
+    cluster_windows: dict[str, list[tuple[date, date]]],
+) -> bool:
+    """Return True if ``trade_date`` falls inside a detected cluster window for ``ticker``."""
+    for start, end in cluster_windows.get(ticker, ()):
+        if start <= trade_date <= end:
+            return True
+    return False
+
+
 def _midpoint_for_range(amount_range: str) -> float:
     """Compute midpoint dollar value from an amount range code or string.
 
     Parameters:
-        amount_range: Code like 'A'-'J' or dollar string like '$1,001 - $15,000'.
+        amount_range: Code like 'A'-'J', dollar string like '$1,001 - $15,000',
+            or a bare band lower bound like '1001.0'.
 
     Returns:
         Midpoint as float, or 0.0 if unparseable.
     """
     if not amount_range:
         return 0.0
-    code = amount_range.strip().upper()
-    if code in AMOUNT_RANGES:
-        lo, hi = AMOUNT_RANGES[code]
-        return (lo + hi) / 2.0
-    # Try parsing dollar range string
-    import re
-    nums = re.findall(r"[\d]+", amount_range.replace(",", ""))
-    if len(nums) >= 2:
-        try:
-            return (float(nums[0]) + float(nums[1])) / 2.0
-        except ValueError:
-            pass
-    return 0.0
+    # Shared with the puller: decimal-aware, so "1001.0" is not read as the
+    # range 1001..0 (that bug stored a $1,001-$15,000 trade as $500.50).
+    return _midpoint_amount(amount_range)
 
 
 # ── Sync: insider_trades ─────────────────────────────────────────────────
@@ -229,7 +315,20 @@ def sync_insider_trades(engine: Engine) -> int:
     """Read signal_sources WHERE source_type='insider', parse JSONB, upsert into insider_trades.
 
     The signal_value JSON contains: shares, price, value, insider_title,
-    is_unusual_size (as stored by InsiderFilingsPuller._emit_signal).
+    filing_date, is_unusual_size (as stored by InsiderFilingsPuller._emit_signal).
+
+    GD-FIX: two honesty fixes vs. the original materializer.
+      1. ``filing_date`` — the column existed (revision f1a2b3c4d5e6) but this
+         query never selected it, so it was NULL on every row. It is now
+         parsed from signal_value and left NULL (never defaulted to the
+         trade date) when the source didn't carry it.
+      2. ``is_cluster_buy`` — this used to be set from ``is_unusual_size``
+         (a single trade over $500K), which is a size flag, not a cluster
+         signal. The real cluster detection already runs in
+         ``insider_filings.py::_detect_cluster_buys`` and is stored as
+         separate CLUSTER_BUY signal_sources rows; those are now read
+         (instead of being filtered out) and used to flag only the trades
+         that actually fall inside a detected multi-insider window.
 
     Returns:
         Number of rows upserted.
@@ -249,22 +348,35 @@ def sync_insider_trades(engine: Engine) -> int:
             log.info("flow_materializer: no insider signals found")
             return 0
 
+        cluster_rows = conn.execute(text(
+            "SELECT ticker, signal_date, signal_value "
+            "FROM signal_sources WHERE source_type = 'insider' "
+            "AND signal_type = 'CLUSTER_BUY' "
+            "ORDER BY signal_date DESC LIMIT 5000"
+        )).fetchall()
+        cluster_windows = _cluster_windows_from_rows(
+            [(r[0], r[1], r[2]) for r in cluster_rows]
+        )
+
         batch: list[dict] = []
         for r in src_rows:
             sv = _parse_signal_value(r[4])
             if not sv:
                 log.debug("flow_materializer: skipping malformed insider row ticker={t}", t=r[0])
                 continue
+            ticker = r[0]
+            trade_date = r[1]
             batch.append({
-                "ticker": r[0],
-                "trade_date": r[1],
+                "ticker": ticker,
+                "trade_date": trade_date,
                 "insider_name": r[2] or "",
                 "trade_type": r[3] or "",
                 "shares": _safe_float(sv.get("shares")),
                 "value": _safe_float(sv.get("value")),
                 "price_per_share": _safe_float(sv.get("price")),
                 "insider_title": sv.get("insider_title", ""),
-                "is_cluster_buy": bool(sv.get("is_unusual_size", False)),
+                "filing_date": _parse_filing_date(sv.get("filing_date")),
+                "is_cluster_buy": _is_in_cluster_window(ticker, trade_date, cluster_windows),
             })
 
         if batch:
@@ -272,16 +384,19 @@ def sync_insider_trades(engine: Engine) -> int:
                 text("""
                     INSERT INTO insider_trades
                         (ticker, trade_date, insider_name, trade_type,
-                         shares, value, price_per_share, insider_title, is_cluster_buy)
+                         shares, value, price_per_share, insider_title,
+                         filing_date, is_cluster_buy)
                     VALUES
                         (:ticker, :trade_date, :insider_name, :trade_type,
-                         :shares, :value, :price_per_share, :insider_title, :is_cluster_buy)
+                         :shares, :value, :price_per_share, :insider_title,
+                         :filing_date, :is_cluster_buy)
                     ON CONFLICT (ticker, trade_date, insider_name, trade_type)
                     DO UPDATE SET
                         shares = EXCLUDED.shares,
                         value = EXCLUDED.value,
                         price_per_share = EXCLUDED.price_per_share,
                         insider_title = EXCLUDED.insider_title,
+                        filing_date = COALESCE(EXCLUDED.filing_date, insider_trades.filing_date),
                         is_cluster_buy = EXCLUDED.is_cluster_buy
                 """),
                 batch,
@@ -294,83 +409,189 @@ def sync_insider_trades(engine: Engine) -> int:
 
 # ── Sync: congressional_trades ───────────────────────────────────────────
 
-def sync_congressional_trades(engine: Engine) -> int:
-    """Read signal_sources WHERE source_type='congressional', parse JSONB,
-    compute amount_midpoint, upsert into congressional_trades.
+# QuiverQuant House/Senate rows are the live feed; ``congressional`` is the
+# native puller (inactive since 2026-09-30), whose rows mirror them.
+_CONGRESS_SOURCE_TYPES: tuple[str, ...] = (
+    "quiverquant:house", "quiverquant:senate", "congressional",
+)
+# Disclosure bases that bound when a trade became public. ``statutory_bound``
+# (trade + 45 days) is not one: late PTRs exist, so it can precede the real
+# disclosure — the people_events pipeline ignores it for the same reason.
+_CONGRESS_KNOWN_BASES: frozenset[str] = frozenset({"reported", "qq_last_modified"})
+# Refuse a rebuild that would shrink the table below this share of its
+# current size (a partial source read must never wipe good rows).
+_CONGRESS_MIN_REBUILD_RATIO: float = 0.5
 
-    The signal_value JSON contains: chamber, party, state, committee,
-    amount_range, amount_midpoint, disclosure_date, disclosure_lag_days
-    (as stored by CongressionalTradingPuller._emit_signal).
+
+def build_congressional_rows(src_rows: Any) -> tuple[list[dict], dict[str, int]]:
+    """Turn signal_sources rows into congressional_trades rows (pure).
+
+    Each source row is ``(id, source_type, ticker, signal_date, source_id,
+    signal_type, signal_value)``; ``signal_date`` is the transaction date.
+
+    disclosure_date is the date the trade was public, never the trade date:
+    a reported disclosure date, else QuiverQuant's ``last_modified`` when it
+    is on/after the trade (an upper bound — PIT-safe). Rows with neither are
+    skipped, not guessed. QuiverQuant rows win over native mirrors of the
+    same (member, ticker, trade date, direction). When several trades share
+    the table's unique key (ticker, disclosure_date, representative,
+    transaction_type), the largest band is kept and the collision counted.
 
     Returns:
-        Number of rows upserted.
+        ``(rows, skips)`` — rows ready to insert, and skip/collision counts.
+    """
+    skips: dict[str, int] = {}
+
+    def skip(reason: str) -> None:
+        skips[reason] = skips.get(reason, 0) + 1
+
+    candidates: list[tuple[int, dict]] = []
+    for sid, source_type, ticker, signal_date, source_id, signal_type, raw in src_rows:
+        sv = _parse_signal_value(raw)
+        txn_date = signal_date if isinstance(signal_date, date) else None
+        if txn_date is None:
+            try:
+                txn_date = date.fromisoformat(str(signal_date)[:10])
+            except (ValueError, TypeError):
+                txn_date = None
+        ticker = _normalize_ticker(ticker or "")
+        if txn_date is None or not ticker:
+            skip("missing_trade_date_or_ticker")
+            continue
+
+        if source_type == "congressional":
+            basis = sv.get("disclosure_basis")
+            if basis not in _CONGRESS_KNOWN_BASES:
+                # No basis = pre-GD-FIX row whose disclosure_date is the trade date.
+                skip("native_no_disclosure_bound" if basis is None else f"native_{basis}")
+                continue
+            disc_date, basis = resolve_disclosure_date(txn_date, sv.get("disclosure_date"))
+            if basis != "reported":
+                skip("native_no_disclosure_bound")
+                continue
+            member = source_id or ""
+            txn_type = _normalize_txn_type(signal_type or "")
+            amount = sv.get("amount_range") or ""
+            chamber = sv.get("chamber") or ""
+            precedence = 1
+        else:
+            disc_date, basis = resolve_disclosure_date(
+                txn_date,
+                sv.get("DisclosureDate") or sv.get("ReportDate") or sv.get("Filed"),
+                sv.get("last_modified") or sv.get("LastModified"),
+            )
+            if basis not in _CONGRESS_KNOWN_BASES:
+                skip("qq_no_disclosure_bound")
+                continue
+            member = sv.get("Representative") or sv.get("Senator") or sv.get("Name") or source_id or ""
+            txn_type = _normalize_txn_type(sv.get("Transaction") or signal_type or "")
+            amount = sv.get("Range") or sv.get("Amount") or ""
+            chamber = "SENATE" if source_type.endswith("senate") else "HOUSE"
+            precedence = 0
+
+        member = str(member).strip()
+        if not member or not txn_type:
+            skip("missing_member_or_type")
+            continue
+        candidates.append((precedence, {
+            "ticker": ticker,
+            "disclosure_date": disc_date,
+            "transaction_date": txn_date,
+            "representative": member,
+            "transaction_type": txn_type,
+            "amount": str(amount),
+            "amount_midpoint": _midpoint_amount(str(amount)),
+            "chamber": chamber,
+            "party": sv.get("party") or sv.get("Party") or "",
+            "state": sv.get("state") or sv.get("State") or "",
+            "committee": sv.get("committee") or sv.get("Committee") or "",
+            "signal_source_id": int(sid) if sid is not None else None,
+        }))
+
+    # QuiverQuant first, so a native mirror of the same trade is dropped.
+    candidates.sort(key=lambda c: c[0])
+    seen_trades: set[tuple] = set()
+    by_key: dict[tuple, dict] = {}
+    for precedence, row in candidates:
+        trade = (_normalize_member_name(row["representative"]), row["ticker"],
+                 row["transaction_date"], row["transaction_type"], row["amount_midpoint"])
+        if trade in seen_trades:
+            skip("duplicate_trade" if precedence == 0 else "native_mirror_of_qq")
+            continue
+        seen_trades.add(trade)
+        key = (row["ticker"], row["disclosure_date"], row["representative"], row["transaction_type"])
+        kept = by_key.get(key)
+        if kept is not None:
+            skip("unique_key_collision")
+            if (row["amount_midpoint"], row["transaction_date"]) <= (
+                kept["amount_midpoint"], kept["transaction_date"]
+            ):
+                continue
+        by_key[key] = row
+    return list(by_key.values()), skips
+
+
+def sync_congressional_trades(engine: Engine) -> int:
+    """Rebuild congressional_trades from signal_sources in one transaction.
+
+    The table is a derived view (this is its only writer). It is rebuilt
+    rather than upserted because disclosure_date is part of its unique key:
+    correcting a date in place would leave the old row behind. The rebuild
+    is atomic (readers see old or new, never empty) and fails closed — an
+    empty or sharply smaller build leaves the table untouched.
+
+    History: rows written before this fix stored the transaction date as
+    disclosure_date (lag 0 on every row, ~4 weeks of look-ahead for any
+    point-in-time use) and QuiverQuant's band lower bound as the amount
+    ("1001.0" -> midpoint $500.50). See build_congressional_rows.
+
+    Returns:
+        Number of rows written (0 when the rebuild was refused).
     """
     _ensure_tables(engine)
-    rows_upserted = 0
 
     with engine.begin() as conn:
         src_rows = conn.execute(text(
-            "SELECT ticker, signal_date, source_id, signal_type, signal_value "
-            "FROM signal_sources WHERE source_type = 'congressional' "
-            "ORDER BY signal_date DESC LIMIT 5000"
-        )).fetchall()
+            "SELECT id, source_type, ticker, signal_date, source_id, signal_type, signal_value "
+            "FROM signal_sources WHERE source_type IN :types"
+        ).bindparams(bindparam("types", expanding=True)),
+            {"types": list(_CONGRESS_SOURCE_TYPES)}).fetchall()
 
-        if not src_rows:
-            log.info("flow_materializer: no congressional signals found")
+        rows, skips = build_congressional_rows(src_rows)
+        existing = conn.execute(text("SELECT COUNT(*) FROM congressional_trades")).scalar() or 0
+        if skips:
+            log.info("flow_materializer: congressional skips {s}", s=skips)
+        if not rows:
+            log.warning("flow_materializer: no congressional rows built — table left unchanged")
+            return 0
+        if existing and len(rows) < existing * _CONGRESS_MIN_REBUILD_RATIO:
+            log.error(
+                "flow_materializer: congressional rebuild refused — {n} rows built vs {e} "
+                "existing (below {r:.0%}); table left unchanged",
+                n=len(rows), e=existing, r=_CONGRESS_MIN_REBUILD_RATIO,
+            )
             return 0
 
-        batch: list[dict] = []
-        for r in src_rows:
-            sv = _parse_signal_value(r[4])
-            if not sv:
-                log.debug("flow_materializer: skipping malformed congressional row ticker={t}", t=r[0])
-                continue
+        conn.execute(text("DELETE FROM congressional_trades"))
+        conn.execute(
+            text("""
+                INSERT INTO congressional_trades
+                    (ticker, disclosure_date, transaction_date, representative,
+                     transaction_type, amount, amount_midpoint, chamber, party,
+                     state, committee, signal_source_id)
+                VALUES
+                    (:ticker, :disclosure_date, :transaction_date, :representative,
+                     :transaction_type, :amount, :amount_midpoint, :chamber, :party,
+                     :state, :committee, :signal_source_id)
+            """),
+            rows,
+        )
 
-            amount_range = sv.get("amount_range", "")
-            stored_midpoint = _safe_float(sv.get("amount_midpoint"))
-            midpoint = stored_midpoint if stored_midpoint > 0 else _midpoint_for_range(amount_range)
-
-            disc_date_str = sv.get("disclosure_date", "")
-            try:
-                disc_date = date.fromisoformat(disc_date_str[:10]) if disc_date_str else r[1]
-            except (ValueError, TypeError):
-                disc_date = r[1]
-
-            batch.append({
-                "ticker": r[0],
-                "disclosure_date": disc_date,
-                "representative": r[2] or "",
-                "transaction_type": r[3] or "",
-                "amount": amount_range,
-                "amount_midpoint": midpoint,
-                "chamber": sv.get("chamber", ""),
-                "party": sv.get("party", ""),
-                "state": sv.get("state", ""),
-            })
-
-        if batch:
-            conn.execute(
-                text("""
-                    INSERT INTO congressional_trades
-                        (ticker, disclosure_date, representative, transaction_type,
-                         amount, amount_midpoint, chamber, party, state)
-                    VALUES
-                        (:ticker, :disclosure_date, :representative, :transaction_type,
-                         :amount, :amount_midpoint, :chamber, :party, :state)
-                    ON CONFLICT (ticker, disclosure_date, representative, transaction_type)
-                    DO UPDATE SET
-                        amount = EXCLUDED.amount,
-                        amount_midpoint = EXCLUDED.amount_midpoint,
-                        chamber = EXCLUDED.chamber,
-                        party = EXCLUDED.party,
-                        state = EXCLUDED.state
-                """),
-                batch,
-            )
-            rows_upserted = len(batch)
-
-    log.info("flow_materializer: congressional_trades upserted {n} rows", n=rows_upserted)
-    return rows_upserted
+    log.info(
+        "flow_materializer: congressional_trades rebuilt — {n} rows (was {e})",
+        n=len(rows), e=existing,
+    )
+    return len(rows)
 
 
 # ── Sync: dark_pool_weekly ───────────────────────────────────────────────
@@ -395,6 +616,7 @@ def sync_dark_pool_weekly(engine: Engine) -> int:
         rs_rows = conn.execute(text(
             "SELECT series_id, obs_date, value "
             "FROM raw_series WHERE series_id LIKE 'DARKPOOL:%' "
+            "AND pull_status = 'SUCCESS' "
             "ORDER BY obs_date DESC LIMIT 50000"
         )).fetchall()
 
@@ -526,6 +748,7 @@ def sync_etf_flows(engine: Engine) -> int:
             "SELECT series_id, obs_date, value "
             "FROM raw_series WHERE series_id LIKE :prefix "
             "AND series_id LIKE :suffix "
+            "AND pull_status = 'SUCCESS' "
             "ORDER BY obs_date DESC LIMIT 20000"
         ), {"prefix": "ETF_FLOW:%", "suffix": "%:5d"}).fetchall()
 
@@ -596,6 +819,7 @@ def sync_junction_points(engine: Engine) -> int:
             hist_rows = conn.execute(text(
                 "SELECT obs_date, value FROM raw_series "
                 "WHERE series_id = :sid "
+                "AND pull_status = 'SUCCESS' "
                 "AND obs_date >= :start "
                 "ORDER BY obs_date ASC"
             ), {"sid": fred_id, "start": two_years_ago}).fetchall()

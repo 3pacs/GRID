@@ -11,34 +11,56 @@
 #   grid_cron.sh briefing daily        # generate daily market briefing
 #   grid_cron.sh briefing weekly       # generate weekly market briefing
 #   grid_cron.sh agents                # run TradingAgents one-shot
+#   grid_cron.sh check                 # preflight only: env, interpreter,
+#                                      # imports, LLM endpoint; runs no job
+#
+# Runs from the tree this script lives in. In production the crontab calls
+# /data/grid_v4/grid_release/scripts/grid_cron.sh, so jobs run the deployed
+# release, not the old /home/grid/grid_v4/grid_repo checkout (OPS-W1).
+# The GRID env file is loaded by scripts/grid_cron_env.sh.
 #
 # All output is logged to ~/grid_v4/logs/cron/
 # ============================================================
 set -euo pipefail
 
-GRID_ROOT="${GRID_ROOT:-$HOME/grid_v4/grid_repo/grid}"
+GRID_ROOT="${GRID_ROOT:-$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)}"
+export GRID_ROOT
 LOG_DIR="${HOME}/grid_v4/logs/cron"
-VENV="${HOME}/grid_v4/venv/bin/activate"
 
 mkdir -p "$LOG_DIR"
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 JOB="${1:-help}"
 
-# ── Activate virtualenv if it exists ──────────────────────────
-if [[ -f "$VENV" ]]; then
-    # shellcheck disable=SC1090
-    source "$VENV"
+# ── Load the GRID env file (fail closed) and pick the interpreter ─
+# shellcheck source=grid_cron_env.sh
+source "$GRID_ROOT/scripts/grid_cron_env.sh"
+if [[ "$JOB" != "help" ]] && ! grid_cron_load_env 2>>"$LOG_DIR/${JOB}_${TIMESTAMP}.log"; then
+    echo "[$(date)] ERROR: $JOB not started: GRID env file not loaded (see $LOG_DIR/${JOB}_${TIMESTAMP}.log)" >&2
+    exit 78
 fi
+GRID_PYTHON_BIN="$(grid_cron_python)"
+python() { "$GRID_PYTHON_BIN" "$@"; }
 
 cd "$GRID_ROOT"
 
-# ── Check llama-server is running ─────────────────────────────
+# ── Check the reasoning backend is running ────────────────────
+# autoresearch/analyst/briefing reason via the Ollama client (ollama/client.py,
+# default http://localhost:11434). The legacy llama.cpp :8080 preflight was left
+# behind by that migration and aborted every nightly run even though Ollama was
+# up. Gate on the endpoint the code actually calls; LLM_HEALTH_URL overrides.
+# (Ported from the grid-svr checkout's unpushed 820d0127, which is what the
+# production crontab has been running since 2026-07-15.)
+llm_health_url() {
+    echo "${LLM_HEALTH_URL:-${OLLAMA_BASE_URL:-http://localhost:11434}/api/tags}"
+}
+
 check_llm() {
-    local url="${LLAMACPP_BASE_URL:-http://localhost:8080}/health"
+    local url
+    url="$(llm_health_url)"
     if ! curl -sf "$url" >/dev/null 2>&1; then
-        echo "[$(date)] ERROR: llama-server not responding at $url" | tee -a "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
-        echo "Start it with: bash scripts/start_llamacpp.sh"
+        echo "[$(date)] ERROR: reasoning backend not responding at $url" | tee -a "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
+        echo "Start it with: ollama serve"
         exit 1
     fi
 }
@@ -81,8 +103,11 @@ print(f'Briefing generated: {result.get(\"title\", \"unknown\")}')
         check_llm
         echo "[$(date)] Running TradingAgents..." >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
         python -c "
-from agents.runner import run_agent
-result = run_agent()
+from db import get_engine
+from agents.runner import AgentRunner
+engine = get_engine()
+runner = AgentRunner(engine)
+result = runner.run()
 print(f'Agent run complete: {result}')
 " >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
         ;;
@@ -114,14 +139,13 @@ print(f'Scoring: {result[\"scoring\"]}')
 
     flows)
         echo "[$(date)] Refreshing dollar flows..." >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
-        python -c "
-from intelligence.dollar_flows import normalize_all_flows, _persist_flows
-from db import get_engine
-engine = get_engine()
-flows = normalize_all_flows(engine, days=7)
-n = _persist_flows(engine, flows)
-print(f'Persisted {n} flows ({len(flows)} normalized)')
-" >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
+        # GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927 W3.3: normalize_all_flows()
+        # already persists internally now (and returns a
+        # FlowNormalizationSummary, not a bare list), so this calls the
+        # single-entry-point script instead of persisting a second time.
+        # See scripts/run_dollar_flows.py --dry-run to preview a run first.
+        python scripts/run_dollar_flows.py --days 7 \
+            >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
         ;;
 
     paper-review)
@@ -165,11 +189,30 @@ except Exception as e:
 " >> "$LOG_DIR/${JOB}_${TIMESTAMP}.log" 2>&1
         ;;
 
+    check)
+        # Preflight for the scheduled jobs (briefing, analyst): no job runs,
+        # nothing is written except this log. Fails if any import fails;
+        # an unreachable LLM endpoint is reported but does not fail the check,
+        # since check_llm already gates each real run.
+        {
+            echo "[$(date)] CHECK root=$GRID_ROOT python=$GRID_PYTHON_BIN env_file=$GRID_ENV_FILE"
+            if curl -sf "$(llm_health_url)" >/dev/null 2>&1; then
+                echo "LLM endpoint OK: $(llm_health_url)"
+            else
+                echo "LLM endpoint NOT responding: $(llm_health_url)"
+            fi
+        } | tee -a "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
+        "$GRID_ROOT/scripts/grid_cron_run.sh" --check \
+            ollama.client ollama.market_briefing db scripts/ai_analyst.py \
+            2>&1 | tee -a "$LOG_DIR/${JOB}_${TIMESTAMP}.log"
+        ;;
+
     help|*)
-        echo "Usage: grid_cron.sh {autoresearch|analyst|briefing [daily|weekly]|agents|bottom-detector|psi-oracle|thesis-snapshot|flows}"
+        echo "Usage: grid_cron.sh {check|autoresearch|analyst|briefing [daily|weekly]|agents|bottom-detector|psi-oracle|thesis-snapshot|flows}"
         echo ""
         echo "Jobs:"
-        echo "  autoresearch     Autonomous hypothesis generation/refinement loop"
+        echo "  check            Preflight only (env, interpreter, imports, LLM endpoint)"
+        echo "  autoresearch    Autonomous hypothesis generation/refinement loop"
         echo "  analyst          AI analyst daily briefing"
         echo "  briefing TYPE    Market briefing (daily, weekly)"
         echo "  agents           Run TradingAgents one-shot"

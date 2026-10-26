@@ -344,6 +344,7 @@ def build_profile_portfolio(
     profile: InvestorProfile,
     *,
     capital: float,
+    years: int = 10,
 ) -> dict[str, Any]:
     eligible = [
         item for item in ranked_metrics
@@ -385,7 +386,7 @@ def build_profile_portfolio(
     monte_carlo = build_monte_carlo_projection(
         allocations,
         capital=capital,
-        years=10,
+        years=years,
         seed=profile.id,
     )
 
@@ -405,7 +406,7 @@ def build_profile_portfolio(
             "review": "weekly",
             "rebalance_threshold": "Only trade if a holding falls below its hold rank, breaks its trend, or position weight drifts materially.",
             "entry_rule": f"New buys must rank inside top {profile.top_n}.",
-            "exit_rule": f"Existing names can be held until rank {profile.top_n + profile.hold_buffer} unless the 10-year chart breaks.",
+            "exit_rule": f"Existing names can be held until rank {profile.top_n + profile.hold_buffer} unless the {years}-year chart breaks.",
         },
         "monte_carlo": monte_carlo,
         "allocations": allocations,
@@ -632,21 +633,27 @@ def build_weekly_recommendation(
         ]
         profile_ranked.sort(key=lambda item: item["score"], reverse=True)
         profile_payloads.append(
-            build_profile_portfolio(profile_ranked, profile, capital=capital)
+            build_profile_portfolio(profile_ranked, profile, capital=capital, years=years)
         )
 
-    as_of = None
-    all_dates = [
-        points[-1][0]
-        for points in price_history.values()
+    ticker_latest_dates = {
+        ticker: max(observed for observed, _value in points).isoformat()
+        for ticker, points in price_history.items()
         if points
-    ]
-    if all_dates:
-        as_of = max(all_dates).isoformat()
+    }
+    latest_dates = list(ticker_latest_dates.values())
+    # Keep the existing `as_of` value for clients, but state that it is the
+    # latest date on ANY loaded ticker, not a common date for the portfolio.
+    as_of = max(latest_dates) if latest_dates else None
+    oldest_latest_date = min(latest_dates) if latest_dates else None
 
     return {
         "status": "ok",
         "as_of": as_of,
+        "as_of_basis": "latest_observation_on_any_loaded_ticker",
+        "oldest_ticker_latest_date": oldest_latest_date,
+        "ticker_latest_dates": ticker_latest_dates,
+        "mixed_latest_dates": len(set(latest_dates)) > 1,
         "capital": round(capital, 2),
         "benchmark": {
             "ticker": benchmark.get("ticker", BENCHMARK_TICKER),

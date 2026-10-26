@@ -215,6 +215,7 @@ class CryptoSignalBridge:
                 SELECT series_id, obs_date, value
                 FROM raw_series
                 WHERE series_id LIKE 'defillama%%'
+                  AND pull_status = 'SUCCESS'
                   AND obs_date >= :since
                 ORDER BY series_id, obs_date
             """), {"since": today - timedelta(days=7)}).fetchall()
@@ -265,7 +266,8 @@ class CryptoSignalBridge:
             rows = conn.execute(text("""
                 SELECT series_id, obs_date, value
                 FROM raw_series
-                WHERE series_id LIKE 'cq:btc%%netflow%%' OR series_id LIKE 'cq:eth%%netflow%%'
+                WHERE (series_id LIKE 'cq:btc%%netflow%%' OR series_id LIKE 'cq:eth%%netflow%%')
+                  AND pull_status = 'SUCCESS'
                   AND obs_date >= :since
                 ORDER BY series_id, obs_date
             """), {"since": today - timedelta(days=30)}).fetchall()
@@ -304,6 +306,7 @@ class CryptoSignalBridge:
                 SELECT series_id, obs_date, value
                 FROM raw_series
                 WHERE series_id LIKE 'cq:%%funding%%'
+                  AND pull_status = 'SUCCESS'
                   AND obs_date >= :since
                 ORDER BY obs_date DESC
                 LIMIT 10

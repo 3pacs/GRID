@@ -1,0 +1,37 @@
+Snapshots
+clustering
+orthogonality
+regime detection
+feature engineering
+feature importance
+options scan
+conflict resolution
+pipeline summary
+Compare
+Refresh
+HISTORY
+Snapshots unavailable: no fixture route for GET /api/v1/snapshots/history/clustering
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

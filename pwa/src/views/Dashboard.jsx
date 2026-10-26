@@ -8,7 +8,7 @@ import { useDevice } from '../hooks/useDevice.js';
 import { useWebSocket } from '../hooks/useWebSocket.js';
 import DashboardFlows from '../components/DashboardFlows.jsx';
 import LessonsWidget from '../components/LessonsWidget.jsx';
-import { formatUtcClock } from '../utils/formatTime.js';
+import { formatUtcClock, formatRelative } from '../utils/formatTime.js';
 
 const MONO = "'JetBrains Mono', 'IBM Plex Mono', monospace";
 const SANS = "'IBM Plex Sans', -apple-system, sans-serif";
@@ -106,12 +106,36 @@ function buildChangeFeed(intel) {
 /* ═══════════════════════════ DASHBOARD ═════���═════════════════════ */
 
 function AudioBriefingPlayer({ onNavigate }) {
+    // audioFile: the saved briefing we can play; audioUrl: its object URL,
+    // fetched with the Authorization header only when the user presses play
+    // (an <audio src> cannot send headers, and the session token must never
+    // be put in a URL).
+    const [audioFile, setAudioFile] = useState(null);
     const [audioUrl, setAudioUrl] = useState(null);
+    const [loadingAudio, setLoadingAudio] = useState(false);
     const [briefingMeta, setBriefingMeta] = useState(null);
     const [playing, setPlaying] = useState(false);
     const [generating, setGenerating] = useState(false);
     const [briefingError, setBriefingError] = useState(null);
+    // Text-only result (no audio_path): local Kokoro TTS is not configured
+    // (audio_status "not_configured") or did not answer ("unavailable").
+    // See audio_briefing.py's audio_note — never a paid fallback.
+    const [textBriefing, setTextBriefing] = useState(null);
+    // True when the latest request produced no audio: any player still shown
+    // is an OLDER recording and must be labelled as such.
+    const [playerIsPrevious, setPlayerIsPrevious] = useState(false);
     const audioRef = React.useRef(null);
+    const audioUrlRef = React.useRef(null);
+
+    const replaceAudioUrl = useCallback((url) => {
+        if (audioUrlRef.current) URL.revokeObjectURL?.(audioUrlRef.current);
+        audioUrlRef.current = url;
+        setAudioUrl(url);
+    }, []);
+
+    useEffect(() => () => {
+        if (audioUrlRef.current) URL.revokeObjectURL?.(audioUrlRef.current);
+    }, []);
 
     useEffect(() => {
         // Check for latest briefing
@@ -119,13 +143,26 @@ function AudioBriefingPlayer({ onNavigate }) {
             const list = r?.briefings || [];
             if (list.length > 0) {
                 const latest = list[0];
-                setAudioUrl(api.getFlowBriefingAudioUrl(latest.filename));
+                setAudioFile(latest.filename);
                 setBriefingMeta(latest);
             }
         }).catch(() => {});
     }, []);
 
-    const togglePlay = () => {
+    const togglePlay = async () => {
+        if (!audioUrl) {
+            if (!audioFile || loadingAudio) return;
+            setLoadingAudio(true);
+            setBriefingError(null);
+            const url = await api.loadFlowBriefingAudio(audioFile);
+            setLoadingAudio(false);
+            if (!url) {
+                setBriefingError('Could not load the briefing audio.');
+                return;
+            }
+            replaceAudioUrl(url);
+            return;
+        }
         if (!audioRef.current) return;
         if (playing) { audioRef.current.pause(); }
         else { audioRef.current.play().catch(() => {}); }
@@ -134,14 +171,34 @@ function AudioBriefingPlayer({ onNavigate }) {
     const generateNew = async () => {
         setGenerating(true);
         setBriefingError(null);
+        setTextBriefing(null);
+        setPlayerIsPrevious(false);
         try {
-            const r = await api.getFlowBriefing(true);
+            const r = await api.generateFlowBriefing(true);
             if (r?.status === 'SUCCESS' && r.briefing?.audio_path) {
                 const filename = r.briefing.audio_path.split('/').pop();
-                setAudioUrl(api.getFlowBriefingAudioUrl(filename));
-                setBriefingMeta({ briefing_date: r.briefing.briefing_date, size_bytes: 0, generated_at: r.briefing.generated_at });
+                replaceAudioUrl(null);
+                setPlayerIsPrevious(false);
+                setAudioFile(filename);
+                setBriefingMeta({
+                    briefing_date: r.briefing.briefing_date, size_bytes: 0,
+                    generated_at: r.briefing.generated_at, provider: r.briefing.provider,
+                });
+            } else if (r?.status === 'SUCCESS' && r.briefing?.script_text) {
+                // On-demand, text-only: local Kokoro TTS is not configured or
+                // did not answer, so the local-LLM script is the whole result.
+                // Never invent audio that wasn't made; when local TTS failed,
+                // say so as an error rather than a quiet note.
+                setTextBriefing(r.briefing);
+                setPlayerIsPrevious(true);
+                if (r.briefing.audio_status === 'unavailable') {
+                    setBriefingError(r.briefing.audio_note || 'Local TTS unavailable — text-only briefing.');
+                }
             } else {
-                setBriefingError(r?.message || 'Audio briefing generation failed.');
+                // Backend returns {error, status:'FAILED'} on failure (e.g. paid
+                // generation disabled) — prefer that honest message over the
+                // generic fallback so the operator sees *why* it failed.
+                setBriefingError(r?.error || r?.message || 'Audio briefing generation failed.');
             }
         } catch {
             setBriefingError('Audio briefing generation failed.');
@@ -157,12 +214,13 @@ function AudioBriefingPlayer({ onNavigate }) {
             borderRadius: tokens.radius.md, padding: pad,
         }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '10px' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
                     <span style={{ fontFamily: MONO, fontSize: '10px', fontWeight: 700,
                         letterSpacing: '1.5px', color: colors.textMuted }}>AUDIO BRIEFING</span>
                     {briefingMeta && (
                         <span style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
                             {briefingMeta.briefing_date}
+                            {briefingMeta.provider && ` · ${briefingMeta.provider}`}
                         </span>
                     )}
                 </div>
@@ -177,9 +235,14 @@ function AudioBriefingPlayer({ onNavigate }) {
                             border: `1px solid ${generating ? colors.border : colors.accent}40`,
                             color: generating ? colors.textDim : colors.accent,
                             cursor: generating ? 'wait' : 'pointer' }}>
-                        {generating ? 'Generating...' : 'New'}
+                        {generating ? 'Generating...' : 'Generate on request'}
                     </button>
                 </div>
+            </div>
+            <div style={{ fontFamily: SANS, fontSize: '11px', color: colors.textDim, marginBottom: '8px' }}>
+                {'On-demand only — no schedule behind this button. Script text comes from a ' +
+                    'local LLM and audio from local Kokoro TTS. Paid providers stay off ' +
+                    'unless GRID_ALLOW_PAID_LLM is set.'}
             </div>
             {briefingError && (
                 <div style={{
@@ -200,24 +263,58 @@ function AudioBriefingPlayer({ onNavigate }) {
                     <span style={{ minWidth: 0, flex: 1 }}>{briefingError}</span>
                 </div>
             )}
-            {audioUrl ? (
+            {textBriefing && (
+                <div data-testid="text-briefing" style={{
+                    padding: '10px 12px', borderRadius: '8px', marginBottom: '10px',
+                    background: colors.bg, border: `1px solid ${colors.border}`,
+                }}>
+                    <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim, marginBottom: '6px' }}>
+                        {`Generated on request (${textBriefing.provider || 'local'}) \u2014 text only, no audio`}
+                    </div>
+                    {textBriefing.audio_note && textBriefing.audio_status !== 'unavailable' && (
+                        <div data-testid="text-briefing-note" style={{ fontFamily: SANS, fontSize: '11px',
+                            color: colors.textDim, marginBottom: '6px' }}>
+                            {textBriefing.audio_note}
+                        </div>
+                    )}
+                    <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.text, lineHeight: 1.6,
+                        whiteSpace: 'pre-wrap' }}>
+                        {textBriefing.script_text}
+                    </div>
+                </div>
+            )}
+            {audioFile && playerIsPrevious && (
+                <div data-testid="previous-recording" style={{ fontFamily: MONO, fontSize: '10px',
+                    color: colors.textDim, marginBottom: '4px' }}>
+                    {`Previous recording${briefingMeta?.briefing_date ? ` (${briefingMeta.briefing_date})` : ''} — not the briefing above`}
+                </div>
+            )}
+            {audioFile ? (
                 <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-                    <button onClick={togglePlay} style={{
+                    <button onClick={togglePlay} disabled={loadingAudio}
+                        aria-label={audioUrl ? (playing ? 'Pause briefing' : 'Play briefing') : 'Load and play briefing'}
+                        style={{
                         width: '36px', height: '36px', borderRadius: '50%',
                         background: `${colors.accent}20`, border: `1px solid ${colors.accent}50`,
-                        color: colors.accent, fontSize: '14px', cursor: 'pointer',
+                        color: colors.accent, fontSize: '14px', cursor: loadingAudio ? 'wait' : 'pointer',
                         display: 'flex', alignItems: 'center', justifyContent: 'center',
                         flexShrink: 0,
-                    }}>{playing ? '\u23F8' : '\u25B6'}</button>
-                    <audio ref={audioRef} src={audioUrl} preload="metadata"
-                        onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
-                        onEnded={() => setPlaying(false)}
-                        style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }}
-                        controls />
+                    }}>{loadingAudio ? '\u2026' : (playing ? '\u23F8' : '\u25B6')}</button>
+                    {audioUrl ? (
+                        <audio ref={audioRef} src={audioUrl} preload="metadata" autoPlay
+                            onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)}
+                            onEnded={() => setPlaying(false)}
+                            style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }}
+                            controls />
+                    ) : (
+                        <span style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim }}>
+                            {loadingAudio ? 'Loading briefing audio\u2026' : 'Press play to load the latest briefing.'}
+                        </span>
+                    )}
                 </div>
-            ) : (
+            ) : !textBriefing && (
                 <div style={{ fontFamily: SANS, fontSize: '12px', color: colors.textDim, fontStyle: 'italic' }}>
-                    No briefing yet. Click "New" to generate one.
+                    No briefing yet. Click "Generate on request" above.
                 </div>
             )}
         </div>
@@ -300,7 +397,12 @@ export default function Dashboard({ onNavigate }) {
 
     const pulse = useMemo(() => PULSE_TICKERS.map(({ key, label }) => {
         const best = livePriceUpdates?.[key] || wsPrices?.[key] || pulsePrices[key];
-        return { key, label, price: best?.price, pct: best?.pct_1d };
+        return {
+            key, label, price: best?.price, pct: best?.pct_1d,
+            // Wave 3 #11: label source/time on the quote itself rather than
+            // letting the pulse row imply a managed feed.
+            source: best?.source, updatedAt: best?.updated_at,
+        };
     }), [pulsePrices, livePriceUpdates, wsPrices]);
 
     const direction = thesis?.overall_direction || 'NEUTRAL';
@@ -571,10 +673,14 @@ export default function Dashboard({ onNavigate }) {
                 fontFamily: MONO, fontSize: isMobile ? '11px' : '12px' }}>
                 <span style={{ fontFamily: MONO, fontSize: '9px', fontWeight: 700, letterSpacing: '1.5px',
                     color: colors.textDim, marginRight: isMobile ? 0 : '12px',
-                    width: isMobile ? '100%' : 'auto', marginBottom: isMobile ? '4px' : 0 }}>PULSE</span>
+                    width: isMobile ? '100%' : 'auto', marginBottom: isMobile ? '4px' : 0 }}
+                    title="Live quotes via yfinance, 5-minute cache, refreshed on request">PULSE</span>
                 {pulse.map((p, i) => (
                     <React.Fragment key={p.key}>
                         <span onClick={() => onNavigate('watchlist-analysis', p.key)}
+                            title={p.updatedAt
+                                ? `${p.source || 'yfinance'} · ${formatRelative(new Date(p.updatedAt))}`
+                                : (p.source || 'yfinance')}
                             style={{ display: 'inline-flex', alignItems: 'baseline', gap: '5px',
                                 cursor: 'pointer', padding: '2px 6px', borderRadius: '3px', transition: 'background 0.15s' }}
                             onMouseEnter={e => { e.currentTarget.style.background = `${colors.accent}10`; }}

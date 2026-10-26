@@ -9,6 +9,7 @@ import { api } from '../api.js';
 import { colors, tokens, shared } from '../styles/shared.js';
 import ChartControls from '../components/ChartControls.jsx';
 import useFullScreen from '../hooks/useFullScreen.js';
+import { formatDateTime } from '../utils/formatTime.js';
 
 // Inline TopoJSON feature extraction (avoids topojson-client dependency).
 // Converts a TopoJSON topology + object into a GeoJSON FeatureCollection.
@@ -93,6 +94,14 @@ const activityColor = d3.scaleLinear()
     .domain([0, 0.35, 0.5, 0.65, 1])
     .range(['#EF4444', '#F59E0B', '#5A7080', '#22C55E', '#10B981'])
     .clamp(true);
+
+// activity_score is null when the backend could not measure any of
+// GDP/FX/night-lights for that country — never fake a neutral reading.
+// Exported for unit testing without needing to render the D3 globe.
+export const NO_DATA_COLOR = '#3A4A63';
+export const activityColorSafe = (score) => (score == null ? NO_DATA_COLOR : activityColor(score));
+export const fmtActivity = (score) => (score == null ? 'N/A' : `${(score * 100).toFixed(0)}%`);
+export const fmtGdpSignal = (s) => (s === 'no_data' || s == null ? 'no data' : s);
 
 const fmtB = (v) => {
     if (v == null) return 'N/A';
@@ -221,7 +230,7 @@ export default function Globe() {
                 const alpha3 = numToAlpha[d.id];
                 const cd = alpha3 ? countryMap[alpha3] : null;
                 if (!cd || !layers.gdp) return '#14203A';
-                return activityColor(cd.activity_score);
+                return activityColorSafe(cd.activity_score);
             })
             .attr('stroke', colors.border)
             .attr('stroke-width', 0.5)
@@ -423,6 +432,11 @@ export default function Globe() {
                 <span style={{ fontSize: tokens.fontSize.sm, color: colors.textMuted, fontWeight: 400, fontFamily: colors.mono }}>
                     Global Capital Flows & Economic Activity
                 </span>
+                {data?.generated_at && (
+                    <span style={{ fontSize: tokens.fontSize.sm, color: colors.textMuted, fontWeight: 400, fontFamily: colors.mono, marginLeft: 'auto' }}>
+                        Generated {formatDateTime(data.generated_at)}
+                    </span>
+                )}
             </div>
 
             {/* Layer toggles */}
@@ -500,9 +514,10 @@ export default function Globe() {
                                         <span style={{ color: colors.textMuted }}>GDP Signal</span>
                                         <span style={{
                                             color: hoveredCountry.gdp_signal === 'growth' ? colors.green
-                                                : hoveredCountry.gdp_signal === 'slowing' ? colors.red : colors.text,
+                                                : hoveredCountry.gdp_signal === 'slowing' ? colors.red
+                                                : hoveredCountry.gdp_signal === 'no_data' ? colors.textMuted : colors.text,
                                             fontWeight: 600,
-                                        }}>{hoveredCountry.gdp_signal}</span>
+                                        }}>{fmtGdpSignal(hoveredCountry.gdp_signal)}</span>
                                         <span style={{ color: colors.textMuted }}>FX 1m</span>
                                         <span style={{
                                             color: (hoveredCountry.fx_change_1m || 0) >= 0 ? colors.green : colors.red,
@@ -513,9 +528,9 @@ export default function Globe() {
                                         }}>{fmtPct(hoveredCountry.night_lights_change)}</span>
                                         <span style={{ color: colors.textMuted }}>Activity</span>
                                         <span style={{
-                                            color: activityColor(hoveredCountry.activity_score),
+                                            color: activityColorSafe(hoveredCountry.activity_score),
                                             fontWeight: 600,
-                                        }}>{(hoveredCountry.activity_score * 100).toFixed(0)}%</span>
+                                        }}>{fmtActivity(hoveredCountry.activity_score)}</span>
                                     </div>
                                     {hotspotSet.has(hoveredCountry.id) && (
                                         <div style={{
@@ -568,16 +583,17 @@ export default function Globe() {
                         <div style={{ padding: '12px 16px', borderBottom: `1px solid ${colors.border}` }}>
                             <div style={shared.sectionTitle}>KEY METRICS</div>
                             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-                                <MetricBox label="GDP Signal" value={selectedCountry.gdp_signal}
+                                <MetricBox label="GDP Signal" value={fmtGdpSignal(selectedCountry.gdp_signal)}
                                     color={selectedCountry.gdp_signal === 'growth' ? colors.green
-                                        : selectedCountry.gdp_signal === 'slowing' ? colors.red : colors.text} />
+                                        : selectedCountry.gdp_signal === 'slowing' ? colors.red
+                                        : selectedCountry.gdp_signal === 'no_data' ? colors.textMuted : colors.text} />
                                 <MetricBox label="FX Change 1m" value={fmtPct(selectedCountry.fx_change_1m)}
                                     color={(selectedCountry.fx_change_1m || 0) >= 0 ? colors.green : colors.red} />
                                 <MetricBox label="Night Lights" value={fmtPct(selectedCountry.night_lights_change)}
                                     color={(selectedCountry.night_lights_change || 0) >= 0 ? colors.green : colors.red} />
                                 <MetricBox label="Activity Score"
-                                    value={`${(selectedCountry.activity_score * 100).toFixed(0)}%`}
-                                    color={activityColor(selectedCountry.activity_score)} />
+                                    value={fmtActivity(selectedCountry.activity_score)}
+                                    color={activityColorSafe(selectedCountry.activity_score)} />
                             </div>
                         </div>
 

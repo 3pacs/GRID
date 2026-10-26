@@ -31,6 +31,23 @@ _NON_RETRYABLE_HTTP = frozenset({400, 401, 403, 404, 405, 410, 422, 451})
 # pullers run on a tight cycle; we'd rather skip than block.
 _MAX_RETRY_AFTER_SECONDS = 30.0
 
+# Shared declared-schema latency classes, aligned with merged PR #881 schema.sql.
+# Installed database compatibility remains a separate qualified assessment;
+# this normalizer does not migrate constraints or repair existing rows.
+VALID_LATENCY_CLASSES = frozenset(
+    {"REALTIME", "INTRADAY", "EOD", "WEEKLY", "MONTHLY", "QUARTERLY", "ANNUAL"}
+)
+DEFAULT_LATENCY_CLASS = "EOD"
+# Common puller spellings that are NOT in the constraint. Unknown values
+# (e.g. BATCH, HISTORICAL, STATIC) fall back to DEFAULT_LATENCY_CLASS with a
+# WARNING instead of raising CheckViolation and failing the whole pull.
+_LATENCY_CLASS_ALIASES = {
+    "DAILY": "EOD",
+    "HOURLY": "INTRADAY",
+    "YEARLY": "ANNUAL",
+    "ANNUALLY": "ANNUAL",
+}
+
 _VALID_REVISION_BEHAVIORS = frozenset({"NEVER", "RARE", "FREQUENT", "OVERWRITE"})
 _REVISION_BEHAVIOR_ALIASES = {
     "RARELY": "RARE",
@@ -52,6 +69,30 @@ def _normalize_revision_behavior(value: Any) -> str:
         v=value,
     )
     return "NEVER"
+
+
+def _normalize_latency_class(value: Any) -> str:
+    """Normalize puller SOURCE_CONFIG latency_class to a constraint-safe value.
+
+    Returns the value unchanged when it is already allowed, maps known
+    aliases (``DAILY`` -> ``EOD``), and otherwise logs a WARNING and returns
+    ``DEFAULT_LATENCY_CLASS`` so auto-create never trips
+    ``source_catalog_latency_class_check`` (grid-hermes journal,
+    2026-10-20 03:24:42Z: Asset_Registries declared ``DAILY``).
+    """
+    normalized = str(value or "").strip().upper()
+    normalized = _LATENCY_CLASS_ALIASES.get(normalized, normalized)
+    if normalized in VALID_LATENCY_CLASSES:
+        return normalized
+
+    log.warning(
+        "Unknown latency_class {v!r}; using {d} for source_catalog "
+        "(allowed: {allowed})",
+        v=value,
+        d=DEFAULT_LATENCY_CLASS,
+        allowed=sorted(VALID_LATENCY_CLASSES),
+    )
+    return DEFAULT_LATENCY_CLASS
 
 
 def _http_status_from_exc(exc: BaseException) -> int | None:
@@ -126,6 +167,21 @@ _CODE_BUG_EXC_TYPES: tuple[type[BaseException], ...] = (
                   # should be detected at puller init and skipped explicitly.
     SyntaxError,
 )
+
+
+def _stable_lock_key(*parts: Any) -> int:
+    """Deterministic signed-63-bit key for ``pg_advisory_xact_lock``.
+
+    Postgres advisory-lock keys are a signed bigint. Deriving the key from
+    a SHA-256 of the given parts means the same ``(source, period)`` pair
+    always maps to the same lock without needing a separate keyspace
+    registry -- advisory locks are mutual-exclusion tokens, not secrets, so
+    a shared 63-bit hash space is fine.
+    """
+    import hashlib
+
+    digest = hashlib.sha256("|".join(str(p) for p in parts).encode()).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFFFFFFFFFF
 
 
 def log_pull_failure(
@@ -347,7 +403,9 @@ class BasePuller:
                     "name": self.SOURCE_NAME,
                     "url": self.SOURCE_CONFIG.get("base_url", ""),
                     "cost": self.SOURCE_CONFIG.get("cost_tier", "FREE"),
-                    "latency": self.SOURCE_CONFIG.get("latency_class", "EOD"),
+                    "latency": _normalize_latency_class(
+                        self.SOURCE_CONFIG.get("latency_class", DEFAULT_LATENCY_CLASS)
+                    ),
                     "pit": self.SOURCE_CONFIG.get("pit_available", False),
                     "rev": _normalize_revision_behavior(
                         self.SOURCE_CONFIG.get("revision_behavior", "NEVER")
@@ -377,6 +435,15 @@ class BasePuller:
     ) -> bool:
         """Check if a raw_series row already exists within the dedup window.
 
+        A ``QUARANTINED`` row (migration #671: a wrong-instrument price batch
+        caught after the fact) does NOT count as existing here — it is not
+        valid data for this ``(series_id, obs_date)``, so a puller must be
+        allowed to re-pull and overwrite it immediately rather than being
+        throttled by the dedup window as if good data were already on file.
+        ``SUCCESS``, ``PARTIAL`` and ``FAILED`` still count as existing (the
+        FAILED case intentionally rate-limits retries against a failing
+        upstream API).
+
         Parameters:
             series_id: The series identifier.
             obs_date: Observation date.
@@ -384,14 +451,15 @@ class BasePuller:
             dedup_hours: Hours to look back for duplicates (default: 1).
 
         Returns:
-            bool: True if a matching row exists.
+            bool: True if a matching non-quarantined row exists.
         """
         cutoff = datetime.now(timezone.utc) - timedelta(hours=dedup_hours)
         result = conn.execute(
             text(
                 "SELECT 1 FROM raw_series "
                 "WHERE series_id = :sid AND source_id = :src "
-                "AND obs_date = :od AND pull_timestamp >= :ts LIMIT 1"
+                "AND obs_date = :od AND pull_timestamp >= :ts "
+                "AND pull_status != 'QUARANTINED' LIMIT 1"
             ),
             {"sid": series_id, "src": self.source_id, "od": obs_date, "ts": cutoff},
         ).fetchone()
@@ -444,6 +512,114 @@ class BasePuller:
 
         rows = conn.execute(text(sql), params).fetchall()
         return {r[0] for r in rows}
+
+    def _file_advisory_lock(self, conn: Any, *key_parts: Any) -> None:
+        """Take a transaction-scoped advisory lock for one logical "file".
+
+        Held for the lifetime of the CURRENT transaction and released
+        automatically on commit or rollback (``pg_advisory_xact_lock``) --
+        callers must call this from INSIDE the same ``with engine.begin()
+        as conn:`` block that does the existence check and the inserts for
+        one file/period. That closes the race where a SmartScheduler
+        timeout leaves a puller's thread orphaned (see
+        ``smart_scheduler.SmartScheduler`` class docstring) and it finishes
+        late, concurrently with a fresh retry for the same file: without
+        this lock both transactions can read "not yet ingested" and both
+        insert, producing duplicate SUCCESS rows for the same
+        (series_id, obs_date). A second caller for the same key blocks
+        here until the first transaction finishes, then re-reads
+        "already ingested" and skips.
+
+        Parameters:
+            conn: Active connection, INSIDE a transaction (``engine.begin()``).
+            key_parts: Anything that identifies the file/period being
+                ingested (e.g. the source name + trade date, or + half-month
+                key). Combined with ``self.SOURCE_NAME`` so two different
+                sources never collide on the same lock by coincidence.
+        """
+        key = _stable_lock_key(self.SOURCE_NAME, *key_parts)
+        conn.execute(text("SELECT pg_advisory_xact_lock(:k)"), {"k": key})
+
+    def _get_existing_source_dates(
+        self,
+        conn: Any,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> set[date]:
+        """obs_dates already stored for this source (ANY series), one query.
+
+        A single upstream "file" (a FINRA daily short-volume file, an SEC
+        FTD half-month file) writes many series ids (one per symbol/CUSIP)
+        under the same handful of obs_dates. Checking "has this file's
+        period already been ingested" only needs to know which obs_dates
+        this source already has SUCCESS rows for -- not which specific
+        series ids -- so this is one cheap query regardless of how many
+        series ids the file contains.
+
+        Parameters:
+            conn: Active database connection.
+            start_date: If given, only consider obs_date >= start_date.
+            end_date: If given, only consider obs_date <= end_date.
+
+        Returns:
+            set[date]: obs_dates with at least one SUCCESS row for this
+                source, within the given bounds.
+        """
+        sql = (
+            "SELECT DISTINCT obs_date FROM raw_series "
+            "WHERE source_id = :src AND pull_status = 'SUCCESS'"
+        )
+        params: dict[str, Any] = {"src": self.source_id}
+        if start_date is not None:
+            sql += " AND obs_date >= :start_date"
+            params["start_date"] = start_date
+        if end_date is not None:
+            sql += " AND obs_date <= :end_date"
+            params["end_date"] = end_date
+
+        rows = conn.execute(text(sql), params).fetchall()
+        return {r[0] for r in rows}
+
+    def _get_existing_pairs_in_range(
+        self,
+        conn: Any,
+        start_date: date,
+        end_date: date,
+    ) -> dict[str, set[date]]:
+        """All (series_id, obs_date) pairs already stored in ONE query.
+
+        Bounded by the obs_date range actually present in the file being
+        processed rather than filtered by a series_id list, this stays a
+        single cheap query no matter how many distinct series ids
+        (CUSIPs / symbols) the file contains -- a FINRA daily file has
+        exactly one obs_date; an SEC FTD half-month file spans roughly
+        10-16 business days. Replaces a per-unique-series-id
+        ``_get_existing_dates`` loop, which was issuing up to ~10k SELECTs
+        for a large FTD file.
+
+        Parameters:
+            conn: Active database connection.
+            start_date: Earliest obs_date present in the file (inclusive).
+            end_date: Latest obs_date present in the file (inclusive).
+
+        Returns:
+            dict mapping series_id -> set of obs_dates already stored
+            (SUCCESS) for that series_id within the range. A series_id
+            with no existing rows is simply absent -- callers should treat
+            a missing key as an empty set.
+        """
+        rows = conn.execute(
+            text(
+                "SELECT series_id, obs_date FROM raw_series "
+                "WHERE source_id = :src AND pull_status = 'SUCCESS' "
+                "AND obs_date BETWEEN :start_date AND :end_date"
+            ),
+            {"src": self.source_id, "start_date": start_date, "end_date": end_date},
+        ).fetchall()
+        out: dict[str, set[date]] = {}
+        for sid, od in rows:
+            out.setdefault(sid, set()).add(od)
+        return out
 
     def _get_latest_date(
         self,
@@ -588,7 +764,9 @@ class BasePuller:
         value: float,
         raw_payload: dict[str, Any] | None = None,
         pull_status: str = "SUCCESS",
-    ) -> None:
+        *,
+        return_result: bool = False,
+    ) -> Any:
         """Insert a row into raw_series.
 
         Runs sanity validation before inserting.  Warnings are logged
@@ -601,13 +779,19 @@ class BasePuller:
             value: Numeric value.
             raw_payload: Optional JSON payload.
             pull_status: Pull status ('SUCCESS', 'PARTIAL', 'FAILED').
+                The schema also allows 'QUARANTINED', but pullers never
+                write it: it is set only by an explicit quarantine of
+                already-stored rows.
+            return_result: Opt in to the exact execute result. The default
+                still returns None. A result does not acknowledge commit.
         """
+        # Legacy callers retain None; opt-in callers inspect affected rows.
         import json
 
         # Run sanity validation (log-only, never blocks)
         self.validate_row(series_id, obs_date, value)
 
-        conn.execute(
+        result = conn.execute(
             text(
                 "INSERT INTO raw_series "
                 "(series_id, source_id, obs_date, value, raw_payload, pull_status) "
@@ -622,3 +806,4 @@ class BasePuller:
                 "status": pull_status,
             },
         )
+        return result if return_result is True else None

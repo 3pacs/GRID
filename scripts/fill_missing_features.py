@@ -27,7 +27,7 @@ import json
 import os
 import sys
 import time
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 os.chdir(os.path.join(os.path.dirname(__file__), ".."))
@@ -42,6 +42,7 @@ from db import get_engine
 from ingestion.base import BasePuller
 from normalization.entity_map import SEED_MAPPINGS
 from normalization.resolver import Resolver
+from store.pit import PITStore, retractions_table_exists
 
 # ── Trust Rankings ──────────────────────────────────────────────────────────
 
@@ -177,7 +178,8 @@ def pull_fred_extended(engine):
             with engine.begin() as conn:
                 existing = set()
                 rows = conn.execute(text(
-                    "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+                    "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
                 ), {"sid": series_id, "src": source_id}).fetchall()
                 existing = {r[0] for r in rows}
 
@@ -234,14 +236,36 @@ YF_MISSING_TICKERS = {
 }
 
 
+YF_ADJUSTED_SOURCE = "yfinance_adjusted_extended"
+
+
+def _extended_yf_series(ticker: str, field: str) -> tuple[str, dict]:
+    """Keep adjusted closes outside the canonical raw YF close namespace.
+
+    Volume retains its existing feature mapping, but its payload records the
+    download settings. Neither field has a verified historical known-at time.
+    """
+    if field == "Close":
+        return f"YF_ADJ:{ticker}:close", {
+            "provider": "yfinance", "download_auto_adjust": True,
+            "price_basis": "adjusted_close", "known_at_verified": False,
+        }
+    if field == "Volume":
+        return f"YF:{ticker}:volume", {
+            "provider": "yfinance", "download_auto_adjust": True,
+            "measurement_basis": "provider_volume", "known_at_verified": False,
+        }
+    raise ValueError(f"Unsupported extended yfinance field: {field}")
+
+
 def pull_yfinance_extended(engine):
-    """Pull additional yfinance tickers — 5 year bulk history."""
+    """Pull adjusted closes and provider volume with explicit provenance."""
     import yfinance as yf
 
-    source_id = _ensure_source(engine, "yfinance", {
+    source_id = _ensure_source(engine, YF_ADJUSTED_SOURCE, {
         "base_url": "https://finance.yahoo.com",
         "cost_tier": "FREE", "latency_class": "EOD",
-        "pit_available": False, "revision_behavior": "RARE",
+        "pit_available": False, "revision_behavior": "FREQUENT",
         "trust_score": "MED", "priority_rank": 20,
     })
 
@@ -278,21 +302,26 @@ def pull_yfinance_extended(engine):
                     for field in ["Close", "Volume"]:
                         if field not in ticker_data.columns:
                             continue
-                        series_id = f"YF:{ticker}:{field.lower()}"
+                        series_id, provenance = _extended_yf_series(ticker, field)
                         existing = set()
                         rows = conn.execute(text(
-                            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+                            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
                         ), {"sid": series_id, "src": source_id}).fetchall()
-                        existing = {r[0] for r in rows}
+                        existing = {
+                            r[0] if isinstance(r[0], date) else date.fromisoformat(r[0])
+                            for r in rows
+                        }
 
                         for idx, val in ticker_data[field].items():
                             obs = idx.date() if hasattr(idx, 'date') else idx
                             if obs in existing or pd.isna(val):
                                 continue
                             conn.execute(text(
-                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                            ), {"sid": series_id, "src": source_id, "od": obs, "val": float(val)})
+                                "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                                "VALUES (:sid, :src, :od, :val, :payload, 'SUCCESS')"
+                            ), {"sid": series_id, "src": source_id, "od": obs,
+                                "val": float(val), "payload": json.dumps(provenance)})
                             count += 1
 
                 results.append({"ticker": ticker, "rows": count, "status": "OK"})
@@ -693,21 +722,59 @@ def pull_stablecoin_supply(engine):
 # ── Computed Features (ratios, slopes, changes) ────────────────────────────
 
 def compute_derived_features(engine):
-    """Compute features that are derived from other features already in the DB."""
+    """Compute features that are derived from other features already in the DB.
+
+    Inputs are read through ``store.pit.PITStore.get_pit`` with
+    vintage_policy "LATEST_AS_OF" as of the computation time (retraction-
+    aware since PR #683), instead of the previous raw SELECT over
+    ``resolved_series`` that read every vintage in an unordered window and
+    kept whichever row a Python dict happened to see last for a given
+    obs_date. See GRID-RERESOLVE-PLAN-20260927, "DERIVED FEATURES", for
+    why that unfiltered read could silently compute from a contaminated
+    vintage still kept as superseded history. Refuses to run entirely if
+    ``resolved_series_retractions`` does not exist yet.
+    """
     results = []
 
+    if not retractions_table_exists(engine):
+        log.error(
+            "compute_derived_features: resolved_series_retractions is "
+            "missing (PR #683 not deployed here) — refusing to run"
+        )
+        return results
+
+    run_date = datetime.now(timezone.utc).date()
+    pit = PITStore(engine)
+
     with engine.connect() as conn:
+        def _feature_id(feature_name: str) -> int | None:
+            row = conn.execute(
+                text("SELECT id FROM feature_registry WHERE name = :fn"),
+                {"fn": feature_name},
+            ).fetchone()
+            return row[0] if row else None
+
         # Get available resolved data for computation
         def get_series(feature_name: str, days: int = 400) -> pd.Series:
-            rows = conn.execute(text("""
-                SELECT obs_date, value FROM resolved_series rs
-                JOIN feature_registry fr ON rs.feature_id = fr.id
-                WHERE fr.name = :fn AND rs.obs_date >= CURRENT_DATE - :days
-                ORDER BY rs.obs_date
-            """), {"fn": feature_name, "days": days}).fetchall()
-            if not rows:
+            fid = _feature_id(feature_name)
+            if fid is None:
                 return pd.Series(dtype=float)
-            return pd.Series({r[0]: r[1] for r in rows}).sort_index()
+            df = pit.get_pit([fid], run_date, vintage_policy="LATEST_AS_OF")
+            if df.empty:
+                return pd.Series(dtype=float)
+            cutoff = run_date - timedelta(days=days)
+            df = df[df["obs_date"] >= cutoff]
+            if df.empty:
+                return pd.Series(dtype=float)
+            # Plain `date` objects, matching the previous implementation's
+            # `pd.Series({date: value, ...})` index exactly (NOT a
+            # DatetimeIndex/Timestamp): _insert_computed below compares
+            # these against a set of plain `date` objects read back from
+            # raw_series, and a Timestamp never equals a `date` there.
+            return pd.Series(
+                df["value"].to_numpy(dtype=float),
+                index=df["obs_date"].to_numpy(),
+            ).sort_index()
 
         # Copper/Gold ratio
         copper = get_series("copper_futures_close")
@@ -799,7 +866,8 @@ def _insert_computed(engine, feature_name: str, series: pd.Series, results: list
     with engine.begin() as conn:
         existing = set()
         rows = conn.execute(text(
-            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src"
+            "SELECT DISTINCT obs_date FROM raw_series WHERE series_id = :sid AND source_id = :src "
+            "AND pull_status != 'QUARANTINED'"
         ), {"sid": f"COMPUTED:{feature_name}", "src": source_id}).fetchall()
         existing = {r[0] for r in rows}
 

@@ -94,6 +94,19 @@ describe('TickerPulseCard (via WidgetGrid)', () => {
         expect(api.getTickerQuote).toHaveBeenCalledWith('AAPL');
     });
 
+    it('labels an intraday SPY bar as delayed with its observation time', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 767.28,
+            sentiment: 'neutral',
+            price_tier: 'intraday_delayed',
+            price_bar_end_at: '2026-09-24T19:55:00+00:00',
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'SPY' } }]} />);
+
+        expect(await screen.findByText('Delayed intraday price · bar ended 19:55 UTC'))
+            .toBeInTheDocument();
+    });
+
     it('shows the "market may be closed" stale state when the quote has no numeric price', async () => {
         api.getTickerQuote.mockResolvedValue({ sentiment: 'neutral' });
         render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'TSLA' } }]} />);
@@ -107,6 +120,70 @@ describe('TickerPulseCard (via WidgetGrid)', () => {
         render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: {} }]} />);
         expect(await screen.findByText('No stock picked.')).toBeInTheDocument();
         expect(api.getTickerQuote).not.toHaveBeenCalled();
+    });
+
+    it('never says "today" for a stale daily price and labels it stale with its real date', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 100.0,
+            change_pct: 0.02,
+            sentiment: 'bullish',
+            price_tier: 'daily',
+            source: 'grid',
+            as_of: '2026-07-10',
+            stale: true,
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'RXT' } }]} />);
+
+        expect(await screen.findByText('Daily price · 2026-07-10 · stale')).toBeInTheDocument();
+        expect(screen.getByText(/as of 2026-07-10/)).toBeInTheDocument();
+        expect(screen.queryByText(/is up today/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/is down today/)).not.toBeInTheDocument();
+        expect(screen.queryByText(/is steady today/)).not.toBeInTheDocument();
+    });
+
+    it('still says "today" for a fresh (non-stale) daily price', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 100.0,
+            change_pct: 0.0,
+            sentiment: 'neutral',
+            price_tier: 'daily',
+            source: 'grid',
+            as_of: '2026-09-26',
+            stale: false,
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'RXT' } }]} />);
+
+        expect(await screen.findByText(/is steady today/)).toBeInTheDocument();
+        expect(screen.getByText('Daily price · 2026-09-26')).toBeInTheDocument();
+    });
+
+    it('labels a live-fallback quote with its source and real observation date', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 42.0,
+            change_pct: 0.01,
+            sentiment: 'neutral',
+            price_tier: 'live_fallback',
+            source: 'live',
+            as_of: '2026-09-25',
+            stale: false,
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'ZZZ' } }]} />);
+
+        expect(await screen.findByText('Live estimate (yfinance) · 2026-09-25')).toBeInTheDocument();
+    });
+
+    it('labels a live-fallback quote with no resolvable date as unconfirmed rather than fabricating one', async () => {
+        api.getTickerQuote.mockResolvedValue({
+            price: 42.0,
+            sentiment: 'neutral',
+            price_tier: 'live_fallback',
+            source: 'live',
+            as_of: null,
+            stale: null,
+        });
+        render(<WidgetGrid widgets={[{ type: 'ticker_pulse', props: { ticker: 'ZZZ' } }]} />);
+
+        expect(await screen.findByText('Live estimate (yfinance) · date unconfirmed')).toBeInTheDocument();
     });
 });
 

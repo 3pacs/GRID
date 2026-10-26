@@ -114,6 +114,24 @@ def _build_client(engine, monkeypatch) -> TestClient:
     return TestClient(app)
 
 
+@pytest.mark.parametrize("path", [
+    "/api/v1/snapshots/latest/test",
+    "/api/v1/snapshots/history/test",
+    "/api/v1/snapshots/compare/test?date_a=2026-09-01&date_b=2026-09-02",
+    "/api/v1/snapshots/categories",
+])
+def test_snapshot_get_engine_failure_is_unavailable(path, monkeypatch):
+    client = _build_client(None, monkeypatch)
+
+    def unavailable():
+        raise RuntimeError("database engine unavailable")
+
+    monkeypatch.setattr(snapshots_router, "get_db_engine", unavailable)
+    response = client.get(path)
+    assert response.status_code == 503
+    assert response.json() == {"detail": "snapshot_store_unavailable"}
+
+
 # ── The bug: /latest/{category} 400'd almost everything ───────────────────
 
 
@@ -273,7 +291,7 @@ def test_list_categories_tolerates_a_null_latest_date():
     assert store.list_categories()[0]["latest_snapshot_date"] is None
 
 
-def test_list_categories_returns_empty_and_warns_when_table_is_unreachable(monkeypatch):
+def test_list_categories_raises_when_table_is_unreachable(monkeypatch):
     """Missing table / DB blip is operational, so it warns rather than errors
     (CLAUDE.md: log.error is for unhandled application bugs, and errors.jsonl
     is the canonical health signal). Asserted on the loguru logger directly —
@@ -290,7 +308,8 @@ def test_list_categories_returns_empty_and_warns_when_table_is_unreachable(monke
     fake_log = MagicMock()
     monkeypatch.setattr(snapshots_store, "log", fake_log)
 
-    assert store.list_categories() == []
+    with pytest.raises(RuntimeError, match="analytical_snapshots"):
+        store.list_categories()
 
     assert fake_log.warning.call_count == 1
     fake_log.error.assert_not_called()

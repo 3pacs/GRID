@@ -32,6 +32,10 @@ from sqlalchemy.engine import Engine
 from store.pit import PITStore
 
 
+class _SideEffectDisabled(Exception):
+    """Internal: the caller switched an optional side effect off."""
+
+
 class ClusterDiscovery:
     """Unsupervised regime discovery via PCA + clustering.
 
@@ -54,7 +58,7 @@ class ClusterDiscovery:
         self.pit_store = pit_store
         log.info("ClusterDiscovery initialised")
 
-    def _get_eligible_feature_ids(self) -> list[int]:
+    def _get_eligible_feature_ids(self, restrict_to: list[int] | None = None) -> list[int]:
         """Retrieve all model-eligible feature IDs.
 
         Capped via GRID_CLUSTERING_MAX_FEATURES (default 500) so an
@@ -63,6 +67,11 @@ class ClusterDiscovery:
         are excluded — they'd just be all-NaN columns that the
         clustering loop drops at the missing-pct filter anyway, but
         loading them costs memory and PIT-pivot time.
+
+        Parameters:
+            restrict_to: Optional candidate ids (e.g. one sector's features);
+                only those that also pass the eligibility and recent-data
+                filters are returned.
 
         Returns:
             list[int]: Feature IDs where model_eligible = TRUE, ordered
@@ -79,6 +88,9 @@ class ClusterDiscovery:
                     "SELECT fr.id "
                     "FROM feature_registry fr "
                     "WHERE fr.model_eligible = TRUE "
+                    "  AND fr.deprecated_at IS NULL "
+                    "  AND (CAST(:restrict AS INTEGER[]) IS NULL "
+                    "       OR fr.id = ANY(CAST(:restrict AS INTEGER[]))) "
                     "  AND EXISTS ("
                     "    SELECT 1 FROM resolved_series rs "
                     "    WHERE rs.feature_id = fr.id "
@@ -87,7 +99,7 @@ class ClusterDiscovery:
                     "ORDER BY fr.id "
                     "LIMIT :lim"
                 ),
-                {"lim": max_features},
+                {"lim": max_features, "restrict": restrict_to},
             ).fetchall()
         ids = [row[0] for row in rows]
         log.info(
@@ -103,6 +115,13 @@ class ClusterDiscovery:
         as_of_date: date | None = None,
         start_date: date | None = None,
         output_dir: str = "outputs/clustering",
+        feature_ids: list[int] | None = None,
+        snapshot_category: str = "clustering",
+        snapshot_subcategory: str | None = None,
+        max_staleness_days: int | None = None,
+        interpret: bool = True,
+        persist: bool = True,
+        partition: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Run full cluster discovery using PCA-reduced features.
 
@@ -111,6 +130,22 @@ class ClusterDiscovery:
             as_of_date: Decision date (default: today).
             start_date: Earliest date for feature data (default: 5y back).
             output_dir: Directory for saving output files.
+            feature_ids: Restrict the candidate features (e.g. one sector's
+                features). ``None`` = every eligible feature (global run).
+            snapshot_category / snapshot_subcategory: Where the result is
+                stored in ``analytical_snapshots``. Per-sector runs use
+                ``clustering_sector`` + the sector name so they never shadow
+                the global ``clustering`` row.
+            max_staleness_days: Exclude features whose last PIT observation
+                is older than this (listed in ``excluded_stale_features``)
+                instead of letting them truncate the matrix. ``None`` keeps
+                the legacy behaviour.
+            interpret: Ask the local Hyperspace LLM for a narrative. The
+                scheduled job passes False (no LLM calls).
+            persist: Write the analytical snapshot.
+            partition: Optional description of the partition (e.g.
+                ``{"sector": "Technology", "etf": "XLK"}``) copied into the
+                payload.
 
         Returns:
             dict: Summary with best_k, all metrics, and cluster assignments.
@@ -164,7 +199,10 @@ class ClusterDiscovery:
         )
 
         # Step a: Load feature matrix, standardise, PCA
-        feature_ids = self._get_eligible_feature_ids()
+        feature_ids = self._get_eligible_feature_ids(restrict_to=feature_ids)
+        if not feature_ids:
+            log.warning("No eligible features with recent data — cannot cluster")
+            return {"error": "No eligible features", "partition": partition}
         matrix = self.pit_store.get_feature_matrix(
             feature_ids=feature_ids,
             start_date=start_date,
@@ -177,14 +215,24 @@ class ClusterDiscovery:
             log.warning("Empty feature matrix — cannot cluster")
             return {"error": "Empty feature matrix"}
 
-        # Drop high-missing features, forward-fill, drop remaining NaNs
+        from discovery.matrix_guard import drop_stale_columns, matrix_window
+
+        # Drop high-missing features, then stale ones (so a feature that
+        # stopped updating cannot truncate every row after its last date),
+        # forward-fill, drop remaining NaNs.
         missing_pct = matrix.isnull().mean()
         matrix = matrix.drop(columns=missing_pct[missing_pct > 0.3].index)
+        matrix, excluded_stale = drop_stale_columns(matrix, as_of_date, max_staleness_days)
         matrix = matrix.ffill(limit=5).dropna()
 
         if matrix.shape[0] < 30:
             log.warning("Insufficient data rows ({n}) for clustering", n=matrix.shape[0])
-            return {"error": f"Insufficient data rows: {matrix.shape[0]}"}
+            return {
+                "error": f"Insufficient data rows: {matrix.shape[0]}",
+                "n_features": int(matrix.shape[1]),
+                "excluded_stale_features": {str(k): v for k, v in excluded_stale.items()},
+                "partition": partition,
+            }
 
         scaler = StandardScaler()
         scaled = scaler.fit_transform(matrix)
@@ -250,14 +298,29 @@ class ClusterDiscovery:
             "n_observations": len(dates),
             "pca_components_used": actual_components,
             "variance_explained": float(sum(pca.explained_variance_ratio_)),
+            "as_of_date": as_of_date.isoformat(),
+            "vintage_policy": "FIRST_RELEASE",
+            "n_features": int(matrix.shape[1]),
+            "feature_ids": [int(c) for c in matrix.columns],
+            **matrix_window(matrix),
+            "max_staleness_days": max_staleness_days,
+            "excluded_stale_features": {str(k): v for k, v in excluded_stale.items()},
+            "partition": partition,
+            # Cluster ids are arbitrary GMM component numbers, not regimes.
+            "cluster_labels": [f"CLUSTER_{i}" for i in range(int(best_k))],
+            "current_cluster": int(labels[-1]),
+            "current_cluster_confidence": float(confidence[-1]),
         }
 
         # Persist snapshot to database for historical comparison
         try:
+            if not persist:
+                raise _SideEffectDisabled()
             from store.snapshots import AnalyticalSnapshotStore
             snap_store = AnalyticalSnapshotStore(db_engine=self.engine)
-            snap_store.save_snapshot(
-                category="clustering",
+            summary["snapshot_id"] = snap_store.save_snapshot(
+                category=snapshot_category,
+                subcategory=snapshot_subcategory,
                 payload=summary,
                 as_of_date=as_of_date,
                 metrics={
@@ -269,11 +332,15 @@ class ClusterDiscovery:
                     "best_persistence": float(results_df.loc[best_idx, "gmm_persistence"]),
                 },
             )
+        except _SideEffectDisabled:
+            pass
         except Exception as exc:
             log.warning("Failed to persist clustering snapshot: {e}", e=str(exc))
 
         # Optional: LLM-assisted interpretation of changing correlations
         try:
+            if not interpret:
+                raise _SideEffectDisabled()
             from hyperspace.client import get_client
             from hyperspace.reasoner import GRIDReasoner
 
@@ -301,6 +368,8 @@ class ClusterDiscovery:
                             e=explanation[:200],
                         )
                         summary["llm_interpretation"] = explanation
+        except _SideEffectDisabled:
+            pass
         except Exception as exc:
             log.debug("Hyperspace interpretation skipped: {e}", e=str(exc))
 

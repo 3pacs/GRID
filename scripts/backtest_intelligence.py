@@ -86,6 +86,9 @@ def run_edge_table(engine: Engine) -> list[EdgeRow]:
             SELECT id, ticker, direction, confidence, actual_move_pct, created_at
             FROM oracle_predictions
             WHERE scored_at IS NOT NULL AND actual_move_pct IS NOT NULL
+              -- `float(conf)` below raises TypeError on a NULL; a prediction
+              -- that stated no confidence has no edge to measure.
+              AND confidence IS NOT NULL
             ORDER BY created_at
         """)).fetchall()
 
@@ -281,6 +284,8 @@ def run_replay(engine: Engine, tickers: list[str]) -> list[dict]:
             FROM oracle_predictions
             WHERE scored_at IS NOT NULL AND actual_move_pct IS NOT NULL
               AND ticker = ANY(:tickers)
+              -- `float(raw_conf)` below raises TypeError on a NULL.
+              AND confidence IS NOT NULL
             ORDER BY created_at
         """), {"tickers": tickers}).fetchall()
 

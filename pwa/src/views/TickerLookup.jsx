@@ -24,6 +24,13 @@ function cleanTicker(value) {
     return String(value || '').replace(/[^A-Za-z0-9.^-]/g, '').toUpperCase().slice(0, 12);
 }
 
+function tickerFromHash() {
+    if (typeof window === 'undefined') return 'RXT';
+    const [, search = ''] = window.location.hash.slice(1).split('?', 2);
+    const params = new URLSearchParams(search);
+    return cleanTicker(params.get('ticker') || params.get('symbol')) || 'RXT';
+}
+
 function metric(value, fallback = '0') {
     if (value == null || value === '') return fallback;
     if (typeof value === 'number') return value.toLocaleString();
@@ -168,16 +175,16 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
         <article className="tl-panel">
             <div className="tl-section-head">
                 <div>
-                    <span>Finviz in Postgres</span>
+                    <span>{finviz?.source || 'SEC EDGAR/XBRL'}</span>
                     <h2>{finviz?.status || 'unavailable'}</h2>
                 </div>
                 <button
                     type="button"
                     className="tl-icon-button"
                     onClick={onRefresh}
-                    disabled={refreshing}
-                    title="Refresh Finviz"
-                    aria-label="Refresh Finviz"
+                    disabled={refreshing || !finviz?.refresh_available}
+                    title="SEC facts update through the scheduled source"
+                    aria-label="SEC reported fundamentals"
                 >
                     {refreshing ? <RefreshCw size={18} className="tl-spin" /> : <Database size={18} />}
                 </button>
@@ -185,15 +192,19 @@ function FinvizPanel({ finviz, onRefresh, refreshing }) {
             <div className="tl-finviz-meta">
                 <span>{finviz?.field_count || 0} fields</span>
                 <span>{finviz?.freshness?.label || 'missing'}</span>
-                <span>{finviz?.latest_obs_date || 'no date'}</span>
+                <span>Fiscal period end: {finviz?.latest_obs_date || 'unavailable'}</span>
             </div>
+            <p className="tl-muted">{finviz?.provenance || 'Reported facts, not live valuation or forecasts.'}</p>
+            <p className="tl-muted">Current P/E, market cap, float, forecasts and short interest are unavailable from this source.</p>
             <div className="tl-finviz-grid">
                 {stats.length ? stats.slice(0, 12).map(stat => (
                     <div key={stat.id}>
                         <span>{stat.label}</span>
-                        <strong>{stat.raw_value ?? '-'}</strong>
+                        <strong>{stat.raw_value ?? 'unavailable'}</strong>
+                        <span>Period {stat.period_start || 'instant'} to {stat.period_end || 'unknown'}</span>
+                        <span>Filed {stat.filed || 'unknown'} · {stat.form || 'unknown'}</span>
                     </div>
-                )) : <p className="tl-muted">No Finviz snapshot rows found for this ticker yet.</p>}
+                )) : <p className="tl-muted">No provenance-complete SEC reported facts stored for this ticker.</p>}
             </div>
         </article>
     );
@@ -263,9 +274,11 @@ function EvidenceTable({ rows }) {
 }
 
 export default function TickerLookup() {
+    const initialTicker = useMemo(tickerFromHash, []);
     const streamRef = useRef(null);
-    const [query, setQuery] = useState('RXT');
-    const [activeTicker, setActiveTicker] = useState('RXT');
+    const currentTickerRef = useRef(initialTicker);
+    const [query, setQuery] = useState(initialTicker);
+    const [activeTicker, setActiveTicker] = useState(initialTicker);
     const [data, setData] = useState(null);
     const [marketData, setMarketData] = useState(null);
     const [period, setPeriod] = useState('1Y');
@@ -413,6 +426,7 @@ export default function TickerLookup() {
         streamRef.current = null;
         setQuery(ticker);
         setActiveTicker(ticker);
+        currentTickerRef.current = ticker;
         setLoading(true);
         setMarketLoading(true);
         setSectionStatus(DETAIL_STATUS_LOADING);
@@ -433,8 +447,14 @@ export default function TickerLookup() {
     }
 
     useEffect(() => {
-        lookup('RXT');
+        lookup(initialTicker);
+        const handleHashChange = () => {
+            const routeTicker = tickerFromHash();
+            if (routeTicker !== currentTickerRef.current) lookup(routeTicker);
+        };
+        window.addEventListener('hashchange', handleHashChange);
         return () => {
+            window.removeEventListener('hashchange', handleHashChange);
             streamRef.current?.close();
             streamRef.current = null;
         };
@@ -642,6 +662,12 @@ export default function TickerLookup() {
                         </div>
                         <Layers size={21} />
                     </div>
+                    {data?.source?.extracted_at ? (
+                        <p className="tl-extract-note">
+                            Static extract from {data.source.extracted_at} — not refreshed since.
+                            The workbook corpus is a one-shot snapshot, not a live feed.
+                        </p>
+                    ) : null}
                     <EvidenceTable rows={evidence} />
                 </article>
 
@@ -894,6 +920,15 @@ const CSS = `
 }
 .tl-card-head svg,
 .tl-section-head svg { color: #f4c542; }
+.tl-extract-note {
+    margin: -4px 0 12px;
+    font-size: 12px;
+    color: #b8a15a;
+    background: rgba(244, 197, 66, 0.08);
+    border: 1px solid rgba(244, 197, 66, 0.25);
+    border-radius: 6px;
+    padding: 6px 10px;
+}
 .tl-icon-button {
     width: 38px;
     height: 38px;

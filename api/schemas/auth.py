@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 class LoginRequest(BaseModel):
@@ -42,3 +42,13 @@ class UserResponse(BaseModel):
     username: str
     role: str
     created_at: str
+
+
+class StreamTicketRequest(BaseModel):
+    path: str = Field(..., min_length=1, max_length=256)
+
+
+class StreamTicketResponse(BaseModel):
+    ticket: str
+    expires_in: int
+    path: str

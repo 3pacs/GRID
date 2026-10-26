@@ -2,7 +2,6 @@
 
 Exported symbols used outside this package:
     _batch_fetch_prices     — api.routers.astrogrid_core, scripts/seed_astrogrid_prediction_corpus
-    _cache_price_to_db      — api.routers.astrogrid_core
     _resolve_feature_names  — api.routers.astrogrid_helpers
 """
 
@@ -176,13 +175,19 @@ def _ensure_watchlist_table() -> None:
                                      'etf', 'index', 'forex'
                                  )),
                 added_at     TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                notes        TEXT
+                notes        TEXT,
+                weight       NUMERIC DEFAULT NULL
             )
         """))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_watchlist_ticker
             ON watchlist (ticker)
         """))
+        # Existing watchlists predate portfolio weights. Schema setup belongs
+        # to the lazy writer/init path, never to the portfolio read request.
+        conn.execute(text(
+            "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
+        ))
     log.debug("Watchlist table ensured")
 
 
@@ -208,8 +213,18 @@ def _row_to_dict(row: Any) -> dict:
 def _fetch_live_price(ticker: str) -> dict | None:
     """Fetch a live/recent price from yfinance as fallback.
 
-    Returns {"price": float, "prev_close": float, "pct_1d": float, "source": "live"}
-    or None on failure.
+    Returns {"price": float, "prev_close": float, "pct_1d": float,
+    "source": "live", "as_of": date | None} or None on failure.
+
+    ``as_of`` is the real trading day the returned close belongs to, read
+    from yfinance's own history — never stamped as ``date.today()`` at the
+    call site. ``fast_info`` (the ``last_price``/``previous_close`` fast
+    path) carries no timestamp field at all (verified against yfinance
+    1.7.0: it exposes ``lastPrice``, ``previousClose``, ``dayHigh``, etc.
+    and nothing dated), so on its own it cannot distinguish a live intraday
+    tick from a frozen close read on a weekend or holiday. Reading the date
+    off history instead means a caller never has to fabricate "today" (#F1
+    D5; see docs/reference/AVAILABILITY_CONTRACT.md).
     """
     try:
         import yfinance as yf
@@ -230,6 +245,7 @@ def _fetch_live_price(ticker: str) -> dict | None:
         info = tk.fast_info
         price = getattr(info, "last_price", None)
         prev = getattr(info, "previous_close", None)
+        hist = None
         if price is None:
             # auto_adjust=False to match the fast_info branch above:
             # last_price/previous_close are raw quotes, so the fallback must
@@ -242,57 +258,32 @@ def _fetch_live_price(ticker: str) -> dict | None:
                     prev = float(hist["Close"].iloc[-2])
         if price is None:
             return None
+
+        if hist is None:
+            # The fast_info path never fetched history — do it now, purely
+            # to read the observation date. Never let this failure sink the
+            # price we already have; an unknown as_of is honest (None), a
+            # crash on a working price fallback is not.
+            try:
+                hist = tk.history(period="5d", auto_adjust=False)
+            except Exception:
+                hist = None
+        as_of = None
+        if hist is not None and not hist.empty:
+            idx = hist.index[-1]
+            as_of = idx.date() if hasattr(idx, "date") else None
+
         pct_1d = round((price - prev) / prev, 5) if prev and prev != 0 else None
         return {
             "price": round(price, 4),
             "prev_close": round(prev, 4) if prev else None,
             "pct_1d": pct_1d,
             "source": "live",
+            "as_of": as_of,
         }
     except Exception as exc:
         log.debug("Live price fetch failed for {t}: {e}", t=ticker, e=str(exc))
         return None
-
-
-def _cache_price_to_db(engine: Any, ticker: str, price: float, date: Any) -> None:
-    """Write yfinance price back to raw_series for future lookups."""
-    try:
-        from datetime import datetime, timezone
-
-        with engine.begin() as conn:
-            src_row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = 'yfinance' LIMIT 1")
-            ).fetchone()
-            if src_row is None:
-                src_row = conn.execute(
-                    text(
-                        "INSERT INTO source_catalog (name, source_type) "
-                        "VALUES ('yfinance', 'market') RETURNING id"
-                    )
-                ).fetchone()
-            source_id = src_row[0]
-
-            series_id = f"yf_{ticker.lower()}_close"
-            obs_date = date if date else datetime.now(timezone.utc).date()
-
-            conn.execute(
-                text(
-                    "INSERT INTO raw_series "
-                    "(source_id, series_id, obs_date, value, pull_timestamp) "
-                    "VALUES (:source_id, :series_id, :obs_date, :value, NOW()) "
-                    "ON CONFLICT (source_id, series_id, obs_date) "
-                    "DO UPDATE SET value = EXCLUDED.value, pull_timestamp = NOW()"
-                ),
-                {
-                    "source_id": source_id,
-                    "series_id": series_id,
-                    "obs_date": str(obs_date),
-                    "value": price,
-                },
-            )
-        log.debug("Cached price to DB: {t} = {p} on {d}", t=ticker, p=price, d=date)
-    except Exception as exc:
-        log.debug("Failed to cache price to DB for {t}: {e}", t=ticker, e=str(exc))
 
 
 def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
@@ -328,9 +319,8 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
         yf_tickers = list(yf_map.values())
         joined = " ".join(yf_tickers)
         # auto_adjust=False: these closes are shown to the user as the live
-        # price and are written back into raw_series by _cache_price_to_db,
-        # so they must stay on the same raw, unadjusted basis as the rest of
-        # the price stack (raw_series "YF:{ticker}:close", fast_info.
+        # price, so they must stay on the same raw, unadjusted basis as the
+        # rest of the price stack (raw_series "YF:{ticker}:close", fast_info.
         # last_price). yfinance's default flipped to True in 0.2.x. The
         # pct_1d/pct_1w returns below would be marginally more correct on an
         # adjusted basis, but over a 5-day window that only differs across a
@@ -375,6 +365,10 @@ def _batch_fetch_prices(tickers: list[str]) -> dict[str, dict]:
                     "pct_1d": pct_1d,
                     "pct_1w": pct_1w,
                     "updated_at": now_iso,
+                    # Wave 3 #11 (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md):
+                    # this is a live yfinance quote, button/cache-triggered
+                    # only — label it so the UI never implies a managed feed.
+                    "source": "yfinance",
                 }
             except Exception as exc:
                 log.debug("Batch price parse failed for {t}: {e}", t=tk, e=str(exc))
@@ -469,7 +463,7 @@ def _preload_one(tk: str) -> str | None:
         period = "3M"
         lookback_days = 90
 
-        _init_table()
+        # Runs under GET /preload: read-only, no _init_table DDL.
         engine = get_db_engine()
         feature_names = _resolve_feature_names(ticker_upper)
 
@@ -612,6 +606,7 @@ def _preload_one(tk: str) -> str | None:
                         "FROM raw_series rs "
                         "JOIN source_catalog sc ON sc.id = rs.source_id "
                         "WHERE sc.name = 'TradingView' "
+                        "AND rs.pull_status = 'SUCCESS' "
                         "AND rs.series_id LIKE :pattern "
                         "ORDER BY rs.pull_timestamp DESC LIMIT 10"
                     ),

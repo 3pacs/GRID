@@ -226,9 +226,13 @@ def bake_endpoint(path: str, token: str, query: dict | None = None,
         if code != 200 or len(body) < 3:
             return path, code, len(body)
         try:
-            json.loads(body)
+            payload = json.loads(body)
         except ValueError:
             return path, code, -1
+        # A degraded payload describes a backend outage, not a market state.
+        # Baking it would freeze that outage into the offline mirror.
+        if isinstance(payload, dict) and payload.get("status") == "degraded":
+            return path, code, 0
         n = write(rel, body)
         return path, code, n
     return path, last_code, last_size

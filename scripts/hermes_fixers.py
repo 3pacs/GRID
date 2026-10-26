@@ -14,13 +14,15 @@ Contains:
 
 from __future__ import annotations
 
+import inspect
 import json
 import re
+import threading
 import time
 import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger as log
 
@@ -38,6 +40,141 @@ MAX_PULL_RETRIES = 3
 AUTORESEARCH_MAX_ITER = 5
 HERMES_TEMPERATURE = 0.3
 
+# ─── Bounded repair (fable-hermes-repair-bound, 2026-09-19) ─────────────
+#
+# Traced (docs/handoffs/2026-09-19/fable-hermes-repair-bound.md): a REPULL
+# repair command used to call _retry_source(attempt=1) with no start_date
+# override, which for pull_all(start_date=...) pullers (YFinancePuller)
+# fell through to the module default start_date="1990-01-01" — a full
+# history backfill masquerading as a routine repair. On cycle 6300 that
+# took 71 minutes (the source was NOT actually stale — every ticker's
+# obs_date already reached yesterday; the "fix" was reprocessing 1.3-2.3M
+# existing rows per series only to insert 0 new ones) and starved every
+# step scheduled after diagnostics for the rest of that cycle and part of
+# the next. REPAIR_LOOKBACK_DAYS bounds every repair attempt to a small,
+# recent window — a full-history backfill is a separately authorised
+# operation (e.g. a one-off script run by a human), never triggered as a
+# side effect of a self-diagnostics repair command.
+REPAIR_LOOKBACK_DAYS = 7
+
+# Cooperative time budget for one repair pass (one run_self_diagnostics or
+# diagnose_and_fix_pulls call, across however many REPULL/retry commands it
+# executes). Pullers that accept a `should_continue` kwarg (currently
+# YFinancePuller.pull_all/pull_ticker) check it between tickers and stop
+# early with a PARTIAL result instead of running unbounded. Must stay
+# under both DIAGNOSTICS_TIMEOUT_SECONDS and DIAGNOSE_PULLS_TIMEOUT_SECONDS
+# in scripts/hermes_operator.py — pinned by
+# tests/test_hermes_repair_bounded.py so the budget can never grow past the
+# step timeout that wraps it.
+REPAIR_BUDGET_SECONDS = 180
+
+# ─── No-overlap guard for repair pulls ───────────────────────────────────
+#
+# _run_with_timeout (scripts/hermes_operator.py) abandons rather than kills
+# a worker thread on timeout — see its docstring. Before this task, a
+# repair pull orphaned that way kept running (observed still pulling
+# tickers 25 minutes into the NEXT cycle) while the next diagnostics cycle
+# started a fresh _retry_source for the same source, doubling the work and
+# never reaching the `last_pull_at` update or cooldown record for either
+# attempt. _REPAIRS_IN_FLIGHT tracks one entry per source while a
+# _retry_source call for it is active; a second call for the same source
+# while the first's thread is still alive is skipped instead of started.
+# Each entry's `token` also flows into that call's `should_continue`, so an
+# abandoned worker's own puller loop sees should_continue() go False (its
+# token was removed/replaced) and stops at its next ticker boundary rather
+# than running for an hour.
+# RLock, not Lock: _retry_source holds _REPAIRS_LOCK while registering its
+# entry and calls _next_repair_token() in that same critical section (and
+# tests call it directly while simulating a takeover under the same lock);
+# a plain Lock would self-deadlock on that reentrant acquire.
+_REPAIRS_LOCK = threading.RLock()
+_REPAIRS_IN_FLIGHT: dict[str, dict[str, Any]] = {}
+_repair_token_seq = 0
+
+
+def _next_repair_token() -> int:
+    global _repair_token_seq
+    with _REPAIRS_LOCK:
+        _repair_token_seq += 1
+        return _repair_token_seq
+
+
+def _thread_is_alive(ident: int | None) -> bool:
+    """True if a live thread with this identity still exists.
+
+    Used instead of trusting an in-flight entry indefinitely: if the
+    process itself somehow lost track of the thread (should not happen
+    with daemon/orphan threads, but this is a safety net), a stale entry
+    does not permanently block retries for a source.
+    """
+    if ident is None:
+        return False
+    return any(t.ident == ident and t.is_alive() for t in threading.enumerate())
+
+
+# ─── Action-loop abandonment (fable-hermes-repair-bound follow-up, ──────
+#     2026-09-20 — controller-directed, see docs/handoffs/2026-09-19/
+#     fable-hermes-repair-bound.md "Action-loop abandonment")
+#
+# Production evidence: cycle 6300's diagnostics step was abandoned by the
+# cycle watchdog at 23:27:12Z ("Cycle 6300 TIMED OUT after 4500s (stuck on:
+# diagnostics)"), but the orphaned worker thread (the compensating control
+# documented in _run_with_timeout — it hands back control on timeout
+# without killing the thread) kept walking the LLM's ACTION: list it had
+# already parsed: _execute_hermes_repair_command logged "Hermes action:
+# re-pulling yfinance_options" at 00:10:04Z (28 minutes into the NEXT
+# cycle, 6301) and "re-pulling TradingView" at 00:38:00Z. The REPAIR_
+# BUDGET_SECONDS deadline and the per-ticker should_continue plumbing
+# (above) bound a single REPULL call once it has started, but neither one
+# stops an abandoned worker from starting the NEXT action in its list —
+# that gap is what let 6300's orphan launch two more repair pulls deep
+# into 6301.
+#
+# _DIAGNOSTICS_TOKEN is a module-level "which diagnostics worker is
+# current" counter, parallel to _REPAIRS_IN_FLIGHT's per-source token but
+# scoped to a whole run_self_diagnostics/diagnose_and_fix_pulls call
+# rather than one source. Each call takes the next token at entry and
+# captures it locally; _diagnostics_abandoned(token, deadline) is then
+# checked BEFORE starting every action/source in that call's loop — not
+# just once at entry — so a worker that goes stale partway through its
+# action list stops at the next boundary instead of running the rest.
+# Abandonment is either condition:
+#   - the shared REPAIR_BUDGET_SECONDS deadline has passed, or
+#   - a newer run_self_diagnostics/diagnose_and_fix_pulls call has started
+#     (bumped _DIAGNOSTICS_TOKEN past the token this call captured).
+# Both functions share one counter/lock: they are both "a diagnostics
+# worker" in the sense that matters here (each owns an LLM-issued or
+# failure-driven list of repair actions it walks one at a time), so a
+# fresh start of either one supersedes an earlier in-flight call of
+# either kind, not just same-function reentry.
+_DIAGNOSTICS_LOCK = threading.Lock()
+_DIAGNOSTICS_TOKEN = 0
+
+
+def _next_diagnostics_token() -> int:
+    global _DIAGNOSTICS_TOKEN
+    with _DIAGNOSTICS_LOCK:
+        _DIAGNOSTICS_TOKEN += 1
+        return _DIAGNOSTICS_TOKEN
+
+
+def _diagnostics_abandoned(token: int, deadline: float) -> tuple[bool, str]:
+    """True + a short reason if the diagnostics worker holding `token`
+    must stop before starting its next action/source.
+
+    Checked at each loop boundary, not just once at entry, so a call that
+    goes stale partway through its action/source list stops there instead
+    of finishing the list on a superseded or expired token.
+    """
+    with _DIAGNOSTICS_LOCK:
+        current = _DIAGNOSTICS_TOKEN
+    if current != token:
+        return True, "worker superseded"
+    if time.monotonic() >= deadline:
+        return True, "repair deadline passed"
+    return False, ""
+
+
 _PULL_ACTIONS: dict[str, str] = {
     "RETRY": "transient error; retry with normal strategy",
     "SKIP": "known outage or maintenance; do not spend a retry",
@@ -49,10 +186,10 @@ _PULL_ACTIONS: dict[str, str] = {
 HERMES_REPAIR_SKILLS: tuple[tuple[str, str], ...] = (
     ("RUN_REGIME", "Re-run regime detection."),
     ("RUN_FEATURES", "Recompute feature importance."),
-    ("REPULL:<source_name>", "Re-pull a specific source if it is not in cooldown."),
+    ("REPULL:<source_name>", "Re-pull a specific source if it is not in cooldown (bounded to the last few days — never a full-history backfill)."),
     ("RUN_PIPELINE", "Trigger the standard full pipeline."),
     ("VACUUM_DB", "Run VACUUM ANALYZE on hot data tables."),
-    ("FIX_DATA_QUALITY[:family]", "Scan recent resolved_series quality and remove exact duplicates."),
+    ("FIX_DATA_QUALITY[:family]", "Scan recent resolved_series quality and report multi-vintage groups (read-only)."),
     ("FIX_OUTPUT_DIRS", "Repair or create common output directories used by reports and widgets."),
     ("ENSURE_OPERATOR_TABLES", "Create Hermes operator issue tables and indexes if missing."),
     ("CHECK_SCHEMA:<table>", "Verify a required public table exists and log a critical issue if not."),
@@ -215,12 +352,76 @@ def _require_engine(engine: Any, cmd: str) -> Any:
     return engine
 
 
+# PR #688 review (2026-09-27): this module used to DELETE dedup "losers"
+# here, keyed on grouping resolved_series rows by (feature_id, obs_date)
+# and keeping only the lowest-`id` row per group. resolved_series' actual
+# unique index is (feature_id, obs_date, vintage_date) -- every row sharing
+# (feature_id, obs_date) with another is therefore ALWAYS a distinct
+# vintage, never a true duplicate: an exact duplicate (same feature_id,
+# obs_date, vintage_date, AND value) is impossible, the index forbids it.
+# store/pit.py's FIRST_RELEASE and LATEST_AS_OF vintage policies read
+# across exactly these rows; deleting all but one per (feature_id,
+# obs_date) collapses point-in-time history and, measured against
+# production, would have destroyed the FIRST_RELEASE row for ~52% of
+# eligible groups. There is therefore no delete path here at all anymore
+# -- see the report-only loop in _run_data_quality_fix below. (A prior
+# revision of this comment described a `ctid`-vs-`id` bug in the now-
+# removed delete predicate; that history is preserved in git blame, not
+# repeated here since the predicate itself is gone.)
+
+
+def _hermes_retractions_table_exists(conn: Any) -> bool:
+    """True if resolved_series_retractions exists (PR #683's migration).
+
+    No longer used to guard a delete (there is none, see the module note
+    above) -- kept only so FIX_DATA_QUALITY's report-only logging can note
+    how many reported multi-vintage rows are also retracted, for operator
+    context. Runs its own SAVEPOINT so a failure here (e.g. insufficient
+    privilege) can never poison the caller's outer transaction; any
+    failure is treated as "table absent". Unqualified (relies on
+    search_path), matching how every other query in this function
+    addresses resolved_series itself -- a hardcoded "public." prefix would
+    silently miss the table on a non-default search_path (e.g. a test's
+    scratch schema).
+    """
+    from sqlalchemy import text as sa_text
+
+    try:
+        with conn.begin_nested():
+            return bool(
+                conn.execute(
+                    sa_text("SELECT to_regclass(:table_name) IS NOT NULL"),
+                    {"table_name": "resolved_series_retractions"},
+                ).scalar()
+            )
+    except Exception:
+        return False
+
+
+# Purely informational -- counts, never deletes. Used only to enrich the
+# report-only log line in _run_data_quality_fix below with how many of the
+# reported multi-vintage rows are also retracted (PR #683,
+# resolved_series_retractions). Qualified with the `rs`/`fr` aliases used in
+# q_dupes above so the join is unambiguous.
+_HERMES_MULTI_VINTAGE_RETRACTED_COUNT_SQL = (
+    "SELECT COUNT(*) FROM resolved_series rs "
+    "JOIN feature_registry fr ON fr.id = rs.feature_id "
+    "WHERE fr.name = :fname AND rs.obs_date = :odate "
+    "AND EXISTS ("
+    "  SELECT 1 FROM resolved_series_retractions rsr"
+    "  WHERE rsr.feature_id = rs.feature_id"
+    "    AND rsr.obs_date = rs.obs_date"
+    "    AND rsr.vintage_date = rs.vintage_date"
+    ")"
+)
+
+
 def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState) -> dict[str, Any]:
     from sqlalchemy import text as sa_text
 
     engine = _require_engine(engine, "FIX_DATA_QUALITY")
     dq_issues: list[dict[str, Any]] = []
-    fixes = 0
+    multi_vintage_groups = 0
     with engine.begin() as conn:
         # Check for NaN/null values in recent resolved_series.
         q_nulls = (
@@ -268,21 +469,39 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
         for r in outlier_rows:
             dq_issues.append({"type": "outlier", "feature": r[0], "value": float(r[1]), "date": str(r[2])})
 
-        # Auto-fix exact duplicates, keeping one row per feature/date.
-        for r in dupe_rows:
-            try:
-                conn.execute(sa_text(
-                    "DELETE FROM resolved_series WHERE ctid NOT IN ("
-                    "  SELECT MIN(ctid) FROM resolved_series rs "
-                    "  JOIN feature_registry fr ON fr.id = rs.feature_id "
-                    "  WHERE fr.name = :fname AND rs.obs_date = :odate "
-                    "  GROUP BY rs.feature_id, rs.obs_date"
-                    ") AND feature_id = (SELECT id FROM feature_registry WHERE name = :fname) "
-                    "AND obs_date = :odate"
-                ), {"fname": r[0], "odate": r[1]})
-                fixes += 1
-            except Exception as exc:
-                log.debug("Hermes: duplicate resolved_series delete failed for {f}: {e}", f=r[0], e=str(exc))
+        # Report multi-vintage groups. PR #688 review (2026-09-27): this
+        # used to DELETE dedup "losers" here -- see the module note above
+        # _hermes_retractions_table_exists for why that was PIT-destroying
+        # and is gone. Report-only now: log the group/row counts and, for
+        # operator context, how many of those rows are already retracted
+        # (PR #683's resolved_series_retractions) -- purely informational,
+        # nothing here is a guard because nothing is deleted.
+        multi_vintage_groups = len(dupe_rows)
+        if dupe_rows:
+            multi_vintage_rows = sum(max(int(r[2]) - 1, 0) for r in dupe_rows)
+            retracted_total = 0
+            if _hermes_retractions_table_exists(conn):
+                for r in dupe_rows:
+                    row_params = {"fname": r[0], "odate": r[1]}
+                    try:
+                        with conn.begin_nested():
+                            retracted_total += conn.execute(
+                                sa_text(_HERMES_MULTI_VINTAGE_RETRACTED_COUNT_SQL),
+                                row_params,
+                            ).scalar() or 0
+                    except Exception as exc:
+                        log.warning(
+                            "Hermes: could not count retracted vintages for "
+                            "{f} on {d}: {e}", f=r[0], d=r[1], e=str(exc),
+                        )
+            log.warning(
+                "Hermes FIX_DATA_QUALITY: {g} multi-vintage resolved_series "
+                "group(s) ({r} row(s) beyond the first vintage, {ret} "
+                "already retracted) in the last 7 days -- report-only, "
+                "nothing deleted (these are distinct vintages, not "
+                "duplicates; see PR #688)",
+                g=multi_vintage_groups, r=multi_vintage_rows, ret=retracted_total,
+            )
 
     severity = "WARNING" if len(dq_issues) < 5 else "ERROR" if len(dq_issues) < 20 else "CRITICAL"
     if dq_issues:
@@ -292,8 +511,8 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
             source=target or "all",
             title=f"Data quality: {len(dq_issues)} issues found",
             detail=str(dq_issues[:10]),
-            fix_applied="dedup" if fixes > 0 else None,
-            fix_result="SUCCESS" if fixes > 0 else None,
+            fix_applied=None,
+            fix_result=None,
             cycle_number=getattr(state, "cycle_count", None),
         )
 
@@ -301,7 +520,8 @@ def _run_data_quality_fix(engine: Any, target: str | None, state: OperatorState)
         "cmd": f"FIX_DATA_QUALITY:{target}" if target else "FIX_DATA_QUALITY",
         "status": "ok",
         "issues_found": len(dq_issues),
-        "duplicates_fixed": fixes,
+        "duplicates_fixed": 0,
+        "multi_vintage_groups_found": multi_vintage_groups,
     }
 
 
@@ -382,13 +602,18 @@ def _inspect_source(engine: Any, source_name: str) -> dict[str, Any]:
         failures = conn.execute(
             sa_text(
                 "SELECT COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON sc.id = rs.source_id "
-                "WHERE LOWER(sc.name) = LOWER(:source) "
-                "AND rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                "       MAX(last_fail) AS last_fail, "
+                "       MAX(CASE WHEN failure_rank = 1 THEN last_error END) AS last_error "
+                "FROM ("
+                " SELECT rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (ORDER BY rs.pull_timestamp DESC, "
+                "                           rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON sc.id = rs.source_id "
+                " WHERE LOWER(sc.name) = LOWER(:source) "
+                " AND rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed"
             ),
             {"source": source_name},
         ).fetchone()
@@ -816,8 +1041,15 @@ def _execute_hermes_repair_command(
     engine: Any,
     health: dict,
     state: OperatorState,
+    should_continue: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
-    """Execute one bounded Hermes repair command."""
+    """Execute one bounded Hermes repair command.
+
+    ``should_continue`` (added for fable-hermes-repair-bound, 2026-09-19)
+    is forwarded to REPULL's ``_retry_source`` call — see that function's
+    docstring. Every other command ignores it; only REPULL can trigger a
+    long-running puller loop.
+    """
     raw_cmd = cmd.strip()
     upper_cmd = raw_cmd.upper()
 
@@ -842,9 +1074,57 @@ def _execute_hermes_repair_command(
             raise ValueError("REPULL requires a source name")
         if state.cooldowns.can_retry(source):
             log.info("Hermes action: re-pulling {s}", s=source)
-            _retry_source(source, _require_engine(engine, raw_cmd), attempt=1)
+            pull_result = _retry_source(
+                source, _require_engine(engine, raw_cmd), attempt=1,
+                state=state, should_continue=should_continue,
+            )
+            if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                # Another worker (possibly an abandoned one from a prior
+                # timed-out cycle) is still pulling this source — do not
+                # start a second overlapping pull, and do not touch the
+                # cooldown; the in-flight attempt owns that outcome.
+                log.info(
+                    "REPULL:{s} skipped — repair already in flight (age {a}s)",
+                    s=source, a=pull_result.get("age_s"),
+                )
+                return {"cmd": raw_cmd, "status": "skipped", "reason": "in_flight"}
+            if pull_result.get("status") == "abandoned":
+                # _retry_source already determined nothing here is safe to
+                # publish (see its docstring, Check 2c) — do not record a
+                # cooldown outcome for a result that may be stale/superseded.
+                log.warning(
+                    "REPULL:{s} abandoned — not recording a cooldown outcome",
+                    s=source,
+                )
+                return {"cmd": raw_cmd, "status": "abandoned", "pull_result": pull_result}
+            if pull_result.get("stopped_by_budget"):
+                # Ran out of REPAIR_BUDGET_SECONDS before finishing — record
+                # it as a failed attempt so the cooldown engages (prevents
+                # the same source being retried again next cycle before the
+                # remainder has had a chance), and leave the backlog
+                # _retry_source already persisted for the next attempt.
+                state.cooldowns.record_attempt(source, success=False, error="budget")
+                return {
+                    "cmd": raw_cmd,
+                    "status": "partial",
+                    "stopped_by_budget": True,
+                    "pull_result": pull_result,
+                }
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source, success=True)
+                return {"cmd": raw_cmd, "status": "no_new_data", "pull_result": pull_result}
+            not_fresh = retry_not_fresh_reason(pull_result)
+            if not_fresh:
+                state.cooldowns.record_attempt(source, success=False, error=not_fresh)
+                log.warning("REPULL:{s} did not recover: {r}", s=source, r=not_fresh)
+                return {
+                    "cmd": raw_cmd,
+                    "status": "failed",
+                    "reason": not_fresh,
+                    "pull_result": pull_result,
+                }
             state.cooldowns.record_attempt(source, success=True)
-            return {"cmd": raw_cmd, "status": "ok"}
+            return {"cmd": raw_cmd, "status": "ok", "pull_result": pull_result}
         log.info("Hermes wants REPULL:{s} but source in cooldown", s=source)
         return {"cmd": raw_cmd, "status": "cooldown"}
 
@@ -1084,7 +1364,13 @@ _CATALOG_TO_REGISTRY: dict[str, str] = {
     "USDA_NASS": "fred",
     "nowcast": "fred",
     "world_bank": "fred",
-    "EIA": "fred",
+    # 2026-09-27 Wave 1 review: was "fred", which is wrong now that "eia"
+    # has its own class-based PULLER_REGISTRY entry (source_catalog's
+    # real row is named "EIA" -- confirmed read-only on grid-svr). Mapping
+    # a REPULL/retry for "EIA" to the FRED puller silently pulled the
+    # wrong source's data under EIA's name; "computed" below is a
+    # separate, pre-existing, unrelated mapping.
+    "EIA": "eia",
     "computed": "fred",
     "FRED": "fred",
     "BLS": "bls",
@@ -1114,6 +1400,24 @@ class _FunctionPuller:
         return self._fn(**call_kwargs)
 
 
+def _retry_target_matches(source_name: str, puller: Any) -> bool:
+    """Match the requested catalog to an existing explicit writer declaration.
+
+    Registry keys select routes; provider/class names and positive row counts
+    do not prove a different requested dataset. Options' existing short route
+    is the sole special case: its capture writer owns YFINANCE_OPTIONS.
+    This declaration check is not native commit or provider-asof evidence.
+    """
+    declared = getattr(puller, "SOURCE_NAME", None)
+    if not isinstance(declared, str) or not declared:
+        return False
+    # Catalog UPDATE compares LOWER(name), not normalized registry keys.
+    # Spaces/dashes/underscores may name distinct catalog rows.
+    requested = source_name.lower()
+    target = declared.lower()
+    return requested == target or (requested == "options" and target == "yfinance_options")
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -1129,24 +1433,16 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
 
     from scripts.hermes_operator import _SOURCE_REGISTRY
 
-    # 1. Direct registry match
+    # Preserve direct precedence and explicit aliases. A map entry only
+    # selects a candidate: its class must declare this exact catalog below.
+    # Fuzzy prefix guesses provide no target-specific routing authority.
     entry = _SOURCE_REGISTRY.get(source_lower)
-
-    # 2. Catalog name mapping
     if entry is None:
         mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
         if mapped:
             entry = _SOURCE_REGISTRY.get(mapped)
-
-    # 3. Fuzzy prefix match
     if entry is None:
-        for key, val in _SOURCE_REGISTRY.items():
-            if source_lower.startswith(key) or key.startswith(source_lower):
-                entry = val
-                break
-
-    if entry is None:
-        raise ValueError(f"No puller registered for source: {source_name}")
+        raise ValueError("No explicit dataset handler registered for requested source")
 
     # Honor registry-level skip flag — entries that are catalogued for the
     # wiring audit but not yet wrapped for the standard _resolve_puller calling
@@ -1156,17 +1452,15 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
             f"Source {source_name} registered but skipped at runtime: {entry['skip_runtime']}"
         )
 
+    # Function-only entries lack a declared catalog contract in this registry.
+    # Refuse before importing/invoking them; do not invent a target argument.
+    if "cls" not in entry:
+        raise ValueError("Retry handler has no explicit catalog identity contract")
+
     mod = importlib.import_module(entry["mod"])
-
-    if "fn" in entry and "cls" not in entry:
-        fn = getattr(mod, entry["fn"])
-        return (
-            _FunctionPuller(fn, engine),
-            "run",
-            dict(entry.get("pull_kwargs", {})),
-        )
-
     cls = getattr(mod, entry["cls"])
+    if not _retry_target_matches(source_name, cls):
+        raise ValueError("Retry handler catalog identity does not match requested source")
 
     # Build constructor kwargs
     ctor_kwargs: dict[str, Any] = {"db_engine": engine}
@@ -1181,45 +1475,457 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
     return puller, method, kwargs
 
 
-def _retry_source(source_name: str, engine: Any, attempt: int = 1) -> dict[str, Any]:
-    """Retry a single source pull with strategy variation per attempt.
+# Outcomes (ingestion.smart_scheduler._classify_outcome) for which a repair
+# pull must not advance source_catalog.last_pull_at nor count as recovered.
+_NOT_FRESH_OUTCOMES = frozenset({"SKIPPED", "FAILED", "PARTIAL", "NO_NEW_DATA"})
 
-    Attempt 1: standard pull (recent data only)
-    Attempt 2: pull with extended lookback
-    Attempt 3: full historical backfill for last 7 days
+
+def retry_not_fresh_reason(pull_result: dict[str, Any]) -> str | None:
+    """Why a completed ``_retry_source`` result is NOT a recovered pull, or None.
+
+    ``_retry_source`` returns normally for a run the puller itself reported
+    as skipped or failed (see its 2026-09-29 note). Callers that used to
+    treat "returned without raising" as success must check this first and
+    record a failed cooldown attempt instead of a recovery.
+    """
+    if not isinstance(pull_result, dict):
+        return None
+    outcome = pull_result.get("outcome")
+    if outcome not in _NOT_FRESH_OUTCOMES:
+        return None
+    note = pull_result.get("outcome_note") or pull_result.get("error")
+    return f"puller reported {outcome}" + (f": {note}" if note else "")
+
+
+def _scheduler_options_retry_guard(engine: Any) -> dict[str, Any] | None:
+    """Observe a completed scheduler capture before constructing a retry.
+
+    Only the explicit caller labels prove scheduler provenance. Legacy
+    options_puller/pre_append_only batches and GEM never qualify. A registered
+    batch proves one completed positive-row ticker capture, not whole-source
+    coverage or freshness. Empty/unavailable evidence leaves retry unchanged.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    observation_engine = None
+    try:
+        # Avoid waiting on the shared pool; the connection and read have their
+        # own bounds. No writer/catalog/provider is constructed by observation.
+        observation_engine = create_engine(
+            engine.url, poolclass=NullPool,
+            connect_args={"connect_timeout": 5, "options":
+                          engine.url.query.get("options", "") +
+                          " -c statement_timeout=5000 -c lock_timeout=1000 "
+                          "-c idle_in_transaction_session_timeout=5000"},
+        )
+        with observation_engine.connect() as conn:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            row = conn.execute(text("""
+                SELECT capture_batch_id, capture_source
+                FROM options_capture_batches
+                WHERE snap_date = :day
+                  AND capture_source IN ('daily_scheduler', 'smart_scheduler')
+                  AND row_count > 0 AND NOT backfilled
+                  AND capture_started_at >= :day_start
+                  AND capture_completed_at >= capture_started_at
+                  AND capture_completed_at <= :now
+                LIMIT 1
+            """), {"day": now.date(), "day_start": day_start, "now": now}).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": "SKIPPED", "outcome": "SKIPPED", "rows_inserted": 0,
+            "reason": "scheduler_options_batch_exists",
+            "observed_session": now.date().isoformat(),
+            "scheduler_capture_batch_id": row[0], "scheduler_capture_source": row[1],
+        }
+    except Exception as exc:
+        # An unavailable observation is unknown, not zero or proof of capture.
+        # Keep the prior retry path and never expose driver connection details.
+        log.warning("Options scheduler capture observation unavailable ({kind}); retry unchanged",
+                    kind=type(exc).__name__)
+        return None
+    finally:
+        if observation_engine is not None:
+            observation_engine.dispose()
+
+
+def _retry_source(
+    source_name: str,
+    engine: Any,
+    attempt: int = 1,
+    state: OperatorState | None = None,
+    should_continue: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """Retry a single source pull, bounded to a recent window and a budget.
+
+    Strategy per attempt — ALWAYS a bounded recent window, never full
+    history (see REPAIR_LOOKBACK_DAYS above for why):
+
+    Attempt 1: last REPAIR_LOOKBACK_DAYS (7) days.
+    Attempt 2: last 2*REPAIR_LOOKBACK_DAYS (14) days.
+    Attempt 3: last 3*REPAIR_LOOKBACK_DAYS (21) days.
+
+    Pullers keyed by `days_back` instead of `start_date` keep the
+    pre-existing widen-on-retry behaviour unchanged (days_back scaled by
+    (attempt + 1) from attempt 2 on) — they were never the source of the
+    full-history defect this bounds.
+
+    Cooperative budget + no-overlap guard:
+    - If a repair for this source is already in flight (a live thread
+      registered in _REPAIRS_IN_FLIGHT), this call does nothing and
+      returns {"status": "skipped", "reason": "in_flight", ...} instead of
+      starting a second, overlapping pull.
+    - Otherwise this call registers itself, and `should_continue` (if
+      given, e.g. a deadline check from run_self_diagnostics or
+      diagnose_and_fix_pulls) is combined with an "am I still the current
+      attempt for this source" check and forwarded to the puller as
+      `should_continue` IF AND ONLY IF the puller's pull method accepts
+      that keyword (currently YFinancePuller.pull_all/pull_ticker).
+      Pullers that don't accept it run exactly as before — one call,
+      uninterruptible for its duration.
+    - If the puller reports `stopped_by_budget`, the unattempted remainder
+      (if any) is persisted to `state.repair_backlog[source]` so the next
+      call resumes from there instead of the first ticker, and
+      `last_pull_at` is NOT advanced (the pull didn't actually finish).
+
+    Abandonment (review Check 2c, fable-hermes-repair-bound follow-up,
+    2026-09-19): determined explicitly at the point the pull call returns,
+    not trusted from the puller's own self-report. Two conditions:
+      - token superseded — this call's `_REPAIRS_IN_FLIGHT` entry is no
+        longer owned by its own token (see the no-overlap guard above).
+      - deadline passed AND the puller did NOT itself report
+        `stopped_by_budget` — i.e. the puller returned something that looks
+        like an ordinary completed result ("ok"), but by the time control
+        is back here the caller's `should_continue` budget had already
+        expired. This covers a puller whose should_continue check is too
+        coarse to catch a single slow provider call finishing after the
+        deadline on what happened to be its last scheduled ticker (see
+        pull_ticker's `timeout` handling in ingestion/yfinance_pull.py for
+        the complementary per-call bound).
+    (A puller that itself reports `stopped_by_budget=True` after checking
+    `should_continue` between tickers is NOT abandonment — that is the
+    ordinary cooperative stop already handled below: backlog persisted,
+    `last_pull_at` withheld, caller records a failed cooldown attempt.)
+    When abandoned, this call publishes NOTHING — no `last_pull_at` update,
+    no `state.repair_backlog`/`repair_last_check`/`repair_uncovered` write —
+    and returns `{"status": "abandoned", ...}` instead of the puller's
+    result, so a caller cannot mistake a stale/superseded result for a
+    fresh one even though the puller itself returned normally.
 
     Returns:
-        dict with pull result info.
+        dict with pull result info. Always has a "status" key. "status" is
+        "abandoned" when this call's result must not be published (see
+        above) — callers must not record a cooldown outcome or touch
+        source_catalog for that status.
     """
-    log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
+    source_key = source_name.lower()
 
-    puller, method, kwargs = _resolve_puller(source_name, engine)
+    with _REPAIRS_LOCK:
+        existing = _REPAIRS_IN_FLIGHT.get(source_key)
+        if existing is not None and _thread_is_alive(existing.get("thread")):
+            age_s = time.monotonic() - existing["started"]
+            log.warning(
+                "Repair for {s} already in flight (age {a:.0f}s) — skipping",
+                s=source_name, a=age_s,
+            )
+            return {
+                "status": "skipped",
+                "reason": "in_flight",
+                "age_s": round(age_s, 1),
+            }
+        token = _next_repair_token()
+        _REPAIRS_IN_FLIGHT[source_key] = {
+            "started": time.monotonic(),
+            "token": token,
+            "thread": threading.get_ident(),
+        }
 
-    # Vary strategy per attempt
-    if attempt >= 2:
-        # Extend lookback on retry — pull more historical data
-        if "days_back" in kwargs:
-            kwargs["days_back"] = kwargs["days_back"] * (attempt + 1)
-        elif hasattr(puller, "pull_all"):
-            # For pullers with start_date, go further back on retry
-            from datetime import timedelta
-            kwargs["start_date"] = (date.today() - timedelta(days=7 * attempt)).isoformat()
-
-    pull_fn = getattr(puller, method)
-    result = pull_fn(**kwargs)
-
-    # Update last_pull_at in source_catalog on success
     try:
-        from sqlalchemy import text
-        with engine.begin() as conn:
-            conn.execute(text(
-                "UPDATE source_catalog SET last_pull_at = NOW() "
-                "WHERE LOWER(name) = LOWER(:name)"
-            ), {"name": source_name})
-    except Exception:
-        pass  # Non-critical — pull succeeded even if catalog update fails
+        if source_key.replace(" ", "_").replace("-", "_") in {"options", "yfinance_options"}:
+            guarded = _scheduler_options_retry_guard(engine)
+            if guarded is not None:
+                # A skip does not clear repair backlog or publish freshness.
+                return guarded
+        log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
 
-    return result if isinstance(result, dict) else {"status": "ok"}
+        puller, method, kwargs = _resolve_puller(source_name, engine)
+        kwargs = dict(kwargs)
+        pull_fn = getattr(puller, method)
+        expected_catalog = getattr(puller, "SOURCE_NAME", None)
+
+        # Registry kwargs may be plain values OR zero-arg callables (e.g.
+        # FINRA's "anchor_date": _finra_short_volume_trade_date, which must
+        # be evaluated at call time, not once when PULLER_REGISTRY is built
+        # at import -- see smart_scheduler.SmartScheduler._run_puller's
+        # identical resolution). _resolve_puller/_build_source_registry
+        # copy PULLER_REGISTRY's "kwargs" through verbatim into
+        # "pull_kwargs", so a callable value reaching here unresolved would
+        # get passed to pull_fn AS a function object instead of the date
+        # string it computes -- resolve it the same way the scheduler does.
+        for key, val in list(kwargs.items()):
+            if key != "should_continue" and callable(val):
+                kwargs[key] = val()
+
+        try:
+            params = inspect.signature(pull_fn).parameters
+        except (TypeError, ValueError):
+            params = {}
+
+        # A. Bounded window — never full history. Never widened past
+        # 3 * REPAIR_LOOKBACK_DAYS: attempt is capped at MAX_PULL_RETRIES by
+        # every caller (diagnose_and_fix_pulls does attempt = min(attempt,
+        # MAX_PULL_RETRIES); the REPULL command handler always passes
+        # attempt=1).
+        window_days: int | None = None
+        if "start_date" in params:
+            from datetime import timedelta
+            window_days = REPAIR_LOOKBACK_DAYS * attempt
+            kwargs["start_date"] = (
+                date.today() - timedelta(days=window_days)
+            ).isoformat()
+        elif attempt >= 2 and "days_back" in kwargs:
+            # Unchanged pre-existing behaviour for days_back-style pullers.
+            kwargs["days_back"] = kwargs["days_back"] * (attempt + 1)
+
+        # Resume from a persisted backlog instead of restarting from the
+        # first ticker, when the puller accepts an explicit ticker_list.
+        backlog: list[str] | None = None
+        if state is not None:
+            backlog = state.repair_backlog.get(source_key) or None
+        if backlog and "ticker_list" in params:
+            kwargs["ticker_list"] = list(backlog)
+
+        # B. Cooperative budget, only for pullers that accept it.
+        if "should_continue" in params:
+            outer_should_continue = should_continue
+
+            def _combined_should_continue() -> bool:
+                if outer_should_continue is not None and not outer_should_continue():
+                    return False
+                current = _REPAIRS_IN_FLIGHT.get(source_key)
+                return current is not None and current.get("token") == token
+
+            kwargs["should_continue"] = _combined_should_continue
+
+        # Dynamic kwargs retain their call-time behavior, but cannot change
+        # which catalog the already-resolved writer is allowed to represent.
+        if (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        ):
+            raise ValueError("Retry handler catalog identity changed before dispatch")
+        raw_result = pull_fn(**kwargs)
+        # Fake-success fix (2026-09-29, follow-up to PR #727 review): a
+        # non-dict return used to become {"status": "ok"} unconditionally,
+        # and a dict's own SKIPPED/FAILED status was never read -- so a
+        # list whose every item was skipped (OptionsPuller outside an
+        # equity session) or failed, a {"status": "FAILED"} dict, or a
+        # lock-skipped {"status": "SKIPPED"} still advanced last_pull_at
+        # below and was recorded as a recovered pull by every caller.
+        # Classify with the SmartScheduler's own rules; see
+        # retry_not_fresh_reason() for what callers do with it.
+        from ingestion.smart_scheduler import _classify_outcome, _puller_owns_catalog
+
+        outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
+        result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        # Keep failures, unknown counts and no-new-data under the unchanged
+        # classifier. A positive result from a rebound writer is not recovery.
+        identity_changed = (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        )
+        if identity_changed:
+            outcome = "FAILED"
+            # A reported count from another target is not this target's count.
+            outcome_rows = None
+            result["status"] = "FAILED"
+            outcome_note = "Retry handler catalog identity changed during dispatch"
+        result.update(outcome=outcome, rows_inserted=outcome_rows)
+        not_fresh = outcome in _NOT_FRESH_OUTCOMES
+        if not_fresh:
+            # Every return carries a normalized outcome/count; nonfresh
+            # results also preserve the explanation for recovery callers.
+            result = {**result, "outcome": outcome}
+            if outcome_note:
+                result["outcome_note"] = outcome_note
+
+        stopped_by_budget = bool(result.get("stopped_by_budget"))
+
+        # Explicit abandonment determination — see this function's docstring.
+        with _REPAIRS_LOCK:
+            current_entry = _REPAIRS_IN_FLIGHT.get(source_key)
+            superseded = current_entry is None or current_entry.get("token") != token
+        deadline_passed = should_continue is not None and not should_continue()
+        abandoned = superseded or (deadline_passed and not stopped_by_budget)
+
+        if abandoned:
+            attempted_n = len(result.get("results") or [])
+            log.warning(
+                "repair worker for {s} abandoned after {n} tickers — exiting "
+                "without publishing state",
+                s=source_name, n=attempted_n,
+            )
+            return {
+                "status": "abandoned",
+                "reason": "superseded" if superseded else "deadline_passed",
+                "tickers_attempted": attempted_n,
+            }
+
+        if identity_changed:
+            # Unrelated output cannot clear this target's backlog or publish
+            # its check summary. The abandonment decision above still wins.
+            return result
+
+        # Per-ticker outcome summary — only present for pullers whose result
+        # carries the yfinance-shaped "results"/"counts" (Check 1a). Freshness
+        # semantics: this records that the source was CHECKED, with the
+        # per-ticker breakdown preserved (duplicate-only is a successful
+        # check, not evidence of currency) — never a claim that every
+        # symbol is current. See _retry_source's own module docstring block
+        # and ingestion/yfinance_pull.py::pull_all.
+        per_ticker_results = result.get("results")
+        counts = result.get("counts")
+        if (
+            state is not None
+            and window_days is not None
+            and isinstance(per_ticker_results, list)
+            and isinstance(counts, dict)
+        ):
+            total_checked = sum(
+                counts.get(k, 0)
+                for k in ("inserted", "duplicate_only", "no_data", "error", "unattempted")
+            )
+            summary_line = (
+                f"{source_name} repair: checked {total_checked} tickers "
+                f"(window {window_days}d): {outcome_rows} written rows, "
+                f"{counts.get('inserted', 0)} inserted tickers, "
+                f"{counts.get('duplicate_only', 0)} duplicate-only, "
+                f"{counts.get('no_data', 0)} no_data, {counts.get('error', 0)} error, "
+                f"{counts.get('unattempted', 0)} unattempted"
+            )
+            log.info(summary_line)
+            state.repair_last_check[source_key] = {
+                "source": source_name,
+                "window_days": window_days,
+                "attempt": attempt,
+                "checked_at": datetime.now(timezone.utc).isoformat(),
+                "counts": dict(counts),
+                "total_tickers": total_checked,
+                "summary": summary_line,
+            }
+
+            # Check 1b — repair needs older than the window stay visible.
+            failing_tickers = [
+                r.get("ticker") for r in per_ticker_results
+                if isinstance(r, dict) and r.get("outcome") in ("no_data", "error") and r.get("ticker")
+            ]
+            attempt_cap_reached = attempt >= MAX_PULL_RETRIES
+            if attempt_cap_reached or failing_tickers:
+                reason = "attempt_cap" if attempt_cap_reached else "per_ticker_failures"
+                state.repair_uncovered[source_key] = {
+                    "window_days": window_days,
+                    "reason": reason,
+                    "tickers": failing_tickers[:50],
+                    "recorded_at": datetime.now(timezone.utc).isoformat(),
+                }
+                log.warning(
+                    "{s} repair: {n} ticker(s) not covered by the {w}d repair "
+                    "window (reason={r}) — data older than the window is NOT "
+                    "covered by repair; a separately authorised backfill is "
+                    "required for full coverage",
+                    s=source_name, n=len(failing_tickers), w=window_days, r=reason,
+                )
+
+        if state is not None:
+            if stopped_by_budget:
+                remainder = result.get("tickers_not_attempted") or []
+                if remainder:
+                    state.repair_backlog[source_key] = list(remainder)
+            else:
+                state.repair_backlog.pop(source_key, None)
+
+        # Only complete positive-write runs advance source freshness.
+        # NO_NEW_DATA is a completed check; callers keep its cadence without
+        # reporting recovery, refreshing a stale source, or claiming filled gaps.
+        if not stopped_by_budget and outcome == "SUCCESS" and not _puller_owns_catalog(source_name, puller):
+            try:
+                from sqlalchemy import text
+                with engine.begin() as conn:
+                    conn.execute(text(
+                        "UPDATE source_catalog SET last_pull_at = NOW() "
+                        "WHERE LOWER(name) = LOWER(:name)"
+                    ), {"name": source_name})
+            except Exception:
+                pass  # Non-critical — pull succeeded even if catalog update fails
+
+        return result
+    finally:
+        with _REPAIRS_LOCK:
+            current = _REPAIRS_IN_FLIGHT.get(source_key)
+            if current is not None and current.get("token") == token:
+                del _REPAIRS_IN_FLIGHT[source_key]
+
+
+def _classify_pull_failure(error: str) -> str:
+    """Bounded deterministic evidence guard; provider labels cannot override DB errors."""
+    message = str(error or "")[:4096].lower()
+    payload = None
+    try:
+        payload = json.loads(message)
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            message = payload["error"].lower()
+    except (ValueError, TypeError):
+        pass
+
+    # Distinctive PostgreSQL/pool messages are sufficient by themselves.
+    # Generic transport phrases require DB-driver provenance to avoid
+    # relabelling an upstream HTTP connection failure as a local DB fault.
+    db_markers = (
+        "remaining connection slots are reserved", "too many clients already",
+        "sorry, too many clients", "queuepool limit", "undefinedcolumn",
+        "undefinedtable", "infailedsqltransaction",
+        "current transaction is aborted", "password authentication failed for user",
+    )
+    if any(marker in message for marker in db_markers):
+        return "database"
+    driver = any(marker in message for marker in (
+        "psycopg2.", "psycopg.", "sqlalchemy.exc.", "sqlalchemy.pool.",
+    ))
+    if driver and any(marker in message for marker in (
+        "connection refused", "server closed the connection unexpectedly",
+        "could not connect to server", "timeout", "operationalerror",
+        "programmingerror", "integrityerror", "databaseerror", "interfaceerror",
+        "statementerror", "pendingrollbackerror",
+    )):
+        return "database"
+    if isinstance(payload, dict):
+        state = str(payload.get("sqlstate") or payload.get("pgcode") or "").lower()
+        if re.fullmatch(r"08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02", state):
+            return "database"
+    if re.search(r"\b(?:sqlstate|pgcode)\s*[:=]\s*['\"]?(?:08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02)\b", message):
+        return "database"
+
+    if isinstance(payload, dict) and any(
+        str(payload.get(key)) in {"401", "403", "429"}
+        for key in ("http_status", "status_code", "status")
+    ):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:http|status(?:_code)?)\s*[:=]?\s*(?:401|403|429)\b", message):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:401|403|429)\s+(?:client error|unauthorized|forbidden|too many requests)\b", message):
+        return "provider_auth_or_quota"
+    if any(marker in message for marker in (
+        "invalid api key", "invalid api_key", "api key is invalid",
+        "api_key is invalid", "api key must be", "api_key must be",
+        "missing api key", "missing api_key", "quota exceeded",
+        "rate limit exceeded", "too many requests",
+    )):
+        return "provider_auth_or_quota"
+    return "unknown"
 
 
 def diagnose_and_fix_pulls(
@@ -1240,21 +1946,26 @@ def diagnose_and_fix_pulls(
     result: dict[str, Any] = {
         "retried": 0, "fixed": 0, "diagnosed": 0,
         "skipped_cooldown": 0, "skipped_no_handler": 0,
-        "skipped_key_check": 0, "escalated": 0,
+        "skipped_key_check": 0, "escalated": 0, "abandoned": 0,
     }
 
     # Find sources with recent failures + their error details
     with engine.connect() as conn:
         failed = conn.execute(
             text(
-                "SELECT sc.name, COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON rs.source_id = sc.id "
-                "WHERE rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours' "
-                "GROUP BY sc.name "
+                "SELECT name, fail_count, last_fail, last_error "
+                "FROM ("
+                " SELECT sc.name, COUNT(*) OVER (PARTITION BY sc.name) AS fail_count, "
+                "        rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (PARTITION BY sc.name "
+                "          ORDER BY rs.pull_timestamp DESC, "
+                "                   rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON rs.source_id = sc.id "
+                " WHERE rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed "
+                "WHERE failure_rank = 1 "
                 "ORDER BY fail_count DESC"
             )
         ).fetchall()
@@ -1292,7 +2003,26 @@ def diagnose_and_fix_pulls(
     diagnosis_text: str | None = None
     fix_actions: dict[str, str] = {}  # source → recommended action
 
-    if hermes_available:
+    # Guard known local DB and real provider access failures before the LLM.
+    # The original payload is inspected only within a bounded pure classifier;
+    # the existing truncated user-facing context remains unchanged.
+    failure_classes = {
+        _normalize_source_key(r[0]): _classify_pull_failure(r[3] or "")
+        for r in failed
+    }
+    guarded_actions = {
+        key: ("CHECK_DB" if kind == "database" else "CHECK_KEY")
+        for key, kind in failure_classes.items()
+        if kind == "database" or (
+            kind == "provider_auth_or_quota" and key in {"fred", "baltic_exchange"}
+        )
+    }
+    diagnosis_info = [
+        f for f in failed_info
+        if _normalize_source_key(f["source"]) not in guarded_actions
+    ]
+
+    if hermes_available and diagnosis_info:
         try:
             from llm.router import get_llm, Tier
             client = get_llm(Tier.REASON)
@@ -1308,7 +2038,7 @@ def diagnose_and_fix_pulls(
                     )},
                     {"role": "user", "content": (
                         "Failed sources with details:\n"
-                        + json.dumps(failed_info, default=str, indent=2)
+                        + json.dumps(diagnosis_info, default=str, indent=2)
                         + f"\nCurrent date: {date.today()}"
                     )},
                 ],
@@ -1317,23 +2047,61 @@ def diagnose_and_fix_pulls(
             if diagnosis_text:
                 log.info("Hermes diagnosis:\n{d}", d=diagnosis_text[:800])
                 result["diagnosis"] = diagnosis_text
-                result["diagnosed"] = len(failed_sources)
+                result["diagnosed"] = len(diagnosis_info)
                 fix_actions = _parse_pull_diagnosis_actions(diagnosis_text)
 
         except Exception as exc:
             log.warning("Hermes diagnosis failed: {e}", e=str(exc))
+
+    fix_actions.update(guarded_actions)
+    # CHECK_KEY is a request for credential attention, not a validation result.
+    # An unsupported LLM key diagnosis remains an unresolved source escalation.
+    for source_key, action in list(fix_actions.items()):
+        if (source_key in {"fred", "baltic_exchange"} and action == "CHECK_KEY"
+                and failure_classes.get(source_key) != "provider_auth_or_quota"):
+            fix_actions[source_key] = "ESCALATE"
 
     if dry_run:
         log.info("Dry run — not retrying pulls")
         result["fix_actions"] = fix_actions
         return result
 
-    # Retry each failed source with cooldown awareness and strategy variation
-    for source_name in failed_sources:
+    # Retry each failed source with cooldown awareness and strategy variation,
+    # under one shared cooperative budget for the whole call (see
+    # REPAIR_BUDGET_SECONDS / _retry_source's docstring).
+    deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
+    my_token = _next_diagnostics_token()
+
+    def should_continue() -> bool:
+        return not _diagnostics_abandoned(my_token, deadline)[0]
+
+    for idx, source_name in enumerate(failed_sources):
+        abandoned, reason = _diagnostics_abandoned(my_token, deadline)
+        if abandoned:
+            remaining = failed_sources[idx:]
+            log.warning(
+                "diagnostics actions: {n} remaining action(s) skipped — {r}",
+                n=len(remaining), r=reason,
+            )
+            result["skipped_actions"] = remaining
+            return result
+
         source_key = _normalize_source_key(source_name)
 
         # Check Hermes recommendation
         action = fix_actions.get(source_key, "RETRY")
+        if action == "CHECK_DB":
+            result["escalated"] += 1
+            log_issue(
+                engine, category="database", severity="CRITICAL",
+                source=source_name,
+                title=f"Database repair required — {source_name}",
+                detail="The latest persisted pull failure identifies a local database or pool error; no provider retry or key check was attempted.",
+                hermes_diagnosis="Deterministic database-error guard",
+                fix_result="SKIPPED",
+                cycle_number=state.cycle_count,
+            )
+            continue
         if action == "SKIP":
             log.info("Hermes says SKIP {s} — known outage", s=source_name)
             result["skipped_cooldown"] += 1
@@ -1385,7 +2153,40 @@ def diagnose_and_fix_pulls(
             if action == "BACKFILL":
                 attempt = MAX_PULL_RETRIES  # force extended lookback
 
-            _retry_source(source_name, engine, attempt=attempt)
+            pull_result = _retry_source(
+                source_name, engine, attempt=attempt,
+                state=state, should_continue=should_continue,
+            )
+            if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                log.info("Skipping {s} — repair already in flight", s=source_name)
+                result["skipped_cooldown"] += 1
+                continue
+            if pull_result.get("status") == "abandoned":
+                # See _retry_source's docstring (Check 2c) — a result marked
+                # abandoned must not be published: no cooldown outcome, no
+                # log_issue "recovered" entry.
+                log.warning(
+                    "Repair for {s} abandoned — not recording a cooldown outcome",
+                    s=source_name,
+                )
+                result["abandoned"] += 1
+                continue
+            if pull_result.get("stopped_by_budget"):
+                state.cooldowns.record_attempt(source_name, success=False, error="budget")
+                result["retried"] += 1
+                log.info("Repair for {s} stopped by budget; backlog persisted", s=source_name)
+                continue
+            if pull_result.get("outcome") == "NO_NEW_DATA":
+                state.cooldowns.record_attempt(source_name, success=True)
+                result["retried"] += 1
+                continue
+            not_fresh = retry_not_fresh_reason(pull_result)
+            if not_fresh:
+                state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
+                result["retried"] += 1
+                log.warning("Repair for {s} did not recover: {r}", s=source_name, r=not_fresh)
+                continue
+
             result["retried"] += 1
             result["fixed"] += 1
             state.cooldowns.record_attempt(source_name, success=True)
@@ -1544,7 +2345,22 @@ def fill_data_gaps(engine: Any, state: OperatorState, dry_run: bool = False) -> 
                     "Gap-filling {s} — {n} features, {d} days back",
                     s=source_name, n=len(info["features"]), d=info["days_back"],
                 )
-                _retry_source(source_name, engine, attempt=2)  # use extended strategy
+                pull_result = _retry_source(source_name, engine, attempt=2, state=state)  # use extended strategy
+                if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                    log.info("Skipping gap-fill for {s} — repair already in flight", s=source_name)
+                    continue
+                if pull_result.get("status") == "abandoned":
+                    # The owning attempt must decide the cooldown outcome.
+                    log.warning("Gap-fill for {s} abandoned — not recording a cooldown outcome", s=source_name)
+                    continue
+                if pull_result.get("outcome") == "NO_NEW_DATA":
+                    state.cooldowns.record_attempt(source_name, success=True)
+                    continue
+                not_fresh = retry_not_fresh_reason(pull_result)
+                if not_fresh:
+                    log.warning("Gap-fill for {s} did not fill: {r}", s=source_name, r=not_fresh)
+                    state.cooldowns.record_attempt(source_name, success=False, error=not_fresh)
+                    continue
                 result["gaps_filled"] += len(info["features"])
                 result["sources_repulled"].append(source_name)
                 state.cooldowns.record_attempt(source_name, success=True)
@@ -1574,11 +2390,38 @@ def run_self_diagnostics(
 
     Hermes outputs structured commands that get executed:
     - commands listed in HERMES_REPAIR_SKILLS
+
+    All repair commands executed here (chiefly REPULL) share one
+    REPAIR_BUDGET_SECONDS cooperative deadline, computed once at entry —
+    see REPAIR_BUDGET_SECONDS / _retry_source's docstring. The step itself
+    is additionally wrapped by the caller (scripts/hermes_operator.py's
+    _run_diagnostics_step) in _run_with_timeout(..., DIAGNOSTICS_TIMEOUT_
+    SECONDS), which must stay comfortably above this budget so the LLM
+    call plus this budget both fit inside the step's own timeout.
+
+    Action-loop abandonment (controller-directed, 2026-09-20 — see
+    docs/handoffs/2026-09-19/fable-hermes-repair-bound.md and
+    _diagnostics_abandoned's docstring above): _run_with_timeout hands
+    control back to the caller on a step timeout WITHOUT killing this
+    function's worker thread (see its own docstring). An abandoned worker
+    that is still between two ACTION: commands must not start the next
+    one — the deadline check alone only bounds a single REPULL once it has
+    started, and does not stop an abandoned worker from starting a later
+    action in the same parsed list, which is exactly what cycle 6300's
+    orphan did at 00:10:04Z/00:38:00Z (28+ minutes into the next cycle).
+    This function takes a diagnostics token at entry and checks
+    _diagnostics_abandoned() before every remaining action, not just the
+    deadline.
     """
     if not hermes_available:
         return {"skipped": "hermes_unavailable"}
 
     result: dict[str, Any] = {"actions_taken": []}
+    deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
+    my_token = _next_diagnostics_token()
+
+    def should_continue() -> bool:
+        return not _diagnostics_abandoned(my_token, deadline)[0]
 
     try:
         from llm.router import get_llm, Tier
@@ -1600,6 +2443,13 @@ def run_self_diagnostics(
             "raw_series_count": health["db"].get("raw_series_count", 0),
             "latest_pull": health["db"].get("latest_pull"),
             "sources_in_cooldown": state.cooldowns.skipped_sources(),
+            # Check 1b: surfaced so the LLM cannot mistake a "checked"
+            # source (last_pull_at advanced, repair_last_check populated)
+            # for one with complete coverage — anything listed here is
+            # still missing data older than its repair window and needs a
+            # separately authorised backfill, not another REPULL.
+            "repair_uncovered": state.repair_uncovered,
+            "repair_last_check": state.repair_last_check,
             "task_failures": _summarize_task_failures(state),
             "subagent_roles": _list_subagents()["subagents"],
             "recent_issues": [
@@ -1654,12 +2504,32 @@ def run_self_diagnostics(
         if dry_run:
             return result
 
-        # Parse and execute structured commands
-        for cmd in _parse_hermes_action_commands(response, limit=7):
-            if cmd.upper() == "NONE":
-                continue
+        # Parse and execute structured commands. Abandonment (deadline
+        # passed OR this call's diagnostics token superseded by a newer
+        # run_self_diagnostics/diagnose_and_fix_pulls start) is checked
+        # BEFORE each remaining action — see this function's docstring and
+        # _diagnostics_abandoned above. Once abandoned, every remaining
+        # action is skipped in one shot: no further ACTION: command is
+        # started, so no further state.*/cooldown/catalog write happens
+        # from this worker.
+        actions = [
+            cmd for cmd in _parse_hermes_action_commands(response, limit=7)
+            if cmd.upper() != "NONE"
+        ]
+        for idx, cmd in enumerate(actions):
+            abandoned, reason = _diagnostics_abandoned(my_token, deadline)
+            if abandoned:
+                remaining = actions[idx:]
+                log.warning(
+                    "diagnostics actions: {n} remaining action(s) skipped — {r}",
+                    n=len(remaining), r=reason,
+                )
+                result["skipped_actions"] = remaining
+                return result
             try:
-                action_result = _execute_hermes_repair_command(cmd, engine, health, state)
+                action_result = _execute_hermes_repair_command(
+                    cmd, engine, health, state, should_continue=should_continue,
+                )
                 if action_result.get("status") != "skipped":
                     result["actions_taken"].append(action_result)
             except Exception as exc:
@@ -1677,8 +2547,37 @@ def run_self_diagnostics(
 
 # ─── Autoresearch trigger ────────────────────────────────────────────
 
-def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[str, Any] | None:
-    """Run autoresearch if system is healthy and enough time has passed."""
+def maybe_run_autoresearch(
+    state: OperatorState,
+    dry_run: bool = False,
+    run_id: str | None = None,
+    generation: int | None = None,
+    is_current_generation: Any = None,
+) -> dict[str, Any] | None:
+    """Run autoresearch if system is healthy and enough time has passed.
+
+    Parameters:
+        run_id: Forwarded to run_autoresearch() for the research_run
+            snapshot trail / idempotent retry. Assigned by the caller
+            (scripts/hermes_operator.py), which also owns retrying with
+            the same run_id after a timeout.
+        generation: Operator-assigned generation id, forwarded to
+            run_autoresearch() for write fencing. None (the default)
+            disables fencing, matching a direct/standalone call.
+        is_current_generation: Callable(int) -> bool, forwarded to
+            run_autoresearch(). See scripts/hermes_operator.py's
+            ``_AutoresearchGenerationTracker``.
+    """
+    from config import settings
+
+    # Off-by-default research gate (2026-09-19): checked FIRST, before the
+    # 12h cooldown, dry_run, or anything else — a disabled flag must never
+    # advance state.last_autoresearch or create a research_run row, so
+    # this must return before either of those can happen below.
+    if not settings.AUTORESEARCH_ENABLED:
+        log.info("autoresearch disabled (AUTORESEARCH_ENABLED=false) — skipping")
+        return {"status": "skipped", "reason": "disabled"}
+
     now = datetime.now(timezone.utc)
 
     # Only run autoresearch every 12 hours
@@ -1693,9 +2592,19 @@ def maybe_run_autoresearch(state: OperatorState, dry_run: bool = False) -> dict[
     log.info("Running autoresearch cycle")
     try:
         from scripts.autoresearch import run_autoresearch
-        result = run_autoresearch(max_iterations=AUTORESEARCH_MAX_ITER)
+        result = run_autoresearch(
+            max_iterations=AUTORESEARCH_MAX_ITER,
+            run_id=run_id,
+            generation=generation,
+            is_current_generation=is_current_generation,
+        )
         state.last_autoresearch = now
         state.hypotheses_tested += result.get("iterations", 0)
+        if result.get("status") == "failed":
+            log.error(
+                "Autoresearch run failed in phase '{p}': {e}",
+                p=result.get("phase"), e=result.get("error"),
+            )
         return result
     except Exception as exc:
         log.warning("Autoresearch failed: {e}", e=str(exc))

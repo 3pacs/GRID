@@ -6,6 +6,8 @@ import sys
 from datetime import datetime, timedelta, timezone
 from types import ModuleType, SimpleNamespace
 
+from fastapi import Response
+
 
 try:
     import api.auth  # noqa: F401
@@ -54,8 +56,13 @@ def test_unscored_hypothesis_still_becomes_candidate():
     ))
 
     assert candidate["status"] == "unscored"
-    assert candidate["confidence"] == 0.35
-    assert candidate["alpha_score"] > 0
+    # A hypothesis row with no stored confidence has no confidence, not 0.35.
+    assert candidate["confidence"] is None
+    assert candidate["score_parts"]["confidence"] is None
+    assert candidate["score_parts"]["prior_weight"] is None
+    # Nothing measured backs this row, so it earns nothing — it is still a
+    # candidate, it just ranks last instead of borrowing a 0.35 prior.
+    assert candidate["alpha_score"] == 0.0
     assert candidate["source_modules"] == ["discovery", "hypotheses"]
 
 
@@ -965,7 +972,7 @@ def test_list_candidates_skips_queue_when_disabled(monkeypatch):
 
     monkeypatch.setattr(surfacer, "_queue_missing_data_requests", _fake_queue)
 
-    payload = surfacer.list_candidates(limit=5, queue_missing_data=False, engine=_Engine())
+    payload = surfacer.list_candidates(Response(), limit=5, queue_missing_data=False, engine=_Engine())
 
     assert queued_calls == []
     assert payload["meta"]["queue_missing_data_enabled"] is False
@@ -1007,7 +1014,7 @@ def test_list_candidates_queues_only_when_explicitly_enabled(monkeypatch):
 
     monkeypatch.setattr(surfacer, "_queue_missing_data_requests", _fake_queue)
 
-    payload = surfacer.list_candidates(limit=5, queue_missing_data=True, engine=_Engine())
+    payload = surfacer.list_candidates(Response(), limit=5, queue_missing_data=True, engine=_Engine())
 
     assert queued_calls == [1]
     assert payload["meta"]["queue_missing_data_enabled"] is True

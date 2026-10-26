@@ -674,28 +674,42 @@ class GDELTPuller(BasePuller):
                 )
                 feature = query_def["feature"]
 
-                # Parse timeline data
+                # Parse timeline data. The DOC API always wraps points one
+                # level deeper than they look: ``timeline`` is a list of
+                # per-series objects (``{"series": "...", "data": [...]}``),
+                # not a flat list of ``{"date": ..., "value": ...}`` points.
+                # This loop used to iterate the outer series objects
+                # directly, so ``point.get("date")`` always missed (the
+                # outer dict has no "date" key) and every point was
+                # silently skipped — 0 rows inserted on every run since
+                # this puller was written, even when the API returned real
+                # data. ``_pull_actor_tones``/``_pull_tension_scores`` below
+                # already unwrap ``data`` correctly; mirror that here.
                 timeline = data.get("timeline", [])
                 with self.engine.begin() as conn:
-                    for point in timeline:
-                        try:
-                            dt_str = point.get("date", "")
-                            value = point.get("value", point.get("tone", 0))
-                            if not dt_str or value is None:
+                    for series_data in timeline:
+                        points = series_data.get("data", [series_data])
+                        if not isinstance(points, list):
+                            points = [points]
+                        for point in points:
+                            try:
+                                dt_str = point.get("date", "")
+                                value = point.get("value", point.get("tone", 0))
+                                if not dt_str or value is None:
+                                    continue
+                                obs_dt = pd.Timestamp(dt_str).date()
+                                if not self._row_exists(feature, obs_dt, conn):
+                                    conn.execute(
+                                        text(
+                                            "INSERT INTO raw_series "
+                                            "(series_id, source_id, obs_date, value, pull_status) "
+                                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                                        ),
+                                        {"sid": feature, "src": self.source_id, "od": obs_dt, "val": float(value)},
+                                    )
+                                    inserted += 1
+                            except (ValueError, TypeError):
                                 continue
-                            obs_dt = pd.Timestamp(dt_str).date()
-                            if not self._row_exists(feature, obs_dt, conn):
-                                conn.execute(
-                                    text(
-                                        "INSERT INTO raw_series "
-                                        "(series_id, source_id, obs_date, value, pull_status) "
-                                        "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                    ),
-                                    {"sid": feature, "src": self.source_id, "od": obs_dt, "val": float(value)},
-                                )
-                                inserted += 1
-                        except (ValueError, TypeError):
-                            continue
 
             except Exception as exc:
                 log.warning(

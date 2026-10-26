@@ -1,7 +1,19 @@
-import React, { useState, useMemo } from 'react';
+import React, { useEffect, useRef, useState, useMemo } from 'react';
 import { api } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { formatRelative, formatFullDateTime } from '../utils/formatTime.js';
+
+// Deep dives, audio briefings, etc. only ever run when a human clicks a
+// button (see GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md — there is no
+// schedule behind any of them). Label every timestamp as "generated on
+// request" so this archive never implies a live/scheduled feed.
+function onRequestLabel(generatedAt, extra) {
+    if (!generatedAt) return extra ? `generated on request — ${extra}` : 'generated on request';
+    const when = formatFullDateTime(new Date(generatedAt));
+    const rel = formatRelative(new Date(generatedAt));
+    const base = `generated on request ${when} (${rel})`;
+    return extra ? `${base} — ${extra}` : base;
+}
 import { useAsyncData } from '../hooks/useAsyncData.js';
 import LoadingSkeleton from '../components/LoadingSkeleton.jsx';
 import ErrorState from '../components/ErrorState.jsx';
@@ -77,12 +89,12 @@ function ExpandableCard({ title, subtitle, badges, children, defaultOpen = false
 }
 
 function DeepDiveList({ dives }) {
-    if (!dives?.length) return <Empty msg="No deep dives yet. They auto-generate with each thesis." />;
+    if (!dives?.length) return <Empty msg="No deep dives yet. Generated on request only — click 'Run Deep Dive' above." />;
     return dives.map(d => (
         <ExpandableCard
             key={d.id}
             title={`Deep Dive #${d.id} — ${d.thesis_direction || 'N/A'}`}
-            subtitle={`${formatRelative(new Date(d.generated_at))} via ${d.model_used} (${d.provider_used})`}
+            subtitle={onRequestLabel(d.generated_at, `${d.model_used} (${d.provider_used})`)}
             badges={<>
                 <Badge text={d.thesis_direction || '?'} color={DIR_COLOR[d.thesis_direction]} />
                 <Badge text={`${d.duration_ms}ms`} color={colors.textMuted} />
@@ -147,16 +159,42 @@ function AudioList({ briefings, onPlay }) {
                     {b.has_script && <span style={{ marginLeft: '8px', color: colors.green }}>transcript saved</span>}
                 </div>
             </div>
-            <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}>
+            <div style={{ fontFamily: MONO, fontSize: '10px', color: colors.textDim }}
+                title={onRequestLabel(b.generated_at, b.provider)}>
                 {formatRelative(new Date(b.generated_at))}
             </div>
         </div>
     ));
 }
 
-function PostmortemList({ postmortems }) {
-    if (!postmortems?.length) return <Empty msg="No post-mortems yet. They auto-generate when theses are scored wrong." />;
-    return postmortems.map((pm, i) => (
+function ThesisScoringHeldBanner({ asOf }) {
+    // Item #16 (Wave 3 triage report): thesis scoring/postmortems are held
+    // at the code level (look-ahead bug in score_old_theses) — never let
+    // this render as a live, ongoing feed.
+    return (
+        <div style={{
+            marginBottom: '10px', padding: '8px 12px', borderRadius: '6px',
+            background: colors.card, border: `1px solid ${colors.yellow}40`,
+            fontFamily: MONO, fontSize: '10px', color: colors.yellow,
+        }}>
+            SCORING HELD (look-ahead bug) — frozen historical record, not a live feed.
+            {asOf ? ` Most recent: ${asOf}.` : ' No scored data on record.'}
+        </div>
+    );
+}
+
+function PostmortemList({ postmortems, asOf }) {
+    if (!postmortems?.length) {
+        return (
+            <>
+                <ThesisScoringHeldBanner asOf={asOf} />
+                <Empty msg="No post-mortems yet. They auto-generate when theses are scored wrong." />
+            </>
+        );
+    }
+    return [
+        <ThesisScoringHeldBanner key="__banner" asOf={asOf} />,
+        ...postmortems.map((pm, i) => (
         <ExpandableCard
             key={i}
             title={`${pm.thesis_direction || '?'} thesis was ${pm.actual_direction || '?'}`}
@@ -192,7 +230,8 @@ function PostmortemList({ postmortems }) {
                 )}
             </div>
         </ExpandableCard>
-    ));
+        )),
+    ];
 }
 
 function DiaryList({ entries }) {
@@ -218,9 +257,17 @@ function DiaryList({ entries }) {
 }
 
 function ThesisList({ snapshots }) {
-    if (!snapshots?.length) return <Empty msg="No thesis snapshots yet." />;
+    // The Outcome/SPY Move columns below come from the same held scorer as
+    // the postmortems (item #16) — snapshots themselves keep being written,
+    // but nothing has scored a new outcome since the look-ahead bug was
+    // found, so "Outcome"/"SPY Move" on any recent row is frozen, not live.
+    const banner = <ThesisScoringHeldBanner asOf={null} />;
+    if (!snapshots?.length) {
+        return (<><div>{banner}</div><Empty msg="No thesis snapshots yet." /></>);
+    }
     return (
         <div style={{ overflowX: 'auto' }}>
+            {banner}
             <table style={{ width: '100%', borderCollapse: 'collapse', fontFamily: MONO, fontSize: '11px' }}>
                 <thead>
                     <tr style={{ borderBottom: `1px solid ${colors.border}` }}>
@@ -296,6 +343,8 @@ export default function Archive() {
     const [activeTab, setActiveTab] = useState('deep_dives');
     const [generating, setGenerating] = useState(false);
     const [playerUrl, setPlayerUrl] = useState(null);
+    const [playerError, setPlayerError] = useState(null);
+    const playerUrlRef = useRef(null);
     const [days, setDays] = useState(90);
 
     const { data: archive, loading, error, refetch: loadArchive } = useAsyncData(async () => {
@@ -312,8 +361,26 @@ export default function Archive() {
         setGenerating(false);
     };
 
-    const playAudio = (filename) => {
-        setPlayerUrl(api.getFlowBriefingAudioUrl(filename));
+    // <audio src> cannot send headers, so the MP3 is fetched with the
+    // Authorization header and played from an object URL; the session token
+    // never goes in a URL.
+    const setPlayer = (url) => {
+        if (playerUrlRef.current) URL.revokeObjectURL?.(playerUrlRef.current);
+        playerUrlRef.current = url;
+        setPlayerUrl(url);
+    };
+    useEffect(() => () => {
+        if (playerUrlRef.current) URL.revokeObjectURL?.(playerUrlRef.current);
+    }, []);
+
+    const playAudio = async (filename) => {
+        setPlayerError(null);
+        const url = await api.loadFlowBriefingAudio(filename);
+        if (!url) {
+            setPlayerError('Could not load that briefing audio.');
+            return;
+        }
+        setPlayer(url);
     };
 
     const counts = useMemo(() => ({
@@ -357,6 +424,12 @@ export default function Archive() {
                 </div>
             </div>
 
+            {playerError && (
+                <div role="status" aria-live="polite" style={{
+                    fontFamily: MONO, fontSize: '11px', color: colors.red, marginBottom: '12px',
+                }}>{playerError}</div>
+            )}
+
             {/* Audio Player (sticky) */}
             {playerUrl && (
                 <div style={{
@@ -368,7 +441,7 @@ export default function Archive() {
                         letterSpacing: '1px', flexShrink: 0 }}>NOW PLAYING</span>
                     <audio src={playerUrl} controls autoPlay
                         style={{ flex: 1, height: '32px', filter: 'invert(1) hue-rotate(180deg)', opacity: 0.7 }} />
-                    <button onClick={() => setPlayerUrl(null)} style={{
+                    <button onClick={() => setPlayer(null)} style={{
                         fontFamily: MONO, fontSize: '12px', background: 'transparent',
                         border: 'none', color: colors.textDim, cursor: 'pointer',
                     }}>{'\u2715'}</button>
@@ -408,7 +481,7 @@ export default function Archive() {
                 <div>
                     {activeTab === 'deep_dives' && <DeepDiveList dives={archive?.deep_dives} />}
                     {activeTab === 'audio' && <AudioList briefings={archive?.audio_briefings} onPlay={playAudio} />}
-                    {activeTab === 'postmortems' && <PostmortemList postmortems={archive?.postmortems} />}
+                    {activeTab === 'postmortems' && <PostmortemList postmortems={archive?.postmortems} asOf={archive?.postmortem_as_of} />}
                     {activeTab === 'diary' && <DiaryList entries={archive?.diary_entries} />}
                     {activeTab === 'theses' && <ThesisList snapshots={archive?.thesis_snapshots} />}
                 </div>

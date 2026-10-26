@@ -1,0 +1,23 @@
+These fixtures are CONSTRUCTED for tests -- they are NOT real FINRA data.
+
+They follow the field layout documented in "Regulation SHO Daily Short
+Sale Volume File Layout" (FINRA, current post-2011-02-28 layout):
+
+    Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market
+
+  https://www.finra.org/sites/default/files/2021-07/DailyShortSaleVolumeFileLayout.pdf
+  https://www.finra.org/finra-data/browse-catalog/short-sale-volume
+
+Files:
+  good.txt              -- well-formed file, 8 data rows across 3 symbols
+                            and 5 markets (N/Q/B/D/O), trailer count matches.
+  empty.txt              -- documented empty-day case: header + trailer("0"),
+                            no data rows.
+  malformed.txt          -- mix of one well-formed row, one row with a
+                            wrong field count, and one row with a
+                            non-numeric ShortVolume.
+  revised_same_date.txt  -- same (date, symbol, market) key as one row in
+                            good.txt but a different ShortVolume, used to
+                            exercise idempotent-write behavior (the second
+                            pull for an already-stored date must not
+                            duplicate or silently overwrite).

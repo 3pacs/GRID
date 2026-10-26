@@ -1,14 +1,143 @@
-"""Tests for the market diary module."""
+"""Tests for the market diary module.
+
+Wave 3 §4.1 fixes covered here (see GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md):
+  * missing / stale close -> None, never a fabricated 0 or a stale value
+    (test_gather_market_moves_* below);
+  * no pre-open thesis snapshot -> verdict None, not a fabricated one
+    (test_gather_thesis_accuracy_*);
+  * _gather_thesis_accuracy must never call
+    analysis.flow_thesis_scoring.generate_unified_thesis() at write time
+    (test_gather_thesis_accuracy_never_calls_generate_unified_thesis,
+    test_market_diary_module_never_imports_generate_unified_thesis).
+"""
 
 from __future__ import annotations
 
-from datetime import date
+import json
+import sqlite3
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import MagicMock
 
+import pytest
+from sqlalchemy import (
+    Boolean,
+    Column,
+    Date,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    create_engine,
+)
+
+sqlite3.register_adapter(date, lambda d: d.isoformat())
+sqlite3.register_adapter(datetime, lambda d: d.isoformat(sep=" "))
+
+YF_SOURCE_ID = 1
+
+
+@pytest.fixture()
+def diary_engine(monkeypatch):
+    """A sqlite engine with the tables market_diary.py's readers touch.
+
+    Includes raw_payload required by the selected daily-policy reader.
+    Raw timestamps use offset-bearing ISO text: SQLite DateTime would strip
+    timezone offsets and turn a qualified-capture fixture into naive UNKNOWN.
+    This is an in-memory query fixture, not PostgreSQL qualification.
+    """
+    # Collection of other SQLite test modules must not change this fixture's
+    # offset-preserving comparison format for datetime parameters.
+    monkeypatch.setitem(
+        sqlite3.adapters, (datetime, sqlite3.PrepareProtocol),
+        lambda d: d.isoformat(sep=" "),
+    )
+    engine = create_engine("sqlite://")
+    md = MetaData()
+    Table(
+        "source_catalog", md,
+        Column("id", Integer, primary_key=True),
+        Column("name", String, nullable=False),
+    )
+    Table(
+        "raw_series", md,
+        Column("series_id", String, nullable=False),
+        Column("source_id", Integer, ForeignKey("source_catalog.id"), nullable=False),
+        Column("obs_date", Date, nullable=False),
+        Column("pull_timestamp", Text, nullable=False),
+        Column("value", Float, nullable=False),
+        Column("raw_payload", Text),
+        Column("pull_status", String, nullable=False),
+    )
+    Table(
+        "thesis_snapshots", md,
+        Column("id", Integer, primary_key=True),
+        Column("timestamp", DateTime, nullable=False),
+        Column("overall_direction", String, nullable=False),
+        Column("conviction", Float),
+    )
+    Table(
+        "cross_reference_checks", md,
+        Column("id", Integer, primary_key=True),
+        Column("name", String),
+        Column("category", String),
+        Column("assessment", String),
+        Column("implication", Text),
+        Column("checked_at", DateTime, nullable=False),
+    )
+    Table(
+        "market_diary", md,
+        Column("id", Integer, primary_key=True),
+        Column("date", Date, nullable=False, unique=True),
+        Column("content", Text, nullable=False),
+        Column("market_moves", Text),
+        Column("active_actors", Text),
+        Column("thesis_accuracy", Text),
+        Column("narrative_model", Text),
+        Column("narrative_fallback", Boolean, nullable=False, server_default="0"),
+        Column("generated_at", DateTime, nullable=False),
+    )
+    md.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(
+            md.tables["source_catalog"].insert(),
+            {"id": YF_SOURCE_ID, "name": "yfinance"},
+        )
+    yield engine
+    engine.dispose()
+
+
+def _price_row(series_id, d, value, ts_offset_h=0, source_id=YF_SOURCE_ID):
+    from price_close_contract import daily_capture_payload
+
+    # Two-day anchor keeps the supported -24h fixture offset post-period.
+    captured_at = datetime(d.year, d.month, d.day, 6, tzinfo=timezone.utc) + timedelta(
+        days=2, hours=ts_offset_h,
+    )
+    _, ticker, field = series_id.split(":")
+    marker = daily_capture_payload(ticker, field, d, captured_at)
+    return {
+        "series_id": series_id, "source_id": source_id, "obs_date": d,
+        "pull_timestamp": captured_at.isoformat(sep=" "),
+        "value": value, "pull_status": "SUCCESS", "raw_payload": json.dumps(marker),
+    }
+
+
+def _insert_prices(engine, rows):
+    from sqlalchemy import MetaData as _MD
+
+    md = _MD()
+    md.reflect(engine, only=["raw_series"])
+    with engine.begin() as conn:
+        for r in rows:
+            conn.execute(md.tables["raw_series"].insert(), r)
 
 
 def test_ensure_table():
-    """ensure_table executes CREATE TABLE without error."""
+    """ensure_table creates the table and adds the narrative_* columns."""
     from intelligence.market_diary import ensure_table
 
     mock_engine = MagicMock()
@@ -17,7 +146,8 @@ def test_ensure_table():
     mock_engine.begin.return_value.__exit__ = MagicMock(return_value=False)
 
     ensure_table(mock_engine)
-    mock_conn.execute.assert_called_once()
+    # 1 CREATE TABLE + 2 ADD COLUMN IF NOT EXISTS (narrative_model, narrative_fallback)
+    assert mock_conn.execute.call_count == 3
 
 
 def test_gather_market_moves_empty_db():
@@ -114,6 +244,8 @@ def test_list_diary_entries_empty():
     mock_rows.fetchall.return_value = []
     mock_conn.execute.side_effect = [
         mock_conn.execute.return_value,  # CREATE TABLE
+        mock_conn.execute.return_value,  # ADD COLUMN narrative_model
+        mock_conn.execute.return_value,  # ADD COLUMN narrative_fallback
         mock_total,  # COUNT
         mock_rows,   # SELECT
     ]
@@ -138,6 +270,8 @@ def test_search_diary_empty():
     mock_rows.fetchall.return_value = []
     mock_conn.execute.side_effect = [
         mock_conn.execute.return_value,  # CREATE TABLE
+        mock_conn.execute.return_value,  # ADD COLUMN narrative_model
+        mock_conn.execute.return_value,  # ADD COLUMN narrative_fallback
         mock_rows,  # ILIKE query
     ]
     mock_engine.connect.return_value.__enter__ = MagicMock(return_value=mock_conn)
@@ -145,3 +279,394 @@ def test_search_diary_empty():
 
     results = search_diary(mock_engine, "nonexistent")
     assert isinstance(results, list)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wave 3 §4.1 fix #2: price freshness (missing / stale close -> None)
+# ──────────────────────────────────────────────────────────────────────
+
+def test_gather_market_moves_disabled_by_default(diary_engine):
+    """PRICES_ENABLED defaults False; moves carries no fabricated prices."""
+    from intelligence import market_diary
+
+    assert market_diary.PRICES_ENABLED is False  # the shipped default
+
+    result = market_diary._gather_market_moves(diary_engine, date(2026, 9, 26))
+    assert result["prices_enabled"] is False
+    assert result["indices"] == {}
+    assert "disabled_reason" in result
+
+
+def test_gather_market_moves_missing_close_is_null_not_zero(diary_engine, monkeypatch):
+    """Only one observation date exists (no prior close) -> null, not chg_pct=0."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    # Only today's row for ^GSPC -- no prior close to diff against.
+    _insert_prices(diary_engine, [_price_row("YF:^GSPC:close", target, 5000.0)])
+
+    result = market_diary._gather_market_moves(diary_engine, target)
+    entry = result["indices"]["S&P 500"]
+    assert entry.get("change_pct") is None
+    assert entry.get("close") is None
+    assert entry.get("status") == "no close for date"
+
+
+def test_gather_market_moves_stale_close_is_null(diary_engine, monkeypatch):
+    """Newest accepted obs_date is before target_date -> refused, not reported as today's move."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    stale_date = date(2026, 9, 24)  # e.g. a holiday gap; today hasn't pulled yet
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", stale_date, 5000.0, ts_offset_h=0),
+        _price_row("YF:^GSPC:close", stale_date - timedelta(days=1), 4950.0, ts_offset_h=-24),
+    ])
+
+    result = market_diary._gather_market_moves(diary_engine, target)
+    entry = result["indices"]["S&P 500"]
+    assert entry == {"status": "no close for date"}
+
+
+def test_fresh_pair_bounds_the_price_read(diary_engine, monkeypatch):
+    """The (today, prior) read is bounded to _PRICE_LOOKBACK_DAYS, not every vintage since 1990."""
+    from intelligence import market_diary
+
+    seen = {}
+    real = market_diary.read_daily_policy_n
+
+    def spy(conn, series_id, n, **kw):
+        seen.update(kw)
+        return real(conn, series_id, n, **kw)
+
+    monkeypatch.setattr(market_diary, "read_daily_policy_n", spy)
+    target = date(2026, 9, 25)
+    with diary_engine.connect() as conn:
+        market_diary._fresh_pair(conn, "YF:^GSPC:close", target)
+    assert seen["start"] == target - timedelta(days=market_diary._PRICE_LOOKBACK_DAYS)
+    assert seen["as_of"] == target and seen["source"] == market_diary._PRICE_SOURCE
+    assert isinstance(seen["as_of_ts"], datetime) and seen["as_of_ts"].utcoffset() is not None
+
+
+def test_gather_market_moves_prior_across_holiday_weekend_still_found(diary_engine, monkeypatch):
+    """A prior close 4 days back (holiday weekend) is inside the lookback."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 8)  # Tuesday after Labor Day
+    prior = date(2026, 9, 4)   # Friday
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5100.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", prior, 5000.0, ts_offset_h=0),
+    ])
+
+    entry = market_diary._gather_market_moves(diary_engine, target)["indices"]["S&P 500"]
+    assert entry["close"] == 5100.0
+    assert entry["change_pct"] == pytest.approx(2.0)
+
+
+def test_gather_market_moves_prior_outside_lookback_is_null(diary_engine, monkeypatch):
+    """A prior close older than the lookback is refused, not diffed against today."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5100.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", target - timedelta(days=30), 5000.0, ts_offset_h=0),
+    ])
+
+    entry = market_diary._gather_market_moves(diary_engine, target)["indices"]["S&P 500"]
+    assert entry == {"status": "no close for date"}
+
+
+def test_gather_market_moves_zero_prior_close_is_null_not_zero(diary_engine, monkeypatch):
+    """A prior close of 0 must render change_pct=None, never a fabricated 0."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5000.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", prior, 0.0, ts_offset_h=0),
+    ])
+
+    result = market_diary._gather_market_moves(diary_engine, target)
+    entry = result["indices"]["S&P 500"]
+    assert entry["close"] == 5000.0
+    assert entry["change_pct"] is None
+
+
+def test_gather_market_moves_fresh_close_records_provenance(diary_engine, monkeypatch):
+    """A fresh (obs_date == target_date) pair records obs_date/price_basis/source."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    _insert_prices(diary_engine, [
+        _price_row("YF:^GSPC:close", target, 5100.0, ts_offset_h=24),
+        _price_row("YF:^GSPC:close", prior, 5000.0, ts_offset_h=0),
+    ])
+
+    result = market_diary._gather_market_moves(diary_engine, target)
+    entry = result["indices"]["S&P 500"]
+    assert entry["obs_date"] == target.isoformat()
+    assert entry["price_basis"] == "raw_close"
+    assert entry["source"] == "yfinance"
+    assert entry["change_pct"] == pytest.approx(2.0, abs=0.01)
+
+
+@pytest.mark.parametrize("capture_case", ["missing", "null", "json_null", "malformed", "naive", "UNKNOWN", "INCOMPLETE"])
+def test_gather_market_moves_unqualified_current_close_is_withheld(diary_engine, monkeypatch, capture_case):
+    from intelligence import market_diary
+    from store.observations import read_latest_n
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    rows = [
+        _price_row("YF:^GSPC:close", target - timedelta(days=1), 5000.0),
+        _price_row("YF:^GSPC:close", target, 5100.0),
+    ]
+    current = rows[-1]
+    if capture_case == "missing":
+        current["raw_payload"] = "{}"
+    elif capture_case == "null":
+        current["raw_payload"] = None
+    elif capture_case == "json_null":
+        current["raw_payload"] = "null"
+    elif capture_case == "malformed":
+        current["raw_payload"] = "{not-json"
+    elif capture_case == "naive":
+        current["pull_timestamp"] = datetime.fromisoformat(current["pull_timestamp"]).replace(tzinfo=None).isoformat(sep=" ")
+    else:
+        payload = json.loads(current["raw_payload"])
+        payload["capture_state"] = capture_case
+        current["raw_payload"] = json.dumps(payload)
+    _insert_prices(diary_engine, rows)
+    entry = market_diary._gather_market_moves(diary_engine, target)["indices"]["S&P 500"]
+    assert entry == {"status": "no close for date"}
+    with diary_engine.connect() as conn:
+        raw = read_latest_n(conn, "YF:^GSPC:close", 2, source="yfinance", as_of=target)
+    assert [o.value for o in raw] == [5100.0, 5000.0]
+
+
+def test_policy_reader_sqlite_preserves_offsets_and_exact_pit_cutoff(diary_engine):
+    from store.observations import read_daily_policy_n
+
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    rows = [_price_row("YF:^GSPC:close", prior, 5000.0), _price_row("YF:^GSPC:close", target, 5100.0)]
+    _insert_prices(diary_engine, rows)
+    cutoff = datetime.fromisoformat(rows[-1]["pull_timestamp"])
+    with diary_engine.connect() as conn:
+        before = read_daily_policy_n(conn, "YF:^GSPC:close", 2, start=prior, as_of=target, as_of_ts=cutoff - timedelta(microseconds=1))
+        equal = read_daily_policy_n(conn, "YF:^GSPC:close", 2, start=prior, as_of=target, as_of_ts=cutoff)
+    assert [o.obs_date for o in before] == [prior]
+    assert [o.obs_date for o in equal] == [target, prior]
+    assert equal[0].pull_timestamp == cutoff and equal[0].pull_timestamp.utcoffset() is not None
+
+
+def test_fresh_pair_returns_vix_pair_from_two_qualified_rows(diary_engine):
+    """^VIX qualifies under the Cboe NY-label-day policy (2026-10-19 owner decision)."""
+    from intelligence import market_diary
+
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    rows = [_price_row("YF:^VIX:close", prior, 16.0), _price_row("YF:^VIX:close", target, 17.0, ts_offset_h=24)]
+    assert all(json.loads(r["raw_payload"])["session_convention"] == "cboe_vol_index_ny_label_day_2026" for r in rows)
+    _insert_prices(diary_engine, rows)
+    with diary_engine.connect() as conn:
+        pair = market_diary._fresh_pair(conn, "YF:^VIX:close", target)
+    assert pair is not None
+    assert [o.value for o in pair] == [17.0, 16.0]
+    assert [o.obs_date for o in pair] == [target, prior]
+
+
+def test_gather_market_moves_reports_vix_gold_and_oil_when_qualified(diary_engine, monkeypatch):
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 25)
+    prior = target - timedelta(days=1)
+    rows = []
+    for sid, before, after in [("YF:^VIX:close", 16.0, 17.0), ("YF:GC=F:close", 2000.0, 2030.0),
+                               ("YF:CL=F:close", 70.0, 68.6)]:
+        rows += [_price_row(sid, prior, before), _price_row(sid, target, after, ts_offset_h=24)]
+    _insert_prices(diary_engine, rows)
+
+    moves = market_diary._gather_market_moves(diary_engine, target)
+    vix = moves["indices"]["VIX"]
+    assert vix["close"] == 17.0 and vix["change_pct"] == pytest.approx(6.25)
+    notable = {n["asset"]: n for n in moves["notable"]}
+    assert notable["Gold"]["change_pct"] == pytest.approx(1.5)
+    assert notable["Crude Oil"]["change_pct"] == pytest.approx(-2.0)
+    assert "Gold" not in moves.get("notable_no_close", [])
+
+
+def test_nyse_holiday_label_for_futures_is_still_withheld(diary_engine, monkeypatch):
+    """Labor Day: CME trades, NYSE is closed, so the label stays UNKNOWN."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 7)
+    rows = [_price_row("YF:GC=F:close", date(2026, 9, 4), 2000.0),
+            _price_row("YF:GC=F:close", target, 2030.0, ts_offset_h=24)]
+    assert rows[-1]["raw_payload"] == "null"
+    _insert_prices(diary_engine, rows)
+    with diary_engine.connect() as conn:
+        assert market_diary._fresh_pair(conn, "YF:GC=F:close", target) is None
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wave 3 §4.1 fix #1: pre-open thesis verdict, no look-ahead
+# ──────────────────────────────────────────────────────────────────────
+
+def test_gather_thesis_accuracy_no_pre_open_snapshot_is_null_verdict(diary_engine):
+    """No thesis_snapshots row before 13:30Z that day -> verdict None with a reason."""
+    from intelligence import market_diary
+
+    target = date(2026, 9, 26)
+    result = market_diary._gather_thesis_accuracy(diary_engine, target)
+    assert result["verdict"] is None
+    assert result["reason"] == "no pre-open thesis snapshot"
+    assert result["morning_thesis"] is None
+
+
+def test_gather_thesis_accuracy_uses_pre_open_snapshot_not_generate_unified_thesis(diary_engine, monkeypatch):
+    """A pre-open snapshot (before 13:30Z) is read directly; a same-day
+    post-cutoff snapshot must NOT be picked (that would still be look-ahead
+    relative to the pre-open call)."""
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", True)
+    target = date(2026, 9, 26)
+    with diary_engine.begin() as conn:
+        from sqlalchemy import MetaData as _MD
+        md = _MD()
+        md.reflect(diary_engine, only=["thesis_snapshots"])
+        tbl = md.tables["thesis_snapshots"]
+        conn.execute(tbl.insert(), {
+            "id": 1,
+            "timestamp": datetime(2026, 9, 26, 12, 0, 0),  # pre-open (before 13:30Z)
+            "overall_direction": "bullish",
+            "conviction": 0.7,
+        })
+        conn.execute(tbl.insert(), {
+            "id": 2,
+            "timestamp": datetime(2026, 9, 26, 18, 0, 0),  # post-open -- must be ignored
+            "overall_direction": "bearish",
+            "conviction": 0.9,
+        })
+
+    result = market_diary._gather_thesis_accuracy(diary_engine, target)
+    assert result["morning_thesis"] == "BULLISH"
+    assert result["morning_conviction"] == pytest.approx(0.7)
+
+
+def test_gather_thesis_accuracy_never_calls_generate_unified_thesis(diary_engine, monkeypatch):
+    """Functional guard: even if generate_unified_thesis is patched to blow
+    up, _gather_thesis_accuracy must not touch it (no import path calls it
+    anymore)."""
+    import analysis.flow_thesis_scoring as scoring
+    from intelligence import market_diary
+
+    forbid = MagicMock(side_effect=AssertionError("must not call generate_unified_thesis"))
+    monkeypatch.setattr(scoring, "generate_unified_thesis", forbid)
+
+    result = market_diary._gather_thesis_accuracy(diary_engine, date(2026, 9, 26))
+
+    forbid.assert_not_called()
+    assert result["reason"] == "no pre-open thesis snapshot"
+
+
+def test_market_diary_module_never_imports_generate_unified_thesis():
+    """Static guard (grep-style, per tests/test_get_side_effects.py's
+    convention of pinning a bug class so it cannot silently come back):
+    the look-ahead bug was a call to generate_unified_thesis() at write
+    time. Assert the source no longer references it at all."""
+    import inspect
+
+    from intelligence import market_diary
+
+    source = inspect.getsource(market_diary)
+    assert "generate_unified_thesis" not in source
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wave 3 §4.1 fix #4: cross_reference_reports (empty) replaced by
+# cross_reference_checks (the table every other consumer reads)
+# ──────────────────────────────────────────────────────────────────────
+
+def test_gather_thesis_accuracy_reads_cross_reference_checks(diary_engine):
+    """Anomalies come from cross_reference_checks, never cross_reference_reports."""
+    from intelligence import market_diary
+
+    target = date(2026, 9, 26)
+    with diary_engine.begin() as conn:
+        from sqlalchemy import MetaData as _MD
+        md = _MD()
+        md.reflect(diary_engine, only=["cross_reference_checks"])
+        tbl = md.tables["cross_reference_checks"]
+        conn.execute(tbl.insert(), {
+            "id": 1, "name": "CFTC vs AIS", "category": "shipping",
+            "assessment": "major_divergence", "implication": "flows understated",
+            "checked_at": datetime(2026, 9, 26, 10, 0, 0),
+        })
+        conn.execute(tbl.insert(), {
+            "id": 2, "name": "irrelevant", "category": "x",
+            "assessment": "consistent", "implication": "",
+            "checked_at": datetime(2026, 9, 26, 11, 0, 0),
+        })
+
+    result = market_diary._gather_thesis_accuracy(diary_engine, target)
+    assert result.get("anomalies_detected") == 1
+    assert "CFTC vs AIS" in result["details"][0]["flag"]
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Wave 3 §4.1 fix #5: --dry-run does not persist
+# ──────────────────────────────────────────────────────────────────────
+
+def test_write_diary_entry_dry_run_does_not_persist(diary_engine, monkeypatch):
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", False)
+    # The diary_engine fixture already created market_diary with the
+    # production schema; ensure_table's DDL is Postgres-only (SERIAL,
+    # JSONB, TIMESTAMPTZ) and isn't the thing under test here, so skip it.
+    monkeypatch.setattr(market_diary, "ensure_table", lambda engine: None)
+    target = date(2026, 9, 26)
+
+    result = market_diary.write_diary_entry(diary_engine, target_date=target, dry_run=True)
+    assert result["dry_run"] is True
+    assert result["date"] == target.isoformat()
+
+    with diary_engine.connect() as conn:
+        from sqlalchemy import text as _text
+        row = conn.execute(_text("SELECT COUNT(*) FROM market_diary")).fetchone()
+    assert row[0] == 0
+
+
+def test_write_diary_entry_persists_narrative_model_and_fallback(diary_engine, monkeypatch):
+    from intelligence import market_diary
+
+    monkeypatch.setattr(market_diary, "PRICES_ENABLED", False)
+    monkeypatch.setattr(market_diary, "ensure_table", lambda engine: None)
+    # No LLM client reachable in the test env -> falls back to the
+    # rule-based narrative, so narrative_fallback must be recorded True.
+    monkeypatch.setattr(
+        "llm.router.get_llm",
+        MagicMock(side_effect=RuntimeError("no LLM in tests")),
+    )
+    target = date(2026, 9, 26)
+
+    result = market_diary.write_diary_entry(diary_engine, target_date=target, dry_run=False)
+    assert result["narrative_fallback"] is True
+    assert result["narrative_model"] is None
+
+    entry = market_diary.get_diary_entry(diary_engine, target)
+    assert entry["narrative_fallback"] is True

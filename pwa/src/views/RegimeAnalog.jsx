@@ -288,6 +288,17 @@ export default function RegimeAnalog({ onNavigate }) {
                 ))}
             </div>
 
+            {/* Honest state: don't just drop the TimesFM tab with no
+                explanation — say why the second-opinion forecast is missing. */}
+            {timesfm && timesfm.available === false && (
+                <div style={{
+                    fontSize: '11px', fontFamily: mono, color: colors.textMuted,
+                    padding: '4px 2px 10px',
+                }}>
+                    Not generated — TimesFM comparison unavailable{timesfm.reason ? `: ${timesfm.reason}` : '.'}
+                </div>
+            )}
+
             {/* ── Forecast Tab ── */}
             {activeTab === 'forecast' && forecast?.outcomes && (
                 <>
@@ -344,6 +355,11 @@ export default function RegimeAnalog({ onNavigate }) {
             {activeTab === 'episodes' && matches?.episodes && (
                 <>
                     <div style={s.sectionTitle}>MATCHED HISTORICAL EPISODES</div>
+                    {matches.episodes.length === 0 && (
+                        <div style={{ fontSize: '12px', fontFamily: mono, color: colors.textMuted, padding: '8px 2px' }}>
+                            Not generated — no historical episode matched the current state vector at this quality threshold.
+                        </div>
+                    )}
                     {/* Header */}
                     <div style={{ ...s.episodeCard, background: 'none', border: 'none', cursor: 'default', padding: '4px 14px' }}>
                         <span style={{ fontSize: '8px', fontFamily: mono, color: colors.textMuted, letterSpacing: '1px' }}>DATE</span>

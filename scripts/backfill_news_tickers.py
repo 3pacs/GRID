@@ -96,6 +96,7 @@ def _fetch_batch(conn, last_id: int, limit: int) -> list[tuple]:
             "SELECT series_id, raw_payload "
             "FROM raw_series "
             "WHERE series_id = ANY(:sids) "
+            "AND pull_status = 'SUCCESS' "
             "LIMIT :lim"
         )
         payload_rows = conn.execute(

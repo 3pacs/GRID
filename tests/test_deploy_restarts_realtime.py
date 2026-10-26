@@ -89,6 +89,27 @@ def _step_named(steps: list[dict], needle: str) -> dict | None:
     return None
 
 
+def _effective_run(step: dict) -> str:
+    """The step's own `run:` text, plus scripts/deploy_verify_release_tree.sh's
+    content when the step delegates to it.
+
+    2026-09-22: the cwd-vs-deploy-path check this file guards moved out of
+    each verify step's inline `run:` block and into one shared script (also
+    fixing a real bug -- the old grid-api inline check compared the literal
+    $DEPLOY_PATH string, which can never match once it's a symlink). The
+    logic these guards care about still runs, just not inline any more, so
+    the guards read the delegated script's content too rather than being
+    fooled by the refactor into passing on a step that no longer checks
+    anything.
+    """
+    run = step.get("run", "")
+    if "deploy_verify_release_tree.sh" in run:
+        script_path = os.path.join(REPO_ROOT, "scripts", "deploy_verify_release_tree.sh")
+        with open(script_path, encoding="utf-8") as handle:
+            run += "\n" + handle.read()
+    return run
+
+
 @pytest.mark.unit
 def test_deploy_restarts_grid_realtime():
     """Without this the daemon keeps running whatever it started with."""
@@ -140,7 +161,7 @@ def test_realtime_verification_reads_the_running_cwd_not_just_liveness():
     step = _step_named(_deploy_steps(), "verify grid-realtime")
     assert step is not None, "deploy.yml does not verify grid-realtime after restarting it"
 
-    run = step.get("run", "")
+    run = _effective_run(step)
     assert "/proc/" in run and "cwd" in run, (
         "the verify step does not read the running process's cwd -- checking "
         "only `systemctl is-active` reproduces the grid-hermes/grid-scheduler "

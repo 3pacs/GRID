@@ -145,7 +145,7 @@ class AssetRegistryPuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://registry.faa.gov",
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "WEEKLY",  # was DAILY (not in constraint); GRID polls weekly (smart_scheduler freq_h 168)
         "pit_available": False,
         "revision_behavior": "RARE",
         "trust_score": "HIGH",
@@ -438,6 +438,7 @@ class AssetRegistryPuller(BasePuller):
                         SELECT id FROM source_catalog
                         WHERE name = 'ICIJ_OFFSHORE' LIMIT 1
                     )
+                    AND pull_status = 'SUCCESS'
                     AND raw_payload->>'officer_name' IS NOT NULL
                     ORDER BY officer_name
                     LIMIT 200

@@ -16,7 +16,6 @@ from api.routers.watchlist_helpers import (
     _guess_asset_type,
     _init_table,
     _fetch_live_price,
-    _cache_price_to_db,
     _resolve_feature_names,
     _row_to_dict,
     _preload_one,
@@ -29,29 +28,72 @@ import api.routers.watchlist_helpers as _wh
 router = APIRouter(tags=["watchlist"])
 
 
+def _read_portfolio_options_pnl(engine) -> dict:
+    """Read optional options results without turning a failed read into zero."""
+    try:
+        with engine.connect() as conn:
+            stats = conn.execute(text("""
+                SELECT
+                    COUNT(*) AS total,
+                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
+                    COUNT(*) FILTER (WHERE outcome = 'LOSS') AS losses,
+                    COUNT(*) FILTER (WHERE outcome = 'EXPIRED') AS expired,
+                    COUNT(*) FILTER (WHERE outcome IS NULL AND expiry > CURRENT_DATE) AS open,
+                    COALESCE(SUM(actual_return) FILTER (WHERE outcome IS NOT NULL), 0) AS total_return
+                FROM options_recommendations
+            """)).fetchone()
+        return {
+            "status": "available",
+            "total_recommendations": stats[0],
+            "wins": stats[1],
+            "losses": stats[2] + stats[3],
+            "open": stats[4],
+            "total_return": round(float(stats[5]), 2),
+        }
+    except Exception as exc:
+        log.warning("Portfolio options read failed: {error_type}", error_type=type(exc).__name__)
+        return {
+            "status": "unavailable",
+            "total_recommendations": None,
+            "wins": None,
+            "losses": None,
+            "open": None,
+            "total_return": None,
+        }
+
+
 @router.get("/")
 def list_watchlist(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
     _token: str = Depends(require_auth),
 ) -> dict:
-    """Return all watchlist items with pagination."""
-    _init_table()
-    engine = get_db_engine()
+    """Return all watchlist items with pagination.
 
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text(
-                "SELECT * FROM watchlist"
-                " ORDER BY added_at DESC"
-                " LIMIT :limit OFFSET :offset"
-            ),
-            {"limit": limit, "offset": offset},
-        ).fetchall()
+    Read-only: no table DDL here (the POST/DELETE writers own
+    ``_init_table``). A missing table is reported as 503, not created.
+    """
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    "SELECT * FROM watchlist"
+                    " ORDER BY added_at DESC"
+                    " LIMIT :limit OFFSET :offset"
+                ),
+                {"limit": limit, "offset": offset},
+            ).fetchall()
 
-        total = conn.execute(
-            text("SELECT COUNT(*) FROM watchlist")
-        ).fetchone()[0]
+            total = conn.execute(
+                text("SELECT COUNT(*) FROM watchlist")
+            ).fetchone()[0]
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     items = [_row_to_dict(row) for row in rows]
     return {
@@ -61,6 +103,12 @@ def list_watchlist(
         "offset": offset,
         "has_more": (offset + limit) < total,
     }
+
+
+# Wave 3 #11: every price this router serves is a live yfinance quote behind
+# a 5-minute cache, button-triggered only (no scheduled writer) — label the
+# source explicitly so responses never imply a managed/vendor feed.
+_PRICE_SOURCE = "yfinance"
 
 
 @router.post("/refresh-prices")
@@ -76,7 +124,7 @@ def refresh_watchlist_prices(
     # Return cached if fresh
     cached = _get_cached_prices()
     if cached is not None:
-        return {"prices": cached, "cached": True}
+        return {"prices": cached, "cached": True, "source": _PRICE_SOURCE}
 
     _init_table()
     engine = get_db_engine()
@@ -86,7 +134,7 @@ def refresh_watchlist_prices(
 
     tickers = [row[0] for row in rows]
     if not tickers:
-        return {"prices": {}, "cached": False}
+        return {"prices": {}, "cached": False, "source": _PRICE_SOURCE}
 
     prices = _batch_fetch_prices(tickers)
 
@@ -100,7 +148,7 @@ def refresh_watchlist_prices(
     except Exception as exc:
         log.debug("Watchlist: broadcast_event failed: {e}", e=str(exc))
 
-    return {"prices": prices, "cached": False}
+    return {"prices": prices, "cached": False, "source": _PRICE_SOURCE}
 
 
 @router.get("/prices")
@@ -110,8 +158,8 @@ async def get_watchlist_prices(
     """Return cached batch prices without triggering refresh or broadcast side effects."""
     cached = _get_cached_prices()
     if cached is not None:
-        return {"prices": cached, "fresh": True, "cached": True}
-    return {"prices": {}, "fresh": False, "cached": False}
+        return {"prices": cached, "fresh": True, "cached": True, "source": _PRICE_SOURCE}
+    return {"prices": {}, "fresh": False, "cached": False, "source": _PRICE_SOURCE}
 
 
 @router.get("/portfolio")
@@ -126,23 +174,21 @@ def get_portfolio(
     options P&L from the recommendation tracker.
     """
 
-    _init_table()
-    engine = get_db_engine()
-
-    # ── Ensure weight column exists ──────────────────────────────
-    try:
-        with engine.begin() as conn:
-            conn.execute(text(
-                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS weight NUMERIC DEFAULT NULL"
-            ))
-    except Exception as exc:
-        log.debug("Watchlist: weight column migration failed (may already exist): {e}", e=str(exc))
-
     # ── Load watchlist with weights ──────────────────────────────
-    with engine.connect() as conn:
-        rows = conn.execute(text(
-            "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
-        )).fetchall()
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text(
+                "SELECT ticker, display_name, asset_type, weight FROM watchlist ORDER BY added_at"
+            )).fetchall()
+    except Exception as exc:
+        log.warning("Portfolio watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Portfolio watchlist data is unavailable",
+        ) from exc
+
+    options_pnl = _read_portfolio_options_pnl(engine)
 
     if not rows:
         return {
@@ -152,10 +198,7 @@ def get_portfolio(
             }, "risk_metrics": {
                 "concentration_top3": 0, "beta_weighted": 0,
                 "sector_diversification_score": 0,
-            }, "options_pnl": {
-                "total_recommendations": 0, "wins": 0, "losses": 0,
-                "open": 0, "total_return": 0,
-            },
+            }, "options_pnl": options_pnl,
         }
 
     items = []
@@ -275,34 +318,6 @@ def get_portfolio(
     hhi = sum(w ** 2 for w in by_sector.values())
     sector_diversification = round(1.0 - hhi, 4)
 
-    # ── Options P&L from recommendation tracker ──────────────────
-    options_pnl = {
-        "total_recommendations": 0, "wins": 0, "losses": 0,
-        "open": 0, "total_return": 0,
-    }
-    try:
-        with engine.connect() as conn:
-            stats = conn.execute(text("""
-                SELECT
-                    COUNT(*) AS total,
-                    COUNT(*) FILTER (WHERE outcome = 'WIN') AS wins,
-                    COUNT(*) FILTER (WHERE outcome = 'LOSS') AS losses,
-                    COUNT(*) FILTER (WHERE outcome = 'EXPIRED') AS expired,
-                    COUNT(*) FILTER (WHERE outcome IS NULL AND expiry > CURRENT_DATE) AS open,
-                    COALESCE(SUM(actual_return) FILTER (WHERE outcome IS NOT NULL), 0) AS total_return
-                FROM options_recommendations
-            """)).fetchone()
-            if stats:
-                options_pnl = {
-                    "total_recommendations": stats[0] or 0,
-                    "wins": stats[1] or 0,
-                    "losses": (stats[2] or 0) + (stats[3] or 0),
-                    "open": stats[4] or 0,
-                    "total_return": round(float(stats[5] or 0), 2),
-                }
-    except Exception as exc:
-        log.debug("Options P&L query failed: {e}", e=str(exc))
-
     return {
         "total_value": ESTIMATED_PORTFOLIO,
         "total_pnl_1d": round(total_pnl_1d, 2),
@@ -335,14 +350,20 @@ def list_watchlist_enriched(
     """
     from datetime import date, timedelta
 
-    _init_table()
-    engine = get_db_engine()
-
-    with engine.connect() as conn:
-        rows = conn.execute(
-            text("SELECT * FROM watchlist ORDER BY added_at DESC LIMIT :limit"),
-            {"limit": limit},
-        ).fetchall()
+    # Read-only: no _init_table DDL on this GET (see list_watchlist).
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("SELECT * FROM watchlist ORDER BY added_at DESC LIMIT :limit"),
+                {"limit": limit},
+            ).fetchall()
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     if not rows:
         return {"items": [], "suggestions": []}
@@ -445,8 +466,8 @@ def list_watchlist_enriched(
                             "pct_1m": None,
                             "source": "live",
                         }
-                        # Write back to DB so next lookup is fast
-                        _cache_price_to_db(engine, tk, live["price"], today)
+                        # No write-back on this GET; POST /refresh-prices owns
+                        # persisting fetched prices.
     except Exception as exc:
         log.debug("Watchlist: price data enrichment failed: {e}", e=str(exc))
 
@@ -709,11 +730,17 @@ def preload_watchlist(
     import time
     import concurrent.futures
 
-    _init_table()
-    engine = get_db_engine()
-
-    with engine.connect() as conn:
-        rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+    # Read-only: no _init_table DDL on this GET (see list_watchlist).
+    try:
+        engine = get_db_engine()
+        with engine.connect() as conn:
+            rows = conn.execute(text("SELECT ticker FROM watchlist")).fetchall()
+    except Exception as exc:
+        log.warning("Watchlist read failed: {error_type}", error_type=type(exc).__name__)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Watchlist data is unavailable",
+        ) from exc
 
     tickers = [row[0] for row in rows]
     if not tickers:

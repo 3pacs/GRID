@@ -1,0 +1,44 @@
+=== /api/v1/system/health ===
+{"status":"degraded","checks":{"database":true,"features_registered":true,"recent_data":true,"pool_healthy":true,"pool_size":20,"pool_checked_out":1,"pool_overflow":-18,"thread_ingestion":false,"ws_clients":0,"disk_percent":68.6,"disk_free_gb":149.6,"llm_available":true,"robinhood":{"mode":"UNCONFIGURED","configured":f
+
+=== /api/v1/system/freshness ===
+{"families":[{"family":"breadth","total":4,"fresh_today":0,"stale":4,"status":"RED"},{"family":"commodity","total":3,"fresh_today":0,"stale":3,"status":"RED"},{"family":"credit","total":10,"fresh_today":0,"stale":10,"status":"RED"},{"family":"crypto","total":11,"fresh_today":0,"stale":11,"status":"RED"},{"family":"equi
+
+=== /api/v1/system/pipeline-health ===
+{"summary":{"total_sources":17,"healthy":5,"stale":0,"broken":12},"sources":[{"name":"AlphaVantage","type":"unknown","status":"broken","last_pull":null,"rows_last_pull":0,"next_scheduled":null,"freshness":"red","series_count":0,"error":null,"field_record":{"availability":"unavailable","provenance":null,"value":null,"un
+
+=== /api/v1/snapshots/research/latest ===
+{"status":"no_runs"}
+---HTTP_STATUS:200---
+
+
+=== /api/v1/godview/pillars/cftc?as_of=2023-02-21 ===
+{"available":true,"status":"partial","pillar":"cftc_positioning","as_of":"2023-02-21","coverage":0.25,"contracts_with_data":1,"contracts_expected":4,"stale_reason":null,"generation_id":"77b18669-b534-4b94-83de-e06450bddb46","generation_published_at":"2026-09-18T17:55:53.987793+00:00","contracts":{"SP500":"ES","NOTE10Y"
+
+=== /api/v1/godview/pillars/cftc?as_of=2020-01-01 ===
+{"available":true,"status":"partial","pillar":"cftc_positioning","as_of":"2020-01-01","coverage":0.0,"contracts_with_data":0,"contracts_expected":4,"stale_reason":null,"generation_id":"77b18669-b534-4b94-83de-e06450bddb46","generation_published_at":"2026-09-18T17:55:53.987793+00:00","contracts":{"SP500":"ES","NOTE10Y":
+
+=== /api/v1/regime/current ===
+{"state":"UNCALIBRATED","confidence":0.0,"transition_probability":0.0,"top_drivers":[],"contradiction_flags":[],"model_version":"none","as_of":"2026-09-18T17:58:48.067136+00:00","baseline_comparison":"No data — run auto_regime or wait for scheduled detection","as_of_date":"","staleness_days":null,"data_as_of":"","dat
+
+=== /api/v1/watchlist/ ===
+{"items":[],"total":0,"limit":50,"offset":0,"has_more":false}
+---HTTP_STATUS:200---
+
+
+=== /api/v1/ten-year-portfolio/weekly?capital=1000000&years=10 ===
+{"status":"empty","as_of":null,"capital":1000000.0,"benchmark":{"ticker":"QQQ","cagr":0.0,"total_return":0.0,"sparkline":[]},"universe":{"mode":"broad_fallback_sparse_stock_history","requested_years":10,"series_available":0,"requested_candidates":19,"stock_candidates":0,"ranked_candidates":0,"source":"raw_series:yfinan
+
+=== /api/v1/dad/ticker/TEST1/gold ===
+{"ticker":"TEST1","status":"unavailable","payload_mode":"compact","gold":{"verdict":"No workbook history yet","score":0,"tone":"neutral","one_liner":"This ticker is not showing up in Dad's copied workbook corpus yet."},"decision_stack":{"stance":"Do not surface hard yet","tone":"light","score":1.0,"cards":[{"source":"D
+
+=== /api/v1/watchlist/TEST1/edge ===
+{"ticker":"TEST1","congressional":[],"insider":[],"dark_pool":null,"whale_flow":[],"prediction_markets":[],"smart_money":[],"lever_pullers":[],"leads":[],"convergence":{"direction":"neutral","source_count":0,"confidence":0.5},"edge_summary":"Limited intelligence signals."}
+---HTTP_STATUS:200---
+
+
+=== /api/v1/snapshots/latest/pipeline_summary?n=1 ===
+[]
+---HTTP_STATUS:200---
+
+

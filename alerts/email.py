@@ -457,7 +457,11 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
         ``dry_run`` or ``sent``/``error``. A truthy return does not mean
         every section built successfully — check ``degraded``.
     """
-    result: dict[str, Any] = {"timestamp": datetime.now(timezone.utc).isoformat()}
+    # One UTC cutoff for this build, including its existing 24-hour and
+    # three-calendar-day windows. This excludes future-dated records;
+    # it does not reconstruct historical vintages or prove PIT completeness.
+    as_of = datetime.now(timezone.utc)
+    result: dict[str, Any] = {"timestamp": as_of.isoformat()}
     try:
         from sqlalchemy import text as sa_text
         from db import get_engine
@@ -476,13 +480,14 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
                 row = conn.execute(sa_text(
                     "SELECT inferred_state, state_confidence, grid_recommendation, "
                     "decision_timestamp FROM decision_journal "
+                    "WHERE decision_timestamp <= :as_of OR decision_timestamp IS NULL "
                     "ORDER BY decision_timestamp DESC LIMIT 1"
-                )).fetchone()
+                ), {"as_of": as_of}).fetchone()
                 if row:
                     ts = row[3]
                     ts = ts if (ts is None or ts.tzinfo) else ts.replace(tzinfo=timezone.utc)
                     age_hours = (
-                        (datetime.now(timezone.utc) - ts).total_seconds() / 3600
+                        (as_of - ts).total_seconds() / 3600
                         if ts is not None else None
                     )
                     if ts is None:
@@ -520,8 +525,9 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(*) FROM decision_journal "
-                    "WHERE decision_timestamp >= NOW() - INTERVAL '24 hours'"
-                )).fetchone()
+                    "WHERE decision_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours' "
+                    "AND decision_timestamp <= :as_of"
+                ), {"as_of": as_of}).fetchone()
                 sections.append(_section_kpi("Decisions (24h)", str(row[0]) if row else "0"))
             except Exception as exc:
                 degraded.append("journal_count")
@@ -532,9 +538,10 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
                 rows = conn.execute(sa_text(
                     "SELECT ticker, direction, score, payoff_multiple, thesis, confidence "
                     "FROM options_mispricing_scans "
-                    "WHERE is_100x = TRUE AND scan_date >= CURRENT_DATE - 3 "
+                    "WHERE is_100x = TRUE AND scan_date >= :as_of_date - 3 "
+                    "AND scan_date <= :as_of_date "
                     "ORDER BY score DESC LIMIT 5"
-                )).fetchall()
+                ), {"as_of_date": as_of.date()}).fetchall()
                 for r in rows:
                     sections.append(_section_100x(r[0], r[1], r[2], r[4], r[3], confidence=r[5]))
             except Exception as exc:
@@ -556,9 +563,10 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             try:
                 row = conn.execute(sa_text(
                     "SELECT COUNT(DISTINCT source_id), MAX(pull_timestamp) FROM raw_series "
-                    "WHERE pull_timestamp >= NOW() - INTERVAL '24 hours' "
+                    "WHERE pull_timestamp >= CAST(:as_of AS TIMESTAMPTZ) - INTERVAL '24 hours' "
+                    "AND pull_timestamp <= :as_of "
                     "AND pull_status = 'SUCCESS'"
-                )).fetchone()
+                ), {"as_of": as_of}).fetchone()
                 if row and row[0]:
                     sections.append(_section_kpi("Active Sources (24h)", str(row[0]),
                                                  f"latest: {str(row[1])[:16]}"))

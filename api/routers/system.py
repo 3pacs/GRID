@@ -15,8 +15,10 @@ from sqlalchemy import text
 from api.auth import require_auth, require_role
 from api.dependencies import get_db_engine
 from api.schemas.system import (
+    DailyFreshnessAudit,
     DatabaseStatus,
     FamilyFreshness,
+    FreshnessAuditBucket,
     FreshnessResponse,
     GridStats,
     HealthResponse,
@@ -33,6 +35,17 @@ from api.schemas.system import (
     ServerHealth,
     StaleSource,
     SystemStatusResponse,
+)
+from store.availability_fields import (
+    FIELD_AVAILABILITY_AVAILABLE,
+    FIELD_AVAILABILITY_UNAVAILABLE,
+    STALE_CONSUMER_QUERY_MISMATCH,
+    STALE_FETCH_FAILED,
+    STALE_NEVER_CONFIGURED,
+    STALE_STALE,
+    STALE_UNKNOWN,
+    measured_field,
+    unavailable_field,
 )
 
 router = APIRouter(prefix="/api/v1/system", tags=["system"])
@@ -65,12 +78,78 @@ def _systemd_service_active(service_name: str) -> bool:
         return False
 
 
+def _cached_local_llm_state() -> dict[str, object]:
+    """Observe stored primary-provider state without importing or probing it.
+
+    This is neither provider selection nor a fresh readiness check. Static
+    attribute reads reject descriptors/methods instead of executing them.
+    """
+    import inspect
+    import sys
+    from types import GetSetDescriptorType, MemberDescriptorType, ModuleType
+
+    state: dict[str, object] = {
+        "state": "unknown",
+        "provider": None,
+        "scope": "configured_local_primary",
+        "source": "process_cache",
+        "fresh": False,
+    }
+    try:
+        llm_module = sys.modules.get("llm.router")
+        if llm_module is None:
+            state["state"] = "not_initialized"
+            return state
+        if type(llm_module) is not ModuleType:
+            return state
+        cache = vars(llm_module).get("_client_cache")
+        if type(cache) is not dict or any(type(key) is not str for key in cache):
+            return state
+        config_module = sys.modules.get("config")
+        if type(config_module) is not ModuleType:
+            return state
+        settings = vars(config_module).get("settings")
+        if settings is None:
+            return state
+        if inspect.getattr_static(type(settings), "__getattribute__") is not object.__getattribute__:
+            return state
+        storage = inspect.getattr_static(type(settings), "__dict__", None)
+        if type(storage) not in (GetSetDescriptorType, MemberDescriptorType):
+            return state
+        primary = inspect.getattr_static(settings, "LLM_LOCAL_PROVIDER", None)
+        if primary is None or (type(primary) is str and primary == ""):
+            primary = inspect.getattr_static(settings, "LLM_QUICK_PROVIDER", None)
+        if primary is None or (type(primary) is str and primary == ""):
+            gemma_primary = inspect.getattr_static(settings, "GEMMA_PRIMARY", False)
+            gemma_enabled = inspect.getattr_static(settings, "GEMMA_ENABLED", False)
+            if type(gemma_primary) is not bool or type(gemma_enabled) is not bool:
+                return state
+            primary = "gemma" if gemma_primary and gemma_enabled else "llamacpp"
+        if type(primary) is not str:
+            return state
+        state["provider"] = primary
+        if primary not in cache:
+            state["state"] = "not_initialized"
+            return state
+        client = cache[primary]
+        storage = inspect.getattr_static(type(client), "__dict__", None)
+        if type(storage) not in (GetSetDescriptorType, MemberDescriptorType):
+            return state
+        available = inspect.getattr_static(client, "is_available", None)
+        if type(available) is bool:
+            state["state"] = "available" if available else "unavailable"
+    except Exception:
+        # Partial or unfamiliar in-process state is optional and stays unknown.
+        pass
+    return state
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     """Health check — no auth required.
 
     Checks database connectivity, data freshness, connection pool,
-    scheduler threads, WebSocket clients, disk space, and LLM availability.
+    scheduler threads, WebSocket clients, disk space, and cached LLM state.
     """
     import shutil
     import threading
@@ -161,14 +240,10 @@ def health() -> HealthResponse:
     except Exception as exc:
         log.debug("Health: disk usage check failed: {e}", e=str(exc))
 
-    # --- LLM availability ---
-    try:
-        from llm.router import get_llm, Tier
-        client = get_llm(Tier.LOCAL)
-        checks["llm_available"] = client.is_available
-    except Exception as exc:
-        log.debug("Health: LLM availability check failed: {e}", e=str(exc))
-        checks["llm_available"] = False
+    # --- Optional LLM: stored state only; never select or initialize a client. ---
+    llm_state = _cached_local_llm_state()
+    checks["llm"] = llm_state
+    checks["llm_available"] = llm_state["state"] == "available"
 
     # --- Robinhood crypto connector ---
     # Local state only (mode, caps): health is unauthenticated and must stay
@@ -184,6 +259,12 @@ def health() -> HealthResponse:
             "live_trading": rh.live,
             "max_position_usd": rh.max_position_usd,
             "max_drawdown_pct": rh.max_drawdown_pct,
+            "max_daily_loss_pct": rh.max_daily_loss_pct,
+            "max_orders_per_day": rh.max_orders_per_day,
+            "max_quote_age_s": rh.max_quote_age_s,
+            "max_spread_bps": rh.max_spread_bps,
+            "use_limit_orders": rh.use_limit_orders,
+            "limit_slippage_bps": rh.limit_slippage_bps,
         }
     except Exception as exc:
         log.warning("Health: Robinhood connector check failed: {e}", e=str(exc))
@@ -374,6 +455,134 @@ def status(_token: str = Depends(require_auth)) -> SystemStatusResponse:
     )
 
 
+def _classify_query_failure(exc: Exception) -> str:
+    """Best-effort category for a failed health-check query, as a ``stale_reason``.
+
+    A bare ``Exception`` carries no structured error taxonomy, so most
+    failures fall through to ``STALE_UNKNOWN`` — this is intentionally
+    approximate and never invented as anything more specific than the
+    message actually supports (a missing column/table reads as a
+    query/schema mismatch; a connection/timeout message reads as a fetch
+    failure). Callers must not treat the result as authoritative.
+    """
+    msg = str(exc).lower()
+    if "does not exist" in msg or "column" in msg or "relation" in msg or "no such table" in msg:
+        return STALE_CONSUMER_QUERY_MISMATCH
+    if "timeout" in msg or "connection" in msg or "could not connect" in msg:
+        return STALE_FETCH_FAILED
+    return STALE_UNKNOWN
+
+
+# The daily audit timer (`grid-data-freshness-check.timer`) runs once at
+# 05:00 UTC via scripts/freshness_audit_universe.sql. Anything older than
+# two full cycles means a run was missed outright, not just "running a bit
+# late" -- treat it the same as a missing audit rather than presenting
+# last-night's (or older) numbers as if they were current.
+_DAILY_AUDIT_STALE_AFTER_HOURS = 48
+
+
+def _read_daily_freshness_audit(engine) -> DailyFreshnessAudit:
+    """Read the pre-computed `data_freshness_audit` table.
+
+    This table is refreshed once daily by a host timer (see module-level
+    comment) and indexed on `audited_at`/`bucket`, so every query here is a
+    handful of index lookups over ~700 rows -- unlike the live lateral
+    scans over `raw_series`/`resolved_series` used elsewhere in this file,
+    it cannot time out regardless of how large the source tables grow.
+
+    Returns availability="unavailable" when the audit has never run (no
+    rows at all) or when its most recent run is more than
+    `_DAILY_AUDIT_STALE_AFTER_HOURS` old -- in both cases the honest answer
+    is "we don't have a current audit," not a stale number rendered as if
+    fresh. The last known buckets/total are still returned alongside a
+    stale `field_record` so a caller that wants the historical context has
+    it, but must key off `availability`/`stale_reason`, never assume the
+    numbers are current.
+    """
+    try:
+        with engine.connect() as conn:
+            prior_timeout = conn.execute(
+                text("SELECT current_setting('statement_timeout')")
+            ).scalar_one()
+            conn.execute(text("SET LOCAL statement_timeout = '3s'"))
+            try:
+                audited_at = conn.execute(
+                    text("SELECT MAX(audited_at) FROM data_freshness_audit")
+                ).scalar_one_or_none()
+
+                buckets: list[FreshnessAuditBucket] = []
+                source_tables: list[str] = []
+                if audited_at is not None:
+                    bucket_rows = conn.execute(
+                        text(
+                            "SELECT bucket, COUNT(*) "
+                            "FROM data_freshness_audit "
+                            "WHERE audited_at = :audited_at "
+                            "GROUP BY bucket ORDER BY bucket"
+                        ),
+                        {"audited_at": audited_at},
+                    ).fetchall()
+                    buckets = [
+                        FreshnessAuditBucket(bucket=row[0], ticker_count=row[1])
+                        for row in bucket_rows
+                    ]
+                    src_rows = conn.execute(
+                        text(
+                            "SELECT DISTINCT source_table FROM data_freshness_audit "
+                            "WHERE audited_at = :audited_at ORDER BY source_table"
+                        ),
+                        {"audited_at": audited_at},
+                    ).fetchall()
+                    source_tables = [row[0] for row in src_rows]
+            finally:
+                conn.execute(
+                    text("SELECT set_config('statement_timeout', :timeout, true)"),
+                    {"timeout": prior_timeout},
+                )
+    except Exception as exc:
+        log.debug("System: data_freshness_audit query failed: {e}", e=str(exc))
+        reason = _classify_query_failure(exc)
+        return DailyFreshnessAudit(
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=reason,
+            field_record=unavailable_field(reason).to_dict(),
+        )
+
+    if audited_at is None:
+        return DailyFreshnessAudit(
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=STALE_NEVER_CONFIGURED,
+            field_record=unavailable_field(STALE_NEVER_CONFIGURED).to_dict(),
+        )
+
+    audited_at_utc = (
+        audited_at.replace(tzinfo=timezone.utc) if audited_at.tzinfo is None else audited_at
+    )
+    total = sum(b.ticker_count for b in buckets)
+    age_hours = (datetime.now(timezone.utc) - audited_at_utc).total_seconds() / 3600
+
+    if age_hours > _DAILY_AUDIT_STALE_AFTER_HOURS:
+        return DailyFreshnessAudit(
+            audited_at=audited_at_utc.isoformat(),
+            total_tickers=total,
+            buckets=buckets,
+            source_tables=source_tables,
+            availability=FIELD_AVAILABILITY_UNAVAILABLE,
+            stale_reason=STALE_STALE,
+            field_record=unavailable_field(STALE_STALE, ingested_at=audited_at_utc).to_dict(),
+        )
+
+    return DailyFreshnessAudit(
+        audited_at=audited_at_utc.isoformat(),
+        total_tickers=total,
+        buckets=buckets,
+        source_tables=source_tables,
+        availability=FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=None,
+        field_record=measured_field(total, unit="tickers", ingested_at=audited_at_utc).to_dict(),
+    )
+
+
 @router.get("/freshness", response_model=FreshnessResponse)
 def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """Per-family data freshness report.
@@ -382,6 +591,7 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
     """
     engine = get_db_engine()
     families: list[FamilyFreshness] = []
+    query_failed_reason: str | None = None
     try:
         with engine.connect() as conn:
             rows = conn.execute(text(
@@ -412,6 +622,7 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 ))
     except Exception as exc:
         log.warning("Freshness query failed: {e}", e=str(exc))
+        query_failed_reason = _classify_query_failure(exc)
 
     # Overall status: worst family status
     if not families or any(f.status == "RED" for f in families):
@@ -433,21 +644,39 @@ def freshness(_token: str = Depends(require_auth)) -> FreshnessResponse:
                 "ORDER BY sc.last_pull_at ASC NULLS FIRST "
                 "LIMIT 20"
             )).fetchall()
-            stale_sources = [
-                StaleSource(
-                    source=r[0],
-                    last_pull=r[1].isoformat() if r[1] else None,
+            for r in rows:
+                src_name, last_pull_at = r[0], r[1]
+                # This query only ever returns sources that are already
+                # >48h stale or never pulled, so every row here is one of
+                # exactly those two contract states — never a fabricated
+                # third state.
+                if last_pull_at is None:
+                    record = unavailable_field(STALE_NEVER_CONFIGURED, source_catalog=src_name)
+                else:
+                    record = measured_field(
+                        None,
+                        source_catalog=src_name,
+                        ingested_at=last_pull_at,
+                        stale_reason=STALE_STALE,
+                    )
+                stale_sources.append(StaleSource(
+                    source=src_name,
+                    last_pull=last_pull_at.isoformat() if last_pull_at else None,
                     stale=True,
-                )
-                for r in rows
-            ]
+                    field_record=record.to_dict(),
+                ))
     except Exception as exc:
         log.debug("System: stale sources query failed: {e}", e=str(exc))
+
+    daily_audit = _read_daily_freshness_audit(engine)
 
     return FreshnessResponse(
         families=families,
         overall_status=overall,
         stale_sources=stale_sources,
+        availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=query_failed_reason,
+        daily_audit=daily_audit,
     )
 
 
@@ -522,16 +751,24 @@ def pipeline_health(
     coverage: dict[str, dict] = {}
     recent_errors: list[PipelineError] = []
     resolver = ResolverStatus()
+    query_failed_reason: str | None = None
 
     try:
         with engine.connect() as conn:
+            # Bound the expensive source aggregate without changing the
+            # timeout of the later, independent health queries.  SQLAlchemy
+            # keeps all of these reads in one implicit transaction, so a
+            # bare SET LOCAL would otherwise affect every later statement.
+            prior_timeout = conn.execute(
+                text("SELECT current_setting('statement_timeout')")
+            ).scalar_one()
+            conn.execute(text("SET LOCAL statement_timeout = '5s'"))
             # ── Per-source pull status ─────────────────────────────────
             source_rows = conn.execute(
                 text(
                     "SELECT sc.name, "
                     "  COALESCE(latest.last_pull, sc.last_pull_at) AS last_pull, "
-                    "  COALESCE(recent.recent_rows, 0) AS recent_rows, "
-                    "  COALESCE(series.series_count, 0) AS series_count "
+                    "  COALESCE(recent.recent_rows, 0) AS recent_rows "
                     "FROM source_catalog sc "
                     "LEFT JOIN LATERAL ("
                     "  SELECT rs.pull_timestamp AS last_pull "
@@ -546,40 +783,35 @@ def pipeline_health(
                     "  WHERE rs.source_id = sc.id "
                     "  AND rs.pull_timestamp >= NOW() - INTERVAL '48 hours'"
                     ") recent ON TRUE "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT COUNT(DISTINCT sampled.series_id) AS series_count "
-                    "  FROM ("
-                    "    SELECT rs.series_id "
-                    "    FROM raw_series rs "
-                    "    WHERE rs.source_id = sc.id "
-                    "    ORDER BY rs.pull_timestamp DESC "
-                    "    LIMIT :series_limit"
-                    "  ) sampled"
-                    ") series ON TRUE "
                     "ORDER BY sc.name"
                 ),
-                {"series_limit": _SERIES_COUNT_SAMPLE_LIMIT},
             ).fetchall()
+            conn.execute(
+                text("SELECT set_config('statement_timeout', :timeout, true)"),
+                {"timeout": prior_timeout},
+            )
 
             for row in source_rows:
                 src_name = row[0]
                 last_pull = row[1]
                 recent_rows = row[2]
-                series_count = row[3]
 
                 src_type = _SOURCE_TYPE_MAP.get(src_name, "unknown")
                 schedule_info = _SOURCE_SCHEDULE.get(src_name)
                 stale_hours = schedule_info[1] if schedule_info else 168  # default 7 days
 
                 # Determine status and freshness
+                last_pull_utc = None
                 if last_pull is None:
                     status = "broken"
                     freshness = "red"
                 else:
-
-                    age = datetime.now(timezone.utc) - last_pull.replace(
-                        tzinfo=timezone.utc
-                    ) if last_pull.tzinfo is None else datetime.now(timezone.utc) - last_pull
+                    last_pull_utc = (
+                        last_pull.replace(tzinfo=timezone.utc)
+                        if last_pull.tzinfo is None
+                        else last_pull
+                    )
+                    age = datetime.now(timezone.utc) - last_pull_utc
                     age_hours = age.total_seconds() / 3600
 
                     if age_hours <= stale_hours:
@@ -591,6 +823,30 @@ def pipeline_health(
                     else:
                         status = "broken"
                         freshness = "red"
+
+                # Contract record (store/availability_fields.py::FieldRecord).
+                # `last_pull` is the only real signal this query has: when
+                # it is None the source has never been pulled at all
+                # (unavailable / never_configured — not fetch_failed, which
+                # would claim we know an attempt was made and failed). When
+                # it exists, that pull timestamp is a genuine measurement
+                # even if it is old, so the field stays `available` and the
+                # degree of staleness is carried in `stale_reason`, not in
+                # `availability`. `rows_last_pull` counts rows written in
+                # the last 48h — a healthy source with rows=0 there is NOT
+                # relabelled empty_source; that would require knowing the
+                # most recent pull *attempt's own* row count, which this
+                # query does not carry (see report: not-measured).
+                if last_pull_utc is None:
+                    field_record = unavailable_field(STALE_NEVER_CONFIGURED, source_catalog=src_name)
+                else:
+                    field_record = measured_field(
+                        recent_rows,
+                        unit="rows",
+                        source_catalog=src_name,
+                        ingested_at=last_pull_utc,
+                        stale_reason=STALE_STALE if status in ("stale", "broken") else None,
+                    )
 
                 # Compute next_scheduled (approximate)
                 next_scheduled = None
@@ -619,7 +875,11 @@ def pipeline_health(
                     rows_last_pull=recent_rows,
                     next_scheduled=next_scheduled,
                     freshness=freshness,
-                    series_count=series_count,
+                    # The sampled distinct count required up to 50,000 heap
+                    # fetches per source, yet this view does not display it.
+                    # Leave the nullable API field unknown, rather than 0.
+                    series_count=None,
+                    field_record=field_record.to_dict(),
                 ))
 
             # ── Coverage by family ─────────────────────────────────────
@@ -650,13 +910,14 @@ def pipeline_health(
 
             # ── Recent errors from server_log ──────────────────────────
             try:
-                err_rows = conn.execute(text(
-                    "SELECT created_at, source, message "
-                    "FROM server_log "
-                    "WHERE level IN ('ERROR', 'CRITICAL') "
-                    "ORDER BY created_at DESC "
-                    "LIMIT 25"
-                )).fetchall()
+                with conn.begin_nested():
+                    err_rows = conn.execute(text(
+                        "SELECT created_at, source, message "
+                        "FROM server_log "
+                        "WHERE level IN ('ERROR', 'CRITICAL') "
+                        "ORDER BY created_at DESC "
+                        "LIMIT 25"
+                    )).fetchall()
                 for row in err_rows:
                     recent_errors.append(PipelineError(
                         timestamp=row[0].isoformat() if row[0] else None,
@@ -665,51 +926,61 @@ def pipeline_health(
                     ))
             except Exception as exc:
                 log.debug("Pipeline: server_log table unavailable: {e}", e=str(exc))
+                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
 
             # ── Resolver status ────────────────────────────────────────
             try:
-                r = conn.execute(
-                    text(
-                        "WITH recent_raw AS ("
-                        "  SELECT series_id "
-                        "  FROM raw_series "
-                        "  WHERE pull_status = 'SUCCESS' "
-                        "  ORDER BY id DESC "
-                        "  LIMIT :pending_limit"
-                        ") "
-                        "SELECT COUNT(DISTINCT rr.series_id) "
-                        "FROM recent_raw rr "
-                        "LEFT JOIN feature_registry fr ON fr.name = rr.series_id "
-                        "WHERE fr.id IS NULL"
-                    ),
-                    {"pending_limit": _RESOLVER_PENDING_SAMPLE_LIMIT},
-                ).fetchone()
-                resolver.pending = r[0] if r else 0
+                with conn.begin_nested():
+                    r = conn.execute(
+                        text(
+                            "WITH recent_raw AS ("
+                            "  SELECT series_id "
+                            "  FROM raw_series "
+                            "  WHERE pull_status = 'SUCCESS' "
+                            "  ORDER BY id DESC "
+                            "  LIMIT :pending_limit"
+                            ") "
+                            "SELECT COUNT(DISTINCT rr.series_id) "
+                            "FROM recent_raw rr "
+                            "LEFT JOIN feature_registry fr ON fr.name = rr.series_id "
+                            "WHERE fr.id IS NULL"
+                        ),
+                        {"pending_limit": _RESOLVER_PENDING_SAMPLE_LIMIT},
+                    ).fetchone()
+                    resolver.pending = r[0] if r else 0
 
-                # Vintages are clamped to today: sources that publish
-                # forward-dated releases (FRED calendar rows reach
-                # 2026-12-31) would otherwise make an idle resolver look
-                # like it ran in the future. Verified on griddb 2026-09-11,
-                # ops-exec run 34547844805: MAX(vintage_date) = 2026-12-31
-                # while the last real resolution was 2026-04-04.
-                r = conn.execute(text(
-                    "SELECT MAX(vintage_date) FROM resolved_series "
-                    "WHERE vintage_date <= CURRENT_DATE"
-                )).fetchone()
-                if r and r[0]:
-                    resolver.last_run = r[0].isoformat()
+                    # Vintages are clamped to today: sources that publish
+                    # forward-dated releases (FRED calendar rows reach
+                    # 2026-12-31) would otherwise make an idle resolver look
+                    # like it ran in the future. Verified on griddb 2026-09-11,
+                    # ops-exec run 34547844805: MAX(vintage_date) = 2026-12-31
+                    # while the last real resolution was 2026-04-04.
+                    r = conn.execute(text(
+                        "SELECT MAX(vintage_date) FROM resolved_series "
+                        "WHERE vintage_date <= CURRENT_DATE"
+                    )).fetchone()
+                    if r and r[0]:
+                        resolver.last_run = r[0].isoformat()
 
-                r = conn.execute(text(
-                    "SELECT COUNT(*) FROM resolved_series "
-                    "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day' "
-                    "AND vintage_date <= CURRENT_DATE"
-                )).fetchone()
-                resolver.last_resolved = r[0] if r else 0
+                    r = conn.execute(text(
+                        "SELECT COUNT(*) FROM resolved_series "
+                        "WHERE vintage_date >= CURRENT_DATE - INTERVAL '1 day' "
+                        "AND vintage_date <= CURRENT_DATE"
+                    )).fetchone()
+                    resolver.last_resolved = r[0] if r else 0
             except Exception as exc:
                 log.debug("Pipeline: resolver status query failed: {e}", e=str(exc))
+                resolver = ResolverStatus()
+                query_failed_reason = query_failed_reason or _classify_query_failure(exc)
 
     except Exception as exc:
         log.warning("Pipeline health query failed: {e}", e=str(exc))
+        # Previously this fell straight through to the summary below with
+        # `sources`/`coverage`/`recent_errors` all still at their empty
+        # initial values -> a 200 the PWA reads as "0 sources, 0 healthy"
+        # (PipelineHealth.jsx summary tiles), indistinguishable from a
+        # pipeline that genuinely has zero sources. Record *why* instead.
+        query_failed_reason = _classify_query_failure(exc)
 
     # ── Build summary ──────────────────────────────────────────────
     healthy = sum(1 for s in sources if s.status == "healthy")
@@ -722,12 +993,17 @@ def pipeline_health(
         broken=broken,
     )
 
+    daily_audit = _read_daily_freshness_audit(engine)
+
     return PipelineHealthResponse(
         summary=summary,
         sources=sources,
         coverage=coverage,
         recent_errors=recent_errors,
         resolver_status=resolver,
+        availability=FIELD_AVAILABILITY_UNAVAILABLE if query_failed_reason else FIELD_AVAILABILITY_AVAILABLE,
+        stale_reason=query_failed_reason,
+        daily_audit=daily_audit,
     )
 
 

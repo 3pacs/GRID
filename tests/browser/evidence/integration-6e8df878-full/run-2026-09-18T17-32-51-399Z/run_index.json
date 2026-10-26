@@ -1,0 +1,550 @@
+{
+  "tree_label": "integration-6e8df878-full",
+  "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+  "generated_at": "2026-09-18T17:36:58.442Z",
+  "results": [
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "admin",
+      "scenario": "healthy",
+      "started_at": "2026-09-18T17:33:04.157Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 2,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.admin"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "watchlist-analysis": {
+          "crashed": false,
+          "console_errors": 4,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "portfolio": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "operator": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "discovery": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "snapshots": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/snapshots/history/clustering"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "godview": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:33:58.139Z"
+    },
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "admin",
+      "scenario": "partial",
+      "started_at": "2026-09-18T17:34:01.426Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 3,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 2,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.admin"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "watchlist-analysis": {
+          "crashed": false,
+          "console_errors": 4,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "portfolio": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "operator": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "discovery": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 8,
+          "evidence": "complete"
+        },
+        "snapshots": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/snapshots/history/clustering"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 3,
+          "evidence": "complete"
+        },
+        "godview": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:34:53.074Z"
+    },
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "admin",
+      "scenario": "empty",
+      "started_at": "2026-09-18T17:34:56.279Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 15,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/watchlist/prices",
+            "http://localhost:5174/api/v1/watchlist/enriched?limit=8",
+            "http://localhost:5174/api/v1/intelligence/thesis",
+            "http://localhost:5174/api/v1/intelligence/risk-map",
+            "http://localhost:5174/api/v1/intelligence/actor-network",
+            "http://localhost:5174/api/v1/intelligence/levers",
+            "http://localhost:5174/api/v1/flows/aggregated?period=weekly&days=30",
+            "http://localhost:5174/api/v1/flows/money-map",
+            "http://localhost:5174/api/v1/flows/sankey",
+            "http://localhost:5174/api/v1/signals",
+            "http://localhost:5174/api/v1/signals/snapshot",
+            "http://localhost:5174/api/v1/options/signals?limit=50",
+            "http://localhost:5174/api/v1/discovery/smart-heatmap?orthogonal_only=true",
+            "http://localhost:5174/api/v1/associations/correlation-matrix?days=252",
+            "http://localhost:5174/api/v1/system/architecture"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.admin"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "watchlist-analysis": {
+          "crashed": false,
+          "console_errors": 4,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "portfolio": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "operator": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "discovery": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "pipeline-health": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 5,
+          "evidence": "complete"
+        },
+        "snapshots": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/snapshots/history/clustering"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "godview": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:35:47.211Z"
+    },
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "contributor",
+      "scenario": "healthy",
+      "started_at": "2026-09-18T17:35:50.452Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 3,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.contributor"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": true,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:36:09.800Z"
+    },
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "contributor",
+      "scenario": "partial",
+      "started_at": "2026-09-18T17:36:14.161Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 3,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.contributor"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": true,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:36:33.050Z"
+    },
+    {
+      "tree_label": "integration-6e8df878-full",
+      "harness_commit": "937dedfd8be0e4bc766447e28544888366dc9cc1",
+      "pwa_dir": "C:/Users/owner/dev/GRID-fable-wt-integration/pwa",
+      "pwa_commit": "6e8df878a2f3893deb01ea6ec99a38edeb534440",
+      "role": "contributor",
+      "scenario": "empty",
+      "started_at": "2026-09-18T17:36:37.582Z",
+      "journeys": {
+        "home": {
+          "crashed": false,
+          "console_errors": 0,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "ticker-lookup": {
+          "crashed": false,
+          "console_errors": 2,
+          "api_non_2xx": [
+            "http://localhost:5174/api/v1/dad/ticker/RXT/gold/stream?token=dev-fixture-token.not-a-real-jwt.contributor"
+          ],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 2,
+          "evidence": "complete"
+        },
+        "ten-year": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": false,
+          "ready": "ok",
+          "ready_wait_ms": 1,
+          "evidence": "complete"
+        },
+        "catalyst-timeline-ACME": {
+          "crashed": false,
+          "console_errors": 1,
+          "api_non_2xx": [],
+          "allow_crash": true,
+          "ready": "ok",
+          "ready_wait_ms": 4,
+          "evidence": "complete"
+        }
+      },
+      "finished_at": "2026-09-18T17:36:56.369Z"
+    }
+  ]
+}

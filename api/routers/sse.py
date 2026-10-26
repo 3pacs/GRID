@@ -12,7 +12,7 @@ events, nine producers); ``contracts/emit.py`` now issues ``pg_notify`` in
 the same transaction as its audit write, and ``events/bus.py`` fans
 listener-delivered events out to subscribers registered with ``remote=True``.
 
-Example:
+Example (header auth; browsers use a single-use ``?ticket=`` instead):
     curl -H "Authorization: Bearer <token>" \\
          "https://grid.stepdad.finance/api/v1/events/stream?channels=grid_contracts_signal_fired"
 """
@@ -27,7 +27,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import StreamingResponse
 from loguru import logger as log
 
-from api.auth import require_auth
+from api.auth import require_auth, require_stream_auth
 from events.bus import RecentEventIds, bus
 from events.channels import ALL_CHANNELS as LEGACY_CHANNELS, Event
 
@@ -52,9 +52,13 @@ def _event_id_of(event: Event) -> Any:
 async def event_stream(
     request: Request,
     channels: str | None = Query(None, description="Comma-separated channel names to subscribe to"),
-    _token: str = Depends(require_auth),
+    _token: str = Depends(require_stream_auth),
 ):
-    """SSE endpoint — streams real-time GRID events to the client."""
+    """SSE endpoint — streams real-time GRID events to the client.
+
+    Auth: ``Authorization: Bearer`` header, or a single-use ``?ticket=`` from
+    ``POST /api/v1/auth/stream-ticket`` (browsers; ``EventSource`` has no headers).
+    """
     # Parse channel filter
     if channels:
         requested = set(ch.strip() for ch in channels.split(","))

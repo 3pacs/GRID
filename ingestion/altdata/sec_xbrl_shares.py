@@ -30,13 +30,18 @@ Graceful degradation:
 
 from __future__ import annotations
 
+import math
 import time
 from datetime import date, datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+from analysis.materialization_accounting import (
+    CommitOutcome, TransactionDeclaration, diagnose_transaction,
+)
 
 from ingestion.altdata.sec_xbrl_financials import (
     _RATE_LIMIT_DELAY_SECS,
@@ -141,11 +146,24 @@ _MAX_RUNTIME_SECS: int = 3600
 # Lookup table of known ADR → ordinary-share ratios. Tickers not in
 # this table default to 1 (1:1 listing or true US-domiciled common).
 # When updating, the rule is: ratio = (number of ordinary shares
-# represented by 1 ADR).
+# represented by 1 ADR) — i.e. ordinary shares per unit of the US
+# price in raw_series. A ratio below 1 means one ADR is a *fraction*
+# of an ordinary share (SNY, HEINY: 2 ADRs = 1 share → 0.5).
+#
+# This is the ratio in force TODAY. When a ticker's ratio has changed
+# over time, also add its effective-dated history to
+# ``_ADR_RATIO_HISTORY`` below; ``_adr_ratio_for(ticker, obs_date)``
+# then returns the ratio in force on ``obs_date``. YF:{TICKER}:close in
+# raw_series is stored unadjusted (e.g. YF:AZN:close jumps ×2.03 from
+# 2026-01-30 to 2026-02-02), so every historical row must use the
+# ratio that matched the security trading on that date.
 _ADR_RATIOS: dict[str, float] = {
     "TSM": 5,      # 1 ADR = 5 common shares
     "NVO": 1,      # 1 ADR = 1 share
-    "AZN": 0.5,    # 1 ADR = 0.5 share
+    # AZN: ADS programme terminated; ordinary shares trade directly on
+    # the NYSE from 2026-02-02, so 1 US-listed unit = 1 ordinary share.
+    # Before that, 1 ADS = 0.5 ordinary share — see _ADR_RATIO_HISTORY.
+    "AZN": 1,
     "BABA": 8,     # 1 ADR = 8 ordinary shares
     "JD": 2,       # 1 ADR = 2 ordinary shares
     "BP": 6,       # 1 ADR = 6 ordinary shares
@@ -157,26 +175,89 @@ _ADR_RATIOS: dict[str, float] = {
     "SHOP": 1,
     "SE": 1,
     "BUD": 1,
-    "HEINY": 2,
+    # HEINY: 2 ADRs = 1 Heineken N.V. ordinary share (sponsored Level I,
+    # Deutsche Bank depositary; theheinekencompany.com ADR page).
+    "HEINY": 0.5,
     "NSRGY": 1,
     "BTI": 1,
     "FMX": 10,     # 1 ADR = 10 shares
     "KOF": 10,
     "CCEP": 1,
+    # TM: each ADS represents ten shares of common stock (20-F FY2026
+    # cover). It was two shares per ADS until Toyota's 5-for-1 split
+    # effective 2021-10-01 (20-F filed 2021-06-24 cover: "each American
+    # Depositary Share representing two shares"); the ADS count did not
+    # change, so the ratio went 2 -> 10. See _ADR_RATIO_HISTORY.
     "TM": 10,
-    "SNY": 2,
+    # GSK: "American Depositary Shares, each representing 2 Ordinary
+    # Shares" (GSK plc 20-F FY2025 and FY2022 covers; JPMorgan depositary).
+    # Was missing (defaulted to 1), which overstated market cap 2x.
+    "GSK": 2,
+    # SHEL: "American Depositary Shares representing two ordinary shares"
+    # (Shell plc 20-F FY2025 and FY2021 covers). Was missing (defaulted
+    # to 1), which overstated market cap 2x.
+    "SHEL": 2,
+    # SONY: "Each American Depositary Share represents one share of Common
+    # Stock" (Sony Group 20-F FY2025 cover; F-6EF 2024-09-13). Explicit so
+    # it is not mistaken for a missing entry.
+    "SONY": 1,
+    # SNY: each ADS represents one-half of one Sanofi ordinary share
+    # (JPMorgan depositary; Sanofi 20-F FY2025 exhibit 2.2). Unchanged
+    # since the NYSE listing on 2002-07-01. Was wrongly 2 (inverted),
+    # which understated market cap 4x.
+    "SNY": 0.5,
     "ASML": 1,
     "RIO": 1,
     "BHP": 2,
 }
 
+# Effective-dated ratio history for tickers whose ratio has changed.
+# Each entry is ``(effective_from, ratio)``: the ratio applies to every
+# obs_date >= effective_from until the next entry. The first entry must
+# be ``date.min`` and the last entry must equal ``_ADR_RATIOS[ticker]``
+# (enforced by tests).
+_ADR_RATIO_HISTORY: dict[str, tuple[tuple[date, float], ...]] = {
+    "AZN": (
+        # 1 ADS = 1 ordinary share before the 2015 ratio change.
+        (date.min, 1.0),
+        # 6-K 2015-06-26: ratio changes from 1 ADS : 1 share to
+        # 2 ADSs : 1 share, effective 2015-07-27.
+        (date(2015, 7, 27), 0.5),
+        # 6-K 2026-01-20: ADS listing on Nasdaq ceases 2026-01-30;
+        # ordinary shares trade on the NYSE from Monday 2026-02-02.
+        (date(2026, 2, 2), 1.0),
+    ),
+    "TM": (
+        # 1 ADS = 2 shares of common stock before the split.
+        (date.min, 2.0),
+        # 5-for-1 split of Toyota common stock effective 2021-10-01
+        # (record date 2021-09-30); ADSs were not split, so from then on
+        # 1 ADS = 10 shares. YF:TM:close is continuous across the date
+        # (177.75 on 09-30, 177.62 on 10-01).
+        (date(2021, 10, 1), 10.0),
+    ),
+}
 
-def _adr_ratio_for(ticker: str) -> float:
-    """Return ordinary-shares-per-ADR for ``ticker``. Defaults to 1."""
+
+def _adr_ratio_for(ticker: str, obs_date: date | None = None) -> float:
+    """Return ordinary shares per US-listed unit for ``ticker``.
+
+    With ``obs_date``, returns the ratio in force on that date (using
+    ``_ADR_RATIO_HISTORY`` when the ticker has one); without it, the
+    current ratio. Defaults to 1 for tickers not in the table.
+    """
     if not ticker:
         return 1.0
+    key = ticker.strip().upper()
     try:
-        return float(_ADR_RATIOS.get(ticker.strip().upper(), 1))
+        if obs_date is not None and key in _ADR_RATIO_HISTORY:
+            ratio = _ADR_RATIO_HISTORY[key][0][1]
+            for effective_from, r in _ADR_RATIO_HISTORY[key]:
+                if effective_from > obs_date:
+                    break
+                ratio = r
+            return float(ratio)
+        return float(_ADR_RATIOS.get(key, 1))
     except (TypeError, ValueError):
         return 1.0
 
@@ -193,8 +274,17 @@ def _extract_shares_entries(
     deduplicates by ``filed`` date (keeping the highest-priority tag for
     each date), and returns newest-last so callers can walk in
     chronological order for forward-fill.
+
+    One filing usually reports the same tag for several period ends
+    (a 20-F shows this year-end and prior year-ends; a 10-Q shows the
+    quarter end and the prior fiscal year end). Within the winning tag,
+    the fact with the LATEST period ``end`` is the filing's current
+    count. Taking the first-listed fact instead (Company Facts lists
+    oldest period first) returned a stale count, e.g. SONY's 20-F filed
+    2025-06-20 yielded the pre-split 2022-03-31 count 1,261,081,781
+    instead of the 2025-03-31 count 6,149,810,645.
     """
-    by_filed: dict[date, tuple[int, int]] = {}
+    by_filed: dict[date, tuple[int, int, date]] = {}
     for priority, (taxonomy, tag) in enumerate(_SHARES_TAG_SPECS):
         try:
             entries = (
@@ -223,12 +313,21 @@ def _extract_shares_entries(
                 filed = date.fromisoformat(filed_str)
             except ValueError:
                 continue
+            try:
+                end = date.fromisoformat(str(entry.get("end") or ""))
+            except ValueError:
+                end = date.min
             existing = by_filed.get(filed)
-            # Lower priority number wins (us-gaap over dei).
-            if existing is None or priority < existing[1]:
-                by_filed[filed] = (shares, priority)
+            # Lower priority number wins (us-gaap over dei); within the
+            # same tag, the latest period end wins (ties keep the first).
+            if (
+                existing is None
+                or priority < existing[1]
+                or (priority == existing[1] and end > existing[2])
+            ):
+                by_filed[filed] = (shares, priority, end)
 
-    pairs = [(filed, shares) for filed, (shares, _p) in by_filed.items()]
+    pairs = [(filed, shares) for filed, (shares, _p, _e) in by_filed.items()]
     pairs.sort(key=lambda p: p[0])
     return pairs
 
@@ -286,7 +385,7 @@ def _fetch_close_prices(
             "sec_xbrl_shares: close lookup failed {t}: {e}",
             t=ticker, e=str(exc),
         )
-        return []
+        raise
     out: list[tuple[date, float]] = []
     # raw_series can have multiple rows per obs_date (different pulls).
     # Keep the last one per date as the canonical close.
@@ -358,40 +457,84 @@ _UPSERT_SQL = text(
 _SOURCE_LABEL: str = "sec_xbrl + yfinance"
 
 
+class _MaterializationDeferred(RuntimeError):
+    """Cooperative stop before commit; not a clean completed ticker."""
+
+
+def _continue_allowed(
+    should_continue: Callable[[], bool] | None,
+    deadline_at: float | None,
+) -> bool:
+    if deadline_at is not None:
+        if type(deadline_at) not in (int, float) or not math.isfinite(deadline_at):
+            raise ValueError("deadline_at must be a finite monotonic instant")
+        if time.monotonic() >= deadline_at:
+            return False
+    if should_continue is not None:
+        if not callable(should_continue):
+            raise ValueError("should_continue must be callable")
+        permitted = should_continue()
+        if type(permitted) is not bool:
+            raise ValueError("should_continue must return bool")
+        return permitted
+    return True
+
+
 def _write_rows(
     engine: Engine,
     ticker: str,
     rows: list[dict[str, Any]],
-) -> int:
-    """Upsert per-day market-cap rows. Returns count written."""
+    *,
+    should_continue: Callable[[], bool] | None = None,
+    deadline_at: float | None = None,
+) -> int | None:
+    """Return affected rows only AFTER transaction exit; None means unknown.
+
+    Statement/commit exceptions propagate, never staged success. Cancellation
+    raises inside the transaction so normal context rollback precedes reporting.
+    Commit acknowledgement exceptions do not establish a persisted zero count.
+    """
     if not rows:
-        return 0
-    written = 0
+        return diagnose_transaction(TransactionDeclaration(
+            ticker, CommitOutcome.NOT_ATTEMPTED, 0, 0, 0, 0, True,
+        )).usable_declared_committed_rows
+    attempted = staged = affected = 0
+    unknown_count = False
     try:
         with engine.begin() as conn:
             for r in rows:
-                try:
-                    conn.execute(
-                        _UPSERT_SQL,
-                        {
-                            "ticker": ticker,
-                            "obs_date": r["obs_date"],
-                            "shares": r["shares"],
-                            "close": r["close"],
-                            "mcap": r["mcap"],
-                            "source": _SOURCE_LABEL,
-                        },
-                    )
-                    written += 1
-                except Exception as exc:
-                    log.warning(
-                        "sec_xbrl_shares upsert failed {t} {d}: {e}",
-                        t=ticker, d=r.get("obs_date"), e=str(exc),
-                    )
+                if not _continue_allowed(should_continue, deadline_at):
+                    raise _MaterializationDeferred("cancelled before commit")
+                attempted += 1
+                result = conn.execute(
+                    _UPSERT_SQL,
+                    {
+                        "ticker": ticker,
+                        "obs_date": r["obs_date"],
+                        "shares": r["shares"],
+                        "close": r["close"],
+                        "mcap": r["mcap"],
+                        "source": _SOURCE_LABEL,
+                    },
+                )
+                staged += 1
+                count = getattr(result, "rowcount", None)
+                # This is a single-row VALUES upsert. Unknown driver counts
+                # stay unknown; statement count is never an affected-row proxy.
+                if type(count) is not int or count not in (0, 1):
+                    unknown_count = True
+                else:
+                    affected += count
+            if not _continue_allowed(should_continue, deadline_at):
+                raise _MaterializationDeferred("cancelled before commit")
     except Exception as exc:
-        log.warning("sec_xbrl_shares txn failed {t}: {e}",
-                    t=ticker, e=str(exc))
-    return written
+        log.warning("sec_xbrl_shares txn failed {t}: {e}", t=ticker, e=str(exc))
+        raise
+    # The context manager has committed successfully before this declaration.
+    return diagnose_transaction(TransactionDeclaration(
+        ticker, CommitOutcome.COMMITTED, attempted, staged, 0,
+        None if unknown_count else affected,
+    )).usable_declared_committed_rows
 
 
 # ── Main runner ─────────────────────────────────────────────────────────
@@ -419,144 +562,171 @@ class SECXBRLSharesPuller:
         limit: int | None = None,
         backfill_days: int = _DEFAULT_BACKFILL_DAYS,
         tickers: list[str] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+        deadline_at: float | None = None,
     ) -> list[dict[str, Any]]:
-        """Pull XBRL shares + close prices → ticker_metrics_daily.
+        """Per-ticker outcomes plus consumed whole-universe accounting summary.
 
-        Parameters:
-            limit: Maximum tickers to process (None = all).
-            backfill_days: How many days back from today to compute rows.
-            tickers: Optional explicit ticker list (overrides sector map).
-
-        Returns:
-            Per-ticker result dicts plus a final SUMMARY entry.
+        Cancellation is checked between calls/rows and before commit. Existing
+        blocking fetch/commit calls cannot be forcibly interrupted by this hook.
+        The supplied monotonic deadline never extends the local runtime cap.
         """
         start_ts = time.monotonic()
-
+        if limit is not None and (type(limit) is not int or limit < 0):
+            raise ValueError("limit must be a nonnegative integer or None")
+        if deadline_at is not None and (
+            type(deadline_at) not in (int, float) or not math.isfinite(deadline_at)
+        ):
+            raise ValueError("deadline_at must be a finite monotonic instant")
+        if should_continue is not None and not callable(should_continue):
+            raise ValueError("should_continue must be callable")
+        effective_deadline = min(start_ts + _MAX_RUNTIME_SECS,
+                                 deadline_at if deadline_at is not None else float("inf"))
         universe = (
             [t.strip().upper() for t in tickers if t and t.strip()]
-            if tickers
-            else _sector_map_tickers()
+            if tickers is not None else _sector_map_tickers()
         )
+        universe = list(dict.fromkeys(universe))
         if not universe:
-            log.error("sec_xbrl_shares: empty universe — aborting")
-            return [{"status": "FAILED", "error": "empty universe"}]
-
-        cik_map = _fetch_ticker_to_cik_map()
-        if not cik_map:
-            log.error("sec_xbrl_shares: CIK map empty — aborting")
-            return [{"status": "FAILED", "error": "cik map empty"}]
-        time.sleep(_RATE_LIMIT_DELAY_SECS)
-
-        today = date.today()
-        window_start = today - timedelta(days=backfill_days)
-
+            return [{"status": "FAILED", "rows": 0, "error": "empty universe"}]
         results: list[dict[str, Any]] = []
-        processed = 0
-        rows_total = 0
         no_shares: list[str] = []
+        fatal_error = None
+        stopped_by_budget = False
+        stop_requested = False
 
-        for ticker in universe:
-            if limit is not None and processed >= limit:
-                log.info("sec_xbrl_shares: limit {n} reached", n=limit)
-                break
-            if time.monotonic() - start_ts > _MAX_RUNTIME_SECS:
-                log.warning("sec_xbrl_shares: runtime cap reached")
-                break
+        def permitted() -> bool:
+            nonlocal stop_requested
+            if stop_requested:
+                return False
+            allowed = _continue_allowed(should_continue, effective_deadline)
+            stop_requested = not allowed
+            return allowed
 
-            cik_padded = cik_map.get(ticker)
-            if not cik_padded:
-                results.append({
-                    "ticker": ticker, "status": "NO_CIK", "rows": 0,
-                })
-                processed += 1
-                continue
+        def pause() -> None:
+            remaining = max(0.0, effective_deadline - time.monotonic())
+            if remaining:
+                time.sleep(min(_RATE_LIMIT_DELAY_SECS, remaining))
 
-            facts = _fetch_company_facts(cik_padded)
-            time.sleep(_RATE_LIMIT_DELAY_SECS)
-            if facts is None:
-                results.append({
-                    "ticker": ticker, "status": "NO_FACTS", "rows": 0,
-                })
-                processed += 1
-                continue
-
-            timeline = _extract_shares_entries(facts)
-            if not timeline:
-                no_shares.append(ticker)
-                results.append({
-                    "ticker": ticker, "status": "NO_SHARES", "rows": 0,
-                })
-                processed += 1
-                continue
-
-            closes = _fetch_close_prices(
-                self.engine, ticker, window_start, today,
-            )
-            if not closes:
-                results.append({
-                    "ticker": ticker, "status": "NO_PRICES", "rows": 0,
-                })
-                processed += 1
-                continue
-
-            adr_ratio = _adr_ratio_for(ticker)
-            day_rows: list[dict[str, Any]] = []
-            for obs, close in closes:
-                raw_shares = _shares_for_date(timeline, obs)
-                if raw_shares is None:
-                    continue
-                # ADR adjustment: divide ordinary-share count by the
-                # ADR ratio so (shares * ADR price) yields the correct
-                # market cap. For non-ADRs and 1:1 listings the ratio
-                # is 1.0 and this is a no-op.
+        try:
+            if limit == 0 or not permitted():
+                stopped_by_budget = True
+                cik_map = {}
+            else:
+                cik_map = _fetch_ticker_to_cik_map()
+                if not cik_map:
+                    raise RuntimeError("cik map empty")
+                if permitted():
+                    pause()
+            today = date.today()
+            window_start = today - timedelta(days=backfill_days)
+            for ticker in universe:
+                if (limit is not None and len(results) >= limit) or not permitted():
+                    stopped_by_budget = True
+                    break
+                write_started = False
                 try:
-                    adj_shares = int(round(float(raw_shares) / adr_ratio))
-                except (TypeError, ValueError, ZeroDivisionError):
-                    adj_shares = int(raw_shares)
-                try:
-                    mcap = float(adj_shares) * float(close)
-                except (TypeError, ValueError):
-                    continue
-                day_rows.append({
-                    "obs_date": obs,
-                    "shares": adj_shares,
-                    "close": close,
-                    "mcap": mcap,
-                })
-
-            written = _write_rows(self.engine, ticker, day_rows)
-            rows_total += written
-
-            log.info(
-                "sec_xbrl_shares: {t} → {w} daily rows "
-                "(latest_shares={s:,})",
-                t=ticker, w=written,
-                s=(timeline[-1][1] if timeline else 0),
-            )
-            results.append({
-                "ticker": ticker,
-                "cik": cik_padded,
-                "status": "SUCCESS" if written > 0 else "NO_ROWS",
-                "rows": written,
-                "latest_shares": timeline[-1][1] if timeline else None,
-            })
-            processed += 1
-
-        elapsed = time.monotonic() - start_ts
-        log.info(
-            "sec_xbrl_shares complete — {p} tickers, {r} rows, "
-            "{n} without shares tag, {e:.1f}s",
-            p=processed, r=rows_total, n=len(no_shares), e=elapsed,
-        )
-        results.append({
-            "status": "SUMMARY",
-            "tickers_processed": processed,
-            "rows_written": rows_total,
-            "no_shares_count": len(no_shares),
-            "no_shares_sample": no_shares[:10],
-            "elapsed_seconds": round(elapsed, 1),
+                    cik_padded = cik_map.get(ticker)
+                    if not cik_padded:
+                        raise RuntimeError("no_cik")
+                    facts = _fetch_company_facts(cik_padded)
+                    if not permitted():
+                        raise _MaterializationDeferred("cancelled after facts")
+                    pause()
+                    if facts is None:
+                        raise RuntimeError("facts_unavailable")
+                    timeline = _extract_shares_entries(facts)
+                    if not timeline:
+                        no_shares.append(ticker)
+                        results.append({"ticker": ticker, "status": "NO_NEW_DATA",
+                                        "rows": 0, "reason": "no_shares"})
+                        continue
+                    if not permitted():
+                        raise _MaterializationDeferred("cancelled before prices")
+                    closes = _fetch_close_prices(self.engine, ticker, window_start, today)
+                    if not permitted():
+                        raise _MaterializationDeferred("cancelled after prices")
+                    if not closes:
+                        results.append({"ticker": ticker, "status": "NO_NEW_DATA",
+                                        "rows": 0, "reason": "no_prices"})
+                        continue
+                    day_rows: list[dict[str, Any]] = []
+                    row_errors = 0
+                    for obs, close in closes:
+                        if not permitted():
+                            raise _MaterializationDeferred("cancelled while building rows")
+                        raw_shares = _shares_for_date(timeline, obs)
+                        if raw_shares is None:
+                            continue
+                        # ADR adjustment: divide ordinary-share count by the
+                        # ADR ratio in force on ``obs`` so (shares * ADR price)
+                        # yields the correct market cap. For non-ADRs and 1:1
+                        # listings the ratio is 1.0 and this is a no-op.
+                        adr_ratio = _adr_ratio_for(ticker, obs)
+                        try:
+                            adj_shares = int(round(float(raw_shares) / adr_ratio))
+                        except (TypeError, ValueError, ZeroDivisionError):
+                            adj_shares = int(raw_shares)
+                        try:
+                            mcap = float(adj_shares) * float(close)
+                        except (TypeError, ValueError):
+                            row_errors += 1
+                            continue
+                        day_rows.append({
+                            "obs_date": obs,
+                            "shares": adj_shares,
+                            "close": close,
+                            "mcap": mcap,
+                        })
+                    if row_errors:
+                        raise ValueError("invalid price row conversion")
+                    if not permitted():
+                        raise _MaterializationDeferred("cancelled before writer")
+                    write_started = True
+                    written = _write_rows(self.engine, ticker, day_rows,
+                                          should_continue=should_continue,
+                                          deadline_at=effective_deadline)
+                    results.append({
+                        "ticker": ticker, "cik": cik_padded,
+                        "status": "FAILED" if written is None else
+                                  "SUCCESS" if written > 0 else "NO_NEW_DATA",
+                        "rows": written,
+                        "reason": "commit_count_unknown" if written is None else
+                                  "pit_empty" if not day_rows else "committed",
+                        "commit_outcome_unknown": written is None,
+                        "latest_shares": timeline[-1][1],
+                    })
+                except _MaterializationDeferred as exc:
+                    results.append({"ticker": ticker, "status": "PARTIAL", "rows": 0,
+                                    "reason": str(exc)})
+                    stopped_by_budget = True
+                    break
+                except Exception as exc:
+                    # A failed write acknowledgement cannot establish persisted
+                    # zero. Earlier tickers' committed counts remain separate.
+                    results.append({"ticker": ticker, "status": "FAILED",
+                                    "rows": None if write_started else 0, "error": str(exc)})
+        except Exception as exc:
+            fatal_error = str(exc)
+        statuses = [item["status"] for item in results]
+        known_rows = sum(item["rows"] for item in results if type(item.get("rows")) is int)
+        unknown_counts = sum(item.get("rows") is None for item in results)
+        summary = {
+            "status": "SUMMARY", "accounting_version": "SEC_XBRL_SHARES_V1",
+            "total": len(universe), "attempted": len(results),
+            "succeeded": statuses.count("SUCCESS"), "no_data": statuses.count("NO_NEW_DATA"),
+            "failed": statuses.count("FAILED"), "unknown": statuses.count("PARTIAL"),
+            "unattempted": len(universe) - len(results),
+            "rows_written": None if unknown_counts else known_rows,
+            "known_committed_rows": known_rows, "unknown_commit_counts": unknown_counts,
+            "tickers_processed": len(results), "stopped_by_budget": stopped_by_budget,
+            "no_shares_count": len(no_shares), "no_shares_sample": no_shares[:10],
+            "elapsed_seconds": round(time.monotonic() - start_ts, 1),
             "generated_at": datetime.now(timezone.utc).isoformat(),
-        })
+        }
+        if fatal_error:
+            summary["error"] = fatal_error
+        results.append(summary)
         return results
 
 

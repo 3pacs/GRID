@@ -37,6 +37,31 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 
+# Owner-approved hold (Wave 3 triage report, item #16, 2026-09-27/28).
+# score_old_theses is the single write path that sets
+# thesis_snapshots.outcome/actual_market_move/scored_at, reached from
+# run_thesis_cycle (step 2) and directly from scripts/grid_cron.sh's
+# "thesis-snapshot" job. It has a real look-ahead bug: _get_spy_price_near
+# resolves an hourly snapshot's "price near timestamp" with
+# ``signal_date/obs_date <= target_ts.date()``, so a mid-session snapshot
+# (e.g. 14:00Z) is scored against that SAME day's close once it exists —
+# a close that arrives hours after the snapshot was taken. It also compares
+# 3 calendar days, not trading sessions. The scorer hasn't produced a
+# correct/wrong verdict since 2026-04-17 in practice (the one weekday
+# 06:00Z cron that drove it, scripts/daily_audio_briefing.py, was removed),
+# but the code path itself is still live and reachable, so this holds it at
+# the code level rather than relying on an absent cron entry.
+# generate_thesis_postmortem (run_thesis_cycle step 3) is gated the same
+# way: it is an LLM-narrated write over thesis_postmortems built from
+# exactly the outcomes score_old_theses produces, i.e. the same standing
+# "postmortem write that feeds learning" hold category Hermes already
+# applies to postmortem_batch (see scripts/hermes_operator.py
+# DAILY_INTEL_HOLD_REASONS["postmortem_batch"]).
+# Re-enabling either is its own reviewed change (the §4.1/§4.2-style fix
+# the triage report describes), not a runtime flag.
+THESIS_SCORING_HELD = True
+
+
 # ── Data Classes ──────────────────────────────────────────────────────────
 
 ROOT_CAUSES = [
@@ -199,6 +224,13 @@ def score_old_theses(engine: Engine, lookback_days: int = 90) -> dict[str, Any]:
     Returns:
         Summary dict with counts of correct/wrong/partial.
     """
+    if THESIS_SCORING_HELD:
+        log.info("score_old_theses: held (THESIS_SCORING_HELD) — see item #16")
+        return {
+            "held": True,
+            "correct": 0, "wrong": 0, "partial": 0, "skipped": 0,
+        }
+
     _ensure_tables(engine)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
@@ -711,28 +743,35 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
 
     # 3. Generate post-mortems for wrong/partial theses that lack one
     postmortems_generated = 0
-    with engine.connect() as conn:
-        wrong_snaps = conn.execute(text("""
-            SELECT ts.id
-            FROM thesis_snapshots ts
-            LEFT JOIN thesis_postmortems tp ON ts.id = tp.snapshot_id
-            WHERE ts.outcome IN ('wrong', 'partial')
-              AND tp.id IS NULL
-              AND ts.timestamp >= NOW() - INTERVAL '30 days'
-            ORDER BY ts.timestamp DESC
-            LIMIT 20
-        """)).fetchall()
+    if THESIS_SCORING_HELD:
+        # Same hold as score_old_theses (item #16): postmortems are an
+        # LLM-narrated write over outcomes the (held) scorer produces —
+        # the standing "postmortem write that feeds learning" category.
+        report["postmortems_held"] = True
+        log.info("run_thesis_cycle: postmortem generation held (THESIS_SCORING_HELD)")
+    else:
+        with engine.connect() as conn:
+            wrong_snaps = conn.execute(text("""
+                SELECT ts.id
+                FROM thesis_snapshots ts
+                LEFT JOIN thesis_postmortems tp ON ts.id = tp.snapshot_id
+                WHERE ts.outcome IN ('wrong', 'partial')
+                  AND tp.id IS NULL
+                  AND ts.timestamp >= NOW() - INTERVAL '30 days'
+                ORDER BY ts.timestamp DESC
+                LIMIT 20
+            """)).fetchall()
 
-    for row in wrong_snaps:
-        try:
-            pm = generate_thesis_postmortem(engine, row[0])
-            if pm:
-                postmortems_generated += 1
-        except Exception as exc:
-            log.warning(
-                "Post-mortem for snapshot {id} failed: {e}",
-                id=row[0], e=str(exc),
-            )
+        for row in wrong_snaps:
+            try:
+                pm = generate_thesis_postmortem(engine, row[0])
+                if pm:
+                    postmortems_generated += 1
+            except Exception as exc:
+                log.warning(
+                    "Post-mortem for snapshot {id} failed: {e}",
+                    id=row[0], e=str(exc),
+                )
 
     report["postmortems_generated"] = postmortems_generated
 

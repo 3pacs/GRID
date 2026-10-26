@@ -498,6 +498,7 @@ class PriceDecomposer:
                         text(
                             "SELECT obs_date, value FROM raw_series "
                             "WHERE series_id LIKE :pat "
+                            "AND pull_status = 'SUCCESS' "
                             "AND obs_date > CURRENT_DATE - :d "
                             "ORDER BY obs_date ASC"
                         ),

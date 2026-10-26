@@ -32,6 +32,16 @@ from ingestion.altdata.reddit_options_pulse import (
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _fake_reddit_app_credentials(monkeypatch):
+    """Dummy (non-secret) OAuth app names so the client can be constructed.
+
+    No test here reaches the network: every fetch path is patched.
+    """
+    monkeypatch.setenv("REDDIT_CLIENT_ID", "test-client-id")
+    monkeypatch.setenv("REDDIT_CLIENT_SECRET", "test-client-secret")
+
+
 @pytest.fixture
 def mock_engine():
     """Mock SQLAlchemy engine that pretends source_id == 7."""

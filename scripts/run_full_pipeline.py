@@ -163,13 +163,9 @@ def run_pipeline(historical: bool = False) -> dict:
             log.info("DexScreener — {r}", r=result)
         except Exception as exc:
             log.warning("DexScreener failed: {e}", e=str(exc))
-        try:
-            from ingestion.pumpfun import PumpFunPuller
-            puller = PumpFunPuller(db_engine=engine)
-            result = puller.pull_all()
-            log.info("PumpFun — {r}", r=result)
-        except Exception as exc:
-            log.warning("PumpFun failed: {e}", e=str(exc))
+        # PumpFun is not pulled: PumpFunPuller has no pull_all (this call
+        # raised every run) and the source is dead as designed -- see the
+        # note above "dexscreener" in ingestion/smart_scheduler.PULLER_REGISTRY.
     summary["steps"]["crypto_ingest"] = _safe_run("Crypto Ingestion", _crypto_ingest)
 
     # -----------------------------------------------------------------------
@@ -397,23 +393,9 @@ def run_pipeline(historical: bool = False) -> dict:
     summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
 
     # -----------------------------------------------------------------------
-    # STEP 12: File rotation / cleanup (insights, briefings, error archives)
-    # -----------------------------------------------------------------------
-    def _cleanup():
-        cleaned = {}
-        try:
-            from outputs.llm_logger import cleanup_old_insights
-            cleaned["insights"] = cleanup_old_insights(max_age_days=90)
-        except Exception as exc:
-            log.debug("Insight cleanup skipped: {e}", e=str(exc))
-        try:
-            from ollama.market_briefing import MarketBriefingGenerator
-            cleaned["briefings"] = MarketBriefingGenerator.cleanup_old_briefings(max_age_days=90)
-        except Exception as exc:
-            log.debug("Briefing cleanup skipped: {e}", e=str(exc))
-        return cleaned
-    summary["steps"]["cleanup"] = _safe_run("File Rotation Cleanup", _cleanup)
-
+    # STEP 12: Retention is held in hermes_operator until its deletion policy
+    # is accepted. RUN_PIPELINE can invoke this runner, so neither insight nor
+    # briefing cleanup may run here around that allow-list gate.
     # -----------------------------------------------------------------------
     # Summary
     # -----------------------------------------------------------------------

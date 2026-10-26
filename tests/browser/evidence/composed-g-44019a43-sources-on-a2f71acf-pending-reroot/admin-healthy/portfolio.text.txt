@@ -1,0 +1,56 @@
+Portfolio
+Watchlist as a weighted basket. No share counts or cost basis are stored, so returns are shown as percentages and no dollar value is reported.
+Portfolio Value
+—
+no position sizes stored
+1D Return (weighted)
++0.00%
+100% of weight priced
+Positions Priced
+1
+all holdings priced
+Missing Price
+0
+SECTOR ALLOCATION
+ALLOCATION
+Technology
+100.0%
+RISK METRICS
+Top-3 Concentration
+100.0%
+high concentration
+Beta Proxy (by asset class)
+1.00
+asset-class proxy, not a measured per-position beta
+Sector Diversification
+0%
+concentrated
+POSITIONS
+TICKER	PRICE	1D CHG	WEIGHT ▼	1W CHG	SECTOR
+TEST1Test One Corp	100.00	+0.00%	100.0%	+1.20%	Technology
+OPTIONS P&L
+No options recommendations tracked yet.
+GRID
+10Y
+CANVAS
+SURFACE
+DASH
+FLOW
+ACTORS
+RISK
+SIGNAL
+Ctrl+K
+MORE
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

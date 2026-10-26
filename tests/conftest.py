@@ -149,6 +149,13 @@ def mock_engine():
     mock_result = MagicMock()
     mock_result.fetchone.return_value = None
     mock_result.fetchall.return_value = []
+    # api/routers/system.py's daily-audit reader (_read_daily_freshness_audit)
+    # uses SELECT ... .scalar_one_or_none() to detect a missing/empty
+    # data_freshness_audit table. Default to "no audit row" so callers that
+    # don't care about that path (most users of this fixture) get the
+    # honest "never configured" branch instead of a truthy MagicMock
+    # blowing up arithmetic on a fake timestamp.
+    mock_result.scalar_one_or_none.return_value = None
     mock_conn.execute.return_value = mock_result
 
     # context manager for engine.connect()

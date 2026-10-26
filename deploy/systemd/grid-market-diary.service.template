@@ -1,0 +1,37 @@
+# TEMPLATE — NOT INSTALLED. Installing this unit (and its .timer) is the
+# activation step for Wave 3 slice W3.1 and needs an explicit operator
+# decision — in particular, confirming the YF quarantine
+# (raw_series_quarantined_20260926) has actually been run before setting
+# GRID_MARKET_DIARY_PRICES_ENABLED=true (see intelligence/market_diary.py).
+# Install (on grid-svr):
+#   sudo cp deploy/systemd/grid-market-diary.service.template /etc/systemd/system/grid-market-diary.service
+#   sudo cp deploy/systemd/grid-market-diary.timer.template   /etc/systemd/system/grid-market-diary.timer
+#   sudo systemctl daemon-reload && sudo systemctl enable --now grid-market-diary.timer
+# WorkingDirectory follows grid-godview-*.service and
+# grid-analytics-snapshots.service.template (the deployed release tree),
+# not the old /home/grid/grid_v4/grid_repo convention this template used
+# to use — that checkout is stale/diverged and no live service runs from it
+# (systemd template sweep, 2026-09-28; same finding as PR #712/#713/#714
+# review for grid-dollar-flows/grid-causal-links/grid-regime-state-vectors).
+[Unit]
+Description=GRID market diary writer (rule-based sections + LLM narrative, pre-open thesis verdict)
+After=network.target postgresql.service
+
+[Service]
+Type=oneshot
+User=grid
+# The deployed release tree (same tree grid-api runs from; .github/workflows/
+# deploy.yml resets it to main) — not the old /home/grid/grid_v4/grid_repo
+# checkout, which is stale/diverged.
+WorkingDirectory=/data/grid_v4/grid_release
+# Same env file grid-scheduler, grid-hermes and the godview writers use
+# (GRID DB settings) — this file itself still lives in the repo checkout.
+EnvironmentFile=/home/grid/grid_v4/grid_repo/.env
+Environment=PYTHONUNBUFFERED=1
+# Price sections stay off until GRID_MARKET_DIARY_PRICES_ENABLED=true is set
+# in the env file below, after the operator confirms the YF quarantine ran.
+ExecStart=/usr/bin/flock -n /tmp/grid-market-diary.lock /usr/bin/python3 scripts/run_market_diary.py
+TimeoutStartSec=10min
+Nice=10
+StandardOutput=journal
+StandardError=journal

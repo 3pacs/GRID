@@ -188,6 +188,52 @@ class TestEmptyResult:
         assert result["energy_by_source"] == []
         assert result["force_vector"] == []
 
+    def test_availability_contract_shape(self) -> None:
+        """An unavailable news-energy result must say so explicitly (per
+        AVAILABILITY_CONTRACT.md), not default as_of to today or leave the
+        caller to infer unavailability from an empty list."""
+        result = NewsEnergyEngine._empty_result("no news features available")
+        assert result["available"] is False
+        assert result["as_of"] is None
+        assert result["stale"] is None
+        assert result["excluded_sources"] == []
+        assert result["freshness"]["as_of"] is None
+        assert result["freshness"]["stale"] is None
+
+
+# ---------------------------------------------------------------------------
+# Summary builder: staleness / excluded-source honesty
+# ---------------------------------------------------------------------------
+
+
+class TestBuildSummaryHonesty:
+    def test_stale_data_is_called_out(self) -> None:
+        from store.availability import freshness
+        from datetime import date
+
+        stale_fresh = freshness(date(2026, 9, 1), stale_after_days=5, today=date(2026, 9, 26))
+        summary = NewsEnergyEngine._build_summary(
+            energy_by_source=[],
+            total_energy=1.0,
+            coherence={"coherence": 0.5, "dominant_direction": "mixed"},
+            force_vector=[],
+            regime_signal={"equilibrium": True, "violations": 0, "violating_sources": []},
+            overall_fresh=stale_fresh,
+        )
+        assert "STALE" in summary
+
+    def test_excluded_sources_are_named_not_silently_dropped(self) -> None:
+        summary = NewsEnergyEngine._build_summary(
+            energy_by_source=[],
+            total_energy=1.0,
+            coherence={"coherence": 0.5, "dominant_direction": "mixed"},
+            force_vector=[],
+            regime_signal={"equilibrium": True, "violations": 0, "violating_sources": []},
+            excluded_sources=[{"feature": "gdelt_theme_econ", "reason": "no rows", "last_observed": None}],
+        )
+        assert "gdelt_theme_econ" in summary
+        assert "unavailable for this window" in summary
+
 
 # ---------------------------------------------------------------------------
 # Summary builder tests

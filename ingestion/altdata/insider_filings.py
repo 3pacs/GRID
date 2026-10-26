@@ -674,6 +674,16 @@ class InsiderFilingsPuller(BasePuller):
                     "transaction_code": trade.get("transaction_code", ""),
                     "is_10b5_1": bool(trade.get("is_10b5_1", False)),
                     "direct_or_indirect": trade.get("direct_or_indirect", ""),
+                    # GD-FIX: this was captured into raw_series.raw_payload
+                    # (see pull_recent below) but dropped when writing the
+                    # signal_sources row, so flow_materializer.sync_insider_trades
+                    # — which reads signal_sources, not raw_series — could never
+                    # populate insider_trades.filing_date. EDGAR's search-index
+                    # `file_date` IS the filing date (not the transaction date),
+                    # so this is never a lookahead into the future relative to
+                    # trade["transaction_date"].
+                    "filing_date": trade.get("filing_date", ""),
+                    "accession": trade.get("accession", ""),
                 }),
             },
         )

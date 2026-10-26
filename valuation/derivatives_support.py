@@ -441,7 +441,7 @@ class DerivativesSupportEngine:
                 row = conn.execute(
                     text("""
                         SELECT value FROM raw_series
-                        WHERE series_id = :sid AND obs_date <= :as_of
+                        WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                         ORDER BY obs_date DESC, pull_timestamp DESC LIMIT 1
                     """),
                     {"sid": prefix, "as_of": as_of},
@@ -459,7 +459,7 @@ class DerivativesSupportEngine:
             row = conn.execute(
                 text("""
                     SELECT value FROM raw_series
-                    WHERE series_id = :sid AND obs_date <= :as_of
+                    WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                     ORDER BY obs_date DESC LIMIT 1
                 """),
                 {"sid": "finra.short_interest_total", "as_of": as_of},
@@ -471,7 +471,7 @@ class DerivativesSupportEngine:
             row = conn.execute(
                 text("""
                     SELECT value FROM raw_series
-                    WHERE series_id = :sid AND obs_date <= :as_of
+                    WHERE series_id = :sid AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                     ORDER BY obs_date DESC LIMIT 1
                 """),
                 {"sid": f"finra.short_interest:{ticker}", "as_of": as_of},
@@ -483,7 +483,7 @@ class DerivativesSupportEngine:
             rows = conn.execute(
                 text("""
                     SELECT value, obs_date FROM raw_series
-                    WHERE series_id LIKE :pattern AND obs_date <= :as_of
+                    WHERE series_id LIKE :pattern AND pull_status = 'SUCCESS' AND obs_date <= :as_of
                     ORDER BY obs_date DESC LIMIT 2
                 """),
                 {"pattern": f"finra.short_interest%{ticker}%", "as_of": as_of},

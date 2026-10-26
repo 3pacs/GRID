@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 import sys
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import config
@@ -21,6 +22,7 @@ class _StopScheduler(Exception):
 class _FakeSchedule:
     def __init__(self) -> None:
         self.jobs: list[dict[str, object]] = []
+        self.callbacks: dict[str, object] = {}
         self.run_pending_calls = 0
 
     def every(self, interval: int = 1) -> "_FakeJob":
@@ -63,6 +65,7 @@ class _FakeJob:
         return self
 
     def do(self, func):
+        self._schedule.callbacks[func.__name__] = func
         self._schedule.jobs.append(
             {
                 "interval": self._interval,
@@ -102,9 +105,396 @@ def test_intelligence_loop_registers_expected_jobs(monkeypatch):
     }
     assert jobs_by_name["_hourly_briefing"]["unit"] == "hours"
     assert jobs_by_name["_capital_flow_refresh"]["interval"] == 4
-    assert jobs_by_name["_nightly_research"]["at"] == "02:45"
+    # _nightly_research, _options_tracker and _paper_trading_signals are
+    # Wave 3 held-writer jobs (owner decision 2026-09-28) and are NOT
+    # registered with a bare `object()` settings double, which has no
+    # GRID_ENABLE_*_JOB attributes — see
+    # test_wave3_held_writer_jobs_default_off / _can_be_enabled below.
+    assert "_nightly_research" not in jobs_by_name
+    assert "_options_tracker" not in jobs_by_name
+    assert "_paper_trading_signals" not in jobs_by_name
     assert jobs_by_name["_actor_news_weekly_tail"]["day"] == "sunday"
     assert jobs_by_name["_actor_news_weekly_tail"]["at"] == "04:00"
-    assert jobs_by_name["_options_tracker"]["unit"] == "days"
     assert jobs_by_name["_fci_compute_6h"]["interval"] == 6
     assert jobs_by_name["_credit_novelty_daily"]["at"] == "04:30"
+    # 2026-10-23: sentiment_predictions had no scoring caller (205 rows, all
+    # PENDING); the closer runs daily after the 06:45 journal-verdicts job.
+    assert jobs_by_name["_sentiment_outcomes_daily"] == {
+        "interval": 1,
+        "unit": "day",
+        "day": None,
+        "at": "06:50",
+        "func": "_sentiment_outcomes_daily",
+    }
+
+
+def test_wave3_held_writer_jobs_default_off(monkeypatch):
+    """Wave 3 owner decision (2026-09-28, GRID-WAVE3-HELD-WRITERS-TRIAGE-
+    20260927.md §6): the weekly scanner_weights writer, the nightly bulk
+    hypothesis generator, and the hourly legacy paper-trading job must not
+    be scheduled unless explicitly opted in. A default ``Settings()`` (no
+    env vars set) must not register any of the three jobs."""
+    fake_schedule = _FakeSchedule()
+
+    monkeypatch.setattr(config, "Settings", lambda: object())
+    monkeypatch.setattr(scheduler, "_sched", fake_schedule)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+
+    names = {job["func"] for job in fake_schedule.jobs}
+    assert "_options_tracker" not in names
+    assert "_nightly_research" not in names
+    assert "_paper_trading_signals" not in names
+
+
+def test_wave3_held_writer_jobs_can_be_enabled_via_env_flags(monkeypatch):
+    """Setting each GRID_ENABLE_*_JOB flag re-registers its job — the hold
+    is reversible via a reviewed config change, not permanently removed."""
+    fake_schedule = _FakeSchedule()
+    fake_settings = SimpleNamespace(
+        GRID_ENABLE_SCANNER_WEIGHTS_JOB=True,
+        GRID_ENABLE_BULK_HYPOTHESIS_JOB=True,
+        GRID_ENABLE_LEGACY_PAPER_TRADING_JOB=True,
+    )
+
+    monkeypatch.setattr(config, "Settings", lambda: fake_settings)
+    monkeypatch.setattr(scheduler, "_sched", fake_schedule)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_options_tracker"]["unit"] == "days"
+    assert jobs_by_name["_nightly_research"]["at"] == "02:45"
+    assert jobs_by_name["_paper_trading_signals"]["unit"] == "hours"
+
+
+@pytest.mark.parametrize(
+    "flag,job_name",
+    [
+        ("GRID_ENABLE_SCANNER_WEIGHTS_JOB", "_options_tracker"),
+        ("GRID_ENABLE_BULK_HYPOTHESIS_JOB", "_nightly_research"),
+        ("GRID_ENABLE_LEGACY_PAPER_TRADING_JOB", "_paper_trading_signals"),
+    ],
+)
+def test_wave3_held_writer_job_flags_are_independent(monkeypatch, flag, job_name):
+    """Each flag gates only its own job — enabling one does not resurrect
+    the other two held jobs."""
+    fake_schedule = _FakeSchedule()
+    fake_settings = SimpleNamespace(**{flag: True})
+
+    monkeypatch.setattr(config, "Settings", lambda: fake_settings)
+    monkeypatch.setattr(scheduler, "_sched", fake_schedule)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+
+    names = {job["func"] for job in fake_schedule.jobs}
+    other_jobs = {
+        "_options_tracker",
+        "_nightly_research",
+        "_paper_trading_signals",
+    } - {job_name}
+
+    assert job_name in names
+    assert not (other_jobs & names)
+
+
+def _run_loop_with_settings(monkeypatch, settings_obj) -> _FakeSchedule:
+    fake_schedule = _FakeSchedule()
+    monkeypatch.setattr(config, "Settings", lambda: settings_obj)
+    monkeypatch.setattr(scheduler, "_sched", fake_schedule)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+    return fake_schedule
+
+
+def test_taiwan_strait_osint_job_default_off(monkeypatch):
+    """Owner decision 2026-09-29: the Taiwan Strait OSINT job (MND URLs
+    404; used to write placeholder rows as SUCCESS) is skipped — never
+    registered — unless GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB is set. Both a
+    bare settings double and the real default settings leave it off."""
+    for settings_obj in (object(), SimpleNamespace(), config.settings):
+        fake_schedule = _run_loop_with_settings(monkeypatch, settings_obj)
+        names = {job["func"] for job in fake_schedule.jobs}
+        assert "_taiwan_strait_osint_daily" not in names
+        # The rest of the loop still registers normally.
+        assert "_crucix_ingest" in names
+
+
+def test_taiwan_strait_osint_job_explicit_false_is_skipped(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=False)
+    )
+    names = {job["func"] for job in fake_schedule.jobs}
+    assert "_taiwan_strait_osint_daily" not in names
+
+
+def test_taiwan_strait_osint_job_can_be_enabled_via_flag(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=True)
+    )
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_taiwan_strait_osint_daily"]["unit"] == "day"
+    assert jobs_by_name["_taiwan_strait_osint_daily"]["at"] == "23:30"
+    # Enabling it does not resurrect the Wave 3 held jobs.
+    assert "_options_tracker" not in jobs_by_name
+    assert "_nightly_research" not in jobs_by_name
+    assert "_paper_trading_signals" not in jobs_by_name
+
+
+def test_taiwan_daily_logs_zero_row_pull_as_failure(monkeypatch):
+    import db
+    from ingestion.altdata import rocaf_pla_activity as rocaf
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=True)
+    )
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "_get_latest_date", lambda self, sid: date(2026, 9, 29))
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "fetch", lambda self, since: ([], []))
+    warnings = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+    fake_schedule.callbacks["_taiwan_strait_osint_daily"]()
+    assert len(warnings) == 1
+    assert "status=FAILED" in warnings[0]
+    assert "0 rows" in warnings[0]
+
+
+def test_sentiment_outcomes_daily_records_outcomes_without_promoting_weights(monkeypatch):
+    """The closer runs the real ``score_past_predictions`` on an eligible
+    backlog (scripted connection, no database): outcomes are recorded, no
+    ``sentiment_weights`` row is inserted or read, and no prediction is
+    computed or logged (the hourly briefing owns that)."""
+    import db
+    from intelligence import sentiment_scorer
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    engine, conn = make_scoring_engine(scored_history())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("closer must not compute or log a prediction")
+
+    monkeypatch.setattr(sentiment_scorer, "compute_sentiment", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "log_prediction", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "run_sentiment_cycle", _forbidden)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert {u["id"]: u["outcome"] for u in conn.updates} == {
+        196: "WRONG", 195: "CORRECT", 194: "NEUTRAL_CORRECT",
+    }
+    assert conn.weight_inserts == []
+    # The idempotent CREATE TABLE IF NOT EXISTS bootstrap names the table;
+    # no read (_load_weights) or write of sentiment_weights may follow.
+    touched = [
+        sql for sql, _ in conn.executed
+        if "sentiment_weights" in sql and not sql.startswith("CREATE TABLE")
+    ]
+    assert touched == []
+    assert infos[-1] == (
+        "sentiment outcomes daily: scored=3 correct=2 accuracy=66.7 weight_promotion=disabled"
+    )
+
+
+def test_sentiment_outcomes_daily_promotes_weights_only_when_flag_set(monkeypatch):
+    """Operator decision: GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=true re-couples
+    weight promotion to the closer; the same backlog then inserts a
+    sentiment_weights version."""
+    import db
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=True)
+    )
+    engine, conn = make_scoring_engine(scored_history())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert len(conn.updates) == 3
+    assert len(conn.weight_inserts) == 1
+    assert infos[-1].endswith("weight_promotion=attempted")
+
+
+def test_sentiment_outcomes_daily_logs_failure_as_warning(monkeypatch):
+    import db
+    from intelligence import sentiment_scorer
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+
+    def _boom(_eng, **_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _boom)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert warnings == ["sentiment outcomes daily failed: db down"]
+
+
+def test_lme_warehouse_job_default_off(monkeypatch):
+    """2026-09-29: LME's URLs return a Cloudflare managed challenge (403)
+    to non-browser clients; the job is only registered behind
+    GRID_ENABLE_LME_WAREHOUSE_JOB."""
+    for settings_obj in (object(), SimpleNamespace(), config.settings):
+        fake_schedule = _run_loop_with_settings(monkeypatch, settings_obj)
+        names = {job["func"] for job in fake_schedule.jobs}
+        assert "_lme_warehouse_daily" not in names
+        assert "_crucix_ingest" in names
+
+
+def test_lme_warehouse_job_can_be_enabled_via_flag(monkeypatch):
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_LME_WAREHOUSE_JOB=True)
+    )
+    jobs_by_name = {job["func"]: job for job in fake_schedule.jobs}
+    assert jobs_by_name["_lme_warehouse_daily"]["unit"] == "day"
+    assert jobs_by_name["_lme_warehouse_daily"]["at"] == "09:00"
+    assert "_taiwan_strait_osint_daily" not in jobs_by_name
+
+
+class _CapturingSchedule:
+    """Minimal fake `schedule` module that captures the real job callables
+    (by function name) instead of just recording their cadence, so a test
+    can invoke one job's closure directly."""
+
+    def __init__(self) -> None:
+        self.callables: dict[str, object] = {}
+
+    def every(self, interval: int = 1) -> "_CapturingJob":
+        return _CapturingJob(self)
+
+    def run_pending(self) -> None:
+        pass
+
+
+class _CapturingJob:
+    _UNITS = {"minutes", "hours", "day", "days"}
+    _DAYS = {
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday",
+    }
+
+    def __init__(self, fake_schedule: _CapturingSchedule) -> None:
+        self._schedule = fake_schedule
+
+    def __getattr__(self, name: str) -> "_CapturingJob":
+        if name in self._UNITS or name in self._DAYS:
+            return self
+        raise AttributeError(name)
+
+    def at(self, when: str) -> "_CapturingJob":
+        return self
+
+    def do(self, func):
+        self._schedule.callables[func.__name__] = func
+        return self
+
+
+def test_thesis_invalidation_hourly_logs_real_monitor_run_fields(monkeypatch):
+    """CAT-190 regression: the hourly job's summary log line must read
+    fields that actually exist on `MonitorRun`/`InvalidationEvent`
+    ('MonitorRun' object has no attribute 'theses_checked' was the
+    production failure). Runs the job's own summary-logging path against
+    a real MonitorRun instance — not a mock — so a stale field name would
+    raise AttributeError here exactly as it did in production."""
+    import db
+    import intelligence.thesis_invalidation_monitor as tim
+    from intelligence.thesis_invalidation_monitor import (
+        InvalidationEvent,
+        MonitorRun,
+    )
+
+    captured = _CapturingSchedule()
+
+    monkeypatch.setattr(config, "Settings", lambda: object())
+    monkeypatch.setattr(scheduler, "_sched", captured)
+    monkeypatch.setattr(
+        scheduler.time,
+        "sleep",
+        lambda _seconds: (_ for _ in ()).throw(_StopScheduler()),
+    )
+
+    with pytest.raises(_StopScheduler):
+        scheduler.run_intelligence_loop()
+
+    thesis_job = captured.callables["_thesis_invalidation_hourly"]
+
+    real_run = MonitorRun(
+        as_of=datetime(2026, 4, 13),
+        predictions_scanned=7,
+        events=[
+            InvalidationEvent(
+                journal_id=1,
+                ticker="AAPL",
+                inval_type="price_level",
+                triggered_at=datetime(2026, 4, 13),
+                reason="close 170 < 180",
+                current_value=170.0,
+                threshold_value=180.0,
+                auto_size_down_to=0.0,
+            ),
+        ],
+        errors=["pred 9: malformed invalidation"],
+    )
+
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(tim, "run_monitor", lambda engine: real_run)
+
+    warnings: list[str] = []
+    infos: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append((msg, kw))
+    )
+
+    thesis_job()
+
+    # No AttributeError should have been swallowed into a warning log.
+    assert warnings == []
+    assert len(infos) == 1
+    msg, kw = infos[0]
+    assert kw["t"] == real_run.predictions_scanned == 7
+    assert kw["i"] == real_run.triggered_count == 1
+    assert kw["e"] == len(real_run.errors) == 1

@@ -159,6 +159,7 @@ def _fetch_close_price(
                 SELECT value, obs_date
                 FROM raw_series
                 WHERE series_id = :sid
+                  AND pull_status = 'SUCCESS'
                   AND obs_date <= :d
                   AND value IS NOT NULL
                 ORDER BY obs_date DESC

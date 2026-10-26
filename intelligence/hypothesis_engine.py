@@ -75,6 +75,16 @@ KILL_REASONS = {
 CONFIDENCE_KILL_THRESHOLD = 0.10  # Below this after 3+ tests → dead
 MIN_TESTS_FOR_CONFIDENCE_KILL = 3
 
+# Owner-approved hold (2026-09-26). score_hypothesis() is the single write
+# path that flips discovered_hypotheses to confirmed/invalidated, reached from
+# Hermes' 30-minute batch, the goal_worker ``score_active_hypothesis`` handler
+# (Hermes DISPATCH_SUBAGENT:hypothesis_scorer, seed_goals_hypo_scoring.py) and
+# HypothesisGenerator's own batch scorer. That scoring has no trial ledger,
+# FDR or holdout, and 86% of confirmed rows correlate GRID's own snap:*
+# telemetry with the market. Re-enabling is its own reviewed change, not a
+# runtime flag.
+ACTIVE_HYPOTHESIS_SCORING_HELD = True
+
 
 # ── Data Classes ─────────────────────────────────────────────────────────────
 
@@ -679,12 +689,19 @@ class AnomalyHunter:
                 q_oracle, {"window": window_days, "min_src": CONVERGENCE_MIN_SOURCES}
             ):
                 ticker, direction, n_models, models, avg_conf, latest = row
+                # AVG() over a group in which no model stated a confidence is
+                # NULL. `f"{None:.2f}"` and `float(None)` both raise; the
+                # convergence is still real, its average confidence is not
+                # a number and says so.
+                conf_str = (
+                    "unstated" if avg_conf is None else f"{float(avg_conf):.2f}"
+                )
                 anomalies.append(Anomaly(
                     anomaly_type="oracle_convergence",
                     entity=ticker,
                     description=(
                         f"{n_models} prediction models agree: {ticker} → {direction} "
-                        f"(avg confidence: {avg_conf:.2f}, models: {', '.join(models)})"
+                        f"(avg confidence: {conf_str}, models: {', '.join(models)})"
                     ),
                     magnitude=float(n_models),
                     signal_date=latest.date() if hasattr(latest, "date") else latest,
@@ -693,7 +710,9 @@ class AnomalyHunter:
                         "direction": direction,
                         "n_models": int(n_models),
                         "models": list(models),
-                        "avg_confidence": round(float(avg_conf), 4),
+                        "avg_confidence": (
+                            None if avg_conf is None else round(float(avg_conf), 4)
+                        ),
                     },
                 ))
 
@@ -816,6 +835,13 @@ class HypothesisGenerator:
 
     def score_hypothesis(self, hypothesis_id: str) -> dict:
         """Score a hypothesis against new data since it was created."""
+        if ACTIVE_HYPOTHESIS_SCORING_HELD:
+            return {
+                "hypothesis_id": hypothesis_id,
+                "outcome": "held",
+                "held": True,
+                "message": "active hypothesis scoring is held (ACTIVE_HYPOTHESIS_SCORING_HELD)",
+            }
         q = text("""
             SELECT id, thesis, pattern_type, evidence, test_criteria,
                    invalidation, confidence, status, times_tested,
@@ -1997,6 +2023,10 @@ def score_due_active_hypotheses(
         "batch_size": batch_size,
         "max_runtime_s": max_runtime_s,
     }
+    if ACTIVE_HYPOTHESIS_SCORING_HELD:
+        counts["held"] = True
+        log.info("score_due_active_hypotheses: held (ACTIVE_HYPOTHESIS_SCORING_HELD)")
+        return counts
 
     # Fetch overdue active hypos. We compute eval_window_end on the fly from
     # the JSONB criteria because the schema doesn't carry a separate column.

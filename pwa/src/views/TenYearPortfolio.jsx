@@ -62,12 +62,12 @@ const DEFAULT_PLAN_STEPS = [
 ];
 
 function pct(value, digits = 1) {
-    if (value == null || Number.isNaN(Number(value))) return 'n/a';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return `${(Number(value) * 100).toFixed(digits)}%`;
 }
 
 function money(value) {
-    if (value == null || Number.isNaN(Number(value))) return '$0';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toLocaleString(undefined, {
         style: 'currency',
         currency: 'USD',
@@ -76,7 +76,7 @@ function money(value) {
 }
 
 function number(value, digits = 1) {
-    if (value == null || Number.isNaN(Number(value))) return 'n/a';
+    if (value == null || Number.isNaN(Number(value))) return '—';
     return Number(value).toFixed(digits);
 }
 
@@ -203,6 +203,7 @@ function PickTable({ picks }) {
                         <th>Drawdown</th>
                         <th>Target</th>
                         <th>Shares</th>
+                        <th>Last price date</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -221,6 +222,7 @@ function PickTable({ picks }) {
                             <td>{pct(pick.max_drawdown, 0)}</td>
                             <td>{money(pick.target_dollars)}</td>
                             <td>{pick.whole_shares?.toLocaleString?.() || 0}</td>
+                            <td>{pick.last_date || 'unknown'}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -253,6 +255,7 @@ function CandidateTable({ candidates }) {
                         <th>Vs QQQ</th>
                         <th>Trend</th>
                         <th>Drawdown</th>
+                        <th>Last price date</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -271,6 +274,7 @@ function CandidateTable({ candidates }) {
                             <td className={pick.relative_cagr >= 0 ? 'ty-good' : 'ty-bad'}>{pct(pick.relative_cagr)}</td>
                             <td>{pct(pick.trend_r2, 0)}</td>
                             <td>{pct(pick.max_drawdown, 0)}</td>
+                            <td>{pick.last_date || 'unknown'}</td>
                         </tr>
                     ))}
                 </tbody>
@@ -284,6 +288,11 @@ export default function TenYearPortfolio() {
     const [data, setData] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
+    // Set only for the router's `status: "empty"` response (a valid result
+    // with nothing to show, distinct from an actual load failure) — kept
+    // separate from `error` so dad-mode copy can tell the two apart instead
+    // of reusing the same "could not load" wording for both.
+    const [emptyMessage, setEmptyMessage] = useState('');
     const [capital, setCapital] = useState(1000000);
     const [activeProfileId, setActiveProfileId] = useState('dad_chartist');
     const [workbookFile, setWorkbookFile] = useState(null);
@@ -299,9 +308,16 @@ export default function TenYearPortfolio() {
     const load = async () => {
         setLoading(true);
         setError('');
+        setEmptyMessage('');
         const result = await api.getTenYearPortfolio({ capital, years: 10 });
         if (result?.error || result?.status === 'error') {
             setError(result?.message || result?.error || 'Portfolio query failed');
+        } else if (result?.status === 'empty') {
+            // The router's own "no eligible price history" response — a
+            // valid, non-error result with nothing to show. Surface its
+            // message instead of silently treating it as a normal payload
+            // (which left the view rendering zeros and a stuck "loading").
+            setEmptyMessage(result?.message || 'No eligible price history yet.');
         } else {
             setData(result);
             if (!result.profiles?.some(profile => profile.id === activeProfileId)) {
@@ -430,6 +446,9 @@ export default function TenYearPortfolio() {
                 </header>
 
                 {error && <div className="tys-error">We could not load the plan just now. Please try Update again in a moment.</div>}
+                {!error && emptyMessage && (
+                    <div className="tys-error">No eligible price history yet, so there is no plan to show.</div>
+                )}
 
                 <section className="tys-block">
                     <h2>Choose a style</h2>
@@ -463,6 +482,8 @@ export default function TenYearPortfolio() {
                                 </li>
                             ))}
                         </ul>
+                    ) : emptyMessage ? (
+                        <p className="tys-lead">No eligible price history yet, so there is no plan to show.</p>
                     ) : (
                         <p className="tys-lead">Press Update to build the plan.</p>
                     )}
@@ -550,7 +571,7 @@ export default function TenYearPortfolio() {
                 </div>
             </header>
 
-            {error && <div className="ty-error">{error}</div>}
+            {(error || emptyMessage) && <div className="ty-error">{error || emptyMessage}</div>}
 
             <section className="ty-profile-strip">
                 {(data?.profiles || []).map(profile => {
@@ -751,15 +772,28 @@ export default function TenYearPortfolio() {
                             <DollarSign size={18} />
                             <strong>{activeProfile?.label || 'Profile'}</strong>
                         </div>
-                        <p>{activeProfile?.description || 'Waiting for the weekly portfolio query.'}</p>
+                        <p>{activeProfile?.description || error || emptyMessage || 'Waiting for the weekly portfolio query.'}</p>
                         <p>{activeProfile?.weekly_policy?.exit_rule || ''}</p>
                     </div>
                 </section>
 
                 <aside className="ty-side">
                     <div className="ty-side-block">
-                        <span>As of</span>
-                        <strong>{data?.as_of || 'loading'}</strong>
+                        <span>Latest loaded date</span>
+                        <strong>{loading ? 'loading' : (data?.as_of || '—')}</strong>
+                        {data?.mixed_latest_dates && (
+                            <small>Other tickers date back to {data.oldest_ticker_latest_date}.</small>
+                        )}
+                    </div>
+                    <div className="ty-side-block">
+                        <span>Price inputs</span>
+                        <strong>{data?.universe?.source === 'mixed:resolved_series+raw_series'
+                            ? 'Resolved + raw stored series'
+                            : data?.universe?.source === 'resolved_series:ticker_full'
+                                ? 'Resolved stored series'
+                                : data?.universe?.source === 'raw_series:YF:*:adj_close'
+                                    ? 'Raw Yahoo series'
+                                    : 'Source unverified'}</strong>
                     </div>
                     <div className="ty-side-block">
                         <span>Benchmark</span>
@@ -770,7 +804,7 @@ export default function TenYearPortfolio() {
                         <strong>{data?.universe?.ranked_candidates ?? 0} ranked</strong>
                     </div>
                     <div className="ty-note">
-                        Research screen, not financial advice. The first version uses GRID Yahoo price history and chart-quality rules; fundamentals can be added next.
+                        Research screen, not financial advice. This uses GRID stored price history and chart-quality rules. Resolved-series price basis is unverified; check each ticker's last price date.
                     </div>
                 </aside>
             </main>

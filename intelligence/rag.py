@@ -611,10 +611,11 @@ class RAGIndexer:
         row_data = []
 
         for row in rows:
-            parts = [
-                f"{row.ticker} {row.direction}",
-                f"confidence={row.confidence}",
-            ]
+            parts = [f"{row.ticker} {row.direction}"]
+            # An unstated confidence is left out of the indexed chunk rather
+            # than embedded as the literal string "confidence=None".
+            if row.confidence is not None:
+                parts.append(f"confidence={row.confidence}")
             if row.model_name:
                 parts.append(f"model={row.model_name}")
             if row.expected_move_pct:

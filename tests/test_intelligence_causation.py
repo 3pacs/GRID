@@ -1,268 +1,129 @@
-"""
-Tests for the causal-links intelligence endpoint.
+"""Tests for GET /api/v1/intelligence/causal-links (Timeline / Causal Map overlay).
 
-Tests the GET /api/v1/intelligence/causal-links API that powers
-the Timeline forensic visualization causal arrow overlay.
-
-Uses unittest.mock to avoid real API calls and database writes.
+Since slice N2 the route only reads persisted, provenance-bearing rows through
+``intelligence.causal_links.read_links_payload``. The real SQL is exercised
+against PostgreSQL in ``tests/test_causal_links_pg.py``.
 """
 
 from __future__ import annotations
 
-import asyncio
-import inspect
-from datetime import date, timedelta
+from datetime import date, datetime, timezone
 from unittest.mock import MagicMock, patch
 
+from intelligence import causal_links as cl
 
-# ── Test fixtures ────────────────────────────────────────────────────────
 
-
-def _mock_engine():
-    """Create a mock SQLAlchemy engine with connection context managers."""
+def _engine():
     engine = MagicMock()
     conn = MagicMock()
     engine.connect.return_value.__enter__ = MagicMock(return_value=conn)
     engine.connect.return_value.__exit__ = MagicMock(return_value=False)
-    engine.begin.return_value.__enter__ = MagicMock(return_value=conn)
-    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
     return engine, conn
 
 
-_SENTINEL = object()
+def _row(**over):
+    row = {
+        "id": 7, "edge_key": "k" * 64, "signal_id": 42, "actor": "Jane Doe", "ticker": "AAPL",
+        "action": "SELL", "action_channel": "form4", "action_date": date(2026, 9, 15),
+        "action_known_at": datetime(2026, 9, 17, tzinfo=timezone.utc),
+        "action_known_at_basis": "filing", "cause_type": "earnings",
+        "probable_cause": "Earnings beat released 2026-09-10 (1.10 vs 1.00 est)",
+        "event_kind": "earnings", "event_key": "earnings:AAPL:2026-09-10",
+        "event_date": date(2026, 9, 10),
+        "event_known_at": datetime(2026, 9, 11, tzinfo=timezone.utc),
+        "event_known_at_basis": "release_date",
+        "known_at": datetime(2026, 9, 17, tzinfo=timezone.utc), "lead_time_days": 4.0,
+        "probability": 0.647, "score_method": cl.SCORE_METHOD,
+        "evidence": '[{"type": "earnings"}]', "run_id": "r2", "first_run_id": "r1",
+        "code_sha": "abc123", "computed_at": datetime(2026, 9, 27, 7, 41, tzinfo=timezone.utc),
+    }
+    row.update(over)
+    return row
 
 
-def _mock_causal_row(
-    id_val=1,
-    signal_id=42,
-    cause_type="congressional",
-    cause_date=_SENTINEL,
-    cause_desc="Nancy Pelosi bought AAPL calls",
-    ticker="AAPL",
-    actor="Nancy Pelosi",
-    probability=0.82,
-    evidence=_SENTINEL,
-    effect_date=_SENTINEL,
-    effect_desc="AAPL rallied 3.2% in 2 sessions",
-    lead_time=2.0,
-):
-    """Create a mock database row matching the causal-links query output."""
-    if cause_date is _SENTINEL:
-        cause_date = date.today() - timedelta(days=5)
-    if effect_date is _SENTINEL:
-        effect_date = date.today() - timedelta(days=3)
-    if evidence is _SENTINEL:
-        evidence = {"lead_time_days": 2, "sources": ["House disclosure"]}
-
-    return (
-        id_val,         # cl.id
-        signal_id,      # cause_signal_id
-        cause_type,     # cause_type
-        cause_date,     # cause_date
-        cause_desc,     # cause_description
-        ticker,         # effect_ticker
-        actor,          # lever_actor
-        probability,    # probability
-        evidence,       # evidence
-        effect_date,    # effect_date
-        effect_desc,    # effect_description
-        lead_time,      # lead_time_days
-    )
+_RUN = {
+    "run_id": "r2", "as_of": "2026-09-27T07:40:00+00:00",
+    "finished_at": "2026-09-27T07:41:00+00:00", "code_sha": "abc123",
+    "edges_written": 1, "tickers_processed": 1,
+}
 
 
-def _run(value):
-    """Resolve route results whether the handler is sync or async."""
-    if not inspect.isawaitable(value):
-        return value
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(value)
-    finally:
-        loop.close()
+def _call(ticker="aapl", days=90, schema=True, run=_RUN, rows=()):
+    from api.routers.intelligence_causation import get_causal_links
 
-
-# ══════════════════════════════════════════════════════════════════════════
-# ENDPOINT TESTS (unit tests via direct function import)
-# ══════════════════════════════════════════════════════════════════════════
+    engine, _ = _engine()
+    with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine), \
+         patch.object(cl, "schema_ready", return_value=schema), \
+         patch.object(cl, "latest_run", return_value=run), \
+         patch.object(cl, "read_links", return_value=list(rows)) as read:
+        out = get_causal_links(ticker=ticker, days=days, _token="t")
+    return out, read
 
 
 class TestCausalLinksEndpoint:
-    """Tests for the causal-links API endpoint."""
-
     def test_router_uses_facade_relative_prefix(self):
-        """The causation router is mounted under the intelligence facade."""
         from api.routers.intelligence_causation import router
 
         assert router.prefix == ""
 
-    def test_valid_ticker_returns_links(self):
-        """Should return causal links for a valid ticker."""
-        engine, conn = _mock_engine()
-        rows = [
-            _mock_causal_row(id_val=1, ticker="AAPL", cause_type="congressional"),
-            _mock_causal_row(id_val=2, ticker="AAPL", cause_type="insider", actor="Tim Cook", probability=0.65),
-        ]
-        conn.execute.return_value.fetchall.return_value = rows
+    def test_schema_missing_is_honest_not_generated(self):
+        out, read = _call(schema=False)
+        assert out["generated"] is False
+        assert out["links"] == []
+        assert out["as_of"] is None
+        assert "not scheduled" in out["reason"]
+        read.assert_not_called()
 
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
+    def test_no_finished_run_is_not_generated(self):
+        out, _ = _call(run=None, rows=[_row()])
+        assert out["generated"] is False
+        assert out["links"] == []
 
-            result = _run(get_causal_links(ticker="AAPL", days=90, _token="test"))
-
-        assert result["ticker"] == "AAPL"
-        assert result["days"] == 90
-        assert len(result["links"]) == 2
-        assert result["links"][0]["cause_type"] == "congressional"
-        assert result["links"][1]["lever_actor"] == "Tim Cook"
-        assert "error" not in result
-
-    def test_days_parameter(self):
-        """Should pass days parameter correctly to the query."""
-        engine, conn = _mock_engine()
-        conn.execute.return_value.fetchall.return_value = [
-            _mock_causal_row(id_val=1, ticker="MSFT"),
-        ]
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="MSFT", days=30, _token="test"))
-
-        assert result["days"] == 30
-        assert len(result["links"]) == 1
-        assert conn.execute.called
-
-    def test_empty_results(self):
-        """Should return empty links list for a ticker with no causal data."""
-        engine, conn = _mock_engine()
-        conn.execute.return_value.fetchall.return_value = []
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="ZZZZ", days=90, _token="test"))
-
-        assert result["ticker"] == "ZZZZ"
-        assert result["links"] == []
-        assert "error" not in result
-
-    def test_ticker_uppercased(self):
-        """Should uppercase the ticker regardless of input case."""
-        engine, conn = _mock_engine()
-        conn.execute.return_value.fetchall.return_value = []
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="aapl", days=90, _token="test"))
-
-        assert result["ticker"] == "AAPL"
+    def test_links_carry_as_of_and_provenance(self):
+        out, read = _call(rows=[_row()])
+        assert out["ticker"] == "AAPL"
+        assert read.call_args.kwargs["ticker"] == "AAPL"
+        assert out["generated"] is True
+        assert out["as_of"] == _RUN["as_of"]
+        assert out["last_run"]["code_sha"] == "abc123"
+        link = out["links"][0]
+        # Arrow runs from the public event to the later trade.
+        assert link["cause_date"] == "2026-09-10"
+        assert link["effect_date"] == "2026-09-15"
+        assert link["effect_description"] == "Jane Doe SELL AAPL"
+        assert link["known_at"].startswith("2026-09-17")
+        assert link["event_known_at_basis"] == "release_date"
+        assert link["run_id"] == "r2" and link["first_run_id"] == "r1"
+        assert link["score"] == 0.647
+        assert link["score_is_probability"] is False
+        assert link["evidence"] == [{"type": "earnings"}]
+        assert "Price reaction" not in str(out)
 
     def test_db_error_returns_graceful_error(self):
-        """Should return an error message if the DB query fails."""
-        engine, conn = _mock_engine()
-        conn.execute.side_effect = Exception("Connection refused")
+        from api.routers.intelligence_causation import get_causal_links
 
+        engine = MagicMock()
+        engine.connect.side_effect = RuntimeError("db down")
         with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="AAPL", days=90, _token="test"))
-
-        assert result["links"] == []
-        assert "error" in result
-        assert "Connection refused" in result["error"]
-
-    def test_null_fields_handled(self):
-        """Should handle None/null fields gracefully in the response."""
-        engine, conn = _mock_engine()
-        row = _mock_causal_row(
-            signal_id=None,
-            actor=None,
-            probability=None,
-            evidence=None,
-            cause_desc=None,
-            effect_desc=None,
-        )
-        conn.execute.return_value.fetchall.return_value = [row]
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="AAPL", days=90, _token="test"))
-
-        link = result["links"][0]
-        assert link["cause_signal_id"] is None
-        assert link["lever_actor"] == "Unknown"
-        assert link["probability"] == 0.5
-        assert link["evidence"] == {}
-        assert link["cause_description"] == ""
-        assert link["effect_description"] == ""
-
-    def test_evidence_json_string_parsed(self):
-        """Should parse evidence when it comes as a JSON string."""
-        engine, conn = _mock_engine()
-        row = _mock_causal_row(
-            evidence='{"lead_time_days": 5, "sources": ["SEC"]}'
-        )
-        conn.execute.return_value.fetchall.return_value = [row]
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="AAPL", days=90, _token="test"))
-
-        link = result["links"][0]
-        assert link["evidence"]["lead_time_days"] == 5
-        assert "SEC" in link["evidence"]["sources"]
-
-    def test_signal_data_join_fills_descriptions(self):
-        """Should use signal_data descriptions when available via LEFT JOIN."""
-        engine, conn = _mock_engine()
-        row = _mock_causal_row(
-            effect_desc="Insider cluster buy detected - 5 directors within 3 days",
-        )
-        conn.execute.return_value.fetchall.return_value = [row]
-
-        with patch("api.routers.intelligence_causation.get_db_engine", return_value=engine):
-            from api.routers.intelligence_causation import get_causal_links
-
-            result = _run(get_causal_links(ticker="AAPL", days=90, _token="test"))
-
-        link = result["links"][0]
-        assert "cluster buy" in link["effect_description"]
+            out = get_causal_links(ticker="SPY", days=30, _token="t")
+        assert out["links"] == [] and out["generated"] is False
+        assert out["error"] == "causal links unavailable"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# HELPER FUNCTION TESTS
-# ══════════════════════════════════════════════════════════════════════════
+class TestCausationGet:
+    def test_causation_get_reads_persisted_links_without_narrative(self):
+        from api.routers import intelligence_forensics as f
 
-
-class TestParseEvidence:
-    """Tests for the _parse_evidence helper."""
-
-    def test_none_returns_empty_dict(self):
-        from api.routers.intelligence_causation import _parse_evidence
-
-        assert _parse_evidence(None) == {}
-
-    def test_dict_passthrough(self):
-        from api.routers.intelligence_causation import _parse_evidence
-
-        data = {"key": "value"}
-        assert _parse_evidence(data) == data
-
-    def test_json_string_parsed(self):
-        from api.routers.intelligence_causation import _parse_evidence
-
-        assert _parse_evidence('{"a": 1}') == {"a": 1}
-
-    def test_invalid_json_returns_empty(self):
-        from api.routers.intelligence_causation import _parse_evidence
-
-        assert _parse_evidence("not json") == {}
-
-    def test_other_types_return_empty(self):
-        from api.routers.intelligence_causation import _parse_evidence
-
-        assert _parse_evidence(12345) == {}
-        assert _parse_evidence([1, 2]) == {}
+        engine, _ = _engine()
+        with patch.object(f, "get_db_engine", return_value=engine), \
+             patch.object(cl, "schema_ready", return_value=True), \
+             patch.object(cl, "latest_run", return_value=_RUN), \
+             patch.object(cl, "read_links", return_value=[_row()]):
+            out = f.get_causation(ticker="aapl", days=30, _token="t")
+        assert out["ticker"] == "AAPL"
+        assert out["narrative"] is None
+        assert out["as_of"] == _RUN["as_of"]
+        assert out["total_causes"] == 1
+        cause = out["causes"][0]
+        assert cause["ticker"] == "AAPL" and cause["probable_cause"].startswith("Earnings beat")
+        assert cause["score_method"] == cl.SCORE_METHOD

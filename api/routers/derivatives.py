@@ -8,7 +8,8 @@ DealerGammaEngine and options_snapshots tables.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+import math
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends, Query
@@ -17,6 +18,7 @@ from sqlalchemy import text
 
 from api.auth import require_auth
 from api.dependencies import get_db_engine
+from store.availability import unavailable
 
 router = APIRouter(
     prefix="/api/v1/derivatives",
@@ -29,6 +31,48 @@ def _get_gex_engine():
     """Lazily import and instantiate DealerGammaEngine."""
     from physics.dealer_gamma import DealerGammaEngine
     return DealerGammaEngine(get_db_engine())
+
+
+def _utc_day() -> date:
+    return datetime.now(timezone.utc).date()
+
+
+def _verified_gex_profile(profile: dict[str, Any]) -> bool:
+    """Require the current completed SPY chain/close contract at API edges."""
+    from ollama.dealer_flow_briefing import valid_spy_gex_profile
+
+    return valid_spy_gex_profile(profile, _utc_day())
+
+
+def _chain_age_fields(profile: dict[str, Any]) -> dict[str, Any]:
+    """Read cutoff, age and marker the opt-in latest-completed read attaches."""
+    return {
+        "chain_age_seconds": profile.get("chain_age_seconds"),
+        "chain_read_cutoff": profile.get("chain_read_cutoff"),
+        "default_resolution": profile.get("default_resolution"),
+    }
+
+
+def _read_profile(engine_gex: Any, ticker: str, args: dict[str, Any]) -> dict[str, Any]:
+    """Read-only /gex and /walls: no day and no batch -> latest completed capture.
+
+    Only these two read surfaces opt in. Every other caller of
+    ``compute_gex_profile`` (regime, vanna-charm, flow narrative, chat, risk,
+    recommendations, briefing) keeps the unchanged UTC-day default.
+    """
+    if not args:
+        return engine_gex.compute_latest_completed_gex_profile(ticker)
+    return engine_gex.compute_gex_profile(ticker, **args)
+
+
+def _gex_provenance(profile: dict[str, Any]) -> dict[str, Any]:
+    return {key: profile[key] for key in (
+        "estimated", "basis", "spot_source", "spot_basis", "spot_obs_date",
+        "spot_available_at", "spot_receipt_id", "chain_snap_date",
+        "chain_batch_id", "chain_capture_ordinal", "chain_capture_started_at",
+        "chain_capture_completed_at", "chain_provider_regular_market_at_min",
+        "chain_provider_regular_market_at_max",
+    )}
 
 
 # ── GET /overview ────────────────────────────────────────────────────
@@ -78,28 +122,95 @@ def get_overview() -> dict[str, Any]:
 
 # ── GET /gex/{ticker} ───────────────────────────────────────────────
 
+def _replay_args(snap_date: date | None, capture_batch_id: str | None) -> dict[str, Any] | None:
+    """Default ({}): latest completed capture (read routes only). Replay needs an explicit day+batch."""
+    if capture_batch_id is None:
+        return {"snap_date": snap_date} if snap_date is not None else {}
+    if snap_date is None:
+        return None
+    return {"snap_date": snap_date, "capture_batch_id": capture_batch_id}
+
+
 @router.get("/gex/{ticker}")
-async def get_gex(ticker: str) -> dict[str, Any]:
+async def get_gex(
+    ticker: str,
+    snap_date: date | None = Query(
+        None,
+        description=("Chain day (default: latest completed capture on or before the "
+                     "last NYSE trading day; the response then carries "
+                     "default_resolution and chain_age_seconds)"),
+    ),
+    capture_batch_id: str | None = Query(
+        None, min_length=1, max_length=64,
+        description="Replay this registered capture batch instead of the day's latest",
+    ),
+) -> dict[str, Any]:
     """Full GEX profile for a single ticker.
 
     Returns gex_aggregate, gamma_flip, gamma_wall, put_wall, call_wall,
     dealer_delta, vanna_exposure, charm_exposure, regime, profile curve,
-    and per_strike breakdown.
+    and per_strike breakdown. By default the latest completed capture on or
+    before the last NYSE trading day is used (never the bare UTC calendar day,
+    which has no chain until ~22:20Z) and the response carries
+    ``default_resolution: "last_completed_capture"`` plus ``chain_age_seconds``;
+    ``snap_date`` + ``capture_batch_id`` replay an earlier batch.
     """
+    args = _replay_args(snap_date, capture_batch_id)
+    if args is None:
+        return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper())
+        result = _read_profile(engine_gex, ticker.upper(), args)
+        if capture_batch_id is not None and isinstance(result, dict):
+            result = {**result, "replayed_batch": True}
         return result
     except Exception as exc:
         log.warning("GEX computation failed for {t}: {e}", t=ticker, e=str(exc))
         return {"error": str(exc), "ticker": ticker.upper()}
 
 
+# ── GET /options-batches/{ticker} ─────────────────────────────────────
+
+@router.get("/options-batches/{ticker}")
+async def get_options_batches(
+    ticker: str,
+    snap_date: date = Query(..., description="Chain day to list capture batches for"),
+) -> dict[str, Any]:
+    """Every registered complete capture batch for a ticker/day, oldest first.
+
+    ``latest`` marks the batch the default readers use; any other listed
+    batch can be replayed via ``/gex`` or ``/walls`` with ``capture_batch_id``.
+    """
+    try:
+        with get_db_engine().connect() as conn:
+            rows = conn.execute(text(
+                "SELECT capture_batch_id, capture_ordinal, capture_started_at, "
+                "capture_completed_at, row_count, capture_source, backfilled "
+                "FROM options_capture_batches "
+                "WHERE ticker = :ticker AND snap_date = :snap_date "
+                "ORDER BY capture_ordinal"
+            ), {"ticker": ticker.upper(), "snap_date": snap_date}).fetchall()
+    except Exception as exc:
+        log.warning("Options batch listing failed for {t}: {e}", t=ticker, e=type(exc).__name__)
+        return {"error": "options batch listing unavailable", "ticker": ticker.upper()}
+    batches = [
+        {
+            "capture_batch_id": r[0], "capture_ordinal": int(r[1]),
+            "capture_started_at": r[2].isoformat() if r[2] else None,
+            "capture_completed_at": r[3].isoformat() if r[3] else None,
+            "row_count": int(r[4]), "capture_source": r[5], "backfilled": bool(r[6]),
+            "latest": i == len(rows) - 1,
+        }
+        for i, r in enumerate(rows)
+    ]
+    return {"ticker": ticker.upper(), "snap_date": snap_date.isoformat(), "batches": batches}
+
+
 # ── GET /regime ──────────────────────────────────────────────────────
 
 @router.get("/regime")
 async def get_regime() -> dict[str, Any]:
-    """Current dealer regime with plain-English interpretation.
+    """Estimated SPY gamma regime with source and model provenance.
 
     Computes SPY GEX and returns regime classification plus explanation
     of what it means for market dynamics.
@@ -108,26 +219,36 @@ async def get_regime() -> dict[str, Any]:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
 
+        if spy.get("error") or not _verified_gex_profile(spy):
+            reason = spy.get("reason") or spy.get("error") or "Dated SPY GEX evidence unavailable"
+            result = unavailable(
+                reason, source="dealer_gamma", regime=None,
+                interpretation=None, gex_aggregate=None,
+                gex_normalized=None, gamma_flip=None, spot=None,
+            )
+            result["error"] = reason
+            return result
+
         regime = spy.get("regime", "UNKNOWN")
         interpretations = {
             "LONG_GAMMA": (
-                "Dealers are long gamma. They hedge by selling rallies and buying dips, "
-                "dampening volatility. Expect mean-reversion and range-bound price action. "
-                "Intraday moves tend to fade. Realized vol will likely undershoot implied."
+                "The assumed dealer-sign model estimates positive gamma at the prior "
+                "verified close. If dealer positions match that assumption, hedge "
+                "sensitivity could dampen moves. Actual positions are unknown."
             ),
             "SHORT_GAMMA": (
-                "Dealers are short gamma. They hedge by buying rallies and selling dips, "
-                "amplifying moves in both directions. Expect trend-following dynamics, "
-                "potential breakouts, and elevated realized volatility. Directional risk is high."
+                "The assumed dealer-sign model estimates negative gamma at the prior "
+                "verified close. If dealer positions match that assumption, hedge "
+                "sensitivity could amplify moves. Actual positions are unknown."
             ),
             "NEUTRAL": (
-                "Gamma exposure is near zero. The market is at or near the gamma flip point. "
-                "Small changes in spot could shift dealers from stabilizing to amplifying flows. "
-                "Watch for regime transitions — this is an inflection zone."
+                "The assumed dealer-sign model estimates gamma near zero at the "
+                "prior verified close. Actual dealer positioning is unknown."
             ),
         }
 
         return {
+            **_gex_provenance(spy),
             "regime": regime,
             "interpretation": interpretations.get(regime, "Unable to determine regime."),
             "gex_aggregate": spy.get("gex_aggregate"),
@@ -144,17 +265,48 @@ async def get_regime() -> dict[str, Any]:
 # ── GET /walls/{ticker} ─────────────────────────────────────────────
 
 @router.get("/walls/{ticker}")
-async def get_walls(ticker: str) -> dict[str, Any]:
+async def get_walls(
+    ticker: str,
+    snap_date: date | None = Query(
+        None,
+        description=("Chain day (default: latest completed capture on or before the "
+                     "last NYSE trading day; the response then carries "
+                     "default_resolution and chain_age_seconds)"),
+    ),
+    capture_batch_id: str | None = Query(
+        None, min_length=1, max_length=64,
+        description="Replay this registered capture batch instead of the day's latest",
+    ),
+) -> dict[str, Any]:
     """Support/resistance levels derived from gamma walls.
 
     Returns put_wall (support), call_wall (resistance), gamma_flip,
-    and current spot price.
+    and current spot price, from the latest completed capture on or before the
+    last NYSE trading day unless ``snap_date`` + ``capture_batch_id`` name an
+    earlier one to replay. A profile the engine could not build keeps its
+    ``error``/``reason`` instead of reading as all-``None`` walls.
     """
+    args = _replay_args(snap_date, capture_batch_id)
+    if args is None:
+        return {"error": "capture_batch_id replay requires snap_date", "ticker": ticker.upper()}
     try:
         engine_gex = _get_gex_engine()
-        result = engine_gex.compute_gex_profile(ticker.upper())
+        result = _read_profile(engine_gex, ticker.upper(), args)
+        if result.get("error"):
+            return {
+                **{k: result[k] for k in ("available", "status", "reason", "source")
+                   if k in result},
+                "error": result["error"],
+                "ticker": ticker.upper(),
+                **_chain_age_fields(result),
+            }
         return {
             "ticker": ticker.upper(),
+            "replayed_batch": capture_batch_id is not None,
+            **_chain_age_fields(result),
+            "chain_snap_date": result.get("chain_snap_date"),
+            "chain_batch_id": result.get("chain_batch_id"),
+            "chain_capture_ordinal": result.get("chain_capture_ordinal"),
             "put_wall": result.get("put_wall"),
             "call_wall": result.get("call_wall"),
             "gamma_wall": result.get("gamma_wall"),
@@ -171,21 +323,27 @@ async def get_walls(ticker: str) -> dict[str, Any]:
 
 @router.get("/vanna-charm/{ticker}")
 async def get_vanna_charm(ticker: str) -> dict[str, Any]:
-    """Decomposed vanna and charm exposures with per-strike breakdown.
+    """Estimated vanna and charm with dated chain/spot provenance.
 
-    Returns aggregate vanna/charm, per-strike decomposition, net dealer
-    delta change from charm decay, days to next OpEx, and a plain-English
-    interpretation of projected dealer hedging flows.
+    Returns modeled sensitivities and per-strike decomposition. It does not
+    infer required hedge orders from open interest.
     """
     try:
         engine_gex = _get_gex_engine()
         result = engine_gex.compute_gex_profile(ticker.upper())
 
-        if result.get("error"):
-            return {"error": result["error"], "ticker": ticker.upper()}
+        if result.get("error") or not _verified_gex_profile(result):
+            return {"error": result.get("error") or "Dated GEX evidence unavailable",
+                    "ticker": ticker.upper()}
 
-        vanna = result.get("vanna_exposure", 0)
-        charm = result.get("charm_exposure", 0)
+        vanna = result.get("vanna_exposure")
+        charm = result.get("charm_exposure")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value)
+            for value in (vanna, charm)
+        ):
+            return {"error": "Vanna/charm exposure unavailable", "ticker": ticker.upper()}
         spot = result.get("spot", 0)
         per_strike = result.get("per_strike", [])
 
@@ -220,26 +378,20 @@ async def get_vanna_charm(ticker: str) -> dict[str, Any]:
         opex = _next_opex(today)
         days_to_opex = (opex - today).days
 
-        # Net dealer delta change: charm accumulates daily until OpEx
-        # charm_exposure is daily delta decay; project forward
-        net_delta_change = round(charm * days_to_opex, 0)
-
-        # Build interpretation
-        action = "sell" if net_delta_change < 0 else "buy"
-        abs_delta_m = abs(net_delta_change) / 1e6
         interpretation = (
-            f"Dealers will need to {action} ~${abs_delta_m:.1f}M delta by "
-            f"{opex.strftime('%b %d')} OpEx due to charm decay"
+            "Vanna and charm are sensitivities from an assumed dealer-sign model. "
+            "Open interest does not establish actual dealer positions or required trades."
         )
 
         return {
+            **_gex_provenance(result),
             "ticker": ticker.upper(),
             "spot": spot,
             "vanna_exposure": vanna,
             "charm_exposure": charm,
             "vanna_by_strike": vanna_by_strike,
             "charm_by_strike": charm_by_strike,
-            "net_dealer_delta_change": net_delta_change,
+            "net_dealer_delta_change": None,
             "interpretation": interpretation,
             "days_to_opex": days_to_opex,
             "opex_date": str(opex),
@@ -556,9 +708,23 @@ async def get_flow_narrative() -> dict[str, Any]:
 
     # Try the LLM-powered briefing first
     try:
-        from ollama.dealer_flow_briefing import get_latest_flow_briefing
+        from ollama.dealer_flow_briefing import (
+            SPOT_CONTRACT,
+            get_latest_flow_briefing,
+            valid_spy_gex_profile,
+        )
         result = get_latest_flow_briefing(db)
-        if result.get("content"):
+        positioning = result.get("positioning_data")
+        saved_gex = positioning.get("gex") if isinstance(positioning, dict) else None
+        spy_saved = saved_gex.get("SPY") if isinstance(saved_gex, dict) else None
+        if (
+            result.get("content")
+            and result.get("stale") is False
+            and result.get("briefing_date") == _utc_day().isoformat()
+            and isinstance(positioning, dict)
+            and positioning.get("spot_contract") == SPOT_CONTRACT
+            and valid_spy_gex_profile(spy_saved, _utc_day())
+        ):
             return result
     except Exception as exc:
         log.debug("LLM flow briefing unavailable: {e}", e=str(exc))
@@ -568,8 +734,28 @@ async def get_flow_narrative() -> dict[str, Any]:
         engine_gex = _get_gex_engine()
         spy = engine_gex.compute_gex_profile("SPY")
 
+        spot = spy.get("spot")
+        if (
+            not valid_spy_gex_profile(spy, _utc_day())
+            or spy.get("available") is False
+            or spy.get("error")
+            or not isinstance(spot, (int, float))
+            or not math.isfinite(spot)
+            or spot <= 0
+        ):
+            reason = spy.get("reason") or spy.get("error") or "No measured SPY spot available"
+            result = unavailable(
+                reason,
+                source=spy.get("source") or "dealer_gamma",
+                content=None,
+                positioning_data=None,
+                briefing_date=None,
+                created_at=None,
+            )
+            result.update({"stale": True, "error": spy.get("error") or reason})
+            return result
+
         regime = spy.get("regime", "UNKNOWN")
-        spot = spy.get("spot", 0)
         gex = spy.get("gex_aggregate", 0)
         flip = spy.get("gamma_flip")
         put_wall = spy.get("put_wall")
@@ -577,37 +763,37 @@ async def get_flow_narrative() -> dict[str, Any]:
         vanna = spy.get("vanna_exposure", 0)
         charm = spy.get("charm_exposure", 0)
 
-        parts = [f"SPY is trading at ${spot:.2f}."]
+        parts = [f"SPY prior verified close was ${spot:.2f}."]
 
         if regime == "LONG_GAMMA":
             parts.append(
-                "Dealers are currently LONG GAMMA, meaning hedging flows will dampen "
-                "price moves. Expect range-bound, mean-reverting action."
+                "The assumed dealer-sign model estimates LONG GAMMA. Conditional "
+                "hedging could dampen moves; actual dealer positions are unknown."
             )
         elif regime == "SHORT_GAMMA":
             parts.append(
-                "Dealers are currently SHORT GAMMA. Hedging flows amplify directional "
-                "moves. Risk of gap moves and sustained trends is elevated."
+                "The assumed dealer-sign model estimates SHORT GAMMA. Conditional "
+                "hedging could amplify moves; actual dealer positions are unknown."
             )
         else:
             parts.append(
-                "Dealer gamma is near NEUTRAL. The market sits close to the gamma "
-                "flip point, making regime transitions likely on small moves."
+                "The assumed dealer-sign model estimates near NEUTRAL gamma. "
+                "Actual dealer positions are unknown."
             )
 
         if flip:
             position = "above" if spot > flip else "below"
-            parts.append(f"Gamma flip is at ${flip:.0f} (spot is {position}).")
+            parts.append(f"Modeled gamma flip is at ${flip:.0f} (prior close is {position}).")
 
         if put_wall and call_wall:
             parts.append(
-                f"Gamma walls: put wall (support) at ${put_wall:.0f}, "
-                f"call wall (resistance) at ${call_wall:.0f}."
+                f"Modeled exposure walls: put at ${put_wall:.0f}, "
+                f"call at ${call_wall:.0f}."
             )
 
         parts.append(
-            f"Aggregate GEX: ${gex:,.0f}. "
-            f"Vanna exposure: ${vanna:,.0f}. Charm exposure: ${charm:,.0f}."
+            f"Modeled aggregate GEX: ${gex:,.0f}. "
+            f"Modeled vanna: ${vanna:,.0f}. Modeled charm: ${charm:,.0f}."
         )
 
         narrative = " ".join(parts)
@@ -869,7 +1055,10 @@ def get_flow_timeline(
 
     db = get_db_engine()
     history: list[dict] = []
-    gamma_flip_crossings: list[dict] = []
+    gex_sign_changes: list[dict] = []
+    failed_dates = 0
+    stored_read_failed = False
+    used_fallback = False
 
     # ── Try options_daily_signals first for stored data ──
     try:
@@ -888,15 +1077,21 @@ def get_flow_timeline(
 
             for r in rows:
                 sig_date = r[0]
-                spot = float(r[1]) if r[1] else 0
                 try:
                     gex_result = engine_gex.compute_gex_profile(ticker, snap_date=sig_date)
-                    net_gex = gex_result.get("gex_aggregate", 0)
-                    regime_raw = (gex_result.get("regime") or "NEUTRAL").lower()
-                    spot = gex_result.get("spot", spot)
-                except Exception:
-                    net_gex = 0
-                    regime_raw = "neutral"
+                    if gex_result.get("error") or any(
+                        gex_result.get(field) is None
+                        for field in ("gex_aggregate", "regime", "spot")
+                    ):
+                        failed_dates += 1
+                        continue
+                    net_gex = gex_result["gex_aggregate"]
+                    regime_raw = gex_result["regime"].lower()
+                    spot = gex_result["spot"]
+                except Exception as exc:
+                    log.debug("Flow timeline GEX for {t} on {d}: {e}", t=ticker, d=sig_date, e=str(exc))
+                    failed_dates += 1
+                    continue
 
                 history.append({
                     "date": str(sig_date),
@@ -907,14 +1102,17 @@ def get_flow_timeline(
                 })
 
                 if prev_gex is not None and prev_gex * net_gex < 0:
-                    gamma_flip_crossings.append({
+                    # This is a change between dated modeled GEX estimates,
+                    # not proof that spot crossed a same-chain flip price.
+                    gex_sign_changes.append({
                         "date": str(sig_date),
-                        "direction": "below" if net_gex < 0 else "above",
-                        "spot_at_crossing": round(spot, 2),
+                        "gex_sign": "negative" if net_gex < 0 else "positive",
+                        "spot": round(spot, 2),
                     })
                 prev_gex = net_gex
 
     except Exception as exc:
+        stored_read_failed = True
         log.debug("Flow timeline daily signals query failed: {e}", e=str(exc))
 
     # ── Fallback: compute from latest snapshot ──
@@ -922,12 +1120,16 @@ def get_flow_timeline(
         try:
             engine_gex = _get_gex_engine()
             result = engine_gex.compute_gex_profile(ticker)
-            if not result.get("error"):
+            if not result.get("error") and all(
+                result.get(field) is not None
+                for field in ("gex_aggregate", "regime", "spot")
+            ):
+                used_fallback = True
                 history.append({
                     "date": result.get("snap_date", str(end_date)),
-                    "net_gex": round(result.get("gex_aggregate", 0)),
-                    "regime": (result.get("regime") or "NEUTRAL").lower(),
-                    "spot": result.get("spot", 0),
+                    "net_gex": round(result["gex_aggregate"]),
+                    "regime": result["regime"].lower(),
+                    "spot": result["spot"],
                 })
         except Exception as exc:
             log.debug("Flow timeline GEX fallback failed: {e}", e=str(exc))
@@ -942,9 +1144,17 @@ def get_flow_timeline(
         "ticker": ticker,
         "days": days,
         "history": history,
+        "history_status": (
+            "unavailable" if not history else
+            "fallback" if used_fallback else
+            "partial" if failed_dates or stored_read_failed else "available"
+        ),
+        "failed_dates": failed_dates,
+        **({"error": "No usable GEX history is available"} if not history else {}),
         "opex_calendar": opex_calendar,
         "catalysts": catalysts,
-        "gamma_flip_crossings": gamma_flip_crossings,
+        "gex_sign_changes": gex_sign_changes,
+        "gamma_flip_crossings": [],  # legacy field; price crossings unverified
     }
 
 

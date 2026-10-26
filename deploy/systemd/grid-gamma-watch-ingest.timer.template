@@ -1,0 +1,12 @@
+# DESIGN ONLY. NOT INSTALLED; cannot enable through WantedBy.
+# Proposed daily receipt replay outside the 03:30-10:30Z backup window.
+# Intraday cadence needs a separate reviewed activation/change proposal.
+[Unit]
+Description=GRID Gamma Watch receipt replay (disabled design)
+ConditionPathExists=/etc/grid/approvals/gamma-watch-ingest
+
+[Timer]
+OnCalendar=Mon..Fri *-*-* 22:45:00 UTC
+Persistent=false
+Unit=grid-gamma-watch-ingest.service
+# Intentionally no [Install] / WantedBy: deployment must not install/enable it.

@@ -116,6 +116,10 @@ _QUERY = text("""
       AND created_at >= NOW() - (:days || ' days')::interval
       AND pnl_pct IS NOT NULL
       AND dedup_keep = TRUE
+      -- This report is a per-confidence-bucket calibration read. A row that
+      -- stated no confidence belongs in no bucket, so it is excluded here
+      -- rather than silently landing in LOW.
+      AND confidence IS NOT NULL
     ORDER BY ticker, direction, entry_price, actual_price, expiry, created_at ASC
 """)
 
@@ -138,9 +142,12 @@ _DUP_COUNT_QUERY = text("""
 """)
 
 
-def _bucket_for(confidence: float) -> str:
+def _bucket_for(confidence: float | None) -> str:
     if confidence is None:
-        return "LOW"
+        # Not LOW. An unstated confidence is not a low confidence, and
+        # folding it into LOW moved the LOW bucket's hit rate and PnL.
+        # The loader already excludes these; this is the belt and braces.
+        return "UNSCORED"
     c = float(confidence)
     if c >= HIGH_THRESHOLD:
         return "HIGH"
@@ -327,7 +334,7 @@ def run(engine, days: int = DEFAULT_DAYS) -> ProfitabilityReport:
     # Aggregate (overall verdict still useful, but secondary)
     by_bucket: dict[str, list[dict[str, Any]]] = {"HIGH": [], "MEDIUM": [], "LOW": []}
     for r in rows:
-        by_bucket[_bucket_for(r["confidence"])].append(r)
+        by_bucket.setdefault(_bucket_for(r["confidence"]), []).append(r)
     buckets = {name: _bucket_stats(name, by_bucket[name]) for name in ("HIGH", "MEDIUM", "LOW")}
 
     # Slice breakdowns — this is what tells us WHICH part of the stack works

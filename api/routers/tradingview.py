@@ -196,6 +196,7 @@ def get_signals(
         "FROM raw_series rs "
         "JOIN source_catalog sc ON sc.id = rs.source_id "
         "WHERE sc.name = 'TradingView' "
+        "AND rs.pull_status = 'SUCCESS' "
     )
     params: dict[str, Any] = {"limit": min(limit, 200)}
 

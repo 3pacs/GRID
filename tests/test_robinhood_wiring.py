@@ -109,11 +109,11 @@ class StubTrader:
         code = rh.crypto_asset_code(ticker)
         return bool(code) and code in self._tradable
 
-    def open_position(self, ticker, direction, size_usd):
+    def open_position(self, ticker, direction, size_usd, client_order_id=None, **_kw):
         self.orders.append({"ticker": ticker, "direction": direction, "size_usd": size_usd})
         return {"status": "dry_run", "symbol": f"{ticker}-USD", "size_usd": size_usd}
 
-    def close_position(self, ticker):
+    def close_position(self, ticker, client_order_id=None, **_kw):
         self.closed.append(ticker)
         return {"status": "dry_run", "direction": "CLOSE", "symbol": f"{ticker}-USD"}
 
@@ -289,6 +289,30 @@ class TestBuildVenueTag:
             tag = se.build_venue_tag(mock_engine, "Robinhood", "w1")
         assert tag is not None and tag.venue == "robinhood"
         assert tag.wallet_id == "w1" and tag.capital == 250.0
+
+    def test_no_wallet_id_auto_resolves_the_active_wallet(self, mock_engine):
+        """Closes the gap where no wallet_id used to mean no gate at all —
+        the newest ACTIVE wallet for the exchange is resolved instead."""
+        from trading import signal_executor as se
+
+        wallet = {"id": "auto-w1", "status": "ACTIVE", "current_capital": 300.0}
+        wm = MagicMock()
+        wm.return_value.get_all_wallets.return_value = [wallet]
+        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
+             patch("trading.wallet_manager.WalletManager", wm):
+            tag = se.build_venue_tag(mock_engine, "robinhood")
+        assert tag is not None
+        assert tag.wallet_id == "auto-w1" and tag.capital == 300.0
+        wm.return_value.get_all_wallets.assert_called_once_with(exchange="robinhood", status="ACTIVE")
+
+    def test_no_wallet_id_and_no_active_wallet_routes_nothing(self, mock_engine):
+        from trading import signal_executor as se
+
+        wm = MagicMock()
+        wm.return_value.get_all_wallets.return_value = []
+        with patch("trading.robinhood.get_robinhood_trader", return_value=StubTrader()), \
+             patch("trading.wallet_manager.WalletManager", wm):
+            assert se.build_venue_tag(mock_engine, "robinhood") is None
 
 
 # ── signal executor: end-to-end signal → paper trade + venue order ─────────
@@ -600,8 +624,13 @@ class TestHealthRobinhoodBlock:
             resp = client.get("/api/v1/system/health")
         assert resp.status_code == 200
         block = resp.json()["checks"]["robinhood"]
-        assert block == {"mode": "DRY_RUN", "configured": True, "live_trading": False,
-                         "max_position_usd": 100.0, "max_drawdown_pct": 0.20}
+        assert block == {
+            "mode": "DRY_RUN", "configured": True, "live_trading": False,
+            "max_position_usd": 100.0, "max_drawdown_pct": 0.20,
+            "max_daily_loss_pct": 0.05, "max_orders_per_day": 6,
+            "max_quote_age_s": 30.0, "max_spread_bps": 250.0,
+            "use_limit_orders": True, "limit_slippage_bps": 25.0,
+        }
         assert session.calls == []  # health never reaches out to the venue
 
     def test_unconfigured_is_reported_not_degraded(self, client, mock_engine):
@@ -622,3 +651,51 @@ class TestHealthRobinhoodBlock:
         assert data["checks"]["robinhood"]["mode"] == "ERROR"
         assert "robinhood connector misconfigured" in data["degraded_reasons"]
         assert data["status"] == "degraded"
+
+
+# ── API: idempotency key + blocked/duplicate status handling ───────────────
+
+
+class TestRobinhoodTradeRoute:
+    def test_idempotency_key_reaches_the_connector(self, client):
+        trader = MagicMock()
+        trader.open_position.return_value = {"status": "dry_run", "symbol": "BTC-USD"}
+        with patch("api.routers.trading._get_robinhood", return_value=trader):
+            resp = client.post("/api/v1/trading/robinhood/trade", headers=_auth_header(), json={
+                "ticker": "BTC", "direction": "LONG", "size_usd": 10.0, "idempotency_key": "abc-123",
+            })
+        assert resp.status_code == 200
+        assert trader.open_position.call_args.kwargs["client_order_id"] == "abc-123"
+
+    def test_blocked_guard_returns_200_with_the_reason(self, client):
+        trader = MagicMock()
+        trader.open_position.return_value = {
+            "error": "Max drawdown breached: 69.0% >= 20.0%. Trading halted.",
+            "status": "blocked", "guard": "drawdown",
+        }
+        with patch("api.routers.trading._get_robinhood", return_value=trader):
+            resp = client.post("/api/v1/trading/robinhood/trade", headers=_auth_header(), json={
+                "ticker": "BTC", "direction": "LONG", "size_usd": 10.0,
+            })
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "blocked" and resp.json()["guard"] == "drawdown"
+
+    def test_duplicate_close_returns_200(self, client):
+        trader = MagicMock()
+        trader.close_position.return_value = {"status": "duplicate", "client_order_id": "k1"}
+        with patch("api.routers.trading._get_robinhood", return_value=trader):
+            resp = client.post("/api/v1/trading/robinhood/close", headers=_auth_header(), json={
+                "ticker": "BTC", "idempotency_key": "k1",
+            })
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "duplicate"
+        assert trader.close_position.call_args.kwargs["client_order_id"] == "k1"
+
+    def test_plain_validation_error_still_400s(self, client):
+        trader = MagicMock()
+        trader.open_position.return_value = {"error": "Invalid direction: SIDEWAYS. Must be LONG or SHORT."}
+        with patch("api.routers.trading._get_robinhood", return_value=trader):
+            resp = client.post("/api/v1/trading/robinhood/trade", headers=_auth_header(), json={
+                "ticker": "BTC", "direction": "SIDEWAYS", "size_usd": 10.0,
+            })
+        assert resp.status_code == 400

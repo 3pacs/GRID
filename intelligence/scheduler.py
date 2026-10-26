@@ -2,8 +2,17 @@
 GRID Intelligence Scheduler — background loop for periodic intelligence tasks.
 
 Runs hourly briefings, capital flow refreshes, daily context pulls,
-nightly research, taxonomy audits, celestial briefings, dealer flow
-briefings, options recommendations/tracking, and paper trading signals.
+taxonomy audits, celestial briefings, dealer flow briefings, and options
+recommendations. Three jobs — nightly bulk hypothesis generation
+(``_nightly_research``), the weekly scanner-weights writer
+(``_options_tracker``), and hourly legacy paper trading
+(``_paper_trading_signals``) — are held off by default per the 2026-09-28
+owner decision (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md §6) and are
+only registered with `schedule` when their respective
+``GRID_ENABLE_*_JOB`` flag is set; see the "Schedule registration"
+section below. The daily Taiwan Strait OSINT job
+(``_taiwan_strait_osint_daily``) is likewise held off by default behind
+``GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB`` (owner decision 2026-09-29).
 
 Extracted from api/main.py lifespan to keep the API entry point lean
 and make the scheduler independently testable.
@@ -16,6 +25,8 @@ import time
 import schedule as _sched
 from loguru import logger as log
 
+_ACTOR_NEWS_BATCH_BUDGET_SECONDS = 30.0
+
 
 def run_intelligence_loop() -> None:
     """Background loop: hourly briefings, 4h capital flows, daily wiki + crypto.
@@ -25,7 +36,7 @@ def run_intelligence_loop() -> None:
     """
     from config import Settings
 
-    _s = Settings()  # noqa: F841 — kept for future use by scheduled tasks
+    _s = Settings()  # gates the three Wave 3 held-writer jobs below
 
     # ── Task definitions ────────────────────────────────────────────────
 
@@ -102,33 +113,9 @@ def run_intelligence_loop() -> None:
         except Exception as exc:
             log.debug("Taxonomy audit failed: {e}", e=str(exc))
 
-    def _price_fallback() -> None:
-        """Pull stale equity/crypto prices via fallback sources."""
-        try:
-            from ingestion.price_fallback import PriceFallbackPuller
-            from db import get_engine as _ge
-            from sqlalchemy import text as _t
-
-            eng = _ge()
-            pfp = PriceFallbackPuller(db_engine=eng)
-            with eng.connect() as conn:
-                stale = conn.execute(_t(
-                    "SELECT fr.name FROM feature_registry fr "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
-                    "  ORDER BY obs_date DESC LIMIT 1"
-                    ") rs ON TRUE "
-                    "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
-                    "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
-                    "AND fr.name LIKE '%\\_full' ESCAPE '\\'"
-                )).fetchall()
-            tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
-            if tickers:
-                results = pfp.pull_many(tickers[:20])
-                pfp.save_to_db(results)
-                log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
-        except Exception as exc:
-            log.debug("Price fallback failed: {e}", e=str(exc))
+    # _price_fallback (ingestion/price_fallback.py) is retired: it wrote
+    # backdated resolved_series vintages directly and every write failed on
+    # the production schema (E1-V7 / DATA-FIX DFa).
 
     def _paper_trading_signals() -> None:
         try:
@@ -218,22 +205,18 @@ def run_intelligence_loop() -> None:
             )
             puller = ActorNewsPuller(_ge())
             actors = enumerate_sector_map_actors(priority_only=True)[:200]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "gdelt", "wikipedia"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news daily skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "gdelt", "wikipedia"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news daily: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news daily: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news daily failed: {e}", e=str(exc))
@@ -249,22 +232,18 @@ def run_intelligence_loop() -> None:
             puller = ActorNewsPuller(_ge())
             # Skip top-200 (handled daily); sweep the rest.
             actors = enumerate_sector_map_actors(priority_only=False)[200:]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news weekly skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news weekly tail: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news weekly tail: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news weekly tail failed: {e}", e=str(exc))
@@ -272,16 +251,31 @@ def run_intelligence_loop() -> None:
     # ── Schedule registration ───────────────────────────────────────────
 
     _sched.every(15).minutes.do(_crucix_ingest)
-    _sched.every(1).hours.do(_paper_trading_signals)
+    # Wave 3 owner decision (2026-09-28, GRID-WAVE3-HELD-WRITERS-TRIAGE-
+    # 20260927.md §6): this job trades hypothesis_registry-derived
+    # strategies (noise-generator lineage) on contaminated *_full resolved
+    # features with no future-date bound. Held off by default — see
+    # config.GRID_ENABLE_LEGACY_PAPER_TRADING_JOB for the full writer
+    # trail. Not registered with `schedule` unless explicitly enabled, so
+    # it is never dispatched, attempted, or timed (mirrors the Hermes
+    # DAILY_INTEL_INITIAL_ALLOWLIST hold semantics in scripts/
+    # hermes_operator.py). Re-enabling is a reviewed code/config change.
+    if getattr(_s, "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB", False):
+        _sched.every(1).hours.do(_paper_trading_signals)
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)
-    _sched.every(6).hours.do(_price_fallback)
     # Note (2026-04-20): Moved from 02:00 → 02:45 to avoid overlap with
     # hermes_operator's 02:00–02:10 hypothesis discovery + backtest scan.
     # Both services run at the same hour; staggering prevents DB contention
     # and duplicate hypothesis writes. See scripts/hermes_operator.py
     # "Daily at 2:00 AM" block.
-    _sched.every().day.at("02:45").do(_nightly_research)
+    # Wave 3 owner decision (2026-09-28, same triage doc §6): this job
+    # built 77,261 hypotheses a night and was failing to insert them into
+    # hypothesis_registry, plus spending nightly ORACLE GPU time on sector
+    # research. Held off by default — see
+    # config.GRID_ENABLE_BULK_HYPOTHESIS_JOB.
+    if getattr(_s, "GRID_ENABLE_BULK_HYPOTHESIS_JOB", False):
+        _sched.every().day.at("02:45").do(_nightly_research)
     _sched.every().day.at("03:15").do(_taxonomy_audit)
     _sched.every().day.at("06:00").do(_daily_context)
     _sched.every().day.at("07:00").do(_options_recommendations)
@@ -289,7 +283,12 @@ def run_intelligence_loop() -> None:
     _sched.every().day.at("15:00").do(_dealer_flow_briefing)
     _sched.every().day.at("18:00").do(_daily_context)
     _sched.every().sunday.at("03:00").do(_weekly_astro_correlations)
-    _sched.every(7).days.do(_options_tracker)
+    # Wave 3 owner decision (2026-09-28, same triage doc §6): this job
+    # writes scanner_weights, a model/weight-registry class of write Hermes
+    # already holds elsewhere. Held off by default — see
+    # config.GRID_ENABLE_SCANNER_WEIGHTS_JOB.
+    if getattr(_s, "GRID_ENABLE_SCANNER_WEIGHTS_JOB", False):
+        _sched.every(7).days.do(_options_tracker)
     _sched.every().day.at("03:30").do(_actor_news_top200)
     _sched.every().sunday.at("04:00").do(_actor_news_weekly_tail)
 
@@ -314,6 +313,43 @@ def run_intelligence_loop() -> None:
             log.warning("journal verdicts daily failed: {e}", e=str(exc))
 
     _sched.every().day.at("06:45").do(_journal_verdicts_daily)
+
+    def _sentiment_outcomes_daily() -> None:
+        """Close the sentiment-prediction loop on a schedule (2026-10-23).
+
+        ``_hourly_briefing`` logs one ``sentiment_predictions`` row per UTC
+        day (``intelligence/sentiment_scorer.py::log_prediction``), but
+        ``score_past_predictions`` -- the step that fills ``realized_return``
+        / ``outcome`` / ``scored_at`` -- had no live caller. The only one in
+        the tree is ``scripts/grid_cron.sh sentiment``, and the crontab never
+        installed it (docs/planning/LEVER-PACKAGE.md, T3). Measured on
+        griddb 2026-10-23: 205 rows since 2026-04-02, every one ``PENDING``.
+
+        Outcome-only. It does not compute or log a prediction -- the hourly
+        briefing already did that -- and it passes ``update_weights=False``,
+        so recording outcomes never inserts a ``sentiment_weights`` version.
+        Learned-weight promotion for this closer is an operator decision:
+        ``config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION`` (default off, same
+        held-writer semantics as the Wave 3 flags). Runs 06:50 UTC: after
+        the 22:02Z close pull the scorer reads, after the 06:45
+        journal-verdicts closer, before the 07:00 options job.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.sentiment_scorer import score_past_predictions
+            promote = bool(getattr(_s, "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION", False))
+            summary = score_past_predictions(_ge(), update_weights=promote)
+            log.info(
+                "sentiment outcomes daily: scored={s} correct={c} accuracy={a} "
+                "weight_promotion={w}{m}",
+                s=summary.get("scored", 0), c=summary.get("correct", 0),
+                a=summary.get("accuracy"), w=summary.get("weight_promotion"),
+                m=(" " + str(summary.get("message") or summary.get("error") or "")).rstrip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sentiment outcomes daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:50").do(_sentiment_outcomes_daily)
 
     def _trial_outcomes_daily() -> None:
         """Score what each trial readout actually did (2026-09-10).
@@ -645,8 +681,17 @@ def run_intelligence_loop() -> None:
         """CAT-35: CFTC COT extremes scan (consumes existing cftc_cot data)."""
         try:
             from db import get_engine as _ge
-            from intelligence.cot_extremes import rank_contrarian_signals, scan_all_extremes
-            extremes = scan_all_extremes(_ge())
+            from intelligence.cot_extremes import rank_contrarian_signals, scan_extremes_report
+            report = scan_extremes_report(_ge())
+            if not report["available"]:
+                # Fail closed: code-keyed CFTC history missing (backfill
+                # pending). Never fall back to the mixed-market legacy ids.
+                log.warning(
+                    "COT extremes weekly: unavailable -- {r} ({u} market/metric pairs skipped)",
+                    r=report["reason"], u=len(report["unavailable"]),
+                )
+                return
+            extremes = report["extremes"]
             ranked = rank_contrarian_signals(extremes)
             top = ranked[:10]
             log.info(
@@ -758,20 +803,28 @@ def run_intelligence_loop() -> None:
             log.warning("SEMI book-to-bill monthly failed: {e}", e=str(exc))
 
     def _ecb_tltro_weekly() -> None:
-        """CAT-12: ECB TLTRO-III outstanding balance + repayment calendar."""
+        """CAT-12: Eurosystem LTRO outstanding (ECB Data Portal, ILM weekly).
+
+        2026-09-29: ingestion.altdata.ecb_tltro never wrote a row (its ECB
+        key 404s, its FRED path was skipped, and TLTRO-III fully matured in
+        Dec 2024). This job now runs ecb_ltro, which stores the official
+        weekly "Longer-term refinancing operations" line under its own
+        source_catalog row ``ecb_ilm_ltro``.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.ecb_tltro import run_ecb_tltro_puller
-            result = run_ecb_tltro_puller(_ge())
+            from ingestion.altdata.ecb_ltro import run_ecb_ltro_puller
+            result = run_ecb_ltro_puller(_ge())
             log.info(
-                "ECB TLTRO: outstanding={o} EUR bn, next={n}, {f} fetched, {i} new",
-                o=result.get("outstanding_eur_bn"),
-                n=result.get("next_repayment"),
+                "ECB LTRO: status={s}, latest={d} = {o} EUR bn, {f} fetched, {i} new",
+                s=result.get("status"),
+                d=result.get("latest_obs_date"),
+                o=result.get("ltro_outstanding_eur_bn"),
                 f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
+                i=result.get("rows_inserted", 0),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("ECB TLTRO weekly failed: {e}", e=str(exc))
+            log.warning("ECB LTRO weekly failed: {e}", e=str(exc))
 
     # Cadence:
     #   Refinery cracks → Thu 16:00 UTC (EIA Wed 10:30 ET release)
@@ -870,28 +923,49 @@ def run_intelligence_loop() -> None:
             log.warning("iron ore ports daily failed: {e}", e=str(exc))
 
     def _taiwan_strait_osint_daily() -> None:
-        """CAT-91: Taiwan MND daily ADIZ incursion count + PLA events."""
+        """CAT-91: daily PLA activity around Taiwan (MND report as republished
+        by the ROC Air Force HQ at air.mnd.gov.tw).
+
+        2026-09-29: the old www.mnd.gov.tw pages 404 and the new MND site's
+        robots.txt disallows all non-Googlebot agents, so this job now runs
+        rocaf_pla_activity (own source_catalog row ``rocaf_pla_activity``,
+        series ``pla_activity:*``). Still registered only when
+        GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB is set.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.taiwan_strait_osint import run_taiwan_strait_puller
-            result = run_taiwan_strait_puller(_ge())
-            log.info(
-                "Taiwan Strait: {f} fetched, {i} new, latest_aircraft={a} (source={s})",
-                f=result.get("fetched", 0),
-                i=result.get("inserted", 0),
-                a=result.get("latest_aircraft_count"),
-                s=result.get("source", "none"),
+            from ingestion.altdata.rocaf_pla_activity import run_rocaf_pla_activity_puller
+            result = run_rocaf_pla_activity_puller(_ge())
+            log_fn = log.warning if result.get("status") == "FAILED" else log.info
+            log_fn(
+                "PLA activity (ROCAF/MND): status={st}, {n} reports, {i} rows, "
+                "latest={d} sorties={a}",
+                st=result.get("status"),
+                n=result.get("reports", 0),
+                i=result.get("rows_inserted", 0),
+                d=result.get("latest_report_date"),
+                a=result.get("latest_aircraft_sorties"),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("Taiwan Strait daily failed: {e}", e=str(exc))
+            log.warning("PLA activity daily failed: {e}", e=str(exc))
 
     # Cadence:
     #   LME warehouse → daily 09:00 UTC (LME publishes ~08:00 London)
     #   Iron ore ports → Fri 10:00 UTC (Mysteel weekly Thursday release)
     #   Taiwan Strait → daily 23:30 UTC (MND publishes Taiwan morning)
-    _sched.every().day.at("09:00").do(_lme_warehouse_daily)
+    # Held off by default (2026-09-29): both LME URLs return a Cloudflare
+    # managed challenge (HTTP 403) to non-browser clients, so every run
+    # fetched nothing. Registered only when GRID_ENABLE_LME_WAREHOUSE_JOB
+    # is set -- see config.GRID_ENABLE_LME_WAREHOUSE_JOB.
+    if getattr(_s, "GRID_ENABLE_LME_WAREHOUSE_JOB", False):
+        _sched.every().day.at("09:00").do(_lme_warehouse_daily)
     _sched.every().friday.at("10:00").do(_iron_ore_ports_daily)
-    _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
+    # Held off by default (owner decision 2026-09-29): the MND source URLs
+    # 404 and the job used to write placeholder rows as SUCCESS. Not
+    # registered with `schedule` unless GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB
+    # is set — see config.GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB.
+    if getattr(_s, "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB", False):
+        _sched.every().day.at("23:30").do(_taiwan_strait_osint_daily)
 
     def _credit_index_proxies_daily() -> None:
         """CAT-7 / CAT-13 / CAT-42: FRED ICE BofA cash-bond OAS proxies
@@ -1078,11 +1152,11 @@ def run_intelligence_loop() -> None:
             from intelligence.thesis_invalidation_monitor import run_monitor
             result = run_monitor(_ge())
             log.info(
-                "thesis invalidation: {t} theses, {i} invalidated, "
-                "{s} size-down",
-                t=result.theses_checked,
-                i=len(result.invalidations),
-                s=sum(1 for e in result.invalidations if e.size_down_applied),
+                "thesis invalidation: {t} predictions scanned, "
+                "{i} triggered, {e} errors",
+                t=result.predictions_scanned,
+                i=result.triggered_count,
+                e=len(result.errors),
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("thesis invalidation hourly failed: {e}", e=str(exc))

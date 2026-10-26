@@ -1,0 +1,85 @@
+Operator
+HERMES STATUS
+ONLINE
+2026-09-15 06:10:00
+last cycle
+0
+consec. failures
+42
+total cycles
+2
+tracked tasks
+SUBSYSTEM HEALTH
+Database
+Data Fresh
+LLM
+Features
+DB Pool
+Ingestion
+Disk: 24% (380GB free)
+API Keys: 4/5
+WS Clients: 0
+no data pulled in 7 days
+DATA PIPELINE FRESHNESS
+macro
+YELLOW
+SERVER RESOURCES
+8%
+CPU
+31%
+RAM (10/32GB)
+DB: Connected · 0.5GB
+STATS SUMMARY
+0
+pulls retried
+0
+fixes applied
+0
+hypotheses tested
+0
+errors diagnosed
+ISSUE TRACKER
+Severity:
+ALL
+CRITICAL
+ERROR
+WARNING
+INFO
+Category:
+ALL
+ingestion
+normalization
+discovery
+inference
+system
+WARNING
+Stale pull
+2026-09-15 06:05:00
+Source: test_puller_finviz
+ERROR
+Convergence detection skipped
+2026-09-15 06:06:00
+Source: trust_scorer
+RECENT CYCLES
+2026-09-15
+10Y
+SURFACE
+DASH
+FLOW
+REFRESH
+SEARCH
+MORE
+ASK
+Ask GRID
+×
+What should I watch?
+Explain the current regime
+Any red flags?
+What are the lever pullers doing?
+Ask GRID anything about the market, your portfolio, or the intelligence picture.
+HORIZON
+1D
+1W
+1M
+3M
+6M+

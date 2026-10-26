@@ -14,7 +14,7 @@ GRID API — Backtest & paper trade endpoints.
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -42,6 +42,23 @@ class BacktestRequest(BaseModel):
     start_date: str = "2015-01-01"
     initial_capital: float = 100_000
     cost_bps: float = 10.0
+
+
+_BACKTEST_NOTE = (
+    "pitch backtest — in-sample regime mapping, not an out-of-sample result"
+)
+
+
+def _results_generated_at(bt: Any) -> str | None:
+    """The pitch backtest JSON has no ``generated_at`` field of its own —
+    label it honestly with the file's mtime instead (Wave 3 #7,
+    GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md: "show file mtime as
+    generated-at"). Returns None if the file doesn't exist.
+    """
+    json_path = bt.output_dir / "backtest_results.json"
+    if not json_path.exists():
+        return None
+    return datetime.fromtimestamp(json_path.stat().st_mtime, tz=timezone.utc).isoformat()
 
 
 @router.post("/run")
@@ -74,30 +91,46 @@ async def run_backtest(req: BacktestRequest) -> dict[str, Any]:
         "regime_stats": result.get("regime_stats"),
         "position_sizing": result.get("position_sizing"),
         "total_transitions": result.get("total_transitions"),
+        "generated_at": _results_generated_at(bt),
+        "note": _BACKTEST_NOTE,
     }
 
 
 @router.get("/results")
 async def get_results() -> dict[str, Any]:
-    """Get latest full backtest results (includes equity curve data)."""
+    """Get latest full backtest results (includes equity curve data).
+
+    Wave 3 #7: labels the response with the results file's mtime as
+    ``generated_at`` and an honest ``note`` — this is a pitch backtest run
+    on demand (``POST /run``), never a live/scheduled result.
+    """
     from backtest.engine import PitchBacktester
 
     bt = PitchBacktester()
     result = bt.get_latest_results()
     if not result:
         raise HTTPException(status_code=404, detail="No backtest results. Run /run first.")
+    result = dict(result)
+    result["generated_at"] = _results_generated_at(bt)
+    result["note"] = _BACKTEST_NOTE
     return result
 
 
 @router.get("/summary")
 async def get_summary() -> dict[str, Any]:
-    """Get pitch-ready summary of latest backtest."""
+    """Get pitch-ready summary of latest backtest.
+
+    Wave 3 #7: same ``generated_at``/``note`` labeling as ``/results``.
+    """
     from backtest.engine import PitchBacktester
 
     bt = PitchBacktester()
     summary = bt.get_summary()
     if not summary:
         raise HTTPException(status_code=404, detail="No backtest results. Run /run first.")
+    summary = dict(summary)
+    summary["generated_at"] = _results_generated_at(bt)
+    summary["note"] = _BACKTEST_NOTE
     return summary
 
 

@@ -1,0 +1,20 @@
+# TEMPLATE ONLY -- not installed by any code path (god-view plan A3, owner).
+# H.4.1 publishes Thursday ~16:30 ET; FRED's WALCL/WTREGEN land ~30 min later.
+# Calendar is anchored to America/New_York so it tracks DST:
+#   Thu 17:30 ET = 21:30 UTC (EDT) / 22:30 UTC (EST)
+#   Fri 09:00 ET retry (catches a late FRED pull or a holiday-shifted release)
+# The writer is idempotent: a retry with unchanged inputs is a no-op run.
+# Check on the host before enabling:
+#   systemd-analyze calendar 'Thu *-*-* 17:30:00 America/New_York'
+[Unit]
+Description=Weekly GRID god view Fed net liquidity writer (after H.4.1)
+
+[Timer]
+OnCalendar=Thu *-*-* 17:30:00 America/New_York
+OnCalendar=Fri *-*-* 09:00:00 America/New_York
+Persistent=true
+RandomizedDelaySec=120
+Unit=grid-godview-fed.service
+
+[Install]
+WantedBy=timers.target
