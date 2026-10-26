@@ -4,5 +4,5 @@
 # qualification of requirements.txt; it only checks that the new floors themselves
 # are a coherent, installable minimum. Used by the manual workflow_dispatch job only.
 tsfresh==0.21.2
-python-dotenv==1.2.3
+python-dotenv==1.2.4
 boto3==1.43.103

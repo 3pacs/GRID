@@ -36,7 +36,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 CONFIG_SOURCE = REPO_ROOT / "config.py"
 REQUIREMENTS_PATH = REPO_ROOT / "requirements.txt"
 
-DOTENV_FLOOR = Version("1.2.3")
+DOTENV_FLOOR = Version("1.2.4")
 BOM = b"\xef\xbb\xbf"
 
 
@@ -296,9 +296,10 @@ def _requirement(name: str) -> Requirement:
 
 
 def test_requirements_pin_python_dotenv_floor() -> None:
-    """EXPECTED RED at base 77347c85 (>=1.0.0); GREEN once PR 752 (>=1.2.3) lands."""
+    """EXPECTED RED on main (>=1.0.0) and on the stale >=1.2.3 floor; GREEN once PR 752 (>=1.2.4) lands."""
     req = _requirement("python-dotenv")
-    assert req.specifier.contains("1.2.3"), req
+    assert req.specifier.contains("1.2.4"), req
+    assert not req.specifier.contains("1.2.3"), req
     assert not req.specifier.contains("1.2.2"), req
     assert not req.specifier.contains("1.0.0"), req
 
