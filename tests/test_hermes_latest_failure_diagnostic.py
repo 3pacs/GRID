@@ -3,6 +3,8 @@ import argparse
 import ast
 import contextlib
 import datetime as dt
+import json
+import re
 from pathlib import Path
 import sqlite3
 import sys
@@ -23,10 +25,14 @@ def row(source=1,hours=1,error='SYNTH_NEW',status='FAILED'):
  return (source,status,(NOW-dt.timedelta(hours=hours)).isoformat(),error)
 
 def projection(path):
- tree=ast.parse(path.read_bytes());fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='diagnose_and_fix_pulls')
+ tree=ast.parse(path.read_bytes())
+ projected=('_normalize_source_key','_classify_pull_failure','diagnose_and_fix_pulls')
+ functions={n.name:n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in projected}
+ if set(functions)!=set(projected):raise AssertionError('MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY')
+
  future=ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0)
- mod=ast.fix_missing_locations(ast.Module(body=[future,fn],type_ignores=[]))
- log=Log();ns={'log':log};exec(compile(mod,str(path),'exec'),ns)
+ mod=ast.fix_missing_locations(ast.Module(body=[future,*(functions[name] for name in projected)],type_ignores=[]))
+ log=Log();ns={'log':log,'json':json,'re':re};exec(compile(mod,str(path),'exec'),ns)
  return ns['diagnose_and_fix_pulls'],log
 
 class Adapter:
@@ -101,6 +107,25 @@ class LatestFailureTests(unittest.TestCase):
   self.assertEqual(a.rows,[]);self.assertEqual(len(a.raw_queries),1)
   self.assertEqual(result,{'retried':0,'fixed':0,'diagnosed':0,'skipped_cooldown':0,'skipped_no_handler':0,'skipped_key_check':0,'escalated':0,'abandoned':0})
   self.assertEqual(logs,[('INFO','No failed pulls in last 24h')])
+
+ def test_projection_runs_actual_database_and_auth_guards_without_retry(self):
+  a,result,_=exercise([
+   row(source=1,error='(psycopg2.OperationalError) remaining connection slots are reserved'),
+   row(source=2,error='HTTP 429 Too Many Requests'),
+  ],catalog=((1,'FRED'),(2,'Baltic_Exchange')))
+  self.assertEqual(result['fix_actions'],{'fred':'CHECK_DB','baltic_exchange':'CHECK_KEY'})
+  self.assertEqual(result['retried'],0);self.assertEqual(result['diagnosed'],0)
+  self.assertEqual(len(a.raw_queries),1)
+  self.assertTrue(all(query.startswith('SELECT ') for query in a.raw_queries))
+
+ def test_projection_uses_source_helpers_not_classifier_stubs(self):
+  fn,_=projection(SOURCE)
+  for name in ('_normalize_source_key','_classify_pull_failure'):
+   self.assertEqual(fn.__globals__[name].__code__.co_filename,str(SOURCE))
+  self.assertEqual(fn.__globals__['_normalize_source_key']('Baltic-Exchange'),'baltic_exchange')
+  classify=fn.__globals__['_classify_pull_failure']
+  self.assertEqual(classify('HTTP 401 Unauthorized'),'provider_auth_or_quota')
+  self.assertEqual(classify('RetryError[JSONDecodeError]'),'unknown')
 
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('--source',type=Path,default=SOURCE)
