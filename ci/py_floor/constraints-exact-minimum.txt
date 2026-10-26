@@ -1,0 +1,8 @@
+# OPTIONAL exact-minimum constraints for the python-floor-qualification workflow.
+# Pins ONLY the three floors raised by #751/#752/#756 to their exact minimum.
+# Every other package stays latest-allowed, so this is NOT a full exact-minimum
+# qualification of requirements.txt; it only checks that the new floors themselves
+# are a coherent, installable minimum. Used by the manual workflow_dispatch job only.
+tsfresh==0.21.2
+python-dotenv==1.2.4
+boto3==1.43.103
