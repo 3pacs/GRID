@@ -610,3 +610,111 @@ def test_the_input_value_materialized_is_still_a_pass_even_with_later_vintages(t
                               "source_priority_used": 2})
     out = _chain_v2(res, tmp_path)
     assert out["links"]["L2_materialization_row"]["state"] == "LINKED_QUALIFIED" and out["accepted"] is True
+
+
+# ---------------------------------------------------------------- v3.2: independent-review corrections (R1 / R3 / R2)
+
+def _ledger_rows(tmp_path: Path, rows: list[tuple[int, float, str, str]], *, resolved_vintage: str = OD, resolved_value: float = REPAIRED):
+    """rows: (new_raw_id, new_value, new_pull_ts, reversed_at). All repair the input vintage (old_raw_id 1)."""
+    led = tmp_path / "ledger_export.csv"
+    led.write_text(LEDGER_HEADER + "".join(
+        f"{nid},1,YF:^GSPC:close,{OD},{VAL},{nv},2026-10-19 13:32:37+00,{pull},us_listed,intraday_snapshot,generic_policy_eligible,rt,^GSPC,x,{rev}\n"
+        for nid, nv, pull, rev in rows))
+    res = tmp_path / "phase3_ledger.csv"
+    res.write_text(RESOLVED_HEADER + f"188921748,686,sp500_full,{OD},{resolved_vintage},{resolved_vintage},{resolved_value},2,close\n")
+    return led, res
+
+
+def _l2_states(res, tmp_path: Path, **kw):
+    (tmp_path / "w").mkdir()
+    out = _chain_v2(res, tmp_path / "w", **kw)
+    return out["links"]["L2_materialization_row"], out
+
+
+def _set_resolved(res, *, value=None, source=None, vintage=None):
+    row = res["L2"]["rows"][0]
+    if value is not None:
+        row["value"] = value
+    if source is not None:
+        row["source_priority_used"] = source
+    if vintage is not None:
+        row["vintage_date"] = vintage
+    return res
+
+
+# R1: a later raw pull needs a compatible resolved vintage_date (>= the later pull's UTC day)
+def test_r1_resolved_vintage_before_the_later_pull_stays_unexplained(tmp_path):
+    res = _with_later_vintage(pulled="2026-10-20T04:18:29+00:00", value=VAL - 14)
+    _set_resolved(res, vintage="2026-10-19")            # counterexample from the review: later pull Oct20, resolved vintage Oct19
+    l2, out = _l2_states(res, tmp_path)
+    assert l2["state"] == "UNEXPLAINED_DIFFERENT_VALUE" and l2["ok"] is False and out["accepted"] is False
+
+
+def test_r1_next_day_resolved_vintage_is_a_compatible_positive(tmp_path):
+    res = _with_later_vintage(pulled="2026-10-20T04:18:29+00:00", value=VAL - 14)
+    _set_resolved(res, vintage="2026-10-20")
+    l2, _ = _l2_states(res, tmp_path)
+    assert l2["state"] == "SUPERSEDED_BY_LATER_VINTAGE" and l2["ok"] is None
+
+
+def test_r1_same_day_ambiguity_is_preserved_at_day_granularity(tmp_path):
+    res = _with_later_vintage(pulled="2026-10-19T23:59:59+00:00", value=VAL - 14)
+    _set_resolved(res, vintage="2026-10-19")
+    l2, _ = _l2_states(res, tmp_path)
+    assert l2["state"] == "SUPERSEDED_BY_LATER_VINTAGE"
+
+
+# R3: a repair explanation needs value + compatible source + date/lineage evidence
+def test_r3_wrong_source_is_not_a_repair_successor(tmp_path):
+    led, resl = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "")])
+    res = _set_resolved(_chain_results(), value=REPAIRED, source=524)      # repair/input source 2, resolved source_priority_used 524
+    l2, out = _l2_states(res, tmp_path, repair_ledger=str(led), resolved_ledger=str(resl))
+    assert l2["state"] == "UNEXPLAINED_DIFFERENT_VALUE" and l2["ok"] is False and out["accepted"] is False
+
+
+def test_r3_resolved_vintage_before_the_repair_pull_is_not_a_successor(tmp_path):
+    led, resl = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "")], resolved_vintage="2026-10-18")
+    res = _set_resolved(_chain_results(), value=REPAIRED, vintage="2026-10-18")
+    l2, _ = _l2_states(res, tmp_path, repair_ledger=str(led), resolved_ledger=str(resl))
+    assert l2["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+
+
+def test_r3_database_row_must_be_the_vintage_named_by_the_resolved_ledger(tmp_path):
+    led, resl = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "")], resolved_vintage="2026-10-19")
+    res = _set_resolved(_chain_results(), value=REPAIRED, vintage="2026-10-21")   # same value/source, but not the ledger's vintage
+    l2, _ = _l2_states(res, tmp_path, repair_ledger=str(led), resolved_ledger=str(resl))
+    assert l2["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+
+
+def test_r3_without_a_resolved_ledger_value_source_and_date_are_enough(tmp_path):
+    led, _ = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "")])
+    res = _set_resolved(_chain_results(), value=REPAIRED, vintage="2026-10-20")
+    l2, out = _l2_states(res, tmp_path, repair_ledger=str(led))
+    assert l2["state"] == "SUPERSEDED_BY_REPAIR" and l2["ok"] is None and out["accepted"] is False
+    assert l2["repair_evidence"] == {"active_repairs": 1, "reversed_repairs_ignored": 0, "matched_resolved_vintage_dates": ["2026-10-20"]}
+
+
+# R2 contract: reversed repairs are historical lineage only and never explain L2 as an active successor
+def test_r2_reversed_only_repair_does_not_explain_l2_but_stays_visible_as_history(tmp_path):
+    led, resl = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "2026-10-20 00:00:00+00")])
+    res = _set_resolved(_chain_results(), value=REPAIRED)
+    l2, out = _l2_states(res, tmp_path, repair_ledger=str(led), resolved_ledger=str(resl))
+    assert l2["state"] == "UNEXPLAINED_DIFFERENT_VALUE" and l2["ok"] is False
+    assert l2["repair_evidence"]["active_repairs"] == 0 and l2["repair_evidence"]["reversed_repairs_ignored"] == 1
+    assert l2["repair_lineage"]["repairs"][0]["reversed"] is True      # the loader still reports the history
+    assert out["accepted"] is False
+
+
+def test_r2_an_active_repair_still_explains_when_another_is_reversed(tmp_path):
+    led, resl = _ledger_rows(tmp_path, [(1958138951, REPAIRED, "2026-10-19 03:52:28+00", "2026-10-20 00:00:00+00"),
+                                        (1958138952, REPAIRED, "2026-10-19 04:00:00+00", "")])
+    res = _set_resolved(_chain_results(), value=REPAIRED)
+    l2, _ = _l2_states(res, tmp_path, repair_ledger=str(led), resolved_ledger=str(resl))
+    assert l2["state"] == "SUPERSEDED_BY_REPAIR"
+    assert l2["repair_evidence"]["active_repairs"] == 1 and l2["repair_evidence"]["reversed_repairs_ignored"] == 1
+
+
+def test_ledger_timestamps_with_a_short_utc_offset_parse():
+    assert m0._utc_day("2026-10-19 03:52:28.442245+00") == "2026-10-19"
+    assert m0._utc_day("2026-10-19T23:59:59Z") == "2026-10-19"
+    assert m0._utc_day("not a date") is None

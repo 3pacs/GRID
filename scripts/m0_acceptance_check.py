@@ -580,11 +580,23 @@ def _ts(v: Any) -> datetime | None:
     if isinstance(v, datetime):
         dt = v
     else:
+        text_ = str(v).replace("Z", "+00:00")
+        if re.search(r"[+-]\d\d$", text_):  # ledger files print offsets as "+00"
+            text_ += ":00"
         try:
-            dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+            dt = datetime.fromisoformat(text_)
         except ValueError:
             return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+def _utc_day(v: Any) -> str | None:
+    ts = _ts(v)
+    return ts.astimezone(timezone.utc).date().isoformat() if ts else None
+
+
+def _vday(row: dict[str, Any]) -> str:
+    return str(row.get("vintage_date"))[:10]
 
 
 def _near(a: Any, b: Any, abs_tol: float) -> bool:
@@ -907,18 +919,37 @@ def evaluate_chain(
         else:
             # No resolved vintage carries the original input.  resolved_series is append-only, so this is a fact about the
             # store, not a read error: the original input was never materialized.
-            successor = bool(lineage and lineage.get("found") and any(
-                _near(r.get("value"), rep_row["new_value"], 1e-9) for r in rr for rep_row in lineage["repairs"]))
-            # A later raw vintage of the SAME series/date (e.g. the post-close INCOMPLETE pull, or the POLICY_ELIGIBLE
-            # promotion) that a resolved row carries.  vintage_date has day granularity, so earlier intraday vintages
-            # of the same day collapse into the later one's resolved row.
+            # (a) Repair successor: needs value AND a compatible source AND date/lineage evidence — numeric equality alone
+            # is not enough.  The repair row is appended under the original's source, so the resolved row must carry that
+            # source, and a resolved vintage cannot predate the repair pull.  When the retained resolved ledger names the
+            # successor, the database row must be that ledger vintage.  Reversed repairs are NOT active successors (see
+            # the reversal contract in the runbook): they are listed as historical and never explain L2.
+            repairs = (lineage or {}).get("repairs", []) if lineage and lineage.get("found") else []
+            active = [x for x in repairs if not x.get("reversed")]
+            ledger_vday = ((lineage or {}).get("resolved_successor") or {}).get("vintage_date")
+            repair_rows = [
+                r for x in active for r in rr
+                if _near(r.get("value"), x["new_value"], 1e-9)
+                and r.get("source_priority_used") == inp.get("source_id")
+                and _utc_day(x["new_pull_ts"]) is not None and _vday(r) >= _utc_day(x["new_pull_ts"])
+                and (ledger_vday is None or _vday(r) == str(ledger_vday)[:10])
+            ]
+            successor = bool(repair_rows)
+            # (b) A later raw vintage of the SAME series/date/source that a resolved row carries.  vintage_date has day
+            # granularity, so earlier intraday vintages of the same day collapse into the later one's resolved row; the
+            # resolved vintage_date must be compatible with the later pull (>= its UTC day), as in the direct linkage above.
             later = [v for v in vint
                      if v.get("_ts") and inp.get("_ts") and v["_ts"] > inp["_ts"]
                      and any(_near(r.get("value"), v.get("value"), 1e-9)
-                             and r.get("source_priority_used") == v.get("source_id") for r in rr)]
+                             and r.get("source_priority_used") == v.get("source_id")
+                             and _vday(r) >= (_utc_day(v["_ts"]) or "9999-12-31") for r in rr)]
+            if repairs:
+                l2["repair_evidence"] = {"active_repairs": len(active), "reversed_repairs_ignored": len(repairs) - len(active),
+                                         "matched_resolved_vintage_dates": sorted({_vday(r) for r in repair_rows})}
             if successor:
                 l2.update(ok=None, state="SUPERSEDED_BY_REPAIR",
-                          reason="the original input was never materialized; a resolved row equals its repair successor (ledger-confirmed)")
+                          reason=("the original input was never materialized; a resolved row equals an ACTIVE (non-reversed) repair successor with a "
+                                  "compatible source and vintage_date (ledger-confirmed)"))
             elif later:
                 l2.update(ok=None, state="SUPERSEDED_BY_LATER_VINTAGE",
                           superseded_by_raw_vintages=[{k: v.get(k) for k in ("id", "pull_timestamp", "value", "capture_state")} for v in later],
