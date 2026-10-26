@@ -1949,21 +1949,37 @@ def diagnose_and_fix_pulls(
         "skipped_key_check": 0, "escalated": 0, "abandoned": 0,
     }
 
-    # Find sources with recent failures + their error details
+    # Find sources with recent failures + their error details. Failures are
+    # recorded in two places: FAILED raw_series rows (only a few pullers write
+    # them) and FAILED/PARTIAL pull_log rows (scheduler jobs and the pullers
+    # that only return a FAILED status, e.g. BIS, RBI, repo_market, ADS).
+    # Reading raw_series alone reported "No failed pulls" while those sources
+    # failed every cycle (grid-hermes journal 2026-10-26). The one window
+    # predicate is pushed down into both UNION ALL legs by PostgreSQL.
     with engine.connect() as conn:
         failed = conn.execute(
             text(
                 "SELECT name, fail_count, last_fail, last_error "
                 "FROM ("
-                " SELECT sc.name, COUNT(*) OVER (PARTITION BY sc.name) AS fail_count, "
-                "        rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
-                "        ROW_NUMBER() OVER (PARTITION BY sc.name "
-                "          ORDER BY rs.pull_timestamp DESC, "
-                "                   rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
-                " FROM raw_series rs "
-                " JOIN source_catalog sc ON rs.source_id = sc.id "
-                " WHERE rs.pull_status = 'FAILED' "
-                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                " SELECT name, COUNT(*) OVER (PARTITION BY name) AS fail_count, "
+                "        failed_at AS last_fail, error AS last_error, "
+                "        ROW_NUMBER() OVER (PARTITION BY name "
+                "          ORDER BY failed_at DESC, error DESC NULLS LAST) AS failure_rank "
+                " FROM ("
+                "  SELECT sc.name AS name, rs.pull_timestamp AS failed_at, "
+                "         rs.raw_payload::text AS error "
+                "  FROM raw_series rs "
+                "  JOIN source_catalog sc ON rs.source_id = sc.id "
+                "  WHERE rs.pull_status = 'FAILED' "
+                "  UNION ALL "
+                "  SELECT COALESCE(sc.name, pl.puller_name) AS name, "
+                "         COALESCE(pl.completed_at, pl.started_at) AS failed_at, "
+                "         pl.error_message AS error "
+                "  FROM pull_log pl "
+                "  LEFT JOIN source_catalog sc ON pl.source_id = sc.id "
+                "  WHERE pl.status IN ('FAILED', 'PARTIAL')"
+                " ) AS failures "
+                " WHERE failed_at > NOW() - INTERVAL '24 hours'"
                 ") AS latest_failed "
                 "WHERE failure_rank = 1 "
                 "ORDER BY fail_count DESC"

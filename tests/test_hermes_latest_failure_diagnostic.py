@@ -52,7 +52,11 @@ class Adapter:
   return self
  def fetchall(self):return self.rows
 
-def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None):
+def plrow(name='synth_job',source=None,hours=1,error='PL_SYNTH',status='FAILED',completed=True):
+ stamp=(NOW-dt.timedelta(hours=hours)).isoformat()
+ return (name,source,stamp,stamp if completed else None,status,error)
+
+def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None,pull_log=()):
  fn,log=projection(source or SOURCE)
  db=sqlite3.connect(':memory:')
  try:
@@ -60,6 +64,8 @@ def exercise(rows,catalog=((1,'SYNTH_A'),(2,'SYNTH_B')),source=None):
   db.execute('CREATE TABLE raw_series(source_id INTEGER,pull_status TEXT,pull_timestamp TEXT,raw_payload TEXT)')
   db.executemany('INSERT INTO source_catalog VALUES(?,?)',catalog)
   db.executemany('INSERT INTO raw_series VALUES(?,?,?,?)',rows)
+  db.execute('CREATE TABLE pull_log(puller_name TEXT,source_id INTEGER,started_at TEXT,completed_at TEXT,status TEXT,error_message TEXT)')
+  db.executemany('INSERT INTO pull_log VALUES(?,?,?,?,?,?)',pull_log)
   adapter=Adapter(db);fake=types.ModuleType('sqlalchemy');fake.text=lambda text:text
   previous=sys.modules.get('sqlalchemy');sys.modules['sqlalchemy']=fake
   try:result=fn(adapter,hermes_available=False,state=object(),dry_run=True)
@@ -126,6 +132,49 @@ class LatestFailureTests(unittest.TestCase):
   classify=fn.__globals__['_classify_pull_failure']
   self.assertEqual(classify('HTTP 401 Unauthorized'),'provider_auth_or_quota')
   self.assertEqual(classify('RetryError[JSONDecodeError]'),'unknown')
+
+class PullLogFailureTests(unittest.TestCase):
+ # 2026-10-26: BIS/RBI/repo_market/ADS failures exist only in pull_log; a
+ # raw_series-only read logged "No failed pulls in last 24h" every cycle.
+ def test_pull_log_only_failure_is_not_reported_as_no_failed_pulls(self):
+  a,_,logs=exercise([],pull_log=[plrow('BIS',source=1,error='RetryError[HTTPError]')])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=1),'RetryError[HTTPError]')])
+  self.assertNotIn(('INFO','No failed pulls in last 24h'),logs)
+  warning=next(text for level,text in logs if level=='WARNING')
+  self.assertIn('SYNTH_A',warning);self.assertIn('RetryError[HTTPError]',warning)
+  self.assertEqual(len(a.raw_queries),1)
+
+ def test_unmapped_pull_log_row_uses_puller_name(self):
+  a,_,_=exercise([],pull_log=[plrow('flow_materialize',source=None,error='JOB_FAILED')])
+  self.assertEqual(a.rows,[('flow_materialize',1,NOW-dt.timedelta(hours=1),'JOB_FAILED')])
+
+ def test_partial_counts_success_and_running_do_not(self):
+  a,_,_=exercise([],pull_log=[
+   plrow('RBI',source=2,hours=2,error='1 of 3 failed',status='PARTIAL'),
+   plrow('RBI',source=2,hours=1,error='SUCCESS_MUST_NOT_COUNT',status='SUCCESS'),
+   plrow('RBI',source=2,hours=1,error='RUNNING_MUST_NOT_COUNT',status='RUNNING',completed=False),
+  ])
+  self.assertEqual(a.rows,[('SYNTH_B',1,NOW-dt.timedelta(hours=2),'1 of 3 failed')])
+
+ def test_pull_log_window_uses_completed_then_started_and_is_strict(self):
+  a,_,_=exercise([],pull_log=[
+   plrow('ADS',source=1,hours=3,error='STARTED_ONLY',completed=False),
+   plrow('ADS',source=1,hours=24,error='BOUNDARY_EXCLUDED'),
+   plrow('ADS',source=1,hours=30,error='OLDER_EXCLUDED'),
+  ])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=3),'STARTED_ONLY')])
+
+ def test_same_source_merges_counts_and_latest_error_across_both_tables(self):
+  a,_,_=exercise([row(source=1,hours=3,error='RAW_OLDER')],
+                 pull_log=[plrow('repo_market',source=1,hours=1,error='PL_NEWER'),
+                           plrow('other_job',source=None,hours=2,error='OTHER')])
+  self.assertEqual(a.rows,[('SYNTH_A',2,NOW-dt.timedelta(hours=1),'PL_NEWER'),
+                           ('other_job',1,NOW-dt.timedelta(hours=2),'OTHER')])
+
+ def test_plain_text_pull_log_error_reaches_the_deterministic_guards(self):
+  _,result,_=exercise([],catalog=((1,'FRED'),),pull_log=[plrow('fred',source=1,error='HTTP 429 Too Many Requests')])
+  self.assertEqual(result['fix_actions'],{'fred':'CHECK_KEY'})
+  self.assertEqual(result['retried'],0)
 
 if __name__=='__main__':
  parser=argparse.ArgumentParser();parser.add_argument('--source',type=Path,default=SOURCE)

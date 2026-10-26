@@ -20,6 +20,7 @@ SOURCE = ROOT / "scripts/hermes_fixers.py"
 
 SOURCE_CATALOG_TEMP_DDL = "CREATE TEMP TABLE source_catalog (\n    id                SERIAL PRIMARY KEY,\n    name              TEXT NOT NULL UNIQUE,\n    base_url          TEXT NOT NULL,\n    cost_tier         TEXT NOT NULL CHECK (cost_tier IN ('FREE', 'LOW', 'PAID')),\n    -- Seven values mirror the live griddb source_catalog_latency_class_check\n    -- (widened out-of-band before 2026-10-20; re-read 2026-10-20). Readers:\n    -- alerts/cadence.py _METADATA_CADENCE; pinned by tests/test_schema_latency_class_constraint.py.\n    latency_class     TEXT NOT NULL CHECK (latency_class IN ('REALTIME', 'INTRADAY', 'EOD', 'WEEKLY', 'MONTHLY', 'QUARTERLY', 'ANNUAL')),\n    pit_available     BOOLEAN NOT NULL DEFAULT FALSE,\n    revision_behavior TEXT NOT NULL CHECK (revision_behavior IN ('NEVER', 'RARE', 'FREQUENT')),\n    trust_score       TEXT NOT NULL CHECK (trust_score IN ('HIGH', 'MED', 'LOW')),\n    priority_rank     INTEGER NOT NULL,\n    active            BOOLEAN NOT NULL DEFAULT TRUE,\n    last_pull_at      TIMESTAMPTZ,\n    uptime_score      DOUBLE PRECISION NOT NULL DEFAULT 1.0,\n    created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW()\n) ON COMMIT DROP;"
 RAW_SERIES_TEMP_DDL = "CREATE TEMP TABLE raw_series (\n    id                BIGSERIAL PRIMARY KEY,\n    series_id         TEXT NOT NULL,\n    source_id         INTEGER NOT NULL REFERENCES source_catalog(id),\n    obs_date          DATE NOT NULL,\n    pull_timestamp    TIMESTAMPTZ NOT NULL DEFAULT NOW(),\n    value             DOUBLE PRECISION NOT NULL,\n    raw_payload       JSONB,\n    -- QUARANTINED: a once-accepted row later found untrustworthy. It is not an\n    -- observation (readers take SUCCESS only) and not a pull failure. Pullers\n    -- never write it. Production got it via\n    -- migrations/versions/raw_series_quarantined_20260926.py (added NOT VALID,\n    -- same constraint name raw_series_pull_status_check).\n    pull_status       TEXT NOT NULL CHECK (pull_status IN ('SUCCESS', 'PARTIAL', 'FAILED', 'QUARANTINED'))\n) ON COMMIT DROP;"
+PULL_LOG_TEMP_DDL = "CREATE TEMP TABLE pull_log (\n    id              SERIAL PRIMARY KEY,\n    puller_name     TEXT NOT NULL,\n    source_id       INTEGER REFERENCES source_catalog(id),\n    started_at      TIMESTAMPTZ NOT NULL,\n    completed_at    TIMESTAMPTZ,\n    status          TEXT NOT NULL CHECK (status IN ('RUNNING','SUCCESS','PARTIAL','FAILED')),\n    rows_inserted   INTEGER DEFAULT 0,\n    rows_expected   INTEGER,\n    error_message   TEXT,\n    features_affected INTEGER[],\n    node_name       TEXT DEFAULT 'grid-svr'\n) ON COMMIT DROP;"
 BASELINE_QUERY_604 = "SELECT sc.name, COUNT(*) AS fail_count,        MAX(rs.pull_timestamp) AS last_fail,        MAX(rs.raw_payload::text) AS last_error FROM raw_series rs JOIN source_catalog sc ON rs.source_id = sc.id WHERE rs.pull_status = 'FAILED' AND rs.pull_timestamp > NOW() - INTERVAL '24 hours' GROUP BY sc.name ORDER BY fail_count DESC"
 
 
@@ -75,6 +76,9 @@ def latest_failure_pg_connection(request):
             # No IF NOT EXISTS: a collision fails rather than touching another table.
             conn.execute(text(SOURCE_CATALOG_TEMP_DDL))
             conn.execute(text(RAW_SERIES_TEMP_DDL))
+            # The diagnostic also reads pull_log FAILED/PARTIAL rows (DDL mirrors
+            # migrations/add_pull_log.sql); empty unless a test inserts rows.
+            conn.execute(text(PULL_LOG_TEMP_DDL))
             conn.execute(text(
                 "CREATE UNIQUE INDEX uq_raw_series_composite "
                 "ON raw_series (series_id, source_id, obs_date, pull_timestamp)"))
@@ -228,3 +232,48 @@ def test_native_empty_has_no_failed_rows_or_retry(latest_failure_pg_connection):
                       "skipped_no_handler": 0, "skipped_key_check": 0, "escalated": 0,
                       "abandoned": 0}
     assert logs == [("INFO", "No failed pulls in last 24h")]
+
+
+def _pull_log(conn, name, source_id, started, completed, status, error):
+    from sqlalchemy import text
+    conn.execute(text(
+        "INSERT INTO pull_log (puller_name, source_id, started_at, completed_at, status, error_message) "
+        "VALUES (:name, :sid, :started, :completed, :status, :error)"
+    ), {"name": name, "sid": source_id, "started": started, "completed": completed,
+        "status": status, "error": error})
+
+
+def test_native_pull_log_failures_merge_with_raw_series(latest_failure_pg_connection):
+    # 2026-10-26: failures recorded only in pull_log read as "No failed pulls".
+    conn, now = latest_failure_pg_connection
+    a = _source(conn, "SYNTH_SOURCE_A")
+    _failure(conn, a, now - timedelta(hours=3), {"error": "RAW_OLDER"}, series="A_RAW")
+    _pull_log(conn, "synth_a_job", a, now - timedelta(hours=2), now - timedelta(hours=1),
+              "PARTIAL", "PL_NEWER")
+    _pull_log(conn, "synth_job", None, now - timedelta(hours=2), None, "FAILED", "STARTED_ONLY")
+    _pull_log(conn, "synth_job", None, now - timedelta(hours=1), now, "SUCCESS", "NOT_FAILED")
+    _pull_log(conn, "synth_job", None, now - timedelta(hours=26), now - timedelta(hours=25),
+              "FAILED", "TOO_OLD")
+    rows, _, logs = _diagnose(conn)
+    assert [tuple(r) for r in rows] == [
+        ("SYNTH_SOURCE_A", 2, now - timedelta(hours=1), "PL_NEWER"),
+        ("synth_job", 1, now - timedelta(hours=2), "STARTED_ONLY"),
+    ]
+    assert ("INFO", "No failed pulls in last 24h") not in logs
+
+
+def test_native_window_is_pushed_into_both_union_legs(latest_failure_pg_connection):
+    from sqlalchemy import text
+    conn, _ = latest_failure_pg_connection
+    tree = ast.parse(SOURCE.read_bytes())
+    fn = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "diagnose_and_fix_pulls")
+    # Adjacent literals are one Constant: this is the exact production statement.
+    statement = next(
+        node.value for node in ast.walk(fn)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        and node.value.startswith("SELECT name, fail_count")
+    )
+    plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + statement)))
+    assert "raw_series" in plan and "pull_log" in plan
+    # The 24h predicate must filter each leg's scan, not only the appended result.
+    assert plan.count("now() - '24:00:00'::interval") >= 2
