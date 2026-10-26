@@ -649,7 +649,7 @@ class YFinancePuller(BasePuller):
                             continue
                         if series_id == SPY_CLOSE_SERIES and interval == "1d":
                             if not math.isfinite(float_val) or float_val <= 0:
-                                result["daily_policy_refusals"] += 1
+                                result["raw_value_refusals"] += 1
                                 continue
                             captured_at = _utc_now()
                             # No provisional SPY close and no implicit history

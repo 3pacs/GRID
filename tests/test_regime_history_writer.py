@@ -381,7 +381,111 @@ class TestSchedulerRegistration:
 # ── Additive staleness fields ───────────────────────────────────────────
 
 
+def _regime_current(reading_ts, history_value, *, utc_today=date(2026, 10, 23)):
+    """Call regime_router.get_current with a journal row at ``reading_ts``.
+
+    Returns (response, conn) so a test can inspect the regime_history lookup key.
+    """
+    from api.routers import regime as regime_router
+
+    engine = MagicMock()
+    conn = MagicMock()
+    conn.__enter__.return_value = conn
+    conn.__exit__.return_value = False
+    prod = MagicMock()
+    prod.fetchone.return_value = (7, "stress_index", "1.0")
+    latest = MagicMock()
+    latest.fetchone.return_value = (
+        "FRAGILE", 0.72, 0.1, {}, "DEFENSIVE", "NEUTRAL", reading_ts,
+    )
+    history = MagicMock()
+    history.fetchone.return_value = (history_value,)
+    conn.execute.side_effect = [prod, latest, history]
+    engine.connect.return_value = conn
+    with (
+        patch.object(regime_router, "get_db_engine", return_value=engine),
+        patch.object(regime_router, "_utc_today", return_value=utc_today),
+    ):
+        return regime_router.get_current(_token="t"), conn
+
+
 class TestStalenessFields:
+    def test_equivalent_utc_and_offset_timestamps_give_the_same_date_ages_and_lookup_key(self):
+        """One instant, two representations, one answer.
+
+        ``2026-10-22T17:30:00-07:00`` is ``2026-10-23T00:30:00Z``. Taking
+        ``.date()`` of the offset form said October 22: age 1 instead of 0,
+        and the regime_history lookup keyed on the wrong day.
+        """
+        utc_ts = datetime(2026, 10, 23, 0, 30, tzinfo=timezone.utc)
+        offset_ts = datetime(2026, 10, 22, 17, 30, tzinfo=timezone(timedelta(hours=-7)))
+        assert utc_ts == offset_ts
+
+        for ts in (utc_ts, offset_ts):
+            resp, conn = _regime_current(ts, date(2026, 10, 21))
+            assert resp.as_of_date == "2026-10-23"
+            assert resp.staleness_days == 0
+            assert resp.data_as_of == "2026-10-21"
+            assert resp.data_staleness_days == 2
+            # Third query is the regime_history lookup; its key is the UTC date.
+            assert conn.execute.call_args_list[2].args[1] == {"d": date(2026, 10, 23)}
+
+    def test_naive_timestamp_is_taken_as_utc(self):
+        naive = datetime(2026, 10, 23, 0, 30)  # noqa: DTZ001 -- the case under test
+        resp, conn = _regime_current(naive, date(2026, 10, 21))
+        assert resp.as_of_date == "2026-10-23"
+        assert resp.staleness_days == 0
+        assert conn.execute.call_args_list[2].args[1] == {"d": date(2026, 10, 23)}
+
+    def test_history_data_as_of_timestamp_is_normalised_to_utc_too(self):
+        # 2026-10-20T17:00-07:00 is 2026-10-21T00:00Z.
+        history_ts = datetime(2026, 10, 20, 17, 0, tzinfo=timezone(timedelta(hours=-7)))
+        resp, _ = _regime_current(datetime(2026, 10, 23, 0, 30, tzinfo=timezone.utc), history_ts)
+        assert resp.data_as_of == "2026-10-21"
+        assert resp.data_staleness_days == 2
+
+    def test_staleness_is_measured_on_the_utc_date_not_the_local_clock(self):
+        """The reading timestamp is UTC; its age must not depend on the host TZ.
+
+        Between 17:00 and 24:00 America/Los_Angeles the local date is one day
+        behind UTC, which made ``staleness_days`` 164 for a reading exactly 165
+        days old. The router must take "today" from the UTC clock.
+        """
+        from api.routers import regime as regime_router
+
+        class _LocalClockADayBehind(date):
+            @classmethod
+            def today(cls):
+                return date(2026, 10, 22)  # what date.today() says late in the PT evening
+
+        reading_ts = datetime(2026, 5, 11, 23, 30, tzinfo=timezone.utc)  # 165 days before 2026-10-23
+        engine = MagicMock()
+        conn = MagicMock()
+        conn.__enter__.return_value = conn
+        conn.__exit__.return_value = False
+        prod = MagicMock()
+        prod.fetchone.return_value = (7, "stress_index", "1.0")
+        latest = MagicMock()
+        latest.fetchone.return_value = (
+            "FRAGILE", 0.72, 0.1, {}, "DEFENSIVE", "NEUTRAL", reading_ts,
+        )
+        history = MagicMock()
+        history.fetchone.return_value = (date(2026, 10, 20),)
+        conn.execute.side_effect = [prod, latest, history]
+        engine.connect.return_value = conn
+
+        with (
+            patch.object(regime_router, "get_db_engine", return_value=engine),
+            patch.object(regime_router, "date", _LocalClockADayBehind),
+            patch.object(regime_router, "_utc_today", return_value=date(2026, 10, 23)),
+        ):
+            resp = regime_router.get_current(_token="t")
+
+        assert resp.as_of_date == "2026-05-11"
+        assert resp.staleness_days == 165
+        assert resp.data_as_of == "2026-10-20"
+        assert resp.data_staleness_days == 3
+
     def test_regime_current_carries_as_of_date_and_age(self):
         from api.routers import regime as regime_router
 

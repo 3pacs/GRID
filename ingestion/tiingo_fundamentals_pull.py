@@ -48,6 +48,33 @@ _FIELD_MAP: dict[str, str] = {
 }
 
 
+# Only these locally authored diagnostics may cross the persistence boundary.
+_SAFE_LOCAL_ERRORS = (
+    "Tiingo daily response must be a list",
+    "Malformed Tiingo daily record",
+    "Invalid Tiingo fundamental value",
+    "Unknown affected row count",
+)
+
+
+def _safe_failure_message(exc: Exception) -> str:
+    """Exclude URLs, headers, bodies and nested exception text from results."""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return f"Tiingo HTTP request failed (status {status})"
+        return "Tiingo HTTP request failed"
+    if (
+        type(exc) is ValueError
+        and len(exc.args) == 1
+        and type(exc.args[0]) is str
+        and exc.args[0] in _SAFE_LOCAL_ERRORS
+    ):
+        return exc.args[0]
+    return "Tiingo fundamentals pull failed"
+
+
 class TiingoFundamentalsPuller(BasePuller):
     """Pulls daily fundamental data from Tiingo into raw_series."""
 
@@ -86,12 +113,12 @@ class TiingoFundamentalsPuller(BasePuller):
         try:
             url = f"{_BASE_URL}/tiingo/fundamentals/{ticker}/daily"
             params = {
-                "token": _TIINGO_API_KEY,
                 "startDate": str(start_date),
                 "endDate": str(end_date),
             }
 
-            r = requests.get(url, params=params, timeout=30)
+            headers = {"Authorization": f"Token {_TIINGO_API_KEY}"}
+            r = requests.get(url, params=params, headers=headers, timeout=30)
             r.raise_for_status()
             data = r.json()
 
@@ -153,11 +180,11 @@ class TiingoFundamentalsPuller(BasePuller):
                 result["errors"].append("Free tier: DOW 30 only")
             else:
                 result["status"] = "FAILED"
-                result["errors"].append(str(e))
+                result["errors"].append(_safe_failure_message(e))
         except Exception as e:
             result["rows_inserted"] = None if transaction_started else 0
             result["status"] = "FAILED"
-            result["errors"].append(str(e))
+            result["errors"].append(_safe_failure_message(e))
 
         return result
 
