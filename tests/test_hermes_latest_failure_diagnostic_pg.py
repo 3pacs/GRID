@@ -10,6 +10,7 @@ import contextlib
 from datetime import timedelta, timezone
 import json
 import os
+import re
 from pathlib import Path
 
 import pytest
@@ -132,12 +133,16 @@ class _OneConnection:
 def _diagnose(conn):
     # Execute actual function source, not a replacement query or a live import.
     tree = ast.parse(SOURCE.read_bytes())
-    fn = next(node for node in tree.body
-              if isinstance(node, ast.FunctionDef) and node.name == "diagnose_and_fix_pulls")
+    projected = ("_normalize_source_key", "_classify_pull_failure", "diagnose_and_fix_pulls")
+    functions = {
+        node.name: node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in projected
+    }
+    assert set(functions) == set(projected), "MISSING_PROJECTED_DIAGNOSTIC_DEPENDENCY"
     future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, fn], type_ignores=[]))
+    module = ast.fix_missing_locations(ast.Module(body=[future, *(functions[name] for name in projected)], type_ignores=[]))
     log = _Log()
-    namespace = {"log": log}
+    namespace = {"log": log, "json": json, "re": re}
     exec(compile(module, str(SOURCE), "exec"), namespace)
     engine = _OneConnection(conn)
     # BOTH flags are necessary: production dry_run is checked after optional LLM diagnosis.
