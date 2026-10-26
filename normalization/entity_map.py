@@ -125,6 +125,36 @@ def validate_selected_request(
             "as_of": cutoff, "start_date": start_date, "vintage_policy": vintage_policy}
 
 
+def series_family(series_id: str) -> str:
+    """Prefix a raw series_id is grouped under in miss reports.
+
+    The text before the first ``:`` or ``.`` (``YF:SPY:close`` -> ``YF``,
+    ``hf_news.bloomberg`` -> ``hf_news``). A feature-shaped id with neither
+    separator groups by its first underscore segment (``gdelt_opec_tone`` ->
+    ``gdelt``) so producer output stays visible in the report; an id with no
+    separator at all (FRED-style ``T10Y2Y``) is ``bare``. Grouping only;
+    never used for resolution.
+    """
+    sid = series_id.strip()
+    cut = min((i for i in (sid.find(":"), sid.find(".")) if i > 0), default=-1)
+    if cut > 0:
+        return sid[:cut]
+    under = sid.find("_")
+    return sid[:under] if under > 0 else "bare"
+
+
+def is_feature_shaped(series_id: str) -> bool:
+    """True for ids written with a feature name rather than a feed separator.
+
+    Producers such as the scheduled GDELT theme queries write
+    ``series_id = feature`` (``gdelt_opec_tone``); such an id without an
+    entity_map entry is producer output the feature channel cannot carry,
+    not evidence of an entity-grained raw feed with its own readers.
+    """
+    sid = series_id.strip()
+    return ":" not in sid and "." not in sid
+
+
 def canonical_feature_name(series_id: str) -> str:
     """Convert a raw series id into the canonical ``feature_registry.name``.
 
@@ -1222,6 +1252,12 @@ class EntityMap:
         # series_ids already warned about, and how many lookups each one
         # swallowed. Reported in bulk by missing_feature_report().
         self._miss_counts: dict[str, int] = {}
+        # series_id -> mapped feature name, for the misses whose static
+        # mapping targets a name absent from feature_registry. Those are the
+        # only misses that drop feature-channel rows; a series_id with no
+        # mapping at all is, in the bulk, an entity-grained feed whose
+        # consumers read raw_series directly (see missing_feature_report).
+        self._mapped_misses: dict[str, str] = {}
         # series_id -> resolved id, or None for a confirmed miss.  Misses are
         # cached too: this path misses constantly by design.
         self._pattern_cache: dict[str, int | None] = {}
@@ -1304,6 +1340,7 @@ class EntityMap:
                 self._unregistered_features.add(feature_name)
 
         if feature_id is None:
+            self._mapped_misses[series_id] = feature_name
             if self._record_miss(series_id) == 1:
                 log.warning(
                     "Mapping exists ({sid} -> {fn}) but feature not in "
@@ -1401,21 +1438,67 @@ class EntityMap:
         Callers that run a bulk pass (the resolver) log this once at the end
         instead of one warning per group.
 
+        Two populations hide inside one count. A series_id whose static
+        mapping targets a name absent from feature_registry is pulled and then
+        dropped at resolution until the feature is registered. A series_id
+        with no mapping at all is reported in two shapes: ids with a feed
+        separator (``YF:<ticker>:<field>``, ``LEGISLATION:*``, ``edgar:8k:*``,
+        ``EARNINGS:*`` ...), whose traced consumers read raw_series directly,
+        which is not proof for untraced consumers or of freshness; and
+        feature-shaped ids (``gdelt_opec_tone``), which are producer output
+        with no mapping, so their resolution, consumers and materialization
+        are unknown and need a mapping or registration decision. Absence of a
+        mapping is not evidence of harmlessness. grid-hermes 2026-10-22/23
+        logged "7211 unmapped series_id(s)" per cycle: 1
+        mapped-but-unregistered, 7,210 without a mapping.
+
         Returns:
             dict with ``lookups_missed`` (total failed lookups),
             ``series_ids`` (how many distinct series_ids missed),
             ``unregistered_features`` (mapped names absent from
-            feature_registry) and ``top_series`` (the 10 worst offenders as
-            ``[series_id, count]`` pairs).
+            feature_registry), ``top_series`` (the 10 worst offenders as
+            ``[series_id, count]`` pairs), ``mapped_unregistered_count`` and
+            ``mapped_unregistered_series`` (``[series_id, feature_name,
+            count]``, worst 10) for the population that drops rows, and
+            ``no_mapping_series_ids`` with ``by_family`` (``[family,
+            series_ids, lookups]``, 12 largest by lookups) for the rest, and
+            ``no_mapping_feature_named`` (how many of those are feature-shaped
+            ids, i.e. producer output without a mapping).
         """
         ranked = sorted(
             self._miss_counts.items(), key=lambda kv: kv[1], reverse=True
+        )
+        mapped = sorted(
+            ([sid, name, self._miss_counts.get(sid, 0)]
+             for sid, name in self._mapped_misses.items()),
+            key=lambda row: (-row[2], row[0]),
+        )
+        families: dict[str, list[int]] = {}
+        no_mapping = 0
+        feature_named = 0
+        for sid, count in self._miss_counts.items():
+            if sid in self._mapped_misses:
+                continue
+            no_mapping += 1
+            if is_feature_shaped(sid):
+                feature_named += 1
+            bucket = families.setdefault(series_family(sid), [0, 0])
+            bucket[0] += 1
+            bucket[1] += count
+        by_family = sorted(
+            ([family, ids, lookups] for family, (ids, lookups) in families.items()),
+            key=lambda row: (-row[2], -row[1], row[0]),
         )
         return {
             "lookups_missed": sum(self._miss_counts.values()),
             "series_ids": len(self._miss_counts),
             "unregistered_features": sorted(self._unregistered_features),
             "top_series": [[sid, n] for sid, n in ranked[:10]],
+            "mapped_unregistered_count": len(mapped),
+            "mapped_unregistered_series": mapped[:10],
+            "no_mapping_series_ids": no_mapping,
+            "no_mapping_feature_named": feature_named,
+            "by_family": by_family[:12],
         }
 
     def _resolve_by_pattern(self, series_id: str) -> int | None:

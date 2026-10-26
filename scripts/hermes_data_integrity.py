@@ -196,6 +196,55 @@ def check_writer_freshness(
     return {"status": "ok", "tables": results}
 
 
+# schema.sql feature_registry: CHECK (family IN (...)). A value outside this
+# tuple is rejected by PostgreSQL, so a registration that used one could never
+# land on a conformant database.
+REGISTRY_FAMILIES: tuple[str, ...] = (
+    "rates", "credit", "equity", "vol", "fx", "commodity", "sentiment", "macro",
+    "crypto", "alternative", "flows", "systemic", "trade", "breadth", "earnings",
+)
+
+
+def sibling_families(name: str, registered: dict[str, str]) -> dict[str, int]:
+    """Families of the registered features sharing ``name``'s first underscore
+    segment, counted; values outside the registry CHECK list are reported
+    under ``"<invalid>"`` so an unexpected registry state is visible."""
+    prefix = name.split("_", 1)[0] + "_"
+    counts: dict[str, int] = {}
+    for other, family in registered.items():
+        if other != name and other.startswith(prefix):
+            key = family if family in REGISTRY_FAMILIES else "<invalid>"
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def ghost_feature_family(name: str, registered: dict[str, str]) -> str | None:
+    """Family for a ghost registration, or None when it cannot be stated.
+
+    The only supported inference is unanimity: every registered feature
+    sharing the name's first underscore segment carries the same valid
+    family (``gdelt_trade_conflict_volume`` joins the ``gdelt_*`` rows'
+    ``sentiment``). No siblings, a disagreement, or an invalid sibling
+    family yields None: the first underscore segment is not a taxonomy
+    boundary (schema.sql seeds ``fed_funds_rate`` as ``rates`` beside
+    ``fed_*`` rows of ``sentiment`` and ``macro``), and a majority or
+    alphabetical pick would persist a guess as registry metadata that the
+    resolver's conflict policy and other consumers read. Ambiguity is
+    returned for an operator to decide, never resolved silently. The result
+    is always a value the registry's family CHECK accepts: the previous
+    ``'unclassified'`` is outside schema.sql's CHECK list, so on a
+    conformant database the INSERT failed and the ghost stayed unregistered
+    (grid-hermes 2026-10-23: ``gdelt_trade_conflict_volume`` reported
+    missing every cycle).
+    """
+    counts = sibling_families(name, registered)
+    if len(counts) == 1:
+        (family,) = counts
+        if family in REGISTRY_FAMILIES:
+            return family
+    return None
+
+
 def register_ghost_features(
     engine: Any,
     cycle_number: int | None = None,
@@ -232,17 +281,25 @@ def register_ghost_features(
 
     with engine.begin() as conn:
         known = {
-            r[0] for r in conn.execute(text("SELECT name FROM feature_registry"))
+            r[0]: r[1]
+            for r in conn.execute(text("SELECT name, family FROM feature_registry"))
         }
-    ghosts = sorted(mapped - known)
+    ghosts = sorted(mapped - set(known))
     if not ghosts:
         return {"status": "ok", "ghosts": [], "registered": 0}
+    inferred = {feature: ghost_feature_family(feature, known) for feature in ghosts}
+    families = {feature: family for feature, family in inferred.items() if family is not None}
+    # Ghosts whose family cannot be stated are reported, never registered:
+    # the operator (or mapping_steward) chooses the family.
+    unresolved = {feature: sibling_families(feature, known)
+                  for feature, family in inferred.items() if family is None}
 
     if dry_run:
-        return {"status": "ok", "ghosts": ghosts, "registered": 0, "dry_run": True}
+        return {"status": "ok", "ghosts": ghosts, "families": families,
+                "unresolved": unresolved, "registered": 0, "dry_run": True}
 
     registered: list[str] = []
-    for feature in ghosts:
+    for feature in sorted(families):
         try:
             with engine.begin() as conn:
                 conn.execute(
@@ -250,35 +307,125 @@ def register_ghost_features(
                         INSERT INTO feature_registry
                             (name, family, description, transformation,
                              normalization, missing_data_policy, eligible_from_date)
-                        VALUES (:n, 'unclassified',
+                        VALUES (:n, :family,
                                 'Auto-registered by Hermes: mapped in entity_map '
                                 'with no registry row, so every observation was '
                                 'being dropped.',
                                 'RAW', 'ZSCORE', 'FORWARD_FILL', '2020-01-01')
                         ON CONFLICT (name) DO NOTHING
                     """),
-                    {"n": feature},
+                    {"n": feature, "family": families[feature]},
                 )
             registered.append(feature)
         except Exception as exc:
             log.warning("Could not register ghost feature {f}: {e}", f=feature, e=str(exc))
 
-    if registered:
+    if registered or unresolved:
+        parts = []
+        if registered:
+            parts.append(
+                "Registered (mapped in entity_map with no feature_registry row, so "
+                "their observations were being dropped), with the family inserted: "
+                + ", ".join(f"{name} ({families[name]})" for name in registered)
+                + ". Registration is not materialization; model_eligible stays at "
+                "the schema default."
+            )
+        if unresolved:
+            parts.append(
+                "Not registered, family ambiguous or unknown, choose one and register "
+                "by hand: " + ", ".join(
+                    f"{name} (siblings: "
+                    + (", ".join(f"{fam} x{n}" for fam, n in sorted(counts.items())) or "none")
+                    + ")" for name, counts in sorted(unresolved.items()))
+                + "."
+            )
         log_issue(
             engine,
             category="data_integrity",
             severity="WARNING",
-            title=f"Registered {len(registered)} ghost-mapped feature(s)",
-            detail=(
-                "These were mapped in entity_map with no feature_registry row, so "
-                "their observations were being dropped: " + ", ".join(registered)
-                + ". Registered as family 'unclassified' — set the real family."
-            ),
+            title=(f"Registered {len(registered)} ghost-mapped feature(s); "
+                   f"{len(unresolved)} need an operator family choice"),
+            detail=" ".join(parts),
             source="entity_map",
             cycle_number=cycle_number,
         )
     return {"status": "ok", "ghosts": ghosts, "registered": len(registered),
-            "names": registered}
+            "names": registered,
+            "registered_families": {name: families[name] for name in registered},
+            "unresolved": unresolved}
+
+
+def describe_unmapped_report(
+    report: dict[str, Any], offenders: list[Any],
+) -> tuple[str, str]:
+    """Operator-issue title and detail for a resolver miss report.
+
+    The actionable population leads: a series_id whose entity_map target has
+    no feature_registry row is pulled and then dropped at resolution, and is
+    fixed by registering the feature (REGISTER_GHOST_FEATURES, which registers
+    only names whose family can be stated). Series without an entity_map
+    entry are described without a no-loss claim: ids with a feed separator
+    are entity-grained feeds whose traced consumers read raw_series directly
+    (not proof for untraced consumers or of freshness); feature-shaped ids are
+    producer output with no mapping, whose consumers and materialization are
+    unknown and which need a mapping or registration decision. A report
+    without the partition counters (pre-revision shape) keeps its unregistered
+    names and says the counts are unknown. Pure: no engine, no I/O.
+    """
+    names = list(report.get("unregistered_features") or [])
+    series_ids = int(report.get("series_ids") or 0)
+    lookups = report.get("lookups_missed", 0)
+    families = list(report.get("by_family") or [])
+    partitioned = "mapped_unregistered_count" in report
+    parts = [f"{lookups} lookup(s) missed over the last 2 days."]
+    if not partitioned:
+        # Legacy report: the names are known, the per-series partition is not.
+        title = (
+            f"{len(names)} feature name(s) missing from feature_registry; series "
+            f"partition counts unknown; {series_ids} series_id(s) missed at resolution"
+        )
+        if names:
+            parts.append(
+                "Mapped feature name(s) with no feature_registry row (rows dropped until "
+                "registered; REGISTER_GHOST_FEATURES): " + ", ".join(names[:10]) + "."
+            )
+        parts.append("How many series were mapped-but-unregistered versus without an "
+                     "entity_map entry is unknown for this report shape.")
+        parts.append("Worst offenders: " + ", ".join(f"{sid} ({n})" for sid, n in offenders) + ".")
+        return title, " ".join(parts)
+    mapped = list(report.get("mapped_unregistered_series") or [])
+    mapped_count = int(report.get("mapped_unregistered_count") or 0)
+    no_mapping = int(report.get("no_mapping_series_ids") or 0)
+    feature_named = report.get("no_mapping_feature_named")
+    if mapped_count:
+        title = (
+            f"{mapped_count} series_id(s) mapped to {len(names)} feature name(s) "
+            f"missing from feature_registry; {no_mapping} series_id(s) without "
+            "entity_map entry"
+        )
+    else:
+        title = f"{no_mapping} series_id(s) without entity_map entry skipped at resolution"
+    if mapped_count:
+        parts.append(
+            "Rows dropped at resolution until the feature is registered "
+            "(REGISTER_GHOST_FEATURES): "
+            + ", ".join(f"{sid} -> {name} ({n})" for sid, name, n in mapped[:10]) + "."
+        )
+    if no_mapping:
+        shaped = (f"{feature_named} of them are feature-shaped ids" if feature_named is not None
+                  else "an unknown number of them are feature-shaped ids")
+        parts.append(
+            "Series without an entity_map entry, by family: "
+            + ", ".join(f"{fam} ({ids} ids, {n} lookups)" for fam, ids, n in families[:8])
+            + f". {shaped} (producer output with no mapping, e.g. scheduled GDELT theme "
+            "features): resolution, consumers and materialization unknown; each needs a "
+            "mapping or registration decision. Ids with a feed separator (YF per-ticker, "
+            "LEGISLATION, edgar, EARNINGS, ...) are entity-grained feeds whose traced "
+            "consumers read raw_series directly; that is not proof for untraced consumers "
+            "or of freshness."
+        )
+    parts.append("Worst offenders: " + ", ".join(f"{sid} ({n})" for sid, n in offenders) + ".")
+    return title, " ".join(parts)
 
 
 def report_unmapped_series(
@@ -334,24 +481,13 @@ def report_unmapped_series(
 
     offenders = report.get("top_series", [])[: max(1, min(int(limit), 200))]
     if report.get("series_ids"):
+        title, detail = describe_unmapped_report(report, offenders)
         log_issue(
             engine,
             category="data_integrity",
             severity="WARNING",
-            title=(
-                f"{report['series_ids']} unmapped series_id(s) skipped at resolution"
-            ),
-            detail=(
-                f"{report['lookups_missed']} lookup(s) missed over the last 2 days. "
-                "These are pulled successfully and then dropped because entity_map "
-                "has no entry. Worst offenders: "
-                + ", ".join(f"{sid} ({n})" for sid, n in offenders)
-                + (
-                    "; mapped-but-unregistered: "
-                    + ", ".join(report.get("unregistered_features", []))
-                    if report.get("unregistered_features") else ""
-                )
-            ),
+            title=title,
+            detail=detail,
             source="entity_map",
             cycle_number=cycle_number,
         )
