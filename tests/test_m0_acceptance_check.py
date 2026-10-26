@@ -456,3 +456,113 @@ def test_every_sql_binds_exactly_its_declared_parameters():
 
     for spec in m0.build_queries(TARGET, reasoning_id=4534) + m0.build_queries(TARGET):
         assert set(text(spec.sql)._bindparams) == set(spec.params), spec.qid
+
+
+# ---------------------------------------------------------------- v2: link states, repair lineage, out-dir precheck
+
+LEDGER_HEADER = "new_raw_id,old_raw_id,series_id,obs_date,old_value,new_value,old_pull_ts,new_pull_ts,cls,repair_reason,payload_kind,run_tag,chunk,inserted_at,reversed_at\n"
+RESOLVED_HEADER = "resolved_id,feature_id,feature,obs_date,vintage_date,release_date,value,source_priority_used,basis\n"
+REPAIRED = 7659.43994140625
+
+
+def _ledgers(tmp_path: Path, *, reversed_at: str = "", resolved_value: float = REPAIRED):
+    led = tmp_path / "ledger_export.csv"
+    led.write_text(LEDGER_HEADER + f"1958138951,1,YF:^GSPC:close,{OD},{VAL},{REPAIRED},2026-10-19 13:32:37+00,2026-10-19 03:52:28+00,"
+                   f"us_listed,intraday_snapshot,generic_policy_eligible,yf-intraday-close-repair-20261019,^GSPC,2026-10-19 03:52:28+00,{reversed_at}\n"
+                   f"1958138952,2,YF:^GSPC:close,2026-10-15,1.0,2.0,x,y,us_listed,r,k,t,^GSPC,z,\n")
+    res = tmp_path / "phase3_ledger.csv"
+    res.write_text(RESOLVED_HEADER + f"188921748,686,sp500_full,{OD},2026-10-19,2026-10-19,{resolved_value},2,close\n")
+    return led, res
+
+
+def _chain_v2(results, tmp_path, **kw):
+    d, rcp, _, _ = _make_capture(tmp_path)
+    return m0.evaluate_chain(results, TARGET, series=m0.DEFAULT_SERIES, feature="sp500_full", reasoning="briefing",
+                             snapshot_key="^GSPC", diary_label="S&P 500", capture_dir=str(d), capture_receipt=str(rcp), **kw)
+
+
+def test_unmarked_input_is_unqualified_not_failed(tmp_path):
+    res = _chain_results()
+    res["H1b"]["rows"][0]["capture_state"] = None  # pre-#853 vintage: no capture_state
+    out = _chain_v2(res, tmp_path)
+    l1 = out["links"]["L1_input_observation"]
+    assert l1["ok"] is None and l1["state"] == "LINKED_UNQUALIFIED" and "capture_state" in l1["reason"]
+    assert out["accepted"] is False and "L1_input_observation" in out["blocking_links"]
+    assert out["link_states"]["L3_reasoning_output"] == "LINKED"
+    assert out["link_states"]["L4_retained_publication_bytes"] == "RETAINED_VERIFIED"
+
+
+def test_no_resolved_row_at_all_is_not_materialized_not_failed(tmp_path):
+    res = _chain_results()
+    res["L2"]["rows"] = []
+    out = _chain_v2(res, tmp_path)
+    l2 = out["links"]["L2_materialization_row"]
+    assert l2["ok"] is None and l2["state"] == "NOT_MATERIALIZED" and out["accepted"] is False
+
+
+def test_repair_successor_is_confirmed_only_by_the_ledger(tmp_path):
+    res = _chain_results(resolved_value=REPAIRED)
+    (tmp_path / "a").mkdir()
+    without = _chain_v2(res, tmp_path / "a")
+    assert without["links"]["L2_materialization_row"]["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+    assert without["links"]["L2_materialization_row"]["ok"] is False
+    (tmp_path / "b").mkdir()
+    led, resl = _ledgers(tmp_path)
+    with_ledger = _chain_v2(res, tmp_path / "b", repair_ledger=str(led), resolved_ledger=str(resl))
+    l2 = with_ledger["links"]["L2_materialization_row"]
+    assert l2["ok"] is None and l2["state"] == "SUPERSEDED_BY_REPAIR"
+    assert l2["repair_lineage"]["repairs"][0]["new_raw_id"] == 1958138951
+    assert l2["repair_lineage"]["resolved_successor"]["resolved_id"] == 188921748
+    assert l2["repair_lineage"]["successor_value_equals_repair_row"] is True
+    assert with_ledger["accepted"] is False  # lineage evidence never sets acceptance
+
+
+def test_ledger_for_a_different_value_does_not_explain_the_mismatch(tmp_path):
+    led, resl = _ledgers(tmp_path)
+    (tmp_path / "x").mkdir()
+    out = _chain_v2(_chain_results(resolved_value=VAL + 5), tmp_path / "x", repair_ledger=str(led), resolved_ledger=str(resl))
+    assert out["links"]["L2_materialization_row"]["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+
+
+def test_accepted_requires_all_four_ok_true_and_states_are_exposed(tmp_path):
+    out = _chain_v2(_chain_results(), tmp_path)
+    assert out["accepted"] is True
+    assert out["link_states"] == {"L1_input_observation": "LINKED_QUALIFIED", "L2_materialization_row": "LINKED_QUALIFIED",
+                                  "L3_reasoning_output": "LINKED", "L4_retained_publication_bytes": "RETAINED_VERIFIED"}
+
+
+def test_load_repair_lineage_filters_and_reports_reversal(tmp_path):
+    led, resl = _ledgers(tmp_path, reversed_at="2026-10-20 00:00:00+00")
+    got = m0.load_repair_lineage(str(led), str(resl), series=m0.DEFAULT_SERIES, obs_date=OD, feature="sp500_full", original_raw_id=1)
+    assert got["found"] is True and len(got["repairs"]) == 1 and got["repairs"][0]["reversed"] is True
+    assert m0.load_repair_lineage(str(led), str(resl), series=m0.DEFAULT_SERIES, obs_date=OD, feature="sp500_full", original_raw_id=99)["found"] is False
+    assert m0.load_repair_lineage(str(led), None, series=m0.DEFAULT_SERIES, obs_date=OD, feature="sp500_full")["resolved_successor"] is None
+
+
+def test_load_repair_lineage_rejects_a_file_with_the_wrong_columns(tmp_path):
+    bad = tmp_path / "bad.csv"
+    bad.write_text("a,b\n1,2\n")
+    got = m0.load_repair_lineage(str(bad), None, series="s", obs_date=OD, feature="f")
+    assert got["found"] is False and "missing columns" in got["error"]
+
+
+def test_lineage_only_reads_files_never_opens_the_engine(tmp_path, capsys):
+    led, resl = _ledgers(tmp_path)
+    rc = m0.main(["--date", OD, "--lineage-only", "--repair-ledger", str(led), "--resolved-ledger", str(resl)], engine_factory=_boom)
+    assert rc == 0
+    got = json.loads(capsys.readouterr().out)
+    assert got["schema"] == "m0-repair-lineage-v1" and got["lineage"]["found"] is True
+    assert got["lineage"]["resolved_successor"]["value"] == REPAIRED
+    assert m0.main(["--date", "2026-01-01", "--lineage-only", "--repair-ledger", str(led)], engine_factory=_boom) == 1
+    assert m0.main(["--date", OD, "--lineage-only"], engine_factory=_boom) == 2
+
+
+def test_missing_out_directory_is_refused_before_any_query(tmp_path, capsys):
+    out = tmp_path / "nope" / "receipt.json"
+    rc = m0.main(["--date", OD, "--i-am-authorized", "--out", str(out)], engine_factory=_boom)
+    assert rc == 2
+    assert "--out directory does not exist" in capsys.readouterr().err
+
+
+def test_receipt_schema_is_v2():
+    assert m0.SCHEMA == "m0-acceptance-receipt-v2"

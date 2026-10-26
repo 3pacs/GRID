@@ -60,7 +60,7 @@ Exit codes: `0` receipt written (or dry-run), `1` `--strict` and not `accepted`,
 | **L3 diary** | `H3:diary` | priced entry: close/obs_date equal a `POLICY_ELIGIBLE` vintage pulled before `generated_at`; or the explicit `"no close for date"` while **no** `POLICY_ELIGIBLE` vintage existed before generation | grounding/narrative quality |
 | **L4** | local files only | `capture.json` sha256 = directory name = receipt export sha; the row's canonical sha256 (sort_keys, compact separators, `ensure_ascii=False`) = the receipt's row sha; `packet.json` has the entry for exactly that row (text sha256, `source_record` equal to the capture record, export sha equal); the DB row's id/`created_at` (briefing) or `generated_at` and index entry (diary) equal the retained record | that anything was published externally. A markdown receipt has no diary row hashes, so a diary chain needs a JSON receipt |
 
-A link that errored or lacks its inputs is `null` (UNKNOWN) and also blocks acceptance; the receipt lists `blocking_links`.
+Each link has `ok` (`true` / `false` / `null`) **and** a `state` (§ Link states); `accepted` needs all four `ok` true. A link that errored or lacks its inputs is `null` (UNKNOWN) and also blocks acceptance; the receipt lists `blocking_links` and `link_states`.
 
 ## Context hops (never set `accepted`) — what each proves and does not
 
@@ -75,7 +75,7 @@ Three timestamps stay separate in the receipt (`queries[].timestamp_kind`): **pr
 **ingestion/materialization** (`pull_timestamp`, `pull_log.started_at`, `created_at`), and **reader** (`resolved_series.vintage_date`,
 `market_diary.generated_at`, `market_briefings.created_at`).
 
-## Receipt (`schema: m0-acceptance-receipt-v1`)
+## Receipt (`schema: m0-acceptance-receipt-v2`)
 
 `schema`, `generated_at_utc`, `target_date`, `host`, `read_only: true`, `authorized_flag: true`, `arguments`, **`accepted`** (true only if L1–L4 are all true),
 `chain{accepted, blocking_links, rule, links{L1_input_observation, L2_materialization_row, L3_reasoning_output, L4_retained_publication_bytes}}`,
@@ -89,3 +89,20 @@ Three timestamps stay separate in the receipt (`queries[].timestamp_kind`): **pr
 - A weekend or holiday target date legitimately has no `pull_log` rows or GSPC vintages (equity pullers skip).
 - `H2` FAIL on the flow tables with grid-hermes OFF is the expected signature of the materialization gap (see `ingestion/flow_materializer.py`
   and `scripts/hermes_operator.py:1508`).
+
+## Link states (receipt v2) — "not a pass" is not the same as "broken"
+| link | `ok=true` state | `ok=null` states (not a pass, not a contradiction) | `ok=false` states |
+|---|---|---|---|
+| L1 | `LINKED_QUALIFIED` (vintage carries `capture_state`) | `LINKED_UNQUALIFIED` (vintage found, no `capture_state` — any pull before the #853 writer), `UNKNOWN` (query failed) | `ABSENT` (no SUCCESS vintage) |
+| L2 | `LINKED_QUALIFIED` | `NOT_MATERIALIZED` (no resolved row exists for the feature/date); `SUPERSEDED_BY_REPAIR` (no resolved vintage carries the original input, and a resolved row equals its **ledger-confirmed** repair successor); `UNKNOWN` | `UNEXPLAINED_DIFFERENT_VALUE` (resolved rows exist, none equals the input or a ledger-confirmed successor) |
+| L3 | `LINKED` / `EXPLICIT_UNAVAILABLE` | `UNKNOWN` | `UNLINKED` |
+| L4 | `RETAINED_VERIFIED` | `UNKNOWN` (capture arguments missing) | `MISMATCH` |
+Without `--repair-ledger` a repaired session reports `UNEXPLAINED_DIFFERENT_VALUE` for L2 (the database alone cannot tell a repair from a defect); with it, `SUPERSEDED_BY_REPAIR`.
+
+## File-only repair lineage (no database)
+`--repair-ledger` (retained `ledger_export.csv`) and `--resolved-ledger` (retained `phase3_ledger.csv`) let the check follow *original raw vintage → repair row (`old_raw_id → new_raw_id`) → resolved successor* from the append-only repair ledgers. They add `repair_lineage` to L2 as **lineage evidence only** — never acceptance evidence.
+`--lineage-only --date D --repair-ledger … [--resolved-ledger …] [--original-raw-id N]` prints that chain as JSON from the two local files and exits (0 found / 1 not found); it opens no database and needs no authorization flag.
+Example (retained 2026-10-19 repair files): original raw 1957972112 (7753.2798, pulled 2026-10-16 13:32:37Z) → repair row 1958138951 (7659.4399, 2026-10-19 03:52:28Z) → `resolved_series` 188921748 (`sp500_full`, vintage 2026-10-19).
+
+## Output directory
+`--out`'s directory must already exist and be writable; the script checks this **before opening the database engine** (exit 2) and never creates it.

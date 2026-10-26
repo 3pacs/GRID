@@ -51,7 +51,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable
 
-SCHEMA = "m0-acceptance-receipt-v1"
+SCHEMA = "m0-acceptance-receipt-v2"
 MAX_STATEMENT_TIMEOUT_S = 20
 DEFAULT_TICKERS = "^GSPC,SPY"
 DEFAULT_SERIES = "YF:^GSPC:close"
@@ -701,6 +701,75 @@ def verify_capture(
     return out
 
 
+# --------------------------------------------------------------------------
+# File-only repair lineage (no database): follows the append-only repair ledger
+# from the original raw vintage to its repair successor and the resolved row the
+# re-resolve produced.  It is lineage evidence, never acceptance evidence.
+# Column names are those of the retained phase1-3 files (ledger_export.csv and
+# phase3_ledger.csv from the 2026-10-19 yfinance repair).
+# --------------------------------------------------------------------------
+
+_LEDGER_REQUIRED = ("new_raw_id", "old_raw_id", "series_id", "obs_date", "old_value", "new_value",
+                    "old_pull_ts", "new_pull_ts")
+_RESOLVED_LEDGER_REQUIRED = ("resolved_id", "feature_id", "feature", "obs_date", "vintage_date", "value", "source_priority_used")
+
+
+def _read_csv_rows(path: str, required: tuple[str, ...]) -> list[dict[str, str]]:
+    import csv  # noqa: PLC0415
+
+    if os.path.getsize(path) > MAX_CAPTURE_FILE_BYTES:
+        raise ValueError(f"{path}: larger than {MAX_CAPTURE_FILE_BYTES} bytes")
+    with open(path, newline="", encoding="utf-8") as fh:
+        reader = csv.DictReader(fh)
+        missing = [c for c in required if c not in (reader.fieldnames or [])]
+        if missing:
+            raise ValueError(f"{path}: missing columns {missing}")
+        return list(reader)
+
+
+def load_repair_lineage(
+    repair_ledger: str,
+    resolved_ledger: str | None,
+    *,
+    series: str,
+    obs_date: str,
+    feature: str,
+    original_raw_id: int | None = None,
+) -> dict[str, Any]:
+    """Follow original raw vintage -> repair row -> resolved successor from retained CSVs. No database."""
+    out: dict[str, Any] = {"source": "retained ledger files (no database)", "found": False, "repairs": [], "resolved_successor": None}
+    try:
+        ledger = _read_csv_rows(repair_ledger, _LEDGER_REQUIRED)
+        resolved = _read_csv_rows(resolved_ledger, _RESOLVED_LEDGER_REQUIRED) if resolved_ledger else []
+    except (OSError, ValueError) as exc:
+        out["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
+        return out
+    for r in ledger:
+        if r["series_id"] != series or r["obs_date"] != obs_date:
+            continue
+        if original_raw_id is not None and str(r["old_raw_id"]) != str(original_raw_id):
+            continue
+        out["repairs"].append({
+            "old_raw_id": int(r["old_raw_id"]), "old_value": float(r["old_value"]), "old_pull_ts": r["old_pull_ts"],
+            "new_raw_id": int(r["new_raw_id"]), "new_value": float(r["new_value"]), "new_pull_ts": r["new_pull_ts"],
+            "run_tag": r.get("run_tag"), "payload_kind": r.get("payload_kind"),
+            "reversed": bool(r.get("reversed_at")),
+        })
+    out["found"] = bool(out["repairs"])
+    if out["found"]:
+        match = [r for r in resolved if r["feature"] == feature and r["obs_date"] == obs_date]
+        if match:
+            m = match[0]
+            out["resolved_successor"] = {
+                "resolved_id": int(m["resolved_id"]), "feature_id": int(m["feature_id"]), "vintage_date": m["vintage_date"],
+                "value": float(m["value"]), "source_priority_used": int(m["source_priority_used"]),
+            }
+            out["successor_value_equals_repair_row"] = any(_near(rep["new_value"], out["resolved_successor"]["value"], 1e-9)
+                                                           for rep in out["repairs"])
+    return out
+
+
+
 def evaluate_chain(
     results: dict[str, dict[str, Any]],
     target: date,
@@ -712,8 +781,16 @@ def evaluate_chain(
     diary_label: str,
     capture_dir: str | None,
     capture_receipt: str | None,
+    repair_ledger: str | None = None,
+    resolved_ledger: str | None = None,
 ) -> dict[str, Any]:
-    """Build the linked L1..L4 chain for ONE session. Pure apart from reading the capture files."""
+    """Build the linked L1..L4 chain for ONE session. Pure apart from reading the capture/ledger files.
+
+    Each link carries ``ok`` (True / False / None) AND a ``state``.  ``ok`` is True only for a fully
+    qualified link; ``None`` means "not a pass, not a defect of the chain": UNKNOWN (inputs missing), LINKED_UNQUALIFIED
+    (input found but carries no capture_state), NOT_MATERIALIZED / SUPERSEDED_BY_REPAIR (no resolved row carries the
+    original input).  ``False`` is reserved for a contradiction.  ``accepted`` needs all four ``ok`` True.
+    """
     od = target.isoformat()
     vint = [dict(v, _ts=_ts(v.get("pull_timestamp"))) for v in (_rows(results, "H1b") or [])]
     chain: dict[str, dict[str, Any]] = {}
@@ -721,7 +798,7 @@ def evaluate_chain(
     # ---- L3 first (it decides which input vintage was actually used)
     used: dict[str, Any] | None = None
     row: dict[str, Any] | None = None
-    l3: dict[str, Any] = {"kind": reasoning, "ok": None}
+    l3: dict[str, Any] = {"kind": reasoning, "ok": None, "state": "UNKNOWN"}
     if reasoning == "briefing":
         rows = _rows(results, "L3:briefings")
         if rows is None:
@@ -766,12 +843,25 @@ def evaluate_chain(
                           reason=None if ok else "diary says 'no close for date' although a POLICY_ELIGIBLE vintage existed before generation")
             else:
                 l3.update(ok=False, reason="diary index entry neither carries a close nor the explicit 'no close for date' reason")
+    l3["state"] = (
+        "UNKNOWN" if l3.get("ok") is None
+        else ("EXPLICIT_UNAVAILABLE" if l3.get("explicit_unavailable_reason") else "LINKED") if l3["ok"]
+        else "UNLINKED"
+    )
     chain["L3_reasoning_output"] = l3
 
     # ---- L1 input observation (the vintage that was used; else the newest vintage)
     inp = used or (max((v for v in vint if v["_ts"]), key=lambda v: v["_ts"], default=None))
+    if _rows(results, "H1b") is None:
+        l1_ok, l1_state = None, "UNKNOWN"
+    elif not inp:
+        l1_ok, l1_state = False, "ABSENT"
+    elif inp.get("capture_state"):
+        l1_ok, l1_state = True, "LINKED_QUALIFIED"
+    else:
+        l1_ok, l1_state = None, "LINKED_UNQUALIFIED"
     chain["L1_input_observation"] = {
-        "ok": None if _rows(results, "H1b") is None else bool(inp and inp.get("capture_state")),
+        "ok": l1_ok, "state": l1_state,
         "series_id": series, "obs_date": od,
         "pull_timestamp": inp.get("pull_timestamp") if inp else None,
         "capture_state": inp.get("capture_state") if inp else None,
@@ -790,37 +880,62 @@ def evaluate_chain(
 
     # ---- L2 materialization row produced from that input
     rr = _rows(results, "L2")
-    l2: dict[str, Any] = {"table": "resolved_series", "ok": None, "materialized_at_basis": "vintage_date (date granularity; resolved_series has no timestamp)"}
+    l2: dict[str, Any] = {"table": "resolved_series", "ok": None, "state": "UNKNOWN",
+                          "materialized_at_basis": "vintage_date (date granularity; resolved_series has no timestamp)"}
     if rr is None:
         l2["reason"] = "query failed"
     elif not inp:
-        l2.update(ok=False, reason="no input vintage to link")
+        l2["reason"] = "no input vintage to link"
     else:
         pdate = (inp["_ts"].date() if inp.get("_ts") else None)
         hit = next((r for r in rr
                     if _near(r.get("value"), inp.get("value"), 1e-9)
                     and r.get("source_priority_used") == inp.get("source_id")
                     and pdate is not None and str(r.get("vintage_date"))[:10] >= pdate.isoformat()), None)
-        l2.update(ok=hit is not None, feature=feature, resolved_rows_examined=len(rr),
+        lineage = None
+        if repair_ledger:
+            lineage = load_repair_lineage(repair_ledger, resolved_ledger, series=series, obs_date=od, feature=feature,
+                                          original_raw_id=inp.get("id"))
+        l2.update(feature=feature, resolved_rows_examined=len(rr),
                   resolved_rows=[{k: str(r.get(k)) if k.endswith("date") else r.get(k)
                                   for k in ("feature_id", "obs_date", "vintage_date", "release_date", "value", "source_priority_used")}
-                                 for r in rr],
-                  row_key=None if not hit else {"feature_id": hit.get("feature_id"), "obs_date": str(hit.get("obs_date"))[:10], "vintage_date": str(hit.get("vintage_date"))[:10]},
-                  materialized_at=None if not hit else str(hit.get("vintage_date"))[:10],
-                  reason=None if hit else "no resolved_series row equals the input vintage (value, source, vintage_date >= pull date)")
+                                 for r in rr])
+        if hit is not None:
+            l2.update(ok=True, state="LINKED_QUALIFIED",
+                      row_key={"feature_id": hit.get("feature_id"), "obs_date": str(hit.get("obs_date"))[:10], "vintage_date": str(hit.get("vintage_date"))[:10]},
+                      materialized_at=str(hit.get("vintage_date"))[:10])
+        else:
+            # No resolved vintage carries the original input.  resolved_series is append-only, so this is a fact about the
+            # store, not a read error: the original input was never materialized.
+            successor = bool(lineage and lineage.get("found") and any(
+                _near(r.get("value"), rep_row["new_value"], 1e-9) for r in rr for rep_row in lineage["repairs"]))
+            if successor:
+                l2.update(ok=None, state="SUPERSEDED_BY_REPAIR",
+                          reason="the original input was never materialized; a resolved row equals its repair successor (ledger-confirmed)")
+            elif not rr:
+                l2.update(ok=None, state="NOT_MATERIALIZED", reason="no resolved_series row exists for the feature/date")
+            else:
+                l2.update(ok=False, state="UNEXPLAINED_DIFFERENT_VALUE",
+                          reason="resolved rows exist but none equals the input vintage or a ledger-confirmed repair successor")
+        if lineage is not None:
+            l2["repair_lineage"] = lineage
     chain["L2_materialization_row"] = l2
 
     # ---- L4 retained bytes
     chain["L4_retained_publication_bytes"] = verify_capture(
         reasoning, row, capture_dir, capture_receipt, snapshot_key=snapshot_key, diary_label=diary_label)
+    l4 = chain["L4_retained_publication_bytes"]
+    l4["state"] = "UNKNOWN" if l4.get("ok") is None else ("RETAINED_VERIFIED" if l4["ok"] else "MISMATCH")
     order = ["L1_input_observation", "L2_materialization_row", "L3_reasoning_output", "L4_retained_publication_bytes"]
     chain = {k: chain[k] for k in order}
     blocking = [k for k, v in chain.items() if v.get("ok") is not True]
     return {
         "accepted": not blocking,
         "blocking_links": blocking,
+        "link_states": {k: v.get("state") for k, v in chain.items()},
         "links": chain,
-        "rule": "accepted only if all four links are true for ONE linked example; counts, row existence and folder presence never set it",
+        "rule": ("accepted only if all four links are ok=true for ONE linked example; counts, row existence and folder presence never set it; "
+                 "ok=null (UNKNOWN / LINKED_UNQUALIFIED / NOT_MATERIALIZED / SUPERSEDED_BY_REPAIR) is not a pass and not a contradiction"),
     }
 
 
@@ -885,6 +1000,13 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
     p.add_argument("--reasoning-id", type=int, default=None, help="link 3: pin the market_briefings.id instead of auto-selecting")
     p.add_argument("--snapshot-key", default=DEFAULT_SNAPSHOT_KEY, help="briefing snapshot_data.equities key for the series")
     p.add_argument("--diary-label", default=DEFAULT_DIARY_LABEL, help="diary market_moves.indices label for the series")
+    p.add_argument("--repair-ledger", default=None,
+                   help="optional retained repair ledger CSV (ledger_export.csv): follows old_raw_id -> new_raw_id; file-only lineage")
+    p.add_argument("--resolved-ledger", default=None,
+                   help="optional retained resolved ledger CSV (phase3_ledger.csv): the resolved row the re-resolve produced")
+    p.add_argument("--original-raw-id", type=int, default=None, help="--lineage-only: pin the original raw_series.id")
+    p.add_argument("--lineage-only", action="store_true",
+                   help="print the repair lineage from --repair-ledger/--resolved-ledger and exit; reads local files only, no database")
     p.add_argument("--out", default=None, help="receipt path (created exclusively; never overwritten)")
     p.add_argument("--strict", action="store_true", help="exit 1 unless accepted is true")
     return p.parse_args(argv)
@@ -916,6 +1038,16 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
         reasoning_id=args.reasoning_id,
     )
 
+    if args.lineage_only:
+        if not args.repair_ledger:
+            print("error: --lineage-only needs --repair-ledger", file=sys.stderr)
+            return 2
+        lineage = load_repair_lineage(args.repair_ledger, args.resolved_ledger, series=args.series, obs_date=target.isoformat(),
+                                      feature=args.feature, original_raw_id=args.original_raw_id)
+        print(json.dumps({"schema": "m0-repair-lineage-v1", "series_id": args.series, "obs_date": target.isoformat(),
+                          "feature": args.feature, "lineage": lineage,
+                          "note": "lineage evidence from retained files; never sets accepted"}, indent=2, sort_keys=True))
+        return 0 if lineage.get("found") else 1
     if args.dry_run:
         print(render_dry_run(queries))
         return 0
@@ -928,6 +1060,15 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
         )
         return 2
 
+    out = args.out or default_out_path(target)
+    out_dir = os.path.dirname(os.path.abspath(out))
+    if not os.path.isdir(out_dir) or not os.access(out_dir, os.W_OK):
+        print(f"error: --out directory does not exist or is not writable: {out_dir} (refusing before any query)", file=sys.stderr)
+        return 2
+    if os.path.exists(out):
+        print(f"error: receipt path already exists, refusing to overwrite: {out}", file=sys.stderr)
+        return 2
+
     engine = (engine_factory or _open_engine)()
     results = {q.qid: run_query(engine, q) for q in queries}
     hops = evaluate(results, target, max_age_days=args.max_age_days, capture_dir=args.capture_dir)
@@ -935,13 +1076,13 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
         results, target, series=args.series, feature=args.feature, reasoning=args.reasoning,
         snapshot_key=args.snapshot_key, diary_label=args.diary_label,
         capture_dir=args.capture_dir, capture_receipt=args.capture_receipt,
+        repair_ledger=args.repair_ledger, resolved_ledger=args.resolved_ledger,
     )
     receipt = build_receipt(
         target, hops, results,
         args_echo={k: v for k, v in vars(args).items() if k not in ("authorized",)},
         chain=chain,
     )
-    out = args.out or default_out_path(target)
     try:
         with open(out, "x", encoding="utf-8") as fh:  # 'x': refuse to overwrite an existing receipt
             json.dump(receipt, fh, indent=2, sort_keys=True, default=str)
@@ -949,7 +1090,7 @@ def main(argv: list[str] | None = None, *, engine_factory: Callable[[], Any] | N
     except FileExistsError:
         print(f"error: receipt path already exists, refusing to overwrite: {out}", file=sys.stderr)
         return 2
-    links = " ".join(f"{k.split('_')[0]}={v.get('ok')}" for k, v in chain["links"].items())
+    links = " ".join(f"{k.split('_')[0]}={v.get('ok')}({v.get('state')})" for k, v in chain["links"].items())
     print(f"receipt written: {out} accepted={chain['accepted']} {links} | context: "
           + " ".join(f"{k}={v['status']}" for k, v in hops.items()))
     return 1 if (args.strict and not chain["accepted"]) else 0
