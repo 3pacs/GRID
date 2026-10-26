@@ -909,9 +909,21 @@ def evaluate_chain(
             # store, not a read error: the original input was never materialized.
             successor = bool(lineage and lineage.get("found") and any(
                 _near(r.get("value"), rep_row["new_value"], 1e-9) for r in rr for rep_row in lineage["repairs"]))
+            # A later raw vintage of the SAME series/date (e.g. the post-close INCOMPLETE pull, or the POLICY_ELIGIBLE
+            # promotion) that a resolved row carries.  vintage_date has day granularity, so earlier intraday vintages
+            # of the same day collapse into the later one's resolved row.
+            later = [v for v in vint
+                     if v.get("_ts") and inp.get("_ts") and v["_ts"] > inp["_ts"]
+                     and any(_near(r.get("value"), v.get("value"), 1e-9)
+                             and r.get("source_priority_used") == v.get("source_id") for r in rr)]
             if successor:
                 l2.update(ok=None, state="SUPERSEDED_BY_REPAIR",
                           reason="the original input was never materialized; a resolved row equals its repair successor (ledger-confirmed)")
+            elif later:
+                l2.update(ok=None, state="SUPERSEDED_BY_LATER_VINTAGE",
+                          superseded_by_raw_vintages=[{k: v.get(k) for k in ("id", "pull_timestamp", "value", "capture_state")} for v in later],
+                          reason=("the original input was never materialized as its own resolved vintage; the resolved rows carry the value of "
+                                  "a later raw vintage of the same series/date (vintage_date is day-granular)"))
             elif not rr:
                 l2.update(ok=None, state="NOT_MATERIALIZED", reason="no resolved_series row exists for the feature/date")
             else:

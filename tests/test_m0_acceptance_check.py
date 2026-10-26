@@ -566,3 +566,47 @@ def test_missing_out_directory_is_refused_before_any_query(tmp_path, capsys):
 
 def test_receipt_schema_is_v2():
     assert m0.SCHEMA == "m0-acceptance-receipt-v2"
+
+
+# ---------------------------------------------------------------- v3.1: SUPERSEDED_BY_LATER_VINTAGE
+
+def _with_later_vintage(*, source_id: int = 2, pulled: str = "2026-10-19T23:30:00+00:00", value: float = VAL - 14):
+    res = _chain_results(resolved_value=value)
+    res["H1b"]["rows"].append({"id": 2, "source_id": source_id, "obs_date": OD, "pull_timestamp": pulled,
+                               "value": value, "capture_state": "INCOMPLETE"})
+    return res
+
+
+def test_resolved_row_equal_to_a_later_raw_vintage_is_superseded_not_unexplained(tmp_path):
+    out = _chain_v2(_with_later_vintage(), tmp_path)
+    l2 = out["links"]["L2_materialization_row"]
+    assert l2["ok"] is None and l2["state"] == "SUPERSEDED_BY_LATER_VINTAGE"
+    assert [v["id"] for v in l2["superseded_by_raw_vintages"]] == [2]
+    assert out["accepted"] is False and "L2_materialization_row" in out["blocking_links"]
+    assert out["link_states"]["L1_input_observation"] == "LINKED_QUALIFIED"  # the used input is still the vintage the briefing saw
+
+
+def test_later_vintage_from_another_source_does_not_explain_the_resolved_value(tmp_path):
+    out = _chain_v2(_with_later_vintage(source_id=524), tmp_path)
+    assert out["links"]["L2_materialization_row"]["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+
+
+def test_an_earlier_vintage_is_not_a_later_vintage(tmp_path):
+    out = _chain_v2(_with_later_vintage(pulled="2026-10-19T12:00:00+00:00"), tmp_path)
+    assert out["links"]["L2_materialization_row"]["state"] == "UNEXPLAINED_DIFFERENT_VALUE"
+
+
+def test_ledger_confirmed_repair_takes_priority_over_a_later_vintage(tmp_path):
+    led, resl = _ledgers(tmp_path)
+    res = _with_later_vintage(value=REPAIRED)
+    (tmp_path / "p").mkdir()
+    out = _chain_v2(res, tmp_path / "p", repair_ledger=str(led), resolved_ledger=str(resl))
+    assert out["links"]["L2_materialization_row"]["state"] == "SUPERSEDED_BY_REPAIR"
+
+
+def test_the_input_value_materialized_is_still_a_pass_even_with_later_vintages(tmp_path):
+    res = _with_later_vintage()
+    res["L2"]["rows"].append({"feature_id": 5, "name": "sp500_full", "obs_date": OD, "vintage_date": OD, "value": VAL,
+                              "source_priority_used": 2})
+    out = _chain_v2(res, tmp_path)
+    assert out["links"]["L2_materialization_row"]["state"] == "LINKED_QUALIFIED" and out["accepted"] is True

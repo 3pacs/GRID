@@ -94,10 +94,10 @@ Three timestamps stay separate in the receipt (`queries[].timestamp_kind`): **pr
 | link | `ok=true` state | `ok=null` states (not a pass, not a contradiction) | `ok=false` states |
 |---|---|---|---|
 | L1 | `LINKED_QUALIFIED` (vintage carries `capture_state`) | `LINKED_UNQUALIFIED` (vintage found, no `capture_state` — any pull before the #853 writer), `UNKNOWN` (query failed) | `ABSENT` (no SUCCESS vintage) |
-| L2 | `LINKED_QUALIFIED` | `NOT_MATERIALIZED` (no resolved row exists for the feature/date); `SUPERSEDED_BY_REPAIR` (no resolved vintage carries the original input, and a resolved row equals its **ledger-confirmed** repair successor); `UNKNOWN` | `UNEXPLAINED_DIFFERENT_VALUE` (resolved rows exist, none equals the input or a ledger-confirmed successor) |
+| L2 | `LINKED_QUALIFIED` | `NOT_MATERIALIZED` (no resolved row exists for the feature/date); `SUPERSEDED_BY_REPAIR` (no resolved vintage carries the original input, and a resolved row equals its **ledger-confirmed** repair successor); `SUPERSEDED_BY_LATER_VINTAGE` (no resolved vintage carries the original input, but a resolved row carries the value of a **later raw vintage of the same series/date and source** — `vintage_date` is day-granular, so an earlier intraday vintage cannot be replayed from the PIT store); `UNKNOWN` | `UNEXPLAINED_DIFFERENT_VALUE` (resolved rows exist, none equals the input or a ledger-confirmed successor) |
 | L3 | `LINKED` / `EXPLICIT_UNAVAILABLE` | `UNKNOWN` | `UNLINKED` |
 | L4 | `RETAINED_VERIFIED` | `UNKNOWN` (capture arguments missing) | `MISMATCH` |
-Without `--repair-ledger` a repaired session reports `UNEXPLAINED_DIFFERENT_VALUE` for L2 (the database alone cannot tell a repair from a defect); with it, `SUPERSEDED_BY_REPAIR`.
+Check order for an L2 with no matching resolved vintage: repair successor (ledger) → later raw vintage → no resolved row at all (`NOT_MATERIALIZED`) → otherwise `UNEXPLAINED_DIFFERENT_VALUE`. Without `--repair-ledger` a repaired session reports `UNEXPLAINED_DIFFERENT_VALUE` for L2 (the database alone cannot tell a repair from a defect); with it, `SUPERSEDED_BY_REPAIR`.
 
 ## File-only repair lineage (no database)
 `--repair-ledger` (retained `ledger_export.csv`) and `--resolved-ledger` (retained `phase3_ledger.csv`) let the check follow *original raw vintage → repair row (`old_raw_id → new_raw_id`) → resolved successor* from the append-only repair ledgers. They add `repair_lineage` to L2 as **lineage evidence only** — never acceptance evidence.
