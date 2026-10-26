@@ -3666,12 +3666,22 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     stale_sources = health["db"].get("stale_sources", [])
     if stale_sources and not dry_run:
         stale_repulled = 0
-        for stale in stale_sources[:15]:  # up to 15 per cycle
+        stale_attempted = 0
+        for stale in stale_sources:
+            # Cooling sources must not consume the bounded repair slots.
+            # Count every admitted retry call, including skipped/no-handler
+            # results, and never start another after this cycle's deadline.
+            if stale_attempted >= 15 or time.monotonic() >= cycle_deadline:
+                break
             src = stale["source"]
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
+                stale_attempted += 1
                 try:
-                    pull_result = _retry_source(src, engine, attempt=1, state=state)
+                    pull_result = _retry_source(
+                        src, engine, attempt=1, state=state,
+                        should_continue=lambda: time.monotonic() < cycle_deadline,
+                    )
                     if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
                         log.info("Skipping stale refresh for {s} — repair already in flight", s=src)
                         continue
