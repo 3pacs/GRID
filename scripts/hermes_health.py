@@ -895,6 +895,9 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                 "size": int(pool.size()) if hasattr(pool, "size") else 0,
                 "checked_out": int(pool.checkedout()) if hasattr(pool, "checkedout") else 0,
                 "overflow": int(pool.overflow()) if hasattr(pool, "overflow") else 0,
+                # overflow() counts currently allocated overflow, and can be
+                # negative while the pool is cold. It is not the ceiling.
+                "max_overflow": int(getattr(pool, "_max_overflow", 0)),
             }
     except Exception as exc:
         result["pool_error"] = str(exc)

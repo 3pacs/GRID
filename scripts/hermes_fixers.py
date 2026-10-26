@@ -1870,6 +1870,64 @@ def _retry_source(
                 del _REPAIRS_IN_FLIGHT[source_key]
 
 
+def _classify_pull_failure(error: str) -> str:
+    """Bounded deterministic evidence guard; provider labels cannot override DB errors."""
+    message = str(error or "")[:4096].lower()
+    payload = None
+    try:
+        payload = json.loads(message)
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            message = payload["error"].lower()
+    except (ValueError, TypeError):
+        pass
+
+    # Distinctive PostgreSQL/pool messages are sufficient by themselves.
+    # Generic transport phrases require DB-driver provenance to avoid
+    # relabelling an upstream HTTP connection failure as a local DB fault.
+    db_markers = (
+        "remaining connection slots are reserved", "too many clients already",
+        "sorry, too many clients", "queuepool limit", "undefinedcolumn",
+        "undefinedtable", "infailedsqltransaction",
+        "current transaction is aborted", "password authentication failed for user",
+    )
+    if any(marker in message for marker in db_markers):
+        return "database"
+    driver = any(marker in message for marker in (
+        "psycopg2.", "psycopg.", "sqlalchemy.exc.", "sqlalchemy.pool.",
+    ))
+    if driver and any(marker in message for marker in (
+        "connection refused", "server closed the connection unexpectedly",
+        "could not connect to server", "timeout", "operationalerror",
+        "programmingerror", "integrityerror", "databaseerror", "interfaceerror",
+        "statementerror", "pendingrollbackerror",
+    )):
+        return "database"
+    if isinstance(payload, dict):
+        state = str(payload.get("sqlstate") or payload.get("pgcode") or "").lower()
+        if re.fullmatch(r"08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02", state):
+            return "database"
+    if re.search(r"\b(?:sqlstate|pgcode)\s*[:=]\s*['\"]?(?:08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02)\b", message):
+        return "database"
+
+    if isinstance(payload, dict) and any(
+        str(payload.get(key)) in {"401", "403", "429"}
+        for key in ("http_status", "status_code", "status")
+    ):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:http|status(?:_code)?)\s*[:=]?\s*(?:401|403|429)\b", message):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:401|403|429)\s+(?:client error|unauthorized|forbidden|too many requests)\b", message):
+        return "provider_auth_or_quota"
+    if any(marker in message for marker in (
+        "invalid api key", "invalid api_key", "api key is invalid",
+        "api_key is invalid", "api key must be", "api_key must be",
+        "missing api key", "missing api_key", "quota exceeded",
+        "rate limit exceeded", "too many requests",
+    )):
+        return "provider_auth_or_quota"
+    return "unknown"
+
+
 def diagnose_and_fix_pulls(
     engine: Any,
     hermes_available: bool,
@@ -1945,7 +2003,26 @@ def diagnose_and_fix_pulls(
     diagnosis_text: str | None = None
     fix_actions: dict[str, str] = {}  # source → recommended action
 
-    if hermes_available:
+    # Guard known local DB and real provider access failures before the LLM.
+    # The original payload is inspected only within a bounded pure classifier;
+    # the existing truncated user-facing context remains unchanged.
+    failure_classes = {
+        _normalize_source_key(r[0]): _classify_pull_failure(r[3] or "")
+        for r in failed
+    }
+    guarded_actions = {
+        key: ("CHECK_DB" if kind == "database" else "CHECK_KEY")
+        for key, kind in failure_classes.items()
+        if kind == "database" or (
+            kind == "provider_auth_or_quota" and key in {"fred", "baltic_exchange"}
+        )
+    }
+    diagnosis_info = [
+        f for f in failed_info
+        if _normalize_source_key(f["source"]) not in guarded_actions
+    ]
+
+    if hermes_available and diagnosis_info:
         try:
             from llm.router import get_llm, Tier
             client = get_llm(Tier.REASON)
@@ -1961,7 +2038,7 @@ def diagnose_and_fix_pulls(
                     )},
                     {"role": "user", "content": (
                         "Failed sources with details:\n"
-                        + json.dumps(failed_info, default=str, indent=2)
+                        + json.dumps(diagnosis_info, default=str, indent=2)
                         + f"\nCurrent date: {date.today()}"
                     )},
                 ],
@@ -1970,11 +2047,19 @@ def diagnose_and_fix_pulls(
             if diagnosis_text:
                 log.info("Hermes diagnosis:\n{d}", d=diagnosis_text[:800])
                 result["diagnosis"] = diagnosis_text
-                result["diagnosed"] = len(failed_sources)
+                result["diagnosed"] = len(diagnosis_info)
                 fix_actions = _parse_pull_diagnosis_actions(diagnosis_text)
 
         except Exception as exc:
             log.warning("Hermes diagnosis failed: {e}", e=str(exc))
+
+    fix_actions.update(guarded_actions)
+    # CHECK_KEY is a request for credential attention, not a validation result.
+    # An unsupported LLM key diagnosis remains an unresolved source escalation.
+    for source_key, action in list(fix_actions.items()):
+        if (source_key in {"fred", "baltic_exchange"} and action == "CHECK_KEY"
+                and failure_classes.get(source_key) != "provider_auth_or_quota"):
+            fix_actions[source_key] = "ESCALATE"
 
     if dry_run:
         log.info("Dry run — not retrying pulls")
@@ -2005,6 +2090,18 @@ def diagnose_and_fix_pulls(
 
         # Check Hermes recommendation
         action = fix_actions.get(source_key, "RETRY")
+        if action == "CHECK_DB":
+            result["escalated"] += 1
+            log_issue(
+                engine, category="database", severity="CRITICAL",
+                source=source_name,
+                title=f"Database repair required — {source_name}",
+                detail="The latest persisted pull failure identifies a local database or pool error; no provider retry or key check was attempted.",
+                hermes_diagnosis="Deterministic database-error guard",
+                fix_result="SKIPPED",
+                cycle_number=state.cycle_count,
+            )
+            continue
         if action == "SKIP":
             log.info("Hermes says SKIP {s} — known outage", s=source_name)
             result["skipped_cooldown"] += 1
