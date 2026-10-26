@@ -602,13 +602,18 @@ def _inspect_source(engine: Any, source_name: str) -> dict[str, Any]:
         failures = conn.execute(
             sa_text(
                 "SELECT COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON sc.id = rs.source_id "
-                "WHERE LOWER(sc.name) = LOWER(:source) "
-                "AND rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                "       MAX(last_fail) AS last_fail, "
+                "       MAX(CASE WHEN failure_rank = 1 THEN last_error END) AS last_error "
+                "FROM ("
+                " SELECT rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (ORDER BY rs.pull_timestamp DESC, "
+                "                           rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON sc.id = rs.source_id "
+                " WHERE LOWER(sc.name) = LOWER(:source) "
+                " AND rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed"
             ),
             {"source": source_name},
         ).fetchone()
@@ -1395,6 +1400,24 @@ class _FunctionPuller:
         return self._fn(**call_kwargs)
 
 
+def _retry_target_matches(source_name: str, puller: Any) -> bool:
+    """Match the requested catalog to an existing explicit writer declaration.
+
+    Registry keys select routes; provider/class names and positive row counts
+    do not prove a different requested dataset. Options' existing short route
+    is the sole special case: its capture writer owns YFINANCE_OPTIONS.
+    This declaration check is not native commit or provider-asof evidence.
+    """
+    declared = getattr(puller, "SOURCE_NAME", None)
+    if not isinstance(declared, str) or not declared:
+        return False
+    # Catalog UPDATE compares LOWER(name), not normalized registry keys.
+    # Spaces/dashes/underscores may name distinct catalog rows.
+    requested = source_name.lower()
+    target = declared.lower()
+    return requested == target or (requested == "options" and target == "yfinance_options")
+
+
 def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, Any]]:
     """Resolve a source name to a puller instance using the registry.
 
@@ -1410,24 +1433,16 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
 
     from scripts.hermes_operator import _SOURCE_REGISTRY
 
-    # 1. Direct registry match
+    # Preserve direct precedence and explicit aliases. A map entry only
+    # selects a candidate: its class must declare this exact catalog below.
+    # Fuzzy prefix guesses provide no target-specific routing authority.
     entry = _SOURCE_REGISTRY.get(source_lower)
-
-    # 2. Catalog name mapping
     if entry is None:
         mapped = _CATALOG_TO_REGISTRY.get(source_name) or _CATALOG_TO_REGISTRY.get(source_lower)
         if mapped:
             entry = _SOURCE_REGISTRY.get(mapped)
-
-    # 3. Fuzzy prefix match
     if entry is None:
-        for key, val in _SOURCE_REGISTRY.items():
-            if source_lower.startswith(key) or key.startswith(source_lower):
-                entry = val
-                break
-
-    if entry is None:
-        raise ValueError(f"No puller registered for source: {source_name}")
+        raise ValueError("No explicit dataset handler registered for requested source")
 
     # Honor registry-level skip flag — entries that are catalogued for the
     # wiring audit but not yet wrapped for the standard _resolve_puller calling
@@ -1437,17 +1452,15 @@ def _resolve_puller(source_name: str, engine: Any) -> tuple[Any, str, dict[str, 
             f"Source {source_name} registered but skipped at runtime: {entry['skip_runtime']}"
         )
 
+    # Function-only entries lack a declared catalog contract in this registry.
+    # Refuse before importing/invoking them; do not invent a target argument.
+    if "cls" not in entry:
+        raise ValueError("Retry handler has no explicit catalog identity contract")
+
     mod = importlib.import_module(entry["mod"])
-
-    if "fn" in entry and "cls" not in entry:
-        fn = getattr(mod, entry["fn"])
-        return (
-            _FunctionPuller(fn, engine),
-            "run",
-            dict(entry.get("pull_kwargs", {})),
-        )
-
     cls = getattr(mod, entry["cls"])
+    if not _retry_target_matches(source_name, cls):
+        raise ValueError("Retry handler catalog identity does not match requested source")
 
     # Build constructor kwargs
     ctor_kwargs: dict[str, Any] = {"db_engine": engine}
@@ -1482,6 +1495,62 @@ def retry_not_fresh_reason(pull_result: dict[str, Any]) -> str | None:
         return None
     note = pull_result.get("outcome_note") or pull_result.get("error")
     return f"puller reported {outcome}" + (f": {note}" if note else "")
+
+
+def _scheduler_options_retry_guard(engine: Any) -> dict[str, Any] | None:
+    """Observe a completed scheduler capture before constructing a retry.
+
+    Only the explicit caller labels prove scheduler provenance. Legacy
+    options_puller/pre_append_only batches and GEM never qualify. A registered
+    batch proves one completed positive-row ticker capture, not whole-source
+    coverage or freshness. Empty/unavailable evidence leaves retry unchanged.
+    """
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.pool import NullPool
+
+    now = datetime.now(timezone.utc)
+    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    observation_engine = None
+    try:
+        # Avoid waiting on the shared pool; the connection and read have their
+        # own bounds. No writer/catalog/provider is constructed by observation.
+        observation_engine = create_engine(
+            engine.url, poolclass=NullPool,
+            connect_args={"connect_timeout": 5, "options":
+                          engine.url.query.get("options", "") +
+                          " -c statement_timeout=5000 -c lock_timeout=1000 "
+                          "-c idle_in_transaction_session_timeout=5000"},
+        )
+        with observation_engine.connect() as conn:
+            conn.execute(text("SET TRANSACTION READ ONLY"))
+            row = conn.execute(text("""
+                SELECT capture_batch_id, capture_source
+                FROM options_capture_batches
+                WHERE snap_date = :day
+                  AND capture_source IN ('daily_scheduler', 'smart_scheduler')
+                  AND row_count > 0 AND NOT backfilled
+                  AND capture_started_at >= :day_start
+                  AND capture_completed_at >= capture_started_at
+                  AND capture_completed_at <= :now
+                LIMIT 1
+            """), {"day": now.date(), "day_start": day_start, "now": now}).fetchone()
+        if row is None:
+            return None
+        return {
+            "status": "SKIPPED", "outcome": "SKIPPED", "rows_inserted": 0,
+            "reason": "scheduler_options_batch_exists",
+            "observed_session": now.date().isoformat(),
+            "scheduler_capture_batch_id": row[0], "scheduler_capture_source": row[1],
+        }
+    except Exception as exc:
+        # An unavailable observation is unknown, not zero or proof of capture.
+        # Keep the prior retry path and never expose driver connection details.
+        log.warning("Options scheduler capture observation unavailable ({kind}); retry unchanged",
+                    kind=type(exc).__name__)
+        return None
+    finally:
+        if observation_engine is not None:
+            observation_engine.dispose()
 
 
 def _retry_source(
@@ -1576,11 +1645,17 @@ def _retry_source(
         }
 
     try:
+        if source_key.replace(" ", "_").replace("-", "_") in {"options", "yfinance_options"}:
+            guarded = _scheduler_options_retry_guard(engine)
+            if guarded is not None:
+                # A skip does not clear repair backlog or publish freshness.
+                return guarded
         log.info("Retrying {s} (attempt {a}/{m})", s=source_name, a=attempt, m=MAX_PULL_RETRIES)
 
         puller, method, kwargs = _resolve_puller(source_name, engine)
         kwargs = dict(kwargs)
         pull_fn = getattr(puller, method)
+        expected_catalog = getattr(puller, "SOURCE_NAME", None)
 
         # Registry kwargs may be plain values OR zero-arg callables (e.g.
         # FINRA's "anchor_date": _finra_short_volume_trade_date, which must
@@ -1636,6 +1711,13 @@ def _retry_source(
 
             kwargs["should_continue"] = _combined_should_continue
 
+        # Dynamic kwargs retain their call-time behavior, but cannot change
+        # which catalog the already-resolved writer is allowed to represent.
+        if (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        ):
+            raise ValueError("Retry handler catalog identity changed before dispatch")
         raw_result = pull_fn(**kwargs)
         # Fake-success fix (2026-09-29, follow-up to PR #727 review): a
         # non-dict return used to become {"status": "ok"} unconditionally,
@@ -1650,6 +1732,18 @@ def _retry_source(
 
         outcome, outcome_rows, outcome_note = _classify_outcome(raw_result)
         result = dict(raw_result) if isinstance(raw_result, dict) else {"status": outcome}
+        # Keep failures, unknown counts and no-new-data under the unchanged
+        # classifier. A positive result from a rebound writer is not recovery.
+        identity_changed = (
+            not _retry_target_matches(source_name, puller)
+            or getattr(puller, "SOURCE_NAME", None) != expected_catalog
+        )
+        if identity_changed:
+            outcome = "FAILED"
+            # A reported count from another target is not this target's count.
+            outcome_rows = None
+            result["status"] = "FAILED"
+            outcome_note = "Retry handler catalog identity changed during dispatch"
         result.update(outcome=outcome, rows_inserted=outcome_rows)
         not_fresh = outcome in _NOT_FRESH_OUTCOMES
         if not_fresh:
@@ -1680,6 +1774,11 @@ def _retry_source(
                 "reason": "superseded" if superseded else "deadline_passed",
                 "tickers_attempted": attempted_n,
             }
+
+        if identity_changed:
+            # Unrelated output cannot clear this target's backlog or publish
+            # its check summary. The abandonment decision above still wins.
+            return result
 
         # Per-ticker outcome summary — only present for pullers whose result
         # carries the yfinance-shaped "results"/"counts" (Check 1a). Freshness
@@ -1771,6 +1870,64 @@ def _retry_source(
                 del _REPAIRS_IN_FLIGHT[source_key]
 
 
+def _classify_pull_failure(error: str) -> str:
+    """Bounded deterministic evidence guard; provider labels cannot override DB errors."""
+    message = str(error or "")[:4096].lower()
+    payload = None
+    try:
+        payload = json.loads(message)
+        if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+            message = payload["error"].lower()
+    except (ValueError, TypeError):
+        pass
+
+    # Distinctive PostgreSQL/pool messages are sufficient by themselves.
+    # Generic transport phrases require DB-driver provenance to avoid
+    # relabelling an upstream HTTP connection failure as a local DB fault.
+    db_markers = (
+        "remaining connection slots are reserved", "too many clients already",
+        "sorry, too many clients", "queuepool limit", "undefinedcolumn",
+        "undefinedtable", "infailedsqltransaction",
+        "current transaction is aborted", "password authentication failed for user",
+    )
+    if any(marker in message for marker in db_markers):
+        return "database"
+    driver = any(marker in message for marker in (
+        "psycopg2.", "psycopg.", "sqlalchemy.exc.", "sqlalchemy.pool.",
+    ))
+    if driver and any(marker in message for marker in (
+        "connection refused", "server closed the connection unexpectedly",
+        "could not connect to server", "timeout", "operationalerror",
+        "programmingerror", "integrityerror", "databaseerror", "interfaceerror",
+        "statementerror", "pendingrollbackerror",
+    )):
+        return "database"
+    if isinstance(payload, dict):
+        state = str(payload.get("sqlstate") or payload.get("pgcode") or "").lower()
+        if re.fullmatch(r"08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02", state):
+            return "database"
+    if re.search(r"\b(?:sqlstate|pgcode)\s*[:=]\s*['\"]?(?:08[0-9a-z]{3}|53300|28p01|42p01|42703|25p02)\b", message):
+        return "database"
+
+    if isinstance(payload, dict) and any(
+        str(payload.get(key)) in {"401", "403", "429"}
+        for key in ("http_status", "status_code", "status")
+    ):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:http|status(?:_code)?)\s*[:=]?\s*(?:401|403|429)\b", message):
+        return "provider_auth_or_quota"
+    if re.search(r"\b(?:401|403|429)\s+(?:client error|unauthorized|forbidden|too many requests)\b", message):
+        return "provider_auth_or_quota"
+    if any(marker in message for marker in (
+        "invalid api key", "invalid api_key", "api key is invalid",
+        "api_key is invalid", "api key must be", "api_key must be",
+        "missing api key", "missing api_key", "quota exceeded",
+        "rate limit exceeded", "too many requests",
+    )):
+        return "provider_auth_or_quota"
+    return "unknown"
+
+
 def diagnose_and_fix_pulls(
     engine: Any,
     hermes_available: bool,
@@ -1796,14 +1953,19 @@ def diagnose_and_fix_pulls(
     with engine.connect() as conn:
         failed = conn.execute(
             text(
-                "SELECT sc.name, COUNT(*) AS fail_count, "
-                "       MAX(rs.pull_timestamp) AS last_fail, "
-                "       MAX(rs.raw_payload::text) AS last_error "
-                "FROM raw_series rs "
-                "JOIN source_catalog sc ON rs.source_id = sc.id "
-                "WHERE rs.pull_status = 'FAILED' "
-                "AND rs.pull_timestamp > NOW() - INTERVAL '24 hours' "
-                "GROUP BY sc.name "
+                "SELECT name, fail_count, last_fail, last_error "
+                "FROM ("
+                " SELECT sc.name, COUNT(*) OVER (PARTITION BY sc.name) AS fail_count, "
+                "        rs.pull_timestamp AS last_fail, rs.raw_payload::text AS last_error, "
+                "        ROW_NUMBER() OVER (PARTITION BY sc.name "
+                "          ORDER BY rs.pull_timestamp DESC, "
+                "                   rs.raw_payload::text DESC NULLS LAST) AS failure_rank "
+                " FROM raw_series rs "
+                " JOIN source_catalog sc ON rs.source_id = sc.id "
+                " WHERE rs.pull_status = 'FAILED' "
+                " AND rs.pull_timestamp > NOW() - INTERVAL '24 hours'"
+                ") AS latest_failed "
+                "WHERE failure_rank = 1 "
                 "ORDER BY fail_count DESC"
             )
         ).fetchall()
@@ -1841,7 +2003,26 @@ def diagnose_and_fix_pulls(
     diagnosis_text: str | None = None
     fix_actions: dict[str, str] = {}  # source → recommended action
 
-    if hermes_available:
+    # Guard known local DB and real provider access failures before the LLM.
+    # The original payload is inspected only within a bounded pure classifier;
+    # the existing truncated user-facing context remains unchanged.
+    failure_classes = {
+        _normalize_source_key(r[0]): _classify_pull_failure(r[3] or "")
+        for r in failed
+    }
+    guarded_actions = {
+        key: ("CHECK_DB" if kind == "database" else "CHECK_KEY")
+        for key, kind in failure_classes.items()
+        if kind == "database" or (
+            kind == "provider_auth_or_quota" and key in {"fred", "baltic_exchange"}
+        )
+    }
+    diagnosis_info = [
+        f for f in failed_info
+        if _normalize_source_key(f["source"]) not in guarded_actions
+    ]
+
+    if hermes_available and diagnosis_info:
         try:
             from llm.router import get_llm, Tier
             client = get_llm(Tier.REASON)
@@ -1857,7 +2038,7 @@ def diagnose_and_fix_pulls(
                     )},
                     {"role": "user", "content": (
                         "Failed sources with details:\n"
-                        + json.dumps(failed_info, default=str, indent=2)
+                        + json.dumps(diagnosis_info, default=str, indent=2)
                         + f"\nCurrent date: {date.today()}"
                     )},
                 ],
@@ -1866,11 +2047,19 @@ def diagnose_and_fix_pulls(
             if diagnosis_text:
                 log.info("Hermes diagnosis:\n{d}", d=diagnosis_text[:800])
                 result["diagnosis"] = diagnosis_text
-                result["diagnosed"] = len(failed_sources)
+                result["diagnosed"] = len(diagnosis_info)
                 fix_actions = _parse_pull_diagnosis_actions(diagnosis_text)
 
         except Exception as exc:
             log.warning("Hermes diagnosis failed: {e}", e=str(exc))
+
+    fix_actions.update(guarded_actions)
+    # CHECK_KEY is a request for credential attention, not a validation result.
+    # An unsupported LLM key diagnosis remains an unresolved source escalation.
+    for source_key, action in list(fix_actions.items()):
+        if (source_key in {"fred", "baltic_exchange"} and action == "CHECK_KEY"
+                and failure_classes.get(source_key) != "provider_auth_or_quota"):
+            fix_actions[source_key] = "ESCALATE"
 
     if dry_run:
         log.info("Dry run — not retrying pulls")
@@ -1901,6 +2090,18 @@ def diagnose_and_fix_pulls(
 
         # Check Hermes recommendation
         action = fix_actions.get(source_key, "RETRY")
+        if action == "CHECK_DB":
+            result["escalated"] += 1
+            log_issue(
+                engine, category="database", severity="CRITICAL",
+                source=source_name,
+                title=f"Database repair required — {source_name}",
+                detail="The latest persisted pull failure identifies a local database or pool error; no provider retry or key check was attempted.",
+                hermes_diagnosis="Deterministic database-error guard",
+                fix_result="SKIPPED",
+                cycle_number=state.cycle_count,
+            )
+            continue
         if action == "SKIP":
             log.info("Hermes says SKIP {s} — known outage", s=source_name)
             result["skipped_cooldown"] += 1

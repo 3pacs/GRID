@@ -33,6 +33,8 @@ def participation(packet, decision_at, max_age_seconds=60, max_skew_seconds=5):
             for limit in (max_age_seconds, max_skew_seconds)
         ):
             raise ValueError("invalid freshness limits")
+        if (decision - end).total_seconds() > max_age_seconds:
+            raise ValueError("stale return interval")
         if not weights or any(
             isinstance(w, bool) or not math.isfinite(w) or w <= 0
             for w in weights.values()

@@ -153,13 +153,23 @@ class TestCadenceAwareStaleSources:
 
         assert "treasury_auction" not in _stale_names(result)
 
-    def test_genuinely_broken_daily_source_is_still_flagged(self, health_engine):
+    def test_genuinely_broken_daily_source_is_still_flagged(self, health_engine, monkeypatch):
         """A source with no override, no catalog metadata, no recent
         raw_series row, and a 3-day-old catalog timestamp must still trip
         the alert -- the fix must not become a blanket exemption."""
         from scripts.hermes_health import check_db_health
 
-        now = datetime.now(timezone.utc)
+        # Pin a weekday: a relative Friday->Monday fixture correctly remains
+        # within DAILY's weekend grace and cannot prove a broken daily source.
+        now = datetime(2026, 9, 23, 12, tzinfo=timezone.utc)
+
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return now.astimezone(tz) if tz else now.replace(tzinfo=None)
+
+        monkeypatch.setattr("scripts.hermes_health.datetime", Clock)
+
         with health_engine.begin() as conn:
             _add_source(conn, "totally_broken_source", last_pull_at=now - timedelta(days=3))
 

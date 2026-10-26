@@ -10,12 +10,119 @@ from __future__ import annotations
 
 import difflib
 import re
-from datetime import date
+from datetime import date, datetime, timezone
 from typing import Any
 
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
+
+
+SELECTED_SOURCE_NAMES = {
+    "fx_rates": "yfinance",
+    "ag_commodity_futures": "YFINANCE_COMMODITY_FUTURES",
+    "finra_short_volume": "FINRA_SHORT_VOLUME",
+    "sec_ftd": "SEC_FTD",
+    "nyfed_gscpi": "NYFED_GSCPI",
+    "baltic_exchange": "Baltic_Exchange",
+    "quiverquant": "quiverquant",
+}
+SELECTED_ROW_CAP = 4096
+SELECTED_QUERY_TIMEOUT_MS = 5000
+
+
+def validate_selected_request(
+    selections: list[dict] | None, *, as_of: datetime, start_date: date,
+    vintage_policy: str = "LATEST_AS_OF",
+) -> dict:
+    """Validate a finite caller-declared selection without reading or registering.
+
+    Names and IDs are expectations, not evidence that a registry row exists.
+    The selected mapper verifies them against separately supplied registry rows.
+    """
+    if not isinstance(as_of, datetime) or as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("as_of must be an aware datetime")
+    cutoff = as_of.astimezone(timezone.utc)
+    if type(start_date) is not date or not 0 <= (cutoff.date() - start_date).days <= 251:
+        raise ValueError("observation range must contain 1..252 UTC dates")
+    if type(vintage_policy) is not str or vintage_policy not in ("FIRST_RELEASE", "LATEST_AS_OF"):
+        raise ValueError("invalid vintage_policy")
+    if selections is None:
+        selections = []
+    if type(selections) is not list or len(selections) > 7:
+        raise ValueError("at most seven selections are allowed")
+    allowed = {"source_key", "scope", "ticker_or_cusip", "series_id",
+               "expected_source_name", "feature_name", "feature_id", "freshness_policy"}
+    scopes = {"ticker", "cusip", "global", "currency", "contract", "index"}
+    selected = {}
+    feature_ids = set()
+    for original in selections:
+        if type(original) is not dict or set(original) - allowed:
+            raise ValueError("invalid selection fields")
+        row = dict(original)
+        key = row.get("source_key")
+        if type(key) is not str or key not in SELECTED_SOURCE_NAMES or key in selected:
+            raise ValueError("source_key must be unique and closed")
+        for field in ("scope", "ticker_or_cusip", "series_id", "expected_source_name", "feature_name"):
+            value = row.get(field)
+            if value is not None and (type(value) is not str or not value or
+                                      value != value.strip() or len(value) > 128 or
+                                      any(ord(c) < 32 for c in value)):
+                raise ValueError("invalid selection string")
+        if row.get("scope") is not None and row["scope"] not in scopes:
+            raise ValueError("invalid selection scope")
+        if row.get("expected_source_name") not in (None, SELECTED_SOURCE_NAMES[key]):
+            raise ValueError("source name does not match source_key")
+        fid = row.get("feature_id")
+        if fid is not None and (type(fid) is not int or not 0 < fid <= 2**63 - 1):
+            raise ValueError("feature_id must be a positive integer")
+        if (fid is None) != (row.get("feature_name") is None):
+            raise ValueError("feature name and ID must be supplied together")
+        if fid is not None:
+            if fid in feature_ids:
+                raise ValueError("selected feature bindings must be distinct")
+            feature_ids.add(fid)
+        if all(row.get(f) is not None for f in
+               ("series_id", "expected_source_name", "feature_name", "feature_id")):
+            if row.get("scope") not in scopes:
+                raise ValueError("bound selection needs an explicit scope")
+            if row["scope"] != "global" and row.get("ticker_or_cusip") is None:
+                raise ValueError("bound scope needs an explicit identity")
+        sid = row.get("series_id")
+        patterns = {
+            "fx_rates": r"FX:[A-Z]{3}:close",
+            "ag_commodity_futures": r"YF:[A-Z0-9^=._-]{1,32}:close",
+            "finra_short_volume": r"finra:short_volume:[A-Z0-9.-]{1,32}",
+            "sec_ftd": r"sec:ftd_balance:[A-Z0-9]{9}",
+            "nyfed_gscpi": r"NYFED:gscpi",
+            "baltic_exchange": r"baltic\.(?:bdi|capesize|panamax|supramax|handysize)",
+        }
+        if sid is not None and key in patterns and not re.fullmatch(patterns[key], sid):
+            raise ValueError("series namespace does not match source_key")
+        expected_scopes = {"fx_rates": "currency", "ag_commodity_futures": "contract",
+                           "finra_short_volume": "ticker", "sec_ftd": "cusip",
+                           "nyfed_gscpi": "global", "baltic_exchange": "index",
+                           "quiverquant": "ticker"}
+        if row.get("scope") is not None and row["scope"] != expected_scopes[key]:
+            raise ValueError("scope does not match source family")
+        if sid is not None and row.get("ticker_or_cusip") is not None:
+            identities = {"fx_rates": sid.split(":")[1] if key == "fx_rates" else None,
+                          "ag_commodity_futures": sid.split(":")[1] if key == "ag_commodity_futures" else None,
+                          "finra_short_volume": sid.rsplit(":", 1)[-1],
+                          "sec_ftd": sid.rsplit(":", 1)[-1],
+                          "baltic_exchange": sid.rsplit(".", 1)[-1].upper()}
+            if key in identities and identities[key] != row["ticker_or_cusip"]:
+                raise ValueError("declared identity does not match selected series")
+        policy = row.get("freshness_policy")
+        if policy is not None:
+            if (type(policy) is not dict or set(policy) != {"max_age_days"} or
+                    type(policy["max_age_days"]) is not int or
+                    not 0 <= policy["max_age_days"] <= 252):
+                raise ValueError("invalid declared freshness policy")
+            row["freshness_policy"] = dict(policy)
+        selected[key] = row
+    return {"selections": [selected.get(k, {"source_key": k}) for k in SELECTED_SOURCE_NAMES],
+            "as_of": cutoff, "start_date": start_date, "vintage_policy": vintage_policy}
 
 
 def canonical_feature_name(series_id: str) -> str:
@@ -1067,6 +1174,38 @@ class EntityMap:
             including misses (None), so a repeated miss costs no lookup.
     """
 
+    @classmethod
+    def for_selected_bindings(cls, selections: list[dict], registry_rows: list[dict]) -> EntityMap:
+        """An inert mapper over at most seven independently read registry rows.
+
+        No constructor, database, static-map mutation, fuzzy fallback, registration
+        or freshness query runs here. A caller expectation earns a mapping only
+        when both its name and ID match an actual supplied registry row.
+        """
+        if type(selections) is not list or len(selections) > 7:
+            raise ValueError("selected mapping exceeds seven selectors")
+        if type(registry_rows) is not list or len(registry_rows) > 7:
+            raise ValueError("selected registry exceeds seven rows")
+        registry = {}
+        names = set()
+        for row in registry_rows:
+            if (type(row) is not dict or type(row.get("id")) is not int or
+                    row["id"] <= 0 or type(row.get("name")) is not str or
+                    row["id"] in registry or row["name"] in names):
+                raise ValueError("ambiguous selected registry")
+            registry[row["id"]] = row["name"]
+            names.add(row["name"])
+        obj = cls.__new__(cls)
+        obj._selected_bindings = {}
+        for row in selections:
+            sid = row.get("series_id")
+            fid = row.get("feature_id")
+            if sid is not None and fid is not None and registry.get(fid) == row.get("feature_name"):
+                if sid in obj._selected_bindings and obj._selected_bindings[sid] != fid:
+                    raise ValueError("one series cannot bind two features")
+                obj._selected_bindings[sid] = fid
+        return obj
+
     def __init__(self, db_engine: Engine) -> None:
         """Initialise the entity mapper.
 
@@ -1143,6 +1282,8 @@ class EntityMap:
         Returns:
             int: The feature_registry.id if a mapping exists, None otherwise.
         """
+        if hasattr(self, "_selected_bindings"):
+            return self._selected_bindings.get(series_id)
         feature_name = SEED_MAPPINGS.get(series_id)
         if feature_name is None:
             pattern_id = self._resolve_by_pattern(series_id)

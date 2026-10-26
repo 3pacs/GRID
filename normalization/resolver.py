@@ -12,6 +12,7 @@ import json
 import math
 import time
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from typing import Any
 
 import pandas as pd
@@ -20,7 +21,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from binance_close_contract import CANONICAL_CLOSE_SERIES, is_completed_canonical_close
-from normalization.entity_map import EntityMap
+from normalization.entity_map import EntityMap, SELECTED_ROW_CAP, validate_selected_request
 from price_close_contract import (
     SPY_CLOSE_CONTRACT,
     SPY_CLOSE_SERIES,
@@ -261,6 +262,145 @@ class Resolver:
         """
         self.engine = db_engine
         log.info("Resolver initialised")
+
+    @staticmethod
+    def _select_source_winner(sources: list[dict], family: str) -> tuple[dict, bool, str | None]:
+        """Shared priority/conflict arithmetic; bulk ordering remains unchanged."""
+        sources.sort(key=lambda s: s["priority_rank"])
+        winner = sources[0]
+        threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
+        conflict_flag = False
+        conflict_detail = None
+        if len(sources) > 1:
+            ref_val = winner["value"]
+            for source in sources[1:]:
+                if ref_val != 0:
+                    pct_diff = abs(source["value"] - ref_val) / abs(ref_val)
+                else:
+                    pct_diff = float("inf") if source["value"] != 0 else 0.0
+                if pct_diff > threshold:
+                    conflict_flag = True
+                    break
+            if conflict_flag:
+                conflict_detail = json.dumps({
+                    "sources": [{"source_name": s["source_name"], "source_id": s["source_id"],
+                                 "value": s["value"], "priority_rank": s["priority_rank"]}
+                                for s in sources],
+                    "threshold": threshold, "family": family,
+                })
+        return winner, conflict_flag, conflict_detail
+
+    def resolve_selected_rows(
+        self, selections: list[dict] | None, raw_rows: list[dict],
+        registry_rows: list[dict], source_rows: list[dict], *, as_of: datetime,
+        start_date: date, vintage_policy: str = "LATEST_AS_OF",
+    ) -> dict:
+        """Resolve a finite supplied batch without I/O, registration or persistence.
+
+        The caller must obtain registry/catalog/raw inputs independently. This
+        routine does not attest their custody. It constructs rows for the existing
+        resolved schema; an API read must never invoke a writer on its behalf.
+        Storage vintages are UTC pull dates, not provider publication instants.
+        """
+        request = validate_selected_request(selections, as_of=as_of, start_date=start_date,
+                                            vintage_policy=vintage_policy)
+        if type(raw_rows) is not list or len(raw_rows) > SELECTED_ROW_CAP:
+            raise ValueError("selected raw row cap exceeded")
+        if type(source_rows) is not list or len(source_rows) > 7:
+            raise ValueError("selected source catalog exceeds seven rows")
+        sources = {}
+        for row in source_rows:
+            if (type(row) is not dict or type(row.get("id")) is not int or row["id"] <= 0 or
+                    type(row.get("name")) is not str or type(row.get("priority_rank")) is not int or
+                    row["id"] in sources):
+                raise ValueError("invalid selected source catalog")
+            sources[row["id"]] = row
+        mapper = EntityMap.for_selected_bindings(request["selections"], registry_rows)
+        families = {r["id"]: r.get("family", "") for r in registry_rows}
+        selectors = {r.get("series_id"): r for r in request["selections"]
+                     if r.get("series_id") is not None and r["source_key"] != "quiverquant"}
+        groups = {}
+        mismatches = set()
+        invalid = set()
+        deadline = time.monotonic() + 5.0
+        for row in raw_rows:
+            if time.monotonic() >= deadline:
+                raise ValueError("selected resolution deadline exceeded")
+            if type(row) is not dict:
+                raise ValueError("raw row must be a dict")
+            selection = selectors.get(row.get("series_id"))
+            if selection is None:
+                raise ValueError("unselected raw series")
+            if row.get("pull_status") != "SUCCESS":
+                continue
+            observed, pulled = row.get("obs_date"), row.get("pull_timestamp")
+            if (type(observed) is not date or not isinstance(pulled, datetime) or
+                    pulled.tzinfo is None or pulled.utcoffset() is None):
+                raise ValueError("invalid raw storage clocks")
+            pulled = pulled.astimezone(timezone.utc)
+            if not request["start_date"] <= observed <= request["as_of"].date() or pulled > request["as_of"]:
+                continue
+            if type(row.get("source_id")) is not int or row["source_id"] <= 0:
+                raise ValueError("invalid raw source ID")
+            source = sources.get(row["source_id"])
+            key = selection["source_key"]
+            if source is None or source["name"] != selection.get("expected_source_name"):
+                mismatches.add(key)
+                continue
+            value = row.get("value")
+            try:
+                valid = type(value) in (int, float, Decimal) and math.isfinite(float(value))
+            except (ValueError, OverflowError):
+                valid = False
+            if not valid:
+                invalid.add(key)
+                continue
+            group = (row["series_id"], observed, pulled.date())
+            groups.setdefault(group, []).append({"value": float(value), "source_id": source["id"],
+                                                "source_name": source["name"],
+                                                "priority_rank": source["priority_rank"]})
+        resolved = []
+        reasons = {}
+        for (sid, observed, vintage), candidates in groups.items():
+            selection = selectors[sid]
+            key = selection["source_key"]
+            fid = mapper.get_feature_id(sid)
+            if fid is None or key in mismatches or key in invalid:
+                continue
+            # The storage key has only day precision. Contradictory same-day
+            # values cannot be assigned an invented intraday vintage/order.
+            if len({r["value"] for r in candidates}) > 1:
+                invalid.add(key)
+                continue
+            winner, conflict, detail = self._select_source_winner(candidates, families[fid])
+            resolved.append({"feature_id": fid, "obs_date": observed, "release_date": vintage,
+                             "vintage_date": vintage, "value": winner["value"],
+                             "source_priority_used": winner["source_id"], "conflict_flag": conflict,
+                             "conflict_detail": detail})
+            reasons[key] = "resolved_observation"
+        # Refuse an entire selector if any same-day group was contradictory.
+        bad_features = {r.get("feature_id") for r in request["selections"]
+                        if r["source_key"] in invalid | mismatches}
+        resolved = [r for r in resolved if r["feature_id"] not in bad_features]
+        status = []
+        for row in request["selections"]:
+            key = row["source_key"]
+            if key == "quiverquant":
+                reason = "resolver_unsupported"
+            elif row.get("series_id") is None or row.get("expected_source_name") is None:
+                reason = "selection_missing"
+            elif mapper.get_feature_id(row["series_id"]) is None:
+                reason = "mapping_missing"
+            elif key in mismatches:
+                reason = "source_mismatch"
+            elif key in invalid:
+                reason = "invalid_value"
+            else:
+                reason = reasons.get(key, "no_resolved_row")
+            status.append({"source_key": key, "status": "available" if reason == "resolved_observation"
+                           else "unavailable", "reason": reason})
+        return {"resolved_rows": resolved, "selections": status,
+                "storage_clock": "pull_date_not_provider_publication", "persisted": False}
 
     # Bulk resolution scans tens of millions of raw_series rows; the
     # default per-statement timeout (120s, see db.get_engine) is too tight
@@ -755,38 +895,10 @@ class Resolver:
                         if not sources:
                             continue
 
-                    sources.sort(key=lambda s: s["priority_rank"])
-                    winner = sources[0]
-
                     family = feature_families.get(feature_id, "")
-                    threshold = FAMILY_CONFLICT_THRESHOLDS.get(family, CONFLICT_THRESHOLD)
-
-                    conflict_flag = False
-                    conflict_detail = None
-
-                    if len(sources) > 1:
-                        ref_val = winner["value"]
-                        for s in sources[1:]:
-                            if ref_val != 0:
-                                pct_diff = abs(s["value"] - ref_val) / abs(ref_val)
-                            else:
-                                pct_diff = float("inf") if s["value"] != 0 else 0.0
-                            if pct_diff > threshold:
-                                conflict_flag = True
-                                break
-
-                        if conflict_flag:
-                            conflict_detail = json.dumps({
-                                "sources": [
-                                    {"source_name": s["source_name"],
-                                     "source_id": s["source_id"],
-                                     "value": s["value"],
-                                     "priority_rank": s["priority_rank"]}
-                                    for s in sources
-                                ],
-                                "threshold": threshold, "family": family,
-                            })
-                            local["conflicts_found"] += 1
+                    winner, conflict_flag, conflict_detail = self._select_source_winner(sources, family)
+                    if conflict_flag:
+                        local["conflicts_found"] += 1
 
                     release_dt = (winner["pull_timestamp"].date()
                                   if hasattr(winner["pull_timestamp"], "date")

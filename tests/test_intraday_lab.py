@@ -207,3 +207,96 @@ def test_cli_publishes_json_safe_input_rejection(tmp_path):
     assert receipt["status"] == "INPUT_REJECTED"
     assert len(receipt["input_sha256"]) == 64
     assert "NaN" not in output.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("instrument,invalid,feature", [
+    ("ES_BOOK", {"ask": 4999}, "es_depth"),
+    ("ES_BOOK", {"bid_size": 0}, "es_depth"),
+    ("ES_BOOK", {"ask_size": -1}, "es_depth"),
+    ("BREADTH", {"up_volume": -1}, "breadth"),
+    ("BREADTH", {"down_volume": -1}, "breadth"),
+])
+@pytest.mark.parametrize("age", [10, 10.000001, 60])
+def test_invalid_latest_cannot_refresh_eligible_measurement(instrument, invalid, feature, age):
+    p = packet()
+    valid = ({"bid": 5000, "ask": 5000.25, "bid_size": 900, "ask_size": 100}
+             if instrument == "ES_BOOK" else {"tick": -800, "up_volume": 100, "down_volume": 900})
+    measured = row(1200 - age, instrument, **valid)
+    measured["available_at"] += 1
+    p["observations"].append(measured)
+    before = compute(p)["features"][feature]
+    invalid_row = row(1200, instrument, **dict(valid, **invalid))
+    p["observations"].append(invalid_row)
+    after = compute(p)["features"][feature]
+    assert after == before
+    if age <= 10:
+        assert after["status"] == "available"
+        assert after["latest_available_at"] == measured["available_at"]
+    else:
+        assert after["status"] == "unavailable" and after["value"] is None
+        assert "latest_available_at" not in after
+    if instrument == "BREADTH":
+        divergence = compute(p)["features"]["breadth_divergence"]
+        assert divergence["status"] == after["status"]
+    # A real eligible fresh replacement recovers, not a fresh invalid receipt.
+    invalid_row["values"] = valid
+    recovered = compute(p)["features"][feature]
+    assert recovered["status"] == "available"
+    assert recovered["latest_available_at"] == 1200
+
+
+def test_filtered_book_freshness_also_guards_ofi_and_partial_repair():
+    p = packet()
+    valid = {"bid": 5000, "ask": 5000.25, "bid_size": 900, "ask_size": 100}
+    p["observations"] += [row(t, "ES_BOOK", **dict(valid, bid_size=900 + t - 1140))
+                          for t in range(1140, 1181, 10)]
+    for t in (1190, 1200):
+        p["observations"].append(row(t, "ES_BOOK", **dict(valid, ask=4999, bid_size=0)))
+    withheld = compute(p)["features"]
+    assert all(withheld[name]["status"] == "unavailable" for name in ("es_depth", "es_ofi"))
+    # Correcting the cross without restoring displayed size is insufficient.
+    p["observations"][-1]["values"]["ask"] = valid["ask"]
+    assert compute(p)["features"]["es_depth"]["status"] == "unavailable"
+    p["observations"][-1]["values"] = dict(valid, bid_size=960)
+    partial = compute(p)["features"]
+    assert partial["es_depth"]["status"] == "available"
+    assert partial["es_ofi"]["status"] == "unavailable"  # Missing eligible 1190 leaves a 20s gap.
+    p["observations"][-2]["values"] = dict(valid, bid_size=950)
+    restored = compute(p)["features"]
+    assert all(restored[name]["status"] == "available" for name in ("es_depth", "es_ofi"))
+    assert all(restored[name]["latest_available_at"] == 1200 for name in ("es_depth", "es_ofi"))
+
+
+@pytest.mark.parametrize("instrument", ["ES_BOOK", "BREADTH"])
+@pytest.mark.parametrize("defect", ["future_event", "future_receipt", "unknown_clock"])
+def test_invalid_timing_cannot_supply_fresh_recovery(instrument, defect):
+    p = packet()
+    valid = ({"bid": 5000, "ask": 5000.25, "bid_size": 900, "ask_size": 100}
+             if instrument == "ES_BOOK" else {"tick": -800, "up_volume": 100, "down_volume": 900})
+    p["observations"].append(row(1140, instrument, **valid))
+    newest = row(1200, instrument, **valid)
+    if defect == "future_event":
+        newest["event_at"] = newest["available_at"] = 1201
+    elif defect == "future_receipt":
+        newest["available_at"] = 1201
+    else:
+        newest["clock"] = "unknown"
+    p["observations"].append(newest)
+    names = ("es_depth", "es_ofi") if instrument == "ES_BOOK" else ("breadth", "breadth_divergence")
+    result = compute(p)["features"]
+    assert all(result[name]["status"] == "unavailable" and result[name]["value"] is None for name in names)
+    newest.update(event_at=1200, available_at=1200, clock="trusted_receipt")
+    assert compute(p)["features"][names[0]]["status"] == "available"
+
+
+def test_missing_unknown_and_valid_zero_breadth_are_distinct():
+    p = {"decision_at": 1200, "session": "synthetic", "observations": []}
+    missing = compute(p)
+    assert missing["provenance"] == "unknown"
+    assert missing["features"]["breadth"]["value"] is None
+    p["observations"].append(row(1200, "BREADTH", tick=0, up_volume=100, down_volume=100))
+    zero = compute(p)["features"]["breadth"]
+    assert zero["status"] == "available" and zero["value"] == 0
+    p["observations"][-1]["clock"] = "unknown"
+    unknown = compute(p)["features"]["breadth"]
+    assert unknown["status"] == "unavailable" and unknown["value"] is None

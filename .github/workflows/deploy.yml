@@ -277,37 +277,188 @@ jobs:
       # This is the same drop-in grid-api already gets, so both services run the
       # tree this workflow actually deployed. Placed after the API verify: if the
       # API did not come back healthy, stop before bouncing a second service.
+      # An intentional operator stop/disable is a hold, not restart authority.
+      # Keep the API gate and only refresh an already active/enabled Hermes.
       - name: Restart grid-hermes
+        id: hermes_restart
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
           set -euo pipefail
+          hermes_state() {
+            local raw key value load='' active='' sub='' unit='' seen=0
+            raw="$(systemctl show grid-hermes --property=LoadState --property=ActiveState --property=SubState --property=UnitFileState)" || {
+              echo "::error::cannot read grid-hermes state" >&2; return 1;
+            }
+            while IFS='=' read -r key value; do
+              case "$key" in
+                LoadState) [ -z "$load" ] && [ -n "$value" ] || return 1; load="$value" ;;
+                ActiveState) [ -z "$active" ] && [ -n "$value" ] || return 1; active="$value" ;;
+                SubState) [ -z "$sub" ] && [ -n "$value" ] || return 1; sub="$value" ;;
+                UnitFileState) [ -z "$unit" ] && [ -n "$value" ] || return 1; unit="$value" ;;
+                *) echo "::error::malformed grid-hermes state" >&2; return 1 ;;
+              esac
+              seen=$((seen + 1))
+            done <<< "$raw"
+            [ "$seen" -eq 4 ] || return 1
+            case "$load" in loaded|masked) ;; *) return 1 ;; esac
+            case "$active:$sub" in active:running|inactive:dead) ;; *) return 1 ;; esac
+            case "$unit" in
+              enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect|linked|linked-runtime|generated|transient) ;;
+              *) return 1 ;;
+            esac
+            if [ "$load" = masked ]; then
+              case "$unit" in masked|masked-runtime) ;; *) return 1 ;; esac
+            fi
+            printf '%s|%s|%s|%s\n' "$load" "$active" "$sub" "$unit"
+          }
+          # Only an already active, persistently enabled daemon is eligible.
+          # Query failures/unknown states fail before any service or drop-in mutation.
+          echo "verify=false" >> "$GITHUB_OUTPUT"
+          state="$(hermes_state)"
+          if [ "$state" != 'loaded|active|running|enabled' ]; then
+            echo "grid-hermes state preserved ($state); no restart or drop-in update"
+            exit 0
+          fi
+          # Recheck immediately before writes; preserve a newly observed hold.
+          state="$(hermes_state)"
+          if [ "$state" != 'loaded|active|running|enabled' ]; then
+            echo "grid-hermes late hold preserved ($state); no restart or drop-in update"
+            exit 0
+          fi
           sudo mkdir -p /etc/systemd/system/grid-hermes.service.d
           printf '%s\n' '[Service]' "WorkingDirectory=$DEPLOY_PATH" | sudo tee /etc/systemd/system/grid-hermes.service.d/zz-release-worktree.conf >/dev/null
           sudo systemctl daemon-reload
-          sudo systemctl restart grid-hermes
+          # No start/enable authority: a stop racing the query stays stopped even if
+          # try-restart succeeds without doing anything. A concurrent disable after
+          # the last query cannot be made atomic by this workflow.
+          state="$(hermes_state)"
+          if [ "$state" != 'loaded|active|running|enabled' ]; then
+            echo "grid-hermes late hold preserved after drop-in ($state); no restart"
+            exit 0
+          fi
+          sudo systemctl try-restart grid-hermes
+          state="$(hermes_state)"
+          if [ "$state" != 'loaded|active|running|enabled' ]; then
+            echo "grid-hermes state preserved after try-restart ($state); tree unverified"
+            exit 0
+          fi
+          echo "verify=true" >> "$GITHUB_OUTPUT"
 
-      # Prove it is running the DEPLOYED tree, not merely that it is alive. A
-      # bare `is-active` would have reported green through the whole period the
-      # daemon ran three-day-old code, which is the failure this exists to make
-      # impossible.
+      # Prove the actual running PID/cwd/SHA only when the same decision
+      # observed an active/enabled service after the conditional restart.
       - name: Verify grid-hermes runs the deployed tree
+        if: ${{ (github.event_name == 'push' || inputs.do_restart == true) && steps.hermes_restart.outputs.verify == 'true' }}
+        run: |
+          set -euo pipefail
+          hermes_state() {
+            local raw key value load='' active='' sub='' unit='' seen=0
+            raw="$(systemctl show grid-hermes --property=LoadState --property=ActiveState --property=SubState --property=UnitFileState)" || {
+              echo "::error::cannot read grid-hermes state" >&2; return 1;
+            }
+            while IFS='=' read -r key value; do
+              case "$key" in
+                LoadState) [ -z "$load" ] && [ -n "$value" ] || return 1; load="$value" ;;
+                ActiveState) [ -z "$active" ] && [ -n "$value" ] || return 1; active="$value" ;;
+                SubState) [ -z "$sub" ] && [ -n "$value" ] || return 1; sub="$value" ;;
+                UnitFileState) [ -z "$unit" ] && [ -n "$value" ] || return 1; unit="$value" ;;
+                *) echo "::error::malformed grid-hermes state" >&2; return 1 ;;
+              esac
+              seen=$((seen + 1))
+            done <<< "$raw"
+            [ "$seen" -eq 4 ] || return 1
+            case "$load" in loaded|masked) ;; *) return 1 ;; esac
+            case "$active:$sub" in active:running|inactive:dead) ;; *) return 1 ;; esac
+            case "$unit" in
+              enabled|enabled-runtime|disabled|masked|masked-runtime|static|indirect|linked|linked-runtime|generated|transient) ;;
+              *) return 1 ;;
+            esac
+            if [ "$load" = masked ]; then
+              case "$unit" in masked|masked-runtime) ;; *) return 1 ;; esac
+            fi
+            printf '%s|%s|%s|%s\n' "$load" "$active" "$sub" "$unit"
+          }
+          # Honor a stop/disable observed after the restart step, without claiming
+          # that an inactive or held service runs this release.
+          state="$(hermes_state)"
+          if [ "$state" != 'loaded|active|running|enabled' ]; then
+            echo "grid-hermes late hold preserved ($state); tree unverified"
+            exit 0
+          fi
+          pid="$(systemctl show -p MainPID --value grid-hermes)"
+          # Resolved-cwd comparison plus an independent read of the deployed
+          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
+
+      # grid-coordinator (uvicorn scripts.compute_coordinator:app, :8100) is a
+      # long-running daemon like grid-hermes: a deploy that does not restart it
+      # leaves it on whatever tree it booted with. It ran from the frozen
+      # /home/grid/grid_v4/grid_repo (5facbdf0) until 2026-10-14, so #836's
+      # connection-leak fix merged green and changed nothing live.
+      #
+      # Deliberately narrower than the API/Hermes steps:
+      #   - never writes a drop-in. Moving the coordinator onto $DEPLOY_PATH is
+      #     an operator decision (done 2026-10-14 via zz-release-worktree.conf);
+      #     a unit still pointed elsewhere is left alone, not repointed.
+      #   - only an already active, enabled unit whose WorkingDirectory is
+      #     exactly $DEPLOY_PATH is eligible; a stop/disable is a hold.
+      #   - try-restart, never start: a stop racing this step stays stopped.
+      # Job state lives in compute_jobs, so a restart costs workers a few
+      # seconds of refused connections, which they already retry.
+      - name: Restart grid-coordinator
+        id: coordinator_restart
         if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
         run: |
           set -euo pipefail
+          coordinator_state() {
+            local raw key value active='' unit='' wd='' seen=0
+            raw="$(systemctl show grid-coordinator --property=ActiveState --property=UnitFileState --property=WorkingDirectory)" || {
+              echo "::error::cannot read grid-coordinator state" >&2; return 1;
+            }
+            while IFS='=' read -r key value; do
+              case "$key" in
+                ActiveState) [ -z "$active" ] && [ -n "$value" ] || return 1; active="$value" ;;
+                UnitFileState) [ -z "$unit" ] && [ -n "$value" ] || return 1; unit="$value" ;;
+                WorkingDirectory) [ -z "$wd" ] || return 1; wd="$value" ;;
+                *) echo "::error::malformed grid-coordinator state" >&2; return 1 ;;
+              esac
+              seen=$((seen + 1))
+            done <<< "$raw"
+            [ "$seen" -eq 3 ] || return 1
+            printf '%s|%s|%s\n' "$active" "$unit" "$wd"
+          }
+          echo "verify=false" >> "$GITHUB_OUTPUT"
+          eligible="active|enabled|$DEPLOY_PATH"
+          state="$(coordinator_state)"
+          if [ "$state" != "$eligible" ]; then
+            echo "grid-coordinator state preserved ($state); no restart"
+            exit 0
+          fi
+          sudo systemctl try-restart grid-coordinator
           for attempt in {1..30}; do
-            state="$(systemctl is-active grid-hermes || true)"
-            [ "$state" = "active" ] && break
+            if curl -fsS -m 5 http://localhost:8100/health >/dev/null; then
+              break
+            fi
             if [ "$attempt" -eq 30 ]; then
-              echo "::error::grid-hermes not active after restart (state=$state)"
-              sudo systemctl status grid-hermes --no-pager -l || true
-              journalctl -u grid-hermes -n 60 --no-pager || true
+              echo "::error::grid-coordinator /health failed after restart"
+              sudo systemctl status grid-coordinator --no-pager -l || true
+              journalctl -u grid-coordinator -n 60 --no-pager || true
               exit 1
             fi
             sleep 2
           done
-          pid="$(systemctl show -p MainPID --value grid-hermes)"
-          # Resolved-cwd comparison plus an independent read of the deployed
-          # SHA -- see scripts/deploy_verify_release_tree.sh's own header.
+          state="$(coordinator_state)"
+          if [ "$state" != "$eligible" ]; then
+            echo "grid-coordinator state changed after try-restart ($state); tree unverified"
+            exit 0
+          fi
+          echo "verify=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify grid-coordinator runs the deployed tree
+        if: ${{ (github.event_name == 'push' || inputs.do_restart == true) && steps.coordinator_restart.outputs.verify == 'true' }}
+        run: |
+          set -euo pipefail
+          pid="$(systemctl show -p MainPID --value grid-coordinator)"
           chmod +x scripts/deploy_verify_release_tree.sh
           ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 

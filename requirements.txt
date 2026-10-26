@@ -41,7 +41,7 @@ matplotlib>=3.8.0
 seaborn>=0.13.2
 
 # Utilities
-python-dotenv>=1.0.0
+python-dotenv>=1.2.4
 schedule>=1.2.0
 pytz>=2024.1  # schedule.at(..., "UTC") timezone support
 pydantic>=2.13.4
@@ -82,7 +82,10 @@ pyarrow>=25.0.1
 polars>=1.40.1
 
 # ML model training
-xgboost>=3.2.0
+# XGBoost 3.4.1 requires Python >=3.12; retain the compatible baseline
+# for GRID's Python 3.11 CI without changing the interpreter baseline.
+xgboost>=3.2.0; python_version < "3.12"
+xgboost>=3.4.1; python_version >= "3.12"
 
 # TradingAgents multi-agent framework (optional)
 # Install separately when the private TradingAgents package is available.

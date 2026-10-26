@@ -89,12 +89,13 @@ def test_gold_get_absent_schema_legacy_hit_and_live_refresh_are_read_only():
             ), "the dead DB fallback read must not run"
             assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE")) for sql in statements)
 
-            # Explicit refresh uses provider data immediately, without persisting raw rows.
+            # Legacy refresh re-reads SEC storage only; missing facts stay unavailable.
             statements.clear()
             refreshed = dad.get_dad_ticker_gold("AAPL", refresh_finviz=True, _token="test")
-            assert refreshed["finviz"]["status"] == "ready"
-            assert refreshed["finviz"]["stats"][0]["parsed"] == 123.45
-            assert refreshed["finviz"]["source"] == "live-readonly"
+            assert refreshed["finviz"]["status"] == "unavailable"
+            assert refreshed["finviz"]["stats"] == []
+            assert refreshed["finviz"]["source"] == "SEC EDGAR/XBRL"
+            assert refreshed["finviz"]["refresh_available"] is False
             assert refreshed["finviz"]["rows_inserted"] == 0
             assert not any(sql.startswith(("INSERT", "UPDATE", "DELETE", "ALTER", "CREATE")) for sql in statements)
     finally:

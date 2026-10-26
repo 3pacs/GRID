@@ -53,7 +53,7 @@ class PmxtArchivePuller(BasePuller):
     SOURCE_CONFIG: dict[str, Any] = {
         "base_url": "https://archive.pmxt.dev",
         "cost_tier": "FREE",
-        "latency_class": "DAILY",
+        "latency_class": "EOD",  # was DAILY: not in source_catalog_latency_class_check
         "pit_available": True,
         "revision_behavior": "NEVER",
         "trust_score": "MED",

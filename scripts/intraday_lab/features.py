@@ -78,6 +78,9 @@ def compute(packet):
     book = rows(packet, "ES_BOOK", ("bid", "ask", "bid_size", "ask_size"), 60)
     book = [r for r in book if 0 < r["values"]["bid"] < r["values"]["ask"]
             and r["values"]["bid_size"] > 0 and r["values"]["ask_size"] > 0]
+    # Only an eligible measurement can satisfy the final freshness bound.
+    if book and t - book[-1]["event_at"] > 10:
+        book = []
     if book:
         v = book[-1]["values"]
         total = v["bid_size"] + v["ask_size"]
@@ -110,6 +113,8 @@ def compute(packet):
     breadth = rows(packet, "BREADTH", ("tick", "up_volume", "down_volume"), 300)
     breadth = [r for r in breadth if r["values"]["up_volume"] >= 0
                and r["values"]["down_volume"] >= 0]
+    if breadth and t - breadth[-1]["event_at"] > 10:
+        breadth = []
     if breadth:
         v = breadth[-1]["values"]
         total = v["up_volume"] + v["down_volume"]

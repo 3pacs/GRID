@@ -2,7 +2,72 @@
 
 from copy import deepcopy
 import pytest
+from datetime import datetime, timedelta
 from scripts.intraday_sector import participation
+
+
+def interval_age_packet(age):
+    p = packet()
+    end = datetime.fromisoformat(NOW.replace("Z", "+00:00")) - timedelta(seconds=age)
+    start = end - timedelta(seconds=60)
+    p.update(interval_start=start.isoformat(), interval_end=end.isoformat(),
+             weights_effective_at=start.isoformat(), weights_available_at=start.isoformat())
+    for constituent in p["constituents"].values():
+        constituent.update(interval_start=start.isoformat(), interval_end=end.isoformat(),
+                           source_at=NOW, available_at=NOW)
+    return p
+
+
+@pytest.mark.parametrize("age,limit,expected", [
+    (0, 0, "VALID_DIAGNOSTIC"),
+    (0.000001, 0, "UNAVAILABLE"),
+    (59.999999, 60, "VALID_DIAGNOSTIC"),
+    (60, 60, "VALID_DIAGNOSTIC"),
+    (60.000001, 60, "UNAVAILABLE"),
+    (86410, 60, "UNAVAILABLE"),
+    (-1, 60, "UNAVAILABLE"),
+])
+def test_measured_interval_freshness_boundary(age, limit, expected):
+    result = participation(interval_age_packet(age), NOW, max_age_seconds=limit)
+    assert result["status"] == expected
+    assert result["directional_edge"] == "UNVALIDATED"
+    if expected == "UNAVAILABLE":
+        assert "weighted_return" not in result
+        if age > limit:
+            assert result["reason"] == "stale return interval"
+
+
+def test_fresh_reports_cannot_repair_old_interval_but_fresh_measurements_can():
+    old = interval_age_packet(86410)
+    assert participation(old, NOW)["reason"] == "stale return interval"
+    fresh = interval_age_packet(10)
+    partial = deepcopy(old)
+    partial["interval_start"], partial["interval_end"] = fresh["interval_start"], fresh["interval_end"]
+    assert participation(partial, NOW)["reason"] == "mismatched return intervals"
+    recovered = participation(fresh, NOW)
+    assert recovered["status"] == "VALID_DIAGNOSTIC"
+    assert recovered["weighted_return"] == pytest.approx(0.002)
+    assert recovered["interval_end"] == fresh["interval_end"]
+    assert recovered["available_at"] == datetime.fromisoformat(NOW.replace("Z", "+00:00")).isoformat()
+    assert recovered["directional_edge"] == "UNVALIDATED"
+
+
+@pytest.mark.parametrize("defect", ["future_weights", "future_source", "future_receipt", "missing_member", "unknown_sector"])
+def test_interval_recovery_keeps_existing_lineage_and_completeness_guards(defect):
+    p = interval_age_packet(10)
+    if defect == "future_weights":
+        p["weights_available_at"] = "2026-10-02T14:01:11Z"
+    elif defect == "future_source":
+        p["constituents"]["A"]["source_at"] = "2026-10-02T14:01:11Z"
+    elif defect == "future_receipt":
+        p["constituents"]["A"]["available_at"] = "2026-10-02T14:01:11Z"
+    elif defect == "missing_member":
+        del p["constituents"]["C"]
+    else:
+        p["constituents"]["C"]["sector"] = ""
+    bad = participation(p, NOW)
+    assert bad["status"] == "UNAVAILABLE" and "weighted_return" not in bad
+    assert participation(interval_age_packet(10), NOW)["status"] == "VALID_DIAGNOSTIC"
 
 START = "2026-10-02T14:00:00Z"
 END = "2026-10-02T14:01:00Z"

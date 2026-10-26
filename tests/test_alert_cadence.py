@@ -49,6 +49,14 @@ class TestCadenceForSource:
         got = cadence.cadence_for_source("some_new_source", latency_class="WEEKLY")
         assert got == cadence.WEEKLY
 
+    def test_intraday_latency_class_is_an_explicit_daily_key(self):
+        # INTRADAY is in the live source_catalog_latency_class_check (8 live
+        # rows on 2026-10-20) but had no _METADATA_CADENCE key, so it reached
+        # DAILY only through the DEFAULT_CADENCE fallback. Pin it as explicit.
+        assert cadence._METADATA_CADENCE["INTRADAY"] is cadence.DAILY
+        got = cadence.cadence_for_source("some_new_source", latency_class="intraday")
+        assert got is cadence.DAILY
+
     def test_update_frequency_takes_priority_over_latency_class(self):
         got = cadence.cadence_for_source(
             "some_new_source", update_frequency="QUARTERLY", latency_class="WEEKLY",
@@ -203,3 +211,12 @@ class TestDailyBusinessDayAwareGrace:
     def test_computed_holiday_set_matches_known_dates(self, year, expected):
         holidays = cadence._us_market_holidays(year)
         assert {d.isoformat() for d in holidays} == expected
+
+
+def test_annual_latency_class_maps_to_quarterly_not_default_daily():
+    """ANNUAL is in the live source_catalog CHECK (pushshift_reddit declares it);
+    without a key it fell to DEFAULT_CADENCE (DAILY) and would flag a yearly
+    archive stale after 30 h."""
+    from alerts.cadence import QUARTERLY, cadence_for_source
+
+    assert cadence_for_source("pushshift_reddit", latency_class="ANNUAL") is QUARTERLY

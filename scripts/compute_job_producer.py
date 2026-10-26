@@ -213,6 +213,22 @@ def get_json(coordinator: str, path: str):
     return response.json()
 
 
+def existing_queued_jobs(coordinator: str) -> int:
+    """Queue depth from the coordinator's cheap index-backed endpoint.
+
+    ``/stats`` aggregates the whole ``compute_jobs`` table; this producer only
+    needs QUEUED. Fall back to ``/stats`` while an older coordinator without
+    ``/stats/queue`` is still deployed.
+    """
+    try:
+        stats = get_json(coordinator, "/stats/queue")
+    except requests.HTTPError as exc:
+        if exc.response is None or exc.response.status_code != 404:
+            raise
+        stats = get_json(coordinator, "/stats")
+    return _as_int(stats.get("job_states", {}).get("QUEUED"), 0)
+
+
 def post_job(coordinator: str, payload: dict) -> dict:
     response = requests.post(f"{coordinator}/jobs", json=payload, timeout=20)
     response.raise_for_status()
@@ -231,8 +247,7 @@ def main(argv=None) -> int:
 
     coordinator = args.coordinator.rstrip("/")
     workers = get_json(coordinator, "/workers")
-    stats = get_json(coordinator, "/stats")
-    existing_queued = _as_int(stats.get("job_states", {}).get("QUEUED"), 0)
+    existing_queued = existing_queued_jobs(coordinator)
 
     target_queued = args.target_queued or recommended_queue_target(workers)
     if args.model_id or args.feature_id:

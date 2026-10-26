@@ -227,7 +227,12 @@ def _pool_exhausted(h: dict) -> bool:
     size = pool.get("size", 0)
     overflow = pool.get("overflow", 0)
     used = pool.get("checked_out", 0)
-    cap = size + overflow
+    # New health snapshots carry configured overflow separately. Retain
+    # compatibility with older producers that only supplied live overflow.
+    max_overflow = pool.get("max_overflow", overflow)
+    if "max_overflow" in pool and max_overflow < 0:
+        return False  # QueuePool max_overflow=-1 means an unbounded pool.
+    cap = size + max_overflow
     if cap <= 0:
         return False
     return (used / cap) >= POOL_EXHAUSTION_THRESHOLD
@@ -235,11 +240,12 @@ def _pool_exhausted(h: dict) -> bool:
 
 def _pool_exhausted_render(h: dict) -> tuple[str, str]:
     pool = h.get("pool") or h.get("db", {}).get("pool") or {}
+    cap = pool.get("size", 0) + pool.get("max_overflow", pool.get("overflow", 0))
     return (
         "GRID DB pool near exhaustion",
         f"Connection pool at "
         f"{pool.get('checked_out', '?')}/"
-        f"{pool.get('size', '?') + pool.get('overflow', 0)} "
+        f"{cap} "
         f"({POOL_EXHAUSTION_THRESHOLD:.0%} threshold). Investigate stuck "
         f"queries: SELECT pid,state,query FROM pg_stat_activity WHERE "
         f"state='active' ORDER BY query_start;",

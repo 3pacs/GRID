@@ -50,7 +50,7 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS
+from ingestion.altdata.fed_liquidity import RRPONTSYD_TO_MILLIONS, format_liquidity_usd
 
 
 # ── Constants ───────────────────────────────────────────────────────────
@@ -113,11 +113,8 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
     """Fed net liquidity: balance sheet minus TGA minus reverse repo.
 
     Logic: 30-day change in net liquidity.
-    - Change > +$100B → strong bullish (+60 to +80)
-    - Change > +$50B  → moderate bullish (+30 to +50)
-    - Change -$50B to +$50B → neutral (-20 to +20)
-    - Change < -$50B  → moderate bearish (-30 to -50)
-    - Change < -$100B → strong bearish (-60 to -80)
+    Existing arithmetic compares millions to 50/100, i.e. $50M/$100M.
+    These bands are preserved here; recalibration requires a separate review.
 
     Score scales linearly within bands.  Confidence from data freshness
     and historical accuracy.
@@ -172,7 +169,7 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
 
             if not bs_30:
                 return _verdict("fed_liquidity", "Fed Net Liquidity",
-                    0, 20, f"${net_liq:,.0f}B current",
+                    0, 20, f"{format_liquidity_usd(net_liq, unit='millions_usd')} current",
                     "need 30d history", "Current net liquidity known but no 30-day baseline.",
                     data_age_hours=age_hours, historical_accuracy=accuracy, status="stale")
 
@@ -201,11 +198,12 @@ def _score_fed_liquidity(engine: Engine, accuracy: float) -> dict:
             return _verdict(
                 "fed_liquidity", "Fed Net Liquidity",
                 score, confidence,
-                data_point=f"${change:+,.0f}B 30d change (current ${net_liq:,.0f}B)",
-                threshold="bearish < -$50B, bullish > +$50B, strong at ±$100B",
+                data_point=(f"{format_liquidity_usd(change, unit='millions_usd', signed=True)} "
+                            f"30d change (current {format_liquidity_usd(net_liq, unit='millions_usd')})"),
+                threshold="current scoring bands: bearish < -$50M, bullish > +$50M, strong at ±$100M",
                 reasoning=(
-                    f"Net liquidity {'rose' if change > 0 else 'fell'} "
-                    f"${abs(change):,.0f}B over 30 days. "
+                    f"Net liquidity {'rose' if change > 0 else 'fell' if change < 0 else 'was unchanged by'} "
+                    f"{format_liquidity_usd(abs(change), unit='millions_usd')} over 30 days. "
                     f"{'Expanding liquidity supports risk assets.' if change > 50 else 'Contracting liquidity pressures risk assets.' if change < -50 else 'Liquidity roughly flat — no strong directional signal.'}"
                 ),
                 data_age_hours=age_hours,

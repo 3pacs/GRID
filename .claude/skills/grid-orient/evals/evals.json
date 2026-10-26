@@ -1,0 +1,39 @@
+{
+  "skill_name": "grid-orient",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "We added a bunch of modules and two new tables. Rebuild the codebase index.",
+      "expected_output": "Runs the scan, checks drift against MODULE_CATALOG, and updates .claude/CODEBASE_INDEX.md.",
+      "files": [],
+      "expectations": [
+        "Counts .py files per directory (intelligence, analysis, physics, features, discovery, trading, oracle, ingestion/altdata, ingestion/international)",
+        "Compares those counts with the layer counts reported in docs/MODULE_CATALOG.md and flags drift explicitly",
+        "Writes or updates .claude/CODEBASE_INDEX.md (function index, schema quick reference, integration map, server ops)",
+        "Does not edit CLAUDE.md or .claude/settings.json (the SessionStart hook already loads the index)"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Rebuild the index, but I'm on a laptop with no tailnet access to grid-svr.",
+      "expected_output": "Handles unreachable ssh steps gracefully rather than fabricating schema or service data.",
+      "files": [],
+      "expectations": [
+        "Completes the local scan steps (module counts, signatures, catalog drift)",
+        "Reports that the DB schema, row counts and service-status steps could not be run because ssh to grid-svr failed",
+        "Does not invent table names, row counts or service states",
+        "Marks the schema and server sections of the index as stale or unverified instead of silently leaving old data"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Does GRID have a transfer entropy module? Use the orient skill.",
+      "expected_output": "Misrouted request: existence checks belong to grid-check-exists, which the skill's note says to use.",
+      "files": [],
+      "expectations": [
+        "Points out that existence checks should use /grid-check-exists <keyword>, per the note in the skill",
+        "Does not rebuild the whole index just to answer an existence question"
+      ]
+    }
+  ]
+}

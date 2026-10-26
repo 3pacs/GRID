@@ -40,6 +40,19 @@ from sqlalchemy.engine import Engine
 
 from store.observations import read_latest, read_latest_n, read_window
 
+
+def _recent_closes(conn: Any, series_id: str, n: int) -> list[Any]:
+    """The ``n`` newest yfinance closes for ``series_id``, newest first.
+
+    Bounds the scan to a calendar window that holds ``n`` sessions (7/5 per
+    session plus a 14-day holiday/gap margin). An unbounded ``read_latest_n``
+    fetched every vintage back to 1990 (~2M rows, ~8 s per call) for each of
+    the 15 reads a briefing makes. Same SUCCESS-only, latest-vintage rows; a
+    series with a gap longer than the margin returns fewer than ``n``.
+    """
+    start = datetime.now(timezone.utc).date() - timedelta(days=(n * 7) // 5 + 14)
+    return read_latest_n(conn, series_id, n, source="yfinance", start=start)
+
 # ── Configuration ─────────────────────────────────────────────────────────
 
 EVALUATION_WINDOW_DAYS = 5  # Score predictions after 5 trading days
@@ -326,7 +339,7 @@ def _score_momentum(engine: Engine) -> SentimentComponent:
 
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 25, source="yfinance")
+            rows = _recent_closes(conn, "YF:^GSPC:close", 25)
 
             if len(rows) >= 6:
                 latest = rows[0].value
@@ -422,7 +435,7 @@ def _score_breadth(engine: Engine) -> SentimentComponent:
             positive = 0
             total = 0
             for etf in etfs:
-                rows = read_latest_n(conn, f"YF:{etf}:close", 6, source="yfinance")
+                rows = _recent_closes(conn, f"YF:{etf}:close", 6)
                 if len(rows) >= 2:
                     total += 1
                     if rows[0].value > rows[1].value:
@@ -443,7 +456,7 @@ def _score_trend(engine: Engine) -> SentimentComponent:
     """SPY position relative to 50d and 200d moving averages."""
     try:
         with engine.connect() as conn:
-            rows = read_latest_n(conn, "YF:^GSPC:close", 200, source="yfinance")
+            rows = _recent_closes(conn, "YF:^GSPC:close", 200)
             if len(rows) >= 50:
                 latest = rows[0].value
                 ma50 = sum(r.value for r in rows[:50]) / 50
@@ -629,8 +642,8 @@ def _score_credit_spread(engine: Engine) -> SentimentComponent:
     """HYG vs LQD ratio — rising = risk appetite (bullish), falling = flight to quality."""
     try:
         with engine.connect() as conn:
-            hyg_rows = read_latest_n(conn, "YF:HYG:close", 21, source="yfinance")
-            lqd_rows = read_latest_n(conn, "YF:LQD:close", 21, source="yfinance")
+            hyg_rows = _recent_closes(conn, "YF:HYG:close", 21)
+            lqd_rows = _recent_closes(conn, "YF:LQD:close", 21)
             if len(hyg_rows) >= 2 and len(lqd_rows) >= 2:
                 hyg_now = hyg_rows[0].value
                 lqd_now = lqd_rows[0].value
@@ -849,11 +862,24 @@ def log_prediction(engine: Engine, result: SentimentResult) -> int | None:
 
 # ── Self-scoring loop ────────────────────────────────────────────────────
 
-def score_past_predictions(engine: Engine) -> dict[str, Any]:
+def score_past_predictions(
+    engine: Engine, *, update_weights: bool = True
+) -> dict[str, Any]:
     """Score pending predictions whose evaluation window has passed.
 
-    Compares predicted sentiment direction vs realized SPY 5-day return.
-    Updates weights based on component-level accuracy.
+    Compares predicted sentiment direction vs realized SPY 5-day return and
+    records ``realized_return`` / ``outcome`` / ``scored_at`` on each row.
+
+    ``update_weights`` (default True) keeps the historical contract of
+    ``run_sentiment_cycle`` and ``scripts/grid_cron.sh sentiment``: once at
+    least 3 predictions are scored in one call, ``_update_weights`` runs and
+    may insert a new ``sentiment_weights`` version that later
+    ``compute_sentiment`` calls consume. ``update_weights=False`` is the
+    outcome-only path for the scheduled closer in ``intelligence/scheduler.py``:
+    outcomes are recorded, no weight row is ever inserted. The returned
+    ``weight_promotion`` says which happened: ``"disabled"``, ``"not_due"``
+    (fewer than 3 scored) or ``"attempted"`` (``_update_weights`` ran; it
+    still needs >= 10 scored rows in history to insert).
 
     Returns summary of scoring results.
     """
@@ -874,7 +900,11 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
             ), {"window": EVALUATION_WINDOW_DAYS}).fetchall()
 
             if not pending:
-                return {"scored": 0, "message": "No predictions ready to score"}
+                return {
+                    "scored": 0,
+                    "message": "No predictions ready to score",
+                    "weight_promotion": "disabled" if not update_weights else "not_due",
+                }
 
             for pred in pending:
                 pred_id, pred_date, pred_score, pred_label, comp_json, weight_json = pred
@@ -931,14 +961,22 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
         log.warning("Scoring failed: {e}", e=e)
         return {"scored": 0, "error": str(e)}
 
-    # Update weights if we have enough scored predictions
-    if scored >= 3:
+    # Learned-weight promotion is coupled to scoring only on the default
+    # path. The scheduled outcome closer passes update_weights=False, so
+    # recording outcomes never inserts a sentiment_weights row unless the
+    # operator enabled promotion (config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION).
+    if not update_weights:
+        weight_promotion = "disabled"
+    elif scored >= 3:
         _update_weights(engine)
+        weight_promotion = "attempted"
+    else:
+        weight_promotion = "not_due"
 
     accuracy = (correct / scored * 100) if scored > 0 else 0
     log.info(
-        "Scored {n} predictions: {c}/{n} correct ({a:.0f}%)",
-        n=scored, c=correct, a=accuracy,
+        "Scored {n} predictions: {c}/{n} correct ({a:.0f}%), weight_promotion={w}",
+        n=scored, c=correct, a=accuracy, w=weight_promotion,
     )
 
     return {
@@ -946,6 +984,7 @@ def score_past_predictions(engine: Engine) -> dict[str, Any]:
         "correct": correct,
         "accuracy": round(accuracy, 1),
         "results": results,
+        "weight_promotion": weight_promotion,
     }
 
 

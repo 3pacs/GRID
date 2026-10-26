@@ -29,6 +29,29 @@ FAKE_MP3 = b"ID3\x04\x00\x00\x00\x00\x00\x00" + b"\xff\xf3" + b"\x00" * 2048
 KOKORO = "http://kokoro.test:8880"
 
 
+@pytest.mark.parametrize("provider", ["local", "gemini", "openai"])
+def test_protected_candidate_is_rejected_before_tts_or_metadata(
+    monkeypatch, kokoro_on, no_paid, provider,
+):
+    attempts = []
+    monkeypatch.setattr(audio_briefing, "_collect_all_data", lambda engine: {"flow": {}})
+
+    def candidate(data):
+        attempts.append(provider)
+        return "PCR proves maximum hedging demand.", provider
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Rejected narrative reached audio synthesis or metadata persistence")
+
+    monkeypatch.setattr(audio_briefing, "_generate_script_candidate", candidate)
+    monkeypatch.setattr(audio_briefing, "_generate_audio_file", forbidden)
+    monkeypatch.setattr(audio_briefing, "_save_metadata", forbidden)
+    with pytest.raises(ValueError, match="publication claim guard"):
+        audio_briefing.generate_briefing_audio(object())
+    assert attempts == [provider]
+    assert not list(kokoro_on.glob("*"))
+
+
 class _Resp:
     def __init__(self, status: int = 200, content: bytes = FAKE_MP3,
                  content_type: str = "audio/mpeg", text: str = "") -> None:
