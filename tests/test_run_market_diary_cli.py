@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import importlib.util
 import sys
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -41,8 +41,11 @@ def test_previous_session_date(runner, today, expected):
 
 
 def _run(runner, monkeypatch, argv, today):
-    """Run main() with a frozen 'today'; return the target_date passed on."""
-    monkeypatch.setattr(runner, "previous_session_date", lambda t=None, _f=runner.previous_session_date: _f(today))
+    """Run main() with the clock frozen at 05:30Z on ``today``; return the target_date passed on."""
+    monkeypatch.setattr(
+        runner, "_utc_now",
+        lambda: datetime(today.year, today.month, today.day, 5, 30, tzinfo=timezone.utc),
+    )
     fake = MagicMock(return_value={"date": "x", "thesis_accuracy": {}, "market_moves": {}})
     monkeypatch.setattr("intelligence.market_diary.write_diary_entry", fake)
     assert runner.main(argv, engine=object()) == 0
