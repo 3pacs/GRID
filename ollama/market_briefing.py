@@ -47,6 +47,247 @@ def _publication_digest(value: str | None) -> PublicationTextDigest:
         return PublicationTextDigest(None, None, None, "capture_failed")
 
 
+def _publication_calendar_assessment(declaration: Any) -> dict[str, Any]:
+    """Assess only an explicitly declared action calendar; never a stored clock."""
+    from datetime import date, datetime, timedelta
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    supplied = dict(declaration) if isinstance(declaration, dict) else {}
+    weekdays = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")
+
+    def result(status, reason, expected=None):
+        return {"status": status, "reason": reason, "expected": expected,
+                "declaration": supplied, "scope": "declared_action_calendar_only"}
+
+    try:
+        civil = date.fromisoformat(supplied.get("date", ""))
+        conditional = {"date": civil.isoformat(), "weekday": weekdays[civil.weekday()]}
+    except (TypeError, ValueError):
+        civil, conditional = None, None
+    if supplied.get("basis") not in ("Gregorian civil date", "gregorian_civil_date"):
+        return result("ACCEPT_WITH_LIMITATION", "calendar_intent_or_basis_unknown",
+                      {"conditional_same_civil_basis": conditional})
+    presentations = supplied.get("presentations")
+    if isinstance(presentations, list):
+        if not presentations or not all(isinstance(item, dict) for item in presentations):
+            return result("ACCEPT_WITH_LIMITATION", "calendar_presentations_unknown")
+        checks = [_publication_calendar_assessment({
+            "basis": supplied["basis"], "reference_instant": supplied.get("reference_instant"),
+            "intent": supplied.get("intent"), "relative_day": supplied.get("relative_day"), **item,
+        }) for item in presentations]
+        status = ("REFUSE_MISMATCH" if any(c["status"] == "REFUSE_MISMATCH" for c in checks)
+                  else "ACCEPT_WITH_LIMITATION" if any(c["status"] != "PASS" for c in checks) else "PASS")
+        return result(status, "labelled_calendar_presentations", checks)
+    zone = supplied.get("timezone")
+    relative = supplied.get("relative_day")
+    if relative is not None and relative not in ("today", "tomorrow"):
+        return result("ACCEPT_WITH_LIMITATION", "relative_day_intent_unknown")
+    if zone is not None:
+        if type(zone) is not str or not zone:
+            return result("ACCEPT_WITH_LIMITATION", "timezone_unknown")
+        if relative is None and supplied.get("intent") not in ("instant", "absolute_date"):
+            return result("ACCEPT_WITH_LIMITATION", "calendar_intent_unknown",
+                          {"conditional_same_civil_basis": conditional})
+        try:
+            qualified_zone = ZoneInfo(zone)
+            if supplied.get("intent") == "absolute_date" and relative is None:
+                if civil is None:
+                    raise ValueError("unqualified date")
+                expected_date = civil
+            else:
+                instant = datetime.fromisoformat(supplied.get("reference_instant", "").replace("Z", "+00:00"))
+                if instant.tzinfo is None or instant.utcoffset() is None:
+                    raise ValueError("unqualified reference")
+                local = instant.astimezone(qualified_zone)
+                expected_date = local.date() + timedelta(days=1 if relative == "tomorrow" else 0)
+        except (AttributeError, TypeError, ValueError, ZoneInfoNotFoundError):
+            return result("ACCEPT_WITH_LIMITATION", "reference_instant_or_timezone_unknown")
+        expected = {"date": expected_date.isoformat(), "weekday": weekdays[expected_date.weekday()],
+                    "timezone": zone}
+    elif relative is not None or supplied.get("intent") == "instant":
+        return result("ACCEPT_WITH_LIMITATION", "relative_day_reference_calendar_unknown")
+    elif civil is not None:
+        expected = conditional
+    else:
+        return result("ACCEPT_WITH_LIMITATION", "civil_date_unknown")
+    if supplied.get("date") is None or supplied.get("weekday") is None:
+        return result("ACCEPT_WITH_LIMITATION", "action_date_or_weekday_unknown", expected)
+    weekday = supplied["weekday"]
+    if supplied["date"] != expected["date"] or type(weekday) is not str or weekday.capitalize() != expected["weekday"]:
+        return result("REFUSE_MISMATCH", "declared_calendar_mismatch", expected)
+    return result("PASS", "declared_calendar_matches", expected)
+
+
+def _publication_metric_assessment(info: dict[str, Any]) -> dict[str, Any]:
+    """Bind typed renderer assertions to supplied definitions, never numeric coincidence."""
+    import math
+    contract, assertion = info.get("metric_contract"), info.get("metric_assertion")
+
+    def result(status, reason, expected=None):
+        return {"status": status, "reason": reason, "expected_definition": expected,
+                "source_truth": "unknown", "scope": "supplied_metric_contract_only"}
+
+    if not isinstance(contract, dict) or not contract:
+        return result("REFUSE_MISMATCH" if isinstance(assertion, dict) and assertion else "ACCEPT_WITH_LIMITATION",
+                      "metric_definition_unknown")
+    if not isinstance(assertion, dict) or not assertion:
+        return result("ACCEPT_WITH_LIMITATION", "metric_assertion_unknown")
+    if not all(type(contract.get(k)) is str and contract[k] for k in ("metric_id", "definition_version", "measure", "unit")):
+        return result("ACCEPT_WITH_LIMITATION", "metric_identity_or_definition_unknown")
+    expected = {k: contract.get(k) for k in ("metric_id", "definition_version", "measure", "unit",
+                "denominator", "cohort_id", "window", "universe", "expiry_scope")}
+    if not all(type(assertion.get(k)) is str and assertion[k] for k in ("metric_id", "definition_version")):
+        return result("ACCEPT_WITH_LIMITATION", "assertion_binding_unknown", expected)
+    if any(assertion[k] != contract[k] for k in ("metric_id", "definition_version")):
+        return result("ACCEPT_WITH_LIMITATION", "metric_version_or_comparison_unknown", expected)
+    for key, reason in (("measure", "metric_definition"), ("unit", "unit")):
+        if assertion.get(key) is None:
+            return result("ACCEPT_WITH_LIMITATION", key + "_unknown", expected)
+        if assertion[key] != contract[key]:
+            return result("REFUSE_MISMATCH", reason, expected)
+    measure = contract["measure"]
+    if (measure in ("buy_share", "buy_to_sell")
+            or contract.get("cohort_id") is not None or assertion.get("cohort_id") is not None):
+        cohorts = (contract.get("cohort_id"), assertion.get("cohort_id"))
+        if not all(type(cohort) is str and cohort.strip() for cohort in cohorts) or cohorts[0] != cohorts[1]:
+            return result("ACCEPT_WITH_LIMITATION", "cohort_comparison_unknown", expected)
+    # A valid assertion cannot lend its definition to a different observation.
+    # Missing top-level fields may be rendered from this explicit contract;
+    # supplied fields must bind, and unknown/different cohorts stay qualified.
+    for key in ("metric_id", "definition_version", "measure", "unit", "denominator", "cohort_id",
+                "window", "universe", "expiry_scope"):
+        if key in ("window", "universe", "expiry_scope") and contract.get(key) is not None:
+            if assertion.get(key) != contract[key]:
+                return result("ACCEPT_WITH_LIMITATION", "cohort_or_scope_comparison_unknown", expected)
+        if key not in info:
+            continue
+        displayed, declared = info[key], contract.get(key)
+        if type(displayed) is not str or displayed == "" or declared is None:
+            return result("ACCEPT_WITH_LIMITATION", "display_metadata_unknown", expected)
+        if displayed != declared:
+            if key in ("metric_id", "definition_version", "cohort_id", "window", "universe", "expiry_scope"):
+                return result("ACCEPT_WITH_LIMITATION", "display_identity_or_cohort_unknown", expected)
+            if isinstance(info.get("metric_transformation"), dict):
+                return result("ACCEPT_WITH_LIMITATION", "display_transformation_unknown", expected)
+            return result("REFUSE_MISMATCH", "displayed_" + key, expected)
+    definitions = {"open_interest": ("calls", "puts", "calls"),
+                   "traded_volume": ("calls", "puts", "calls"),
+                   "buy_share": ("buys_plus_sells", "buys", "sells"),
+                   "buy_to_sell": ("sells", "buys", "sells")}
+    if measure not in definitions:
+        return result("ACCEPT_WITH_LIMITATION", "metric_definition_or_transformation_unknown", expected)
+    denominator, numerator_key, other_key = definitions[measure]
+    if contract.get("denominator") is None or assertion.get("denominator") is None:
+        return result("ACCEPT_WITH_LIMITATION", "denominator_unknown", expected)
+    if contract["denominator"] != denominator or assertion["denominator"] != denominator:
+        return result("REFUSE_MISMATCH", "denominator", expected)
+    numbers = [contract.get(numerator_key), contract.get(other_key), assertion.get("value")]
+    if not all(type(v) in (int, float) for v in numbers):
+        return result("ACCEPT_WITH_LIMITATION", "bound_counts_or_value_unknown", expected)
+    try:
+        finite = all(math.isfinite(v) and v >= 0 for v in numbers)
+    except OverflowError:
+        finite = False
+    if not finite:
+        return result("ACCEPT_WITH_LIMITATION", "bound_counts_or_value_unknown", expected)
+    numerator, other, value = numbers
+    divisor = numerator + other if measure == "buy_share" else other
+    if divisor == 0:
+        return result("ACCEPT_WITH_LIMITATION", "denominator_undefined", expected)
+    if contract["unit"] not in ("ratio", "percent"):
+        return result("ACCEPT_WITH_LIMITATION", "ratio_unit_mapping_unknown", expected)
+    computed = numerator / divisor * (100 if contract["unit"] == "percent" else 1)
+    if not math.isclose(value, computed, rel_tol=1e-9, abs_tol=1e-9):
+        return result("REFUSE_MISMATCH", "denominator" if measure.startswith("buy_") else "bound_ratio_value", expected)
+    raw = info.get("value")
+    try:
+        raw_finite = type(raw) in (int, float) and math.isfinite(raw)
+    except OverflowError:
+        raw_finite = False
+    if not raw_finite:
+        return result("ACCEPT_WITH_LIMITATION", "display_value_unknown", expected)
+    if not math.isclose(raw, value, rel_tol=1e-9, abs_tol=1e-9):
+        return result("ACCEPT_WITH_LIMITATION", "display_value_transformation_unknown", expected)
+    return result("PASS", "bound_definition_and_value_match", expected)
+
+
+def _publication_lineage_assessment(info: dict[str, Any]) -> dict[str, Any]:
+    """Preserve supplied clocks/versions; receipts are declarations, not authentication."""
+    from copy import deepcopy
+    from datetime import datetime
+    lineage = info.get("lineage")
+    lineage = lineage if isinstance(lineage, dict) else {}
+    names = ("observed_at", "release_at", "available_at", "ingested_at", "stored_row_clock",
+             "captured_at", "artifact_captured_at", "original_publication_time", "pit_possession")
+    clocks = dict.fromkeys(names)
+    if isinstance(lineage.get("clocks"), dict):
+        clocks.update(deepcopy(lineage["clocks"]))
+
+    def receipt(name):
+        value = lineage.get(name)
+        return type(value) is str and bool(value.strip())
+
+    def qualified_clock(value):
+        if type(value) is not str:
+            return False
+        try:
+            instant = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return instant.tzinfo is not None and instant.utcoffset() is not None
+        except ValueError:
+            return False
+
+    clock_status, clock_reason = "ACCEPT_WITH_LIMITATION", "publication_or_pit_unknown"
+    if clocks.get("original_publication_time") is not None and not receipt("publication_receipt_id"):
+        clock_status, clock_reason = "REFUSE_MISMATCH", "publication_time_receipt_missing"
+    elif clocks.get("pit_possession") is True and not receipt("pit_receipt_id"):
+        clock_status, clock_reason = "REFUSE_MISMATCH", "pit_receipt_missing"
+    elif (clocks.get("original_publication_time") is not None and receipt("publication_receipt_id")
+          and clocks.get("pit_possession") is True and receipt("pit_receipt_id")):
+        qualified = all(value is None or qualified_clock(value) for key, value in clocks.items()
+                        if key in names and key != "pit_possession")
+        clock_status, clock_reason = (("PASS", "independent_receipt_references_declared_only") if qualified
+                                      else ("ACCEPT_WITH_LIMITATION", "clock_timezone_or_value_unknown"))
+    versions = deepcopy(lineage.get("versions")) if isinstance(lineage.get("versions"), list) else []
+    previous = lineage.get("previous_versions")
+    previous = previous if isinstance(previous, list) else []
+    required = ("source_id", "series_id", "observation_date", "version_id", "content_sha256",
+                "revision_clock", "contract_receipt_id")
+    complete = bool(versions) and all(isinstance(v, dict) and all(
+        type(v.get(k)) is str and v[k] for k in required) for v in versions)
+    version_status, version_reason = "ACCEPT_WITH_LIMITATION", "version_or_comparison_unknown"
+    if complete:
+        keys = {(v["source_id"], v["series_id"], v["observation_date"]) for v in versions}
+        hashes_valid = all(len(v["content_sha256"]) == 64 and all(
+            c in "0123456789abcdefABCDEF" for c in v["content_sha256"]) for v in versions)
+        if len(keys) == 1 and hashes_valid and all(qualified_clock(v["revision_clock"]) for v in versions):
+            version_status, version_reason = "PASS", "distinct_versions_retained_declarations_only"
+            by_id = {}
+            by_record = {}
+            for version in versions:
+                identity = version["version_id"]
+                if identity in by_id and by_id[identity] != version["content_sha256"]:
+                    version_status, version_reason = "ACCEPT_WITH_LIMITATION", "version_identity_conflict_unknown"
+                by_id[identity] = version["content_sha256"]
+                by_record[identity] = version
+            if lineage.get("assert_immutable_history") is True:
+                if not previous:
+                    version_status, version_reason = "ACCEPT_WITH_LIMITATION", "history_preimage_unknown"
+                elif any(not isinstance(old, dict) or type(old.get("version_id")) is not str
+                         or any(old.get(k) != versions[0][k]
+                         for k in ("source_id", "series_id", "observation_date"))
+                         or by_id.get(old.get("version_id")) != old.get("content_sha256")
+                         or any(by_record.get(old["version_id"], {}).get(k) != value
+                                for k, value in old.items()) for old in previous):
+                    version_status, version_reason = "REFUSE_MISMATCH", "immutable_history_assertion_mismatch"
+                elif version_status != "PASS":
+                    version_status, version_reason = "REFUSE_MISMATCH", "immutable_history_assertion_mismatch"
+    status = ("REFUSE_MISMATCH" if "REFUSE_MISMATCH" in (clock_status, version_status)
+              else "PASS" if clock_status == version_status == "PASS" else "ACCEPT_WITH_LIMITATION")
+    return {"status": status, "clocks": clocks, "clock_status": clock_status, "clock_reason": clock_reason,
+            "versions": versions, "version_status": version_status, "version_reason": version_reason,
+            "source_truth": "unknown", "receipts": "declared_references_not_verified",
+            "scope": "renderer_declarations_not_storage_or_historical_possession"}
+
+
 def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str, Any],
                                  *, narrative_span: tuple[int, int] | None = None) -> dict[str, Any]:
     """Present declared metadata for displayed numeric feature candidates only.
@@ -91,6 +332,12 @@ def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str
     for path in selected:
         key = paths[path]
         info = features[key] if isinstance(features[key], dict) else {}
+        metric = _publication_metric_assessment(info)
+        if metric["status"] == "PASS":
+            info = dict(info)
+            for field in ("metric_id", "definition_version", "measure", "unit", "denominator", "cohort_id"):
+                if field not in info:
+                    info[field] = metric["expected_definition"].get(field)
         value = info.get("value")
         try:
             finite = type(value) in (int, float) and math.isfinite(value)
@@ -110,6 +357,10 @@ def _publication_evidence_footer(snapshot: dict[str, Any], diagnostics: dict[str
             "vintage_date": declaration(info.get("vintage_date")),
             "basis": declaration(info.get("basis") or info.get("price_basis")),
             "measure": declaration(info.get("measure")),
+            "denominator": declaration(info.get("denominator")), "cohort_id": declaration(info.get("cohort_id")),
+            "metric_id": declaration(info.get("metric_id")), "definition_version": declaration(info.get("definition_version")),
+            "metric_binding": metric,
+            "lineage": _publication_lineage_assessment(info),
             "verification_state": "unknown",
             "unverified_flag": info.get("unverified") if type(info.get("unverified")) is bool else None,
             "flag_scope": "upstream_declaration_only",
@@ -695,6 +946,15 @@ class MarketBriefingEngine:
         Source/normalization references are declarations, not independently verified
         truth or currentness. An assembly/generation clock cannot fill an evidence gap.
         """
+        metric = _publication_metric_assessment(info)
+        if metric["status"] == "PASS":
+            info = dict(info)
+            for field in ("metric_id", "definition_version", "measure", "unit", "denominator", "cohort_id"):
+                if field not in info:
+                    info[field] = metric["expected_definition"].get(field)
+        elif isinstance(info.get("metric_assertion"), dict) and info["metric_assertion"]:
+            info = dict(info)  # Refuse interpretation, never mutate the original raw record.
+            info.update(measure=None, unit=None, denominator=None)
         asof = info.get("obs_date") or info.get("date") or "unknown"
         source = info.get("source_id") or info.get("source") or "unknown"
         parts = [f"- {category}:{name}: raw value={info.get('value', 'unknown')}",
@@ -730,6 +990,11 @@ class MarketBriefingEngine:
                     parts.append("z-score=unknown")
             else:
                 parts.append("z-score=unknown")
+        if info.get("metric_contract") is not None or info.get("metric_assertion") is not None:
+            parts.append("metric_contract_status=" + metric["status"] + "; reason=" + metric["reason"])
+        if isinstance(info.get("lineage"), dict):
+            lineage = _publication_lineage_assessment(info)
+            parts.append("lineage_status=" + lineage["status"] + "; publication/PIT receipts are declarations only")
         return " | ".join(parts)
 
     def _build_data_context(self, snapshot: dict[str, Any]) -> str:
@@ -745,6 +1010,10 @@ class MarketBriefingEngine:
         facts = publication_context_facts(snapshot)
         lines: list[str] = []
         lines.append(f"## Market Data Snapshot — {snapshot['timestamp']} (assembly time, not an evidence clock)")
+        calendar = _publication_calendar_assessment(snapshot.get("action_calendar"))
+        lines.append("DECLARED ACTION CALENDAR (data only): " + json.dumps(calendar, sort_keys=True, default=str))
+        lines.append("Hold refused interpretations. Missing action calendar/zone/relative-day intent stays unknown; "
+                     "a same-civil-date mismatch is conditional until a common basis is declared.")
         lines.append("")
 
         for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
@@ -842,15 +1111,30 @@ class MarketBriefingEngine:
         pcr = snapshot.get("options", {}).get("spy_put_call")
         lines.append("### OPTIONS — SPY PUT/CALL RATIO")
         if pcr:
-            lines.append(
-                "Definition: SPY put/call ratio, open interest, all "
-                "expiries (put open interest / call open interest)."
-            )
+            typed_options = ("metric_contract" in pcr or "metric_assertion" in pcr)
+            legacy_oi = (not typed_options
+                         and pcr.get("measure") in (None, "", "open_interest", "oi_pcr", "put_open_interest/call_open_interest")
+                         and pcr.get("unit") in (None, "ratio")
+                         and pcr.get("expiry_scope") in (None, "all"))
+            if legacy_oi:
+                lines.append(
+                    "Definition: SPY put/call ratio, open interest, all "
+                    "expiries (put open interest / call open interest)."
+                )
+                lines.append(f"- Value: {pcr.get('value', 'unknown')} (as of {pcr.get('date', 'unknown')}, "
+                             f"source: {pcr.get('source', 'unknown')})")
+            else:
+                binding = _publication_metric_assessment(pcr)
+                if binding["status"] == "PASS" and binding["expected_definition"]["measure"] in ("open_interest", "traded_volume"):
+                    meaning = "open interest" if binding["expected_definition"]["measure"] == "open_interest" else "traded volume"
+                    scope = binding["expected_definition"].get("expiry_scope") or "unknown"
+                    lines.append(f"Declared definition: SPY put/call {meaning}; expiry scope={scope}. "
+                                 "Definition/units are declared, not independently verified.")
+                else:
+                    lines.append("Declared put/call definition: unknown; interpretation held. "
+                                 f"Contract status={binding['status']}; reason={binding['reason']}.")
+                lines.append(self._format_evidence_value("options", "spy_put_call", pcr))
             lines.append("Interpretation: relative contracts only; buyer/seller initiation and hedge intent are unmeasured.")
-            lines.append(
-                f"- Value: {pcr['value']} (as of {pcr['date']}, "
-                f"source: {pcr['source']})"
-            )
         else:
             lines.append(
                 "- Value: unavailable (no spy_pcr / options_daily_signals data)"
@@ -1391,13 +1675,12 @@ class MarketBriefingEngine:
         Returns:
             str: User prompt.
         """
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         return (
             f"Generate the {briefing_type} GRID market conditions briefing.\n\n"
-            f"Current time: {now.strftime('%Y-%m-%d %H:%M:%S %Z')}\n"
-            f"Day of week: {now.strftime('%A')}\n"
-            f"Market hours context: "
-            f"{'US markets are open' if 9 <= now.hour <= 16 and now.weekday() < 5 else 'US markets are closed'}\n\n"
+            f"Prompt assembly time (UTC, not action/publication/PIT time): {now.isoformat()}\n"
+            "Action calendar, timezone and relative-day reference are unknown unless explicitly supplied "
+            "in the declared action calendar. Do not infer a market session from the host clock.\n\n"
             f"{data_context}\n\n"
             f"Analyze these conditions using the GRID framework. Follow the "
             f"market analysis framework structure. Be specific about feature "
@@ -1472,7 +1755,9 @@ class MarketBriefingEngine:
     def _persist_to_db(self, result: dict[str, Any]) -> int | None:
         """Persist briefing + sentiment to the database for API serving.
 
-        Creates the market_briefings table if needed. Returns briefing ID.
+        Requires explicitly prepared schema; never creates or repairs it.
+        Uses the shared read-only readiness check and transaction-local bounds.
+        Missing readiness/schema or a failed write returns None after rollback.
         """
         eng = self.engine
         if eng is None:
@@ -1484,24 +1769,27 @@ class MarketBriefingEngine:
 
         try:
             from sqlalchemy import text as _text
-            with eng.connect() as conn:
-                conn.execute(_text("""
-                    CREATE TABLE IF NOT EXISTS market_briefings (
-                        id              SERIAL PRIMARY KEY,
-                        briefing_type   TEXT NOT NULL,
-                        briefing_date   DATE NOT NULL,
-                        content         TEXT NOT NULL,
-                        sentiment_score REAL,
-                        sentiment_label TEXT,
-                        sentiment_data  JSONB,
-                        snapshot_data   JSONB,
-                        created_at      TIMESTAMPTZ DEFAULT NOW()
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_market_briefings_date
-                        ON market_briefings (briefing_date DESC);
-                    CREATE INDEX IF NOT EXISTS idx_market_briefings_type
-                        ON market_briefings (briefing_type, briefing_date DESC);
-                """))
+            from intelligence.schema_readiness import ColumnRequirement, require_relation
+
+            # Proposed per-transaction limits, not assumptions about live roles
+            # or session defaults. Connection acquisition needs its own caller
+            # bound. Explicit schema preparation belongs to the shared owner.
+            with eng.begin() as conn:
+                conn.execute(_text(
+                    "SELECT set_config('lock_timeout', '500ms', true), "
+                    "set_config('statement_timeout', '2s', true)"
+                ))
+                require_relation(conn, "market_briefings", {
+                    "id": ColumnRequirement("int4", nullable=False, default_kind="generated_integer"),
+                    "briefing_type": ColumnRequirement("text", nullable=False),
+                    "briefing_date": ColumnRequirement("date", nullable=False),
+                    "content": ColumnRequirement("text", nullable=False),
+                    "sentiment_score": ColumnRequirement("float4", nullable=True),
+                    "sentiment_label": ColumnRequirement("text", nullable=True),
+                    "sentiment_data": ColumnRequirement("jsonb", nullable=True),
+                    "snapshot_data": ColumnRequirement("jsonb", nullable=True),
+                    "created_at": ColumnRequirement("timestamptz", nullable=True, default_kind="transaction_timestamp"),
+                }, primary_key=("id",))
 
                 sentiment = result.get("sentiment")
                 row = conn.execute(_text(
@@ -1519,10 +1807,11 @@ class MarketBriefingEngine:
                     "sdata": json.dumps(sentiment) if sentiment else None,
                     "snap": json.dumps(result["snapshot"], default=str),
                 }).fetchone()
-                conn.commit()
-                bid = row[0] if row else None
-                log.info("Briefing persisted to DB id={id}", id=bid)
-                return bid
+                if row is None or type(row[0]) is not int:
+                    raise RuntimeError("Publication insert returned no integer row identity")
+                bid = row[0]
+            log.info("Briefing persisted to DB id={id}", id=bid)
+            return bid
         except Exception as e:
             log.warning("Failed to persist briefing to DB: {e}", e=e)
             return None

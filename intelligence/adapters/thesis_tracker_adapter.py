@@ -9,6 +9,8 @@ from sqlalchemy.engine import Engine
 
 from intelligence.adapters.base import BaseAdapter, clamp, sid
 from intelligence.signal_registry import RegisteredSignal, SignalType
+from intelligence.thesis_tracker import _snapshot_conviction_fraction
+from intelligence.thesis_schema import require_thesis_connection
 
 _SRC = "thesis_tracker"
 _REFRESH = 4.0
@@ -23,29 +25,42 @@ class ThesisTrackerAdapter(BaseAdapter):
         vu = now + timedelta(hours=4)
         signals: list[RegisteredSignal] = []
         with engine.connect() as conn:
+            schema = require_thesis_connection(conn, allow_legacy_unit=True)
             row = conn.execute(text("""
-                SELECT overall_direction, conviction, key_drivers, narrative, timestamp
+                SELECT overall_direction, conviction, key_drivers, narrative, timestamp,
+                       to_jsonb(thesis_snapshots)->>'conviction_unit' AS conviction_unit
                 FROM thesis_snapshots ORDER BY timestamp DESC LIMIT 1
             """)).fetchone()
         if row:
-            direction, conviction, drivers, narrative, ts = row
+            direction, conviction, drivers, narrative, ts, unit = row
             d = (direction or "neutral").lower()
             if d not in ("bullish", "bearish"):
                 d = "neutral"
-            conv = clamp(float(conviction or 50) / 100)
-            signals.append(RegisteredSignal(
+            # A pre-receipt row (including an old schema) has unknown units.
+            # Never guess by magnitude, impute null/zero, or clamp invalid input.
+            conv = None
+            if unit in ("fraction", "percent") and conviction is not None:
+                try:
+                    conv = _snapshot_conviction_fraction({
+                        "conviction": conviction, "conviction_unit": unit})
+                except (TypeError, ValueError):
+                    pass
+            if conv is not None:
+                signals.append(RegisteredSignal(
                 signal_id=sid(_SRC, "current", str(now.date())),
                 source_module=_SRC, signal_type=SignalType.DIRECTIONAL,
-                ticker=None, direction=d, value=round(float(conviction or 50), 4),
-                z_score=None, confidence=round(conv, 4),
+                ticker=None, direction=d, value=conv * 100,
+                z_score=None, confidence=conv,
                 valid_from=now, valid_until=vu, freshness_hours=0.0,
-                metadata={"conviction": float(conviction or 50),
+                metadata={"conviction": conv * 100, "conviction_unit": "percent",
+                          "confidence_unit": "fraction", "stored_conviction_unit": unit,
                           "key_drivers": drivers if isinstance(drivers, list) else [],
                           "narrative_preview": str(narrative)[:200] if narrative else ""},
                 provenance="thesis_tracker:current_snapshot",
-            ))
+                ))
 
         with engine.connect() as conn:
+            require_thesis_connection(conn, expected_schema=schema, allow_legacy_unit=True)
             acc = conn.execute(text("""
                 SELECT COUNT(*) FILTER (WHERE thesis_direction = actual_direction) as correct,
                        COUNT(*) FILTER (WHERE thesis_direction != actual_direction AND actual_direction IS NOT NULL) as wrong,

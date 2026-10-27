@@ -28,8 +28,9 @@ os.environ.setdefault("GRID_JWT_SECRET", "test-secret")
 
 
 # ── 1. Conviction format bug ────────────────────────────────────────────
-# Bug: thesis_tracker logged conviction as {c:.0%} but value was 0-100
-# (integer %), not 0-1 (float ratio). 8% showed as "800%".
+# Bug: an already-percent input was multiplied again, displaying 8% as 800%.
+# The tracker now normalizes declared units to fractions before display/storage;
+# assert actual output and precision rather than an obsolete source format token.
 
 class TestConvictionFormat:
 
@@ -44,18 +45,75 @@ class TestConvictionFormat:
         assert "min(100" in source, \
             "generate_unified_thesis must cap conviction at 100"
 
-    def test_thesis_tracker_log_format_not_percent(self):
-        """thesis_tracker log must use {c:.0f}% not {c:.0%} for 0-100 values."""
+    @pytest.mark.parametrize("payload,stored,label", [
+        ({"conviction": 8, "conviction_unit": "percent"}, 0.08, "8%"),
+        ({"conviction": 0.08, "conviction_unit": "fraction"}, 0.08, "8%"),
+        ({"conviction": 0.08}, 0.08, "8%"),
+        ({"conviction": 8.25, "conviction_unit": "percent"}, 0.0825, "8.25%"),
+        ({"conviction": 0.0825, "conviction_unit": "fraction"}, 0.0825, "8.25%"),
+        ({"conviction": 1, "conviction_unit": "percent"}, 0.01, "1%"),
+        ({"conviction": 1, "conviction_unit": "fraction"}, 1.0, "100%"),
+        ({"conviction": 0}, 0.0, "0%"),
+        ({}, None, "unknown"),
+        ({"conviction": None, "conviction_unit": None}, None, "unknown"),
+    ])
+    def test_thesis_tracker_log_format_not_percent(self, monkeypatch, payload, stored, label):
+        """Normalize once; keep fractional percentages and unknown explicit."""
         from intelligence import thesis_tracker
-        import inspect
-        source = inspect.getsource(thesis_tracker.snapshot_thesis)
-        # Must NOT contain :.0% format (which would multiply 8 by 100 → 800%)
-        assert ":.0%" not in source, \
-            "snapshot_thesis must not use :.0% format on 0-100 conviction values. " \
-            "Use {c:.0f}% instead."
-        # Must contain the correct format
-        assert ":.0f}%" in source or ".0f}%" in source, \
-            "snapshot_thesis should format conviction as {c:.0f}%"
+        from unittest.mock import MagicMock
+        from types import SimpleNamespace
+        import copy
+        import json
+
+        engine = MagicMock()
+        connection = engine.begin.return_value.__enter__.return_value
+        connection.execute.return_value.fetchone.return_value = (17,)
+        ensure = MagicMock(return_value="synthetic_thesis")
+        def check_connection(actual, *, expected_schema):
+            assert actual is connection
+            assert expected_schema == "synthetic_thesis"
+            assert not connection.execute.called
+        readiness = MagicMock(side_effect=check_connection)
+        monkeypatch.setattr(thesis_tracker, "require_thesis_connection", readiness)
+        messages = []
+        monkeypatch.setattr(thesis_tracker, "_ensure_tables", ensure)
+        monkeypatch.setattr(thesis_tracker, "log", SimpleNamespace(
+            info=lambda message, **values: messages.append(message.format(**values))))
+        original = copy.deepcopy(payload)
+        identifier = thesis_tracker.snapshot_thesis(engine, payload)
+        assert identifier == 17 and payload == original
+        ensure.assert_called_once_with(engine)
+        readiness.assert_called_once_with(connection, expected_schema="synthetic_thesis")
+        engine.begin.assert_called_once_with()
+        connection.execute.assert_called_once()
+        parameters = connection.execute.call_args.args[1]
+        assert parameters["conviction"] == stored
+        assert messages == [f"Thesis snapshot #17 archived: neutral (conviction {label})"]
+        # Unknown unit provenance stays unknown at the serializer boundary.
+        record = thesis_tracker.ThesisSnapshot(17, "2026-10-27T00:00:00+00:00",
+            "neutral", stored, [], [], {}, "synthetic")
+        serialized = json.loads(json.dumps(record.to_dict()))
+        assert serialized["conviction"] == stored
+        assert serialized["conviction_unit"] is None
+
+    @pytest.mark.parametrize("payload", [
+        {"conviction": "1.00000000000000001", "conviction_unit": "fraction"},
+        {"conviction": "100.00000000000000001", "conviction_unit": "percent"},
+        {"conviction": "-1e-999", "conviction_unit": "fraction"},
+        {"conviction": float("nan"), "conviction_unit": "percent"},
+        {"conviction": 1, "conviction_unit": None},
+    ])
+    def test_thesis_tracker_invalid_conviction_has_no_write_or_success_log(self, monkeypatch, payload):
+        from intelligence import thesis_tracker
+        from unittest.mock import MagicMock
+        engine, ensure, logger = MagicMock(), MagicMock(), MagicMock()
+        monkeypatch.setattr(thesis_tracker, "_ensure_tables", ensure)
+        monkeypatch.setattr(thesis_tracker, "log", logger)
+        with pytest.raises(ValueError):
+            thesis_tracker.snapshot_thesis(engine, payload)
+        ensure.assert_not_called()
+        engine.begin.assert_not_called()
+        logger.info.assert_not_called()
 
 
 # ── 2. Hermes status running=False bug ──────────────────────────────────
