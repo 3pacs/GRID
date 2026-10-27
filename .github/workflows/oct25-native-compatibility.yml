@@ -195,7 +195,7 @@ jobs:
           from pathlib import Path
           import xml.etree.ElementTree as ET
           expected = {'tests.test_oct25_publication_native_compatibility', 'tests.test_oct25_thesis_native_compatibility'}
-          expected_counts = {'tests.test_oct25_publication_native_compatibility':26, 'tests.test_oct25_thesis_native_compatibility':22}
+          expected_counts = {'tests.test_oct25_publication_native_compatibility':26, 'tests.test_oct25_thesis_native_compatibility':42}
           report = {'passed':False,'cases':0,'skips':0,'failures':0,'errors':0,'modules':[],'module_counts':{},'expected_modules':sorted(expected)}
           try:
               root = ET.parse('oct25-native-results.xml').getroot()

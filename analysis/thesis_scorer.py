@@ -2606,6 +2606,15 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
     Returns the snapshot ID, or None on failure.
     """
     try:
+        from intelligence.thesis_tracker import _ensure_tables, _snapshot_conviction_fraction
+        # This scorer's declared output is percent; normalize before any effect.
+        if thesis.get("conviction_unit", "percent") != "percent":
+            raise ValueError("scored thesis conviction_unit must be percent")
+        conviction = _snapshot_conviction_fraction({
+            "conviction": thesis["conviction"], "conviction_unit": "percent"})
+        if conviction is None:
+            return None
+        _ensure_tables(engine)
         model_states = {}
         for m in thesis.get("models", []):
             model_states[m["key"]] = {
@@ -2634,13 +2643,13 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
         with engine.begin() as conn:
             row = conn.execute(text(
                 "INSERT INTO thesis_snapshots "
-                "(overall_direction, conviction, key_drivers, risk_factors, "
+                "(overall_direction, conviction, conviction_unit, key_drivers, risk_factors, "
                 "model_states, narrative) "
-                "VALUES (:dir, :conv, :kd, :rf, :ms, :narr) "
+                "VALUES (:dir, :conv, 'fraction', :kd, :rf, :ms, :narr) "
                 "RETURNING id"
             ), {
                 "dir": thesis["direction"].lower(),
-                "conv": thesis["conviction"] / 100,
+                "conv": conviction,
                 "kd": json.dumps(key_drivers),
                 "rf": json.dumps(risk_factors),
                 "ms": json.dumps(model_states),

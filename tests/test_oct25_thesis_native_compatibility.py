@@ -132,10 +132,13 @@ def test_generator_storage_history_http(native_modules, native_pg_engine, monkey
     assert stored == (Decimal("0.14"), None, None)
     record = tracker.get_thesis_history(engine)[0]
     assert record.id == snapshot_id and record.conviction == 0.14
-    assert record.narrative == thesis["narrative"] and record.conviction_unit is None
+    assert record.narrative == thesis["narrative"] and record.conviction_unit == "fraction"
     payload = _history_http(engine, monkeypatch)
     assert payload["count"] == 1 and "error" not in payload
     assert payload["snapshots"][0] == record.to_dict()
+    signal = _directional_signal(engine)
+    assert signal.confidence == 0.14 and signal.value == pytest.approx(14)
+    assert signal.metadata["stored_conviction_unit"] == "fraction"
 
 
 def _history_http(engine, monkeypatch):
@@ -162,14 +165,22 @@ def _history_http(engine, monkeypatch):
     ({"conviction": 0}, 0.0), ({}, None),
     ({"conviction": None, "conviction_unit": None}, None),
 ])
-def test_units_null_default_real_persistence(native_modules, native_pg_engine, payload, expected):
+def test_units_null_default_real_persistence(native_modules, native_pg_engine, payload, expected, monkeypatch):
     tracker = native_modules[2]
     identifier = tracker.snapshot_thesis(native_pg_engine, dict(payload))
     records = tracker.get_thesis_history(native_pg_engine)
     assert len(records) == 1 and records[0].id == identifier
     assert records[0].conviction == expected
-    assert records[0].to_dict()["conviction_unit"] is None
+    unit = "fraction" if expected is not None else None
+    assert records[0].to_dict()["conviction_unit"] == unit
     assert json.loads(json.dumps(records[0].to_dict()))["conviction"] == expected
+    response = _history_http(native_pg_engine, monkeypatch)["snapshots"][0]
+    assert (response["conviction"], response["conviction_unit"]) == (expected, unit)
+    signal = _directional_signal(native_pg_engine)
+    if expected is None:
+        assert signal is None
+    else:
+        assert signal.confidence == expected and signal.value == expected * 100
 
 
 @pytest.mark.parametrize("value,unit", [
@@ -205,6 +216,90 @@ def test_historical_unknown_null_http(native_modules, native_pg_engine, monkeypa
     assert [row["conviction"] for row in by_id] == [None, 0, 1, 0.75, 75]
     assert all(row["conviction_unit"] is None for row in by_id)
     assert all(row["narrative"] == "original synthetic record" and row["outcome"] is None for row in by_id)
+    assert _directional_signal(native_pg_engine) is None
+
+
+def _directional_signal(engine):
+    from intelligence.adapters.thesis_tracker_adapter import ThesisTrackerAdapter
+    from intelligence.signal_registry import RegisteredSignal, SignalType
+    signals = ThesisTrackerAdapter().extract_signals(engine)
+    directional = [s for s in signals if s.signal_type == SignalType.DIRECTIONAL]
+    assert len(directional) <= 1
+    assert all(isinstance(s, RegisteredSignal) for s in signals)
+    return directional[0] if directional else None
+
+
+@pytest.mark.parametrize("value,unit,expected", [
+    (Decimal("0.75"), "fraction", 0.75), (75, "percent", 0.75),
+    (1, "percent", 0.01), (1, "fraction", 1.0), (0, "fraction", 0.0),
+    (75, None, None), (0, None, None), (None, None, None),
+    (Decimal("0.75"), "unknown", None),
+    (Decimal("1.00000000000000001"), "fraction", None),
+    (Decimal("NaN"), "fraction", None), (101, "percent", None),
+    (Decimal("-0.00000000000000001"), "fraction", None),
+])
+def test_adapter_explicit_receipts_and_refusal(native_modules, native_pg_engine, value, unit, expected):
+    tracker = native_modules[2]
+    tracker._ensure_tables(native_pg_engine)
+    with native_pg_engine.begin() as conn:
+        conn.execute(text("INSERT INTO thesis_snapshots (overall_direction,conviction,conviction_unit,narrative) VALUES ('bullish',:v,:u,'invented')"), {"v":value,"u":unit})
+    signal = _directional_signal(native_pg_engine)
+    if expected is None:
+        assert signal is None
+    else:
+        assert signal.confidence == expected and signal.value == expected * 100
+        assert signal.metadata["conviction_unit"] == "percent"
+        assert signal.metadata["confidence_unit"] == "fraction"
+
+
+def test_additive_receipt_preserves_legacy_and_accuracy_denominator(native_modules, native_pg_engine):
+    from intelligence.adapters.thesis_tracker_adapter import ThesisTrackerAdapter
+    from intelligence.signal_registry import SignalType
+    tracker = native_modules[2]
+    tracker._ensure_tables(native_pg_engine)
+    with native_pg_engine.begin() as conn:
+        conn.execute(text("ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit"))
+        conn.execute(text("INSERT INTO thesis_snapshots (overall_direction,conviction) VALUES ('bullish',75)"))
+        for actual in ['bullish','bullish','bearish',None,None]:
+            conn.execute(text("INSERT INTO thesis_postmortems (thesis_direction,actual_direction) VALUES ('bullish',:a)"), {"a":actual})
+    # Actual old schema produces no fabricated directional signal; accuracy's
+    # original total includes the two unknown actual directions.
+    signals = ThesisTrackerAdapter().extract_signals(native_pg_engine)
+    assert len(signals) == 1 and signals[0].signal_type == SignalType.MAGNITUDE
+    assert signals[0].value == 0.4 and signals[0].metadata["total"] == 5
+    tracker.snapshot_thesis(native_pg_engine, {"conviction":75,"conviction_unit":"percent"})
+    with native_pg_engine.connect() as conn:
+        rows = conn.execute(text("SELECT conviction,conviction_unit FROM thesis_snapshots ORDER BY id")).all()
+    assert rows == [(Decimal(75),None),(Decimal("0.75"),"fraction")]
+
+
+def test_scorer_writer_receipt_to_adapter(native_modules, native_pg_engine, monkeypatch):
+    scorer, tracker = native_modules[1:]
+    thesis = {"direction":"BULLISH","conviction":75,"score":75,"bull_pct":87.5,
+              "bear_pct":12.5,"evaluation_window":"5d","active_models":0,"total_models":0,"models":[]}
+    identifier = scorer.snapshot_thesis(native_pg_engine, thesis)
+    assert identifier is not None
+    record = tracker.get_thesis_history(native_pg_engine)[0]
+    assert record.conviction == 0.75 and record.conviction_unit == "fraction"
+    response = _history_http(native_pg_engine, monkeypatch)["snapshots"][0]
+    assert response["conviction"] == 0.75 and response["conviction_unit"] == "fraction"
+    assert _directional_signal(native_pg_engine).confidence == 0.75
+
+
+@pytest.mark.parametrize("payload", [
+    {"conviction":101}, {"conviction":None}, {"conviction":float("nan")},
+    {"conviction":1,"conviction_unit":"fraction"}, {"conviction":1,"conviction_unit":None},
+])
+def test_scorer_writer_invalid_unknown_before_effects(native_modules, native_pg_engine, payload):
+    statements = []
+    def observed(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+    event.listen(native_pg_engine, "before_cursor_execute", observed)
+    try:
+        assert native_modules[1].snapshot_thesis(native_pg_engine, payload) is None
+        assert statements == []
+    finally:
+        event.remove(native_pg_engine, "before_cursor_execute", observed)
 
 
 @pytest.mark.parametrize("directions,expected_counts,expected_score", [

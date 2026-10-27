@@ -90,8 +90,7 @@ class ThesisSnapshot:
     outcome: str | None = None      # correct / wrong / partial
     actual_market_move: float | None = None  # SPY % change over scoring period
     scored_at: str | None = None
-    # Old rows have no per-row unit receipt. Never infer fraction/percent from
-    # magnitude, including 1.0; new write normalization does not repair history.
+    # Only explicit stored receipts establish units; old rows stay unknown.
     conviction_unit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -136,6 +135,8 @@ def _ensure_tables(engine: Engine) -> None:
                 scored_at TIMESTAMPTZ
             )
         """))
+        # Additive, nullable receipt with no default or historical backfill.
+        conn.execute(text("ALTER TABLE thesis_snapshots ADD COLUMN IF NOT EXISTS conviction_unit TEXT"))
         conn.execute(text("""
             CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_ts
                 ON thesis_snapshots (timestamp DESC)
@@ -228,14 +229,15 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
     with engine.begin() as conn:
         row = conn.execute(text("""
             INSERT INTO thesis_snapshots
-                (overall_direction, conviction, key_drivers, risk_factors,
+                (overall_direction, conviction, conviction_unit, key_drivers, risk_factors,
                  model_states, narrative)
             VALUES
-                (:direction, :conviction, :drivers, :risks, :states, :narrative)
+                (:direction, :conviction, :conviction_unit, :drivers, :risks, :states, :narrative)
             RETURNING id
         """), {
             "direction": direction,
             "conviction": conviction,
+            "conviction_unit": "fraction" if conviction is not None else None,
             "drivers": json.dumps(key_drivers),
             "risks": json.dumps(risk_factors),
             "states": json.dumps(model_states, default=str),
@@ -519,7 +521,7 @@ def get_thesis_history(engine: Engine, days: int = 90) -> list[ThesisSnapshot]:
         rows = conn.execute(text("""
             SELECT id, timestamp, overall_direction, conviction,
                    key_drivers, risk_factors, model_states, narrative,
-                   outcome, actual_market_move, scored_at
+                   outcome, actual_market_move, scored_at, conviction_unit
             FROM thesis_snapshots
             WHERE timestamp >= :cutoff
             ORDER BY timestamp DESC
@@ -539,6 +541,7 @@ def get_thesis_history(engine: Engine, days: int = 90) -> list[ThesisSnapshot]:
             outcome=r[8],
             actual_market_move=float(r[9]) if r[9] is not None else None,
             scored_at=r[10].isoformat() if r[10] else None,
+            conviction_unit=(r[11] if len(r) > 11 and r[11] in ("fraction", "percent") else None),
         ))
 
     return snapshots
