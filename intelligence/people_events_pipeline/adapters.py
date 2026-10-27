@@ -26,13 +26,18 @@ Overwritable sources
 ---------------------
 Several ``signal_sources`` writers upsert with ``ON CONFLICT ... DO UPDATE SET
 signal_value = EXCLUDED.signal_value`` under a key that does not identify one
-act (QuiverQuant uses a constant ``source_id`` per endpoint, so the key is
+act (QuiverQuant used a constant ``source_id`` per endpoint, so the key was
 effectively ``(ticker, signal_date, signal_type)``). Two acts that share that
 key overwrite each other, and the row's ``created_at`` then belongs to the
 *first* payload, not the one now stored. For those sources ``created_at`` is
 not a valid known_at bound; ``SourceSpec.overwritable`` makes the adapter use
 the payload's own disclosure timestamp, else the materializer's own
 observation time (``observed_at``), never ``created_at``.
+
+The QuiverQuant writer now keys insider / house / senate / lobbying rows by act
+(``qq_<endpoint>:<identity>``), but rows written before that keep the constant
+id and the adapter cannot tell the two apart from ``source_id`` alone, so these
+sources stay ``overwritable`` (the conservative reading).
 """
 
 from __future__ import annotations
@@ -664,9 +669,12 @@ def gov_contract_from_usaspending(frame: pd.DataFrame, spec: SourceSpec, observe
     return _finish(rows), skips
 
 
-# The quarter-end date GD-FIX's writer (quiverquant._gov_contract_period_date)
-# stores as signal_date. It reads (Year, Qtr) as a CALENDAR quarter; used here
-# only to recognise rows written under that post-fix key.
+# The quarter-end dates the QuiverQuant writer has stored as signal_date, used
+# only to recognise rows written under a post-fix key (never as the act date).
+# #694 (GD-FIX) read (Year, Qtr) as a CALENDAR quarter and stored this date; the
+# writer now stores the federal FISCAL quarter end (``federal_fiscal_quarter``).
+# Rows written between the two are dated at the calendar end until
+# ``scripts/qq_gov_contracts_redate.py`` moves them, so both are post-fix.
 _WRITER_QUARTER_END = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
 
 
@@ -694,7 +702,12 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
     day; those rows were only rewritten within that same day, so each is a
     valid "seen by the end of created_at's day" observation. Rows dated the
     quarter end (the post-fix key) are rewritten in place across days, so
-    they only support the materializer's own observation time. The merge
+    they only support the materializer's own observation time. Two dates mark
+    a post-fix row: the federal fiscal quarter end (the writer since the
+    fiscal-quarter fix) and the calendar quarter end (the writer from #694
+    until then). A pre-fix snapshot dated a pull day that happens to equal
+    one of those is treated as post-fix, which only ever picks the later
+    (observed_at) bound. The merge
     step then takes the earliest bound across all rows with the same
     (ticker, quarter, amount).
     """
@@ -709,7 +722,7 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
             if qtr not in (1, 2, 3, 4):
                 raise ValueError(qtr)
             start, end = federal_fiscal_quarter(year, qtr)
-            writer_end = date(year, *_WRITER_QUARTER_END[qtr])
+            writer_ends = {date(year, *_WRITER_QUARTER_END[qtr]), end}
         except (TypeError, ValueError, KeyError):
             skips[f"{spec.source_type}:missing_year_or_quarter"] += 1
             continue
@@ -720,7 +733,7 @@ def gov_contract_qq_aggregate(frame: pd.DataFrame, spec: SourceSpec, observed_at
         stored = R.parse_date(rec.get("signal_date"))
         created = R.to_utc(rec.get("created_at"))
         snapshot_bound = None
-        if stored is not None and stored != writer_end and created is not None:
+        if stored is not None and stored not in writer_ends and created is not None:
             snapshot_bound = R.next_session_open_after(created.date())  # pre-fix daily snapshot
         bound = _min_bound([(snapshot_bound, "first_seen"), _observed(spec, observed_at)])
         if bound is None:

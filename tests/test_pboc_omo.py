@@ -336,41 +336,40 @@ class TestSentinelHandling:
 
 
 # ---------------------------------------------------------------------------
-# Fallback path — macro_china_cb_operation missing, repo_rate_hist used
+# Removed fallbacks — the akshare proxies must NOT be written as OMO/MLF data
 # ---------------------------------------------------------------------------
 
 
-class TestFallbackRepoRate:
-    def test_uses_repo_rate_hist_when_cb_operation_missing(
+class TestNoMislabeledFallback:
+    def test_repo_rate_hist_and_lpr_are_not_used(
         self, engine_row_missing: MagicMock
     ) -> None:
-        """When ``macro_china_cb_operation`` does not exist on the akshare
-        module, the puller must fall back to ``repo_rate_hist``."""
+        """When the preferred akshare functions are missing (as they are in
+        akshare 1.18.52), the puller must NOT fall back to ``repo_rate_hist``
+        (FR007) or ``macro_china_lpr`` (LPR): those were previously stored
+        under ``pboc:omo_*`` / ``pboc:mlf_*`` names with fabricated 0 flows.
+        """
         fr_df = pd.DataFrame(
             [
                 {"date": "2026-04-07", "FR007": 1.85},
                 {"date": "2026-04-08", "FR007": 1.87},
             ]
         )
+        lpr_df = pd.DataFrame([{"TRADE_DATE": "2026-04-20", "LPR1Y": 3.0}])
 
         class FakeAkshare:
-            """Only exposes repo_rate_hist / macro_china_lpr."""
+            """Only exposes the old proxy functions."""
 
             repo_rate_hist = staticmethod(lambda: fr_df)
-            macro_china_lpr = staticmethod(lambda: pd.DataFrame())
+            macro_china_lpr = staticmethod(lambda: lpr_df)
 
-        fake_ak = FakeAkshare()
-
-        with patch.dict(sys.modules, {"akshare": fake_ak}):
+        with patch.dict(sys.modules, {"akshare": FakeAkshare()}):
             puller = PBOCOmoPuller(engine_row_missing)
-            puller.pull()
+            summary = puller.pull()
+            saved = puller.save_to_db()
 
-        assert len(puller._omo_snapshots) == 2
-        # injection / withdrawal default to 0 when the fallback schema only
-        # carries a rate column
-        assert all(s.injection_cny_bn == 0.0 for s in puller._omo_snapshots)
-        assert puller._omo_snapshots[0].reverse_repo_7d_rate == 1.85
-        assert puller._omo_snapshots[1].reverse_repo_7d_rate == 1.87
+        assert summary == {"omo_rows": 0, "mlf_rows": 0}
+        assert saved == {"fetched": 0, "inserted": 0}
 
 
 # ---------------------------------------------------------------------------

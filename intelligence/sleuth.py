@@ -44,6 +44,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence.lever_pullers import _IDENTITY_SQL
+
 # Best-effort Langfuse tracing — no-op when SDK absent / keys missing.
 try:
     from langfuse import (
@@ -759,19 +761,21 @@ class Sleuth:
         try:
             with self.engine.connect() as conn:
                 # Find tickers with activity from multiple source types
-                rows = conn.execute(text("""
+                # An actor is the person behind a row (QuiverQuant act ids are
+                # per act, not per person), as lever_pullers resolves it.
+                rows = conn.execute(text(f"""
                     SELECT ticker,
                            COUNT(DISTINCT source_type) AS type_count,
-                           COUNT(DISTINCT source_id) AS actor_count,
+                           COUNT(DISTINCT {_IDENTITY_SQL}) AS actor_count,
                            ARRAY_AGG(DISTINCT source_type) AS types,
-                           ARRAY_AGG(DISTINCT source_id) AS actors
+                           ARRAY_AGG(DISTINCT {_IDENTITY_SQL}) AS actors
                     FROM signal_sources
                     WHERE signal_date >= :cutoff
                       AND ticker IS NOT NULL
                     GROUP BY ticker
                     HAVING COUNT(DISTINCT source_type) >= 2
-                       AND COUNT(DISTINCT source_id) >= 2
-                    ORDER BY COUNT(DISTINCT source_id) DESC
+                       AND COUNT(DISTINCT {_IDENTITY_SQL}) >= 2
+                    ORDER BY COUNT(DISTINCT {_IDENTITY_SQL}) DESC
                     LIMIT 15
                 """), {"cutoff": cutoff}).fetchall()
         except Exception as exc:
@@ -1149,7 +1153,7 @@ class Sleuth:
         new_leads = self.generate_leads()
 
         # 2. Investigate high-priority leads immediately
-        high_priority = [l for l in new_leads if l.priority >= HIGH_PRIORITY_THRESHOLD]
+        high_priority = [lead for lead in new_leads if lead.priority >= HIGH_PRIORITY_THRESHOLD]
         investigated: list[Lead] = []
         for lead in high_priority[:5]:  # cap to avoid runaway LLM calls
             try:
@@ -1164,7 +1168,7 @@ class Sleuth:
         # 3. Follow rabbit holes on the top lead
         rabbit_hole_results: list[Lead] = []
         if investigated:
-            top_lead = max(investigated, key=lambda l: l.priority)
+            top_lead = max(investigated, key=lambda lead: lead.priority)
             if top_lead.follow_up_leads:
                 try:
                     for fu_id in top_lead.follow_up_leads[:2]:
@@ -1193,22 +1197,22 @@ class Sleuth:
             "total_resolved": total_resolved,
             "top_findings": [
                 {
-                    "id": l.id,
-                    "question": l.question[:200],
-                    "findings": (l.findings or "")[:300],
-                    "hypotheses": l.hypotheses[:2],
-                    "priority": l.priority,
+                    "id": lead.id,
+                    "question": lead.question[:200],
+                    "findings": (lead.findings or "")[:300],
+                    "hypotheses": lead.hypotheses[:2],
+                    "priority": lead.priority,
                 }
-                for l in investigated
+                for lead in investigated
             ],
             "new_leads_summary": [
                 {
-                    "id": l.id,
-                    "question": l.question[:200],
-                    "category": l.category,
-                    "priority": l.priority,
+                    "id": lead.id,
+                    "question": lead.question[:200],
+                    "category": lead.category,
+                    "priority": lead.priority,
                 }
-                for l in new_leads[:10]
+                for lead in new_leads[:10]
             ],
         }
 
@@ -1269,7 +1273,7 @@ if __name__ == "__main__":
 
     if leads:
         print("\nInvestigating top lead...")
-        top = max(leads, key=lambda l: l.priority)
+        top = max(leads, key=lambda lead: lead.priority)
         result = sleuth.investigate_lead(top)
         print(f"  Findings: {result.findings}")
         for h in result.hypotheses:
