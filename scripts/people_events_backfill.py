@@ -10,7 +10,7 @@ Modes
                      what is already stored; write a plan receipt; no writes.
 ``execute``          apply the plan in throttled batches (``writer.apply_write_plan``,
                      one ``people_events_runs`` row per batch). Refuses to start
-                     or continue inside 03:30-10:30Z. Watches table growth and
+                     or continue inside the operational blackout windows. Watches total table growth and
                      stops if the projected size leaves the declared band.
 ``verify``           read-only checks after execute: counts by year and code
                      equal the plan, ``known_at`` present on 100%, no row known
@@ -25,7 +25,7 @@ historical source, not a full-scope view of the live channel.
 Example (grid-svr, after #780 is deployed, outside 03:30-10:30Z)::
 
     python -m scripts.people_events_backfill plan    --form345 .../nonderiv_transactions.parquet --out-dir ~/research/gd3
-    python -m scripts.people_events_backfill execute --form345 ... --out-dir ~/research/gd3 --batch-rows 20000 --sleep 2
+    python -m scripts.people_events_backfill execute --form345 ... --out-dir ~/research/gd3 --batch-rows 50 --sleep 2 --baseline-bytes <pre-GD3 size> --expect-source-sha256 <plan source hash>
     python -m scripts.people_events_backfill verify  --form345 ... --out-dir ~/research/gd3
 """
 
@@ -51,6 +51,7 @@ from intelligence.people_events_pipeline import merge as M
 from intelligence.people_events_pipeline import plan as P
 from intelligence.people_events_pipeline import readonly as RO
 from intelligence.people_events_pipeline import security as S
+from scripts import people_events_backfill_safety as G
 
 DEFAULT_CODES = ("P", "S", "A")
 # Expected on-disk cost per row (heap + TOAST + indexes), from the design doc
@@ -62,7 +63,14 @@ GROWTH_CHECK_MIN_ROWS = 100_000
 MIN_MINUTES_BEFORE_WINDOW = 60
 VERIFY_STATEMENT_TIMEOUT_MS = 600_000
 
-_SIZE_SQL = "SELECT pg_total_relation_size('people_events') AS bytes"
+_SIZE_SQL = """SELECT pg_total_relation_size('people_events')
+    + pg_total_relation_size('people_event_revisions')
+    + pg_total_relation_size('people_events_runs') AS bytes"""
+_RUN_AUDIT_SQL = """
+    SELECT run_id, mode, materializer_version, inputs, counts, status, started_at, finished_at, error
+    FROM people_events_runs WHERE left(run_id, length(:prefix)) = :prefix
+    ORDER BY length(run_id), run_id
+"""
 _COUNT_BY_YEAR_CODE_SQL = """
     SELECT extract(year FROM known_at AT TIME ZONE 'UTC')::int AS year, transaction_code AS code, count(*) AS n
     FROM people_events
@@ -137,17 +145,59 @@ def minutes_until_window(now: datetime | None = None) -> float:
 
 
 def _write(path: Path, receipt: dict[str, Any]) -> None:
-    path.write_text(json.dumps(D.to_jsonable(receipt), indent=2, sort_keys=True, default=str))
+    G.atomic_json(path, D.to_jsonable(receipt))
 
 
 def _rw_engine(url: str) -> Engine:
-    options = "-c statement_timeout=120000 -c lock_timeout=5000 -c application_name=people_events_backfill"
+    options = (f"-c statement_timeout={G.STATEMENT_TIMEOUT_MS} -c lock_timeout={G.LOCK_TIMEOUT_MS} "
+               "-c application_name=people_events_backfill")
     return create_engine(url, connect_args={"options": options}, pool_size=2, max_overflow=0, pool_pre_ping=True)
 
 
 def _scalar(engine: Engine, sql: str) -> Any:
     with engine.connect() as conn:
         return conn.execute(text(RO.guard_sql(sql))).scalar()
+
+
+def _run_audit(engine: Engine, prefix: str, source_hash: str) -> dict:
+    """One streamed full audit at startup/resume; never scan run history per batch.
+
+    Validate JSON types before using counters: SQL casts accept string integers
+    and can fail unpredictably on malformed state. Invalid runs remain evidence
+    and make validate_resume refuse continuation without reconciliation.
+    """
+    audit = dict(batches=0, successful=0, inserted=0, written=0, invalid=0)
+    digest = hashlib.sha256()
+    required_counts = {"insert", "written", *G.ZERO_COUNT_KEYS}
+    with engine.connect().execution_options(stream_results=True) as conn:
+        for row in conn.execute(text(_RUN_AUDIT_SQL), {"prefix": prefix}).mappings():
+            batch = audit["batches"]
+            inputs, counts = row["inputs"], row["counts"]
+            valid_inputs = (isinstance(inputs, dict) and set(inputs) == {"batch", "form345_sha256"}
+                            and type(inputs["batch"]) is int and inputs["batch"] == batch
+                            and inputs["form345_sha256"] == source_hash)
+            valid_counts = (isinstance(counts, dict) and set(counts) == required_counts
+                            and all(type(value) is int for value in counts.values())
+                            and 1 <= counts["insert"] <= G.MAX_TRANSACTION_ROWS
+                            and counts["written"] == counts["insert"]
+                            and all(counts[key] == 0 for key in G.ZERO_COUNT_KEYS))
+            completed = (isinstance(row["started_at"], datetime) and isinstance(row["finished_at"], datetime)
+                         and row["finished_at"] >= row["started_at"] and row["error"] is None)
+            valid = (row["run_id"] == f"{prefix}-b{batch:05d}" and valid_inputs and valid_counts
+                     and row["mode"] == "backfill" and row["materializer_version"] == PIPELINE_VERSION
+                     and row["status"] == "SUCCESS" and completed)
+            audit["batches"] += 1
+            audit["successful"] += row["status"] == "SUCCESS"
+            for key, total in (("insert", "inserted"), ("written", "written")):
+                if isinstance(counts, dict) and type(counts.get(key)) is int:
+                    audit[total] += counts[key]
+            if not valid:
+                audit["invalid"] += 1
+                continue
+            if batch:
+                digest.update(b"\n")
+            digest.update(G.batch_audit_record(row["run_id"], inputs["batch"], counts))
+    return {**audit, "progress_digest": digest.hexdigest()}
 
 
 def _load(args: argparse.Namespace, url: str) -> tuple[pd.DataFrame, dict, pd.DataFrame]:
@@ -170,11 +220,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--codes", default=",".join(DEFAULT_CODES))
     ap.add_argument("--out-dir", type=Path, required=True)
     ap.add_argument("--db-url-env", help="env var holding the database URL (default: config.settings.DB_URL)")
-    ap.add_argument("--batch-rows", type=int, default=20_000)
-    ap.add_argument("--sleep", type=float, default=2.0, help="seconds between batches")
+    ap.add_argument("--batch-rows", type=int, default=50, help="rows per transaction; hard maximum 50")
+    ap.add_argument("--sleep", type=float, default=2.0, help="seconds between logical 20,000-row groups")
     ap.add_argument("--max-gb", type=float, default=8.0, help="stop if projected table growth exceeds this")
     ap.add_argument("--max-batches", type=int, help="stop after this many batches (staged runs)")
+    ap.add_argument("--baseline-bytes", type=int, help="sum of all three table sizes at the pre-GD3 backup; required on first execute")
+    ap.add_argument("--expect-source-sha256", help="approved full-history plan input hash; required on first execute")
     args = ap.parse_args(argv)
+    if (args.batch_rows < 1 or args.sleep < 0 or not 0 < args.max_gb <= 8
+            or (args.max_batches is not None and args.max_batches < 1)):
+        ap.error("positive batch/batch-limit, nonnegative sleep and 0 < --max-gb <= 8 required")
+    args.batch_rows = min(args.batch_rows, G.MAX_TRANSACTION_ROWS)
+    codes = [code.strip().upper() for code in args.codes.split(",")]
+    if sorted(codes) != sorted(DEFAULT_CODES):
+        ap.error("GD3 scope is exactly P,S,A")
+    args.codes = ",".join(sorted(codes))
 
     import os
 
@@ -194,13 +254,18 @@ def main(argv: list[str] | None = None) -> int:
             # later full load would split, i.e. duplicate acts. Full scope only.
             print("refusing --quarters in execute: the backfill must load the full history", file=sys.stderr)
             return 2
-        left = minutes_until_window()
-        if left < MIN_MINUTES_BEFORE_WINDOW:
-            print(f"refusing to start: {left:.0f} min before the 03:30Z window (< {MIN_MINUTES_BEFORE_WINDOW})",
+        if not (args.out_dir / G.MANIFEST_NAME).exists() and not args.expect_source_sha256:
+            print("refusing first execute: --expect-source-sha256 from the reviewed plan is required", file=sys.stderr)
+            return 2
+        if not G.write_window_open():
+            print("refusing to start: GD3 write blackout or within 60 minutes of nightly backup",
                   file=sys.stderr)
             return 2
 
     t0 = time.perf_counter()
+    source_hash = sha256_file(args.form345)
+    if args.expect_source_sha256 and source_hash != args.expect_source_sha256:
+        raise RuntimeError("Form345 source does not match the reviewed plan hash")
     try:
         events, stats, stored = _load(args, url)
     except RO.WindowClosed as exc:
@@ -209,18 +274,23 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"status": "STOPPED_WINDOW"}))
         return 4
     observed_at = datetime.now(timezone.utc)  # after every read
+    if sha256_file(args.form345) != source_hash:
+        raise RuntimeError("Form345 source changed while loading; refusing plan/execute/verify")
     stats["pit"] = M.pit_violations(events, pd.Timestamp(observed_at))
     plan = P.build_write_plan(events, stored, pd.Timestamp(observed_at))
     counts = P.plan_counts(plan).get("form4", {})
     receipt: dict[str, Any] = {
         "mode": args.mode, "pipeline_version": PIPELINE_VERSION, "observed_at": observed_at.isoformat(),
-        "form345": str(args.form345), "form345_sha256": sha256_file(args.form345),
+        "form345": str(args.form345), "form345_sha256": source_hash,
         "quarters": args.quarters, "codes": args.codes, "stats": stats, "plan": counts,
         "stored_rows_before": int(len(stored)), "load_s": round(time.perf_counter() - t0, 1),
     }
 
     if args.mode == "plan":
         receipt["expected_counts"] = expected_counts(events)
+        receipt["size_estimate_gb"] = {"design_800_bytes_per_event": round(len(events) * 800 / 1e9, 3),
+                                       "design_1000_bytes_per_event": round(len(events) * 1000 / 1e9, 3),
+                                       "guard_2000_bytes_per_event": round(len(events) * 2000 / 1e9, 3)}
         out = args.out_dir / f"plan_{stamp}.json"
         out.write_text(json.dumps(D.to_jsonable(receipt), indent=2, sort_keys=True, default=str))
         print(json.dumps({"out": str(out), "plan": counts, "pit": stats["pit"]}, default=str))
@@ -259,46 +329,81 @@ def main(argv: list[str] | None = None) -> int:
             or stats["pit"]["known_after_observation"]):
         print("refusing to execute: PIT invariants violated in the plan", file=sys.stderr)
         return 3
+    if not set(plan["op"]) <= {"insert", "unchanged"}:
+        print("refusing execute: GD3 accepts insert/unchanged plans only (revision writes exceed row budget)",
+              file=sys.stderr)
+        return 3
+    if not G.write_window_open():
+        print("refusing execute after loading: GD3 write window closed", file=sys.stderr)
+        return 4
     todo = plan[plan["op"] != "unchanged"].reset_index(drop=True)
     rows_planned = int((todo["op"] == "insert").sum())
     engine = _rw_engine(url)
-    bytes_before = int(_scalar(engine, _SIZE_SQL))
-    receipt.update({"bytes_before": bytes_before, "rows_planned": rows_planned, "batches": []})
+    receipt.update({"rows_planned": rows_planned, "batch_rows": args.batch_rows,
+                    "throttle_rows": G.THROTTLE_ROWS, "progress_path": str(args.out_dir / G.PROGRESS_NAME)})
     log_path = args.out_dir / f"execute_{stamp}.json"
     position = {k: i for i, k in enumerate(zip(events["channel"], events["dedup_key"]))}
     written = 0
     status = "DONE"
     run_id = None
-    # Each batch's apply_write_plan takes and releases the writer's advisory
-    # lock, so another writer could interleave between batches; the unique
-    # index and the one-row UPDATE checks make that fail (FAILED receipt),
-    # never duplicate. Run nothing else against people_events meanwhile.
+    batches_before = global_before = 0
+    baseline_bytes = None
+    # One immutable baseline for every staged execution, one durable append
+    # per committed batch, and one constant-size final receipt per invocation.
     try:
-        for n, start in enumerate(range(0, len(todo), args.batch_rows)):
-            if args.max_batches is not None and n >= args.max_batches:
-                status = "STOPPED_MAX_BATCHES"
-                break
-            try:
-                RO.assert_db_window_open()
-            except RO.WindowClosed:
-                status = "STOPPED_WINDOW"
-                break
-            batch = todo.iloc[start:start + args.batch_rows]
-            rows = sorted({position[k] for k in zip(batch["channel"], batch["dedup_key"]) if k in position})
-            ev_batch = events.iloc[rows]
-            run_id = f"gd3-{stamp}-b{n:05d}"
-            res = apply_write_plan(engine, ev_batch, batch, run_id=run_id, mode="backfill",
-                                   observed_at=observed_at,
-                                   inputs={"form345_sha256": receipt["form345_sha256"], "batch": n})
-            written += int(res["counts"]["insert"])
+        with G.execution_lock(args.out_dir):
             bytes_now = int(_scalar(engine, _SIZE_SQL))
-            ok, info = growth_check(bytes_before, bytes_now, written, rows_planned, args.max_gb)
-            receipt["batches"].append({"run_id": run_id, "status": res["status"], **info})
-            log_path.write_text(json.dumps(D.to_jsonable(receipt), indent=2, sort_keys=True, default=str))
-            if not ok:
-                status = "STOPPED_GROWTH"
-                break
-            time.sleep(args.sleep)
+            if not (args.out_dir / G.MANIFEST_NAME).exists() and len(stored):
+                raise RuntimeError("first GD3 execute requires an empty form4 scope")
+            manifest, resumed = G.load_manifest(args.out_dir, G.scope_identity(receipt, expected_counts(events)),
+                baseline_bytes=args.baseline_bytes, current_bytes=bytes_now, max_gb=args.max_gb, stamp=stamp)
+            baseline_bytes = manifest["baseline_bytes"]
+            batches_before, global_before, progress_digest = G.read_progress(
+                args.out_dir / G.PROGRESS_NAME, manifest["run_prefix"])
+            audit = _run_audit(engine, manifest["run_prefix"], source_hash)
+            G.validate_resume(batches=batches_before, rows=global_before, database=audit,
+                stored_rows=len(stored), plan_counts=counts, total_rows=len(events), progress_digest=progress_digest)
+            receipt.update({"baseline_bytes": baseline_bytes, "bytes_before": bytes_now,
+                            "resumed": resumed, "batches_before": batches_before})
+            throttle_rows = 0
+            for n, start in enumerate(range(0, len(todo), args.batch_rows)):
+                if args.max_batches is not None and n >= args.max_batches:
+                    status = "STOPPED_MAX_BATCHES"
+                    break
+                if not G.write_window_open():
+                    status = "STOPPED_WINDOW"
+                    break
+                bytes_now = int(_scalar(engine, _SIZE_SQL))
+                ok, info = growth_check(baseline_bytes, bytes_now, global_before + written, len(events), args.max_gb)
+                if not ok or bytes_now - baseline_bytes >= int(args.max_gb * 1e9) - G.GROWTH_RESERVE_BYTES:
+                    status = "STOPPED_GROWTH"
+                    break
+                batch = todo.iloc[start:start + args.batch_rows]
+                rows = sorted({position[k] for k in zip(batch["channel"], batch["dedup_key"]) if k in position})
+                ev_batch = events.iloc[rows]
+                run_id = f"{manifest['run_prefix']}-b{batches_before + n:05d}"
+                res = apply_write_plan(engine, ev_batch, batch, run_id=run_id, mode="backfill",
+                    observed_at=observed_at, inputs={"form345_sha256": source_hash, "batch": batches_before + n},
+                    before_transaction=G.require_write_entry_window, before_commit=G.require_write_window)
+                if res["status"] != "SUCCESS" or int(res["counts"]["insert"]) != len(batch):
+                    raise RuntimeError("GD3 writer did not commit the complete insert-only batch")
+                written += int(res["counts"]["insert"])
+                bytes_now = int(_scalar(engine, _SIZE_SQL))
+                ok, info = growth_check(baseline_bytes, bytes_now, global_before + written, len(events), args.max_gb)
+                G.append_progress(args.out_dir / G.PROGRESS_NAME, {"run_id": run_id,
+                    "status": res["status"], "batch_rows": len(batch), **info})
+                receipt["growth"] = info
+                if not ok or bytes_now - baseline_bytes >= int(args.max_gb * 1e9) - G.GROWTH_RESERVE_BYTES:
+                    status = "STOPPED_GROWTH"
+                    break
+                throttle_rows += len(batch)
+                if throttle_rows >= G.THROTTLE_ROWS:
+                    time.sleep(args.sleep)
+                    throttle_rows = 0
+    except G.WriteWindowClosed as exc:
+        status = "STOPPED_WINDOW"
+        receipt["error"] = str(exc)
+        receipt["failed_run_id"] = run_id
     except BaseException as exc:  # noqa: BLE001 -- recorded, then re-raised
         status = "FAILED"
         receipt["error"] = repr(exc)[:2000]
@@ -307,6 +412,7 @@ def main(argv: list[str] | None = None) -> int:
     finally:
         receipt["status"] = status
         receipt["rows_written"] = written
+        receipt["global_rows_written"] = global_before + written
         try:
             receipt["bytes_after"] = int(_scalar(engine, _SIZE_SQL))
         except Exception as exc:  # noqa: BLE001 -- never mask the original error
@@ -314,7 +420,7 @@ def main(argv: list[str] | None = None) -> int:
             receipt["bytes_after_error"] = repr(exc)[:500]
         _write(log_path, receipt)
         engine.dispose()
-    growth = None if receipt["bytes_after"] is None else receipt["bytes_after"] - bytes_before
+    growth = None if receipt["bytes_after"] is None or baseline_bytes is None else receipt["bytes_after"] - baseline_bytes
     print(json.dumps({"out": str(log_path), "status": status, "rows_written": written,
                       "bytes_growth": growth}, default=str))
     return 0 if status == "DONE" else 4

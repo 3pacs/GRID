@@ -132,7 +132,7 @@ def _run_puller(monkeypatch, ticker, ordinary_shares, closes):
     )
     monkeypatch.setattr(mod, "_fetch_close_prices", lambda *_a, **_k: closes)
 
-    def _capture(_engine, t, rows):
+    def _capture(_engine, t, rows, **_controls):
         written[t] = rows
         return len(rows)
 
@@ -203,7 +203,7 @@ def test_puller_tm_is_continuous_across_2021_split(monkeypatch):
     )
     monkeypatch.setattr(
         mod, "_write_rows",
-        lambda _e, _t, rows: written.update({r["obs_date"]: r for r in rows}) or len(rows),
+        lambda _e, _t, rows, **_controls: written.update({r["obs_date"]: r for r in rows}) or len(rows),
     )
     mod.SECXBRLSharesPuller(_FakeEngine()).pull_all(tickers=["TM"], backfill_days=4000)
     pre, post = written[date(2021, 9, 30)], written[date(2021, 10, 1)]
@@ -258,3 +258,212 @@ def test_extract_same_tag_without_end_keeps_first():
         _shares_fact(200, "2026-01-02"),
     ]}}}}}
     assert mod._extract_shares_entries(facts) == [(date(2026, 1, 2), 100)]
+
+# Transaction/accounting integration: memory engine, no native database.
+class _AccountingEngine:
+    def __init__(self, *, fail_at=None, commit_error=False, counts=(1, 1, 1)):
+        self.fail_at, self.commit_error, self.counts = fail_at, commit_error, counts
+        self.calls = self.begins = self.commits = self.rollbacks = 0
+        self.persisted = []
+
+    def begin(self):
+        self.begins += 1
+        self.staged = []
+        return self
+
+    def __enter__(self):
+        return self
+
+    def execute(self, _sql, params):
+        from types import SimpleNamespace
+        self.calls += 1
+        if self.calls == self.fail_at:
+            raise RuntimeError("statement failure")
+        self.staged.append(dict(params))
+        return SimpleNamespace(rowcount=self.counts[self.calls - 1])
+
+    def __exit__(self, typ, _value, _trace):
+        if typ is not None:
+            self.rollbacks += 1
+            self.staged.clear()
+        elif self.commit_error:
+            self.rollbacks += 1
+            raise RuntimeError("commit failure")
+        else:
+            self.commits += 1
+            self.persisted.extend(self.staged)
+        return False
+
+
+def _accounting_rows(n=3):
+    return [{"obs_date": date(2026, 9, i + 1), "shares": 10, "close": 2, "mcap": 20}
+            for i in range(n)]
+
+
+def test_accounting_writer_returns_after_commit():
+    engine = _AccountingEngine()
+    assert mod._write_rows(engine, "A", _accounting_rows()) == 3
+    assert engine.commits == 1 and len(engine.persisted) == 3
+
+
+def test_accounting_statement_failure_rolls_back_and_stops():
+    engine = _AccountingEngine(fail_at=2)
+    with pytest.raises(RuntimeError):
+        mod._write_rows(engine, "A", _accounting_rows())
+    assert engine.calls == 2 and engine.rollbacks == 1 and engine.commits == 0
+    assert engine.persisted == []
+
+
+def test_accounting_commit_failure_never_returns_staged_count():
+    engine = _AccountingEngine(commit_error=True)
+    with pytest.raises(RuntimeError):
+        mod._write_rows(engine, "A", _accounting_rows(2))
+    assert engine.calls == 2 and engine.commits == 0 and engine.persisted == []
+
+
+def test_accounting_prior_ticker_commit_survives_later_failure():
+    engine = _AccountingEngine()
+    assert mod._write_rows(engine, "A", _accounting_rows(1)) == 1
+    engine.fail_at = 3
+    with pytest.raises(RuntimeError):
+        mod._write_rows(engine, "B", _accounting_rows(3))
+    assert len(engine.persisted) == 1 and engine.persisted[0]["ticker"] == "A"
+
+
+@pytest.mark.parametrize("count", [None, -1, True, 2])
+def test_accounting_unknown_driver_count_not_statement_length(count):
+    engine = _AccountingEngine(counts=(count,))
+    assert mod._write_rows(engine, "A", _accounting_rows(1)) is None
+    assert engine.commits == 1
+
+
+def test_accounting_zero_affected_rows_are_not_staged_rows():
+    engine = _AccountingEngine(counts=(0, 1))
+    assert mod._write_rows(engine, "A", _accounting_rows(2)) == 1
+
+
+def test_accounting_pit_empty_does_not_open_transaction():
+    engine = _AccountingEngine()
+    assert mod._write_rows(engine, "A", []) == 0
+    assert engine.begins == 0
+
+
+def test_accounting_cancel_during_rows_rolls_back():
+    engine = _AccountingEngine()
+    decisions = iter((True, False))
+    with pytest.raises(mod._MaterializationDeferred):
+        mod._write_rows(engine, "A", _accounting_rows(), should_continue=lambda: next(decisions))
+    assert engine.calls == 1 and engine.rollbacks == 1 and engine.commits == 0
+
+
+def test_accounting_cancel_before_commit_rolls_back():
+    engine = _AccountingEngine()
+    decisions = iter((True, True, False))
+    with pytest.raises(mod._MaterializationDeferred):
+        mod._write_rows(engine, "A", _accounting_rows(2), should_continue=lambda: next(decisions))
+    assert engine.calls == 2 and engine.rollbacks == 1 and engine.commits == 0
+
+
+def test_accounting_exact_deadline_prevents_first_statement(monkeypatch):
+    monkeypatch.setattr(mod.time, "monotonic", lambda: 100)
+    engine = _AccountingEngine()
+    with pytest.raises(mod._MaterializationDeferred):
+        mod._write_rows(engine, "A", _accounting_rows(), deadline_at=100)
+    assert engine.calls == 0 and engine.commits == 0
+
+
+def _setup_accounting_puller(monkeypatch):
+    monkeypatch.setattr(mod.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(mod, "_fetch_ticker_to_cik_map", lambda: {"A": "1", "B": "2"})
+    monkeypatch.setattr(mod, "_fetch_company_facts", lambda _: {})
+    monkeypatch.setattr(mod, "_extract_shares_entries", lambda _: [(date(2026, 1, 1), 10)])
+    monkeypatch.setattr(mod, "_fetch_close_prices", lambda *_: [(date(2026, 9, 1), 2)])
+    monkeypatch.setattr(mod, "_write_rows", lambda *_args, **_kw: 1)
+    return mod.SECXBRLSharesPuller(_FakeEngine())
+
+
+def test_accounting_positive_prefix_limit_is_partial(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    out = _setup_accounting_puller(monkeypatch).pull_all(tickers=["A", "B"], limit=1)
+    assert out[-1]["unattempted"] == 1
+    assert _classify_outcome(out)[:2] == ("PARTIAL", 1)
+
+
+def test_accounting_pit_empty_is_clean_not_failure(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    monkeypatch.setattr(mod, "_shares_for_date", lambda *_: None)
+    monkeypatch.setattr(mod, "_write_rows", lambda *_args, **_kw: 0)
+    out = puller.pull_all(tickers=["A"])
+    assert out[0]["reason"] == "pit_empty"
+    assert _classify_outcome(out)[:2] == ("NO_NEW_DATA", 0)
+
+
+def test_accounting_close_error_not_clean_empty(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    def failure(*_):
+        raise RuntimeError("lookup failed")
+    monkeypatch.setattr(mod, "_fetch_close_prices", failure)
+    out = puller.pull_all(tickers=["A"])
+    assert out[0]["status"] == "FAILED" and out[0]["rows"] == 0
+    assert _classify_outcome(out)[:2] == ("FAILED", 0)
+
+
+def test_accounting_write_error_keeps_prior_subtotal_unknown_total(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome, _extract_rows
+    puller = _setup_accounting_puller(monkeypatch)
+    def write(_engine, ticker, _rows, **_kw):
+        if ticker == "B":
+            raise RuntimeError("commit acknowledgement lost")
+        return 1
+    monkeypatch.setattr(mod, "_write_rows", write)
+    out = puller.pull_all(tickers=["A", "B"])
+    assert out[-1]["known_committed_rows"] == 1 and out[-1]["rows_written"] is None
+    assert _classify_outcome(out)[:2] == ("PARTIAL", None)
+    assert _extract_rows(out) is None
+
+
+def test_accounting_prestart_cancel_has_no_fetch(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    def forbidden():
+        raise AssertionError("no fetch after cancellation")
+    monkeypatch.setattr(mod, "_fetch_ticker_to_cik_map", forbidden)
+    out = puller.pull_all(tickers=["A", "B"], should_continue=lambda: False)
+    assert out[-1]["attempted"] == 0 and out[-1]["unattempted"] == 2
+    assert _classify_outcome(out)[:2] == ("PARTIAL", 0)
+
+
+def test_accounting_deadline_expiry_after_fact_stops_no_writer(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    now = [100]
+    monkeypatch.setattr(mod.time, "monotonic", lambda: now[0])
+    def facts(_):
+        now[0] = 101
+        return {}
+    monkeypatch.setattr(mod, "_fetch_company_facts", facts)
+    def forbidden(*_args, **_kw):
+        raise AssertionError("writer after deadline")
+    monkeypatch.setattr(mod, "_write_rows", forbidden)
+    out = puller.pull_all(tickers=["A", "B"], deadline_at=101)
+    assert _classify_outcome(out)[:2] == ("PARTIAL", 0)
+    assert out[-1]["unknown"] == 1 and out[-1]["unattempted"] == 1
+
+
+def test_accounting_missing_cik_or_facts_are_not_clean_empty(monkeypatch):
+    from ingestion.smart_scheduler import _classify_outcome
+    puller = _setup_accounting_puller(monkeypatch)
+    monkeypatch.setattr(mod, "_fetch_company_facts", lambda _: None)
+    assert _classify_outcome(puller.pull_all(tickers=["A"]))[:2] == ("FAILED", 0)
+    assert _classify_outcome(puller.pull_all(tickers=["UNKNOWN"]))[:2] == ("FAILED", 0)
+
+
+def test_accounting_close_query_failure_propagates():
+    class Engine:
+        def connect(self):
+            raise RuntimeError("database unavailable")
+    with pytest.raises(RuntimeError):
+        mod._fetch_close_prices(Engine(), "A", date(2026, 1, 1), date(2026, 2, 1))

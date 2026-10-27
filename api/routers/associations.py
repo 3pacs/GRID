@@ -6,6 +6,7 @@ lag analysis, cluster assignments, regime fingerprints, and anomalies.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import date, timedelta
 from typing import Any
 
@@ -234,11 +235,26 @@ async def get_correlation_matrix(
     - **expected**: Same family, different semantic group
     - **trivial**: Same semantic group or one derived from the other (hidden by default)
 
+    The whole build (DB connection, PIT feature matrix, correlation) is
+    synchronous and takes tens of seconds on the full feature set, so it runs
+    in a worker thread: done inline it held the single uvicorn event loop (and
+    a DB connection, "acquired_by=MainThread") for the duration and stalled
+    every other route.
+
     Parameters:
         days: Lookback period in calendar days.
         min_corr: Minimum |correlation| for strong_pairs.
         show_trivial: Include trivial/duplicate pairs in the response.
     """
+    return await asyncio.to_thread(
+        _compute_correlation_matrix, days, min_corr, show_trivial,
+    )
+
+
+def _compute_correlation_matrix(
+    days: int, min_corr: float, show_trivial: bool,
+) -> dict[str, Any]:
+    """Blocking body of ``get_correlation_matrix`` (runs in a worker thread)."""
     engine = get_db_engine()
     pit_store = get_pit_store()
 
@@ -603,7 +619,16 @@ async def get_anomalies(
 
     Flags features with current z-score > threshold or breaking
     historical correlation with partner features.
+
+    Like the correlation matrix, the build is synchronous DB/PIT work (plus a
+    possible alert e-mail), so it runs in a worker thread rather than on the
+    event loop.
     """
+    return await asyncio.to_thread(_compute_anomalies, sigma_threshold, days)
+
+
+def _compute_anomalies(sigma_threshold: float, days: int) -> dict[str, Any]:
+    """Blocking body of ``get_anomalies`` (runs in a worker thread)."""
     engine = get_db_engine()
     pit_store = get_pit_store()
 

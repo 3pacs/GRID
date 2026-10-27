@@ -699,7 +699,7 @@ if __name__ == "__main__":
         host=os.environ.get("PG_HOST", "100.75.185.36"),
         port=int(os.environ.get("PG_PORT", "5432")),
         user=os.environ.get("PG_USER", "grid"),
-        password=os.environ.get("PG_PASSWORD", "gridmaster2026"),
+        password=os.environ.get("PG_PASSWORD") or os.environ["GRID_DB_PASSWORD"],
         dbname=os.environ.get("PG_DB", "griddb"),
     )
     cur = conn.cursor()

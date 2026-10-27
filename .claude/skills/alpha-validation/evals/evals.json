@@ -1,0 +1,43 @@
+{
+  "skill_name": "alpha-validation",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Validate this: 'BTC bearish because weekend low volume. Probability 0.62. Invalidated if sentiment turns.'",
+      "expected_output": "FAIL: condition only, no lever; missing thesis magnitude and timeframe; vague invalidation.",
+      "files": [],
+      "expectations": [
+        "Returns an explicit FAIL verdict",
+        "Says the prediction uses a condition (weekend low volume) with no lever: no named actor, action or liquidity valve",
+        "Flags missing magnitude and timeframe in the thesis",
+        "Flags the invalidation ('sentiment turns') as unobservable",
+        "Flags the missing confidence label from the set confirmed/derived/estimated/rumored/inferred",
+        "Does not recommend logging it to the journal"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Validate: LEVER: Tether minted $500M USDT on 2026-03-29 (valve: crypto liquidity). CONDITION: BTC at support with low volume. THESIS: BTC +2-3% within 6h. INVALIDATION: no new mint confirmed within 24h. CONFIDENCE: estimated. PROBABILITY: 2.5",
+      "expected_output": "FAIL on probability out of [0,1] (and the invalidation overlaps the lever's occurrence); otherwise structure is fine.",
+      "files": [],
+      "expectations": [
+        "Returns FAIL specifically because probability 2.5 is outside [0, 1]",
+        "Identifies lever (Tether, $500M mint, crypto liquidity valve) and condition (low volume at support) as distinct and valid",
+        "States that the prediction would pass if the probability were a valid value such as 0.25",
+        "Optionally notes the invalidation is about the lever's confirmation rather than a mutually exclusive observable market outcome"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Validate and, if it passes, log it: LEVER: Fed raised the discount rate 50bp on 2026-03-30 (credit valve). CONDITION: financial conditions index +1.5 sd. THESIS: XLF -3% to -5% within 72h. INVALIDATION: Fed signals a cut within 24h OR XLF closes above $50. CONFIDENCE: confirmed. PROBABILITY: 0.75",
+      "expected_output": "PASS on structure; then the journal logging path must be checked (validate_prediction module path) and journal immutability respected.",
+      "files": [],
+      "expectations": [
+        "Returns PASS with per-section reasoning (lever, condition, thesis, invalidation, confidence, probability)",
+        "Checks the cited source is within its evaluation window if an alt-data source is cited (none here; Fed release is primary)",
+        "Before logging, verifies the validator referenced in the skill (validation/prediction_validator.py) actually exists in the repo and reports if it does not",
+        "Treats the journal as append-only/immutable and does not edit or delete existing journal entries"
+      ]
+    }
+  ]
+}

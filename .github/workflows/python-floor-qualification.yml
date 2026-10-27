@@ -1,0 +1,172 @@
+# Python floor qualification for requirements.txt floor bumps (#751/#752/#756).
+# Companion files: ci/py_floor/settings_smoke.py, ci/py_floor/constraints-exact-minimum.txt,
+# tests/test_dotenv_dependency_contract.py.
+#
+# Scope: fresh, isolated venvs on Python 3.10.12 and 3.11 for the full
+# `pip install -r requirements.txt` graph. Separate from the existing "GRID Tests"
+# workflow; it does not start Postgres or run the suite.
+name: Python floor qualification
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - requirements.txt
+      - .github/workflows/python-floor-qualification.yml
+      - ci/py_floor/**
+      - tests/test_dotenv_dependency_contract.py
+  workflow_dispatch:
+    inputs:
+      run_exact_minimum:
+        description: "Also run the optional exact-minimum constraints job"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Normal job: latest-allowed resolution of the checked-out requirements.txt.
+  # `ref: head` is the tree under test. `ref: base` re-runs the SAME environment
+  # with main's previous requirements.txt, so a 3.10 failure can be attributed
+  # (or not) to the new floors by old-vs-new comparison. base cells are diagnostic.
+  # ---------------------------------------------------------------------------
+  latest-allowed:
+    name: latest-allowed py${{ matrix.python }} ${{ matrix.ref }}
+    # ubuntu-22.04 ships system Python 3.10.12; setup-python is still pinned below.
+    # Availability of an exact 3.10.12 build in the setup-python manifest: UNKNOWN.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    continue-on-error: ${{ matrix.ref == 'base' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10.12", "3.11"]
+        ref: [head, base]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      GRID_GIT_SINK_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python (no pip cache, fresh resolution)
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Choose requirements file under test
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || 'origin/main' }}
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.ref }}" = "base" ]; then
+            if [ "$BASE_SHA" = "origin/main" ]; then git fetch --no-tags --depth=1 origin main; fi
+            git fetch --no-tags --depth=1 origin "${BASE_SHA#origin/}" || true
+            git show "${BASE_SHA}:requirements.txt" > "$RUNNER_TEMP/requirements.under-test.txt"
+          else
+            cp requirements.txt "$RUNNER_TEMP/requirements.under-test.txt"
+          fi
+          sha256sum "$RUNNER_TEMP/requirements.under-test.txt"
+
+      - name: Record platform
+        run: |
+          {
+            echo "matrix: py=${{ matrix.python }} ref=${{ matrix.ref }}"
+            python -VV; uname -a; cat /etc/os-release | head -3
+            python -c "import platform,sys;print(platform.platform(), platform.machine(), sys.version)"
+          } | tee "$RUNNER_TEMP/platform.txt"
+
+      - name: Create fresh venv and install full requirements
+        run: |
+          set -euo pipefail
+          python -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          pip --version | tee -a "$RUNNER_TEMP/platform.txt"
+          pip install -r "$RUNNER_TEMP/requirements.under-test.txt"
+
+      - name: pip check
+        run: . "$RUNNER_TEMP/venv/bin/activate" && pip check
+
+      - name: Record chosen graph (pip freeze)
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          pip freeze | sort | tee "$RUNNER_TEMP/freeze.txt"
+
+      - name: Import tsfresh / dotenv / boto3
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -c "import tsfresh, dotenv, boto3; print('tsfresh', tsfresh.__version__, 'boto3', boto3.__version__)"
+
+      - name: Real Settings smoke
+        run: |
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python ci/py_floor/settings_smoke.py | tee "$RUNNER_TEMP/settings-smoke.txt"
+
+      # The accepted dotenv/settings contract test is not on main yet. Fail loudly
+      # (rather than silently skip) if the PR under test does not carry it.
+      - name: dotenv/settings contract test (head only)
+        if: matrix.ref == 'head'
+        run: |
+          set -euo pipefail
+          test -f tests/test_dotenv_dependency_contract.py || {
+            echo "tests/test_dotenv_dependency_contract.py missing: land the accepted contract test first"; exit 1; }
+          . "$RUNNER_TEMP/venv/bin/activate"
+          python -m pytest tests/test_dotenv_dependency_contract.py -q -p no:cacheprovider
+
+      - name: Upload graph record
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: py-floor-${{ matrix.python }}-${{ matrix.ref }}
+          path: |
+            ${{ runner.temp }}/platform.txt
+            ${{ runner.temp }}/freeze.txt
+            ${{ runner.temp }}/requirements.under-test.txt
+            ${{ runner.temp }}/settings-smoke.txt
+          if-no-files-found: warn
+
+  # ---------------------------------------------------------------------------
+  # OPTIONAL, manual only: the three bumped floors pinned to their exact minimum.
+  # Clearly separate from the normal job; never part of the default PR checks.
+  # ---------------------------------------------------------------------------
+  exact-minimum:
+    name: exact-minimum (3 floors) py${{ matrix.python }}
+    if: github.event_name == 'workflow_dispatch' && inputs.run_exact_minimum
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10.12", "3.11"]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      GRID_GIT_SINK_DISABLED: "1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install with exact-minimum constraints, check, import, smoke
+        run: |
+          set -euo pipefail
+          python -VV | tee "$RUNNER_TEMP/platform.txt"
+          python -m venv "$RUNNER_TEMP/venv"
+          . "$RUNNER_TEMP/venv/bin/activate"
+          pip install -r requirements.txt -c ci/py_floor/constraints-exact-minimum.txt
+          pip check
+          pip freeze | sort | tee "$RUNNER_TEMP/freeze.txt"
+          python -c "import tsfresh, dotenv, boto3"
+          python ci/py_floor/settings_smoke.py
+      - name: Upload graph record
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: py-floor-exact-min-${{ matrix.python }}
+          path: |
+            ${{ runner.temp }}/platform.txt
+            ${{ runner.temp }}/freeze.txt

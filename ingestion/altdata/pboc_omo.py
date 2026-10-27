@@ -29,14 +29,17 @@ Design notes
 Akshare wraps the PBoC public data portal cleanly. Preferred functions
 (as per task spec) are ``macro_china_cb_operation`` for OMO history and
 ``macro_china_mlf_rate`` for MLF history. The upstream akshare API has
-churned names in the past, so the puller falls back to:
+churned names in the past.
 
-* ``repo_rate_hist`` (FR007 7-day repo rate) → proxy for reverse repo rate
-* ``macro_china_lpr`` (LPR1Y) → proxy for MLF rate
-
-If akshare is not installed, or every attempted call raises, the puller
-logs a warning and returns a zero-row result — it never crashes the
-scheduler process.
+2026-09-29: neither preferred function exists in the akshare release GRID
+runs (1.18.52), and the old proxy fallbacks (``repo_rate_hist`` FR007,
+frozen at 2020-10-29, and ``macro_china_lpr``) were written under OMO/MLF
+series names with fabricated 0 flows. The fallbacks are removed, so this
+puller now writes nothing unless akshare grows the real functions, and the
+intelligence scheduler runs ``pboc_omo_official`` (official pbc.gov.cn
+announcements, its own source_id) instead. The historical ``pboc`` rows
+already stored under this source are mislabeled; quarantining them is an
+owner decision (production data write) and is NOT done here.
 """
 
 from __future__ import annotations
@@ -198,16 +201,12 @@ class PBOCOmoPuller(BasePuller):
             except Exception as exc:
                 log.warning("pboc_omo: macro_china_cb_operation failed: {e}", e=str(exc))
 
-        # Fallback: interbank 7-day repo rate (proxy for PBoC 7-day reverse repo stance)
-        func = getattr(ak, "repo_rate_hist", None)
-        if func is not None:
-            try:
-                df = func()
-                if df is not None and not df.empty:
-                    log.info("pboc_omo: loaded {n} rows from repo_rate_hist (fallback)", n=len(df))
-                    return df
-            except Exception as exc:
-                log.warning("pboc_omo: repo_rate_hist failed: {e}", e=str(exc))
+        # NO fallback. The former ``repo_rate_hist`` fallback (FR007, an
+        # interbank repo fixing whose history ends 2020-10-29) was written
+        # under the OMO series names with injection/withdrawal defaulted to
+        # 0 -- mislabeled data. The official replacement is
+        # ingestion/altdata/pboc_omo_official.py (source
+        # ``pboc_omo_announcements``), which reads pbc.gov.cn directly.
 
         log.warning("pboc_omo: no OMO source available")
         return None
@@ -234,15 +233,9 @@ class PBOCOmoPuller(BasePuller):
             except Exception as exc:
                 log.warning("pboc_omo: macro_china_mlf_rate failed: {e}", e=str(exc))
 
-        func = getattr(ak, "macro_china_lpr", None)
-        if func is not None:
-            try:
-                df = func()
-                if df is not None and not df.empty:
-                    log.info("pboc_omo: loaded {n} rows from macro_china_lpr (fallback)", n=len(df))
-                    return df
-            except Exception as exc:
-                log.warning("pboc_omo: macro_china_lpr failed: {e}", e=str(exc))
+        # NO fallback. The former ``macro_china_lpr`` fallback wrote the Loan
+        # Prime Rate under ``pboc:mlf_rate`` and a fabricated 0 under
+        # ``pboc:mlf_net_cny_bn`` -- mislabeled data, so it was removed.
 
         log.warning("pboc_omo: no MLF source available")
         return None

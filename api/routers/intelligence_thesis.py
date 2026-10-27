@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
 
 from api.auth import require_auth
@@ -503,6 +503,8 @@ async def run_daily_investigation(
 @router.get("/diary")
 async def get_diary(
     date: str | None = Query(None, description="Date in YYYY-MM-DD format"),
+    reference_overlay: bool = Query(False, description="Review original diary alongside fixed historical S&P reference evidence"),
+    reference_as_of: str | None = Query(None, description="Required offset-aware ISO timestamp for the opt-in reference review"),
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Retrieve a market diary entry by date.
@@ -510,6 +512,19 @@ async def get_diary(
     If no date is provided, returns the most recent entry.
     """
     from datetime import date as date_type
+
+    if reference_overlay is True:
+        if not date or not isinstance(reference_as_of, str):
+            raise HTTPException(status_code=400, detail="Reference review requires an explicit date and aware reference_as_of")
+        try:
+            from intelligence.market_diary import get_diary_reference_review
+
+            target = date_type.fromisoformat(date)
+            return get_diary_reference_review(
+                get_db_engine(), target, reference_as_of=reference_as_of,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     try:
         from intelligence.market_diary import get_diary_entry, list_diary_entries

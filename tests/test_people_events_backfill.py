@@ -53,6 +53,7 @@ def test_growth_check_band_and_projection():
 
 
 import json  # noqa: E402
+import hashlib  # noqa: E402
 from datetime import datetime, timezone  # noqa: E402
 
 import pytest  # noqa: E402
@@ -63,7 +64,9 @@ def _fake_world(monkeypatch, n_events: int, writer):
                  nonderiv_trans_sk=str(i)) for i in range(n_events)]
     events, stats = B.build_events(pd.DataFrame(rows), ("P", "S", "A"), pd.DataFrame())
 
-    monkeypatch.setattr(B, "_load", lambda args, url: (events, dict(stats), pd.DataFrame()))
+    stored = []
+    audit = []
+    monkeypatch.setattr(B, "_load", lambda args, url: (events, dict(stats), pd.DataFrame(stored)))
     monkeypatch.setattr(B, "sha256_file", lambda path: "0" * 64)
     monkeypatch.setattr(B, "_rw_engine", lambda url: type("E", (), {"dispose": lambda self: None})())
     size = {"bytes": 0}
@@ -74,20 +77,38 @@ def _fake_world(monkeypatch, n_events: int, writer):
     monkeypatch.setattr(B, "_scalar", scalar)
     monkeypatch.setattr(B.RO, "assert_db_window_open", lambda now=None: None)
     monkeypatch.setattr(B, "minutes_until_window", lambda now=None: 600.0)
+    monkeypatch.setattr(B.G, "write_window_open", lambda now=None, **kwargs: True)
     monkeypatch.setattr(B.time, "sleep", lambda s: None)
     import intelligence.people_events_pipeline.writer as W
 
     def fake_apply(engine, ev, plan, **kw):
-        size["bytes"] += 1000 * len(plan)
-        return writer(ev, plan)
+        kw["before_transaction"]()
+        result = writer(ev, plan)
+        kw["before_commit"]()
+        size["bytes"] += 1000 * len(plan) + 500  # include run metadata, not just events
+        stored.extend(ev.to_dict("records"))
+        audit.append((kw["run_id"], len(plan)))
+        return result
 
     monkeypatch.setattr(W, "apply_write_plan", fake_apply)
+
+    def fake_audit(engine, prefix, source_hash):
+        values = [(run, count) for run, count in audit if run.startswith(prefix + "-b")]
+        n = sum(count for _, count in values)
+        digest = hashlib.sha256(b"\n".join(B.G.batch_audit_record(run, batch,
+            {"insert": count, "written": count, **dict.fromkeys(B.G.ZERO_COUNT_KEYS, 0)})
+            for batch, (run, count) in enumerate(values))).hexdigest()
+        return {"batches": len(values), "successful": len(values), "inserted": n, "written": n,
+                "invalid": 0, "progress_digest": digest}
+
+    monkeypatch.setattr(B, "_run_audit", fake_audit)
     return events
 
 
 def _args(tmp_path, *extra):
     return ["execute", "--form345", str(tmp_path / "x.parquet"), "--out-dir", str(tmp_path),
-            "--db-url-env", "PE_TEST_URL", "--batch-rows", "3", *extra]
+            "--db-url-env", "PE_TEST_URL", "--batch-rows", "3", "--baseline-bytes", "0",
+            "--expect-source-sha256", "0" * 64, *extra]
 
 
 def test_execute_slices_batches_and_records_receipts(tmp_path, monkeypatch):
@@ -103,7 +124,10 @@ def test_execute_slices_batches_and_records_receipts(tmp_path, monkeypatch):
     assert B.main(_args(tmp_path)) == 0
     assert sorted(seen) == sorted(events["dedup_key"])
     receipt = json.loads(next(tmp_path.glob("execute_*.json")).read_text())
-    assert receipt["status"] == "DONE" and receipt["rows_written"] == 8 and len(receipt["batches"]) == 3
+    assert receipt["status"] == "DONE" and receipt["rows_written"] == 8
+    assert "batches" not in receipt  # growing batch list is append-only JSONL now
+    progress = [json.loads(line) for line in (tmp_path / B.G.PROGRESS_NAME).read_text().splitlines()]
+    assert len(progress) == 3 and progress[-1]["rows_written"] == 8
 
 
 def test_execute_failure_is_recorded_as_failed(tmp_path, monkeypatch):
@@ -136,7 +160,7 @@ def test_execute_stops_on_max_batches_and_refuses_partial_scope(tmp_path, monkey
 def test_execute_refuses_close_to_the_window(tmp_path, monkeypatch):
     monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
     _fake_world(monkeypatch, 2, lambda ev, plan: {"status": "SUCCESS", "counts": {"insert": len(plan)}})
-    monkeypatch.setattr(B, "minutes_until_window", lambda now=None: 30.0)
+    monkeypatch.setattr(B.G, "write_window_open", lambda now=None, **kwargs: False)
     assert B.main(_args(tmp_path)) == 2
 
 
@@ -144,3 +168,123 @@ def test_minutes_until_window():
     assert B.minutes_until_window(datetime(2026, 10, 2, 2, 30, tzinfo=timezone.utc)) == 60.0
     assert B.minutes_until_window(datetime(2026, 10, 2, 5, 0, tzinfo=timezone.utc)) == 0.0
     assert B.minutes_until_window(datetime(2026, 10, 2, 11, 30, tzinfo=timezone.utc)) == 16 * 60.0
+
+
+def test_execute_clamps_old_20000_flag_to_fifty(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    sizes = []
+    _fake_world(monkeypatch, 101, lambda ev, plan:
+                sizes.append(len(plan)) or {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    assert B.main(_args(tmp_path, "--batch-rows", "20000")) == 0
+    assert sizes == [50, 50, 1]
+
+
+def test_execute_resume_reuses_baseline_and_does_not_repeat_rows(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    seen = []
+    _fake_world(monkeypatch, 8, lambda ev, plan:
+                seen.extend(plan["dedup_key"]) or {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    assert B.main(_args(tmp_path, "--max-batches", "1")) == 4
+    manifest = (tmp_path / B.G.MANIFEST_NAME).read_bytes()
+    assert B.main(_args(tmp_path)) == 0
+    assert len(seen) == len(set(seen)) == 8
+    assert (tmp_path / B.G.MANIFEST_NAME).read_bytes() == manifest
+    assert B.G.read_progress(tmp_path / B.G.PROGRESS_NAME,
+                           json.loads(manifest)["run_prefix"])[:2] == (3, 8)
+
+
+def test_execute_missing_progress_or_db_disagreement_refuses_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    seen = []
+    _fake_world(monkeypatch, 8, lambda ev, plan:
+                seen.extend(plan["dedup_key"]) or {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    assert B.main(_args(tmp_path, "--max-batches", "1")) == 4
+    progress_path = tmp_path / B.G.PROGRESS_NAME
+    original = progress_path.read_text()
+    progress_path.unlink()
+    with pytest.raises(RuntimeError, match="progress is missing"):
+        B.main(_args(tmp_path))
+    progress_path.write_text(original)
+    monkeypatch.setattr(B, "_run_audit", lambda *args:
+                        {"batches": 2, "successful": 2, "inserted": 6, "written": 6,
+                         "invalid": 0, "progress_digest": "unexpected"})
+    with pytest.raises(RuntimeError, match="disagree"):
+        B.main(_args(tmp_path))
+    assert len(seen) == 3
+
+
+def test_execute_requires_prebackup_baseline_and_rejects_update_plan(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    calls = []
+    _fake_world(monkeypatch, 3, lambda ev, plan:
+                calls.append(1) or {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    args = _args(tmp_path)
+    del args[args.index("--baseline-bytes"):args.index("--baseline-bytes") + 2]
+    with pytest.raises(RuntimeError, match="baseline-bytes"):
+        B.main(args)
+    original_plan = B.P.build_write_plan
+
+    def updates(*args):
+        plan = original_plan(*args)
+        plan.loc[0, "op"] = "supersede"
+        return plan
+
+    monkeypatch.setattr(B.P, "build_write_plan", updates)
+    assert B.main(_args(tmp_path)) == 3
+    assert not calls
+
+
+def test_execute_rejects_unapproved_codes_and_changed_input(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    _fake_world(monkeypatch, 3, lambda ev, plan: pytest.fail("must not write"))
+    with pytest.raises(SystemExit):
+        B.main(_args(tmp_path, "--codes", "P,S,M"))
+    with pytest.raises(RuntimeError, match="reviewed plan hash"):
+        B.main(_args(tmp_path, "--expect-source-sha256", "1" * 64))
+    args = _args(tmp_path)
+    del args[args.index("--expect-source-sha256"):args.index("--expect-source-sha256") + 2]
+    assert B.main(args) == 2
+    hashes = iter(["0" * 64, "1" * 64])
+    monkeypatch.setattr(B, "sha256_file", lambda path: next(hashes))
+    with pytest.raises(RuntimeError, match="source changed while loading"):
+        B.main(_args(tmp_path))
+
+
+def test_execute_growth_includes_run_metadata_and_stops_before_absolute_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    calls = []
+    _fake_world(monkeypatch, 3, lambda ev, plan:
+                calls.append(1) or {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    # 7.98GB is below8GB but violates the conservative32MiB reserve before writes.
+    monkeypatch.setattr(B, "_scalar", lambda engine, sql: 7_980_000_000)
+    assert B.main(_args(tmp_path)) == 4
+    assert not calls
+    receipt = json.loads(next(tmp_path.glob("execute_*.json")).read_text())
+    assert receipt["status"] == "STOPPED_GROWTH"
+
+
+def test_execute_throttle_preserves_twenty_thousand_row_cadence(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    _fake_world(monkeypatch, 101, lambda ev, plan: {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    monkeypatch.setattr(B.G, "THROTTLE_ROWS", 100)
+    sleeps = []
+    monkeypatch.setattr(B.time, "sleep", sleeps.append)
+    assert B.main(_args(tmp_path, "--batch-rows", "50", "--sleep", "2")) == 0
+    assert sleeps == [2.0]
+
+
+def test_execute_audits_full_run_history_once_per_start_or_resume(tmp_path, monkeypatch):
+    monkeypatch.setenv("PE_TEST_URL", "postgresql://x/y_test")
+    _fake_world(monkeypatch, 12, lambda ev, plan: {"status": "SUCCESS", "counts": {"insert": len(plan)}})
+    original = B._run_audit
+    calls = []
+
+    def audit(*args):
+        calls.append(1)
+        return original(*args)
+
+    monkeypatch.setattr(B, "_run_audit", audit)
+    assert B.main(_args(tmp_path, "--max-batches", "2")) == 4
+    assert calls == [1]
+    assert B.main(_args(tmp_path)) == 0
+    assert calls == [1, 1]

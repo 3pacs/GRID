@@ -22,6 +22,7 @@ All tickers on commercial tier.
 from __future__ import annotations
 
 import os
+import math
 import time
 from datetime import date
 from typing import Any
@@ -45,6 +46,33 @@ _FIELD_MAP: dict[str, str] = {
     "pbRatio": "pb_ratio",
     "trailingPEG1Y": "peg_ratio",
 }
+
+
+# Only these locally authored diagnostics may cross the persistence boundary.
+_SAFE_LOCAL_ERRORS = (
+    "Tiingo daily response must be a list",
+    "Malformed Tiingo daily record",
+    "Invalid Tiingo fundamental value",
+    "Unknown affected row count",
+)
+
+
+def _safe_failure_message(exc: Exception) -> str:
+    """Exclude URLs, headers, bodies and nested exception text from results."""
+    if isinstance(exc, requests.exceptions.HTTPError):
+        response = getattr(exc, "response", None)
+        status = getattr(response, "status_code", None)
+        if type(status) is int and 100 <= status <= 599:
+            return f"Tiingo HTTP request failed (status {status})"
+        return "Tiingo HTTP request failed"
+    if (
+        type(exc) is ValueError
+        and len(exc.args) == 1
+        and type(exc.args[0]) is str
+        and exc.args[0] in _SAFE_LOCAL_ERRORS
+    ):
+        return exc.args[0]
+    return "Tiingo fundamentals pull failed"
 
 
 class TiingoFundamentalsPuller(BasePuller):
@@ -81,32 +109,40 @@ class TiingoFundamentalsPuller(BasePuller):
             "errors": [],
         }
 
+        transaction_started = False
         try:
             url = f"{_BASE_URL}/tiingo/fundamentals/{ticker}/daily"
             params = {
-                "token": _TIINGO_API_KEY,
                 "startDate": str(start_date),
                 "endDate": str(end_date),
             }
 
-            r = requests.get(url, params=params, timeout=30)
+            headers = {"Authorization": f"Token {_TIINGO_API_KEY}"}
+            r = requests.get(url, params=params, headers=headers, timeout=30)
             r.raise_for_status()
             data = r.json()
 
-            if not data:
-                result["status"] = "NO_DATA"
+            if type(data) is not list:
+                raise ValueError("Tiingo daily response must be a list")
+            if data == []:
+                result["status"] = "NO_NEW_DATA"
                 return result
 
             rows_inserted = 0
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 for row in data:
+                    if not isinstance(row, dict) or "date" not in row or not any(k in row and row[k] is not None for k in _FIELD_MAP):
+                        raise ValueError("Malformed Tiingo daily record")
                     obs_date = pd.to_datetime(row["date"]).date()
 
                     for tiingo_field, grid_suffix in _FIELD_MAP.items():
                         value = row.get(tiingo_field)
                         if value is None:
                             continue
+                        if isinstance(value, bool) or not math.isfinite(float(value)):
+                            raise ValueError("Invalid Tiingo fundamental value")
 
                         series_id = f"TIINGO_FUND:{ticker}:{grid_suffix}"
                         f"{ticker.lower()}_{grid_suffix}"
@@ -130,21 +166,25 @@ class TiingoFundamentalsPuller(BasePuller):
                                 "val": float(value),
                             },
                         )
-                        rows_inserted += max(0, int(res.rowcount or 0))
+                        if type(res.rowcount) is not int or res.rowcount < 0:
+                            raise ValueError("Unknown affected row count")
+                        rows_inserted += res.rowcount
 
             result["rows_inserted"] = rows_inserted
             log.info("Tiingo fundamentals {t}: {n} rows", t=ticker, n=rows_inserted)
 
         except requests.exceptions.HTTPError as e:
+            result["rows_inserted"] = None if transaction_started else 0
             if "400" in str(e) and "Free" in str(e):
                 result["status"] = "PAYWALLED"
                 result["errors"].append("Free tier: DOW 30 only")
             else:
                 result["status"] = "FAILED"
-                result["errors"].append(str(e))
+                result["errors"].append(_safe_failure_message(e))
         except Exception as e:
+            result["rows_inserted"] = None if transaction_started else 0
             result["status"] = "FAILED"
-            result["errors"].append(str(e))
+            result["errors"].append(_safe_failure_message(e))
 
         return result
 

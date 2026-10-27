@@ -78,12 +78,78 @@ def _systemd_service_active(service_name: str) -> bool:
         return False
 
 
+def _cached_local_llm_state() -> dict[str, object]:
+    """Observe stored primary-provider state without importing or probing it.
+
+    This is neither provider selection nor a fresh readiness check. Static
+    attribute reads reject descriptors/methods instead of executing them.
+    """
+    import inspect
+    import sys
+    from types import GetSetDescriptorType, MemberDescriptorType, ModuleType
+
+    state: dict[str, object] = {
+        "state": "unknown",
+        "provider": None,
+        "scope": "configured_local_primary",
+        "source": "process_cache",
+        "fresh": False,
+    }
+    try:
+        llm_module = sys.modules.get("llm.router")
+        if llm_module is None:
+            state["state"] = "not_initialized"
+            return state
+        if type(llm_module) is not ModuleType:
+            return state
+        cache = vars(llm_module).get("_client_cache")
+        if type(cache) is not dict or any(type(key) is not str for key in cache):
+            return state
+        config_module = sys.modules.get("config")
+        if type(config_module) is not ModuleType:
+            return state
+        settings = vars(config_module).get("settings")
+        if settings is None:
+            return state
+        if inspect.getattr_static(type(settings), "__getattribute__") is not object.__getattribute__:
+            return state
+        storage = inspect.getattr_static(type(settings), "__dict__", None)
+        if type(storage) not in (GetSetDescriptorType, MemberDescriptorType):
+            return state
+        primary = inspect.getattr_static(settings, "LLM_LOCAL_PROVIDER", None)
+        if primary is None or (type(primary) is str and primary == ""):
+            primary = inspect.getattr_static(settings, "LLM_QUICK_PROVIDER", None)
+        if primary is None or (type(primary) is str and primary == ""):
+            gemma_primary = inspect.getattr_static(settings, "GEMMA_PRIMARY", False)
+            gemma_enabled = inspect.getattr_static(settings, "GEMMA_ENABLED", False)
+            if type(gemma_primary) is not bool or type(gemma_enabled) is not bool:
+                return state
+            primary = "gemma" if gemma_primary and gemma_enabled else "llamacpp"
+        if type(primary) is not str:
+            return state
+        state["provider"] = primary
+        if primary not in cache:
+            state["state"] = "not_initialized"
+            return state
+        client = cache[primary]
+        storage = inspect.getattr_static(type(client), "__dict__", None)
+        if type(storage) not in (GetSetDescriptorType, MemberDescriptorType):
+            return state
+        available = inspect.getattr_static(client, "is_available", None)
+        if type(available) is bool:
+            state["state"] = "available" if available else "unavailable"
+    except Exception:
+        # Partial or unfamiliar in-process state is optional and stays unknown.
+        pass
+    return state
+
+
 @router.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     """Health check — no auth required.
 
     Checks database connectivity, data freshness, connection pool,
-    scheduler threads, WebSocket clients, disk space, and LLM availability.
+    scheduler threads, WebSocket clients, disk space, and cached LLM state.
     """
     import shutil
     import threading
@@ -174,14 +240,10 @@ def health() -> HealthResponse:
     except Exception as exc:
         log.debug("Health: disk usage check failed: {e}", e=str(exc))
 
-    # --- LLM availability ---
-    try:
-        from llm.router import get_llm, Tier
-        client = get_llm(Tier.LOCAL)
-        checks["llm_available"] = client.is_available
-    except Exception as exc:
-        log.debug("Health: LLM availability check failed: {e}", e=str(exc))
-        checks["llm_available"] = False
+    # --- Optional LLM: stored state only; never select or initialize a client. ---
+    llm_state = _cached_local_llm_state()
+    checks["llm"] = llm_state
+    checks["llm_available"] = llm_state["state"] == "available"
 
     # --- Robinhood crypto connector ---
     # Local state only (mode, caps): health is unauthenticated and must stay

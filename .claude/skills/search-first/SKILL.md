@@ -1,6 +1,6 @@
 ---
 name: search-first
-description: Research-before-coding workflow. Search for existing tools, libraries, and patterns before writing custom code. Invokes the researcher agent.
+description: Research-before-coding workflow. Search for existing tools, libraries, and patterns before writing custom code. Delegates to a general-purpose subagent.
 origin: ECC
 ---
 
@@ -24,7 +24,7 @@ Use this skill when:
 │     Define what functionality is needed      │
 │     Identify language/framework constraints  │
 ├─────────────────────────────────────────────┤
-│  2. PARALLEL SEARCH (researcher agent)      │
+│  2. PARALLEL SEARCH (subagent)              │
 │     ┌──────────┐ ┌──────────┐ ┌──────────┐  │
 │     │  npm /   │ │  MCP /   │ │  GitHub / │  │
 │     │  PyPI    │ │  Skills  │ │  Web      │  │
@@ -69,7 +69,7 @@ Before writing a utility or adding functionality, mentally run through:
 
 ### Full Mode (agent)
 
-For non-trivial functionality, launch the researcher agent:
+For non-trivial functionality, launch a general-purpose subagent:
 
 ```
 Task(subagent_type="general-purpose", prompt="
