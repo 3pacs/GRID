@@ -1456,10 +1456,17 @@ class EntityMap:
             dict with ``lookups_missed`` (total failed lookups),
             ``series_ids`` (how many distinct series_ids missed),
             ``unregistered_features`` (mapped names absent from
-            feature_registry), ``top_series`` (the 10 worst offenders as
-            ``[series_id, count]`` pairs), ``mapped_unregistered_count`` and
-            ``mapped_unregistered_series`` (``[series_id, feature_name,
-            count]``, worst 10) for the population that drops rows, and
+            feature_registry as of the last registry read), ``top_series``
+            (the 10 worst offenders as ``[series_id, count]`` pairs),
+            ``mapped_unregistered_count`` and ``mapped_unregistered_series``
+            (``[series_id, feature_name, count]``, worst 10) for the mapped
+            series whose target is still absent at that read, which is the
+            population that drops rows and whose distinct targets are
+            ``unregistered_features``; ``mapped_resolved_count`` and
+            ``mapped_resolved_series`` for mapped series that missed earlier
+            but whose target has since been registered (historical, not
+            actionable; their earlier misses stay in the cumulative
+            ``lookups_missed``, ``series_ids`` and ``top_series``); and
             ``no_mapping_series_ids`` with ``by_family`` (``[family,
             series_ids, lookups]``, 12 largest by lookups) for the rest, and
             ``no_mapping_feature_named`` (how many of those are feature-shaped
@@ -1468,10 +1475,20 @@ class EntityMap:
         ranked = sorted(
             self._miss_counts.items(), key=lambda kv: kv[1], reverse=True
         )
-        mapped = sorted(
-            ([sid, name, self._miss_counts.get(sid, 0)]
-             for sid, name in self._mapped_misses.items()),
-            key=lambda row: (-row[2], row[0]),
+        # _mapped_misses is history; whether a target is missing *now* is
+        # judged against the last registry read (_feature_cache), so the
+        # per-series rows and the deduplicated names share one snapshot. The
+        # negative cache (_unregistered_features) is cleared on every refresh
+        # and cannot be that snapshot on its own.
+        current: list[list] = []
+        resolved: list[list] = []
+        for sid, name in self._mapped_misses.items():
+            row = [sid, name, self._miss_counts.get(sid, 0)]
+            (resolved if name in self._feature_cache else current).append(row)
+        mapped = sorted(current, key=lambda row: (-row[2], row[0]))
+        resolved.sort(key=lambda row: (-row[2], row[0]))
+        unregistered = {name for _, name, _ in current} | (
+            self._unregistered_features - self._feature_cache.keys()
         )
         families: dict[str, list[int]] = {}
         no_mapping = 0
@@ -1492,10 +1509,12 @@ class EntityMap:
         return {
             "lookups_missed": sum(self._miss_counts.values()),
             "series_ids": len(self._miss_counts),
-            "unregistered_features": sorted(self._unregistered_features),
+            "unregistered_features": sorted(unregistered),
             "top_series": [[sid, n] for sid, n in ranked[:10]],
             "mapped_unregistered_count": len(mapped),
             "mapped_unregistered_series": mapped[:10],
+            "mapped_resolved_count": len(resolved),
+            "mapped_resolved_series": resolved[:10],
             "no_mapping_series_ids": no_mapping,
             "no_mapping_feature_named": feature_named,
             "by_family": by_family[:12],

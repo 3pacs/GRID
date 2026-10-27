@@ -236,3 +236,89 @@ def test_resolver_warning_names_both_populations(MockEntityMap, warnings_capture
     assert "7210 series_id(s) have no entity_map entry" in line
     assert "['YF', 4900, 4900]" in line and "7211 lookup(s) skipped" in line
     assert "Resolution skipped 7211 lookup(s) across 7211 unmapped" not in line
+
+
+# PR914-F1: the per-series rows and the deduplicated names must describe the same
+# registry snapshot. _unregistered_features is a negative cache cleared on every
+# refresh, so a second absent target used to evict the first name, and a target
+# registered later stayed listed as missing.
+SYN_A, SYN_B, SYN_ALIAS = "SYNF1:a", "SYNF1:b", "SYNF1:a_alias"
+
+
+@pytest.fixture
+def mutable_registry(monkeypatch):
+    """feature_registry rows the test can change between lookups; synthetic mappings."""
+    rows: list[tuple[int, str]] = [(1, "some_other_feature")]
+    engine = MagicMock()
+    conn = MagicMock()
+    engine.connect.return_value.__enter__.return_value = conn
+
+    def _execute(statement, *_args, **_kwargs):
+        result = MagicMock()
+        result.fetchall.return_value = list(rows) if "feature_registry" in str(statement) else []
+        return result
+
+    conn.execute.side_effect = _execute
+    em = EntityMap(db_engine=engine)
+    for sid, target in ((SYN_A, "syn_one"), (SYN_B, "syn_two"), (SYN_ALIAS, "syn_one")):
+        monkeypatch.setitem(entity_map_module.SEED_MAPPINGS, sid, target)
+    return em, rows
+
+
+def test_two_distinct_absent_targets_are_both_named(mutable_registry) -> None:
+    em, _ = mutable_registry
+    assert em.get_feature_id(SYN_A) is None
+    assert em.get_feature_id(SYN_B) is None
+    report = em.missing_feature_report()
+    assert report["mapped_unregistered_count"] == 2
+    assert report["unregistered_features"] == ["syn_one", "syn_two"]
+    assert report["mapped_resolved_count"] == 0
+    title, _ = integrity.describe_unmapped_report(report, report["top_series"])
+    assert title.startswith("2 series_id(s) mapped to 2 feature name(s)")
+
+
+def test_aliases_sharing_one_target_name_it_once(mutable_registry) -> None:
+    em, _ = mutable_registry
+    assert em.get_feature_id(SYN_A) is None
+    assert em.get_feature_id(SYN_ALIAS) is None
+    report = em.missing_feature_report()
+    assert report["mapped_unregistered_count"] == 2
+    assert report["unregistered_features"] == ["syn_one"]
+    assert {row[0] for row in report["mapped_unregistered_series"]} == {SYN_A, SYN_ALIAS}
+
+
+def test_one_target_registered_later_leaves_only_the_other_missing(mutable_registry) -> None:
+    em, rows = mutable_registry
+    assert em.get_feature_id(SYN_A) is None
+    assert em.get_feature_id(SYN_B) is None
+    rows.append((7, "syn_one"))
+    assert em.get_feature_id(SYN_A) == 7   # cached miss on syn_one, refresh finds it
+    report = em.missing_feature_report()
+    assert report["mapped_unregistered_count"] == 1
+    assert report["mapped_unregistered_series"] == [[SYN_B, "syn_two", 1]]
+    assert report["unregistered_features"] == ["syn_two"]
+    assert report["mapped_resolved_series"] == [[SYN_A, "syn_one", 1]]
+    # Historical misses stay counted and stay out of the no-mapping population.
+    assert report["lookups_missed"] == 2 and report["series_ids"] == 2
+    assert report["no_mapping_series_ids"] == 0 and report["by_family"] == []
+    title, detail = integrity.describe_unmapped_report(report, report["top_series"])
+    assert title.startswith("1 series_id(s) mapped to 1 feature name(s)")
+    assert f"{SYN_A} -> syn_one" not in detail
+    assert "1 mapped series_id(s) missed earlier" in detail
+
+
+def test_all_targets_registered_later_report_nothing_actionable(mutable_registry) -> None:
+    em, rows = mutable_registry
+    for sid in (SYN_A, SYN_B, SYN_ALIAS):
+        assert em.get_feature_id(sid) is None
+    rows.extend([(7, "syn_one"), (8, "syn_two")])
+    assert em.get_feature_id(SYN_B) == 8   # one refresh; syn_one is now in the cache too
+    report = em.missing_feature_report()
+    assert report["mapped_unregistered_count"] == 0
+    assert report["unregistered_features"] == []
+    assert report["mapped_resolved_count"] == 3
+    assert report["no_mapping_series_ids"] == 0
+    title, detail = integrity.describe_unmapped_report(report, report["top_series"])
+    assert "missing from feature_registry" not in title
+    assert "REGISTER_GHOST_FEATURES" not in detail
+    assert "3 mapped series_id(s) missed earlier" in detail

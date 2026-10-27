@@ -411,6 +411,12 @@ def describe_unmapped_report(
             "(REGISTER_GHOST_FEATURES): "
             + ", ".join(f"{sid} -> {name} ({n})" for sid, name, n in mapped[:10]) + "."
         )
+    resolved_count = int(report.get("mapped_resolved_count") or 0)
+    if resolved_count:
+        parts.append(
+            f"{resolved_count} mapped series_id(s) missed earlier in the window but "
+            "their feature is registered now (counted in the lookups above; no action)."
+        )
     if no_mapping:
         shaped = (f"{feature_named} of them are feature-shaped ids" if feature_named is not None
                   else "an unknown number of them are feature-shaped ids")
