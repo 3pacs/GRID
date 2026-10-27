@@ -53,12 +53,19 @@ jobs:
           import os
           import secrets
           from pathlib import Path
+          import re
           admin = secrets.token_hex(32)
           writer = secrets.token_hex(32)
+          assert re.fullmatch(r'[0-9a-f]{64}', admin)
+          assert re.fullmatch(r'[0-9a-f]{64}', writer)
           assert admin != writer
+          # GitHub's interpreted masking protocol is the only credential output.
+          # Flush both registrations before environment handoff/step headers.
+          print(f'::add-mask::{admin}', flush=True)
+          print(f'::add-mask::{writer}', flush=True)
           url = f'postgresql://qq_ci_writer:{writer}@127.0.0.1:15432/qq_batch_test'
           # Runner-owned environment handoff stays inside this disposable job.
-          # Never print credentials, pass them in argv, or upload this file.
+          # No ordinary credential logging, argv values, or uploaded env file.
           with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
               for key, value in {'POSTGRES_PASSWORD': admin, 'DB_PASSWORD': writer,
                                  'GRID_TEST_DB_URL': url, 'GRID_QQ_TEST_DB_URL': url}.items():
