@@ -29,12 +29,13 @@ env:
   # provide the persistent PostgreSQL 15 + TimescaleDB the reset step expects
   # (see docs/SERVER-SERVICES.md, "Alien Runner" / "Threadripper Runner").
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
-  ON_SELF_HOSTED: ${{ vars.TEST_RUNNER != '' }}
+  # PR543's existing research-digest branch uses hosted CI and ephemeral DB only.
+  ON_SELF_HOSTED: ${{ !(github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') && vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -827,7 +828,7 @@ jobs:
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -868,7 +869,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:

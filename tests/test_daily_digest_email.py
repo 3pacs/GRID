@@ -10,8 +10,18 @@ regime timestamp must never render as a current regime.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
+import pytest
 
 import alerts.email as email_mod
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_research_audience(monkeypatch):
+    """Content tests require an explicit research audience, never live config."""
+    monkeypatch.setattr(email_mod, "_get_settings", lambda: SimpleNamespace(
+        RESEARCH_DIGEST_EMAIL_TO=("research.one@example.com", "research.two@example.com")))
 
 
 class _FakeResult:

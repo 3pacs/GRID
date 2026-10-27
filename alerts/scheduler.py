@@ -85,10 +85,19 @@ def _read_state(engine: Any) -> dict[str, Any] | None:
     return {"seen_at": seen_at, "status": payload.get("status")}
 
 
-def _write_state(engine: Any, at: datetime, status: str) -> None:
-    """Persist {status}. Raises on failure — see caller."""
+def _write_state(
+    engine: Any, at: datetime, status: str, delivery: dict[str, Any] | None = None,
+) -> None:
+    """Persist status and optional bounded research relay outcome metadata.
+
+    Raises on failure. No recipient key/version change clears old suppression;
+    a failed terminal write leaves the pre-send uncertain marker in place.
+    """
     from sqlalchemy import text as sa_text
 
+    payload: dict[str, Any] = {"status": status}
+    if delivery:
+        payload["delivery"] = delivery
     with engine.begin() as conn:
         conn.execute(
             sa_text(
@@ -97,7 +106,7 @@ def _write_state(engine: Any, at: datetime, status: str) -> None:
                 "ON CONFLICT (alert_type, entity_id) DO UPDATE SET "
                 "seen_at = EXCLUDED.seen_at, payload = EXCLUDED.payload"
             ),
-            {"t": _ALERT_TYPE, "e": _ENTITY_ID, "seen_at": at, "payload": json.dumps({"status": status})},
+            {"t": _ALERT_TYPE, "e": _ENTITY_ID, "seen_at": at, "payload": json.dumps(payload)},
         )
 
 
@@ -177,7 +186,13 @@ def _send_digest_once_per_window(engine: Any, now: datetime) -> None:
 
             result = daily_digest()
             status = result.get("send_status", "uncertain")
-            _write_state(engine, now, status=status)
+            delivery = result.get("delivery")
+            if isinstance(delivery, dict) and delivery:
+                if delivery.get("outcome") == "partial":
+                    status = "uncertain"
+                _write_state(engine, now, status=status, delivery=delivery)
+            else:
+                _write_state(engine, now, status=status)
             if status != "sent":
                 log.warning(
                     "Daily digest did not confirm send this attempt (status={s}): {e}",

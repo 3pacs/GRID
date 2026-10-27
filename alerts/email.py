@@ -12,7 +12,9 @@ TLS is forced for external SMTP to protect signal data in transit.
 from __future__ import annotations
 
 import smtplib
+import re
 import threading
+from collections.abc import Iterable
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -259,11 +261,47 @@ def _send_in_thread(subject: str, html: str, plain: str) -> None:
     t.start()
 
 
-def _do_send(subject: str, html: str, plain: str) -> str:
+def _validated_research_recipients(value: tuple[str, ...]) -> tuple[str, str]:
+    """Two unique ASCII mailbox addresses, never a comma-joined envelope.
+
+    This deliberately accepts simple addr-specs rather than display names,
+    groups or quoted local parts. Normalize case/outer spaces and deduplicate
+    before requiring exactly two. Never fall back to the global audience.
+    """
+    if not isinstance(value, (tuple, list)):
+        raise ValueError("research audience must be an address sequence")
+    unique: list[str] = []
+    for raw in value:
+        if not isinstance(raw, str) or any(ord(c) < 32 or ord(c) >= 127 for c in raw):
+            raise ValueError("research audience contains invalid characters")
+        address = raw.strip().lower()
+        if len(address) > 254 or not re.fullmatch(
+            r"[a-z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-z0-9-]+(?:\.[a-z0-9-]+)+", address,
+        ):
+            raise ValueError("research audience contains an invalid mailbox")
+        local, domain = address.rsplit("@", 1)
+        if len(local) > 64 or local.startswith(".") or local.endswith(".") or ".." in local:
+            raise ValueError("research audience contains an invalid local part")
+        if any(len(label) > 63 or label.startswith("-") or label.endswith("-") for label in domain.split(".")):
+            raise ValueError("research audience contains an invalid domain")
+        if address not in unique:
+            unique.append(address)
+    if len(unique) != 2:
+        raise ValueError("research audience must contain exactly two unique mailboxes")
+    return unique[0], unique[1]
+
+
+def _do_send(
+    subject: str, html: str, plain: str, *,
+    research_recipients: tuple[str, ...] | None = None,
+    delivery: dict[str, Any] | None = None,
+) -> str:
     """Send over SMTP, returning one of three outcomes — not a bool.
 
-    "sent": ``sendmail()`` returned normally — the relay accepted the
-        message. A later failure in ``quit()`` does not change this:
+    "sent": the relay accepted the message (for research, every envelope
+        recipient). A partial research refusal is instead "uncertain";
+        callers must not retry the whole audience. A later failure in
+        ``quit()`` does not change a confirmed acceptance:
         QUIT is connection cleanup, not part of the accept decision, and
         treating its failure as "the send failed" was the exact bug this
         fixes — an accepted message could be reported as a failure and
@@ -278,15 +316,25 @@ def _do_send(subject: str, html: str, plain: str) -> str:
         Callers must not treat this as either success or a safe-to-retry
         failure.
     """
+    audience: tuple[str, ...] = ()
+    def outcome(label: str, accepted: Iterable[str] = (), refused: Iterable[str] = ()) -> None:
+        if research_recipients is not None and delivery is not None:
+            delivery.update({"outcome": label, "audience": list(audience),
+                             "relay_accepted": list(accepted), "refused": list(refused)})
     try:
+        if research_recipients is not None:
+            if delivery is not None:
+                delivery.clear()
+            audience = _validated_research_recipients(research_recipients)
         cfg = _get_settings()
         if not cfg.ALERT_EMAIL_ENABLED:
+            outcome("disabled")
             return "failed"
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = cfg.ALERT_EMAIL_FROM
-        msg["To"] = cfg.ALERT_EMAIL_TO
+        msg["To"] = ", ".join(audience) if research_recipients is not None else cfg.ALERT_EMAIL_TO
         msg.attach(MIMEText(plain, "plain"))
         msg.attach(MIMEText(html, "html"))
 
@@ -305,12 +353,18 @@ def _do_send(subject: str, html: str, plain: str) -> str:
         if cfg.ALERT_SMTP_USER and cfg.ALERT_SMTP_PASSWORD:
             smtp.login(cfg.ALERT_SMTP_USER, cfg.ALERT_SMTP_PASSWORD)
     except Exception as exc:
+        outcome("failed")
         log.warning("Newsletter send failed before relay acceptance — {s}: {e}", s=subject, e=str(exc))
         return "failed"
 
     try:
-        smtp.sendmail(cfg.ALERT_EMAIL_FROM, [cfg.ALERT_EMAIL_TO], msg.as_string())
+        refused = smtp.sendmail(
+            cfg.ALERT_EMAIL_FROM,
+            list(audience) if research_recipients is not None else [cfg.ALERT_EMAIL_TO],
+            msg.as_string(),
+        )
     except (smtplib.SMTPRecipientsRefused, smtplib.SMTPSenderRefused, smtplib.SMTPResponseException) as exc:
+        outcome("failed", refused=audience if isinstance(exc, smtplib.SMTPRecipientsRefused) else ())
         # An explicit rejection response — the relay told us no before
         # accepting the body. Clean, safe to retry.
         log.warning("Newsletter send rejected by relay — {s}: {e}", s=subject, e=str(exc))
@@ -320,10 +374,31 @@ def _do_send(subject: str, html: str, plain: str) -> str:
             pass
         return "failed"
     except Exception as exc:
+        outcome("uncertain")
         # Connection lost, timed out, or otherwise interrupted while
         # transmitting — genuinely unknown whether the relay got it.
         log.warning("Newsletter send outcome unknown — {s}: {e}", s=subject, e=str(exc))
         return "uncertain"
+
+    status = "sent"
+    if research_recipients is not None:
+        # sendmail may accept one recipient while returning refusals for the
+        # other. That is neither all-sent nor safely retryable for the pair.
+        # Unknown result shapes/recipient keys are conservatively uncertain.
+        if not isinstance(refused, dict) or any(
+            not isinstance(key, str) or key not in audience
+            or not isinstance(value, tuple) or len(value) != 2
+            or not isinstance(value[0], int) or not 400 <= value[0] <= 599
+            for key, value in refused.items()
+        ):
+            status = "uncertain"
+            outcome("uncertain")
+        elif refused:
+            accepted = [address for address in audience if address not in refused]
+            status = "uncertain" if accepted else "failed"
+            outcome("partial" if accepted else "failed", accepted, refused.keys())
+        else:
+            outcome("accepted", audience)
 
     try:
         smtp.quit()
@@ -333,8 +408,11 @@ def _do_send(subject: str, html: str, plain: str) -> str:
             "accepted, this does not change the outcome: {e}", e=str(exc),
         )
 
-    log.info("Newsletter sent — {s}", s=subject)
-    return "sent"
+    if research_recipients is None:
+        log.info("Newsletter sent — {s}", s=subject)
+    else:
+        log.info("Research newsletter relay outcome={status} — {s}", status=status, s=subject)
+    return status
 
 
 def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
@@ -344,7 +422,11 @@ def _send(subject: str, sections: list[dict], footer_note: str = "") -> None:
     _send_in_thread(subject, html, plain)
 
 
-def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> str:
+def _send_sync(
+    subject: str, sections: list[dict], footer_note: str = "", *,
+    research_recipients: tuple[str, ...] | None = None,
+    delivery: dict[str, Any] | None = None,
+) -> str:
     """Render and send synchronously, returning "sent"/"failed"/"uncertain".
 
     ``_send`` exists to keep request handlers non-blocking; it fires a
@@ -358,7 +440,9 @@ def _send_sync(subject: str, sections: list[dict], footer_note: str = "") -> str
     """
     html = _render_html(subject, sections, footer_note)
     plain = "\n\n".join(f"[{s['title']}]\n{s.get('body', '')}" for s in sections)
-    return _do_send(subject, html, plain)
+    if research_recipients is None:
+        return _do_send(subject, html, plain)
+    return _do_send(subject, html, plain, research_recipients=research_recipients, delivery=delivery)
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +526,9 @@ def send_weekly_review(review_content: str) -> None:
 _STALE_REGIME_HOURS = 24
 
 
-def daily_digest(dry_run: bool = False) -> dict[str, Any]:
+def daily_digest(
+    dry_run: bool = False, *, research_recipients: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     """Compile and send a daily digest newsletter with live data.
 
     Parameters:
@@ -450,6 +536,10 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
             Use this to preview a section count/titles/degraded-collector
             list against real data before relying on a live send — e.g.
             after a period where this function wasn't being invoked at all.
+        research_recipients: Optional explicit research-only audience for
+            controlled callers. Otherwise RESEARCH_DIGEST_EMAIL_TO is used.
+            Exactly two validated unique mailboxes are required; empty or
+            invalid values fail closed, never falling back to ALERT_EMAIL_TO.
 
     Returns:
         dict summarizing what was built: ``sections``, ``section_titles``,
@@ -463,6 +553,11 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
     as_of = datetime.now(timezone.utc)
     result: dict[str, Any] = {"timestamp": as_of.isoformat()}
     try:
+        audience = _validated_research_recipients(
+            getattr(_get_settings(), "RESEARCH_DIGEST_EMAIL_TO", ())
+            if research_recipients is None else research_recipients
+        )
+        result["research_recipients"] = list(audience)
         from sqlalchemy import text as sa_text
         from db import get_engine
 
@@ -661,7 +756,9 @@ def daily_digest(dry_run: bool = False) -> dict[str, Any]:
         # handler, so blocking here on real SMTP I/O is safe — and it's
         # what lets the caller record a claim only after an actual
         # confirmed outcome instead of after merely dispatching one.
-        send_status = _send_sync(subject, sections)
+        delivery: dict[str, Any] = {}
+        send_status = _send_sync(subject, sections, research_recipients=audience, delivery=delivery)
+        result["delivery"] = delivery
         result["send_status"] = send_status
         result["sent"] = send_status == "sent"
         if send_status != "sent":
