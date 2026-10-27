@@ -41,11 +41,25 @@ to users without the availability contract (`docs/reference/AVAILABILITY_CONTRAC
 
 ## Cost and refresh
 
-`raw_series` has ~1.93e9 rows (511 GB). The view query is a per-series index
-probe (`VALUES` tickers x fields `CROSS JOIN LATERAL` into `raw_series`, using
-`idx_raw_series_dedup`), run with `SET LOCAL enable_hashjoin / mergejoin /
-seqscan / bitmapscan = off`. It still takes **~100 s per field for 70 tickers,
-~10 minutes in total**.
+`raw_series` has ~1.93e9 rows (511 GB) and each YF series ~21k vintages since
+2026-01-01 for only ~200 dates. The first definition read every vintage (heap row
+and payload) to keep one per date; its first production refresh was cancelled at
+the 1200 s cap (2026-10-26). Since `yf_latest_vintage_scan_20261026` the view is
+built per series in two steps, run with `SET LOCAL enable_hashjoin / mergejoin /
+seqscan / bitmapscan = off`:
+
+1. newest `pull_timestamp` per date, an **index-only** scan of
+   `uq_raw_series_composite (series_id, source_id, obs_date, pull_timestamp)`:
+   ~21k index entries (~130 pages), no heap blocks;
+2. one probe per date for the latest `SUCCESS` vintage of source 2 at or before
+   that timestamp: only the ~200 winning rows (with `raw_payload`) are read.
+
+Same rows and columns as before (proved row-for-row on PostgreSQL in
+`tests/test_yf_latest_daily_vintage_pg.py`). Expected cost: ~330 blocks per
+series worst case versus ~740 before; cold worst case ~14 min for 420 series,
+typically a few minutes, seconds-to-a-minute warm. The index-only step needs the
+table's visibility map to be mostly set; check one series with
+`EXPLAIN (ANALYZE, BUFFERS)` (`Heap Fetches` small) before the first run.
 
 * The migration creates the view `WITH NO DATA` (instant). Reading it raises
   "materialized view has not been populated" until the first refresh.
@@ -56,7 +70,8 @@ seqscan / bitmapscan = off`. It still takes **~100 s per field for 70 tickers,
   morning slot and the 05:30Z market diary), `REFRESH MATERIALIZED VIEW
   CONCURRENTLY`: readers are never blocked. `statement_timeout` is 1200 s, one
   transaction, the script logs row count and duration and exits 1 on failure.
-  `--dry-run` prints the SQL without connecting.
+  `--dry-run` prints the SQL without connecting; `--statement-timeout-s N`
+  (60-7200) raises the cap for a deliberately long first run.
 * 10:45Z is deliberately outside the nightly `pg_dump` window (03:30–10:30Z,
   enforced for all timer templates by `tests/test_systemd_template_invariants.py`).
   Consequence: the view lags the morning pull until 10:45Z, so the diary and
