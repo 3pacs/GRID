@@ -952,14 +952,22 @@ class Resolver:
         # EntityMap counts its misses and reports them here.
         unmapped = entity_map.missing_feature_report()
         if unmapped["lookups_missed"]:
+            # Actionable population first: a mapped name missing from
+            # feature_registry drops rows until it is registered. Series
+            # with no entity_map entry are, in the bulk, entity-grained
+            # feeds read from raw_series directly (see
+            # EntityMap.missing_feature_report).
             log.warning(
-                "Resolution skipped {n} lookup(s) across {s} unmapped "
-                "series_id(s); {u} mapped feature name(s) are missing from "
-                "feature_registry: {names}. Worst offenders: {top}",
-                n=unmapped["lookups_missed"], s=unmapped["series_ids"],
+                "Resolution: {m} series_id(s) mapped to {u} feature name(s) "
+                "missing from feature_registry (rows dropped until registered): "
+                "{names}; {s} series_id(s) have no entity_map entry, by family: "
+                "{fam}; {n} lookup(s) skipped. Worst offenders: {top}",
+                m=unmapped.get("mapped_unregistered_count", 0),
                 u=len(unmapped["unregistered_features"]),
                 names=unmapped["unregistered_features"][:10],
-                top=unmapped["top_series"],
+                s=unmapped.get("no_mapping_series_ids", unmapped["series_ids"]),
+                fam=unmapped.get("by_family", [])[:8],
+                n=unmapped["lookups_missed"], top=unmapped["top_series"],
             )
 
         summary = _summary(
