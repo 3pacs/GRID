@@ -2601,69 +2601,9 @@ def score_thesis(engine: Engine, force_refresh: bool = False) -> dict[str, Any]:
 # ══════════════════════════════════════════════════════════════════════════
 
 def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
-    """Persist a thesis score to thesis_snapshots for future accuracy evaluation.
-
-    Returns the snapshot ID, or None on failure.
-    """
-    try:
-        from intelligence.thesis_tracker import _ensure_tables, _snapshot_conviction_fraction
-        # This scorer's declared output is percent; normalize before any effect.
-        if thesis.get("conviction_unit", "percent") != "percent":
-            raise ValueError("scored thesis conviction_unit must be percent")
-        conviction = _snapshot_conviction_fraction({
-            "conviction": thesis["conviction"], "conviction_unit": "percent"})
-        if conviction is None:
-            return None
-        _ensure_tables(engine)
-        model_states = {}
-        for m in thesis.get("models", []):
-            model_states[m["key"]] = {
-                "direction": m["direction"],
-                "score": m["score"],
-                "confidence": m["confidence"],
-                "data_point": m["data_point"],
-                "reasoning": m["reasoning"],
-                "status": m["status"],
-            }
-
-        key_drivers = [
-            {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in sorted(thesis.get("models", []), key=lambda x: -abs(x["score"]))[:3]
-            if m["status"] == "active"
-        ]
-        risk_factors = [
-            {"key": m["key"], "name": m["name"], "detail": m["reasoning"]}
-            for m in thesis.get("models", [])
-            if m["status"] == "active" and (
-                (thesis["direction"] == "BULLISH" and m["direction"] == "bearish")
-                or (thesis["direction"] == "BEARISH" and m["direction"] == "bullish")
-            )
-        ]
-
-        with engine.begin() as conn:
-            row = conn.execute(text(
-                "INSERT INTO thesis_snapshots "
-                "(overall_direction, conviction, conviction_unit, key_drivers, risk_factors, "
-                "model_states, narrative) "
-                "VALUES (:dir, :conv, 'fraction', :kd, :rf, :ms, :narr) "
-                "RETURNING id"
-            ), {
-                "dir": thesis["direction"].lower(),
-                "conv": conviction,
-                "kd": json.dumps(key_drivers),
-                "rf": json.dumps(risk_factors),
-                "ms": json.dumps(model_states),
-                "narr": _build_narrative(thesis),
-            }).fetchone()
-
-        snap_id = row[0] if row else None
-        log.info("Thesis snapshot saved: id={id}, dir={d}, conv={c}",
-                 id=snap_id, d=thesis["direction"], c=thesis["conviction"])
-        return snap_id
-
-    except Exception as exc:
-        log.warning("Failed to snapshot thesis: {e}", e=str(exc))
-        return None
+    """Compatibility-HOLD artifact: retain failure interface; never write."""
+    log.warning("THESIS_COMPATIBILITY_HOLD: scorer snapshot writes are disabled")
+    return None
 
 
 def _build_narrative(thesis: dict) -> str:

@@ -86,7 +86,9 @@ def native_pg_engine(native_modules):
                 WHERE r.rolname = current_user AND d.datname = current_database()
             """)).one()
             assert identity[:2] == ("oct25_native_test", "oct25_ci_writer")
-            assert 140000 <= identity[2] < 150000
+            major = int(os.environ['GRID_OCT25_PG_MAJOR'])
+            assert major in (14, 15)
+            assert major * 10000 <= identity[2] < (major + 1) * 10000
             assert tuple(identity[3:]) == (False, False, False, False, True)
             conn.execute(text(f'CREATE SCHEMA "{schema}"'))
             created = True
@@ -96,6 +98,8 @@ def native_pg_engine(native_modules):
         })
         with scoped.connect() as conn:
             assert conn.execute(text("SELECT current_schema()")).scalar_one() == schema
+        from intelligence.thesis_schema import prepare_thesis_schema
+        prepare_thesis_schema(scoped, schema)
         yield scoped
     finally:
         if scoped is not None:
@@ -267,6 +271,13 @@ def test_additive_receipt_preserves_legacy_and_accuracy_denominator(native_modul
     signals = ThesisTrackerAdapter().extract_signals(native_pg_engine)
     assert len(signals) == 1 and signals[0].signal_type == SignalType.MAGNITUDE
     assert signals[0].value == 0.4 and signals[0].metadata["total"] == 5
+    from intelligence.schema_readiness import SchemaNotReady
+    from intelligence.thesis_schema import prepare_thesis_schema
+    with pytest.raises(SchemaNotReady):
+        tracker.snapshot_thesis(native_pg_engine, {"conviction":75,"conviction_unit":"percent"})
+    with native_pg_engine.connect() as conn:
+        schema = conn.execute(text("SELECT current_schema()")).scalar_one()
+    prepare_thesis_schema(native_pg_engine, schema)
     tracker.snapshot_thesis(native_pg_engine, {"conviction":75,"conviction_unit":"percent"})
     with native_pg_engine.connect() as conn:
         rows = conn.execute(text("SELECT conviction,conviction_unit FROM thesis_snapshots ORDER BY id")).all()
@@ -322,3 +333,252 @@ def test_category_denominator_native_sql(native_modules, native_pg_engine, direc
     if expected_score == 7.2:
         assert verdict["confidence"] == 72.5
     assert "other/unknown" in verdict["data_point"]
+
+
+@pytest.mark.parametrize('caller', ['snapshot_thesis', 'generate_thesis_postmortem',
+    'get_thesis_history', 'get_thesis_accuracy', 'run_thesis_cycle', 'load_thesis_postmortems'])
+def test_missing_schema_refuses_before_caller_work(native_modules, native_pg_engine, caller):
+    from intelligence.schema_readiness import SchemaNotReady
+    with native_pg_engine.begin() as conn:
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+    statements=[]
+    def record(conn,cursor,statement,parameters,context,executemany): statements.append(statement)
+    event.listen(native_pg_engine,'before_cursor_execute',record)
+    args = ({'conviction':0},) if caller=='snapshot_thesis' else ((1,) if caller=='generate_thesis_postmortem' else ())
+    try:
+        with pytest.raises(SchemaNotReady):
+            getattr(native_modules[2],caller)(native_pg_engine,*args)
+        assert statements and all(s.lstrip().startswith('SELECT') for s in statements)
+    finally:
+        event.remove(native_pg_engine,'before_cursor_execute',record)
+
+
+def test_missing_schema_second_writer_refuses(native_modules,native_pg_engine):
+    with native_pg_engine.begin() as conn:
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+    assert native_modules[1].snapshot_thesis(native_pg_engine,{'conviction':75}) is None
+    with native_pg_engine.connect() as conn:
+        assert conn.execute(text('SELECT count(*) FROM thesis_snapshots')).scalar_one()==0
+
+
+@pytest.mark.parametrize('change', [
+    'ALTER COLUMN conviction_unit TYPE INTEGER USING NULL',
+    'ALTER COLUMN conviction_unit SET NOT NULL',
+    "ALTER COLUMN conviction_unit SET DEFAULT 'fraction'",
+])
+def test_incompatible_receipt_refuses_readiness_and_preparation(native_modules,native_pg_engine,change):
+    from intelligence.schema_readiness import SchemaNotReady
+    from intelligence.thesis_schema import prepare_thesis_schema
+    with native_pg_engine.begin() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text('ALTER TABLE thesis_snapshots '+change))
+    with pytest.raises(SchemaNotReady): native_modules[2]._ensure_tables(native_pg_engine)
+    with pytest.raises(SchemaNotReady): prepare_thesis_schema(native_pg_engine,schema)
+
+
+def test_explicit_preparation_rolls_back_partial_ddl(native_modules,native_pg_engine):
+    from intelligence.thesis_schema import prepare_thesis_schema
+    with native_pg_engine.begin() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+    def fail_after_addition(conn,cursor,statement,parameters,context,executemany):
+        if 'CREATE INDEX' in statement: raise RuntimeError('invented post-addition failure')
+    event.listen(native_pg_engine,'before_cursor_execute',fail_after_addition)
+    try:
+        with pytest.raises(RuntimeError,match='invented'): prepare_thesis_schema(native_pg_engine,schema)
+    finally: event.remove(native_pg_engine,'before_cursor_execute',fail_after_addition)
+    with native_pg_engine.connect() as conn:
+        assert not conn.execute(text("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='thesis_snapshots'::regclass AND attname='conviction_unit' AND NOT attisdropped)")).scalar_one()
+
+
+def test_explicit_preparation_contention_fails_without_retry(native_modules,native_pg_engine):
+    from intelligence.thesis_schema import prepare_thesis_schema
+    from sqlalchemy.exc import DBAPIError
+    attempted=[]
+    def record(conn,cursor,statement,parameters,context,executemany):
+        if statement.lstrip().startswith(('ALTER TABLE','CREATE TABLE','CREATE INDEX')): attempted.append(statement)
+    with native_pg_engine.begin() as blocker:
+        schema=blocker.execute(text('SELECT current_schema()')).scalar_one()
+        blocker.execute(text('LOCK TABLE thesis_snapshots IN ACCESS EXCLUSIVE MODE'))
+        event.listen(native_pg_engine,'before_cursor_execute',record)
+        try:
+            with pytest.raises(DBAPIError) as exc: prepare_thesis_schema(native_pg_engine,schema)
+            assert exc.value.orig.pgcode=='55P03'
+            assert attempted.count(exc.value.statement)==1
+            assert len(attempted)<=2
+        finally: event.remove(native_pg_engine,'before_cursor_execute',record)
+    native_modules[2]._ensure_tables(native_pg_engine)
+
+
+def test_explicit_statement_timeout_rolls_back(native_modules,native_pg_engine):
+    from intelligence.schema_readiness import bounded_schema_transaction
+    from sqlalchemy.exc import DBAPIError
+    with pytest.raises(DBAPIError) as exc:
+        with bounded_schema_transaction(native_pg_engine) as (conn,execute):
+            execute("INSERT INTO thesis_snapshots(overall_direction) VALUES('neutral')")
+            execute('SELECT pg_catalog.pg_sleep(3)')
+    assert exc.value.orig.pgcode=='57014'
+    with native_pg_engine.connect() as conn:
+        assert conn.execute(text('SELECT count(*) FROM thesis_snapshots')).scalar_one()==0
+
+
+def test_nonowner_runtime_can_write_read_without_ddl(native_modules,native_pg_engine,monkeypatch):
+    from sqlalchemy.exc import DBAPIError
+    from intelligence.thesis_schema import prepare_thesis_schema
+    raw=os.environ.get('GRID_OCT25_RUNTIME_DB_URL')
+    assert raw, 'explicit synthetic nonowner runtime URL required'
+    url=make_url(raw)
+    assert url.set(username='oct25_ci_writer',password=_test_url().password)==_test_url()
+    assert url.username=='oct25_ci_runtime' and url.password and url.password!=_test_url().password
+    with native_pg_engine.begin() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text(f'GRANT USAGE ON SCHEMA "{schema}" TO oct25_ci_runtime'))
+        conn.execute(text(f'GRANT SELECT,INSERT ON ALL TABLES IN SCHEMA "{schema}" TO oct25_ci_runtime'))
+        conn.execute(text(f'GRANT USAGE ON ALL SEQUENCES IN SCHEMA "{schema}" TO oct25_ci_runtime'))
+    runtime=create_engine(url,poolclass=NullPool,connect_args={'connect_timeout':5,'options':f'-csearch_path={schema} -cstatement_timeout=10000 -clock_timeout=5000'})
+    try:
+        with runtime.connect() as conn:
+            identity=conn.execute(text("SELECT current_user,rolsuper,rolcreatedb,rolcreaterole,rolreplication FROM pg_roles WHERE rolname=current_user")).one()
+            assert tuple(identity)==('oct25_ci_runtime',False,False,False,False)
+            assert conn.execute(text("SELECT NOT has_schema_privilege(current_user,current_schema(),'CREATE')")).scalar_one()
+        native_modules[2].snapshot_thesis(runtime,{'conviction':75,'conviction_unit':'percent'})
+        assert native_modules[2].get_thesis_history(runtime)[0].conviction==0.75
+        assert _history_http(runtime,monkeypatch)['snapshots'][0]['conviction_unit']=='fraction'
+        assert _directional_signal(runtime).confidence==0.75
+        with pytest.raises(DBAPIError) as exc: prepare_thesis_schema(runtime,schema)
+        assert exc.value.orig.pgcode=='42501'
+    finally: runtime.dispose()
+
+
+def test_held_scoring_stays_before_readiness(native_modules,native_pg_engine):
+    with native_pg_engine.begin() as conn:
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+    assert native_modules[2].score_old_theses(native_pg_engine)['held'] is True
+
+
+def test_ordinary_ready_paths_never_issue_ddl(native_modules,native_pg_engine):
+    statements=[]
+    def record(conn,cursor,statement,parameters,context,executemany): statements.append(statement)
+    event.listen(native_pg_engine,'before_cursor_execute',record)
+    try:
+        native_modules[2].snapshot_thesis(native_pg_engine,{'conviction':0})
+        native_modules[2].get_thesis_history(native_pg_engine)
+        assert statements and not any(s.lstrip().upper().startswith(('CREATE','ALTER','DROP','SET')) for s in statements)
+    finally: event.remove(native_pg_engine,'before_cursor_execute',record)
+
+
+@pytest.mark.parametrize('change',[
+    'ALTER TABLE thesis_snapshots ALTER COLUMN id DROP DEFAULT',
+    'ALTER TABLE thesis_snapshots ALTER COLUMN timestamp DROP DEFAULT',
+    'ALTER TABLE thesis_postmortems ALTER COLUMN id DROP DEFAULT',
+    'ALTER TABLE thesis_postmortems ALTER COLUMN generated_at DROP DEFAULT',
+    'ALTER TABLE thesis_snapshots DROP CONSTRAINT thesis_snapshots_pkey CASCADE',
+    'ALTER TABLE thesis_postmortems DROP CONSTRAINT thesis_postmortems_pkey',
+    'ALTER TABLE thesis_postmortems DROP CONSTRAINT thesis_postmortems_snapshot_id_fkey',
+])
+def test_functional_schema_contract_refusal(native_modules,native_pg_engine,change):
+    from intelligence.schema_readiness import SchemaNotReady
+    from intelligence.thesis_schema import prepare_thesis_schema
+    with native_pg_engine.begin() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text(change))
+    with pytest.raises(SchemaNotReady):native_modules[2]._ensure_tables(native_pg_engine)
+    with pytest.raises(SchemaNotReady):prepare_thesis_schema(native_pg_engine,schema)
+
+
+@pytest.mark.parametrize('caller',['snapshot','history','second_writer','adapter'])
+def test_actual_operation_connection_namespace_is_bound(native_modules,native_pg_engine,caller):
+    from intelligence.schema_readiness import SchemaNotReady
+    from intelligence.thesis_schema import prepare_thesis_schema
+    other='oct25_thesis_'+uuid4().hex
+    with native_pg_engine.begin() as conn:
+        primary=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text(f'CREATE SCHEMA "{other}"'))
+    try:
+        prepare_thesis_schema(native_pg_engine,other)
+        connections=[]; statements=[]
+        def select_namespace(dbapi,record):
+            chosen=primary if not connections else other
+            connections.append(chosen)
+            cursor=dbapi.cursor()
+            try:cursor.execute(f'SET search_path TO "{chosen}"')
+            finally:cursor.close()
+        def observe(conn,cursor,statement,parameters,context,executemany):statements.append(statement)
+        event.listen(native_pg_engine,'connect',select_namespace)
+        event.listen(native_pg_engine,'before_cursor_execute',observe)
+        try:
+            if caller=='second_writer':
+                assert native_modules[1].snapshot_thesis(native_pg_engine,{'conviction':75,'direction':'BULLISH','models':[]}) is None
+            else:
+                with pytest.raises(SchemaNotReady,match='outside'):
+                    if caller=='snapshot':native_modules[2].snapshot_thesis(native_pg_engine,{'conviction':0})
+                    elif caller=='history':native_modules[2].get_thesis_history(native_pg_engine)
+                    else:
+                        from datetime import datetime,timezone
+                        from intelligence.adapters.thesis_tracker_adapter import ThesisTrackerAdapter
+                        ThesisTrackerAdapter()._build_signals(native_pg_engine,datetime.now(timezone.utc))
+            assert connections==[primary,other]
+            assert not any(s.lstrip().startswith('INSERT') for s in statements)
+        finally:
+            event.remove(native_pg_engine,'connect',select_namespace)
+            event.remove(native_pg_engine,'before_cursor_execute',observe)
+        with native_pg_engine.connect() as conn:
+            assert conn.execute(text(f'SELECT count(*) FROM "{other}".thesis_snapshots')).scalar_one()==0
+    finally:
+        with native_pg_engine.begin() as conn:conn.execute(text(f'DROP SCHEMA "{other}" CASCADE'))
+
+
+def test_combined_preparation_supports_actual_thesis_and_publication_writers(native_modules,native_pg_engine):
+    from intelligence.runtime_schema import prepare_runtime_schema
+    with native_pg_engine.connect() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+    result=prepare_runtime_schema(native_pg_engine,thesis_schema=schema,publication_schema=schema)
+    assert result['state']=='ready'
+    native_modules[2].snapshot_thesis(native_pg_engine,{'conviction':75,'conviction_unit':'percent'})
+    from ollama.market_briefing import MarketBriefingEngine
+    publication=MarketBriefingEngine.__new__(MarketBriefingEngine)
+    publication.engine=native_pg_engine
+    payload={'type':'synthetic','content':'invented combined preparation',
+             'sentiment':None,'snapshot':{'publication_time':None,'pit':'UNKNOWN'}}
+    assert type(publication._persist_to_db(payload)) is int
+    with native_pg_engine.connect() as conn:
+        content,snapshot=conn.execute(text('SELECT content,snapshot_data FROM market_briefings')).one()
+        assert content==payload['content'] and snapshot==payload['snapshot']
+        assert conn.execute(text('SELECT conviction_unit FROM thesis_snapshots')).scalar_one()=='fraction'
+
+
+def test_combined_preparation_late_failure_is_atomic(native_modules,native_pg_engine):
+    from intelligence.runtime_schema import prepare_runtime_schema
+    with native_pg_engine.begin() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+    def fail_publication_index(conn,cursor,statement,parameters,context,executemany):
+        if 'CREATE INDEX' in statement and 'idx_market_briefings_date' in statement:
+            raise RuntimeError('invented publication DDL failure')
+    event.listen(native_pg_engine,'before_cursor_execute',fail_publication_index)
+    try:
+        with pytest.raises(RuntimeError,match='invented'):
+            prepare_runtime_schema(native_pg_engine,thesis_schema=schema,publication_schema=schema)
+    finally:event.remove(native_pg_engine,'before_cursor_execute',fail_publication_index)
+    with native_pg_engine.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('market_briefings')")).scalar_one() is None
+        assert not conn.execute(text("SELECT EXISTS(SELECT 1 FROM pg_attribute WHERE attrelid='thesis_snapshots'::regclass AND attname='conviction_unit' AND NOT attisdropped)")).scalar_one()
+
+
+def test_incompatible_publication_refuses_before_thesis_upgrade(native_modules,native_pg_engine):
+    from intelligence.runtime_schema import prepare_runtime_schema
+    from intelligence.schema_readiness import SchemaNotReady
+    with native_pg_engine.connect() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+    prepare_runtime_schema(native_pg_engine,thesis_schema=schema,publication_schema=schema)
+    with native_pg_engine.begin() as conn:
+        conn.execute(text('ALTER TABLE thesis_snapshots DROP COLUMN conviction_unit'))
+        conn.execute(text('ALTER TABLE market_briefings ALTER COLUMN created_at DROP DEFAULT'))
+    statements=[]
+    def capture(conn,cursor,statement,parameters,context,executemany):statements.append(statement)
+    event.listen(native_pg_engine,'before_cursor_execute',capture)
+    try:
+        with pytest.raises(SchemaNotReady):
+            prepare_runtime_schema(native_pg_engine,thesis_schema=schema,publication_schema=schema)
+        assert not any(s.lstrip().startswith(('CREATE','ALTER')) for s in statements)
+    finally:event.remove(native_pg_engine,'before_cursor_execute',capture)

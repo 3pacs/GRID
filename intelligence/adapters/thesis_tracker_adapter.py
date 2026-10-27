@@ -10,6 +10,7 @@ from sqlalchemy.engine import Engine
 from intelligence.adapters.base import BaseAdapter, clamp, sid
 from intelligence.signal_registry import RegisteredSignal, SignalType
 from intelligence.thesis_tracker import _snapshot_conviction_fraction
+from intelligence.thesis_schema import require_thesis_connection
 
 _SRC = "thesis_tracker"
 _REFRESH = 4.0
@@ -24,6 +25,7 @@ class ThesisTrackerAdapter(BaseAdapter):
         vu = now + timedelta(hours=4)
         signals: list[RegisteredSignal] = []
         with engine.connect() as conn:
+            schema = require_thesis_connection(conn, allow_legacy_unit=True)
             row = conn.execute(text("""
                 SELECT overall_direction, conviction, key_drivers, narrative, timestamp,
                        to_jsonb(thesis_snapshots)->>'conviction_unit' AS conviction_unit
@@ -58,6 +60,7 @@ class ThesisTrackerAdapter(BaseAdapter):
                 ))
 
         with engine.connect() as conn:
+            require_thesis_connection(conn, expected_schema=schema, allow_legacy_unit=True)
             acc = conn.execute(text("""
                 SELECT COUNT(*) FILTER (WHERE thesis_direction = actual_direction) as correct,
                        COUNT(*) FILTER (WHERE thesis_direction != actual_direction AND actual_direction IS NOT NULL) as wrong,
