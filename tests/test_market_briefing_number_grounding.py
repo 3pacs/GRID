@@ -19,6 +19,7 @@ import json
 import os
 from copy import deepcopy
 from datetime import date, datetime, timedelta, timezone
+from contextlib import contextmanager
 
 import pytest
 
@@ -29,6 +30,22 @@ from price_close_contract import daily_capture_payload
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────────
+
+# Independently declared synthetic pg_catalog rows for the prepared publication
+# schema. Exercise the real readiness helper, never replace it with a pass stub.
+# Fields: kind,namespace,column,type,type_namespace,notnull,hasdefault,inherited,default_kind.
+_PUBLICATION_CATALOG = (
+    ('r', 'publication_test', 'id', 'int4', 'pg_catalog', True, True, False, 'generated_integer'),
+    ('r', 'publication_test', 'briefing_type', 'text', 'pg_catalog', True, False, False, None),
+    ('r', 'publication_test', 'briefing_date', 'date', 'pg_catalog', True, False, False, None),
+    ('r', 'publication_test', 'content', 'text', 'pg_catalog', True, False, False, None),
+    ('r', 'publication_test', 'sentiment_score', 'float4', 'pg_catalog', False, False, False, None),
+    ('r', 'publication_test', 'sentiment_label', 'text', 'pg_catalog', False, False, False, None),
+    ('r', 'publication_test', 'sentiment_data', 'jsonb', 'pg_catalog', False, False, False, None),
+    ('r', 'publication_test', 'snapshot_data', 'jsonb', 'pg_catalog', False, False, False, None),
+    ('r', 'publication_test', 'created_at', 'timestamptz', 'pg_catalog', False, True, False, 'transaction_timestamp'),
+)
+
 
 
 class _FakeResult:
@@ -42,6 +59,9 @@ class _FakeResult:
     def fetchall(self):
         return self._many
 
+    def all(self):
+        return self._many
+
 
 class _FakeConnection:
     """Dispatches by SQL substring, like tests/test_briefing_sentiment_readonly.py's
@@ -49,17 +69,31 @@ class _FakeConnection:
     ``_gather_market_snapshot`` issues many distinct queries on one connection.
     """
 
-    def __init__(self, *, row_by_sid=None, pcr_row=None, options_row=None, insert_id=1):
+    def __init__(self, *, row_by_sid=None, pcr_row=None, options_row=None, insert_id=1,
+                 publication_catalog=None, publication_primary_key=("id",)):
         self.row_by_sid = row_by_sid or {}
         self.pcr_row = pcr_row
         self.options_row = options_row
         self.insert_id = insert_id
         self.executed: list[str] = []
+        self.publication_catalog = _PUBLICATION_CATALOG if publication_catalog is None else publication_catalog
+        self.publication_primary_key = publication_primary_key
+        self.commit_count = 0
+        self.rollback_count = 0
 
     def execute(self, stmt, params=None):
         sql = str(stmt)
         self.executed.append(sql)
         params = params or {}
+
+        if "FROM pg_catalog.pg_class c" in sql:
+            assert params == {"relation": "market_briefings"}, "UNMODELED_CATALOG_RELATION"
+            return _FakeResult(many=list(self.publication_catalog))
+        if "FROM pg_catalog.pg_constraint co" in sql:
+            assert params == {"relation": "market_briefings"}, "UNMODELED_CONSTRAINT_RELATION"
+            keys = ([('p', list(self.publication_primary_key), None, None, [], True)]
+                    if self.publication_primary_key else [])
+            return _FakeResult(many=keys)
 
         if "FROM raw_series r" in sql and "JOIN source_catalog" in sql:
             # store.observations readers: YF snapshot values are read as
@@ -91,7 +125,10 @@ class _FakeConnection:
         return _FakeResult()
 
     def commit(self):
-        pass
+        self.commit_count += 1
+
+    def rollback(self):
+        self.rollback_count += 1
 
     def __enter__(self):
         return self
@@ -108,6 +145,15 @@ class _FakeEngine:
 
     def connect(self):
         return self._conn
+
+    @contextmanager
+    def begin(self):
+        try:
+            yield self._conn
+            self._conn.commit()
+        except BaseException:
+            self._conn.rollback()
+            raise
 
 
 class _FakeOllamaClient:
@@ -1299,3 +1345,39 @@ def test_review_v3_unknown_ratio_without_numeric_unit_remains_nonclaim():
     annotated, guard = annotate_publication_context(text, _basis_snapshot("empty"))
     assert guard["passed"]
     assert annotated == text
+
+
+# Fake protocol tests are narrow SQL-input models, not real-PostgreSQL proof.
+def test_publication_fake_exercises_real_readiness_before_insert():
+    conn = _FakeConnection()
+    engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+    engine.engine = _FakeEngine(conn)
+    payload = {"type": "hourly", "content": "Synthetic retained content.", "snapshot": {}, "sentiment": None}
+    assert engine._persist_to_db(payload) == 1
+    assert conn.commit_count == 1 and conn.rollback_count == 0
+    catalog = next(i for i, sql in enumerate(conn.executed) if "FROM pg_catalog.pg_class c" in sql)
+    keys = next(i for i, sql in enumerate(conn.executed) if "FROM pg_catalog.pg_constraint co" in sql)
+    insert = next(i for i, sql in enumerate(conn.executed) if "INSERT INTO market_briefings" in sql)
+    assert catalog < keys < insert
+    assert not any("CREATE TABLE" in sql or "CREATE INDEX" in sql for sql in conn.executed)
+
+
+@pytest.mark.parametrize("broken", ["missing_relation", "missing_snapshot", "missing_id_generation", "missing_pk"])
+def test_publication_fake_cannot_bypass_real_readiness_refusal(broken):
+    rows = list(_PUBLICATION_CATALOG)
+    pk = ("id",)
+    if broken == "missing_relation":
+        rows = []
+    elif broken == "missing_snapshot":
+        rows = [row for row in rows if row[2] != "snapshot_data"]
+    elif broken == "missing_id_generation":
+        rows[0] = (*rows[0][:8], None)
+    else:
+        pk = ()
+    conn = _FakeConnection(publication_catalog=rows, publication_primary_key=pk)
+    engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+    engine.engine = _FakeEngine(conn)
+    payload = {"type": "hourly", "content": "Synthetic retained content.", "snapshot": {}, "sentiment": None}
+    assert engine._persist_to_db(payload) is None
+    assert conn.commit_count == 0 and conn.rollback_count == 1
+    assert not any("INSERT INTO market_briefings" in sql for sql in conn.executed)

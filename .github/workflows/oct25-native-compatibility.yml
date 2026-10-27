@@ -31,7 +31,6 @@ jobs:
       THESIS_CASES: "72"
       PURE_CASES: "35"
       GRID_OCT25_PG_MAJOR: ${{ matrix.pg }}
-      GRID_OCT25_ROLLBACK_RECEIPT: ${{ runner.temp }}/g3-g5-rollback.json
       DB_HOST: 127.0.0.1
       DB_PORT: "15432"
       DB_NAME: oct25_native_test
@@ -54,6 +53,12 @@ jobs:
           import os, re
           assert re.fullmatch('[0-9a-f]{40}', os.environ['HOLD_SHA']), 'UNBOUND_HOLD'
           assert int(os.environ['THESIS_CASES']) > 0 and int(os.environ['PURE_CASES']) > 0
+          from pathlib import Path
+          receipt = Path(os.environ['RUNNER_TEMP']) / 'g3-g5-rollback.json'
+          assert receipt.is_absolute()
+          assert not any(c in str(receipt) for c in ('\r', '\n'))
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
+              output.write(f'GRID_OCT25_ROLLBACK_RECEIPT={receipt}\n')
           PY
 
       - uses: actions/checkout@v7

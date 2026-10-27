@@ -68,7 +68,13 @@ class TestConvictionFormat:
         engine = MagicMock()
         connection = engine.begin.return_value.__enter__.return_value
         connection.execute.return_value.fetchone.return_value = (17,)
-        ensure = MagicMock()
+        ensure = MagicMock(return_value="synthetic_thesis")
+        def check_connection(actual, *, expected_schema):
+            assert actual is connection
+            assert expected_schema == "synthetic_thesis"
+            assert not connection.execute.called
+        readiness = MagicMock(side_effect=check_connection)
+        monkeypatch.setattr(thesis_tracker, "require_thesis_connection", readiness)
         messages = []
         monkeypatch.setattr(thesis_tracker, "_ensure_tables", ensure)
         monkeypatch.setattr(thesis_tracker, "log", SimpleNamespace(
@@ -77,6 +83,7 @@ class TestConvictionFormat:
         identifier = thesis_tracker.snapshot_thesis(engine, payload)
         assert identifier == 17 and payload == original
         ensure.assert_called_once_with(engine)
+        readiness.assert_called_once_with(connection, expected_schema="synthetic_thesis")
         engine.begin.assert_called_once_with()
         connection.execute.assert_called_once()
         parameters = connection.execute.call_args.args[1]

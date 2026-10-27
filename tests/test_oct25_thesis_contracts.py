@@ -60,6 +60,8 @@ class MemoryBoundary:
         self.statements = []
         self.acquisitions = 0
         self.schema_calls = 0
+        self.connection_checks = 0
+        self.namespace = "synthetic_thesis"
 
     def begin(self):
         self.acquisitions += 1
@@ -86,6 +88,16 @@ class MemoryBoundary:
 
 def schema_stub(engine):
     engine.schema_calls += 1
+    return engine.namespace
+
+
+def connection_contract(connection, *, expected_schema):
+    """Explicit isolated seam: bind the operation connection to its preflight."""
+    assert isinstance(connection, MemoryBoundary)
+    assert expected_schema == connection.namespace == "synthetic_thesis"
+    assert connection.acquisitions > 0
+    connection.connection_checks += 1
+    return expected_schema
 
 
 def load(path, names, **overrides):
@@ -98,7 +110,7 @@ def load(path, names, **overrides):
                      timedelta=timedelta, json=json, dataclass=dataclass, asdict=asdict,
                      log=Log(), text=Query, DEFAULT_ACCURACY=0.5,
                      BULLISH="bullish", BEARISH="bearish", NEUTRAL="neutral",
-                     _ensure_tables=schema_stub)
+                     _ensure_tables=schema_stub, require_thesis_connection=connection_contract)
     namespace.update(overrides)
     exec(compile(ast.fix_missing_locations(module), path, "exec"), namespace)
     return namespace
@@ -257,11 +269,19 @@ class ThesisContracts(unittest.TestCase):
         boundary = MemoryBoundary()
         ns = tracker()
         self.assertEqual(ns["snapshot_thesis"](boundary, out), 17)
+        self.assertEqual(boundary.connection_checks, 1)
         params = boundary.statements[0][1]
         self.assertEqual(params["conviction"], 0.5, "GENERATOR_PERCENT_TO_STORAGE_FRACTION")
         self.assertEqual(params["narrative"], out["narrative"])
         self.assertEqual(out["conviction"], 50)
         self.assertIn("50%", ns["log"].messages[0])
+
+    def test_T3_operation_namespace_drift_refuses_before_insert(self):
+        ns = tracker(); boundary = MemoryBoundary()
+        ns["_ensure_tables"] = lambda engine: "wrong_namespace"
+        with self.assertRaises(AssertionError):
+            ns["snapshot_thesis"](boundary, {"conviction": 0.5})
+        self.assertEqual(boundary.statements, [])
 
     def test_T3_nullable_snapshot_seam(self):
         for data in [{}, {"conviction": None, "narrative": "unverified separate textual conviction"}]:
