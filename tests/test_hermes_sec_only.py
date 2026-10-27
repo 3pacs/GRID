@@ -494,12 +494,26 @@ class FinraCompositionTests(unittest.TestCase):
             self.assertFalse(r['native_accepted']);self.assertIsNone(r['workflow'])
 
 
+# PR806's independently reviewed adapter delta is the sole allowed change to
+# this historical default-tail snapshot. Reverse its exact source text before
+# checking the original pin; altered guards/provenance or unrelated edits fail.
+_PRE_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        from ingestion.options import OptionsPuller\n\n        self._puller = OptionsPuller(db_engine=db_engine)\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        # Do not construct the puller (which resolves catalog identity) until\n        # the secondary-writer policy has allowed a real attempt.\n        self._engine = db_engine\n        self._puller = None\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+
+def scheduler_tail_before_reviewed_options_delta(source):
+    tail = source.split('\nimport calendar\n', 1)[1]
+    assert tail.count(_PR806_OPTIONS_METHODS) == 1, 'PR806_OPTIONS_DELTA_CHANGED'
+    return tail.replace(_PR806_OPTIONS_METHODS, _PRE_PR806_OPTIONS_METHODS, 1)
+
+
 class CurrentSecDefaultTests(unittest.TestCase):
     def test_unselected_default_source_tails_are_current_base_exact(self):
         # Operator tail: accepted PR911 head 7ec182b, blob 4b039ec9.
         # Parent 9135c68 tail d1b16920 differs only in the approved stale block.
         for path,marker,pin in [(OPER,'\nimport argparse\n','381edbc4c69e5024c19ec0f616c6420d81b375bb293a8974b7f5b78dde32f624'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
-            self.assertEqual(digest(path.read_text().split(marker,1)[1].encode()),pin)
+            source = path.read_text(encoding='utf-8')
+            tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else source.split(marker, 1)[1]
+            self.assertEqual(digest(tail.encode()), pin)
 
     def test_default_tail_pin_rejects_guard_and_unselected_source_mutations(self):
         original=OPER.read_text()
@@ -517,6 +531,25 @@ class CurrentSecDefaultTests(unittest.TestCase):
                 def changed_read(path,*args,**kwargs):
                     return changed if path==OPER else read(path,*args,**kwargs)
                 with patch.object(Path,'read_text',changed_read):
+                    with self.assertRaises(AssertionError):
+                        self.test_unselected_default_source_tails_are_current_base_exact()
+
+    def test_reviewed_options_delta_and_unrelated_scheduler_mutations_are_rejected(self):
+        original = SCHED.read_text(encoding='utf-8')
+        mutations = [
+            ('if guarded is not None:', 'if False:'),
+            ('self._puller = None', 'self._puller = OptionsPuller(db_engine=db_engine)'),
+            ('capture_source="smart_scheduler"', 'capture_source="options_puller"'),
+            ('SKIP_RETRY_MINUTES = 30', 'SKIP_RETRY_MINUTES = 31'),
+        ]
+        read = Path.read_text
+        for before, after in mutations:
+            with self.subTest(mutation=before):
+                self.assertIn(before, original)
+                changed = original.replace(before, after, 1)
+                def changed_read(path, *args, **kwargs):
+                    return changed if path == SCHED else read(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', changed_read):
                     with self.assertRaises(AssertionError):
                         self.test_unselected_default_source_tails_are_current_base_exact()
 
