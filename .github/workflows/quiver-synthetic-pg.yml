@@ -21,9 +21,6 @@ jobs:
       DB_PORT: "15432"
       DB_NAME: qq_batch_test
       DB_USER: qq_ci_writer
-      DB_PASSWORD: synthetic-writer-only
-      GRID_TEST_DB_URL: postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test
-      GRID_QQ_TEST_DB_URL: postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test
       GRID_QQ_REQUIRE_PG: "1"
       GRID_JWT_SECRET: synthetic-ci-only
       TESTING: "true"
@@ -49,6 +46,25 @@ jobs:
         timeout-minutes: 10
         run: python -m pip install -r requirements.txt
 
+      - name: Generate ephemeral job-only database credentials
+        timeout-minutes: 1
+        run: |
+          python - <<'PY'
+          import os
+          import secrets
+          from pathlib import Path
+          admin = secrets.token_hex(32)
+          writer = secrets.token_hex(32)
+          assert admin != writer
+          url = f'postgresql://qq_ci_writer:{writer}@127.0.0.1:15432/qq_batch_test'
+          # Runner-owned environment handoff stays inside this disposable job.
+          # Never print credentials, pass them in argv, or upload this file.
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
+              for key, value in {'POSTGRES_PASSWORD': admin, 'DB_PASSWORD': writer,
+                                 'GRID_TEST_DB_URL': url, 'GRID_QQ_TEST_DB_URL': url}.items():
+                  output.write(f'{key}={value}\n')
+          PY
+
       # Hosted disposable VM only. Host networking makes the server-side address
       # genuinely127.0.0.1; Docker port publishing would expose a172.* server address
       # and fail the unchanged fixture. PG listens only on loopback port15432.
@@ -59,7 +75,7 @@ jobs:
           docker run --detach --name qq-synthetic-pg --network host \
             --label grid-purpose=quiver-synthetic-ci \
             -e POSTGRES_USER=qq_ci_admin \
-            -e POSTGRES_PASSWORD=synthetic-admin-only \
+            -e POSTGRES_PASSWORD \
             -e POSTGRES_DB=postgres \
             postgres:14 -c listen_addresses=127.0.0.1 -c port=15432
           ready=0
@@ -71,11 +87,26 @@ jobs:
             sleep 1
           done
           test "$ready" = 1
-          docker exec -e PGPASSWORD=synthetic-admin-only qq-synthetic-pg \
-            psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 15432 -U qq_ci_admin -d postgres \
-            -c "CREATE ROLE qq_ci_writer LOGIN PASSWORD 'synthetic-writer-only' NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION;" \
-            -c "CREATE DATABASE qq_batch_test OWNER qq_ci_writer;" \
-            -c "COMMENT ON DATABASE qq_batch_test IS 'grid-quiver-synthetic-ci-only';"
+          python - <<'PY'
+          import os
+          import re
+          import psycopg2
+          from psycopg2 import sql
+          admin, writer = os.environ['POSTGRES_PASSWORD'], os.environ['DB_PASSWORD']
+          assert re.fullmatch(r'[0-9a-f]{64}', admin)
+          assert re.fullmatch(r'[0-9a-f]{64}', writer)
+          assert admin != writer
+          connection = psycopg2.connect(host='127.0.0.1', port=15432, dbname='postgres',
+                                        user='qq_ci_admin', password=admin, connect_timeout=5)
+          try:
+              connection.autocommit = True
+              with connection.cursor() as cursor:
+                  cursor.execute(sql.SQL("CREATE ROLE qq_ci_writer LOGIN PASSWORD {} NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION").format(sql.Literal(writer)))
+                  cursor.execute("CREATE DATABASE qq_batch_test OWNER qq_ci_writer")
+                  cursor.execute("COMMENT ON DATABASE qq_batch_test IS 'grid-quiver-synthetic-ci-only'")
+          finally:
+              connection.close()
+          PY
           docker inspect --format='image={{.Image}} network={{.HostConfig.NetworkMode}} purpose={{index .Config.Labels "grid-purpose"}}' qq-synthetic-pg
 
       - name: Verify synthetic identity before tests
@@ -84,7 +115,11 @@ jobs:
           python - <<'PY'
           import os
           from sqlalchemy import create_engine, text
-          expected = 'postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test'
+          import re
+          password = os.environ['DB_PASSWORD']
+          assert re.fullmatch(r'[0-9a-f]{64}', password)
+          expected = f'postgresql://qq_ci_writer:{password}@127.0.0.1:15432/qq_batch_test'
+          assert os.environ['GRID_TEST_DB_URL'] == expected
           assert os.environ['GRID_QQ_TEST_DB_URL'] == expected
           engine = create_engine(expected, connect_args={'connect_timeout': 5})
           try:
