@@ -753,6 +753,18 @@ def _source_catalog_column_exists(conn: Any, column_name: str) -> bool:
     return bool(row)
 
 
+def _relation_exists(conn: Any, relation: str) -> bool:
+    """Whether ``relation`` resolves on the current search_path, without a
+    query error (which would abort the caller's PostgreSQL transaction)."""
+    from sqlalchemy import text as sa_text
+
+    row = conn.execute(
+        sa_text("SELECT to_regclass(:relation) IS NOT NULL"),
+        {"relation": relation},
+    ).scalar()
+    return bool(row)
+
+
 def check_db_health(engine: Any) -> dict[str, Any]:
     """Check database connectivity and basic stats."""
     from sqlalchemy import text
@@ -802,6 +814,38 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                 )
             ).fetchone()
             result["failed_pulls_1h"] = row[0] if row else 0
+
+            # Only a few pullers write FAILED raw_series rows (fred, the
+            # Baltic legacy branch, ecb, world_bank); BIS, RBI, repo_market,
+            # ADS and every scheduler job record failures in pull_log only,
+            # so a raw_series-only count read 0 while those sources failed
+            # every cycle (grid-hermes journal 2026-10-26). Count both and
+            # keep the split so the total's meaning stays explicit.
+            result["failed_pulls_24h_raw_series"] = result["failed_pulls_24h"]
+            result["failed_pulls_1h_raw_series"] = result["failed_pulls_1h"]
+            # A DB without pull_log reports the split as unknown (None), not
+            # 0, and must not abort the rest of this transaction.
+            result["failed_pulls_24h_pull_log"] = None
+            result["failed_pulls_1h_pull_log"] = None
+            if _relation_exists(conn, "pull_log"):
+                row = conn.execute(
+                    text(
+                        "SELECT "
+                        "COUNT(*) FILTER (WHERE COALESCE(completed_at, started_at) "
+                        "  > NOW() - INTERVAL '24 hours'), "
+                        "COUNT(*) FILTER (WHERE COALESCE(completed_at, started_at) "
+                        "  > NOW() - INTERVAL '1 hour') "
+                        "FROM pull_log "
+                        "WHERE status IN ('FAILED', 'PARTIAL') "
+                        "AND COALESCE(completed_at, started_at) > NOW() - INTERVAL '24 hours'"
+                    )
+                ).fetchone()
+                pull_log_24h = int(row[0] or 0) if row else 0
+                pull_log_1h = int(row[1] or 0) if row else 0
+                result["failed_pulls_24h_pull_log"] = pull_log_24h
+                result["failed_pulls_1h_pull_log"] = pull_log_1h
+                result["failed_pulls_24h"] += pull_log_24h
+                result["failed_pulls_1h"] += pull_log_1h
 
             # Source freshness, cadence-aware (GRID-STALE-SOURCES-AUDIT-
             # 20260929.md). Two fixes over the old flat-26h rule:

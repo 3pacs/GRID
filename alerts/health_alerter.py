@@ -159,7 +159,8 @@ def _failed_pulls_render(h: dict) -> tuple[str, str]:
         f"GRID: {n_1h} failed pulls in last hour ({n_24h} in 24h)",
         f"{n_1h} pulls failed in the last hour (threshold "
         f"{FAILED_PULLS_1H_THRESHOLD}); 24h cumulative is {n_24h}. "
-        f"Check raw_series.pull_status FAILED rows + scheduler logs.",
+        f"Check raw_series.pull_status FAILED rows, pull_log FAILED/PARTIAL "
+        f"rows + scheduler logs.",
     )
 
 

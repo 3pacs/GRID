@@ -496,8 +496,30 @@ class FinraCompositionTests(unittest.TestCase):
 
 class CurrentSecDefaultTests(unittest.TestCase):
     def test_unselected_default_source_tails_are_current_base_exact(self):
-        for path,marker,pin in [(OPER,'\nimport argparse\n','d1b169204f2ed57db284acee8993cf338281311204e32f1eef0871601d6c78a5'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
+        # Operator tail: accepted PR911 head 7ec182b, blob 4b039ec9.
+        # Parent 9135c68 tail d1b16920 differs only in the approved stale block.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','381edbc4c69e5024c19ec0f616c6420d81b375bb293a8974b7f5b78dde32f624'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
             self.assertEqual(digest(path.read_text().split(marker,1)[1].encode()),pin)
+
+    def test_default_tail_pin_rejects_guard_and_unselected_source_mutations(self):
+        original=OPER.read_text()
+        mutations=[
+            ('stale_attempted >= 15','stale_attempted >= 16'),
+            (' or time.monotonic() >= cycle_deadline',''),
+            ('if state.cooldowns.can_retry(src):','if True:'),
+            ('def git_pull() -> dict[str, Any]:','def unintended_git_pull() -> dict[str, Any]:'),
+        ]
+        read=Path.read_text
+        for before,after in mutations:
+            with self.subTest(mutation=before):
+                self.assertIn(before,original)
+                changed=original.replace(before,after,1)
+                def changed_read(path,*args,**kwargs):
+                    return changed if path==OPER else read(path,*args,**kwargs)
+                with patch.object(Path,'read_text',changed_read):
+                    with self.assertRaises(AssertionError):
+                        self.test_unselected_default_source_tails_are_current_base_exact()
+
     def test_all_accepted_sec_function_bodies_are_preserved(self):
         manifest=accepted_sec_source_manifest(SCHED.read_text())
         self.assertEqual([row[0] for row in manifest['nodes']],list(_ACCEPTED_SEC_NAMES))
