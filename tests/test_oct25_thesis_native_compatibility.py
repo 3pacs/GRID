@@ -395,31 +395,47 @@ def test_explicit_preparation_contention_fails_without_retry(native_modules,nati
     from intelligence.thesis_schema import prepare_thesis_schema
     from sqlalchemy.exc import DBAPIError
     attempted=[]
+    transactions=[]
     def record(conn,cursor,statement,parameters,context,executemany):
-        if statement.lstrip().startswith(('ALTER TABLE','CREATE TABLE','CREATE INDEX')): attempted.append(statement)
+        # Catalog preflight can acquire a relation lock before the first DDL.
+        attempted.append(statement)
+    def record_begin(conn): transactions.append(conn)
     with native_pg_engine.begin() as blocker:
         schema=blocker.execute(text('SELECT current_schema()')).scalar_one()
         blocker.execute(text('LOCK TABLE thesis_snapshots IN ACCESS EXCLUSIVE MODE'))
         event.listen(native_pg_engine,'before_cursor_execute',record)
+        event.listen(native_pg_engine,'begin',record_begin)
         try:
             with pytest.raises(DBAPIError) as exc: prepare_thesis_schema(native_pg_engine,schema)
             assert exc.value.orig.pgcode=='55P03'
-            assert attempted.count(exc.value.statement)==1
-            assert len(attempted)<=2
-        finally: event.remove(native_pg_engine,'before_cursor_execute',record)
+            assert exc.value.statement and attempted.count(exc.value.statement)==1
+            assert len(transactions)==1, 'preparation must not retry the transaction'
+            assert attempted[-1]==exc.value.statement, 'no SQL after the blocking failure'
+        finally:
+            event.remove(native_pg_engine,'before_cursor_execute',record)
+            event.remove(native_pg_engine,'begin',record_begin)
     native_modules[2]._ensure_tables(native_pg_engine)
 
 
 def test_explicit_statement_timeout_rolls_back(native_modules,native_pg_engine):
-    from intelligence.schema_readiness import bounded_schema_transaction
+    from intelligence.schema_readiness import bounded_schema_transaction, quote_schema
     from sqlalchemy.exc import DBAPIError
+    with native_pg_engine.connect() as conn:
+        schema=conn.execute(text('SELECT current_schema()')).scalar_one()
+    # Preparation intentionally uses pg_catalog-only search_path.
+    relation=quote_schema(schema)+'.thesis_snapshots'
+    inserted=False
     with pytest.raises(DBAPIError) as exc:
         with bounded_schema_transaction(native_pg_engine) as (conn,execute):
-            execute("INSERT INTO thesis_snapshots(overall_direction) VALUES('neutral')")
+            execute(f"INSERT INTO {relation}(overall_direction) VALUES('neutral')")
+            assert execute(f'SELECT count(*) FROM {relation}').scalar_one()==1
+            inserted=True
             execute('SELECT pg_catalog.pg_sleep(3)')
+    assert inserted, 'timeout must follow a successful transactional write'
     assert exc.value.orig.pgcode=='57014'
+    assert exc.value.statement=='SELECT pg_catalog.pg_sleep(3)'
     with native_pg_engine.connect() as conn:
-        assert conn.execute(text('SELECT count(*) FROM thesis_snapshots')).scalar_one()==0
+        assert conn.execute(text(f'SELECT count(*) FROM {relation}')).scalar_one()==0
 
 
 def test_nonowner_runtime_can_write_read_without_ddl(native_modules,native_pg_engine,monkeypatch):

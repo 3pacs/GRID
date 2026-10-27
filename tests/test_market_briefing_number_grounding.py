@@ -142,6 +142,10 @@ class _FakeEngine:
 
     def __init__(self, conn: _FakeConnection):
         self._conn = conn
+        # Count only explicit begin() transactions; connect() users (for
+        # example sentiment setup/prediction) retain connection-wide counters.
+        self.transaction_commit_count = 0
+        self.transaction_rollback_count = 0
 
     def connect(self):
         return self._conn
@@ -151,8 +155,10 @@ class _FakeEngine:
         try:
             yield self._conn
             self._conn.commit()
+            self.transaction_commit_count += 1
         except BaseException:
             self._conn.rollback()
+            self.transaction_rollback_count += 1
             raise
 
 
@@ -1381,3 +1387,23 @@ def test_publication_fake_cannot_bypass_real_readiness_refusal(broken):
     assert engine._persist_to_db(payload) is None
     assert conn.commit_count == 0 and conn.rollback_count == 1
     assert not any("INSERT INTO market_briefings" in sql for sql in conn.executed)
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_publication_transaction_counts_exclude_unrelated_connection_commits(prepared):
+    conn = _FakeConnection(publication_catalog=None if prepared else ())
+    db = _FakeEngine(conn)
+    # Legitimate unrelated work may commit on the reused connection before
+    # the publication transaction begins; it must not be erased or miscounted.
+    conn.commit()
+    conn.commit()
+    engine = MarketBriefingEngine.__new__(MarketBriefingEngine)
+    engine.engine = db
+    payload = {"type": "hourly", "content": "Synthetic retained content.", "snapshot": {}, "sentiment": None}
+    result = engine._persist_to_db(payload)
+    assert (result == 1) if prepared else (result is None)
+    assert db.transaction_commit_count == (1 if prepared else 0)
+    assert db.transaction_rollback_count == (0 if prepared else 1)
+    assert conn.commit_count == (3 if prepared else 2), "UNRELATED_COMMITS_MUST_REMAIN_VISIBLE"
+    assert conn.rollback_count == (0 if prepared else 1)
+    assert any("INSERT INTO market_briefings" in sql for sql in conn.executed) is prepared

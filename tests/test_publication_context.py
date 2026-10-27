@@ -601,12 +601,15 @@ def test_generation_file_guard_survives_real_database_readiness_refusal(tmp_path
     monkeypatch.setattr('ingestion.social_sentiment.SocialSentimentPuller', _no_network)
     conn = _FakeConnection(publication_catalog=())
     good = 'SPY put/call open-interest ratio is 1.97.'
-    engine = _make_engine(_FakeOllamaClient(good), _FakeEngine(conn), tmp_path)
+    db = _FakeEngine(conn)
+    engine = _make_engine(_FakeOllamaClient(good), db, tmp_path)
     monkeypatch.setattr(engine, '_gather_market_snapshot', snapshot)
     result = engine.generate_briefing('hourly', save=True)
     assert good in result['content']
     assert result['publication_context_guard']['passed'] is True
     assert len(list(tmp_path.glob('hourly_*.md'))) == 1
     assert result['content'] in next(tmp_path.glob('hourly_*.md')).read_text()
-    assert conn.rollback_count == 1 and conn.commit_count == 0
+    # The shared connection also serves earlier sentiment work; the
+    # publication transaction itself must roll back without committing.
+    assert db.transaction_rollback_count == 1 and db.transaction_commit_count == 0
     assert not any('INSERT INTO market_briefings' in sql for sql in conn.executed)
