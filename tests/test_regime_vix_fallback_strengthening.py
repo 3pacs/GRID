@@ -984,3 +984,39 @@ def test_whole_fallback_normalization_read_failure_aborts_the_vector(engine, mon
     monkeypatch.setattr(sv_mod, "_fetch_series", failing)
     with pytest.raises(RuntimeError, match="normalization read failure"):
         sv_mod.compute_state_vector(engine, AS_OF)
+
+
+def test_transient_vix_basis_failure_still_labels_the_vixcls_vector(engine, monkeypatch):
+    """[positive] Regression: a one-shot failure resolving the basis must not leave a VIXCLS vector unlabelled.
+
+    Counterexample on 7e0c0d7f: the FIRST VIXCLS value-window read (inside
+    ``_resolve_vix_series``) raises once; the memo is not set, the dimension
+    loop re-reads VIXCLS successfully and computes both VIX dims from plain
+    VIXCLS, yet ``vix_basis`` stayed None, which the field documents as
+    "neither had enough known history" and which the cache writes as no
+    ``__vix_basis__`` at all (indistinguishable from a pre-R4 row). The
+    vector itself must stay the plain VIXCLS one (no gap fill is attempted
+    after a failed resolve); only the label is corrected to "VIXCLS".
+    """
+    import intelligence.regime.state_vector as sv_mod
+
+    _seed(engine, "VIXCLS", FRED_SRC, _vix, end=date(2025, 6, 4))
+    plain = sv_mod.compute_state_vector(engine, AS_OF)  # no backup yet: plain VIXCLS
+    _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe, end=date(2025, 12, 31))
+    real = sv_mod._fetch_series
+    failures = 0
+
+    def flaky(engine, sid, as_of, lookback_days=sv_mod.VALUE_LOOKBACK_DAYS):
+        nonlocal failures
+        if sid == "VIXCLS" and lookback_days == sv_mod.VALUE_LOOKBACK_DAYS and failures == 0:
+            failures += 1
+            raise RuntimeError("synthetic one-shot VIXCLS window failure")
+        return real(engine, sid, as_of, lookback_days)
+
+    monkeypatch.setattr(sv_mod, "_fetch_series", flaky)
+    sv = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert failures == 1
+    assert sv.values == plain.values  # plain VIXCLS dims, no fill
+    assert all(v is not None for v in _vix_dims(sv))
+    assert sv.vix_basis == plain.vix_basis == "VIXCLS"

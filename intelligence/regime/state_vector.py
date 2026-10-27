@@ -908,6 +908,13 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
             log.debug("Dim {d} failed for {dt}: {e}", d=dim.name, dt=as_of, e=str(exc))
             values.append(None)
 
+    if vix_basis is None and any(
+        v is not None for d, v in zip(STATE_DIMENSIONS, values) if d.series_id == VIX_SERIES
+    ):
+        # The basis read failed but a later VIXCLS read fed the VIX dims:
+        # they are plain VIXCLS (no fill is tried unresolved), so label them.
+        vix_basis = VIX_SERIES
+
     non_null = sum(1 for v in values if v is not None)
     completeness = non_null / len(values) if values else 0.0
 
