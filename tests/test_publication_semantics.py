@@ -53,7 +53,8 @@ AUDIO = isolated('intelligence/audio_briefing.py',
 MARKET = isolated('ollama/market_briefing.py', [
     'MarketBriefingEngine', 'PublicationTextDigest', '_publication_digest', '_publication_stage_diagnostics',
     'PublicationGuardReceipt', 'PublicationReceipt', '_publication_call_binding', '_publication_guard',
-    '_publication_evidence_footer',
+    '_publication_evidence_footer', '_publication_calendar_assessment',
+    '_publication_metric_assessment', '_publication_lineage_assessment',
 ])
 
 

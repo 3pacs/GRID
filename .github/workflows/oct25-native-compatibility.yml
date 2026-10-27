@@ -1,0 +1,239 @@
+name: Oct25 native compatibility qualification
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oct25-native-pg-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  oct25-pg14:
+    name: Oct25 PG14 native compatibility
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "15432"
+      DB_NAME: oct25_native_test
+      DB_USER: oct25_ci_writer
+      GRID_OCT25_REQUIRE_PG: "1"
+      GRID_JWT_SECRET: synthetic-ci-only
+      TESTING: "true"
+      GRID_GIT_SINK_DISABLED: "1"
+      GIT_SINK_PUSH_ENABLED: "false"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Record receiving checkout
+        env:
+          EXPECTED_CHECKOUT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CHECKOUT"
+          git show -s --format='checkout=%H tree=%T parents=%P'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install existing project test dependencies
+        timeout-minutes: 10
+        run: python -m pip install -r requirements.txt
+
+      - name: Generate ephemeral job-only database credentials
+        timeout-minutes: 1
+        run: |
+          python - <<'PY'
+          import os
+          import secrets
+          from pathlib import Path
+          import re
+          admin = secrets.token_hex(32)
+          writer = secrets.token_hex(32)
+          assert re.fullmatch(r'[0-9a-f]{64}', admin)
+          assert re.fullmatch(r'[0-9a-f]{64}', writer)
+          assert admin != writer
+          # GitHub's interpreted masking protocol is the only credential output.
+          # Flush both registrations before environment handoff/step headers.
+          print(f'::add-mask::{admin}', flush=True)
+          print(f'::add-mask::{writer}', flush=True)
+          url = f'postgresql://oct25_ci_writer:{writer}@127.0.0.1:15432/oct25_native_test'
+          # Runner-owned environment handoff stays inside this disposable job.
+          # No ordinary credential logging, argv values, or uploaded env file.
+          with Path(os.environ['GITHUB_ENV']).open('a', encoding='utf-8') as output:
+              for key, value in {'POSTGRES_PASSWORD': admin, 'DB_PASSWORD': writer,
+                                 'GRID_TEST_DB_URL': url, 'GRID_OCT25_TEST_DB_URL': url}.items():
+                  output.write(f'{key}={value}\n')
+          PY
+
+      # Hosted disposable VM only. Host networking makes the server-side address
+      # genuinely127.0.0.1; Docker port publishing would expose a172.* server address
+      # and fail the unchanged fixture. PG listens only on loopback port15432.
+      - name: Start isolated synthetic PostgreSQL14
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          docker run --detach --name oct25-synthetic-pg --network host \
+            --label grid-purpose=oct25-synthetic-ci \
+            -e POSTGRES_USER=oct25_ci_admin \
+            -e POSTGRES_PASSWORD \
+            -e POSTGRES_DB=postgres \
+            postgres:14.24 -c listen_addresses=127.0.0.1 -c port=15432
+          ready=0
+          for attempt in $(seq 1 45); do
+            if docker exec oct25-synthetic-pg pg_isready -h 127.0.0.1 -p 15432 -U oct25_ci_admin -d postgres; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          python - <<'PY'
+          import os
+          import re
+          import psycopg2
+          from psycopg2 import sql
+          admin, writer = os.environ['POSTGRES_PASSWORD'], os.environ['DB_PASSWORD']
+          assert re.fullmatch(r'[0-9a-f]{64}', admin)
+          assert re.fullmatch(r'[0-9a-f]{64}', writer)
+          assert admin != writer
+          connection = psycopg2.connect(host='127.0.0.1', port=15432, dbname='postgres',
+                                        user='oct25_ci_admin', password=admin, connect_timeout=5)
+          try:
+              connection.autocommit = True
+              with connection.cursor() as cursor:
+                  cursor.execute(sql.SQL("CREATE ROLE oct25_ci_writer LOGIN PASSWORD {} NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION").format(sql.Literal(writer)))
+                  cursor.execute("CREATE DATABASE oct25_native_test OWNER oct25_ci_writer")
+                  cursor.execute("COMMENT ON DATABASE oct25_native_test IS 'grid-oct25-synthetic-ci-only'")
+          finally:
+              connection.close()
+          PY
+          docker inspect --format='image={{.Image}} network={{.HostConfig.NetworkMode}} purpose={{index .Config.Labels "grid-purpose"}}' oct25-synthetic-pg
+
+      - name: Verify synthetic identity before tests
+        timeout-minutes: 1
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          import re
+          password = os.environ['DB_PASSWORD']
+          assert re.fullmatch(r'[0-9a-f]{64}', password)
+          expected = f'postgresql://oct25_ci_writer:{password}@127.0.0.1:15432/oct25_native_test'
+          assert os.environ['GRID_TEST_DB_URL'] == expected
+          assert os.environ['GRID_OCT25_TEST_DB_URL'] == expected
+          engine = create_engine(expected, connect_args={'connect_timeout': 5})
+          try:
+              with engine.connect() as conn:
+                  identity = conn.execute(text("SELECT current_database(), current_user, host(inet_server_addr()), inet_server_port(), current_setting('server_version_num')::int, rolsuper, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname=current_user")).one()
+                  assert tuple(identity[:4]) == ('oct25_native_test', 'oct25_ci_writer', '127.0.0.1', 15432), identity
+                  assert identity[4] // 10000 == 14, identity
+                  assert tuple(identity[5:]) == (False, False, False, False), identity
+                  marker = conn.execute(text("SELECT shobj_description(oid,'pg_database') FROM pg_database WHERE datname=current_database()")).scalar_one()
+                  assert marker == 'grid-oct25-synthetic-ci-only', marker
+                  import json
+                  from pathlib import Path
+                  Path('oct25-native-identity.json').write_text(json.dumps({'observed_identity': list(identity), 'marker': marker})+'\n')
+                  print('Synthetic PG identity verified:', tuple(identity))
+          finally:
+              engine.dispose()
+          PY
+
+      - name: Record runtime and Settings binding
+        timeout-minutes: 1
+        env:
+          POSTGRES_PASSWORD: ""
+        run: |
+          python - <<'PY'
+          import hashlib, importlib.metadata, json, os, platform, subprocess
+          from pathlib import Path
+          from config import Settings
+          expected = os.environ['GRID_OCT25_TEST_DB_URL']
+          assert Settings().DB_URL == expected
+          assert os.environ['GRID_TEST_DB_URL'] == expected
+          assert not os.environ.get('POSTGRES_PASSWORD')
+          data = {
+              'checkout': subprocess.check_output(['git','rev-parse','HEAD'], text=True).strip(),
+              'tree': subprocess.check_output(['git','rev-parse','HEAD^{tree}'], text=True).strip(),
+              'python': platform.python_version(), 'platform': platform.platform(),
+              'packages': {p: importlib.metadata.version(p) for p in ['pytest','pytest-timeout','pytest-xdist','SQLAlchemy','psycopg2-binary']},
+              'requirements_sha256': hashlib.sha256(Path('requirements.txt').read_bytes()).hexdigest(),
+              'identity': json.loads(Path('oct25-native-identity.json').read_text()),
+              'image_tag': 'postgres:14.24',
+              'settings_binding_verified': True, 'admin_credential_absent_from_test_step': True,
+              'command': ['python','-m','pytest','-q','--tb=short','-o','addopts=','--timeout=60','--timeout-method=thread','-n','0','--junitxml=oct25-native-results.xml','tests/test_oct25_publication_native_compatibility.py','tests/test_oct25_thesis_native_compatibility.py'],
+          }
+          Path('oct25-native-runtime.json').write_text(json.dumps(data, indent=2)+'\n')
+          print(json.dumps(data, indent=2))
+          PY
+
+      - name: Run exactly two native compatibility modules serially
+        timeout-minutes: 10
+        env:
+          POSTGRES_PASSWORD: ""
+        run: |
+          python -m pytest -q --tb=short -o addopts= --timeout=60 --timeout-method=thread -n 0 --junitxml=oct25-native-results.xml \
+            tests/test_oct25_publication_native_compatibility.py \
+            tests/test_oct25_thesis_native_compatibility.py
+
+      - name: Require native coverage and no skipped cases
+        if: always()
+        timeout-minutes: 1
+        env:
+          POSTGRES_PASSWORD: ""
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          expected = {'tests.test_oct25_publication_native_compatibility', 'tests.test_oct25_thesis_native_compatibility'}
+          expected_counts = {'tests.test_oct25_publication_native_compatibility':26, 'tests.test_oct25_thesis_native_compatibility':22}
+          report = {'passed':False,'cases':0,'skips':0,'failures':0,'errors':0,'modules':[],'module_counts':{},'expected_modules':sorted(expected)}
+          try:
+              root = ET.parse('oct25-native-results.xml').getroot()
+              cases = root.findall('.//testcase')
+              def module_name(case):
+                  name = case.attrib.get('classname','')
+                  return next((m for m in expected if name == m or name.startswith(m+'.')), name)
+              observed = {module_name(case) for case in cases}
+              report.update(cases=len(cases), skips=len(root.findall('.//skipped')), failures=len(root.findall('.//failure')), errors=len(root.findall('.//error')), modules=sorted(observed))
+              report['module_counts'] = {m:sum(module_name(case)==m for case in cases) for m in sorted(observed)}
+              report['case_seconds'] = sum(float(case.attrib.get('time','0')) for case in cases)
+              report['expected_counts'] = expected_counts
+              report['passed'] = report['module_counts'] == expected_counts and expected == observed and not any(report[k] for k in ('skips','failures','errors'))
+          finally:
+              Path('oct25-native-summary.json').write_text(json.dumps(report,indent=2)+'\n')
+              print(json.dumps(report,indent=2))
+          assert report['passed'], 'Native receipt missing module coverage or has failed/skipped/error cases'
+          PY
+
+      - name: Destroy synthetic database container and volume
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          if docker container inspect oct25-synthetic-pg >/dev/null 2>&1; then
+            test "$(docker inspect --format='{{index .Config.Labels "grid-purpose"}}' oct25-synthetic-pg)" = oct25-synthetic-ci
+            timeout 30s docker rm --force --volumes oct25-synthetic-pg
+          fi
+          test -z "$(docker ps -aq --filter name='^/oct25-synthetic-pg$')"
+
+      - name: Retain only native runtime and count metadata
+        if: always()
+        timeout-minutes: 1
+        uses: actions/upload-artifact@v7.0.2
+        with:
+          name: oct25-native-metadata-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            oct25-native-runtime.json
+            oct25-native-summary.json
+          if-no-files-found: error
+          retention-days: 7

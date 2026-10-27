@@ -80,7 +80,7 @@ class ThesisSnapshot:
     id: int
     timestamp: str
     overall_direction: str          # bullish / bearish / neutral
-    conviction: float               # 0-1
+    conviction: float | None        # raw stored value; legacy units may be unknown
     key_drivers: list[str]
     risk_factors: list[str]
     model_states: dict              # {model_name: {direction, confidence, current_state}}
@@ -90,6 +90,9 @@ class ThesisSnapshot:
     outcome: str | None = None      # correct / wrong / partial
     actual_market_move: float | None = None  # SPY % change over scoring period
     scored_at: str | None = None
+    # Old rows have no per-row unit receipt. Never infer fraction/percent from
+    # magnitude, including 1.0; new write normalization does not repair history.
+    conviction_unit: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -164,21 +167,59 @@ def _ensure_tables(engine: Engine) -> None:
 
 # ── 1. Snapshot Current Thesis ────────────────────────────────────────────
 
+def _snapshot_conviction_fraction(thesis_data: dict) -> float | None:
+    """Normalize a declared input for the existing fractional storage contract.
+
+    The legacy tracker type and direct API test fixtures declare fractions.
+    The unified producer now declares percent explicitly. Missing/null remains
+    unknown, and an explicit unknown or unsupported unit cannot be guessed.
+    This validates prospective input only; it never interprets historical rows.
+    """
+    from decimal import Decimal, InvalidOperation
+
+    value = thesis_data.get("conviction")
+    if value is None:
+        return None
+    unit = thesis_data.get("conviction_unit", "fraction")
+    if unit not in ("fraction", "percent"):
+        raise ValueError("conviction_unit must be fraction or percent")
+    if isinstance(value, bool):
+        raise ValueError("conviction must be a finite number, not boolean")
+    # Accept these representations explicitly, without invoking arbitrary
+    # __float__ methods. Decimal(float) preserves the exact binary input;
+    # decimal strings and Decimal values retain their exact supplied bounds.
+    if type(value) not in (int, float, str, Decimal):
+        raise ValueError("conviction must be int, float, decimal string, or Decimal")
+    try:
+        exact = Decimal(value)
+    except InvalidOperation as exc:
+        raise ValueError("conviction must be a valid decimal number") from exc
+    maximum = 100 if unit == "percent" else 1
+    if not exact.is_finite() or not 0 <= exact <= maximum:
+        raise ValueError("conviction is outside its declared unit range")
+    # Storage remains approximate float, but rounding cannot admit an invalid
+    # original value. This does not clamp or infer the declared unit.
+    number = float(exact)
+    return number / 100.0 if unit == "percent" else number
+
+
 def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
     """Archive the current unified thesis with full model states.
 
     Args:
         engine: SQLAlchemy engine.
         thesis_data: Dict with keys: overall_direction, conviction,
-            key_drivers, risk_factors, model_states, narrative.
+            key_drivers, risk_factors, model_states, narrative. conviction_unit
+            is percent or fraction; omitted unit retains the legacy fraction
+            input contract. Missing/null conviction is stored as NULL.
 
     Returns:
         Snapshot ID.
     """
+    conviction = _snapshot_conviction_fraction(thesis_data)
     _ensure_tables(engine)
 
     direction = thesis_data.get("overall_direction", "neutral")
-    conviction = float(thesis_data.get("conviction", 0.5))
     key_drivers = thesis_data.get("key_drivers", [])
     risk_factors = thesis_data.get("risk_factors", [])
     model_states = thesis_data.get("model_states", {})
@@ -203,8 +244,9 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
 
     snapshot_id = row[0]
     log.info(
-        "Thesis snapshot #{id} archived: {d} (conviction {c:.0f}%)",
-        id=snapshot_id, d=direction, c=conviction,
+        "Thesis snapshot #{id} archived: {d} (conviction {c})",
+        id=snapshot_id, d=direction,
+        c=f"{conviction * 100:g}%" if conviction is not None else "unknown",
     )
     return snapshot_id
 
@@ -489,7 +531,7 @@ def get_thesis_history(engine: Engine, days: int = 90) -> list[ThesisSnapshot]:
             id=r[0],
             timestamp=r[1].isoformat() if r[1] else "",
             overall_direction=r[2],
-            conviction=float(r[3]) if r[3] is not None else 0.0,
+            conviction=float(r[3]) if r[3] is not None else None,
             key_drivers=_parse_json(r[4], []),
             risk_factors=_parse_json(r[5], []),
             model_states=_parse_json(r[6], {}),
