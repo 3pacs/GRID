@@ -2614,7 +2614,7 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
             "conviction": thesis["conviction"], "conviction_unit": "percent"})
         if conviction is None:
             return None
-        _ensure_tables(engine)
+        schema = _ensure_tables(engine)
         model_states = {}
         for m in thesis.get("models", []):
             model_states[m["key"]] = {
@@ -2641,6 +2641,8 @@ def snapshot_thesis(engine: Engine, thesis: dict[str, Any]) -> int | None:
         ]
 
         with engine.begin() as conn:
+            from intelligence.thesis_schema import require_thesis_connection
+            require_thesis_connection(conn, expected_schema=schema)
             row = conn.execute(text(
                 "INSERT INTO thesis_snapshots "
                 "(overall_direction, conviction, conviction_unit, key_drivers, risk_factors, "

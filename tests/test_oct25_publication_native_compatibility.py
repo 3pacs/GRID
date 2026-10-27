@@ -221,6 +221,8 @@ def native_publication_engine():
     # No config fallback: never connect to the application's default DB.
     if os.environ.get("GRID_OCT25_REQUIRE_PG") != "1":
         pytest.skip("PostgreSQL compatibility requires focused GRID_OCT25_REQUIRE_PG=1")
+    pg_major = os.environ.get("GRID_OCT25_PG_MAJOR")
+    assert pg_major in ("14", "15"), "EXPLICIT_PG14_OR_PG15_SELECTOR_REQUIRED"
     url = os.environ.get("GRID_OCT25_TEST_DB_URL")
     assert url, "EXPLICIT_HOSTED_PG_URL_REQUIRED"
     target = make_url(url)
@@ -247,10 +249,28 @@ def native_publication_engine():
                 "FROM pg_roles WHERE rolname=current_user"
             )).one()
             assert tuple(identity[:2]) == ("oct25_native_test", "oct25_ci_writer")
-            assert 140000 <= identity[2] < 150000, "PG14_REQUIRED"
+            assert identity[2] // 10000 == int(pg_major), "OBSERVED_PG_MAJOR_MUST_MATCH_SELECTOR"
             assert tuple(identity[3:]) == (False, False, False, False), "LIMITED_WRITER_REQUIRED"
             conn.execute(text(f'CREATE SCHEMA "{schema}"'))
         isolated = create_engine(url, connect_args={"options": f"-csearch_path={schema}"})
+        # Explicit isolated synthetic test preparation, outside the writer.
+        # Root composes the shared preparation owner implementation separately.
+        with isolated.begin() as conn:
+            conn.execute(text("""
+                CREATE TABLE market_briefings (
+                    id SERIAL PRIMARY KEY,
+                    briefing_type TEXT NOT NULL,
+                    briefing_date DATE NOT NULL,
+                    content TEXT NOT NULL,
+                    sentiment_score REAL,
+                    sentiment_label TEXT,
+                    sentiment_data JSONB,
+                    snapshot_data JSONB,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                CREATE INDEX idx_market_briefings_date ON market_briefings (briefing_date DESC);
+                CREATE INDEX idx_market_briefings_type ON market_briefings (briefing_type, briefing_date DESC);
+            """))
         yield isolated
     finally:
         if isolated is not None:
@@ -378,3 +398,241 @@ def test_native_calendar_json_keeps_narrow_explicit_basis(presentation, expected
     assert result["status"] == expected
     assert result["scope"] == "declared_action_calendar_only"
     assert declaration == original
+
+
+# New persistence-hardening cases: native execution is delegated to existing CI.
+def persistence_payload():
+    snapshot = {"features": {"alpha": {"value": 0.125, "date": "2026-10-23"}}}
+    return {"type": "daily", "content": "Observation 0.125." + footer_for(snapshot)["rendered_text"],
+            "snapshot": snapshot, "sentiment": None}
+
+
+def persistence_writer(db_engine):
+    writer = publication.MarketBriefingEngine.__new__(publication.MarketBriefingEngine)
+    writer.engine = db_engine
+    return writer
+
+
+def test_prepared_writer_has_no_ddl_and_restores_session_timeouts(native_publication_engine):
+    db = native_publication_engine
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    with db.connect() as conn:
+        before = tuple(conn.execute(text(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')"
+        )).one())
+    statements = []
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(statement)
+    event.listen(db, "before_cursor_execute", capture)
+    try:
+        writer = persistence_writer(db)
+        first, second = writer._persist_to_db(payload), writer._persist_to_db(payload)
+    finally:
+        event.remove(db, "before_cursor_execute", capture)
+    assert type(first) is int and type(second) is int and first != second
+    assert statements
+    assert all(s.lstrip().upper().startswith(("SELECT", "WITH", "INSERT")) for s in statements), "ORDINARY_WRITER_MUST_NOT_DDL"
+    assert sum("INSERT INTO market_briefings" in s for s in statements) == 2
+    with db.connect() as conn:
+        after = tuple(conn.execute(text(
+            "SELECT current_setting('lock_timeout'), current_setting('statement_timeout')"
+        )).one())
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 2
+    assert after == before, "TRANSACTION_LOCAL_TIMEOUTS_MUST_NOT_LEAK"
+    assert payload == original
+
+
+@pytest.mark.parametrize("broken", ["missing_relation", "missing_column", "wrong_content_type",
+                                    "nullable_content", "missing_id_default"])
+def test_invalid_schema_refuses_without_lazy_repair(native_publication_engine, broken):
+    db = native_publication_engine
+    sql = {"missing_relation": "DROP TABLE market_briefings",
+           "missing_column": "ALTER TABLE market_briefings DROP COLUMN snapshot_data",
+           "wrong_content_type": "ALTER TABLE market_briefings ALTER COLUMN content TYPE integer USING NULL",
+           "nullable_content": "ALTER TABLE market_briefings ALTER COLUMN content DROP NOT NULL",
+           "missing_id_default": "ALTER TABLE market_briefings ALTER COLUMN id DROP DEFAULT"}[broken]
+    with db.begin() as conn:
+        conn.execute(text(sql))
+    statements = []
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(statement)
+    event.listen(db, "before_cursor_execute", capture)
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    try:
+        assert persistence_writer(db)._persist_to_db(payload) is None, "UNREADY_SCHEMA_MUST_REFUSE"
+    finally:
+        event.remove(db, "before_cursor_execute", capture)
+    assert all(s.lstrip().upper().startswith(("SELECT", "WITH", "INSERT")) for s in statements)
+    assert not any("INSERT INTO market_briefings" in s for s in statements), "READINESS_REFUSAL_MUST_PRECEDE_INSERT"
+    with db.connect() as conn:
+        if broken == "missing_relation":
+            assert conn.execute(text("SELECT to_regclass('market_briefings')")).scalar_one() is None
+        else:
+            assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+    assert payload == original
+
+
+def test_lock_contention_refuses_and_next_transaction_recovers(native_publication_engine):
+    import time
+    db = native_publication_engine
+    writer = persistence_writer(db)
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    with db.connect() as blocker:
+        tx = blocker.begin()
+        try:
+            blocker.execute(text("LOCK TABLE market_briefings IN ACCESS EXCLUSIVE MODE"))
+            started = time.monotonic()
+            assert writer._persist_to_db(payload) is None, "LOCK_CONTENTION_MUST_NOT_PUBLISH"
+            elapsed = time.monotonic() - started
+            assert elapsed < 8, "SOURCE_TRANSACTION_BOUND_MUST_BE_EFFECTIVE"
+        finally:
+            tx.rollback()
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+    assert type(writer._persist_to_db(payload)) is int, "FAILED_TRANSACTION_MUST_RELEASE_AND_RECOVER"
+    assert payload == original
+
+
+def test_statement_timeout_cancels_synthetic_slow_trigger(native_publication_engine):
+    import time
+    db = native_publication_engine
+    with db.begin() as conn:
+        conn.execute(text("""
+            CREATE FUNCTION synthetic_slow_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN PERFORM pg_sleep(10); RETURN NEW; END $$;
+            CREATE TRIGGER synthetic_slow_publication BEFORE INSERT ON market_briefings
+                FOR EACH ROW EXECUTE FUNCTION synthetic_slow_publication();
+        """))
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    started = time.monotonic()
+    assert persistence_writer(db)._persist_to_db(payload) is None, "SLOW_WRITE_MUST_BE_CANCELLED"
+    assert time.monotonic() - started < 8
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+    assert payload == original
+
+
+def test_failed_insert_rolls_back_trigger_effects_and_preserves_original(native_publication_engine):
+    db = native_publication_engine
+    writer = persistence_writer(db)
+    payload = persistence_payload()
+    row_id = writer._persist_to_db(payload)
+    assert type(row_id) is int
+    with db.begin() as conn:
+        old = conn.execute(text(
+            "SELECT content,snapshot_data,created_at FROM market_briefings WHERE id=:id"
+        ), {"id": row_id}).one()
+        conn.execute(text("""
+            CREATE TABLE synthetic_publication_audit (note TEXT);
+            CREATE FUNCTION synthetic_reject_publication() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN INSERT INTO synthetic_publication_audit VALUES ('must rollback');
+                RAISE EXCEPTION 'synthetic publication refusal'; END $$;
+            CREATE TRIGGER synthetic_reject_publication BEFORE INSERT ON market_briefings
+                FOR EACH ROW EXECUTE FUNCTION synthetic_reject_publication();
+        """))
+    original = deepcopy(payload)
+    assert writer._persist_to_db(payload) is None
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM synthetic_publication_audit")).scalar_one() == 0
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 1
+        current = conn.execute(text(
+            "SELECT content,snapshot_data,created_at FROM market_briefings WHERE id=:id"
+        ), {"id": row_id}).one()
+    assert tuple(current) == tuple(old), "HISTORICAL_CONTENT_AND_STORAGE_CLOCK_MUST_REMAIN_IMMUTABLE"
+    assert decode_footer(current[0])["records"] == [expected_record(None)]
+    assert payload == original
+
+
+def test_deferred_commit_failure_cannot_acknowledge_publication(native_publication_engine):
+    db = native_publication_engine
+    with db.begin() as conn:
+        conn.execute(text("""
+            CREATE FUNCTION synthetic_reject_publication_commit() RETURNS trigger LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'synthetic commit refusal'; END $$;
+            CREATE CONSTRAINT TRIGGER synthetic_reject_publication_commit
+                AFTER INSERT ON market_briefings DEFERRABLE INITIALLY DEFERRED
+                FOR EACH ROW EXECUTE FUNCTION synthetic_reject_publication_commit();
+        """))
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    assert persistence_writer(db)._persist_to_db(payload) is None, "COMMIT_FAILURE_MUST_NOT_ACKNOWLEDGE_ROW"
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+    assert payload == original
+
+
+@pytest.mark.parametrize("broken", ["constant_id", "missing_timestamp_default", "constant_timestamp",
+                                    "missing_primary_key", "composite_primary_key"])
+def test_functional_generation_and_primary_key_refuse_before_insert(native_publication_engine, broken):
+    db = native_publication_engine
+    sql = {
+        "constant_id": "ALTER TABLE market_briefings ALTER COLUMN id SET DEFAULT 7",
+        "missing_timestamp_default": "ALTER TABLE market_briefings ALTER COLUMN created_at DROP DEFAULT",
+        "constant_timestamp": "ALTER TABLE market_briefings ALTER COLUMN created_at SET DEFAULT TIMESTAMPTZ '2000-01-01T00:00:00Z'",
+        "missing_primary_key": "ALTER TABLE market_briefings DROP CONSTRAINT market_briefings_pkey",
+        "composite_primary_key": "ALTER TABLE market_briefings DROP CONSTRAINT market_briefings_pkey; ALTER TABLE market_briefings ADD PRIMARY KEY (id,briefing_type)",
+    }[broken]
+    with db.begin() as conn:
+        conn.execute(text(sql))
+    statements = []
+    def capture(_conn, _cursor, statement, _params, _context, _many):
+        statements.append(statement)
+    event.listen(db, "before_cursor_execute", capture)
+    payload = persistence_payload()
+    original = deepcopy(payload)
+    try:
+        assert persistence_writer(db)._persist_to_db(payload) is None
+    finally:
+        event.remove(db, "before_cursor_execute", capture)
+    assert not any("INSERT INTO market_briefings" in s for s in statements), "FUNCTIONAL_READINESS_MUST_REFUSE_BEFORE_INSERT"
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+    assert payload == original
+
+
+def test_optional_performance_indexes_are_not_write_authority(native_publication_engine):
+    db = native_publication_engine
+    with db.begin() as conn:
+        conn.execute(text("DROP INDEX idx_market_briefings_date; DROP INDEX idx_market_briefings_type"))
+    payload = persistence_payload()
+    assert type(persistence_writer(db)._persist_to_db(payload)) is int
+    with db.connect() as conn:
+        assert conn.execute(text("SELECT to_regclass('idx_market_briefings_date')")).scalar_one() is None
+        assert conn.execute(text("SELECT to_regclass('idx_market_briefings_type')")).scalar_one() is None
+    assert decode_footer(payload["content"])["records"] == [expected_record(None)]
+
+
+def test_prior_schema_readiness_does_not_authorize_actual_other_connection(native_publication_engine):
+    from intelligence.schema_readiness import require_relation, ColumnRequirement
+    db = native_publication_engine
+    # Prior A observation is explicitly NOT passed as authorization to writer B.
+    with db.connect() as conn:
+        schema_a = require_relation(conn, "market_briefings", {"id": ColumnRequirement("int4")})
+    schema_b = "pub_other_" + uuid.uuid4().hex
+    actual = None
+    try:
+        with db.begin() as conn:
+            conn.execute(text(f'CREATE SCHEMA "{schema_b}"'))
+            conn.execute(text(f'CREATE TABLE "{schema_b}".market_briefings (LIKE market_briefings INCLUDING ALL)'))
+            conn.execute(text(f'ALTER TABLE "{schema_b}".market_briefings ALTER COLUMN created_at DROP DEFAULT'))
+        actual = create_engine(os.environ["GRID_OCT25_TEST_DB_URL"],
+                               connect_args={"options": f"-csearch_path={schema_b}"})
+        with actual.connect() as conn:
+            assert conn.execute(text("SELECT current_schema()")).scalar_one() == schema_b
+        assert schema_a != schema_b
+        payload = persistence_payload()
+        original = deepcopy(payload)
+        assert persistence_writer(actual)._persist_to_db(payload) is None, "PRIOR_A_READY_MUST_NOT_AUTHORIZE_B"
+        for engine in (db, actual):
+            with engine.connect() as conn:
+                assert conn.execute(text("SELECT count(*) FROM market_briefings")).scalar_one() == 0
+        assert payload == original
+    finally:
+        if actual is not None:
+            actual.dispose()
+        with db.begin() as conn:
+            conn.execute(text(f'DROP SCHEMA IF EXISTS "{schema_b}" CASCADE'))

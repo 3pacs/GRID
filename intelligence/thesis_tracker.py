@@ -36,6 +36,8 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from intelligence.thesis_schema import require_thesis_connection
+
 
 # Owner-approved hold (Wave 3 triage report, item #16, 2026-09-27/28).
 # score_old_theses is the single write path that sets
@@ -117,53 +119,10 @@ class ThesisPostMortem:
 
 # ── Table Setup ───────────────────────────────────────────────────────────
 
-def _ensure_tables(engine: Engine) -> None:
-    """Create thesis tracking tables if they do not exist."""
-    with engine.begin() as conn:
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS thesis_snapshots (
-                id SERIAL PRIMARY KEY,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                overall_direction TEXT NOT NULL,
-                conviction NUMERIC,
-                key_drivers JSONB,
-                risk_factors JSONB,
-                model_states JSONB,
-                narrative TEXT,
-                outcome TEXT,
-                actual_market_move NUMERIC,
-                scored_at TIMESTAMPTZ
-            )
-        """))
-        # Additive, nullable receipt with no default or historical backfill.
-        conn.execute(text("ALTER TABLE thesis_snapshots ADD COLUMN IF NOT EXISTS conviction_unit TEXT"))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_ts
-                ON thesis_snapshots (timestamp DESC)
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_thesis_snapshots_unscored
-                ON thesis_snapshots (timestamp)
-                WHERE outcome IS NULL
-        """))
-        conn.execute(text("""
-            CREATE TABLE IF NOT EXISTS thesis_postmortems (
-                id SERIAL PRIMARY KEY,
-                snapshot_id INT REFERENCES thesis_snapshots(id),
-                thesis_direction TEXT,
-                actual_direction TEXT,
-                models_right JSONB,
-                models_wrong JSONB,
-                what_we_missed TEXT,
-                root_cause TEXT,
-                lesson TEXT,
-                generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """))
-        conn.execute(text("""
-            CREATE INDEX IF NOT EXISTS idx_thesis_pm_snapshot
-                ON thesis_postmortems (snapshot_id)
-        """))
+def _ensure_tables(engine: Engine) -> str:
+    """Read-only readiness; schema preparation is a separate explicit action."""
+    from intelligence.thesis_schema import require_thesis_schema
+    return require_thesis_schema(engine)
 
 
 # ── 1. Snapshot Current Thesis ────────────────────────────────────────────
@@ -218,7 +177,7 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
         Snapshot ID.
     """
     conviction = _snapshot_conviction_fraction(thesis_data)
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
 
     direction = thesis_data.get("overall_direction", "neutral")
     key_drivers = thesis_data.get("key_drivers", [])
@@ -227,6 +186,7 @@ def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
     narrative = thesis_data.get("narrative", "")
 
     with engine.begin() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         row = conn.execute(text("""
             INSERT INTO thesis_snapshots
                 (overall_direction, conviction, conviction_unit, key_drivers, risk_factors,
@@ -275,7 +235,7 @@ def score_old_theses(engine: Engine, lookback_days: int = 90) -> dict[str, Any]:
             "correct": 0, "wrong": 0, "partial": 0, "skipped": 0,
         }
 
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
 
     cutoff = datetime.now(timezone.utc) - timedelta(days=lookback_days)
     scoring_age = datetime.now(timezone.utc) - timedelta(days=3)
@@ -283,6 +243,7 @@ def score_old_theses(engine: Engine, lookback_days: int = 90) -> dict[str, Any]:
     results = {"correct": 0, "wrong": 0, "partial": 0, "skipped": 0}
 
     with engine.begin() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         rows = conn.execute(text("""
             SELECT id, timestamp, overall_direction
             FROM thesis_snapshots
@@ -391,9 +352,10 @@ def generate_thesis_postmortem(
     Returns:
         ThesisPostMortem or None if snapshot not found or not wrong/partial.
     """
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
 
     with engine.connect() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         snap = conn.execute(text("""
             SELECT id, timestamp, overall_direction, conviction,
                    key_drivers, risk_factors, model_states, narrative,
@@ -418,6 +380,7 @@ def generate_thesis_postmortem(
 
     # Check if post-mortem already exists
     with engine.connect() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         existing = conn.execute(text("""
             SELECT id FROM thesis_postmortems WHERE snapshot_id = :sid
         """), {"sid": snapshot_id}).fetchone()
@@ -493,7 +456,7 @@ def generate_thesis_postmortem(
     )
 
     # Persist
-    _store_thesis_postmortem(engine, pm)
+    _store_thesis_postmortem(engine, pm, expected_schema=schema)
 
     log.info(
         "Thesis post-mortem for snapshot #{id}: {d}→{a} (root: {r})",
@@ -514,10 +477,11 @@ def get_thesis_history(engine: Engine, days: int = 90) -> list[ThesisSnapshot]:
     Returns:
         List of ThesisSnapshot ordered by timestamp descending.
     """
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     with engine.connect() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         rows = conn.execute(text("""
             SELECT id, timestamp, overall_direction, conviction,
                    key_drivers, risk_factors, model_states, narrative,
@@ -556,10 +520,11 @@ def get_thesis_accuracy(engine: Engine) -> dict[str, Any]:
         Dict with overall accuracy, per-model accuracy, trend over time,
         and best-condition analysis.
     """
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
 
     with engine.connect() as conn:
         # Overall accuracy last 90 days
+        require_thesis_connection(conn, expected_schema=schema)
         scored = conn.execute(text("""
             SELECT outcome, COUNT(*) as cnt,
                    AVG(actual_market_move) as avg_move
@@ -739,7 +704,7 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
     Returns:
         Summary dict with snapshot_id, scoring results, postmortem count.
     """
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
     report: dict[str, Any] = {}
 
     # Freshness guard — warn if core market data is stale
@@ -796,6 +761,7 @@ def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
         log.info("run_thesis_cycle: postmortem generation held (THESIS_SCORING_HELD)")
     else:
         with engine.connect() as conn:
+            require_thesis_connection(conn, expected_schema=schema)
             wrong_snaps = conn.execute(text("""
                 SELECT ts.id
                 FROM thesis_snapshots ts
@@ -850,10 +816,11 @@ def load_thesis_postmortems(
     Returns:
         List of post-mortem dicts with snapshot context.
     """
-    _ensure_tables(engine)
+    schema = _ensure_tables(engine)
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
     with engine.connect() as conn:
+        require_thesis_connection(conn, expected_schema=schema)
         rows = conn.execute(text("""
             SELECT tp.id, tp.snapshot_id, tp.thesis_direction,
                    tp.actual_direction, tp.models_right, tp.models_wrong,
@@ -943,9 +910,13 @@ def _classify_root_cause(
     return "thesis_outdated"
 
 
-def _store_thesis_postmortem(engine: Engine, pm: ThesisPostMortem) -> None:
-    """Persist a thesis post-mortem to the database."""
+def _store_thesis_postmortem(engine: Engine, pm: ThesisPostMortem, *, expected_schema: str) -> None:
+    """Persist only under the caller's explicit, previously resolved namespace."""
+    from intelligence.schema_readiness import SchemaNotReady
+    if not isinstance(expected_schema, str) or not expected_schema:
+        raise SchemaNotReady("postmortem persistence requires an explicit namespace")
     with engine.begin() as conn:
+        require_thesis_connection(conn, expected_schema=expected_schema)
         conn.execute(text("""
             INSERT INTO thesis_postmortems
                 (snapshot_id, thesis_direction, actual_direction,

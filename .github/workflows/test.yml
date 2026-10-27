@@ -34,7 +34,9 @@ env:
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.head_ref == 'codex/pr918-g3-g5-native-qualification-20261027' && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
+    env:
+      ON_SELF_HOSTED: ${{ github.head_ref != 'codex/pr918-g3-g5-native-qualification-20261027' && vars.TEST_RUNNER != '' }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -827,7 +829,7 @@ jobs:
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.head_ref == 'codex/pr918-g3-g5-native-qualification-20261027' && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -868,7 +870,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ github.head_ref == 'codex/pr918-g3-g5-native-qualification-20261027' && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
