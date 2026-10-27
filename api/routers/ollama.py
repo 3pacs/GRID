@@ -22,7 +22,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from loguru import logger as log
-from outputs.path_utils import ensure_output_dir
+from outputs.path_utils import APIOutputState, OutputStateError, api_output_state, ensure_output_dir
 from pydantic import BaseModel
 
 from api.auth import require_auth
@@ -34,6 +34,21 @@ router = APIRouter(
 )
 
 _BRIEFING_DIR = Path(__file__).parent.parent.parent / "outputs" / "market_briefings"
+_API_OUTPUT_BINDING: APIOutputState | None = None
+
+
+def configure_api_output_state(state_root: Path) -> None:
+    """Prospective API startup binding, never inferred from env/source/history.
+
+    Binding is per process and cannot silently change after configuration.
+    No runtime caller is activated by defining this capability.
+    """
+    global _API_OUTPUT_BINDING
+    binding = APIOutputState(state_root, _BRIEFING_DIR)
+    if _API_OUTPUT_BINDING is not None and _API_OUTPUT_BINDING != binding:
+        raise OutputStateError("API output state is already bound")
+    _API_OUTPUT_BINDING = binding
+
 
 
 class BriefingRequest(BaseModel):
@@ -75,7 +90,13 @@ def _get_briefing_engine():
         engine = get_engine()
     except Exception:
         engine = None
-    return MarketBriefingEngine(db_engine=engine)
+    if _API_OUTPUT_BINDING is None:
+        return MarketBriefingEngine(db_engine=engine)
+    try:
+        with api_output_state(_API_OUTPUT_BINDING):
+            return MarketBriefingEngine(db_engine=engine)
+    except (OutputStateError, OSError):
+        raise HTTPException(status_code=503, detail="API output state unavailable")
 
 
 def _get_reasoner():
@@ -84,7 +105,22 @@ def _get_reasoner():
 
 
 def _get_briefing_dir() -> Path:
-    return ensure_output_dir(_BRIEFING_DIR)
+    if _API_OUTPUT_BINDING is None:
+        return ensure_output_dir(_BRIEFING_DIR)
+    try:
+        with api_output_state(_API_OUTPUT_BINDING):
+            return ensure_output_dir(_BRIEFING_DIR)
+    except (OutputStateError, OSError):
+        raise HTTPException(status_code=503, detail="API output state unavailable")
+
+
+def _briefing_file(filename: str) -> Path:
+    if _API_OUTPUT_BINDING is None:
+        return _get_briefing_dir() / filename
+    try:
+        return _API_OUTPUT_BINDING.file(filename)
+    except (OutputStateError, OSError):
+        raise HTTPException(status_code=503, detail="API output state unavailable")
 
 
 def _backend_name(client: Any) -> str:
@@ -144,8 +180,17 @@ async def get_latest_briefing(
     briefing_type: str = Query(default="hourly"),
 ) -> dict[str, Any]:
     """Get the most recent saved briefing of the given type."""
-    engine = _get_briefing_engine()
-    content = engine.get_latest_briefing(briefing_type=briefing_type)
+    if _API_OUTPUT_BINDING is None:
+        engine = _get_briefing_engine()
+        content = engine.get_latest_briefing(briefing_type=briefing_type)
+    else:
+        if briefing_type not in ("hourly", "daily", "weekly"):
+            raise HTTPException(status_code=400, detail="Unknown briefing type")
+        try:
+            files = sorted(_get_briefing_dir().glob(f"{briefing_type}_*.md"), reverse=True)
+            content = _briefing_file(files[0].name).read_text(encoding="utf-8") if files else None
+        except (OutputStateError, OSError):
+            raise HTTPException(status_code=503, detail="API output state unavailable")
     if content is None:
         return {"content": None, "message": f"No {briefing_type} briefings found"}
     return {"content": content, "type": briefing_type}
@@ -157,32 +202,46 @@ async def list_briefings(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> dict[str, Any]:
     """List saved briefing files."""
-    pattern = f"{briefing_type}*.md" if briefing_type else "*.md"
-    files = sorted(_get_briefing_dir().glob(pattern), reverse=True)[:limit]
+    if _API_OUTPUT_BINDING is not None and briefing_type not in ("", "hourly", "daily", "weekly"):
+        raise HTTPException(status_code=400, detail="Unknown briefing type")
+    try:
+        pattern = f"{briefing_type}*.md" if briefing_type else "*.md"
+        files = sorted(_get_briefing_dir().glob(pattern), reverse=True)[:limit]
 
-    briefings = []
-    for f in files:
-        name = f.stem
-        parts = name.split("_", 1)
-        btype = parts[0] if parts else "unknown"
-        briefings.append({
-            "filename": f.name,
-            "type": btype,
-            "size_bytes": f.stat().st_size,
-            "modified": f.stat().st_mtime,
-        })
+        briefings = []
+        for f in files:
+            if _API_OUTPUT_BINDING is not None:
+                f = _briefing_file(f.name)
+            name = f.stem
+            parts = name.split("_", 1)
+            btype = parts[0] if parts else "unknown"
+            briefings.append({
+                "filename": f.name,
+                "type": btype,
+                "size_bytes": f.stat().st_size,
+                "modified": f.stat().st_mtime,
+            })
 
-    return {"briefings": briefings, "total": len(briefings)}
+        return {"briefings": briefings, "total": len(briefings)}
+    except (OutputStateError, OSError):
+        if _API_OUTPUT_BINDING is None:
+            raise
+        raise HTTPException(status_code=503, detail="API output state unavailable")
 
 
 @router.get("/briefings/{filename}")
 async def read_briefing(filename: str) -> dict[str, Any]:
     """Read a specific saved briefing file."""
-    filepath = _get_briefing_dir() / filename
-    if not filepath.exists() or not filepath.is_file():
-        raise HTTPException(status_code=404, detail="Briefing not found")
-    content = filepath.read_text(encoding="utf-8")
-    return {"filename": filename, "content": content}
+    try:
+        filepath = _briefing_file(filename)
+        if not filepath.exists() or not filepath.is_file():
+            raise HTTPException(status_code=404, detail="Briefing not found")
+        content = filepath.read_text(encoding="utf-8")
+        return {"filename": filename, "content": content}
+    except (OutputStateError, OSError):
+        if _API_OUTPUT_BINDING is None:
+            raise
+        raise HTTPException(status_code=503, detail="API output state unavailable")
 
 
 @router.post("/ask")
