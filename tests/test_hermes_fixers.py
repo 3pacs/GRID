@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 from types import ModuleType
 from unittest.mock import MagicMock
+
+import pytest
 
 from scripts import hermes_fixers
 
@@ -91,7 +94,7 @@ def test_fix_output_dirs_skill_creates_common_output_directories(tmp_path, monke
         "outputs/llm_insights",
     ):
         assert (tmp_path / rel_path).is_dir()
-        assert str(tmp_path / rel_path) in result["paths"][rel_path]
+        assert str(tmp_path / rel_path) in result["paths"][str(Path(rel_path))]
 
 
 def test_cooldown_source_skill_pauses_noisy_source() -> None:
@@ -392,10 +395,13 @@ def test_retry_source_handles_function_based_registry_entries(monkeypatch) -> No
     engine.begin.return_value.__enter__ = MagicMock(return_value=MagicMock())
     engine.begin.return_value.__exit__ = MagicMock(return_value=False)
 
-    result = hermes_fixers._retry_source("regulatory_events", engine)
+    # This registry shape has no explicit catalog identity contract. The
+    # strict retry boundary refuses before the function or DB is invoked.
+    with pytest.raises(ValueError, match="no explicit catalog identity contract"):
+        hermes_fixers._retry_source("regulatory_events", engine)
 
-    assert result == {"status": "ok", "source": "fn"}
-    assert calls == [{"db_engine": engine, "days_back": 7}]
+    assert calls == []
+    engine.begin.assert_not_called()
 
 
 def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None:
@@ -411,6 +417,8 @@ def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None
     fake_module = ModuleType(module_name)
 
     class _Puller:
+        SOURCE_NAME = 'finra_short_volume'
+
         def __init__(self, db_engine=None):
             self.db_engine = db_engine
 
@@ -441,7 +449,9 @@ def test_retry_source_resolves_callable_kwargs_at_call_time(monkeypatch) -> None
 
     result = hermes_fixers._retry_source("finra_short_volume", engine)
 
-    assert result == {"status": "SUCCESS", "rows_inserted": 0}
+    assert result["status"] == "SUCCESS"
+    assert result["rows_inserted"] == 0
+    assert result["outcome"] == "NO_NEW_DATA"
     # The callable was CALLED, not passed through as a function object.
     assert calls == [{"anchor_date": "2026-09-16", "weekdays_back": 5}]
 
@@ -461,6 +471,8 @@ def test_retry_source_never_resolves_should_continue_kwarg(monkeypatch) -> None:
     captured: dict = {}
 
     class _Puller:
+        SOURCE_NAME = 'should_continue_source'
+
         def __init__(self, db_engine=None):
             pass
 
@@ -532,6 +544,8 @@ def test_resolve_puller_for_eia_does_not_pass_api_key_kwarg(monkeypatch) -> None
     captured: dict = {}
 
     class _FakeEIAPullerCls:
+        SOURCE_NAME = 'EIA'
+
         def __init__(self, **kwargs):
             captured.update(kwargs)
 

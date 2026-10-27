@@ -28,6 +28,8 @@ import hashlib
 import json
 import os
 import time
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +44,22 @@ TIINGO_META_URL = "https://api.tiingo.com/tiingo/daily/{ticker}"
 TD_ADJUST_MODES = ("all", "none")
 #: The pinned window (v6 §2.3), inclusive: the discovery read window, both adjust modes.
 TD_START, TD_WINDOW_END = v6.CROSSCHECK.discovery_window
+_td_start_override: ContextVar[str | None] = ContextVar("vs1_td_start_override", default=None)
+
+
+def td_start() -> str:
+    return _td_start_override.get() or TD_START
+
+
+@contextmanager
+def discovery_vendor_window(start: str):
+    """Scope an earlier version's vendor coverage without changing v6."""
+    check_request_window(start, TD_END_EXCLUSIVE)
+    token = _td_start_override.set(start)
+    try:
+        yield
+    finally:
+        _td_start_override.reset(token)
 #: TwelveData's ``end_date`` is exclusive, so the inclusive window is requested with the bound
 #: 2020-01-01, a market holiday: the response ends at 2019-12-31 and carries no 2020 row.
 TD_END_EXCLUSIVE = HOLDOUT_START.isoformat()
@@ -158,10 +176,11 @@ def td_symbol(ticker: str) -> str:
     return ticker.replace("-", ".")
 
 
-def td_params(ticker: str, adjust: str, *, start: str = TD_START,
+def td_params(ticker: str, adjust: str, *, start: str | None = None,
               end_exclusive: str = TD_END_EXCLUSIVE) -> dict[str, Any]:
     if adjust not in TD_ADJUST_MODES:
         raise ValueError(adjust)
+    start = start or td_start()
     check_request_window(start, end_exclusive)
     return {"symbol": td_symbol(ticker), "interval": "1day", "start_date": start, "end_date": end_exclusive,
             "adjust": adjust, "outputsize": TD_OUTPUTSIZE}
@@ -265,6 +284,12 @@ def fetch_twelvedata(
     log = FetchLog(out_dir / "fetch_log.jsonl")
     done = log.final()
     order = [benchmark] + sorted(set(tickers) - {benchmark})
+    for ticker in order:
+        for adjust in TD_ADJUST_MODES:
+            prior = done.get(f"{ticker}|{adjust}")
+            if _td_start_override.get() is not None and prior is not None \
+                    and (prior.get("params") or {}).get("start_date") != td_start():
+                raise FetchStopped("TwelveData receipt belongs to another discovery window")
     todo = _jobs(order, done)
     say = progress or (lambda _m: None)
     counts = {"skipped_done": len(order) * len(TD_ADJUST_MODES) - sum(1 for j in todo if j.kind == "window"),
@@ -357,12 +382,12 @@ def _benchmark_plan_check(entry: Mapping[str, Any], kind: str, stop_log: FetchLo
     """Both adjust modes must come back for the benchmark from the window's first to its last session."""
     ok = entry.get("outcome") == "ok" and entry.get("last") == TD_WINDOW_END
     if kind == "window":
-        ok = ok and entry.get("first") == TD_START
+        ok = ok and entry.get("first") == td_start()
     if ok:
         return
     stop_log.append({"key": "_stop", "outcome": "plan_cannot_serve_window", "benchmark_entry": entry.get("key"),
                      "first": entry.get("first"), "last": entry.get("last"), "td_code": entry.get("td_code")})
-    raise FetchStopped(f"TwelveData did not return {entry.get('key')} over {TD_START}..{TD_WINDOW_END}: the "
+    raise FetchStopped(f"TwelveData did not return {entry.get('key')} over {td_start()}..{TD_WINDOW_END}: the "
                        "cross-check cannot run as specified (v6 §2.3); stop, the owner decides")
 
 
@@ -435,9 +460,18 @@ def _json_or_none(body: bytes) -> Any:
 # --- reading the saved files back (the probe) ---------------------------------------------------------
 
 
-def _closes(out_dir: Path, entry: Mapping[str, Any]) -> tuple[dict[str, float], int]:
+def _validate_td_symbol(doc: Any, ticker: str) -> None:
+    """Bind a successful cached response to the actual requested ticker, not its receipt."""
+    meta = doc.get("meta") if isinstance(doc, dict) else None
+    if (not isinstance(meta, dict) or not isinstance(meta.get("symbol"), str)
+            or meta["symbol"] != td_symbol(ticker)):
+        raise FetchStopped(f"TwelveData cached body symbol does not match requested {td_symbol(ticker)}")
+
+
+def _closes(out_dir: Path, entry: Mapping[str, Any], ticker: str) -> tuple[dict[str, float], int]:
     """Window closes of one saved body, and the number of rows dated on or after 2020-01-01 (never returned)."""
     doc = json.loads(read_gz(Path(out_dir) / entry["file"]))
+    _validate_td_symbol(doc, ticker)
     closes, holdout = {}, 0
     for v in doc.get("values") or []:
         d = str(v.get("datetime", ""))[:10]
@@ -446,7 +480,7 @@ def _closes(out_dir: Path, entry: Mapping[str, Any]) -> tuple[dict[str, float], 
         if d >= HOLDOUT_START.isoformat():
             holdout += 1
             continue
-        if d < TD_START:
+        if d < td_start():
             continue
         try:
             closes[d] = float(v["close"])
@@ -467,20 +501,28 @@ def load_td_closes(out_dir: Path, ticker: str, done: Mapping[str, dict] | None =
     the dates the window file lacks are added). Fail closed: a mode whose files carry any row
     dated on or after 2020-01-01, whose supplement is missing, or whose supplement disagrees on
     an overlapping date is dropped, and ``state`` names why.
+    Every successful body, including an optional supplement, must identify the requested
+    ticker using TwelveData's exact canonical symbol; a mismatch stops the reader.
     """
     done = FetchLog(Path(out_dir) / "fetch_log.jsonl").final() if done is None else done
     out: dict[str, Any] = {"receipts": {}, "holdout_rows": 0, "supplemented": [], "problems": []}
     unavailable = 0
     for adjust in TD_ADJUST_MODES:
         entry = done.get(f"{ticker}|{adjust}")
+        supp = done.get(f"{ticker}|{adjust}|supplement")
+        if supp is not None and supp["outcome"] == "ok" and not needs_supplement(entry):
+            # Optional rows remain ignored, but their successful body must belong to this ticker.
+            _validate_td_symbol(json.loads(read_gz(Path(out_dir) / supp["file"])), ticker)
         if entry is None:
+            continue
+        if _td_start_override.get() is not None and (entry.get("params") or {}).get("start_date") != td_start():
+            out["problems"].append(f"{adjust}:wrong_window")
             continue
         out["receipts"][adjust] = {k: entry.get(k) for k in _RECEIPT_KEYS}
         if entry["outcome"] != "ok":
             unavailable += 1
             continue
-        closes, holdout = _closes(out_dir, entry)
-        supp = done.get(f"{ticker}|{adjust}|supplement")
+        closes, holdout = _closes(out_dir, entry, ticker)
         if supp is not None:
             out["receipts"][f"{adjust}_supplement"] = {k: supp.get(k) for k in _RECEIPT_KEYS}
         if needs_supplement(entry):
@@ -488,7 +530,7 @@ def load_td_closes(out_dir: Path, ticker: str, done: Mapping[str, dict] | None =
                 out["problems"].append(f"{adjust}:supplement_missing")
                 continue
             if supp["outcome"] == "ok":
-                extra, extra_holdout = _closes(out_dir, supp)
+                extra, extra_holdout = _closes(out_dir, supp, ticker)
                 holdout += extra_holdout
                 if any(d in closes and extra[d] != closes[d] for d in extra):
                     out["problems"].append(f"{adjust}:supplement_mismatch")

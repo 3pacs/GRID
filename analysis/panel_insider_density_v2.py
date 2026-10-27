@@ -1078,7 +1078,7 @@ class Harness:
             "prereg_sha256": prereg,
             "primary_trial": self.primary,
             "spec": asdict(spec),
-            "windows": {"discovery_start": v1.DISCOVERY_START, "split": v1.SPLIT, "end": v1.END},
+            "windows": {"discovery_start": v1.discovery_start(), "split": v1.SPLIT, "end": v1.END},
             "selection": f"Holm at ledger run alpha {spec.alpha:.6g} (q={spec.ledger_q}, k={spec.run_k}) "
                          "over every declared trial incl. untestable; BH-adjusted p reported only",
             "null": "block sign-flip of the per-date rank-IC series; block from discovery IC acf1 "
@@ -1684,7 +1684,7 @@ def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PRER
             "registry_head_sha256": v1.REGISTERED_RECORD_SHA256[1],
             "status": "superseded before any price read (Stage-0 power gate failed; owner option (a))",
         },
-        "windows": {"discovery_start": v1.DISCOVERY_START, "split": v1.SPLIT, "end": v1.END},
+        "windows": {"discovery_start": v1.discovery_start(), "split": v1.SPLIT, "end": v1.END},
         "promotion_allowed": False,
     }
     return [header, record]

@@ -201,6 +201,43 @@ def test_statement_timeout_above_sixty_seconds_is_refused(seconds):
         scan_script.read_only_engine(seconds)
 
 
+def _captured_engine(monkeypatch):
+    """No DB, no .env: capture what the engine factory would pass to SQLAlchemy."""
+    import sys
+    import types
+
+    import sqlalchemy
+
+    seen = {}
+    monkeypatch.setattr(sqlalchemy, "create_engine", lambda url, **kw: seen.update(kw) or "engine")
+    monkeypatch.setitem(sys.modules, "config", types.SimpleNamespace(settings=types.SimpleNamespace(DB_URL="x")))
+    return seen
+
+
+def test_the_default_ceiling_stays_sixty_seconds_for_every_existing_caller(monkeypatch):
+    seen = _captured_engine(monkeypatch)
+    assert scan_script.MAX_STATEMENT_TIMEOUT_S == 60
+    assert scan_script.read_only_engine(60) == "engine"
+    assert "-c statement_timeout=60000 " in seen["connect_args"]["options"]
+    assert "-c default_transaction_read_only=on" in seen["connect_args"]["options"]
+
+
+@pytest.mark.parametrize("seconds", [61, 300, 900])
+def test_a_raised_ceiling_admits_longer_statements_read_only(monkeypatch, seconds):
+    seen = _captured_engine(monkeypatch)
+    scan_script.read_only_engine(seconds, "probe", max_statement_timeout_s=900)
+    options = seen["connect_args"]["options"]
+    assert f"-c statement_timeout={seconds * 1000} " in options
+    assert "-c default_transaction_read_only=on" in options and seen["isolation_level"] == "AUTOCOMMIT"
+
+
+@pytest.mark.parametrize(("seconds", "ceiling"), [(901, 900), (301, 300), (0, 900), (60, 901), (60, 0)])
+def test_the_raised_ceiling_is_bounded_by_the_absolute_maximum(seconds, ceiling):
+    assert scan_script.ABSOLUTE_MAX_STATEMENT_TIMEOUT_S == 900
+    with pytest.raises(ValueError, match="statement timeout"):
+        scan_script.read_only_engine(seconds, "probe", max_statement_timeout_s=ceiling)
+
+
 def test_bh_threshold_reports_the_step_up_cut():
     ledger = [{"p": p} for p in (0.001, 0.004, 0.2, 1.0, 1.0)]
     cut = scan_script.bh_threshold(ledger, 0.10)
@@ -236,6 +273,10 @@ def test_scan_end_to_end_writes_a_new_ledger_artifact(engine, tmp_path, monkeypa
                  "run/discovery-frozen.json", "run/holdout-result.json"):
         assert (tmp_path / name).exists()
     assert json.loads((tmp_path / "summary.json").read_text())["trials"] == 12
+    # Wall-clock timings live only in the unhashed ops log, never in summary.json (E1-V5).
+    assert "read_seconds" not in summary and "total_seconds" not in summary
+    timing = json.loads((tmp_path / scan_script.TIMING_FILE).read_text())
+    assert set(timing) == {"read_seconds", "total_seconds"}
     assert "self_lag_p" in (tmp_path / "trial-ledger.csv").read_text().splitlines()[0]
     with engine.connect() as conn, pytest.raises(FileExistsError):
         scan_script.scan(conn, tmp_path, args)

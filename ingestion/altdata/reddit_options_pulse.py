@@ -21,21 +21,28 @@ Why it matters:
 
 Data source:
 
-    Reddit public JSON API — no auth, no API key, only requires a
-    User-Agent header.  Rate limit: ~60 requests / minute / IP.
+    Reddit Data API via application-only OAuth (free tier, see
+    ingestion/altdata/reddit_oauth.py). 2026-09-29: the old unauthenticated
+    ``www.reddit.com/...search.json`` path returns ``403 Blocked`` from
+    grid-svr on every run, and Reddit's robots.txt disallows it, so it was
+    removed. Requires the owner-registered app credentials
+    ``REDDIT_CLIENT_ID`` / ``REDDIT_CLIENT_SECRET`` (+ ``REDDIT_USERNAME``
+    for the User-Agent) in the environment; without them the run reports
+    FAILED ("not configured") and sends nothing to Reddit.
 
-    * https://www.reddit.com/r/options/search.json
-        ?q=title%3A%22daily+discussion%22&restrict_sr=1&sort=new&limit=10
+    * GET https://oauth.reddit.com/r/options/search
+        ?q=title:"daily discussion"&restrict_sr=1&sort=new&limit=10
       -> finds the daily discussion threads by title match.
 
-    * https://www.reddit.com/<permalink>.json?limit=500
-      -> returns the thread post + the entire comment tree.
+    * GET https://oauth.reddit.com/r/options/comments/<id>?limit=500
+      -> returns the thread post + the comment tree.
 
-Failure modes — graceful degrade only, never crash:
+Failure modes — never crash, never write on failure:
 
-    * 429 / 403 from Reddit -> log warning, return zero rows.
-    * Empty / malformed JSON -> log warning, return zero rows.
-    * Search returns no daily-discussion match -> log info, return zero rows.
+    * credentials absent -> status FAILED "not configured", zero rows.
+    * 429 / 403 / other HTTP error -> log warning, status FAILED, zero rows.
+    * Empty / malformed JSON -> log warning, zero rows.
+    * Search returns no daily-discussion match -> log info, zero rows.
 
 Series stored in raw_series:
 
@@ -59,6 +66,11 @@ import requests
 from loguru import logger as log
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.reddit_oauth import (
+    RedditAPIError,
+    RedditAppClient,
+    RedditNotConfigured,
+)
 from ingestion.base import BasePuller
 
 # ── Configuration constants ──────────────────────────────────────────
@@ -361,75 +373,55 @@ def _flatten_comments(thread_json: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def _http_get_json(
-    url: str,
-    user_agent: str,
+    client: RedditAppClient,
+    path: str,
     params: dict[str, Any] | None = None,
 ) -> dict[str, Any] | list[Any] | None:
-    """Issue a single GET to Reddit and return parsed JSON.
+    """GET one Reddit Data API path through the OAuth client.
 
-    Returns ``None`` on any error (rate-limit, network, decode).
+    Returns ``None`` on an HTTP error or decode failure (logged). A missing
+    credential (``RedditNotConfigured``) propagates to the caller.
     """
-    headers = {
-        "User-Agent": user_agent,
-        "Accept": "application/json",
-    }
     try:
-        resp = requests.get(
-            url,
-            headers=headers,
-            params=params,
-            timeout=_REQUEST_TIMEOUT,
-        )
-    except requests.RequestException as exc:
-        log.warning("reddit_options_pulse: request to {u} failed: {e}", u=url, e=str(exc))
+        return client.get_json(path, params=params)
+    except RedditNotConfigured:
+        raise
+    except RedditAPIError as exc:
+        if exc.status == 429:
+            log.warning("reddit_options_pulse: rate-limited (429) on {p}", p=path)
+        elif exc.status == 403:
+            log.warning("reddit_options_pulse: forbidden (403) on {p}", p=path)
+        else:
+            log.warning("reddit_options_pulse: HTTP {s} on {p}", s=exc.status, p=path)
         return None
-
-    if resp.status_code == 429:
-        log.warning("reddit_options_pulse: rate-limited (429) on {u}", u=url)
-        return None
-    if resp.status_code == 403:
-        log.warning("reddit_options_pulse: forbidden (403) on {u}", u=url)
-        return None
-    if resp.status_code != 200:
-        log.warning(
-            "reddit_options_pulse: HTTP {s} on {u}",
-            s=resp.status_code, u=url,
-        )
-        return None
-
-    try:
-        return resp.json()
-    except ValueError as exc:
-        log.warning("reddit_options_pulse: JSON decode failed: {e}", e=str(exc))
+    except (requests.RequestException, ValueError) as exc:
+        log.warning("reddit_options_pulse: request to {p} failed: {e}", p=path, e=str(exc))
         return None
 
 
-def _fetch_daily_thread(user_agent: str) -> dict[str, Any] | None:
+def _fetch_daily_thread(client: RedditAppClient) -> dict[str, Any] | None:
     """Find and fetch the latest /r/options daily discussion thread.
 
     Two-step process:
 
-        1. Hit the search endpoint with each query in DAILY_THREAD_QUERIES
+        1. Search the subreddit with each query in DAILY_THREAD_QUERIES
            until we find a post whose title contains "daily discussion".
-        2. Fetch that post's full comment tree via
-           ``/r/options/comments/<id>.json?limit=500``.
+        2. Fetch that post's comment tree via
+           ``/r/options/comments/<id>?limit=500``.
 
-    Returns:
-        A dict shaped as ``{"post": <link_data>, "thread": <raw_thread_json>}``
-        on success, or ``None`` on any failure path.  The shape is chosen so
-        that downstream code can call ``_flatten_comments(d["thread"])`` and
-        also read ``d["post"]`` for thread metadata (id, permalink, created).
+    Returns ``{"post": <link_data>, "thread": <raw_thread_json>}`` on
+    success, or ``None`` on any failure path.
     """
     for query in DAILY_THREAD_QUERIES:
-        search_url = f"{REDDIT_BASE_URL}/r/{REDDIT_SUBREDDIT}/search.json"
         params = {
             "q": f'title:"{query}"',
             "restrict_sr": 1,
             "sort": "new",
             "limit": 10,
-            "raw_json": 1,
         }
-        search_payload = _http_get_json(search_url, user_agent, params=params)
+        search_payload = _http_get_json(
+            client, f"/r/{REDDIT_SUBREDDIT}/search", params=params
+        )
         if not isinstance(search_payload, dict):
             continue
 
@@ -449,13 +441,14 @@ def _fetch_daily_thread(user_agent: str) -> dict[str, Any] | None:
             if "daily discussion" not in title and "moves tomorrow" not in title:
                 continue
 
-            permalink = data.get("permalink")
-            if not permalink:
+            post_id = data.get("id")
+            if not post_id:
                 continue
 
-            thread_url = f"{REDDIT_BASE_URL}{permalink}.json"
             thread_payload = _http_get_json(
-                thread_url, user_agent, params={"limit": 500, "raw_json": 1}
+                client,
+                f"/r/{REDDIT_SUBREDDIT}/comments/{post_id}",
+                params={"limit": 500},
             )
             if thread_payload is None:
                 continue
@@ -551,9 +544,11 @@ class RedditOptionsPulsePuller(BasePuller):
         "priority_rank": 55,
     }
 
-    def __init__(self, db_engine: Engine) -> None:
+    def __init__(self, db_engine: Engine, client: RedditAppClient | None = None) -> None:
         super().__init__(db_engine)
         self._user_agent = REDDIT_USER_AGENT
+        self._client = client
+        self.last_error: str | None = None
 
     # ── Public API ───────────────────────────────────────────────────
 
@@ -564,13 +559,23 @@ class RedditOptionsPulsePuller(BasePuller):
             List of ``RedditOptionsPulse`` snapshots, newest first.  Empty
             if Reddit failed or no daily-discussion thread could be found.
         """
+        self.last_error = None
         try:
-            payload = _fetch_daily_thread(self._user_agent)
+            client = self._client or RedditAppClient()
+        except RedditNotConfigured as exc:
+            self.last_error = f"not configured: {exc}"
+            log.warning("reddit_options_pulse: {e}", e=str(exc))
+            return []
+
+        try:
+            payload = _fetch_daily_thread(client)
         except Exception as exc:  # never crash the scheduler
+            self.last_error = f"fetch raised: {exc}"
             log.warning("reddit_options_pulse: fetch raised {e}", e=str(exc))
             return []
 
         if not payload:
+            self.last_error = "no daily-discussion thread fetched"
             return []
 
         post_data = payload.get("post") if isinstance(payload, dict) else None
@@ -709,6 +714,8 @@ def run_reddit_options_pulse_puller(engine: Engine) -> dict[str, Any]:
             }
     """
     summary: dict[str, Any] = {
+        "status": "FAILED",
+        "error": None,
         "fetched": 0,
         "inserted": 0,
         "thread_date": None,
@@ -721,6 +728,7 @@ def run_reddit_options_pulse_puller(engine: Engine) -> dict[str, Any]:
         puller = RedditOptionsPulsePuller(engine)
     except Exception as exc:
         log.warning("reddit_options_pulse: puller init failed: {e}", e=str(exc))
+        summary["error"] = f"init failed: {exc}"
         return summary
 
     try:
@@ -731,14 +739,17 @@ def run_reddit_options_pulse_puller(engine: Engine) -> dict[str, Any]:
 
     summary["fetched"] = len(pulses)
     if not pulses:
+        summary["error"] = puller.last_error or "no pulse"
         return summary
 
     try:
         inserted = puller.save_to_db(pulses)
     except Exception as exc:
         log.warning("reddit_options_pulse: save raised {e}", e=str(exc))
+        summary["error"] = f"save failed: {exc}"
         return summary
 
+    summary["status"] = "SUCCESS"
     summary["inserted"] = inserted
     head = pulses[0]
     summary["thread_date"] = head.thread_date.isoformat()

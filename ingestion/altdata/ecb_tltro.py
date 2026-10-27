@@ -1,6 +1,14 @@
 """
 GRID ECB TLTRO-III outstanding balance + repayment calendar puller (CAT-12).
 
+SUPERSEDED 2026-09-29 -- no longer scheduled. It never wrote a row: the ECB
+key below (``ILM/M.U2.C.LT3.U2.EUR``) returns HTTP 404 "No Series", the
+scheduler never passed a FRED key, and the FRED candidates are not TLTRO
+series (``ECBASSETSW`` is total Eurosystem assets -- do NOT re-enable that
+path under the ``ecb_tltro:outstanding_eur_bn`` name). TLTRO-III fully
+matured in Dec 2024. The weekly job now runs ``ingestion/altdata/ecb_ltro.py``
+(source ``ecb_ilm_ltro``). This module is kept only for its tests/history.
+
 Targeted Longer-Term Refinancing Operations III (TLTRO-III) was the ECB's
 emergency long-term refinancing programme (2019-2024): cheap multi-year loans
 to Eurozone banks, conditional on lending volumes. Each scheduled repayment

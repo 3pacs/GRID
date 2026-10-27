@@ -42,6 +42,87 @@ NOTE (hermes/scheduler split, verified 2026-04-13):
 
 from __future__ import annotations
 
+# A selected FINRA workflow is a finite invocation, never a daemon cycle.
+# Its actual entry origin precedes selection parsing, imports and source reads.
+def _hermes_finra_bootstrap(argv, *, entry_t0, clock):
+    if not (type(entry_t0) is float and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    last = entry_t0
+    def check():
+        nonlocal last
+        value = clock()
+        if not (type(value) in (int, float) and value == value
+                and last <= value < entry_t0 + 450):
+            raise ValueError("FINRA_ENTRY_BOUND")
+        last = value
+    try:
+        check()
+        if any(type(a) is not str or a.startswith("--sec-") for a in argv):
+            return 2
+        import runpy
+        from pathlib import Path
+        check()
+        scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+        check()
+        runpy.run_path(str(scheduler), run_name="__hermes_finra_only__",
+                       init_globals={"HERMES_FINRA_ONLY_ARGS": list(argv),
+                                     "HERMES_FINRA_ENTRY_ORIGIN": entry_t0,
+                                     "HERMES_FINRA_CLOCK": clock})
+    except SystemExit:
+        raise
+    except BaseException:
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _finra_sys
+    if any(type(a) is str and a.startswith("--finra-") for a in _finra_sys.argv[1:]):
+        from time import monotonic as _finra_clock
+        try:
+            _finra_origin = _finra_clock()
+        except BaseException:
+            _finra_origin = None
+        raise SystemExit(_hermes_finra_bootstrap(_finra_sys.argv[1:], entry_t0=_finra_origin, clock=_finra_clock))
+
+# SEC-only dispatch is deliberately before chdir, environment/config and heavy
+# imports. Ordinary invocations fall through byte-identical legacy startup.
+def _hermes_sec_bootstrap(argv, *, entry_t0, clock):
+    # The selected branch captures its actual origin before these imports/reads.
+    if not (type(entry_t0) in (int, float) and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    try:
+        before_import = clock()
+        if not (type(before_import) in (int, float) and entry_t0 <= before_import < entry_t0 + 120):
+            return 2
+        import runpy
+        from pathlib import Path
+        now = clock()
+    except BaseException:
+        return 2
+    if not (type(now) in (int, float) and before_import <= now < entry_t0 + 120):
+        return 2
+    scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+    runpy.run_path(str(scheduler), run_name="__hermes_sec_only__",
+                   init_globals={"HERMES_SEC_ONLY_ARGS": list(argv),
+                                 "HERMES_SEC_OUTER_ORIGIN": entry_t0,
+                                 "HERMES_SEC_CLOCK": clock})
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _sec_sys
+    if any(type(a) is str and a.startswith("--sec-") for a in _sec_sys.argv[1:]):
+        from time import monotonic as _sec_clock
+        try:
+            _sec_origin = _sec_clock()  # before runpy/pathlib/selection/source reads
+        except BaseException:
+            _sec_origin = None
+        raise SystemExit(_hermes_sec_bootstrap(_sec_sys.argv[1:], entry_t0=_sec_origin, clock=_sec_clock))
+
+
 import argparse
 import json
 import os
@@ -110,6 +191,9 @@ TIMEOUT_BLACKLIST_HOURS = 24          # blacklist sources that cause cycle timeo
 # Hung LLM calls used to consume the full 900s cycle budget; these caps + the
 # cooldown blacklist break the loop after a single timeout.
 ORACLE_CYCLE_TIMEOUT_SECONDS = 4000           # oracle.run_cycle: 41 tickers x ~80s + headroom (was 300, caused 24h blacklist loop)
+# Admission reserve for timeout/report bookkeeping and cycle cleanup. Do not
+# shrink the oracle's quality budget to fit a cycle delayed by ingestion.
+ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS = 300
 SIGNAL_CLASSIFICATION_TIMEOUT_SECONDS = 120   # gemma micro classifier batch
 ANOMALY_NARRATION_TIMEOUT_SECONDS = 90        # gemma micro anomaly narrator
 KNOWLEDGE_MAP_TIMEOUT_SECONDS = 120           # gemma micro knowledge mapper
@@ -132,7 +216,12 @@ DIAGNOSE_PULLS_TIMEOUT_SECONDS = 240          # Hermes pull diagnosis/fix step �
 # tests/test_hermes_repair_bounded.py.
 DIAGNOSTICS_TIMEOUT_SECONDS = 300
 RESOLUTION_TIMEOUT_SECONDS = 420              # normalization.resolver.Resolver.resolve_pending. Outer guard only — RESOLUTION_SCAN_BUDGET_SECONDS is what bounds the step. Must hold that budget (180) + one slice of overshoot capped at MIN_SCAN_SLICE_TIMEOUT_S (60) + the worst resolve phase observed live on 2026-09-14 (77.5s, cycle 6014) = 317.5s. Was 240, which the 371-411s cold scan of ops-exec run 292 did not fit inside. tests/test_hermes_resolution_watermark.py pins the invariant.
-SMART_INGESTION_TIMEOUT_SECONDS = 300         # smart_scheduler.tick() — matches TICK_TIME_BUDGET_S in ingestion/smart_scheduler.py so Hermes doesn't pull the plug while SmartScheduler is mid-shutdown
+# tick() stops STARTING jobs after 300s; a final options call can still take
+# 900s. Include that overshoot plus 60s for result persistence/cleanup so
+# the enclosing step does not abandon a cooperating options capture.
+# This scopes the fix to options; existing 1800s registry jobs still need
+# separate budget review. The 4500s whole-cycle watchdog is unchanged.
+SMART_INGESTION_TIMEOUT_SECONDS = 1260
 TIMESFM_TIMEOUT_SECONDS = 240                 # oracle/forecaster_adapter.run_timesfm_forecast_cycle
 ASTROGRID_CELESTIAL_TIMEOUT_SECONDS = 240      # oracle.astrogrid_cycle.run_celestial_cycle: deterministic sky build is sub-second; the budget is almost entirely the one local-LLM interpretation call (num_predict=1200). Degrades to a deterministic fallback if the model is offline, so a timeout here means the model was slow, not absent.
 DAILY_INTEL_BATCH_OBSERVED_S = 360            # HISTORICAL — observed run length of the OLD monolithic 02:00 daily block (source_audit → backtest_scan → postmortem → options_improvement → hypothesis_review → auto_discover) with LLM calls, measured 2026-05-08. Superseded by DAILY_INTEL_CYCLE_BUDGET_SECONDS below for the timeout-budget pin (fable-daily-intel-resumable, 2026-09-20) — kept only because it is a documented historical measurement other notes reference; nothing computes with it anymore.
@@ -557,6 +646,10 @@ _SOURCE_OVERRIDES: dict[str, dict[str, Any]] = {
     # keeps the scheduler-side fail-closed behaviour while fixing the
     # retry-side ctor mismatch.
     "eia":             {"api_key": None},
+    # Tiingo also reads its key from the module environment and accepts only
+    # db_engine. Preserve the scheduler's api_key_mode="env" missing-key gate;
+    # the retry adapter must not forward an unsupported api_key keyword.
+    "tiingo":          {"api_key": None},
 }
 
 
@@ -583,6 +676,8 @@ def _build_source_registry() -> dict[str, dict[str, Any]]:
     for entry in PULLER_REGISTRY:
         name = entry["name"]
         cfg: dict[str, Any] = {"mod": entry["mod"], "cls": entry["cls"]}
+        if entry.get("hold_reason"):
+            cfg["skip_runtime"] = entry["hold_reason"]
         if "api_key" in entry:
             cfg["api_key"] = entry["api_key"]
         method = entry.get("method")
@@ -754,6 +849,7 @@ from scripts.hermes_health import (  # noqa: E402, F401
 from scripts.hermes_fixers import (  # noqa: E402, F401
     _resolve_puller,
     _retry_source,
+    retry_not_fresh_reason,
     diagnose_and_fix_pulls,
     maybe_run_pipeline,
     fill_data_gaps,
@@ -3438,6 +3534,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     """Execute one operator cycle."""
     state.cycle_count += 1
     cycle_start = time.monotonic()
+    cycle_deadline = cycle_start + CYCLE_TIMEOUT_SECONDS
     cycle_result: dict[str, Any] = {
         "cycle": state.cycle_count,
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -3569,12 +3666,40 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     stale_sources = health["db"].get("stale_sources", [])
     if stale_sources and not dry_run:
         stale_repulled = 0
-        for stale in stale_sources[:15]:  # up to 15 per cycle
+        stale_attempted = 0
+        for stale in stale_sources:
+            # Cooling sources must not consume the bounded repair slots.
+            # Count every admitted retry call, including skipped/no-handler
+            # results, and never start another after this cycle's deadline.
+            if stale_attempted >= 15 or time.monotonic() >= cycle_deadline:
+                break
             src = stale["source"]
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
+                stale_attempted += 1
                 try:
-                    _retry_source(src, engine, attempt=1, state=state)
+                    pull_result = _retry_source(
+                        src, engine, attempt=1, state=state,
+                        should_continue=lambda: time.monotonic() < cycle_deadline,
+                    )
+                    if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
+                        log.info("Skipping stale refresh for {s} — repair already in flight", s=src)
+                        continue
+                    if pull_result.get("status") == "abandoned":
+                        # The owning attempt must decide the cooldown outcome.
+                        log.warning("Stale refresh for {s} abandoned — not recording a cooldown outcome", s=src)
+                        continue
+                    if pull_result.get("outcome") == "NO_NEW_DATA":
+                        state.cooldowns.record_attempt(src, success=True)
+                        log.info("Stale source {s} checked with no new writes; remains stale", s=src)
+                        continue
+                    not_fresh = retry_not_fresh_reason(pull_result)
+                    if not_fresh:
+                        # Skipped / every item failed: not a refresh, and
+                        # _retry_source left last_pull_at alone (2026-09-29).
+                        state.cooldowns.record_attempt(src, success=False, error=not_fresh)
+                        log.info("Stale refresh for {s} did not refresh: {r}", s=src, r=not_fresh)
+                        continue
                     state.cooldowns.record_attempt(src, success=True)
                     stale_repulled += 1
                     log.info("Proactively refreshed stale source: {s}", s=src)
@@ -3907,7 +4032,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         # cycle picks the hour up instead of losing it.
         #
         # Ahead of the oracle this is insurance rather than the common case:
-        # only diagnose (240) + smart ingestion (300) + resolution (420) are
+        # only diagnose (240) + smart ingestion (1260) + resolution (420) are
         # budgeted before it, well inside the 4500s cap. The unbudgeted steps
         # that also run first -- pipeline, data gatherer, autoresearch,
         # self-diagnostics, the 7a-7c digests -- have no cap of their own, so
@@ -3954,36 +4079,49 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
         if state.last_oracle_cycle is not None:
             hours_since_oracle = (now - state.last_oracle_cycle).total_seconds() / 3600
         if hours_since_oracle >= 6 and state.cooldowns.can_retry("oracle_cycle"):
-            state.current_step = "oracle_cycle"
-            log.info("Running Oracle prediction cycle...")
-            # Record cycle start eagerly: even if the inner timeout fires
-            # the orphan thread keeps running and writes predictions to DB.
-            # We must NOT refire oracle for another 6h regardless. (2026-05-09)
-            state.last_oracle_cycle = now
-            if not dry_run:
-                from oracle.engine import OracleEngine
-                from oracle.report import send_oracle_report
-
-                def _oracle_call():
-                    oracle = OracleEngine(db_engine=engine)
-                    return oracle.run_cycle()
-
-                oracle_result, ok = _run_with_timeout(
-                    "oracle_cycle", _oracle_call,
-                    ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+            budget_left = cycle_deadline - time.monotonic()
+            needed = ORACLE_CYCLE_TIMEOUT_SECONDS + ORACLE_CYCLE_CLEANUP_RESERVE_SECONDS
+            if budget_left < needed:
+                log.info(
+                    "Oracle cycle deferred — {b:.0f}s of cycle budget left, needs {n}s including cleanup",
+                    b=budget_left, n=needed,
                 )
-                if ok and oracle_result:
-                    cycle_result["oracle"] = {
-                        "predictions": oracle_result["new_predictions"],
-                        "scoring": oracle_result["scoring"],
-                        "leaderboard": oracle_result.get("leaderboard", [])[:3],
-                    }
-                    if oracle_result["new_predictions"] > 0:
-                        send_oracle_report(oracle_result)
-                    state.last_oracle_cycle = now
-                    state.cooldowns.record_attempt("oracle_cycle", success=True)
+                cycle_result["oracle"] = {
+                    "deferred": "insufficient_cycle_budget",
+                    "budget_left_s": round(budget_left, 1),
+                    "required_s": needed,
+                }
             else:
-                log.info("[DRY RUN] Would run Oracle cycle")
+                state.current_step = "oracle_cycle"
+                log.info("Running Oracle prediction cycle...")
+                # Record start only after admission: an orphan can still write
+                # predictions after its inner timeout, so an actual dispatch
+                # must not refire for 6h. A budget deferral leaves this untouched.
+                state.last_oracle_cycle = now
+                if not dry_run:
+                    from oracle.engine import OracleEngine
+                    from oracle.report import send_oracle_report
+
+                    def _oracle_call():
+                        oracle = OracleEngine(db_engine=engine)
+                        return oracle.run_cycle()
+
+                    oracle_result, ok = _run_with_timeout(
+                        "oracle_cycle", _oracle_call,
+                        ORACLE_CYCLE_TIMEOUT_SECONDS, state,
+                    )
+                    if ok and oracle_result:
+                        cycle_result["oracle"] = {
+                            "predictions": oracle_result["new_predictions"],
+                            "scoring": oracle_result["scoring"],
+                            "leaderboard": oracle_result.get("leaderboard", [])[:3],
+                        }
+                        if oracle_result["new_predictions"] > 0:
+                            send_oracle_report(oracle_result)
+                        state.last_oracle_cycle = now
+                        state.cooldowns.record_attempt("oracle_cycle", success=True)
+                else:
+                    log.info("[DRY RUN] Would run Oracle cycle")
         elif hours_since_oracle >= 6:
             log.info(
                 "Skipping oracle_cycle — blacklisted (timed out previously, "
@@ -4285,11 +4423,16 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                     try:
                         from ingestion.tiingo_pull import TiingoPuller
                         tp = TiingoPuller(engine)
-                        # Pull all tracked tickers (daily update)
-                        tiingo_result = tp.pull_all(start_date=str(now_utc.date() - timedelta(days=5)))
+                        # Routine incremental update: skips tickers that are
+                        # already current and shares the cross-process
+                        # advisory lock with grid-scheduler's daily Tiingo
+                        # worker (stale-sources audit 2026-09-29) -- this
+                        # used to be an unlocked pull_all() racing it.
+                        tiingo_result = tp.pull_incremental()
                         cycle_result["tiingo_daily"] = {
-                            "succeeded": sum(1 for r in tiingo_result if r["status"] == "SUCCESS"),
-                            "total": len(tiingo_result),
+                            k: tiingo_result.get(k)
+                            for k in ("status", "current", "fetched", "succeeded",
+                                      "failed", "tickers", "rows_inserted")
                         }
                     except Exception as exc:
                         log.warning("Tiingo price pull failed: {e}", e=str(exc))

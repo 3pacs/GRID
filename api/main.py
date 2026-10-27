@@ -448,6 +448,7 @@ for _label, _module_path, _required in [
     ("dad", "api.routers.dad", False),
     ("price_alerts", "api.routers.price_alerts", False),
     ("godview", "api.routers.godview", False),
+    ("evals_e2", "api.routers.evals_e2", False),
 ]:
     _router = _load_router(_module_path, label=_label, required=_required)
     if _router is not None:

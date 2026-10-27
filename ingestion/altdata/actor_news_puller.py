@@ -19,6 +19,7 @@ The puller is idempotent via UNIQUE(actor_id, source, url).
 from __future__ import annotations
 
 import html
+import math
 import re
 import time
 import xml.etree.ElementTree as ET
@@ -113,6 +114,15 @@ class BioRow:
     net_worth_usd: float | None = None
 
 
+class _ActorBatchDeferred(Exception):
+    """Cooperative scheduled-only yield; deliberately not RequestException."""
+
+    def __init__(self, reason: str, retry_after: str | None = None) -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.retry_after = retry_after
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -200,18 +210,27 @@ class ActorNewsPuller:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": USER_AGENT})
         self._last_call: dict[str, float] = {}
+        self._batch_deadline: float | None = None
+        self._batch_progress: dict[str, Any] | None = None
 
     # -----------------------------------------------------------------------
     # Rate limiting
     # -----------------------------------------------------------------------
 
+    def _check_batch_budget(self, wait: float = 0.0) -> None:
+        if self._batch_deadline is not None and time.monotonic() + max(wait, 0.0) >= self._batch_deadline:
+            raise _ActorBatchDeferred("budget_exhausted")
+
     def _throttle(self, source: str) -> None:
+        self._check_batch_budget()
         delay = _RATE_LIMIT.get(source, 0.5)
         now = time.time()
         last = self._last_call.get(source, 0.0)
         wait = delay - (now - last)
         if wait > 0:
+            self._check_batch_budget(wait)
             time.sleep(wait)
+        self._check_batch_budget()
         self._last_call[source] = time.time()
 
     # -----------------------------------------------------------------------
@@ -282,6 +301,11 @@ class ActorNewsPuller:
         )
         try:
             resp = self.session.get(url, timeout=_REQUEST_TIMEOUT)
+            if self._batch_deadline is not None and resp.status_code == 429:
+                # Yield the whole scheduled batch; do not enter retry/backoff
+                # or continue other actors while the provider is throttling.
+                raw_retry = resp.headers.get("Retry-After")
+                raise _ActorBatchDeferred("gdelt_rate_limited", str(raw_retry)[:128] if raw_retry is not None else None)
             resp.raise_for_status()
             payload = resp.json() if resp.text.strip() else {}
         except (requests.RequestException, ValueError) as exc:
@@ -518,38 +542,106 @@ class ActorNewsPuller:
         """
         actor_id = actor["actor_id"]
         query = self._build_query(actor)
-        counts: dict[str, int] = {}
+        counts: dict[str, int] = self._batch_progress["source_rows_fetched"] if self._batch_progress is not None else {}
 
         all_rows: list[NewsRow] = []
         if "google_news" in sources:
+            self._check_batch_budget()
             rs = self._fetch_google_news(actor_id, query)
             counts["google_news"] = len(rs)
             all_rows.extend(rs)
         if "gdelt" in sources:
+            self._check_batch_budget()
             rs = self._fetch_gdelt(actor_id, query)
             counts["gdelt"] = len(rs)
             all_rows.extend(rs)
         if "sec_edgar" in sources:
+            self._check_batch_budget()
             rs = self._fetch_sec_edgar(actor_id, actor["name"])
             counts["sec_edgar"] = len(rs)
             all_rows.extend(rs)
         if "crossref" in sources:
+            self._check_batch_budget()
             rs = self._fetch_crossref(actor_id, actor["name"])
             counts["crossref"] = len(rs)
             all_rows.extend(rs)
 
         if all_rows:
+            self._check_batch_budget()
+            if self._batch_progress is not None:
+                self._batch_progress["news_write_attempted"] = True
             self._insert_news_rows(all_rows)
+            if self._batch_progress is not None:
+                self._batch_progress["news_write_completed"] = True
 
         if "wikipedia" in sources:
+            self._check_batch_budget()
             bio = self._fetch_wikipedia(actor_id, actor["name"])
             if bio is not None:
-                self._upsert_bio(bio)
                 counts["wikipedia"] = 1
+                self._check_batch_budget()
+                if self._batch_progress is not None:
+                    self._batch_progress["bio_write_attempted"] = True
+                self._upsert_bio(bio)
+                if self._batch_progress is not None:
+                    self._batch_progress["bio_write_completed"] = True
             else:
                 counts["wikipedia"] = 0
 
         return counts
+
+    def pull_batch(
+        self, actors: list[dict[str, Any]], sources: list[str], *, budget_seconds: float,
+    ) -> dict[str, Any]:
+        """Opt-in cooperative batch; no IO cancellation or durable retry queue.
+
+        Source counts are fetched rows, never affected/inserted SQL rows. A
+        deferred/failed actor can have unwritten fetched news or prior writes;
+        its progress flags do not attest row-level persistence or rollback.
+        This session/puller must not be shared with concurrent calls.
+        """
+        if type(budget_seconds) not in (int, float) or not math.isfinite(budget_seconds) or budget_seconds <= 0:
+            raise ValueError("budget_seconds must be finite and positive")
+        if self._batch_deadline is not None:
+            raise RuntimeError("actor-news batch already active")
+        result: dict[str, Any] = {
+            "actors_requested": len(actors), "actors_attempted": 0, "actors_completed": 0,
+            "failed_actor_ids": [], "deferred_actor_ids": [], "incomplete_actors": [],
+            "source_rows_fetched": {}, "stop_reason": "completed", "retry_after": None,
+        }
+        self._batch_deadline = time.monotonic() + budget_seconds
+        try:
+            for index, actor in enumerate(actors):
+                self._batch_progress = {"source_rows_fetched": {}, "news_write_attempted": False,
+                                        "news_write_completed": False, "bio_write_attempted": False,
+                                        "bio_write_completed": False}
+                started = False
+                try:
+                    self._check_batch_budget()
+                    started = True
+                    result["actors_attempted"] += 1
+                    self.pull_one_actor(actor, sources)
+                    result["actors_completed"] += 1
+                except _ActorBatchDeferred as exc:
+                    result["stop_reason"], result["retry_after"] = exc.reason, exc.retry_after
+                    result["deferred_actor_ids"] = [a["actor_id"] for a in actors[index:]]
+                    if started:
+                        result["incomplete_actors"].append({"actor_id": actor["actor_id"],
+                                                            "reason": exc.reason, **self._batch_progress})
+                    break
+                except Exception as exc:
+                    result["failed_actor_ids"].append(actor["actor_id"])
+                    result["incomplete_actors"].append({"actor_id": actor["actor_id"],
+                                                        "reason": "actor_error", **self._batch_progress})
+                    log.debug("actor_news batch skipped {a}: {e}", a=actor["actor_id"], e=str(exc))
+                finally:
+                    for source, count in self._batch_progress["source_rows_fetched"].items():
+                        totals = result["source_rows_fetched"]
+                        totals[source] = totals.get(source, 0) + count
+            return result
+        finally:
+            self._batch_deadline = None
+            self._batch_progress = None
 
     # -----------------------------------------------------------------------
     # DB writes

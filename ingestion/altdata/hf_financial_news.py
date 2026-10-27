@@ -17,6 +17,21 @@ Series stored:
 Data sources:
 - https://huggingface.co/datasets/zeroshot/twitter-financial-news-sentiment
 - https://huggingface.co/datasets/takala/financial_phrasebank
+
+Revision gate (2026-09-29)
+--------------------------
+These are STATIC historical corpora (e.g. danidanou/Bloomberg_Financial_News
+was last modified on the Hub on 2024-06-18; its articles end in 2013). They
+never produce "new" data on a daily/weekly cadence. Every scheduled run used
+to stream the whole corpus again and first ran
+``SELECT MAX(obs_date) ... WHERE series_id LIKE 'hf_news.<subset>.%'`` over
+~1.5M rows, which hit the 120s statement timeout (pull_log FAILED every
+Sunday; Hermes SmartScheduler FAILED daily). Now each subset first asks the
+free Hub API (``/api/datasets/<id>``, no key) for the dataset's
+``lastModified``; if that is not newer than this source's latest SUCCESS
+``raw_series.pull_timestamp`` (an index-only lookup), the subset is reported
+``UNCHANGED`` and nothing heavy runs. A Hub API failure is reported FAILED,
+never SUCCESS. Pass ``force=True`` to re-ingest regardless.
 """
 
 from __future__ import annotations
@@ -26,6 +41,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
+import requests
 from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
@@ -129,6 +145,28 @@ _BATCH_SIZE: int = 5000  # bigger batches for large datasets
 
 # Delay between subset downloads to be polite
 _SUBSET_DELAY: float = 2.0
+
+# Free Hugging Face Hub API (no key) used for the revision gate.
+HF_DATASET_API: str = "https://huggingface.co/api/datasets/{hf_id}"
+_HF_API_TIMEOUT: int = 30
+_USER_AGENT: str = "GRID/4.0 (research; stepdadfinance@gmail.com)"
+
+
+def fetch_hf_dataset_last_modified(hf_id: str) -> datetime:
+    """Return the Hub ``lastModified`` timestamp (UTC) for a dataset.
+
+    Raises on HTTP error or a missing/unparseable field.
+    """
+    resp = requests.get(
+        HF_DATASET_API.format(hf_id=hf_id),
+        headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
+        timeout=_HF_API_TIMEOUT,
+    )
+    resp.raise_for_status()
+    raw = resp.json().get("lastModified")
+    if not raw:
+        raise ValueError(f"no lastModified for {hf_id}")
+    return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(timezone.utc)
 
 # Feature definitions
 HF_NEWS_FEATURES: dict[str, str] = {
@@ -291,6 +329,61 @@ class HFFinancialNewsPuller(BasePuller):
         """
         return f"{_SERIES_PREFIX}.{subset_name}"
 
+    # Injectable for tests; defaults to the live Hub API.
+    _last_modified_fetcher = staticmethod(fetch_hf_dataset_last_modified)
+
+    def _latest_success_pull(self) -> datetime | None:
+        """Latest SUCCESS pull_timestamp for this source (index-only scan)."""
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT MAX(pull_timestamp) FROM raw_series "
+                    "WHERE pull_status = 'SUCCESS' AND source_id = :src"
+                ),
+                {"src": self.source_id},
+            ).fetchone()
+        if not row or row[0] is None:
+            return None
+        ts = row[0]
+        if isinstance(ts, datetime) and ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return ts
+
+    def _revision_gate(self, subset_name: str, hf_id: str) -> dict[str, Any] | None:
+        """Return an UNCHANGED/FAILED result dict to short-circuit, or None to ingest."""
+        last_pull = self._latest_success_pull()
+        if last_pull is None:
+            return None  # nothing ingested yet: do the full pull
+        try:
+            modified = self._last_modified_fetcher(hf_id)
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "HF news {s}: Hub revision check failed: {e}", s=subset_name, e=str(exc),
+            )
+            return {
+                "status": "FAILED",
+                "rows_inserted": 0,
+                "subset": subset_name,
+                "error": f"hub revision check failed: {exc}"[:300],
+            }
+        if modified <= last_pull:
+            log.info(
+                "HF news {s}: dataset unchanged since {m} (last ingest {p}) -- skipping",
+                s=subset_name, m=modified.isoformat(), p=last_pull.isoformat(),
+            )
+            return {
+                "status": "UNCHANGED",
+                "rows_inserted": 0,
+                "subset": subset_name,
+                "dataset_last_modified": modified.isoformat(),
+                "last_ingested_at": last_pull.isoformat(),
+            }
+        log.info(
+            "HF news {s}: dataset modified {m} after last ingest {p} -- re-ingesting",
+            s=subset_name, m=modified.isoformat(), p=last_pull.isoformat(),
+        )
+        return None
+
     def _get_latest_namespace_date(self, series_prefix: str) -> date | None:
         """Return the latest obs_date across a namespaced series prefix.
 
@@ -411,6 +504,7 @@ class HFFinancialNewsPuller(BasePuller):
         self,
         subset_name: str,
         start_date: str | date | None = None,
+        force: bool = False,
     ) -> dict[str, Any]:
         """Pull one dataset from HuggingFace using DATASET_CONFIGS.
 
@@ -446,6 +540,11 @@ class HFFinancialNewsPuller(BasePuller):
             }
 
         sid = self._series_id(subset_name)
+
+        if not force:
+            gated = self._revision_gate(subset_name, ds_cfg["hf_id"])
+            if gated is not None:
+                return gated
 
         # Determine start date for incremental pull
         is_per_article = ds_cfg.get("per_article", ds_cfg.get("date_field") is not None)
@@ -640,6 +739,7 @@ class HFFinancialNewsPuller(BasePuller):
         self,
         subsets: list[str] | None = None,
         start_date: str | date | None = None,
+        force: bool = False,
     ) -> list[dict[str, Any]]:
         """Pull all priority subsets (or a custom list).
 
@@ -669,6 +769,7 @@ class HFFinancialNewsPuller(BasePuller):
             result = self.pull_subset(
                 subset_name=subset_name,
                 start_date=start_date,
+                force=force,
             )
             results.append(result)
 
@@ -677,11 +778,23 @@ class HFFinancialNewsPuller(BasePuller):
                 time.sleep(_SUBSET_DELAY)
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        unchanged = sum(1 for r in results if r["status"] == "UNCHANGED")
+        failed = [r for r in results if r["status"] == "FAILED"]
         total_rows = sum(r["rows_inserted"] for r in results)
         log.info(
-            "HF news pull_all -- {ok}/{total} subsets, {rows} rows total",
+            "HF news pull_all -- {ok} ingested, {u} unchanged, {f} failed of {total}; {rows} rows",
             ok=succeeded,
+            u=unchanged,
+            f=len(failed),
             total=len(results),
             rows=total_rows,
         )
+        # Both callers (SmartScheduler and the grid-scheduler group runner)
+        # treat a returned list as success, so a run where EVERY subset
+        # failed must raise -- otherwise it would be recorded as SUCCESS.
+        if results and len(failed) == len(results):
+            raise RuntimeError(
+                "HF news: every subset failed: "
+                + "; ".join(str(r.get("error", ""))[:80] for r in failed)[:300]
+            )
         return results

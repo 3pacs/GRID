@@ -277,8 +277,9 @@ class TestRunTaiwanStraitPuller:
         assert result["latest_aircraft_count"] == 24
         assert mock_insert.call_count == 4
 
-    def test_fallback_to_seed(self, mock_engine):
-        """MND 500s → fallback seed row written, source=seed."""
+    def test_fetch_failure_writes_no_rows(self, mock_engine):
+        """MND unreachable → nothing written: no placeholder/seed rows and
+        never a SUCCESS row for an unobserved day (2026-09-29 fix)."""
         import requests
 
         with patch(
@@ -286,16 +287,73 @@ class TestRunTaiwanStraitPuller:
             side_effect=requests.RequestException("boom"),
         ), patch.object(
             TaiwanStraitPuller, "_get_existing_dates", return_value=set()
+        ) as mock_existing, patch.object(
+            TaiwanStraitPuller, "_insert_raw"
+        ) as mock_insert:
+            result = run_taiwan_strait_puller(mock_engine)
+
+        assert result["source"] == "none"
+        assert result["fetched"] == 0
+        assert result["inserted"] == 0
+        assert result["latest_aircraft_count"] is None
+        mock_insert.assert_not_called()
+        # save_to_db short-circuits before opening a write transaction.
+        mock_existing.assert_not_called()
+        mock_engine.begin.assert_not_called()
+
+    def test_http_404_on_both_urls_writes_no_rows(self, mock_engine):
+        """The production failure mode: both MND URLs return 404."""
+        import requests
+
+        resp = MagicMock()
+        resp.raise_for_status.side_effect = requests.HTTPError(
+            "404 Client Error: Not Found"
+        )
+        with patch(
+            "ingestion.altdata.taiwan_strait_osint.requests.get",
+            return_value=resp,
         ), patch.object(
             TaiwanStraitPuller, "_insert_raw"
         ) as mock_insert:
             result = run_taiwan_strait_puller(mock_engine)
 
-        assert result["source"] == "seed"
-        assert result["fetched"] == 1
-        assert result["inserted"] == 4  # still writes the seed row × 4 series
-        assert result["latest_aircraft_count"] == 0
-        assert mock_insert.call_count == 4
+        assert result["source"] == "none"
+        assert result["inserted"] == 0
+        mock_insert.assert_not_called()
+        mock_engine.begin.assert_not_called()
+
+    def test_unparseable_html_writes_no_rows(self, mock_engine):
+        """MND reachable but no parseable release → nothing written."""
+        resp = MagicMock()
+        resp.text = "<html><body><p>nothing here</p></body></html>"
+        resp.raise_for_status.return_value = None
+        with patch(
+            "ingestion.altdata.taiwan_strait_osint.requests.get",
+            return_value=resp,
+        ), patch.object(
+            TaiwanStraitPuller, "_insert_raw"
+        ) as mock_insert:
+            result = run_taiwan_strait_puller(mock_engine)
+
+        assert result["source"] == "none"
+        assert result["fetched"] == 0
+        assert result["inserted"] == 0
+        mock_insert.assert_not_called()
+
+    def test_pull_failure_returns_no_snapshots(self, puller):
+        """pull() itself never fabricates a snapshot on failure."""
+        import requests
+
+        with patch(
+            "ingestion.altdata.taiwan_strait_osint.requests.get",
+            side_effect=requests.RequestException("boom"),
+        ):
+            out = puller.pull()
+
+        assert out["snapshots"] == []
+        assert out["source"] == "none"
+        assert out["error"]
+        assert not hasattr(puller, "_seed_snapshot")
 
     def test_idempotent_rerun_same_date(self, mock_engine):
         """Re-run with same date already in raw_series → zero new inserts."""

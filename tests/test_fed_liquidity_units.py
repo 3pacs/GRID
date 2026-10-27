@@ -16,6 +16,7 @@ tests/test_ingestion.py.
 from __future__ import annotations
 
 from datetime import date, datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -79,7 +80,7 @@ def test_compute_derived_stores_net_liquidity_in_millions():
 
     puller._load_series_from_db = MagicMock(side_effect=fake_load)
     puller._row_exists = MagicMock(return_value=False)
-    puller._insert_raw = MagicMock()
+    puller._insert_raw = MagicMock(return_value=SimpleNamespace(rowcount=1))
 
     puller._compute_derived(date(2024, 6, 1), date(2024, 6, 30))
 

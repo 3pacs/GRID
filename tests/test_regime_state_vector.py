@@ -502,3 +502,291 @@ def test_cache_round_trip_preserves_price_basis(engine, monkeypatch):
     served = sv_mod.get_or_compute_state_vector(engine, AS_OF, persist=False)
     assert served.price_basis == "spy_full"
     assert served.cached is True
+
+
+# ── Cadence-aware staleness (GRID-STALE-SOURCES-AUDIT-20260929.md §4) ────
+
+
+class TestStaleThresholdDays:
+    """Pure unit coverage of the per-series threshold table itself."""
+
+    def test_monthly_fred_series_get_70_days(self):
+        from intelligence.regime.state_vector import _stale_threshold_days
+
+        for sid in ("UNRATE", "INDPRO", "TCU", "M2SL", "UMCSENT"):
+            assert _stale_threshold_days(sid) == 70
+
+    def test_unclassified_series_keeps_old_30_day_rule(self):
+        from intelligence.regime.state_vector import _stale_threshold_days
+
+        assert _stale_threshold_days("T10Y2Y") == 30
+        assert _stale_threshold_days("VIXCLS") == 30
+        assert _stale_threshold_days("DERIVED:SPY_MA_RATIO") == 30
+
+    def test_quarterly_series_get_a_wider_window_than_monthly(self):
+        from intelligence.regime.state_vector import (
+            QUARTERLY_FRED_SERIES,
+            _stale_threshold_days,
+        )
+
+        # No quarterly series in STATE_DIMENSIONS today, but the tier must
+        # already behave correctly for the day one is added.
+        assert QUARTERLY_FRED_SERIES == frozenset()
+        assert _stale_threshold_days("SOME_QUARTERLY_SERIES") == 30  # unmapped -> default
+        from intelligence.regime import state_vector as sv_mod
+
+        try:
+            sv_mod.QUARTERLY_FRED_SERIES = frozenset({"SOME_QUARTERLY_SERIES"})
+            assert _stale_threshold_days("SOME_QUARTERLY_SERIES") == 160
+        finally:
+            sv_mod.QUARTERLY_FRED_SERIES = frozenset()
+
+
+class TestComputeStateVectorMonthlyStaleness:
+    """End-to-end: a monthly FRED series ~50 days old (always-stale under
+    the old flat 30-day rule) must not appear in stale_dimensions, while a
+    non-monthly series at the same age still would. Mirrors the audit's
+    UNRATE finding — GRID had the September release within minutes, but
+    the old rule called it stale every single day of the month.
+    """
+
+    def test_unrate_at_50_days_is_not_flagged_but_would_have_been_under_old_rule(
+        self, engine, monkeypatch,
+    ):
+        from intelligence.regime import state_vector as sv_mod
+
+        # Normalization is computed for this fixture/as_of; no process cache.
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=50)  # >30d (old rule) but <70d (new rule)
+        first_obs = latest_obs - timedelta(days=34)
+        d = first_obs
+        value = 4.0
+        while d <= latest_obs:
+            _insert(engine, "UNRATE", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.01  # tiny drift so std != 0
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "unemployment_level" not in sv.stale_dimensions
+        assert "unemployment_dir" not in sv.stale_dimensions
+        # Sanity: the old unconditional rule (30 days) would have caught
+        # this — confirms the fix is doing real work, not a no-op.
+        assert (as_of - latest_obs).days > 30
+
+    def test_non_monthly_series_at_the_same_age_is_still_flagged(
+        self, engine, monkeypatch,
+    ):
+        from intelligence.regime import state_vector as sv_mod
+
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=50)
+        first_obs = latest_obs - timedelta(days=104)  # ICSA needs 100 rows (default min_history)
+        d = first_obs
+        value = 200.0
+        while d <= latest_obs:
+            _insert(engine, "ICSA", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.5
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "initial_claims" in sv.stale_dimensions
+
+    def test_unrate_at_90_days_is_flagged_stale(self, engine, monkeypatch):
+        """The other side of the fix: 70 days is a wider window than the
+        old flat 30, not an unconditional exemption. A monthly series
+        genuinely missing its release for ~90 days (beyond the ~4-8 week
+        publication lag the threshold covers) must still be flagged."""
+        from intelligence.regime import state_vector as sv_mod
+
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=90)  # > MONTHLY_STALE_DAYS (70)
+        first_obs = latest_obs - timedelta(days=34)
+        d = first_obs
+        value = 4.0
+        while d <= latest_obs:
+            _insert(engine, "UNRATE", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.01
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "unemployment_level" in sv.stale_dimensions
+        assert "unemployment_dir" in sv.stale_dimensions
+
+    def test_pretend_quarterly_series_at_200_days_is_flagged_stale(self, engine, monkeypatch):
+        """No dimension in STATE_DIMENSIONS is quarterly today, so this
+        proves QUARTERLY_STALE_DAYS (160) is enforced -- not skipped or
+        infinite -- the moment a series is classified quarterly, using
+        ICSA (already wired to the 'initial_claims' dimension) as a
+        stand-in via QUARTERLY_FRED_SERIES."""
+        from intelligence.regime import state_vector as sv_mod
+
+        monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({"ICSA"}))
+
+        as_of = date(2026, 9, 20)
+        latest_obs = as_of - timedelta(days=200)  # > QUARTERLY_STALE_DAYS (160)
+        first_obs = latest_obs - timedelta(days=104)  # ICSA needs 100 rows (default min_history)
+        d = first_obs
+        value = 200.0
+        while d <= latest_obs:
+            _insert(engine, "ICSA", d, value, source_id=FRED_SRC)
+            d += timedelta(days=1)
+            value += 0.5
+
+        sv = sv_mod.compute_state_vector(engine, as_of)
+
+        assert "initial_claims" in sv.stale_dimensions
+
+
+def _seed_staleness_series(engine, sid, age, *, count=120, status="SUCCESS", value=1.0):
+    """Synthetic daily observations for real bounded-reader regression tests."""
+    latest = AS_OF - timedelta(days=age)
+    dates = []
+    candidate = latest
+    while len(dates) < count:
+        # This synthetic daily fixture isolates threshold/window behavior.
+        # There is no official October2025 unemployment observation.
+        if sid != 'UNRATE' or candidate != date(2025, 10, 1):
+            dates.append(candidate)
+        candidate -= timedelta(days=1)
+    rows = [
+        {
+            "sid": sid, "src": FRED_SRC, "dt": observation_date,
+            "ts": T0, "value": value + i * 0.01, "status": status,
+        }
+        for i, observation_date in enumerate(dates)
+    ]
+    with engine.begin() as conn:
+        conn.execute(text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, "
+            "pull_timestamp, value, pull_status) "
+            "VALUES (:sid, :src, :dt, :ts, :value, :status)"
+        ), rows)
+
+
+@pytest.mark.parametrize("sid,name,threshold", [
+    ("UNRATE", "unemployment_level", 70),
+    ("ICSA", "initial_claims", 30),
+    ("ICSA_QUARTERLY", "initial_claims", 160),
+])
+@pytest.mark.parametrize("offset", [-1, 0, 1, 59, 60, 61, 180])
+def test_stale_flag_remains_monotonic_for_usable_values(
+    engine, monkeypatch, sid, name, threshold, offset,
+):
+    from intelligence.regime import state_vector as sv_mod
+
+    if sid == "ICSA_QUARTERLY":
+        sid = "ICSA"
+        monkeypatch.setattr(sv_mod, "QUARTERLY_FRED_SERIES", frozenset({sid}))
+    age = threshold + offset
+    _seed_staleness_series(engine, sid, age)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES)
+    # Normalization and SQL both run: this is a retained usable value,
+    # including ages beyond the former threshold+60 stale-read cutoff.
+    assert result.values[sv_mod.DIM_NAMES.index(name)] == pytest.approx(-1.7105047343638058)
+    assert (name in result.stale_dimensions) == (age > threshold)
+
+
+@pytest.mark.parametrize("mode", [
+    "absent", "failed_only", "insufficient_history", "beyond_value_window", "future_only",
+])
+def test_unavailable_inputs_are_none_without_a_stale_flag(engine, monkeypatch, mode):
+    from intelligence.regime import state_vector as sv_mod
+
+    if mode == "failed_only":
+        _seed_staleness_series(engine, "UNRATE", 0, status="FAILED")
+    elif mode == "insufficient_history":
+        _seed_staleness_series(engine, "UNRATE", 131, count=5)
+    elif mode == "beyond_value_window":
+        _seed_staleness_series(engine, "UNRATE", 2600)
+    elif mode == "future_only":
+        _seed_staleness_series(engine, "UNRATE", -130, count=30)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is None
+    assert "unemployment_level" not in result.stale_dimensions
+
+
+@pytest.mark.parametrize("age,usable", [(2491, True), (2492, False)])
+def test_staleness_respects_inclusive_compute_window_and_min_history(
+    engine, monkeypatch, age, usable,
+):
+    from intelligence.regime import state_vector as sv_mod
+
+    # UNRATE requires 30 observations. At age 2491 exactly 30 daily
+    # observations fit in the inclusive 2520-day compute window; at 2492
+    # only 29 fit, even though the longer normalization read sees them all.
+    _seed_staleness_series(engine, "UNRATE", age)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert (result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None) == usable
+    assert ("unemployment_level" in result.stale_dimensions) == usable
+
+
+def test_failed_marker_cannot_hide_retained_stale_value(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    _seed_staleness_series(engine, "UNRATE", 131)
+    _seed_staleness_series(engine, "UNRATE", 0, count=1, status="FAILED", value=0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None
+    assert "unemployment_level" in result.stale_dimensions
+
+
+def test_retained_numeric_zero_is_usable_and_stale(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_get_normalization_stats", lambda *_args: {})
+    _seed_staleness_series(engine, "UNRATE", 131, value=0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] == 0
+    assert "unemployment_level" in result.stale_dimensions
+
+
+def test_mixed_source_compute_input_remains_unavailable_without_stale_flag(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    _seed_staleness_series(engine, "UNRATE", 131)
+    _insert(engine, "UNRATE", AS_OF - timedelta(days=130), 4.0, source_id=YF_SRC)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES)
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is None
+    assert "unemployment_level" not in result.stale_dimensions
+
+
+def test_retained_stale_value_in_vector_above_cache_completeness_floor(engine, monkeypatch):
+    from intelligence.regime import state_vector as sv_mod
+
+    monkeypatch.setattr(sv_mod, "_get_crossref_score", lambda _e, _d: None)
+    _seed_staleness_series(engine, "UNRATE", 131)
+    for sid in [
+        "VIXCLS", "T10Y2Y", "DFF", "BAMLH0A0HYM2", "BAMLC0A0CM", "TCU",
+        "INDPRO", "M2SL", "UMCSENT", "ICSA", "COMPUTED:fed_net_liquidity",
+        "COMPUTED:fed_net_liquidity_change_1m",
+    ]:
+        _seed_staleness_series(engine, sid, 0)
+
+    result = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert len(result.values) == len(sv_mod.DIM_NAMES) == 24
+    assert result.completeness == 0.75
+    assert result.completeness >= sv_mod.MIN_CACHE_COMPLETENESS
+    assert result.values[sv_mod.DIM_NAMES.index("unemployment_level")] is not None
+    assert "unemployment_level" in result.stale_dimensions
+    assert "unemployment_dir" in result.stale_dimensions

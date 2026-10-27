@@ -23,6 +23,11 @@ No return is aligned to an insider event and no label is computed; nothing is wr
 
 ``ISSUERS.json``: a JSON list of tickers, or ``{"issuers": [{"ticker", "cik", "current_tickers", ...}]}``
 (the probe needs ``cik`` and ``current_tickers`` for the C1 interval report and the entity check).
+
+``--statement-timeout-s`` (default 60) is operational only: it bounds each read-only statement and may
+be raised up to :data:`PROBE_MAX_STATEMENT_TIMEOUT_S` (900 s) when cold per-ticker basis queries exceed
+60 s under concurrent ingest. No pre-registration text sets a timeout; it changes no admission rule,
+threshold or result -- a statement either completes with the same rows or the probe stops.
 """
 
 from __future__ import annotations
@@ -35,6 +40,10 @@ from pathlib import Path
 
 from analysis import price_admission_fetch as fetch
 from analysis import price_admission_probe as gd4
+
+#: The probe's own statement-timeout ceiling (seconds): above the 60 s default of every other read-only
+#: research script, at most ``scripts.run_real_panel_scan.ABSOLUTE_MAX_STATEMENT_TIMEOUT_S``.
+PROBE_MAX_STATEMENT_TIMEOUT_S = 900
 
 
 def _log(message: str) -> None:
@@ -107,7 +116,8 @@ def cmd_probe(args) -> None:
     vendors = gd4.VendorFiles(Path(args.twelvedata_dir), Path(args.tiingo_meta_dir))
     from scripts.run_real_panel_scan import read_only_engine
 
-    engine = read_only_engine(args.statement_timeout_s, "vs1_v6_price_probe")
+    engine = read_only_engine(args.statement_timeout_s, "vs1_v6_price_probe",
+                              max_statement_timeout_s=PROBE_MAX_STATEMENT_TIMEOUT_S)
 
     def progress(i: int, n: int, t: str) -> None:
         if i % 25 == 0 or i == n:
@@ -180,7 +190,8 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--as-of-ts", help="snapshot instant (default: now); every read is bounded by it")
     p.add_argument("--code-sha", required=True)
     p.add_argument("--out", required=True)
-    p.add_argument("--statement-timeout-s", type=int, default=60)
+    p.add_argument("--statement-timeout-s", type=int, default=60,
+                   help=f"per-statement bound, 1..{PROBE_MAX_STATEMENT_TIMEOUT_S} s (operational; default 60)")
     p.set_defaults(func=cmd_probe)
     c = sub.add_parser("coverage")
     c.add_argument("--issuers", required=True)

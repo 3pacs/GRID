@@ -119,6 +119,8 @@ class TestBoundedRepairWindow:
         captured: dict[str, Any] = {}
 
         class FakePuller:
+            SOURCE_NAME = 'boundedsrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 captured["start_date"] = start_date
                 return {"status": "SUCCESS", "stopped_by_budget": False,
@@ -135,6 +137,8 @@ class TestBoundedRepairWindow:
         captured: dict[str, Any] = {}
 
         class FakePuller:
+            SOURCE_NAME = 'boundedsrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 captured["start_date"] = start_date
                 return {"status": "SUCCESS", "stopped_by_budget": False,
@@ -154,6 +158,8 @@ class TestBoundedRepairWindow:
         captured: dict[str, Any] = {}
 
         class FakePuller:
+            SOURCE_NAME = 'daysbacksrc'
+
             def run(self, days_back=None):
                 captured["days_back"] = days_back
                 return {"status": "ok"}
@@ -198,6 +204,7 @@ class TestCooperativeBudgetAndBacklog:
     def test_slow_provider_stops_at_budget_and_persists_backlog(self) -> None:
         tickers = [f"T{i}" for i in range(20)]
         puller = _SlowTickerPuller(tickers, sleep_s=0.3)
+        puller.SOURCE_NAME = 'slowsrc'
         state = OperatorState()
         engine = MagicMock()
 
@@ -224,6 +231,7 @@ class TestCooperativeBudgetAndBacklog:
     def test_next_attempt_resumes_from_backlog_instead_of_restarting(self) -> None:
         tickers = [f"T{i}" for i in range(6)]
         puller = _SlowTickerPuller(tickers, sleep_s=0.0)
+        puller.SOURCE_NAME = 'resumesrc'
         state = OperatorState()
         # Pretend a prior attempt left a backlog.
         state.repair_backlog["resumesrc"] = ["T4", "T5"]
@@ -246,6 +254,7 @@ class TestCooperativeBudgetAndBacklog:
     def test_repull_command_records_failed_attempt_and_engages_cooldown_on_budget_stop(self) -> None:
         tickers = [f"T{i}" for i in range(20)]
         puller = _SlowTickerPuller(tickers, sleep_s=0.3)
+        puller.SOURCE_NAME = 'slowsrc2'
         state = OperatorState()
         engine = MagicMock()
 
@@ -273,10 +282,12 @@ class TestCooperativeBudgetAndBacklog:
 
 
 class TestRepeatedZeroInsertResultsStayBounded:
-    def test_three_consecutive_zero_insert_repairs_update_freshness_and_cool_down(self) -> None:
+    def test_three_zero_insert_repairs_keep_cadence_without_freshness(self) -> None:
         tickers = ["A", "B", "C"]
 
         class ZeroInsertPuller:
+            SOURCE_NAME = 'zerosrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 use = ticker_list if ticker_list is not None else tickers
                 return {
@@ -297,6 +308,7 @@ class TestRepeatedZeroInsertResultsStayBounded:
             for _ in range(3):
                 result = hf._retry_source("zerosrc", engine, attempt=1, state=state)
                 assert result["status"] == "SUCCESS"
+                assert result["outcome"] == "NO_NEW_DATA"
                 assert result["stopped_by_budget"] is False
                 state.cooldowns.record_attempt("zerosrc", success=True)
                 assert not state.cooldowns.can_retry("zerosrc"), (
@@ -308,7 +320,7 @@ class TestRepeatedZeroInsertResultsStayBounded:
             hf_mod._resolve_puller = orig_resolve
 
         update_calls = [c for c in conn.calls if "UPDATE source_catalog" in c and "last_pull_at" in c]
-        assert len(update_calls) == 3, "last_pull_at must be advanced on every completed (non-budget-stopped) repair"
+        assert update_calls == [], "a zero-write check cannot establish freshness"
         assert "zerosrc" not in state.repair_backlog
 
 
@@ -322,6 +334,8 @@ class TestNoOverlappingRepairWorkers:
         outcome: dict[str, Any] = {}
 
         class BlockingPuller:
+            SOURCE_NAME = 'blocksrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 started_event.set()
                 release_event.wait(5)
@@ -367,6 +381,8 @@ class TestNoOverlappingRepairWorkers:
         captured: dict[str, Any] = {}
 
         class RecordingPuller:
+            SOURCE_NAME = 'tokensrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 captured["should_continue"] = should_continue
                 # Simulate this attempt's slot being taken over by a
@@ -455,6 +471,8 @@ class TestFreshnessSemanticsSummary:
         tickers = ["SPY", "XLI", "EMB", "ZZZZ", "BADTICK"]
 
         class MixedOutcomePuller:
+            SOURCE_NAME = 'yfinance'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 use = ticker_list if ticker_list is not None else tickers
                 results = []
@@ -503,6 +521,8 @@ class TestFreshnessSemanticsSummary:
 
     def test_attempt_cap_records_repair_uncovered_even_with_no_failures(self) -> None:
         class CleanPuller:
+            SOURCE_NAME = 'yfinance'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 use = ticker_list if ticker_list is not None else ["SPY"]
                 results = [
@@ -564,6 +584,8 @@ class TestAbandonmentUnderRealOuterTimeout:
         state = OperatorState()
 
         class BlockingPuller:
+            SOURCE_NAME = 'registrysrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 started_event.set()
                 block_event.wait(5)
@@ -627,6 +649,8 @@ class TestAbandonmentUnderRealOuterTimeout:
         tickers = ["T0", "T1"]
 
         class BlockFirstTickerPuller:
+            SOURCE_NAME = 'abandonsrc'
+
             def pull_all(self, ticker_list=None, start_date=None, should_continue=None):
                 use = ticker_list if ticker_list is not None else tickers
                 attempted = []

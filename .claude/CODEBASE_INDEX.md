@@ -102,7 +102,7 @@ from a clone and unused either way.
 | grid-micro-mapper | :8085 | /data/grid/logs/micro-mapper.log | sudo systemctl restart grid-micro-mapper |
 
 SSH: `ssh grid-svr` (User: grid, Tailscale 100.75.185.36)
-DB: `PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost`
+DB: `psql -U grid -d griddb -h localhost`
 Public: https://grid.stepdad.finance
 
 ## Hypothesis Engine State

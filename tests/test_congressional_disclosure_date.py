@@ -62,3 +62,26 @@ def test_same_day_disclosure_is_accepted_as_reported():
     disc_date, basis = resolve_disclosure_date(txn_date, "2026-03-01")
     assert disc_date == txn_date
     assert basis == "reported"
+
+
+def test_last_modified_bounds_disclosure_when_no_reported_date():
+    """QuiverQuant's last_modified can only come after publication, so it is
+    a PIT-safe upper bound — preferred over the 45-day statutory guess."""
+    txn_date = date(2026, 9, 2)
+    disc_date, basis = resolve_disclosure_date(txn_date, None, "2026-10-08")
+    assert disc_date == date(2026, 10, 8)
+    assert basis == "qq_last_modified"
+
+
+def test_reported_date_beats_last_modified():
+    txn_date = date(2026, 9, 2)
+    disc_date, basis = resolve_disclosure_date(txn_date, "2026-09-20", "2026-10-08")
+    assert disc_date == date(2026, 9, 20)
+    assert basis == "reported"
+
+
+def test_last_modified_before_trade_is_ignored():
+    txn_date = date(2026, 9, 2)
+    disc_date, basis = resolve_disclosure_date(txn_date, None, "2026-08-01")
+    assert disc_date == txn_date + timedelta(days=DISCLOSURE_STATUTORY_LAG_DAYS)
+    assert basis == "statutory_bound"

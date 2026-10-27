@@ -78,6 +78,32 @@ CODE_FILES = (
     "scripts/run_vs1_v5_insider_density.py",
     "scripts/run_vs1_v6_insider_density.py",
 )
+# Earlier frozen records retain their original digest. v7 additionally pins the
+# code that chooses its extended window and admits prices before Stage-0.
+V7_CODE_FILES = CODE_FILES + (
+    "analysis/panel_insider_density_v7.py",
+    "analysis/price_admission_fetch.py",
+    "analysis/price_admission_probe.py",
+    "scripts/run_price_admission_probe.py",
+    "scripts/run_real_panel_scan.py",
+    "scripts/run_vs1_v7_insider_density.py",
+    "scripts/run_vs1_v7_price_admission_probe.py",
+)
+# v8 additionally pins its harness/wrappers and the E0 code and manifest its Stage-0 runs.
+V8_CODE_FILES = V7_CODE_FILES + (
+    "analysis/panel_insider_density_v8.py",
+    "scripts/run_vs1_v8_insider_density.py",
+    "scripts/run_vs1_v8_price_admission_probe.py",
+    "evals/e0/__init__.py",
+    "evals/e0/benchmark.py",
+    "evals/e0/config.json",
+    "evals/e0/generator.py",
+    "evals/e0/machinery.py",
+    "evals/e0/manifest.py",
+    "evals/e0/runners.py",
+    "evals/e0/structure.py",
+    "evals/e0/MANIFEST.sha256",
+)
 
 
 def _now() -> datetime:
@@ -101,8 +127,9 @@ def _events(args, universe):
     return args.h.load_inputs(Path(args.form4), Path(args.submissions), universe, owners)
 
 
-def _code_files() -> dict:
-    return {f: v1.file_sha256(REPO / f) for f in CODE_FILES}
+def _code_files(h=v2) -> dict:
+    files = {"vs1-v7": V7_CODE_FILES, "vs1-v8": V8_CODE_FILES}.get(h.VERSION, CODE_FILES)
+    return {f: v1.file_sha256(REPO / f) for f in files}
 
 
 def _admitted_universe(args, universe):
@@ -160,7 +187,7 @@ def _observed(args, manifest: v2.PriceManifest, power: dict) -> dict:
         "issuer_map_sha256": v1.data_sha256(Path(args.issuer_map)),
         "sic_map_sha256": v1.data_sha256(Path(args.sic_map)),
         "power_sha256": digest(power),
-        "code_file_sha256": _code_files(),
+        "code_file_sha256": _code_files(args.h),
     }
 
 

@@ -128,7 +128,7 @@ Run: `cd /Users/anikdang/dev/GRID && python -m alembic upgrade head`
 
 If alembic is not configured locally, apply directly:
 ```bash
-ssh grid-svr "cd /data/grid_v4/grid_repo && PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -f -" <<'SQL'
+ssh grid-svr "cd /data/grid_v4/grid_repo && psql -U grid -d griddb -h localhost -f -" <<'SQL'
 CREATE TABLE IF NOT EXISTS canvas_boards (
     id SERIAL PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -157,7 +157,7 @@ SQL
 - [ ] **Step 3: Verify tables exist**
 
 ```bash
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost -c '\dt canvas_*'"
+ssh grid-svr "psql -U grid -d griddb -h localhost -c '\dt canvas_*'"
 ```
 Expected: 3 tables listed.
 
@@ -1644,7 +1644,7 @@ ssh grid-svr 'cd /data/grid_v4/grid_repo && git pull origin main && cd pwa && np
 - [ ] **Step 5: Apply migration on server**
 
 ```bash
-ssh grid-svr "PGPASSWORD=gridmaster2026 psql -U grid -d griddb -h localhost" <<'SQL'
+ssh grid-svr "psql -U grid -d griddb -h localhost" <<'SQL'
 CREATE TABLE IF NOT EXISTS canvas_boards (...);
 CREATE TABLE IF NOT EXISTS canvas_nodes (...);
 CREATE TABLE IF NOT EXISTS canvas_edges (...);

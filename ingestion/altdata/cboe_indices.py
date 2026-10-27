@@ -1,9 +1,18 @@
 """
 GRID CBOE volatility and strategy indices ingestion module.
 
-Pulls free CBOE indices beyond VIX: SKEW, VVIX, PUT/CALL ratio, and
-implied correlation. These provide tail risk, vol-of-vol, and
-positioning signals that complement the existing VIX coverage.
+Pulls free CBOE index closes: VIX, VIX3M and VIX9D (the originator's own
+daily closes — FRED's ``VIXCLS`` is a republication of ``CBOE:VIX``), plus
+SKEW, VVIX, PUT/CALL ratio and implied correlation for tail risk,
+vol-of-vol and positioning.
+
+``CBOE:VIX`` is the backup feed for the regime vector's VIX dimensions:
+FRED posts VIXCLS the next business day and its API times out often enough
+that the Sept 23-25 2026 closes only landed on Sept 29. Cboe's CSV has the
+close the same evening. The series ids continue the ``scripts/
+bulk_historical_pull.py`` history (``CBOE:VIX`` 1990→2026-03-25, source
+CBOE) and are mapped to ``vix_spot`` / ``vix3m_spot`` / ``vix9d_spot`` in
+``normalization/entity_map.py``.
 
 Data source: CBOE Datashop CSV downloads (public, no API key needed).
 """
@@ -22,8 +31,23 @@ from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, _http_status_from_exc, retry_on_failure
 
-# CBOE index download URLs and feature mappings
+# CBOE index download URLs and feature mappings. Keys are raw_series ids.
 CBOE_INDICES: dict[str, dict[str, str]] = {
+    "CBOE:VIX": {
+        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv",
+        "description": "CBOE VIX daily close (authoritative source of FRED VIXCLS)",
+        "value_col": "CLOSE",
+    },
+    "CBOE:VIX3M": {
+        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX3M_History.csv",
+        "description": "CBOE 3-month VIX daily close",
+        "value_col": "CLOSE",
+    },
+    "CBOE:VIX9D": {
+        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX9D_History.csv",
+        "description": "CBOE 9-day VIX daily close",
+        "value_col": "CLOSE",
+    },
     "skew_index": {
         "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/SKEW_History.csv",
         "description": "CBOE SKEW index (tail risk pricing, >130 = elevated)",
@@ -69,6 +93,7 @@ class CBOEIndicesPuller(BasePuller):
     Data source: https://www.cboe.com/tradable_products/ (CSV downloads)
 
     Features:
+    - CBOE:VIX / CBOE:VIX3M / CBOE:VIX9D: daily closes (VIX backup feed)
     - skew_index: CBOE SKEW (tail risk pricing, >130 = elevated)
     - vvix: VIX of VIX (vol-of-vol)
     - put_call_ratio: CBOE PUT/CALL ratio for exchange options
@@ -284,16 +309,20 @@ class CBOEIndicesPuller(BasePuller):
                 start_date = max(start_date, cutoff)
 
             with self.engine.begin() as conn:
+                # One set lookup for the whole window. The previous per-row
+                # ``_row_exists`` check only looked back one hour, so every
+                # daily run re-inserted the full CSV history (vvix: 553,970
+                # rows for 5,118 dates by 2026-10-06). History already on
+                # file is a vintage, not a new observation.
+                existing = self._get_existing_dates(
+                    feature_name, conn, start_date=start_date,
+                )
                 for _, row in df.iterrows():
                     obs_date = row["date"].date()
-                    if obs_date < start_date:
+                    if obs_date < start_date or obs_date in existing:
                         continue
 
                     value = float(row["value"])
-
-                    if self._row_exists(feature_name, obs_date, conn):
-                        continue
-
                     self._insert_raw(
                         conn=conn,
                         series_id=feature_name,
@@ -301,6 +330,7 @@ class CBOEIndicesPuller(BasePuller):
                         value=value,
                         raw_payload={"source_url": config["url"]},
                     )
+                    existing.add(obs_date)
                     rows_inserted += 1
 
             log.info(

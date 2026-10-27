@@ -44,12 +44,20 @@ CREATE TABLE raw_series (
 )
 """
 
-# check_db_health also reads source freshness; only these columns are touched.
+# check_db_health also reads source freshness; only these columns are
+# touched. `id` and `latency_class` were added for the cadence-aware
+# staleness fix (GRID-STALE-SOURCES-AUDIT-20260929.md): check_db_health now
+# LATERAL-joins raw_series on source_catalog.id and reads latency_class as
+# a cadence fallback signal. This table stays empty in every test below, so
+# the LATERAL join never matches a row either way -- these columns just
+# need to exist for the query to parse.
 _SOURCE_CATALOG_DDL = """
 CREATE TABLE source_catalog (
+    id            SERIAL PRIMARY KEY,
     name          TEXT NOT NULL,
     last_pull_at  TIMESTAMPTZ,
-    active        BOOLEAN NOT NULL DEFAULT TRUE
+    active        BOOLEAN NOT NULL DEFAULT TRUE,
+    latency_class TEXT NOT NULL DEFAULT 'EOD'
 )
 """
 

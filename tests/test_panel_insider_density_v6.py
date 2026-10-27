@@ -118,7 +118,8 @@ def _panel_inputs(tmp_path):
     return engine, events, admission, universe, manifest
 
 
-def test_prices_outside_the_c1_interval_are_blanked_with_the_same_mask_as_features(tmp_path):
+def test_prices_outside_the_c1_interval_are_blanked_with_the_same_mask_as_features(tmp_path, monkeypatch):
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)  # exercise the historical v6 price path
     engine, events, admission, universe, manifest = _panel_inputs(tmp_path)
     vault = _vault(tmp_path / "vault")
     key, _ = _discovery_key(tmp_path / "reg", vault, manifest)
@@ -144,8 +145,9 @@ def test_prices_outside_the_c1_interval_are_blanked_with_the_same_mask_as_featur
     assert np.isfinite(p.label[before, other]).sum() > 0
 
 
-def test_v5_would_have_used_the_gap_closes_v6_does_not(tmp_path):
+def test_v5_would_have_used_the_gap_closes_v6_does_not(tmp_path, monkeypatch):
     """v5's start-only L_T left the 2017-2018 re-use gap's closes in labels; the single C1 interval does not."""
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)  # exercise the historical v6 price path
     engine, events, admission, universe, manifest = _panel_inputs(tmp_path)
     vault = _vault(tmp_path / "vault")
     key, _ = _discovery_key(tmp_path / "reg", vault, manifest)
@@ -161,7 +163,8 @@ def test_v5_would_have_used_the_gap_closes_v6_does_not(tmp_path):
     assert np.isnan(c1["A90|fwd20"].label[gap, j]).all()
 
 
-def test_v6_refuses_while_v5_is_opened(tmp_path):
+def test_v6_refuses_while_v5_is_opened(tmp_path, monkeypatch):
+    monkeypatch.setattr(v6, "SUPERSEDED_BY", None)  # isolate the original cross-registry guard
     vault = _vault(tmp_path / "vault")
     vault.add_file(v5.WITNESS_PATH, v5.REGISTERED_ANCHOR_LINE + b"\n" + b'{"head_sha256":"' + b"e" * 64
                    + b'","prev_anchor_sha256":"x","records":4,"run_at":"2026-10-01T00:00:00+00:00"}\n')

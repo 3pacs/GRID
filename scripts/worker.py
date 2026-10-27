@@ -1010,7 +1010,7 @@ def run_kill_predictor_score(params):
         + " port=" + os.environ.get("PG_PORT", "5432")
         + " dbname=" + os.environ.get("PG_DATABASE", "griddb")
         + " user=" + os.environ.get("PG_USER", "grid")
-        + " password=" + os.environ.get("PG_PASSWORD", "gridmaster2026")
+        + " password=" + (os.environ.get("PG_PASSWORD") or os.environ["GRID_DB_PASSWORD"])
     )
     conn = psycopg2.connect(pg_dsn)
     conn.autocommit = True
@@ -1142,7 +1142,7 @@ def _pg_connect_for_embedding_batch():
         + " port=" + os.environ.get("PG_PORT", "5432")
         + " dbname=" + os.environ.get("PG_DATABASE", "griddb")
         + " user=" + os.environ.get("PG_USER", "grid")
-        + " password=" + os.environ.get("PG_PASSWORD", "gridmaster2026")
+        + " password=" + (os.environ.get("PG_PASSWORD") or os.environ["GRID_DB_PASSWORD"])
     )
     conn = psycopg2.connect(pg_dsn)
     conn.autocommit = False

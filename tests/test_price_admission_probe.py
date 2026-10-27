@@ -433,6 +433,158 @@ def test_run_probe_end_to_end_on_sqlite(tmp_path):
     assert "twelvedata_unavailable" in rec["ZZZ"]["reasons"]
 
 
+@pytest.mark.parametrize("extra", [[], ["--statement-timeout-s", "300"]])
+def test_the_probe_passes_its_own_900_second_ceiling_and_defaults_to_60(tmp_path, monkeypatch, extra):
+    """Operational only: the timeout reaches the read-only engine; the probe's outputs do not depend on it."""
+    engine, series = _db()
+    _Vendors(series, tmp_path).write(TICKERS)
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    calls = []
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: calls.append((a, k)) or engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    out = tmp_path / "probe"
+    cli.main(["probe", "--tickers-file", _tickers_file(tmp_path), "--twelvedata-dir", str(tmp_path / "td"),
+              "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+              "--as-of-ts", SNAPSHOT.isoformat(), *extra])
+    (seconds, name), kwargs = calls[0]
+    assert seconds == (300 if extra else 60) and name == "vs1_v6_price_probe"
+    assert kwargs == {"max_statement_timeout_s": cli.PROBE_MAX_STATEMENT_TIMEOUT_S} and cli.PROBE_MAX_STATEMENT_TIMEOUT_S == 900
+    assert cli.PROBE_MAX_STATEMENT_TIMEOUT_S <= rps.ABSOLUTE_MAX_STATEMENT_TIMEOUT_S
+    assert (out / "price_manifest.json").exists()
+
+
+def _tickers_file(tmp_path):
+    path = tmp_path / "tickers.json"
+    path.write_text(json.dumps(list(TICKERS)))
+    return str(path)
+
+
+def _assert_no_prices(report: dict, prices: list[float]) -> None:
+    """Check all serialized values and keys, except typed receipt timestamps.
+
+    Fetch receipts carry canonical UTC datetimes, whose seconds/microseconds
+    can coincidentally contain a fixture price (e.g. 56.636467 vs 6.6364).
+    Only the paths emitted by the three report builders have that meaning.
+    """
+    td_report = (report.get("probe") == gd4.PROBE_NAME
+                 or report.get("report") == f"{gd4.STUDY}-twelvedata-crosscheck")
+    meta_report = report.get("report") == f"{gd4.STUDY}-tiingo-metadata"
+    receipt_modes = (*fetch.TD_ADJUST_MODES, *(f"{a}_supplement" for a in fetch.TD_ADJUST_MODES))
+
+    def scrub(value: object, path: tuple = ()) -> object:
+        td_time = (td_report and len(path) == 6 and path[0] == "tickers"
+                   and isinstance(path[1], str)
+                   and path[2:4] == ("twelvedata", "receipts") and path[4] in receipt_modes
+                   and path[5] == "fetched_at")
+        meta_time = (meta_report and len(path) == 4 and path[0] == "tickers"
+                     and isinstance(path[1], str)
+                     and path[2:] == ("receipt", "fetched_at"))
+        if td_time or meta_time:
+            assert isinstance(value, str), f"invalid receipt timestamp at {path}"
+            try:
+                stamp = datetime.fromisoformat(value)
+            except ValueError:
+                raise AssertionError(f"invalid receipt timestamp at {path}") from None
+            assert stamp.tzinfo == timezone.utc and stamp.isoformat() == value, (
+                f"invalid receipt timestamp at {path}")
+            return None
+        if isinstance(value, dict):
+            return {k: scrub(v, (*path, k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [scrub(v, (*path, i)) for i, v in enumerate(value)]
+        return value
+
+    text_ = json.dumps(scrub(report))
+    for v in prices:
+        assert repr(v) not in text_ and f"{v:.4f}" not in text_, "price leaked in report"
+
+
+@pytest.mark.parametrize("kind,mode", [("probe", a) for a in ("all", "none", "all_supplement", "none_supplement")]
+                         + [("cross", "none"), ("meta", None)])
+def test_report_privacy_guard_accepts_receipt_timestamp_collision(kind, mode):
+    # Actual CI collision: raw 6.63635 rounds to 6.6364 inside these timestamp digits.
+    receipt = {"fetched_at": "2026-10-20T09:32:56.636467+00:00"}
+    if kind == "meta":
+        report = {"report": f"{gd4.STUDY}-tiingo-metadata", "tickers": {"BBB": {"receipt": receipt}}}
+    else:
+        report = {**({"probe": gd4.PROBE_NAME} if kind == "probe" else
+                     {"report": f"{gd4.STUDY}-twelvedata-crosscheck"}),
+                  "tickers": {"BBB": {"twelvedata": {"receipts": {mode: receipt}}}}}
+    before = json.dumps(report)
+    assert "6.6364" in before
+    _assert_no_prices(report, [6.63635])
+    assert json.dumps(report) == before  # checking must not alter the reports
+
+
+@pytest.mark.parametrize("leak", [
+    6.63635, 6.6364, "6.63635", "6.6364", {"nested": [0, {"close": 6.63635}]},
+    "vendor close USD 6.6364 per share", {"close_6.63635": None}, {"6.6364": None},
+    {"fetched_at": "2026-10-20T09:32:56.636467+00:00"},
+])
+def test_report_privacy_guard_rejects_prices_in_values_and_keys(leak):
+    # A fetched_at key away from a declared receipt path has no exemption.
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices({"probe": gd4.PROBE_NAME, "extra": leak}, [6.63635])
+
+
+@pytest.mark.parametrize("value", [
+    6.63635, "6.6364", [6.63635], {"close": 6.6364},
+    "2026-10-20T09:32:56.636467+00:00 close=6.63635",
+    "2026-10-20T09:32:56.636467", "2026-10-20T09:32:56.636467+01:00",
+])
+def test_report_privacy_guard_rejects_malformed_or_price_bearing_receipt_time(value):
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": {"twelvedata": {
+        "receipts": {"none": {"fetched_at": value}}}}}}
+    with pytest.raises(AssertionError, match="invalid receipt timestamp"):
+        _assert_no_prices(report, [6.63635])
+
+
+@pytest.mark.parametrize("key,value", [("close", 6.63635), ("close_6.6364", None)])
+def test_report_privacy_guard_rejects_prices_beside_valid_receipt_time(key, value):
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": {"twelvedata": {"receipts": {"none": {
+        "fetched_at": "2026-10-20T09:32:56.636467+00:00", key: value}}}}}}
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices(report, [6.63635])
+
+
+@pytest.mark.parametrize("shape", ["ticker_list", "unknown_report", "unknown_mode", "nested_receipt"])
+def test_report_privacy_guard_rejects_misplaced_timestamp(shape):
+    receipts = {"none": {"fetched_at": "2026-10-20T09:32:56.636467+00:00"}}
+    ticker = {"twelvedata": {"receipts": receipts}}
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": ticker}}
+    if shape == "ticker_list":
+        report["tickers"] = [ticker]
+    elif shape == "unknown_report":
+        report["probe"] = "other"
+    elif shape == "unknown_mode":
+        receipts["other"] = receipts.pop("none")
+    else:
+        report["tickers"] = {"BBB": {"extra": ticker}}
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices(report, [6.63635])
+
+
+def test_the_probe_report_is_identical_whatever_the_timeout(tmp_path, monkeypatch):
+    engine, series = _db()
+    _Vendors(series, tmp_path).write(TICKERS)
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    outs = []
+    for seconds in ("60", "900"):
+        out = tmp_path / f"probe{seconds}"
+        cli.main(["probe", "--tickers-file", _tickers_file(tmp_path), "--twelvedata-dir", str(tmp_path / "td"),
+                  "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+                  "--as-of-ts", SNAPSHOT.isoformat(), "--statement-timeout-s", seconds])
+        outs.append(out)
+    for name in ("probe_report.json", "crosscheck_report.json", "tiingo_meta_report.json", "price_manifest.json"):
+        assert (outs[0] / name).read_bytes() == (outs[1] / name).read_bytes(), name
+
+
 def test_cli_writes_reports_and_a_manifest_the_v6_harness_accepts(tmp_path, monkeypatch):
     engine, series = _db()
     _Vendors(series, tmp_path).write(TICKERS)
@@ -492,9 +644,8 @@ def test_cli_writes_reports_and_a_manifest_the_v6_harness_accepts(tmp_path, monk
     for line in (out / "sha256s.txt").read_text().splitlines():
         h, name = line.split()
         assert v1.data_sha256(out / name) == h
-    for text_ in (json.dumps(report), json.dumps(cross), json.dumps(meta)):
-        for v in list(series["AAA"][1].values())[:20]:
-            assert repr(v) not in text_ and f"{v:.4f}" not in text_
+    for artifact in (report, cross, meta):
+        _assert_no_prices(artifact, list(series["AAA"][1].values())[:20])
     with pytest.raises(FileExistsError):
         cli.main(base + ["--out", str(out)])
     with pytest.raises(SystemExit):
@@ -521,3 +672,101 @@ def test_event_coverage_is_issuer_level():
     cov = gd4.event_coverage(issuers, ["AAA", "CCC", "XLK"])
     assert (cov.issuers, cov.issuers_price_admitted, cov.events, cov.events_price_admitted) == (3, 2, 8, 5)
     assert cov.event_fraction == pytest.approx(5 / 8) and cov.not_admitted == ["BBB"]
+
+
+# --- the explicit other-source list (source_id IN (...)) returns exactly what source_id <> :src returned ----
+
+_LEGACY_OTHER_ROWS_SQL = (
+    "SELECT sc.name, r.pull_status, COUNT(*) FROM raw_series r JOIN source_catalog sc ON sc.id = r.source_id "
+    "WHERE r.series_id = :sid AND r.source_id <> :src AND r.obs_date >= :lo AND r.obs_date <= :hi "
+    "AND r.pull_timestamp <= :ts GROUP BY sc.name, r.pull_status"
+)
+
+
+def _legacy_read_other_source_rows(conn, sid, source_id, lo, hi, as_of_ts, other_source_ids=None):
+    """The query as merged in #705 (``source_id <> :src``), kept verbatim as the reference."""
+    from sqlalchemy import text
+
+    gd4.check_window(lo, hi)
+    out: dict[str, dict[str, int]] = {}
+    for name, status, n in conn.execute(text(_LEGACY_OTHER_ROWS_SQL), {"sid": sid, "src": source_id, "lo": lo,
+                                                                       "hi": hi, "ts": as_of_ts}).fetchall():
+        out.setdefault(str(name), {})[str(status)] = int(n)
+    return out
+
+
+def _db_with_edge_rows():
+    """The fixture DB plus rows the two queries must treat alike: an uncatalogued source, a NULL source,
+    another source's post-snapshot and out-of-window rows, and a QUARANTINED other-source row."""
+    from sqlalchemy import text
+
+    engine, series = _db()
+    days = list(series["AAA"][0])
+    extra = [
+        ("YF:AAA:adj_close", 9999, days[3], PULL, "SUCCESS"),              # source_id not in source_catalog
+        ("YF:AAA:close", None, days[4], PULL, "SUCCESS"),                  # NULL source_id
+        ("YF:DDD:close", YFINANCE, days[5], datetime(2026, 9, 20, 9, 0), "SUCCESS"),  # pulled after the snapshot
+        ("YF:DDD:adj_close", YFINANCE, date(2011, 1, 3), PULL, "SUCCESS"),  # before the read window
+        ("YF:DDD:adj_close", KAGGLE, days[6], PULL, "QUARANTINED"),
+        ("YF:BBB:close", TD_SPLITS, days[7], PULL, "FAILED"),
+    ]
+    with engine.begin() as c:
+        c.execute(text("INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, "
+                       "pull_status) VALUES (:sid, :src, :d, :ts, 1.0, '{}', :st)"),
+                  [{"sid": s, "src": src, "d": d, "ts": ts, "st": st} for s, src, d, ts, st in extra])
+    return engine, series
+
+
+def test_the_explicit_list_counts_exactly_what_the_inequality_counted():
+    engine, _ = _db_with_edge_rows()
+    lo, hi = gd4.DEFAULT_WINDOW
+    with engine.connect() as conn:
+        others = gd4.read_other_sources(conn, TIINGO)
+        assert others == ((YFINANCE, "yfinance"), (KAGGLE, "KAGGLE_BULK"), (TD_SPLITS, "TWELVEDATA_SPLITS"))
+        ids = [i for i, _ in others]
+        seen_any = False
+        for t in ("XLK", "AAA", "BBB", "CCC", "DDD", "EEE", "ZZZ"):
+            for fld in ("close", "adj_close"):
+                sid = f"YF:{t}:{fld}"
+                legacy = _legacy_read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT)
+                assert gd4.read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT, ids) == legacy, sid
+                assert gd4.read_other_source_rows(conn, sid, TIINGO, lo, hi, SNAPSHOT) == legacy, sid
+                seen_any = seen_any or bool(legacy)
+        assert seen_any
+        assert gd4.read_other_source_rows(conn, "YF:DDD:adj_close", TIINGO, lo, hi, SNAPSHOT, ids) == {
+            "KAGGLE_BULK": {"QUARANTINED": 1}}
+        assert gd4.read_other_source_rows(conn, "YF:AAA:adj_close", TIINGO, lo, hi, SNAPSHOT, []) == {}
+        with pytest.raises(gd4.ProbeRefused, match="admitted source"):
+            gd4.read_other_source_rows(conn, "YF:AAA:close", TIINGO, lo, hi, SNAPSHOT, [TIINGO, YFINANCE])
+
+
+def _probe_cli(tmp_path, engine, monkeypatch, name):
+    import scripts.run_real_panel_scan as rps
+    from scripts import run_price_admission_probe as cli
+
+    monkeypatch.setattr(rps, "read_only_engine", lambda *a, **k: engine)
+    monkeypatch.setattr(engine, "dispose", lambda: None)
+    tickers = tmp_path / "tickers.json"
+    if not tickers.exists():
+        tickers.write_text(json.dumps(TICKERS))
+    out = tmp_path / name
+    cli.main(["probe", "--tickers-file", str(tickers), "--twelvedata-dir", str(tmp_path / "td"),
+              "--tiingo-meta-dir", str(tmp_path / "meta"), "--code-sha", "c" * 40, "--out", str(out),
+              "--as-of-ts", SNAPSHOT.isoformat()])
+    return out
+
+
+def test_reports_and_manifest_are_byte_identical_under_the_old_and_new_query(tmp_path, monkeypatch):
+    engine, series = _db_with_edge_rows()
+    _Vendors(series, tmp_path).write(TICKERS)
+    new = _probe_cli(tmp_path, engine, monkeypatch, "new")
+    monkeypatch.setattr(gd4, "read_other_source_rows", _legacy_read_other_source_rows)
+    old = _probe_cli(tmp_path, engine, monkeypatch, "old")
+    for name in ("probe_report.json", "crosscheck_report.json", "tiingo_meta_report.json", "price_manifest.json",
+                 "sha256s.txt"):
+        assert (new / name).read_bytes() == (old / name).read_bytes(), name
+    report = json.loads((new / "probe_report.json").read_text())
+    audit = report["source_filtering_query"]
+    assert audit["other_source_ids"] == [YFINANCE, KAGGLE, TD_SPLITS] and TIINGO not in audit["other_source_ids"]
+    assert audit["other_sources"][0] == {"id": YFINANCE, "name": "yfinance"}
+    assert report["summary"]["source_filtering"]["other_source_rows_by_source"]["KAGGLE_BULK"] == 41

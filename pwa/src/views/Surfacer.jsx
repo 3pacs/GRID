@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
     Activity,
     AlertTriangle,
@@ -973,20 +973,29 @@ export default function Surfacer() {
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState('');
 
+    const loadInFlight = useRef(false);
     const load = useCallback(async () => {
+        if (loadInFlight.current) return;
+        loadInFlight.current = true;
         setLoading(true);
         setError('');
-        const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false&queue_missing_data=false');
-        if (data?.error || data?.status === 'degraded') {
-            // Degraded means the backend could not read candidates. Show the
-            // outage; never fall through to a brief that reads as a market call.
-            setError(data?.message || (typeof data?.error === 'string' ? data.error : '') || 'Surfacer failed to load.');
+        try {
+            const data = await api.get('/api/v1/surfacer/candidates?limit=18&fresh_only=false&queue_missing_data=false');
+            if (data?.error || data?.status === 'degraded') {
+                // Never present a failed read as an actionable market brief.
+                setError(data?.message || (typeof data?.error === 'string' ? data.error : '') || 'Surfacer failed to load.');
+                setPayload({ candidates: [], meta: {} });
+            } else {
+                setPayload(data);
+                setSelectedId(current => current || data?.candidates?.[0]?.id || '');
+            }
+        } catch {
+            setError('Surfacer failed to load. Please retry.');
             setPayload({ candidates: [], meta: {} });
-        } else {
-            setPayload(data);
-            setSelectedId(current => current || data?.candidates?.[0]?.id || '');
+        } finally {
+            loadInFlight.current = false;
+            setLoading(false);
         }
-        setLoading(false);
     }, []);
 
     useEffect(() => {
@@ -1066,7 +1075,7 @@ export default function Surfacer() {
                 </div>
                 <button type="button" className="surfacer-refresh" style={styles.button} onClick={load} disabled={loading}>
                     <RefreshCw size={15} />
-                    {loading ? 'Loading' : 'Refresh'}
+                    {loading ? 'Loading' : error ? 'Retry' : 'Refresh'}
                 </button>
             </div>
 

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import math
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from typing import Any
 
 from fastapi import APIRouter, Depends
@@ -19,6 +20,51 @@ from api.dependencies import get_db_engine
 from utils.ttl_cache import TTLCache
 
 router = APIRouter(prefix="/api/v1/flows", tags=["flows"])
+
+
+def _today() -> date:
+    """Host-local calendar day the flows reads use (``date.today()``, unchanged).
+
+    One module-level seam: tests pin a day with
+    ``monkeypatch.setattr(flows, "_today", lambda: day)`` instead of swapping
+    ``datetime.date`` process-wide (review 2026-10-20, Judgement 4).
+    """
+    return date.today()
+
+
+# Tables each provenance-carrying endpoint actually reads (see
+# docs/flows_provenance_contract.md). Provenance describes materialization
+# state of these tables, not the truth of the values served.
+_PROV_SECTORS = ("options_daily_signals",)
+_PROV_SECTOR_DETAIL = (
+    "insider_trades", "congressional_trades", "dark_pool_weekly", "etf_flows",
+    "options_daily_signals",
+)
+_PROV_SANKEY = ("capital_flow_snapshots", "options_daily_signals")
+_PROV_MONEY_MAP = ("signal_sources", "options_daily_signals")
+_PROV_COMPANY = ("signal_sources",)
+_PROV_JUNCTION_POINTS = ("junction_point_readings",)
+
+
+def _provenance(tables: tuple[str, ...]) -> dict[str, Any]:
+    """Read-only provenance envelope; never raises (see store.materialization_provenance)."""
+    from store.materialization_provenance import endpoint_provenance
+
+    try:
+        return endpoint_provenance(get_db_engine(), tables)
+    except Exception as exc:  # noqa: BLE001 - the envelope must not break the endpoint
+        log.warning("Flows: provenance unavailable: {e}", e=str(exc))
+        return {
+            **{t: {"table": t, "unavailable": True, "reason": f"error:{type(exc).__name__}"} for t in tables},
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+
+def _with_provenance(payload: dict[str, Any], tables: tuple[str, ...]) -> dict[str, Any]:
+    """Shallow copy of ``payload`` plus ``provenance``; cached payloads stay untouched."""
+    out = dict(payload)
+    out["provenance"] = _provenance(tables)
+    return out
 
 
 _SECTOR_CACHE_TTL: float = 300.0  # 5 minutes — "fresh" window
@@ -79,7 +125,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
     val_map: dict[str, float] = {}
     try:
         from api.dependencies import get_pit_store
-        from datetime import date, timedelta
+        from datetime import timedelta
 
         pit = get_pit_store()
 
@@ -93,7 +139,7 @@ def _compute_sectors_payload() -> dict[str, Any]:
         feature_ids = [name_to_id[n] for n in needed_features if n in name_to_id]
 
         if feature_ids:
-            today = date.today()
+            today = _today()
             hist = pit.get_feature_matrix(
                 feature_ids=feature_ids,
                 start_date=today - timedelta(days=504),
@@ -149,8 +195,8 @@ def _compute_sectors_payload() -> dict[str, Any]:
     price_map: dict[str, float] = {}
     change_30d_map: dict[str, float] = {}
     try:
-        from datetime import date, timedelta
-        today = date.today()
+        from datetime import timedelta
+        today = _today()
         d30 = today - timedelta(days=30)
         # Bound the "latest price" scan too — without this, DISTINCT ON
         # over series_id IN (...) has to sort the *entire* history of every
@@ -469,13 +515,93 @@ def get_sectors(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
     cached = _sector_cache.get(_SECTOR_CACHE_KEY)
     if cached is not None:
-        return cached
+        return _with_provenance(cached, _PROV_SECTORS)
 
     stale = _sector_stale_cache.get(_SECTOR_CACHE_KEY)
     if stale is not None:
-        return stale
+        return _with_provenance(stale, _PROV_SECTORS)
 
-    return {"sectors": {}, "stale": True, "unavailable": True}
+    return _with_provenance({"sectors": {}, "stale": True, "unavailable": True}, _PROV_SECTORS)
+
+
+def _read_congressional_activity(engine: Any, tickers: list[str], today: Any) -> list[dict]:
+    """Recent congressional trades for ``tickers``, never future-dated.
+
+    ``congressional_trades.disclosure_date`` can lie in the future (a 2026-10-19
+    read showed rows dated 2026-11-22..26). A trade that has not been disclosed
+    yet must not be listed as recent: the query is bounded to
+    ``disclosure_date <= CURRENT_DATE`` (the same clock the provenance envelope
+    uses) and any future row is dropped again here. How many exist is reported
+    by ``provenance.congressional_trades.future_dated_rows``, not by this list.
+    """
+    from datetime import timedelta
+
+    if not tickers:
+        return []
+    placeholders = ", ".join(f":t{i}" for i in range(len(tickers)))
+    params = {f"t{i}": t for i, t in enumerate(tickers)}
+    params["d60"] = today - timedelta(days=60)
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT ticker, disclosure_date, representative, transaction_type, amount "
+            "FROM congressional_trades "
+            "WHERE ticker IN (" + placeholders + ") AND disclosure_date >= :d60 "
+            "AND disclosure_date <= CURRENT_DATE "
+            "ORDER BY disclosure_date DESC LIMIT 20"
+        ), params).fetchall()
+    return [
+        {"ticker": r[0], "date": str(r[1]) if r[1] else None,
+         "representative": r[2], "type": r[3], "amount": r[4]}
+        for r in rows
+        if not (r[1] is not None and hasattr(r[1], "toordinal") and r[1] > today)
+    ]
+
+
+def _read_dark_pool_signal(
+    engine: Any, tickers: list[str], today: Any,
+) -> tuple[str | None, str | None, str | None]:
+    """``(signal, as_of, reason)`` from the sector's newest dark-pool week.
+
+    A directional signal is only returned from real short-volume data in a week
+    no older than the table's staleness threshold. Otherwise ``signal`` is
+    ``None`` (rendered as "--", never as "neutral") and ``reason`` says why:
+    ``no_rows`` | ``stale`` | ``no_short_volume``. ``short_volume`` NULL is *not*
+    zero: the old code summed it as 0, so a week with total volume and no short
+    volume gave ratio 0 and "accumulation" (2026-10-19, rows dated 2026-03-09).
+    """
+    from store.materialization_provenance import WEEKLY_STALE_AFTER_DAYS
+
+    if not tickers:
+        return None, None, "no_rows"
+    placeholders = ", ".join(f":t{i}" for i in range(len(tickers)))
+    params = {f"t{i}": t for i, t in enumerate(tickers)}
+    with engine.connect() as conn:
+        rows = conn.execute(text(
+            "SELECT ticker, short_volume, total_volume, report_date "
+            "FROM dark_pool_weekly "
+            "WHERE ticker IN (" + placeholders + ") "
+            "AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly "
+            "WHERE ticker IN (" + placeholders + ") AND report_date <= CURRENT_DATE)"
+        ), params).fetchall()
+    if not rows:
+        return None, None, "no_rows"
+    report_date = rows[0][3]
+    as_of = report_date.isoformat() if hasattr(report_date, "isoformat") else (
+        str(report_date) if report_date is not None else None)
+    if hasattr(report_date, "toordinal") and (today - report_date).days > WEEKLY_STALE_AFTER_DAYS:
+        return None, as_of, "stale"
+    usable = [r for r in rows if r[1] is not None and r[2] is not None and float(r[2]) > 0]
+    if not usable:
+        return None, as_of, "no_short_volume"
+    total_short = sum(float(r[1]) for r in usable)
+    total_vol = sum(float(r[2]) for r in usable)
+    ratio = total_short / total_vol
+    signal = (
+        "accumulation" if ratio < 0.40
+        else "distribution" if ratio > 0.55
+        else "neutral"
+    )
+    return signal, as_of, None
 
 
 @router.get("/sectors/{sector_name}/detail")
@@ -484,7 +610,7 @@ def get_sector_detail(
     _token: str = Depends(require_auth),
 ) -> dict[str, Any]:
     """Return detailed subsector breakdown with per-actor price data and options."""
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     from analysis.sector_map import SECTOR_MAP
 
@@ -494,7 +620,7 @@ def get_sector_detail(
         raise HTTPException(status_code=404, detail=f"Sector '{sector_name}' not found")
 
     engine = get_db_engine()
-    today = date.today()
+    today = _today()
     lookback_30 = today - timedelta(days=30)
     lookback_504 = today - timedelta(days=504)
 
@@ -740,7 +866,10 @@ def get_sector_detail(
 
     insider_activity: list[dict] = []
     congressional_activity: list[dict] = []
-    dark_pool_signal = "neutral"
+    # None, never "neutral", when there is no usable dark-pool reading.
+    dark_pool_signal: str | None = None
+    dark_pool_as_of: str | None = None
+    dark_pool_reason: str | None = "no_rows"
     etf_flow_5d: float | None = None
 
     # Each query runs independently so one missing table doesn't kill the rest
@@ -767,40 +896,15 @@ def get_sector_detail(
             log.warning("insider_trades query failed (non-fatal): {e}", e=str(exc))
 
         try:
-            with engine.connect() as conn:
-                params = {**ticker_params, "d60": today - timedelta(days=60)}
-                cong_rows = conn.execute(text(
-                    "SELECT ticker, disclosure_date, representative, transaction_type, amount "
-                    "FROM congressional_trades "
-                    "WHERE ticker IN (" + placeholders + ") AND disclosure_date >= :d60 "
-                    "ORDER BY disclosure_date DESC LIMIT 20"
-                ), params).fetchall()
-                for r in cong_rows:
-                    congressional_activity.append({
-                        "ticker": r[0], "date": str(r[1]) if r[1] else None,
-                        "representative": r[2], "type": r[3], "amount": r[4],
-                    })
+            congressional_activity = _read_congressional_activity(engine, sector_tickers, today)
         except Exception as exc:
             log.warning("congressional_trades query failed (non-fatal): {e}", e=str(exc))
 
         try:
-            with engine.connect() as conn:
-                dp_rows = conn.execute(text(
-                    "SELECT ticker, short_volume, total_volume "
-                    "FROM dark_pool_weekly "
-                    "WHERE ticker IN (" + placeholders + ") "
-                    "AND report_date = (SELECT MAX(report_date) FROM dark_pool_weekly)"
-                ), ticker_params).fetchall()
-                total_short = sum(float(r[1] or 0) for r in dp_rows)
-                total_vol = sum(float(r[2] or 0) for r in dp_rows)
-                if total_vol > 0:
-                    ratio = total_short / total_vol
-                    dark_pool_signal = (
-                        "accumulation" if ratio < 0.40
-                        else "distribution" if ratio > 0.55
-                        else "neutral"
-                    )
+            dark_pool_signal, dark_pool_as_of, dark_pool_reason = _read_dark_pool_signal(
+                engine, sector_tickers, today)
         except Exception as exc:
+            dark_pool_reason = "error"
             log.warning("dark_pool_weekly query failed (non-fatal): {e}", e=str(exc))
 
     try:
@@ -869,7 +973,7 @@ def get_sector_detail(
                 f"In 2-3 sentences, summarize the investment narrative for the {sector_name} sector. "
                 f"Subsector breakdown: {'; '.join(sector_summary_parts)}. "
                 f"ETF {etf_ticker} 30d change: {'+' if (etf_change or 0) >= 0 else ''}{((etf_change or 0) * 100):.1f}%. "
-                f"Dark pool signal: {dark_pool_signal}."
+                f"Dark pool signal: {dark_pool_signal or 'unavailable'}."
             )
             client = get_client()
             resp = client.generate(prompt=prompt, temperature=0.3)
@@ -927,6 +1031,8 @@ def get_sector_detail(
             "relative_strength_1m": relative_strength_1m,
             "etf_flow_5d": etf_flow_5d,
             "dark_pool_signal": dark_pool_signal,
+            "dark_pool_as_of": dark_pool_as_of,
+            "dark_pool_reason": dark_pool_reason,
             "congressional_activity": congressional_activity,
             "insider_activity": insider_activity,
         },
@@ -936,6 +1042,7 @@ def get_sector_detail(
             "narrative": narrative,
         },
         "connections": connections,
+        "provenance": _provenance(_PROV_SECTOR_DETAIL),
     }
 
 
@@ -1144,14 +1251,14 @@ def _build_sector_connections(
     All DB queries are parameterized, wrapped in try/except, and
     gracefully degrade if tables are missing.
     """
-    from datetime import date, timedelta
+    from datetime import timedelta
 
     cache_key = f"{sector_name}"
     cached = _sector_connections_cache.get(cache_key)
     if cached is not None:
         return cached
 
-    today = date.today()
+    today = _today()
 
     ticker_set = set(sector_tickers)
 
@@ -1386,7 +1493,7 @@ def _build_sector_connections(
                     text(
                         "SELECT ticker, disclosure_date FROM congressional_trades "
                         "WHERE ticker IN (" + placeholders + ") "
-                        "AND disclosure_date >= :d60"
+                        "AND disclosure_date >= :d60 AND disclosure_date <= CURRENT_DATE"
                     ),
                     params,
                 ).fetchall()
@@ -1423,7 +1530,7 @@ def _build_sector_connections(
                         "SELECT ticker, SUM(short_volume) AS sv, SUM(total_volume) AS tv "
                         "FROM dark_pool_weekly "
                         "WHERE ticker IN (" + placeholders + ") "
-                        "AND report_date >= :d14 "
+                        "AND report_date >= :d14 AND short_volume IS NOT NULL "
                         "GROUP BY ticker"
                     ),
                     params,
@@ -1606,13 +1713,13 @@ def get_sankey_data(
     cache_key = as_of or "today"
     cached = _sankey_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return _with_provenance(cached, _PROV_SANKEY)
 
     from datetime import date, timedelta
     from analysis.sector_map import SECTOR_MAP
 
     engine = get_db_engine()
-    today = date.fromisoformat(as_of) if as_of else date.today()
+    today = date.fromisoformat(as_of) if as_of else _today()
 
     # Build nodes and links from sector map + live data
     nodes = []
@@ -1852,7 +1959,7 @@ def get_sankey_data(
     }
 
     _sankey_cache.set(cache_key, result)
-    return result
+    return _with_provenance(result, _PROV_SANKEY)
 
 
 def _apply_physics_scores(engine, today, setups: list) -> None:
@@ -2092,7 +2199,7 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
     cached = _money_map_cache.get("money_map")
     if cached is not None:
         log.debug("Money map cache hit")
-        return cached
+        return _with_provenance(cached, _PROV_MONEY_MAP)
 
     from analysis.money_flow import build_flow_map
     engine = get_db_engine()
@@ -2100,7 +2207,7 @@ def get_money_map(_token: str = Depends(require_auth)) -> dict[str, Any]:
 
     _money_map_cache.set("money_map", result)
 
-    return result
+    return _with_provenance(result, _PROV_MONEY_MAP)
 
 
 # ── Company drill-down endpoint ───────────────────────────────────────
@@ -2118,8 +2225,14 @@ async def get_company_drill(
     """
     from analysis.money_flow import get_company_drill as _get_company_drill
 
+    from starlette.concurrency import run_in_threadpool
+
     engine = get_db_engine()
-    return _get_company_drill(engine, ticker)
+    result = _get_company_drill(engine, ticker)
+    if not isinstance(result, dict):
+        return result
+    # The probes are blocking (<= 5 s each): keep them off the event loop.
+    return await run_in_threadpool(_with_provenance, result, _PROV_COMPANY)
 
 
 # ── Aggregated dollar flow endpoint ─────────────────────────────────────
@@ -2218,7 +2331,8 @@ def _get_flow_map(engine, as_of=None):
 async def get_flow_map_v2(_token: str = Depends(require_auth)) -> dict:
     """8-layer junction point flow map with edges."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return flow_map.to_dict()
 
 
@@ -2280,6 +2394,7 @@ def get_junction_points(_token: str = Depends(require_auth)) -> dict:
         "layer_summaries": layer_summaries,
         "total_layers": len(flow_map.layers),
         "total_junction_points": len(junction_points),
+        "provenance": _provenance(_PROV_JUNCTION_POINTS),
     }
 
 
@@ -2305,7 +2420,8 @@ def _infer_trend(node) -> str:
 async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
     """Summary of all 8 junction point layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
     return {
         "layers": [layer.to_dict() for layer in flow_map.layers],
         "edges": [edge.to_dict() for edge in flow_map.edges],
@@ -2319,7 +2435,8 @@ async def get_flow_layers(_token: str = Depends(require_auth)) -> dict:
 async def get_flow_layer_detail(layer_id: str, _token: str = Depends(require_auth)) -> dict:
     """Detailed view of a single junction point layer."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     layer = next(
         (flow_layer for flow_layer in flow_map.layers if flow_layer.id == layer_id),
@@ -2352,7 +2469,8 @@ async def get_flow_waterfall(
 ) -> dict:
     """Trace money from a source node through all layers."""
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Find starting node
     start_node = None
@@ -2453,7 +2571,8 @@ async def get_flow_orthogonality(_token: str = Depends(require_auth)) -> dict:
     import numpy as np
 
     engine = get_db_engine()
-    flow_map = _get_flow_map(engine)
+    # Blocking build (DB reads + TTLCache); never run it on the event loop.
+    flow_map = await asyncio.to_thread(_get_flow_map, engine)
 
     # Collect nodes with numeric values for PCA
     nodes_with_data = []
@@ -2688,13 +2807,12 @@ async def get_cds_history(
 ) -> dict:
     """Historical spread data for a CDS proxy series."""
     from intelligence.cds_tracker import CDS_SERIES, _get_spread_history
-    from datetime import date
 
     if series_key not in CDS_SERIES:
         return {"error": f"Unknown series: {series_key}", "available": list(CDS_SERIES.keys())}
 
     cfg = CDS_SERIES[series_key]
-    history = _get_spread_history(get_db_engine(), cfg["id"], date.today(), lookback_days=days)
+    history = _get_spread_history(get_db_engine(), cfg["id"], _today(), lookback_days=days)
 
     return {
         "series_key": series_key,
@@ -2742,9 +2860,15 @@ async def generate_briefing(
     Explicit write: calls the script LLM and, when ``audio`` is true (the
     default), text-to-speech, saving the MP3 and its JSON sidecar.
 
+    Generation is blocking I/O (local LLM call, then a Kokoro TTS request of
+    ~20-60s on CPU), so it runs in a worker thread: grid-api is a single
+    uvicorn process and calling it inline would freeze every other request.
+
     Returns:
         Script text, audio path, flow/credit/thesis summaries.
     """
+    import asyncio
+
     from intelligence.audio_briefing import (
         generate_briefing_audio,
         generate_briefing_script,
@@ -2753,10 +2877,8 @@ async def generate_briefing(
     engine = get_db_engine()
 
     try:
-        if audio:
-            result = generate_briefing_audio(engine)
-        else:
-            result = generate_briefing_script(engine)
+        generate = generate_briefing_audio if audio else generate_briefing_script
+        result = await asyncio.to_thread(generate, engine)
     except Exception as exc:
         log.error("Briefing generation failed: {e}", e=str(exc))
         return {"error": str(exc), "status": "FAILED"}

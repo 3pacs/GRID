@@ -41,12 +41,14 @@ written from a successfully parsed announcement.
 
 from __future__ import annotations
 
+import html as html_lib
+import math
 import re
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from typing import Any, Iterable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from loguru import logger as log
@@ -88,7 +90,10 @@ _OP_DATE_RE = re.compile(r"(\d{4})年(\d{1,2})月(\d{1,2})日")
 # "3000亿元14天期逆回购操作". Excludes 买断式 (outright) reverse repos,
 # which are a different instrument with their own announcements.
 _PROSE_OP_RE = re.compile(
-    r"(?P<amt>\d+(?:\.\d+)?)亿元(?P<term>隔夜|\d+天)期?(?P<kind>买断式)?逆回购"
+    # Capture the complete visible token, including unfamiliar signs or
+    # malformed punctuation. Never restart at a positive numeric suffix.
+    r"(?P<amt>[^\u3400-\u9fff\s]+)"
+    r"亿元(?P<term>隔夜|\d+天)期?(?P<kind>买断式)?逆回购"
 )
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
@@ -140,15 +145,34 @@ def _normalise_term(raw: str) -> str | None:
 
 def _yi_to_bn(raw: str) -> float | None:
     """'1390亿元' -> 139.0 (CNY bn). 1 亿 = 0.1 bn."""
-    m = re.search(r"(\d+(?:\.\d+)?)\s*亿元", raw)
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*亿元", raw.strip())
     if not m:
         return None
-    return float(m.group(1)) / 10.0
+    value = float(m.group(1)) / 10.0
+    return value if math.isfinite(value) else None
 
 
 def _pct(raw: str) -> float | None:
-    m = re.search(r"(\d+(?:\.\d+)?)\s*%", raw)
-    return float(m.group(1)) if m else None
+    m = re.fullmatch(r"([+\-]?\d+(?:\.\d+)?)\s*%", raw.strip())
+    value = float(m.group(1)) if m else None
+    return value if value is not None and math.isfinite(value) else None
+
+
+def _official_announcement_url(url: str) -> bool:
+    """Require a detail page in the declared official OMO column."""
+    try:
+        parsed = urlsplit(url)
+    except ValueError:
+        return False
+    column = "/zhengcehuobisi/125207/125213/125431/125475/"
+    return (
+        parsed.scheme == "https"
+        and parsed.netloc == "www.pbc.gov.cn"
+        and parsed.path.startswith(column)
+        and re.fullmatch(r"[0-9]+/index\.html", parsed.path[len(column):]) is not None
+        and not parsed.query
+        and not parsed.fragment
+    )
 
 
 def parse_index(html: str, base_url: str = PBOC_BASE_URL) -> list[IndexItem]:
@@ -157,6 +181,8 @@ def parse_index(html: str, base_url: str = PBOC_BASE_URL) -> list[IndexItem]:
     seen: set[str] = set()
     for m in _INDEX_ITEM_RE.finditer(html):
         url = urljoin(base_url, m.group("href"))
+        if not _official_announcement_url(url):
+            continue
         if url in seen:
             continue
         seen.add(url)
@@ -180,18 +206,22 @@ def _article_text_and_rows(html: str) -> tuple[str, list[list[str]]]:
     rows: list[list[str]] = []
     for tr in re.findall(r"<tr[^>]*>(.*?)</tr>", body, flags=re.S):
         cells = [
-            _WS_RE.sub("", _TAG_RE.sub("", td))
+            _WS_RE.sub("", html_lib.unescape(_TAG_RE.sub("", td)))
             for td in re.findall(r"<td[^>]*>(.*?)</td>", tr, flags=re.S)
         ]
         if any(cells):
             rows.append(cells)
 
-    text = _WS_RE.sub("", _TAG_RE.sub("", body))
+    # Strip actual markup before decoding entities, so encoded visible signs
+    # remain part of their numeric token rather than being dropped as markup.
+    text = _WS_RE.sub("", html_lib.unescape(_TAG_RE.sub("", body)))
     return text, rows
 
 
 def parse_announcement(html: str, url: str = "", title: str = "") -> Announcement | None:
     """Parse one announcement page. Returns None when it cannot be parsed."""
+    if not _official_announcement_url(url) or not title.strip():
+        return None
     text, rows = _article_text_and_rows(html)
 
     m = _OP_DATE_RE.search(text)
@@ -218,9 +248,17 @@ def parse_announcement(html: str, url: str = "", title: str = "") -> Announcemen
             continue
         rate_cell = next((v for k, v in rec.items() if "利率" in k), "")
         amt_cell = next((v for k, v in rec.items() if "中标量" in k or "操作量" in k), "")
-        table_rates[term] = _pct(rate_cell)
+        rate = _pct(rate_cell)
         amt = _yi_to_bn(amt_cell)
+        if ("亿元" in amt_cell and amt is None) or ("%" in rate_cell and rate is None):
+            return None
+        if rate is not None:
+            if table_rates.get(term) is not None and table_rates[term] != rate:
+                return None
+            table_rates[term] = rate
         if amt is not None:
+            if term in table_amounts and table_amounts[term] != amt:
+                return None
             table_amounts[term] = amt
 
     ops: dict[str, ReverseRepoOp] = {}
@@ -228,11 +266,21 @@ def parse_announcement(html: str, url: str = "", title: str = "") -> Announcemen
         if pm.group("kind"):  # 买断式 outright reverse repo -- different instrument
             continue
         term = _normalise_term(pm.group("term"))
-        if term is None or term in ops:
+        if term is None:
             continue
+        # A clause separator may precede a bare amount. Remove separators
+        # only at the start; signs and internal punctuation remain validated.
+        amount_token = pm.group("amt").lstrip("，。；：、,;:（）()")
+        amount = _yi_to_bn(amount_token + "亿元")
+        if amount is None:
+            return None
+        if term in ops and ops[term].amount_cny_bn != amount:
+            return None
+        if term in table_amounts and table_amounts[term] != amount:
+            return None
         ops[term] = ReverseRepoOp(
             term=term,
-            amount_cny_bn=float(pm.group("amt")) / 10.0,
+            amount_cny_bn=amount,
             rate_pct=table_rates.get(term),
         )
     # Table rows the prose did not mention (defensive).
@@ -288,11 +336,20 @@ class PBOCOmoAnnouncementsPuller(BasePuller):
         self._session = session or requests.Session()
         self._session.headers.update({"User-Agent": USER_AGENT})
 
-    def _get(self, url: str) -> str:
+    def _get(self, url: str) -> tuple[str, str]:
+        """Return body and validated final URL; requested URL is not provenance."""
+        is_index = url == PBOC_OMO_INDEX_URL
+        if not is_index and not _official_announcement_url(url):
+            raise ValueError("PBoC request URL is not an official index/detail")
         resp = self._session.get(url, timeout=REQUEST_TIMEOUT_S)
         resp.raise_for_status()
+        final_url = getattr(resp, "url", None)
+        if not isinstance(final_url, str) or not (
+            final_url == PBOC_OMO_INDEX_URL if is_index else _official_announcement_url(final_url)
+        ):
+            raise ValueError("PBoC response final URL lacks official provenance")
         resp.encoding = resp.encoding if resp.encoding and resp.encoding.lower() != "iso-8859-1" else "utf-8"
-        return resp.text
+        return resp.text, final_url
 
     def fetch(self, since: date | None) -> tuple[list[Announcement], list[str]]:
         """Fetch announcements published on/after ``since`` (all listed if None).
@@ -300,7 +357,7 @@ class PBOCOmoAnnouncementsPuller(BasePuller):
         Returns (parsed announcements, error strings). Raises if the index
         itself cannot be fetched or parsed.
         """
-        index_html = self._get(PBOC_OMO_INDEX_URL)
+        index_html, _index_url = self._get(PBOC_OMO_INDEX_URL)
         items = parse_index(index_html)
         if not items:
             raise ValueError("PBoC OMO index: no announcements parsed (layout change?)")
@@ -314,11 +371,11 @@ class PBOCOmoAnnouncementsPuller(BasePuller):
             if n:
                 time.sleep(DETAIL_FETCH_DELAY_S)
             try:
-                html = self._get(item.url)
+                html, final_url = self._get(item.url)
             except Exception as exc:  # noqa: BLE001
                 errors.append(f"{item.url}: fetch {exc}")
                 continue
-            ann = parse_announcement(html, url=item.url, title=item.title)
+            ann = parse_announcement(html, url=final_url, title=item.title)
             if ann is None:
                 errors.append(f"{item.url}: unparseable")
                 continue
@@ -327,6 +384,25 @@ class PBOCOmoAnnouncementsPuller(BasePuller):
 
     def save(self, announcements: Iterable[Announcement]) -> int:
         """Insert rows for parsed announcements; skip (series, date) already stored."""
+        announcements = list(announcements)
+        # Validate the entire batch before any transaction or partial insert.
+        values: dict[tuple[date, str], tuple[float, float | None]] = {}
+        for ann in announcements:
+            if not _official_announcement_url(ann.url) or not ann.title.strip():
+                raise ValueError("PBoC announcement requires official URL and title")
+            for op in ann.operations:
+                if not math.isfinite(op.amount_cny_bn) or op.amount_cny_bn < 0:
+                    raise ValueError("PBoC amount must be finite and nonnegative")
+                if op.rate_pct is not None and not math.isfinite(op.rate_pct):
+                    raise ValueError("PBoC rate must be finite when supplied")
+                key = (ann.op_date, op.term)
+                previous = values.get(key)
+                if previous is not None and (
+                    previous[0] != op.amount_cny_bn
+                    or (previous[1] is not None and op.rate_pct is not None and previous[1] != op.rate_pct)
+                ):
+                    raise ValueError("PBoC conflicting duplicate date/term")
+                values[key] = (op.amount_cny_bn, op.rate_pct if op.rate_pct is not None else (previous[1] if previous else None))
         anns = [a for a in announcements if a.operations]
         if not anns:
             return 0

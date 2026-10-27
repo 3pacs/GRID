@@ -83,6 +83,21 @@ _NON_FRED_CONTAINERS: frozenset[tuple[str, str]] = frozenset(
         ("ingestion/crucix_bridge.py", "_EXTRACTORS"),
         ("ingestion/crucix_bridge.py", "_SKIP_SOURCES"),
         ("ingestion/scheduler.py", "_SOURCE_NAME_ALIASES"),
+        # SmartScheduler run-outcome vocabulary (_classify_outcome).
+        ("ingestion/smart_scheduler.py", "OUTCOME_SUCCESS"),
+        ("ingestion/smart_scheduler.py", "OUTCOME_NO_NEW_DATA"),
+        ("ingestion/smart_scheduler.py", "OUTCOME_SKIPPED"),
+        ("ingestion/smart_scheduler.py", "OUTCOME_FAILED"),
+        ("ingestion/smart_scheduler.py", "OUTCOME_PARTIAL"),
+        ("ingestion/smart_scheduler.py", "_ITEM_OK"),
+        ("ingestion/smart_scheduler.py", "_ITEM_SKIP"),
+        ("ingestion/smart_scheduler.py", "_ITEM_FAIL"),
+        # Source-freshness verdict vocabulary (ingestion/source_freshness.py).
+        ("ingestion/source_freshness.py", "FRESH"),
+        ("ingestion/source_freshness.py", "PARTIAL"),
+        ("ingestion/source_freshness.py", "UNKNOWN"),
+        ("ingestion/source_freshness.py", "STALE"),
+        ("ingestion/source_freshness.py", "NEVER"),
         ("ingestion/web_scraper.py", "TRUST_LABELS"),
         # Freightos route codes (FBX01…), not FRED ids.
         ("ingestion/altdata/supply_chain.py", "FBX_ROUTES"),

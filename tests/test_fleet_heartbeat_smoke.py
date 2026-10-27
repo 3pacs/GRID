@@ -20,6 +20,13 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import intelligence.fleet_heartbeat as mod  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _only_test_freshness_paths(monkeypatch, tmp_path):
+    # Never inspect the production /data path while exercising temporary files.
+    monkeypatch.setattr(mod, "FRESHNESS", {"test-default": (str(tmp_path / "missing-test-file"), 60)})
 
 
 def test_module_imports_and_exposes_registries():

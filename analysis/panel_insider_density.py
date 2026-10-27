@@ -63,6 +63,8 @@ import hashlib
 import json
 import math
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timezone
 from pathlib import Path
@@ -141,6 +143,24 @@ VS1_SECTOR = "Technology"
 OTHER_SECTORS: tuple[str, ...] = tuple(s for s in EQUITY_SECTORS if s != VS1_SECTOR)
 
 DISCOVERY_START = "2012-01-01T00:00:00+00:00"
+_discovery_start_override: ContextVar[str | None] = ContextVar("vs1_discovery_start_override", default=None)
+
+
+def discovery_start() -> str:
+    """Version-scoped discovery start; the default stays pinned for v1-v6."""
+    return _discovery_start_override.get() or DISCOVERY_START
+
+
+@contextmanager
+def discovery_window(start: str):
+    """Use a version's start without changing another run's module globals."""
+    if pd.Timestamp(start).tz is None or pd.Timestamp(start) >= pd.Timestamp(SPLIT):
+        raise ValueError("discovery start must be timezone aware and before the split")
+    token = _discovery_start_override.set(start)
+    try:
+        yield
+    finally:
+        _discovery_start_override.reset(token)
 SPLIT = "2020-01-01T00:00:00+00:00"
 END = "2026-07-01T00:00:00+00:00"
 
@@ -1195,7 +1215,7 @@ class TrialPanel:
 
 def window_bounds(window: str) -> tuple[pd.Timestamp, pd.Timestamp]:
     if window == "discovery":
-        return pd.Timestamp(stamp(DISCOVERY_START)), pd.Timestamp(stamp(SPLIT))
+        return pd.Timestamp(stamp(discovery_start())), pd.Timestamp(stamp(SPLIT))
     if window == "holdout":
         return pd.Timestamp(stamp(SPLIT)), pd.Timestamp(stamp(END))
     raise ValueError("window must be discovery or holdout")
@@ -1635,7 +1655,7 @@ def discover_panel(
         "origin": ORIGIN,
         "prereg_sha256": prereg,
         "spec": asdict(spec),
-        "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
+        "windows": {"discovery_start": discovery_start(), "split": SPLIT, "end": END},
         "selection": f"Holm at ledger run alpha {spec.alpha:.6g} (q={spec.ledger_q}, k={spec.run_k}) "
                      "over every declared trial incl. untestable; BH-adjusted p reported only",
         "null": "block sign-flip of the per-date rank-IC series; block from discovery IC acf1 "
@@ -1970,7 +1990,7 @@ def registration_records(now: datetime, code_sha: str, prereg_sha256: str = PRER
                               "alpha": run_alpha(OTHER_SECTORS_RUN_K),
                               "trials": list(trial_names())},
         },
-        "windows": {"discovery_start": DISCOVERY_START, "split": SPLIT, "end": END},
+        "windows": {"discovery_start": discovery_start(), "split": SPLIT, "end": END},
         "promotion_allowed": False,
     }
     return [header, record]

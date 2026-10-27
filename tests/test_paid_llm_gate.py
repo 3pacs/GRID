@@ -231,8 +231,8 @@ class TestAudioBriefingPaidGate:
 # 20260927.md #5): script generation tries a LOCAL LLM first (free, always
 # attempted) and only falls back to the paid Gemini/OpenAI path -- unchanged,
 # still gated -- when no local node answers. Audio synthesis is skipped (not
-# an error) when GRID_ALLOW_PAID_LLM is off, since there is no local TTS
-# option today.
+# an error) when neither local Kokoro (GRID_KOKORO_URL) nor the paid opt-in
+# is configured. Local Kokoro coverage: tests/test_audio_briefing_kokoro.py.
 # ---------------------------------------------------------------------------
 
 class TestAudioBriefingLocalFirst:
@@ -287,7 +287,11 @@ class TestAudioBriefingLocalFirst:
         monkeypatch.setattr(llm_router, "get_llm", lambda *a, **kw: dead_client)
         monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", False)
 
-        with pytest.raises(RuntimeError, match="Local LLM, Gemini, and OpenAI all failed"):
+        def _boom_gemini():
+            raise AssertionError("must not build a paid client with the gate off")
+        monkeypatch.setattr(audio_briefing, "_get_gemini_client", _boom_gemini)
+
+        with pytest.raises(RuntimeError, match="No local LLM answered"):
             audio_briefing._generate_script_text(self._data())
 
     def test_generate_briefing_audio_is_text_only_when_gate_off(self, monkeypatch):
@@ -297,13 +301,16 @@ class TestAudioBriefingLocalFirst:
         from intelligence import audio_briefing
 
         monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", False)
+        monkeypatch.setattr(config.settings, "GRID_KOKORO_URL", "")
         monkeypatch.setattr(audio_briefing, "_collect_all_data", lambda engine: self._data())
         monkeypatch.setattr(
             audio_briefing, "_generate_script_text", lambda data: ("local script", "local"),
         )
 
         def _boom_audio(*a, **kw):
-            raise AssertionError("must not synthesize audio when GRID_ALLOW_PAID_LLM is off")
+            raise AssertionError(
+                "must not synthesize audio with no local TTS and GRID_ALLOW_PAID_LLM off"
+            )
         monkeypatch.setattr(audio_briefing, "_generate_audio_file", _boom_audio)
 
         result = audio_briefing.generate_briefing_audio(MagicMock())
@@ -311,24 +318,28 @@ class TestAudioBriefingLocalFirst:
         assert result.script_text == "local script"
         assert result.provider == "local"
         assert result.audio_note
+        assert result.audio_status == "not_configured"
 
     def test_generate_briefing_audio_synthesizes_when_gate_on(self, monkeypatch):
         from intelligence import audio_briefing
 
         monkeypatch.setattr(config.settings, "GRID_ALLOW_PAID_LLM", True)
+        monkeypatch.setattr(config.settings, "GRID_KOKORO_URL", "")
         monkeypatch.setattr(audio_briefing, "_collect_all_data", lambda engine: self._data())
         monkeypatch.setattr(
             audio_briefing, "_generate_script_text", lambda data: ("local script", "local"),
         )
         monkeypatch.setattr(
             audio_briefing, "_generate_audio_file",
-            lambda script, briefing_date: "/tmp/briefing_2026-09-28_x.mp3",
+            lambda script, briefing_date: ("/tmp/briefing_2026-09-28_x.mp3", "openai"),
         )
         monkeypatch.setattr(audio_briefing, "_save_metadata", lambda result: None)
 
         result = audio_briefing.generate_briefing_audio(MagicMock())
         assert result.audio_path == "/tmp/briefing_2026-09-28_x.mp3"
         assert result.audio_note == ""
+        assert result.audio_status == "generated"
+        assert result.tts_provider == "openai"
 
 
 # ---------------------------------------------------------------------------

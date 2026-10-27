@@ -21,6 +21,16 @@ FLAGS = [
     "GRID_ENABLE_SCANNER_WEIGHTS_JOB",
     "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
     "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
+    # Not a Wave 3 flag, but the same default-off job gate on the same
+    # blank-value validator (owner decision 2026-09-29): the Taiwan Strait
+    # OSINT job in intelligence/scheduler.py.
+    "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
+    # Same default-off gate (2026-09-29): LME warehouse job, whose LME URLs
+    # sit behind a Cloudflare managed challenge.
+    "GRID_ENABLE_LME_WAREHOUSE_JOB",
+    # Same default-off gate (PR #903 source review, 2026-10-23): learned
+    # sentiment_weights promotion from the daily outcome closer.
+    "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
 ]
 
 

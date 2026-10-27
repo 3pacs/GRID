@@ -242,10 +242,10 @@ class TestProcessEarningsDates:
         # Mock _get_existing_dates to return empty sets (no dedup hits)
         puller._get_existing_dates = MagicMock(return_value=set())
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
+        inserted = puller._process_earnings_dates("AAPL", stock)
         # 3 rows x 3 fields (eps_estimate, eps_actual, surprise_pct) = 9
         # No beat_flags because none exceed 10%
-        assert inserted == 9
+        assert len(inserted) == 9
 
     def test_skips_existing_dates(self):
         engine, mock_conn = _make_mock_engine()
@@ -260,8 +260,10 @@ class TestProcessEarningsDates:
         existing = {date(2025, 1, 29), date(2024, 10, 31), date(2024, 7, 25)}
         puller._get_existing_dates = MagicMock(return_value=existing)
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        points = puller._process_earnings_dates("AAPL", stock)
+        puller._insert_raw = MagicMock()
+        assert puller._store_points(mock_conn, points) == 0
+        puller._insert_raw.assert_not_called()
 
     def test_handles_empty_dataframe(self):
         engine, mock_conn = _make_mock_engine()
@@ -271,8 +273,8 @@ class TestProcessEarningsDates:
         stock = MagicMock()
         stock.earnings_dates = pd.DataFrame()
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_earnings_dates("AAPL", stock)
+        assert len(inserted) == 0
 
     def test_handles_none_earnings_dates(self):
         engine, mock_conn = _make_mock_engine()
@@ -282,8 +284,8 @@ class TestProcessEarningsDates:
         stock = MagicMock()
         stock.earnings_dates = None
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_earnings_dates("AAPL", stock)
+        assert len(inserted) == 0
 
     def test_handles_exception_on_access(self):
         engine, mock_conn = _make_mock_engine()
@@ -293,8 +295,8 @@ class TestProcessEarningsDates:
         stock = MagicMock()
         type(stock).earnings_dates = PropertyMock(side_effect=Exception("API error"))
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_earnings_dates("AAPL", stock)
+        assert len(inserted) == 0
 
     def test_significant_surprise_creates_beat_flag(self):
         engine, mock_conn = _make_mock_engine()
@@ -317,9 +319,9 @@ class TestProcessEarningsDates:
 
         puller._get_existing_dates = MagicMock(return_value=set())
 
-        inserted = puller._process_earnings_dates(mock_conn, "AAPL", stock)
+        inserted = puller._process_earnings_dates("AAPL", stock)
         # eps_estimate + eps_actual + surprise_pct + beat_flag = 4
-        assert inserted == 4
+        assert len(inserted) == 4
 
 
 class TestProcessQuarterlyEarnings:
@@ -336,9 +338,9 @@ class TestProcessQuarterlyEarnings:
 
         puller._get_existing_dates = MagicMock(return_value=set())
 
-        inserted = puller._process_quarterly_earnings(mock_conn, "AAPL", stock)
+        inserted = puller._process_quarterly_earnings("AAPL", stock)
         # 3 rows x 2 fields (revenue_actual + quarterly_earnings) = 6
-        assert inserted == 6
+        assert len(inserted) == 6
 
     def test_handles_empty_dataframe(self):
         engine, mock_conn = _make_mock_engine()
@@ -348,8 +350,8 @@ class TestProcessQuarterlyEarnings:
         stock = MagicMock()
         stock.quarterly_earnings = pd.DataFrame()
 
-        inserted = puller._process_quarterly_earnings(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_quarterly_earnings("AAPL", stock)
+        assert len(inserted) == 0
 
     def test_handles_none(self):
         engine, mock_conn = _make_mock_engine()
@@ -359,8 +361,8 @@ class TestProcessQuarterlyEarnings:
         stock = MagicMock()
         stock.quarterly_earnings = None
 
-        inserted = puller._process_quarterly_earnings(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_quarterly_earnings("AAPL", stock)
+        assert len(inserted) == 0
 
 
 class TestProcessEarningsHistory:
@@ -377,9 +379,9 @@ class TestProcessEarningsHistory:
 
         puller._get_existing_dates = MagicMock(return_value=set())
 
-        inserted = puller._process_earnings_history(mock_conn, "AAPL", stock)
+        inserted = puller._process_earnings_history("AAPL", stock)
         # 2 rows with surprise data
-        assert inserted == 2
+        assert len(inserted) == 2
 
     def test_handles_empty_history(self):
         engine, mock_conn = _make_mock_engine()
@@ -389,8 +391,8 @@ class TestProcessEarningsHistory:
         stock = MagicMock()
         stock.earnings_history = pd.DataFrame()
 
-        inserted = puller._process_earnings_history(mock_conn, "AAPL", stock)
-        assert inserted == 0
+        inserted = puller._process_earnings_history("AAPL", stock)
+        assert len(inserted) == 0
 
 
 class TestPullTicker:
@@ -537,6 +539,9 @@ class TestGetSummary:
         assert summary["failed"] == 1
         assert summary["partial"] == 1
         assert summary["total_rows_inserted"] == 15
+        assert summary["actual_rows_inserted"] == 15
+        assert summary["acknowledged_rows_inserted"] == 15
+        assert summary["commit_outcome_unknown"] is False
         assert summary["failed_tickers"] == ["BAD"]
         assert len(summary["significant_beats"]) == 1
         assert len(summary["significant_misses"]) == 0

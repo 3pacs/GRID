@@ -29,6 +29,10 @@ def _fast_calculations(monkeypatch):
     monkeypatch.setattr(options, "_compute_oi_concentration", lambda *_args: 0.5)
 
 
+@pytest.mark.skip(reason=(
+    "opt-in local PG14 check of the retired delete-then-insert contract; since "
+    "options_append_only_20260930 the append-only contract is enforced in CI by "
+    "tests/test_options_append_only_pg.py"))
 def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
     synthetic_session_pg14, monkeypatch,
 ):
@@ -41,7 +45,7 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
         def __init__(self, db_engine):
             # The opt-in fixture owns only options tables, not source_catalog.
             self.engine = db_engine
-            self._push_to_resolved = lambda *_args: None
+            self._push_to_resolved = lambda *_args, **_kwargs: 0
 
     monkeypatch.setattr(options, "OptionsPuller", BoundPuller)
     calls = defaultdict(list)
@@ -91,6 +95,10 @@ def test_gem_wrapper_real_batch_writer_nine_tickers_six_expiries(
     ).empty
 
 
+@pytest.mark.skip(reason=(
+    "opt-in local PG14 check of the retired delete-then-insert contract; since "
+    "options_append_only_20260930 the append-only contract is enforced in CI by "
+    "tests/test_options_append_only_pg.py"))
 def test_legacy_style_upsert_retains_provenance_until_canonical_replacement(
     synthetic_session_pg14, monkeypatch,
 ):

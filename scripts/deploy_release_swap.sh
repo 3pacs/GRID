@@ -199,6 +199,8 @@ fi
 # An old scheduler process can keep its cwd after a rename, but pruning that
 # folder makes its next import (or an incidental restart) unsafe.
 PRESERVATION_FILE="${RELEASES_DIR}/.runtime-preservation"
+RETENTION_FILE="${RELEASES_DIR}/.runtime-retention"
+retained_release_dir=""
 if [ -n "${GRID_DEPLOY_TEST_SANDBOX:-}" ]; then
   # Legacy filesystem failure-injection tests predate this production gate.
   # The escape hatch is confined to their temporary sandbox, never the live
@@ -270,6 +272,41 @@ if [ "${test_only_skip_preservation:-0}" != 1 ]; then
      [ "$scheduler_workdir" != "$scheduler_dir" ]; then
     echo "scheduler PID/cwd/effective WorkingDirectory is not pinned to $scheduler_dir" >&2
     exit 5
+  fi
+
+  # Keep one separately approved rollback without replacing any recovery field.
+  # The controller writes this exact three-line record under this same lock.
+  # Absence preserves the prior contract; an invalid existing record fails closed.
+  if [ -e "$RETENTION_FILE" ] || [ -L "$RETENTION_FILE" ]; then
+    if [ ! -f "$RETENTION_FILE" ] || [ -L "$RETENTION_FILE" ]; then
+      echo "runtime retention record is not a regular unlinked file" >&2
+      exit 5
+    fi
+    mapfile -t retention_lines < "$RETENTION_FILE"
+    if [ "${#retention_lines[@]}" -ne 3 ] ||
+       [[ "${retention_lines[0]}" != rollback=* ]] ||
+       [[ "${retention_lines[1]}" != rollback_sha=* ]] ||
+       [[ "${retention_lines[2]}" != rollback_tree=* ]]; then
+      echo "invalid runtime retention record: expected rollback path and SHA/tree" >&2
+      exit 5
+    fi
+    retained_release_dir="${retention_lines[0]#rollback=}"
+    retained_release_sha="${retention_lines[1]#rollback_sha=}"
+    retained_release_tree="${retention_lines[2]#rollback_tree=}"
+    # Bash mapfile loses NUL bytes (and their suffixes). Trust parsed fields
+    # only when their canonical reconstruction matches every original byte.
+    if ! cmp -s "$RETENTION_FILE" <(printf 'rollback=%s\nrollback_sha=%s\nrollback_tree=%s\n' \
+        "$retained_release_dir" "$retained_release_sha" "$retained_release_tree"); then
+      echo "invalid runtime retention record: noncanonical bytes" >&2
+      exit 5
+    fi
+    if [ ! -d "$retained_release_dir" ] || [ -L "$retained_release_dir" ] ||
+       [ "$(realpath -e -- "$retained_release_dir")" != "$retained_release_dir" ] ||
+       [ "$(dirname -- "$retained_release_dir")" != "$releases_root" ]; then
+      echo "runtime retention target is missing, linked, outside or noncanonical" >&2
+      exit 5
+    fi
+    verify_preserved_checkout rollback "$retained_release_dir" "$retained_release_sha" "$retained_release_tree"
   fi
 fi
 
@@ -514,6 +551,7 @@ if [ -e "$CANDIDATE_DIR" ]; then
   refresh_runtime_release_dirs
   if [ "${test_only_skip_preservation:-0}" != 1 ] &&
      { [ "$CANDIDATE_DIR" = "$scheduler_dir" ] || [ "$CANDIDATE_DIR" = "$recovery_dir" ] ||
+       [ "$CANDIDATE_DIR" = "$retained_release_dir" ] ||
        [ "${runtime_release_dirs[$CANDIDATE_DIR]:-0}" = 1 ]; }; then
     echo "candidate label names a protected runtime directory" >&2
     exit 5
@@ -594,9 +632,13 @@ if [ -n "$previous_target" ]; then
   kept=0
   for rel in "${all_releases[@]}"; do
     refresh_runtime_release_dirs
+    if [ -n "$retained_release_dir" ]; then
+      verify_preserved_checkout rollback "$retained_release_dir" "$retained_release_sha" "$retained_release_tree"
+    fi
     if [ "$rel" = "$CANDIDATE_DIR" ] || [ "$rel" = "$previous_target" ] ||
        { [ "${test_only_skip_preservation:-0}" != 1 ] &&
          { [ "$rel" = "$scheduler_dir" ] || [ "$rel" = "$recovery_dir" ] ||
+           [ "$rel" = "$retained_release_dir" ] ||
            [ "${runtime_release_dirs[$rel]:-0}" = 1 ]; }; }; then
       kept=$((kept + 1))
       continue

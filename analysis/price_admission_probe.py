@@ -42,6 +42,8 @@ import dataclasses
 import hashlib
 import json
 import math
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
 from fractions import Fraction
@@ -49,7 +51,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
 import pandas as pd
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 
 from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_v2 as v2
@@ -69,6 +71,32 @@ SERIES_TEMPLATE = v6.SERIES_TEMPLATE
 BASIS = v6.BASIS
 BENCHMARK = v6.BENCHMARK
 CROSSCHECK = v6.CROSSCHECK
+_probe_context: ContextVar[tuple[str, str, str] | None] = ContextVar("vs1_probe_context", default=None)
+
+
+@contextmanager
+def preregistered_window(start: str, study: str, body_sha256: str):
+    """Scope a later version's read window and prereg pin; v6 stays default."""
+    if not v1._is_hex64(body_sha256):
+        raise ValueError("probe preregistration body hash is not pinned")
+    if date.fromisoformat(start) >= HOLDOUT_START:
+        raise ValueError("probe start must precede holdout")
+    token = _probe_context.set((start, study, body_sha256))
+    try:
+        yield
+    finally:
+        _probe_context.reset(token)
+
+
+def probe_rule():
+    context = _probe_context.get()
+    return (dataclasses.replace(CROSSCHECK, discovery_window=(context[0], CROSSCHECK.discovery_window[1]))
+            if context else CROSSCHECK)
+
+
+def probe_identity() -> tuple[str, str]:
+    context = _probe_context.get()
+    return (context[1], context[2]) if context else (STUDY, PREREG_BODY_SHA256)
 SPLICE_TOL = v6.SPLICE_TOL
 
 #: The first holdout instant. Nothing on or after it is ever read (v6 §3, §8).
@@ -380,7 +408,7 @@ def assess_ticker(
         reasons.append("splice_failed")
 
     # TwelveData return cross-check (v4)
-    cross = v6.crosscheck_statistics(sessions, adj_iso, close_iso, td_all or {}, td_none or {})
+    cross = v6.crosscheck_statistics(sessions, adj_iso, close_iso, td_all or {}, td_none or {}, probe_rule())
     if td_state != "ok":
         reasons.append(f"twelvedata_{td_state}")
     if not cross["passed"]:
@@ -477,12 +505,18 @@ _STATUS_SQL = (
     "SELECT pull_status, COUNT(*) FROM raw_series WHERE series_id = :sid AND source_id = :src "
     "AND obs_date >= :lo AND obs_date <= :hi AND pull_timestamp <= :ts GROUP BY pull_status"
 )
+# Every catalog source other than the admitted one, resolved once per run (recorded in the probe report).
+_OTHER_SOURCES_SQL = "SELECT id, name FROM source_catalog WHERE id <> :src ORDER BY id"
 # Rows of every other source under the series id in the window, by status (counted, never read as prices).
-_OTHER_ROWS_SQL = (
+# ``source_id IN (<the explicit other-source ids>)`` rather than ``source_id <> :src``: the inequality is not an
+# index condition, so Postgres fetched every row of the series from the heap (the admitted source's included)
+# before filtering; with an explicit list the composite index (series_id, source_id, obs_date, pull_timestamp)
+# bounds the scan. Same rows: the inner join to source_catalog already dropped any source_id not in the catalog.
+_OTHER_ROWS_SQL = text(
     "SELECT sc.name, r.pull_status, COUNT(*) FROM raw_series r JOIN source_catalog sc ON sc.id = r.source_id "
-    "WHERE r.series_id = :sid AND r.source_id <> :src AND r.obs_date >= :lo AND r.obs_date <= :hi "
+    "WHERE r.series_id = :sid AND r.source_id IN :others AND r.obs_date >= :lo AND r.obs_date <= :hi "
     "AND r.pull_timestamp <= :ts GROUP BY sc.name, r.pull_status"
-)
+).bindparams(bindparam("others", expanding=True))
 
 
 def _d(v: Any) -> date:
@@ -529,13 +563,26 @@ def read_statuses(conn, sid: str, source_id: int, lo: date, hi: date, as_of_ts: 
         text(_STATUS_SQL), {"sid": sid, "src": source_id, "lo": lo, "hi": hi, "ts": as_of_ts}).fetchall()}
 
 
-def read_other_source_rows(conn, sid: str, source_id: int, lo: date, hi: date,
-                           as_of_ts: datetime) -> dict[str, dict[str, int]]:
-    """{source name: {pull_status: rows}} of every other source under the series id in the window."""
+def read_other_sources(conn, source_id: int) -> tuple[tuple[int, str], ...]:
+    """(id, name) of every ``source_catalog`` row other than ``source_id``, by id."""
+    return tuple((int(i), str(n)) for i, n in conn.execute(text(_OTHER_SOURCES_SQL), {"src": source_id}).fetchall())
+
+
+def read_other_source_rows(conn, sid: str, source_id: int, lo: date, hi: date, as_of_ts: datetime,
+                           other_source_ids: Sequence[int] | None = None) -> dict[str, dict[str, int]]:
+    """{source name: {pull_status: rows}} of every other source under the series id in the window.
+
+    ``other_source_ids``: the run's explicit list (:func:`read_other_sources`); resolved here when omitted.
+    """
     check_window(lo, hi)
+    ids = [i for i, _ in read_other_sources(conn, source_id)] if other_source_ids is None else list(other_source_ids)
+    if source_id in ids:
+        raise ProbeRefused("the other-source list contains the admitted source")
     out: dict[str, dict[str, int]] = {}
-    for name, status, n in conn.execute(text(_OTHER_ROWS_SQL), {"sid": sid, "src": source_id, "lo": lo, "hi": hi,
-                                                                "ts": as_of_ts}).fetchall():
+    if not ids:
+        return out
+    for name, status, n in conn.execute(_OTHER_ROWS_SQL, {"sid": sid, "others": ids, "lo": lo, "hi": hi,
+                                                          "ts": as_of_ts}).fetchall():
         out.setdefault(str(name), {})[str(status)] = int(n)
     return out
 
@@ -617,12 +664,13 @@ class C1Interval:
 
 def probe_ticker(conn, ticker: str, source_id: int, lo: date, hi: date, as_of_ts: datetime, *,
                  calendar: Sequence[date], vendors: VendorFiles, sec_name: str | None, is_benchmark: bool,
-                 inside_interval: Sequence[bool] | None) -> dict:
+                 inside_interval: Sequence[bool] | None, other_source_ids: Sequence[int] | None = None) -> dict:
     check_window(lo, hi)
     close_sid, adj_sid = series_id(ticker, CLOSE_FIELD), series_id(ticker, ADJ_FIELD)
     others: dict[str, dict[str, int]] = {}
     for sid in (close_sid, adj_sid):
-        for name, by_status in read_other_source_rows(conn, sid, source_id, lo, hi, as_of_ts).items():
+        for name, by_status in read_other_source_rows(conn, sid, source_id, lo, hi, as_of_ts,
+                                                      other_source_ids).items():
             for status, n in by_status.items():
                 others.setdefault(name, {})[status] = others.get(name, {}).get(status, 0) + n
     return assess_ticker(
@@ -646,17 +694,21 @@ def run_probe(conn, tickers: Sequence[str], *, benchmark: str, source: str, lo: 
     if benchmark != BENCHMARK:
         raise ProbeRefused(f"VS1 v6 declares benchmark {BENCHMARK}")
     source_id, source_name = resolve_source(conn, source)
+    other_sources = read_other_sources(conn, source_id)
+    other_ids = [i for i, _ in other_sources]
     calendar = sorted(r.obs_date for r in read_selected(conn, series_id(benchmark, ADJ_FIELD), lo, hi, as_of_ts))
     wanted = sorted(set(tickers) - {benchmark})
     mask = interval.mask(calendar) if interval is not None and calendar else None
     names = dict(sec_names or {})
     records = {benchmark: probe_ticker(conn, benchmark, source_id, lo, hi, as_of_ts, calendar=calendar,
-                                       vendors=vendors, sec_name=None, is_benchmark=True, inside_interval=None)}
+                                       vendors=vendors, sec_name=None, is_benchmark=True, inside_interval=None,
+                                       other_source_ids=other_ids)}
     for i, t in enumerate(wanted):
         inside = list(mask[t].to_numpy(dtype=bool)) if mask is not None and t in mask.columns else None
         try:
             records[t] = probe_ticker(conn, t, source_id, lo, hi, as_of_ts, calendar=calendar, vendors=vendors,
-                                      sec_name=names.get(t), is_benchmark=False, inside_interval=inside)
+                                      sec_name=names.get(t), is_benchmark=False, inside_interval=inside,
+                                      other_source_ids=other_ids)
         except ProbeRefused:
             raise
         except Exception as exc:  # a per-ticker failure refuses that ticker, visibly
@@ -667,6 +719,7 @@ def run_probe(conn, tickers: Sequence[str], *, benchmark: str, source: str, lo: 
     return {"source": {"name": source_name, "id": source_id}, "calendar_sessions": len(calendar),
             "calendar": [calendar[0].isoformat(), calendar[-1].isoformat()] if calendar else None,
             "interval_receipt_sha256": interval.receipt_sha256 if interval is not None else None,
+            "other_sources": [{"id": i, "name": n} for i, n in other_sources],
             "records": records}
 
 
@@ -681,7 +734,8 @@ def _count(items: Iterable[str]) -> dict[str, int]:
 
 
 def _common(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime) -> dict:
-    return {"prereg": {"study": STUDY, "body_sha256": PREREG_BODY_SHA256, "rules": "v6 §2.2 rules 3-4, §2.3"},
+    study, body = probe_identity()
+    return {"prereg": {"study": study, "body_sha256": body, "rules": "v6 §2.2 rules 3-4, §2.3"},
             "code_sha": code_sha, "snapshot_as_of_ts": snapshot_as_of_ts.astimezone(timezone.utc).isoformat(),
             "window": "discovery", "read_window": {"start": lo.isoformat(), "end": hi.isoformat()},
             "source": dict(probe["source"]), "promotion_allowed": False}
@@ -689,6 +743,7 @@ def _common(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of
 
 def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                             twelvedata_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     recs = probe["records"]
     tickers = {}
     for t, r in sorted(recs.items()):
@@ -701,16 +756,16 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
                             and r["twelvedata"]["state"] == "ok" and not r["twelvedata"].get("has_window_end"))
     holdout_rows = sum(int(r["twelvedata"].get("holdout_rows", 0)) for r in tickers.values())
     return {
-        "report": "vs1-v6-twelvedata-crosscheck",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
-        "rule": dataclasses.asdict(CROSSCHECK),
+        "report": f"{common['prereg']['study']}-twelvedata-crosscheck",
+        **common,
+        "rule": dataclasses.asdict(probe_rule()),
         "request": {"url": fetch.TD_URL, "params": {**fetch.td_params("{ticker}", "all"), "adjust": ["all", "none"]},
                     "supplement_params": {**fetch.td_params("{ticker}", "all", start=fetch.TD_SUPPLEMENT_START),
                                           "adjust": ["all", "none"]},
                     "fetch_log_sha256": twelvedata_fetch_log_sha256},
         "window_implementation": {
             "note": fetch.TD_WINDOW_NOTE,
-            "registered_window": [fetch.TD_START, fetch.TD_WINDOW_END],
+            "registered_window": [fetch.td_start(), fetch.TD_WINDOW_END],
             "end_date_exclusive_bound": fetch.TD_END_EXCLUSIVE,
             "assertion": "no TwelveData row dated on or after 2020-01-01",
             "rows_dated_2020_or_later": holdout_rows,
@@ -726,7 +781,7 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
             "twelvedata_state": _count(r["twelvedata"]["state"] for r in tickers.values()),
             "twelvedata_unavailable": sorted(t for t, r in tickers.items() if r["twelvedata"]["state"] == "unavailable"),
             "twelvedata_not_fetched": sorted(t for t, r in tickers.items() if r["twelvedata"]["state"] == "not_fetched"),
-            "below_n_pairs": sorted(t for t, r in tickers.items() if r["pairs"] < CROSSCHECK.min_pairs),
+            "below_n_pairs": sorted(t for t, r in tickers.items() if r["pairs"] < probe_rule().min_pairs),
             "excluded_adjustment_pairs_total": sum(r["excluded_adjustment_pairs"] for r in tickers.values()),
             "dropped_nonconsecutive_total": sum(r["dropped_nonconsecutive"] for r in tickers.values()),
             "twelvedata_missing_window_end": td_end_missing,
@@ -739,6 +794,7 @@ def build_crosscheck_report(probe: Mapping, *, lo: date, hi: date, code_sha: str
 
 def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: str, snapshot_as_of_ts: datetime,
                              tiingo_meta_fetch_log_sha256: str | None) -> dict:
+    common = _common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts)
     tickers = {}
     for t, r in sorted(probe["records"].items()):
         if "tiingo_meta" not in r:
@@ -749,8 +805,8 @@ def build_tiingo_meta_report(probe: Mapping, *, lo: date, hi: date, code_sha: st
                       "sec_name": r["entity"]["sec_name"], "entity_check": r["entity"]["check"],
                       "listed_from": r["listed_from"]}
     return {
-        "report": "vs1-v6-tiingo-metadata",
-        **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
+        "report": f"{common['prereg']['study']}-tiingo-metadata",
+        **common,
         "request": {"url": fetch.TIINGO_META_URL, "fetch_log_sha256": tiingo_meta_fetch_log_sha256},
         "name_match": {"jaccard_min": v6.NAME_JACCARD_MIN, "stop_tokens": sorted(v6.NAME_STOP_TOKENS),
                        "or": "one joined token string prefixes the other"},
@@ -811,9 +867,15 @@ def build_report(probe: Mapping, *, tickers: Sequence[str], benchmark: str, lo: 
         "probe_version": PROBE_VERSION,
         **_common(probe, lo=lo, hi=hi, code_sha=code_sha, snapshot_as_of_ts=snapshot_as_of_ts),
         "read_window": {"start": lo.isoformat(), "end": hi.isoformat(),
-                        "why": "discovery 2012-01-01..2019-12-31 plus the harness's 60-day warm-up; nothing on or "
-                               "after 2020-01-01 is read"},
+                        "why": f"discovery {v1.discovery_start()[:10]}..2019-12-31 plus the harness's "
+                               "60-day warm-up; nothing on or after 2020-01-01 is read"},
         "refused_sources": sorted(REFUSED_SOURCES) + [f"{p}*" for p in REFUSED_PREFIXES] + ["every source but TIINGO"],
+        **({"source_filtering_query": {
+            "other_sources": list(probe["other_sources"]),
+            "other_source_ids": [s["id"] for s in probe["other_sources"]],
+            "resolved": "once, at the start of the run: every source_catalog row whose id is not the admitted "
+                        "source's; each ticker's other-source row counts use source_id IN (this list)",
+        }} if "other_sources" in probe else {}),
         "series_template": SERIES_TEMPLATE,
         "basis": BASIS,
         "benchmark": benchmark,
@@ -824,7 +886,7 @@ def build_report(probe: Mapping, *, tickers: Sequence[str], benchmark: str, lo: 
                        "max_split_term": MAX_SPLIT_TERM, "max_whole_split": MAX_WHOLE_SPLIT,
                        "min_split_move": MIN_SPLIT_MOVE, "max_distribution_drop": MAX_DISTRIBUTION_DROP,
                        "td_match_days": TD_MATCH_DAYS, "splice_tol": SPLICE_TOL,
-                       "crosscheck": dataclasses.asdict(CROSSCHECK), "low_price_usd": LOW_PRICE_USD},
+                       "crosscheck": dataclasses.asdict(probe_rule()), "low_price_usd": LOW_PRICE_USD},
         "interpretation": list(INTERPRETATION),
         "crosscheck_report_sha256": crosscheck_report_sha256,
         "tiingo_meta_report_sha256": tiingo_meta_report_sha256,

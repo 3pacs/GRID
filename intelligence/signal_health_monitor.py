@@ -74,6 +74,7 @@ EXPECTED_CADENCE_BY_PREFIX: dict[str, int] = {
     "credit_card:":         7,    # weekly credit card spend
     "buybacks:":            90,   # quarterly buyback announcements
     "semi:":                30,   # monthly semiconductor sales
+    "ecb_ilm:":             7,    # weekly Eurosystem LTRO outstanding (ECB ILM)
     "ecb_tltro:":           7,    # weekly ECB TLTRO drawdown
     "pboc:":                1,    # daily PBOC OMO and balance sheet
     "pboc_omo_ann:":        1,    # daily PBoC OMO announcements (pbc.gov.cn)
@@ -82,6 +83,7 @@ EXPECTED_CADENCE_BY_PREFIX: dict[str, int] = {
     "lme:":                 1,    # daily LME metal warehouses
     "iron_ore:":            7,    # weekly iron ore
     "taiwan_strait:":       1,    # daily Taiwan Strait incidents
+    "pla_activity:":        1,    # daily PLA activity (MND via air.mnd.gov.tw)
     "credit_proxy:":        1,    # daily credit proxy stack
     "ais:":                 1,    # 4h cadence aggregated to daily
     "social_port:":         1,    # daily social port mentions

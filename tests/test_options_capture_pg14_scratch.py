@@ -47,7 +47,7 @@ def _puller(engine, yahoo):
     puller = options.OptionsPuller.__new__(options.OptionsPuller)
     puller.engine = engine
     puller._yahoo = yahoo
-    puller._push_to_resolved = lambda *_args: None
+    puller._push_to_resolved = lambda *_args, **_kwargs: 0
     return puller
 
 
@@ -284,6 +284,10 @@ def test_pg14_real_clock_non_session_refuses_before_provider(scratch_pg14) -> No
         assert conn.execute(text("SELECT COUNT(*) FROM options_snapshots")).scalar_one() == 0
 
 
+@pytest.mark.skip(reason=(
+    "opt-in local PG14 check of the retired delete-then-insert contract; since "
+    "options_append_only_20260930 the append-only contract is enforced in CI by "
+    "tests/test_options_append_only_pg.py"))
 def test_pg14_migration_replacement_rollback_and_overlap(synthetic_session_pg14, monkeypatch):
     engine, now = synthetic_session_pg14
     day = now.date()

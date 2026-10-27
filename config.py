@@ -9,12 +9,13 @@ non-development environments.
 
 from __future__ import annotations
 
+import math
 import os
 import sys
 
 from dotenv import load_dotenv
 from loguru import logger as log
-from pydantic import ConfigDict, field_validator
+from pydantic import ConfigDict, Field, field_validator
 from pydantic_settings import BaseSettings
 
 # Load .env from the project root (same directory as this file)
@@ -84,6 +85,12 @@ class Settings(BaseSettings):
     # SECFTDPuller fails closed with a clear error if this is unset rather
     # than silently sending an unidentified request.
     SEC_USER_AGENT: str = ""
+    # Reddit Data API, application-only OAuth (free tier). Owner registers a
+    # "script" app at reddit.com/prefs/apps; see ingestion/altdata/reddit_oauth.py.
+    # Empty = Reddit pullers report FAILED "not configured" and send nothing.
+    REDDIT_CLIENT_ID: str = ""
+    REDDIT_CLIENT_SECRET: str = ""
+    REDDIT_USERNAME: str = ""
     GDELT_API_KEY: str = ""
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
@@ -268,12 +275,45 @@ class Settings(BaseSettings):
     OLLAMA_Z4_CHAT_MODEL: str = "qwen3:8b"
     OLLAMA_Z4_EMBED_MODEL: str = "nomic-embed-text"
 
-    # koala card 1 — Kokoro TTS server (CPU inference, FastAPI on :8091).
-    # OpenAI-compatible /v1/audio/speech endpoint. 54 voices, 24kHz mono WAV.
-    # Useful as a local replacement for OpenAI TTS in audio_briefing.py.
-    KOKORO_TTS_BASE_URL: str = "http://koala:8091"
-    KOKORO_TTS_ENABLED: bool = True
-    KOKORO_TTS_VOICE: str = "af_sarah"
+    # Local Kokoro TTS for the on-demand audio briefing
+    # (intelligence/audio_briefing.py). Kokoro-FastAPI, OpenAI-compatible
+    # ``POST /v1/audio/speech`` returning MP3. Verified 2026-10-01Z: gridz4
+    # (HP Z4 G4) runs it as the docker container ``kokoro-tts-cpu``
+    # (ghcr.io/remsky/kokoro-fastapi-cpu) on :8880 with 67 voices; grid-svr
+    # reaches it at http://gridz4:8880. The old koala:8091 server has been
+    # offline since ~2026-07-25. Empty URL = not configured: the briefing is
+    # text-only and says so. Paid TTS is never a fallback for a local failure.
+    GRID_KOKORO_URL: str = ""
+    GRID_KOKORO_VOICE: str = "af_heart"
+    # Read timeout for one synthesis. ~24s measured for a 234-word script on
+    # gridz4 CPU; 60s leaves headroom while staying well inside the ~100s
+    # Cloudflare origin limit once LLM script time is added.
+    GRID_KOKORO_TIMEOUT_SECONDS: float = Field(60.0, gt=0, le=600)
+    # Writable directory for briefing MP3 + JSON sidecars. Empty = automatic:
+    # /data/grid_v4/briefings when running from an immutable release
+    # (grid_release.releases/<sha>), else <checkout>/outputs/briefings.
+    GRID_BRIEFING_DIR: str = ""
+
+    @field_validator("GRID_KOKORO_TIMEOUT_SECONDS", mode="before")
+    @classmethod
+    def _coerce_blank_kokoro_timeout(cls, v: object) -> object:
+        """Blank, non-finite or out-of-range (<=0, >600) values keep the 60s
+        default instead of crashing grid-api startup over an optional
+        feature; non-numeric garbage still raises so a real typo is seen."""
+        if isinstance(v, str):
+            if not v.strip():
+                return 60.0
+            try:
+                num = float(v)
+            except ValueError:
+                return v
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            num = float(v)
+        else:
+            return v
+        if not math.isfinite(num) or num <= 0 or num > 600:
+            return 60.0
+        return num
 
     # koala card 1 — whisper.cpp Vulkan transcription server (port 8092).
     # whisper-large-v3-turbo model, runs on GTX TITAN X via Vulkan backend.
@@ -455,6 +495,37 @@ class Settings(BaseSettings):
     GRID_ENABLE_BULK_HYPOTHESIS_JOB: bool = False
     GRID_ENABLE_LEGACY_PAPER_TRADING_JOB: bool = False
 
+    # Taiwan Strait OSINT job (owner decision 2026-09-29, GRID-STALE-SOURCES-
+    # AUDIT-20260929.md §2D / §5 row 5). `intelligence/scheduler.py`'s daily
+    # 23:30 `_taiwan_strait_osint_daily` -> `run_taiwan_strait_puller` job
+    # scrapes Taiwan MND pages that now 404; until 2026-09-29 it then wrote
+    # zero-count placeholder "seed" rows into raw_series as SUCCESS. The
+    # puller no longer writes placeholders, and the job stays unregistered
+    # (same semantics as the Wave 3 flags above) until the scraper has a
+    # working MND endpoint and this flag is set in a reviewed change.
+    GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB: bool = False
+
+    # LME warehouse job (2026-09-29, GRID-DEAD-FEEDS-FIX-20260929.md). Both
+    # LME URLs answer HTTP 403 with a Cloudflare managed challenge
+    # ("cf-mitigated: challenge") to any non-browser client; there is no
+    # free programmatic LME endpoint and GRID does not bypass bot checks.
+    # The daily 09:00 `_lme_warehouse_daily` job therefore stays
+    # unregistered until a legitimate endpoint exists and this flag is set
+    # in a reviewed change.
+    GRID_ENABLE_LME_WAREHOUSE_JOB: bool = False
+
+    # Sentiment learned-weight promotion (source review on PR #903,
+    # 2026-10-23). The daily `_sentiment_outcomes_daily` closer in
+    # intelligence/scheduler.py records outcomes on sentiment_predictions
+    # through `score_past_predictions(update_weights=False)`; the Bayesian
+    # `_update_weights` step, which inserts a new sentiment_weights version
+    # that every later compute_sentiment() consumes, is a model/weight-
+    # registry write in the same held category as the Wave 3 flags above.
+    # It stays off for the scheduled closer until this flag is set in a
+    # reviewed change. The historical run_sentiment_cycle / grid_cron.sh
+    # contract (scoring followed by promotion) is unchanged by this flag.
+    GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION: bool = False
+
     # Paid LLM providers (openai, openrouter, anthropic, huggingface) are hard-gated
     # OFF unless this is explicitly True. Declared here because llm/router.py reads
     # it via getattr(settings, ...) and pydantic-settings only binds env vars to
@@ -469,6 +540,9 @@ class Settings(BaseSettings):
         "GRID_ENABLE_SCANNER_WEIGHTS_JOB",
         "GRID_ENABLE_BULK_HYPOTHESIS_JOB",
         "GRID_ENABLE_LEGACY_PAPER_TRADING_JOB",
+        "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
+        "GRID_ENABLE_LME_WAREHOUSE_JOB",
+        "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
         mode="before",
     )
     @classmethod

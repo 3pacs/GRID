@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.sqlite*
+*.db
+*.log
+snapshot.json
+chain.csv
+.env
+tape-recordings/
+research-evidence/

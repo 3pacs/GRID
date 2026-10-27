@@ -1,0 +1,138 @@
+name: Quiver synthetic PostgreSQL qualification
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quiver-synthetic-pg-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  quiver-pg14:
+    name: Quiver PG14 synthetic contracts
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      DB_HOST: 127.0.0.1
+      DB_PORT: "15432"
+      DB_NAME: qq_batch_test
+      DB_USER: qq_ci_writer
+      DB_PASSWORD: synthetic-writer-only
+      GRID_TEST_DB_URL: postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test
+      GRID_QQ_TEST_DB_URL: postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test
+      GRID_QQ_REQUIRE_PG: "1"
+      GRID_JWT_SECRET: synthetic-ci-only
+      TESTING: "true"
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Record receiving checkout
+        env:
+          EXPECTED_CHECKOUT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$EXPECTED_CHECKOUT"
+          git show -s --format='checkout=%H tree=%T parents=%P'
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Install existing project test dependencies
+        timeout-minutes: 10
+        run: python -m pip install -r requirements.txt
+
+      # Hosted disposable VM only. Host networking makes the server-side address
+      # genuinely127.0.0.1; Docker port publishing would expose a172.* server address
+      # and fail the unchanged fixture. PG listens only on loopback port15432.
+      - name: Start isolated synthetic PostgreSQL14
+        timeout-minutes: 3
+        run: |
+          set -euo pipefail
+          docker run --detach --name qq-synthetic-pg --network host \
+            --label grid-purpose=quiver-synthetic-ci \
+            -e POSTGRES_USER=qq_ci_admin \
+            -e POSTGRES_PASSWORD=synthetic-admin-only \
+            -e POSTGRES_DB=postgres \
+            postgres:14 -c listen_addresses=127.0.0.1 -c port=15432
+          ready=0
+          for attempt in $(seq 1 45); do
+            if docker exec qq-synthetic-pg pg_isready -h 127.0.0.1 -p 15432 -U qq_ci_admin -d postgres; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+          test "$ready" = 1
+          docker exec -e PGPASSWORD=synthetic-admin-only qq-synthetic-pg \
+            psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -p 15432 -U qq_ci_admin -d postgres \
+            -c "CREATE ROLE qq_ci_writer LOGIN PASSWORD 'synthetic-writer-only' NOSUPERUSER NOCREATEROLE NOCREATEDB NOREPLICATION;" \
+            -c "CREATE DATABASE qq_batch_test OWNER qq_ci_writer;" \
+            -c "COMMENT ON DATABASE qq_batch_test IS 'grid-quiver-synthetic-ci-only';"
+          docker inspect --format='image={{.Image}} network={{.HostConfig.NetworkMode}} purpose={{index .Config.Labels "grid-purpose"}}' qq-synthetic-pg
+
+      - name: Verify synthetic identity before tests
+        timeout-minutes: 1
+        run: |
+          python - <<'PY'
+          import os
+          from sqlalchemy import create_engine, text
+          expected = 'postgresql://qq_ci_writer:synthetic-writer-only@127.0.0.1:15432/qq_batch_test'
+          assert os.environ['GRID_QQ_TEST_DB_URL'] == expected
+          engine = create_engine(expected, connect_args={'connect_timeout': 5})
+          try:
+              with engine.connect() as conn:
+                  identity = conn.execute(text("SELECT current_database(), current_user, host(inet_server_addr()), inet_server_port(), current_setting('server_version_num')::int, rolsuper, rolcreaterole, rolcreatedb, rolreplication FROM pg_roles WHERE rolname=current_user")).one()
+                  assert tuple(identity[:4]) == ('qq_batch_test', 'qq_ci_writer', '127.0.0.1', 15432), identity
+                  assert identity[4] // 10000 == 14, identity
+                  assert tuple(identity[5:]) == (False, False, False, False), identity
+                  marker = conn.execute(text("SELECT shobj_description(oid,'pg_database') FROM pg_database WHERE datname=current_database()")).scalar_one()
+                  assert marker == 'grid-quiver-synthetic-ci-only', marker
+                  print('Synthetic PG identity verified:', tuple(identity))
+          finally:
+              engine.dispose()
+          PY
+
+      - name: Run all six native Quiver modules serially
+        timeout-minutes: 10
+        run: |
+          python -m pytest -q --tb=short --timeout=60 -n 0 --junitxml=qq-native-results.xml \
+            tests/test_qq_short_transactions_pg.py \
+            tests/test_qq_final_safety_pg.py \
+            tests/test_qq_cleanup_safety_pg.py \
+            tests/test_qq_publication_cleanup_pg.py \
+            tests/test_qq_audit_context_pg.py \
+            tests/test_qq_interruption_receipt_pg.py
+
+      - name: Require native coverage and no skipped cases
+        if: always()
+        timeout-minutes: 1
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('qq-native-results.xml').getroot()
+          cases = root.findall('.//testcase')
+          expected = {'tests.test_qq_short_transactions_pg', 'tests.test_qq_final_safety_pg', 'tests.test_qq_cleanup_safety_pg', 'tests.test_qq_publication_cleanup_pg', 'tests.test_qq_audit_context_pg', 'tests.test_qq_interruption_receipt_pg'}
+          observed = {case.attrib.get('classname') for case in cases}
+          assert expected <= observed, (expected, observed)
+          assert cases and not root.findall('.//skipped') and not root.findall('.//failure') and not root.findall('.//error')
+          print('Native Quiver qualification: passed=', len(cases), 'modules=', sorted(observed), 'skipped=0')
+          PY
+
+      - name: Destroy synthetic database container and volume
+        if: always()
+        timeout-minutes: 1
+        run: |
+          set -euo pipefail
+          if docker container inspect qq-synthetic-pg >/dev/null 2>&1; then
+            test "$(docker inspect --format='{{index .Config.Labels "grid-purpose"}}' qq-synthetic-pg)" = quiver-synthetic-ci
+            timeout 30s docker rm --force --volumes qq-synthetic-pg
+          fi
+          test -z "$(docker ps -aq --filter name='^/qq-synthetic-pg$')"

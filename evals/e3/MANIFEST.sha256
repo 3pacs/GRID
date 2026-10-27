@@ -1,0 +1,7 @@
+# E3 hill-climb harness manifest (sha256, CRLF->LF for text files)
+# version: e3-v1
+45a7ded776b481687d44fdac3cb6195f89a9a3d6154df573665b45e1a6450175  .gitattributes
+041fd2f510cda8fbcdf11f989d7097957f52c6bd82ffe762c5fcd187b0820e8c  README.md
+5500d66b5b920a0a35a18dbdce65db39b4f6ca9705b8a1111754affd127967e5  __init__.py
+9df5e3ac931d9317970e158e35c290a59f7209d0051e09976021d6a63cb56d02  ledger.py
+a6bd121427a01cd52a3144175352ff9c38b8919d83e37136151f2f68cdc18348  manifest.py
