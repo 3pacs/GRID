@@ -808,6 +808,10 @@ class Settings(BaseSettings):
 
     # Email alerts
     ALERT_EMAIL_ENABLED: bool = True
+    # Research newsletter only. Supply a JSON array of two approved addresses
+    # at deployment; an empty/invalid audience fails closed without falling
+    # back to ALERT_EMAIL_TO. Other alert categories retain their own routing.
+    RESEARCH_DIGEST_EMAIL_TO: tuple[str, ...] = ()
     ALERT_EMAIL_TO: str = "stepdadfinance@gmail.com"
     # 2026-09-10: GRID sends as the Hermes mailbox (ROADMAP Phase 15). A bare
     # "@grid-svr" sender through local Postfix is what Gmail dropped silently.
