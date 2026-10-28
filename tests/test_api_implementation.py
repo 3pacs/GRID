@@ -19,8 +19,12 @@ import deploy_api_isolated as txn
 import deploy_api_launcher as launcher
 import deploy_api_rollback as rollback
 import deploy_api_bundle as builder
-from test_api_bundle_contract import fixture
-from test_api_isolation_prototype import Simulation
+if __package__:
+    from .test_api_bundle_contract import fixture
+    from .test_api_isolation_prototype import Simulation
+else:
+    from test_api_bundle_contract import fixture
+    from test_api_isolation_prototype import Simulation
 
 
 def binding():

@@ -6,8 +6,12 @@ import stat
 import types
 import unittest
 
-import test_api_implementation as implementation
-from test_api_implementation import Kernel, binding, adapter, txn
+if __package__:
+    from . import test_api_implementation as implementation
+    from .test_api_implementation import Kernel, binding, adapter, txn
+else:
+    import test_api_implementation as implementation
+    from test_api_implementation import Kernel, binding, adapter, txn
 
 
 def approval(b,k):

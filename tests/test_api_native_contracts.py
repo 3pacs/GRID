@@ -4,7 +4,10 @@ import ast
 import types
 import unittest
 from unittest.mock import patch
-import test_api_implementation as impl
+if __package__:
+    from . import test_api_implementation as impl
+else:
+    import test_api_implementation as impl
 import api_isolation_bootstrap as bootstrap
 import api_isolation_native_store as native
 from api_bundle_contract import Refusal,json_hash

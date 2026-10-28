@@ -1,8 +1,12 @@
 """Missing/stale history controls, with injected manager and durable-state model."""
 import copy
 import unittest
-import test_api_implementation as impl
-import test_api_reconciliation as reconciliation
+if __package__:
+    from . import test_api_implementation as impl
+    from . import test_api_reconciliation as reconciliation
+else:
+    import test_api_implementation as impl
+    import test_api_reconciliation as reconciliation
 
 
 class LedgerTests(unittest.TestCase):
