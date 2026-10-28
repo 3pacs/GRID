@@ -27,9 +27,6 @@ Workflow file format:
 from __future__ import annotations
 
 import os
-import hashlib
-import json
-import stat
 import re
 from pathlib import Path
 from typing import Any
@@ -41,108 +38,6 @@ from loguru import logger as log
 _WORKFLOWS_DIR = Path(__file__).parent
 _AVAILABLE_DIR = _WORKFLOWS_DIR / "available"
 _ENABLED_DIR = _WORKFLOWS_DIR / "enabled"
-
-
-class WorkflowStateUnknown(ValueError):
-    """The supplied isolated API selection cannot be established."""
-
-
-def _plain_path(path: Path, *, directory: bool) -> Path:
-    """Reject relative, aliased and nonregular paths before reading content.
-
-    Deployment must keep the supplied namespaces immutable while reading;
-    this portable check is not a descriptor-based race/security boundary.
-    """
-    if not path.is_absolute() or ".." in path.parts:
-        raise WorkflowStateUnknown("workflow state requires an absolute plain path")
-    try:
-        for part in (*reversed(path.parents), path):
-            info = part.lstat()
-            if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
-                raise WorkflowStateUnknown("workflow path aliases are unsupported")
-        mode = path.stat().st_mode
-        if not (stat.S_ISDIR(mode) if directory else stat.S_ISREG(mode)):
-            raise WorkflowStateUnknown("workflow path has incompatible type")
-        return path
-    except OSError as exc:
-        raise WorkflowStateUnknown("workflow state path is unavailable") from exc
-
-
-def read_api_selection(binding: dict[str, str]) -> list[dict[str, Any]]:
-    """Read a prospective, externally attested API-only selection snapshot.
-
-    No environment/default path discovery, initialization, migration or writes.
-    The trusted caller supplies an absolute state_root, receipt_sha256 and
-    source_identity. selection.json must bind every available definition's raw
-    SHA256, its exact enabled filenames, version 1 and the same source identity.
-    Receipt authentication/continuity and namespace custody are caller duties.
-    """
-    try:
-        if not isinstance(binding, dict) or set(binding) != {
-            "state_root", "receipt_sha256", "source_identity"
-        } or not all(isinstance(v, str) and v for v in binding.values()):
-            raise WorkflowStateUnknown("incomplete workflow state binding")
-        digest = binding["receipt_sha256"]
-        if not re.fullmatch(r"[0-9a-f]{64}", digest):
-            raise WorkflowStateUnknown("invalid workflow receipt digest")
-        source = _plain_path(_WORKFLOWS_DIR.absolute(), directory=True)
-        available = _plain_path(_AVAILABLE_DIR.absolute(), directory=True)
-        root = _plain_path(Path(binding["state_root"]), directory=True)
-        # State cannot overlap any part of the source bundle.
-        bundle = source.parent
-        if root == bundle or bundle in root.parents or root in bundle.parents:
-            raise WorkflowStateUnknown("workflow state overlaps source bundle")
-        raw = _plain_path(root / "selection.json", directory=False).read_bytes()
-        if hashlib.sha256(raw).hexdigest() != digest:
-            raise WorkflowStateUnknown("workflow receipt identity mismatch")
-        receipt = json.loads(raw)
-        if not isinstance(receipt, dict) or set(receipt) != {
-            "version", "source_identity", "definitions", "enabled"
-        } or type(receipt["version"]) is not int or receipt["version"] != 1:
-            raise WorkflowStateUnknown("unsupported workflow receipt version/schema")
-        if receipt["source_identity"] != binding["source_identity"]:
-            raise WorkflowStateUnknown("workflow source identity mismatch")
-        definitions, enabled = receipt["definitions"], receipt["enabled"]
-        if not isinstance(definitions, dict) or not isinstance(enabled, list):
-            raise WorkflowStateUnknown("invalid workflow selection")
-        if any(not isinstance(n, str) or not re.fullmatch(r"[A-Za-z0-9_-]+\.md", n)
-               for n in [*definitions, *enabled]):
-            raise WorkflowStateUnknown("unsafe workflow selection filename")
-        if len(enabled) != len(set(enabled)) or not set(enabled) <= set(definitions):
-            raise WorkflowStateUnknown("unknown or duplicate selected workflow")
-        if set(definitions) != {p.name for p in available.glob("*.md")}:
-            raise WorkflowStateUnknown("workflow definition inventory mismatch")
-        result = []
-        names = set()
-        for filename in sorted(definitions):
-            path = _plain_path(available / filename, directory=False)
-            content = path.read_bytes()
-            if hashlib.sha256(content).hexdigest() != definitions[filename]:
-                raise WorkflowStateUnknown("workflow definition identity mismatch")
-            # Parse the checked bytes without consulting legacy enabled links.
-            frontmatter, body = _parse_frontmatter(content.decode("utf-8"))
-            if not isinstance(frontmatter, dict):
-                raise WorkflowStateUnknown("invalid workflow definition")
-            sections = _parse_sections(body)
-            name = frontmatter.get("name", path.stem)
-            if not isinstance(name, str) or name in names:
-                raise WorkflowStateUnknown("ambiguous workflow identity")
-            names.add(name)
-            result.append({
-                "name": name, "group": frontmatter.get("group", "misc"),
-                "schedule": frontmatter.get("schedule", ""),
-                "secrets": frontmatter.get("secrets", []),
-                "depends_on": frontmatter.get("depends_on", []),
-                "description": frontmatter.get("description", ""),
-                "steps": sections.get("steps", ""), "output": sections.get("output", ""),
-                "notes": sections.get("notes", ""), "file_path": str(path),
-                "enabled": filename in enabled,
-            })
-        return result
-    except WorkflowStateUnknown:
-        raise
-    except (OSError, ValueError, TypeError, KeyError) as exc:
-        raise WorkflowStateUnknown("workflow selection is unavailable or incompatible") from exc
 
 
 def _parse_frontmatter(content: str) -> tuple[dict[str, Any], str]:
