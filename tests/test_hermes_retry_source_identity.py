@@ -15,6 +15,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 FIXERS = ROOT / "scripts/hermes_fixers.py"
 SCHEDULER = ROOT / "ingestion/smart_scheduler.py"
+OPTIONS = ROOT / "ingestion/options.py"
 
 
 class Log:
@@ -45,6 +46,23 @@ class Engine:
 
     def begin(self):
         return Transaction(self)
+
+    def connect(self):
+        self.observations = getattr(self, "observations", 0) + 1
+        if getattr(self, "observation_error", None):
+            raise self.observation_error
+        engine = self
+        class Observation:
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def execute(self, sql, params=None):
+                engine.observed_sql = getattr(engine, "observed_sql", []) + [(sql, params)]
+                return self
+            def fetchone(self):
+                return getattr(engine, "counts", (0, 0))
+        return Observation()
 
 
 def project(fixers: Path, scheduler: Path, importer):
@@ -80,6 +98,12 @@ def project(fixers: Path, scheduler: Path, importer):
             if any(isinstance(n, ast.Name) and n.id in {"_CATALOG_TO_REGISTRY", "_NOT_FRESH_OUTCOMES"} for n in targets):
                 selected.append(node)
     exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])), "<actual-fixers>", "exec"), env)
+    # Project only the actual policy helper, with its dependencies supplied by
+    # the harness. Never import the options module or any provider/DB package.
+    guard = next(n for n in ast.parse(OPTIONS.read_text(encoding="utf-8")).body
+                 if isinstance(n, ast.FunctionDef) and n.name == "automatic_options_capture_guard")
+    env["Engine"] = Any
+    exec(compile(ast.fix_missing_locations(ast.Module(body=[guard], type_ignores=[])), "<actual-options-guard>", "exec"), env)
     return env
 
 
@@ -93,6 +117,8 @@ class Harness:
         self.calls = []
         self.callback = lambda puller, kwargs: {"status": "SUCCESS", "rows_inserted": 2}
         self.options_guard = None
+        self.policy = "legacy"
+        self.policy_imports = []
         real_import = builtins.__import__
 
         def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -100,6 +126,9 @@ class Harness:
                 return types.SimpleNamespace(_SOURCE_REGISTRY=self.registry)
             if name == "ingestion.smart_scheduler":
                 return types.SimpleNamespace(**self.env)
+            if name == "ingestion.options" and tuple(fromlist) == ("automatic_options_capture_guard",):
+                self.policy_imports.append(tuple(fromlist))
+                return types.SimpleNamespace(automatic_options_capture_guard=self.env["automatic_options_capture_guard"])
             if name == "sqlalchemy":
                 return types.SimpleNamespace(text=lambda sql: sql)
             if name == "importlib":
@@ -109,7 +138,13 @@ class Harness:
             raise AssertionError("Unexpected production import: " + name)
         # Functions capture their builtins at definition time: install the
         # rejecting importer before compiling either production projection.
+        self.rejecting_import = fake_import
         self.env = project(FIXERS, SCHEDULER, fake_import)
+        def getenv(name, default):
+            assert name == "GRID_OPTIONS_AUTOMATIC_WRITER_POLICY"
+            return default if self.policy is None else self.policy
+        self.env.update(os=types.SimpleNamespace(getenv=getenv), text=lambda sql: sql,
+                        _utc_now=lambda: datetime(2026, 10, 27, 15, tzinfo=timezone.utc))
         self.env["_scheduler_options_retry_guard"] = lambda engine: self.options_guard
 
     def import_module(self, name):
@@ -389,13 +424,86 @@ class SourceIdentityTests(unittest.TestCase):
         self.assertEqual(self.h.engine.formed_updates[0]["params"], {"name": "yfinance_earnings"})
 
 
+    def test_26_real_daily_policy_refuses_before_constructor_and_preserves_backlog(self):
+        for name in ("options", "yfinance_options", "YFINANCE_OPTIONS", "yfinance-options"):
+            with self.subTest(name=name):
+                h = Harness()
+                h.policy = "daily_scheduler"
+                h.add("options", "YFINANCE_OPTIONS")
+                h.registry["yfinance_options"] = h.registry["options"]
+                state = types.SimpleNamespace(repair_backlog={name: ["SYNTH"]})
+                result = h.retry(name, state=state)
+                self.assertEqual(result["outcome"], "SKIPPED")
+                self.assertEqual(result["rows_inserted"], 0)
+                self.assertEqual(state.repair_backlog, {name: ["SYNTH"]})
+                self.assertEqual(h.constructed, [])
+                self.assertEqual(h.calls, [])
+                self.assertEqual(h.imports, [])
+                self.assertEqual(h.engine.formed_updates, [])
+                self.assertEqual(h.env["_REPAIRS_IN_FLIGHT"], {})
+                self.assertEqual(h.env["_repair_token_seq"], 0)
+                self.assertEqual(h.engine.observed_sql[0][0], "SET TRANSACTION READ ONLY")
+
+    def test_27_unknown_metadata_cannot_become_fallback_or_freshness(self):
+        for counts, error in [(None, None), ((0, 0), None), ((366, 122), None),
+                              ((0, 0), RuntimeError("synthetic-private-driver-detail"))]:
+            with self.subTest(counts=counts, error=type(error).__name__):
+                h = Harness()
+                h.policy = "daily_scheduler"
+                h.engine.counts, h.engine.observation_error = counts, error
+                result = h.retry("options")
+                self.assertEqual(result["outcome"], "SKIPPED")
+                self.assertEqual(result["rows_inserted"], 0)
+                self.assertEqual(h.constructed + h.calls + h.imports + h.engine.formed_updates, [])
+                self.assertNotIn("synthetic-private-driver-detail", repr(result) + repr(h.env["log"].entries))
+
+    def test_28_unset_blank_legacy_keep_existing_single_writer_and_observation_contract(self):
+        for policy in (None, "", "legacy", " LEGACY "):
+            with self.subTest(policy=policy):
+                h = Harness()
+                h.policy = policy
+                h.add("options", "YFINANCE_OPTIONS")
+                result = h.retry("options")
+                self.assertEqual(result["outcome"], "SUCCESS")
+                self.assertEqual(h.constructed, ["options"])
+                self.assertEqual(h.engine.formed_updates, [])
+                self.assertEqual(getattr(h.engine, "observations", 0), 0)
+
+    def test_29_invalid_policy_refuses_without_observation_or_repair_token(self):
+        self.h.policy = "UNKNOWN"
+        result = self.h.retry("options")
+        self.assertEqual(result["reason"], "invalid_options_writer_policy")
+        self.assertEqual(getattr(self.h.engine, "observations", 0), 0)
+        self.assertEqual(self.h.env["_repair_token_seq"], 0)
+        self.assertEqual(self.h.calls + self.h.constructed, [])
+
+    def test_30_allowlist_does_not_admit_options_module_or_provider_imports(self):
+        for name, fromlist in [("ingestion.options", ()), ("ingestion.options", ("OptionsPuller",)),
+                               ("ingestion.options", ("automatic_options_capture_guard", "OptionsPuller")),
+                               ("requests", ()), ("yfinance", ())]:
+            with self.subTest(name=name, fromlist=fromlist), self.assertRaises(AssertionError):
+                self.h.rejecting_import(name, fromlist=fromlist)
+
+    def test_31_removed_guard_is_detected_by_effect_refusal_invariant(self):
+        self.h.policy = "daily_scheduler"
+        self.h.add("options", "YFINANCE_OPTIONS")
+        self.h.env["automatic_options_capture_guard"] = lambda engine: None
+        result = self.h.retry("options")
+        self.assertEqual(result["outcome"], "SUCCESS")  # negative-control mutation
+        with self.assertRaises(AssertionError):
+            self.assertEqual(self.h.constructed, [])
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fixers", type=Path)
     parser.add_argument("--scheduler", type=Path)
+    parser.add_argument("--options", type=Path)
     args, remaining = parser.parse_known_args()
     if args.fixers:
         FIXERS = args.fixers
     if args.scheduler:
         SCHEDULER = args.scheduler
+    if args.options:
+        OPTIONS = args.options
     unittest.main(argv=[__file__, *remaining], verbosity=2)
