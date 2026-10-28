@@ -733,24 +733,29 @@ class TestBaselinePredictionsPaidGate:
 
 class TestRegressionEvalArmBGate:
     @pytest.fixture(autouse=True)
-    def _ensure_env_file(self):
-        """``scripts/run_regression_eval.py`` ``sys.exit(2)``s at import time
-        if the repo has no ``.env`` (a real dev checkout always does; CI's
-        Backend Tests job passes env vars directly and has none). That's a
-        pre-existing script quirk unrelated to the paid gate -- create an
-        empty one only if missing, so importing the module in a test doesn't
-        depend on it, and remove it again so nothing is left behind.
+    def _ensure_env_file(self, monkeypatch):
+        """Supply only this import's synthetic env prerequisite, without
+        creating/removing a repository file shared by xdist workers or
+        loading a developer's real .env. The script's production guard and
+        both paid-client assertions remain unchanged.
         """
         import pathlib
+        import dotenv
 
         env_path = pathlib.Path(__file__).resolve().parent.parent / ".env"
-        created = False
-        if not env_path.exists():
-            env_path.write_text("DB_PASSWORD=testpass\n")
-            created = True
-        yield
-        if created:
-            env_path.unlink(missing_ok=True)
+        real_exists = pathlib.Path.exists
+        real_load_dotenv = dotenv.load_dotenv
+
+        def exists(path):
+            return True if path == env_path else real_exists(path)
+
+        def load_dotenv(dotenv_path=None, *args, **kwargs):
+            if dotenv_path == env_path:
+                return False
+            return real_load_dotenv(dotenv_path, *args, **kwargs)
+
+        monkeypatch.setattr(pathlib.Path, "exists", exists)
+        monkeypatch.setattr(dotenv, "load_dotenv", load_dotenv)
 
     def _load_module(self):
         import importlib
