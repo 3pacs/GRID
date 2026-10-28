@@ -163,10 +163,18 @@ def test_init_idempotent_with_repeat_load(fake_engine_with_features) -> None:
     """Constructing two EntityMaps in the same process must not corrupt
     SEED_MAPPINGS — the V2 merge needs to remain a no-op on the second
     call."""
-    n_before = len(SEED_MAPPINGS)
+    # A fresh worker has not merged V2 yet; earlier tests must not be a
+    # prerequisite. Validate that first merge before pinning its result.
+    expected = dict(SEED_MAPPINGS)
+    for raw_id, feature_name in NEW_MAPPINGS_V2.items():
+        expected.setdefault(raw_id, feature_name)
     EntityMap(db_engine=fake_engine_with_features)
+    assert SEED_MAPPINGS == expected
+    n_before = len(SEED_MAPPINGS)
+    mappings_before = dict(SEED_MAPPINGS)
     EntityMap(db_engine=fake_engine_with_features)
     assert len(SEED_MAPPINGS) == n_before
+    assert SEED_MAPPINGS == mappings_before
 
 
 def test_module_loadable_without_db() -> None:
