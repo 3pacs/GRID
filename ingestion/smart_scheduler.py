@@ -2566,7 +2566,7 @@ class SmartScheduler:
                 summary["failed"] += 1
 
         # Report what's still due for next tick
-        summary["still_due"] = [p["name"] for p in due[MAX_PULLERS_PER_TICK:]]
+        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]
 
         elapsed = time.monotonic() - tick_start
         log.info(
