@@ -503,7 +503,13 @@ _PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n  
 def scheduler_tail_before_reviewed_options_delta(source):
     tail = source.split('\nimport calendar\n', 1)[1]
     assert tail.count(_PR806_OPTIONS_METHODS) == 1, 'PR806_OPTIONS_DELTA_CHANGED'
-    return tail.replace(_PR806_OPTIONS_METHODS, _PRE_PR806_OPTIONS_METHODS, 1)
+    # The separately reviewed backlog fix changes exactly this one reporting
+    # line. Reverse only that exact occurrence before applying the historical
+    # pin, so all other scheduler and SEC guards remain protected.
+    reviewed = '        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]\n'
+    historical = '        summary["still_due"] = [p["name"] for p in due[MAX_PULLERS_PER_TICK:]]\n'
+    assert tail.count(reviewed) == 1, 'REVIEWED_BACKLOG_DELTA_CHANGED'
+    return tail.replace(_PR806_OPTIONS_METHODS, _PRE_PR806_OPTIONS_METHODS, 1).replace(reviewed, historical, 1)
 
 
 class CurrentSecDefaultTests(unittest.TestCase):
@@ -557,6 +563,26 @@ class CurrentSecDefaultTests(unittest.TestCase):
         manifest=accepted_sec_source_manifest(SCHED.read_text())
         self.assertEqual([row[0] for row in manifest['nodes']],list(_ACCEPTED_SEC_NAMES))
         self.assertEqual(accepted_sec_source_digest(SCHED.read_text()),_ACCEPTED_SEC_SOURCE_SHA256)
+
+    def test_reviewed_backlog_allowance_rejects_mutation_or_duplication(self):
+        original = SCHED.read_text(encoding='utf-8')
+        reviewed = '        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]\n'
+        self.assertEqual(original.count(reviewed), 1)
+        mutations = [
+            original.replace(reviewed, reviewed.replace('summary["ran"]', 'summary["ran"] + 1'), 1),
+            original.replace(reviewed, reviewed.replace('summary["ran"]', 'MAX_PULLERS_PER_TICK'), 1),
+            original + '\n' + reviewed,
+            original.replace('MAX_PULLERS_PER_TICK = 8', 'MAX_PULLERS_PER_TICK = 9', 1),
+        ]
+        read = Path.read_text
+        for changed in mutations:
+            with self.subTest(changed=changed != original):
+                self.assertNotEqual(changed, original)
+                def changed_read(path, *args, **kwargs):
+                    return changed if path == SCHED else read(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', changed_read):
+                    with self.assertRaises(AssertionError):
+                        self.test_unselected_default_source_tails_are_current_base_exact()
     def test_sec_wrong_source_and_clock_refuse_before_reads(self):
         m=front();selection={'schema':'hermes-sec-only-v1','base':m._SEC_ONLY_BASE,
           'source':'other','module':'ingestion.altdata.sec_xbrl_shares','class':'SECXBRLSharesPuller',
