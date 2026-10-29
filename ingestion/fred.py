@@ -187,7 +187,6 @@ FRED_SERIES_LIST: list[str] = [
     # ── Money market / liquidity ──
     "MMMFFAQ027S",         # Money market fund total assets (quarterly)
     "WRMFNS",              # Retail money market funds (weekly)
-    "RRPONTSYD",           # Overnight reverse repo (daily)
 ]
 
 # Minimum delay between FRED API calls (seconds)

@@ -102,7 +102,7 @@ def _safe_run(label: str, fn, *args, **kwargs) -> Any:
         return None
 
 
-def run_pipeline(historical: bool = False) -> dict:
+def run_pipeline(historical: bool = False, *, send_digest: bool = True) -> dict:
     """Execute the full GRID pipeline.
 
     Steps:
@@ -117,6 +117,8 @@ def run_pipeline(historical: bool = False) -> dict:
 
     Parameters:
         historical: If True, pull from 1990-01-01. Otherwise incremental.
+        send_digest: Include the research digest for standalone callers.
+            Hermes passes False because its scheduled digest owns delivery.
 
     Returns:
         Summary dict with step results.
@@ -387,10 +389,13 @@ def run_pipeline(historical: bool = False) -> dict:
     # -----------------------------------------------------------------------
     # STEP 11: Daily digest email
     # -----------------------------------------------------------------------
-    def _digest():
-        from alerts.email import daily_digest
-        daily_digest()
-    summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
+    if send_digest is True:
+        def _digest():
+            from alerts.email import daily_digest
+            daily_digest()
+        summary["steps"]["digest"] = _safe_run("Daily Digest Email", _digest)
+    else:
+        summary["steps"]["digest"] = {"skipped": "disabled_by_caller"}
 
     # -----------------------------------------------------------------------
     # STEP 12: Retention is held in hermes_operator until its deletion policy
