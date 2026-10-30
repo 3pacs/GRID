@@ -107,9 +107,14 @@ ACCESS_SKEW_SECONDS = 60
 #: Used when the token response omits or mangles ``expires_in``.
 DEFAULT_ACCESS_LIFETIME_SECONDS = 1800
 REFRESH_TOKEN_LIFETIME_SECONDS = 7 * 24 * 3600
-#: Longest category name echoed from a provider ``errors`` object.
-_ERROR_KEY_MAX_CHARS = 40
-_ERROR_KEYS_MAX = 10
+#: The only ``errors`` categories of GET /quotes whose *names* may be logged
+#: (documented Schwab shape). Any other key is counted, never echoed, so a
+#: provider- or request-controlled key cannot reach the log.
+ERROR_CATEGORY_ALLOWLIST: tuple[str, ...] = (
+    "invalidSymbols",
+    "invalidCusips",
+    "invalidSSIDs",
+)
 
 _O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
@@ -714,24 +719,29 @@ def _as_int(v: Any) -> int | None:
 
 
 def _summarise_errors(errors: Any) -> str:
-    """Bounded, value-free summary of a provider ``errors`` object for logging.
+    """Bounded summary of a provider ``errors`` object for logging.
 
-    Only category names (truncated) and counts are emitted; the values,
-    which could echo request input or provider text, are never logged.
+    Emits only counts. The only names that appear are the fixed literals in
+    :data:`ERROR_CATEGORY_ALLOWLIST`; every other key is folded into an
+    ``other_keys`` count. Neither keys outside the allowlist nor any value
+    is ever echoed, so provider- or request-controlled text cannot reach
+    the log.
     """
     if isinstance(errors, Mapping):
         parts: list[str] = []
-        for key in list(errors)[:_ERROR_KEYS_MAX]:
-            value = errors[key]
-            count = len(value) if isinstance(value, (list, tuple, Mapping, str)) else 1
-            parts.append(f"{str(key)[:_ERROR_KEY_MAX_CHARS]}={count}")
-        extra = len(errors) - _ERROR_KEYS_MAX
-        if extra > 0:
-            parts.append(f"+{extra} more")
+        other = 0
+        for key, value in errors.items():
+            if key in ERROR_CATEGORY_ALLOWLIST:
+                count = len(value) if isinstance(value, (list, tuple, Mapping, str)) else 1
+                parts.append(f"{key}={count}")
+            else:
+                other += 1
+        if other:
+            parts.append(f"other_keys={other}")
         return ", ".join(parts) or "empty"
     if isinstance(errors, (list, tuple)):
-        return f"{len(errors)} entries"
-    return type(errors).__name__
+        return f"list={len(errors)}"
+    return "unrecognised"
 
 
 def parse_quotes(body: Mapping[str, Any]) -> dict[str, SchwabQuote]:
@@ -771,6 +781,7 @@ def parse_quotes(body: Mapping[str, Any]) -> dict[str, SchwabQuote]:
 
 
 __all__ = [
+    "ERROR_CATEGORY_ALLOWLIST",
     "MARKET_BASE",
     "READ_ONLY_PATHS",
     "TOKEN_URL",

@@ -845,8 +845,9 @@ def test_p2_errors_object_values_never_reach_logs(log_lines) -> None:
     assert len(err_lines) == 1
     line = err_lines[0]
     assert MARKER not in line and "x" * 50 not in line
-    assert "invalidSymbols=2" in line and "other=1" in line and "+13 more" in line
-    assert len(line) < 1000
+    assert "invalidSymbols=2" in line and "other_keys=22" in line
+    assert "other=" not in line and huge_key[:40] not in line
+    assert len(line) < 200
 
 
 @pytest.mark.parametrize("errors", [["a", MARKER], MARKER, 42])
@@ -854,6 +855,41 @@ def test_p2_non_mapping_errors_objects_are_summarised(log_lines, errors) -> None
     parse_quotes({"errors": errors})
     line = next(line for line in log_lines if "returned errors" in line)
     assert MARKER not in line
+    assert line.rstrip().endswith(("list=2", "unrecognised"))
+
+
+# Second independent review (d522aa27): provider-controlled *keys* must not
+# reach the log either, truncated or not.
+@pytest.mark.parametrize("key", [
+    MARKER,                              # bare fake secret as the key
+    "invalidSymbols" + MARKER,           # allowlisted prefix + secret suffix
+    MARKER + "invalidSymbols",           # secret prefix + allowlisted suffix
+    "invalidsymbols",                    # case variant of an allowlisted name
+    "Bearer " + MARKER,
+    "k" * 39 + MARKER,                   # survives a 40-char truncation
+])
+def test_p2_errors_object_keys_never_reach_logs(log_lines, key) -> None:
+    body = {"SPY": SPY_BODY["SPY"], "errors": {key: ["NOPE"], "invalidCusips": ["x", "y"]}}
+    out = parse_quotes(body)
+    assert set(out) == {"SPY"}
+    err_lines = [line for line in log_lines if "returned errors" in line]
+    assert len(err_lines) == 1
+    line = err_lines[0]
+    assert MARKER not in line and MARKER[:8] not in line and key not in line
+    assert "invalidCusips=2" in line and "other_keys=1" in line
+
+
+def test_p2_error_summary_emits_only_allowlisted_literals(log_lines) -> None:
+    """Every token before '=' in the summary is an allowlist literal or 'other_keys'."""
+    body = {"errors": {"invalidSymbols": ["A"], "invalidSSIDs": [1, 2, 3],
+                       "zzz": 1, MARKER: {"deep": MARKER}, 7: None}}
+    parse_quotes(body)
+    line = next(line for line in log_lines if "returned errors" in line)
+    summary = line.split("returned errors: ", 1)[1].strip()
+    names = [part.split("=", 1)[0] for part in summary.split(", ")]
+    assert set(names) <= set(sm.ERROR_CATEGORY_ALLOWLIST) | {"other_keys"}
+    assert summary == "invalidSymbols=1, invalidSSIDs=3, other_keys=3"
+    assert sm._summarise_errors({}) == "empty"
 
 
 # -- P3: missing expires_in -----------------------------------------------------
