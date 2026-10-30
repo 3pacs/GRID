@@ -68,6 +68,7 @@ import errno
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import time
@@ -720,19 +721,36 @@ def _as_float(v: Any) -> float | None:
     return f if math.isfinite(f) else None
 
 
+_INT_STRING = re.compile(r"[+-]?[0-9]+")
+
+
 def _as_int(v: Any) -> int | None:
-    """Non-negative integral count or ``None``. Rejects booleans, non-finite,
-    negative, fractional and > int64 values instead of truncating; never raises."""
+    """Non-negative integral count or ``None``; never raises.
+
+    * ``int`` (not ``bool``): exact.
+    * ``float``: only when finite and integral (``12.0`` -> 12); fractional
+      values are dropped, never truncated.
+    * ``str``: only a plain decimal integer (``"9007199254740993"``), parsed
+      with ``int()`` so no precision is lost through ``float``; decimal,
+      exponent, fractional or overflow strings are ``None``.
+    * anything else, negatives and values above int64 are ``None``.
+    """
     if v is None or isinstance(v, bool):
         return None
     try:
         if isinstance(v, int):
             n = v
-        else:
-            f = float(v)
-            if not math.isfinite(f) or f != int(f):
+        elif isinstance(v, float):
+            if not math.isfinite(v) or v != int(v):
                 return None
-            n = int(f)
+            n = int(v)
+        elif isinstance(v, str):
+            text = v.strip()
+            if not _INT_STRING.fullmatch(text):
+                return None
+            n = int(text)
+        else:
+            return None
     except (TypeError, ValueError, OverflowError):
         return None
     return n if 0 <= n <= MAX_COUNT else None

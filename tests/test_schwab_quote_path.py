@@ -57,7 +57,7 @@ def make_quote(symbol: str = "SPY", *, age_s: float = 3.0, **over: Any) -> Schwa
         "total_volume": VOLUME,
         "quote_time_ms": NOW_MS - int(age_s * 1000),
         "trade_time_ms": NOW_MS - int(age_s * 1000) - 50,
-        "raw": {},
+        "raw": {"symbol": symbol},
     }
     fields.update(over)
     return SchwabQuote(**fields)
@@ -805,6 +805,156 @@ def test_reader_expires_in_overflow_falls_back_to_default(expires_in):
 
 
 # ---------------------------------------------------------------------------
+# review r4 finding 1: provider symbol identity (never trust the mapping key)
+
+
+def test_identity_match_is_required_and_reported():
+    row = classify_quote("SPY", make_quote("SPY"), now=NOW)
+    assert row.status == "fresh" and row.provider_symbol == "SPY"
+    assert row.to_private_dict()["provider_symbol"] == "SPY"
+
+
+def test_identity_mismatch_is_invalid_never_live():
+    q = make_quote("OTHER")  # raw symbol OTHER, but requested/keyed as SYNTH
+    row = classify_quote("SYNTH", q, now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason == "provider symbol does not match requested symbol"
+    assert row.provider_symbol == "OTHER" and row.last is None
+    payload = row.to_private_dict()
+    assert is_unavailable(payload) and payload["symbol"] == "SYNTH" and payload["provider_symbol"] == "OTHER"
+
+
+@pytest.mark.parametrize("raw", [{}, {"symbol": None}, {"symbol": ""}, {"symbol": "  "}, {"symbol": 1}, {"symbol": True}, {"symbol": ["SPY"]}])
+def test_identity_missing_or_non_string_is_missing(raw):
+    row = classify_quote("SPY", make_quote("SPY", raw=raw), now=NOW)
+    assert row.status == "missing" and row.live is False
+    assert row.reason == "provider symbol missing from entry" and row.provider_symbol is None
+
+
+def test_identity_is_case_and_whitespace_normalised():
+    row = classify_quote("spy", make_quote("SPY", raw={"symbol": " spy "}), now=NOW)
+    assert row.status == "fresh" and row.provider_symbol == "SPY"
+
+
+def test_identity_alias_must_be_explicit_and_scoped():
+    q = make_quote("OTHER")
+    # no aliases -> mismatch
+    assert classify_quote("SYNTH", q, now=NOW).status == "invalid"
+    # explicit alias for SYNTH -> accepted, reported under the requested symbol
+    row = classify_quote("SYNTH", q, now=NOW, aliases={"SYNTH": {"OTHER"}})
+    assert row.status == "fresh" and row.symbol == "SYNTH" and row.provider_symbol == "OTHER"
+    # alias declared for a different symbol does not leak
+    assert classify_quote("SYNTH", q, now=NOW, aliases={"SPY": {"OTHER"}}).status == "invalid"
+    # alias set that does not contain the provider symbol
+    assert classify_quote("SYNTH", q, now=NOW, aliases={"SYNTH": {"ELSE"}}).status == "invalid"
+    # aliases are case-normalised
+    assert classify_quote("synth", q, now=NOW, aliases={"synth": ["other"]}).status == "fresh"
+    assert qp.NO_ALIASES == {}
+
+
+def test_identity_check_precedes_value_checks():
+    # a mismatched entry with perfect values is still invalid; nothing measured leaks
+    row = classify_quote("SYNTH", make_quote("OTHER"), now=NOW)
+    assert row.status == "invalid" and row.bid is None and row.quote_time is None
+
+
+def test_e2e_mapping_key_with_embedded_other_symbol_is_not_attributed():
+    text = body_text(SYNTH=entry("OTHER"), SPY=entry("SPY"))
+    assert json.loads(text)["SYNTH"]["symbol"] == "OTHER"
+    snap = read_private_quotes(ParsingReader(text), ["SYNTH", "SPY"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SYNTH"].status == "invalid" and by["SYNTH"].live is False
+    assert by["SYNTH"].provider_symbol == "OTHER"
+    assert by["SPY"].status == "fresh" and by["SPY"].live is True
+    assert [q.symbol for q in snap.quotes if q.live] == ["SPY"]
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+
+
+def test_e2e_embedded_symbol_missing_is_missing_not_live():
+    text = body_text(SPY=entry("SPY")).replace('"symbol": "SPY", ', "", 1)
+    assert "symbol" not in json.loads(text)["SPY"]
+    snap = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW)
+    row = snap.by_symbol()["SPY"]
+    assert row.status == "missing" and row.reason == "provider symbol missing from entry"
+
+
+def test_e2e_explicit_alias_through_parser():
+    text = body_text(SYNTH=entry("OTHER"))
+    snap = read_private_quotes(ParsingReader(text), ["SYNTH"], now=NOW, aliases={"SYNTH": {"OTHER"}})
+    row = snap.by_symbol()["SYNTH"]
+    assert row.status == "fresh" and row.provider_symbol == "OTHER"
+    assert snap.to_private_dict()["quotes"]["SYNTH"]["provider_symbol"] == "OTHER"
+
+
+def test_e2e_lowercase_embedded_symbol_matches():
+    text = body_text(SPY=entry("spy"))
+    row = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW).by_symbol()["SPY"]
+    assert row.status == "fresh" and row.provider_symbol == "SPY"
+
+
+# ---------------------------------------------------------------------------
+# review r4 finding 2: integer strings must not round-trip through float
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        ("9007199254740993", 9007199254740993),          # 2**53 + 1, lost by float
+        ("9223372036854775807", 2**63 - 1),              # int64 max exact
+        ("9223372036854775808", None),                   # int64 max + 1 -> overflow
+        ("1.0000000000000001", None),                    # fractional string, never 1
+        ("12.0", None), ("1e3", None), ("1E3", None), ("0x10", None), ("1_000", None),
+        ("+7", 7), ("-7", None), ("-0", 0), (" 7 ", 7), ("007", 7), ("", None), (" ", None),
+        ("7.", None), (".7", None), ("nan", None), ("inf", None), ("7a", None),
+        ("1" + "0" * 400, None),                         # exact int() then > int64
+        ("1" + "0" * 5000, None),                        # beyond int() digit limit -> ValueError -> None
+    ],
+)
+def test_reader_as_int_string_policy_is_exact(value, expected):
+    assert sm._as_int(value) == expected
+
+
+def test_reader_as_int_python_numbers_unchanged():
+    assert sm._as_int(9007199254740993) == 9007199254740993
+    assert sm._as_int(12.0) == 12 and sm._as_int(12.5) is None and sm._as_int(2**53 + 1) == 2**53 + 1
+
+
+def test_e2e_large_integer_strings_keep_exact_values():
+    text = body_text(SPY=entry("SPY", totalVolume="9007199254740993", bidSize="9223372036854775807",
+                               quoteTime=str(NOW_MS - 3000)))
+    row = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW).by_symbol()["SPY"]
+    assert row.status == "fresh"
+    assert row.total_volume == 9007199254740993 and row.bid_size == 2**63 - 1
+    assert row.quote_time == NOW - timedelta(seconds=3)
+    payload = row.to_private_dict()
+    assert payload["total_volume"] == 9007199254740993
+    assert '"total_volume": 9007199254740993' in json.dumps(payload, allow_nan=False)
+
+
+@pytest.mark.parametrize("field", ["bidSize", "askSize", "totalVolume"])
+@pytest.mark.parametrize("literal", ['"1.0000000000000001"', '"9223372036854775808"', '"12.0"', '"1e3"', '"-1"'])
+def test_e2e_fractional_or_overflow_count_strings_are_dropped(field: str, literal: str):
+    text = body_text(SPY=entry("SPY", **{field: 0})).replace(f'"{field}": 0', f'"{field}": {literal}', 1)
+    row = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW).by_symbol()["SPY"]
+    attr = {"bidSize": "bid_size", "askSize": "ask_size", "totalVolume": "total_volume"}[field]
+    assert row.status == "fresh" and getattr(row, attr) is None
+
+
+def test_e2e_quote_time_string_precision_and_rejection():
+    exact = str(NOW_MS - 3000)
+    good = read_private_quotes(ParsingReader(body_text(SPY=entry("SPY", quoteTime=exact))), ["SPY"], now=NOW)
+    assert good.by_symbol()["SPY"].status == "fresh"
+    bad = read_private_quotes(ParsingReader(body_text(SPY=entry("SPY", quoteTime=exact + ".5"))), ["SPY"], now=NOW)
+    assert bad.by_symbol()["SPY"].status == "missing" and bad.by_symbol()["SPY"].live is False
+
+
+def test_reader_refresh_normalisation_unchanged_for_normal_inputs():
+    assert sm._normalise_expires_in(1800) == 1800 and sm._normalise_expires_in("1800") == 1800
+    assert sm._normalise_expires_in(None) == sm.DEFAULT_ACCESS_LIFETIME_SECONDS
+    assert sm._normalise_expires_in("garbage") == sm.DEFAULT_ACCESS_LIFETIME_SECONDS
+
+
+# ---------------------------------------------------------------------------
 # source guards: no I/O, no credentials, no network, no persistence paths
 
 
@@ -836,7 +986,7 @@ def test_public_surface_is_exactly_the_documented_one():
     assert set(qp.__all__) == {
         "AUDIENCE_PRIVATE", "DEFAULT_FUTURE_TOLERANCE_S", "DEFAULT_MAX_QUOTE_AGE_S",
         "DEFAULT_MAX_SPREAD_PCT", "MAX_COUNT", "MAX_EPOCH_MS", "MEASURED_STATUSES",
-        "PERSIST_ALLOWED", "PROVIDER",
+        "PERSIST_ALLOWED", "PROVIDER", "Aliases", "NO_ALIASES",
         "REDISTRIBUTION", "SOURCE", "STATUSES", "AudienceError", "PrivateQuote",
         "PrivateQuoteSnapshot", "QuoteSource", "classify_quote", "read_private_quotes",
     }

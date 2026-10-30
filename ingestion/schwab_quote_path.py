@@ -25,6 +25,11 @@ consumer can rely on. It adds what the reader deliberately leaves out:
   numbers are never coerced to prices, counts are non-negative integral
   int64 or ``None``, string fields are strings or ``None``, and one
   malformed entry is skipped (class name logged) rather than raised.
+* **Symbol identity** — the provider's own ``symbol`` field (from the raw
+  entry) must match the requested symbol (case-normalised) or an explicitly
+  supplied alias; a missing embedded symbol is ``missing`` and a mismatch is
+  ``invalid``. A response mapping keyed ``SYNTH`` whose entry says ``OTHER``
+  is never attributed to ``SYNTH``. No aliases are built in.
 * **Declared audience label, not access control** — ``audience`` is a
   caller-supplied declaration (default ``"private"``) that the read is for
   private GRID use; ``read_private_quotes`` refuses any other value as a
@@ -73,6 +78,8 @@ MAX_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z; later timestamps are m
 MAX_COUNT = 2**63 - 1  # sizes/volumes above int64 are treated as malformed
 
 QuoteStatus = Literal["fresh", "stale", "delayed", "missing", "invalid", "unavailable"]
+Aliases = Mapping[str, Iterable[str]]  # requested symbol -> accepted provider symbols
+NO_ALIASES: Mapping[str, frozenset[str]] = {}
 STATUSES: tuple[str, ...] = ("fresh", "stale", "delayed", "missing", "invalid", "unavailable")
 MEASURED_STATUSES: frozenset[str] = frozenset({"fresh", "stale", "delayed"})
 AGE_BUCKETS: tuple[tuple[float, str], ...] = (
@@ -120,6 +127,7 @@ class PrivateQuote:
     realtime: bool | None
     asset_main_type: str | None
     max_quote_age_s: float
+    provider_symbol: str | None = None  # the provider's own symbol field, when present
 
     @property
     def measured(self) -> bool:
@@ -130,6 +138,7 @@ class PrivateQuote:
         """Availability-contract payload for private GRID consumers."""
         common = {
             "symbol": self.symbol,
+            "provider_symbol": self.provider_symbol,
             "audience": AUDIENCE_PRIVATE,
             "redistribution": REDISTRIBUTION,
             "persist_allowed": PERSIST_ALLOWED,
@@ -261,15 +270,18 @@ def read_private_quotes(
     max_quote_age_s: float = DEFAULT_MAX_QUOTE_AGE_S,
     future_tolerance_s: float = DEFAULT_FUTURE_TOLERANCE_S,
     max_spread_pct: float | None = DEFAULT_MAX_SPREAD_PCT,
+    aliases: Aliases | None = None,
 ) -> PrivateQuoteSnapshot:
     """Read quotes through an injected reader and classify every requested symbol.
 
     ``now`` must be timezone-aware; it is the receipt clock used for ages and
     the ``vintage`` of every row. ``audience`` is a caller declaration, not
     access control: any value other than ``"private"`` raises
-    :class:`AudienceError` before the reader is touched. A row whose
-    classification fails on malformed provider data becomes ``invalid``
-    (class name only); the snapshot itself never aborts on one row.
+    :class:`AudienceError` before the reader is touched. ``aliases`` maps a
+    requested symbol to the provider symbols accepted for it (none by
+    default). A row whose classification fails on malformed provider data
+    becomes ``invalid`` (class name only); the snapshot itself never aborts
+    on one row.
     """
     _require_private(audience)
     now = _require_aware(now, "now")
@@ -300,6 +312,7 @@ def read_private_quotes(
                     max_quote_age_s=max_quote_age_s,
                     future_tolerance_s=future_tolerance_s,
                     max_spread_pct=max_spread_pct,
+                    aliases=aliases,
                 )
             )
         except (ValueError, TypeError, OverflowError, OSError, ArithmeticError) as exc:
@@ -324,6 +337,7 @@ def classify_quote(
     max_quote_age_s: float = DEFAULT_MAX_QUOTE_AGE_S,
     future_tolerance_s: float = DEFAULT_FUTURE_TOLERANCE_S,
     max_spread_pct: float | None = DEFAULT_MAX_SPREAD_PCT,
+    aliases: Aliases | None = None,
 ) -> PrivateQuote:
     """Pure classification of one reader row. Deterministic for fixed ``now``."""
     now = _require_aware(now, "now")
@@ -331,6 +345,13 @@ def classify_quote(
     if quote is None:
         return _unavailable_row(
             symbol, now, "symbol absent from reader response", max_quote_age_s, status="missing"
+        )
+    provider_symbol = _provider_symbol(quote)
+    identity_problem = _identity_problem(symbol, provider_symbol, aliases)
+    if identity_problem is not None:
+        status, reason = identity_problem
+        return _unavailable_row(
+            symbol, now, reason, max_quote_age_s, status=status, provider_symbol=provider_symbol
         )
 
     quote_time = _ms_to_dt(quote.quote_time_ms)
@@ -367,6 +388,7 @@ def classify_quote(
             realtime=quote.realtime if isinstance(quote.realtime, bool) else None,
             asset_main_type=_str_or_none(quote.asset_main_type),
             max_quote_age_s=max_quote_age_s,
+            provider_symbol=provider_symbol,
         )
 
     # Missing: any required field absent. Never substitute 0 or a midpoint.
@@ -487,6 +509,36 @@ def _str_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) else None
 
 
+def _provider_symbol(quote: SchwabQuote) -> str | None:
+    """The provider's own ``symbol`` field from the raw entry, or ``None``.
+
+    The reader falls back to the response-mapping key when the entry has no
+    ``symbol``; that key is the requester's label, not the provider's identity,
+    so identity is read from ``raw`` here.
+    """
+    raw = quote.raw if isinstance(quote.raw, Mapping) else {}
+    value = raw.get("symbol")
+    return value.strip().upper() if isinstance(value, str) and value.strip() else None
+
+
+def _identity_problem(
+    symbol: str, provider_symbol: str | None, aliases: Aliases | None
+) -> tuple[QuoteStatus, str] | None:
+    """``None`` when the provider symbol matches ``symbol`` or one of its
+    explicitly supplied aliases; otherwise the (status, reason) to fail with."""
+    if provider_symbol is None:
+        return "missing", "provider symbol missing from entry"
+    wanted = symbol.strip().upper()
+    if provider_symbol == wanted:
+        return None
+    for key, accepted in (aliases or NO_ALIASES).items():
+        if str(key).strip().upper() != wanted:
+            continue
+        if any(str(a).strip().upper() == provider_symbol for a in accepted):
+            return None
+    return "invalid", "provider symbol does not match requested symbol"
+
+
 def _normalise_symbols(symbols: str | Iterable[str]) -> tuple[str, ...]:
     if isinstance(symbols, str):
         parts = [s.strip().upper() for s in symbols.split(",")]
@@ -530,6 +582,7 @@ def _unavailable_row(
     reason: str,
     max_quote_age_s: float,
     status: QuoteStatus = "unavailable",
+    provider_symbol: str | None = None,
 ) -> PrivateQuote:
     return PrivateQuote(
         symbol=symbol,
@@ -549,6 +602,7 @@ def _unavailable_row(
         realtime=None,
         asset_main_type=None,
         max_quote_age_s=max_quote_age_s,
+        provider_symbol=provider_symbol,
     )
 
 
@@ -560,11 +614,13 @@ __all__ = [
     "MAX_COUNT",
     "MAX_EPOCH_MS",
     "MEASURED_STATUSES",
+    "NO_ALIASES",
     "PERSIST_ALLOWED",
     "PROVIDER",
     "REDISTRIBUTION",
     "SOURCE",
     "STATUSES",
+    "Aliases",
     "AudienceError",
     "PrivateQuote",
     "PrivateQuoteSnapshot",
