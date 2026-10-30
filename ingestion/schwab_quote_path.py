@@ -20,7 +20,11 @@ consumer can rely on. It adds what the reader deliberately leaves out:
   quote timestamps that are malformed or out of range, are ``invalid``; a
   malformed optional field (sizes, volume, trade time) is dropped to ``None``.
   No single bad row aborts the snapshot. Every payload serialises under
-  strict JSON (``allow_nan=False``).
+  strict JSON (``allow_nan=False``). The reader's parser (``parse_quotes``)
+  applies the same policy at the JSON boundary: booleans and non-finite
+  numbers are never coerced to prices, counts are non-negative integral
+  int64 or ``None``, string fields are strings or ``None``, and one
+  malformed entry is skipped (class name logged) rather than raised.
 * **Declared audience label, not access control** — ``audience`` is a
   caller-supplied declaration (default ``"private"``) that the read is for
   private GRID use; ``read_private_quotes`` refuses any other value as a
@@ -66,6 +70,7 @@ DEFAULT_MAX_QUOTE_AGE_S = 20.0
 DEFAULT_FUTURE_TOLERANCE_S = 5.0
 DEFAULT_MAX_SPREAD_PCT = 1.0
 MAX_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z; later timestamps are malformed
+MAX_COUNT = 2**63 - 1  # sizes/volumes above int64 are treated as malformed
 
 QuoteStatus = Literal["fresh", "stale", "delayed", "missing", "invalid", "unavailable"]
 STATUSES: tuple[str, ...] = ("fresh", "stale", "delayed", "missing", "invalid", "unavailable")
@@ -144,6 +149,7 @@ class PrivateQuote:
                 quote_time=None,
                 trade_time=None,
                 realtime=None,
+                asset_main_type=None,
             )
             payload["live"] = False
             payload.update(common)
@@ -359,7 +365,7 @@ def classify_quote(
             received_at=now,
             age_seconds=age,
             realtime=quote.realtime if isinstance(quote.realtime, bool) else None,
-            asset_main_type=quote.asset_main_type,
+            asset_main_type=_str_or_none(quote.asset_main_type),
             max_quote_age_s=max_quote_age_s,
         )
 
@@ -392,8 +398,10 @@ def classify_quote(
     if bid > ask:
         return row("invalid", "bid above ask", False)
     if max_spread_pct is not None:
-        mid = (bid + ask) / 2.0
-        if (ask - bid) / mid * 100.0 > max_spread_pct:
+        ratio = _spread_ratio(bid, ask)
+        if ratio is None:
+            return row("invalid", "spread not computable", False)
+        if ratio * 100.0 > max_spread_pct:
             return row("invalid", "spread wider than max_spread_pct", False)
 
     # Delayed: provider says the entitlement is not real-time. Measured but never live.
@@ -449,10 +457,34 @@ def _is_finite_number(value: Any) -> bool:
 
 
 def _finite_int(value: Any) -> int | None:
-    """Optional count fields: int when finite and numeric, else None (never a guess)."""
+    """Optional count fields: a non-negative integral number within int64, else
+    ``None``. Fractional values are dropped, never truncated; negatives dropped."""
     if not _is_finite_number(value):
         return None
+    if value != int(value) or value < 0 or value > MAX_COUNT:
+        return None
     return int(value)
+
+
+def _spread_ratio(bid: float, ask: float) -> float | None:
+    """(ask - bid) / mid without overflow for extreme finite prices.
+
+    ``mid`` is ``bid/2 + ask/2`` (never ``(bid + ask)/2``, which overflows to
+    ``inf`` near the float maximum and would make any spread look like zero).
+    Requires ``0 < bid <= ask``; returns ``None`` if any step is non-finite.
+    """
+    if not (0 < bid <= ask):
+        return None
+    mid = bid / 2.0 + ask / 2.0
+    spread = ask - bid
+    if not math.isfinite(mid) or not math.isfinite(spread) or mid <= 0:
+        return None
+    ratio = spread / mid
+    return ratio if math.isfinite(ratio) else None
+
+
+def _str_or_none(value: Any) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _normalise_symbols(symbols: str | Iterable[str]) -> tuple[str, ...]:
@@ -525,6 +557,7 @@ __all__ = [
     "DEFAULT_FUTURE_TOLERANCE_S",
     "DEFAULT_MAX_QUOTE_AGE_S",
     "DEFAULT_MAX_SPREAD_PCT",
+    "MAX_COUNT",
     "MAX_EPOCH_MS",
     "MEASURED_STATUSES",
     "PERSIST_ALLOWED",

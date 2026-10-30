@@ -17,8 +17,14 @@ from typing import Any
 import pytest
 from loguru import logger
 
+from ingestion import schwab_market as sm
 from ingestion import schwab_quote_path as qp
-from ingestion.schwab_market import SchwabAuthError, SchwabQuote, SchwabTransientError
+from ingestion.schwab_market import (
+    SchwabAuthError,
+    SchwabQuote,
+    SchwabTransientError,
+    parse_quotes,
+)
 from ingestion.schwab_quote_path import (
     AudienceError,
     PrivateQuote,
@@ -434,7 +440,7 @@ def test_nonfinite_stale_quote_cannot_become_live_or_stale_with_values():
 
 
 @pytest.mark.parametrize("field", ["bid_size", "ask_size", "total_volume"])
-@pytest.mark.parametrize("value", NONFINITE + [True, "5", [1]])
+@pytest.mark.parametrize("value", NONFINITE + [True, "5", [1], 12.5, -1, -0.5, 2**63, 10**400, 1e30])
 def test_malformed_optional_count_fields_drop_to_none_and_stay_strict_json(field: str, value):
     row = classify_quote("SPY", make_quote(**{field: value}), now=NOW)
     assert row.status == "fresh" and row.live is True  # optional field, valid quote
@@ -444,8 +450,8 @@ def test_malformed_optional_count_fields_drop_to_none_and_stay_strict_json(field
 
 
 def test_optional_count_field_float_integral_is_kept():
-    row = classify_quote("SPY", make_quote(bid_size=12.0), now=NOW)
-    assert row.bid_size == 12
+    row = classify_quote("SPY", make_quote(bid_size=12.0, ask_size=0, total_volume=2**63 - 1), now=NOW)
+    assert row.bid_size == 12 and row.ask_size == 0 and row.total_volume == 2**63 - 1
 
 
 def test_snapshot_payloads_are_strict_json_across_all_statuses():
@@ -552,6 +558,253 @@ def test_module_documents_audience_as_label_not_access_control():
 
 
 # ---------------------------------------------------------------------------
+# review r3 finding: extreme finite prices must not overflow the spread check
+
+BIG = 1.7e308
+
+
+def test_extreme_finite_prices_cannot_evade_spread_threshold():
+    # (bid + ask) / 2 overflows to inf and (ask - bid) / inf == 0 would pass the 1 % gate.
+    assert (1e308 + BIG) / 2.0 == float("inf")  # the trap the old formula fell into
+    row = classify_quote("SPY", make_quote(last_price=BIG, bid_price=1e308, ask_price=BIG), now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason == "spread wider than max_spread_pct"
+    json.dumps(row.to_private_dict(), allow_nan=False)
+
+
+@pytest.mark.parametrize(
+    "bid,ask,expected",
+    [
+        (BIG, BIG, "fresh"),                      # zero spread at the float ceiling
+        (1e308, 1.000001e308, "fresh"),           # 0.0001 % spread at extreme magnitude
+        (1e308, 1.02e308, "invalid"),             # ~2 % spread, extreme magnitude
+        (1e-300, 1e-300, "fresh"),                # tiny but positive, zero spread
+        (1e-300, 2e-300, "invalid"),              # tiny, 66 % spread
+        (BID, ASK, "fresh"),                      # ordinary
+    ],
+)
+def test_spread_check_is_overflow_safe_and_preserves_valid_quotes(bid, ask, expected):
+    row = classify_quote("SPY", make_quote(last_price=bid, bid_price=bid, ask_price=ask), now=NOW)
+    assert row.status == expected, row.reason
+    json.dumps(row.to_private_dict(), allow_nan=False)
+
+
+def test_spread_ratio_helper():
+    assert qp._spread_ratio(1e308, BIG) == pytest.approx(0.5185, abs=1e-3)
+    assert qp._spread_ratio(BIG, BIG) == 0.0
+    assert qp._spread_ratio(2.0, 1.0) is None and qp._spread_ratio(0.0, 1.0) is None
+    assert qp._spread_ratio(1.0, float("inf")) is None
+
+
+# ---------------------------------------------------------------------------
+# review r3 findings: reader parser -> classifier boundary (end to end, JSON text in)
+
+
+def entry(symbol: str = "SPY", **quote_over: Any) -> dict[str, Any]:
+    q: dict[str, Any] = {
+        "lastPrice": LAST, "bidPrice": BID, "askPrice": ASK, "bidSize": BID_SIZE,
+        "askSize": ASK_SIZE, "totalVolume": VOLUME,
+        "quoteTime": NOW_MS - 3000, "tradeTime": NOW_MS - 3050,
+    }
+    q.update(quote_over)
+    return {"assetMainType": "EQUITY", "realtime": True, "symbol": symbol, "quote": q}
+
+
+class ParsingReader:
+    """Runs the pinned reader parser over JSON *text*, exactly as the client does."""
+
+    def __init__(self, body_text: str):
+        self.body_text = body_text
+        self.calls: list[tuple[str, ...]] = []
+
+    def quotes(self, symbols, fields="quote"):
+        self.calls.append(tuple(symbols))
+        return parse_quotes(json.loads(self.body_text))
+
+
+def body_text(**entries: dict[str, Any]) -> str:
+    # Render with json.dumps then splice raw tokens like 1e999 (valid JSON, parses to inf).
+    return json.dumps(entries)
+
+
+def test_e2e_1e999_size_in_one_row_does_not_lose_the_valid_row(log_lines):
+    text = body_text(SPY=entry("SPY"), QQQ=entry("QQQ")).replace(
+        json.dumps({"bidSize": BID_SIZE})[1:-1], '"bidSize": 1e999', 1
+    )
+    # the replace hits the first bidSize, i.e. SPY; make the second row the good one
+    assert text.count("1e999") == 1 and json.loads(text)["SPY"]["quote"]["bidSize"] == float("inf")
+    snap = read_private_quotes(ParsingReader(text), ["SPY", "QQQ"], now=NOW)
+    by = snap.by_symbol()
+    assert by["QQQ"].status == "fresh" and by["QQQ"].live is True
+    assert by["SPY"].status == "fresh" and by["SPY"].bid_size is None  # optional count dropped
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+    assert snap.source_error is None
+
+
+@pytest.mark.parametrize("field", ["lastPrice", "bidPrice", "askPrice", "quoteTime"])
+def test_e2e_1e999_required_field_is_not_live_and_other_row_survives(field: str):
+    text = body_text(SPY=entry("SPY", **{field: 0}), QQQ=entry("QQQ")).replace(
+        f'"{field}": 0', f'"{field}": 1e999', 1
+    )
+    snap = read_private_quotes(ParsingReader(text), ["SPY", "QQQ"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SPY"].status == "missing" and by["SPY"].live is False  # parser -> None -> missing
+    assert by["QQQ"].status == "fresh"
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+
+
+@pytest.mark.parametrize("field", ["lastPrice", "bidPrice", "askPrice"])
+@pytest.mark.parametrize("literal", ["true", "false"])
+def test_e2e_boolean_price_is_never_coerced_to_a_live_price(field: str, literal: str):
+    text = body_text(SPY=entry("SPY", **{field: 0})).replace(f'"{field}": 0', f'"{field}": {literal}', 1)
+    assert json.loads(text)["SPY"]["quote"][field] in (True, False)
+    snap = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW)
+    row = snap.by_symbol()["SPY"]
+    assert row.status == "missing" and row.live is False and row.last is None
+    assert sm._as_float(True) is None and sm._as_float(False) is None
+
+
+@pytest.mark.parametrize("literal", ["1e999", "-1e999", "true", "123", "[1]", "{}", "null"])
+def test_e2e_non_string_asset_main_type_is_dropped_and_json_stays_strict(literal: str):
+    text = body_text(SPY=entry("SPY")).replace('"assetMainType": "EQUITY"', f'"assetMainType": {literal}', 1)
+    snap = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW)
+    row = snap.by_symbol()["SPY"]
+    assert row.status == "fresh" and row.asset_main_type is None
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+    json.dumps(snap.status_only(), allow_nan=False)
+
+
+@pytest.mark.parametrize("field", ["bidSize", "askSize", "totalVolume"])
+@pytest.mark.parametrize(
+    "literal,expected",
+    [("12.5", None), ("-1", None), ("-0.5", None), ("1e999", None), ("-1e999", None),
+     ("true", None), ('"7"', 7), ("1e30", None), ("9223372036854775808", None),
+     ("1" + "0" * 400, None), ("12.0", 12), ("0", 0), ("9223372036854775807", 2**63 - 1)],
+)
+def test_e2e_counts_are_never_truncated_or_negative(field: str, literal: str, expected):
+    text = body_text(SPY=entry("SPY", **{field: 0})).replace(f'"{field}": 0', f'"{field}": {literal}', 1)
+    snap = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW)
+    row = snap.by_symbol()["SPY"]
+    assert row.status == "fresh"
+    attr = {"bidSize": "bid_size", "askSize": "ask_size", "totalVolume": "total_volume"}[field]
+    assert getattr(row, attr) == expected
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+
+
+@pytest.mark.parametrize("literal", ["1e999", "-1", "true", '"abc"', "1" + "0" * 400, "12.5"])
+def test_e2e_malformed_quote_time_literal_is_not_live(literal: str):
+    text = body_text(SPY=entry("SPY", quoteTime=0), QQQ=entry("QQQ")).replace('"quoteTime": 0', f'"quoteTime": {literal}', 1)
+    snap = read_private_quotes(ParsingReader(text), ["SPY", "QQQ"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SPY"].live is False and by["SPY"].status in ("missing", "invalid")
+    assert by["QQQ"].status == "fresh"
+
+
+def test_e2e_realtime_literal_variants_through_parser():
+    text = body_text(A=entry("A"), B=entry("B"), C=entry("C"), D=entry("D"))
+    text = text.replace('"realtime": true', '"realtime": "false"', 1)          # A
+    text = text.replace('"realtime": true', '"realtime": null', 1)             # B
+    text = text.replace('"realtime": true', '"realtime": 1', 1)                # C
+    snap = read_private_quotes(ParsingReader(text), ["A", "B", "C", "D"], now=NOW)
+    by = snap.by_symbol()
+    assert by["A"].status == "missing" and by["B"].status == "missing" and by["C"].status == "missing"
+    assert by["D"].status == "fresh" and by["D"].live is True
+    assert [q.symbol for q in snap.quotes if q.live] == ["D"]
+
+
+def test_e2e_extreme_prices_through_parser_hit_spread_gate():
+    text = body_text(SPY=entry("SPY", lastPrice=0, bidPrice=0, askPrice=0))
+    text = text.replace('"lastPrice": 0', '"lastPrice": 1.7e308').replace('"bidPrice": 0', '"bidPrice": 1e308').replace('"askPrice": 0', '"askPrice": 1.7e308')
+    snap = read_private_quotes(ParsingReader(text), ["SPY"], now=NOW)
+    row = snap.by_symbol()["SPY"]
+    assert row.status == "invalid" and row.reason == "spread wider than max_spread_pct"
+
+
+def test_e2e_mixed_body_strict_json_and_one_live_row(log_lines):
+    text = body_text(
+        GOOD=entry("GOOD"),
+        BOOLP=entry("BOOLP", lastPrice=0),
+        INFS=entry("INFS", bidSize=0),
+        FRAC=entry("FRAC", askSize=0),
+        NEG=entry("NEG", totalVolume=-5),
+        BIGT=entry("BIGT", quoteTime=0),
+        AMT=entry("AMT"),
+    )
+    text = text.replace('"lastPrice": 0', '"lastPrice": true', 1)
+    text = text.replace('"bidSize": 0', '"bidSize": 1e999', 1)
+    text = text.replace('"askSize": 0', '"askSize": 12.5', 1)
+    text = text.replace('"quoteTime": 0', '"quoteTime": 1e999', 1)
+    text = text.replace('"assetMainType": "EQUITY", "realtime": true, "symbol": "AMT"',
+                        '"assetMainType": 1e999, "realtime": true, "symbol": "AMT"', 1)
+    syms = ["GOOD", "BOOLP", "INFS", "FRAC", "NEG", "BIGT", "AMT", "ABSENT"]
+    snap = read_private_quotes(ParsingReader(text), syms, now=NOW)
+    assert len(snap.quotes) == len(syms) and snap.source_error is None
+    by = snap.by_symbol()
+    assert by["GOOD"].status == "fresh" and by["GOOD"].live
+    assert by["BOOLP"].status == "missing" and by["BIGT"].status == "missing" and by["ABSENT"].status == "missing"
+    assert by["INFS"].status == "fresh" and by["INFS"].bid_size is None
+    assert by["FRAC"].status == "fresh" and by["FRAC"].ask_size is None
+    assert by["NEG"].status == "fresh" and by["NEG"].total_volume is None
+    assert by["AMT"].status == "fresh" and by["AMT"].asset_main_type is None
+    blob = json.dumps(snap.to_private_dict(), allow_nan=False)
+    json.dumps(snap.status_only(), allow_nan=False)
+    assert "Infinity" not in blob and "NaN" not in blob
+    assert [q.symbol for q in snap.quotes if q.live] == ["GOOD", "INFS", "FRAC", "NEG", "AMT"]
+
+
+def test_e2e_malformed_entry_is_skipped_not_raised(monkeypatch, log_lines):
+    # Even if a parse step raises for one entry, the other entries survive and no text leaks.
+    real = sm._parse_entry
+
+    def flaky(symbol, entry_):
+        if symbol == "BAD":
+            raise OverflowError(SECRET_MARKER)
+        return real(symbol, entry_)
+
+    monkeypatch.setattr(sm, "_parse_entry", flaky)
+    text = body_text(BAD=entry("BAD"), SPY=entry("SPY"))
+    snap = read_private_quotes(ParsingReader(text), ["BAD", "SPY"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SPY"].status == "fresh" and by["BAD"].status == "missing"
+    joined = "".join(log_lines)
+    assert SECRET_MARKER not in joined and "OverflowError" in joined
+
+
+# reader helpers directly (the pinned reader is part of this candidate's boundary)
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(1, 1.0), (1.5, 1.5), ("2.5", 2.5), (None, None), (True, None), (False, None),
+     (float("inf"), None), (float("nan"), None), ("nan", None), ("inf", None), ("x", None),
+     ([1], None), (10**400, None), (1.7e308, 1.7e308)],
+)
+def test_reader_as_float_policy(value, expected):
+    assert sm._as_float(value) == expected
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [(7, 7), (0, 0), (7.0, 7), ("7", 7), (None, None), (True, None), (False, None), (7.5, None),
+     (-1, None), (-0.0, 0), (float("inf"), None), (float("nan"), None), ("x", None),
+     (2**63 - 1, 2**63 - 1), (2**63, None), (10**400, None), (1e30, None), ([1], None)],
+)
+def test_reader_as_int_policy(value, expected):
+    assert sm._as_int(value) == expected
+
+
+def test_reader_helpers_never_raise_on_extremes():
+    for v in (10**400, -(10**400), 1e308, float("inf"), "1e999", object(), {}, [], b"1"):
+        sm._as_float(v)
+        sm._as_int(v)
+
+
+@pytest.mark.parametrize("expires_in", [float("inf"), 10**400, "1e999"])
+def test_reader_expires_in_overflow_falls_back_to_default(expires_in):
+    assert sm._normalise_expires_in(expires_in) == sm.DEFAULT_ACCESS_LIFETIME_SECONDS
+
+
+# ---------------------------------------------------------------------------
 # source guards: no I/O, no credentials, no network, no persistence paths
 
 
@@ -582,7 +835,8 @@ def test_module_imports_only_the_reviewed_reader_types():
 def test_public_surface_is_exactly_the_documented_one():
     assert set(qp.__all__) == {
         "AUDIENCE_PRIVATE", "DEFAULT_FUTURE_TOLERANCE_S", "DEFAULT_MAX_QUOTE_AGE_S",
-        "DEFAULT_MAX_SPREAD_PCT", "MAX_EPOCH_MS", "MEASURED_STATUSES", "PERSIST_ALLOWED", "PROVIDER",
+        "DEFAULT_MAX_SPREAD_PCT", "MAX_COUNT", "MAX_EPOCH_MS", "MEASURED_STATUSES",
+        "PERSIST_ALLOWED", "PROVIDER",
         "REDISTRIBUTION", "SOURCE", "STATUSES", "AudienceError", "PrivateQuote",
         "PrivateQuoteSnapshot", "QuoteSource", "classify_quote", "read_private_quotes",
     }
