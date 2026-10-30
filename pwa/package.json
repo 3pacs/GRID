@@ -27,13 +27,13 @@
     "graphology-layout": "^0.6.1",
     "graphology-layout-forceatlas2": "^0.10.1",
     "graphology-types": "^0.24.8",
-    "lucide-react": "^1.48.0",
+    "lucide-react": "^1.61.0",
     "maplibre-gl": "^6.11.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "sigma": "^3.0.2",
     "three": "^0.186.1",
-    "zustand": "^5.0.15"
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
