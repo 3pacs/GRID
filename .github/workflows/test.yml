@@ -24,14 +24,18 @@ env:
   # vitest 5 both included) in both places -- this pin is about keeping CI
   # and the deploy build on the same version, not the safety check itself.
   NODE_VERSION: "22.23.2"
-  # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
+  # Non-empty -> target any self-hosted runner labelled `tests` (alien x3,
+  # threadripper); empty/unset -> ubuntu-latest. Every `tests` runner must
+  # provide the persistent PostgreSQL 15 + TimescaleDB the reset step expects
+  # (see docs/SERVER-SERVICES.md, "Alien Runner" / "Threadripper Runner").
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
-  ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}
+  # PR543's existing research-digest branch uses hosted CI and ephemeral DB only.
+  ON_SELF_HOSTED: ${{ !((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) && vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -47,11 +51,11 @@ jobs:
           cache: pip
 
       # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
-      # Postgres container. alien keeps a persistent PostgreSQL 15 +
-      # TimescaleDB service (see docs/SERVER-SERVICES.md, "Alien Runner")
+      # Postgres container. Self-hosted `tests` runners keep a persistent
+      # PostgreSQL 15 + TimescaleDB service (see docs/SERVER-SERVICES.md)
       # that the next step resets instead of pulling+starting a container.
       - name: Start ephemeral Postgres (hosted runner)
-        if: env.ON_ALIEN != 'true'
+        if: env.ON_SELF_HOSTED != 'true'
         run: |
           docker run -d --name grid-test-pg \
             -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
@@ -61,8 +65,8 @@ jobs:
             sleep 1
           done
 
-      - name: Reset persistent Postgres (alien)
-        if: env.ON_ALIEN == 'true'
+      - name: Reset persistent Postgres (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
         env:
           PGPASSWORD: testpass
         run: |
@@ -106,7 +110,7 @@ jobs:
             exit "$collection_status"
           fi
 
-          # -n auto: one worker per core (24 on alien, 4 on ubuntu-latest).
+          # -n auto: one worker per core (24 on alien, 32 on threadripper, 4 on ubuntu-latest).
           # --dist loadgroup honours the xdist_group markers tests/conftest.py
           # assigns: every test that can reach a live PostgreSQL shares one
           # group and so runs serially on a single worker, and every other test
@@ -143,6 +147,9 @@ jobs:
       # PostgreSQL (test_people_events_migration_pg.py) and the upsert/read
       # store contract -- known_at LEAST() merge, PIT known_at <= as_of
       # filtering, dedup-key collision merging -- against a real database.
+      # people_events_v2_20261001 (test_people_events_v2_migration_pg.py):
+      # TEXT security_id FK, append-only guards, revision log, one current
+      # version per key, run log honesty, writer idempotency/supersession.
       # `-m "not unit"` excludes test_people_events_store.py's PeopleEvent
       # validation tests (pure-Python, already covered by the main suite
       # above) and keeps only its DB-backed contract tests. A skip
@@ -155,9 +162,52 @@ jobs:
           TESTING: "true"
         run: |
           set -o pipefail
-          python -m pytest tests/test_people_events_migration_pg.py tests/test_people_events_store.py -m "not unit" -q -rA | tee /tmp/grid-people-events-pg.txt
+          python -m pytest tests/test_people_events_migration_pg.py tests/test_people_events_store.py tests/test_people_events_v2_migration_pg.py -m "not unit" -q -rA | tee /tmp/grid-people-events-pg.txt
           if grep -q "SKIPPED" /tmp/grid-people-events-pg.txt; then
             echo "::error::People events PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # GD5 people-density look-ahead canary (tests/test_people_density_lookahead.py,
+      # acceptance test 13 of the GD5 slice): on a real people_events table
+      # built from the migration DDL, load_events never returns a row known
+      # after as_of and appending such rows changes no density feature (A, C,
+      # S, D_self, D_peer); a leak self-test proves the canary trips when the
+      # store filters on event_time. E1-style fixture: GRID_TEST_DB_URL only,
+      # E1_REQUIRE_PG=1 so an unreachable PostgreSQL fails; a skip fails this step.
+      - name: People density look-ahead canary (PostgreSQL)
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_people_density_lookahead.py -q -rA | tee /tmp/grid-people-density-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-people-density-pg.txt; then
+            echo "::error::People density look-ahead canary was skipped"
+            exit 1
+          fi
+
+      # GEM append-only options capture (options_append_only_20260930):
+      # proves on real PostgreSQL that two same-day capture batches both
+      # survive, the options_snapshots view (every default reader, including
+      # the frozen GEX-levels v1 paper log) shows only the latest complete
+      # batch, UPDATE/DELETE/TRUNCATE are refused, an earlier batch replays
+      # end to end, and downgrade refuses to collapse batches. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: Options append-only capture PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_options_append_only_pg.py -q -rA | tee /tmp/grid-options-append-only-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-options-append-only-pg.txt; then
+            echo "::error::Options append-only PostgreSQL contract was skipped"
             exit 1
           fi
 
@@ -499,6 +549,26 @@ jobs:
             exit 1
           fi
 
+      # security_master all-issuers seed loader (scripts/apply_security_master_seed.py):
+      # runs the real batched INSERT ... ON CONFLICT DO NOTHING and the printed rollback
+      # SQL against a throwaway schema -- proves types and NULLs round-trip, an existing
+      # row is never rewritten, a second apply inserts nothing, and the rollback aborts
+      # when people_events or security_sector_membership reference the seeded entities.
+      - name: security_master seed loader PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_apply_security_master_seed_pg.py -q -rA | tee /tmp/grid-security-master-seed-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-security-master-seed-pg.txt; then
+            echo "::error::security_master seed loader PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       # Slice N2 causal-link persistence
       # (migrations/versions/causal_links_provenance_20260927.py,
       # intelligence/causal_links.py, scripts/run_causal_links.py): additive
@@ -641,6 +711,108 @@ jobs:
             exit 1
           fi
 
+      # E1 integrity gates (evals/e1, GRID-EVALS-SELF-IMPROVING-ENGINE-PLAN
+      # milestone M1): look-ahead canary (append-future determinism + planted
+      # future-leak on store.observations, store.pit, the regime state vector
+      # and the VS1 panel builders), honest success over every SmartScheduler
+      # registry entry, raw_series provenance / one meaning per source, and
+      # byte-identical reruns of the VS1 ledger and the real-panel scan. The
+      # suite is hash-pinned (evals/e1/MANIFEST.sha256, checked first); known
+      # violations on main are strict, named xfails (evals/e1/known_violations.py).
+      # Not under tests/, so the general run above never collects it. A skip
+      # (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E1 integrity gates
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          E1_REQUIRE_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m evals.e1.manifest --check
+          python -m pytest evals/e1 -q -rA --durations=10 | tee /tmp/grid-e1-gates.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-e1-gates.txt; then
+            echo "::error::E1 integrity gates: a gate was skipped"
+            exit 1
+          fi
+
+      # E1-V3/V4/V6 writer fixes against production's DDL (schema.sql
+      # verbatim): bls / wiki_history registry entry points, the four repaired
+      # raw_series writers (append-only, pull_status set, no non-schema
+      # columns) and coingecko's raw_series provenance through the real
+      # resolver. A skip (PostgreSQL unreachable) must fail this step.
+      - name: E1 writer provenance PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e1_writer_provenance_pg.py -q -rA | tee /tmp/grid-e1-writers-pg.txt
+          if grep -qE "^SKIPPED \[" /tmp/grid-e1-writers-pg.txt; then
+            echo "::error::E1 writer provenance PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # E2 forward scoreboard (evals/e2, milestone M2): price resolution is
+      # point-in-time against real SQL (no close before its pull or its
+      # session close, no revision pulled after the run instant, one named
+      # source), a full board run resolves only once the exit close is
+      # observable, and the price session is server-enforced read-only.
+      # A skip (PostgreSQL unreachable) must fail this step, not pass it.
+      - name: E2 forward scoreboard price resolution PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_price_resolver_pg.py -q -rA | tee /tmp/grid-e2-prices-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-prices-pg.txt; then
+            echo "::error::E2 forward scoreboard PostgreSQL contract was skipped"
+            exit 1
+          fi
+
+      # E2 witness sync (scripts/e2_witness_sync.sh): commits only the E2
+      # anchor folder of its dedicated vault clone, refuses anything but a
+      # pure append, never the GEX mirror's clone. The general run above
+      # cannot show a skip (bash/git/flock missing), so this reruns the
+      # file on its own and fails if any test skipped.
+      - name: E2 witness sync contract
+        env:
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_e2_witness_sync.py -q -rA | tee /tmp/grid-e2-witness-sync.txt
+          if grep -q "SKIPPED" /tmp/grid-e2-witness-sync.txt; then
+            echo "::error::E2 witness sync contract was skipped"
+            exit 1
+          fi
+
+      # scripts/audit_backdated_vintages.py (DATA-FIX DFa): exact per-feature
+      # counts of backdated resolved_series vintages on a real PostgreSQL
+      # schema, read-only transactions, DB-window refusal. A skip (PostgreSQL
+      # unreachable) must fail this step, not pass it.
+      - name: Backdated vintages audit PostgreSQL contract
+        env:
+          GRID_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          REQUIRE_BACKDATED_AUDIT_PG: "1"
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set -o pipefail
+          python -m pytest tests/test_audit_backdated_vintages_pg.py -q -rA | tee /tmp/grid-backdated-audit-pg.txt
+          if grep -q "SKIPPED" /tmp/grid-backdated-audit-pg.txt; then
+            echo "::error::Backdated vintages audit PostgreSQL contract was skipped"
+            exit 1
+          fi
+
       - name: Check for SQL injection patterns
         run: |
           echo "Checking for unsafe SQL patterns..."
@@ -651,12 +823,12 @@ jobs:
           fi
 
       - name: Stop ephemeral Postgres (hosted runner)
-        if: always() && env.ON_ALIEN != 'true'
+        if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -697,7 +869,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:

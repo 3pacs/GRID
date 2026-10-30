@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sqlite3
 import urllib.error
@@ -45,22 +46,53 @@ def _read_upstream(path: str) -> dict:
     return data
 
 
+UNAVAILABLE_REASON = "Gamma Watch collector unavailable or invalid; no cached substitute."
+ROUTE_NOT_SERVED_REASON = "route not served by collector"
+
+
+def _parse_served_at(value) -> datetime:
+    """Collector clock as an aware datetime.
+
+    The legacy ``/api/state`` sends an ISO-8601 string (``Z`` or an offset);
+    the ``gex-screen/2`` frame sends epoch seconds as a number. Anything else
+    (missing, bool, non-finite, naive, unparseable) is invalid and the bridge
+    fails closed rather than guessing.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("served_at missing or not a clock")
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise ValueError("served_at not finite")
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    source = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if source.tzinfo is None:
+        raise ValueError("served_at has no UTC offset")
+    return source
+
+
 def _bridge(path: str, response: Response) -> dict:
     response.headers["Cache-Control"] = "no-store"
     now = datetime.now(timezone.utc)
+    reason = UNAVAILABLE_REASON
     try:
         data = _read_upstream(path)
         if path == "/api/state":
-            source = datetime.fromisoformat(data["served_at"].replace("Z", "+00:00"))
+            source = _parse_served_at(data.get("served_at"))
             age = (now - source).total_seconds()
             if not -5 <= age <= 20:
                 raise ValueError("Collector response stale")
         return {"status": "available", "bridge_received_at": now.isoformat(), "data": data,
                 "note": "Transport available does not mean live inputs. Preserve each source timestamp, error, coverage and modeling assumption. No signal promotion."}
-    except (OSError, ValueError, KeyError, TypeError):
-        response.status_code = 503
-        return {"status": "unavailable", "bridge_received_at": now.isoformat(), "data": None,
-                "reason": "Gamma Watch collector unavailable or invalid; no cached substitute."}
+    except urllib.error.HTTPError as exc:
+        # The v4 collector (gex-screen/2) does not serve /api/journal or
+        # /api/contracts; say so instead of reporting the collector as down.
+        if exc.code == 404:
+            reason = ROUTE_NOT_SERVED_REASON
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, OverflowError):
+        pass
+    response.status_code = 503
+    return {"status": "unavailable", "bridge_received_at": now.isoformat(), "data": None,
+            "reason": reason}
 
 
 @router.get("/state")

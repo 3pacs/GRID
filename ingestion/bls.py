@@ -97,6 +97,25 @@ class BLSPuller(BasePuller):
             return None
         return date(int(year), month, 1)
 
+    def pull_all(self, start_year: int | None = None) -> dict[str, Any]:
+        """SmartScheduler entry point: the default BLS series, one bounded request.
+
+        Pulls :data:`BLS_SERIES_LIST` from ``start_year`` (default: two years
+        before the current one) through the current year. That window is a
+        single BLS query per 50-series chunk -- well under the 20-year span
+        a keyed request allows -- and wide enough to pick up any monthly
+        observation first published since the previous weekly run. Dates
+        already stored as SUCCESS are skipped, so raw_series is only ever
+        appended to (see :meth:`_fetch_and_store`).
+
+        Returns:
+            The :meth:`pull_series` result (``rows_inserted``, ``status``,
+            ``errors``).
+        """
+        if start_year is None:
+            start_year = date.today().year - 2
+        return self.pull_series(start_year=start_year)
+
     def pull_series(
         self,
         series_ids: list[str] | None = None,
@@ -151,6 +170,8 @@ class BLSPuller(BasePuller):
             series_chunks.append(series_ids[i : i + _MAX_SERIES_PER_QUERY])
 
         total_inserted = 0
+        requests_attempted = 0
+        requests_succeeded = 0
 
         for chunk in series_chunks:
             for yr_start, yr_end in year_ranges:
@@ -163,12 +184,21 @@ class BLSPuller(BasePuller):
                     result["errors"].append(msg)
                     result["status"] = "PARTIAL"
                     result["rows_inserted"] = total_inserted
+                    if requests_attempted and not requests_succeeded:
+                        result["status"] = "FAILED"
                     return result
 
                 inserted = self._fetch_and_store(chunk, yr_start, yr_end, result)
-                total_inserted += inserted
+                requests_attempted += 1
+                if inserted is not None:
+                    # A successful empty or duplicate-only response still
+                    # counts as request success, independently of stored rows.
+                    requests_succeeded += 1
+                    total_inserted += inserted
 
         result["rows_inserted"] = total_inserted
+        if requests_attempted and not requests_succeeded:
+            result["status"] = "FAILED"
         log.info("BLS pull complete — {n} rows inserted", n=total_inserted)
         return result
 
@@ -178,7 +208,7 @@ class BLSPuller(BasePuller):
         start_year: int,
         end_year: int,
         result: dict[str, Any],
-    ) -> int:
+    ) -> int | None:
         """Make a single BLS API request and store the results.
 
         Parameters:
@@ -188,7 +218,8 @@ class BLSPuller(BasePuller):
             result: Mutable result dict to append errors to.
 
         Returns:
-            int: Number of rows inserted.
+            Number of rows inserted (including zero on a successful response),
+            or None when the request fails. Database errors still propagate.
         """
         payload: dict[str, Any] = {
             "seriesid": series_ids,
@@ -217,14 +248,14 @@ class BLSPuller(BasePuller):
             log.error("BLS API request failed: {err}", err=str(exc))
             result["errors"].append(str(exc))
             result["status"] = "PARTIAL"
-            return 0
+            return None
 
         if data.get("status") != "REQUEST_SUCCEEDED":
             msg = f"BLS API error: {data.get('message', 'Unknown error')}"
             log.error(msg)
             result["errors"].append(msg)
             result["status"] = "PARTIAL"
-            return 0
+            return None
 
         inserted = 0
         with self.engine.begin() as conn:

@@ -25,6 +25,8 @@ import time
 import schedule as _sched
 from loguru import logger as log
 
+_ACTOR_NEWS_BATCH_BUDGET_SECONDS = 30.0
+
 
 def run_intelligence_loop() -> None:
     """Background loop: hourly briefings, 4h capital flows, daily wiki + crypto.
@@ -111,33 +113,9 @@ def run_intelligence_loop() -> None:
         except Exception as exc:
             log.debug("Taxonomy audit failed: {e}", e=str(exc))
 
-    def _price_fallback() -> None:
-        """Pull stale equity/crypto prices via fallback sources."""
-        try:
-            from ingestion.price_fallback import PriceFallbackPuller
-            from db import get_engine as _ge
-            from sqlalchemy import text as _t
-
-            eng = _ge()
-            pfp = PriceFallbackPuller(db_engine=eng)
-            with eng.connect() as conn:
-                stale = conn.execute(_t(
-                    "SELECT fr.name FROM feature_registry fr "
-                    "LEFT JOIN LATERAL ("
-                    "  SELECT obs_date FROM resolved_series WHERE feature_id = fr.id "
-                    "  ORDER BY obs_date DESC LIMIT 1"
-                    ") rs ON TRUE "
-                    "WHERE fr.model_eligible = TRUE AND fr.family IN ('equity','crypto','commodity') "
-                    "AND (rs.obs_date IS NULL OR rs.obs_date < CURRENT_DATE - 1) "
-                    "AND fr.name LIKE '%\\_full' ESCAPE '\\'"
-                )).fetchall()
-            tickers = [r[0].replace('_full', '').upper().replace('_', '-') for r in stale]
-            if tickers:
-                results = pfp.pull_many(tickers[:20])
-                pfp.save_to_db(results)
-                log.info("Price fallback: {n}/{t} stale tickers refreshed", n=len(results), t=len(tickers))
-        except Exception as exc:
-            log.debug("Price fallback failed: {e}", e=str(exc))
+    # _price_fallback (ingestion/price_fallback.py) is retired: it wrote
+    # backdated resolved_series vintages directly and every write failed on
+    # the production schema (E1-V7 / DATA-FIX DFa).
 
     def _paper_trading_signals() -> None:
         try:
@@ -227,22 +205,18 @@ def run_intelligence_loop() -> None:
             )
             puller = ActorNewsPuller(_ge())
             actors = enumerate_sector_map_actors(priority_only=True)[:200]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "gdelt", "wikipedia"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news daily skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "gdelt", "wikipedia"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news daily: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news daily: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news daily failed: {e}", e=str(exc))
@@ -258,22 +232,18 @@ def run_intelligence_loop() -> None:
             puller = ActorNewsPuller(_ge())
             # Skip top-200 (handled daily); sweep the rest.
             actors = enumerate_sector_map_actors(priority_only=False)[200:]
-            counts = {"actors": 0, "news": 0, "bios": 0}
-            for actor in actors:
-                try:
-                    res = puller.pull_one_actor(
-                        actor,
-                        sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
-                    )
-                    counts["actors"] += 1
-                    counts["news"] += res.get("news", 0)
-                    counts["bios"] += res.get("bios", 0)
-                except Exception as exc:  # noqa: BLE001
-                    log.debug("actor_news weekly skipped {a}: {e}",
-                              a=actor.get("actor_id"), e=str(exc))
+            counts = puller.pull_batch(
+                actors, sources=["google_news", "wikipedia", "sec_edgar", "crossref"],
+                budget_seconds=_ACTOR_NEWS_BATCH_BUDGET_SECONDS,
+            )
+            fetched = counts["source_rows_fetched"]
             log.info(
-                "Actor news weekly tail: {a} actors, {n} news, {b} bios",
-                a=counts["actors"], n=counts["news"], b=counts["bios"],
+                "Actor news weekly tail: {a}/{total} actors completed, {n} news fetched, {b} bios fetched; "
+                "deferred={d}, failed={f}, stop={stop}",
+                a=counts["actors_completed"], total=counts["actors_requested"],
+                n=sum(count for source, count in fetched.items() if source != "wikipedia"),
+                b=fetched.get("wikipedia", 0), d=len(counts["deferred_actor_ids"]),
+                f=len(counts["failed_actor_ids"]), stop=counts["stop_reason"],
             )
         except Exception as exc:  # noqa: BLE001
             log.warning("Actor news weekly tail failed: {e}", e=str(exc))
@@ -294,7 +264,6 @@ def run_intelligence_loop() -> None:
         _sched.every(1).hours.do(_paper_trading_signals)
     _sched.every(1).hours.do(_hourly_briefing)
     _sched.every(4).hours.do(_capital_flow_refresh)
-    _sched.every(6).hours.do(_price_fallback)
     # Note (2026-04-20): Moved from 02:00 → 02:45 to avoid overlap with
     # hermes_operator's 02:00–02:10 hypothesis discovery + backtest scan.
     # Both services run at the same hour; staggering prevents DB contention
@@ -344,6 +313,43 @@ def run_intelligence_loop() -> None:
             log.warning("journal verdicts daily failed: {e}", e=str(exc))
 
     _sched.every().day.at("06:45").do(_journal_verdicts_daily)
+
+    def _sentiment_outcomes_daily() -> None:
+        """Close the sentiment-prediction loop on a schedule (2026-10-23).
+
+        ``_hourly_briefing`` logs one ``sentiment_predictions`` row per UTC
+        day (``intelligence/sentiment_scorer.py::log_prediction``), but
+        ``score_past_predictions`` -- the step that fills ``realized_return``
+        / ``outcome`` / ``scored_at`` -- had no live caller. The only one in
+        the tree is ``scripts/grid_cron.sh sentiment``, and the crontab never
+        installed it (docs/planning/LEVER-PACKAGE.md, T3). Measured on
+        griddb 2026-10-23: 205 rows since 2026-04-02, every one ``PENDING``.
+
+        Outcome-only. It does not compute or log a prediction -- the hourly
+        briefing already did that -- and it passes ``update_weights=False``,
+        so recording outcomes never inserts a ``sentiment_weights`` version.
+        Learned-weight promotion for this closer is an operator decision:
+        ``config.GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION`` (default off, same
+        held-writer semantics as the Wave 3 flags). Runs 06:50 UTC: after
+        the 22:02Z close pull the scorer reads, after the 06:45
+        journal-verdicts closer, before the 07:00 options job.
+        """
+        try:
+            from db import get_engine as _ge
+            from intelligence.sentiment_scorer import score_past_predictions
+            promote = bool(getattr(_s, "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION", False))
+            summary = score_past_predictions(_ge(), update_weights=promote)
+            log.info(
+                "sentiment outcomes daily: scored={s} correct={c} accuracy={a} "
+                "weight_promotion={w}{m}",
+                s=summary.get("scored", 0), c=summary.get("correct", 0),
+                a=summary.get("accuracy"), w=summary.get("weight_promotion"),
+                m=(" " + str(summary.get("message") or summary.get("error") or "")).rstrip(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sentiment outcomes daily failed: {e}", e=str(exc))
+
+    _sched.every().day.at("06:50").do(_sentiment_outcomes_daily)
 
     def _trial_outcomes_daily() -> None:
         """Score what each trial readout actually did (2026-09-10).
@@ -827,19 +833,28 @@ def run_intelligence_loop() -> None:
     #   SEMI book-to-bill → 21st 11:00 UTC (monthly ~3-week lag)
     #   ECB TLTRO → Mon 09:00 UTC (ECB publishes weekly balance-sheet updates)
     def _pboc_omo_daily() -> None:
-        """CAT-3: PBoC 7-day reverse repo + MLF daily pull."""
+        """CAT-3: PBoC open-market-operation announcements (official pbc.gov.cn).
+
+        2026-09-29: switched from ingestion.altdata.pboc_omo (akshare; the
+        preferred functions do not exist and its fallbacks wrote mislabeled
+        FR007/LPR data frozen in 2020) to pboc_omo_official, which writes
+        under its own source_catalog row ``pboc_omo_announcements``.
+        """
         try:
             from db import get_engine as _ge
-            from ingestion.altdata.pboc_omo import run_pboc_omo_puller
-            result = run_pboc_omo_puller(_ge())
+            from ingestion.altdata.pboc_omo_official import (
+                run_pboc_omo_announcements_puller,
+            )
+            result = run_pboc_omo_announcements_puller(_ge())
             log.info(
-                "PBoC OMO: {o} OMO rows, {m} MLF rows, {i} inserted",
-                o=result.get("omo_rows", 0),
-                m=result.get("mlf_rows", 0),
-                i=result.get("inserted", 0),
+                "PBoC OMO announcements: status={s}, {a} parsed, {i} inserted, latest={d}",
+                s=result.get("status"),
+                a=result.get("announcements", 0),
+                i=result.get("rows_inserted", 0),
+                d=result.get("latest_op_date"),
             )
         except Exception as exc:  # noqa: BLE001
-            log.warning("PBoC OMO daily failed: {e}", e=str(exc))
+            log.warning("PBoC OMO announcements daily failed: {e}", e=str(exc))
 
     def _taiwan_exports_monthly() -> None:
         """CAT-9: Taiwan export orders + foundry utilization monthly."""
@@ -930,7 +945,8 @@ def run_intelligence_loop() -> None:
             from db import get_engine as _ge
             from ingestion.altdata.rocaf_pla_activity import run_rocaf_pla_activity_puller
             result = run_rocaf_pla_activity_puller(_ge())
-            log.info(
+            log_fn = log.warning if result.get("status") == "FAILED" else log.info
+            log_fn(
                 "PLA activity (ROCAF/MND): status={st}, {n} reports, {i} rows, "
                 "latest={d} sorties={a}",
                 st=result.get("status"),

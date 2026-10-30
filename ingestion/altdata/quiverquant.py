@@ -12,6 +12,11 @@ Pulls all available endpoints from QuiverQuant API (Trader plan $75/mo):
   - Political Beta (party correlation)
 
 All data stored in signal_sources with source_type='quiverquant:{endpoint}'.
+
+source_id identifies the act, not the feed: insider / house / senate / lobbying
+rows are keyed ``qq_<endpoint>:<identity>`` (see ``quiverquant_identity``) so
+that two acts on the same ticker and date no longer overwrite each other; the
+aggregate endpoints keep the constant ``qq_<endpoint>``.
 """
 
 from __future__ import annotations
@@ -26,12 +31,31 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
+from ingestion.altdata.quiverquant_identity import (
+    fiscal_quarter_end,
+    parse_year_qtr,
+    source_id_for,
+    transition_guard_blocks,
+    transition_marker_path,
+)
 from ingestion.base import BasePuller
+from ingestion.altdata import quiverquant_transactions as tx
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
 _TIMEOUT = 120
 _MAX_ATTEMPTS = 3
+STORE_BATCH_ROWS = tx.MAX_WRITE_ROWS
+
+
+class QuiverStoreAborted(RuntimeError):
+    """Preserve acknowledged writes without claiming an uncertain transaction."""
+
+    def __init__(self, message: str, *, stored: int, failed: int = 0, uncertain: bool = False):
+        super().__init__(message)
+        self.stored = stored
+        self.failed = failed
+        self.commit_uncertain = uncertain
 
 # Endpoints to pull with their config
 ENDPOINTS = {
@@ -188,48 +212,42 @@ def _insider_signal_type(rec: dict[str, Any]) -> str:
     return "insider_buy" if "buy" in txn or "purchase" in txn else "insider_sell"
 
 
-# Calendar-quarter end dates. gov_contracts records carry a fiscal (Year,
-# Qtr) pair for a quarterly aggregate, not a per-event date, so this maps
-# the quarter to a stable marker for that period rather than to "today".
-_QUARTER_END_MONTH_DAY: dict[int, tuple[int, int]] = {1: (3, 31), 2: (6, 30), 3: (9, 30), 4: (12, 31)}
-
-
 def _gov_contract_period_date(rec: dict) -> date | None:
     """Resolve a stable period-end date for a gov_contracts quarterly record.
+
+    QuiverQuant's ``(Year, Qtr)`` is the US *federal fiscal* quarter: FY Y Q1
+    is Oct-Dec of Y-1, Q2 Jan-Mar Y, Q3 Apr-Jun Y, Q4 Jul-Sep Y. GD-FIX (#694)
+    read it as a calendar quarter, which dated every aggregate one quarter too
+    late (the people-events PIT canary saw "2026 Q4" on 2026-09-11, before
+    calendar Q4 began, and ``max(signal_date)`` was a future 2026-12-31).
+
+    The date is a stable key, not a "known at" time: QuiverQuant publishes the
+    aggregate while its quarter is still running and rewrites it in place on every
+    pull after the quarter ends too (``DO UPDATE SET signal_value``), so a stored
+    value was not known at ``signal_date``. Do not score it as known then.
 
     Parameters:
         rec: A raw QuiverQuant ``/live/govcontracts`` record.
 
     Returns:
-        The quarter-end date for the record's (Year, Qtr), or ``None`` when
-        those fields aren't present/parseable.
+        The fiscal-quarter end date for the record's (Year, Qtr), or ``None``
+        when those fields aren't present/parseable.
     """
-    year = rec.get("Year") or rec.get("year")
-    qtr = rec.get("Qtr") or rec.get("qtr") or rec.get("Quarter") or rec.get("quarter")
-    try:
-        year = int(year)
-        qtr = int(qtr)
-    except (TypeError, ValueError):
+    year_qtr = parse_year_qtr(rec)
+    if year_qtr is None:
         return None
-    month_day = _QUARTER_END_MONTH_DAY.get(qtr)
-    if month_day is None:
-        return None
-    month, day = month_day
-    try:
-        return date(year, month, day)
-    except ValueError:
-        return None
+    return fiscal_quarter_end(*year_qtr)
 
 
 def _resolve_signal_date(rec: dict, endpoint_key: str, today: date) -> date:
     """Resolve the signal_date to store for one QuiverQuant record.
 
     GD-FIX: gov_contracts records have no per-event date — only a (Year,
-    Qtr) pair describing the aggregate's fiscal quarter — so the old
+    Qtr) pair describing the aggregate's federal fiscal quarter — so the old
     fallback of ``signal_date = today`` meant the same ~821 quarterly rows
     were re-inserted under a new date every single daily pull (the plan's
     evidence: the row count multiplying about 30x/month). Anchoring
-    signal_date to the quarter's own end date instead means a re-pull of
+    signal_date to the fiscal quarter's own end date instead means a re-pull of
     unchanged data hits the same (source_type, source_id, ticker,
     signal_date, signal_type) key and updates in place via the existing
     ON CONFLICT clause, rather than inserting a new row.
@@ -266,17 +284,28 @@ def _store_signals(
     source_type: str,
     endpoint_key: str,
 ) -> int:
-    """Store QuiverQuant records into signal_sources table."""
+    """Store QuiverQuant records into signal_sources table.
+
+    ``source_id`` is built from the act's identity (``source_id_for``), so two
+    acts that share a ticker and a date land in two rows instead of the second
+    overwriting the first. Records that still share a full key (an identical
+    act reported twice, or acts QuiverQuant gives us no field to tell apart)
+    upsert onto one row, and the count is logged so the residue is visible.
+    """
     if not records:
         return 0
 
     import json as _json
 
-    rows_inserted = 0
+    rows_inserted = failed = 0
+    tx.validate_batch_size(STORE_BATCH_ROWS)
+    prepared: list[dict[str, Any]] = []
     today = date.today()
+    seen_keys: set[tuple[str, str, date, str]] = set()
+    key_repeats = 0
 
-    with engine.begin() as conn:
-        for rec in records:
+    for rec in records:
+        try:
             ticker = rec.get("Ticker") or rec.get("ticker") or ""
             if not ticker:
                 continue
@@ -299,26 +328,79 @@ def _store_signals(
             elif endpoint_key == "insider_trading":
                 signal_type = _insider_signal_type(rec)
 
-            try:
-                conn.execute(text("""
+            source_id = source_id_for(endpoint_key, rec)
+            key = (source_id, ticker.upper(), signal_date, signal_type)
+            if key in seen_keys:
+                key_repeats += 1
+            seen_keys.add(key)
+
+            prepared.append({
+                "source_type": source_type, "source_id": source_id,
+                "signal_type": signal_type, "ticker": ticker.upper(),
+                "signal_date": signal_date, "signal_value": _json.dumps(signal_value),
+            })
+        except (ValueError, TypeError, AttributeError):
+            failed += 1
+            log.warning("QuiverQuant {}: malformed record skipped before writing", endpoint_key)
+
+    statement = text("""
                     INSERT INTO signal_sources
                         (source_type, source_id, signal_type, ticker, signal_date, signal_value, created_at)
                     VALUES
                         (:source_type, :source_id, :signal_type, :ticker, :signal_date, CAST(:signal_value AS jsonb), NOW())
                     ON CONFLICT (source_type, source_id, ticker, signal_date, signal_type)
                     DO UPDATE SET signal_value = EXCLUDED.signal_value
-                """), {
-                    "source_type": source_type,
-                    "source_id": f"qq_{endpoint_key}",
-                    "signal_type": signal_type,
-                    "ticker": ticker.upper(),
-                    "signal_date": signal_date,
-                    "signal_value": _json.dumps(signal_value),
-                })
-                rows_inserted += 1
-            except Exception as exc:
-                log.debug("QuiverQuant insert skip for {}: {}", ticker, exc)
+                """)
 
+    def write(batch: list[dict[str, Any]]) -> None:
+        with tx.write_transaction(engine) as (conn, check):
+            for params in batch:
+                check()
+                conn.execute(statement, params)
+
+    for start in range(0, len(prepared), STORE_BATCH_ROWS):
+        batch = prepared[start:start + STORE_BATCH_ROWS]
+        try:
+            write(batch)
+        except Exception as exc:
+            if isinstance(exc, tx.CommitAcknowledgedCleanupError):
+                rows_inserted += len(batch)
+            if not tx.is_rolled_back_write_error(exc):
+                raise QuiverStoreAborted(
+                    "QuiverQuant writes stopped; inspect acknowledged count before any retry",
+                    stored=rows_inserted, failed=failed,
+                    uncertain=isinstance(exc, tx.CommitUncertain),
+                ) from exc
+            # The failed batch was rolled back successfully. Isolate bad rows
+            # in NEW transactions; PostgreSQL's aborted transaction is never reused.
+            for params in batch:
+                try:
+                    write([params])
+                except Exception as row_exc:
+                    if isinstance(row_exc, tx.CommitAcknowledgedCleanupError):
+                        rows_inserted += 1
+                    if not tx.is_rolled_back_write_error(row_exc):
+                        raise QuiverStoreAborted(
+                            "QuiverQuant row writes stopped; no automatic replay",
+                            stored=rows_inserted, failed=failed,
+                            uncertain=isinstance(row_exc, tx.CommitUncertain),
+                        ) from row_exc
+                    failed += 1
+                    log.warning("QuiverQuant {}: one rejected row skipped", endpoint_key)
+                else:
+                    rows_inserted += 1
+        else:
+            rows_inserted += len(batch)
+
+    if key_repeats:
+        log.info(
+            "QuiverQuant {}: {} of {} records repeat a full signal_sources key "
+            "(same act twice, or indistinguishable acts) and were upserted onto one row",
+            endpoint_key, key_repeats, len(records),
+        )
+
+    if failed:
+        raise QuiverStoreAborted("QuiverQuant stored valid rows with rejected records", stored=rows_inserted, failed=failed)
     return rows_inserted
 
 
@@ -329,6 +411,20 @@ def pull_endpoint(
     """Pull a single QuiverQuant endpoint."""
     if endpoint_key not in ENDPOINTS:
         return {"endpoint": endpoint_key, "status": "UNKNOWN", "rows": 0}
+
+    if transition_guard_blocks(endpoint_key):
+        # Fail-closed until the coordinator has run the re-key / re-date scripts and
+        # created the marker file: no API call (the API is paid) and no write. Returned
+        # as SKIPPED, never SUCCESS. NB: only an all-skipped result is read by the
+        # scheduler as SKIPPED (flat 30-minute retry, no backoff); a mixed one is PARTIAL
+        # and feeds the exponential failure backoff. ``pull_all`` therefore holds the
+        # whole job while any endpoint is held, so the scheduler sees all-skipped.
+        reason = (
+            f"QuiverQuant {endpoint_key} held: transition marker {transition_marker_path()} not found "
+            "(create it after scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run)"
+        )
+        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        return {"endpoint": endpoint_key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0}
 
     cfg = ENDPOINTS[endpoint_key]
     api_key = _get_api_key()
@@ -341,13 +437,40 @@ def pull_endpoint(
         log.info("QuiverQuant {}: {} records fetched, {} stored", endpoint_key, len(records), rows)
         time.sleep(_RATE_LIMIT)
         return {"endpoint": endpoint_key, "status": "SUCCESS", "fetched": len(records), "stored": rows}
+    except QuiverStoreAborted as exc:
+        log.error("QuiverQuant {} stopped: {}", endpoint_key, exc)
+        return {
+            "endpoint": endpoint_key, "status": "FAILED", "error": str(exc),
+            "stored": exc.stored, "failed_records": exc.failed,
+            "stored_is_acknowledged_prefix": True,
+            "commit_uncertain": exc.commit_uncertain,
+        }
     except Exception as exc:
         log.error("QuiverQuant {} failed: {}", endpoint_key, exc)
         return {"endpoint": endpoint_key, "status": "FAILED", "error": str(exc)}
 
 
 def pull_all(engine: Engine) -> list[dict[str, Any]]:
-    """Pull all QuiverQuant endpoints."""
+    """Pull all QuiverQuant endpoints.
+
+    While the transition guard holds any endpoint, the whole job is held: every endpoint
+    is reported SKIPPED and nothing is pulled. A mixed result (aggregates pulled, guarded
+    endpoints skipped) would be classified PARTIAL by ``smart_scheduler``, which feeds its
+    exponential failure backoff (30 min .. 24 h, rebuilt from ``pull_log`` on restart) and
+    could delay the first real pull after the marker is created. An all-skipped result
+    retries every 30 minutes with no backoff, makes no API call, and cannot hide an
+    aggregate-endpoint failure because no aggregate endpoint runs while held.
+    """
+    held = [key for key in ENDPOINTS if transition_guard_blocks(key)]
+    if held:
+        reason = (
+            f"QuiverQuant job held: transition marker {transition_marker_path()} not found "
+            f"(guarded endpoints: {', '.join(sorted(held))}); create it after "
+            "scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run"
+        )
+        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        return [{"endpoint": key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0} for key in ENDPOINTS]
+
     log.info("QuiverQuant: pulling all {} endpoints", len(ENDPOINTS))
     results = []
     for key in ENDPOINTS:

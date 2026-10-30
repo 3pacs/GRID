@@ -67,7 +67,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from sqlalchemy.exc import SQLAlchemyError
 
-from ingestion.market_calendar import is_market_open
+from ingestion.market_calendar import is_market_open, last_trading_day
 
 # GEX-6: route Black-Scholes Greeks through the canonical primitives in
 # `physics/greeks/black_scholes.py` (landed in GEX-3, #79). The local _d1/_d2/
@@ -85,6 +85,17 @@ DEALER_PUT_SIGN: float = -1.0
 
 # Fixed gamma-flip search resolution, independent of chart point count.
 FLIP_SEARCH_STEP_PCT: float = 0.001
+
+# Marker on profiles from ``compute_latest_completed_gex_profile`` -- the
+# explicit opt-in for read surfaces that serve the latest completed capture
+# instead of the UTC day. ``compute_gex_profile(snap_date=None)`` is unchanged.
+DEFAULT_RESOLUTION: str = "last_completed_capture"
+
+
+def _utc_now() -> datetime:
+    """Wall clock for chain-age and completion checks (patchable in tests)."""
+    return datetime.now(timezone.utc)
+
 
 # ── Black-Scholes Greeks (shims over physics/greeks/black_scholes) ───────────
 
@@ -158,8 +169,19 @@ class DealerGammaEngine:
         snap_date: date | None = None,
         spot_range_pct: float = 0.15,
         n_points: int = 50,
+        capture_batch_id: str | None = None,
+        *,
+        cutoff: datetime | None = None,
     ) -> dict[str, Any]:
         """Compute the full GEX profile for a ticker.
+
+        By default the chain is the latest complete capture batch for
+        ``ticker``/``snap_date`` (the ``options_snapshots`` view). Passing
+        ``capture_batch_id`` replays that specific registered batch from
+        ``options_snapshots_all`` instead -- e.g. GEM's 10:05 NY batch after a
+        later same-day scheduler capture -- and fails closed (no-data result)
+        unless the batch is registered for exactly that ticker/day and all of
+        its rows are present.
 
         Returns:
             Dictionary with:
@@ -193,7 +215,11 @@ class DealerGammaEngine:
         if snap_date is None:
             snap_date = datetime.now(timezone.utc).date()
 
-        chain = self._load_chain(ticker, snap_date)
+        if capture_batch_id is None:
+            chain = self._load_chain(ticker, snap_date)
+        else:
+            chain = self._load_chain(ticker, snap_date, capture_batch_id=capture_batch_id,
+                                     cutoff=cutoff)
         if chain.empty:
             return {"error": f"No options data for {ticker} on {snap_date}", "ticker": ticker}
 
@@ -543,26 +569,146 @@ class DealerGammaEngine:
             for p, g in zip(prices, gex_values)
         ]
 
-    def _load_chain(self, ticker: str, snap_date: date) -> pd.DataFrame:
+    def compute_latest_completed_gex_profile(self, ticker: str) -> dict[str, Any]:
+        """Opt-in read: the profile of the latest completed capture, with its age.
+
+        For read-only surfaces (``/derivatives/gex``, ``/derivatives/walls``
+        without a day) whose UTC day has no chain until the once-per-session
+        capture (~22:20Z). One cutoff is taken once and bound through the whole
+        read: :meth:`latest_completed_capture_batch` selects one exact registered
+        batch completed by the cutoff on or before the last NYSE trading day,
+        and that batch is loaded through the registered-replay path, which
+        re-checks its registry row count, and validated against the same cutoff
+        (a batch, row or quote clock after it fails closed). ``chain_age_seconds``
+        is cutoff minus the admitted batch's completion and is never negative.
+
+        ``compute_gex_profile(snap_date=None)`` and every internal default caller
+        are unchanged; this method is the only route to a prior-session chain
+        without an explicit day.
+        """
+        cutoff = _utc_now()
+        on_or_before = last_trading_day(cutoff.date())
+        selected = self.latest_completed_capture_batch(ticker, on_or_before, cutoff)
+        marker = {"default_resolution": DEFAULT_RESOLUTION, "chain_read_cutoff": cutoff.isoformat()}
+        if selected is None:
+            reason = (f"no completed options capture for {ticker} on or before "
+                      f"{on_or_before} (last NYSE trading day) as of {cutoff.isoformat()}")
+            result = unavailable(
+                reason, source="options_capture_batches",
+                snap_date=None, chain_snap_date=None, chain_batch_id=None,
+                chain_age_seconds=None, spot=None, regime=None, gamma_flip=None,
+                gamma_flip_crossings=None, gamma_wall=None, put_wall=None,
+                call_wall=None, gex_aggregate=None, gex_normalized=None,
+                dealer_delta=None, vanna_exposure=None, charm_exposure=None,
+                profile=None, per_strike=None,
+            )
+            result.update({"ticker": ticker, "error": reason, **marker})
+            return result
+        day, batch_id = selected
+        result = self.compute_gex_profile(ticker, day, capture_batch_id=batch_id, cutoff=cutoff)
+        if result.get("error"):
+            return {**result, **marker}
+        completed = datetime.fromisoformat(result["chain_capture_completed_at"])
+        age = (cutoff - completed).total_seconds()
+        if (result.get("chain_batch_id") != batch_id
+                or result.get("chain_snap_date") != day.isoformat() or age < 0):
+            # Defensive: the loader already enforces both; never publish a
+            # different batch or a capture from after the cutoff.
+            return {"error": f"No options data for {ticker} on {day}", "ticker": ticker, **marker}
+        return {**result, **marker, "chain_age_seconds": int(age)}
+
+    def latest_completed_capture_batch(
+        self, ticker: str, on_or_before: date, cutoff: datetime,
+    ) -> tuple[date, str] | None:
+        """Exact ``(snap_date, capture_batch_id)`` of the latest batch completed by ``cutoff``.
+
+        Reads ``options_capture_batches`` (a row is registered once its capture
+        completed): latest day on or before ``on_or_before``, then highest
+        ordinal on that day, both bounded by ``capture_completed_at <= cutoff``.
+        A batch registered later than the cutoff is invisible even when it is
+        the day's latest in the ``options_snapshots`` view. ``None`` when none
+        qualifies or the registry cannot be read; the caller fails closed.
+        """
+        query = text("""
+            SELECT snap_date, capture_batch_id FROM options_capture_batches
+            WHERE ticker = :ticker
+              AND snap_date <= :on_or_before
+              AND capture_completed_at <= :cutoff
+            ORDER BY snap_date DESC, capture_ordinal DESC
+            LIMIT 1
+            """)
+        try:
+            with self.engine.connect() as conn:
+                row = conn.execute(query, {"ticker": ticker, "on_or_before": on_or_before,
+                                           "cutoff": cutoff}).fetchone()
+        except SQLAlchemyError:
+            return None
+        if not row:
+            return None
+        day, batch_id = row[0], row[1]
+        if isinstance(day, datetime):
+            day = day.date()
+        if (not isinstance(day, date) or day > on_or_before
+                or not isinstance(batch_id, str) or not batch_id):
+            return None
+        return day, batch_id
+
+    def _load_chain(
+        self, ticker: str, snap_date: date, *, capture_batch_id: str | None = None,
+        cutoff: datetime | None = None,
+    ) -> pd.DataFrame:
         """Load only the requested day's chain; reject mixed or late captures.
 
         Only one fully completed capture is eligible. A legacy or partially
         published chain without ordinal, start, batch, and completion provenance fails
         closed, as do rows mixed with an older writer.
+
+        Default: the ``options_snapshots`` view, i.e. the latest complete
+        registered batch for the ticker/day. ``capture_batch_id``: that exact
+        registered batch from ``options_snapshots_all``; its registered
+        ticker, day, ordinal and row count must all match or nothing loads.
+        ``cutoff`` (opt-in latest-completed reads only): the read boundary the
+        batch was selected at; completion, row creation and quote clocks after
+        it fail closed. Without it the check uses the current clock as before.
         """
         if not is_market_open(snap_date):
             return pd.DataFrame()
-        try:
-            with self.engine.connect() as conn:
-                rows = conn.execute(text("""
+        params = {"ticker": ticker, "snap_date": snap_date}
+        if capture_batch_id is None:
+            query = text("""
                 SELECT strike, opt_type, open_interest, implied_vol AS implied_volatility,
                        expiry, (expiry - :snap_date) AS dte, created_at,
                        capture_batch_id, capture_ordinal,
-                       capture_started_at, capture_completed_at, provider_regular_market_at
+                       capture_started_at, capture_completed_at, provider_regular_market_at,
+                       NULL AS registered_row_count
                 FROM options_snapshots
                 WHERE ticker = :ticker AND snap_date = :snap_date
                 ORDER BY expiry, strike, opt_type
-                """), {"ticker": ticker, "snap_date": snap_date}).fetchall()
+                """)
+        else:
+            if not isinstance(capture_batch_id, str) or not capture_batch_id:
+                return pd.DataFrame()
+            params["batch"] = capture_batch_id
+            query = text("""
+                SELECT s.strike, s.opt_type, s.open_interest, s.implied_vol AS implied_volatility,
+                       s.expiry, (s.expiry - :snap_date) AS dte, s.created_at,
+                       s.capture_batch_id, s.capture_ordinal,
+                       s.capture_started_at, s.capture_completed_at,
+                       s.provider_regular_market_at, b.row_count AS registered_row_count
+                FROM options_snapshots_all s
+                JOIN options_capture_batches b
+                  ON b.capture_batch_id = s.capture_batch_id
+                 AND b.capture_ordinal = s.capture_ordinal
+                 AND b.ticker = s.ticker AND b.snap_date = s.snap_date
+                 AND b.capture_started_at = s.capture_started_at
+                 AND b.capture_completed_at = s.capture_completed_at
+                WHERE s.ticker = :ticker AND s.snap_date = :snap_date
+                  AND s.capture_batch_id = :batch
+                ORDER BY s.expiry, s.strike, s.opt_type
+                """)
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(query, params).fetchall()
         except SQLAlchemyError:
             # Until the additive migration exists, no old batch earns a
             # guessed source market date.
@@ -570,6 +716,10 @@ class DealerGammaEngine:
 
         if not rows:
             return pd.DataFrame()
+        if capture_batch_id is not None and {row[12] for row in rows} != {len(rows)}:
+            # Replay of an incompletely stored batch never loads.
+            return pd.DataFrame()
+        rows = [tuple(row[:12]) for row in rows]
 
         created = [row[6] for row in rows]
         batches = {row[7] for row in rows}
@@ -577,7 +727,7 @@ class DealerGammaEngine:
         starts = {row[9] for row in rows}
         completions = {row[10] for row in rows}
         quote_times = [row[11] for row in rows]
-        now = datetime.now(timezone.utc)
+        now = cutoff if cutoff is not None else _utc_now()
         if (any(not isinstance(ts, datetime) or ts.tzinfo is None for ts in created)
                 or len(batches) != 1 or not next(iter(batches))
                 or len(ordinals) != 1
@@ -598,6 +748,8 @@ class DealerGammaEngine:
                 or not isinstance(completed_at, datetime) or completed_at.tzinfo is None):
             return pd.DataFrame()
         first, last = min(created), max(created)
+        if cutoff is not None and last > cutoff:
+            return pd.DataFrame()
         if (first.astimezone(timezone.utc).date() != snap_date
                 or last.astimezone(timezone.utc).date() != snap_date
                 or started_at.astimezone(timezone.utc).date() != snap_date
@@ -712,8 +864,11 @@ class DealerGammaEngine:
         long_gamma = [r for r in results if r["regime"] == "LONG_GAMMA"]
         short_gamma = [r for r in results if r["regime"] == "SHORT_GAMMA"]
 
+        # Label with the chain day(s) actually loaded, never the wall-clock day.
+        chain_days = sorted({str(r.get("chain_snap_date") or r.get("snap_date")) for r in results})
         return {
-            "snap_date": str(snap_date or datetime.now(timezone.utc).date()),
+            "snap_date": chain_days[0] if len(chain_days) == 1 else None,
+            "chain_snap_dates": chain_days,
             "total_tickers": len(results),
             "aggregate_gex": round(total_gex, 0),
             "aggregate_vanna": round(total_vanna, 0),
@@ -729,6 +884,7 @@ class DealerGammaEngine:
             "tickers": [
                 {
                     "ticker": r["ticker"],
+                    "chain_snap_date": r.get("chain_snap_date"),
                     "spot": r["spot"],
                     "gex": r["gex_aggregate"],
                     "regime": r["regime"],

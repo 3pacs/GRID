@@ -260,21 +260,14 @@ def test_every_harness_module_pins_every_lower_version_as_earlier():
         assert sorted(e.number for e in harness.pins.earlier) == list(range(1, number))
         for e in harness.pins.earlier:
             assert (e.prereg_sha256, e.registry_head_sha256, e.witness_path, e.anchor_line) == pinned[e.number]
-        if number == 7:
-            # v7 is preregistered in code, but its first two registry records
-            # cannot be pinned until the witnessed registration has happened.
-            assert module.REGISTERED_RECORD_SHA256 is None
-            assert module.REGISTERED_ANCHOR_LINE is None
-            assert harness.pins.registered_record_sha256 is None
-            assert harness.pins.registered_anchor_line is None
-        else:
-            pinned[number] = (module.PREREG_BODY_SHA256, module.REGISTERED_RECORD_SHA256[1], module.WITNESS_PATH,
-                              module.REGISTERED_ANCHOR_LINE)
+        head = module.REGISTERED_RECORD_SHA256[1] if module.REGISTERED_RECORD_SHA256 else None  # newest may be unpinned
+        pinned[number] = (module.PREREG_BODY_SHA256, head, module.WITNESS_PATH, module.REGISTERED_ANCHOR_LINE)
         found.append(number)
     assert found == list(range(2, max(found) + 1)) and max(found) >= 3
     # Historical supersession pins still point to v6's two-record head.
     newest = importlib.import_module("analysis.panel_insider_density_v6")
-    assert max(found) == 7 and newest.SUPERSEDED_BY == {"version": "vs1-v7"}
+    assert max(found) == 8 and newest.SUPERSEDED_BY == {"version": "vs1-v7"}
+    assert importlib.import_module("analysis.panel_insider_density_v7").SUPERSEDED_BY == {"version": "vs1-v8"}
     for number in range(1, 6):
         module = v1 if number == 1 else importlib.import_module(f"analysis.panel_insider_density_v{number}")
         assert module.SUPERSEDED_BY and module.SUPERSEDED_BY["registry_head_sha256"] == newest.REGISTERED_RECORD_SHA256[1]

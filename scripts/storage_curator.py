@@ -43,6 +43,21 @@ DEFAULT_ACTIVE_ROOTS: tuple[Path, ...] = (
 
 DEFAULT_COLD_ROOT = Path(os.environ.get("GRID_COLD_STORAGE_ROOT", "/mirror"))
 DEFAULT_REPORT_DIR = Path("outputs/storage_maintenance")
+RUNTIME_GRID_ROOT = Path("/data/grid_v4")
+
+
+def storage_report_dir(
+    *, source_file: Path | None = None, data_root: Path | None = None
+) -> Path:
+    """Keep reports written by an immutable production release outside Git.
+
+    Local checkouts retain their relative default for tests and developer runs.
+    """
+    data_root = data_root if data_root is not None else RUNTIME_GRID_ROOT
+    source = (source_file or Path(__file__)).resolve()
+    if data_root / "grid_release.releases" in source.parents:
+        return data_root / "storage_maintenance"
+    return DEFAULT_REPORT_DIR
 
 
 @dataclass
@@ -513,11 +528,12 @@ def markdown_report(report: StorageMaintenanceReport) -> str:
 def write_storage_maintenance_report(
     report: StorageMaintenanceReport,
     *,
-    output_dir: Path = DEFAULT_REPORT_DIR,
+    output_dir: Path | None = None,
 ) -> StorageMaintenanceReport:
     from outputs.path_utils import ensure_output_dir
 
-    out = ensure_output_dir(output_dir)
+    resolved_output_dir = output_dir if output_dir is not None else storage_report_dir()
+    out = ensure_output_dir(resolved_output_dir)
     stamp = datetime.fromisoformat(report.generated_at).strftime("%Y%m%dT%H%M%SZ")
     json_path = out / f"storage_maintenance_{stamp}.json"
     markdown_path = out / f"storage_maintenance_{stamp}.md"

@@ -1,0 +1,41 @@
+{
+  "skill_name": "resolver-patterns",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Add SPY-like ticker 'XLRE' end to end so its close price shows up in resolved_series.",
+      "expected_output": "feature_registry INSERT, SEED_MAPPINGS entry, pull via Tiingo/yfinance, resolve via direct SQL.",
+      "files": [],
+      "expectations": [
+        "Inserts a feature_registry row with all required fields: name, family, description, transformation, normalization, missing_data_policy, eligible_from_date",
+        "Uses the naming convention that matches the direct-SQL join (name 'xlre_full' for series 'YF:XLRE:close')",
+        "Adds the mapping \"YF:XLRE:close\": \"xlre_full\" in normalization/entity_map.py (SEED_MAPPINGS or NEW_MAPPINGS_V2)",
+        "Resolves with direct SQL INSERT ... ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING rather than the Python resolver for a bulk backfill",
+        "Does not hardcode credentials"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "Here is my resolver query run via SQLAlchemy: text(\"... WHERE series_id LIKE 'YF:%:close' ...\"). It throws a bind-parameter error. Fix it.",
+      "expected_output": "Identifies the text() :close bind-parameter gotcha; use psycopg2 raw SQL (or escape).",
+      "files": [],
+      "expectations": [
+        "Identifies that SQLAlchemy text() treats ':close' as a bind parameter",
+        "Recommends running the raw SQL via psycopg2 (per the skill) or otherwise escaping the colon",
+        "Keeps the pull_status = 'SUCCESS' filter and the ON CONFLICT clause intact"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "The Python resolver is O(n^2) slow on our 120M row raw_series. We also need conflict detection across Tiingo and yfinance for equities. What do we do?",
+      "expected_output": "Split: direct SQL for bulk loads; Python Resolver with lookback_days and workers for multi-source conflict detection.",
+      "files": [],
+      "expectations": [
+        "Recommends direct SQL for bulk loads and explains the LIMIT/OFFSET O(n^2) reason",
+        "Recommends Resolver(engine).resolve_pending(lookback_days=7, workers=8) for the conflict-detection part",
+        "States equity conflict threshold is 1% (crypto 3%, alt 5%) and conflicts are flagged in conflict_detail",
+        "Mentions build_price_panel() needs drop_duplicates() when two sources supply the same ticker"
+      ]
+    }
+  ]
+}

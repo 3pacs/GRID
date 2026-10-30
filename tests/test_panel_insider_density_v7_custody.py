@@ -2,14 +2,56 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 import pytest
 
 from analysis import panel_insider_density as v1
 from analysis import panel_insider_density_v6 as v6
 from analysis import panel_insider_density_v7 as v7
 from tests.test_panel_insider_density import NOW
-from tests.test_panel_insider_density_v2 import _register
+from tests.test_panel_insider_density_v2 import _Vault, _register
 from tests.test_panel_insider_density_v6 import _vault
+
+
+def test_v7_registration_pins_match_witnessed_anchor():
+    assert v7.REGISTERED_RECORD_SHA256 == (
+        "a04654d988f4705fb0620b2474684197bf1a170957f93c8dfcae32315aff7e48",
+        "4b42f649ce2a69191de5b73d14aebdd7bbe470b8ae65cb98a099201484c40e53",
+    )
+    assert v7.V7.pins.registered_record_sha256 == v7.REGISTERED_RECORD_SHA256
+    assert v7.V7.pins.registered_anchor_line == v7.REGISTERED_ANCHOR_LINE
+    assert hashlib.sha256(v7.REGISTERED_ANCHOR_LINE + b"\n").hexdigest() == (
+        "255c9c6be265d0b22a74f480aaf8544701f25df3e5e2a786a2113e16b5fee05e"
+    )
+    anchor = json.loads(v7.REGISTERED_ANCHOR_LINE)
+    assert anchor == {"head_sha256": v7.REGISTERED_RECORD_SHA256[1],
+                      "prev_anchor_sha256": None, "records": 2,
+                      "run_at": "2026-09-30T01:43:00+00:00"}
+
+
+def test_v7_changed_local_registration_head_is_refused(tmp_path):
+    log = v7.registry(tmp_path / "wrong-registry")
+    log.append([
+        {"kind": "header", "prereg_sha256": v7.PREREG_BODY_SHA256, "run_at": "2026-09-30T01:43:00+00:00"},
+        {"kind": "preregistration", "prereg_sha256": v7.PREREG_BODY_SHA256,
+         "run_at": "2026-09-30T01:43:00+00:00"},
+    ])
+    assert log.verify_chain()["ok"]
+    with pytest.raises(PermissionError, match="not the pinned vs1-v7 registration"):
+        v7.V7._chain(log)
+
+
+@pytest.mark.parametrize("anchor", [
+    v7.REGISTERED_ANCHOR_LINE.replace(v7.REGISTERED_RECORD_SHA256[1].encode(), b"a" * 64),
+    v7.REGISTERED_ANCHOR_LINE.replace(b"01:43:00", b"01:43:01"),
+])
+def test_v7_changed_offhost_witness_anchor_is_refused(tmp_path, anchor):
+    vault = _Vault(tmp_path / "vault", h=v7, seeds=("vs1-v1", "vs1-v2"))
+    vault.add_file(v7.WITNESS_PATH, anchor + b"\n")
+    with pytest.raises(PermissionError, match="pinned registration"):
+        vault.witness()
 
 
 def test_v6_stop_requires_exact_witness_and_cannot_open_after_supersession(tmp_path):

@@ -6,7 +6,7 @@
 set -e
 VENV=/home/grid/grid_v4/venv/bin/python3
 REPO=/home/grid/grid_v4/grid_repo
-DB="postgresql://grid:gridmaster2026@localhost:5432/griddb"
+DB="postgresql://grid:${GRID_DB_PASSWORD:?set GRID_DB_PASSWORD}@localhost:5432/griddb"
 
 echo "=== GRID Server Startup ==="
 echo ""

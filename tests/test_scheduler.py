@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from types import SimpleNamespace
 
 import config
@@ -22,6 +22,7 @@ class _StopScheduler(Exception):
 class _FakeSchedule:
     def __init__(self) -> None:
         self.jobs: list[dict[str, object]] = []
+        self.callbacks: dict[str, object] = {}
         self.run_pending_calls = 0
 
     def every(self, interval: int = 1) -> "_FakeJob":
@@ -64,6 +65,7 @@ class _FakeJob:
         return self
 
     def do(self, func):
+        self._schedule.callbacks[func.__name__] = func
         self._schedule.jobs.append(
             {
                 "interval": self._interval,
@@ -115,6 +117,15 @@ def test_intelligence_loop_registers_expected_jobs(monkeypatch):
     assert jobs_by_name["_actor_news_weekly_tail"]["at"] == "04:00"
     assert jobs_by_name["_fci_compute_6h"]["interval"] == 6
     assert jobs_by_name["_credit_novelty_daily"]["at"] == "04:30"
+    # 2026-10-23: sentiment_predictions had no scoring caller (205 rows, all
+    # PENDING); the closer runs daily after the 06:45 journal-verdicts job.
+    assert jobs_by_name["_sentiment_outcomes_daily"] == {
+        "interval": 1,
+        "unit": "day",
+        "day": None,
+        "at": "06:50",
+        "func": "_sentiment_outcomes_daily",
+    }
 
 
 def test_wave3_held_writer_jobs_default_off(monkeypatch):
@@ -251,6 +262,113 @@ def test_taiwan_strait_osint_job_can_be_enabled_via_flag(monkeypatch):
     assert "_options_tracker" not in jobs_by_name
     assert "_nightly_research" not in jobs_by_name
     assert "_paper_trading_signals" not in jobs_by_name
+
+
+def test_taiwan_daily_logs_zero_row_pull_as_failure(monkeypatch):
+    import db
+    from ingestion.altdata import rocaf_pla_activity as rocaf
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB=True)
+    )
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "_get_latest_date", lambda self, sid: date(2026, 9, 29))
+    monkeypatch.setattr(rocaf.ROCAFPLAActivityPuller, "fetch", lambda self, since: ([], []))
+    warnings = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+    fake_schedule.callbacks["_taiwan_strait_osint_daily"]()
+    assert len(warnings) == 1
+    assert "status=FAILED" in warnings[0]
+    assert "0 rows" in warnings[0]
+
+
+def test_sentiment_outcomes_daily_records_outcomes_without_promoting_weights(monkeypatch):
+    """The closer runs the real ``score_past_predictions`` on an eligible
+    backlog (scripted connection, no database): outcomes are recorded, no
+    ``sentiment_weights`` row is inserted or read, and no prediction is
+    computed or logged (the hourly briefing owns that)."""
+    import db
+    from intelligence import sentiment_scorer
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    engine, conn = make_scoring_engine(scored_history())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+
+    def _forbidden(*_args, **_kwargs):
+        raise AssertionError("closer must not compute or log a prediction")
+
+    monkeypatch.setattr(sentiment_scorer, "compute_sentiment", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "log_prediction", _forbidden)
+    monkeypatch.setattr(sentiment_scorer, "run_sentiment_cycle", _forbidden)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert {u["id"]: u["outcome"] for u in conn.updates} == {
+        196: "WRONG", 195: "CORRECT", 194: "NEUTRAL_CORRECT",
+    }
+    assert conn.weight_inserts == []
+    # The idempotent CREATE TABLE IF NOT EXISTS bootstrap names the table;
+    # no read (_load_weights) or write of sentiment_weights may follow.
+    touched = [
+        sql for sql, _ in conn.executed
+        if "sentiment_weights" in sql and not sql.startswith("CREATE TABLE")
+    ]
+    assert touched == []
+    assert infos[-1] == (
+        "sentiment outcomes daily: scored=3 correct=2 accuracy=66.7 weight_promotion=disabled"
+    )
+
+
+def test_sentiment_outcomes_daily_promotes_weights_only_when_flag_set(monkeypatch):
+    """Operator decision: GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=true re-couples
+    weight promotion to the closer; the same backlog then inserts a
+    sentiment_weights version."""
+    import db
+    from tests.test_sentiment_scorer import make_scoring_engine, scored_history
+
+    fake_schedule = _run_loop_with_settings(
+        monkeypatch, SimpleNamespace(GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION=True)
+    )
+    engine, conn = make_scoring_engine(scored_history())
+    monkeypatch.setattr(db, "get_engine", lambda: engine)
+    infos: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "info", lambda msg, **kw: infos.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert len(conn.updates) == 3
+    assert len(conn.weight_inserts) == 1
+    assert infos[-1].endswith("weight_promotion=attempted")
+
+
+def test_sentiment_outcomes_daily_logs_failure_as_warning(monkeypatch):
+    import db
+    from intelligence import sentiment_scorer
+
+    fake_schedule = _run_loop_with_settings(monkeypatch, object())
+    monkeypatch.setattr(db, "get_engine", lambda: object())
+
+    def _boom(_eng, **_kwargs):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(sentiment_scorer, "score_past_predictions", _boom)
+    warnings: list[str] = []
+    monkeypatch.setattr(
+        scheduler.log, "warning", lambda msg, **kw: warnings.append(msg.format(**kw))
+    )
+
+    fake_schedule.callbacks["_sentiment_outcomes_daily"]()
+
+    assert warnings == ["sentiment outcomes daily failed: db down"]
 
 
 def test_lme_warehouse_job_default_off(monkeypatch):

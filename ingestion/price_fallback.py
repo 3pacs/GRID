@@ -7,6 +7,10 @@ Uses free-tier APIs as fallback sources:
 3. Stooq.com (no API key needed, CSV download)
 
 Falls through sources in priority order until one succeeds.
+
+Fetch-only: ``save_to_db`` is retired (it backdated ``resolved_series``
+vintages directly, see its docstring) and refuses with
+:class:`PriceFallbackRetired`.
 """
 
 from __future__ import annotations
@@ -18,6 +22,17 @@ from typing import Any
 
 import requests
 from loguru import logger as log
+
+
+RETIRED_REASON = (
+    "PriceFallbackPuller.save_to_db is retired (E1-V7 / DATA-FIX DFa): it wrote backdated "
+    "resolved_series vintages directly; prices reach resolved_series only via raw_series "
+    "and normalization/resolver.py"
+)
+
+
+class PriceFallbackRetired(RuntimeError):
+    """The fallback writer is retired; nothing is stored."""
 
 
 class PriceFallbackPuller:
@@ -126,71 +141,16 @@ class PriceFallbackPuller:
         }
 
     def save_to_db(self, results: list[dict]) -> int:
-        """Save fallback prices to resolved_series."""
-        if not self.engine or not results:
-            return 0
-        from sqlalchemy import text
-        saved = 0
-        with self.engine.begin() as conn:
-            source_id = self._resolve_source_id(conn)
-            for r in results:
-                tk = r["ticker"].lower().replace("-", "_")
-                feature_name = f"{tk}_full"
-                # Find or skip feature
-                feat = conn.execute(
-                    text("SELECT id FROM feature_registry WHERE name = :n"),
-                    {"n": feature_name},
-                ).fetchone()
-                if not feat:
-                    continue
-                conn.execute(
-                    text(
-                        "INSERT INTO resolved_series (feature_id, obs_date, release_date, value, source_priority_used) "
-                        "VALUES (:fid, :d, :d, :v, :src) "
-                        "ON CONFLICT (feature_id, obs_date, vintage_date) DO UPDATE SET value = :v"
-                    ),
-                    {"fid": feat[0], "d": r["date"], "v": r["price"], "src": source_id},
-                )
-                saved += 1
-        log.info("Saved {n} fallback prices to resolved_series", n=saved)
-        return saved
+        """Retired: this writer may not store anything (E1-V7, DATA-FIX DFa).
 
-    def _resolve_source_id(self, conn: Any) -> int:
-        """Return a source_catalog id for fallback prices, creating it if needed."""
-        from sqlalchemy import text
-
-        row = conn.execute(
-            text("SELECT id FROM source_catalog WHERE name = :name"),
-            {"name": "PriceFallback"},
-        ).fetchone()
-        if row:
-            return int(row[0])
-
-        try:
-            created = conn.execute(
-                text(
-                    "INSERT INTO source_catalog "
-                    "(name, base_url, cost_tier, latency_class, pit_available, "
-                    "revision_behavior, trust_score, priority_rank) "
-                    "VALUES (:name, :base_url, 'FREE', 'REALTIME', FALSE, "
-                    "'NEVER', 'MED', 90) "
-                    "RETURNING id"
-                ),
-                {
-                    "name": "PriceFallback",
-                    "base_url": "stooq/alphavantage/twelvedata",
-                },
-            ).fetchone()
-            if created:
-                return int(created[0])
-        except Exception as exc:
-            log.debug("PriceFallback source_catalog create failed: {e}", e=str(exc))
-            row = conn.execute(
-                text("SELECT id FROM source_catalog WHERE name = :name"),
-                {"name": "PriceFallback"},
-            ).fetchone()
-            if row:
-                return int(row[0])
-            raise
-
-        raise RuntimeError("PriceFallback source_catalog id could not be resolved")
+        It used to insert fallback quotes straight into ``resolved_series``
+        with ``release_date = obs_date``, no ``vintage_date`` and
+        ``ON CONFLICT ... DO UPDATE SET value``: a backdated vintage that a
+        re-run rewrote in place, attributed to a source the resolver never
+        saw. ``vintage_date`` is NOT NULL with no default, so on the
+        production schema every call failed and its error was swallowed by
+        the scheduler. Prices reach ``resolved_series`` only through
+        ``raw_series`` plus ``normalization/resolver.py``; a fallback quote
+        source would need its own ``raw_series`` source and entity mapping.
+        """
+        raise PriceFallbackRetired(RETIRED_REASON)

@@ -1,0 +1,38 @@
+[
+  {
+    "query": "I want to add a new intelligence module that computes an implied volatility skew and butterfly arbitrage check for SPY options. Plan the file layout under intelligence/.",
+    "should_trigger": true
+  },
+  {
+    "query": "does GRID already have anything for tracking insider buying clusters? don't want to duplicate it",
+    "should_trigger": true
+  },
+  {
+    "query": "about to write intelligence/catalyst_calendar.py for upcoming earnings and FOMC dates, thoughts on the structure?",
+    "should_trigger": true
+  },
+  {
+    "query": "Let's build a transfer-entropy lead/lag detector between sector ETFs and credit spreads. Start by creating the new file in analysis/.",
+    "should_trigger": true
+  },
+  {
+    "query": "We keep ending up with three half-finished versions of the same thing. Before I ask you to code a Brier score tracker for our predictions, what's the right check to run first?",
+    "should_trigger": true
+  },
+  {
+    "query": "Rebuild .claude/CODEBASE_INDEX.md, the module counts in CLAUDE.md look stale after last week's refactors.",
+    "should_trigger": false
+  },
+  {
+    "query": "Add the ticker XLRE to the Tiingo universe and get it into resolved_series.",
+    "should_trigger": false
+  },
+  {
+    "query": "Why did the last Hermes cycle skip the rotation paper trader step?",
+    "should_trigger": false
+  },
+  {
+    "query": "Fix the off-by-one in intelligence/trust_scorer.py where the 14-day insider window excludes day 14.",
+    "should_trigger": false
+  }
+]

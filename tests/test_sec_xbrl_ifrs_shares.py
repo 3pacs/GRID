@@ -146,3 +146,17 @@ def test_runner_resolve_universe_merges_foreign_issuers():
     uni = _resolve_universe("AAPL,TSM", include_foreign=True)
     assert uni[0] == "AAPL"
     assert uni.count("TSM") == 1  # not duplicated despite being in both
+
+
+def test_ifrs_clean_no_shares_distinct_from_unavailable_facts(monkeypatch):
+    import ingestion.altdata.sec_xbrl_shares as mod
+    from ingestion.smart_scheduler import _classify_outcome
+    monkeypatch.setattr(mod.time, "monotonic", lambda: 100)
+    monkeypatch.setattr(mod.time, "sleep", lambda _: None)
+    monkeypatch.setattr(mod, "_fetch_ticker_to_cik_map", lambda: {"TSM": "1"})
+    monkeypatch.setattr(mod, "_fetch_company_facts", lambda _: {"facts": {}})
+    out = mod.SECXBRLSharesPuller(object()).pull_all(tickers=["TSM"])
+    assert out[0]["reason"] == "no_shares"
+    assert _classify_outcome(out)[:2] == ("NO_NEW_DATA", 0)
+    monkeypatch.setattr(mod, "_fetch_company_facts", lambda _: None)
+    assert _classify_outcome(mod.SECXBRLSharesPuller(object()).pull_all(tickers=["TSM"]))[:2] == ("FAILED", 0)

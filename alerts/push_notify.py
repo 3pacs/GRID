@@ -534,8 +534,11 @@ def integrate_with_email_alerts() -> None:
     # Wrap 100x opportunity alerts
     _original_100x = email_mod.alert_on_100x_opportunity
 
-    def _100x_with_push(ticker: str, score: float, direction: str, thesis: str) -> None:
-        _original_100x(ticker, score, direction, thesis)
+    def _100x_with_push(
+        ticker: str, score: float, direction: str, thesis: str,
+        confidence: str | None = None,
+    ) -> None:
+        _original_100x(ticker, score, direction, thesis, confidence=confidence)
         notify_trade_recommendation(ticker, direction)
 
     email_mod.alert_on_100x_opportunity = _100x_with_push

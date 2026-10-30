@@ -6,11 +6,12 @@
  */
 import React, { useEffect, useState, useRef, useCallback, useMemo } from 'react';
 import * as d3 from 'd3';
-import { api } from '../api.js';
+import { api, snapshotStoredRequest, storedAnalysisMatchesRequest } from '../api.js';
 import { shared, colors, tokens } from '../styles/shared.js';
 import { formatTime, formatDate } from '../utils/formatTime.js';
 import { useDevice } from '../hooks/useDevice.js';
 import PriceChart from '../components/PriceChart.jsx';
+import ExactMarketFeatureCard from '../components/ExactMarketFeatureCard.jsx';
 import GEXProfile from '../components/GEXProfile.jsx';
 import VannaCharmViz from '../components/VannaCharmViz.jsx';
 import FlowTimeline from '../components/FlowTimeline.jsx';
@@ -1140,7 +1141,7 @@ function CapitalFlowPath({ sectorPath, ticker }) {
    Main component
    ═══════════════════════════════════════════════════════════════════ */
 
-export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
+function OrdinaryWatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const { isMobile } = useDevice();
     const currentTickerRef = useRef(ticker);
     currentTickerRef.current = ticker;
@@ -1152,6 +1153,7 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     const [overviewUnavailable, setOverviewUnavailable] = useState(false);
     const [overviewLoading, setOverviewLoading] = useState(true);
     const [period, setPeriod] = useState('3M');
+    const analysisPeriodRef = useRef(period);
     const [priceLoading, setPriceLoading] = useState(false);
     const [gexData, setGexData] = useState(null);
     const [gexLoading, setGexLoading] = useState(true);
@@ -1166,7 +1168,14 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
     useEffect(() => {
         if (!ticker) return;
         let active = true;
-        periodRequestRef.current += 1;
+        const requestId = ++periodRequestRef.current;
+        const requestTicker = ticker;
+        const requestPeriod = period;
+        analysisPeriodRef.current = requestPeriod;
+        const isCurrentAnalysisRequest = () => active
+            && periodRequestRef.current === requestId
+            && currentTickerRef.current === requestTicker
+            && analysisPeriodRef.current === requestPeriod;
 
         // Reset state for new ticker
         setData(null);
@@ -1188,16 +1197,36 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
 
         // Phase 1: Fetch core analysis data (fastest — often cached)
         api.getTickerAnalysis(ticker, period).then(result => {
-            if (!active) return;
+            if (!active || currentTickerRef.current !== requestTicker) return;
             if (result?.error) {
+                if (!isCurrentAnalysisRequest()) return;
                 setError(result.message || 'Failed to load');
                 setData(null);
-            } else {
+            } else if (isCurrentAnalysisRequest()) {
                 setData(result);
+            } else {
+                // Same-ticker initial sections can still load, but their old
+                // period's price fields must not replace a newer request.
+                setData(prev => ({
+                    ...result,
+                    ...prev,
+                    price_history: prev?.price_history ?? [],
+                    price_source: prev?.price_source ?? 'unavailable',
+                    live_price: prev?.live_price ?? null,
+                    market_features: prev?.market_features ?? null,
+                    period: prev?.period ?? analysisPeriodRef.current,
+                    availability: {
+                        ...result?.availability,
+                        ...prev?.availability,
+                        price: prev?.availability?.price ?? 'unknown',
+                    },
+                }));
             }
+            // Ticker-only initial metadata has completed. Period loading is
+            // independently owned by the current period request.
             setDataLoading(false);
         }).catch(err => {
-            if (!active) return;
+            if (!isCurrentAnalysisRequest()) return;
             setError(err.message || 'Failed to load');
             setDataLoading(false);
         });
@@ -1257,36 +1286,50 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                 ? ftResult.value : { error: 'Flow timeline unavailable' });
             setSecondaryLoading(false);
         });
-        return () => { active = false; };
+        return () => {
+            active = false;
+            periodRequestRef.current += 1;
+            analysisPeriodRef.current = null;
+        };
     }, [ticker]);
 
     const handlePeriodChange = useCallback(async (newPeriod) => {
         if (newPeriod === period) return;
         const requestId = ++periodRequestRef.current;
         const requestTicker = ticker;
+        analysisPeriodRef.current = newPeriod;
+        const isCurrentAnalysisRequest = () => periodRequestRef.current === requestId
+            && currentTickerRef.current === requestTicker
+            && analysisPeriodRef.current === newPeriod;
         setPeriod(newPeriod);
         setPriceLoading(true);
         try {
             const refreshed = await api.getTickerAnalysis(ticker, newPeriod);
-            if (periodRequestRef.current !== requestId || currentTickerRef.current !== requestTicker) return;
+            if (!isCurrentAnalysisRequest()) return;
             if (refreshed?.error) {
                 return;
             }
             setData(prev => ({
+                ...refreshed,
                 ...prev,
                 price_history: refreshed.price_history,
                 price_source: refreshed.price_source,
+                live_price: refreshed.live_price,
+                market_features: refreshed.market_features,
                 availability: {
+                    ...refreshed.availability,
                     ...prev?.availability,
                     price: refreshed.availability?.price,
                 },
                 period: refreshed.period,
             }));
+            setError(null);
         } catch (err) {
             // Keep existing data on failure
         } finally {
-            if (periodRequestRef.current === requestId && currentTickerRef.current === requestTicker) {
+            if (isCurrentAnalysisRequest()) {
                 setPriceLoading(false);
+                setDataLoading(false);
             }
         }
     }, [ticker, period]);
@@ -1373,6 +1416,8 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
                     </div>
                 </div>
             </div>
+
+            <ExactMarketFeatureCard analysis={data} ticker={ticker} loading={dataLoading} overview={overview} />
 
             {/* ═══ AI OVERVIEW ═══ */}
             {overviewLoading ? (
@@ -1631,4 +1676,193 @@ export default function WatchlistAnalysis({ ticker, onBack, enrichedData }) {
             <div style={{ height: '80px' }} />
         </div>
     );
+}
+
+// A separate component keeps ordinary cold-navigation effects entirely dormant.
+// Render-time keys mask old context even before effect cleanup runs.
+function StoredWatchlistAnalysis({ ticker, onBack, storedRequest, invalidMode }) {
+    const [period, setPeriod] = useState('3M');
+    const [state, setState] = useState(null);
+    const generation = useRef(0);
+    let snapshot = null, invalidReason = invalidMode ? 'stored_mode_invalid' : null;
+    if (!invalidReason) {
+        try { snapshot = snapshotStoredRequest(storedRequest); }
+        catch (error) { invalidReason = error.message; }
+    }
+    const contextKey = JSON.stringify([ticker, period, snapshot?.json ?? null, invalidReason]);
+    const currentKey = useRef(contextKey);
+    currentKey.current = contextKey;
+    useEffect(() => {
+        const requestGeneration = ++generation.current;
+        const isCurrent = () => generation.current === requestGeneration && currentKey.current === contextKey;
+        if (invalidReason || !ticker) {
+            setState({ key: contextKey, loading: false, error: invalidReason ?? 'ticker_missing', data: null });
+            return () => { generation.current += 1; };
+        }
+        // Snapshot is detached before the first await; no mutation of caller context.
+        const request = snapshot.value;
+        setState({ key: contextKey, loading: true, error: null, data: null });
+        api.getTickerAnalysis(ticker, period, { storedOnly: true, storedRequest: request }).then(result => {
+            if (!isCurrent()) return;
+            if (!storedAnalysisMatchesRequest(result, ticker, period, request)) {
+                setState({ key: contextKey, loading: false, error: 'response_context_mismatch', data: null });
+            } else {
+                setState({ key: contextKey, loading: false, error: null, data: result });
+            }
+        }).catch(error => {
+            if (isCurrent()) setState({ key: contextKey, loading: false, error: error.message || 'stored_read_failed', data: null });
+        });
+        return () => { generation.current += 1; };
+    }, [contextKey]);
+    const visible = state?.key === contextKey ? state : null;
+    return <div>
+        <button type="button" onClick={onBack}>Back</button>
+        <h2>{ticker} — Stored source context</h2>
+        <label>Observation display period <select aria-label="Stored display period" value={period} onChange={event => setPeriod(event.target.value)}>
+            {['1M', '3M', '6M', '1Y'].map(value => <option key={value} value={value}>{value}</option>)}
+        </select></label>
+        <p>Stored-only read; no ordinary price, overview, options or secondary requests.</p>
+        {(invalidReason || visible?.error) && <p role="alert">Stored source evidence unavailable — {invalidReason || visible.error}</p>}
+        <ExactMarketFeatureCard analysis={visible?.data ?? null} ticker={ticker}
+            loading={!invalidReason && (!visible || visible.loading)} overview={null} />
+    </div>;
+}
+
+function AcceptedWatchlistAnalysis({ ticker, onBack, enrichedData, storedOnly = false, storedRequest = null }) {
+    if (storedOnly === false) return <OrdinaryWatchlistAnalysis ticker={ticker} onBack={onBack} enrichedData={enrichedData} />;
+    return <StoredWatchlistAnalysis ticker={ticker} onBack={onBack} storedRequest={storedRequest} invalidMode={storedOnly !== true} />;
+}
+
+// JSON.parse remains the syntax/value authority. A structural walk of that
+// valid raw text checks decoded member names before the value reaches preview.
+// Each object owns its own names; array items and string contents are separate.
+function parseUnambiguousStoredJSON(text) {
+    const parsed = JSON.parse(text);
+    let position = 0;
+    const whitespace = () => {
+        while (' \t\r\n'.includes(text[position]) && position < text.length) position += 1;
+    };
+    const stringToken = () => {
+        const start = position++;
+        while (position < text.length) {
+            const character = text[position++];
+            if (character === '\\') position += 1;
+            else if (character === '"') break;
+        }
+        return text.slice(start, position);
+    };
+    const value = () => {
+        whitespace();
+        if (text[position] === '{') {
+            position += 1;
+            whitespace();
+            const names = new Set();
+            if (text[position] === '}') { position += 1; return; }
+            while (position < text.length) {
+                whitespace();
+                const name = JSON.parse(stringToken());
+                if (names.has(name)) throw new Error('stored_request_duplicate_key');
+                names.add(name);
+                whitespace();
+                position += 1; // colon: the complete text already passed JSON.parse
+                value();
+                whitespace();
+                if (text[position++] === '}') return;
+            }
+        } else if (text[position] === '[') {
+            position += 1;
+            whitespace();
+            if (text[position] === ']') { position += 1; return; }
+            while (position < text.length) {
+                value();
+                whitespace();
+                if (text[position++] === ']') return;
+            }
+        } else if (text[position] === '"') {
+            stringToken(); // property-looking string values are not object names
+        } else {
+            while (position < text.length && !',]} \t\r\n'.includes(text[position])) position += 1;
+        }
+    };
+    value();
+    return parsed;
+}
+
+function storedDraft(text) {
+    if (!text.trim()) return { error: 'Add a declared request with selections, cutoff, start date and vintage policy.' };
+    let parsed;
+    try { parsed = parseUnambiguousStoredJSON(text); }
+    catch (error) {
+        return { error: error.message === 'stored_request_duplicate_key'
+            ? 'The request repeats an object field. Declare each field once; repeated fields are ambiguous.'
+            : 'The request must be valid JSON. Check its quotes, commas and brackets.' };
+    }
+    const required = ['selections', 'as_of', 'start_date', 'vintage_policy'];
+    if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return { error: 'The request must be one JSON object.' };
+    const missing = required.filter(key => !Object.hasOwn(parsed, key));
+    if (missing.length) return { error: `Missing request fields: ${missing.join(', ')}.` };
+    try { return { snapshot: snapshotStoredRequest(parsed) }; }
+    catch (error) {
+        return { error: error.message === 'stored_request_too_large'
+            ? 'The request exceeds the 16 KiB size limit.'
+            : 'Use only selections, as_of, start_date and vintage_policy with JSON values. Dates and policy must be strings.' };
+    }
+}
+
+function StoredRequestEntry({ ticker, onBack, onOrdinary }) {
+    const [text, setText] = useState('');
+    const [error, setError] = useState(null);
+    const [applied, setApplied] = useState(null);
+    const submission = useRef(0);
+    const draft = useMemo(() => storedDraft(text), [text]);
+    const load = event => {
+        event.preventDefault();
+        if (!ticker) { setError('Select a ticker before loading stored data.'); return; }
+        if (!draft.snapshot) { setError(draft.error); return; }
+        // Explicit submit owns an independent snapshot. Subsequent draft edits
+        // never mutate it; a fresh mount invalidates the previous submission.
+        setApplied({ request: draft.snapshot.value, generation: ++submission.current });
+        setError(null);
+    };
+    const reset = () => { setText(''); setError(null); setApplied(null); };
+    return <div>
+        <h2>Stored analysis for {ticker || 'no ticker selected'}</h2>
+        <p>Read declared stored observations. Supply the exact source selections, an aware cutoff, observation start date and vintage policy. No sources or dates are selected automatically.</p>
+        <button type="button" onClick={onOrdinary}>Return to ordinary analysis</button>
+        <form onSubmit={load}>
+            <label htmlFor="stored-analysis-request">Declared stored request</label>
+            <textarea id="stored-analysis-request" rows={8} value={text}
+                onChange={event => { setText(event.target.value); setError(null); }}
+                placeholder="Paste your request JSON. Required fields: selections, as_of, start_date, vintage_policy."
+                aria-describedby="stored-analysis-help" />
+            <p id="stored-analysis-help">Use an explicit timezone in as_of. Editing this draft does not change the loaded request. Load stored data to apply it.</p>
+            {draft.snapshot && <section aria-label="Stored request preview">
+                <h3>Request preview</h3>
+                <p>Cutoff: {draft.snapshot.value.as_of || 'Not supplied'}</p>
+                <p>Observation start: {draft.snapshot.value.start_date || 'Not supplied'}</p>
+                <p>Vintage policy: {draft.snapshot.value.vintage_policy || 'Not supplied'}</p>
+                <p>Declared selections: {draft.snapshot.value.selections?.length ?? 0}</p>
+                <details><summary>Declared source bindings</summary><pre>{JSON.stringify(draft.snapshot.value.selections, null, 2)}</pre></details>
+                <p>The stored read validates these bindings; this preview does not establish availability or freshness.</p>
+            </section>}
+            {error && <p role="alert">Stored data unavailable: {error}</p>}
+            <button type="submit">Load stored data</button>
+            <button type="button" onClick={reset}>Reset stored request</button>
+        </form>
+        <AcceptedWatchlistAnalysis key={applied?.generation ?? 'empty'} ticker={ticker} onBack={onBack}
+            storedOnly={true} storedRequest={applied?.request ?? null} />
+    </div>;
+}
+
+export default function WatchlistAnalysis(props) {
+    const [entryOpen, setEntryOpen] = useState(false);
+    // Keep the accepted explicit caller interface intact. The ordinary actual
+    // app mount needs only ticker/onBack to reach the human entry control.
+    if (props.storedOnly !== undefined && props.storedOnly !== false) return <AcceptedWatchlistAnalysis {...props} />;
+    if (entryOpen) return <StoredRequestEntry key={props.ticker ?? ''} ticker={props.ticker}
+        onBack={props.onBack} onOrdinary={() => setEntryOpen(false)} />;
+    return <>
+        <button type="button" onClick={() => setEntryOpen(true)}>Stored analysis</button>
+        <AcceptedWatchlistAnalysis {...props} />
+    </>;
 }

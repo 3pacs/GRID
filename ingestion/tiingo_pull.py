@@ -58,6 +58,14 @@ _REQUEST_TIMEOUT = 30
 #     rate limiter, and
 #   * holds a cross-process advisory lock, so grid-scheduler and
 #     grid-hermes can never write the same (series, obs_date) concurrently.
+#
+# That run-level lock only covers pull_incremental. pull_all / pull_ticker
+# (backfill and universe scripts) do not take it, and the check-then-insert
+# in _insert_rows is not atomic: two transactions writing the same ticker
+# can each miss the other's uncommitted rows in NOT EXISTS and both insert.
+# That is how the 09-15..09-28 byte-identical duplicate SUCCESS pairs were
+# made (GRID-TIINGO-DUPLICATES-20260929). _insert_rows therefore also takes
+# a per-ticker pg_advisory_xact_lock before its INSERT, on every path.
 ROUTINE_OVERLAP_DAYS = 10          # re-check this many days behind the latest stored session
 NEW_TICKER_START = "2020-01-01"    # routine first pull for a ticker with no TIINGO rows (pull_ticker's default)
 EOD_READY_ET = dtime(18, 0)        # a session's EOD bar is treated as published from 18:00 America/New_York
@@ -307,8 +315,17 @@ class TiingoPuller(BasePuller):
         pairs inside one batch collapse to one. One statement per
         _INSERT_CHUNK_ROWS rows, all in one transaction, instead of one
         round trip per row -- the per-row form was ~28s per ticker on a
-        ~50k-row history. Concurrent routine writers are kept apart by the
-        advisory lock in pull_incremental.
+        ~50k-row history.
+
+        Concurrency: before the first INSERT, the transaction takes a
+        per-ticker ``pg_advisory_xact_lock`` (see _lock_tickers). A second
+        writer for the same ticker -- an orphaned SmartScheduler thread, a
+        backfill script's pull_all, a manual pull_ticker -- waits there
+        until the first commits. Its INSERT then runs as a new READ
+        COMMITTED statement, so NOT EXISTS sees the committed rows and it
+        inserts nothing. Without the lock, both transactions miss each
+        other's uncommitted rows and both insert (the 09-29 duplicate
+        pairs). The lock is released at commit or rollback.
         """
         if not rows_batch:
             return 0
@@ -332,6 +349,7 @@ class TiingoPuller(BasePuller):
         )
         inserted = 0
         with self.engine.begin() as conn:
+            self._lock_tickers(conn, [r["sid"] for r in rows_batch])
             for i in range(0, len(rows_batch), _INSERT_CHUNK_ROWS):
                 chunk = rows_batch[i:i + _INSERT_CHUNK_ROWS]
                 res = conn.execute(sql, {
@@ -342,6 +360,23 @@ class TiingoPuller(BasePuller):
                 })
                 inserted += max(0, int(res.rowcount or 0))
         return inserted
+
+    def _lock_tickers(self, conn: Any, series_ids: list[str]) -> None:
+        """Take the per-ticker write lock for every ticker in ``series_ids``.
+
+        Must run inside the inserting transaction (``engine.begin()``),
+        before the INSERT. A series id ``YF:<TICKER>:<field>`` locks on
+        ``YF:<TICKER>`` (everything before the last ``:``), so all six
+        fields of one ticker share one lock: a pull_ticker batch takes
+        exactly one. The key is BasePuller._file_advisory_lock's
+        sha256-derived 63-bit key, namespaced by SOURCE_NAME, the same
+        helper the file-based pullers use for this orphaned-thread race.
+        Several tickers are locked in sorted order, so two writers with
+        overlapping batches cannot deadlock.
+        """
+        tickers = sorted({sid.rsplit(":", 1)[0] for sid in series_ids})
+        for ticker_key in tickers:
+            self._file_advisory_lock(conn, "prices", ticker_key)
 
     def _latest_tiingo_obs(self, ticker: str) -> date | None:
         """Latest SUCCESS obs_date this source holds for ``ticker``'s close.

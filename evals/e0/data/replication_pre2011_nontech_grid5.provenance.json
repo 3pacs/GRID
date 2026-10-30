@@ -1,0 +1,17 @@
+{
+  "access": "read-only transaction, statement_timeout 120s, outside 03:25-10:30Z",
+  "csv_sha256": "f80c2e156aaaf9818d36f911a97e3097db6a5548108114fd2d4c1d2881d35248",
+  "first_date": "1993-06-01",
+  "grid": "every 5th session of the union trading calendar",
+  "grid_dates": 887,
+  "last_date": "2010-12-30",
+  "obs_window": [
+    "1993-06-01",
+    "2010-12-31"
+  ],
+  "panel": "replication_pre2011_nontech_grid5",
+  "query_note": "grid-svr psql, 2026-09-30 21:59Z-23:09Z UTC, 1042 candidate tickers queried, 710 returned rows",
+  "source": "raw_series TIINGO (source_id 524) YF:{ticker}:adj_close, SUCCESS rows of the latest pull batch",
+  "tickers": 710,
+  "universe": "today's non-Technology sector-map company tickers minus the VS1 Technology deny-list"
+}

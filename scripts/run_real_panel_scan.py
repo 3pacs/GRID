@@ -52,6 +52,11 @@ MAX_STATEMENT_TIMEOUT_S = 60
 #: cache under concurrent ingest (2026-09-29: YF:XLK:adj_close other-source count 154 s cold, 0.8 s warm).
 ABSOLUTE_MAX_STATEMENT_TIMEOUT_S = 900
 
+#: Wall-clock timings of a run (read / total seconds), for ops only. Written next to the
+#: artifacts but outside them: never in summary.json, never hashed or compared, because
+#: the same inputs and code must give byte-identical artifacts on any host (E1-V5).
+TIMING_FILE = "timing.json"
+
 WEEKLY = {"stale_sessions": 10}
 
 FEATURES: tuple[SeriesSpec, ...] = (
@@ -261,11 +266,14 @@ def scan(conn, output: Path, args) -> dict:
         "discovery_manifest_sha256": frozen["sha256"],
         "method": payload["method"],
         "caveats": payload["caveats"],
-        "read_seconds": round(read_seconds, 1),
-        "total_seconds": round(time.time() - started, 1),
     }
     write_once(output / "summary.json", summary)
     write_once(output / "frozen-candidates.json", result["candidates"])
+    # Host-dependent, so kept out of every deterministic artifact (see TIMING_FILE).
+    write_once(output / TIMING_FILE, {
+        "read_seconds": round(read_seconds, 1),
+        "total_seconds": round(time.time() - started, 1),
+    })
     return summary
 
 
