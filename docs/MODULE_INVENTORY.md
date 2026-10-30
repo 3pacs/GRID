@@ -2157,6 +2157,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Reads:** `__future__`, `config`, `dataclasses`, `json`, `os`, `pathlib`, `requests`, `stat`, `time`, `typing`
 **Tests:** `tests/test_schwab_market.py` (all HTTP faked)
 
+#### `ingestion/schwab_quote_path.py` — 459 LOC
+**Docstring:** Private GRID quote path over the reviewed Schwab reader. Turns `SchwabQuote` rows from `ingestion/schwab_market.py` into availability-contract payloads with provenance (`as_of` = provider `quoteTime`, `vintage` = GRID receipt time), freshness (`max_quote_age_s`, default 20 s = gex-watch's RTD callback-age gate) and an explicit status per symbol (`fresh` / `stale` / `delayed` / `missing` / `invalid` / `unavailable`; only `fresh` is `live`). Missing values are `None`, never 0. **Private boundary:** `audience="private"`, `redistribution="prohibited"`, `persist_allowed=False`; `read_private_quotes` refuses any other audience before touching the reader; `status_only()` is the only projection allowed outside (statuses and age buckets, no measured values). Reader is injected (no network, credentials, token file, clock or DB in this module). Not scheduled, not wired into Hermes/GEX; chain seam documented in `docs/reference/SCHWAB_GEX_CHAIN_SEAM.md` (added 2026-10-30).
+**Functions:** `read_private_quotes`, `classify_quote`, `PrivateQuote` (`to_private_dict`, `status_only`), `PrivateQuoteSnapshot` (`by_symbol`, `counts`, `to_private_dict`, `status_only`), `AudienceError`, `QuoteSource`
+**Reads:** `__future__`, `collections.abc`, `config`, `dataclasses`, `datetime`, `ingestion.schwab_market`, `json`, `store.availability`, `typing`
+**Tests:** `tests/test_schwab_quote_path.py` (offline, fake reader, injected clock)
+
 #### `ingestion/sec_velocity.py` — 426 LOC
 **Docstring:** GRID SEC 8-K filing velocity module.
 **Functions:** `SECVelocityPuller`
