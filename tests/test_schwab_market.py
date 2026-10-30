@@ -6,10 +6,13 @@ the network, the operator's real token file or ``~/.config/grid/schwab``.
 
 from __future__ import annotations
 
+import fcntl
 import inspect
 import json
 import os
 import stat
+import threading
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -388,7 +391,7 @@ def test_parse_quotes_skips_errors_and_missing_quote(log_lines) -> None:
     out = parse_quotes(body)
     assert set(out) == {"SPY", "QQQ"}
     assert out["QQQ"].last_price is None
-    assert any("errors for some symbols" in line for line in log_lines)
+    assert any("returned errors: invalidSymbols=1" in line for line in log_lines)
     assert parse_quotes({}) == {} and parse_quotes(None) == {}  # type: ignore[arg-type]
 
 
@@ -480,3 +483,406 @@ def test_no_secret_ever_logged_or_in_exceptions(tmp_path: Path, session, log_lin
     for secret in (FAKE_KEY, FAKE_SECRET, FAKE_ACCESS, FAKE_REFRESH, "fake-new-access-cccc"):
         assert secret not in blob
     assert "Authorization" not in blob and "Bearer" not in blob
+
+
+# ---------------------------------------------------------------------------
+# Independent review of ecb23e66 (PR #931) — adversarial controls.
+# Every case uses disposable files under tmp_path and fabricated markers;
+# the operator's real token path is never touched.
+# ---------------------------------------------------------------------------
+
+MARKER = "FAKE-SECRET-MARKER-9f3a1c"
+
+
+def _tb(exc: BaseException) -> str:
+    return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _client_needing_refresh(tmp_path: Path, session: FakeSession, **kw) -> tuple[SchwabMarketClient, Path]:
+    tf = tmp_path / "tokens.json"
+    write_token_file(tf, access_expires_at=NOW - 10, refresh_expires_at=NOW + 86400)
+    kw.setdefault("now", lambda: NOW)
+    kw.setdefault("sleep", lambda s: None)
+    client = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=tf,
+                                session=session, **kw)
+    return client, tf
+
+
+def _refresh_ok(session: FakeSession, access: str = "fake-new-access", **extra) -> None:
+    body = {"access_token": access, "expires_in": 1800}
+    body.update(extra)
+    session.post_queue.append(FakeResponse(200, body))
+
+
+# -- P1: temp-file write -------------------------------------------------------
+
+@pytest.mark.parametrize("link", ["hard", "sym"])
+def test_p1_preplaced_link_at_old_tmp_path_is_never_written(tmp_path: Path, session, link) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    dummy = tmp_path / "victim.txt"
+    dummy.write_text("untouched\n")
+    os.chmod(dummy, 0o644)
+    old_tmp = tf.with_name(tf.name + ".tmp")  # the deterministic path ecb23e66 used
+    if link == "hard":
+        os.link(dummy, old_tmp)
+    else:
+        os.symlink(dummy, old_tmp)
+    _refresh_ok(session, "fake-new-access-" + MARKER)
+
+    client.refresh()
+
+    assert dummy.read_text() == "untouched\n"
+    assert stat.S_IMODE(dummy.stat().st_mode) == 0o644
+    assert MARKER not in old_tmp.read_text()  # link target untouched
+    assert not tf.is_symlink() and tf.is_file()
+    assert stat.S_IMODE(tf.stat().st_mode) == 0o600
+    assert json.loads(tf.read_text())["access_token"] == "fake-new-access-" + MARKER
+    leftovers = [p.name for p in tmp_path.iterdir()
+                 if p.name.startswith(".tokens-") or (p.suffix == ".tmp" and p != old_tmp)]
+    assert leftovers == []
+
+
+def test_p1_temp_file_is_unique_exclusive_and_0600(tmp_path: Path, session, monkeypatch) -> None:
+    """The temp file is created by mkstemp (O_EXCL, random name, 0600) and fsynced."""
+    client, _tf = _client_needing_refresh(tmp_path, session)
+    seen: dict[str, Any] = {}
+    real_mkstemp = sm.tempfile.mkstemp
+
+    def spy(*a, **k):
+        fd, name = real_mkstemp(*a, **k)
+        seen["name"] = name
+        seen["mode"] = stat.S_IMODE(os.fstat(fd).st_mode)
+        seen["dir"] = k.get("dir")
+        return fd, name
+
+    monkeypatch.setattr(sm.tempfile, "mkstemp", spy)
+    fsyncs: list[int] = []
+    monkeypatch.setattr(sm.os, "fsync", lambda fd: fsyncs.append(fd))
+    _refresh_ok(session)
+    client.refresh()
+    assert Path(seen["dir"]) == tmp_path
+    assert Path(seen["name"]).parent == tmp_path and Path(seen["name"]).name.startswith(".tokens-")
+    assert seen["mode"] == 0o600
+    assert not Path(seen["name"]).exists()  # renamed over the destination
+    assert len(fsyncs) >= 1
+
+
+def test_p1_refuses_to_replace_symlinked_destination(tmp_path: Path, session) -> None:
+    real = tmp_path / "real-tokens.json"
+    write_token_file(real, access_expires_at=NOW - 10, refresh_expires_at=NOW + 86400)
+    link = tmp_path / "tokens.json"
+    os.symlink(real, link)
+    client = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=link,
+                                session=session, now=lambda: NOW)
+    client._tokens = json.loads(real.read_text())  # bypass the read guard to reach the writer
+    with pytest.raises(SchwabConfigError, match="not a regular file"):
+        client._write_tokens({"access_token": "x"})
+    assert json.loads(real.read_text())["access_token"] == FAKE_ACCESS
+    assert link.is_symlink()
+
+
+def test_p1_refuses_group_or_other_writable_directory(tmp_path: Path, session) -> None:
+    d = tmp_path / "shared"
+    d.mkdir(mode=0o700)
+    tf = d / "tokens.json"
+    write_token_file(tf, access_expires_at=NOW - 10, refresh_expires_at=NOW + 86400)
+    client = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=tf,
+                                session=session, now=lambda: NOW)
+    os.chmod(d, 0o770)
+    try:
+        with pytest.raises(SchwabConfigError, match="group/other writable"):
+            client.quotes("SPY")
+    finally:
+        os.chmod(d, 0o700)
+    assert session.calls == []
+
+
+# -- P2: fd-bound private reads -----------------------------------------------
+
+def test_p2_symlink_to_private_token_file_is_refused(tmp_path: Path, session) -> None:
+    real = tmp_path / "real.json"
+    write_token_file(real, access_expires_at=NOW + 1500, refresh_expires_at=NOW + 86400)
+    link = tmp_path / "tokens.json"
+    os.symlink(real, link)
+    client = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=link,
+                                session=session, now=lambda: NOW)
+    with pytest.raises(SchwabConfigError, match="symbolic link"):
+        client.quotes("SPY")
+    assert session.calls == []
+
+
+def test_p2_symlink_to_private_credentials_file_is_refused(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(sm.settings, "SCHWAB_APP_KEY", "")
+    monkeypatch.setattr(sm.settings, "SCHWAB_APP_SECRET", "")
+    real = tmp_path / "real.env"
+    real.write_text(f"SCHWAB_APP_KEY={FAKE_KEY}\nSCHWAB_APP_SECRET={FAKE_SECRET}\n")
+    os.chmod(real, 0o600)
+    link = tmp_path / "credentials.env"
+    os.symlink(real, link)
+    with pytest.raises(SchwabConfigError, match="symbolic link"):
+        load_credentials(credentials_file=link)
+
+
+def test_p2_non_regular_file_is_refused(tmp_path: Path, session) -> None:
+    fifo = tmp_path / "tokens.json"
+    os.mkfifo(fifo, 0o600)
+    client = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=fifo,
+                                session=session, now=lambda: NOW)
+    with pytest.raises(SchwabConfigError, match="not a regular file"):
+        client.quotes("SPY")
+
+
+@pytest.mark.skipif(not hasattr(os, "geteuid") or os.geteuid() == 0, reason="needs non-root POSIX")
+def test_p2_foreign_owner_is_refused_via_fstat(tmp_path: Path, session, monkeypatch) -> None:
+    """Ownership cannot be changed without root, so the uid check is driven
+    through the fstat seam with the real file otherwise untouched."""
+    client, _tf = _client_needing_refresh(tmp_path, session)
+    monkeypatch.setattr(sm, "_expected_uid", lambda: os.geteuid() + 1)
+    with pytest.raises(SchwabConfigError, match="owned by uid"):
+        client.quotes("SPY")
+    assert session.calls == []
+
+
+def test_p2_read_uses_validated_descriptor_not_a_second_open(client, session, monkeypatch) -> None:
+    """If the read went through Path.read_text()/Path.stat() a swap between
+    check and read would be possible; forbid both and prove the read still works."""
+    def boom(*a, **k):
+        raise AssertionError("path re-opened after validation")
+    monkeypatch.setattr(Path, "read_text", boom)
+    monkeypatch.setattr(Path, "stat", boom)
+    session.get_queue.append(FakeResponse(200, SPY_BODY))
+    assert client.quotes("SPY")["SPY"].last_price == 601.22
+
+
+def test_p2_check_and_read_share_one_fd(tmp_path: Path, monkeypatch) -> None:
+    """Swap the file between fstat validation and the read: the data must come
+    from the descriptor that was validated, not from the swapped-in path."""
+    tf = tmp_path / "tokens.json"
+    tf.write_text('{"access_token": "validated"}')
+    os.chmod(tf, 0o600)
+    real_check = sm._check_private_fd
+
+    def swap_then_check(fd, path):
+        st = real_check(fd, path)
+        attacker = tmp_path / "attacker.json"
+        attacker.write_text('{"access_token": "swapped"}')
+        os.chmod(attacker, 0o644)
+        os.replace(attacker, tf)  # replace the path after validation
+        return st
+
+    monkeypatch.setattr(sm, "_check_private_fd", swap_then_check)
+    assert json.loads(sm._read_private(tf))["access_token"] == "validated"
+
+
+# -- P2: exception chaining -----------------------------------------------------
+
+def test_p2_transport_exception_text_absent_from_traceback_on_get(tmp_path: Path, session) -> None:
+    client, _tf = _client_needing_refresh(tmp_path, session, max_retries=0)
+    _refresh_ok(session)
+    session.get_queue.append(requests.ConnectionError(f"proxy auth {MARKER} https://u:{MARKER}@x"))
+    with pytest.raises(SchwabTransientError) as ei:
+        client.quotes("SPY")
+    assert MARKER not in _tb(ei.value)
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+
+
+def test_p2_transport_exception_text_absent_from_traceback_on_refresh(tmp_path: Path, session) -> None:
+    client, _tf = _client_needing_refresh(tmp_path, session)
+    session.post_queue.append(requests.ConnectionError(f"basic {MARKER}"))
+    with pytest.raises(SchwabTransientError) as ei:
+        client.refresh()
+    assert MARKER not in _tb(ei.value)
+    assert ei.value.__cause__ is None and ei.value.__suppress_context__
+
+
+def test_p2_non_json_bodies_do_not_leak_text(tmp_path: Path, session) -> None:
+    class BadJSON(FakeResponse):
+        def json(self):
+            raise ValueError(f"Expecting value: {MARKER}")
+
+    client, _tf = _client_needing_refresh(tmp_path, session)
+    session.post_queue.append(BadJSON(200, {}))
+    with pytest.raises(SchwabTransientError) as ei:
+        client.refresh()
+    assert MARKER not in _tb(ei.value)
+    _refresh_ok(session)
+    session.get_queue.append(BadJSON(200, {}))
+    with pytest.raises(SchwabTransientError) as ei2:
+        client.quotes("SPY")
+    assert MARKER not in _tb(ei2.value)
+
+
+# -- P2: concurrency / lock -----------------------------------------------------
+
+def test_p2_lock_file_is_private_and_exclusive(client, session, tmp_path: Path) -> None:
+    session.get_queue.append(FakeResponse(200, SPY_BODY))
+    client.quotes("SPY")
+    lock_path = tmp_path / "tokens.json.lock"
+    assert lock_path.is_file() and stat.S_IMODE(lock_path.stat().st_mode) == 0o600
+
+    held = threading.Event()
+    release = threading.Event()
+
+    def holder():
+        with client._lock():
+            held.set()
+            release.wait(5)
+
+    t = threading.Thread(target=holder)
+    t.start()
+    assert held.wait(5)
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    finally:
+        os.close(fd)
+        release.set()
+        t.join(5)
+    fd = os.open(lock_path, os.O_RDWR)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # released after exit
+    finally:
+        os.close(fd)
+
+
+def test_p2_second_client_reuses_refresh_done_by_first(tmp_path: Path) -> None:
+    """Two clients share one token file and both hold stale caches. Only one
+    refresh happens and both caches equal the final file."""
+    sa, sb = FakeSession(), FakeSession()
+    tf = tmp_path / "tokens.json"
+    write_token_file(tf, access_expires_at=NOW - 10, refresh_expires_at=NOW + 86400)
+    mk = lambda s: SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=tf,
+                                      session=s, now=lambda: NOW)
+    a, b = mk(sa), mk(sb)
+    a._load_tokens(); b._load_tokens()  # both cache the stale state
+    _refresh_ok(sa, "fake-access-from-A")
+    sa.get_queue.append(FakeResponse(200, SPY_BODY))
+    sb.get_queue.append(FakeResponse(200, SPY_BODY))
+
+    a.quotes("SPY")
+    b.quotes("SPY")
+
+    assert [c["method"] for c in sa.calls] == ["POST", "GET"]
+    assert [c["method"] for c in sb.calls] == ["GET"]  # no second refresh
+    assert sb.calls[0]["headers"]["Authorization"] == "Bearer fake-access-from-A"
+    final = json.loads(tf.read_text())
+    assert a._tokens == final == b._tokens
+    assert [p.name for p in tmp_path.iterdir() if p.name.startswith(".tokens-")] == []
+
+
+def test_p2_stale_401_does_not_refresh_when_file_already_rotated(tmp_path: Path) -> None:
+    """A 401 for a token that is no longer the one on disk re-reads the file
+    instead of refreshing again (another holder already refreshed)."""
+    sa, sb = FakeSession(), FakeSession()
+    tf = tmp_path / "tokens.json"
+    write_token_file(tf, access_expires_at=NOW + 1500, refresh_expires_at=NOW + 86400)
+    a = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=tf,
+                           session=sa, now=lambda: NOW)
+    b = SchwabMarketClient(app_key=FAKE_KEY, app_secret=FAKE_SECRET, token_file=tf,
+                           session=sb, now=lambda: NOW)
+
+    def a_get(url, params=None, headers=None, timeout=None):
+        sa.calls.append({"method": "GET", "url": url, "params": dict(params or {}),
+                         "headers": dict(headers or {}), "timeout": timeout})
+        if len(sa.calls) == 1:
+            _refresh_ok(sb, "fake-access-from-B")
+            b.refresh()  # someone else rotates the file between A's attempts
+            return FakeResponse(401)
+        return FakeResponse(200, SPY_BODY)
+
+    sa.get = a_get  # type: ignore[method-assign]
+    a.quotes("SPY")
+    assert [c["method"] for c in sa.calls] == ["GET", "GET"]  # no POST from A
+    assert sa.calls[1]["headers"]["Authorization"] == "Bearer fake-access-from-B"
+
+
+# -- P2: refresh-token expiry policy ------------------------------------------
+
+def test_p2_unchanged_refresh_token_keeps_old_expiry(tmp_path: Path, session) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    _refresh_ok(session, refresh_token=FAKE_REFRESH)  # same token echoed back
+    client.refresh()
+    saved = json.loads(tf.read_text())
+    assert saved["refresh_token"] == FAKE_REFRESH
+    assert saved["refresh_expires_at"] == NOW + 86400  # not extended
+
+
+def test_p2_omitted_refresh_token_keeps_old_expiry(tmp_path: Path, session) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    _refresh_ok(session)
+    client.refresh()
+    saved = json.loads(tf.read_text())
+    assert saved["refresh_token"] == FAKE_REFRESH
+    assert saved["refresh_expires_at"] == NOW + 86400
+
+
+def test_p2_changed_refresh_token_gets_new_seven_day_expiry(tmp_path: Path, session) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    _refresh_ok(session, refresh_token="fake-rotated-refresh")
+    client.refresh()
+    saved = json.loads(tf.read_text())
+    assert saved["refresh_token"] == "fake-rotated-refresh"
+    assert saved["refresh_expires_at"] == int(NOW) + 7 * 86400
+
+
+# -- P2: provider error objects are not logged raw ----------------------------
+
+def test_p2_errors_object_values_never_reach_logs(log_lines) -> None:
+    huge_key = "k" * 500
+    body = {
+        "SPY": SPY_BODY["SPY"],
+        "errors": {
+            "invalidSymbols": [MARKER, "NOPE"],
+            "other": {"detail": MARKER},
+            huge_key: "x" * 10_000,
+            **{f"cat{i}": [i] for i in range(20)},
+        },
+    }
+    out = parse_quotes(body)
+    assert set(out) == {"SPY"}
+    err_lines = [line for line in log_lines if "returned errors" in line]
+    assert len(err_lines) == 1
+    line = err_lines[0]
+    assert MARKER not in line and "x" * 50 not in line
+    assert "invalidSymbols=2" in line and "other=1" in line and "+13 more" in line
+    assert len(line) < 1000
+
+
+@pytest.mark.parametrize("errors", [["a", MARKER], MARKER, 42])
+def test_p2_non_mapping_errors_objects_are_summarised(log_lines, errors) -> None:
+    parse_quotes({"errors": errors})
+    line = next(line for line in log_lines if "returned errors" in line)
+    assert MARKER not in line
+
+
+# -- P3: missing expires_in -----------------------------------------------------
+
+@pytest.mark.parametrize("expires_in", [None, "garbage", 0, -5])
+def test_p3_missing_or_bad_expires_in_is_normalised_before_persist(tmp_path: Path, session,
+                                                                   expires_in, log_lines) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    body = {"access_token": "fake-new"}
+    if expires_in is not None:
+        body["expires_in"] = expires_in
+    session.post_queue.append(FakeResponse(200, body))
+    client.refresh()  # must not raise after the file has been written
+    saved = json.loads(tf.read_text())
+    assert saved["expires_in"] == sm.DEFAULT_ACCESS_LIFETIME_SECONDS
+    assert saved["access_expires_at"] == int(NOW) + sm.DEFAULT_ACCESS_LIFETIME_SECONDS
+    assert any("expires in 1800s" in line for line in log_lines)
+
+
+def test_refresh_with_empty_access_token_does_not_persist(tmp_path: Path, session) -> None:
+    client, tf = _client_needing_refresh(tmp_path, session)
+    session.post_queue.append(FakeResponse(200, {"access_token": "", "expires_in": 1800}))
+    with pytest.raises(SchwabAuthError):
+        client.refresh()
+    assert json.loads(tf.read_text())["access_token"] == FAKE_ACCESS
+
+
+def test_posix_requirement_is_fail_closed(client, session, monkeypatch) -> None:
+    monkeypatch.setattr(sm, "fcntl", None)
+    with pytest.raises(SchwabConfigError, match="POSIX"):
+        client.quotes("SPY")
+    assert session.calls == []

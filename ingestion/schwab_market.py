@@ -24,11 +24,32 @@ Operational constraints (set by the operator on 2026-10-29):
 * **Secrets never leave the 0600 files.** The app key, app secret, access
   token and refresh token are read from ``SCHWAB_APP_KEY`` /
   ``SCHWAB_APP_SECRET`` (or the fallback credentials file) and the token
-  file. They are never logged, never included in exception messages and
-  never written anywhere except the token file (rewritten atomically at
-  mode 0600). Request headers are never logged.
+  file. They are never logged, never included in exception messages or
+  chained causes, and never written anywhere except the token file. Request
+  headers are never logged.
 * **No DB writes, no scheduling.** This slice is a client only. It is not
   registered in ``ingestion/scheduler.py`` and does not touch ``raw_series``.
+
+Secret-file handling (POSIX only; the client refuses to run where
+``fcntl`` is unavailable because the guarantees below cannot be met):
+
+* Every secret file is opened once with ``O_NOFOLLOW`` and validated on the
+  open descriptor (``fstat``): regular file, owned by the effective uid, no
+  group/other permission bits. The data is read from that same descriptor,
+  so there is no check-then-read window. Symlinks, FIFOs and foreign-owned
+  files are refused. The parent directory must be owned by the effective
+  uid and not group/other writable.
+* The token file is rewritten through a uniquely named temporary file
+  created exclusively (``mkstemp``, 0600) in the same directory, fsynced and
+  then atomically renamed over the destination. A destination that is not a
+  regular file (e.g. a symlink) is refused.
+* Read-refresh-write runs under an exclusive ``flock`` on
+  ``<token file>.lock`` so several clients or processes sharing one token
+  file never refresh concurrently; after taking the lock the file is
+  re-read and a refresh another holder already performed is reused.
+* ``refresh_expires_at`` is only extended when the provider returns a
+  refresh token that differs from the stored one; an unchanged or omitted
+  refresh token keeps its existing expiry.
 
 Token file shape (written by the login helper and by :meth:`refresh`)::
 
@@ -37,25 +58,32 @@ Token file shape (written by the login helper and by :meth:`refresh`)::
      "access_expires_at": <epoch>, "refresh_expires_at": <epoch>}
 
 Transient failures (429 / 5xx / connection errors) are retried with
-exponential backoff and logged at ``warning`` level; only programming
-errors reach ``log.error``.
+exponential backoff and logged at ``warning`` level with the exception
+class name only; only programming errors reach ``log.error``.
 """
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import stat
+import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 
 import requests
 from requests.auth import HTTPBasicAuth
 
 from config import log, settings
+
+try:  # POSIX advisory locks; absent on Windows.
+    import fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX hosts
+    fcntl = None  # type: ignore[assignment]
 
 TOKEN_URL = "https://api.schwabapi.com/v1/oauth/token"
 MARKET_BASE = "https://api.schwabapi.com/marketdata/v1"
@@ -76,9 +104,16 @@ DEFAULT_BACKOFF_BASE = 1.0
 DEFAULT_BACKOFF_CAP = 30.0
 #: Refresh the access token when it expires within this many seconds.
 ACCESS_SKEW_SECONDS = 60
+#: Used when the token response omits or mangles ``expires_in``.
+DEFAULT_ACCESS_LIFETIME_SECONDS = 1800
 REFRESH_TOKEN_LIFETIME_SECONDS = 7 * 24 * 3600
+#: Longest category name echoed from a provider ``errors`` object.
+_ERROR_KEY_MAX_CHARS = 40
+_ERROR_KEYS_MAX = 10
 
-_CRED_KEYS = ("SCHWAB_APP_KEY", "SCHWAB_APP_SECRET")
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+_O_CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_O_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 class SchwabError(RuntimeError):
@@ -116,21 +151,146 @@ class SchwabQuote:
 
 
 # ---------------------------------------------------------------------------
-# Credentials and token-file helpers
+# Private-file primitives
 # ---------------------------------------------------------------------------
 
-def _require_private(path: Path) -> None:
-    """Refuse to read a secret file that is readable by group or others."""
-    mode = stat.S_IMODE(path.stat().st_mode)
+def _expected_uid() -> int | None:
+    return os.geteuid() if hasattr(os, "geteuid") else None
+
+
+def _require_posix() -> None:
+    if fcntl is None:
+        raise SchwabConfigError(
+            "Schwab client requires a POSIX host (fcntl locks and 0600 semantics)"
+        )
+
+
+def _check_private_dir(directory: Path) -> None:
+    """The directory holding secret files must be ours and not group/other writable."""
+    try:
+        st = os.lstat(directory)
+    except OSError as exc:
+        raise SchwabConfigError(
+            f"cannot stat directory {directory}: {exc.strerror}"
+        ) from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise SchwabConfigError(f"refusing: {directory} is not a directory")
+    uid = _expected_uid()
+    if uid is not None and st.st_uid != uid:
+        raise SchwabConfigError(
+            f"refusing: directory {directory} is owned by uid {st.st_uid}, expected {uid}"
+        )
+    if stat.S_IMODE(st.st_mode) & 0o022:
+        raise SchwabConfigError(
+            f"refusing: directory {directory} is group/other writable "
+            f"(mode {oct(stat.S_IMODE(st.st_mode))})"
+        )
+
+
+def _check_private_fd(fd: int, path: Path) -> os.stat_result:
+    """Validate an *open* descriptor: regular file, owned by us, mode 0600 or tighter."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise SchwabConfigError(f"refusing to read {path}: not a regular file")
+    uid = _expected_uid()
+    if uid is not None and st.st_uid != uid:
+        raise SchwabConfigError(
+            f"refusing to read {path}: owned by uid {st.st_uid}, expected {uid}"
+        )
+    mode = stat.S_IMODE(st.st_mode)
     if mode & 0o077:
         raise SchwabConfigError(
             f"refusing to read {path}: mode {oct(mode)} is not private; run chmod 600"
         )
+    return st
 
 
-def _parse_env_file(path: Path) -> dict[str, str]:
+def _read_private(path: Path) -> str:
+    """Open ``path`` once without following links, validate the descriptor, read it.
+
+    The check and the read use the same descriptor, so a swap of the path
+    between them cannot change what is validated.
+    """
+    _require_posix()
+    _check_private_dir(path.parent)
+    try:
+        fd = os.open(path, os.O_RDONLY | _O_NOFOLLOW | _O_CLOEXEC | _O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            raise SchwabConfigError(
+                f"refusing to read {path}: it is a symbolic link"
+            ) from None
+        if exc.errno == errno.ENOENT:
+            raise FileNotFoundError(str(path)) from None
+        raise SchwabConfigError(f"cannot open {path}: {exc.strerror}") from None
+    try:
+        _check_private_fd(fd, path)
+    except BaseException:
+        os.close(fd)
+        raise
+    with os.fdopen(fd, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+class _TokenFileLock:
+    """Exclusive advisory lock on ``<token file>.lock`` (same directory, 0600)."""
+
+    def __init__(self, token_file: Path) -> None:
+        self.path = token_file.with_name(token_file.name + ".lock")
+        self._fd: int | None = None
+
+    def __enter__(self) -> Self:
+        _require_posix()
+        _check_private_dir(self.path.parent)
+        try:
+            fd = os.open(
+                self.path,
+                os.O_RDWR | os.O_CREAT | _O_NOFOLLOW | _O_CLOEXEC,
+                0o600,
+            )
+        except OSError as exc:
+            if exc.errno == errno.ELOOP:
+                raise SchwabConfigError(
+                    f"refusing: lock file {self.path} is a symbolic link"
+                ) from None
+            raise SchwabConfigError(
+                f"cannot open lock file {self.path}: {exc.strerror}"
+            ) from None
+        try:
+            st = os.fstat(fd)
+            if not stat.S_ISREG(st.st_mode):
+                raise SchwabConfigError(f"refusing: lock file {self.path} is not a regular file")
+            uid = _expected_uid()
+            if uid is not None and st.st_uid != uid:
+                raise SchwabConfigError(
+                    f"refusing: lock file {self.path} is owned by uid {st.st_uid}"
+                )
+            if stat.S_IMODE(st.st_mode) & 0o077:
+                os.fchmod(fd, 0o600)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        except BaseException:
+            os.close(fd)
+            raise
+        self._fd = fd
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        fd, self._fd = self._fd, None
+        if fd is None:
+            return
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+# ---------------------------------------------------------------------------
+# Credentials
+# ---------------------------------------------------------------------------
+
+def _parse_env_file(text: str) -> dict[str, str]:
     out: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
+    for line in text.splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -148,7 +308,8 @@ def load_credentials(
 
     Order: explicit arguments → ``settings.SCHWAB_APP_KEY`` /
     ``settings.SCHWAB_APP_SECRET`` → the fallback credentials file (default
-    ``settings.SCHWAB_CREDENTIALS_FILE``, must be mode 0600). Raises
+    ``settings.SCHWAB_CREDENTIALS_FILE``; must be a regular file owned by us
+    at mode 0600, reached without following a symlink). Raises
     :class:`SchwabConfigError` when neither source is filled in. The values
     are returned to the caller and never logged.
     """
@@ -160,9 +321,12 @@ def load_credentials(
     cred_path = Path(
         credentials_file if credentials_file is not None else settings.SCHWAB_CREDENTIALS_FILE
     ).expanduser()
-    if cred_path.exists():
-        _require_private(cred_path)
-        values = _parse_env_file(cred_path)
+    try:
+        text = _read_private(cred_path)
+    except FileNotFoundError:
+        text = None
+    if text is not None:
+        values = _parse_env_file(text)
         key = key or values.get("SCHWAB_APP_KEY", "").strip()
         secret = secret or values.get("SCHWAB_APP_SECRET", "").strip()
         if key.startswith("PASTE_"):
@@ -239,18 +403,22 @@ class SchwabMarketClient:
 
     # -- token file ---------------------------------------------------------
 
+    def _lock(self) -> _TokenFileLock:
+        return _TokenFileLock(self._token_file)
+
     def _load_tokens(self) -> dict[str, Any]:
-        if not self._token_file.exists():
+        try:
+            text = _read_private(self._token_file)
+        except FileNotFoundError:
             raise SchwabConfigError(
                 f"Schwab token file {self._token_file} missing; run the login helper"
-            )
-        _require_private(self._token_file)
+            ) from None
         try:
-            data = json.loads(self._token_file.read_text(encoding="utf-8"))
-        except ValueError as exc:  # corrupt file; message carries no secret
+            data = json.loads(text)
+        except ValueError:  # corrupt file; message carries no secret
             raise SchwabConfigError(
                 f"Schwab token file {self._token_file} is not valid JSON"
-            ) from exc
+            ) from None
         if not isinstance(data, dict) or "access_token" not in data:
             raise SchwabConfigError(
                 f"Schwab token file {self._token_file} has no access_token"
@@ -259,22 +427,43 @@ class SchwabMarketClient:
         return data
 
     def _write_tokens(self, payload: dict[str, Any]) -> None:
-        """Atomically replace the token file at mode 0600."""
-        tmp = self._token_file.with_name(self._token_file.name + ".tmp")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        """Atomically replace the token file via an exclusive 0600 temp file."""
+        _require_posix()
+        directory = self._token_file.parent
+        _check_private_dir(directory)
         try:
+            dst = os.lstat(self._token_file)
+        except FileNotFoundError:
+            dst = None
+        if dst is not None and not stat.S_ISREG(dst.st_mode):
+            raise SchwabConfigError(
+                f"refusing to replace {self._token_file}: not a regular file"
+            )
+        fd, tmp_name = tempfile.mkstemp(prefix=".tokens-", suffix=".tmp", dir=directory)
+        tmp = Path(tmp_name)
+        try:
+            os.fchmod(fd, 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, self._token_file)
         except BaseException:
             tmp.unlink(missing_ok=True)
             raise
-        os.replace(tmp, self._token_file)
-        os.chmod(self._token_file, 0o600)
+        try:
+            dfd = os.open(directory, os.O_RDONLY | _O_CLOEXEC)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass
         self._tokens = payload
 
     def token_status(self) -> dict[str, Any]:
         """Non-secret token status: expiry epochs, scope, validity flags."""
-        t = self._tokens or self._load_tokens()
+        t = self._load_tokens()
         now = self._now()
         return {
             "token_file": str(self._token_file),
@@ -289,9 +478,13 @@ class SchwabMarketClient:
 
     def refresh(self) -> None:
         """Exchange the stored refresh token for a new access token and persist it."""
-        old = self._tokens or self._load_tokens()
-        refresh_token = old.get("refresh_token")
-        if not refresh_token:
+        with self._lock():
+            self._refresh_locked(self._load_tokens())
+
+    def _refresh_locked(self, old: dict[str, Any]) -> None:
+        """Perform the refresh. Caller must hold the token-file lock."""
+        old_refresh = old.get("refresh_token")
+        if not old_refresh:
             raise SchwabAuthError("no refresh token stored; re-run the login helper")
         refresh_expires_at = float(old.get("refresh_expires_at") or 0)
         if refresh_expires_at and refresh_expires_at <= self._now():
@@ -302,14 +495,16 @@ class SchwabMarketClient:
         try:
             resp = self._session.post(
                 TOKEN_URL,
-                data={"grant_type": "refresh_token", "refresh_token": refresh_token},
+                data={"grant_type": "refresh_token", "refresh_token": old_refresh},
                 auth=HTTPBasicAuth(self._app_key, self._app_secret),
                 headers={"Accept": "application/json"},
                 timeout=self._timeout,
             )
         except requests.RequestException as exc:
+            # ``from None``: the transport exception text may echo request
+            # details and must not surface in tracebacks.
             log.warning("Schwab token refresh network error: {err}", err=type(exc).__name__)
-            raise SchwabTransientError("Schwab token refresh failed (network)") from exc
+            raise SchwabTransientError("Schwab token refresh failed (network)") from None
 
         status = int(resp.status_code)
         if status in (400, 401):
@@ -324,27 +519,50 @@ class SchwabMarketClient:
             log.warning("Schwab token refresh returned HTTP {status}", status=status)
             raise SchwabTransientError(f"Schwab token refresh returned HTTP {status}")
 
-        payload = dict(resp.json())
-        if "access_token" not in payload:
+        try:
+            body = resp.json()
+        except ValueError:
+            raise SchwabTransientError("Schwab token refresh returned non-JSON body") from None
+        if not isinstance(body, Mapping) or not body.get("access_token"):
             raise SchwabAuthError("Schwab token refresh response had no access_token")
+
+        # Normalise everything *before* persisting so nothing can fail after
+        # the file has changed.
+        payload: dict[str, Any] = dict(body)
+        expires_in = _normalise_expires_in(payload.get("expires_in"))
+        payload["expires_in"] = expires_in
         now = int(self._now())
         payload["obtained_at"] = now
-        payload["access_expires_at"] = now + int(payload.get("expires_in", 1800))
-        if payload.get("refresh_token"):
+        payload["access_expires_at"] = now + expires_in
+        new_refresh = payload.get("refresh_token")
+        rotated = bool(new_refresh) and new_refresh != old_refresh
+        if rotated:
             payload["refresh_expires_at"] = now + REFRESH_TOKEN_LIFETIME_SECONDS
         else:
-            payload["refresh_token"] = refresh_token
+            payload["refresh_token"] = old_refresh
             payload["refresh_expires_at"] = old.get("refresh_expires_at")
         self._write_tokens(payload)
-        log.info("Schwab access token refreshed (expires in {s}s)", s=payload["expires_in"])
+        log.info(
+            "Schwab access token refreshed (expires in {s}s, refresh token rotated={r})",
+            s=expires_in, r=rotated,
+        )
 
-    def _access_token(self, force_refresh: bool = False) -> str:
-        t = self._tokens or self._load_tokens()
-        expires_at = float(t.get("access_expires_at") or 0)
-        if force_refresh or expires_at - ACCESS_SKEW_SECONDS <= self._now():
-            self.refresh()
-            t = self._tokens or self._load_tokens()
-        return str(t["access_token"])
+    def _access_token(self, stale_token: str | None = None) -> str:
+        """Return a usable access token, refreshing under the file lock if needed.
+
+        ``stale_token`` is the token a request just got a 401 for: the file
+        is re-read under the lock and a refresh is only performed if the
+        stored token is still that one (another holder may have refreshed).
+        """
+        with self._lock():
+            t = self._load_tokens()
+            expires_at = float(t.get("access_expires_at") or 0)
+            expiring = expires_at - ACCESS_SKEW_SECONDS <= self._now()
+            still_stale = stale_token is not None and t.get("access_token") == stale_token
+            if expiring or still_stale:
+                self._refresh_locked(t)
+                t = self._tokens or self._load_tokens()
+            return str(t["access_token"])
 
     # -- HTTP ---------------------------------------------------------------
 
@@ -363,8 +581,10 @@ class SchwabMarketClient:
         url = MARKET_BASE + path
         reauthed = False
         attempt = 0
+        stale: str | None = None
         while True:
-            token = self._access_token()
+            token = self._access_token(stale_token=stale)
+            stale = None
             try:
                 resp = self._session.get(
                     url,
@@ -375,8 +595,9 @@ class SchwabMarketClient:
             except requests.RequestException as exc:
                 if attempt >= self._max_retries:
                     raise SchwabTransientError(
-                        f"Schwab GET {path} failed after {attempt + 1} attempts (network)"
-                    ) from exc
+                        f"Schwab GET {path} failed after {attempt + 1} attempts "
+                        f"(network: {type(exc).__name__})"
+                    ) from None
                 delay = self._backoff(attempt, None)
                 log.warning(
                     "Schwab GET {path} network error ({err}); retry {n} in {d:.1f}s",
@@ -388,11 +609,16 @@ class SchwabMarketClient:
 
             status = int(resp.status_code)
             if status == 200:
-                return resp.json()
+                try:
+                    return resp.json()
+                except ValueError:
+                    raise SchwabTransientError(
+                        f"Schwab GET {path} returned a non-JSON body"
+                    ) from None
             if status == 401 and not reauthed:
                 reauthed = True
+                stale = token
                 log.warning("Schwab GET {path} returned 401; refreshing access token once", path=path)
-                self._access_token(force_refresh=True)
                 continue
             if status == 429 or 500 <= status < 600:
                 if attempt >= self._max_retries:
@@ -407,8 +633,7 @@ class SchwabMarketClient:
                 self._sleep(delay)
                 attempt += 1
                 continue
-            # 4xx other than 401/429: caller error, no retry. Body is not a secret
-            # but keep it short; never echo headers.
+            # Other 4xx: caller error, no retry. Never echo the body or headers.
             raise SchwabError(f"Schwab GET {path} returned HTTP {status}")
 
     # -- public read-only surface -----------------------------------------
@@ -466,6 +691,14 @@ class SchwabMarketClient:
 # Parsing
 # ---------------------------------------------------------------------------
 
+def _normalise_expires_in(value: Any) -> int:
+    try:
+        seconds = int(value) if value is not None else DEFAULT_ACCESS_LIFETIME_SECONDS
+    except (TypeError, ValueError):
+        seconds = DEFAULT_ACCESS_LIFETIME_SECONDS
+    return seconds if seconds > 0 else DEFAULT_ACCESS_LIFETIME_SECONDS
+
+
 def _as_float(v: Any) -> float | None:
     try:
         return None if v is None else float(v)
@@ -480,18 +713,40 @@ def _as_int(v: Any) -> int | None:
         return None
 
 
+def _summarise_errors(errors: Any) -> str:
+    """Bounded, value-free summary of a provider ``errors`` object for logging.
+
+    Only category names (truncated) and counts are emitted; the values,
+    which could echo request input or provider text, are never logged.
+    """
+    if isinstance(errors, Mapping):
+        parts: list[str] = []
+        for key in list(errors)[:_ERROR_KEYS_MAX]:
+            value = errors[key]
+            count = len(value) if isinstance(value, (list, tuple, Mapping, str)) else 1
+            parts.append(f"{str(key)[:_ERROR_KEY_MAX_CHARS]}={count}")
+        extra = len(errors) - _ERROR_KEYS_MAX
+        if extra > 0:
+            parts.append(f"+{extra} more")
+        return ", ".join(parts) or "empty"
+    if isinstance(errors, (list, tuple)):
+        return f"{len(errors)} entries"
+    return type(errors).__name__
+
+
 def parse_quotes(body: Mapping[str, Any]) -> dict[str, SchwabQuote]:
     """Parse the ``{"SPY": {"quote": {...}, ...}, ...}`` body of GET /quotes.
 
     Symbols Schwab could not resolve come back under an ``errors`` key and
-    are skipped with a warning; everything else must carry a ``quote`` map.
+    are skipped with a bounded warning; everything else must carry a
+    ``quote`` map.
     """
     out: dict[str, SchwabQuote] = {}
     if not isinstance(body, Mapping):
         return out
     errors = body.get("errors")
     if errors:
-        log.warning("Schwab quotes returned errors for some symbols: {e}", e=errors)
+        log.warning("Schwab quotes returned errors: {e}", e=_summarise_errors(errors))
     for symbol, entry in body.items():
         if symbol == "errors" or not isinstance(entry, Mapping):
             continue
