@@ -14,11 +14,24 @@ consumer can rely on. It adds what the reader deliberately leaves out:
   ``fresh``, ``stale``, ``delayed``, ``missing``, ``invalid`` or
   ``unavailable``; only ``fresh`` is ``live``. Missing numbers are ``None``,
   never ``0`` or a midpoint.
-* **Private access boundary** — the snapshot carries ``audience="private"``
-  and ``redistribution="prohibited"``; ``read_private_quotes`` refuses any
-  other audience, and ``status_only()`` is the sole projection that may leave
-  the private boundary (statuses and ages, no measured values). Schwab's terms
-  forbid redistributing its data; nothing here may feed a public page.
+* **Fail-closed inputs** — a row is ``live`` only when the provider's
+  ``realtime`` flag is exactly ``True``; a missing flag is ``missing`` and a
+  non-boolean flag is ``invalid``. Non-finite or non-numeric prices, and
+  quote timestamps that are malformed or out of range, are ``invalid``; a
+  malformed optional field (sizes, volume, trade time) is dropped to ``None``.
+  No single bad row aborts the snapshot. Every payload serialises under
+  strict JSON (``allow_nan=False``).
+* **Declared audience label, not access control** — ``audience`` is a
+  caller-supplied declaration (default ``"private"``) that the read is for
+  private GRID use; ``read_private_quotes`` refuses any other value as a
+  declared-intent check. It is not authentication and does not gate any
+  endpoint. Every payload carries ``redistribution="prohibited"`` and
+  ``persist_allowed=False`` as labels. A real authorized private endpoint is
+  a separate integration gate that this module does not provide; no endpoint
+  is wired. ``status_only()`` is the projection intended for non-private
+  consumers (statuses and age buckets, no measured values); whether it may
+  reach any surface is that surface owner's gate. Schwab's terms forbid
+  redistributing its data; nothing here may feed a public page.
 
 Boundaries this module keeps on purpose:
 
@@ -26,13 +39,14 @@ Boundaries this module keeps on purpose:
   with a ``quotes(symbols)`` method) is injected by the caller.
 * No persistence: ``persist_allowed`` is always ``False``. GRID stores no
   Schwab quote in ``raw_series`` or any snapshot table from this path.
-* No scheduling, no Hermes/GEX wiring, no public projection.
+* No scheduling, no Hermes/GEX wiring, no endpoint, no public projection.
 * Exception text from the reader is never echoed; only the class name is.
 """
 
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,6 +65,7 @@ PERSIST_ALLOWED = False
 DEFAULT_MAX_QUOTE_AGE_S = 20.0
 DEFAULT_FUTURE_TOLERANCE_S = 5.0
 DEFAULT_MAX_SPREAD_PCT = 1.0
+MAX_EPOCH_MS = 4_102_444_800_000  # 2100-01-01T00:00:00Z; later timestamps are malformed
 
 QuoteStatus = Literal["fresh", "stale", "delayed", "missing", "invalid", "unavailable"]
 STATUSES: tuple[str, ...] = ("fresh", "stale", "delayed", "missing", "invalid", "unavailable")
@@ -64,7 +79,11 @@ AGE_BUCKETS: tuple[tuple[float, str], ...] = (
 
 
 class AudienceError(PermissionError):
-    """Raised when a non-private audience asks for Schwab-sourced values."""
+    """Raised when the caller declares a non-private audience.
+
+    A declared-intent check only: ``audience`` is caller-controlled and is not
+    authentication or access control.
+    """
 
 
 class QuoteSource(Protocol):
@@ -124,6 +143,7 @@ class PrivateQuote:
                 total_volume=None,
                 quote_time=None,
                 trade_time=None,
+                realtime=None,
             )
             payload["live"] = False
             payload.update(common)
@@ -157,10 +177,11 @@ class PrivateQuote:
         return payload
 
     def status_only(self) -> dict[str, Any]:
-        """The only projection allowed outside the private boundary.
+        """Projection intended for non-private consumers.
 
         Carries status, liveness and an age bucket. No price, size, volume or
-        timestamp from the provider is included.
+        timestamp from the provider is included. Whether it may reach any
+        surface is that surface owner's gate, not this module's.
         """
         return {
             "symbol": self.symbol,
@@ -238,12 +259,15 @@ def read_private_quotes(
     """Read quotes through an injected reader and classify every requested symbol.
 
     ``now`` must be timezone-aware; it is the receipt clock used for ages and
-    the ``vintage`` of every row. ``audience`` must be ``"private"``; any other
-    value raises :class:`AudienceError` before the reader is touched.
+    the ``vintage`` of every row. ``audience`` is a caller declaration, not
+    access control: any value other than ``"private"`` raises
+    :class:`AudienceError` before the reader is touched. A row whose
+    classification fails on malformed provider data becomes ``invalid``
+    (class name only); the snapshot itself never aborts on one row.
     """
     _require_private(audience)
     now = _require_aware(now, "now")
-    _check_limits(max_quote_age_s, future_tolerance_s)
+    _check_limits(max_quote_age_s, future_tolerance_s, max_spread_pct)
     requested = _normalise_symbols(symbols)
     if not requested:
         return PrivateQuoteSnapshot((), now, (), None)
@@ -259,17 +283,28 @@ def read_private_quotes(
             for sym in requested
         )
         return PrivateQuoteSnapshot(quotes, now, requested, name)
-    quotes = tuple(
-        classify_quote(
-            sym,
-            rows.get(sym) if isinstance(rows, Mapping) else None,
-            now=now,
-            max_quote_age_s=max_quote_age_s,
-            future_tolerance_s=future_tolerance_s,
-            max_spread_pct=max_spread_pct,
-        )
-        for sym in requested
-    )
+    classified: list[PrivateQuote] = []
+    for sym in requested:
+        try:
+            classified.append(
+                classify_quote(
+                    sym,
+                    rows.get(sym) if isinstance(rows, Mapping) else None,
+                    now=now,
+                    max_quote_age_s=max_quote_age_s,
+                    future_tolerance_s=future_tolerance_s,
+                    max_spread_pct=max_spread_pct,
+                )
+            )
+        except (ValueError, TypeError, OverflowError, OSError, ArithmeticError) as exc:
+            name = type(exc).__name__
+            log.warning("Schwab quote classification failed for one symbol: {n}", n=name)
+            classified.append(
+                _unavailable_row(
+                    sym, now, f"classification failed: {name}", max_quote_age_s, status="invalid"
+                )
+            )
+    quotes = tuple(classified)
     snap = PrivateQuoteSnapshot(quotes, now, requested, None)
     log.info("Schwab private quotes: {c}", c=json.dumps(snap.counts(), sort_keys=True))
     return snap
@@ -286,15 +321,25 @@ def classify_quote(
 ) -> PrivateQuote:
     """Pure classification of one reader row. Deterministic for fixed ``now``."""
     now = _require_aware(now, "now")
-    _check_limits(max_quote_age_s, future_tolerance_s)
+    _check_limits(max_quote_age_s, future_tolerance_s, max_spread_pct)
     if quote is None:
         return _unavailable_row(
             symbol, now, "symbol absent from reader response", max_quote_age_s, status="missing"
         )
 
     quote_time = _ms_to_dt(quote.quote_time_ms)
-    trade_time = _ms_to_dt(quote.trade_time_ms)
-    age = (now - quote_time).total_seconds() if quote_time else None
+    trade_time = _ms_to_dt(quote.trade_time_ms)  # optional: malformed -> None
+    age: float | None = None
+    if quote_time is not None:
+        try:
+            age = (now - quote_time).total_seconds()
+        except (OverflowError, ArithmeticError):
+            quote_time, age = None, None
+    if age is not None and not math.isfinite(age):
+        quote_time, age = None, None
+    bid_size = _finite_int(quote.bid_size)
+    ask_size = _finite_int(quote.ask_size)
+    total_volume = _finite_int(quote.total_volume)
 
     def row(status: QuoteStatus, reason: str | None, live: bool) -> PrivateQuote:
         measured = status in MEASURED_STATUSES
@@ -306,14 +351,14 @@ def classify_quote(
             last=quote.last_price if measured else None,
             bid=quote.bid_price if measured else None,
             ask=quote.ask_price if measured else None,
-            bid_size=quote.bid_size if measured else None,
-            ask_size=quote.ask_size if measured else None,
-            total_volume=quote.total_volume if measured else None,
+            bid_size=bid_size if measured else None,
+            ask_size=ask_size if measured else None,
+            total_volume=total_volume if measured else None,
             quote_time=quote_time if measured else None,
             trade_time=trade_time if measured else None,
             received_at=now,
             age_seconds=age,
-            realtime=quote.realtime,
+            realtime=quote.realtime if isinstance(quote.realtime, bool) else None,
             asset_main_type=quote.asset_main_type,
             max_quote_age_s=max_quote_age_s,
         )
@@ -324,19 +369,24 @@ def classify_quote(
         ("lastPrice", quote.last_price),
         ("bidPrice", quote.bid_price),
         ("askPrice", quote.ask_price),
+        ("realtime", quote.realtime),
     )
     for name, value in required:
         if value is None:
             return row("missing", f"{name} missing", False)
-    if quote_time is None or age is None:  # pragma: no cover - narrowed above
-        return row("missing", "quoteTime missing", False)
 
     # Invalid: provider values that cannot be a quote.
+    if quote_time is None or age is None:
+        return row("invalid", "quoteTime malformed or out of range", False)
+    for name, value in (("lastPrice", quote.last_price), ("bidPrice", quote.bid_price),
+                        ("askPrice", quote.ask_price)):
+        if not _is_finite_number(value):
+            return row("invalid", f"{name} non-finite or non-numeric", False)
+    if not isinstance(quote.realtime, bool):
+        return row("invalid", "realtime flag not boolean", False)
     if age < -future_tolerance_s:
         return row("invalid", "quoteTime is in the future beyond tolerance", False)
-    bid, ask, last = quote.bid_price, quote.ask_price, quote.last_price
-    if bid is None or ask is None or last is None:  # pragma: no cover - narrowed above
-        return row("missing", "price missing", False)
+    bid, ask, last = float(quote.bid_price), float(quote.ask_price), float(quote.last_price)
     if bid <= 0 or ask <= 0 or last <= 0:
         return row("invalid", "non-positive price", False)
     if bid > ask:
@@ -350,7 +400,7 @@ def classify_quote(
     if quote.realtime is False:
         return row("delayed", "provider marked quote as not realtime", False)
 
-    # Stale vs fresh by the provider's own quote time.
+    # Stale vs fresh by the provider's own quote time. Only realtime=True reaches here.
     if age > max_quote_age_s:
         return row("stale", f"quote older than {max_quote_age_s:g}s", False)
     return row("fresh", None, True)
@@ -377,9 +427,32 @@ def _require_aware(value: datetime, name: str) -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def _check_limits(max_quote_age_s: float, future_tolerance_s: float) -> None:
-    if max_quote_age_s <= 0 or future_tolerance_s < 0:
-        raise ValueError("max_quote_age_s must be > 0 and future_tolerance_s >= 0")
+def _check_limits(
+    max_quote_age_s: float, future_tolerance_s: float, max_spread_pct: float | None = None
+) -> None:
+    if not _is_finite_number(max_quote_age_s) or max_quote_age_s <= 0:
+        raise ValueError("max_quote_age_s must be a finite number > 0")
+    if not _is_finite_number(future_tolerance_s) or future_tolerance_s < 0:
+        raise ValueError("future_tolerance_s must be a finite number >= 0")
+    if max_spread_pct is not None and (not _is_finite_number(max_spread_pct) or max_spread_pct < 0):
+        raise ValueError("max_spread_pct must be None or a finite number >= 0")
+
+
+def _is_finite_number(value: Any) -> bool:
+    """True for int/float (not bool) that is finite."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except (TypeError, OverflowError):
+        return False
+
+
+def _finite_int(value: Any) -> int | None:
+    """Optional count fields: int when finite and numeric, else None (never a guess)."""
+    if not _is_finite_number(value):
+        return None
+    return int(value)
 
 
 def _normalise_symbols(symbols: str | Iterable[str]) -> tuple[str, ...]:
@@ -394,10 +467,18 @@ def _normalise_symbols(symbols: str | Iterable[str]) -> tuple[str, ...]:
     return tuple(seen)
 
 
-def _ms_to_dt(ms: int | None) -> datetime | None:
-    if ms is None:
+def _ms_to_dt(ms: Any) -> datetime | None:
+    """Epoch milliseconds -> aware UTC datetime; ``None`` for anything malformed.
+
+    Rejects bools, non-numbers, non-finite values, negatives and anything past
+    ``MAX_EPOCH_MS``. Never raises.
+    """
+    if not _is_finite_number(ms) or ms < 0 or ms > MAX_EPOCH_MS:
         return None
-    return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    try:
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
 
 
 def _age_bucket(age: float | None) -> str:
@@ -444,6 +525,7 @@ __all__ = [
     "DEFAULT_FUTURE_TOLERANCE_S",
     "DEFAULT_MAX_QUOTE_AGE_S",
     "DEFAULT_MAX_SPREAD_PCT",
+    "MAX_EPOCH_MS",
     "MEASURED_STATUSES",
     "PERSIST_ALLOWED",
     "PROVIDER",

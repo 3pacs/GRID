@@ -144,9 +144,29 @@ def test_delayed_entitlement_is_measured_but_never_live():
     assert payload["realtime"] is False and payload["last"] == LAST
 
 
-def test_unknown_realtime_flag_does_not_block_fresh():
+def test_unknown_entitlement_fails_closed_as_missing():
+    # Review finding 1: realtime=None must never be fresh/live.
     row = classify_quote("SPY", make_quote(realtime=None), now=NOW)
-    assert row.status == "fresh" and row.to_private_dict()["realtime"] is None
+    assert row.status == "missing" and row.live is False and row.reason == "realtime missing"
+    payload = row.to_private_dict()
+    assert is_unavailable(payload) and payload["last"] is None and payload["realtime"] is None
+
+
+@pytest.mark.parametrize("flag", ["false", "true", "True", "FALSE", 1, 0, 1.0, "", [], {}])
+def test_malformed_entitlement_flag_fails_closed_as_invalid(flag):
+    # Review finding 1: a non-boolean realtime (e.g. the string "false") is invalid, never live.
+    row = classify_quote("SPY", make_quote(realtime=flag), now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason == "realtime flag not boolean"
+    payload = row.to_private_dict()
+    assert is_unavailable(payload) and payload["last"] is None and payload["realtime"] is None
+    json.dumps(payload, allow_nan=False)
+
+
+def test_only_exact_true_realtime_can_be_live():
+    assert classify_quote("SPY", make_quote(realtime=True), now=NOW).live is True
+    for flag in (False, None, "true", 1):
+        assert classify_quote("SPY", make_quote(realtime=flag), now=NOW).live is False
 
 
 # ---------------------------------------------------------------------------
@@ -264,7 +284,8 @@ def test_non_schwab_exceptions_propagate():
 
 
 @pytest.mark.parametrize("audience", ["public", "", "PRIVATE", "gex-public-page"])
-def test_non_private_audience_is_refused_before_reader_is_touched(audience: str):
+def test_declared_non_private_audience_is_refused_before_reader_is_called(audience: str):
+    # A declared-intent check only: the audience string is caller-controlled, not authentication.
     reader = FakeReader({"SPY": make_quote()})
     with pytest.raises(AudienceError):
         read_private_quotes(reader, "SPY", now=NOW, audience=audience)
@@ -288,10 +309,22 @@ def test_non_utc_aware_now_is_normalised_to_utc():
     assert row.received_at == NOW and row.received_at.tzinfo == timezone.utc
 
 
-@pytest.mark.parametrize("kwargs", [{"max_quote_age_s": 0}, {"max_quote_age_s": -1}, {"future_tolerance_s": -1}])
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"max_quote_age_s": 0}, {"max_quote_age_s": -1}, {"future_tolerance_s": -1},
+        # Review finding 2: NaN / infinite limits must be rejected, not silently compared.
+        {"max_quote_age_s": float("nan")}, {"max_quote_age_s": float("inf")},
+        {"future_tolerance_s": float("nan")}, {"future_tolerance_s": float("inf")},
+        {"max_spread_pct": float("nan")}, {"max_spread_pct": float("inf")}, {"max_spread_pct": -1},
+        {"max_quote_age_s": True}, {"max_quote_age_s": "20"},
+    ],
+)
 def test_bad_limits_are_rejected(kwargs):
     with pytest.raises(ValueError):
         classify_quote("SPY", make_quote(), now=NOW, **kwargs)
+    with pytest.raises(ValueError):
+        read_private_quotes(FakeReader({"SPY": make_quote()}), "SPY", now=NOW, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -340,7 +373,7 @@ def test_logs_never_contain_measured_values_or_symbols_prices(log_lines):
         assert s not in joined, s
 
 
-def test_every_payload_carries_private_boundary_markers():
+def test_every_payload_carries_audience_and_redistribution_labels():
     rows = [
         classify_quote("SPY", make_quote(), now=NOW),
         classify_quote("SPY", make_quote(age_s=99), now=NOW),
@@ -367,6 +400,155 @@ def test_payloads_are_deterministic_and_rows_frozen():
     with pytest.raises(dataclasses.FrozenInstanceError):
         row.last = 1.0  # type: ignore[misc]
     assert isinstance(row, PrivateQuote)
+
+
+# ---------------------------------------------------------------------------
+# review finding 2: non-finite / non-numeric prices and strict JSON
+
+NONFINITE = [float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("field", ["last_price", "bid_price", "ask_price"])
+@pytest.mark.parametrize("value", NONFINITE)
+def test_nonfinite_required_price_is_invalid_not_live(field: str, value: float):
+    row = classify_quote("SPY", make_quote(**{field: value}), now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason.endswith("non-finite or non-numeric")
+    payload = row.to_private_dict()
+    assert is_unavailable(payload) and payload["last"] is None and payload["bid"] is None
+    json.dumps(payload, allow_nan=False)  # strict JSON must not break
+
+
+@pytest.mark.parametrize("field", ["last_price", "bid_price", "ask_price"])
+@pytest.mark.parametrize("value", [True, False, "731.37", [731.37], {"v": 1}])
+def test_non_numeric_required_price_is_invalid(field: str, value):
+    row = classify_quote("SPY", make_quote(**{field: value}), now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason.endswith("non-finite or non-numeric")
+
+
+def test_nonfinite_stale_quote_cannot_become_live_or_stale_with_values():
+    # NaN compares False against every threshold; it must not slip through as fresh.
+    row = classify_quote("SPY", make_quote(age_s=99.0, bid_price=float("nan")), now=NOW)
+    assert row.status == "invalid" and row.live is False and row.bid is None
+
+
+@pytest.mark.parametrize("field", ["bid_size", "ask_size", "total_volume"])
+@pytest.mark.parametrize("value", NONFINITE + [True, "5", [1]])
+def test_malformed_optional_count_fields_drop_to_none_and_stay_strict_json(field: str, value):
+    row = classify_quote("SPY", make_quote(**{field: value}), now=NOW)
+    assert row.status == "fresh" and row.live is True  # optional field, valid quote
+    payload = row.to_private_dict()
+    assert payload[field.replace("_price", "")] is None
+    json.dumps(payload, allow_nan=False)
+
+
+def test_optional_count_field_float_integral_is_kept():
+    row = classify_quote("SPY", make_quote(bid_size=12.0), now=NOW)
+    assert row.bid_size == 12
+
+
+def test_snapshot_payloads_are_strict_json_across_all_statuses():
+    rows = {
+        "A": make_quote("A"),
+        "B": make_quote("B", age_s=99.0),
+        "C": make_quote("C", realtime=False),
+        "D": make_quote("D", realtime=None),
+        "E": make_quote("E", realtime="false"),
+        "F": make_quote("F", bid_price=float("nan")),
+        "G": make_quote("G", quote_time_ms=10**20),
+        "H": make_quote("H", bid_price=None),
+    }
+    snap = read_private_quotes(FakeReader(rows), list(rows) + ["Z"], now=NOW)
+    assert len(snap.quotes) == 9
+    json.dumps(snap.to_private_dict(), allow_nan=False)
+    json.dumps(snap.status_only(), allow_nan=False)
+    statuses = {q.symbol: q.status for q in snap.quotes}
+    assert statuses == {
+        "A": "fresh", "B": "stale", "C": "delayed", "D": "missing", "E": "invalid",
+        "F": "invalid", "G": "invalid", "H": "missing", "Z": "missing",
+    }
+    assert [q.symbol for q in snap.quotes if q.live] == ["A"]
+
+
+# ---------------------------------------------------------------------------
+# review finding 3: out-of-range / malformed timestamps never abort the snapshot
+
+BAD_MS = [10**20, 2**63, 2**64, -1, -(10**20), qp.MAX_EPOCH_MS + 1, float("nan"), float("inf"),
+          True, False, "1761762000123", [1], 1e300]
+
+
+@pytest.mark.parametrize("ms", BAD_MS)
+def test_malformed_quote_time_is_invalid_not_exception(ms):
+    row = classify_quote("SPY", make_quote(quote_time_ms=ms), now=NOW)
+    assert row.status == "invalid" and row.live is False
+    assert row.reason == "quoteTime malformed or out of range"
+    assert row.quote_time is None and row.age_seconds is None
+    payload = row.to_private_dict()
+    assert is_unavailable(payload) and payload["as_of"] is None
+    json.dumps(payload, allow_nan=False)
+
+
+@pytest.mark.parametrize("ms", BAD_MS)
+def test_malformed_trade_time_is_dropped_but_quote_stays_valid(ms):
+    row = classify_quote("SPY", make_quote(trade_time_ms=ms), now=NOW)
+    assert row.status == "fresh" and row.live is True and row.trade_time is None
+    json.dumps(row.to_private_dict(), allow_nan=False)
+
+
+def test_boundary_timestamps():
+    assert qp._ms_to_dt(0) == datetime(1970, 1, 1, tzinfo=timezone.utc)
+    assert qp._ms_to_dt(qp.MAX_EPOCH_MS) == datetime(2100, 1, 1, tzinfo=timezone.utc)
+    assert qp._ms_to_dt(qp.MAX_EPOCH_MS + 1) is None
+    assert qp._ms_to_dt(-1) is None
+    assert qp._ms_to_dt(NOW_MS + 0.5) is not None  # finite float ms is accepted
+
+
+def test_one_pathological_row_never_aborts_the_snapshot():
+    rows = {"SPY": make_quote(), "QQQ": make_quote("QQQ", quote_time_ms=2**64),
+            "IWM": make_quote("IWM", quote_time_ms=-(10**20))}
+    snap = read_private_quotes(FakeReader(rows), ["SPY", "QQQ", "IWM"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SPY"].status == "fresh" and by["SPY"].live is True
+    assert by["QQQ"].status == "invalid" and by["IWM"].status == "invalid"
+    assert snap.source_error is None
+
+
+def test_unexpected_classification_error_is_contained_per_row(monkeypatch, log_lines):
+    real = qp.classify_quote
+
+    def flaky(symbol, quote, **kw):
+        if symbol == "QQQ":
+            raise OverflowError(SECRET_MARKER)
+        return real(symbol, quote, **kw)
+
+    monkeypatch.setattr(qp, "classify_quote", flaky)
+    rows = {"SPY": make_quote(), "QQQ": make_quote("QQQ")}
+    snap = read_private_quotes(FakeReader(rows), ["SPY", "QQQ"], now=NOW)
+    by = snap.by_symbol()
+    assert by["SPY"].status == "fresh"
+    assert by["QQQ"].status == "invalid" and by["QQQ"].reason == "classification failed: OverflowError"
+    blob = json.dumps(snap.to_private_dict()) + "".join(log_lines)
+    assert SECRET_MARKER not in blob and "OverflowError" in "".join(log_lines)
+
+
+def test_now_near_datetime_max_does_not_abort():
+    far = datetime(9999, 12, 31, 23, 59, 59, tzinfo=timezone.utc)
+    row = classify_quote("SPY", make_quote(), now=far)
+    assert row.status == "stale" and row.live is False
+    json.dumps(row.to_private_dict(), allow_nan=False)
+
+
+# ---------------------------------------------------------------------------
+# audience wording: a declared label, never described as access control
+
+
+def test_module_documents_audience_as_label_not_access_control():
+    doc = qp.__doc__ or ""
+    assert "not access control" in doc and "not authentication" in doc
+    assert "separate integration gate" in doc
+    assert "enforced" not in doc.lower() and "access boundary" not in doc.lower()
+    assert "Declared audience label" in doc
 
 
 # ---------------------------------------------------------------------------
@@ -400,7 +582,7 @@ def test_module_imports_only_the_reviewed_reader_types():
 def test_public_surface_is_exactly_the_documented_one():
     assert set(qp.__all__) == {
         "AUDIENCE_PRIVATE", "DEFAULT_FUTURE_TOLERANCE_S", "DEFAULT_MAX_QUOTE_AGE_S",
-        "DEFAULT_MAX_SPREAD_PCT", "MEASURED_STATUSES", "PERSIST_ALLOWED", "PROVIDER",
+        "DEFAULT_MAX_SPREAD_PCT", "MAX_EPOCH_MS", "MEASURED_STATUSES", "PERSIST_ALLOWED", "PROVIDER",
         "REDISTRIBUTION", "SOURCE", "STATUSES", "AudienceError", "PrivateQuote",
         "PrivateQuoteSnapshot", "QuoteSource", "classify_quote", "read_private_quotes",
     }

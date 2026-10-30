@@ -107,7 +107,10 @@ and no value, so `broker.py` counts them as `missing_contracts` exactly as it do
 ## 5. What this slice does and does not include
 
 * Included: this note and `ingestion/schwab_quote_path.py` (SPY underlying quote with
-  provenance/freshness, private audience, no persistence) plus its tests.
+  provenance/freshness, fail-closed classification, declared-audience label, no persistence)
+  plus its tests. The `audience` argument is a caller declaration, not access control; a real
+  authorized private endpoint is a separate integration gate that neither this note nor the
+  module provides.
 * Not included, by design: the `schwab_chain_to_rtd_records` implementation, any GEX-tree edit,
   any scheduler/Hermes step, any `raw_series` write, any live call, any public projection.
 * Still unverified: the live `/chains` field names and units above, Schwab's `isDelayed`
