@@ -1775,7 +1775,9 @@ class MarketBriefingEngine:
     def _persist_to_db(self, result: dict[str, Any]) -> int | None:
         """Persist briefing + sentiment to the database for API serving.
 
-        Creates the market_briefings table if needed. Returns briefing ID.
+        Requires explicitly prepared schema; never creates or repairs it.
+        Uses the shared read-only readiness check and transaction-local bounds.
+        Missing readiness/schema or a failed write returns None after rollback.
         """
         eng = self.engine
         if eng is None:
@@ -1787,24 +1789,27 @@ class MarketBriefingEngine:
 
         try:
             from sqlalchemy import text as _text
-            with eng.connect() as conn:
-                conn.execute(_text("""
-                    CREATE TABLE IF NOT EXISTS market_briefings (
-                        id              SERIAL PRIMARY KEY,
-                        briefing_type   TEXT NOT NULL,
-                        briefing_date   DATE NOT NULL,
-                        content         TEXT NOT NULL,
-                        sentiment_score REAL,
-                        sentiment_label TEXT,
-                        sentiment_data  JSONB,
-                        snapshot_data   JSONB,
-                        created_at      TIMESTAMPTZ DEFAULT NOW()
-                    );
-                    CREATE INDEX IF NOT EXISTS idx_market_briefings_date
-                        ON market_briefings (briefing_date DESC);
-                    CREATE INDEX IF NOT EXISTS idx_market_briefings_type
-                        ON market_briefings (briefing_type, briefing_date DESC);
-                """))
+            from intelligence.schema_readiness import ColumnRequirement, require_relation
+
+            # Proposed per-transaction limits, not assumptions about live roles
+            # or session defaults. Connection acquisition needs its own caller
+            # bound. Explicit schema preparation belongs to the shared owner.
+            with eng.begin() as conn:
+                conn.execute(_text(
+                    "SELECT set_config('lock_timeout', '500ms', true), "
+                    "set_config('statement_timeout', '2s', true)"
+                ))
+                require_relation(conn, "market_briefings", {
+                    "id": ColumnRequirement("int4", nullable=False, default_kind="generated_integer"),
+                    "briefing_type": ColumnRequirement("text", nullable=False),
+                    "briefing_date": ColumnRequirement("date", nullable=False),
+                    "content": ColumnRequirement("text", nullable=False),
+                    "sentiment_score": ColumnRequirement("float4", nullable=True),
+                    "sentiment_label": ColumnRequirement("text", nullable=True),
+                    "sentiment_data": ColumnRequirement("jsonb", nullable=True),
+                    "snapshot_data": ColumnRequirement("jsonb", nullable=True),
+                    "created_at": ColumnRequirement("timestamptz", nullable=True, default_kind="transaction_timestamp"),
+                }, primary_key=("id",))
 
                 sentiment = result.get("sentiment")
                 row = conn.execute(_text(
@@ -1822,13 +1827,15 @@ class MarketBriefingEngine:
                     "sdata": json.dumps(sentiment) if sentiment else None,
                     "snap": json.dumps(result["snapshot"], default=str),
                 }).fetchone()
-                conn.commit()
-                bid = row[0] if row else None
-                log.info("Briefing persisted to DB id={id}", id=bid)
-                return bid
+                if row is None or type(row[0]) is not int:
+                    raise RuntimeError("Publication insert returned no integer row identity")
+                bid = row[0]
+            log.info("Briefing persisted to DB id={id}", id=bid)
+            return bid
         except Exception as e:
             log.warning("Failed to persist briefing to DB: {e}", e=e)
             return None
+
 
     def _save_briefing(self, result: dict[str, Any]) -> None:
         """Save a briefing to disk as a markdown file.
