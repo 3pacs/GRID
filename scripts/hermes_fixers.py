@@ -1132,7 +1132,7 @@ def _execute_hermes_repair_command(
     if upper_cmd == "RUN_PIPELINE":
         log.info("Hermes action: triggering pipeline")
         from scripts.run_full_pipeline import run_pipeline
-        run_pipeline(historical=False)
+        run_pipeline(historical=False, send_digest=False)
         state.last_pipeline_run = datetime.now(timezone.utc)
         return {"cmd": raw_cmd, "status": "ok"}
 
@@ -1625,6 +1625,15 @@ def _retry_source(
     """
     source_key = source_name.lower()
 
+    if source_key.replace(" ", "_").replace("-", "_") in {"options", "yfinance_options"}:
+        from ingestion.options import automatic_options_capture_guard
+
+        guarded = automatic_options_capture_guard(engine)
+        if guarded is not None:
+            # Before construction, provider calls, backlog publication or a
+            # catalog freshness write; every repair entry point comes here.
+            return guarded
+
     with _REPAIRS_LOCK:
         existing = _REPAIRS_IN_FLIGHT.get(source_key)
         if existing is not None and _thread_is_alive(existing.get("thread")):
@@ -1943,6 +1952,13 @@ def diagnose_and_fix_pulls(
     - Retry strategy varies per attempt (standard → extended → backfill)
     - Failures are tracked with full context for pattern analysis
     """
+    # Query/LLM latency consumes the same budget as the subsequent repairs.
+    # Taking ownership here also prevents a slow older diagnosis from taking
+    # a fresh token after a newer diagnostics pass has already superseded it.
+    if not dry_run:
+        deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
+        my_token = _next_diagnostics_token()
+
     from sqlalchemy import text
     result: dict[str, Any] = {
         "retried": 0, "fixed": 0, "diagnosed": 0,
@@ -2080,6 +2096,16 @@ def diagnose_and_fix_pulls(
         if _normalize_source_key(f["source"]) not in guarded_actions
     ]
 
+    if not dry_run:
+        abandoned, reason = _diagnostics_abandoned(my_token, deadline)
+        if abandoned:
+            log.warning(
+                "diagnostics actions: {n} remaining action(s) skipped — {r}",
+                n=len(failed_sources), r=reason,
+            )
+            result["skipped_actions"] = failed_sources
+            return result
+
     if hermes_available and diagnosis_info:
         try:
             from llm.router import get_llm, Tier
@@ -2127,9 +2153,6 @@ def diagnose_and_fix_pulls(
     # Retry each failed source with cooldown awareness and strategy variation,
     # under one shared cooperative budget for the whole call (see
     # REPAIR_BUDGET_SECONDS / _retry_source's docstring).
-    deadline = time.monotonic() + REPAIR_BUDGET_SECONDS
-    my_token = _next_diagnostics_token()
-
     def should_continue() -> bool:
         return not _diagnostics_abandoned(my_token, deadline)[0]
 
@@ -2319,7 +2342,7 @@ def maybe_run_pipeline(state: OperatorState, dry_run: bool = False) -> dict[str,
     log.info("Running full pipeline")
     try:
         from scripts.run_full_pipeline import run_pipeline
-        summary = run_pipeline(historical=False)
+        summary = run_pipeline(historical=False, send_digest=False)
         state.last_pipeline_run = now
         return summary
     except Exception as exc:

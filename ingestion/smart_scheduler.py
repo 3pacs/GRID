@@ -527,7 +527,7 @@ if __name__ == "__hermes_sec_only__":
 # Selected FINRA reuses the finite owned-worker driver. It never invokes tick,
 # constructs a puller in this process, or delegates retries to this caller.
 _FINRA_SELECTED_BASE = "c4662193a1b526e4ccc149b0394bfc52754e3eec"
-_FINRA_SELECTED_PINS = {"driver": "717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31",
+_FINRA_SELECTED_PINS = {"driver": "4bb5204c2fd45b1714688dda1d892b1192ef7be1217e4d3abc350b42fc27ee68",
                         "producer": "76579df966612c7f215a9f9c27251574ec13488a31c1e40221dbe09a651337f5"}
 _FINRA_SELECTED_USED = False
 _FINRA_SELECTED_CODES = frozenset({
@@ -1099,11 +1099,19 @@ class _OptionsSchedulerAdapter:
     SOURCE_NAME = "YFINANCE_OPTIONS"
 
     def __init__(self, db_engine: Engine) -> None:
-        from ingestion.options import OptionsPuller
-
-        self._puller = OptionsPuller(db_engine=db_engine)
+        # Do not construct the puller (which resolves catalog identity) until
+        # the secondary-writer policy has allowed a real attempt.
+        self._engine = db_engine
+        self._puller = None
 
     def pull(self, should_continue: Any = None) -> dict[str, Any]:
+        from ingestion.options import OptionsPuller, automatic_options_capture_guard
+
+        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))
+        if guarded is not None:
+            return guarded
+        if self._puller is None:
+            self._puller = OptionsPuller(db_engine=self._engine)
         return self._puller.pull_all(
             should_continue=should_continue, capture_source="smart_scheduler",
         ).summary
@@ -2558,7 +2566,7 @@ class SmartScheduler:
                 summary["failed"] += 1
 
         # Report what's still due for next tick
-        summary["still_due"] = [p["name"] for p in due[MAX_PULLERS_PER_TICK:]]
+        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]
 
         elapsed = time.monotonic() - tick_start
         log.info(

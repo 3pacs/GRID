@@ -494,12 +494,32 @@ class FinraCompositionTests(unittest.TestCase):
             self.assertFalse(r['native_accepted']);self.assertIsNone(r['workflow'])
 
 
+# PR806's independently reviewed adapter delta is the sole allowed change to
+# this historical default-tail snapshot. Reverse its exact source text before
+# checking the original pin; altered guards/provenance or unrelated edits fail.
+_PRE_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        from ingestion.options import OptionsPuller\n\n        self._puller = OptionsPuller(db_engine=db_engine)\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+_PR806_OPTIONS_METHODS = '    def __init__(self, db_engine: Engine) -> None:\n        # Do not construct the puller (which resolves catalog identity) until\n        # the secondary-writer policy has allowed a real attempt.\n        self._engine = db_engine\n        self._puller = None\n\n    def pull(self, should_continue: Any = None) -> dict[str, Any]:\n        from ingestion.options import OptionsPuller, automatic_options_capture_guard\n\n        guarded = automatic_options_capture_guard(getattr(self, "_engine", None))\n        if guarded is not None:\n            return guarded\n        if self._puller is None:\n            self._puller = OptionsPuller(db_engine=self._engine)\n        return self._puller.pull_all(\n            should_continue=should_continue, capture_source="smart_scheduler",\n        ).summary\n'
+
+def scheduler_tail_before_reviewed_options_delta(source):
+    tail = source.split('\nimport calendar\n', 1)[1]
+    assert tail.count(_PR806_OPTIONS_METHODS) == 1, 'PR806_OPTIONS_DELTA_CHANGED'
+    # The separately reviewed backlog fix changes exactly this one reporting
+    # line. Reverse only that exact occurrence before applying the historical
+    # pin, so all other scheduler and SEC guards remain protected.
+    reviewed = '        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]\n'
+    historical = '        summary["still_due"] = [p["name"] for p in due[MAX_PULLERS_PER_TICK:]]\n'
+    assert tail.count(reviewed) == 1, 'REVIEWED_BACKLOG_DELTA_CHANGED'
+    return tail.replace(_PR806_OPTIONS_METHODS, _PRE_PR806_OPTIONS_METHODS, 1).replace(reviewed, historical, 1)
+
+
 class CurrentSecDefaultTests(unittest.TestCase):
     def test_unselected_default_source_tails_are_current_base_exact(self):
         # Operator tail: accepted PR911 head 7ec182b, blob 4b039ec9.
         # Parent 9135c68 tail d1b16920 differs only in the approved stale block.
         for path,marker,pin in [(OPER,'\nimport argparse\n','381edbc4c69e5024c19ec0f616c6420d81b375bb293a8974b7f5b78dde32f624'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
-            self.assertEqual(digest(path.read_text().split(marker,1)[1].encode()),pin)
+            source = path.read_text(encoding='utf-8')
+            tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else source.split(marker, 1)[1]
+            self.assertEqual(digest(tail.encode()), pin)
 
     def test_default_tail_pin_rejects_guard_and_unselected_source_mutations(self):
         original=OPER.read_text()
@@ -520,10 +540,49 @@ class CurrentSecDefaultTests(unittest.TestCase):
                     with self.assertRaises(AssertionError):
                         self.test_unselected_default_source_tails_are_current_base_exact()
 
+    def test_reviewed_options_delta_and_unrelated_scheduler_mutations_are_rejected(self):
+        original = SCHED.read_text(encoding='utf-8')
+        mutations = [
+            ('if guarded is not None:', 'if False:'),
+            ('self._puller = None', 'self._puller = OptionsPuller(db_engine=db_engine)'),
+            ('capture_source="smart_scheduler"', 'capture_source="options_puller"'),
+            ('SKIP_RETRY_MINUTES = 30', 'SKIP_RETRY_MINUTES = 31'),
+        ]
+        read = Path.read_text
+        for before, after in mutations:
+            with self.subTest(mutation=before):
+                self.assertIn(before, original)
+                changed = original.replace(before, after, 1)
+                def changed_read(path, *args, **kwargs):
+                    return changed if path == SCHED else read(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', changed_read):
+                    with self.assertRaises(AssertionError):
+                        self.test_unselected_default_source_tails_are_current_base_exact()
+
     def test_all_accepted_sec_function_bodies_are_preserved(self):
         manifest=accepted_sec_source_manifest(SCHED.read_text())
         self.assertEqual([row[0] for row in manifest['nodes']],list(_ACCEPTED_SEC_NAMES))
         self.assertEqual(accepted_sec_source_digest(SCHED.read_text()),_ACCEPTED_SEC_SOURCE_SHA256)
+
+    def test_reviewed_backlog_allowance_rejects_mutation_or_duplication(self):
+        original = SCHED.read_text(encoding='utf-8')
+        reviewed = '        summary["still_due"] = [p["name"] for p in due[summary["ran"]:]]\n'
+        self.assertEqual(original.count(reviewed), 1)
+        mutations = [
+            original.replace(reviewed, reviewed.replace('summary["ran"]', 'summary["ran"] + 1'), 1),
+            original.replace(reviewed, reviewed.replace('summary["ran"]', 'MAX_PULLERS_PER_TICK'), 1),
+            original + '\n' + reviewed,
+            original.replace('MAX_PULLERS_PER_TICK = 8', 'MAX_PULLERS_PER_TICK = 9', 1),
+        ]
+        read = Path.read_text
+        for changed in mutations:
+            with self.subTest(changed=changed != original):
+                self.assertNotEqual(changed, original)
+                def changed_read(path, *args, **kwargs):
+                    return changed if path == SCHED else read(path, *args, **kwargs)
+                with patch.object(Path, 'read_text', changed_read):
+                    with self.assertRaises(AssertionError):
+                        self.test_unselected_default_source_tails_are_current_base_exact()
     def test_sec_wrong_source_and_clock_refuse_before_reads(self):
         m=front();selection={'schema':'hermes-sec-only-v1','base':m._SEC_ONLY_BASE,
           'source':'other','module':'ingestion.altdata.sec_xbrl_shares','class':'SECXBRLSharesPuller',
@@ -582,3 +641,128 @@ class SecPreservationEncodingTests(unittest.TestCase):
         source="class SecOnlyRefused(ValueError):\n    pass\n"
         with patch.object(ast,'dump',side_effect=AssertionError('version-dependent AST dump forbidden')):
             self.assertEqual(accepted_sec_source_manifest(source)['nodes'],[['SecOnlyRefused',source]])
+
+
+class GuardianWorkflowRuntime(WorkflowRuntime):
+    """Synthetic process boundary; actual V8 supervisor and receipt guards run.
+
+    No GuardianHandle constructor/native method or guardian_main is invoked.
+    Parent-death/control watching is an inert arm here, not kernel proof.
+    """
+    def __init__(self,driver, *, guardian_fault=None):
+        super().__init__(driver)
+        self.guardian_fault=guardian_fault
+        self.guardian_events=[];self.guardian_frames=[];self.guardian_handles=[]
+
+    def launch(self,context,bound):
+        packet=json.loads(bound)
+        def spawn(owner,packet_bytes, *, arm):
+            self.guardian_events.append('spawn')
+            return super(GuardianWorkflowRuntime,self).launch(owner,packet_bytes)
+        guard_runtime=types.SimpleNamespace(clock=self.clock,wait=self.wait,
+            _spawn_worker=spawn,
+            close=lambda owner:self.guardian_events.append('guardian_context_closed'))
+        arm=types.SimpleNamespace(armed=True,end=packet['call']['t0']+150,
+                                 clock=self.clock,check=lambda:'NONE')
+        frame=self.driver.supervise_guarded_worker(guard_runtime,context,bound,arm)
+        if self.guardian_fault=='packet':
+            frame['attempt_packet_sha256']='0'*64
+        if self.guardian_fault=='worker_eof':
+            frame['stop']['stderr_eof']=False
+        self.guardian_frames.append(frame)
+        # Only the OS-owned handle boundary is projected. Exact class identity
+        # makes real run_live validate the guardian frame and nested worker.
+        handle=object.__new__(self.driver.GuardianHandle)
+        handle.owner=context;handle.identity=(handle,1)
+        handle.output=bytearray(encode(frame));handle.closed=False
+        handle.poll=lambda:0
+        handle.reap=lambda code:code==0
+        handle.capture_complete=lambda:True
+        handle.signal=lambda kind:False
+        def close():
+            handle.closed=True
+            return self.guardian_fault!='close'
+        handle.close=close
+        self.guardian_handles.append(handle)
+        if self.guardian_fault=='late':
+            self.c.now=460.0
+        return handle
+
+
+class FinraV8CallerCouplingTests(unittest.TestCase):
+    # These six cases are prepared source, UNRUN until a finite allocation.
+    def harness(self,guardian_fault=None):
+        h=FinraCompositionHarness()
+        h.runtime=GuardianWorkflowRuntime(h.driver,guardian_fault=guardian_fault)
+        # Keep the original runtime/clock; use the actual caller-loaded classes.
+        # The real loader still validates and executes the exact pinned bytes.
+        load=h.ns['_sec_load']
+        def bind_runtime(path,raw,expected_sha):
+            module=load(path,raw,expected_sha)
+            h.runtime.driver=module
+            return module
+        h.ns['_sec_load']=bind_runtime
+        return h
+
+    def test_exact_v8_dependency_pin_and_unchanged_profile(self):
+        h=self.harness()
+        self.assertEqual(h.m._FINRA_SELECTED_PINS['driver'],
+            '4bb5204c2fd45b1714688dda1d892b1192ef7be1217e4d3abc350b42fc27ee68')
+        self.assertEqual(digest(h.files[h.driver_path]),h.m._FINRA_SELECTED_PINS['driver'])
+        self.assertEqual(h.m._FINRA_SELECTED_PINS['producer'],
+            '76579df966612c7f215a9f9c27251574ec13488a31c1e40221dbe09a651337f5')
+        self.assertEqual(h.selection['kwargs'],{'trade_date':'2026-10-13',
+            'url':'https://cdn.finra.org/equity/regsho/daily/CNMSshvol20261013.txt',
+            'market_prefix':'CNMS','dry_run':False})
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_actual_v8_guardian_supervisor_receipt_composes_through_caller(self):
+        h=self.harness();r=h.run()
+        self.assertEqual(r['status'],'COMPLETE');self.assertEqual(r['driver_invocations'],1)
+        self.assertEqual(h.constructors,1);self.assertEqual(h.runtime.launches,1)
+        self.assertEqual(h.runtime.guardian_events,['spawn','guardian_context_closed'])
+        self.assertEqual(h.runtime.guardian_frames[0]['schema'],'finra-independent-guardian-v1')
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['reaped'])
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['stdout_eof'])
+        self.assertTrue(h.runtime.guardian_frames[0]['stop']['stderr_eof'])
+        self.assertTrue(h.runtime.guardian_handles[0].closed)
+        self.assertEqual(r['workflow']['frame']['origin'],10.)
+        self.assertEqual(r['workflow']['frame']['end'],460.)
+        self.assertEqual(r['workflow']['observed_transaction_ack'],'ACKNOWLEDGED')
+        self.assertEqual(r['workflow']['observed_committed_rows'],2)
+        self.assertFalse(r['native_accepted']);self.assertFalse(r['live_qualified'])
+        self.assertFalse(r['workload_success']);self.assertEqual(r['commit'],'UNKNOWN')
+
+    def test_old_driver_selection_pin_refuses_before_reads_or_constructor(self):
+        h=self.harness()
+        h.selection['artifacts']['driver']['sha256']='717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31'
+        r=h.run()
+        self.assertEqual((r['status'],r['code']),('REFUSED','SOURCE_PIN'))
+        self.assertEqual(h.reads,[]);self.assertEqual(h.constructors,0)
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_old_driver_admission_pin_refuses_before_constructor(self):
+        h=self.harness()
+        h.packet['runtime']['driver_sha256']='717041aa520f3c179f41c8dc9af1d31641b754f7f20b9f56ecdc4bfe23c54b31'
+        r=h.run()
+        self.assertEqual((r['status'],r['code']),('REFUSED','ADMISSION_BINDING'))
+        self.assertEqual(h.constructors,0);self.assertEqual(h.runtime.events,[])
+        self.assertEqual(h.runtime.launches,0);self.assertFalse(h.runtime.spent)
+
+    def test_invalid_guardian_identity_or_worker_closure_never_retries(self):
+        for fault in ('packet','worker_eof','close'):
+            with self.subTest(fault=fault):
+                h=self.harness(fault);r=h.run()
+                self.assertEqual(r['status'],'UNKNOWN')
+                self.assertEqual(r['driver_invocations'],1);self.assertEqual(h.runtime.launches,1)
+                self.assertEqual(h.constructors,1);self.assertTrue(h.runtime.spent)
+                self.assertEqual(r['commit'],'UNKNOWN');self.assertFalse(r['workload_success'])
+                self.assertFalse(r['native_accepted']);self.assertFalse(r['live_qualified'])
+
+    def test_guardian_late_original_deadline_stays_unknown(self):
+        h=self.harness('late');r=h.run()
+        self.assertEqual(r['status'],'UNKNOWN');self.assertEqual(r['driver_invocations'],1)
+        self.assertEqual(h.runtime.launches,1);self.assertEqual(h.constructors,1)
+        self.assertTrue(h.runtime.spent);self.assertTrue(h.runtime.guardian_handles[0].closed)
+        self.assertEqual(r['commit'],'UNKNOWN');self.assertFalse(r['native_accepted'])
+

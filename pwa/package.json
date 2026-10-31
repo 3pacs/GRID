@@ -27,13 +27,13 @@
     "graphology-layout": "^0.6.1",
     "graphology-layout-forceatlas2": "^0.10.1",
     "graphology-types": "^0.24.8",
-    "lucide-react": "^1.48.0",
+    "lucide-react": "^1.61.0",
     "maplibre-gl": "^6.11.2",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "sigma": "^3.0.2",
-    "three": "^0.186.0",
-    "zustand": "^5.0.15"
+    "three": "^0.186.1",
+    "zustand": "^5.0.16"
   },
   "devDependencies": {
     "@testing-library/jest-dom": "^7.0.1",
@@ -44,7 +44,7 @@
     "@vitejs/plugin-react": "^6.1.1",
     "jsdom": "^30.0.1",
     "typescript": "^7.0.2",
-    "vite": "^8.3.1",
+    "vite": "^8.3.5",
     "vitest": "^5.0.2"
   }
 }

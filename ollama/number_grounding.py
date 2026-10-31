@@ -236,6 +236,12 @@ def _publication_basis_reasons(text: str, snapshot: dict[str, Any], facts: dict[
             reasons.add("unestablished_session_close_finality")
 
     pcr = [r for r in records if r["path"] == "options.spy_put_call"]
+    # A definitional conflation is unsupported even without SPY/ratio wording.
+    # Keep truthful distinctions and separate traded-volume observations intact.
+    if re.search(r"\bopen[- ]interest\s*(?:,\s*(?:though|although|but)\s+(?:this|it)\s+)?"
+                 r"(?:measures?|represents?|reflects?|means?|is)\s+"
+                 r"(?:(?:contract|traded|trading)\s+volume|volume of (?:traded )?contracts)\b", probe):
+        reasons.add("open_interest_is_not_traded_volume")
     options_context = ((bool(pcr) and re.search(r"\b(?:spy|p/c|pcr|put|call|ratio|participants)\b", probe))
                        or re.search(r"\bspy\b.*\b(?:p/c|pcr|put|call|ratio)\b", probe))
     change = re.search(r"\b(?:rise|rose|risen|rising|fell|fall|fallen|falling|increas\w*|decreas\w*|stable|unchanged|tighten\w*|widen\w*|changed)\b", probe)
@@ -265,8 +271,41 @@ def _publication_basis_reasons(text: str, snapshot: dict[str, Any], facts: dict[
 
     credit = [r for r in records if r["path"].startswith("credit.")]
     spread_claim = re.search(r"\b(?:credit spreads?|credit oas|oas|spread stability)\b", probe)
+    # Nominal ETF price comparisons cannot become a measured credit spread,
+    # including when no credit record was supplied to this generation.
+    nominal_pair_spread = (re.search(r"\bhyg\b", probe) and re.search(r"\blqd\b", probe)
+                          and re.search(r"\b(?:widen\w*|tighten\w*)\s+(?:credit\s+)?spreads?\b|"
+                                        r"\bspreads?\s+(?:(?:is|are)\s+)?(?:widen\w*|tighten\w*)\b", probe))
+    spread_claim = spread_claim or nominal_pair_spread
     if spread_claim or (credit and change and re.search(r"\bhyg(?:/lqd)?\b|\bprice-relative proxy\b", probe)):
         supported = False
+        # Explicit nominal price-gap arithmetic is a different measure from
+        # credit/OAS spreads. Permit only this finite, source-bound comparison.
+        nominal = re.fullmatch(r"hyg and lqd (?:absolute )?nominal price spread is "
+                               r"(?P<direction>widening|tightening)\.?\s*", normalized)
+        pair = {r["instrument"]: r for r in credit
+                if r["instrument"] in ("HYG", "LQD") and r["path"] == "credit." + r["instrument"]}
+        if nominal and len(pair) == 2:
+            legs = [pair["HYG"], pair["LQD"]]
+            compatible = all(r["comparator_available"] and r["measure"] == "ETF_price"
+                             and r["unit"] == "USD" and r["value"] >= 0
+                             and r["comparator"]["value"] >= 0 and r["price_basis"]
+                             for r in legs)
+            if compatible:
+                compatible = (legs[0]["date"] == legs[1]["date"]
+                              and legs[0]["comparator"]["date"] == legs[1]["comparator"]["date"]
+                              and legs[0]["source_id"] == legs[1]["source_id"]
+                              and legs[0]["price_basis"] == legs[1]["price_basis"]
+                              and all(legs[0][key] is not None and legs[0][key] == legs[1][key]
+                                      for key in ("basis", "denominator", "window", "universe")
+                                      if key in legs[0]["comparison_metadata_supplied"]
+                                      or key in legs[1]["comparison_metadata_supplied"]))
+            if compatible:
+                # "Widening" here means the absolute nominal USD price gap,
+                # not signed subtraction, returns, yield spread or credit risk.
+                gap = abs(legs[0]["value"] - legs[1]["value"])
+                prior_gap = abs(legs[0]["comparator"]["value"] - legs[1]["comparator"]["value"])
+                supported = (gap > prior_gap if nominal["direction"] == "widening" else gap < prior_gap)
         for record in credit:
             if not (record["eligible"] and record["value"] is not None
                     and record["source_id"] and record["receipt_id"]):
@@ -397,6 +436,44 @@ def _strip_publication_disclosures(text: str) -> str:
     )
 
 
+def _vix_direction_reason(text: str, snapshot: dict[str, Any]) -> str | None:
+    """Check only explicit two-tenor ordering, never a temporal price trend."""
+    token = r"vix(?:\s*3m)?"
+    value = r"\d+(?:\.\d+)?"
+    pattern = (r"\b(?P<left>" + token + r")\s+(?P<lv>" + value + r")\s+"
+               r"(?:is\s+)?(?P<relation>above|below|higher than|lower than|versus|vs\.?)\s+"
+               r"(?P<right>" + token + r")\s+(?P<rv>" + value + r")\b")
+    volatility = snapshot.get("volatility") or {}
+    for match in re.finditer(pattern, text):
+        left, right = (re.sub(r"\s+", "", match[group]).upper() for group in ("left", "right"))
+        if left == right:
+            continue
+        readings = [volatility.get("^" + name) or volatility.get(name) or {} for name in (left, right)]
+        supplied = [item.get("value") for item in readings]
+        if any(type(v) not in (int, float) or not math.isfinite(v) or v < 0 for v in supplied):
+            return "unbound_vix_comparison_reading"
+        # Protected comparisons cannot gain permission from a nearby but
+        # unbound quote. Keep numeric binding refusal distinct from ordering.
+        if any(abs(float(match[g]) - v) > 0.005 for g, v in zip(("lv", "rv"), supplied)):
+            return "unbound_vix_comparison_reading"
+        relation = match["relation"]
+        if relation in ("above", "higher than") and supplied[0] <= supplied[1]:
+            return "contradicted_vix_tenor_direction"
+        if relation in ("below", "lower than") and supplied[0] >= supplied[1]:
+            return "contradicted_vix_tenor_direction"
+        if relation.startswith(("versus", "vs")):
+            tail = text[match.end():]
+            direction = re.match(r"\s+(?:declines?|decreases?|falls?|rises?|increases?)\s+"
+                                 r"(?:by|with|across|over)\s+(?:the\s+)?horizon\b", tail)
+            if direction:
+                # Horizon increases from VIX (~30d) to VIX3M, independent of prose order.
+                short, long = supplied if left == "VIX" else supplied[::-1]
+                declining = direction[0].strip().startswith(("declin", "decreas", "fall"))
+                if (declining and long >= short) or (not declining and long <= short):
+                    return "contradicted_vix_tenor_direction"
+    return None
+
+
 def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     """Omit specific unsupported sentences, retaining other descriptive prose.
 
@@ -448,6 +525,15 @@ def annotate_publication_context(text: str, snapshot: dict[str, Any]) -> tuple[s
         ):
             normalized = re.sub(disclosure, "", normalized)
         reasons: set[str] = _publication_basis_reasons(original, snapshot, facts)
+        vix_direction_reason = _vix_direction_reason(normalized, snapshot)
+        if vix_direction_reason:
+            reasons.add(vix_direction_reason)
+        # A price-relative ETF proxy cannot itself establish measured credit stress.
+        if re.search(r"\bhyg\s*/\s*lqd\s+(?:(?:price-relative\s+)?proxy\s+)?"
+                     r"(?:(?:clearly|directly|definitively|conclusively)\s+)?"
+                     r"(?:proves?|confirms?|establishes?|demonstrates?)\s+"
+                     r"(?:(?:worsening|increasing|elevated)\s+)?(?:credit\s+)?stress\b", normalized):
+            reasons.add("price_proxy_does_not_establish_credit_stress")
         trend = r"\b(?:worsen\w*|deteriorat\w*|improv\w*|stabili[sz]\w*|transitioning|shifting|remained|unchanged)\b"
         if (re.search(r"\b(?:regime|fragile)\b|\bstate\s*:|^\s*(?:the\s+)?conditions\b|\bmarket conditions\b", normalized) and re.search(trend, normalized)) or re.search(
             r"\bdirection(?: of travel)?\s*(?::|-|is|=)\s*(?:\w+\s+){0,2}"
@@ -942,6 +1028,12 @@ def _excluded_spans(text: str) -> list[tuple[int, int]]:
     spans: list[tuple[int, int]] = []
     for pattern in _EXCLUSION_PATTERNS:
         spans.extend((m.start(), m.end()) for m in pattern.finditer(text))
+    # Exclude only the index-name token, preserving offsets and real amounts.
+    # A following numeric modifier (500%, 500.25, 500x, 500,000) is not a name.
+    # Match supported ampersand forms directly in original text, avoiding
+    # normalization-induced offset changes. XLE is a word, not an x multiplier.
+    for match in re.finditer(r"\bs\s*(?:[&＆]|&amp;)\s*p\s+(?P<name>500)(?![\w%]|[.,]\d|\s*%|\s*[xX]\b)\b", text, re.IGNORECASE):
+        spans.append(match.span("name"))
     return spans
 
 
@@ -998,6 +1090,8 @@ def extract_numeric_mentions(text: str, *, include_small_integers: bool = False)
     - Dates (ISO, slash, or month-name form) and clock times, including the
       ``*Generated: 2026-09-24T06:09:53.123456*`` footer this codebase writes.
     - Markdown list numbering ("1. ", "2) ") at line start.
+    - The literal name token "500" in "S&P 500" (or HTML-escaped ampersand),
+      not separate amounts, percentages or decimal quantities.
     - Bare 4-digit integers that read as a calendar year (1990-2039).
     - Bare integers of 1-2 digits with no $ / % / decimal / comma marker —
       these are section/step counts ("3 sources", "## 2.", "Top 5"), not

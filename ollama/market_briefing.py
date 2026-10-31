@@ -699,6 +699,8 @@ class MarketBriefingEngine:
                     ],
                     "fx": [
                         "YF:UUP:close", "YF:FXE:close", "YF:FXY:close",
+                        # Legacy input grouping retained; publication renderer
+                        # labels EEM separately as an equity ETF proxy, not FX.
                         "YF:EEM:close",
                     ],
                     "macro": [
@@ -967,6 +969,8 @@ class MarketBriefingEngine:
                  f"basis={info.get('price_basis') or info.get('basis') or 'unknown'}",
                  f"session_finality={info.get('session_finality') if info.get('session_finality') not in (None, '') else 'unknown'}"]
         parts.append(f"measure={info.get('measure') or 'unknown'}")
+        if category == "equity_etf_proxies" and name.upper() == "EEM":
+            parts.append("instrument class=emerging-market equity ETF; equity-price proxy, not FX")
         if category == "credit" and name.upper() in {"HYG", "LQD", "JNK", "EMB"}:
             parts.append("collector observation=ETF price; not a measured credit spread or OAS")
         parts.extend(f"{key}={info.get(key) if type(info.get(key)) is str else 'unknown'}"
@@ -1016,10 +1020,10 @@ class MarketBriefingEngine:
                      "a same-civil-date mismatch is conditional until a common basis is declared.")
         lines.append("")
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
-            data = snapshot.get(category, {})
+        for category, data in self._publication_display_categories(snapshot):
             if data:
-                lines.append(f"### {category.upper()}")
+                heading = "EQUITY ETF PROXIES" if category == "equity_etf_proxies" else category.upper()
+                lines.append(f"### {heading}")
                 for label, info in data.items():
                     tenor = '^' + label.lstrip('^').upper()
                     if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
@@ -1689,6 +1693,22 @@ class MarketBriefingEngine:
             f"confidence level."
         )
 
+    @staticmethod
+    def _publication_display_categories(snapshot: dict[str, Any]) -> list[tuple[str, Any]]:
+        """Display legacy fx.EEM as equity, retaining original input custody."""
+        rows = []
+        for category in ("equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"):
+            data = snapshot.get(category, {})
+            if category == "fx" and isinstance(data, dict):
+                equity_proxies = {name: info for name, info in data.items() if name.upper() == "EEM"}
+                data = {name: info for name, info in data.items() if name.upper() != "EEM"}
+                rows.append((category, data))
+                if equity_proxies:
+                    rows.append(("equity_etf_proxies", equity_proxies))
+            else:
+                rows.append((category, data))
+        return rows
+
     def _generate_fallback_briefing(
         self, snapshot: dict[str, Any], reason: str = "source_evidence_unknown",
     ) -> str:
@@ -1715,10 +1735,10 @@ class MarketBriefingEngine:
             "",
         ]
 
-        for category in ["equities", "equity_volume", "rates", "credit", "volatility", "commodities", "fx", "macro"]:
-            data = snapshot.get(category, {})
+        for category, data in self._publication_display_categories(snapshot):
             if data:
-                lines.append(f"## {category.replace('_', ' ').title()}")
+                heading = "Equity ETF Proxies" if category == "equity_etf_proxies" else category.replace('_', ' ').title()
+                lines.append(f"## {heading}")
                 for label, info in data.items():
                     tenor = '^' + label.lstrip('^').upper()
                     if category == "volatility" and tenor in facts['vix_observation_dates'] and facts['vix_observation_dates'][tenor] is None:
