@@ -2151,6 +2151,12 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `run_pull_group`, `backfill_all`, `run_pushshift_backfill`, `run_daily_pulls`, `run_monthly_pulls`, `start_scheduler`
 **Reads:** `__future__`, `alerts`, `config`, `datetime`, `db`, `discovery`, `ingestion`, `intelligence`, `loguru`, `schedule`, `scripts`, `socket`, `sqlalchemy`, `sys`, `time`, `tqdm`, `typing`
 
+#### `ingestion/schwab_market.py` — 797 LOC
+**Docstring:** GRID Schwab Trader API market-data client (read-only). GET-only against `https://api.schwabapi.com/marketdata/v1` (quotes, option chains, expiration chain, price history, market hours) for the Schwab app "GRID" (Market Data Production, scope readonly). Auto-refreshes the access token via the OAuth token endpoint and rewrites the 0600 token file atomically; refuses token/credential files that are not mode 0600. **Weekly re-login:** Schwab refresh tokens expire after 7 days, so the operator re-runs the interactive login helper (`~/dev/grid-schwab/schwab_auth.py login`, outside the repo) weekly — nothing in GRID logs in. **No redistribution:** Schwab's terms forbid redistributing its data; nothing from this client may reach a public page (e.g. gex.stepdad.finance) without operator sign-off. No account/order endpoints, no DB writes, not registered in `ingestion/scheduler.py` (added 2026-10-29; intended to replace the thinkorswim RTD leg of the GEX feed later).
+**Functions:** `SchwabMarketClient` (`quotes`, `option_chain`, `expiration_chain`, `price_history`, `market_hours`, `refresh`, `token_status`), `load_credentials`, `is_configured`, `parse_quotes`, `SchwabQuote`
+**Reads:** `__future__`, `config`, `dataclasses`, `json`, `os`, `pathlib`, `requests`, `stat`, `time`, `typing`
+**Tests:** `tests/test_schwab_market.py` (all HTTP faked)
+
 #### `ingestion/sec_velocity.py` — 426 LOC
 **Docstring:** GRID SEC 8-K filing velocity module.
 **Functions:** `SECVelocityPuller`
