@@ -215,10 +215,14 @@ class TestConversion:
         with pytest.raises(InvalidChainError, match="PrivateQuote"):
             convert(underlying={"last": 1})  # type: ignore[arg-type]
 
-    def test_underlying_absent_or_unparseable_is_unseen(self):
-        for b in (body(underlying=None), body(underlying={"last": 1, "bid": 1, "ask": 1}), body(underlying="x")):
+    def test_underlying_absent_or_without_quote_time_is_unseen(self):
+        for b in (body(underlying=None), body(underlying={"symbol": "SPY", "last": 1, "bid": 1, "ask": 1})):
             f = by_field(convert(b), "SPY")
             assert all(r["callback_seen"] is False for r in f.values())
+
+    def test_underlying_not_a_mapping_is_invalid(self):
+        with pytest.raises(InvalidChainError, match="underlying is not a mapping"):
+            convert(body(underlying="x"))
 
     def test_deterministic_and_strict_json(self):
         a, b = convert(), convert()
@@ -342,9 +346,9 @@ class TestInvalidBodies:
         reasons = sorted(r["reason"] for r in env["rejected"])
         assert reasons == sorted([
             "malformed expiry bucket", "malformed strike bucket", "malformed strike bucket",
-            "duplicate contract entry", "contract entry is not a mapping",
+            "duplicate contract entry", "ambiguous duplicate entries", "contract entry is not a mapping",
         ])
-        assert env["seen_contracts"] == 3  # P735.5 had no usable entry
+        assert env["seen_contracts"] == 2  # P735.5 had no usable entry; P735 was ambiguous
 
     def test_received_at_must_be_aware(self):
         with pytest.raises(InvalidChainError, match="timezone-aware"):
@@ -367,6 +371,132 @@ class TestInvalidBodies:
         before = copy.deepcopy(b)
         convert(b)
         assert b == before
+
+
+# ── identity (r2 finding 2) ──────────────────────────────────────────────────
+
+def _universe(root: str) -> list[dict[str, Any]]:
+    return [{**c, "symbol": c["symbol"].replace(".SPY", f".{root}")} for c in UNIVERSE]
+
+
+def _requote(q: PrivateQuote, **over: Any) -> PrivateQuote:
+    return PrivateQuote(**{**q.__dict__, **over})
+
+
+class TestIdentity:
+    def test_matching_identity_keys_underlying_by_requested_symbol(self):
+        env = convert(body(symbol=" spy "))
+        assert env["symbol"] == "SPY"
+        assert by_field(env, "SPY")["LAST"]["callback_seen"] is True
+
+    def test_missing_chain_symbol_fails_closed(self):
+        b = body()
+        del b["symbol"]
+        with pytest.raises(InvalidChainError, match="chain symbol missing"):
+            convert(b)
+
+    @pytest.mark.parametrize("sym", ["QQQ", "", None, 5, "SPY.X"])
+    def test_chain_symbol_mismatch_fails_closed(self, sym):
+        with pytest.raises(InvalidChainError, match="chain symbol"):
+            convert(body(symbol=sym))
+
+    def test_raw_qqq_underlying_never_becomes_spy(self):
+        """The reviewer's case: a QQQ underlying object inside an SPY chain."""
+        b = body(underlying={"symbol": "QQQ", "last": 500.0, "bid": 499.9, "ask": 500.1, "quoteTime": QT_MS})
+        with pytest.raises(InvalidChainError, match="underlying symbol does not match"):
+            convert(b)
+
+    def test_raw_underlying_without_symbol_fails_closed(self):
+        b = body(underlying={"last": 500.0, "bid": 499.9, "ask": 500.1, "quoteTime": QT_MS})
+        with pytest.raises(InvalidChainError, match="underlying symbol missing"):
+            convert(b)
+
+    def test_injected_qqq_quote_never_becomes_spy(self):
+        """The reviewer's case: a classified QQQ quote injected as the underlying."""
+        q = _requote(_quote("fresh", live=True), symbol="QQQ", provider_symbol="QQQ")
+        with pytest.raises(InvalidChainError, match="requested for a different symbol"):
+            convert(underlying=q)
+
+    def test_injected_quote_with_foreign_provider_symbol_fails_closed(self):
+        q = _requote(_quote("fresh", live=True), provider_symbol="QQQ")
+        with pytest.raises(InvalidChainError, match="underlying provider symbol does not match"):
+            convert(underlying=q)
+
+    def test_injected_quote_without_provider_symbol_fails_closed(self):
+        q = _requote(_quote("fresh", live=True), provider_symbol=None)
+        with pytest.raises(InvalidChainError, match="underlying provider symbol missing"):
+            convert(underlying=q)
+
+    def test_explicit_alias_is_accepted_for_chain_and_underlying(self):
+        b = body(symbol="SPY.X", underlying={"symbol": "spy.x", "last": 731.37, "bid": 731.35, "ask": 731.39, "quoteTime": QT_MS})
+        env = convert(b, aliases={"spy": ["SPY.X"]})
+        assert env["symbol"] == "SPY" and by_field(env, "SPY")["LAST"]["callback_seen"] is True
+        q = _requote(_quote("fresh", live=True), provider_symbol="SPY.X")
+        assert by_field(convert(underlying=q, aliases={"SPY": ("spy.x",)}), "SPY")["LAST"]["value"] == 700.0
+
+    def test_alias_for_another_symbol_or_value_does_not_apply(self):
+        with pytest.raises(InvalidChainError):
+            convert(body(symbol="SPY.X"), aliases={"QQQ": ["SPY.X"]})
+        with pytest.raises(InvalidChainError):
+            convert(body(symbol="SPY.X"), aliases={"SPY": ["SPY.Y"]})
+
+    def test_universe_root_must_match_requested_symbol(self):
+        with pytest.raises(InvalidChainError, match="is not a SPY contract"):
+            schwab_chain_to_rtd_records(body(), _universe("QQQ"), received_at=RECEIVED)
+        with pytest.raises(InvalidChainError, match="is not a QQQ contract"):
+            schwab_chain_to_rtd_records(body(symbol="QQQ"), UNIVERSE, received_at=RECEIVED, symbol="QQQ")
+
+    def test_other_symbol_end_to_end(self):
+        b = body(symbol="QQQ", underlying={"symbol": "QQQ", "last": 500.0, "bid": 499.9, "ask": 500.1, "quoteTime": QT_MS})
+        for m in ("callExpDateMap", "putExpDateMap"):
+            for strikes in b[m].values():
+                for entries in strikes.values():
+                    for e in entries:
+                        e["symbol"] = e["symbol"].replace("SPY   ", "QQQ   ")
+        env = schwab_chain_to_rtd_records(b, _universe("QQQ"), received_at=RECEIVED, symbol="qqq")
+        assert env["symbol"] == "QQQ" and env["seen_contracts"] == 4
+        assert by_field(env, "QQQ")["LAST"]["value"] == 500.0
+        assert not [r for r in env["records"] if r["symbol"] == "SPY"]
+
+    @pytest.mark.parametrize("sym", ["", "  ", None])
+    def test_requested_symbol_must_be_non_empty(self, sym):
+        with pytest.raises(InvalidChainError, match="requested symbol"):
+            convert(symbol=sym)  # type: ignore[arg-type]
+
+
+# ── duplicates (r2 finding 4) ────────────────────────────────────────────────
+
+class TestDuplicates:
+    @staticmethod
+    def _dup(first: dict[str, Any], second: dict[str, Any]) -> dict[str, Any]:
+        b = body()
+        b["callExpDateMap"][f"{EXPIRY}:20"]["735.0"] = [first, second]
+        return convert(b)
+
+    @pytest.mark.parametrize("conflicting", [False, True])
+    @pytest.mark.parametrize("order", ["good_first", "bad_first"])
+    def test_every_duplicate_entry_is_invalidated(self, conflicting, order):
+        good = entry("CALL", 735.0)
+        other = entry("CALL", 735.0, bid=9.9, openInterest=1) if conflicting else entry("CALL", 735.0)
+        env = self._dup(good, other) if order == "good_first" else self._dup(other, good)
+        f = by_field(env, ".SPY261120C735")
+        assert all(r["callback_seen"] is False and r["value"] is None for r in f.values())
+        assert {"symbol": ".SPY261120C735", "reason": "ambiguous duplicate entries"} in env["rejected"]
+        assert any(r["reason"] == "duplicate contract entry" for r in env["rejected"])
+        assert env["seen_contracts"] == 3  # the three unique contracts are the positive control
+        assert by_field(env, ".SPY261120P735")["BID"]["callback_seen"] is True
+
+    def test_triplicate_across_buckets_is_also_ambiguous(self):
+        b = body()
+        b["callExpDateMap"][f"{EXPIRY}:20"]["735.0"] = [entry("CALL", 735.0)]
+        b["callExpDateMap"][f"{EXPIRY}:21"] = {"735": [entry("CALL", 735.0)], "735.00": [entry("CALL", 735.0)]}
+        env = convert(b)
+        assert all(not r["callback_seen"] for r in by_field(env, ".SPY261120C735").values())
+        assert sum(1 for r in env["rejected"] if r["reason"] == "duplicate contract entry") == 2
+
+    def test_unique_entries_are_a_positive_control(self):
+        env = convert()
+        assert env["seen_contracts"] == 4 and env["rejected"] == []
 
 
 # ── source guard ─────────────────────────────────────────────────────────────

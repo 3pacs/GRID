@@ -106,7 +106,7 @@ and no value, so `broker.py` counts them as `missing_contracts` exactly as it do
 
 ## 5. What this slice does and does not include
 
-* Included (2026-10-31): `ingestion/schwab_chain_seam.py` — `schwab_chain_to_rtd_records(chain_body, contracts, *, received_at, host="GRID", underlying=None)` exactly as in §3, with `rejected[]` per-contract reasons and `InvalidChainError` for unusable bodies.
+* Included (2026-10-31): `ingestion/schwab_chain_seam.py` — `schwab_chain_to_rtd_records(chain_body, contracts, *, received_at, host="GRID", underlying=None, symbol="SPY", aliases=None)` as in §3, with `rejected[]` per-contract reasons and `InvalidChainError` for unusable bodies; r2 adds requested-symbol identity for the chain body, the universe roots and the underlying (raw or injected), explicit aliases only, underlying records keyed by the requested symbol, and invalidation of every ambiguous duplicate expiry/type/strike entry.
 * Included: this note and `ingestion/schwab_quote_path.py` (SPY underlying quote with
   provenance/freshness, fail-closed classification, declared-audience label, no persistence)
   plus its tests. The `audience` argument is a caller declaration, not access control; a real

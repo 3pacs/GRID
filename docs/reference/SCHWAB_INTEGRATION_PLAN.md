@@ -8,8 +8,8 @@ nothing Schwab-sourced may be published. The target the user named (wired by Sun
 decision that the author cannot make.
 
 Pins: PR #931 reader at `29f636a2` (OPEN, unmerged); accepted private quote-path candidate r4
-`b7af6579`; main `4ef90a14`; this candidate branch `claude/schwab-integration-20261031`
-(local only, never pushed).
+`b7af6579`; r1 `77b88654` on main `4ef90a14` (reviewed: REQUEST CHANGES); r2 on main `25fe9fd9`, branch
+`claude/schwab-integration-r2-20261031` (local only, never pushed).
 
 ## 1. Slices, what exists, what is newly wired, who owns it
 
@@ -18,9 +18,9 @@ Pins: PR #931 reader at `29f636a2` (OPEN, unmerged); accepted private quote-path
 | 1 | **Reader** | `ingestion/schwab_market.py` (#931 + r4 boundary): OAuth refresh, private token file, `/quotes`, `/chains`, exact-integer and finite-float parsing | nothing | this author (PR #931) | GRID Root merges; Anik authorizes the release |
 | 2 | **Quote path** | `ingestion/schwab_quote_path.py` (r4): classification `fresh/stale/delayed/missing/invalid/unavailable`, provenance, identity, fail-closed inputs, declared-audience label | nothing | this author; retained independent source reviewer | — |
 | 3 | **Materialization** | pattern: `store/availability.py` contract | `ingestion/schwab_private_store.py`: process-local bounded store, identity + `as_of` + `vintage` carried, read-time ageing (`fresh`→`stale`, never promoted), `ProvenanceError` on loss of provenance, exact ints | this author | durable persistence (`raw_series` / table) is **not** built: needs Anik's redistribution/persistence sign-off (`persist_allowed=False`) |
-| 4 | **Private API** | `api/auth.py` JWT role gate (`require_role("admin")`), optional router table in `api/main.py` | `api/routers/schwab_private.py`: `/api/v1/schwab/private/{status,quotes}`, admin-only, default-off flag `SCHWAB_PRIVATE_QUOTES_ENABLED` (config + `.env.example`), `Cache-Control: no-store, private` | this author | operator flips the flag in a reviewed change; Root deploys |
-| 5 | **Private UI** | `pwa/src/views/TenYearPortfolio.jsx` "API setup" card (already Schwab-aware), `pwa/src/api.js` fetch wrapper, `authSession` role | `pwa/src/components/SchwabPrivateQuote.jsx` (admin-only render; LIVE label only when `live && fresh`; as-of + vintage shown; unsafe-integer counts not rendered), `api.getSchwabPrivateQuotes/Status` (excluded from the GET cache) | this author (no separate PWA owner on record) | Anik decides whether the admin view is enough or a different private surface is wanted |
-| 6 | **Options / GEX seam** | `docs/reference/SCHWAB_GEX_CHAIN_SEAM.md`; GEX read contract in `collectors/gamma_watch/broker.py` | `ingestion/schwab_chain_seam.py`: pure `schwab_chain_to_rtd_records` with its own identity (`spy-chain-schwab-v1`/`GRID`), so the GEX identity gate rejects it | GEX owner (Claude session `local_d0cd874c`, gex lane; Codex custodians for the RTD collector on ANIK) | the six owner decisions in the seam note §4; no GEX file is touched here |
+| 4 | **Private API** | `api/auth.py` JWT role gate (`require_role("admin")`), optional router table in `api/main.py` | `api/routers/schwab_private.py`: `/api/v1/schwab/private/{status,quotes}`, admin-only, default-off flag `SCHWAB_PRIVATE_QUOTES_ENABLED` (config + `.env.example`); receipt time taken after the source operation and freshness re-evaluated at response time (r2); `Cache-Control: no-store, private` on handler responses (200/503/500; the framework's 401/403/422 carry no quote data) | this author | operator flips the flag in a reviewed change; Root deploys |
+| 5 | **Private UI** | `pwa/src/views/TenYearPortfolio.jsx` "API setup" card (already Schwab-aware), `pwa/src/api.js` fetch wrapper, `authSession` role | `pwa/src/components/SchwabPrivateQuote.jsx` (admin-only render; LIVE only when `live && fresh` and not aged past `stale_after_seconds` on a monotonic local clock, re-evaluated each second with cleanup and no promotion (r2); as-of, vintage and evaluation time shown; counts use the server's `*_exact` strings), `api.getSchwabPrivateQuotes/Status` (excluded from the GET cache) | this author (no separate PWA owner on record) | Anik decides whether the admin view is enough or a different private surface is wanted |
+| 6 | **Options / GEX seam** | `docs/reference/SCHWAB_GEX_CHAIN_SEAM.md`; GEX read contract in `collectors/gamma_watch/broker.py` | `ingestion/schwab_chain_seam.py`: pure `schwab_chain_to_rtd_records` with its own identity (`spy-chain-schwab-v1`/`GRID`), so the GEX identity gate rejects it; requested-symbol identity for chain, universe and underlying with explicit aliases only, and ambiguous duplicates invalidated (r2) | GEX owner (Claude session `local_d0cd874c`, gex lane; Codex custodians for the RTD collector on ANIK) | the six owner decisions in the seam note §4; no GEX file is touched here |
 | 7 | **Scheduling / Hermes** | `ingestion/scheduler.py` pattern | nothing | Hermes owner | not requested; not built |
 | 8 | **Credentials / runtime** | login helper `~/dev/grid-schwab/schwab_auth.py` on precision5520; token file 0600 | nothing | Anik (operator) | see §3 |
 
@@ -64,7 +64,8 @@ GEX         ─> (not connected) schwab_chain_to_rtd_records() would feed a snap
    610 tests, `tsc --noEmit` and `npm run build` pass with Node 22.22.1 (one patch below the
    lockfile's engine floor 22.22.2; installed with `--engine-strict=false`, CI uses its own Node).
 6. **Reviewer limit carried forward.** The outer-key alias limitation from r4 stands: an
-   alias-keyed outer `/quotes` response maps to `missing`.
+   alias-keyed outer `/quotes` response maps to `missing`. Nothing in this plan or its receipts
+   claims to prove how measured data would be disclosed on a live surface; that is D5/D6.
 
 ## 4. Minimum decisions required for live acceptance (in order)
 

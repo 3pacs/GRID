@@ -14,8 +14,17 @@ Rules (all fail closed, per contract):
 
 * body must be a mapping with ``status`` absent or ``"SUCCESS"`` and at least one of
   ``callExpDateMap`` / ``putExpDateMap`` as a mapping; otherwise :class:`InvalidChainError`;
+* identity (r2): the body's ``symbol``, every universe contract's root, and the underlying's
+  identity (the raw ``underlying.symbol`` or an injected :class:`PrivateQuote`'s requested and
+  provider symbols) must equal the **requested** ``symbol`` or an explicitly passed alias
+  (``aliases``: requested symbol -> accepted provider symbols; none by default); missing or
+  mismatched identity raises :class:`InvalidChainError` (fail closed) and underlying records
+  are keyed by the requested symbol, never a literal;
 * the contract universe is the GEX owner's ``contracts.json`` (``symbol, expiry, opt_type,
   strike``); it is read, validated and never rewritten;
+* duplicates (r2): an expiry/type/strike key that appears more than once in the body is
+  ambiguous; every one of its entries is dropped, the contract is emitted ``callback_seen:
+  false`` and the reason is recorded, whether the duplicates are identical or conflicting;
 * a contract is *seen* only when the body entry's identity matches the universe entry on
   all of OCC symbol (converted to the thinkorswim form), ``putCall``, expiry and strike,
   and carries a parseable ``quoteTimeInLong``; anything else is recorded in ``rejected``
@@ -46,10 +55,12 @@ from typing import Any
 from ingestion.schwab_market import _as_float, _as_int, _as_str
 from ingestion.schwab_quote_path import (
     AUDIENCE_PRIVATE,
+    NO_ALIASES,
     PERSIST_ALLOWED,
     PROVIDER,
     REDISTRIBUTION,
     SOURCE,
+    Aliases,
     PrivateQuote,
     _ms_to_dt,
 )
@@ -96,10 +107,36 @@ def occ_to_tos(occ: Any) -> str | None:
     return tos_symbol(m.group("root"), m.group("ymd"), m.group("cp"), strike)
 
 
-def parse_contracts(universe: Any) -> tuple[Contract, ...]:
-    """Validate a ``contracts.json``-shaped universe; raises :class:`InvalidChainError`."""
+def _normalise_symbol(value: Any) -> str | None:
+    text = _as_str(value)
+    if text is None:
+        return None
+    text = text.strip().upper()
+    return text or None
+
+
+def _require_identity(requested: str, provider: Any, aliases: Aliases | None, what: str) -> None:
+    """``provider`` must equal ``requested`` or one of its explicitly approved aliases."""
+    got = _normalise_symbol(provider)
+    if got is None:
+        raise InvalidChainError(f"{what} symbol missing")
+    if got == requested:
+        return
+    for key, accepted in (aliases or NO_ALIASES).items():
+        if _normalise_symbol(key) != requested:
+            continue
+        if any(_normalise_symbol(a) == got for a in accepted):
+            return
+    raise InvalidChainError(f"{what} symbol does not match the requested symbol")
+
+
+def parse_contracts(universe: Any, *, symbol: str | None = None) -> tuple[Contract, ...]:
+    """Validate a ``contracts.json``-shaped universe; raises :class:`InvalidChainError`.
+
+    With ``symbol``, every contract's root must equal it (universe identity)."""
     if isinstance(universe, (str, bytes, Mapping)) or not isinstance(universe, Iterable):
         raise InvalidChainError("contract universe must be a list of contract mappings")
+    symbol_root = _normalise_symbol(symbol) if symbol is not None else None
     out: list[Contract] = []
     seen: set[str] = set()
     for i, raw in enumerate(universe):
@@ -119,6 +156,8 @@ def parse_contracts(universe: Any) -> tuple[Contract, ...]:
             raise InvalidChainError(f"contract {symbol} strike must be a positive number")
         m = _TOS.match(symbol)
         assert m is not None
+        if symbol_root is not None and m.group("root") != symbol_root:
+            raise InvalidChainError(f"contract {symbol} is not a {symbol_root} contract")
         expected = tos_symbol(
             m.group("root"), _parse_date(expiry).strftime("%y%m%d"), "C" if opt_type == "call" else "P", strike
         )
@@ -140,17 +179,23 @@ def schwab_chain_to_rtd_records(
     received_at: datetime,
     host: str = DEFAULT_HOST,
     underlying: PrivateQuote | None = None,
+    symbol: str = "SPY",
+    aliases: Aliases | None = None,
 ) -> dict[str, Any]:
     """Normalize a ``/chains`` body against the GEX universe into a ``spy-rtd-v1``-shaped
     record list under the seam's own identity. Pure; strict JSON; see module docstring."""
     received_at = _require_aware(received_at)
-    universe = parse_contracts(contracts)
+    requested = _normalise_symbol(symbol)
+    if requested is None:
+        raise InvalidChainError("requested symbol must be a non-empty string")
+    universe = parse_contracts(contracts, symbol=requested)
     if not isinstance(chain_body, Mapping):
         raise InvalidChainError("chain body is not a mapping")
+    _require_identity(requested, chain_body.get("symbol"), aliases, "chain")
     status = chain_body.get("status")
     if status is not None and status != "SUCCESS":
         raise InvalidChainError("chain status is not SUCCESS")
-    index, index_problems = _index_chain(chain_body)
+    index, index_problems, ambiguous = _index_chain(chain_body)
     if not isinstance(host, str) or not host.strip():
         raise InvalidChainError("host must be a non-empty string")
 
@@ -158,7 +203,13 @@ def schwab_chain_to_rtd_records(
     rejected: list[dict[str, str]] = list(index_problems)
     seen = 0
     for c in universe:
-        entry = index.get((c.expiry, c.opt_type, c.strike))
+        key = (c.expiry, c.opt_type, c.strike)
+        if key in ambiguous:
+            rejected.append({"symbol": c.symbol, "reason": "ambiguous duplicate entries"})
+            for field in CONTRACT_FIELDS:
+                records.append(_unseen(c.symbol, field))
+            continue
+        entry = index.get(key)
         problem = None if entry is not None else "absent from chain body"
         if entry is not None:
             problem = _identity_problem(c, entry)
@@ -189,10 +240,11 @@ def schwab_chain_to_rtd_records(
                     }
                 )
 
-    records.extend(_underlying_records(chain_body, underlying))
+    records.extend(_underlying_records(chain_body, underlying, requested, aliases))
     envelope = {
         "schema": SCHEMA,
         "host": host.strip(),
+        "symbol": requested,
         "source": SOURCE,
         "provider": PROVIDER,
         "audience": AUDIENCE_PRIVATE,
@@ -217,9 +269,12 @@ def schwab_chain_to_rtd_records(
 # helpers
 # ---------------------------------------------------------------------------
 
-def _index_chain(body: Mapping[str, Any]) -> tuple[dict[tuple[str, str, float], Mapping[str, Any]], list[dict[str, str]]]:
+def _index_chain(
+    body: Mapping[str, Any],
+) -> tuple[dict[tuple[str, str, float], Mapping[str, Any]], list[dict[str, str]], set[tuple[str, str, float]]]:
     index: dict[tuple[str, str, float], Mapping[str, Any]] = {}
     problems: list[dict[str, str]] = []
+    ambiguous: set[tuple[str, str, float]] = set()
     maps = (("callExpDateMap", "call"), ("putExpDateMap", "put"))
     present = 0
     for key, opt_type in maps:
@@ -245,7 +300,8 @@ def _index_chain(body: Mapping[str, Any]) -> tuple[dict[tuple[str, str, float], 
                         problems.append({"symbol": f"{key}:{exp_key}:{strike_key}", "reason": "contract entry is not a mapping"})
                         continue
                     k = (expiry, opt_type, strike)
-                    if k in index:
+                    if k in index or k in ambiguous:
+                        ambiguous.add(k)
                         problems.append({"symbol": f"{key}:{exp_key}:{strike_key}", "reason": "duplicate contract entry"})
                         continue
                     index[k] = entry
@@ -253,7 +309,9 @@ def _index_chain(body: Mapping[str, Any]) -> tuple[dict[tuple[str, str, float], 
                         raise InvalidChainError(f"chain body holds more than {MAX_CONTRACTS} contracts")
     if present == 0:
         raise InvalidChainError("chain body has neither callExpDateMap nor putExpDateMap")
-    return index, problems
+    for k in ambiguous:
+        index.pop(k, None)  # every entry of an ambiguous key is dropped, first included
+    return index, problems, ambiguous
 
 
 def _identity_problem(c: Contract, entry: Mapping[str, Any]) -> str | None:
@@ -297,24 +355,38 @@ def _contract_values(entry: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
-def _underlying_records(body: Mapping[str, Any], quote: PrivateQuote | None) -> list[dict[str, Any]]:
+def _underlying_records(
+    body: Mapping[str, Any], quote: PrivateQuote | None, requested: str, aliases: Aliases | None
+) -> list[dict[str, Any]]:
+    """Underlying LAST/BID/ASK keyed by the requested symbol; identity is verified first.
+
+    An injected classified quote must have been requested for ``requested`` and its
+    provider symbol must pass the alias check; a raw ``underlying`` object must carry a
+    matching ``symbol``. Missing or mismatched identity fails closed. An absent
+    underlying (no object, no injected quote) is simply unseen."""
     if quote is not None:
         if not isinstance(quote, PrivateQuote):
             raise InvalidChainError("underlying must be a quote-path PrivateQuote")
+        if _normalise_symbol(quote.symbol) != requested:
+            raise InvalidChainError("underlying quote was requested for a different symbol")
+        _require_identity(requested, quote.provider_symbol, aliases, "underlying provider")
         if not quote.measured or quote.quote_time is None:
-            return [_unseen("SPY", f) for f in UNDERLYING_FIELDS]
+            return [_unseen(requested, f) for f in UNDERLYING_FIELDS]
         ts = quote.quote_time.isoformat()
         vals = {"LAST": quote.last, "BID": quote.bid, "ASK": quote.ask}
-        return [_seen_or_unseen("SPY", f, vals[f], ts) for f in UNDERLYING_FIELDS]
+        return [_seen_or_unseen(requested, f, vals[f], ts) for f in UNDERLYING_FIELDS]
     raw = body.get("underlying")
+    if raw is None:
+        return [_unseen(requested, f) for f in UNDERLYING_FIELDS]
     if not isinstance(raw, Mapping):
-        return [_unseen("SPY", f) for f in UNDERLYING_FIELDS]
+        raise InvalidChainError("underlying is not a mapping")
+    _require_identity(requested, raw.get("symbol"), aliases, "underlying")
     ts_dt = _ms_to_dt(raw.get("quoteTime"))
     if ts_dt is None:
-        return [_unseen("SPY", f) for f in UNDERLYING_FIELDS]
+        return [_unseen(requested, f) for f in UNDERLYING_FIELDS]
     ts = ts_dt.isoformat()
     vals = {"LAST": _as_float(raw.get("last")), "BID": _as_float(raw.get("bid")), "ASK": _as_float(raw.get("ask"))}
-    return [_seen_or_unseen("SPY", f, vals[f], ts) for f in UNDERLYING_FIELDS]
+    return [_seen_or_unseen(requested, f, vals[f], ts) for f in UNDERLYING_FIELDS]
 
 
 def _seen_or_unseen(symbol: str, field: str, value: float | None, ts: str) -> dict[str, Any]:

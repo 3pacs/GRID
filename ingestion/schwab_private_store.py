@@ -26,7 +26,8 @@ Fail-closed: :func:`materialize` refuses anything that is not a
 audience is not ``"private"`` or whose redistribution label is not
 ``"prohibited"``, and a measured row that lacks a provider quote time (loss of
 provenance). Integer fields (sizes, volume) are carried as Python ``int`` and are
-never passed through ``float``, so values above 2**53 keep their precision in JSON.
+never passed through ``float``, so values above 2**53 keep their precision in JSON;
+the view also carries ``*_exact`` decimal strings for JavaScript consumers (r2).
 """
 
 from __future__ import annotations
@@ -151,6 +152,7 @@ class MaterializedQuote:
                 asset_main_type=None,
             )
             payload.update(common)
+            payload.update(_exact_strings(None, None, None))
             return payload
         provenance = Provenance(
             source=row.source,
@@ -176,7 +178,18 @@ class MaterializedQuote:
             payload["status"] = row.status
             payload["reason"] = row.reason
         payload.update(common)
+        payload.update(_exact_strings(row.bid_size, row.ask_size, row.total_volume))
         return payload
+
+
+def _exact_strings(bid_size: int | None, ask_size: int | None, total_volume: int | None) -> dict[str, str | None]:
+    """Decimal-string twins of the integer fields for JSON clients whose numbers lose
+    precision above 2**53 (JavaScript). ``None`` stays ``None``; never ``"0"`` for missing."""
+    return {
+        "bid_size_exact": None if bid_size is None else str(bid_size),
+        "ask_size_exact": None if ask_size is None else str(ask_size),
+        "total_volume_exact": None if total_volume is None else str(total_volume),
+    }
 
 
 def materialize(snapshot: PrivateQuoteSnapshot) -> tuple[MaterializedQuote, ...]:

@@ -12,9 +12,20 @@ When enabled and hit by an admin it builds the reviewed reader
 :class:`PrivateQuoteStore`. The response carries the classified snapshot and the
 store view, both availability-contract payloads with provenance, provider quote time
 (as-of), receipt time (vintage), identity (requested and provider symbol) and an explicit
-status; ``live`` is true only for ``fresh`` rows. Responses are ``Cache-Control:
-no-store, private``: Schwab data may not be redistributed, and this router is the only
-GRID surface that serves it. No persistence, no scheduling, no public projection.
+status; ``live`` is true only for ``fresh`` rows.
+
+Timing (r2): the receipt clock is read **after** the source operation returns or fails,
+so classification ages and the row vintage measure actual receipt, not request start;
+the store view is then evaluated at response time with a second clock read, so a row
+that aged past the gate while the response was being built is reported ``stale``.
+The clock is injectable for tests (``_clock``).
+
+Headers: every response the two route handlers produce (200, 503, 500) carries
+``Cache-Control: no-store, private`` and ``X-GRID-Audience: private``. Responses produced
+before the handler runs — the role dependency's 401/403 and FastAPI's 422 query
+validation — are the framework's and do not carry these headers; they contain no quote
+data. Schwab data may not be redistributed, and this router is the only GRID surface
+that serves it. No persistence, no scheduling, no public projection.
 """
 
 from __future__ import annotations
@@ -28,10 +39,12 @@ from fastapi.responses import JSONResponse
 
 from api.auth import require_role
 from config import log, settings
+from ingestion.schwab_market import SchwabError
 from ingestion.schwab_private_store import SCHEMA as VIEW_SCHEMA
 from ingestion.schwab_private_store import PrivateQuoteStore, ProvenanceError
 from ingestion.schwab_quote_path import (
     DEFAULT_MAX_QUOTE_AGE_S,
+    PrivateQuoteSnapshot,
     QuoteSource,
     read_private_quotes,
 )
@@ -46,6 +59,41 @@ MAX_SYMBOLS_PER_READ = 10
 _SYMBOL = re.compile(r"^[A-Z0-9.$^/-]{1,12}$")
 _STORE = PrivateQuoteStore()
 NO_STORE = "no-store, private"
+
+
+def _clock() -> datetime:
+    """Wall clock for receipt and evaluation times; replaced in tests."""
+    return datetime.now(timezone.utc)
+
+
+class _Prefetched:
+    """A QuoteSource that replays one already-performed read (rows or the captured error)."""
+
+    def __init__(self, rows: Any, error: SchwabError | None) -> None:
+        self._rows = rows
+        self._error = error
+
+    def quotes(self, symbols: Any, fields: str | None = "quote") -> Any:
+        if self._error is not None:
+            raise self._error
+        return self._rows
+
+
+def _read_with_receipt(source: QuoteSource, wanted: list[str]) -> PrivateQuoteSnapshot:
+    """Perform the source read, then stamp receipt time, then classify against it.
+
+    ``read_private_quotes`` needs its receipt clock up front, so the read is performed
+    here and replayed through :class:`_Prefetched`; the reviewed classification,
+    identity and failure handling in the quote path are unchanged.
+    """
+    rows: Any = None
+    error: SchwabError | None = None
+    try:
+        rows = source.quotes(wanted)
+    except SchwabError as exc:
+        error = exc
+    received_at = _clock()  # actual receipt: after the operation returned or failed
+    return read_private_quotes(_Prefetched(rows, error), wanted, now=received_at)
 
 
 def _enabled() -> bool:
@@ -105,7 +153,7 @@ def _private_error(status_code: int, detail: str) -> JSONResponse:
 def private_status(response: Response) -> dict[str, Any]:
     """Flag state plus the status-only projection of the store (no measured values)."""
     _private(response)
-    now = datetime.now(timezone.utc)
+    now = _clock()
     rows = {}
     for sym in _STORE.symbols():
         row = _STORE.get(sym, now=now)
@@ -136,15 +184,17 @@ def private_quotes(
         source = _quote_source()
     except HTTPException as exc:
         return _private_error(exc.status_code, str(exc.detail))
-    now = datetime.now(timezone.utc)
-    snapshot = read_private_quotes(source, wanted, now=now)
+    snapshot = _read_with_receipt(source, wanted)
     try:
         stored = _STORE.put(snapshot)
     except ProvenanceError as exc:
         log.error("Schwab private snapshot failed materialization: {e}", e=str(exc))
         return _private_error(500, "snapshot lost provenance")
+    evaluated_at = _clock()  # response time: freshness is assessed again here
     return {
+        "received_at": snapshot.received_at.isoformat(),
+        "evaluated_at": evaluated_at.isoformat(),
         "snapshot": snapshot.to_private_dict(),
-        "view": _STORE.view(now=now, symbols=wanted),
+        "view": _STORE.view(now=evaluated_at, symbols=wanted),
         "stored_rows": stored,
     }

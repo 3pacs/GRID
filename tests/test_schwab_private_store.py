@@ -257,6 +257,16 @@ class TestPayload:
         assert back["bid_size"] == value and isinstance(back["bid_size"], int)
         assert back["total_volume"] == value and isinstance(back["total_volume"], int)
         assert re.search(rf'"bid_size": {value}\b', text)  # serialised as an exact integer literal
+        assert back["bid_size_exact"] == str(value) and back["total_volume_exact"] == str(value)
+        assert back["ask_size_exact"] == "200"
+
+    def test_exact_strings_are_none_when_missing(self):
+        (m,) = materialize(snap(row(bid_size=None, total_volume=None)))
+        p = m.to_private_dict(NOW)
+        assert p["bid_size_exact"] is None and p["total_volume_exact"] is None and p["ask_size_exact"] == "200"
+        (u,) = materialize(snap(row(status="missing")))
+        up = u.to_private_dict(NOW)
+        assert (up["bid_size_exact"], up["ask_size_exact"], up["total_volume_exact"]) == (None, None, None)
 
 
 # ── store ────────────────────────────────────────────────────────────────────
