@@ -33,11 +33,18 @@ import { api } from '../api.js';
  * cases; if one is needed it requires a separate trustworthy bound or marking
  * the quote non-LIVE on resume, neither of which this card provides.
  *
- * Requests do not overlap (the button is disabled while one is in flight) and a
- * request sequence number isolates a late response or timer from a newer
+ * Requests do not overlap (a synchronous busy guard plus the disabled button) and
+ * a request sequence number isolates a late response or timer from a newer
  * request; a response settling after unmount installs no timer and updates no
- * state. Missing values render as "—", never 0; counts use the server's `*_exact`
- * decimal strings.
+ * state.
+ *
+ * Pending reread (r6): starting a read clears the prior rows and their timing
+ * state immediately, so no row — and therefore no LIVE label — is visible while
+ * a read is pending; only the new request's own timing, from its own start
+ * reading through its own response reading, can display LIVE once it settles.
+ * A failed or rejected read leaves the card cleared with an error message. No
+ * cancellation or timeout is implemented. Missing values render as "—", never 0;
+ * counts use the server's `*_exact` decimal strings.
  */
 
 export const STATUS_LABELS = {
@@ -180,6 +187,7 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
     const [elapsed, setElapsed] = useState(null); // seconds since the accepted request was sent, or null = untrusted
     const timingRef = useRef(null);   // timing state of the accepted (latest) request
     const requestSeqRef = useRef(0);  // isolates late responses/timers of older requests
+    const busyRef = useRef(false);    // synchronous no-overlap guard (state may lag a tick)
     const mountedRef = useRef(false);
 
     useEffect(() => {
@@ -201,10 +209,16 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
     }, [rows]);
 
     const read = async () => {
-        if (busy) return; // requests never overlap
+        if (busyRef.current) return; // requests never overlap
+        busyRef.current = true;
         const seq = requestSeqRef.current + 1;
         requestSeqRef.current = seq;
         const timingAtStart = startTiming(monotonicNow()); // before the request leaves
+        // Pending reread: the prior row and its timing are gone now, not when the response lands.
+        timingRef.current = null;
+        setRows([]);
+        setElapsed(null);
+        setMessage('Reading… previous values cleared until this read settles.');
         setBusy(true);
         let result;
         try {
@@ -213,6 +227,7 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
             result = { error: true, status: 0 };
         }
         if (!mountedRef.current || seq !== requestSeqRef.current) return; // settled after unmount or superseded: touch nothing
+        busyRef.current = false;
         if (!result || result.error) {
             timingRef.current = null;
             setRows([]);

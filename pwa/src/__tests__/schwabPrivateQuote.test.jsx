@@ -4,7 +4,11 @@
  * sha256 43cb5ede…). Rows: M1 valid fast delivery · M2 invalid start · M3 invalid later
  * reading · M4 full backwards · M5 partial backwards · M6 equal/forward · M7 sticky ·
  * M8 trusted reread · M9 transit boundary · M10 request race/isolation · M11 cleanup.
- * Fake clock (mocked performance.now) and fake api only; no real time, provider or DB.
+ * Pending-reread addendum (CLAUDE-CONTROLLER-01a18502-DEPENDENCY-SCHWAB-REREAD-MATRIX-20261031,
+ * sha256 3068b4ca…): R1 pending past expiry · R2 eventual success · R3 failure/rejection ·
+ * R4 cancellation (not implemented) · R5 timeout (not implemented) · R6 unmount and late
+ * completion · R7 superseded request / no-overlap · R8 clock failure while pending.
+ * Fake clock (mocked performance.now), fake timers and fake promises only; no real time, provider or DB.
  */
 import React from 'react';
 import fs from 'node:fs';
@@ -382,6 +386,157 @@ describe('<SchwabPrivateQuote /> M2–M7 clock trust', () => {
         mono -= 25_000; tick();                                    // backwards: untrusted now, still not LIVE
         expect(live()).toBeNull();
         mono += 100; tick();
+        expect(live()).toBeNull();
+    });
+});
+
+describe('<SchwabPrivateQuote /> pending reread (addendum R1–R8)', () => {
+    function deferred() {
+        let resolve, reject;
+        const promise = new Promise((res, rej) => { resolve = res; reject = rej; });
+        return { promise, resolve, reject };
+    }
+    async function liveRowThenPendingReread() {
+        const pending = deferred();
+        api.getSchwabPrivateQuotes
+            .mockImplementationOnce(inFlight(100, view({ SPY: serverRow() })))
+            .mockImplementationOnce(() => pending.promise);
+        const utils = render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(live()).toBeTruthy();
+        await readOnce();                                          // reread starts, promise pending
+        return { pending, ...utils };
+    }
+
+    it('R1: pending past expiry — the old row is cleared at reread start; advancing time never shows LIVE', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        expect(live()).toBeNull();
+        expect(screen.queryByText('731.37')).toBeNull();
+        expect(screen.getByText(/previous values cleared/)).toBeTruthy();
+        expect(vi.getTimerCount()).toBe(0);                        // no old timer survives
+        mono += 30_000; tick(30_000);                              // well past the old row's bound
+        expect(live()).toBeNull();
+        expect(screen.queryByText('731.37')).toBeNull();
+        mono += 100;
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(live()).toBeNull();                                 // 30.1 s whole-request interval: STALE on arrival
+        expect(screen.getByText(/aged out since evaluation/)).toBeTruthy();
+    });
+
+    it('R1: a fast pending reread inside the old bound — clearing is immediate and the new row is bounded on its own', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        mono += 2_000; tick(2_000);
+        expect(live()).toBeNull();
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(live()).toBeTruthy();                               // 5 + 2.0 s on its own timing
+        expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it('R2: eventual success — only the new response\'s own timing can show LIVE; no old timer promotes', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        mono += 200;
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(live()).toBeTruthy();
+        expect(card().getAttribute('data-timing-reason')).toBe('');
+        mono += 15_000; tick();                                    // 5 + 15.2 = 20.2 s on the new request
+        expect(live()).toBeNull();
+        expect(screen.getByText(/aged out since evaluation/)).toBeTruthy();
+    });
+
+    it('R3: failure (handled error) during a pending reread — prior row does not return, no timer remains', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        mono += 30_000; tick(30_000);
+        await act(async () => { pending.resolve({ error: true, status: 503 }); });
+        expect(live()).toBeNull();
+        expect(screen.queryByText('731.37')).toBeNull();
+        expect(screen.getByText(/disabled or not configured/)).toBeTruthy();
+        expect(vi.getTimerCount()).toBe(0);
+        mono += 5_000; tick(5_000);
+        expect(live()).toBeNull();
+    });
+
+    it('R3: rejection of the pending promise — prior row does not return, no timer remains', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        await act(async () => { pending.reject(new Error('boom')); });
+        expect(live()).toBeNull();
+        expect(screen.queryByText('731.37')).toBeNull();
+        expect(screen.getByText(/Network error/)).toBeTruthy();
+        expect(vi.getTimerCount()).toBe(0);
+        expect(screen.getByRole('button').disabled).toBe(false);
+    });
+
+    it('R4/R5: cancellation and timeout are not implemented (documented); a pending read simply waits with nothing LIVE', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        mono += 600_000; tick(600_000);                            // ten minutes: still pending, still nothing LIVE
+        expect(live()).toBeNull();
+        expect(screen.getByRole('button').disabled).toBe(true);
+        const src = fs.readFileSync(path.resolve(__dirname, '../components/SchwabPrivateQuote.jsx'), 'utf8').replace(/\n \* /g, ' ');
+        expect(src).toMatch(/No cancellation or timeout is implemented/);
+        await act(async () => { pending.resolve({ error: true, status: 0 }); });
+        expect(screen.getByRole('button').disabled).toBe(false);
+    });
+
+    it('R6: unmount during a pending reread, then late resolve — nothing updates, no timer installed', async () => {
+        const { pending, unmount } = await liveRowThenPendingReread();
+        unmount();
+        expect(vi.getTimerCount()).toBe(0);
+        mono += 100;
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(vi.getTimerCount()).toBe(0);
+        expect(screen.queryByTestId('schwab-private-quote')).toBeNull();
+    });
+
+    it('R6: unmount during a pending reread, then late reject — nothing updates, no timer installed', async () => {
+        const { pending, unmount } = await liveRowThenPendingReread();
+        unmount();
+        await act(async () => { pending.reject(new Error('late')); });
+        expect(vi.getTimerCount()).toBe(0);
+        expect(screen.queryByTestId('schwab-private-quote')).toBeNull();
+    });
+
+    it('R7: superseded request — overlap is prevented synchronously, so no older request can complete after a newer one begins', async () => {
+        const pending = deferred();
+        api.getSchwabPrivateQuotes.mockImplementationOnce(() => pending.promise);
+        render(<SchwabPrivateQuote />);
+        const button = screen.getByText('Read private quote');
+        await act(async () => { fireEvent.click(button); fireEvent.click(button); fireEvent.click(button); });
+        expect(api.getSchwabPrivateQuotes).toHaveBeenCalledTimes(1);
+        expect(screen.getByRole('button').disabled).toBe(true);
+        mono += 200;
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(live()).toBeTruthy();
+        expect(screen.getByRole('button').disabled).toBe(false);
+        expect(vi.getTimerCount()).toBe(1);
+    });
+
+    it('R8: clock failure while pending applies to the new request only — no old row exists to be promoted', async () => {
+        const pending = deferred();
+        api.getSchwabPrivateQuotes
+            .mockImplementationOnce(inFlight(100, view({ SPY: serverRow() })))
+            .mockImplementationOnce(() => pending.promise);
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(live()).toBeTruthy();
+        mono = 500;                                                // clock rolled back before the reread starts: new start 500
+        await readOnce();
+        expect(live()).toBeNull();
+        mono = 400;                                                // rollback while pending, relative to the new start
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(live()).toBeNull();
+        expect(untrustedShown()).toBeTruthy();
+        expect(card().getAttribute('data-timing-reason')).toBe('reading before request start');
+        mono = 9_000; tick();
+        expect(live()).toBeNull();
+    });
+
+    it('R8: an earlier request\'s timer callback cannot act after a reread started (timer removed, sequence advanced)', async () => {
+        const { pending } = await liveRowThenPendingReread();
+        expect(vi.getTimerCount()).toBe(0);
+        mono = 0; tick(5_000);                                     // nothing to tick; no state change, no throw
+        expect(live()).toBeNull();
+        mono = 900;                                                // below the reread's own start (1100): its own rollback
+        await act(async () => { pending.resolve(view({ SPY: serverRow() })); });
+        expect(card().getAttribute('data-timing-reason')).toBe('reading before request start');
         expect(live()).toBeNull();
     });
 });
