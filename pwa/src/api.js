@@ -124,6 +124,7 @@ class GRIDApi {
         if (
             path.startsWith('/api/v1/auth/')
             || path.startsWith('/api/v1/gamma-watch/')
+            || path.startsWith('/api/v1/schwab/private/')
             || path.startsWith('/api/v1/realtime/')
             || path.startsWith('/api/v1/chat/')
             || path.startsWith('/api/v1/alerts')
@@ -397,6 +398,19 @@ class GRIDApi {
         return this._fetch('/api/v1/strategy/assign', {
             method: 'POST', body: JSON.stringify(data),
         });
+    }
+
+    // Schwab private quotes (admin role + server flag; private data, never cached here)
+    async getSchwabPrivateStatus() {
+        return this._fetch('/api/v1/schwab/private/status', { gridForce: true, gridTtlMs: 0 });
+    }
+
+    async getSchwabPrivateQuotes(symbols = ['SPY']) {
+        const list = (Array.isArray(symbols) ? symbols : [symbols])
+            .map(s => String(s ?? '').trim().toUpperCase())
+            .filter(Boolean);
+        const params = new URLSearchParams({ symbols: list.join(',') });
+        return this._fetch(`/api/v1/schwab/private/quotes?${params.toString()}`, { gridForce: true, gridTtlMs: 0 });
     }
 
     // Ten-year portfolio query

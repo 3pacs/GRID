@@ -118,14 +118,17 @@ def _mock_engine(
     write_conn = MagicMock()
     existing_result = MagicMock()
     existing_result.fetchone.return_value = (1,) if already_resolved else None
-    insert_result = MagicMock()
-
     def _write_execute(statement, params=None):
         # Dispatched rather than a fixed [existing, insert] * n list: that
         # list was sized for a shape _flush_batch no longer has (it issues a
         # single executemany INSERT per flush), so it ran dry as soon as the
         # call pattern shifted. Keyed on the statement, it cannot.
-        return insert_result if "INSERT" in str(statement).upper() else existing_result
+        if "INSERT" in str(statement).upper():
+            inserted = MagicMock()
+            inserted.rowcount = 0 if already_resolved else len(params)
+            inserted.supports_sane_multi_rowcount.return_value = True
+            return inserted
+        return existing_result
 
     write_conn.execute.side_effect = _write_execute
 
@@ -195,7 +198,11 @@ def _dispatch_begin(engine, series_result, worker_rows, write_conn):
                 if not sids or (r[0] in sids)
             ]
             return result
-        return write_conn.execute(statement, params)
+        result = write_conn.execute(statement, params)
+        if "INSERT INTO resolved_series" in sql and isinstance(params, list):
+            result.rowcount = len(params)
+            result.supports_sane_multi_rowcount.return_value = True
+        return result
 
     conn = MagicMock()
     conn.execute.side_effect = _execute
@@ -321,7 +328,8 @@ class TestSingleSourceUnit:
             # is the whole window. The Hermes cycle keys its watermark off
             # these, so a return path that omits them silently costs a cycle
             # its progress — see normalization.resolver._scan_series_ids.
-            "scanned_through", "scan_complete",
+            "scanned_through", "scan_complete", "resolved_count_status",
+            "batch_failure_outcomes", "other_writer_outcomes_unknown",
         }
 
     @patch("normalization.resolver.EntityMap")
@@ -703,8 +711,10 @@ class TestSkipAndErrorUnit:
         resolver = Resolver(db_engine=engine)
         summary = resolver.resolve_pending()
 
-        # _flush_batch catches the error and returns 0
+        # The failed write is reported and the watermark must not advance.
         assert summary["resolved"] == 0
+        assert summary["errors"] == 1
+        assert summary["batch_failure_outcomes"]["rolled_back"] == 1
 
     @patch("normalization.resolver.EntityMap")
     def test_family_lookup_failure_uses_default_threshold(self, MockEntityMap):
@@ -1197,8 +1207,12 @@ class _RecordingEngine:
         engine = self
 
         class _Result:
-            def __init__(self, rows):
+            def __init__(self, rows, rowcount=-1):
                 self._rows = rows
+                self.rowcount = rowcount
+
+            def supports_sane_multi_rowcount(self):
+                return True
 
             def fetchall(self):
                 return self._rows
@@ -1212,7 +1226,7 @@ class _RecordingEngine:
                 engine.calls.append((sql, params))
                 if isinstance(params, list):          # executemany → INSERT
                     engine.inserts.append(params)
-                    return _Result([])
+                    return _Result([], rowcount=len(params))
                 if "SELECT DISTINCT" in sql:
                     return _Result(
                         [(sid,) for sid in sorted({r[0] for r in engine._raw_rows})]
@@ -1395,7 +1409,8 @@ class TestResolutionWindow:
         assert set(summary) == {
             "resolved", "conflicts_found", "errors",
             "series_scanned", "duration_s", "dry_run", "unmapped",
-            "scanned_through", "scan_complete",
+            "scanned_through", "scan_complete", "resolved_count_status",
+            "batch_failure_outcomes", "other_writer_outcomes_unknown",
         }
         assert set(summary["unmapped"]) == {
             "lookups_missed", "series_ids", "unregistered_features",
