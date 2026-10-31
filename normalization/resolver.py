@@ -173,26 +173,72 @@ def _window_bounds(
     return {"since": since, "until": until}
 
 
-def _flush_batch(engine: Engine, batch: list[dict]) -> int:
-    """Insert a batch of resolved rows, skipping conflicts. Returns count inserted."""
+class _ResolvedBatchError(RuntimeError):
+    """A failed batch with a conservative transaction outcome."""
+
+    def __init__(self, outcome: str, cause: Exception):
+        super().__init__(f"resolved batch {outcome}: {type(cause).__name__}: {cause}")
+        self.outcome = outcome
+
+
+def _flush_batch(engine: Engine, batch: list[dict]) -> int | None:
+    """Return a confirmed insert count, or None when the driver cannot provide one.
+
+    A raised _ResolvedBatchError carries not_started, rolled_back or unknown;
+    a failed transaction exit cannot distinguish commit from cleanup failure.
+    """
     if not batch:
         return 0
+    manager = None
+    conn = None
+    count = None
     try:
-        with engine.begin() as conn:
-            conn.execute(
-                text(
-                    "INSERT INTO resolved_series "
-                    "(feature_id, obs_date, release_date, vintage_date, "
-                    "value, source_priority_used, conflict_flag, conflict_detail) "
-                    "VALUES (:fid, :od, :rd, :vd, :val, :src, :cf, :cd) "
-                    "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"
-                ),
-                batch,
-            )
-        return len(batch)
+        manager = engine.begin()
+        conn = manager.__enter__()
     except Exception as exc:
-        log.error("Batch insert failed ({n} rows): {e}", n=len(batch), e=str(exc))
-        return 0
+        # A failure while entering may occur after the server has acted.
+        raise _ResolvedBatchError("unknown" if manager is not None else "not_started", exc) from exc
+    try:
+        result = conn.execute(
+            text(
+                "INSERT INTO resolved_series "
+                "(feature_id, obs_date, release_date, vintage_date, "
+                "value, source_priority_used, conflict_flag, conflict_detail) "
+                "VALUES (:fid, :od, :rd, :vd, :val, :src, :cf, :cd) "
+                "ON CONFLICT (feature_id, obs_date, vintage_date) DO NOTHING"
+            ),
+            batch,
+        )
+        # Invalid or unavailable row counts do not make the transaction fail.
+        # BaseException is intentionally not caught here: the outer handler
+        # must first exit the transaction and then propagate the interruption.
+        try:
+            value = result.rowcount
+            if (result.supports_sane_multi_rowcount() is True
+                    and type(value) is int and 0 <= value <= len(batch)):
+                count = value
+        except Exception:
+            count = None
+    except BaseException as exc:
+        try:
+            suppressed = manager.__exit__(type(exc), exc, exc.__traceback__)
+        except BaseException as cleanup_exc:
+            if not isinstance(exc, Exception):
+                raise exc from cleanup_exc
+            if not isinstance(cleanup_exc, Exception):
+                raise
+            raise _ResolvedBatchError("unknown", exc) from exc
+        if not isinstance(exc, Exception):
+            raise
+        if suppressed:
+            raise _ResolvedBatchError("unknown", exc) from exc
+        raise _ResolvedBatchError("rolled_back", exc) from exc
+    # A sane count remains provisional until transaction exit succeeds.
+    try:
+        manager.__exit__(None, None, None)
+    except Exception as exc:
+        raise _ResolvedBatchError("unknown", exc) from exc
+    return count
 
 
 def _resolve_spy_close_receipt(
@@ -717,7 +763,7 @@ class Resolver:
         }
 
         def _summary(
-            resolved: int = 0,
+            resolved: int | None = 0,
             conflicts: int = 0,
             errors: int = 0,
             series: int = 0,
@@ -734,6 +780,11 @@ class Resolver:
             )
             return {
                 "resolved": resolved,
+                "resolved_count_status": ("unknown" if resolved is None else
+                                          "dry_run_candidates" if dry_run else "confirmed"),
+                "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
+                                           "unknown": 0},
+                "other_writer_outcomes_unknown": 0,
                 "conflicts_found": conflicts,
                 "errors": errors,
                 "series_scanned": series,
@@ -796,17 +847,29 @@ class Resolver:
 
         # Counters (thread-safe)
         lock = threading.Lock()
-        totals = {"resolved": 0, "conflicts_found": 0, "errors": 0}
+        totals = {"resolved": 0, "conflicts_found": 0, "errors": 0,
+                  "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
+                                             "unknown": 0},
+                  "other_writer_outcomes_unknown": 0}
 
-        def _flush(batch: list[dict]) -> int:
+        def _flush(batch: list[dict]) -> int | None:
             """Persist a batch, or just count it when dry-running."""
             if dry_run:
                 return len(batch)
             return _flush_batch(self.engine, batch)
 
-        def _resolve_partition(partition: list[str], worker_id: int) -> dict[str, int]:
+        def _resolve_partition(partition: list[str], worker_id: int) -> dict[str, Any]:
             """Resolve a partition of series_ids."""
-            local = {"resolved": 0, "conflicts_found": 0, "errors": 0}
+            local = {"resolved": 0, "conflicts_found": 0, "errors": 0,
+                     "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
+                                                "unknown": 0},
+                     "other_writer_outcomes_unknown": 0}
+
+            def _add_resolved(count: int | None) -> None:
+                if local["resolved"] is None or count is None:
+                    local["resolved"] = None
+                else:
+                    local["resolved"] += count
             INSERT_BATCH = 500
 
             # Memoise series_id -> feature_id for this partition. The loop
@@ -878,11 +941,19 @@ class Resolver:
                             ) for s in sources)
                             if eligible:
                                 if dry_run:
-                                    local["resolved"] += 1
+                                    _add_resolved(1)
                                 else:
-                                    local["resolved"] += _resolve_spy_close_receipt(
-                                        self.engine, feature_id, obs_date_val, sources
-                                    )
+                                    try:
+                                        count = _resolve_spy_close_receipt(
+                                            self.engine, feature_id, obs_date_val, sources
+                                        )
+                                    except Exception:
+                                        # Its transaction may have committed before
+                                        # exit failed; do not report a confirmed zero.
+                                        local["resolved"] = None
+                                        local["other_writer_outcomes_unknown"] += 1
+                                        raise
+                                    _add_resolved(count)
                         continue
 
                     if series_id in CANONICAL_CLOSE_SERIES:
@@ -912,12 +983,12 @@ class Resolver:
                     })
 
                     if len(insert_batch) >= INSERT_BATCH:
-                        local["resolved"] += _flush(insert_batch)
+                        _add_resolved(_flush(insert_batch))
                         insert_batch = []
 
                 # Flush remaining
                 if insert_batch:
-                    local["resolved"] += _flush(insert_batch)
+                    _add_resolved(_flush(insert_batch))
 
                 log.info("Worker {w}: resolved={r}, conflicts={c}{d}",
                          w=worker_id, r=local["resolved"],
@@ -927,10 +998,21 @@ class Resolver:
             except Exception as exc:
                 log.error("Worker {w} failed: {e}", w=worker_id, e=str(exc))
                 local["errors"] += 1
+                if isinstance(exc, _ResolvedBatchError):
+                    local["batch_failure_outcomes"][exc.outcome] += 1
+                    if exc.outcome == "unknown":
+                        local["resolved"] = None
 
             with lock:
-                for k in totals:
+                for k in ("conflicts_found", "errors"):
                     totals[k] += local[k]
+                if totals["resolved"] is None or local["resolved"] is None:
+                    totals["resolved"] = None
+                else:
+                    totals["resolved"] += local["resolved"]
+                for outcome, count in local["batch_failure_outcomes"].items():
+                    totals["batch_failure_outcomes"][outcome] += count
+                totals["other_writer_outcomes_unknown"] += local["other_writer_outcomes_unknown"]
 
             return local
 
@@ -979,6 +1061,8 @@ class Resolver:
             scanned_through=scanned_through,
             scan_complete=scan_complete,
         )
+        summary["batch_failure_outcomes"] = totals["batch_failure_outcomes"]
+        summary["other_writer_outcomes_unknown"] = totals["other_writer_outcomes_unknown"]
         log.info(
             "Resolution {k} — resolved={r}, conflicts={c}, errors={e}, "
             "series={s}, scanned through {w}, {t}s{d}",
@@ -1059,8 +1143,17 @@ class Resolver:
             })
             return
 
-        for key in ("resolved", "conflicts_found", "errors", "series_scanned"):
+        if totals["resolved"] is None or result["resolved"] is None:
+            totals["resolved"] = None
+        else:
+            totals["resolved"] += result["resolved"]
+        for key in ("conflicts_found", "errors", "series_scanned"):
             totals[key] += result[key]
+        totals["resolved_count_status"] = ("unknown" if totals["resolved"] is None else
+                                           "dry_run_candidates" if dry_run else "confirmed")
+        for outcome, count in result.get("batch_failure_outcomes", {}).items():
+            totals["batch_failure_outcomes"][outcome] += count
+        totals["other_writer_outcomes_unknown"] += result.get("other_writer_outcomes_unknown", 0)
         totals["duration_s"] = round(totals["duration_s"] + result["duration_s"], 2)
         totals["chunks"] += 1
         if result["errors"]:
@@ -1126,6 +1219,10 @@ class Resolver:
 
         totals: dict[str, Any] = {
             "resolved": 0, "conflicts_found": 0, "errors": 0,
+            "resolved_count_status": "dry_run_candidates" if dry_run else "confirmed",
+            "batch_failure_outcomes": {"not_started": 0, "rolled_back": 0,
+                                       "unknown": 0},
+            "other_writer_outcomes_unknown": 0,
             "series_scanned": 0, "duration_s": 0.0,
             "dry_run": dry_run, "chunks": 0, "chunks_failed": 0,
             "chunks_narrowed": 0, "failed_ranges": [],
