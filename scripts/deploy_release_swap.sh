@@ -182,7 +182,12 @@ CANDIDATE_DIR="${RELEASES_DIR}/${LABEL}"
 KEEP_RELEASES=2
 LOCK_WAIT_SECS="${DEPLOY_LOCK_WAIT_SECS:-600}"
 
-mkdir -p "$RELEASES_DIR"
+# 0755 regardless of the runner's umask (002 on grid-svr, which made every
+# release directory 775 until 2026-10-31) -- see the candidate chmod below.
+# Only applies when this call creates the directory; an existing one is left
+# exactly as it is.
+# shellcheck disable=SC2174  # -m applies only to the deepest directory, on purpose
+mkdir -p -m 0755 "$RELEASES_DIR"
 
 # Serialize every run targeting this <live_path> -- see header. Held for the
 # remainder of the script, released automatically on any exit.
@@ -570,6 +575,13 @@ if [ -L "$LIVE_PATH" ]; then
 else
   mkdir -p "$CANDIDATE_DIR"
 fi
+# The release directory itself is always 0755, never group- or
+# world-writable. `cp -a` copies whatever mode the live release has, and
+# `mkdir` follows the runner's umask (002 on grid-svr), so on 2026-10-31 all
+# six release directories were 775 and GRID #918's installed-binding
+# diagnostic refused the live release path as writable. Top level only: this
+# never changes the mode of anything inside the release.
+chmod 0755 "$CANDIDATE_DIR"
 
 if ! "$BUILD_HOOK" "$CANDIDATE_DIR" "$@"; then
   echo "build_hook failed -- $LIVE_PATH left untouched, candidate preserved at $CANDIDATE_DIR" >&2
