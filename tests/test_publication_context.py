@@ -594,3 +594,22 @@ def test_accounting_and_commercial_topics_are_not_cross_market_transfers_or_pcr_
 def test_accounting_and_commercial_topics_do_not_license_protected_claims(claim):
     from ollama.number_grounding import check_publication_claims
     assert not check_publication_claims(claim)['passed']
+
+
+def test_generation_file_guard_survives_real_database_readiness_refusal(tmp_path, monkeypatch):
+    monkeypatch.setattr('ingestion.wiki_history.WikiHistoryPuller', _no_network)
+    monkeypatch.setattr('ingestion.social_sentiment.SocialSentimentPuller', _no_network)
+    conn = _FakeConnection(publication_catalog=())
+    good = 'SPY put/call open-interest ratio is 1.97.'
+    db = _FakeEngine(conn)
+    engine = _make_engine(_FakeOllamaClient(good), db, tmp_path)
+    monkeypatch.setattr(engine, '_gather_market_snapshot', snapshot)
+    result = engine.generate_briefing('hourly', save=True)
+    assert good in result['content']
+    assert result['publication_context_guard']['passed'] is True
+    assert len(list(tmp_path.glob('hourly_*.md'))) == 1
+    assert result['content'] in next(tmp_path.glob('hourly_*.md')).read_text()
+    # The shared connection also serves earlier sentiment work; the
+    # publication transaction itself must roll back without committing.
+    assert db.transaction_rollback_count == 1 and db.transaction_commit_count == 0
+    assert not any('INSERT INTO market_briefings' in sql for sql in conn.executed)

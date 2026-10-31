@@ -270,6 +270,7 @@ def generate_unified_thesis(engine: Engine) -> dict[str, Any]:
     return {
         "overall_direction": overall_direction.upper(),
         "conviction": conviction_pct,
+        "conviction_unit": "percent",
         "bullish_score": round(bullish_score, 1),
         "bearish_score": round(bearish_score, 1),
         "active_theses": len(active_theses),
@@ -300,7 +301,9 @@ def _build_narrative(
     dir_label = {"bullish": "BULLISH", "bearish": "BEARISH", "neutral": "NEUTRAL"}.get(direction, "NEUTRAL")
     parts.append(
         f"GRID's unified thesis is {dir_label} with {conviction}% conviction "
-        f"({bull_score:.0f} bull vs {bear_score:.0f} bear across {total} active signals)."
+        f"(weighted score magnitude, not calibrated probability). "
+        f"Weighted scores: {bull_score:g} bull vs {bear_score:g} bear "
+        f"across {total} active signals; these scores are not vote counts."
     )
 
     if key_drivers:
