@@ -1,7 +1,7 @@
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import SchwabPrivateQuote, { AGE_TICK_MS, count, describeError, describeRow } from '../components/SchwabPrivateQuote.jsx';
+import SchwabPrivateQuote, { AGE_TICK_MS, count, describeError, describeRow, elapsedSince } from '../components/SchwabPrivateQuote.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -105,6 +105,95 @@ describe('describeError', () => {
         expect(describeError({ error: true, status: 422 })).toMatch(/rejected/);
         expect(describeError({ error: true, status: 0 })).toMatch(/Network/);
         expect(describeError(undefined)).toMatch(/Network/);
+    });
+});
+
+describe('elapsedSince', () => {
+    it('measures from the given monotonic start and never goes negative', () => {
+        mono = 5000;
+        expect(elapsedSince(2000)).toBe(3);
+        expect(elapsedSince(9000)).toBe(0);
+        expect(elapsedSince(null)).toBe(0);
+        expect(elapsedSince(NaN)).toBe(0);
+    });
+});
+
+// Transit: the mocked api advances the fake monotonic clock while the request is "in flight".
+function inFlight(ms, result) {
+    return () => { mono += ms; return Promise.resolve(result); };
+}
+
+describe('<SchwabPrivateQuote /> request/response transit (r3)', () => {
+    it("the reviewer's case: 5 s server age + 30 s transit against a 20 s gate renders STALE, never LIVE", async () => {
+        const serverRow = row({ freshness: { ...freshness, age_seconds: 5, stale_after_seconds: 20 } });
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(30_000, view({ SPY: serverRow })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText('STALE')).toBeTruthy();
+        expect(screen.getByText(/aged out since evaluation/)).toBeTruthy();
+        expect(screen.getByTestId('schwab-private-quote').querySelector('tr[data-aged-out="true"]')).toBeTruthy();
+        expect(api.getSchwabPrivateQuotes).toHaveBeenCalledTimes(1);
+    });
+
+    it('transit just inside the gate is LIVE and then ages out on the timer', async () => {
+        const serverRow = row({ freshness: { ...freshness, age_seconds: 5, stale_after_seconds: 20 } });
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(14_000, view({ SPY: serverRow })));  // 5 + 14 = 19 s
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        mono += 1_500; tick();                                    // 20.5 s > 20 s
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText('STALE')).toBeTruthy();
+    });
+
+    it('transit exactly at the gate is still LIVE (bound is inclusive) and 1 ms more is not', async () => {
+        const serverRow = row({ freshness: { ...freshness, age_seconds: 5, stale_after_seconds: 20 } });
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(15_000, view({ SPY: serverRow })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        cleanup();
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(15_001, view({ SPY: serverRow })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+    });
+
+    it('a normal fast response is LIVE with the transit still counted', async () => {
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(200, view({ SPY: row() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        mono += 18_700; tick();                                   // 1 + 0.2 + 18.7 = 19.9 s
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        mono += 200; tick();                                      // 20.1 s
+        expect(screen.queryByText('LIVE')).toBeNull();
+    });
+
+    it('a slow failed request leaves no rows and no timer', async () => {
+        api.getSchwabPrivateQuotes.mockImplementation(inFlight(30_000, { error: true, status: 503 }));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText(/disabled or not configured/)).toBeTruthy();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('a slow re-read after a live row never shows a false LIVE and cleans up on unmount', async () => {
+        api.getSchwabPrivateQuotes
+            .mockImplementationOnce(inFlight(100, view({ SPY: row() })))
+            .mockImplementationOnce(inFlight(40_000, view({ SPY: row() })));
+        const { unmount } = render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        await readOnce();                                         // second read: 1 + 40 s old on arrival
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText('STALE')).toBeTruthy();
+        mono -= 40_000; tick();                                   // backwards clock: still no promotion
+        expect(screen.queryByText('LIVE')).toBeNull();
+        unmount();
+        expect(vi.getTimerCount()).toBe(0);
     });
 });
 

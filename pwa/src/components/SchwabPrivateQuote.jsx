@@ -10,10 +10,13 @@ import { api } from '../api.js';
  * `live === true` and `quote_status === 'fresh'` AND the row has not aged past
  * `stale_after_seconds` since the server evaluated it (r2). Ageing uses the
  * server's `age_seconds` plus monotonic elapsed time measured locally with
- * `performance.now()`; a local timer re-evaluates every second and is cleared on
- * unmount or when the rows are replaced. Nothing is polled from the provider and
- * nothing ever promotes back to LIVE: once aged out, a row stays STALE until the
- * admin reads again. Missing values render as "—", never 0; counts that JSON
+ * `performance.now()` from the moment the request is **sent** (r3), so the
+ * request/response transit is inside the bound: a value that is 5 s old at the
+ * server and takes 30 s to arrive is 35 s old on first render and is shown STALE,
+ * never LIVE. A local timer re-evaluates every second and is cleared on unmount,
+ * on error and when the rows are replaced. Nothing is polled from the provider
+ * and nothing ever promotes back to LIVE: once aged out, a row stays STALE until
+ * the admin reads again. Missing values render as "—", never 0; counts that JSON
  * cannot carry exactly use the server's `*_exact` decimal strings.
  */
 
@@ -31,6 +34,13 @@ export const AGE_TICK_MS = 1000;
 export function monotonicNow() {
     if (typeof performance !== 'undefined' && typeof performance.now === 'function') return performance.now();
     return Date.now();
+}
+
+/** Seconds elapsed on the monotonic clock since `startMs`; 0 when unknown or negative. */
+export function elapsedSince(startMs) {
+    if (typeof startMs !== 'number' || !Number.isFinite(startMs)) return 0;
+    const seconds = (monotonicNow() - startMs) / 1000;
+    return seconds > 0 ? seconds : 0;
 }
 
 function num(value, digits = 2) {
@@ -99,14 +109,15 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
     const [message, setMessage] = useState('Not read yet. Private, admin-only; never published.');
     const [rows, setRows] = useState([]);
     const [elapsed, setElapsed] = useState(0);
-    const receivedAtRef = useRef(null);
+    const requestStartRef = useRef(null); // monotonic ms when the request was SENT (r3)
 
     useEffect(() => {
         if (rows.length === 0) return undefined;
         const tick = () => {
-            const start = receivedAtRef.current;
-            const seconds = start === null ? 0 : (monotonicNow() - start) / 1000;
-            setElapsed(prev => (seconds > prev ? seconds : prev)); // monotonic: never moves back
+            setElapsed(prev => {
+                const seconds = elapsedSince(requestStartRef.current);
+                return seconds > prev ? seconds : prev; // monotonic: never moves back
+            });
         };
         const id = setInterval(tick, AGE_TICK_MS);
         return () => clearInterval(id);
@@ -114,10 +125,11 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
 
     const read = async () => {
         setBusy(true);
+        const start = monotonicNow(); // before the request leaves: transit time counts as age
         try {
             const result = await api.getSchwabPrivateQuotes(symbols);
             if (!result || result.error) {
-                receivedAtRef.current = null;
+                requestStartRef.current = null;
                 setRows([]);
                 setElapsed(0);
                 setMessage(describeError(result));
@@ -125,8 +137,8 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
             }
             const view = result.view && typeof result.view === 'object' ? result.view : {};
             const viewRows = view.rows && typeof view.rows === 'object' ? view.rows : {};
-            receivedAtRef.current = monotonicNow();
-            setElapsed(0);
+            requestStartRef.current = start;
+            setElapsed(elapsedSince(start)); // first render already includes the transit
             setRows(Object.keys(viewRows).sort().map(key => viewRows[key]));
             setMessage(`Evaluated at ${typeof view.evaluated_at === 'string' ? view.evaluated_at : '—'} · source ${typeof view.source === 'string' ? view.source : '—'} · redistribution ${typeof view.redistribution === 'string' ? view.redistribution : '—'}`);
         } finally {
