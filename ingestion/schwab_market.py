@@ -75,7 +75,7 @@ import time
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Self
+from typing import Any
 
 import requests
 from requests.auth import HTTPBasicAuth
@@ -246,7 +246,7 @@ class _TokenFileLock:
         self.path = token_file.with_name(token_file.name + ".lock")
         self._fd: int | None = None
 
-    def __enter__(self) -> Self:
+    def __enter__(self) -> _TokenFileLock:  # noqa: PYI034 -- typing.Self needs 3.11; grid-svr runs 3.10
         _require_posix()
         _check_private_dir(self.path.parent)
         try:
