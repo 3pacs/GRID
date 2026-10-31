@@ -17,7 +17,7 @@ numpy>=1.26.0
 duckdb>=1.5.5
 fedfred>=1.2.9
 yfinance>=1.5.1
-requests>=2.31.0
+requests>=2.34.2
 beautifulsoup4>=4.14.3
 edgartools>=4.6.3
 # strategy.portfolio_workbook_plan imports openpyxl at module load (Workbook,
