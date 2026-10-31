@@ -410,6 +410,7 @@ for _label, _module_path, _required in [
     ("celestial", "api.routers.celestial", False),
     ("derivatives", "api.routers.derivatives", False),
     ("gamma_watch", "api.routers.gamma_watch", False),
+    ("schwab_private", "api.routers.schwab_private", False),
     ("watchlist", "api.routers.watchlist", False),
     ("associations", "api.routers.associations", False),
     ("strategy", "api.routers.strategy", False),

@@ -19,7 +19,8 @@ import {
     Upload,
 } from 'lucide-react';
 import { api } from '../api.js';
-import { isSimpleUser } from '../authSession.js';
+import { getStoredRole, isSimpleUser } from '../authSession.js';
+import SchwabPrivateQuote from '../components/SchwabPrivateQuote.jsx';
 import { tickerName } from '../components/home/plain.js';
 
 const SANS = "'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif";
@@ -735,6 +736,8 @@ export default function TenYearPortfolio() {
                             {apiSaved ? 'Saved' : 'Save setup'}
                         </button>
                     </div>
+
+                    {getStoredRole() === 'admin' && <SchwabPrivateQuote symbols={['SPY']} />}
 
                     <div className="ty-oracle-card ty-chat-card">
                         <div className="ty-card-title">

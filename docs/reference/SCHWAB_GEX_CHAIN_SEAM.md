@@ -1,6 +1,6 @@
 # Schwab → GEX option-chain seam (design note, no GEX changes)
 
-**Status:** documentation only, 2026-10-30. Nothing in `collectors/gamma_watch/`,
+**Status:** seam function implemented 2026-10-31 as `ingestion/schwab_chain_seam.py` (pure, synthetic tests in `tests/test_schwab_chain_seam.py`); it is still not read by any GEX gate — the envelope carries `schema: "spy-chain-schwab-v1"` / `host: "GRID"` so `broker.py` rejects it until the owner decisions in §4 are made. Everything below about GEX ownership is unchanged from 2026-10-30. Nothing in `collectors/gamma_watch/`,
 `api/routers/gamma_watch.py`, gex-watch on grid-svr or the ANIK collector is changed by this
 note. GEX changes stay with the GEX owner (Claude session `local_d0cd874c`, gex lane; Codex
 custodians for the RTD collector) and every existing GEX gate stays in force. Nothing
@@ -106,12 +106,13 @@ and no value, so `broker.py` counts them as `missing_contracts` exactly as it do
 
 ## 5. What this slice does and does not include
 
+* Included (2026-10-31): `ingestion/schwab_chain_seam.py` — `schwab_chain_to_rtd_records(chain_body, contracts, *, received_at, host="GRID", underlying=None)` exactly as in §3, with `rejected[]` per-contract reasons and `InvalidChainError` for unusable bodies.
 * Included: this note and `ingestion/schwab_quote_path.py` (SPY underlying quote with
   provenance/freshness, fail-closed classification, declared-audience label, no persistence)
   plus its tests. The `audience` argument is a caller declaration, not access control; a real
   authorized private endpoint is a separate integration gate that neither this note nor the
   module provides.
-* Not included, by design: the `schwab_chain_to_rtd_records` implementation, any GEX-tree edit,
+* Not included, by design: any GEX-tree edit, the `/chains` call itself (no leg fetches a chain),
   any scheduler/Hermes step, any `raw_series` write, any live call, any public projection.
 * Still unverified: the live `/chains` field names and units above, Schwab's `isDelayed`
   semantics for SPY options, gamma sign/scale relative to RTD `GAMMA`, and the refresh-token
