@@ -1,12 +1,28 @@
 # TEMPLATE — NOT INSTALLED. See grid-market-diary.service.template.
-# Weekday 22:30Z run, after the US close and after grid-causal-links
-# (07:40Z) / grid-analytics-snapshots (07:15Z) — no dependency between
-# them, just spread across the day.
+# Runs the NEXT MORNING for the PREVIOUS US trading session (the service
+# passes --previous-session), Tue..Sat 05:30Z, instead of the old Mon..Fri
+# 22:30Z evening run.
+#
+# Why: yfinance closes are read through store.observations.read_daily_policy_n,
+# which returns only POLICY_ELIGIBLE captures, and
+# price_close_contract.daily_capture_boundary makes a close eligible only after
+# the next New York local midnight — 04:00Z during EDT, 05:00Z during EST. An
+# evening run for "today" therefore finds no qualified close and reports "no
+# close for date" for every index.
+#
+# Dependency: the 05:15Z yfinance morning slot in ingestion/scheduler.py
+# captures the previous session's qualified close. 05:30Z sits after both the
+# 05:00Z EST boundary and that 05:15Z capture (plus RandomizedDelaySec below
+# only pushes it later). If the 05:15Z slot is moved, move this timer with it.
+#
+# Tue..Sat because the previous session of Tue..Fri is Mon..Thu and of Sat is
+# Fri; Sun/Mon mornings have no new session to report. Holidays are handled by
+# the runner (last_trading_day), not the timer.
 [Unit]
-Description=Run the GRID market diary writer once a weekday evening
+Description=Run the GRID market diary writer each morning for the previous US session
 
 [Timer]
-OnCalendar=Mon..Fri *-*-* 22:30:00 UTC
+OnCalendar=Tue..Sat *-*-* 05:30:00 UTC
 RandomizedDelaySec=5min
 Persistent=true
 Unit=grid-market-diary.service
