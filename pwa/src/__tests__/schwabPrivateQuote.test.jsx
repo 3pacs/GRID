@@ -1,7 +1,7 @@
 import React from 'react';
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import SchwabPrivateQuote, { AGE_TICK_MS, count, describeError, describeRow, elapsedSince } from '../components/SchwabPrivateQuote.jsx';
+import SchwabPrivateQuote, { AGE_TICK_MS, count, describeError, describeRow, elapsedSince, isTrustedElapsed, monotonicNow } from '../components/SchwabPrivateQuote.jsx';
 import { api } from '../api.js';
 
 vi.mock('../api.js', () => ({
@@ -39,11 +39,12 @@ function tick(ms = AGE_TICK_MS) {
 }
 
 describe('describeRow', () => {
-    it('labels LIVE only when the server says live and fresh and the row has not aged out', () => {
-        expect(describeRow(row()).label).toBe('LIVE');
-        expect(describeRow(row({ live: false })).label).toBe('FRESH');
-        expect(describeRow(row({ quote_status: 'stale', live: true })).label).toBe('STALE');
-        expect(describeRow(row({ quote_status: 'delayed', live: false })).label).toBe('DELAYED');
+    it('labels LIVE only when the server says live and fresh, the row has not aged out and elapsed time is trusted', () => {
+        expect(describeRow(row(), 0).label).toBe('LIVE');
+        expect(describeRow(row({ live: false }), 0).label).toBe('FRESH');
+        expect(describeRow(row({ quote_status: 'stale', live: true }), 0).label).toBe('STALE');
+        expect(describeRow(row({ quote_status: 'delayed', live: false }), 0).label).toBe('DELAYED');
+        expect(describeRow(row()).label).toBe('STALE');               // no elapsed argument = untrusted (r4)
     });
 
     it('ages a fresh row out with elapsed time and never promotes', () => {
@@ -56,7 +57,21 @@ describe('describeRow', () => {
         expect(aged.last).toBe('731.37');                             // values kept, label changed
         expect(describeRow(row({ live: false }), 0).live).toBe(false);
         expect(describeRow(row({ quote_status: 'stale', live: false }), -50).label).toBe('STALE');
-        expect(describeRow(row(), -5).label).toBe('LIVE');            // negative elapsed is treated as 0
+    });
+
+    it('treats untrusted elapsed time as a clock failure: STALE, never LIVE (r4)', () => {
+        for (const bad of [null, undefined, NaN, -5, -0.001, Infinity, -Infinity, '5']) {
+            const d = describeRow(row(), bad);
+            expect(d.label).toBe('STALE');
+            expect(d.live).toBe(false);
+            expect(d.clockUntrusted).toBe(true);
+            expect(d.reason).toMatch(/local clock untrusted/);
+            expect(d.ageSeconds).toBeNull();
+            expect(d.last).toBe('731.37');                            // values kept, clearly labelled
+        }
+        expect(describeRow(row(), 0).label).toBe('LIVE');            // zero is a trusted interval
+        expect(describeRow(row({ quote_status: 'delayed', live: false }), null).label).toBe('DELAYED');
+        expect(describeRow(row({ quote_status: 'delayed', live: false }), null).clockUntrusted).toBe(false);
     });
 
     it('cannot bound a fresh row without age or gate metadata, so it is not live', () => {
@@ -108,13 +123,140 @@ describe('describeError', () => {
     });
 });
 
-describe('elapsedSince', () => {
-    it('measures from the given monotonic start and never goes negative', () => {
+describe('elapsedSince / monotonicNow / isTrustedElapsed (r4)', () => {
+    it('measures from the given monotonic start and returns null for anything untrusted', () => {
         mono = 5000;
         expect(elapsedSince(2000)).toBe(3);
-        expect(elapsedSince(9000)).toBe(0);
-        expect(elapsedSince(null)).toBe(0);
-        expect(elapsedSince(NaN)).toBe(0);
+        expect(elapsedSince(5000)).toBe(0);
+        expect(elapsedSince(9000)).toBeNull();     // rollback: reading earlier than the start
+        expect(elapsedSince(null)).toBeNull();
+        expect(elapsedSince(NaN)).toBeNull();
+        expect(elapsedSince('2000')).toBeNull();
+        expect(elapsedSince(Infinity)).toBeNull();
+        mono = NaN;
+        expect(elapsedSince(2000)).toBeNull();     // clock returns NaN
+        mono = Infinity;
+        expect(elapsedSince(2000)).toBeNull();     // clock returns a non-finite value
+    });
+
+    it('has no Date.now fallback: a missing or throwing performance.now is untrusted', () => {
+        const original = globalThis.performance.now;
+        globalThis.performance.now = undefined;
+        expect(Number.isNaN(monotonicNow())).toBe(true);
+        expect(elapsedSince(0)).toBeNull();
+        globalThis.performance.now = () => { throw new Error('no clock'); };
+        expect(Number.isNaN(monotonicNow())).toBe(true);
+        globalThis.performance.now = original;
+    });
+
+    it('isTrustedElapsed accepts only finite non-negative numbers', () => {
+        expect(isTrustedElapsed(0)).toBe(true);
+        expect(isTrustedElapsed(12.5)).toBe(true);
+        for (const bad of [null, undefined, NaN, -1, Infinity, '1', {}]) expect(isTrustedElapsed(bad)).toBe(false);
+    });
+});
+
+// Clock-failure controls: the mocked api manipulates the fake monotonic clock while the request is "in flight".
+function inFlightSet(value, result) {
+    return () => { mono = value; return Promise.resolve(result); };
+}
+
+describe('<SchwabPrivateQuote /> clock failures (r4)', () => {
+    const serverRow = () => row({ freshness: { ...freshness, age_seconds: 5, stale_after_seconds: 20 } });
+
+    it('rollback during the request (before first render) renders STALE with the clock reason, never LIVE', async () => {
+        mono = 50_000;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(10_000, view({ SPY: serverRow() })));   // clock went backwards in transit
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText('STALE')).toBeTruthy();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+        expect(screen.getByTestId('schwab-private-quote').querySelector('tr[data-clock-untrusted="true"]')).toBeTruthy();
+        mono = 10_500; tick();                                                                           // clock recovers: still not promoted
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+    });
+
+    it('NaN clock at request start renders STALE even when the clock is fine on arrival', async () => {
+        mono = NaN;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(2_000, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+        mono = 3_000; tick();
+        expect(screen.queryByText('LIVE')).toBeNull();
+    });
+
+    it('NaN clock on arrival renders STALE', async () => {
+        mono = 1_000;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(NaN, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+    });
+
+    it('missing performance.now (no Date.now fallback) renders STALE', async () => {
+        const original = globalThis.performance.now;
+        globalThis.performance.now = undefined;
+        try {
+            api.getSchwabPrivateQuotes.mockResolvedValue(view({ SPY: serverRow() }));
+            render(<SchwabPrivateQuote />);
+            await readOnce();
+            expect(screen.queryByText('LIVE')).toBeNull();
+            expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+        } finally {
+            globalThis.performance.now = original;
+        }
+    });
+
+    it('rollback after first render on the timer fails closed and stays closed', async () => {
+        mono = 1_000;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(1_200, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        mono = 500; tick();                                                                              // earlier than the request start
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+        mono = 2_000; tick();                                                                            // recovery does not promote
+        expect(screen.queryByText('LIVE')).toBeNull();
+    });
+
+    it('fast positive control: trusted clock, 0.2 s transit, LIVE then aged out on the timer', async () => {
+        mono = 1_000;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(1_200, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText('LIVE')).toBeTruthy();
+        expect(screen.queryByText(/local clock untrusted/)).toBeNull();
+        mono = 16_200; tick();                                                                           // 5 + 15.2 = 20.2 s
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/aged out since evaluation/)).toBeTruthy();
+    });
+
+    it('slow positive control: trusted clock, 30 s transit, STALE by age (not by clock failure)', async () => {
+        mono = 1_000;
+        api.getSchwabPrivateQuotes.mockImplementation(inFlightSet(31_000, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.queryByText('LIVE')).toBeNull();
+        expect(screen.getByText(/aged out since evaluation/)).toBeTruthy();
+        expect(screen.queryByText(/local clock untrusted/)).toBeNull();
+    });
+
+    it('a successful re-read with a trusted clock recovers from an untrusted state', async () => {
+        mono = NaN;
+        api.getSchwabPrivateQuotes
+            .mockImplementationOnce(inFlightSet(1_000, view({ SPY: serverRow() })))
+            .mockImplementationOnce(inFlightSet(1_100, view({ SPY: serverRow() })));
+        render(<SchwabPrivateQuote />);
+        await readOnce();
+        expect(screen.getByText(/local clock untrusted/)).toBeTruthy();
+        await readOnce();                                                                                // start 1000, arrival 1100
+        expect(screen.getByText('LIVE')).toBeTruthy();
     });
 });
 

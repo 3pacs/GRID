@@ -16,7 +16,14 @@ import { api } from '../api.js';
  * never LIVE. A local timer re-evaluates every second and is cleared on unmount,
  * on error and when the rows are replaced. Nothing is polled from the provider
  * and nothing ever promotes back to LIVE: once aged out, a row stays STALE until
- * the admin reads again. Missing values render as "—", never 0; counts that JSON
+ * the admin reads again.
+ *
+ * Clock trust (r4): elapsed time is only ever trusted from `performance.now()`.
+ * If that clock is unavailable or non-finite, if the request start is not
+ * finite, or if the clock reads earlier than the request start (rollback), the
+ * elapsed value is `null` = untrusted, and a fresh row is shown STALE with the
+ * reason "local clock untrusted; freshness unbounded" and is never LIVE. There
+ * is no Date.now fallback. Untrusted is sticky until the next successful read. Missing values render as "—", never 0; counts that JSON
  * cannot carry exactly use the server's `*_exact` decimal strings.
  */
 
@@ -31,16 +38,32 @@ export const STATUS_LABELS = {
 
 export const AGE_TICK_MS = 1000;
 
+/** Monotonic milliseconds, or NaN when no trustworthy monotonic clock exists (no Date.now fallback). */
 export function monotonicNow() {
-    if (typeof performance !== 'undefined' && typeof performance.now === 'function') return performance.now();
-    return Date.now();
+    if (typeof performance === 'undefined' || typeof performance.now !== 'function') return NaN;
+    let value;
+    try { value = performance.now(); } catch { return NaN; }
+    return typeof value === 'number' && Number.isFinite(value) ? value : NaN;
 }
 
-/** Seconds elapsed on the monotonic clock since `startMs`; 0 when unknown or negative. */
+/**
+ * Seconds elapsed on the monotonic clock since `startMs`, or `null` when the
+ * interval cannot be trusted: non-finite start, no monotonic clock, non-finite
+ * reading, or a reading earlier than the start (clock rollback). Never 0 for
+ * an unknown interval. Pure apart from the clock read.
+ */
 export function elapsedSince(startMs) {
-    if (typeof startMs !== 'number' || !Number.isFinite(startMs)) return 0;
-    const seconds = (monotonicNow() - startMs) / 1000;
-    return seconds > 0 ? seconds : 0;
+    if (typeof startMs !== 'number' || !Number.isFinite(startMs)) return null;
+    const now = monotonicNow();
+    if (!Number.isFinite(now)) return null;
+    const seconds = (now - startMs) / 1000;
+    if (!Number.isFinite(seconds) || seconds < 0) return null;
+    return seconds;
+}
+
+/** True when `elapsedSeconds` is a trusted, finite, non-negative interval. */
+export function isTrustedElapsed(elapsedSeconds) {
+    return typeof elapsedSeconds === 'number' && Number.isFinite(elapsedSeconds) && elapsedSeconds >= 0;
 }
 
 function num(value, digits = 2) {
@@ -56,22 +79,26 @@ export function count(value, exact) {
 }
 
 /**
- * Describe one server row at `elapsedSeconds` after it was received. Pure.
+ * Describe one server row at `elapsedSeconds` after the request was sent. Pure.
  * A fresh row whose `age_seconds + elapsed` exceeds `stale_after_seconds`
- * is shown STALE (aged out locally) and is never live; nothing promotes.
+ * is shown STALE (aged out locally) and is never live. An untrusted
+ * `elapsedSeconds` (null, NaN, negative, non-finite) is a clock failure: a
+ * fresh row is then shown STALE with an explicit reason and is never live.
+ * Nothing promotes.
  */
-export function describeRow(row, elapsedSeconds = 0) {
+export function describeRow(row, elapsedSeconds = null) {
     if (!row || typeof row !== 'object') {
-        return { symbol: '?', label: 'UNAVAILABLE', live: false, measured: false, reason: 'no row', agedOut: false };
+        return { symbol: '?', label: 'UNAVAILABLE', live: false, measured: false, reason: 'no row', agedOut: false, clockUntrusted: false };
     }
     const status = typeof row.quote_status === 'string' ? row.quote_status : 'unavailable';
     const freshness = row.freshness && typeof row.freshness === 'object' ? row.freshness : {};
-    const elapsed = typeof elapsedSeconds === 'number' && Number.isFinite(elapsedSeconds) && elapsedSeconds > 0 ? elapsedSeconds : 0;
+    const trusted = isTrustedElapsed(elapsedSeconds);
     const serverAge = typeof freshness.age_seconds === 'number' && Number.isFinite(freshness.age_seconds) ? freshness.age_seconds : null;
     const staleAfter = typeof freshness.stale_after_seconds === 'number' && Number.isFinite(freshness.stale_after_seconds) ? freshness.stale_after_seconds : null;
-    const effectiveAge = serverAge === null ? null : serverAge + elapsed;
-    // A fresh row with unknown age or gate cannot be bounded, so it is never shown live.
-    const agedOut = status === 'fresh' && (effectiveAge === null || staleAfter === null || effectiveAge > staleAfter);
+    const effectiveAge = serverAge === null || !trusted ? null : serverAge + elapsedSeconds;
+    const clockUntrusted = status === 'fresh' && !trusted;
+    // A fresh row with unknown age, unknown gate or untrusted elapsed time cannot be bounded: never live.
+    const agedOut = status === 'fresh' && (clockUntrusted || effectiveAge === null || staleAfter === null || effectiveAge > staleAfter);
     const effectiveStatus = agedOut ? 'stale' : status;
     const live = row.live === true && status === 'fresh' && !agedOut;
     const measured = effectiveStatus === 'fresh' || effectiveStatus === 'stale' || effectiveStatus === 'delayed';
@@ -82,7 +109,10 @@ export function describeRow(row, elapsedSeconds = 0) {
         live,
         measured,
         agedOut,
-        reason: agedOut ? 'aged out since evaluation' : (typeof row.reason === 'string' ? row.reason : null),
+        clockUntrusted,
+        reason: clockUntrusted
+            ? 'local clock untrusted; freshness unbounded'
+            : (agedOut ? 'aged out since evaluation' : (typeof row.reason === 'string' ? row.reason : null)),
         asOf: typeof freshness.as_of === 'string' ? freshness.as_of : null,
         vintage: typeof freshness.vintage === 'string' ? freshness.vintage : null,
         evaluatedAt: typeof freshness.evaluated_at === 'string' ? freshness.evaluated_at : null,
@@ -108,14 +138,16 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
     const [busy, setBusy] = useState(false);
     const [message, setMessage] = useState('Not read yet. Private, admin-only; never published.');
     const [rows, setRows] = useState([]);
-    const [elapsed, setElapsed] = useState(0);
+    const [elapsed, setElapsed] = useState(null); // seconds since the request was sent, or null = untrusted
     const requestStartRef = useRef(null); // monotonic ms when the request was SENT (r3)
 
     useEffect(() => {
         if (rows.length === 0) return undefined;
         const tick = () => {
             setElapsed(prev => {
+                if (prev === null) return null; // untrusted is sticky until the next successful read
                 const seconds = elapsedSince(requestStartRef.current);
+                if (seconds === null) return null; // rollback or clock loss after first render: fail closed
                 return seconds > prev ? seconds : prev; // monotonic: never moves back
             });
         };
@@ -125,20 +157,20 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
 
     const read = async () => {
         setBusy(true);
-        const start = monotonicNow(); // before the request leaves: transit time counts as age
+        const start = monotonicNow(); // before the request leaves: transit time counts as age; NaN = untrusted
         try {
             const result = await api.getSchwabPrivateQuotes(symbols);
             if (!result || result.error) {
                 requestStartRef.current = null;
                 setRows([]);
-                setElapsed(0);
+                setElapsed(null);
                 setMessage(describeError(result));
                 return;
             }
             const view = result.view && typeof result.view === 'object' ? result.view : {};
             const viewRows = view.rows && typeof view.rows === 'object' ? view.rows : {};
-            requestStartRef.current = start;
-            setElapsed(elapsedSince(start)); // first render already includes the transit
+            requestStartRef.current = Number.isFinite(start) ? start : null;
+            setElapsed(elapsedSince(start)); // first render includes the transit; null when the clock cannot be trusted
             setRows(Object.keys(viewRows).sort().map(key => viewRows[key]));
             setMessage(`Evaluated at ${typeof view.evaluated_at === 'string' ? view.evaluated_at : '—'} · source ${typeof view.source === 'string' ? view.source : '—'} · redistribution ${typeof view.redistribution === 'string' ? view.redistribution : '—'}`);
         } finally {
@@ -162,7 +194,7 @@ export default function SchwabPrivateQuote({ symbols = ['SPY'] }) {
                     </thead>
                     <tbody>
                         {described.map(row => (
-                            <tr key={row.symbol} data-status={row.label.toLowerCase()} data-aged-out={row.agedOut ? 'true' : 'false'}>
+                            <tr key={row.symbol} data-status={row.label.toLowerCase()} data-aged-out={row.agedOut ? 'true' : 'false'} data-clock-untrusted={row.clockUntrusted ? 'true' : 'false'}>
                                 <td>{row.symbol}{row.providerSymbol && row.providerSymbol !== row.symbol ? ` (${row.providerSymbol})` : ''}</td>
                                 <td><span className={`ty-schwab-badge${row.live ? ' is-live' : ''}`}>{row.label}</span>{row.reason ? ` ${row.reason}` : ''}</td>
                                 <td>{row.last}</td>
