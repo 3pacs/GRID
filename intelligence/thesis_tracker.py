@@ -164,53 +164,9 @@ def _snapshot_conviction_fraction(thesis_data: dict) -> float | None:
 
 
 def snapshot_thesis(engine: Engine, thesis_data: dict) -> int:
-    """Archive the current unified thesis with full model states.
+    """Compatibility-HOLD artifact: refuse snapshots before any DB/provider work."""
+    raise RuntimeError("THESIS_COMPATIBILITY_HOLD: snapshot writes are disabled in this artifact")
 
-    Args:
-        engine: SQLAlchemy engine.
-        thesis_data: Dict with keys: overall_direction, conviction,
-            key_drivers, risk_factors, model_states, narrative. conviction_unit
-            is percent or fraction; omitted unit retains the legacy fraction
-            input contract. Missing/null conviction is stored as NULL.
-
-    Returns:
-        Snapshot ID.
-    """
-    conviction = _snapshot_conviction_fraction(thesis_data)
-    schema = _ensure_tables(engine)
-
-    direction = thesis_data.get("overall_direction", "neutral")
-    key_drivers = thesis_data.get("key_drivers", [])
-    risk_factors = thesis_data.get("risk_factors", [])
-    model_states = thesis_data.get("model_states", {})
-    narrative = thesis_data.get("narrative", "")
-
-    with engine.begin() as conn:
-        require_thesis_connection(conn, expected_schema=schema)
-        row = conn.execute(text("""
-            INSERT INTO thesis_snapshots
-                (overall_direction, conviction, conviction_unit, key_drivers, risk_factors,
-                 model_states, narrative)
-            VALUES
-                (:direction, :conviction, :conviction_unit, :drivers, :risks, :states, :narrative)
-            RETURNING id
-        """), {
-            "direction": direction,
-            "conviction": conviction,
-            "conviction_unit": "fraction" if conviction is not None else None,
-            "drivers": json.dumps(key_drivers),
-            "risks": json.dumps(risk_factors),
-            "states": json.dumps(model_states, default=str),
-            "narrative": narrative,
-        }).fetchone()
-
-    snapshot_id = row[0]
-    log.info(
-        "Thesis snapshot #{id} archived: {d} (conviction {c})",
-        id=snapshot_id, d=direction,
-        c=f"{conviction * 100:g}%" if conviction is not None else "unknown",
-    )
-    return snapshot_id
 
 
 # ── 2. Score Old Theses ───────────────────────────────────────────────────
@@ -691,115 +647,12 @@ def _compute_best_conditions(conn) -> dict:
 # ── 6. Full Thesis Cycle ─────────────────────────────────────────────────
 
 def run_thesis_cycle(engine: Engine) -> dict[str, Any]:
-    """Run a full thesis tracking cycle for hermes scheduling.
+    """Compatibility-HOLD artifact: observable refusal without reads or providers."""
+    return {"compatibility_hold": True, "snapshot_id": None,
+            "snapshot_error": "THESIS_COMPATIBILITY_HOLD",
+            "scoring": {"held": True}, "postmortems_held": True,
+            "postmortems_generated": 0}
 
-    1. Snapshot current thesis (if available from flow_thesis)
-    2. Score old unscored theses
-    3. Generate post-mortems for wrong/partial theses
-    4. Return summary report
-
-    Args:
-        engine: SQLAlchemy engine.
-
-    Returns:
-        Summary dict with snapshot_id, scoring results, postmortem count.
-    """
-    schema = _ensure_tables(engine)
-    report: dict[str, Any] = {}
-
-    # Freshness guard — warn if core market data is stale
-    try:
-        from intelligence.freshness_guard import check_freshness, log_stale_features
-        core_features = [
-            "sp500_close", "vix_spot", "treasury_10y", "dxy_index",
-            "hy_oas_spread", "gold_futures_close",
-        ]
-        statuses = check_freshness(engine, core_features)
-        log_stale_features(statuses, caller="thesis_tracker.run_thesis_cycle")
-    except Exception as exc:
-        log.warning("Freshness check failed in thesis_tracker: {e}", e=exc)
-
-    # 1. Snapshot current thesis (try to get from flow_thesis if available)
-    snapshot_id = None
-    thesis_data = None
-    try:
-        from analysis.flow_thesis import generate_unified_thesis
-        thesis_data = generate_unified_thesis(engine)
-        if thesis_data:
-            snapshot_id = snapshot_thesis(engine, thesis_data)
-            report["snapshot_id"] = snapshot_id
-    except ImportError:
-        log.debug("flow_thesis not available yet — skipping snapshot")
-        report["snapshot_id"] = None
-        report["snapshot_note"] = "flow_thesis module not available"
-    except Exception as exc:
-        log.warning("Thesis snapshot failed: {e}", e=str(exc))
-        report["snapshot_id"] = None
-        report["snapshot_error"] = str(exc)
-
-    # 1b. Launch deep dive in background (never blocks the cycle)
-    if snapshot_id and thesis_data:
-        try:
-            from intelligence.deep_dive import deep_dive_async
-            deep_dive_async(engine, thesis_data, snapshot_id)
-            report["deep_dive"] = "launched"
-        except Exception as exc:
-            log.warning("Deep dive launch failed: {e}", e=str(exc))
-            report["deep_dive"] = f"failed: {exc}"
-
-    # 2. Score old theses
-    score_results = score_old_theses(engine)
-    report["scoring"] = score_results
-
-    # 3. Generate post-mortems for wrong/partial theses that lack one
-    postmortems_generated = 0
-    if THESIS_SCORING_HELD:
-        # Same hold as score_old_theses (item #16): postmortems are an
-        # LLM-narrated write over outcomes the (held) scorer produces —
-        # the standing "postmortem write that feeds learning" category.
-        report["postmortems_held"] = True
-        log.info("run_thesis_cycle: postmortem generation held (THESIS_SCORING_HELD)")
-    else:
-        with engine.connect() as conn:
-            require_thesis_connection(conn, expected_schema=schema)
-            wrong_snaps = conn.execute(text("""
-                SELECT ts.id
-                FROM thesis_snapshots ts
-                LEFT JOIN thesis_postmortems tp ON ts.id = tp.snapshot_id
-                WHERE ts.outcome IN ('wrong', 'partial')
-                  AND tp.id IS NULL
-                  AND ts.timestamp >= NOW() - INTERVAL '30 days'
-                ORDER BY ts.timestamp DESC
-                LIMIT 20
-            """)).fetchall()
-
-        for row in wrong_snaps:
-            try:
-                pm = generate_thesis_postmortem(engine, row[0])
-                if pm:
-                    postmortems_generated += 1
-            except Exception as exc:
-                log.warning(
-                    "Post-mortem for snapshot {id} failed: {e}",
-                    id=row[0], e=str(exc),
-                )
-
-    report["postmortems_generated"] = postmortems_generated
-
-    # 4. Quick accuracy summary
-    try:
-        accuracy = get_thesis_accuracy(engine)
-        report["accuracy"] = accuracy["overall"]
-    except Exception as exc:
-        log.warning("Accuracy computation failed: {e}", e=str(exc))
-        report["accuracy"] = {"error": str(exc)}
-
-    log.info(
-        "Thesis cycle complete: snap={s}, scored={sc}, postmortems={pm}",
-        s=snapshot_id, sc=score_results.get("correct", 0) + score_results.get("wrong", 0),
-        pm=postmortems_generated,
-    )
-    return report
 
 
 # ── Load Post-Mortems ─────────────────────────────────────────────────────
