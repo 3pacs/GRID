@@ -168,6 +168,38 @@ jobs:
           print('Native Quiver qualification: passed=', len(cases), 'modules=', sorted(observed), 'skipped=0')
           PY
 
+      - name: Resolver native transaction and watermark contracts
+        timeout-minutes: 4
+        env:
+          GRID_RESOLVER_REQUIRE_PG: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+        run: |
+          set -euo pipefail
+          unset PYTEST_ADDOPTS PYTEST_PLUGINS PYTHONPATH
+          while IFS= read -r key; do unset "$key"; done < <(compgen -A variable PG || true)
+          python - <<'PY'
+          import platform
+          import psycopg2
+          from psycopg2.extensions import libpq_version
+          import sqlalchemy
+          print('resolver runtime: python=', platform.python_version(),
+                'sqlalchemy=', sqlalchemy.__version__, 'psycopg2=', psycopg2.__version__,
+                'libpq_compiled=', psycopg2.__libpq_version__, 'libpq_runtime=', libpq_version())
+          PY
+          docker inspect --format='resolver synthetic image={{.Image}}' qq-synthetic-pg
+          timeout --signal=TERM --kill-after=10s 150s python -m pytest \
+            tests/test_resolver_transaction_pg.py --noconftest -o addopts= \
+            -p no:cacheprovider -p no:xdist --capture=tee-sys -q -rA \
+            --junitxml=resolver-native-results.xml
+          python - <<'PY'
+          import xml.etree.ElementTree as ET
+          root = ET.parse('resolver-native-results.xml').getroot()
+          cases = root.findall('.//testcase')
+          if len(cases) != 35 or root.findall('.//skipped') or root.findall('.//failure') or root.findall('.//error'):
+              raise SystemExit('resolver native qualification count or result mismatch')
+          print('Resolver native qualification: passed=', len(cases), 'skipped=0')
+          PY
+
       - name: Destroy synthetic database container and volume
         if: always()
         timeout-minutes: 1

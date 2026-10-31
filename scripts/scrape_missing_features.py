@@ -59,7 +59,7 @@ def ensure_entity_mappings(engine, features: list[dict]) -> None:
             SEED_MAPPINGS[series_id] = feat["name"]
 
 
-def resolve_scraped_data(engine) -> int:
+def resolve_scraped_data(engine) -> int | None:
     """Run the resolver on web-scraped data to populate resolved_series."""
     resolver = Resolver(db_engine=engine)
     result = resolver.resolve_pending()
