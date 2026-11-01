@@ -66,7 +66,7 @@
 #   1  nothing to roll back to (see the message on stderr for which case)
 #   2  usage error
 #   3  could not acquire the per-<live_path> lock -- a deploy build/swap is in progress
-#   5  refused: --schema-compatible was not passed
+#   5  refused: --schema-compatible was not passed, or rollback root is unsafe
 #   6  refused: <live_path>.releases/.activation-in-progress is present and
 #      --override-stuck-activation was not passed
 
@@ -174,6 +174,29 @@ MSG
     exit 6
   fi
   echo "proceeding past $INPROGRESS_MARKER (${age}s old) -- --override-stuck-activation was passed" >&2
+fi
+
+# A recorded previous release is not automatically a trusted source root.
+# Preserve schema/activation acknowledgments and refuse unsafe targets without
+# repairing permissions or guessing another rollback. The swap writer records
+# direct children of RELEASES_DIR; linked/escaping targets are not that contract.
+target_leaf="$(basename -- "$target")"
+if [ -z "$target_leaf" ] || [ "$target_leaf" = . ] || [ "$target_leaf" = .. ] ||
+   [ "$target" != "$RELEASES_DIR/$target_leaf" ] ||
+   [ -L "$target" ] || [ ! -d "$target" ]; then
+  echo 'unsafe rollback root path; refusing without changing the live pointer' >&2
+  exit 5
+fi
+root_metadata="$(stat -c '%u %a' -- "$target")" || exit 5
+if [[ ! "$root_metadata" =~ ^[0-9]+\ [0-7]{3,4}$ ]]; then
+  echo 'unavailable rollback root metadata; refusing' >&2
+  exit 5
+fi
+read -r root_uid root_mode <<< "$root_metadata"
+if { [ "$root_uid" != 0 ] && [ "$root_uid" != "$(id -u)" ]; } ||
+   (( (8#$root_mode & 8#22) != 0 )); then
+  echo 'unsafe rollback root owner/mode; refusing without permission repair' >&2
+  exit 5
 fi
 
 current_target=""

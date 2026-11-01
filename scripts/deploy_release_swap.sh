@@ -565,15 +565,49 @@ fi
 # a fast incremental update, exactly like the pre-existing single-directory
 # approach -- this script only changes WHEN and WHERE that lands, not how
 # expensive it is to produce.
+# Preserve the existing copy/umask/ACL behavior; a private root must not be
+# silently widened to 0755. Refuse an unsafe candidate instead of chmod/chown
+# or recursively normalizing legitimate writable runtime data.
 if [ -L "$LIVE_PATH" ]; then
   cp -a "$(readlink -f "$LIVE_PATH")" "$CANDIDATE_DIR"
 else
-  mkdir -p "$CANDIDATE_DIR"
+  # Only tighten the caller's creation mask for this new root. Preserve a
+  # restrictive mask (e.g.077 ->0700), and do not affect the build hook's mask
+  # or copied runtime-data entries. Default ACL behavior is checked below.
+  creation_mask="$(umask)"
+  if [[ ! "$creation_mask" =~ ^[0-7]{3,4}$ ]]; then
+    echo 'unavailable candidate creation mask; refusing' >&2
+    exit 5
+  fi
+  printf -v candidate_mask '%04o' "$((8#$creation_mask | 8#22))"
+  ( umask "$candidate_mask"; mkdir -p "$CANDIDATE_DIR" )
+fi
+
+candidate_root_is_protected() {
+  [ ! -L "$CANDIDATE_DIR" ] && [ -d "$CANDIDATE_DIR" ] || return 1
+  local root_metadata root_uid root_mode
+  root_metadata="$(stat -c '%u %a' -- "$CANDIDATE_DIR")" || return 1
+  [[ "$root_metadata" =~ ^[0-9]+\ [0-7]{3,4}$ ]] || return 1
+  read -r root_uid root_mode <<< "$root_metadata"
+  [ "$root_uid" = 0 ] || [ "$root_uid" = "$(id -u)" ] || return 1
+  (( (8#$root_mode & 8#22) == 0 ))
+}
+if ! candidate_root_is_protected; then
+  echo 'unsafe candidate root before build; refusing without changing the live pointer' >&2
+  exit 5
 fi
 
 if ! "$BUILD_HOOK" "$CANDIDATE_DIR" "$@"; then
   echo "build_hook failed -- $LIVE_PATH left untouched, candidate preserved at $CANDIDATE_DIR" >&2
   exit 1
+fi
+
+# The build hook may have committed a migration. Refusal here leaves the file
+# pointer unchanged, but cannot promise that the DB is unchanged (same exit4
+# classification as a failed swap after a successful build).
+if ! candidate_root_is_protected; then
+  echo '::error::UNSAFE CANDIDATE AFTER SUCCESSFUL BUILD: live pointer unchanged; build/migration may already have committed. Candidate preserved; operator reconciliation required.' >&2
+  exit 4
 fi
 
 previous_target=""
