@@ -1,0 +1,109 @@
+name: Task11 proposed rolling Ubuntu22 ACL qualification
+
+on:
+  push:
+    branches: [codex/task11-acl-rolling-20261101-a2]
+
+permissions: {}
+
+concurrency:
+  group: task11-acl-rolling-20261101-a2
+  cancel-in-progress: false
+
+jobs:
+  qualify-two-acl-cases:
+    if: >-
+      github.repository == '3pacs/GRID' &&
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/task11-acl-rolling-20261101-a2' &&
+      github.event.created == true && github.event.deleted == false &&
+      github.event.forced == false && github.run_attempt == 1
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Verify already-provided disposable image and prerequisites
+        env:
+          ACL_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          test "$ACL_RUNNER_ENVIRONMENT" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test ! -e /home/runner/.netrc
+          test ! -L /home/runner/.netrc
+          for tool in python3 git setfacl getfacl cp stat flock; do
+            test -x "/usr/bin/$tool"
+          done
+          /usr/bin/python3 -I -B - <<'PYCODE'
+          from pathlib import Path
+          rows=[list(map(int,line.split())) for line in Path('/proc/self/uid_map').read_text().splitlines()]
+          assert rows and all(len(r)==3 and r[2]>0 for r in rows)
+          assert any(start<=2001<start+count for start,host,count in rows)
+          PYCODE
+      - name: Anonymous exact-commit checkout, no Actions or credentials
+        id: checkout
+        run: |
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
+          root="$RUNNER_TEMP/task11-acl-checkout-$GITHUB_RUN_ID-1"
+          test ! -e "$root"
+          test ! -L "$root"
+          mkdir -m 0700 -- "$root"
+          printf '%s\n' "$GITHUB_RUN_ID" > "$root/.task11-owned"
+          printf 'ACL_CHECKOUT_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+          export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+          export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false
+          export GIT_LFS_SKIP_SMUDGE=1 GIT_NO_REPLACE_OBJECTS=1
+          public_git() {
+            /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+              GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+              GIT_LFS_SKIP_SMUDGE=1 GIT_NO_REPLACE_OBJECTS=1 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c core.fsmonitor=false -c submodule.recurse=false "$@"
+          }
+          public_git -C "$root" init -q
+          /usr/bin/timeout --signal=TERM --kill-after=2s 60s \
+            /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null \
+            GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/false \
+            GIT_LFS_SKIP_SMUDGE=1 GIT_NO_REPLACE_OBJECTS=1 \
+            /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false -c submodule.recurse=false -C "$root" \
+            fetch --no-tags --depth=1 https://github.com/3pacs/GRID.git "$GITHUB_SHA"
+          public_git -C "$root" checkout --detach -q FETCH_HEAD
+          test "$(public_git -C "$root" rev-parse HEAD)" = "$GITHUB_SHA"
+      - name: Run exactly two pinned ACL cases, require no skips
+        env:
+          ACL_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: |
+          cd "$ACL_CHECKOUT_ROOT"
+          test "$(sha256sum ci/task11_acl/qualify.py | cut -d' ' -f1)" = ea90a58177b29d07d0c11685bf080086fcc90974f84636e7af92b37c9e0ce0df
+          /usr/bin/timeout --signal=TERM --kill-after=2s 40s \
+            /usr/bin/python3 -I -B ci/task11_acl/qualify.py --qualify \
+            "$ACL_CHECKOUT_ROOT" "$ACL_CHECKOUT_ROOT.acl-results"
+      - name: Remove only this run's owned checkout and result files
+        if: ${{ always() && steps.checkout.outcome != 'skipped' }}
+        run: |
+          /usr/bin/python3 -I -B - <<'PYCODE'
+          import json,os,shutil,stat
+          from pathlib import Path
+          run=os.environ['GITHUB_RUN_ID']
+          assert run.isdecimal() and os.environ['GITHUB_RUN_ATTEMPT']=='1'
+          parent=Path(os.environ['RUNNER_TEMP']);root=parent/('task11-acl-checkout-'+run+'-1')
+          assert parent.resolve()==parent and parent.is_dir()
+          if root.exists() or root.is_symlink():
+              st=root.lstat()
+              assert stat.S_ISDIR(st.st_mode) and not root.is_symlink() and st.st_uid==os.geteuid()
+              assert (root/'.task11-owned').read_text()==run+'\n'
+              results=Path(str(root)+'.acl-results')
+              if results.exists() or results.is_symlink():
+                  rs=results.lstat();assert stat.S_ISDIR(rs.st_mode) and not results.is_symlink() and rs.st_uid==os.geteuid()
+                  shutil.rmtree(results)
+              shutil.rmtree(root)
+          assert not root.exists() and not Path(str(root)+'.acl-results').exists()
+          print('OWNED_CI_CHECKOUT_CLEANUP '+json.dumps({'complete':True}))
+          PYCODE

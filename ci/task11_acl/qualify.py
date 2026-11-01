@@ -1,13 +1,13 @@
 """Exact two-case disposable hosted ACL qualifier; no app/DB/provider imports."""
 import base64,hashlib,importlib.util,json,os,platform,re,selectors,signal,stat,subprocess,sys,time,unittest
 from pathlib import Path
-PARENT='5bb533e58da29f6fda5bf71fac3e8568f4db6aba'
-BRANCH='codex/task11-acl-only-20261031-a1'
-IMAGE='20261026.341.1'
+PARENT='77b1e50addcc3e1de969be88c4f7896280b4fc8a'
+BRANCH='codex/task11-acl-rolling-20261101-a2'
+IMAGE_SCOPE='rolling-ubuntu-22.04-platform-header-required'
 NAMES=('test_copied_explicit_source_acl_preserved','test_fresh_default_acl_safe_or_prebuild_refusal')
 IDS=tuple('RootModeTests.'+n for n in NAMES)
 EXPECTED_SOURCE={'scripts/deploy_release_swap.sh': '4806bf3b3ebbfdf9aa37be35b80589b307d827e81d93c8fd579fa36de4716ad0', 'scripts/deploy_release_rollback.sh': '1c58de5e5f42c7183f4e4154733bfbf2efe2ab1614942fe0029ce1184a506850', 'tests/deploy/test_deploy_release_root_modes.py': '0f9f4a224e5f37a8c1b8461f346133629a8b167d2e05df98be3f8dff07535b18'}
-EXPECTED_WORKFLOWS={'.github/workflows/claude-code-review.yml': 'd414367e6e5ab016f8c1a66633a63efbf45ca2a2accca2b526bbbdfac678b7cb', '.github/workflows/claude.yml': '8a384c6695a4b0e9f572a2518e411cb99f7907de7c0601a6e89c74fa4eccd301', '.github/workflows/dad-smoke.yml': '8a8e604f8360a6ed217d4645ec4a1acf51c85ff6eaae439b3419e9c1c00740ba', '.github/workflows/deploy.yml': 'a1460cf95694a9c7ff9ea4af903ee6064ecdab0089df5a95f96a40404085dca2', '.github/workflows/evals-freeze.yml': '20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7', '.github/workflows/gemini-task.yml': 'f958e99c53adf7e04a81470a3a1da79bd026e98ac752671a4174678ddb87ee0d', '.github/workflows/oct25-native-compatibility.yml': '731882dbdbb5e6ac0965538c485a476ff6a5719a7f9dd83ac25d84afa31be34a', '.github/workflows/ops-bringup.yml': '25f5fea92a8a36b69b6f0130db46dc36295d5f4be07fa6cba20cc0b4f9d07c0e', '.github/workflows/ops-exec.yml': '3e074c7240188f9a19ac4bc82e9a39defec37cda6044a60aa9f79dd7f007958a', '.github/workflows/python-floor-qualification.yml': 'd0d37e95eeb5e56029f4b9db04716d886bd2ed9aa6be786e89821acb50f797c1', '.github/workflows/quiver-synthetic-pg.yml': '2d62583afc4fb5a2060e1fddffe3801cb1903ab6bd5d4bc766307649151ce198', '.github/workflows/test.yml': '61096e7f3f97d01fa575595bc24423222de95137aca8379bbd3062b2ca86ad71'}
+EXPECTED_WORKFLOWS={'.github/workflows/task11-acl-only.yml': '22ecffc4e6c028d24c18db3165c9a4d488e4e579c3c3f73df6cb123da6b5e46a','.github/workflows/claude-code-review.yml': 'd414367e6e5ab016f8c1a66633a63efbf45ca2a2accca2b526bbbdfac678b7cb', '.github/workflows/claude.yml': '8a384c6695a4b0e9f572a2518e411cb99f7907de7c0601a6e89c74fa4eccd301', '.github/workflows/dad-smoke.yml': '8a8e604f8360a6ed217d4645ec4a1acf51c85ff6eaae439b3419e9c1c00740ba', '.github/workflows/deploy.yml': 'a1460cf95694a9c7ff9ea4af903ee6064ecdab0089df5a95f96a40404085dca2', '.github/workflows/evals-freeze.yml': '20a1a5cd825e42388188035d2ffd84b80f049c20c158763dd05a760048d17cc7', '.github/workflows/gemini-task.yml': 'f958e99c53adf7e04a81470a3a1da79bd026e98ac752671a4174678ddb87ee0d', '.github/workflows/oct25-native-compatibility.yml': '731882dbdbb5e6ac0965538c485a476ff6a5719a7f9dd83ac25d84afa31be34a', '.github/workflows/ops-bringup.yml': '25f5fea92a8a36b69b6f0130db46dc36295d5f4be07fa6cba20cc0b4f9d07c0e', '.github/workflows/ops-exec.yml': '3e074c7240188f9a19ac4bc82e9a39defec37cda6044a60aa9f79dd7f007958a', '.github/workflows/python-floor-qualification.yml': 'd0d37e95eeb5e56029f4b9db04716d886bd2ed9aa6be786e89821acb50f797c1', '.github/workflows/quiver-synthetic-pg.yml': '2d62583afc4fb5a2060e1fddffe3801cb1903ab6bd5d4bc766307649151ce198', '.github/workflows/test.yml': '61096e7f3f97d01fa575595bc24423222de95137aca8379bbd3062b2ca86ad71'}
 class Refused(Exception):pass
 
 def mapped(text,uid=2001):
@@ -55,7 +55,7 @@ def verify_source(root):
   f=root/rel
   if f.is_symlink() or hashlib.sha256(f.read_bytes()).hexdigest()!=digest:raise Refused('SOURCE_HASH')
  actual={p.relative_to(root).as_posix() for p in (root/'.github/workflows').iterdir() if p.suffix in ('.yml','.yaml')}
- if actual!=set(EXPECTED_WORKFLOWS)|{'.github/workflows/task11-acl-only.yml'}:raise Refused('WORKFLOW_SET')
+ if actual!=set(EXPECTED_WORKFLOWS)|{'.github/workflows/task11-acl-rolling.yml'}:raise Refused('WORKFLOW_SET')
  for rel,digest in EXPECTED_WORKFLOWS.items():
   if hashlib.sha256((root/rel).read_bytes()).hexdigest()!=digest:raise Refused('OTHER_WORKFLOW_DRIFT')
 
@@ -135,7 +135,9 @@ def capture(argv,env,budget=30):
   if primary is not None and sys.exc_info()[1] is None:raise primary
 
 def parent(root,results):
- if os.environ.get('ACL_RUNNER_ENVIRONMENT')!='github-hosted' or os.environ.get('RUNNER_OS')!='Linux' or os.environ.get('RUNNER_ARCH')!='X64' or os.environ.get('ImageOS')!='ubuntu22' or os.environ.get('ImageVersion')!=IMAGE:raise Refused('RUNNER_IMAGE')
+ if os.environ.get('ACL_RUNNER_ENVIRONMENT')!='github-hosted' or os.environ.get('RUNNER_OS')!='Linux' or os.environ.get('RUNNER_ARCH')!='X64':raise Refused('RUNNER_IMAGE')
+ os_release=platform.freedesktop_os_release()
+ if os_release.get('ID')!='ubuntu' or os_release.get('VERSION_ID')!='22.04':raise Refused('OS_RELEASE')
  if not mapped(Path('/proc/self/uid_map').read_text()):raise Refused('UID_2001_UNMAPPED')
  if not all(Path('/usr/bin/'+n).is_file() and os.access('/usr/bin/'+n,os.X_OK) for n in ('setfacl','getfacl','cp','stat','flock')):raise Refused('TOOLS_MISSING')
  if os.environ.get('GITHUB_EVENT_NAME')!='push' or os.environ.get('GITHUB_REF')!='refs/heads/'+BRANCH or os.environ.get('GITHUB_REPOSITORY')!='3pacs/GRID' or os.environ.get('GITHUB_RUN_ATTEMPT')!='1':raise Refused('EVENT_CONTEXT')
@@ -147,7 +149,7 @@ def parent(root,results):
  if parents!=[PARENT]:raise Refused('RECEIVING_PARENT')
  verify_source(root)
  results.mkdir(mode=0o700,exist_ok=False)
- facts=dict(protocol='task11.acl.preflight.v1',head=sha,tree=git(root,'rev-parse','HEAD^{tree}'),parent=PARENT,python=platform.python_version(),kernel=platform.release(),uid_map=Path('/proc/self/uid_map').read_text().strip(),image_os=os.environ['ImageOS'],image_version=os.environ['ImageVersion'],runner_environment='github-hosted',source_hashes=EXPECTED_SOURCE)
+ facts=dict(protocol='task11.acl.preflight.v1',head=sha,tree=git(root,'rev-parse','HEAD^{tree}'),parent=PARENT,python=platform.python_version(),kernel=platform.release(),uid_map=Path('/proc/self/uid_map').read_text().strip(),os_release={'ID':os_release['ID'],'VERSION_ID':os_release['VERSION_ID']},image_environment_untrusted={'ImageOS':os.environ.get('ImageOS'),'ImageVersion':os.environ.get('ImageVersion')},image_scope=IMAGE_SCOPE,runner_environment='github-hosted',source_hashes=EXPECTED_SOURCE)
  for name in ('setfacl','getfacl','cp','stat','bash'):
   r=subprocess.run(['/usr/bin/'+name,'--version'],capture_output=True,text=True,timeout=2)
   if r.returncode:raise Refused('TOOL_VERSION')
