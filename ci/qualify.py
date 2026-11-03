@@ -9,7 +9,7 @@ import re
 import stat
 import sys
 
-BRANCH = 'codex/task11-pr933-native-preflight-20261103-n2'
+BRANCH = 'codex/task11-pr933-native-preflight-20261103-n3'
 COLLECTOR_SHA = '8d0de6b38c5acf47ad2b83598c27ba30f94d3475283af01045c06c092088398f'
 CASE_SHA = '1f54b56848af809dd0174d687ded2148b3bd4353cf36df0c9b7a40c712bab566'
 CASE_COUNT = 14
@@ -26,11 +26,18 @@ PREREQUISITE_CODES = frozenset(('NONE', 'ANCESTOR_ACL', 'PREREQUISITE',
     'TIME_BOUND', 'CLEANUP_UNKNOWN', 'PREREQUISITE_SHAPE', 'PREREQUISITE_ERROR'))
 
 
+def acl_permitted(role: str, access: str, default: str) -> bool:
+    # A default ACL initializes direct children; HOME is not a creation parent.
+    # Unknown values and HOME access ACLs remain refused.
+    return (access == 'ABSENT' and
+            (default == 'ABSENT' or (role == 'HOME' and default == 'PRESENT')))
+
+
 def prerequisite_report(backend, module, root):
-    """Observe four fixed roles; extra ACL presence never enables fixtures.
+    """Observe four fixed roles; only HOME default ACL presence is permitted.
 
     Well-shaped ACL presence is permitted by the unchanged descriptor walker,
-    so it is safe to diagnose the remaining roles before enforcing absence.
+    so remaining roles can be diagnosed before enforcing the role-specific policy.
     A descriptor failure blocks all later roles: these paths form one chain.
     No observed ACL snapshot is promoted after a race or uncertain cleanup.
     """
@@ -54,7 +61,7 @@ def prerequisite_report(backend, module, root):
                     any(v not in ('ABSENT','PRESENT') for v in value['acl'].values())):
                 raise Refused('PREREQUISITE_SHAPE')
             a,d=value['acl']['access'],value['acl']['default']
-            passed=a==d=='ABSENT'
+            passed=acl_permitted(role,a,d)
             row.update(phase='FINAL_VERIFIED',status='PASS' if passed else 'FAIL',
                 code='NONE' if passed else 'ANCESTOR_ACL',access_acl=a,default_acl=d)
         except BaseException as exc:
@@ -76,7 +83,7 @@ def prerequisite_report(backend, module, root):
                 default_acl='UNKNOWN' if final_seen else 'UNRUN',causes=causes)
             blocker={'role':role,'code':code}
         rows.append(row)
-    report={'protocol':'pr933.native.prerequisites.v1','phase':'BEFORE_FIXTURES',
+    report={'protocol':'pr933.native.prerequisites.v2','phase':'BEFORE_FIXTURES',
         'directories':rows,'fixtures_allowed':all(r['status']=='PASS' for r in rows),
         'snapshot_atomic':False,'unsafe_descendants_read':False}
     screen_prerequisites(report)
@@ -86,7 +93,7 @@ def prerequisite_report(backend, module, root):
 def screen_prerequisites(record):
     """Exact four-role screen, closed provenance/status graph, max4096 bytes."""
     keys={'protocol','phase','directories','fixtures_allowed','snapshot_atomic','unsafe_descendants_read'}
-    if type(record) is not dict or set(record)!=keys or record['protocol']!='pr933.native.prerequisites.v1' or record['phase']!='BEFORE_FIXTURES':
+    if type(record) is not dict or set(record)!=keys or record['protocol']!='pr933.native.prerequisites.v2' or record['phase']!='BEFORE_FIXTURES':
         raise Refused('PREREQUISITE_SHAPE')
     if (record['snapshot_atomic'] is not False or record['unsafe_descendants_read'] is not False
             or type(record['fixtures_allowed']) is not bool or type(record['directories']) is not list
@@ -109,7 +116,7 @@ def screen_prerequisites(record):
         if row['phase']=='FINAL_VERIFIED':
             if row['access_acl'] not in ('ABSENT','PRESENT') or row['default_acl'] not in ('ABSENT','PRESENT') or row['causes']:
                 raise Refused('PREREQUISITE_SHAPE')
-            expected=('PASS','NONE') if row['access_acl']==row['default_acl']=='ABSENT' else ('FAIL','ANCESTOR_ACL')
+            expected=('PASS','NONE') if acl_permitted(role,row['access_acl'],row['default_acl']) else ('FAIL','ANCESTOR_ACL')
             if (row['status'],row['code'])!=expected:raise Refused('PREREQUISITE_SHAPE')
         else:
             expected={'FINAL_UNVERIFIED':('FAIL','UNKNOWN'),'NOT_OBSERVED':('BLOCKED','UNRUN')}.get(row['phase'])
@@ -132,6 +139,67 @@ def require_prerequisites(backend,module,root,emit):
             raise Refused('ANCESTOR_PREREQUISITE')
         raise Refused('ANCESTOR_ACL')
     return record
+
+
+def create_fixture_root(backend, module, root) -> tuple:
+    """Create only fixtures beneath a held, freshly checked checkout FD.
+
+    The unchanged backend rechecks every ancestor/name and closes its own FDs.
+    Creating a child legitimately changes checkout timestamps/size/link count;
+    its identity, owner, group, type and mode must remain identical. The full
+    post-creation snapshot is revalidated by the descriptor walker. No native
+    case may run until new-directory ACLs and all descriptor cleanup pass.
+    """
+    if not re.fullmatch(r'/home/runner/task11-pr933-checkout-[1-9][0-9]{0,19}-1',str(root)):
+        raise Refused('CHECKOUT_LOCATION')
+    owned=str(root/'fixtures')
+    roles={'/home':'HOME','/home/runner':'RUNNER_HOME',str(root):'CHECKOUT',owned:'FIXTURES'}
+    seen={}; parent_fd=None; child_fd=None
+
+    def observe(row):
+        path=row['path']
+        if path in roles:
+            if row['failures'] or row['descent_blocked']:
+                raise Refused('CREATION_PREREQUISITE')
+            acl=row['acl']
+            if not acl_permitted(roles[path],acl['access'],acl['default']):
+                raise Refused('CREATION_ACL')
+            seen[path]=row
+
+    try:
+        with backend.bound(str(root),'DIRECTORY',observe) as (fd,row):
+            before=row['metadata']
+            if before['uid']!=backend.uid or before['mode']!=0o700:
+                raise Refused('CREATION_PARENT')
+            parent_fd=os.dup(fd)
+        backend.budget.tick()
+        if module.snapshot(os.fstat(parent_fd))!=before:
+            raise Refused('CREATION_RACE')
+        # No absolute-path mkdir, no replacement, no ACL or mode repair.
+        os.mkdir('fixtures',0o700,dir_fd=parent_fd)
+        child_fd=os.open('fixtures',os.O_PATH|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent_fd)
+        created=module.snapshot(os.fstat(child_fd))
+        if created['kind']!='DIRECTORY' or created['uid']!=backend.uid or created['mode']!=0o700:
+            raise Refused('CREATION_IDENTITY')
+        seen.clear()
+        with backend.bound(owned,'DIRECTORY',observe) as (_,row):
+            parent=seen[str(root)]['metadata']
+            stable=('kind','uid','gid','mode','device','inode')
+            if any(parent[k]!=before[k] for k in stable):
+                raise Refused('CREATION_RACE')
+            if (module.snapshot(os.fstat(parent_fd))!=parent or
+                    module.snapshot(os.fstat(child_fd))!=created or
+                    module.snapshot(os.stat('fixtures',dir_fd=parent_fd,follow_symlinks=False))!=created or
+                    row['metadata']!=created):
+                raise Refused('CREATION_RACE')
+        return created['device'],created['inode'],created['uid']
+    finally:
+        uncertain=False
+        for fd in (child_fd,parent_fd):
+            if fd is not None:
+                try:backend.close(fd)
+                except BaseException:uncertain=True
+        if uncertain:raise Refused('CREATION_CLEANUP_UNKNOWN')
 
 
 def emit_record(record,state):
@@ -222,8 +290,11 @@ def main():
         backend=m.Metadata(m.Budget(),uid=uid)
         require_prerequisites(backend,m,root,emit)
         cases=load(root/'ci/native_cases.py','native_cases',CASE_SHA)
-        owned=root/'fixtures'; owned.mkdir(mode=0o700)
-        st=owned.lstat();identity=(st.st_dev,st.st_ino,st.st_uid)
+        owned=root/'fixtures'
+        identity=create_fixture_root(backend,m,root)
+        emit({'protocol':'pr933.native.fixture-root.v1','creation_parent':'CHECKOUT',
+              'descriptor_bound_creation':True,'new_fixture_acl_absent':True,
+              'identity_verified':True,'descriptor_cleanup':True})
         violations=[]
         def audit(event,args):
             if event.startswith('socket.') or event in ('os.system','os.exec','os.posix_spawn','os.chown'):
