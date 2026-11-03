@@ -1,0 +1,102 @@
+name: Task11 PR933 native metadata fixture qualification
+
+on:
+  push:
+    branches: [codex/task11-pr933-native-preflight-20261103-n1]
+
+permissions: {}
+concurrency:
+  group: task11-pr933-native-preflight-20261103-n1
+  cancel-in-progress: false
+
+jobs:
+  native-fixtures:
+    if: >-
+      github.repository == '3pacs/GRID' && github.event_name == 'push' &&
+      github.ref == 'refs/heads/codex/task11-pr933-native-preflight-20261103-n1' &&
+      github.event.created == true && github.event.deleted == false &&
+      github.event.forced == false && github.run_attempt == 1
+    runs-on: ubuntu-22.04
+    timeout-minutes: 3
+    defaults:
+      run:
+        shell: bash --noprofile --norc -euo pipefail {0}
+    steps:
+      - name: Check prerequisites and anonymously check out this exact public commit
+        id: checkout
+        env:
+          QUALIFICATION_RUNNER: ${{ runner.environment }}
+        run: |
+          test "$QUALIFICATION_RUNNER" = github-hosted
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$GITHUB_RUN_ATTEMPT" = 1
+          test ! -e /home/runner/.netrc
+          test ! -L /home/runner/.netrc
+          for tool in python3 git timeout setfacl getfacl; do test -x "/usr/bin/$tool"; done
+          /usr/bin/python3 -I -B - <<'PY'
+          import os,re,stat
+          run=os.environ['GITHUB_RUN_ID']
+          assert re.fullmatch('[1-9][0-9]{0,19}',run)
+          assert os.geteuid() not in (0,65534)
+          for p in ('/','/home','/home/runner'):
+              s=os.lstat(p)
+              assert stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.geteuid()) and not s.st_mode & 0o7022
+          root='/home/runner/task11-pr933-checkout-'+run+'-1'
+          os.mkdir(root,0o700)
+          fd=os.open(root+'/.task11-owned',os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+          try: os.write(fd,(run+'\n').encode())
+          finally: os.close(fd)
+          PY
+          root="/home/runner/task11-pr933-checkout-$GITHUB_RUN_ID-1"
+          public_git() {
+            /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+              GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+              GIT_ASKPASS=/bin/false GIT_LFS_SKIP_SMUDGE=1 GIT_NO_REPLACE_OBJECTS=1 \
+              /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+              -c core.fsmonitor=false -c submodule.recurse=false "$@"
+          }
+          public_git -C "$root" init -q
+          /usr/bin/timeout --signal=TERM --kill-after=2s 60s \
+            /usr/bin/env -i PATH=/usr/bin:/bin LANG=C LC_ALL=C \
+            GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 \
+            GIT_ASKPASS=/bin/false GIT_LFS_SKIP_SMUDGE=1 GIT_NO_REPLACE_OBJECTS=1 \
+            /usr/bin/git -c credential.helper= -c core.hooksPath=/dev/null \
+            -c core.fsmonitor=false -c submodule.recurse=false -C "$root" \
+            fetch --no-tags --depth=1 https://github.com/3pacs/GRID.git "$GITHUB_SHA" >/dev/null 2>&1
+          public_git -C "$root" checkout --detach -q FETCH_HEAD
+          test "$(public_git -C "$root" rev-parse HEAD)" = "$GITHUB_SHA"
+          printf 'CHECKOUT_HEAD %s\n' "$(public_git -C "$root" rev-parse HEAD)"
+          printf 'CHECKOUT_TREE %s\n' "$(public_git -C "$root" rev-parse 'HEAD^{tree}')"
+          test "$(public_git -C "$root" ls-tree -r --name-only HEAD)" = "$(printf '%s\n' .github/workflows/task11-pr933-native.yml ci/metadata_preflight.py ci/native_cases.py ci/qualify.py)"
+      - name: Run the fourteen pinned synthetic cases and require zero skips
+        env:
+          QUALIFICATION_RUNNER: ${{ runner.environment }}
+        run: |
+          root="/home/runner/task11-pr933-checkout-$GITHUB_RUN_ID-1"
+          test "$(sha256sum "$root/ci/qualify.py" | cut -d' ' -f1)" = 49f008e8c174ff5dabc2d169933dbc158b5fda89a86db9a115f499247686336c
+          /usr/bin/timeout --signal=TERM --kill-after=2s 40s \
+            /usr/bin/python3 -I -B "$root/ci/qualify.py"
+      - name: Clean only the owned disposable checkout and fixtures
+        if: ${{ always() && steps.checkout.outcome != 'skipped' }}
+        run: |
+          /usr/bin/timeout --signal=TERM --kill-after=2s 15s /usr/bin/python3 -I -B - <<'PY'
+          import json,os,re,shutil,stat
+          run=os.environ['GITHUB_RUN_ID']
+          assert re.fullmatch('[1-9][0-9]{0,19}',run) and os.environ['GITHUB_RUN_ATTEMPT']=='1'
+          root='/home/runner/task11-pr933-checkout-'+run+'-1'
+          assert shutil.rmtree.avoids_symlink_attacks
+          for p in ('/','/home','/home/runner'):
+              s=os.lstat(p);assert stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.geteuid()) and not s.st_mode & 0o7022
+          if os.path.lexists(root):
+              s=os.lstat(root);assert stat.S_ISDIR(s.st_mode) and s.st_uid==os.geteuid() and not s.st_mode&0o077
+              fd=os.open(root+'/.task11-owned',os.O_RDONLY|os.O_NOFOLLOW)
+              try:
+                  t=os.fstat(fd);assert stat.S_ISREG(t.st_mode) and t.st_uid==os.geteuid() and t.st_nlink==1
+                  assert os.read(fd,128)==(run+'\n').encode()
+              finally:os.close(fd)
+              assert (os.lstat(root).st_dev,os.lstat(root).st_ino)==(s.st_dev,s.st_ino)
+              shutil.rmtree(root)
+          assert not os.path.lexists(root)
+          print('OWNED_CHECKOUT_CLEANUP '+json.dumps({'complete':True}))
+          PY
