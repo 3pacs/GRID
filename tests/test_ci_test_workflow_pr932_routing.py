@@ -93,7 +93,16 @@ def _templates(predicate: str) -> dict[str, str]:
     }
 
 
-CANDIDATE = _templates(f"({PRIOR_ALTERNATIVES} || {PR932_CONJUNCTION})")
+# The #933 source proposal adds an independent conjunction; #932 controls below
+# continue testing its own routing and all its original negative cases.
+PR933_CONJUNCTION = (
+    "(github.event_name == 'pull_request' && github.repository == '3pacs/GRID' "
+    "&& github.event.pull_request.number == 933 "
+    "&& github.event.pull_request.head.repo.full_name == '3pacs/GRID' "
+    "&& github.event.pull_request.base.ref == 'main' "
+    "&& github.head_ref == 'claude/release-dir-mode-0755-20261031')"
+)
+CANDIDATE = _templates(f"(({PRIOR_ALTERNATIVES} || {PR932_CONJUNCTION}) || {PR933_CONJUNCTION})")
 BASELINE = _templates(PRIOR_ALTERNATIVES)
 
 
