@@ -56,6 +56,18 @@ class Settings(BaseSettings):
     BLS_API_KEY: str = ""
     TIINGO_API_KEY: str = ""
 
+    # Schwab Trader API app "GRID" (Market Data Production, OAuth scope
+    # readonly). Both keys default empty: ingestion/schwab_market.py logs a
+    # warning and stays disabled when they are missing. When the env fields
+    # are blank the client falls back to SCHWAB_CREDENTIALS_FILE (the local
+    # helper's file, mode 0600). Tokens are never stored in .env; the token
+    # file is rewritten by the client on refresh (0600). Read-only market
+    # data only -- no account, position or order endpoints exist in GRID.
+    SCHWAB_APP_KEY: str = ""
+    SCHWAB_APP_SECRET: str = ""
+    SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
+    SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
 
@@ -925,6 +937,7 @@ class Settings(BaseSettings):
             "EIA_API_KEY": self.EIA_API_KEY,
             "GDELT_API_KEY": self.GDELT_API_KEY,
             "WORLDNEWS_API_KEY": self.WORLDNEWS_API_KEY,
+            "SCHWAB_APP_KEY": self.SCHWAB_APP_KEY,
         }
         return {k: bool(v) for k, v in keys.items()}
 
