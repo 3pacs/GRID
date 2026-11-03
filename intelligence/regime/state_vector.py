@@ -881,9 +881,19 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
             # No fill is the pre-R4 behaviour: VIXCLS as known, however late.
             log.debug("state_vector: VIX gap fill skipped for {dt}: {e}", dt=as_of, e=str(exc))
     norm_stats = _get_normalization_stats(engine, as_of, reader)
+    vix_unavailable = False
     if vix_series != VIX_SERIES:
         # The fallback is z-scored against its own history, never VIXCLS's.
-        fallback_stats = _series_norm_stats(reader, vix_series)
+        try:
+            fallback_stats = _series_norm_stats(reader, vix_series)
+        except Exception as exc:
+            # The fallback is optional: a failed read of its history leaves
+            # the VIX dims unavailable (as pre-R4 with no VIX source), not the
+            # whole vector. Without its stats they cannot be z-scored.
+            log.debug("state_vector: VIX fallback stats unavailable for {dt}: {e}", dt=as_of, e=str(exc))
+            fallback_stats = None
+            vix_unavailable = True
+            vix_basis = None
         if fallback_stats is not None:
             norm_stats = {**norm_stats, vix_series: fallback_stats}
     spy_prices, price_basis = _fetch_spy_prices(engine, as_of)
@@ -892,6 +902,9 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
 
     for dim in STATE_DIMENSIONS:
         if dim.series_id == VIX_SERIES:
+            if vix_unavailable:
+                values.append(None)
+                continue
             dim = replace(dim, series_id=vix_series)
         try:
             # Same accepted 2520-day series drives value and stale age.

@@ -763,7 +763,7 @@ def test_long_stale_vixcls_gap_is_filled_without_a_length_bound(engine):
     """[unknown] A 10-week VIXCLS outage is filled end to end from Cboe; no max-gap rule exists.
 
     VIXCLS stops 2025-03-31 but still has >= min_history known closes, so it
-    stays the basis and its whole trailing gap (49 weekdays) comes from
+    stays the basis and its whole trailing gap (50 weekdays) comes from
     Cboe; the VIX dims are then not stale and carry the hybrid label.
     Contract question: should a gap this long switch to the whole-series
     fallback (Cboe-normalized) or be flagged, rather than fill a VIXCLS
@@ -959,31 +959,48 @@ def test_persistent_vixcls_window_failure_leaves_label_and_dims_unavailable(engi
     assert _vix_dims(sv) == (None, None)
 
 
-def test_whole_fallback_normalization_read_failure_aborts_the_vector(engine, monkeypatch):
-    """[unknown] A failing Cboe 10000-day read in whole fallback raises out of compute_state_vector.
+def test_whole_fallback_normalization_read_failure_keeps_other_dimensions(engine, monkeypatch):
+    """[positive] Regression (U5): a failing Cboe normalization read in whole fallback degrades only the VIX dims.
 
-    VIXCLS is absent; the Cboe value window reads fine, its normalization
-    read raises. Pre-R4 this vector (no VIX source) would have been returned
-    with the VIX dims None; now the whole vector raises, whereas the hybrid
-    path swallows backup-read failures. Reviews of ae990424 / 7e0c0d7f list
-    this as "not newly exercised ... universal graceful degradation is not
-    claimed". Contract question: should an optional backup normalization
-    failure degrade to VIX dims None (label None) instead of aborting?
-    Pinned as current behaviour, not endorsed.
+    VIXCLS is absent; the Cboe value window reads fine and its normalization
+    read raises. On 7e0c0d7f / e4bc1c69 the whole vector raised, while pre-R4
+    (no VIX source) returned the other dimensions with the VIX dims None.
+    The optional fallback must not add that failure dependency: VIX dims and
+    the basis label are unavailable (None), and every other dimension equals
+    the vector computed with no VIX source at all.
     """
     import intelligence.regime.state_vector as sv_mod
 
+    _seed(engine, "T10Y2Y", FRED_SRC, lambda d: 0.5 + 0.3 * math.sin(d.toordinal() / 17.0),
+          end=date(2025, 6, 9))
+    no_vix_source = sv_mod.compute_state_vector(engine, AS_OF)  # pre-R4 shape: no VIX history
+    assert no_vix_source.vix_basis is None
+    assert _vix_dims(no_vix_source) == (None, None)
+
     _seed(engine, "CBOE:VIX", CBOE_SRC, _cboe, end=date(2025, 12, 31))
+    usable = sv_mod.compute_state_vector(engine, AS_OF)
+    assert usable.vix_basis == "CBOE:VIX"  # whole fallback selected when reads succeed
+    assert all(v is not None for v in _vix_dims(usable))
+
     real = sv_mod._fetch_series
+    calls = []
 
     def failing(engine, sid, as_of, lookback_days=sv_mod.VALUE_LOOKBACK_DAYS):
         if sid == "CBOE:VIX" and lookback_days == sv_mod.NORM_LOOKBACK_DAYS:
+            calls.append(sid)
             raise RuntimeError("synthetic Cboe normalization read failure")
         return real(engine, sid, as_of, lookback_days)
 
     monkeypatch.setattr(sv_mod, "_fetch_series", failing)
-    with pytest.raises(RuntimeError, match="normalization read failure"):
-        sv_mod.compute_state_vector(engine, AS_OF)
+    sv = sv_mod.compute_state_vector(engine, AS_OF)
+
+    assert calls == ["CBOE:VIX"]
+    assert sv.vix_basis is None
+    assert _vix_dims(sv) == (None, None)
+    assert sv.values == no_vix_source.values
+    assert sv.completeness == no_vix_source.completeness
+    assert sv.stale_dimensions == no_vix_source.stale_dimensions
+    assert any(v is not None for v in sv.values)  # the other dimensions really are present
 
 
 def test_transient_vix_basis_failure_still_labels_the_vixcls_vector(engine, monkeypatch):
