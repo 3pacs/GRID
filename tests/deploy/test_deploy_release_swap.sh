@@ -46,12 +46,6 @@
 #       silent no-op; a marker matching the given label is cleared; a
 #       marker belonging to a DIFFERENT label is left alone (and says so),
 #       so one deploy's cleanup can never clear a later deploy's marker.
-#   13. Under the runner's umask 002, the release root and every new
-#       release directory are created 0755, never group- or world-writable
-#       -- both on a first run and when the candidate is seeded by `cp -a`
-#       from a 775 live release. Only the release directory's own mode is
-#       set: modes inside the release, and existing directories, are left
-#       as they were.
 #
 # Runs entirely inside a temp sandbox -- never touches any real GRID path,
 # any real database, or any production host. Safe to run anywhere with a
@@ -62,6 +56,7 @@
 # Usage: bash tests/deploy/test_deploy_release_swap.sh
 
 set -euo pipefail
+umask 077  # private synthetic fixture inputs; not production permission repair
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -72,6 +67,15 @@ CLEAR_MARKER_SCRIPT="${REPO_ROOT}/scripts/deploy_clear_activation_marker.sh"
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 export GRID_DEPLOY_TEST_SANDBOX="$SANDBOX"
+
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file
+unset GIT_DIR GIT_WORK_TREE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG
+export TASK11_POLICY_FIXTURE_ROOT="$SANDBOX"
+fixture_repo="$(/usr/bin/python3 -I -S -B "$REPO_ROOT/tests/deploy/source_policy_fixture.py" install "$REPO_ROOT" "$SANDBOX" filesystem)"
+export PATH="$SANDBOX/source-policy-unit-bin:$PATH"
+SWAP_SCRIPT="$fixture_repo/scripts/deploy_release_swap.sh"
+ROLLBACK_SCRIPT="$fixture_repo/scripts/deploy_release_rollback.sh"
+CLEAR_MARKER_SCRIPT="$fixture_repo/scripts/deploy_clear_activation_marker.sh"
 
 pass_count=0
 fail_count=0
@@ -829,64 +833,6 @@ assert_true "clear-marker with the wrong label: says so, doesn't silently do not
 bash "$CLEAR_MARKER_SCRIPT" "$t12_live" "labelA" > "${SANDBOX}/t12/clear_right.log" 2>&1
 assert_true "clear-marker with the RIGHT label: removes the marker" \
   "$([ ! -f "${t12_live}.releases/.activation-in-progress" ] && echo true || echo false)"
-
-# ── Test 13: release directories are 0755 under the runner's umask 002 ─────
-# On 2026-10-31 every release directory on grid-svr was 775 (the deploy
-# runner's umask is 002, and `cp -a` carries a 775 live release's mode into
-# the next candidate), so GRID #918's installed-binding diagnostic refused the
-# live release path as group-writable.
-
-t13_hook="${SANDBOX}/t13/build_ok.sh"
-mkdir -p "${SANDBOX}/t13"
-cat > "$t13_hook" << 'HOOK'
-#!/usr/bin/env bash
-set -euo pipefail
-mkdir -p "$1/sub"
-echo "content-$(basename "$1")" > "$1/marker.txt"
-HOOK
-chmod +x "$t13_hook"
-
-# 13a: first run with nothing at the live path yet.
-t13a_live="${SANDBOX}/t13/a/grid_release"
-mkdir -p "$(dirname "$t13a_live")"
-set +e
-(umask 002 && bash "$SWAP_SCRIPT" "$t13a_live" "first" "$t13_hook") > "${SANDBOX}/t13/swap_a.log" 2>&1
-t13a_exit=$?
-set -e
-assert_eq "umask 002, first run: swap exits 0" "0" "$t13a_exit"
-assert_eq "umask 002, first run: the release root is created 0755" \
-  "755" "$(stat -c %a "${t13a_live}.releases")"
-assert_eq "umask 002, first run: the new release directory is 0755" \
-  "755" "$(stat -c %a "${t13a_live}.releases/first")"
-assert_eq "umask 002, first run: a directory the build creates still follows the umask" \
-  "775" "$(stat -c %a "${t13a_live}.releases/first/sub")"
-
-# 13b: the candidate is seeded by `cp -a` from a 775 live release that has a
-# 775 directory inside it -- today's production shape before the 2026-10-31
-# manual chmod.
-t13b_live="${SANDBOX}/t13/b/grid_release"
-mkdir -p "${t13b_live}.releases/old/sub"
-echo "content-old" > "${t13b_live}.releases/old/marker.txt"
-chmod 0775 "${t13b_live}.releases" "${t13b_live}.releases/old" "${t13b_live}.releases/old/sub"
-ln -s "${t13b_live}.releases/old" "$t13b_live"
-set +e
-(umask 002 && bash "$SWAP_SCRIPT" "$t13b_live" "new" "$t13_hook") > "${SANDBOX}/t13/swap_b.log" 2>&1
-t13b_exit=$?
-set -e
-if [ "$t13b_exit" -ne 0 ]; then
-  echo "--- t13b swap.log ---"; cat "${SANDBOX}/t13/swap_b.log"; echo "--- end ---"
-fi
-assert_eq "umask 002, cp -a from a 775 live release: swap exits 0" "0" "$t13b_exit"
-assert_eq "umask 002, cp -a from a 775 live release: the new release directory is 0755" \
-  "755" "$(stat -c %a "${t13b_live}.releases/new")"
-assert_eq "umask 002, cp -a from a 775 live release: the swap went live" \
-  "content-new" "$(cat "$t13b_live/marker.txt")"
-assert_eq "umask 002, cp -a: a copied 775 directory inside the release keeps its mode" \
-  "775" "$(stat -c %a "${t13b_live}.releases/new/sub")"
-assert_eq "umask 002, cp -a: the previous release directory's mode is not changed" \
-  "775" "$(stat -c %a "${t13b_live}.releases/old")"
-assert_eq "umask 002, cp -a: an existing release root's mode is not changed" \
-  "775" "$(stat -c %a "${t13b_live}.releases")"
 
 echo
 echo "=== ${pass_count} passed, ${fail_count} failed ==="

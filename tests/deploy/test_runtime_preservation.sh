@@ -1,10 +1,27 @@
 #!/usr/bin/env bash
 # Linux-only integration test. Uses a real process cwd and a fake systemctl.
 set -euo pipefail
+umask 077  # private synthetic fixture inputs; not production permission repair
 repo="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
 source_swap="$repo/scripts/deploy_release_swap.sh"
 box="$(mktemp -d)"
-trap 'kill "${scheduler_pid:-}" "${activated_pid:-}" "${realtime_pid:-}" "${deleted_pid:-}" 2>/dev/null || true; rm -rf "$box"' EXIT
+cleanup() {
+  local pid
+  for pid in "${scheduler_pid:-}" "${activated_pid:-}" "${realtime_pid:-}" "${deleted_pid:-}"; do
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || continue
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  rm -rf "$box"
+}
+trap cleanup EXIT
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file
+unset GIT_DIR GIT_WORK_TREE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG
+export TASK11_POLICY_FIXTURE_ROOT="$box"
+fixture_repo="$(/usr/bin/python3 -I -S -B "$repo/tests/deploy/source_policy_fixture.py" install "$repo" "$box" filesystem)"
+source_swap="$fixture_repo/scripts/deploy_release_swap.sh"
+cp "$fixture_repo/scripts/deploy_source_policy.py" "$fixture_repo/scripts/_production_source_policy.py" "$box/"
+export PATH="$box/source-policy-unit-bin:$PATH"
 live="$box/grid_release"
 root="${live}.releases"
 mkdir -p "$box/cgroup/scheduler" "$box/cgroup/realtime/workers" "$box/proc"
