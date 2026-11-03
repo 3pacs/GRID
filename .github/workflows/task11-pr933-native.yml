@@ -1,19 +1,19 @@
-name: Task11 PR933 native metadata fixture qualification
+name: Task11 PR933 native metadata fixture qualification N2
 
 on:
   push:
-    branches: [codex/task11-pr933-native-preflight-20261103-n1]
+    branches: [codex/task11-pr933-native-preflight-20261103-n2]
 
 permissions: {}
 concurrency:
-  group: task11-pr933-native-preflight-20261103-n1
+  group: task11-pr933-native-preflight-20261103-n2
   cancel-in-progress: false
 
 jobs:
   native-fixtures:
     if: >-
       github.repository == '3pacs/GRID' && github.event_name == 'push' &&
-      github.ref == 'refs/heads/codex/task11-pr933-native-preflight-20261103-n1' &&
+      github.ref == 'refs/heads/codex/task11-pr933-native-preflight-20261103-n2' &&
       github.event.created == true && github.event.deleted == false &&
       github.event.forced == false && github.run_attempt == 1
     runs-on: ubuntu-22.04
@@ -74,7 +74,7 @@ jobs:
           QUALIFICATION_RUNNER: ${{ runner.environment }}
         run: |
           root="/home/runner/task11-pr933-checkout-$GITHUB_RUN_ID-1"
-          test "$(sha256sum "$root/ci/qualify.py" | cut -d' ' -f1)" = 49f008e8c174ff5dabc2d169933dbc158b5fda89a86db9a115f499247686336c
+          test "$(sha256sum "$root/ci/qualify.py" | cut -d' ' -f1)" = 9aa58c5af2ed435e8a35b3d3d1849296c8aa26b2011d2389eaed4d8ca7e43369
           /usr/bin/timeout --signal=TERM --kill-after=2s 40s \
             /usr/bin/python3 -I -B "$root/ci/qualify.py"
       - name: Clean only the owned disposable checkout and fixtures

@@ -9,13 +9,136 @@ import re
 import stat
 import sys
 
-BRANCH = 'codex/task11-pr933-native-preflight-20261103-n1'
+BRANCH = 'codex/task11-pr933-native-preflight-20261103-n2'
 COLLECTOR_SHA = '8d0de6b38c5acf47ad2b83598c27ba30f94d3475283af01045c06c092088398f'
 CASE_SHA = '1f54b56848af809dd0174d687ded2148b3bd4353cf36df0c9b7a40c712bab566'
 CASE_COUNT = 14
 
 
 class Refused(Exception): pass
+
+
+DIRECTORY_ROLES = ('HOME', 'RUNNER_HOME', 'CHECKOUT', 'SOURCE')
+PREREQUISITE_CODES = frozenset(('NONE', 'ANCESTOR_ACL', 'PREREQUISITE',
+    'PATH_SYNTAX', 'PATH_LINK', 'PATH_TYPE', 'PATH_OWNER', 'GROUP_WRITE',
+    'OTHER_WRITE', 'SPECIAL_MODE', 'ACL_UNKNOWN', 'PATH_RACE', 'IO_ABSENT',
+    'IO_INACCESSIBLE', 'IO_OTHER', 'DEPTH_BOUND', 'ENTRY_BOUND', 'FINDING_BOUND',
+    'TIME_BOUND', 'CLEANUP_UNKNOWN', 'PREREQUISITE_SHAPE', 'PREREQUISITE_ERROR'))
+
+
+def prerequisite_report(backend, module, root):
+    """Observe four fixed roles; extra ACL presence never enables fixtures.
+
+    Well-shaped ACL presence is permitted by the unchanged descriptor walker,
+    so it is safe to diagnose the remaining roles before enforcing absence.
+    A descriptor failure blocks all later roles: these paths form one chain.
+    No observed ACL snapshot is promoted after a race or uncertain cleanup.
+    """
+    if not re.fullmatch(r'/home/runner/task11-pr933-checkout-[1-9][0-9]{0,19}-1',str(root)):
+        raise Refused('CHECKOUT_LOCATION')
+    paths=('/home','/home/runner',str(root),str(root/'ci'))
+    rows=[]; blocker=None
+    for role,path in zip(DIRECTORY_ROLES,paths):
+        row={'role':role,'phase':'NOT_ATTEMPTED','status':'BLOCKED',
+             'code':blocker['code'] if blocker else 'PREREQUISITE',
+             'access_acl':'UNRUN','default_acl':'UNRUN',
+             'blocked_by':[blocker['role']] if blocker else [],'causes':[]}
+        if blocker is not None:
+            rows.append(row);continue
+        observed=[]
+        try:
+            value=backend.inspect(path,'DIRECTORY',observed.append)
+            if (type(value) is not dict or value.get('path')!=path or
+                    value.get('failures')!=[] or value.get('descent_blocked') is not False or
+                    type(value.get('acl')) is not dict or set(value['acl'])!={'access','default'} or
+                    any(v not in ('ABSENT','PRESENT') for v in value['acl'].values())):
+                raise Refused('PREREQUISITE_SHAPE')
+            a,d=value['acl']['access'],value['acl']['default']
+            passed=a==d=='ABSENT'
+            row.update(phase='FINAL_VERIFIED',status='PASS' if passed else 'FAIL',
+                code='NONE' if passed else 'ANCESTOR_ACL',access_acl=a,default_acl=d)
+        except BaseException as exc:
+            if isinstance(exc,module.Refused): code=exc.code
+            elif isinstance(exc,OSError): code=module.io_code(exc)
+            elif isinstance(exc,Refused): code=str(exc)
+            else: code='PREREQUISITE_ERROR'
+            if code not in PREREQUISITE_CODES or code in ('NONE','ANCESTOR_ACL'):
+                code='PREREQUISITE_ERROR'
+            # Only closed error categories; no paths, ACL subjects, exception text
+            # or raw metadata leave this boundary. A failed walk is not stable.
+            final_seen=any(type(v) is dict and v.get('path')==path for v in observed)
+            causes=sorted({c for v in observed if type(v) is dict
+                for c in (v.get('failures') if type(v.get('failures')) is list else [])
+                if type(c) is str and c in PREREQUISITE_CODES-{'NONE','ANCESTOR_ACL'}})
+            row.update(phase='FINAL_UNVERIFIED' if final_seen else 'NOT_OBSERVED',
+                status='FAIL' if final_seen else 'BLOCKED',code=code,
+                access_acl='UNKNOWN' if final_seen else 'UNRUN',
+                default_acl='UNKNOWN' if final_seen else 'UNRUN',causes=causes)
+            blocker={'role':role,'code':code}
+        rows.append(row)
+    report={'protocol':'pr933.native.prerequisites.v1','phase':'BEFORE_FIXTURES',
+        'directories':rows,'fixtures_allowed':all(r['status']=='PASS' for r in rows),
+        'snapshot_atomic':False,'unsafe_descendants_read':False}
+    screen_prerequisites(report)
+    return report
+
+
+def screen_prerequisites(record):
+    """Exact four-role screen, closed provenance/status graph, max4096 bytes."""
+    keys={'protocol','phase','directories','fixtures_allowed','snapshot_atomic','unsafe_descendants_read'}
+    if type(record) is not dict or set(record)!=keys or record['protocol']!='pr933.native.prerequisites.v1' or record['phase']!='BEFORE_FIXTURES':
+        raise Refused('PREREQUISITE_SHAPE')
+    if (record['snapshot_atomic'] is not False or record['unsafe_descendants_read'] is not False
+            or type(record['fixtures_allowed']) is not bool or type(record['directories']) is not list
+            or len(record['directories'])!=4):raise Refused('PREREQUISITE_SHAPE')
+    blocker=None
+    for role,row in zip(DIRECTORY_ROLES,record['directories']):
+        if type(row) is not dict or set(row)!={'role','phase','status','code','access_acl','default_acl','blocked_by','causes'}:
+            raise Refused('PREREQUISITE_SHAPE')
+        if (row['role']!=role or type(row['code']) is not str or row['code'] not in PREREQUISITE_CODES
+                or type(row['phase']) is not str or type(row['causes']) is not list):
+            raise Refused('PREREQUISITE_SHAPE')
+        if (any(type(c) is not str or c not in PREREQUISITE_CODES-{'NONE','ANCESTOR_ACL'} for c in row['causes'])
+                or row['causes']!=sorted(set(row['causes']))):raise Refused('PREREQUISITE_SHAPE')
+        if blocker:
+            if (row['phase'],row['status'],row['code'],row['access_acl'],row['default_acl'],row['blocked_by'],row['causes']) != (
+                    'NOT_ATTEMPTED','BLOCKED',blocker['code'],'UNRUN','UNRUN',[blocker['role']],[]):
+                raise Refused('PREREQUISITE_SHAPE')
+            continue
+        if row['blocked_by']!=[]:raise Refused('PREREQUISITE_SHAPE')
+        if row['phase']=='FINAL_VERIFIED':
+            if row['access_acl'] not in ('ABSENT','PRESENT') or row['default_acl'] not in ('ABSENT','PRESENT') or row['causes']:
+                raise Refused('PREREQUISITE_SHAPE')
+            expected=('PASS','NONE') if row['access_acl']==row['default_acl']=='ABSENT' else ('FAIL','ANCESTOR_ACL')
+            if (row['status'],row['code'])!=expected:raise Refused('PREREQUISITE_SHAPE')
+        else:
+            expected={'FINAL_UNVERIFIED':('FAIL','UNKNOWN'),'NOT_OBSERVED':('BLOCKED','UNRUN')}.get(row['phase'])
+            if (expected is None or (row['status'],row['access_acl'])!=expected
+                    or row['default_acl']!=expected[1] or row['code'] in ('NONE','ANCESTOR_ACL')):
+                raise Refused('PREREQUISITE_SHAPE')
+            blocker={'role':role,'code':row['code']}
+    if record['fixtures_allowed']!=all(r['status']=='PASS' for r in record['directories']):
+        raise Refused('PREREQUISITE_SHAPE')
+    raw=(json.dumps(record,sort_keys=True,allow_nan=False,separators=(',',':'))+'\n').encode('ascii')
+    if len(raw)>4096:raise Refused('RESULT_BOUND')
+    return raw
+
+
+def require_prerequisites(backend,module,root,emit):
+    record=prerequisite_report(backend,module,root)
+    emit(record)
+    if not record['fixtures_allowed']:
+        if any(r['phase']!='FINAL_VERIFIED' for r in record['directories']):
+            raise Refused('ANCESTOR_PREREQUISITE')
+        raise Refused('ANCESTOR_ACL')
+    return record
+
+
+def emit_record(record,state):
+    raw=(json.dumps(record,sort_keys=True,allow_nan=False)+'\n').encode('ascii')
+    if state['bytes']+len(raw)>16384:raise Refused('OUTPUT_BOUND')
+    state['bytes']+=len(raw)
+    sys.stdout.buffer.write(raw);sys.stdout.buffer.flush()
 
 
 def decode(raw):
@@ -72,7 +195,8 @@ def load(path,name,digest):
 
 
 def main():
-    owned=None; identity=None; complete=False
+    owned=None; identity=None; complete=False; output_state={'bytes':0}
+    emit=lambda record:emit_record(record,output_state)
     try:
         if len(sys.argv)!=1 or not sys.flags.isolated or not sys.dont_write_bytecode: raise Refused('STARTUP')
         if platform.system()!='Linux' or sys.version_info[:2]!=(3,10): raise Refused('PYTHON_PLATFORM')
@@ -96,9 +220,7 @@ def main():
         m=load(root/'ci/metadata_preflight.py','native_backend',COLLECTOR_SHA)
         # Unchanged descriptor/predicate implementation; parameter is actual fixture UID.
         backend=m.Metadata(m.Budget(),uid=uid)
-        for p in ('/home','/home/runner',str(root),str(root/'ci')):
-            r=backend.inspect(p,'DIRECTORY',lambda _:None)
-            if r['acl']!={'access':'ABSENT','default':'ABSENT'}: raise Refused('ANCESTOR_ACL')
+        require_prerequisites(backend,m,root,emit)
         cases=load(root/'ci/native_cases.py','native_cases',CASE_SHA)
         owned=root/'fixtures'; owned.mkdir(mode=0o700)
         st=owned.lstat();identity=(st.st_dev,st.st_ino,st.st_uid)
@@ -124,13 +246,12 @@ def main():
             'image_scope':'rolling-ubuntu-22.04-platform-setup-header-required',
             'collector_sha256':COLLECTOR_SHA,'native_case_sha256':CASE_SHA,
             'fixed_production_profile_run':False,'fixture_cleanup':True}
-        raw=(json.dumps(facts,sort_keys=True)+'\n').encode()
-        if len(raw)>16384: raise Refused('OUTPUT_BOUND')
-        sys.stdout.buffer.write(raw);sys.stdout.buffer.flush();complete=True
+        emit(facts);complete=True
         return 0
     except BaseException as exc:
         code=str(exc) if isinstance(exc,Refused) else 'NATIVE_REFUSED'
-        print(json.dumps({'protocol':'pr933.native.refusal.v1','code':code,'qualified':False}),flush=True)
+        try:emit({'protocol':'pr933.native.refusal.v1','code':code,'qualified':False})
+        except BaseException:pass  # A full/broken output sink cannot manufacture success.
         return 2
     finally:
         # On failure retain fixture for the workflow's independently owned cleanup.
