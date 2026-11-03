@@ -66,7 +66,9 @@ from __future__ import annotations
 
 import errno
 import json
+import math
 import os
+import re
 import stat
 import tempfile
 import time
@@ -699,23 +701,63 @@ class SchwabMarketClient:
 def _normalise_expires_in(value: Any) -> int:
     try:
         seconds = int(value) if value is not None else DEFAULT_ACCESS_LIFETIME_SECONDS
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         seconds = DEFAULT_ACCESS_LIFETIME_SECONDS
-    return seconds if seconds > 0 else DEFAULT_ACCESS_LIFETIME_SECONDS
+    return seconds if 0 < seconds <= MAX_COUNT else DEFAULT_ACCESS_LIFETIME_SECONDS
+
+
+MAX_COUNT = 2**63 - 1  # counts/timestamps larger than int64 are treated as malformed
 
 
 def _as_float(v: Any) -> float | None:
-    try:
-        return None if v is None else float(v)
-    except (TypeError, ValueError):
+    """Finite float or ``None``. Booleans, non-finite values (JSON ``1e999``
+    parses as ``inf``) and unparsable inputs are ``None``; nothing raises."""
+    if v is None or isinstance(v, bool):
         return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+_INT_STRING = re.compile(r"[+-]?[0-9]+")
 
 
 def _as_int(v: Any) -> int | None:
-    try:
-        return None if v is None else int(v)
-    except (TypeError, ValueError):
+    """Non-negative integral count or ``None``; never raises.
+
+    * ``int`` (not ``bool``): exact.
+    * ``float``: only when finite and integral (``12.0`` -> 12); fractional
+      values are dropped, never truncated.
+    * ``str``: only a plain decimal integer (``"9007199254740993"``), parsed
+      with ``int()`` so no precision is lost through ``float``; decimal,
+      exponent, fractional or overflow strings are ``None``.
+    * anything else, negatives and values above int64 are ``None``.
+    """
+    if v is None or isinstance(v, bool):
         return None
+    try:
+        if isinstance(v, int):
+            n = v
+        elif isinstance(v, float):
+            if not math.isfinite(v) or v != int(v):
+                return None
+            n = int(v)
+        elif isinstance(v, str):
+            text = v.strip()
+            if not _INT_STRING.fullmatch(text):
+                return None
+            n = int(text)
+        else:
+            return None
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return n if 0 <= n <= MAX_COUNT else None
+
+
+def _as_str(v: Any) -> str | None:
+    return v if isinstance(v, str) else None
 
 
 def _summarise_errors(errors: Any) -> str:
@@ -757,27 +799,40 @@ def parse_quotes(body: Mapping[str, Any]) -> dict[str, SchwabQuote]:
     errors = body.get("errors")
     if errors:
         log.warning("Schwab quotes returned errors: {e}", e=_summarise_errors(errors))
+    skipped = 0
     for symbol, entry in body.items():
         if symbol == "errors" or not isinstance(entry, Mapping):
             continue
-        q = entry.get("quote") or {}
-        if not isinstance(q, Mapping):
-            q = {}
-        out[str(symbol)] = SchwabQuote(
-            symbol=str(entry.get("symbol") or symbol),
-            asset_main_type=entry.get("assetMainType"),
-            realtime=entry.get("realtime"),
-            last_price=_as_float(q.get("lastPrice")),
-            bid_price=_as_float(q.get("bidPrice")),
-            ask_price=_as_float(q.get("askPrice")),
-            bid_size=_as_int(q.get("bidSize")),
-            ask_size=_as_int(q.get("askSize")),
-            total_volume=_as_int(q.get("totalVolume")),
-            quote_time_ms=_as_int(q.get("quoteTime")),
-            trade_time_ms=_as_int(q.get("tradeTime")),
-            raw=entry,
-        )
+        try:
+            out[str(symbol)] = _parse_entry(str(symbol), entry)
+        except (TypeError, ValueError, OverflowError, ArithmeticError) as exc:
+            # One malformed entry must never lose the other symbols in the body.
+            skipped += 1
+            log.warning("Schwab quote entry skipped: {n}", n=type(exc).__name__)
+    if skipped:
+        log.warning("Schwab quotes: {k} entries skipped as malformed", k=skipped)
     return out
+
+
+def _parse_entry(symbol: str, entry: Mapping[str, Any]) -> SchwabQuote:
+    q = entry.get("quote") or {}
+    if not isinstance(q, Mapping):
+        q = {}
+    realtime = entry.get("realtime")
+    return SchwabQuote(
+        symbol=_as_str(entry.get("symbol")) or symbol,
+        asset_main_type=_as_str(entry.get("assetMainType")),
+        realtime=realtime if isinstance(realtime, bool) or realtime is None else None,
+        last_price=_as_float(q.get("lastPrice")),
+        bid_price=_as_float(q.get("bidPrice")),
+        ask_price=_as_float(q.get("askPrice")),
+        bid_size=_as_int(q.get("bidSize")),
+        ask_size=_as_int(q.get("askSize")),
+        total_volume=_as_int(q.get("totalVolume")),
+        quote_time_ms=_as_int(q.get("quoteTime")),
+        trade_time_ms=_as_int(q.get("tradeTime")),
+        raw=entry,
+    )
 
 
 __all__ = [

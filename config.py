@@ -67,6 +67,11 @@ class Settings(BaseSettings):
     SCHWAB_APP_SECRET: str = ""
     SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
     SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+    # Private admin-only quote endpoint (api/routers/schwab_private.py). Off by
+    # default: while False the router answers 503 and never touches the reader,
+    # credentials or the network. Turning it on is an operator decision made in a
+    # reviewed change; Schwab data is private and may not be redistributed.
+    SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
 
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
@@ -555,6 +560,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
         "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )
     @classmethod
