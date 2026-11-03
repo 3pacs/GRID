@@ -34,7 +34,10 @@ proposal does not authorize them or change their release sequence.
 `scripts/deploy_metadata_preflight.py` retains the reviewed self-contained
 source SHA256`8d0de6b38c5acf47ad2b83598c27ba30f94d3475283af01045c06c092088398f`.
 Its44mocked controls are relocated to `tests/deploy`; both source references
-in the test use the new location. The collector is standalone and is not wired
+in the test use the new location. The test audit fence is active only during
+its own test case, with context reset registered as cleanup, so importing the
+module cannot block unrelated repository tests. Four import/scope controls
+preserve that isolation and refusal of every protected event category. The collector is standalone and is not wired
 into automatic deployment or introduced as a new mandatory release gate.
 
 It aggregates33fixed path/runner metadata nodes, reports separate group/other

@@ -1,4 +1,5 @@
 import copy
+import contextvars
 import errno
 import importlib.util
 import io
@@ -16,8 +17,9 @@ P=Path(__file__).resolve().parents[2]
 spec=importlib.util.spec_from_file_location('candidate',P/'scripts/deploy_metadata_preflight.py')
 M=importlib.util.module_from_spec(spec);spec.loader.exec_module(M)
 EVENTS=[]
+BOUNDARY_ACTIVE=contextvars.ContextVar('metadata_test_boundary_active',default=False)
 def audit(event,args):
-    if event.startswith('socket.') or event in {'subprocess.Popen','os.system','os.exec','os.posix_spawn','os.chmod','os.chown','os.setxattr','os.kill','os.killpg'}:
+    if BOUNDARY_ACTIVE.get() and (event.startswith('socket.') or event in {'subprocess.Popen','os.system','os.exec','os.posix_spawn','os.chmod','os.chown','os.setxattr','os.kill','os.killpg'}):
         EVENTS.append(event);raise AssertionError('OFFLINE_BOUNDARY')
 sys.addaudithook(audit)
 
@@ -97,6 +99,9 @@ def raw_unit(**changes):
     return ('\n'.join(k+'='+v for k,v in d.items())+'\n').encode()
 
 class Tests(unittest.TestCase):
+    def setUp(self):
+        token=BOUNDARY_ACTIVE.set(True)
+        self.addCleanup(BOUNDARY_ACTIVE.reset,token)
     def tearDown(self):self.assertEqual(EVENTS,[])
     def collect(self,fs=None,unit=None,limits=None):
         fs=fs or filesystem();b=M.Budget(clock=lambda:1,limits=limits)
