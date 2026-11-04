@@ -785,10 +785,12 @@ _URL_QUERY_RE = re.compile(r"(https?://[^\s?#'\"<>]+)\?[^\s'\"<>)]*")
 # before the host so passwords containing "@" are covered too.
 _URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@")
 # key=value, key: value, "key": "value", 'key'='value' -- the key may be
-# quoted, and a quoted value is redacted whole (spaces included).
+# quoted, and a quoted value is redacted whole (spaces included). An
+# unterminated quote (pull_log truncates messages at 500 chars) is redacted
+# to the end of the text.
 _SECRET_ASSIGN_RE = re.compile(
     r"(?i)\b([a-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|auth)[a-z0-9_]*['\"]?\s*[=:]\s*)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s,&'\"}]+)"
+    r"(?:\"[^\"]*(?:\"|$)|'[^']*(?:'|$)|[^\s,&'\"}]+)"
 )
 _BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
 

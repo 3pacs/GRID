@@ -114,3 +114,11 @@ def test_redact_reason_dsn_and_json_forms():
     assert "abc def 123" not in r and '"series": "SOFR"' in r
     assert "zzz999" not in redact_reason("{'token': 'zzz999'}")
     assert "qqq777" not in redact_reason("access_token=qqq777&x=1")
+
+
+def test_redact_reason_unterminated_quote():
+    from scripts.hermes_health import redact_reason
+
+    assert "hunter2" not in redact_reason('bad login password="hunter2')
+    assert "hunter2 and more" not in redact_reason("cfg {'api_key': 'hunter2 and more")
+    assert redact_reason('password="x" ok').endswith(" ok")
