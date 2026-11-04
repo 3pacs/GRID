@@ -88,7 +88,10 @@ def project(fixers: Path, scheduler: Path, importer):
                 selected.append(node)
     exec(compile(ast.fix_missing_locations(ast.Module(body=selected, type_ignores=[])), "<actual-classifier>", "exec"), env)
     names = {"_FunctionPuller", "_resolve_puller", "_retry_source", "_next_repair_token",
-             "_thread_is_alive", "retry_not_fresh_reason", "_retry_target_matches"}
+             "_thread_is_alive", "retry_not_fresh_reason", "_retry_target_matches",
+             # api_key_mode-aware construction (2026-11-04).
+             "MissingRetryApiKey", "_lookup_retry_api_key", "_construct_retry_puller",
+             "NoRetryHandler"}
     selected = []
     for node in ast.parse(fixers.read_text()).body:
         if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in names:

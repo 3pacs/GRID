@@ -175,3 +175,31 @@ def test_stale_reader_cooling_prefix_does_not_consume_admitted_slots(monkeypatch
     assert retry.call_args.args[0] == source
     state.cooldowns.record_attempt.assert_not_called()
     engine.begin.assert_not_called()
+
+
+def test_stale_block_gives_slots_to_configured_sources_only(monkeypatch):
+    """2026-11-04: entries health marks ``not_configured`` (no key/token/SDK
+    on the latest pull_log row) must not take one of the 15 refresh slots;
+    a payload without the field behaves exactly as before."""
+    source, state, engine, active = _setup(monkeypatch)
+    monkeypatch.setattr(ho, "_STALE_NOT_ACTIONABLE_LOGGED", set())
+    monkeypatch.setattr(hf, "_DETERMINISTIC_SKIPS", {})
+    pulled = []
+
+    class Completed:
+        SOURCE_NAME = source
+        def pull(self):
+            pulled.append(source)
+            return {"status": "SUCCESS", "rows_inserted": 6}
+
+    def resolve(name, *_a):
+        if name != source:
+            pytest.fail(f"not-configured source {name} reached a retry")
+        return Completed(), "pull", {}
+
+    monkeypatch.setattr(hf, "_resolve_puller", resolve)
+    stale = [{"source": f"UNSET_{i}", "not_configured": True} for i in range(20)]
+    stale.append({"source": source})
+    assert _read("stale", source, state, engine, stale_sources=stale) == 1
+    assert pulled == [source]
+    state.cooldowns.record_attempt.assert_called_once()

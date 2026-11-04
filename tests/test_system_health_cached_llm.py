@@ -166,11 +166,13 @@ class CachedHealthTests(unittest.TestCase):
                     calls.append('forbidden_provider_probe')
                     raise RuntimeError('forbidden synthetic provider probe')
                 real_router = load_nodes(ROOT/'llm/router.py',
-                    ['Tier', '_gemma_or_default', '_fallback_chain', 'get_llm'],
+                    ['Tier', '_gemma_or_default', '_fallback_chain', '_fallback_warning', 'get_llm'],
                     {'Enum': Enum, '_client_cache': cache,
                      '_provider_in_backoff': lambda _: False,
                      '_create_client': forbidden_factory,
-                     'log': SimpleNamespace(warning=lambda *a, **k: None)})
+                     '_FALLBACK_WARNED': set(),
+                     'log': SimpleNamespace(warning=lambda *a, **k: None,
+                                            debug=lambda *a, **k: None)})
                 router.get_llm = real_router['get_llm']
                 router.Tier = real_router['Tier']
                 response = health()

@@ -24,6 +24,49 @@ _client_instance: LlamaCppClient | None = None
 _ENDPOINT_BACKOFF_UNTIL: dict[str, float] = {}
 _ENDPOINT_BACKOFF_SECONDS = 300.0
 
+# Failed /health probes are cached per base_url for this long, so a dead
+# endpoint (e.g. a retired host still named in .env) is not re-probed — and
+# re-warned — by every client construction. The router builds a fresh client
+# each time its primary provider is unavailable, which on grid-hermes logged
+# "llama.cpp server not available at http://100.126.129.45:8080" 76x/day.
+_PROBE_FAILURE_TTL_SECONDS = 600.0
+_PROBE_FAILED_UNTIL: dict[str, float] = {}
+# base_urls whose unavailability was already warned in this process; cleared
+# when the endpoint answers again, so a later outage warns once more.
+_UNAVAILABLE_WARNED: set[str] = set()
+# base_url -> per-slot context size reported by the server's /props.
+_CTX_SIZE_BY_URL: dict[str, int] = {}
+_DEFAULT_CTX_SIZE = 4096
+
+# Prompt-budget fitting. Indented JSON (Hermes status reports) measured
+# 2.37 chars/token on the grid-svr Qwen3.8 tokenizer (/tokenize probe,
+# 2026-11-04), so the old chars//3 estimate under-counted and 9.2-9.9k-token
+# prompts were sent to an 8192-token slot, failing with HTTP 400
+# exceed_context_size_error after waiting 60-150s for the slot.
+_PESSIMISTIC_CHARS_PER_TOKEN = 2.0
+_FALLBACK_CHARS_PER_TOKEN = 2.3
+_PER_MESSAGE_TEMPLATE_TOKENS = 8
+_CONTEXT_SAFETY_TOKENS = 64
+_TRUNCATION_MARKER = "\n[... {n} characters truncated to fit the model context ...]\n"
+
+
+def _ctx_size_from_props(props: Any) -> int | None:
+    """Per-slot n_ctx from a llama-server /props payload, or None."""
+    if not isinstance(props, dict):
+        return None
+    candidates = []
+    dgs = props.get("default_generation_settings")
+    if isinstance(dgs, dict):
+        candidates.append(dgs.get("n_ctx"))
+        params = dgs.get("params")
+        if isinstance(params, dict):
+            candidates.append(params.get("n_ctx"))
+    candidates.append(props.get("n_ctx"))
+    for value in candidates:
+        if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+            return value
+    return None
+
 
 class LlamaCppClient:
     """Client for the llama-server OpenAI-compatible API.
@@ -66,6 +109,7 @@ class LlamaCppClient:
         # --reasoning-budget flag in /etc/default/z4-llama.
         self.reasoning_headroom = reasoning_headroom
         self.is_available: bool = False
+        self._ctx_size: int = _CTX_SIZE_BY_URL.get(self.base_url.rstrip("/"), _DEFAULT_CTX_SIZE)
         self._knowledge_cache: dict[str, str] = {}
         # Keyed by base_url alone (not base_url|model): several router
         # provider names (llamacpp, llamacpp_oracle, ...) can point at the
@@ -86,30 +130,64 @@ class LlamaCppClient:
         if backoff_until:
             _ENDPOINT_BACKOFF_UNTIL.pop(self._backoff_key, None)
 
-        # Health probe
+        probe_failed_until = _PROBE_FAILED_UNTIL.get(self._backoff_key)
+        if probe_failed_until and time.time() < probe_failed_until:
+            # A probe of this endpoint failed moments ago; do not spend
+            # another round-trip (and another warning) finding that out.
+            log.debug("llama.cpp endpoint recently unreachable — {url}", url=self.base_url)
+            return
+
+        self._probe_health(timeout=5)
+        if self.is_available:
+            log.info("llama.cpp server connected — {url}", url=self.base_url)
+
+    def _probe_health(self, timeout: float) -> bool:
+        """Probe /health; cache failures; fetch n_ctx on success.
+
+        Unavailability is warned once per endpoint per outage (later probes
+        that still fail log at debug); the first success after an outage
+        logs the recovery at info.
+        """
         try:
-            resp = requests.get(f"{self.base_url}/health", timeout=5)
+            resp = requests.get(f"{self.base_url}/health", timeout=timeout)
             self.is_available = resp.status_code == 200
         except Exception:
             self.is_available = False
 
-        # Fetch actual context size from server
-        self._ctx_size = 4096
-        if self.is_available:
-            try:
-                props = requests.get(f"{self.base_url}/props", timeout=5).json()
-                self._ctx_size = props.get("default_generation_settings", {}).get("n_ctx", 4096)
-                log.info("llama.cpp ctx_size={c}", c=self._ctx_size)
-            except Exception:
-                log.debug("Failed to fetch llama.cpp ctx_size, using default", exc_info=True)
+        if not self.is_available:
+            _PROBE_FAILED_UNTIL[self._backoff_key] = time.time() + _PROBE_FAILURE_TTL_SECONDS
+            if self._backoff_key not in _UNAVAILABLE_WARNED:
+                _UNAVAILABLE_WARNED.add(self._backoff_key)
+                log.warning(
+                    "llama.cpp server not available at {url} — GRID will operate "
+                    "without it (re-probed at most every {t:.0f}s; further misses at debug)",
+                    url=self.base_url, t=_PROBE_FAILURE_TTL_SECONDS,
+                )
+            else:
+                log.debug("llama.cpp server still unavailable at {url}", url=self.base_url)
+            return False
 
-        if self.is_available:
-            log.info("llama.cpp server connected — {url}", url=self.base_url)
-        else:
-            log.warning(
-                "llama.cpp server not available at {url} — GRID will operate without it",
-                url=self.base_url,
-            )
+        _PROBE_FAILED_UNTIL.pop(self._backoff_key, None)
+        if self._backoff_key in _UNAVAILABLE_WARNED:
+            _UNAVAILABLE_WARNED.discard(self._backoff_key)
+            log.info("llama.cpp server reachable again — {url}", url=self.base_url)
+        self._refresh_ctx_size()
+        return True
+
+    def _refresh_ctx_size(self) -> None:
+        """Read the per-slot context size from /props (not hardcoded)."""
+        try:
+            props = requests.get(f"{self.base_url}/props", timeout=5).json()
+        except Exception:
+            log.debug("Failed to fetch llama.cpp ctx_size, using default", exc_info=True)
+            return
+        n_ctx = _ctx_size_from_props(props)
+        if n_ctx is None:
+            return
+        if _CTX_SIZE_BY_URL.get(self._backoff_key) != n_ctx:
+            log.info("llama.cpp ctx_size={c} — {url}", c=n_ctx, url=self.base_url)
+        _CTX_SIZE_BY_URL[self._backoff_key] = n_ctx
+        self._ctx_size = n_ctx
 
     # ------------------------------------------------------------------
     # Knowledge loading (delegates to knowledge.loader)
@@ -144,6 +222,7 @@ class LlamaCppClient:
         num_predict: int | None = None,
         system_knowledge: list[str] | None = None,
         extra_metadata: dict | None = None,
+        enable_thinking: bool | None = None,
     ) -> str | None:
         """Send a chat completion request to llama-server.
 
@@ -156,6 +235,20 @@ class LlamaCppClient:
                 the system prompt as context.
             extra_metadata: Optional dict of A/B-test or call-site tags
                 forwarded to the feedback-loop logger (Langfuse).
+            enable_thinking: ``False`` asks a reasoning model's chat template
+                to skip the thinking phase (llama-server
+                ``chat_template_kwargs: {"enable_thinking": false}``,
+                verified against the grid-svr Qwen3.8-27B oracle server on
+                2026-11-04: finish=stop, no reasoning_content) and drops the
+                reasoning headroom from max_tokens. Use it for structured
+                answers. ``None`` keeps the server's default behaviour.
+
+        Prompts are fitted to the server's per-slot context (n_ctx from
+        /props): an over-long prompt is counted with /tokenize and its
+        longest message is truncated in the middle, so the request leaves
+        room for an answer instead of failing with HTTP 400
+        exceed_context_size_error. A 400 of that type is retried once,
+        fitted to the n_ctx/n_prompt_tokens the server reported.
 
         Returns:
             str: The assistant's response text, or None if unavailable.
@@ -167,13 +260,11 @@ class LlamaCppClient:
             backoff_until = _ENDPOINT_BACKOFF_UNTIL.get(self._backoff_key)
             if backoff_until and time.time() < backoff_until:
                 return None
+            probe_failed_until = _PROBE_FAILED_UNTIL.get(self._backoff_key)
+            if probe_failed_until and time.time() < probe_failed_until:
+                return None
             # Retry health check — server may have started after us
-            try:
-                resp = requests.get(f"{self.base_url}/health", timeout=3)
-                self.is_available = resp.status_code == 200
-            except Exception:
-                log.debug("llama.cpp health re-check failed", exc_info=True)
-            if not self.is_available:
+            if not self._probe_health(timeout=3):
                 return None
 
         # Inject knowledge into system message if requested
@@ -187,7 +278,10 @@ class LlamaCppClient:
         # Budget reasoning tokens on top of the requested content length —
         # otherwise a reasoning model spends the whole max_tokens thinking
         # and returns empty content (finish_reason=length, content="").
-        gen_budget = requested_num_predict + self.reasoning_headroom
+        # With thinking disabled there is no reasoning phase to budget for.
+        gen_budget = requested_num_predict + (
+            0 if enable_thinking is False else self.reasoning_headroom
+        )
 
         payload: dict[str, Any] = {
             "model": model or self.model,
@@ -196,30 +290,33 @@ class LlamaCppClient:
             "temperature": temperature,
             "stream": False,
         }
-
-        # Clamp max_tokens so prompt + generation fits in context
-        # Rough estimate: 4 chars ≈ 1 token
-        total_prompt_chars = sum(len(m["content"]) for m in messages)
-        est_prompt_tokens = total_prompt_chars // 3  # conservative
-        # Match the server's --ctx-size (check /props or use configured value)
-        max_ctx = getattr(self, '_ctx_size', None) or 4096
-        available_for_gen = max(256, max_ctx - est_prompt_tokens - 64)
-        if payload["max_tokens"] > available_for_gen:
-            log.debug(
-                "Clamping max_tokens {orig} → {clamped} (est prompt={p} tok)",
-                orig=payload["max_tokens"], clamped=available_for_gen,
-                p=est_prompt_tokens,
-            )
-            payload["max_tokens"] = available_for_gen
+        if enable_thinking is not None:
+            payload["chat_template_kwargs"] = {"enable_thinking": bool(enable_thinking)}
 
         start = time.monotonic()
         try:
-            resp = requests.post(
-                f"{self.base_url}/v1/chat/completions",
-                json=payload,
-                timeout=self.timeout,
-            )
+            resp = None
+            retry_prompt_tokens: int | None = None
+            for attempt in range(2):
+                fitted, prompt_tokens = self._fit_messages_to_context(
+                    payload["messages"] if attempt else messages, requested_num_predict,
+                    known_prompt_tokens=None if attempt == 0 else retry_prompt_tokens,
+                )
+                payload["messages"] = fitted
+                payload["max_tokens"] = self._clamp_generation(gen_budget, prompt_tokens)
+
+                resp = requests.post(
+                    f"{self.base_url}/v1/chat/completions",
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                if attempt == 0 and resp.status_code == 400:
+                    retry_prompt_tokens = self._note_context_overflow(resp)
+                    if retry_prompt_tokens is not None:
+                        continue
+                break
             latency_ms = (time.monotonic() - start) * 1000
+            messages = payload["messages"]
 
             if resp.status_code >= 400:
                 error_body = ""
@@ -303,6 +400,138 @@ class LlamaCppClient:
             self._mark_chat_failure(str(exc))
             return None
 
+    # ------------------------------------------------------------------
+    # Prompt-budget fitting
+    # ------------------------------------------------------------------
+    def _count_prompt_tokens(self, messages: list[dict[str, str]]) -> int | None:
+        """Exact-ish prompt size via llama-server /tokenize, or None.
+
+        /tokenize is served outside the generation slots, so it answers
+        immediately even while the single REASON slot is busy (measured
+        10ms on grid-svr 2026-11-04). Adds a small per-message allowance for
+        the chat template's role markers.
+        """
+        text = "\n".join(str(m.get("content") or "") for m in messages)
+        try:
+            resp = requests.post(
+                f"{self.base_url}/tokenize", json={"content": text}, timeout=5,
+            )
+            if resp.status_code != 200:
+                return None
+            tokens = resp.json().get("tokens")
+        except Exception:
+            log.debug("llama.cpp /tokenize failed", exc_info=True)
+            return None
+        if not isinstance(tokens, list):
+            return None
+        return len(tokens) + _PER_MESSAGE_TEMPLATE_TOKENS * len(messages)
+
+    def _fit_messages_to_context(
+        self,
+        messages: list[dict[str, str]],
+        requested_num_predict: int,
+        known_prompt_tokens: int | None = None,
+    ) -> tuple[list[dict[str, str]], int]:
+        """Return (messages that fit n_ctx with answer room, prompt tokens).
+
+        The answer keeps at least min(requested_num_predict, n_ctx // 4)
+        tokens (never fewer than 256). Short prompts are not tokenized at
+        all: a pessimistic 2 chars/token bound proves they fit.
+        """
+        n_ctx = int(getattr(self, "_ctx_size", None) or _DEFAULT_CTX_SIZE)
+        answer_room = max(256, min(int(requested_num_predict), n_ctx // 4))
+        limit = max(256, n_ctx - answer_room - _CONTEXT_SAFETY_TOKENS)
+
+        def _chars(msgs: list[dict[str, str]]) -> int:
+            return sum(len(str(m.get("content") or "")) for m in msgs)
+
+        total_chars = _chars(messages)
+        if known_prompt_tokens is None:
+            pessimistic = int(total_chars / _PESSIMISTIC_CHARS_PER_TOKEN) + (
+                _PER_MESSAGE_TEMPLATE_TOKENS * len(messages)
+            )
+            if pessimistic <= limit:
+                return messages, int(total_chars / _FALLBACK_CHARS_PER_TOKEN)
+            tokens = self._count_prompt_tokens(messages)
+            if tokens is None:
+                tokens = int(total_chars / _FALLBACK_CHARS_PER_TOKEN) + (
+                    _PER_MESSAGE_TEMPLATE_TOKENS * len(messages)
+                )
+        else:
+            tokens = known_prompt_tokens
+        if tokens <= limit:
+            return messages, tokens
+
+        original_tokens = tokens
+        fitted = [dict(m) for m in messages]
+        for _ in range(4):
+            if tokens <= limit:
+                break
+            chars_per_token = max(0.5, _chars(fitted) / max(tokens, 1))
+            idx = max(range(len(fitted)), key=lambda i: len(str(fitted[i].get("content") or "")))
+            content = str(fitted[idx].get("content") or "")
+            if len(content) <= 256:
+                break
+            # Keep what fits, less a 5% margin on the kept part (a margin on
+            # the cut would over-truncate when most of the message goes).
+            keep = int((len(content) - (tokens - limit) * chars_per_token) * 0.95) - 64
+            keep = max(128, min(keep, len(content) - 1))
+            head = int(keep * 0.75)
+            tail = keep - head
+            fitted[idx]["content"] = (
+                content[:head]
+                + _TRUNCATION_MARKER.format(n=len(content) - keep)
+                + (content[-tail:] if tail > 0 else "")
+            )
+            counted = self._count_prompt_tokens(fitted)
+            tokens = counted if counted is not None else int(
+                _chars(fitted) / chars_per_token
+            ) + _PER_MESSAGE_TEMPLATE_TOKENS * len(fitted)
+        log.info(
+            "llama.cpp prompt truncated {a} -> {b} tokens to fit n_ctx={n} "
+            "(answer room {r}) — {url}",
+            a=original_tokens, b=tokens, n=n_ctx, r=answer_room, url=self.base_url,
+        )
+        return fitted, tokens
+
+    def _clamp_generation(self, gen_budget: int, prompt_tokens: int) -> int:
+        """max_tokens that keeps prompt + generation inside n_ctx."""
+        max_ctx = int(getattr(self, "_ctx_size", None) or _DEFAULT_CTX_SIZE)
+        available_for_gen = max(256, max_ctx - prompt_tokens - _CONTEXT_SAFETY_TOKENS)
+        if gen_budget > available_for_gen:
+            log.debug(
+                "Clamping max_tokens {orig} → {clamped} (prompt={p} tok)",
+                orig=gen_budget, clamped=available_for_gen, p=prompt_tokens,
+            )
+            return available_for_gen
+        return gen_budget
+
+    def _note_context_overflow(self, resp: Any) -> int | None:
+        """On a 400 exceed_context_size_error, learn n_ctx; return prompt size.
+
+        Returns the server-reported n_prompt_tokens when the error is a
+        context overflow (so the caller can refit and retry once), else None.
+        """
+        try:
+            body = resp.json()
+        except Exception:
+            return None
+        error = body.get("error") if isinstance(body, dict) else None
+        if not isinstance(error, dict) or error.get("type") != "exceed_context_size_error":
+            return None
+        n_ctx = error.get("n_ctx")
+        if isinstance(n_ctx, int) and n_ctx > 0:
+            self._ctx_size = n_ctx
+            _CTX_SIZE_BY_URL[self._backoff_key] = n_ctx
+        n_prompt = error.get("n_prompt_tokens")
+        if not isinstance(n_prompt, int) or n_prompt <= 0:
+            return None
+        log.info(
+            "llama.cpp context overflow ({p} prompt tokens > n_ctx {n}) — refitting once",
+            p=n_prompt, n=self._ctx_size,
+        )
+        return n_prompt
+
     def _mark_chat_failure(self, reason: str) -> None:
         """Back off endpoints that pass /health but fail real chat calls."""
         self.is_available = False
@@ -325,6 +554,7 @@ class LlamaCppClient:
         temperature: float = 0.3,
         num_predict: int | None = None,
         extra_metadata: dict | None = None,
+        enable_thinking: bool | None = None,
     ) -> str | None:
         """Single-turn generation via chat endpoint.
 
@@ -351,6 +581,7 @@ class LlamaCppClient:
             temperature=temperature,
             num_predict=num_predict,
             extra_metadata=extra_metadata,
+            enable_thinking=enable_thinking,
         )
 
     # ------------------------------------------------------------------

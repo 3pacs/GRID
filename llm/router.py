@@ -88,6 +88,52 @@ def _provider_in_backoff(provider: str) -> bool:
     return True
 
 
+# (provider, fallback) pairs already warned in this process. A dead primary
+# (LLM_LOCAL_PROVIDER=llamacpp_quick pointing at a retired host) made every
+# get_llm() call log "LLM provider ... unavailable, falling back to ..."
+# (76x/day on grid-hermes). Warn once per pair per outage; repeats go to
+# debug, and the pair re-arms when the primary is seen available again.
+_FALLBACK_WARNED: set[tuple[str, str]] = set()
+
+
+def _fallback_warning(provider: str, fallback: str | None) -> None:
+    """Log a provider fallback once per outage (``fallback=None`` re-arms)."""
+    if fallback is None:
+        for pair in [p for p in _FALLBACK_WARNED if p[0] == provider]:
+            _FALLBACK_WARNED.discard(pair)
+        return
+    pair = (provider, fallback)
+    if pair in _FALLBACK_WARNED:
+        log.debug("LLM provider {p} unavailable, using {fb}", p=provider, fb=fallback)
+        return
+    _FALLBACK_WARNED.add(pair)
+    log.warning(
+        "LLM provider {p} unavailable, falling back to {fb} "
+        "(further fallbacks for this pair logged at debug until {p} recovers)",
+        p=provider, fb=fallback,
+    )
+
+
+def supported_chat_kwargs(client: Any, **wanted: Any) -> dict[str, Any]:
+    """The subset of ``wanted`` keyword arguments ``client.chat`` accepts.
+
+    Lets callers pass provider-specific options (``enable_thinking`` on the
+    llama.cpp client) without a TypeError on clients that do not take them
+    (Ollama, cloud clients, _NullClient, test doubles).
+    """
+    import inspect
+
+    try:
+        params = inspect.signature(client.chat).parameters
+    except (TypeError, ValueError, AttributeError):
+        return {}
+    if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+        # **kwargs swallows anything; only forward what a real llama.cpp
+        # style signature would name explicitly.
+        return {}
+    return {k: v for k, v in wanted.items() if k in params}
+
+
 def _gemma_or_default(settings: Any, key: str, legacy_key: str, default: str) -> str:
     """Return configured provider, with legacy Gemma-primary fallback for unset keys."""
     configured = getattr(settings, key, None) or getattr(settings, legacy_key, None)
@@ -178,6 +224,7 @@ def get_llm(
         client = _create_client(provider)
         if client is not None and getattr(client, "is_available", True):
             _client_cache[provider] = client
+            _fallback_warning(provider, None)
             return client
 
     for fallback in _fallback_chain(tier, provider):
@@ -188,10 +235,7 @@ def get_llm(
         else:
             fb_client = _create_client(fallback)
         if fb_client is not None and getattr(fb_client, "is_available", False):
-            log.warning(
-                "LLM provider {p} unavailable, falling back to {fb}",
-                p=provider, fb=fallback,
-            )
+            _fallback_warning(provider, fallback)
             _client_cache[fallback] = fb_client
             return fb_client
 

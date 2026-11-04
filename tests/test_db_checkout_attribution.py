@@ -474,3 +474,63 @@ class TestInstrumentationCannotBreakRealCheckout:
         finally:
             conn.close()  # must not raise either
             monkeypatch.setattr(db_module, "_engine", None)  # don't leak into other tests
+
+
+class TestLongHoldSummaries:
+    """2026-11-04: 323 "DB connection held" warnings/day, ~85% 8-11s batch
+    scans (resolver partition workers, PITStore.get_feature_matrix)."""
+
+    def _capture(self, monkeypatch):
+        warnings: list[str] = []
+        debugs: list[str] = []
+        monkeypatch.setattr(db_module.log, "warning",
+                            lambda template, **k: warnings.append(template.format(**k)))
+        monkeypatch.setattr(db_module.log, "debug",
+                            lambda template, **k: debugs.append(template.format(**k)))
+        monkeypatch.setattr(db_module, "_hold_summary", {})
+        return warnings, debugs
+
+    def test_batch_shaped_holds_are_summarised_per_acquirer_group(self, monkeypatch):
+        warnings, debugs = self._capture(monkeypatch)
+        for worker in range(4):
+            db_module._report_long_hold(10.5, f"ThreadPoolExecutor-142_{worker}",
+                                        f"ThreadPoolExecutor-142_{worker}", 0.0)
+        assert len(warnings) == 1 and len(debugs) == 3
+        # Next interval: one warning carrying the suppressed count.
+        db_module._hold_summary["ThreadPoolExecutor"][0] -= db_module._HOLD_SUMMARY_INTERVAL_SECONDS
+        db_module._report_long_hold(9.0, "ThreadPoolExecutor-150_0", "ThreadPoolExecutor-150_0", 0.0)
+        assert len(warnings) == 2
+        assert "+3 more ThreadPoolExecutor holds" in warnings[1]
+        assert "longest 10.5s" in warnings[1]
+
+    def test_severe_holds_always_warn(self, monkeypatch):
+        warnings, _ = self._capture(monkeypatch)
+        for _ in range(3):
+            db_module._report_long_hold(db_module._LIFETIME_ALERT_SECONDS + 10,
+                                        "ThreadPoolExecutor-11_0", "ThreadPoolExecutor-11_0", 0.0)
+        assert len(warnings) == 3
+
+    def test_declared_batch_hold_logs_at_debug(self, monkeypatch):
+        warnings, debugs = self._capture(monkeypatch)
+        monkeypatch.setattr(db_module, "_LIFETIME_WARN_SECONDS", 0.01)
+        engine = _sqlite_engine()
+        _wire_attribution(engine)
+        with db_module.expected_long_hold(30):
+            conn = engine.connect()
+            time.sleep(0.05)
+            conn.close()
+        assert warnings == []
+        assert any("declared batch hold" in d for d in debugs)
+
+    def test_acquirer_group(self):
+        assert db_module._acquirer_group("ThreadPoolExecutor-142_2") == "ThreadPoolExecutor"
+        assert db_module._acquirer_group("hermes-cycle-1365") == "hermes-cycle"
+        assert db_module._acquirer_group("MainThread") == "MainThread"
+
+    def test_threshold_env_parsing(self, monkeypatch):
+        monkeypatch.setenv("GRID_DB_HOLD_TEST", "12.5")
+        assert db_module._env_seconds("GRID_DB_HOLD_TEST", 5.0) == 12.5
+        monkeypatch.setenv("GRID_DB_HOLD_TEST", "nope")
+        assert db_module._env_seconds("GRID_DB_HOLD_TEST", 5.0) == 5.0
+        monkeypatch.setenv("GRID_DB_HOLD_TEST", "-1")
+        assert db_module._env_seconds("GRID_DB_HOLD_TEST", 5.0) == 5.0

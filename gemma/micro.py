@@ -21,12 +21,81 @@ Deployment:
 
 from __future__ import annotations
 
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any
 
 import requests
 from loguru import logger as log
+
+
+# ─── Per-process circuit breaker (2026-11-04) ───────────────────────────
+#
+# grid-hermes logged "Gemma micro 'knowledge_mapper' failed (15018ms): ...
+# localhost:8085 Read timed out" 86x/day: the mapper is a CPU-only
+# llama-server (gemma-4-e2b, --n-gpu-layers 0, 4 threads, ctx 2048) that
+# cannot produce 1024 tokens inside the 15s client timeout, so every call
+# burned 15s and a warning. After CIRCUIT_TIMEOUT_THRESHOLD consecutive
+# timeouts a micro model is skipped for a cooldown (doubling per re-open, up
+# to CIRCUIT_MAX_COOLDOWN_SECONDS); one warning per opening, the skipped
+# calls are silent (debug). After the cooldown one call is let through: a
+# success closes the circuit, another timeout re-opens it.
+CIRCUIT_TIMEOUT_THRESHOLD = 3
+CIRCUIT_BASE_COOLDOWN_SECONDS = 1800.0
+CIRCUIT_MAX_COOLDOWN_SECONDS = 6 * 3600.0
+
+
+class _MicroCircuit:
+    """Consecutive-timeout breaker for one micro model (thread-safe)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.consecutive_timeouts = 0
+        self.open_until = 0.0
+        self.openings = 0
+
+    def allow(self) -> bool:
+        with self._lock:
+            return time.monotonic() >= self.open_until
+
+    def record_success(self) -> bool:
+        """Close the circuit; True if it had been opened before."""
+        with self._lock:
+            was_open = self.openings > 0
+            self.consecutive_timeouts = 0
+            self.openings = 0
+            self.open_until = 0.0
+            return was_open
+
+    def record_timeout(self) -> tuple[int, float | None]:
+        """Count a timeout; returns (consecutive count, cooldown if opened)."""
+        with self._lock:
+            self.consecutive_timeouts += 1
+            if self.consecutive_timeouts < CIRCUIT_TIMEOUT_THRESHOLD and self.openings == 0:
+                return self.consecutive_timeouts, None
+            cooldown = min(
+                CIRCUIT_BASE_COOLDOWN_SECONDS * (2 ** self.openings),
+                CIRCUIT_MAX_COOLDOWN_SECONDS,
+            )
+            self.openings += 1
+            self.open_until = time.monotonic() + cooldown
+            return self.consecutive_timeouts, cooldown
+
+
+# Keyed by model name + endpoint, shared by every client instance in the
+# process (the pool singleton and any ad-hoc GemmaMicroClient).
+_CIRCUITS: dict[str, _MicroCircuit] = {}
+_CIRCUITS_LOCK = threading.Lock()
+
+
+def _circuit_for(config: "MicroModelConfig") -> _MicroCircuit:
+    key = f"{config.name}@{config.base_url}"
+    with _CIRCUITS_LOCK:
+        circuit = _CIRCUITS.get(key)
+        if circuit is None:
+            circuit = _CIRCUITS[key] = _MicroCircuit()
+        return circuit
 
 
 @dataclass(frozen=True)
@@ -165,8 +234,16 @@ class GemmaMicroClient:
             input_text: The text to process.
 
         Returns:
-            str: Model output, or None if unavailable.
+            str: Model output, or None if unavailable (or its circuit is
+            open after repeated timeouts).
         """
+        circuit = _circuit_for(self.config)
+        if not circuit.allow():
+            log.debug(
+                "Gemma micro '{name}' skipped — circuit open after repeated timeouts",
+                name=self.config.name,
+            )
+            return None
         if not self.is_available:
             # Retry health check
             try:
@@ -211,6 +288,11 @@ class GemmaMicroClient:
 
             data = resp.json()
             content = data["choices"][0]["message"]["content"]
+            if circuit.record_success():
+                log.info(
+                    "Gemma micro '{name}' answered again ({l:.0f}ms) — circuit closed",
+                    name=self.config.name, l=latency_ms,
+                )
             log.debug(
                 "Gemma micro '{name}' — {l:.0f}ms",
                 name=self.config.name,
@@ -240,6 +322,27 @@ class GemmaMicroClient:
                 pass  # never let observability break micro inference
             return content
 
+        except requests.Timeout as exc:
+            latency_ms = (time.monotonic() - start) * 1000
+            count, cooldown = circuit.record_timeout()
+            if cooldown is not None:
+                log.warning(
+                    "Gemma micro '{name}' timed out {n}x in a row ({l:.0f}ms, {url}) — "
+                    "skipping it for {m:.0f} min",
+                    name=self.config.name, n=count, l=latency_ms,
+                    url=self.config.base_url, m=cooldown / 60,
+                )
+            elif count == 1:
+                log.warning(
+                    "Gemma micro '{name}' failed ({l:.0f}ms): {err}",
+                    name=self.config.name, l=latency_ms, err=str(exc),
+                )
+            else:
+                log.debug(
+                    "Gemma micro '{name}' timed out again ({n} in a row, {l:.0f}ms)",
+                    name=self.config.name, n=count, l=latency_ms,
+                )
+            return None
         except Exception as exc:
             latency_ms = (time.monotonic() - start) * 1000
             log.warning(
