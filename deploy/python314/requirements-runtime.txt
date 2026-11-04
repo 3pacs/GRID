@@ -10,3 +10,5 @@ lightgbm
 playwright
 pypdf
 transformers
+# grid-svr CPU (Xeon E5-2670: AVX, no AVX2): polars' default runtime SIGILLs there; the compat runtime is the official fix
+polars-runtime-compat

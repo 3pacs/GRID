@@ -53,19 +53,26 @@ for d, dirs, files in os.walk(root):
                 mods.add(x.module.split(".")[0])
 third = sorted(m for m in mods if m not in stdlib and m not in local and not m.startswith("_"))
 missing = []
-for m in third:
-    try:
-        importlib.import_module(m)
-    except Exception as e:   # noqa: BLE001 - every failure is listed, none hides another
-        missing.append(f"{m} ({type(e).__name__}: {str(e)[:80]})")
+import signal, subprocess
+for m in third:   # each import in its own process: a crash (e.g. SIGILL on this CPU) names the module, never hides the rest
+    r = subprocess.run([sys.executable, "-c", f"import {m}"], capture_output=True, text=True, timeout=300)
+    if r.returncode < 0:
+        missing.append(f"{m} (killed by {signal.Signals(-r.returncode).name})")
+    elif r.returncode:
+        last = (r.stderr.strip().splitlines() or ["?"])[-1]
+        missing.append(f"{m} ({last[:100]})")
 print(f"compiled {n} GRID files under {sysconfig.get_python_version()}; syntax errors: {len(bad_syntax)}")
 for b in bad_syntax[:20]:
     print("  SYNTAX", b)
 print(f"third-party modules imported by GRID code: {len(third)}; not importable here: {len(missing)}")
 for m in missing:
     print("  MISSING", m)
+crashed = [m for m in missing if "killed by" in m]
+if crashed:
+    sys.exit(f"CRASHED on this CPU: {', '.join(crashed)}")
 EOF
   "$v/bin/python" -c "import torch; print('torch', torch.__version__, '| cuda available:', torch.cuda.is_available())" || true
+  "$v/bin/python" -c "import polars._plr as p; print('polars runtime:', getattr(p, '__file__', '?').split('/site-packages/')[-1].split('/')[0])" || true
 }
 
 if [ -x "$VENV/bin/python" ]; then
