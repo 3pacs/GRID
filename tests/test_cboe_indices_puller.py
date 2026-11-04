@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -120,3 +120,104 @@ class TestNoDailyHistoryReinsert:
             date(2026, 9, 24), date(2026, 9, 25),
         ]
         assert out["rows_inserted"] == 2
+
+
+def _pcr_page(ratio: str = "0.87") -> dict:
+    """Shape of cdn.cboe.com/data/us/options/market_statistics/daily/<day>_daily_options
+    (probed from grid-svr 2026-11-04, trimmed)."""
+    return {
+        "ratios": [
+            {"name": "TOTAL PUT/CALL RATIO", "value": ratio},
+            {"name": "INDEX PUT/CALL RATIO", "value": "0.96"},
+        ],
+        "SUM OF ALL PRODUCTS": [
+            {"name": "VOLUME", "call": 7971384, "put": 6917180, "total": 14888564},
+        ],
+    }
+
+
+class _Today(date):
+    @classmethod
+    def today(cls):
+        return cls(2026, 11, 4)  # a Wednesday
+
+
+@pytest.mark.unit
+class TestDeadFeedsReplaced:
+    def test_dead_icj_and_totalpc_urls_are_gone(self):
+        urls = " ".join(c["url"] + c.get("fallback_url", "") for c in CBOE_INDICES.values())
+        assert "ICJ_History" not in urls and "totalpc.csv" not in urls
+        assert "correlation_index" not in CBOE_INDICES and "put_call_ratio" not in CBOE_INDICES
+
+    def test_cor3m_is_a_close_series_mapped_to_a_registered_name(self):
+        from normalization.entity_map import NEW_MAPPINGS_V2, SEED_MAPPINGS
+
+        cfg = CBOE_INDICES["CBOE:COR3M"]
+        assert cfg["url"].endswith("COR3M_History.csv") and cfg["value_col"] == "CLOSE"
+        assert {**SEED_MAPPINGS, **NEW_MAPPINGS_V2}["CBOE:COR3M"] == "implied_correlation_3m"
+
+    def test_pull_all_includes_put_call(self, puller):
+        ok = {"status": "SUCCESS", "rows_inserted": 0}
+        with patch.object(puller, "pull_index", return_value=ok), \
+             patch.object(puller, "pull_put_call_ratio", return_value=dict(ok)) as pcr:
+            results = puller.pull_all(days_back=7)
+        pcr.assert_called_once_with(days_back=7)
+        assert len(results) == len(CBOE_INDICES) + 1
+
+
+@pytest.mark.unit
+class TestPutCallDailyPages:
+    def _run(self, puller, monkeypatch, pages: dict, existing=frozenset(), days_back=None):
+        monkeypatch.setattr(cboe_indices, "date", _Today)
+        inserted: list[tuple[date, float]] = []
+        requested: list[str] = []
+
+        def fake_json(url):
+            requested.append(url)
+            return pages.get(url.rsplit("/", 1)[1].split("_")[0])
+
+        with patch.object(puller, "_download_json", side_effect=fake_json), \
+             patch.object(puller, "_get_existing_dates", return_value=set(existing)), \
+             patch.object(puller, "_insert_raw",
+                          side_effect=lambda conn, series_id, obs_date, value, **_:
+                          inserted.append((obs_date, value))):
+            out = puller.pull_put_call_ratio(days_back=days_back)
+        return out, inserted, requested
+
+    def test_stores_total_ratio_for_missing_weekdays_only(self, puller, monkeypatch):
+        pages = {"2026-11-02": _pcr_page("0.87"), "2026-11-03": _pcr_page("0.91")}
+        existing = {date(2026, 10, d) for d in range(25, 32)}
+        out, inserted, requested = self._run(puller, monkeypatch, pages, existing)
+        assert inserted == [(date(2026, 11, 2), 0.87), (date(2026, 11, 3), 0.91)]
+        # 11-01 is Sunday: never requested. 11-04 (today) is requested, no page yet.
+        assert [u.rsplit("/", 1)[1][:10] for u in requested] == ["2026-11-02", "2026-11-03", "2026-11-04"]
+        assert out == {"status": "SUCCESS", "rows_inserted": 2, "feature_name": "put_call_ratio"}
+
+    def test_no_page_for_today_is_not_a_failure(self, puller, monkeypatch):
+        existing = {date(2026, 10, 25) + timedelta(days=i) for i in range(10)}
+        out, inserted, requested = self._run(puller, monkeypatch, {}, existing)
+        assert len(requested) == 1 and inserted == []
+        assert out["status"] == "SUCCESS" and out["rows_inserted"] == 0
+
+    def test_every_page_refused_is_failed(self, puller, monkeypatch):
+        out, inserted, requested = self._run(puller, monkeypatch, {})
+        assert len(requested) >= cboe_indices.PUT_CALL_ALL_REFUSED_MIN
+        assert out["status"] == "FAILED" and "refused" in out["error"]
+
+    def test_page_without_ratio_is_not_stored(self, puller, monkeypatch):
+        pages = {"2026-11-03": {"ratios": [{"name": "INDEX PUT/CALL RATIO", "value": "1"}]}}
+        existing = {date(2026, 10, 25) + timedelta(days=i) for i in range(9)}
+        out, inserted, _ = self._run(puller, monkeypatch, pages, existing)
+        assert inserted == [] and out["status"] == "FAILED"
+
+    def test_download_json_maps_403_to_no_page(self, puller):
+        resp = MagicMock(status_code=403)
+        with patch.object(cboe_indices.requests, "get", return_value=resp):
+            assert puller._download_json("https://example.invalid/x") is None
+
+    def test_scheduler_sees_all_clean_items_as_no_new_data(self):
+        from ingestion.smart_scheduler import OUTCOME_NO_NEW_DATA, _classify_outcome
+
+        items = [{"status": "SUCCESS", "rows_inserted": 0, "feature_name": k} for k in CBOE_INDICES]
+        items.append({"status": "SUCCESS", "rows_inserted": 0, "feature_name": "put_call_ratio"})
+        assert _classify_outcome(items)[0] == OUTCOME_NO_NEW_DATA

@@ -43,6 +43,21 @@ from ingestion.altdata import quiverquant_transactions as tx
 
 _BASE_URL = "https://api.quiverquant.com/beta"
 _RATE_LIMIT = 1.0  # seconds between requests
+
+# Transition-hold reasons already warned about in this process. The hold is
+# an operator state (the marker file is created by hand), so each distinct
+# reason warns once and repeats at DEBUG; the result stays SKIPPED with the
+# reason every run (14 identical warnings a day on grid-hermes before
+# 2026-11-04).
+_WARNED_HOLD_REASONS: set[str] = set()
+
+
+def _warn_hold_once(reason: str) -> None:
+    if reason in _WARNED_HOLD_REASONS:
+        log.debug("QuiverQuant pull SKIPPED: {}", reason)
+        return
+    _WARNED_HOLD_REASONS.add(reason)
+    log.warning("QuiverQuant pull SKIPPED (logged once per process): {}", reason)
 _TIMEOUT = 120
 _MAX_ATTEMPTS = 3
 STORE_BATCH_ROWS = tx.MAX_WRITE_ROWS
@@ -423,7 +438,7 @@ def pull_endpoint(
             f"QuiverQuant {endpoint_key} held: transition marker {transition_marker_path()} not found "
             "(create it after scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run)"
         )
-        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        _warn_hold_once(reason)
         return {"endpoint": endpoint_key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0}
 
     cfg = ENDPOINTS[endpoint_key]
@@ -468,7 +483,7 @@ def pull_all(engine: Engine) -> list[dict[str, Any]]:
             f"(guarded endpoints: {', '.join(sorted(held))}); create it after "
             "scripts/qq_rekey_signal_sources.py and scripts/qq_gov_contracts_redate.py have run"
         )
-        log.warning("QuiverQuant pull SKIPPED: {}", reason)
+        _warn_hold_once(reason)
         return [{"endpoint": key, "status": "SKIPPED", "skipped_reason": reason, "stored": 0} for key in ENDPOINTS]
 
     log.info("QuiverQuant: pulling all {} endpoints", len(ENDPOINTS))

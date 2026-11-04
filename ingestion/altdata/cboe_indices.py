@@ -3,8 +3,23 @@ GRID CBOE volatility and strategy indices ingestion module.
 
 Pulls free CBOE index closes: VIX, VIX3M and VIX9D (the originator's own
 daily closes — FRED's ``VIXCLS`` is a republication of ``CBOE:VIX``), plus
-SKEW, VVIX, PUT/CALL ratio and implied correlation for tail risk,
-vol-of-vol and positioning.
+SKEW, VVIX, the 3-month implied correlation index COR3M and the total
+exchange PUT/CALL ratio for tail risk, vol-of-vol and positioning.
+
+Two feeds were rebuilt on 2026-11-04, when both old URLs answered 403 on
+every run (so the source never finished better than PARTIAL):
+
+* implied correlation: Cboe discontinued ICJ (``correlation_index``, last
+  observation 2021-11-19). Its successor COR3M is published as
+  ``COR3M_History.csv`` (probed from grid-svr: DATE,OPEN,HIGH,LOW,CLOSE from
+  2006-01-03) and stored as ``CBOE:COR3M`` -> ``implied_correlation_3m``, a
+  new series rather than a continuation, because the methodology and level
+  differ.
+* put/call: ``totalpc.csv`` stopped in 2019. Cboe now serves one JSON page
+  per trading day, ``data/us/options/market_statistics/daily/<date>_daily_options``
+  (probed: ``ratios[]`` with "TOTAL PUT/CALL RATIO", plus put/call volumes;
+  403 on non-trading days). Stored as ``put_call_ratio`` (registered, 0 rows
+  before), one obs per trading day, recent days only.
 
 ``CBOE:VIX`` is the backup feed for the regime vector's VIX dimensions:
 FRED posts VIXCLS the next business day and its API times out often enough
@@ -20,6 +35,7 @@ Data source: CBOE Datashop CSV downloads (public, no API key needed).
 from __future__ import annotations
 
 import io
+import math
 import time
 from datetime import date, timedelta
 from typing import Any
@@ -58,17 +74,36 @@ CBOE_INDICES: dict[str, dict[str, str]] = {
         "description": "VIX of VIX (vol-of-vol)",
         "value_col": "VVIX",
     },
-    "put_call_ratio": {
-        "url": "https://cdn.cboe.com/api/global/us_options/market_statistics/daily_put_call_volume/totalpc.csv",
-        "fallback_url": "https://cdn.cboe.com/data/us/exchange_traded_products/market_statistics/volume_put_call_ratios/total_exchange_pcr.csv",
-        "description": "CBOE total exchange PUT/CALL volume ratio",
-        "value_col": "PCR",
+    "CBOE:COR3M": {
+        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/COR3M_History.csv",
+        "description": "CBOE 3-month implied correlation index (successor to ICJ)",
+        "value_col": "CLOSE",
     },
-    "correlation_index": {
-        "url": "https://cdn.cboe.com/api/global/us_indices/daily_prices/ICJ_History.csv",
-        "description": "CBOE implied correlation index (ICJ)",
-        "value_col": "ICJ",
-    },
+}
+
+# Total exchange put/call ratio: one JSON page per trading day.
+PUT_CALL_SERIES_ID: str = "put_call_ratio"
+PUT_CALL_URL: str = (
+    "https://cdn.cboe.com/data/us/options/market_statistics/daily/{day}_daily_options"
+)
+PUT_CALL_RATIO_NAME: str = "TOTAL PUT/CALL RATIO"
+# Calendar days looked back on a scheduled run. Only missing weekdays are
+# requested, so a normal run asks for one or two pages.
+PUT_CALL_DEFAULT_LOOKBACK_DAYS: int = 10
+# If at least this many dates were requested and every one was refused, the
+# CDN is blocking us rather than describing holidays: FAILED, not SUCCESS.
+PUT_CALL_ALL_REFUSED_MIN: int = 3
+_PUT_CALL_DELAY: float = 0.3
+
+_HEADERS: dict[str, str] = {
+    # CBOE's CDN returns 403 for generic bot User-Agents. A mainstream
+    # browser string gets past the WAF without bypassing any real
+    # protection (the files are publicly linked from cboe.com).
+    "User-Agent": (
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://www.cboe.com/",
 }
 
 # Minimum delay between CBOE requests (seconds)
@@ -96,8 +131,8 @@ class CBOEIndicesPuller(BasePuller):
     - CBOE:VIX / CBOE:VIX3M / CBOE:VIX9D: daily closes (VIX backup feed)
     - skew_index: CBOE SKEW (tail risk pricing, >130 = elevated)
     - vvix: VIX of VIX (vol-of-vol)
-    - put_call_ratio: CBOE PUT/CALL ratio for exchange options
-    - correlation_index: ICJ implied correlation
+    - CBOE:COR3M: 3-month implied correlation (ICJ's successor)
+    - put_call_ratio: total exchange PUT/CALL ratio (daily JSON pages)
 
     Attributes:
         engine: SQLAlchemy engine for database operations.
@@ -134,17 +169,7 @@ class CBOEIndicesPuller(BasePuller):
         Raises:
             requests.RequestException: On HTTP errors.
         """
-        headers = {
-            # CBOE's CDN returns 403 for generic bot User-Agents. A mainstream
-            # browser string gets past the WAF without bypassing any real
-            # protection (the CSVs are publicly linked from cboe.com).
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/csv,application/csv,*/*",
-            "Referer": "https://www.cboe.com/",
-        }
+        headers = {**_HEADERS, "Accept": "text/csv,application/csv,*/*"}
         resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
         # 4xx responses are permanent for this URL — don't burn retries.
         if resp.status_code in (400, 401, 403, 404, 410):
@@ -155,6 +180,106 @@ class CBOEIndicesPuller(BasePuller):
 
         df = pd.read_csv(io.StringIO(resp.text))
         return df
+
+    @retry_on_failure(
+        max_attempts=3,
+        backoff=3.0,
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.RequestException),
+    )
+    def _download_json(self, url: str) -> dict[str, Any] | None:
+        """Fetch a CBOE JSON page; None when the CDN has no page (403/404).
+
+        For the per-day put/call pages a 403 is how Cboe answers a date with
+        no session (weekend, holiday, today before publication), so it is not
+        an error here; ``pull_put_call_ratio`` decides what an all-refused
+        window means.
+        """
+        headers = {**_HEADERS, "Accept": "application/json,*/*"}
+        resp = requests.get(url, headers=headers, timeout=_REQUEST_TIMEOUT)
+        if resp.status_code in (403, 404):
+            return None
+        resp.raise_for_status()
+        data = resp.json()
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _total_put_call(page: dict[str, Any]) -> float | None:
+        """The published TOTAL PUT/CALL RATIO, or None if absent/invalid."""
+        for item in page.get("ratios") or []:
+            if isinstance(item, dict) and item.get("name") == PUT_CALL_RATIO_NAME:
+                try:
+                    value = float(item.get("value"))
+                except (TypeError, ValueError):
+                    return None
+                return value if math.isfinite(value) and value > 0 else None
+        return None
+
+    def pull_put_call_ratio(self, days_back: int | None = None) -> dict[str, Any]:
+        """Store the total exchange put/call ratio for recent trading days.
+
+        Only weekdays in the window that ``raw_series`` does not already hold
+        are requested. obs_date is the session date in the page URL; the
+        pull timestamp is when we read it, as for every other puller.
+        """
+        lookback = days_back if days_back is not None else PUT_CALL_DEFAULT_LOOKBACK_DAYS
+        end = date.today()
+        start = end - timedelta(days=max(lookback, 0))
+        rows_inserted = 0
+        requested = refused = unparsed = 0
+        try:
+            with self.engine.begin() as conn:
+                existing = self._get_existing_dates(
+                    PUT_CALL_SERIES_ID, conn, start_date=start, end_date=end,
+                )
+                day = start
+                while day <= end:
+                    if day.weekday() < 5 and day not in existing:
+                        url = PUT_CALL_URL.format(day=day.isoformat())
+                        requested += 1
+                        page = self._download_json(url)
+                        time.sleep(_PUT_CALL_DELAY)
+                        if page is None:
+                            refused += 1
+                        else:
+                            value = self._total_put_call(page)
+                            if value is None:
+                                unparsed += 1
+                                log.warning(
+                                    "CBOE put/call {d}: page has no valid {n}",
+                                    d=day, n=PUT_CALL_RATIO_NAME,
+                                )
+                            else:
+                                totals = (page.get("SUM OF ALL PRODUCTS") or [{}])[0]
+                                self._insert_raw(
+                                    conn=conn,
+                                    series_id=PUT_CALL_SERIES_ID,
+                                    obs_date=day,
+                                    value=value,
+                                    raw_payload={
+                                        "source_url": url,
+                                        "put_volume": totals.get("put"),
+                                        "call_volume": totals.get("call"),
+                                    },
+                                )
+                                rows_inserted += 1
+                    day += timedelta(days=1)
+        except Exception as exc:
+            log.warning("CBOE put/call pull failed: {e}", e=str(exc))
+            return {"status": "FAILED", "rows_inserted": 0,
+                    "feature_name": PUT_CALL_SERIES_ID, "error": str(exc)}
+
+        log.info(
+            "CBOE put/call — {n} rows inserted ({r} requested, {x} no session page)",
+            n=rows_inserted, r=requested, x=refused,
+        )
+        if requested >= PUT_CALL_ALL_REFUSED_MIN and refused == requested:
+            return {"status": "FAILED", "rows_inserted": 0, "feature_name": PUT_CALL_SERIES_ID,
+                    "error": f"all {requested} daily put/call pages refused (403/404)"}
+        if unparsed and not rows_inserted:
+            return {"status": "FAILED", "rows_inserted": 0, "feature_name": PUT_CALL_SERIES_ID,
+                    "error": f"{unparsed} put/call page(s) without {PUT_CALL_RATIO_NAME}"}
+        return {"status": "SUCCESS", "rows_inserted": rows_inserted,
+                "feature_name": PUT_CALL_SERIES_ID}
 
     def _parse_date_column(self, df: pd.DataFrame) -> pd.DataFrame:
         """Find and parse the date column in a CBOE CSV.
@@ -401,6 +526,8 @@ class CBOEIndicesPuller(BasePuller):
             )
             results.append(result)
             time.sleep(_RATE_LIMIT_DELAY)
+
+        results.append(self.pull_put_call_ratio(days_back=days_back))
 
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         total_rows = sum(r["rows_inserted"] for r in results)

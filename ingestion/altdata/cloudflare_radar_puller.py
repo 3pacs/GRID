@@ -53,6 +53,9 @@ _ENDPOINTS: dict[str, str] = {
 _REQUEST_TIMEOUT: int = 30
 _RATE_LIMIT_DELAY: float = 1.0  # seconds between requests
 
+# "No token" is a permanent config state; pull() warns about it once per process.
+_WARNED_NO_CF_TOKEN: bool = False
+
 # Top 30 countries by internet traffic (ISO 3166-1 alpha-2)
 TOP_COUNTRIES: list[str] = [
     "US", "CN", "DE", "JP", "GB", "FR", "BR", "IN", "KR", "CA",
@@ -607,10 +610,17 @@ class CloudflareRadarPuller(BasePuller):
         # Every Radar endpoint 403s without a bearer token — short-circuit
         # the whole pull so we don't log one ERROR per endpoint per cycle.
         if _resolve_cf_token() is None:
-            log.warning(
-                "CF Radar: no CF_RADAR_TOKEN / CLOUDFLARE_API_TOKEN set; "
-                "skipping all endpoints this cycle"
-            )
+            # Permanent config state: warn once per process (it warned 21
+            # times a day on grid-hermes), keep returning SKIPPED.
+            global _WARNED_NO_CF_TOKEN
+            if not _WARNED_NO_CF_TOKEN:
+                _WARNED_NO_CF_TOKEN = True
+                log.warning(
+                    "CF Radar: no CF_RADAR_TOKEN / CLOUDFLARE_API_TOKEN set; "
+                    "skipping all endpoints (logged once per process)"
+                )
+            else:
+                log.debug("CF Radar: no token set; skipping all endpoints this cycle")
             return {
                 "status": "SKIPPED",
                 "total_inserted": 0,

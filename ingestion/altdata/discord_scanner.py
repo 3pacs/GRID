@@ -60,6 +60,10 @@ _DISCORD_GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json"
 # Max messages to fetch per channel in batch mode
 _BATCH_LIMIT: int = 100
 
+# "No users configured" is a permanent config state; pull_recent() warns about
+# it once per process (19 times a day on grid-hermes before 2026-11-04).
+_WARNED_NO_USERS: bool = False
+
 # Rate limit between channel reads
 _CHANNEL_DELAY: float = 1.5  # Discord is strict on self-bot rate limits
 
@@ -496,7 +500,16 @@ class DiscordScanner(BasePuller):
             Summary dict.
         """
         if not self.users:
-            log.warning("DiscordScanner: no users configured — skipping")
+            # Permanent config state: warn once per process, keep SKIPPED.
+            global _WARNED_NO_USERS
+            if not _WARNED_NO_USERS:
+                _WARNED_NO_USERS = True
+                log.warning(
+                    "DiscordScanner: no users configured — skipping "
+                    "(logged once per process; set DISCORD_USERS)"
+                )
+            else:
+                log.debug("DiscordScanner: no users configured — skipping")
             return {
                 "source": "discord",
                 "status": "SKIPPED",

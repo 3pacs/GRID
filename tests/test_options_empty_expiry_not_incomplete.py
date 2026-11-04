@@ -266,7 +266,12 @@ def test_get_options_null_side_is_a_failed_fetch() -> None:
 
 
 def test_get_options_empty_result_list_is_a_failed_fetch() -> None:
-    assert _client(_Response(200, {"optionChain": {"result": [], "error": None}})).get_options("NOPE") is None
+    # Still a failed fetch to any ``if not chain`` caller (falsy), but marked
+    # NO_CHAIN so _pull_ticker can record "no listed options" (2026-11-04).
+    from ingestion import options as options_mod
+    result = _client(_Response(200, {"optionChain": {"result": [], "error": None}})).get_options("NOPE")
+    assert not result
+    assert result is options_mod.NO_CHAIN
 
 
 def test_get_options_non_200_is_a_failed_fetch() -> None:

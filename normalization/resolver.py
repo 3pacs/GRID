@@ -1039,7 +1039,15 @@ class Resolver:
             # with no entity_map entry are, in the bulk, entity-grained
             # feeds read from raw_series directly (see
             # EntityMap.missing_feature_report).
-            log.warning(
+            # WARNING only when rows are actually being dropped (a mapped name
+            # absent from feature_registry). A run whose only misses are
+            # unmapped ids is the steady state (entity-grained feeds read
+            # from raw_series directly) and is reported at INFO, with the
+            # same full detail, so the line stays greppable without making
+            # every cycle a warning.
+            log.log(
+                "WARNING" if (unmapped.get("mapped_unregistered_count", 0)
+                              or unmapped.get("unregistered_features")) else "INFO",
                 "Resolution: {m} series_id(s) mapped to {u} feature name(s) "
                 "missing from feature_registry (rows dropped until registered): "
                 "{names}; {s} series_id(s) have no entity_map entry, by family: "

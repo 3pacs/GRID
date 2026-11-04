@@ -594,11 +594,13 @@ class TestOptionsCoverage:
         assert out["status"] == "PARTIAL"
 
     def test_empty_chain_result_marks_no_chain(self) -> None:
-        from ingestion.options import YahooOptionsClient
+        from ingestion.options import NO_CHAIN, YahooOptionsClient
 
         client = YahooOptionsClient.__new__(YahooOptionsClient)
         client.crumb = "c"
         client.session = SimpleNamespace(get=lambda *a, **k: Resp(200, {"optionChain": {"result": [], "error": None}}))
-        assert client.get_options("NUOX") is None and client.last_no_chain is True
+        # A well-formed empty result is the falsy NO_CHAIN sentinel (merged
+        # with the no-listed-options cache), never a transport failure.
+        assert client.get_options("NUOX") is NO_CHAIN and not client.get_options("NUOX")
         client.session = SimpleNamespace(get=lambda *a, **k: Resp(500, None))
         assert client.get_options("SPY") is None and client.last_no_chain is False
