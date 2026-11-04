@@ -1,4 +1,4 @@
-"""Register the 46 mapped features the resolver has been dropping rows for.
+"""Register the 47 mapped features the resolver drops (or is about to).
 
 Revision ID: ghost_features_20261104
 Revises: merge_yf_finra_20261023
@@ -34,7 +34,7 @@ Confirmed absent, and confirmed fed, not assumed
 -------------------------------------------------
 Read-only against griddb on 2026-11-04 (statement_timeout 30 s):
 
-* none of the 46 names (45 logged plus one successor) below has a ``feature_registry`` row;
+* none of the 47 names (45 logged, plus bls_jolts_openings and the COR3M successor) below has a ``feature_registry`` row;
   ``count(*) WHERE name LIKE 'etf_flow%'`` is 0.
 * every mapped series id has live SUCCESS rows in ``raw_series``:
   ``ETF_FLOW:<T>:{5d,20d,accel}`` 22 rows in the last 30 obs-days, obs from
@@ -48,7 +48,12 @@ Read-only against griddb on 2026-11-04 (statement_timeout 30 s):
   2026-11-04 00:54Z (its upstream, Opportunity Insights, stops at
   2024-06-16 -- the same as its registered siblings ``oi_*``).
 
-Plus one new name, ``implied_correlation_3m``: ``ingestion/altdata/
+Plus two names that are not in the log because their writer is new:
+``bls_jolts_openings`` -- ``ingestion/bls.py`` requested ``JTS00000000JOL``,
+which BLS answers "Series does not exist", so JOLTS was never stored; the bls
+puller now requests ``JTS000000000000000JOL`` (total nonfarm job openings,
+SA level, 2026 M09 = 7523), mapped in entity_map alongside the old key -- and
+``implied_correlation_3m``: ``ingestion/altdata/
 cboe_indices.py`` replaces Cboe's discontinued ICJ index (``correlation_index``,
 last observation 2021-11-19, CSV now 403) with its successor COR3M, written as
 ``CBOE:COR3M``; COR3M_History.csv was probed from grid-svr on 2026-11-04
@@ -164,6 +169,10 @@ VALUES
   ('implied_correlation_3m', 'vol', 'CBOE 3-month implied correlation index (COR3M), successor to the discontinued ICJ',
    'CBOE CSV download', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2006-01-03', FALSE),
 
+  -- BLS JOLTS (ingestion/bls.py, JTS000000000000000JOL)
+  ('bls_jolts_openings', 'macro', 'JOLTS total nonfarm job openings, seasonally adjusted level (thousands)',
+   'BLS JTS000000000000000JOL', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2000-12-01', FALSE),
+
   -- Treasury curve (FRED DGS2; siblings yc_1y / yc_5y / yc_30y)
   ('yc_2y', 'rates', '2-year Treasury constant maturity yield',
    'DGS2 from FRED', 1, 0, 'RAW', 'FORWARD_FILL', '1990-01-01', TRUE),
@@ -255,6 +264,7 @@ REGISTERED_FEATURES: tuple[str, ...] = (
     "vix3m_spot",
     "vix9d_spot",
     "implied_correlation_3m",
+    "bls_jolts_openings",
     "yc_2y",
     *(f"etf_flow_{t}_{s}" for t in _ETF_TICKERS for s in ("5d", "20d", "accel")),
 )

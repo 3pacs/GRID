@@ -82,13 +82,19 @@ class TestRevisionCoversTheLog:
     def test_revision_registers_every_logged_name(self):
         assert set(LOGGED_GHOSTS.values()) <= set(_names_inserted())
 
-    def test_revision_adds_only_the_cor3m_successor_beyond_the_log(self):
-        assert set(_names_inserted()) - set(LOGGED_GHOSTS.values()) == {"implied_correlation_3m"}
+    def test_revision_adds_only_the_two_new_writers_beyond_the_log(self):
+        assert set(_names_inserted()) - set(LOGGED_GHOSTS.values()) == {
+            "implied_correlation_3m", "bls_jolts_openings",
+        }
         assert ALL_MAPPINGS["CBOE:COR3M"] == "implied_correlation_3m"
+
+    def test_jolts_maps_from_the_real_bls_id_and_keeps_the_old_key(self):
+        assert ALL_MAPPINGS["JTS000000000000000JOL"] == "bls_jolts_openings"
+        assert ALL_MAPPINGS["JTS00000000JOL"] == "bls_jolts_openings"
 
     def test_no_duplicates_and_exports_match(self):
         names = _names_inserted()
-        assert len(names) == len(set(names)) == 46
+        assert len(names) == len(set(names)) == 47
         assert list(_revision().REGISTERED_FEATURES) == names
 
     def test_every_registered_name_is_targeted_by_a_mapping(self):
@@ -116,7 +122,7 @@ class TestRevisionCoversTheLog:
     def test_upgrade_executes_insert_and_reports_counts(self, monkeypatch):
         mod = _revision()
         conn = MagicMock()
-        conn.execute.return_value.scalar.side_effect = [0, 46]
+        conn.execute.return_value.scalar.side_effect = [0, 47]
         fake_op = MagicMock()
         fake_op.get_bind.return_value = conn
         monkeypatch.setattr(mod, "op", fake_op)

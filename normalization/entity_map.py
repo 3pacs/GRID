@@ -529,6 +529,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CUUR0000SA0": "bls_cpi_u_all",
     "PRS85006092": "bls_nonfarm_productivity",
     "JTS00000000JOL": "bls_jolts_openings",
+    # The id above is not a BLS series ("Series does not exist"), so JOLTS was
+    # never stored. ingestion/bls.py now pulls the real one (2026-11-04):
+    # total nonfarm job openings, SA level -- 2026 M09 = 7523. The old key is
+    # kept; it is harmless.
+    "JTS000000000000000JOL": "bls_jolts_openings",
 
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
