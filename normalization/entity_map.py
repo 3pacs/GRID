@@ -728,15 +728,20 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # "ANALYST:sol_analyst_hold": "sol_analyst_hold",      # DEAD: no matching feature in registry
 
     # ── Fed liquidity equation (fed_liquidity.py) ────────────────────────
-    "RRPONTSYD": "overnight_reverse_repo",
+    # Owner decision 2026-11-04: the live series feed the registered names
+    # that stopped updating on 2026-04-02, instead of new duplicate names.
+    "RRPONTSYD": "reverse_repo_usage",
     "WSHOSHO": "fed_treasury_holdings",
     "SWPT": "central_bank_liq_swaps",
-    "H8B1023NCBCMG": "bank_reserves_at_fed",
-    "TOTRESNS": "total_reserves",
+    # H8B1023NCBCMG is monthly C&I-loan growth, not bank reserves (FRED
+    # metadata); TOTRESNS is total reserves. Owner decision 2026-11-04.
+    "H8B1023NCBCMG": "ci_loans_growth",
+    "TOTRESNS": "bank_reserves_at_fed",
     "COMPUTED:fed_net_liquidity": "fed_net_liquidity",
     "COMPUTED:fed_net_liquidity_change_1w": "fed_net_liquidity_change_1w",
     "COMPUTED:fed_net_liquidity_change_1m": "fed_net_liquidity_change_1m",
-    "COMPUTED:reverse_repo_pct_of_peak": "reverse_repo_pct_of_peak",
+    # All-history peak; repo_market's window-peak copy was dropped.
+    "COMPUTED:reverse_repo_pct_of_peak": "rrp_as_pct_of_peak",
     "COMPUTED:tga_drawdown": "tga_drawdown",
 
     # ── ETF flow proxies (institutional_flows.py) ──────────────────────
@@ -940,6 +945,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # BCB Brazil (puller writes feature name as series_id)
     "brazil_selic_rate": "brazil_selic_rate",
+    # BCB code 1 / 3545 under their correct names (owner decision 2026-11-04).
+    "brazil_usd_brl_fx": "brazil_usd_brl",
+    "brazil_fx_reserves": "brazil_fx_reserves",
     "brazil_ipca_yoy": "brazil_ipca_yoy",
     "brazil_credit_growth": "brazil_credit_growth",
 

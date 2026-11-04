@@ -47,6 +47,13 @@ LOGGED_GHOSTS: dict[str, str] = {
     **{f"ETF_FLOW:{t}:{s}": f"etf_flow_{t.lower()}_{s}" for t in ETF for s in ("5d", "20d", "accel")},
 }
 
+# Owner decision 2026-11-04: these two logged series feed the registered
+# names that stopped updating on 2026-04-02, instead of new duplicates.
+REMAPPED_TO_REGISTERED: dict[str, str] = {
+    "COMPUTED:reverse_repo_pct_of_peak": "rrp_as_pct_of_peak",
+    "RRPONTSYD": "reverse_repo_usage",
+}
+
 
 def _revision():
     return importlib.import_module("migrations.versions.ghost_features_20261104")
@@ -77,10 +84,13 @@ def warnings_captured():
 class TestRevisionCoversTheLog:
     def test_every_logged_mapping_is_still_in_place(self):
         for sid, name in LOGGED_GHOSTS.items():
-            assert ALL_MAPPINGS.get(sid) == name, sid
+            expected = REMAPPED_TO_REGISTERED.get(sid, name)
+            assert ALL_MAPPINGS.get(sid) == expected, sid
 
     def test_revision_registers_every_logged_name(self):
-        assert set(LOGGED_GHOSTS.values()) <= set(_names_inserted())
+        logged = {n for sid, n in LOGGED_GHOSTS.items() if sid not in REMAPPED_TO_REGISTERED}
+        assert logged <= set(_names_inserted())
+        assert not set(REMAPPED_TO_REGISTERED.values()) & set(_names_inserted())
 
     def test_revision_adds_only_the_expected_names_beyond_the_log(self):
         # + bls_cpi_u_all / bls_nonfarm_productivity: owner decision 2026-11-04
@@ -88,6 +98,7 @@ class TestRevisionCoversTheLog:
         assert set(_names_inserted()) - set(LOGGED_GHOSTS.values()) == {
             "implied_correlation_3m", "bls_jolts_openings",
             "bls_cpi_u_all", "bls_nonfarm_productivity",
+            "ci_loans_growth", "bank_reserves_at_fed", "brazil_usd_brl", "brazil_fx_reserves",
         }
         assert ALL_MAPPINGS["CBOE:COR3M"] == "implied_correlation_3m"
 
@@ -97,7 +108,7 @@ class TestRevisionCoversTheLog:
 
     def test_no_duplicates_and_exports_match(self):
         names = _names_inserted()
-        assert len(names) == len(set(names)) == 49
+        assert len(names) == len(set(names)) == 51
         assert list(_revision().REGISTERED_FEATURES) == names
 
     def test_every_registered_name_is_targeted_by_a_mapping(self):
@@ -125,7 +136,7 @@ class TestRevisionCoversTheLog:
     def test_upgrade_executes_insert_and_reports_counts(self, monkeypatch):
         mod = _revision()
         conn = MagicMock()
-        conn.execute.return_value.scalar.side_effect = [0, 49]
+        conn.execute.return_value.scalar.side_effect = [0, 51]
         fake_op = MagicMock()
         fake_op.get_bind.return_value = conn
         monkeypatch.setattr(mod, "op", fake_op)
@@ -139,11 +150,14 @@ class TestRevisionCoversTheLog:
 @pytest.mark.unit
 class TestResolutionOverTheSeededRegistry:
     def test_every_logged_series_resolves_once_registered(self):
-        registry = [(9000 + i, n) for i, n in enumerate(_names_inserted())]
+        # The remap targets already exist on griddb (registered before this
+        # revision), so the fake registry carries them too.
+        names = _names_inserted() + sorted(set(REMAPPED_TO_REGISTERED.values()))
+        registry = [(9000 + i, n) for i, n in enumerate(names)]
         ids = dict((n, i) for i, n in registry)
         em = EntityMap(db_engine=_engine(registry))
         for sid, name in LOGGED_GHOSTS.items():
-            assert em.get_feature_id(sid) == ids[name], sid
+            assert em.get_feature_id(sid) == ids[REMAPPED_TO_REGISTERED.get(sid, name)], sid
         report = em.missing_feature_report()
         assert report["lookups_missed"] == 0 and report["unregistered_features"] == []
 

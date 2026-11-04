@@ -1,4 +1,4 @@
-"""Register the 49 mapped features the resolver drops (or is about to).
+"""Register the 51 mapped features the resolver drops (or is about to).
 
 Revision ID: ghost_features_20261104
 Revises: merge_yf_finra_20261023
@@ -34,8 +34,9 @@ Confirmed absent, and confirmed fed, not assumed
 -------------------------------------------------
 Read-only against griddb on 2026-11-04 (statement_timeout 30 s):
 
-* none of the 49 names (45 logged, plus bls_jolts_openings, the COR3M successor,
-  bls_cpi_u_all and bls_nonfarm_productivity) below has a ``feature_registry`` row;
+* none of the 51 names below has a ``feature_registry`` row (43 logged, plus
+  bls_jolts_openings, the COR3M successor, bls_cpi_u_all, bls_nonfarm_productivity
+  and the four correctly named H.8 / BCB features from the 2026-11-04 owner decisions);
   ``count(*) WHERE name LIKE 'etf_flow%'`` is 0.
 * every mapped series id has live SUCCESS rows in ``raw_series``:
   ``ETF_FLOW:<T>:{5d,20d,accel}`` 22 rows in the last 30 obs-days, obs from
@@ -62,14 +63,13 @@ last observation 2021-11-19, CSV now 403) with its successor COR3M, written as
 
 Deliberately left as they are
 -----------------------------
-* ``overnight_reverse_repo`` duplicates two stale rows, ``reverse_repo``
-  (119) and ``reverse_repo_usage`` (18104), and ``reverse_repo_pct_of_peak``
-  duplicates ``rrp_as_pct_of_peak`` (18105) -- all three last resolved
-  2026-04-02 from a yield-curve puller that no longer writes. ``yc_2y``
-  likewise shadows the stale ``treasury_2y`` (107, last 2026-04-02) while
-  matching its live siblings ``yc_1y`` / ``yc_5y`` / ``yc_30y``. The live
-  writers already target the names registered here; collapsing the stale
-  duplicates is a separate consumer-facing change.
+* Owner decision 2026-11-04 on the stale duplicates: ``RRPONTSYD`` and
+  ``COMPUTED:reverse_repo_pct_of_peak`` now map onto the already-registered
+  ``reverse_repo_usage`` / ``rrp_as_pct_of_peak`` (last resolved 2026-04-02),
+  so ``overnight_reverse_repo`` / ``reverse_repo_pct_of_peak`` are no longer
+  registered here. ``yc_2y`` stays (it is read by the derived-spread and
+  sanity code and matches ``yc_1y`` / ``yc_5y`` / ``yc_30y``); the three
+  ``treasury_2y`` readers were repointed to it.
 * ``yc_10y`` is mapped from ``DGS10`` and absent too, but ``DGS10`` has no
   observation after 2026-04-02 on griddb, so it is not a ghost today
   (0063's rule: no registry row without a producer).
@@ -149,16 +149,12 @@ VALUES
    'oi_spend_high minus oi_spend_low', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2020-01-13', FALSE),
 
   -- Fed liquidity equation (altdata/fed_liquidity.py, FRED RRPONTSYD)
-  ('overnight_reverse_repo', 'rates', 'Fed ON RRP facility daily usage (billions)',
-   'RRPONTSYD from FRED', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2003-02-07', TRUE),
   ('fed_net_liquidity', 'macro', 'Fed net liquidity = Fed total assets - TGA - ON RRP (millions USD)',
    'COMPUTED: WALCL - WTREGEN - RRPONTSYD', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2026-03-20', TRUE),
   ('fed_net_liquidity_change_1w', 'macro', 'Week-over-week change in Fed net liquidity',
    'COMPUTED: 7-day delta of fed_net_liquidity', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2026-03-20', TRUE),
   ('fed_net_liquidity_change_1m', 'macro', 'Month-over-month change in Fed net liquidity',
    'COMPUTED: 30-day delta of fed_net_liquidity', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2026-03-20', TRUE),
-  ('reverse_repo_pct_of_peak', 'rates', 'ON RRP usage as a percentage of its historical peak (drain gauge)',
-   'RRPONTSYD / max(RRPONTSYD)', 1, 0, 'RAW', 'FORWARD_FILL', '2026-03-20', TRUE),
   ('tga_drawdown', 'rates', '30-day change in the Treasury General Account (negative = spending = liquidity injection)',
    'COMPUTED: 30-day delta of WTREGEN', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2026-03-25', TRUE),
 
@@ -183,6 +179,20 @@ VALUES
    'BLS CUUR0000SA0', 1, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', FALSE),
   ('bls_nonfarm_productivity', 'macro', 'Nonfarm business labor productivity, % change at annual rate (BLS, quarterly)',
    'BLS PRS85006092', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2024-01-01', FALSE),
+
+  -- Correct names for mislabeled series (owner decisions 2026-11-04). FRED
+  -- H8B1023NCBCMG is monthly C&I-loan growth (was mapped to the never-
+  -- registered bank_reserves_at_fed); TOTRESNS is total reserves. BCB code 1
+  -- is USD/BRL and 3545 annual reserves, now written under new raw ids
+  -- (brazil_usd_brl_fx / brazil_fx_reserves; BCB backfills from 1994-01-01).
+  ('ci_loans_growth', 'macro', 'Commercial and industrial loans, all commercial banks, monthly growth (FRED H8B1023NCBCMG)',
+   'H8B1023NCBCMG from FRED', 1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+  ('bank_reserves_at_fed', 'macro', 'Total reserves of depository institutions (FRED TOTRESNS)',
+   'TOTRESNS from FRED', 1, 0, 'ZSCORE', 'FORWARD_FILL', '1990-01-01', FALSE),
+  ('brazil_usd_brl', 'fx', 'USD/BRL commercial exchange rate, sell (BCB SGS 1)',
+   'BCB SGS 1', 1, 0, 'RAW', 'FORWARD_FILL', '1994-01-01', FALSE),
+  ('brazil_fx_reserves', 'macro', 'Brazil international reserves, annual (BCB SGS 3545)',
+   'BCB SGS 3545', 1, 0, 'ZSCORE', 'FORWARD_FILL', '1994-01-01', FALSE),
 
   -- Treasury curve (FRED DGS2; siblings yc_1y / yc_5y / yc_30y)
   ('yc_2y', 'rates', '2-year Treasury constant maturity yield',
@@ -266,11 +276,9 @@ REGISTERED_FEATURES: tuple[str, ...] = (
     "eurozone_hicp_yoy",
     "ecb_bank_lending_yoy",
     "oi_k_shape_ratio",
-    "overnight_reverse_repo",
     "fed_net_liquidity",
     "fed_net_liquidity_change_1w",
     "fed_net_liquidity_change_1m",
-    "reverse_repo_pct_of_peak",
     "tga_drawdown",
     "vix3m_spot",
     "vix9d_spot",
@@ -278,6 +286,10 @@ REGISTERED_FEATURES: tuple[str, ...] = (
     "bls_jolts_openings",
     "bls_cpi_u_all",
     "bls_nonfarm_productivity",
+    "ci_loans_growth",
+    "bank_reserves_at_fed",
+    "brazil_usd_brl",
+    "brazil_fx_reserves",
     "yc_2y",
     *(f"etf_flow_{t}_{s}" for t in _ETF_TICKERS for s in ("5d", "20d", "accel")),
 )

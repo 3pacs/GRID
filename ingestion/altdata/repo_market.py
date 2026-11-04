@@ -44,7 +44,9 @@ REPO_SERIES: dict[str, dict[str, str]] = {
 # Derived features computed from the raw series above
 DERIVED_FEATURES: list[str] = [
     "sofr_spread_to_ffr",     # SOFR minus effective FFR
-    "rrp_as_pct_of_peak",     # Current RRP / peak RRP
+    # rrp_as_pct_of_peak is no longer derived here (2026-11-04): this window's
+    # peak disagreed with fed_liquidity's all-history peak, which now feeds
+    # the feature (COMPUTED:reverse_repo_pct_of_peak -> rrp_as_pct_of_peak).
     "treasury_bill_spread",   # 3M T-bill minus SOFR
 ]
 
@@ -129,7 +131,6 @@ class RepoMarketPuller(BasePuller):
     - sofr_rate: Secured Overnight Financing Rate
     - sofr_spread_to_ffr: SOFR minus effective FFR (positive = funding stress)
     - reverse_repo_usage: Fed ON RRP facility usage (billions)
-    - rrp_as_pct_of_peak: current usage / peak usage
     - treasury_bill_spread: 3M T-bill minus SOFR
 
     Attributes:
@@ -339,13 +340,7 @@ class RepoMarketPuller(BasePuller):
 
             sofr = raw_data.get("sofr_rate", {})
             ffr = raw_data.get("fed_funds_effective", {})
-            rrp = raw_data.get("reverse_repo_usage", {})
             tbill = raw_data.get("treasury_bill_3m", {})
-
-            # Peak RRP for ratio calculation
-            rrp_peak = max(rrp.values()) if rrp else 1.0
-            if rrp_peak == 0:
-                rrp_peak = 1.0
 
             # sofr_spread_to_ffr
             spread_rows = 0
@@ -368,29 +363,6 @@ class RepoMarketPuller(BasePuller):
                 "feature": "sofr_spread_to_ffr",
                 "status": "SUCCESS",
                 "rows_inserted": spread_rows,
-            })
-
-            # rrp_as_pct_of_peak
-            pct_rows = 0
-            for obs_date, val in sorted(rrp.items()):
-                pct = val / rrp_peak
-                if not self._row_exists("rrp_as_pct_of_peak", obs_date, conn):
-                    insert_result = self._insert_raw(
-                        conn=conn,
-                        series_id="rrp_as_pct_of_peak",
-                        obs_date=obs_date,
-                        value=pct,
-                        raw_payload={"rrp": val, "peak": rrp_peak},
-                        return_result=True,
-                    )
-                    affected = getattr(insert_result, "rowcount", None)
-                    if type(affected) is not int or affected < 0:
-                        raise ValueError("Unknown affected row count")
-                    pct_rows += affected
-            results.append({
-                "feature": "rrp_as_pct_of_peak",
-                "status": "SUCCESS",
-                "rows_inserted": pct_rows,
             })
 
             # treasury_bill_spread: 3M T-bill minus SOFR

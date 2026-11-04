@@ -23,8 +23,12 @@ BCB_SERIES: dict[int, str] = {
     11: "brazil_selic_rate",
     13522: "brazil_ipca_yoy",
     20539: "brazil_credit_growth",
-    1: "brazil_discount_rate",
-    3545: "brazil_usd_brl",
+    # Owner decision 2026-11-04: written under new raw ids so the old,
+    # mislabeled rows (code 1 stored as "brazil_discount_rate", code 3545 as
+    # "brazil_usd_brl") never mix with correctly labeled data. Neither old
+    # name was ever registered, so no resolved history is affected.
+    1: "brazil_usd_brl_fx",      # USD/BRL commercial rate (sell), daily
+    3545: "brazil_fx_reserves",  # international reserves, annual
     7454: "brazil_trade_balance",
     13761: "brazil_primary_balance_gdp",
 }
@@ -36,10 +40,6 @@ _RATE_LIMIT_DELAY: float = 1.0
 # 1994 answers HTTP 406 ("... período de consulta ... até 10 anos ..."),
 # which is why codes 1 and 11 failed on every bulk pull (verified from
 # grid-svr 2026-11-04). Daily series are fetched in <=10-year windows.
-# NB: code 1 is the USD/BRL commercial rate (sell), code 3545 is annual
-# international reserves -- the feature names "brazil_discount_rate" and
-# "brazil_usd_brl" do not describe them; renaming would orphan history and
-# entity_map rows, so it is flagged for the owner instead of done here.
 _DAILY_SERIES: frozenset[int] = frozenset({1, 11})
 _REVISION_LOOKBACK_DAYS: int = 400
 _MAX_DAILY_WINDOW_YEARS: int = 10
