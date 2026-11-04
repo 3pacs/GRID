@@ -677,3 +677,22 @@ class TestCEPII:
         out = puller.pull_all()
         assert pulled == [2022]
         assert out["succeeded"] == out["total"] == 1 and out["total_rows"] == 5
+
+
+def test_sec_velocity_default_identity_is_resolved(monkeypatch):
+    from ingestion import sec_velocity
+
+    seen: list[str] = []
+    monkeypatch.setattr(sec_velocity, "set_identity", lambda ident: seen.append(ident))
+    monkeypatch.setattr(sec_velocity.BasePuller, "__init__", lambda self, engine: setattr(self, "source_id", 1))
+    sec_velocity.SECVelocityPuller(db_engine=None)
+    assert seen and "localhost" not in seen[0] and "@" in seen[0]
+
+
+def test_gdelt_cadence_and_jupiter_default():
+    from config import Settings
+    from ingestion.smart_scheduler import PULLER_REGISTRY
+
+    gdelt = next(p for p in PULLER_REGISTRY if p["name"] == "gdelt")
+    assert gdelt["freq_h"] >= 1
+    assert "token.jup.ag" not in Settings.model_fields["SOLANA_UNIVERSE_JUPITER_URL"].default
