@@ -61,6 +61,62 @@ _EQUITY_TZ = ZoneInfo("America/New_York")
 REGULAR_SESSION_OPEN_ET = (9, 30)
 DEFAULT_CAPTURE_SOURCE = "options_puller"
 
+# Tickers Yahoo serves no listed options for. The catalyst universe carries
+# ~30 sub-$2B names (NUOX, VXRT, TKPHF, ...) that have no listed options; on
+# grid-hermes every one of them was re-fetched and re-warned on every run
+# (336 lines in the 24 h to 2026-11-04) and, reported SKIPPED/FAILED, kept the
+# whole options source PARTIAL. A confirmed "no listed options" answer is
+# remembered for NO_OPTIONS_TTL_SECONDS in process memory, logged once per
+# ticker per TTL, and reported per ticker as NO_NEW_DATA with
+# ``no_options=True`` -- a checked ticker with nothing to capture. After the
+# TTL the ticker is probed again, so a new listing is picked up within a day.
+# Hand-listed EQUITY_TICKERS are never cached: they are known optionable, so
+# an empty answer for them stays a visible incomplete capture.
+NO_OPTIONS_TTL_SECONDS = 24 * 3600
+_NO_OPTIONS_UNTIL: dict[str, float] = {}
+
+
+class _NoChain:
+    """``get_options`` result for a well-formed response carrying no chain.
+
+    Falsy, so any caller that only checks ``if not chain`` keeps treating it
+    as a failed fetch; ``_pull_ticker`` checks identity to tell "this symbol
+    has no listed options" from a transport failure.
+    """
+
+    def __bool__(self) -> bool:
+        return False
+
+    def __repr__(self) -> str:
+        return "NO_CHAIN"
+
+
+NO_CHAIN = _NoChain()
+
+
+def _no_options_cached(ticker: str) -> bool:
+    until = _NO_OPTIONS_UNTIL.get(ticker)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        del _NO_OPTIONS_UNTIL[ticker]
+        return False
+    return True
+
+
+def _no_options_result(ticker: str, why: str) -> dict[str, Any]:
+    """Remember ``ticker`` as optionless (unless hand-listed) and report it."""
+    if ticker in EQUITY_TICKERS:
+        log.warning("{t}: {w} (hand-listed optionable ticker; not cached)", t=ticker, w=why)
+        return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": why}
+    _NO_OPTIONS_UNTIL[ticker] = time.monotonic() + NO_OPTIONS_TTL_SECONDS
+    log.info(
+        "{t}: no listed options ({w}) -- not re-checked for {h}h",
+        t=ticker, w=why, h=NO_OPTIONS_TTL_SECONDS // 3600,
+    )
+    return {"ticker": ticker, "status": "NO_NEW_DATA", "rows_inserted": 0,
+            "reason": f"no listed options: {why}", "no_options": True}
+
 
 class _OptionsBudgetExpired(Exception):
     """Stop a capture without publishing an incomplete chain."""
@@ -98,14 +154,17 @@ class OptionsPullResults(list[dict[str, Any]]):
         rows = sum(counts) if known_rows else None
         ok = statuses.count("SUCCESS")
         deferred = statuses.count("DEFERRED")
+        # Tickers with no listed options were checked and have nothing to
+        # capture; they complete coverage rather than break it.
+        no_options = sum(1 for r in self if r.get("no_options") and r.get("status") == "NO_NEW_DATA")
         if not self or all(s == "SKIPPED" for s in statuses):
             reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
             status, note = "SKIPPED", "no ticker capture completed"
             if reasons:
                 note = f"{note}: {', '.join(reasons)}"
-        elif not ok and not deferred:
+        elif not ok and not deferred and not no_options:
             status, note = "FAILED", "no ticker succeeded"
-        elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
+        elif self.publication_error or not self.full_universe or ok + no_options != len(self) or not known_rows:
             status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
         elif not rows:
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
@@ -116,6 +175,7 @@ class OptionsPullResults(list[dict[str, Any]]):
             "scope": "full_universe" if self.full_universe else "subset",
             "tickers_total": len(self), "tickers_ok": ok,
             "tickers_deferred": deferred,
+            "tickers_no_options": no_options,
             "snapshots": sum(r.get("snapshots", 0) for r in self),
             "error": note if status in ("PARTIAL", "FAILED") else None,
             "reason": note,
@@ -315,7 +375,13 @@ class YahooOptionsClient:
                 log.warning("Yahoo options {t}: provider error in chain response", t=ticker)
                 return None
             results = chain.get("result") if isinstance(chain, dict) else None
-            if not isinstance(results, list) or not results:
+            if results == []:
+                # Well-formed response, no error, empty result list: Yahoo has
+                # no chain for this symbol (NUOX, CRNX on 2026-11-04, every
+                # run). Not a transport failure; the caller decides.
+                log.debug("Yahoo options {t}: no chain result", t=ticker)
+                return NO_CHAIN
+            if not isinstance(results, list):
                 log.warning("Yahoo options {t}: no chain result", t=ticker)
                 return None
             result = results[0]
@@ -504,9 +570,11 @@ class OptionsPuller(BasePuller):
 
         total_snaps = sum(r.get("snapshots", 0) for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
+        no_options = sum(1 for r in results if r.get("no_options"))
         log.info(
-            "Options pull complete — {ok}/{total} tickers, {snaps} snapshots",
-            ok=succeeded, total=len(tickers), snaps=total_snaps,
+            "Options pull complete — {ok}/{total} tickers, {snaps} snapshots, "
+            "{no} without listed options",
+            ok=succeeded, total=len(tickers), snaps=total_snaps, no=no_options,
         )
         outcome = OptionsPullResults(results, full_universe=full_universe)
         if outcome.summary["status"] == "SUCCESS":
@@ -589,6 +657,9 @@ class OptionsPuller(BasePuller):
             if _before_regular_open(now):
                 return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
                         "reason": "pre-session"}
+            if _no_options_cached(ticker):
+                return {"ticker": ticker, "status": "NO_NEW_DATA", "rows_inserted": 0,
+                        "reason": "no listed options (cached)", "no_options": True}
             capture_clock = time.monotonic()
             # Force a 64-bit PostgreSQL transaction ID for each capture. It is
             # allocated in database order, survives rollback, and needs no
@@ -599,6 +670,8 @@ class OptionsPuller(BasePuller):
                     text("SELECT txid_current(), clock_timestamp()"),
                 ).fetchone()
             first = self._yahoo.get_options(ticker)
+            if first is NO_CHAIN:
+                return _no_options_result(ticker, "provider returned no chain")
             if not first:
                 return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from Yahoo"}
 
@@ -611,8 +684,7 @@ class OptionsPuller(BasePuller):
 
             expirations = first.get("expirations", [])
             if not expirations:
-                log.warning("{t}: no options expirations", t=ticker)
-                return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0, "reason": "no expirations"}
+                return _no_options_result(ticker, "no expirations")
             selected_expirations = expirations[:max_expirations]
 
             total_call_oi = 0
@@ -650,6 +722,9 @@ class OptionsPuller(BasePuller):
                 else:
                     chain_data = self._yahoo.get_options(ticker, exp_ts)
                     time.sleep(0.2)
+                    if chain_data is NO_CHAIN:
+                        # Listed expiry, no chain page: a failed fetch, as before.
+                        log.warning("Yahoo options {t}: no chain result", t=ticker)
                 if not chain_data:
                     complete = False
                     failed_fetches += 1
