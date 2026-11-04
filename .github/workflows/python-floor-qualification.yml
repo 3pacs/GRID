@@ -25,10 +25,13 @@ jobs:
           test "$GITHUB_SHA" = "$PR922_APPROVED_COMMIT"
           python3 -c 'import pr922_native_job_supervisor_v3 as v; v.verify_checkout()'
           python3 -c 'import platform,sys; assert sys.version_info[:2] == (3,12) and platform.machine() == "x86_64"; print(sys.version, platform.platform())'
-          command -v pg_config >/dev/null
-          PG_BIN="$(pg_config --bindir)"
+          # Use the PG16 server suite rather than libpq-dev's potentially
+          # different pg_config major. Fail closed if the image has drifted.
+          PG_BIN="/usr/lib/postgresql/16/bin"
           for tool in initdb pg_ctl postgres psql; do test -x "$PG_BIN/$tool"; done
-          "$PG_BIN/postgres" --version
+          PG_VERSION="$("$PG_BIN/postgres" --version)"
+          case "$PG_VERSION" in 'postgres (PostgreSQL) 16.15'*) ;; *) exit 1 ;; esac
+          echo "$PG_VERSION"
           echo "$PG_BIN" >> "$GITHUB_PATH"
       # Proposed network/package setup; execution needs separate admission.
       - name: Install two hash-pinned synthetic-test dependencies in job venv
