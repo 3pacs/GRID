@@ -238,8 +238,8 @@ if __name__ == "__main__":
         max_rounds = 25
 
     log.remove()
-    from config import scrubbed_stderr  # scrubs credentials, tracebacks included
-    log.add(scrubbed_stderr, level="INFO")
+    from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
     run_spider(
         max_rounds=max_rounds,
         sleep_between=args.sleep_between,

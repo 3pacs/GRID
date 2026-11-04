@@ -62,8 +62,8 @@ def main() -> int:
 
     if args.verbose:
         log.remove()
-        from config import scrubbed_stderr  # scrubs credentials, tracebacks included
-        log.add(scrubbed_stderr, level="DEBUG")
+        from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+        log.add(scrubbed_stderr, level="DEBUG", diagnose=LOG_DIAGNOSE)
 
     if args.since_hours <= 0:
         log.error("--since-hours must be > 0")

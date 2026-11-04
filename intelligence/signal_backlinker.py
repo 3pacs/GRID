@@ -482,8 +482,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     log.remove()
-    from config import scrubbed_stderr  # scrubs credentials, tracebacks included
-    log.add(scrubbed_stderr, level="INFO")
+    from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
     run_backlinker(
         interval=args.interval,
         lookback_minutes=args.lookback_minutes,

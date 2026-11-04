@@ -385,6 +385,6 @@ def run_extractor(interval: int = 300) -> None:
 
 if __name__ == "__main__":
     log.remove()
-    from config import scrubbed_stderr  # scrubs credentials, tracebacks included
-    log.add(scrubbed_stderr, level="INFO")
+    from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
     run_extractor()

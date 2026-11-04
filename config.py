@@ -1001,11 +1001,17 @@ def scrubbed_stderr(message: str) -> None:
     sys.stderr.write(_scrub_log_text(str(message)))
 
 
+# loguru's diagnose mode prints the value of every local variable under each traceback line. Those bare values
+# (an API key, an OAuth access token fetched at runtime) carry no key= prefix for the patterns to find, so it is
+# off unless GRID_LOG_DIAGNOSE=1 is set for a debugging session.
+LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+
 log.remove()  # Remove default handler
 log.configure(patcher=_scrub_log_record)
 log.add(
     scrubbed_stderr,
     level=settings.LOG_LEVEL,
+    diagnose=LOG_DIAGNOSE,
     colorize=sys.stderr.isatty(),
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "

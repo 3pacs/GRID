@@ -101,6 +101,23 @@ def test_console_sink_scrubs_tracebacks_and_extras(monkeypatch, capsys):
     assert "pull failed" in err and "RuntimeError" in err  # the traceback is still there
     assert KEY not in err
     assert "token=[REDACTED]" in err
+    assert "└" not in err  # no diagnose variable dump: bare values there carry no key= for the patterns to catch
+
+
+def test_stderr_sinks_keep_diagnose_off():
+    """Every scrubbed_stderr sink passes diagnose=LOG_DIAGNOSE, so tracebacks never dump local variable values."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    add = re.compile(r"\b(?:log|logger)\.add\(\s*scrubbed_stderr\b[^)]*\)", re.S)
+    missing = []
+    for top in ("api", "ingestion", "intelligence", "scripts", "orchestration", "store", "evals"):
+        for p in (root / top).rglob("*.py") if (root / top).is_dir() else ():
+            for call in add.findall(p.read_text(encoding="utf-8", errors="replace")):
+                if "diagnose=LOG_DIAGNOSE" not in call:
+                    missing.append(f"{p.relative_to(root)}: {call}")
+    assert missing == []
 
 
 def test_value_with_ampersand_or_hash_fully_scrubbed():
