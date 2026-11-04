@@ -1,0 +1,81 @@
+name: Python 3.14
+
+# The 2026-11 runtime upgrade (Anik, 2026-11-04: "lets get it to 3.14"). Production grid-api / grid-hermes still run
+# /usr/bin/python3.10 until the cutover; this job proves the whole backend suite on CPython 3.14 with the requirements
+# as they resolve there (numpy/scipy/matplotlib move to their first 3.14-wheeled releases), against the same ephemeral
+# PostgreSQL 15 and with the same commands as GRID Tests' Backend Tests job. It does not replace that job.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-tests-py314:
+    name: Backend Tests (Python 3.14)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Start ephemeral Postgres
+        run: |
+          docker run -d --name grid-test-pg \
+            -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
+            -p 5432:5432 postgres:15
+          for i in $(seq 1 30); do
+            docker exec grid-test-pg pg_isready -U grid > /dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: |
+          python -V
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist
+          pip freeze > /tmp/py314-freeze.txt
+          echo "::group::resolved packages (Python 3.14)"
+          cat /tmp/py314-freeze.txt
+          echo "::endgroup::"
+
+      - name: Run tests
+        env:
+          DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          GRID_BRIEFING_ROUTE_TEST_DB_URL: postgresql://grid:testpass@localhost:5432/griddb_test
+          DB_PASSWORD: testpass
+          GRID_JWT_SECRET: test-secret-ci
+          TESTING: "true"
+        run: |
+          set +e
+          python -m pytest tests/ --co -q > /tmp/grid-pytest-collection.txt 2>/tmp/grid-pytest-collection.err
+          collection_status=$?
+          set -e
+          if [ "$collection_status" -ne 0 ]; then
+            echo "::group::pytest collection error (tail of stdout)"
+            tail -200 /tmp/grid-pytest-collection.txt
+            echo "::endgroup::"
+            cat /tmp/grid-pytest-collection.err
+            exit "$collection_status"
+          fi
+          tail -3 /tmp/grid-pytest-collection.txt
+          set +e
+          python -m pytest tests/ -v --tb=short --maxfail=50 --timeout=180 \
+            -n auto --dist loadgroup --durations=25 \
+            > /tmp/grid-pytest-output.txt 2>&1
+          pytest_status=$?
+          set -e
+          echo "::group::pytest output (tail -300)"
+          tail -300 /tmp/grid-pytest-output.txt
+          echo "::endgroup::"
+          exit "$pytest_status"
