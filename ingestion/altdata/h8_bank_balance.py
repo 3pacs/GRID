@@ -18,18 +18,27 @@ component (CAT-124).
 
 Implementation
 --------------
-FRED publishes every H.8 series under the H8 family. We pull the core
-8 series on a weekly cadence (the H.8 release is Friday PM for
-Wednesday-ending week):
+FRED publishes the H.8 weekly levels (billions USD, seasonally adjusted,
+all commercial banks, week ending Wednesday; released Friday PM). We pull
+the core 8:
 
-  H8B1001NCBCMG  Total assets, all commercial banks
-  H8B1023NCBCMG  Commercial & industrial loans
-  H8B1029NCBCMG  Real estate loans
-  H8B1094NCBCMG  Consumer loans
-  H8B1116NCBCMG  Cash assets
-  H8B1151NCBCMG  Total deposits
-  H8B1155NCBCMG  Large time deposits
-  H8B1247NCBCMG  Total liabilities
+  TLAACBW027SBOG  Total assets
+  TOTCI           Commercial & industrial loans
+  RELACBW027SBOG  Real estate loans
+  CLSACBW027SBOG  Consumer loans
+  CASACBW027SBOG  Cash assets
+  DPSACBW027SBOG  Deposits
+  LTDACBW027SBOG  Large time deposits
+  TLBACBW027SBOG  Total liabilities
+
+Until 2026-11 this list carried ``H8B1001NCBCMG``..``H8B1247NCBCMG``. FRED's
+own metadata (probed from grid-svr 2026-11-04) shows those are MONTHLY
+"% Chg. at Annual Rate" growth series -- not weekly levels, and several were
+mislabelled (H8B1001 = bank credit, H8B1247 = credit-card loans). Their
+latest observation was 2026-09-01, so ``fed_h8`` read as stale against its
+weekly cadence even when every pull succeeded. The weekly level series above
+are current to 2026-10-21. Historical ``fed_h8:H8B*`` rows are left as
+written (raw_series is append-only).
 
 Deltas are computed downstream; we only store the raw weekly levels
 here under series_id ``fed_h8:<fred_code>`` in raw_series.
@@ -40,6 +49,7 @@ same retry + rate-limit behavior for free.
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from typing import Any
@@ -54,17 +64,18 @@ from ingestion.base import BasePuller
 # ── Core H.8 series we track ──────────────────────────────────────────────
 
 H8_SERIES: dict[str, str] = {
-    "H8B1001NCBCMG": "total_assets_all_banks",
-    "H8B1023NCBCMG": "ci_loans",
-    "H8B1029NCBCMG": "real_estate_loans",
-    "H8B1094NCBCMG": "consumer_loans",
-    "H8B1116NCBCMG": "cash_assets",
-    "H8B1151NCBCMG": "total_deposits",
-    "H8B1155NCBCMG": "large_time_deposits",
-    "H8B1247NCBCMG": "total_liabilities",
+    "TLAACBW027SBOG": "total_assets_all_banks",
+    "TOTCI": "ci_loans",
+    "RELACBW027SBOG": "real_estate_loans",
+    "CLSACBW027SBOG": "consumer_loans",
+    "CASACBW027SBOG": "cash_assets",
+    "DPSACBW027SBOG": "total_deposits",
+    "LTDACBW027SBOG": "large_time_deposits",
+    "TLBACBW027SBOG": "total_liabilities",
 }
 
 FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+_API_KEY_RE = re.compile(r"api_key=[^&\s]+")
 
 # Weekly cadence — request a 2-year window on every pull so we catch
 # any revisions. Idempotent via raw_series dedup.
@@ -130,7 +141,12 @@ class H8BankBalancePuller(BasePuller):
             resp.raise_for_status()
             payload = resp.json()
         except Exception as exc:  # noqa: BLE001
-            log.warning("h8_bank_balance: fetch failed for {c}: {e}", c=fred_code, e=str(exc))
+            # requests' HTTPError text embeds the full URL, api_key included;
+            # never let the key reach the journal.
+            log.warning(
+                "h8_bank_balance: fetch failed for {c}: {e}",
+                c=fred_code, e=_API_KEY_RE.sub("api_key=REDACTED", str(exc)),
+            )
             return []
 
         rows: list[H8Row] = []

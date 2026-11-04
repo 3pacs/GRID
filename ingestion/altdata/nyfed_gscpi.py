@@ -10,7 +10,7 @@ Source: https://www.newyorkfed.org/research/policy/gscpi
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
@@ -43,6 +43,18 @@ def _raw_series_success_exists(
         {"sid": series_id, "src": source_id, "od": obs_date},
     ).fetchone()
     return row is not None
+
+
+_GSCPI_DATE_FORMAT = "%d-%b-%Y"
+
+
+def _parse_gscpi_date(value: Any) -> Any:
+    """Parse one GSCPI date cell; anything unparseable becomes NaT."""
+    if isinstance(value, (pd.Timestamp, datetime, date)):
+        return pd.Timestamp(value)
+    if isinstance(value, str):
+        return pd.to_datetime(value.strip(), format=_GSCPI_DATE_FORMAT, errors="coerce")
+    return pd.NaT
 
 
 class NYFedGSCPIPuller(BasePuller):
@@ -92,7 +104,13 @@ class NYFedGSCPIPuller(BasePuller):
             date_col = "Date"
             val_col = "GSCPI"
 
-            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+            # The sheet stores dates as "31-Jan-1998" text below a banner
+            # block. An explicit format parses them without pandas'
+            # per-element "Could not infer format" UserWarning (20 journal
+            # lines/day on grid-hermes 2026-11-03); banner/header rows coerce
+            # to NaT and are dropped below, as before. Real Excel date cells
+            # (an older workbook) are kept as-is.
+            df[date_col] = df[date_col].map(_parse_gscpi_date)
             df = df.dropna(subset=[date_col, val_col])
 
             inserted = 0

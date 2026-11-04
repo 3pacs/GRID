@@ -66,6 +66,10 @@ DERIVED_FEATURES: list[str] = [
 # Rate limit between FRED API calls
 _RATE_LIMIT_DELAY: float = 0.3
 
+# Share of unusable rows in one window above which skipped FRED observations
+# are logged at WARNING instead of DEBUG (holiday "." markers are ~4%).
+_MISSING_WARN_SHARE: float = 0.25
+
 
 class FullYieldCurvePuller(BasePuller):
     """Pulls the full US Treasury yield curve and derived metrics from FRED.
@@ -109,7 +113,9 @@ class FullYieldCurvePuller(BasePuller):
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        # Transport errors only: a deterministic parse failure returns the same
+        # answer on every attempt, so retrying it only triples the log lines.
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_fred_series(
         self, series_id: str, start_date: date, end_date: date
@@ -212,9 +218,19 @@ class FullYieldCurvePuller(BasePuller):
                 kept_dates.append(obs_date)
                 kept_values.append(float(value))
 
-            # Log skipped values (ATTENTION.md #13)
+            # Log skipped values (ATTENTION.md #13). A few "." holiday
+            # markers per year are expected and logged at DEBUG (grid-hermes
+            # 2026-11-03: "FRED DGS1: skipped 11 missing ... kept 250/261" at
+            # WARNING for every series, every run); non-finite values or an
+            # unusually large missing share stay at WARNING.
             if missing or non_finite:
-                log.warning(
+                skipped = missing + non_finite
+                emit = (
+                    log.warning
+                    if non_finite or skipped > total * _MISSING_WARN_SHARE
+                    else log.debug
+                )
+                emit(
                     "FRED {sid}: skipped {m} missing/unparseable and {nf} "
                     "non-finite observations; kept {k}/{t}",
                     sid=series_id,

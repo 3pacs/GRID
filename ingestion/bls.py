@@ -24,8 +24,31 @@ BLS_SERIES_LIST: list[str] = [
     "LNS14000000",     # Unemployment Rate
     "CUUR0000SA0",     # CPI-U All Items
     "PRS85006092",     # Nonfarm Business Productivity
-    "JTS00000000JOL",  # JOLTS Job Openings
+    # JOLTS job openings, total nonfarm. The 14-character "JTS00000000JOL"
+    # this list carried is not a BLS id: the API answered "Series does not
+    # exist for Series JTS00000000JOL" (probed from grid-svr 2026-11-04) and
+    # nothing was ever stored. The 21-character id returns data (2026 M09
+    # 7523). normalization/entity_map.py still maps the old id.
+    "JTS000000000000000JOL",
 ]
+
+# BLS publishes "-" for an observation that will never exist -- e.g. October
+# 2025 for LNS14000000 / CUUR0000SA0, footnote "Data unavailable due to the
+# 2025 lapse in appropriations." It is a known no-data marker, not bad data.
+_BLS_NO_DATA_MARKERS: frozenset[str] = frozenset({"-", ""})
+
+# Process-scoped de-duplication for messages that are identical on every run
+# (no-data markers, BLS per-series messages). The first sighting is logged;
+# repeats are DEBUG.
+_REPORTED_ONCE: set[tuple[str, ...]] = set()
+
+
+def _first_sighting(*key: str) -> bool:
+    """Return True the first time ``key`` is seen in this process."""
+    if key in _REPORTED_ONCE:
+        return False
+    _REPORTED_ONCE.add(key)
+    return True
 
 # BLS API endpoint
 _BLS_API_URL = "https://api.bls.gov/publicAPI/v2/timeseries/data/"
@@ -245,17 +268,29 @@ class BLSPuller(BasePuller):
             resp.raise_for_status()
             data = resp.json()
         except requests.RequestException as exc:
-            log.error("BLS API request failed: {err}", err=str(exc))
+            # Transport/HTTP failure: operational, not a code bug.
+            log.warning("BLS API request failed: {err}", err=str(exc))
             result["errors"].append(str(exc))
             result["status"] = "PARTIAL"
             return None
 
         if data.get("status") != "REQUEST_SUCCEEDED":
             msg = f"BLS API error: {data.get('message', 'Unknown error')}"
-            log.error(msg)
+            # e.g. REQUEST_NOT_PROCESSED "daily threshold ... reached":
+            # an operational refusal, not a code bug.
+            log.warning(msg)
             result["errors"].append(msg)
             result["status"] = "PARTIAL"
             return None
+
+        # A succeeded request can still carry per-series messages, e.g.
+        # "Series does not exist for Series X". They were ignored silently.
+        for message in data.get("message") or []:
+            text_msg = str(message)
+            if _first_sighting("message", text_msg):
+                log.warning("BLS API message: {m}", m=text_msg)
+            else:
+                log.debug("BLS API message (repeat): {m}", m=text_msg)
 
         inserted = 0
         with self.engine.begin() as conn:
@@ -270,9 +305,20 @@ class BLSPuller(BasePuller):
                     if obs_date_val is None:
                         continue
 
+                    raw_value = obs.get("value", "0")
+                    if isinstance(raw_value, str) and raw_value.strip() in _BLS_NO_DATA_MARKERS:
+                        # Known permanent gap: skip quietly, once per
+                        # (series, period) per process at INFO.
+                        key = ("no_data", sid, str(obs.get("year")), str(obs.get("period")))
+                        emit = log.info if _first_sighting(*key) else log.debug
+                        emit(
+                            "BLS {sid} {yr}/{p}: no data published ({v!r}); skipped",
+                            sid=sid, yr=obs.get("year"), p=obs.get("period"), v=raw_value,
+                        )
+                        continue
                     try:
-                        value = float(obs.get("value", "0").replace(",", ""))
-                    except (ValueError, TypeError):
+                        value = float(raw_value.replace(",", ""))
+                    except (ValueError, TypeError, AttributeError):
                         log.warning(
                             "Invalid BLS value for {sid} {yr}/{p}: {v}",
                             sid=sid,

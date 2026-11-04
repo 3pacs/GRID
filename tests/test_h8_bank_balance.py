@@ -187,6 +187,9 @@ class TestH8Constants:
     def test_eight_core_series(self):
         assert len(H8_SERIES) == 8
 
-    def test_series_ids_are_fred_codes(self):
+    def test_series_are_weekly_levels_not_monthly_growth_codes(self):
+        # H8B*NCBCMG are FRED's monthly "% Chg. at Annual Rate" series; the
+        # puller's contract is weekly levels (fed_h8 cadence WEEKLY).
         for code in H8_SERIES:
-            assert code.startswith("H8B")
+            assert not code.startswith("H8B"), code
+        assert "TOTCI" in H8_SERIES and H8_SERIES["TOTCI"] == "ci_loans"
