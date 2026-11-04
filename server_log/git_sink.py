@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from server_log.sanitizer import Sanitizer, build_sanitizer_from_settings
+from utils.redaction import redact_secrets
 
 if TYPE_CHECKING:
     from loguru import Message
@@ -191,9 +192,11 @@ class GitSink:
                 )
             self._dedup[key] = (now, 1)
             # The shared redactor also covers URL query keys and traceback
-            # text that the value/pattern sanitizer can miss.
-            from utils.redaction import redact_secrets
-
+            # text the value/pattern sanitizer can miss. Fields are redacted
+            # BEFORE encoding: json.dumps escapes quotes (\"api_key\": ...),
+            # which a post-encoding pass cannot match. The encoded line is
+            # passed through once more as a backstop.
+            entry = {k: (redact_secrets(v) if isinstance(v, str) else v) for k, v in entry.items()}
             sanitized = redact_secrets(self._sanitizer.scrub(json.dumps(entry, default=str)))
             with open(self._errors_path, "a", encoding="utf-8") as f:
                 f.write(sanitized + "\n")

@@ -967,6 +967,12 @@ settings = Settings()
 log.remove()  # Remove default handler
 
 
+try:
+    from utils.redaction import redact_secrets as _redact_secrets
+except ImportError:  # config.py loaded standalone (dotenv contract tests)
+    _redact_secrets = None
+
+
 def _redact_log_record(record: dict) -> None:
     """Redact credentials from every log message before any sink sees it.
 
@@ -975,14 +981,16 @@ def _redact_log_record(record: dict) -> None:
     embeds the request URL) from many modules. Redacting here covers every
     caller; utils.redaction leaves ordinary text unchanged.
     """
-    from utils.redaction import redact_secrets
-
-    record["message"] = redact_secrets(record["message"])
+    # Imported once at module load: a per-record import breaks logging
+    # wherever builtins.__import__ is patched.
+    if _redact_secrets is None:
+        return
+    record["message"] = _redact_secrets(record["message"])
     extra = record.get("extra")
     if extra:
         for key, value in list(extra.items()):
             if isinstance(value, str):
-                extra[key] = redact_secrets(value)
+                extra[key] = _redact_secrets(value)
 
 
 log.configure(patcher=_redact_log_record)
@@ -995,9 +1003,8 @@ def _redacting_stderr_sink(message: str) -> None:
     requests' "...for url: ...?apiKey=" text) is formatted later, so the
     final string is redacted again here before it reaches journald.
     """
-    from utils.redaction import redact_secrets
-
-    sys.stderr.write(redact_secrets(str(message)))
+    text_ = str(message)
+    sys.stderr.write(_redact_secrets(text_) if _redact_secrets is not None else text_)
 
 # diagnose=False: loguru's diagnose mode prints local variable values in
 # tracebacks (it logged FredAPI(api_key='...') 4,642 times). Set

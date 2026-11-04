@@ -533,7 +533,9 @@ def test_h8_fetch_failure_never_logs_api_key(logs):
     with patch("ingestion.altdata.h8_bank_balance.requests.get", side_effect=err):
         assert p._fetch_series("TOTCI") == []
     joined = " ".join(msg for _, msg in logs)
-    assert "SECRETKEY123" not in joined and "api_key=REDACTED" in joined
+    # The module's own api_key=REDACTED, or the central log patcher's
+    # "?[REDACTED]" once config is imported: either way the key is gone.
+    assert "SECRETKEY123" not in joined and "REDACTED" in joined
 
 
 def test_gscpi_text_dates_parse_without_inference_warning():
