@@ -125,3 +125,40 @@ def test_central_loguru_config_redacts_messages_and_disables_diagnose() -> None:
     assert "failed: for url: https://api.polygon.io/v3/x?[REDACTED]" in out
     src = open(config.__file__, encoding="utf-8").read()
     assert "diagnose=_LOG_DIAGNOSE" in src and src.count("diagnose=_LOG_DIAGNOSE") >= 2
+
+
+def test_stderr_sink_redacts_exception_tracebacks(capsys) -> None:
+    import config
+    from loguru import logger
+
+    sink = logger.add(config._redacting_stderr_sink, level="DEBUG", format="{message}", diagnose=False)
+    try:
+        try:
+            raise requests.exceptions.HTTPError(
+                "403 Client Error for url: https://api.polygon.io/v3/x?apiKey=PolyKey123456"
+            )
+        except requests.exceptions.HTTPError:
+            logger.bind(url="https://api.polygon.io/v3/y?apiKey=PolyKey123456").exception("pull failed")
+    finally:
+        logger.remove(sink)
+    err = capsys.readouterr().err
+    assert "pull failed" in err and "HTTPError" in err
+    assert "PolyKey123456" not in err
+
+
+def test_git_sink_output_is_redacted(tmp_path, monkeypatch) -> None:
+    from server_log import git_sink as gs
+
+    sink = object.__new__(gs.GitSink)
+    sink.__dict__.update(
+        _buffer_lock=__import__("threading").Lock(), _dedup={}, _pending_count=0,
+        _errors_path=tmp_path / "errors.jsonl",
+        _sanitizer=type("S", (), {"scrub": staticmethod(lambda t: t)})(),
+    )
+    monkeypatch.setattr(sink, "_format_entry",
+                        lambda record: {"message": "for url: https://api.x.io/v1?api_key=PolyKey123456"}, raising=False)
+    monkeypatch.setattr(sink, "_rotate_locked", lambda: None, raising=False)
+    msg = type("M", (str,), {})("x")
+    msg.record = {"message": "x", "name": "n", "function": "f", "line": 1}
+    sink.write(msg)
+    assert "PolyKey123456" not in (tmp_path / "errors.jsonl").read_text()

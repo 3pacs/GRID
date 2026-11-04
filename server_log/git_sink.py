@@ -190,7 +190,11 @@ class GitSink:
                     f"{int(now - first_ts)}s] {entry['message']}"
                 )
             self._dedup[key] = (now, 1)
-            sanitized = self._sanitizer.scrub(json.dumps(entry, default=str))
+            # The shared redactor also covers URL query keys and traceback
+            # text that the value/pattern sanitizer can miss.
+            from utils.redaction import redact_secrets
+
+            sanitized = redact_secrets(self._sanitizer.scrub(json.dumps(entry, default=str)))
             with open(self._errors_path, "a", encoding="utf-8") as f:
                 f.write(sanitized + "\n")
             self._pending_count += 1
