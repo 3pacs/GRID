@@ -969,8 +969,29 @@ log.remove()  # Remove default handler
 
 try:
     from utils.redaction import redact_secrets as _redact_secrets
-except ImportError:  # config.py loaded standalone (dotenv contract tests)
-    _redact_secrets = None
+except ImportError:
+    # Fail closed: config.py loaded without the repo's utils package (the
+    # dotenv contract tests copy it standalone) still masks the common
+    # leak shapes -- URL query strings and key/token/secret assignments --
+    # and says so once on stderr.
+    import re as _re
+
+    _FALLBACK_QUERY_RE = _re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?[^\s#'\"<>]*")
+    _FALLBACK_ASSIGN_RE = _re.compile(
+        r"(?i)\b([a-z0-9_-]*(?:key|token|secret|password|passwd|auth)[a-z0-9_-]*['\"]?\s*[=:]\s*['\"]?)"
+        r"[^\s,&'\"}]+"
+    )
+
+    def _redact_secrets(text: str | None) -> str | None:  # type: ignore[misc]
+        if text is None:
+            return None
+        text = _FALLBACK_QUERY_RE.sub(lambda m: m.group(1) + "?[REDACTED]", str(text))
+        return _FALLBACK_ASSIGN_RE.sub(lambda m: m.group(1) + "[REDACTED]", text)
+
+    sys.stderr.write(
+        "WARNING: utils.redaction unavailable; config.py is using its fallback "
+        "log redactor (URL query strings and key=value only)\n"
+    )
 
 
 def _redact_log_record(record: dict) -> None:
@@ -983,8 +1004,6 @@ def _redact_log_record(record: dict) -> None:
     """
     # Imported once at module load: a per-record import breaks logging
     # wherever builtins.__import__ is patched.
-    if _redact_secrets is None:
-        return
     record["message"] = _redact_secrets(record["message"])
     extra = record.get("extra")
     if extra:
@@ -1003,8 +1022,7 @@ def _redacting_stderr_sink(message: str) -> None:
     requests' "...for url: ...?apiKey=" text) is formatted later, so the
     final string is redacted again here before it reaches journald.
     """
-    text_ = str(message)
-    sys.stderr.write(_redact_secrets(text_) if _redact_secrets is not None else text_)
+    sys.stderr.write(_redact_secrets(str(message)))
 
 # diagnose=False: loguru's diagnose mode prints local variable values in
 # tracebacks (it logged FredAPI(api_key='...') 4,642 times). Set
