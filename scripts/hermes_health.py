@@ -10,6 +10,7 @@ Contains:
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -779,6 +780,31 @@ _NOT_CONFIGURED_MARKERS = (
 )
 
 
+_URL_QUERY_RE = re.compile(r"(https?://[^\s?#'\"<>]+)\?[^\s'\"<>)]*")
+_URL_USERINFO_RE = re.compile(r"(https?://)[^/\s@'\"<>]+@")
+_SECRET_ASSIGN_RE = re.compile(
+    r"(?i)\b([a-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|auth)[a-z0-9_]*\s*[=:]\s*)"
+    r"(['\"]?)[^\s,&'\"]+"
+)
+_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
+
+
+def redact_reason(reason: str | None) -> str | None:
+    """Strip credentials from a pull_log error before it leaves the DB.
+
+    Pull errors embed request URLs (FRED-style ``?api_key=...``) and
+    occasionally ``token=...`` text; these reasons go into alert emails and
+    the Hermes LLM prompt. Drops URL query strings and userinfo entirely and
+    masks key/token/secret/password assignments.
+    """
+    if reason is None:
+        return None
+    text_ = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", str(reason))
+    text_ = _URL_QUERY_RE.sub(r"\1?[REDACTED]", text_)
+    text_ = _BEARER_RE.sub(r"\1 [REDACTED]", text_)
+    return _SECRET_ASSIGN_RE.sub(r"\1\2[REDACTED]", text_)
+
+
 def is_not_configured_reason(reason: str | None) -> bool:
     """True when a pull_log reason says the source is switched off on this host."""
     text_ = (reason or "").lower()
@@ -829,7 +855,7 @@ def _attach_last_attempts(conn: Any, stale: list[dict[str, Any]], stale_ids: dic
         _, status, reason, attempted_at = row
         entry["last_attempt_status"] = status
         entry["last_attempt_at"] = attempted_at.isoformat() if attempted_at else None
-        entry["last_attempt_reason"] = (str(reason)[:300] if reason else None)
+        entry["last_attempt_reason"] = (redact_reason(reason)[:300] if reason else None)
         entry["not_configured"] = is_not_configured_reason(reason)
 
 
