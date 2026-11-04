@@ -72,3 +72,15 @@ def test_log_issue_deduplicates_recent_unresolved_noise() -> None:
     assert "OPERATOR_ISSUE_DEDUPE_HOURS" in source
     assert "IS NOT DISTINCT FROM :src" in source
     assert "duplicate issue suppressed" in source
+
+
+def test_not_configured_reason_markers():
+    from scripts.hermes_health import is_not_configured_reason
+
+    assert is_not_configured_reason("PullerReportedFailure: no_api_key")
+    assert is_not_configured_reason("SKIPPED: all 3 items skipped: not_configured")
+    assert is_not_configured_reason("SKIPPED: ['no CF Radar token configured']")
+    assert is_not_configured_reason("pmxt SDK not installed")
+    assert not is_not_configured_reason("PullerReportedFailure: puller did not report committed write count")
+    assert not is_not_configured_reason("NO_NEW_DATA: run completed, 0 rows written")
+    assert not is_not_configured_reason(None)

@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
     OPENSECRETS_API_KEY: str = ""
+    # Read via getattr(settings, ...) by the Hermes retry path; the puller
+    # itself reads os.environ (api_key_mode "env" / "first" in the registry).
+    QUIVERQUANT_API_KEY: str = ""
+    UK_COMPANIES_HOUSE_KEY: str = ""
 
     # Backup data source API keys
     COINGECKO_API_KEY: str = ""          # Free: 30 req/min, Pro: unlimited

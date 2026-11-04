@@ -765,6 +765,74 @@ def _relation_exists(conn: Any, relation: str) -> bool:
     return bool(row)
 
 
+# Reasons a puller gives when it did not run because it is switched off on
+# this host (no key/token/user list/SDK). Such a source is reported in the
+# alert, but not counted as broken: nothing in GRID can fix it but the owner.
+_NOT_CONFIGURED_MARKERS = (
+    "not configured",
+    "not_configured",
+    "no_api_key",
+    "no api key",
+    "missing api key",
+    "token configured",
+    "not installed",
+)
+
+
+def is_not_configured_reason(reason: str | None) -> bool:
+    """True when a pull_log reason says the source is switched off on this host."""
+    text_ = (reason or "").lower()
+    return any(marker in text_ for marker in _NOT_CONFIGURED_MARKERS)
+
+
+def _attach_last_attempts(conn: Any, stale: list[dict[str, Any]], stale_ids: dict[str, int]) -> None:
+    """Annotate each stale source with its latest pull_log attempt.
+
+    The alert used to say only "N sources past freshness window"; this adds
+    why: the last attempt's status, time and reason (e.g. "puller did not
+    report committed write count", "no_api_key", "NO_NEW_DATA: ..."), and a
+    ``not_configured`` flag. pull_log is small (~13k rows on 2026-11-04)
+    and the lookup is restricted to the stale source ids. Best-effort: a
+    failure leaves the entries unannotated rather than failing health.
+    """
+    from sqlalchemy import text
+
+    ids = sorted({sid for sid in stale_ids.values() if sid is not None})
+    if not ids:
+        return
+    try:
+        # Savepoint: a failed lookup must not abort the health transaction
+        # that the remaining check_db_health queries still use.
+        with conn.begin_nested():
+            rows = conn.execute(
+                text(
+                    "SELECT DISTINCT ON (source_id) source_id, status, error_message, "
+                    "       COALESCE(completed_at, started_at) AS attempted_at "
+                    "FROM pull_log "
+                    "WHERE source_id = ANY(:ids) "
+                    "ORDER BY source_id, started_at DESC"
+                ),
+                {"ids": ids},
+            ).fetchall()
+    except Exception as exc:
+        log.warning("stale_sources last-attempt lookup failed: {e}", e=str(exc))
+        return
+    latest = {row[0]: row for row in rows}
+    for entry in stale:
+        row = latest.get(stale_ids.get(entry["source"]))
+        if row is None:
+            entry["last_attempt_status"] = None
+            entry["last_attempt_at"] = None
+            entry["last_attempt_reason"] = None
+            entry["not_configured"] = False
+            continue
+        _, status, reason, attempted_at = row
+        entry["last_attempt_status"] = status
+        entry["last_attempt_at"] = attempted_at.isoformat() if attempted_at else None
+        entry["last_attempt_reason"] = (str(reason)[:300] if reason else None)
+        entry["not_configured"] = is_not_configured_reason(reason)
+
+
 def check_db_health(engine: Any) -> dict[str, Any]:
     """Check database connectivity and basic stats."""
     from sqlalchemy import text
@@ -872,7 +940,7 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                 text(
                     f"SELECT sc.name, sc.last_pull_at, sc.latency_class, "
                     f"       {update_frequency_expr} AS update_frequency, "
-                    "        latest.latest_success "
+                    "        latest.latest_success, sc.id "
                     "FROM source_catalog sc "
                     "LEFT JOIN LATERAL ("
                     "    SELECT rs.pull_timestamp AS latest_success "
@@ -886,7 +954,8 @@ def check_db_health(engine: Any) -> dict[str, Any]:
             ).fetchall()
             now = datetime.now(timezone.utc)
             stale: list[dict[str, Any]] = []
-            for name, last_pull_at, latency_class, update_frequency, latest_success in rows:
+            stale_ids: dict[str, int] = {}
+            for name, last_pull_at, latency_class, update_frequency, latest_success, source_id in rows:
                 if is_excluded(name):
                     continue
                 effective = last_pull_at
@@ -903,7 +972,10 @@ def check_db_health(engine: Any) -> dict[str, Any]:
                         "cadence": cadence.kind,
                         "age_hours": round(age, 1) if age is not None else None,
                     })
+                    stale_ids[name] = source_id
             stale.sort(key=lambda s: (s["age_hours"] is None, -(s["age_hours"] or 0)))
+            if stale and _relation_exists(conn, "pull_log"):
+                _attach_last_attempts(conn, stale, stale_ids)
             result["stale_sources"] = stale
 
             # QUARANTINED rows (migrations/versions/raw_series_quarantined_20260926.py)
