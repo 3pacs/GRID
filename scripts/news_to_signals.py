@@ -665,7 +665,8 @@ if __name__ == "__main__":
     import argparse
 
     log.remove()
-    log.add(sys.stderr, level="INFO")
+    from config import scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.add(scrubbed_stderr, level="INFO")
 
     parser = argparse.ArgumentParser(description="News intelligence -> signal_data")
     parser.add_argument("--dry-run", action="store_true", help="Count only, no writes")

@@ -961,12 +961,14 @@ settings = Settings()
 
 # Configure loguru
 #
-# Credentials are scrubbed from log output (journal, files, the git sink). Pullers log exception text, and a
-# requests HTTPError carries the full request URL, query-string API key included. Two layers:
+# Credentials are scrubbed from log output. Pullers log exception text, and a requests HTTPError carries the full
+# request URL, query-string API key included. Two layers:
 #   - a patcher scrubs each record's message and string extras before any sink sees it; it lives on the logger
 #     core, so it also covers sinks that scripts add after log.remove();
-#   - the console sink scrubs the fully rendered line, which is the only place the formatted traceback of
-#     log.exception()/log.opt(exception=...) exists as text.
+#   - scrubbed_stderr, the console sink, scrubs the fully rendered line, which is the only place the formatted
+#     traceback of log.exception()/log.opt(exception=...) exists as text. Scripts that replace the console sink
+#     must add scrubbed_stderr, not sys.stderr (tests/test_log_secret_scrubbing.py enforces it). A plain file sink
+#     still gets scrubbed messages and extras but an unscrubbed traceback; the git sink scrubs its own entries.
 try:
     from server_log.sanitizer import Sanitizer, secret_values_from_settings
 
@@ -993,7 +995,8 @@ def _scrub_log_record(record: dict) -> None:
             record["extra"][key] = _scrub_log_text(value)
 
 
-def _scrubbed_stderr(message: str) -> None:
+def scrubbed_stderr(message: str) -> None:
+    """Console sink: writes the scrubbed rendered line to stderr."""
     # sys.stderr looked up per call, so redirected/captured stderr keeps working
     sys.stderr.write(_scrub_log_text(str(message)))
 
@@ -1001,7 +1004,7 @@ def _scrubbed_stderr(message: str) -> None:
 log.remove()  # Remove default handler
 log.configure(patcher=_scrub_log_record)
 log.add(
-    _scrubbed_stderr,
+    scrubbed_stderr,
     level=settings.LOG_LEVEL,
     colorize=sys.stderr.isatty(),
     format=(

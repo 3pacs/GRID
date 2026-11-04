@@ -85,7 +85,7 @@ def test_config_installs_log_patcher(monkeypatch):
         logger.remove(sink_id)
     out = buf.getvalue()
     assert KEY not in out
-    assert "apikey=[REDACTED]&b=1" in out
+    assert "apikey=[REDACTED]" in out
 
 
 def test_console_sink_scrubs_tracebacks_and_extras(monkeypatch, capsys):
@@ -101,6 +101,29 @@ def test_console_sink_scrubs_tracebacks_and_extras(monkeypatch, capsys):
     assert "pull failed" in err and "RuntimeError" in err  # the traceback is still there
     assert KEY not in err
     assert "token=[REDACTED]" in err
+
+
+def test_value_with_ampersand_or_hash_fully_scrubbed():
+    """A credential containing & or # is redacted whole, not cut at the delimiter."""
+    out = Sanitizer(generic=False).scrub("config: api_key=qa1&qb2#qc3 password: qd4&qe5#qf6 token=qg7&qh8")
+    assert out == "config: api_key=[REDACTED] password: [REDACTED] token=[REDACTED]"
+
+
+def test_no_raw_stderr_sinks_outside_config():
+    """A sink added as sys.stderr would print unscrubbed tracebacks; scripts must use config.scrubbed_stderr."""
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    raw = re.compile(r"\b(?:log|logger)\.add\(\s*sys\.stderr\b")
+    offenders = [
+        f"{p.relative_to(root)}"
+        for top in ("api", "ingestion", "intelligence", "scripts", "orchestration", "store", "evals")
+        if (root / top).is_dir()
+        for p in (root / top).rglob("*.py")
+        if raw.search(p.read_text(encoding="utf-8", errors="replace"))
+    ]
+    assert offenders == []
 
 
 def test_pull_context_scrubs_persisted_error():

@@ -28,7 +28,7 @@ _PATTERNS: list[tuple[re.Pattern[str], str]] = [
     # Generic password= in connection strings or logs
     (re.compile(r"(?i)(password\s*[=:]\s*)[^\s,;\"'}\]]+"), r"\1[REDACTED]"),
     # API key patterns (long alphanumeric strings preceded by key/token/secret)
-    (re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[=:]\s*)[^\s,;\"'}\]&#]+"), r"\1[REDACTED]"),
+    (re.compile(r"(?i)((?:api[_-]?key|token|secret)\s*[=:]\s*)[^\s,;\"'}\]]+"), r"\1[REDACTED]"),
     # Credentials in URL query strings (?apikey=..., &key=..., &access_token=...): a requests HTTPError message
     # carries the full request URL, so any puller that passes its key as a query parameter would otherwise log it.
     (re.compile(r"(?i)([?&](?:api[_-]?key|apikey|key|token|access[_-]?key|access[_-]?token|auth[_-]?token|"

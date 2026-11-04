@@ -125,7 +125,8 @@ def main() -> int:
     args = _parse_args()
     if args.verbose:
         log.remove()
-        log.add(sys.stderr, level="DEBUG")
+        from config import scrubbed_stderr  # scrubs credentials, tracebacks included
+        log.add(scrubbed_stderr, level="DEBUG")
 
     engine = get_engine()
 
