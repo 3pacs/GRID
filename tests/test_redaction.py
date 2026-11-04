@@ -81,3 +81,28 @@ def test_nasa_fire_pull_failure_redacts_map_key(monkeypatch) -> None:
     out = puller.pull()
     assert out["status"] == "FAILED" and key not in out["error"]
     assert logged and key not in logged[0]
+
+
+@pytest.mark.parametrize(
+    "text, secret",
+    [
+        ("Authorization: Basic dXNlcjpwYXNzd29yZA==", "dXNlcjpwYXNzd29yZA=="),
+        ("headers={'Authorization': 'Token abc123def456 extra'}", "abc123def456"),
+        ("jwt eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0In0.c2lnbmF0dXJlX3Zh", "eyJzdWIiOiIxMjM0In0"),
+        ("aws_access_key=AKIAABCDEFGH", "AKIAABCDEFGH"),
+        ("private_key: -----BEGINKEY", "BEGINKEY"),
+        ("client_secret=zzz123", "zzz123"),
+        ("redis://default:pa/ss@cache:6379/0", "pa/ss"),
+        ("wss://feed.example/stream?token=abc123xyz", "abc123xyz"),
+        ("ftp://u:p@ss/word@files.example/x", "ss/word"),
+    ],
+)
+def test_more_credential_forms_are_removed(text: str, secret: str) -> None:
+    assert secret not in redact_secrets(text)
+
+
+def test_reason_words_survive() -> None:
+    # Plain prose naming a credential kind must stay readable in alerts.
+    for msg in ("SKIPPED: ['no CF Radar token configured']", "PullerReportedFailure: no_api_key",
+                "Data unavailable due to the 2025 lapse in appropriations"):
+        assert redact_secrets(msg) == msg
