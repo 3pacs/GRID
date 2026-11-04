@@ -102,3 +102,15 @@ def test_redact_reason_strips_credentials():
         "puller did not report committed write count"
     )
     assert redact_reason(None) is None
+
+
+def test_redact_reason_dsn_and_json_forms():
+    from scripts.hermes_health import redact_reason
+
+    r = redact_reason("could not connect to postgresql://grid:p@ss@word@db.internal:5432/griddb")
+    assert "p@ss" not in r and "word@db" not in r
+    assert "postgresql://[REDACTED]@db.internal:5432/griddb" in r
+    r = redact_reason('payload {"api_key": "abc def 123", "series": "SOFR"}')
+    assert "abc def 123" not in r and '"series": "SOFR"' in r
+    assert "zzz999" not in redact_reason("{'token': 'zzz999'}")
+    assert "qqq777" not in redact_reason("access_token=qqq777&x=1")
