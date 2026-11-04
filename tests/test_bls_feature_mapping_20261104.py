@@ -56,3 +56,17 @@ def test_repo_market_no_longer_derives_window_peak_ratio() -> None:
     from ingestion.altdata import repo_market
 
     assert "rrp_as_pct_of_peak" not in repo_market.DERIVED_FEATURES
+
+
+def test_live_10y_feeds_treasury_10y() -> None:
+    m = _all()
+    assert m["yc_10y"] == m["DGS10"] == m["treasury_10y"] == "treasury_10y"
+
+
+def test_derived_spreads_read_the_live_names() -> None:
+    import ast
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parents[1].joinpath("scripts/compute_derived_features.py").read_text()
+    assert '"yc_10y"' not in src and '"treasury_10y"' in src and '"yc_2y"' in src
+    ast.parse(src)

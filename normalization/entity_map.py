@@ -217,7 +217,9 @@ SEED_MAPPINGS: dict[str, str] = {
     "DGS1": "yc_1y",
     "DGS2": "yc_2y",
     "DGS5": "yc_5y",
-    "DGS10": "yc_10y",
+    # Live 10Y feeds the registered treasury_10y (owner decision 2026-11-04);
+    # yc_10y was never registered, so its live rows were dropped.
+    "DGS10": "treasury_10y",
     "DGS30": "yc_30y",
     "DFII10": "yc_real_10y",
     "UMCSENT": "umich_sentiment",
@@ -254,6 +256,9 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── Yield curve series (stored with feature name as series_id) ──────────
     "yc_1y": "yc_1y",
     "yc_5y": "yc_5y",
+    # yield_curve_full writes the 10Y as raw "yc_10y" (live); it resolves into
+    # treasury_10y, which the dashboard/canvas/regime/thesis code reads.
+    "yc_10y": "treasury_10y",
     "yc_30y": "yc_30y",
     "yc_real_10y": "yc_real_10y",
     "yc_breakeven_10y": "yc_breakeven_10y",
@@ -993,7 +998,7 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # Yield curve puller (stores as treasury_Xy, sofr, reverse_repo)
     "sofr": "sofr_rate",
     "reverse_repo": "reverse_repo_usage",
-    "treasury_10y": "yc_10y",
+    "treasury_10y": "treasury_10y",
     "treasury_2y": "yc_2y",
     "treasury_30y": "yc_30y",
 
