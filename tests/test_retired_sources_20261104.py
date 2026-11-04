@@ -14,11 +14,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_baltic_exchange_is_held_in_the_smart_scheduler() -> None:
+def test_baltic_exchange_and_dune_are_held_in_the_smart_scheduler() -> None:
     from ingestion.smart_scheduler import hold_reason_for
 
-    reason = hold_reason_for("baltic_exchange")
-    assert reason and "Retired 2026-11-04" in reason
+    for name in ("baltic_exchange", "dune"):
+        reason = hold_reason_for(name)
+        assert reason and "Retired 2026-11-04" in reason, name
 
 
 def test_intelligence_scheduler_no_longer_runs_retired_jobs() -> None:
