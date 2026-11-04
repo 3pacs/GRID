@@ -138,21 +138,32 @@ def test_opportunity_card_with_null_fields_renders_placeholders():
     assert card["title"] == "#3 — DNTH PUTS"
     body = card["body"]
     assert "N/A/10" in body          # score
-    assert "N/Ax" in body            # payoff header
+    assert "no executable contract quoted" in body
     assert "NoneType" not in body
     assert "None" not in body
+
+
+def _contract(iv=None) -> dict:
+    from datetime import datetime, timezone
+
+    return {"strike": 70.0, "bid": 3.10, "ask": 3.40, "iv": iv, "oi": None, "volume": None,
+            "last_trade": None, "expiry": "2026-12-18",
+            "quote_at": datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc),
+            "quote_source": "yfinance option_chain"}
 
 
 def test_opportunity_card_null_iv_atm_only():
     opp = _opp()
     verification = {"verified": True, "issues": [], "corrections": [], "bonus_data": [],
-                    "live_spot": 72.5, "recommended_strikes": []}
+                    "live_spot": 72.5, "contract": _contract(), "recommended_strikes": []}
 
     body = hx._format_opportunity_card(opp, verification, 1)["body"]
 
-    assert "42x" in body
-    assert "6.4/10" in body
+    assert "BUY DNTH 2026-12-18 $70.00 PUT @ $3.40 (ask)" in body
+    assert "6.40/10" in body
     assert "$72.50" in body
+    # Contract IV missing -> odds and invalidation are N/A, never guessed.
+    assert "N/A of finishing past breakeven" in body
     assert "None" not in body
 
 
@@ -195,7 +206,13 @@ def _run_digest_with(monkeypatch, opportunities):
     monkeypatch.setattr(hx, "_get_engine", lambda: _Engine())
     monkeypatch.setattr(hx, "_verify_opportunity", lambda t, o, e: {
         "verified": True, "issues": [], "corrections": [], "bonus_data": [],
-        "live_spot": None, "live_chain": None, "recommended_strikes": []})
+        "live_spot": None, "live_chain": None, "contract": _contract(iv=0.6),
+        "recommended_strikes": []})
+    monkeypatch.setattr(hx, "_load_recent_calls", lambda engine, since: [])
+    monkeypatch.setattr(hx, "_persist_calls", lambda engine, run_id, calls: len(calls))
+    monkeypatch.setattr(hx, "_load_track_record", lambda engine, as_of: {"calls": []})
+    monkeypatch.setattr(hx, "_catalyst_before_expiry",
+                        lambda engine, t, today, exp: {"status": "unavailable"})
     monkeypatch.setattr(hx.time, "sleep", lambda *_: None)
     monkeypatch.setattr(hx, "_send_in_thread",
                         lambda subject, html, plain: sent.update(subject=subject, html=html, plain=plain))
@@ -233,9 +250,9 @@ def test_run_100x_digest_sends_with_null_iv_atm_row(monkeypatch):
 
     assert result["sent"] is True
     assert result["opportunities"] == 2
-    assert sent["subject"].endswith("0 100x + 2 High-Score Opportunities")
+    assert sent["subject"] == "GRID Options — 2 calls: BMRN PUT, DNTH PUT"
     assert "DNTH PUTS" in sent["html"] and "BMRN PUTS" in sent["html"]
-    assert "60.1%" in sent["html"]
+    assert "60.0% / N/A open" in sent["html"]   # contract IV shown, OI missing labelled
     assert "None" not in sent["plain"]
 
 

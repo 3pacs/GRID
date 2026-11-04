@@ -69,6 +69,11 @@ class MispricingOpportunity:
     # which is a different and false claim.
     iv_atm: float | None = None
     confidence: str = "LOW"         # LOW / MEDIUM / HIGH
+    # The options_daily_signals row the scores were computed from. It can be
+    # older than scan_date (the read takes the latest quality row at or
+    # before it), so consumers must show it rather than assume "today".
+    signal_date: date | None = None
+    signal_captured_at: Any = None   # options_daily_signals.created_at
 
     @property
     def is_100x(self) -> bool:
@@ -99,6 +104,14 @@ class OptionsScanner:
     TERM_INVERSION_THRESHOLD = -0.05  # Negative term slope = backwardation
     IV_PERCENTILE_CHEAP = 10     # Below 10th percentile = historically cheap
     IV_PERCENTILE_RICH = 95      # Above 95th percentile = historically rich
+
+    # A quality row older than this (calendar days before scan_date) is not
+    # scored. Without the bound the read returned whatever row was last good:
+    # CLDX's options chain stopped on 2026-10-01 and its 2026-10-01 row was
+    # re-scored and re-emailed as a fresh CALL on 21 scan days through
+    # 2026-11-03 (29 of 325 digest-eligible scan rows 2026-09-04..11-03 used
+    # a row more than 3 days old). Four days covers a weekend plus a holiday.
+    MAX_SIGNAL_AGE_DAYS = 4
 
     # Above this share of the scanned universe, a missing column stops being
     # a per-ticker thin-chain gap and starts being a data-source problem.
@@ -431,6 +444,8 @@ class OptionsScanner:
             spot_price=spot_price,
             iv_atm=iv_atm,
             confidence=confidence,
+            signal_date=current.get("signal_date"),
+            signal_captured_at=current.get("created_at"),
         )
 
         # Only return if score is meaningful (lowered from 3.0 to allow
@@ -889,7 +904,9 @@ class OptionsScanner:
 
         Skips rows where total_oi < 1000 (illiquid/expiring chain garbage)
         or iv_atm < 0.03 (sub-3% IV is physically impossible for equities).
-        Falls back to older data if today's data is garbage.
+        Falls back to older data if today's data is garbage, but never to a
+        row more than ``MAX_SIGNAL_AGE_DAYS`` before ``scan_date``: a ticker
+        whose chain stopped updating has no current signal, and returns None.
         """
         with self.engine.connect() as conn:
             row = conn.execute(
@@ -897,14 +914,18 @@ class OptionsScanner:
                     "SELECT put_call_ratio, max_pain, iv_skew, total_oi, "
                     "total_volume, near_expiry, spot_price, iv_atm, "
                     "iv_25d_put, iv_25d_call, term_structure_slope, "
-                    "oi_concentration "
+                    "oi_concentration, signal_date, created_at "
                     "FROM options_daily_signals "
                     "WHERE ticker = :ticker AND signal_date <= :sd "
+                    "AND signal_date >= :oldest "
                     "AND total_oi >= 1000 "
                     "AND (iv_atm IS NULL OR iv_atm >= 0.03) "
                     "ORDER BY signal_date DESC LIMIT 1"
                 ),
-                {"ticker": ticker, "sd": scan_date},
+                {
+                    "ticker": ticker, "sd": scan_date,
+                    "oldest": scan_date - timedelta(days=self.MAX_SIGNAL_AGE_DAYS),
+                },
             ).fetchone()
 
         if row is None:
@@ -923,6 +944,8 @@ class OptionsScanner:
             "iv_25d_call": row[9],
             "term_structure_slope": row[10],
             "oi_concentration": row[11],
+            "signal_date": row[12] if len(row) > 12 else None,
+            "created_at": row[13] if len(row) > 13 else None,
         }
 
     def _get_signal_history(self, ticker: str, scan_date: date) -> pd.DataFrame:
@@ -1092,8 +1115,12 @@ class OptionsScanner:
                         "payoff": float(opp.estimated_payoff_multiple),
                         "dir": opp.direction,
                         "thesis": opp.thesis,
+                        # direction is kept so a later outcome study can
+                        # ask which signal's vote was right, not only
+                        # which signal fired.
                         "signals": json.dumps({
-                            k: {"score": v["score"], "value": str(v.get("value", ""))}
+                            k: {"score": v["score"], "value": str(v.get("value", "")),
+                                "direction": v.get("direction", "")}
                             for k, v in opp.signals.items()
                         }),
                         "strikes": [float(s) for s in opp.strikes if s is not None],
