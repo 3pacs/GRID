@@ -82,9 +82,12 @@ class TestRevisionCoversTheLog:
     def test_revision_registers_every_logged_name(self):
         assert set(LOGGED_GHOSTS.values()) <= set(_names_inserted())
 
-    def test_revision_adds_only_the_two_new_writers_beyond_the_log(self):
+    def test_revision_adds_only_the_expected_names_beyond_the_log(self):
+        # + bls_cpi_u_all / bls_nonfarm_productivity: owner decision 2026-11-04
+        # to register the BLS series that were mapped but unregistered.
         assert set(_names_inserted()) - set(LOGGED_GHOSTS.values()) == {
             "implied_correlation_3m", "bls_jolts_openings",
+            "bls_cpi_u_all", "bls_nonfarm_productivity",
         }
         assert ALL_MAPPINGS["CBOE:COR3M"] == "implied_correlation_3m"
 
@@ -94,7 +97,7 @@ class TestRevisionCoversTheLog:
 
     def test_no_duplicates_and_exports_match(self):
         names = _names_inserted()
-        assert len(names) == len(set(names)) == 47
+        assert len(names) == len(set(names)) == 49
         assert list(_revision().REGISTERED_FEATURES) == names
 
     def test_every_registered_name_is_targeted_by_a_mapping(self):
@@ -122,7 +125,7 @@ class TestRevisionCoversTheLog:
     def test_upgrade_executes_insert_and_reports_counts(self, monkeypatch):
         mod = _revision()
         conn = MagicMock()
-        conn.execute.return_value.scalar.side_effect = [0, 47]
+        conn.execute.return_value.scalar.side_effect = [0, 49]
         fake_op = MagicMock()
         fake_op.get_bind.return_value = conn
         monkeypatch.setattr(mod, "op", fake_op)

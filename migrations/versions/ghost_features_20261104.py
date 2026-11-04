@@ -1,4 +1,4 @@
-"""Register the 47 mapped features the resolver drops (or is about to).
+"""Register the 49 mapped features the resolver drops (or is about to).
 
 Revision ID: ghost_features_20261104
 Revises: merge_yf_finra_20261023
@@ -34,7 +34,8 @@ Confirmed absent, and confirmed fed, not assumed
 -------------------------------------------------
 Read-only against griddb on 2026-11-04 (statement_timeout 30 s):
 
-* none of the 47 names (45 logged, plus bls_jolts_openings and the COR3M successor) below has a ``feature_registry`` row;
+* none of the 49 names (45 logged, plus bls_jolts_openings, the COR3M successor,
+  bls_cpi_u_all and bls_nonfarm_productivity) below has a ``feature_registry`` row;
   ``count(*) WHERE name LIKE 'etf_flow%'`` is 0.
 * every mapped series id has live SUCCESS rows in ``raw_series``:
   ``ETF_FLOW:<T>:{5d,20d,accel}`` 22 rows in the last 30 obs-days, obs from
@@ -173,6 +174,16 @@ VALUES
   ('bls_jolts_openings', 'macro', 'JOLTS total nonfarm job openings, seasonally adjusted level (thousands)',
    'BLS JTS000000000000000JOL', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2000-12-01', FALSE),
 
+  -- BLS CPI-U and productivity (ingestion/bls.py). Owner decision 2026-11-04:
+  -- register rather than drop. CUUR0000SA0 is NOT seasonally adjusted, so it
+  -- is not the FRED CPIAUCSL-backed cpi feature (raw_series: 320 months from
+  -- 2000-01-01); PRS85006092 is nonfarm business labor productivity, % change
+  -- at an annual rate (quarterly, from 2024-01-01).
+  ('bls_cpi_u_all', 'macro', 'CPI-U all items, not seasonally adjusted index (BLS)',
+   'BLS CUUR0000SA0', 1, 0, 'RAW', 'FORWARD_FILL', '2000-01-01', FALSE),
+  ('bls_nonfarm_productivity', 'macro', 'Nonfarm business labor productivity, % change at annual rate (BLS, quarterly)',
+   'BLS PRS85006092', 1, 0, 'ZSCORE', 'FORWARD_FILL', '2024-01-01', FALSE),
+
   -- Treasury curve (FRED DGS2; siblings yc_1y / yc_5y / yc_30y)
   ('yc_2y', 'rates', '2-year Treasury constant maturity yield',
    'DGS2 from FRED', 1, 0, 'RAW', 'FORWARD_FILL', '1990-01-01', TRUE),
@@ -265,6 +276,8 @@ REGISTERED_FEATURES: tuple[str, ...] = (
     "vix9d_spot",
     "implied_correlation_3m",
     "bls_jolts_openings",
+    "bls_cpi_u_all",
+    "bls_nonfarm_productivity",
     "yc_2y",
     *(f"etf_flow_{t}_{s}" for t in _ETF_TICKERS for s in ("5d", "20d", "accel")),
 )
