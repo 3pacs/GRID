@@ -524,8 +524,12 @@ SEED_MAPPINGS: dict[str, str] = {
 # V2 mappings for international, trade, physical, and alternative data
 NEW_MAPPINGS_V2: dict[str, str] = {
     # BLS (raw BLS series IDs from bls.py)
-    "CES0000000001": "bls_nonfarm_payrolls",
-    "LNS14000000": "bls_unemployment_rate",
+    # Same series as FRED PAYEMS / UNRATE (2026-09: 159044 / 4.2 from both),
+    # so they resolve into the existing features as a second source with
+    # conflict checking (owner decision 2026-11-04), not as duplicate
+    # bls_* features.
+    "CES0000000001": "nonfarm_payrolls",
+    "LNS14000000": "unemployment_rate",
     "CUUR0000SA0": "bls_cpi_u_all",
     "PRS85006092": "bls_nonfarm_productivity",
     "JTS00000000JOL": "bls_jolts_openings",
@@ -534,6 +538,8 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # total nonfarm job openings, SA level -- 2026 M09 = 7523. The old key is
     # kept; it is harmless.
     "JTS000000000000000JOL": "bls_jolts_openings",
+    # FRED republishes the same JOLTS level (thousands, SA).
+    "JTSJOL": "bls_jolts_openings",
 
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
