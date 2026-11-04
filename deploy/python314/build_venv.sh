@@ -75,17 +75,17 @@ EOF
   "$v/bin/python" -c "import polars._plr as p; print('polars runtime:', getattr(p, '__file__', '?').split('/site-packages/')[-1].split('/')[0])" || true
 }
 
-if [ -x "$VENV/bin/python" ]; then
-  echo "venv exists: $VENV (re-checking only)"
-  check "$VENV"
-  exit 0
-fi
-
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [ -f "$src/constraints-3.14.txt" ] && [ -f "$src/requirements-runtime.txt" ] || { echo "ABORT: lock files not next to the script" >&2; exit 2; }
-trap 'rc=$?; [ $rc -ne 0 ] && { echo "FAILED (exit $rc): removing half-built $VENV" >&2; rm -rf "$VENV"; }' EXIT
 
-"$PY" -m venv "$VENV"
+if [ -x "$VENV/bin/python" ]; then
+  # update in place to the (possibly extended) lock; pip only adds or changes what differs. Nothing runs from it yet,
+  # but a failed update keeps the venv for inspection instead of removing it.
+  echo "venv exists: $VENV (updating to the lock, then re-checking)"
+else
+  trap 'rc=$?; [ $rc -ne 0 ] && { echo "FAILED (exit $rc): removing half-built $VENV" >&2; rm -rf "$VENV"; }' EXIT
+  "$PY" -m venv "$VENV"
+fi
 "$VENV/bin/python" -m pip install -q --upgrade pip
 nice -n 19 "$VENV/bin/pip" install -q -r "$RELEASE/requirements.txt" -r "$src/requirements-runtime.txt" -c "$src/constraints-3.14.txt"
 nice -n 19 "$VENV/bin/pip" install -q "$TORCH" --index-url "$TORCH_INDEX"
