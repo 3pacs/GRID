@@ -56,6 +56,23 @@ class Settings(BaseSettings):
     BLS_API_KEY: str = ""
     TIINGO_API_KEY: str = ""
 
+    # Schwab Trader API app "GRID" (Market Data Production, OAuth scope
+    # readonly). Both keys default empty: ingestion/schwab_market.py logs a
+    # warning and stays disabled when they are missing. When the env fields
+    # are blank the client falls back to SCHWAB_CREDENTIALS_FILE (the local
+    # helper's file, mode 0600). Tokens are never stored in .env; the token
+    # file is rewritten by the client on refresh (0600). Read-only market
+    # data only -- no account, position or order endpoints exist in GRID.
+    SCHWAB_APP_KEY: str = ""
+    SCHWAB_APP_SECRET: str = ""
+    SCHWAB_TOKEN_FILE: str = "~/.config/grid/schwab/tokens.json"
+    SCHWAB_CREDENTIALS_FILE: str = "~/.config/grid/schwab/credentials.env"
+    # Private admin-only quote endpoint (api/routers/schwab_private.py). Off by
+    # default: while False the router answers 503 and never touches the reader,
+    # credentials or the network. Turning it on is an operator decision made in a
+    # reviewed change; Schwab data is private and may not be redistributed.
+    SCHWAB_PRIVATE_QUOTES_ENABLED: bool = False
+
     # TradingView webhook
     TRADINGVIEW_WEBHOOK_SECRET: str = ""
 
@@ -543,6 +560,7 @@ class Settings(BaseSettings):
         "GRID_ENABLE_TAIWAN_STRAIT_OSINT_JOB",
         "GRID_ENABLE_LME_WAREHOUSE_JOB",
         "GRID_ENABLE_SENTIMENT_WEIGHT_PROMOTION",
+        "SCHWAB_PRIVATE_QUOTES_ENABLED",
         mode="before",
     )
     @classmethod
@@ -925,6 +943,7 @@ class Settings(BaseSettings):
             "EIA_API_KEY": self.EIA_API_KEY,
             "GDELT_API_KEY": self.GDELT_API_KEY,
             "WORLDNEWS_API_KEY": self.WORLDNEWS_API_KEY,
+            "SCHWAB_APP_KEY": self.SCHWAB_APP_KEY,
         }
         return {k: bool(v) for k, v in keys.items()}
 

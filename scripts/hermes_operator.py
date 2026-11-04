@@ -3495,7 +3495,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
 
     if result.get("errors"):
         log.warning(
-            "Resolution completed with {e} worker error(s) — resolved={r}, "
+            "Resolution completed with {e} worker error(s) — inserted count={r} (None means unknown), "
             "watermark held at {w}",
             e=result["errors"], r=result.get("resolved", 0),
             w=getattr(state, "last_resolution", None),
@@ -3521,7 +3521,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
             o=since, w=state.last_resolution,
         )
     log.info(
-        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s "
+        "Resolution: inserted count={r} (None means unknown), {c} conflicts, {s} series in {t}s "
         "(scanned through {w}, complete={k})",
         r=result.get("resolved", 0), c=result.get("conflicts_found", 0),
         s=result.get("series_scanned", 0), t=result.get("duration_s", 0),
