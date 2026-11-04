@@ -1,0 +1,19 @@
+# GRID code imports these outside requirements.txt; production had them hand-installed in /home/grid/.local (2026-11-04
+# inventory of grid-svr's python3.10 user site against an AST scan of non-test imports). torch is installed separately
+# by build_venv.sh from the PyTorch cu128 index (GPU wheel, not part of CI).
+datasets
+eth-account
+feedparser
+google-genai
+hyperliquid-python-sdk
+lightgbm
+playwright
+pypdf
+transformers
+# grid-svr CPU (Xeon E5-2670: AVX, no AVX2): polars' default runtime SIGILLs there; the compat runtime is the official fix
+polars-runtime-compat
+# imported by grid-api (api/routers/intelligence_regime.py) and timeseries/: production has psutil from the Ubuntu
+# python3-psutil package (invisible to a venv) and a hand-copied TimesFM 2.5 tree in ~/.local; PyPI timesfm 3.0.2 is that
+# same layout (ForecastConfig, TimesFM_2p5_200M_torch)
+psutil
+timesfm
