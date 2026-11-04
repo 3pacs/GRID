@@ -135,7 +135,7 @@ def test_opportunity_card_with_null_fields_renders_placeholders():
 
     card = hx._format_opportunity_card(opp, verification, 3)
 
-    assert card["title"] == "#3 — DNTH PUTS"
+    assert card["title"] == "#3 — DNTH PUTS (UNPROVEN)"
     body = card["body"]
     assert "N/A/10" in body          # score
     assert "no executable contract quoted" in body

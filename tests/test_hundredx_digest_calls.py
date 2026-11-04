@@ -241,7 +241,7 @@ def test_card_states_the_exact_call():
     card = hx._format_opportunity_card(opp, v, 1)
     plain = hx._plain(card["body"])
 
-    assert card["title"] == "#1 — OMER PUTS"
+    assert card["title"] == "#1 — OMER PUTS (UNPROVEN)"
     assert "BUY OMER 2027-01-15 $17.00 PUT @ $2.40 (ask)" in plain
     assert "bid $1.35 / ask $2.40 / mid $1.88" in plain
     assert "2026-11-03 15:02Z via yfinance option_chain" in plain

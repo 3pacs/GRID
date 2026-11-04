@@ -36,7 +36,7 @@ from alerts import hundredx_digest as hx
 
 VERIFY_CAP = 15
 
-_CARD_TITLE = re.compile(r"^\[#(\d+) — (\S+) (CALL|PUT)S\]$", re.MULTILINE)
+_CARD_TITLE = re.compile(r"^\[#(\d+) — (\S+) (CALL|PUT)S(?: \(UNPROVEN\))?\]$", re.MULTILINE)
 
 
 # ── Synthetic scanner rows ──────────────────────────────────────────────────
@@ -305,7 +305,25 @@ def test_100x_tier_is_withheld_and_does_not_consume_slots(monkeypatch):
     assert run.result["100x_count"] == 0
 
 
-def test_call_direction_is_withheld(monkeypatch):
+def test_calls_are_sent_and_labelled_unproven(monkeypatch):
+    # 2026-11-04 owner decision: send CALLs labelled, don't withhold them.
+    rows = _universe(6)
+    calls = {"R00", "R02"}
+    rows = [dataclasses.replace(o, direction="CALL") if o.ticker in calls else o for o in rows]
+
+    run = _run(monkeypatch, rows)
+
+    assert calls <= set(run.verified)
+    assert run.result["gated"].get("direction_suppressed", 0) == 0
+    assert "CALLS (UNPROVEN)" in run.sent["plain"]
+    assert "42.0% of the time over 5 days" in run.sent["plain"]
+    assert {c["direction"] for c in run.persisted} == {"CALL", "PUT"}
+
+
+def test_call_direction_gate_still_withholds_when_enabled(monkeypatch):
+    from alerts import hundredx_digest as hd
+
+    monkeypatch.setattr(hd, "SUPPRESSED_DIRECTIONS", frozenset({"CALL"}))
     rows = _universe(6)
     calls = {"R00", "R02"}
     rows = [dataclasses.replace(o, direction="CALL") if o.ticker in calls else o for o in rows]
@@ -340,7 +358,8 @@ def test_row_without_an_executable_contract_is_withheld(monkeypatch):
 
 
 def test_nothing_is_sent_when_every_row_is_withheld(monkeypatch):
-    rows = [dataclasses.replace(o, direction="CALL") for o in _universe(4)]
+    # Every row in the still-withheld 100x tier (CALLs are sent since 2026-11-04).
+    rows = _universe(4, hundredx_ranks=frozenset(range(4)))
 
     run = _run(monkeypatch, rows)
 
@@ -436,7 +455,7 @@ def test_cards_ship_in_score_order(monkeypatch):
 def test_html_body_carries_the_same_order(monkeypatch):
     run = _run(monkeypatch, _universe(4))
 
-    titles = re.findall(r'<div class="card-title">#\d+ — (\S+) PUTS</div>', run.sent["html"])
+    titles = re.findall(r'<div class="card-title">#\d+ — (\S+) PUTS(?: \(UNPROVEN\))?</div>', run.sent["html"])
     assert titles == _r(0, 1, 2, 3)
 
 

@@ -271,7 +271,19 @@ MAX_SPREAD_PCT = 0.60
 # PUT calls are still sent: 58.8% at 5 days (n=102), but that edge is
 # September-only (10-day 87.8% Sep vs 42.9% Oct), so it is labelled
 # unproven and the track record carries the evidence.
-SUPPRESSED_DIRECTIONS = frozenset({"CALL"})
+# 2026-11-04 (owner): send CALLs again, labelled unproven, rather than
+# withholding them. The gate stays available: add a direction here to
+# withhold it again.
+SUPPRESSED_DIRECTIONS: frozenset[str] = frozenset()
+
+# Shown on every card of that direction until the persisted track record
+# (options_digest_calls) says otherwise. Measured 2026-09-04..11-03.
+DIRECTION_CAVEATS = {
+    "CALL": ("UNPROVEN: in the Sep-Nov backfill CALLs went the called direction "
+             "42.0% of the time over 5 days (n=143) and 84% expired worthless"),
+    "PUT": ("UNPROVEN: the PUT edge was September-only (10-day direction hit "
+            "87.8% in Sep vs 42.9% in Oct)"),
+}
 
 # The is_100x tier ("estimated payoff >= 100x"): 0 of 7 calls ended above
 # entry, all 7 lost the premium, and the 30-100x bucket was 0 of 39. The
@@ -846,6 +858,9 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
     rows.append(("Signal data as of", sig_txt))
     rows.append(("Composite score", f"{_fmt(opp.get('score'), '.2f')}/10 "
                                     f"(no measured relation to outcome — see Track Record)"))
+    caveat = DIRECTION_CAVEATS.get(direction)
+    if caveat:
+        rows.insert(0, ("Track record", caveat))
 
     llm_verdict = opp.get("llm_verdict", "UNREVIEWED")
     if llm_verdict not in ("PASS", "UNREVIEWED"):
@@ -856,7 +871,8 @@ def _format_opportunity_card(opp: dict, verification: dict, index: int) -> dict:
         rows.append(("Data issue", _esc(issue)))
 
     body = f'<div class="call-line">{_esc(call_line)}</div>{_kv_table(rows)}'
-    return {"title": f"#{index} — {ticker} {direction}S", "body": body,
+    label = " (UNPROVEN)" if direction in DIRECTION_CAVEATS else ""
+    return {"title": f"#{index} — {ticker} {direction}S{label}", "body": body,
             "accent": "red" if direction == "PUT" else "green"}
 
 
