@@ -539,10 +539,11 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # the stale block skips not-configured / deterministically failing
         # sources, and records deterministic retry failures. Needs reviewer
         # acceptance like the prior pins.
-        # SCHED re-pinned 11bca7eb -> 915af86b (2026-11-04 wave): the only
-        # scheduler edits are gdelt freq_h 0.083 -> 1 and earnings_calendar
-        # timeout_s 120 -> 300. Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','915af86b778de99889081ebe7350a3ea78815a5eeb3714843986cc968e6661c2')]:
+        # SCHED re-pinned 11bca7eb -> bb81613a (2026-11-04 wave): the only
+        # scheduler edits are gdelt freq_h 0.083 -> 1, earnings_calendar
+        # timeout_s 120 -> 300, and a retirement hold_reason on
+        # baltic_exchange. Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','bb81613a424dc005cae96ef6328339f2617ec41e5d8fdfda7e6f5efcbd978d21')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
