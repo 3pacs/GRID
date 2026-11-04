@@ -106,3 +106,22 @@ def test_reason_words_survive() -> None:
     for msg in ("SKIPPED: ['no CF Radar token configured']", "PullerReportedFailure: no_api_key",
                 "Data unavailable due to the 2025 lapse in appropriations"):
         assert redact_secrets(msg) == msg
+
+
+def test_central_loguru_config_redacts_messages_and_disables_diagnose() -> None:
+    import io
+
+    import config  # noqa: F401  (installs the patcher)
+    from loguru import logger
+
+    buf = io.StringIO()
+    sink = logger.add(buf, level="DEBUG", format="{message}", diagnose=False)
+    try:
+        logger.warning("failed: {e}", e="for url: https://api.polygon.io/v3/x?apiKey=PolyKey123456")
+    finally:
+        logger.remove(sink)
+    out = buf.getvalue()
+    assert "PolyKey123456" not in out
+    assert "failed: for url: https://api.polygon.io/v3/x?[REDACTED]" in out
+    src = open(config.__file__, encoding="utf-8").read()
+    assert "diagnose=_LOG_DIAGNOSE" in src and src.count("diagnose=_LOG_DIAGNOSE") >= 2
