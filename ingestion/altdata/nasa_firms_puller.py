@@ -6,13 +6,25 @@ Fires near critical infrastructure (refineries, ports, data centers,
 power plants) are market-moving events.
 
 API: https://firms.modaps.eosdis.nasa.gov/api/area
-Uses NASA Earthdata JWT for authentication.
+Authentication is the FIRMS MAP_KEY in the URL path
+(``/api/area/csv/{MAP_KEY}/{SOURCE}/{w,s,e,n}/{days}``), read from
+``NASA_FIRMS_KEY`` -- the same variable ``ingestion/physical/nasa_fire.py``
+uses. The previous request omitted the MAP_KEY and sent the Earthdata JWT as
+a Bearer header; FIRMS answered ``400 Invalid MAP_KEY`` for every region
+(probed from grid-svr 2026-11-04), so this puller had stored nothing.
+
+Satellite: VIIRS_SNPP_NRT stopped at 2026-11-02 in FIRMS' own
+data_availability listing while NOAA-20/NOAA-21 are current, so the puller
+asks ``/api/data_availability`` which NRT product is fresh and uses the first
+current one in ``_SOURCE_PREFERENCE``. A region count from a stale product
+would be a false zero, so no current product means FAILED, not 0 fires.
 """
 
 from __future__ import annotations
 
+import os
 import time
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import requests
@@ -24,6 +36,14 @@ from ingestion.base import BasePuller, retry_on_failure
 FIRMS_API = "https://firms.modaps.eosdis.nasa.gov/api/area/csv"
 # MAP_KEY endpoint for FIRMS (simpler, uses MAP_KEY not Earthdata JWT)
 FIRMS_MAP_API = "https://firms.modaps.eosdis.nasa.gov/api/country/csv"
+FIRMS_AVAILABILITY_API = "https://firms.modaps.eosdis.nasa.gov/api/data_availability/csv"
+
+# Fresh-first NRT products (all serve the same CSV columns for our use).
+_SOURCE_PREFERENCE: tuple[str, ...] = (
+    "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "VIIRS_SNPP_NRT", "MODIS_NRT",
+)
+# A product whose max_date is older than this is not "current".
+_MAX_PRODUCT_LAG_DAYS = 1
 
 # Permanent HTTP codes for FIRMS. 400 usually means a bbox is outside
 # the supported range for the source (MODIS_NRT vs VIIRS_SNPP_NRT differ),
@@ -82,45 +102,87 @@ class NASAFirmsPuller(BasePuller):
         "priority_rank": 25,
     }
 
-    def __init__(self, db_engine: Engine, token: str | None = None) -> None:
+    def __init__(self, db_engine: Engine, token: str | None = None, map_key: str | None = None) -> None:
         super().__init__(db_engine)
         if token:
             self.token = token
         else:
             from config import settings
             self.token = getattr(settings, "NASA_EARTHDATA_TOKEN", "")
+        self.map_key = map_key if map_key is not None else os.environ.get("NASA_FIRMS_KEY", "")
+
+    def _redact(self, text_: str) -> str:
+        return text_.replace(self.map_key, "***") if self.map_key else text_
+
+    def _current_source(self, today: date) -> str | None:
+        """First preferred NRT product whose data reaches ``today - lag``.
+
+        Returns None if FIRMS lists no current product. If the availability
+        listing itself cannot be read, falls back to the first preference
+        (the area request will then show whether it works).
+        """
+        try:
+            resp = requests.get(f"{FIRMS_AVAILABILITY_API}/{self.map_key}/ALL", timeout=30)
+            if resp.status_code != 200:
+                raise FIRMSPermanentError(f"data_availability HTTP {resp.status_code}")
+            max_dates: dict[str, date] = {}
+            for line in resp.text.strip().split("\n")[1:]:
+                parts = line.strip().split(",")
+                if len(parts) >= 3:
+                    try:
+                        max_dates[parts[0]] = date.fromisoformat(parts[2])
+                    except ValueError:
+                        continue
+        except Exception as exc:
+            log.warning("FIRMS availability listing unavailable ({e}); using {s}",
+                        e=self._redact(str(exc)), s=_SOURCE_PREFERENCE[0])
+            return _SOURCE_PREFERENCE[0]
+        cutoff = today - timedelta(days=_MAX_PRODUCT_LAG_DAYS)
+        for source in _SOURCE_PREFERENCE:
+            if max_dates.get(source) is not None and max_dates[source] >= cutoff:
+                return source
+        return None
 
     @retry_on_failure(max_attempts=3, retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.exceptions.RequestException))
     def _fetch_fires(
         self,
         west: float, south: float, east: float, north: float,
         days: int = 2,
-        source: str = "VIIRS_SNPP_NRT",
+        source: str = _SOURCE_PREFERENCE[0],
     ) -> list[dict[str, Any]]:
         """Fetch fire data for a bounding box.
 
         Args:
             west, south, east, north: Bounding box coordinates.
-            days: Number of days of data (1-10).
-            source: Satellite source (VIIRS_SNPP_NRT, MODIS_NRT).
+            days: Number of days of data (FIRMS accepts 1..5).
+            source: FIRMS NRT product (see ``_SOURCE_PREFERENCE``).
 
         Returns:
             List of fire point dicts.
         """
-        url = f"{FIRMS_API}/{source}/{west},{south},{east},{north}/{days}"
-        headers = {}
-        if self.token:
-            headers["Authorization"] = f"Bearer {self.token}"
-
-        resp = requests.get(url, headers=headers, timeout=60)
+        url = f"{FIRMS_API}/{self.map_key}/{source}/{west},{south},{east},{north}/{days}"
+        try:
+            resp = requests.get(url, timeout=60)
+        except requests.exceptions.RequestException as exc:
+            # requests puts the URL (and so the MAP_KEY) in its messages;
+            # the retry wrapper logs str(exc), so re-raise it redacted.
+            raise ConnectionError(self._redact(f"{type(exc).__name__}: {exc}")) from None
         if resp.status_code in _HTTP_PERMANENT_CODES:
+            # Never put the URL in the message: the MAP_KEY is a path segment.
             raise FIRMSPermanentError(
-                f"FIRMS {url} returned {resp.status_code}"
+                f"FIRMS area {source} returned {resp.status_code}: "
+                f"{self._redact(resp.text.strip()[:120])}"
             )
-        resp.raise_for_status()
+        if resp.status_code >= 400:
+            raise requests.exceptions.HTTPError(f"FIRMS area {source} returned {resp.status_code}")
 
-        # Parse CSV response
+        # Parse CSV response. A valid answer always starts with the header
+        # row, even with zero fires; anything else is an error page.
         lines = resp.text.strip().split("\n")
+        if not lines or not lines[0].startswith("latitude,"):
+            raise FIRMSPermanentError(
+                f"FIRMS area {source} returned no CSV header: {self._redact(lines[0][:120] if lines else '')}"
+            )
         if len(lines) < 2:
             return []
 
@@ -138,86 +200,131 @@ class NASAFirmsPuller(BasePuller):
         """Pull fire data for all monitored regions.
 
         Args:
-            days: Days of data to fetch.
+            days: Days of data to fetch (FIRMS accepts 1..5).
 
         Returns:
-            Summary with fire counts and infrastructure alerts.
+            Write-contract summary: ``status``, ``rows_inserted`` (rows
+            committed to raw_series) and ``succeeded``/``total`` regions.
         """
+        if not self.map_key:
+            return {"status": "SKIPPED", "rows_inserted": 0,
+                    "skipped_reason": "NASA_FIRMS_KEY not set (FIRMS MAP_KEY required)"}
+
+        today = date.today()
+        source = self._current_source(today)
+        if source is None:
+            return {"status": "FAILED", "rows_inserted": 0,
+                    "error": f"no FIRMS NRT product has data newer than {today - timedelta(days=_MAX_PRODUCT_LAG_DAYS)}"}
+
         total_fires = 0
+        rows_inserted = 0
         infra_alerts: list[dict[str, Any]] = []
         region_counts: dict[str, int] = {}
+        failed: list[str] = []
 
-        for region_name, bbox in REGIONS.items():
-            try:
-                fires = self._fetch_fires(*bbox, days=days)
+        for idx, (region_name, bbox) in enumerate(REGIONS.items()):
+            if idx:
                 time.sleep(1.0)  # Rate limit
-
-                region_counts[region_name] = len(fires)
-                total_fires += len(fires)
-
-                # Store regional fire count
+            try:
+                fires = self._fetch_fires(*bbox, days=days, source=source)
                 with self.engine.begin() as conn:
-                    self._insert_raw(conn,
+                    n = _inserted(self._insert_raw(
+                        conn,
                         series_id=f"firms:{region_name}:fire_count",
-                        obs_date=date.today(),
+                        obs_date=today,
                         value=float(len(fires)),
-                        raw_payload={"region": region_name, "days": days, "bbox": list(bbox)},
-                    )
-
-                # Check proximity to critical infrastructure
-                for fire in fires:
-                    try:
-                        lat = float(fire.get("latitude", 0))
-                        lon = float(fire.get("longitude", 0))
-                        brightness = float(fire.get("bright_ti4", fire.get("brightness", 0)))
-                        confidence = fire.get("confidence", "")
-
-                        for infra_lat, infra_lon, radius_km, infra_name in CRITICAL_INFRA:
-                            dist = _haversine(lat, lon, infra_lat, infra_lon)
-                            if dist <= radius_km:
-                                alert = {
-                                    "infrastructure": infra_name,
-                                    "fire_lat": lat,
-                                    "fire_lon": lon,
-                                    "distance_km": round(dist, 1),
-                                    "brightness": brightness,
-                                    "confidence": confidence,
-                                    "region": region_name,
-                                }
-                                infra_alerts.append(alert)
-                                log.warning(
-                                    "FIRE NEAR INFRA: {n} — {d:.0f}km away, brightness={b}",
-                                    n=infra_name, d=dist, b=brightness,
-                                )
-                    except (ValueError, TypeError):
-                        pass
-
+                        raw_payload={"region": region_name, "days": days,
+                                     "bbox": list(bbox), "satellite": source},
+                        return_result=True,
+                    ))
+                rows_inserted += n
             except FIRMSPermanentError as exc:
-                log.warning(
-                    "FIRMS {r}: permanent failure, skipping region — {e}",
-                    r=region_name, e=str(exc),
-                )
+                failed.append(region_name)
+                log.warning("FIRMS {r}: permanent failure, skipping region — {e}",
+                            r=region_name, e=self._redact(str(exc)))
+                continue
             except Exception as exc:
-                log.debug("FIRMS pull failed for {r}: {e}", r=region_name, e=str(exc))
+                failed.append(region_name)
+                log.warning("FIRMS pull failed for {r}: {e}", r=region_name, e=self._redact(str(exc)))
+                continue
 
-        # Store infrastructure alerts
+            region_counts[region_name] = len(fires)
+            total_fires += len(fires)
+
+            # Check proximity to critical infrastructure
+            for fire in fires:
+                try:
+                    lat = float(fire.get("latitude", 0))
+                    lon = float(fire.get("longitude", 0))
+                    brightness = float(fire.get("bright_ti4", fire.get("brightness", 0)))
+                    confidence = fire.get("confidence", "")
+                except (ValueError, TypeError):
+                    continue
+                for infra_lat, infra_lon, radius_km, infra_name in CRITICAL_INFRA:
+                    dist = _haversine(lat, lon, infra_lat, infra_lon)
+                    if dist <= radius_km:
+                        infra_alerts.append({
+                            "infrastructure": infra_name,
+                            "fire_lat": lat,
+                            "fire_lon": lon,
+                            "distance_km": round(dist, 1),
+                            "brightness": brightness,
+                            "confidence": confidence,
+                            "region": region_name,
+                        })
+                        log.warning(
+                            "FIRE NEAR INFRA: {n} — {d:.0f}km away, brightness={b}",
+                            n=infra_name, d=dist, b=brightness,
+                        )
+
         if infra_alerts:
-            with self.engine.begin() as conn:
-                self._insert_raw(conn,
-                    series_id="firms:infra_alerts",
-                    obs_date=date.today(),
-                    value=float(len(infra_alerts)),
-                    raw_payload={"alerts": infra_alerts},
-                )
+            try:
+                with self.engine.begin() as conn:
+                    n = _inserted(self._insert_raw(
+                        conn,
+                        series_id="firms:infra_alerts",
+                        obs_date=today,
+                        value=float(len(infra_alerts)),
+                        raw_payload={"alerts": infra_alerts, "satellite": source},
+                        return_result=True,
+                    ))
+                rows_inserted += n
+            except Exception as exc:
+                failed.append("infra_alerts")
+                log.warning("FIRMS infra alert store failed: {e}", e=str(exc))
 
-        log.info("NASA FIRMS: {t} fires across {r} regions, {a} infrastructure alerts",
-                 t=total_fires, r=len(region_counts), a=len(infra_alerts))
+        log.info("NASA FIRMS ({s}): {t} fires across {r} regions, {a} infrastructure alerts, {n} rows",
+                 s=source, t=total_fires, r=len(region_counts), a=len(infra_alerts), n=rows_inserted)
 
-        return {
+        total = len(REGIONS)
+        succeeded = len(region_counts)
+        if not failed:
+            status = "SUCCESS"
+        elif rows_inserted:
+            status = "PARTIAL"
+        else:
+            status = "FAILED"
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "succeeded": succeeded,
+            "total": total,
+            "satellite": source,
             "total_fires": total_fires,
             "region_counts": region_counts,
             "infrastructure_alerts": infra_alerts,
         }
+        if failed:
+            result["error"] = f"{len(failed)} FIRMS items failed: {', '.join(failed)}"
+        return result
+
+
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
 
 
 def _haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:

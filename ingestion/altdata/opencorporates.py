@@ -20,6 +20,7 @@ This module:
 
 from __future__ import annotations
 
+import os
 import re
 import time
 from datetime import date
@@ -40,6 +41,22 @@ _GET_COMPANY: str = f"{_BASE_URL}/companies/{{jurisdiction_code}}/{{company_numb
 _SEARCH_OFFICERS: str = f"{_BASE_URL}/officers/search"
 
 _REQUEST_TIMEOUT: int = 30
+
+# api.opencorporates.com now rejects unauthenticated calls: probed from
+# grid-svr 2026-11-04, officers/search and companies/search both answered
+# 401 {"error":{"message":"Invalid Api Token..."}}. The token is read from
+# the environment (the hermes/scheduler units load the repo .env).
+_API_TOKEN_ENV: str = "OPENCORPORATES_API_TOKEN"
+_NO_TOKEN_REASON: str = (
+    f"{_API_TOKEN_ENV} not set; api.opencorporates.com requires an API token "
+    "(unauthenticated calls return 401 Invalid Api Token)"
+)
+_NO_INPUT_REASON: str = (
+    "no ICIJ officer rows (OFFSHORE:*) to cross-reference "
+    "(the offshore_leaks puller writes them; it is held for match-quality review)"
+)
+# Officer searches per run (the old free-tier guard stopped at 45 calls).
+_MAX_SEARCHES_PER_RUN: int = 45
 _RATE_LIMIT_DELAY: float = 2.0  # seconds between requests
 
 
@@ -61,6 +78,14 @@ class _RateLimiter:
 
 
 # -- Puller Class -------------------------------------------------------------
+
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
+
 
 class OpenCorporatesPuller(BasePuller):
     """Pulls corporate registry data from the OpenCorporates API.
@@ -95,6 +120,12 @@ class OpenCorporatesPuller(BasePuller):
         super().__init__(db_engine)
         self._limiter = _RateLimiter()
         self._search_calls_used: int = 0
+        self._api_token: str = os.environ.get(_API_TOKEN_ENV, "").strip()
+        self._failed_requests: int = 0
+        self._auth_failed: bool = False
+        self._officers_available: int = 0
+        self._officers_searched: int = 0
+        self._rows_inserted: int = 0
         log.info(
             "OpenCorporatesPuller initialised -- source_id={sid}",
             sid=self.source_id,
@@ -116,14 +147,27 @@ class OpenCorporatesPuller(BasePuller):
             Parsed JSON response dict, or None on failure.
         """
         self._limiter.wait()
+        query = dict(params or {})
+        token = getattr(self, "_api_token", "")
+        if token:
+            query["api_token"] = token
 
         try:
-            resp = requests.get(url, params=params, timeout=_REQUEST_TIMEOUT)
+            resp = requests.get(url, params=query, timeout=_REQUEST_TIMEOUT)
         except requests.RequestException as exc:
-            log.warning("OpenCorporates request failed: {e}", e=str(exc))
+            self._failed_requests = getattr(self, "_failed_requests", 0) + 1
+            # requests' message carries the full URL incl. the token param.
+            msg = str(exc).replace(token, "***") if token else str(exc)
+            log.warning("OpenCorporates request failed: {e}", e=msg)
             return None
 
+        if resp.status_code == 401:
+            self._auth_failed = True
+            self._failed_requests = getattr(self, "_failed_requests", 0) + 1
+            log.warning("OpenCorporates rejected the API token (HTTP 401)")
+            return None
         if resp.status_code == 403:
+            self._failed_requests = getattr(self, "_failed_requests", 0) + 1
             log.warning("OpenCorporates rate limit hit (403). Backing off.")
             time.sleep(10.0)
             return None
@@ -131,6 +175,7 @@ class OpenCorporatesPuller(BasePuller):
             log.debug("OpenCorporates 404: {u}", u=url)
             return None
         if resp.status_code != 200:
+            self._failed_requests = getattr(self, "_failed_requests", 0) + 1
             log.warning(
                 "OpenCorporates HTTP {s} for {u}",
                 s=resp.status_code,
@@ -395,6 +440,8 @@ class OpenCorporatesPuller(BasePuller):
                 e=str(exc),
             )
 
+        icij_officers = icij_officers[:_MAX_SEARCHES_PER_RUN]
+        self._officers_available = len(icij_officers)
         if not icij_officers:
             log.info("No ICIJ officers found in raw_series for cross-reference")
             return []
@@ -410,17 +457,11 @@ class OpenCorporatesPuller(BasePuller):
 
         for officer in icij_officers:
             name = officer["name"]
-
-            # Guard against burning through the 50/month search quota
-            if self._search_calls_used >= 45:
-                log.warning(
-                    "Approaching OpenCorporates search limit "
-                    "({n}/50 used). Stopping cross-reference.",
-                    n=self._search_calls_used,
-                )
-                break
+            if self._auth_failed:
+                break  # every further call would be rejected the same way
 
             results = self.search_officer(name)
+            self._officers_searched += 1
 
             if results:
                 cross_ref = {
@@ -432,7 +473,7 @@ class OpenCorporatesPuller(BasePuller):
                 cross_refs.append(cross_ref)
 
                 # Store each matched company registration
-                self._store_cross_ref(cross_ref)
+                self._rows_inserted += self._store_cross_ref(cross_ref)
 
                 log.info(
                     "ICIJ officer '{name}' found in {n} company registrations",
@@ -500,15 +541,16 @@ class OpenCorporatesPuller(BasePuller):
                 }
 
                 try:
-                    self._insert_raw(
-                        conn=conn,
-                        series_id=series_id,
-                        obs_date=today,
-                        value=1.0,  # binary flag: match exists
-                        raw_payload=payload,
-                        pull_status="SUCCESS",
-                    )
-                    inserted += 1
+                    with conn.begin_nested():
+                        inserted += _inserted(self._insert_raw(
+                            conn=conn,
+                            series_id=series_id,
+                            obs_date=today,
+                            value=1.0,  # binary flag: match exists
+                            raw_payload=payload,
+                            pull_status="SUCCESS",
+                            return_result=True,
+                        ))
                 except Exception as exc:
                     log.debug(
                         "Failed to insert cross-ref for {name}/{co}: {e}",
@@ -532,35 +574,56 @@ class OpenCorporatesPuller(BasePuller):
     def pull_all(self) -> dict[str, Any]:
         """Run full OpenCorporates ingestion.
 
-        Cross-references top 50 ICIJ individuals against OpenCorporates
-        public company registrations.
+        Cross-references up to ``_MAX_SEARCHES_PER_RUN`` ICIJ individuals
+        against OpenCorporates public company registrations.
 
         Returns:
-            Dict with status, officers_checked, matches_found,
-            registrations_stored.
+            Write-contract summary: ``status``, ``rows_inserted`` (rows
+            committed to raw_series) and ``succeeded``/``total`` officers.
         """
+        if not self._api_token:
+            return {"status": "SKIPPED", "rows_inserted": 0, "skipped_reason": _NO_TOKEN_REASON}
+
         log.info("Starting OpenCorporates pull_all")
+        self._failed_requests = 0
+        self._auth_failed = False
+        self._officers_searched = 0
+        self._rows_inserted = 0
 
         cross_refs = self.cross_reference_icij(self.engine)
+        if not self._officers_available:
+            return {"status": "SKIPPED", "rows_inserted": 0, "skipped_reason": _NO_INPUT_REASON}
 
-        total_registrations = sum(
-            cr.get("match_count", 0) for cr in cross_refs
-        )
+        total_registrations = sum(cr.get("match_count", 0) for cr in cross_refs)
+        total = self._officers_available
+        searched_ok = max(self._officers_searched - self._failed_requests, 0)
+        if self._auth_failed:
+            status, error = "FAILED", "OpenCorporates rejected the API token (HTTP 401)"
+        elif self._failed_requests:
+            status = "PARTIAL" if (searched_ok or self._rows_inserted) else "FAILED"
+            error = f"{self._failed_requests} of {total} officer searches failed"
+        else:
+            status, error = "SUCCESS", None
 
-        result = {
-            "status": "SUCCESS" if cross_refs else "NO_MATCHES",
-            "officers_checked": len(cross_refs),
-            "matches_found": len([cr for cr in cross_refs if cr["match_count"] > 0]),
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": self._rows_inserted,
+            "succeeded": searched_ok if status != "SUCCESS" else total,
+            "total": total,
+            "officers_checked": self._officers_searched,
+            "matches_found": len(cross_refs),
             "total_registrations": total_registrations,
             "search_calls_used": self._search_calls_used,
-            "search_calls_remaining": max(0, 50 - self._search_calls_used),
         }
+        if error:
+            result["error"] = error
 
         log.info(
             "OpenCorporates pull complete: {m} officers matched, "
-            "{r} registrations found, {u}/50 search calls used",
+            "{r} registrations found, {n} rows stored, {u} search calls used",
             m=result["matches_found"],
             r=total_registrations,
+            n=self._rows_inserted,
             u=self._search_calls_used,
         )
         return result

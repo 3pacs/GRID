@@ -56,8 +56,18 @@ from ingestion.base import BasePuller, retry_on_failure
 # ---------------------------------------------------------------------------
 
 _SPARQL_URL: str = "https://query.wikidata.org/sparql"
+_SEARCH_URL: str = "https://www.wikidata.org/w/api.php"
 _RATE_LIMIT_SECONDS: float = 1.0
 _REQUEST_TIMEOUT: int = 60
+
+# 429 handling (2026-11-04: 437 "429 Too Many Requests" warnings in 24h, the
+# entity search ran unthrottled with a generic User-Agent and the batch kept
+# going). A 429/503 waits the server's Retry-After (or a short backoff) and
+# retries; a Retry-After above the cap, or this many 429s in a row, stops the
+# whole batch, which then reports PARTIAL with the rows already committed.
+_MAX_CONSECUTIVE_429: int = 3
+_MAX_RETRY_AFTER_SECONDS: float = 60.0
+_DEFAULT_429_BACKOFF_SECONDS: float = 5.0
 
 _HEADERS: dict[str, str] = {
     "Accept": "application/sparql-results+json",
@@ -91,13 +101,53 @@ _ORG_LINK_PROPS: frozenset[str] = frozenset({
     "P39", "P108", "P3320", "P463", "P1037", "P169",
 })
 
-# Maximum depth for recursive connection discovery.
-_MAX_RECURSE_DEPTH: int = 6
+# Hops of family-link discovery beyond a matched actor. The old value (6),
+# combined with re-*searching* every connection's label as if it were a
+# person's name ('delegate', 'Chair of the Federal Reserve', 'Farmers and
+# Drovers Bank'), made each run fan out into hundreds of pointless searches.
+# Recursion now follows the connection's Q-id directly, one hop deep.
+_MAX_RECURSE_DEPTH: int = 1
 
 
 # ---------------------------------------------------------------------------
 # Rate limiter
 # ---------------------------------------------------------------------------
+
+class WikidataRateLimited(RuntimeError):
+    """Wikidata keeps refusing with 429; stop the batch instead of hammering."""
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a Retry-After header (delta-seconds or HTTP-date)."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(float(value), 0.0)
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+
+        when = parsedate_to_datetime(value)
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        return max((when - datetime.now(timezone.utc)).total_seconds(), 0.0)
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+def _clean_actor_name(name: str) -> str:
+    """Person part of a seed actor name.
+
+    Seed names carry context, e.g. 'Jim Simons (Estate / Renaissance)' or
+    'George Soros / Soros Fund Management'; the entity search wants the
+    person's name only.
+    """
+    cleaned = re.sub(r"\s*\([^)]*\)", "", name or "")
+    cleaned = cleaned.split(" / ")[0]
+    return " ".join(cleaned.split())
+
 
 class _RateLimiter:
     """Enforces a minimum interval between outbound HTTP requests."""
@@ -116,6 +166,14 @@ class _RateLimiter:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _written(result: Any) -> int:
+    """Rows an upsert wrote (inserted or refreshed); unknown fails closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
+
 
 def _qid(uri: str) -> str:
     """Extract Q-identifier from a full Wikidata URI."""
@@ -219,6 +277,34 @@ class WikidataPersonPuller(BasePuller):
     # SPARQL helpers
     # ------------------------------------------------------------------
 
+    def _http_get(self, url: str, params: dict[str, Any], headers: dict[str, str],
+                  timeout: int) -> requests.Response:
+        """Rate-limited GET that honours 429/503 Retry-After.
+
+        Raises:
+            WikidataRateLimited: Retry-After above the cap, or
+                ``_MAX_CONSECUTIVE_429`` refusals in a row.
+            requests.HTTPError: any other non-2xx response.
+        """
+        while True:
+            self._limiter.wait()
+            resp = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if resp.status_code not in (429, 503):
+                self._consecutive_429 = 0
+                resp.raise_for_status()
+                return resp
+            self._consecutive_429 = getattr(self, "_consecutive_429", 0) + 1
+            wait = _retry_after_seconds(resp.headers.get("Retry-After"))
+            if wait is None:
+                wait = _DEFAULT_429_BACKOFF_SECONDS * self._consecutive_429
+            if wait > _MAX_RETRY_AFTER_SECONDS or self._consecutive_429 >= _MAX_CONSECUTIVE_429:
+                raise WikidataRateLimited(
+                    f"Wikidata HTTP {resp.status_code} x{self._consecutive_429} "
+                    f"(Retry-After {wait:.0f}s); stopping this batch"
+                )
+            log.info("Wikidata HTTP {s}; waiting {w:.1f}s (Retry-After)", s=resp.status_code, w=wait)
+            time.sleep(wait)
+
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
@@ -235,14 +321,12 @@ class WikidataPersonPuller(BasePuller):
         Returns:
             List of result bindings (dicts).
         """
-        self._limiter.wait()
-        resp = requests.get(
+        resp = self._http_get(
             _SPARQL_URL,
             params={"query": query, "format": "json"},
             headers=_HEADERS,
             timeout=_REQUEST_TIMEOUT,
         )
-        resp.raise_for_status()
         return resp.json().get("results", {}).get("bindings", [])
 
     # ------------------------------------------------------------------
@@ -262,11 +346,9 @@ class WikidataPersonPuller(BasePuller):
         if not name or len(name.strip()) < 2:
             return []
 
-        name.strip().replace('"', '\\"')
-
         # Use mwapi EntitySearch for fast name lookup, then enrich via SPARQL.
         # The old CONTAINS(LCASE()) approach scanned all Q5 entities — too slow.
-        search_url = "https://www.wikidata.org/w/api.php"
+        # Same limiter and descriptive User-Agent as SPARQL (Wikimedia UA policy).
         search_params = {
             "action": "wbsearchentities",
             "search": name.strip(),
@@ -276,12 +358,15 @@ class WikidataPersonPuller(BasePuller):
             "format": "json",
         }
         try:
-            import requests
-            resp = requests.get(search_url, params=search_params, timeout=15,
-                                headers={"User-Agent": "GRID-Intelligence/1.0"})
-            resp.raise_for_status()
+            resp = self._http_get(
+                _SEARCH_URL, params=search_params,
+                headers={"User-Agent": _HEADERS["User-Agent"]}, timeout=15,
+            )
             candidates = resp.json().get("search", [])
+        except WikidataRateLimited:
+            raise
         except Exception as exc:
+            self._request_errors = getattr(self, "_request_errors", 0) + 1
             log.warning(
                 "Wikidata entity search failed for '{name}': {e}",
                 name=name, e=exc,
@@ -307,7 +392,10 @@ class WikidataPersonPuller(BasePuller):
 
         try:
             bindings = self._sparql(query)
+        except WikidataRateLimited:
+            raise
         except Exception as exc:
+            self._request_errors = getattr(self, "_request_errors", 0) + 1
             log.warning(
                 "Wikidata SPARQL enrichment failed for '{name}': {e}",
                 name=name, e=exc,
@@ -343,8 +431,10 @@ class WikidataPersonPuller(BasePuller):
     def _fetch_connections(self, qid: str) -> list[dict[str, Any]]:
         """Fetch all relevant connections for a Wikidata person Q-id.
 
-        Queries each property in ``_PERSON_PROPERTIES`` individually to
-        keep SPARQL queries simple and reliable.
+        One SPARQL query covers every property in ``_PERSON_PROPERTIES``
+        (``VALUES (?p ?ps)``; shape probed 2026-11-04) instead of one query
+        per property: 13x fewer requests against a rate-limited endpoint.
+        Each property keeps the old 50-statement cap.
 
         Parameters:
             qid: Wikidata Q-identifier (e.g. "Q313566").
@@ -354,48 +444,53 @@ class WikidataPersonPuller(BasePuller):
             target_qid, target_label, target_description, start_date,
             end_date.
         """
+        if not re.fullmatch(r"Q\d+", qid or ""):
+            return []
+        values = " ".join(f"(p:{pid} ps:{pid})" for pid in _PERSON_PROPERTIES)
+        query = (
+            "SELECT ?p ?target ?targetLabel ?targetDescription ?start ?end WHERE { "
+            f"  VALUES (?p ?ps) {{ {values} }} "
+            f"  wd:{qid} ?p ?stmt . "
+            "  ?stmt ?ps ?target . "
+            "  OPTIONAL { ?stmt pq:P580 ?start } "
+            "  OPTIONAL { ?stmt pq:P582 ?end } "
+            '  SERVICE wikibase:label { bd:serviceParam wikibase:language "en" } '
+            f"}} LIMIT {50 * len(_PERSON_PROPERTIES)}"
+        )
+
+        try:
+            bindings = self._sparql(query)
+        except WikidataRateLimited:
+            raise
+        except Exception as exc:
+            self._request_errors = getattr(self, "_request_errors", 0) + 1
+            log.debug("Wikidata connections query failed for {qid}: {e}", qid=qid, e=exc)
+            return []
+
         connections: list[dict[str, Any]] = []
-
-        for prop_id, rel_name in _PERSON_PROPERTIES.items():
-            query = (
-                f"SELECT ?target ?targetLabel ?targetDescription "
-                f"?start ?end WHERE {{ "
-                f"  wd:{qid} p:{prop_id} ?stmt . "
-                f"  ?stmt ps:{prop_id} ?target . "
-                f"  OPTIONAL {{ ?stmt pq:P580 ?start }} "
-                f"  OPTIONAL {{ ?stmt pq:P582 ?end }} "
-                f'  SERVICE wikibase:label {{ bd:serviceParam wikibase:language "en" }} '
-                f"}} LIMIT 50"
-            )
-
-            try:
-                bindings = self._sparql(query)
-            except Exception as exc:
-                log.debug(
-                    "Wikidata {prop} query failed for {qid}: {e}",
-                    prop=prop_id, qid=qid, e=exc,
-                )
+        per_prop: dict[str, int] = {}
+        for b in bindings:
+            prop_id = _qid(_safe_val(b, "p"))
+            rel_name = _PERSON_PROPERTIES.get(prop_id)
+            if rel_name is None or per_prop.get(prop_id, 0) >= 50:
                 continue
-
-            for b in bindings:
-                target_uri = _safe_val(b, "target")
-                target_qid = _qid(target_uri)
-                if not target_qid or not target_qid.startswith("Q"):
-                    continue
-
-                connections.append({
-                    "property_id": prop_id,
-                    "relationship": rel_name,
-                    "target_qid": target_qid,
-                    "target_label": _safe_val(b, "targetLabel"),
-                    "target_description": _safe_val(b, "targetDescription"),
-                    "start_date": _safe_val(b, "start"),
-                    "end_date": _safe_val(b, "end"),
-                })
+            target_qid = _qid(_safe_val(b, "target"))
+            if not target_qid or not target_qid.startswith("Q"):
+                continue
+            per_prop[prop_id] = per_prop.get(prop_id, 0) + 1
+            connections.append({
+                "property_id": prop_id,
+                "relationship": rel_name,
+                "target_qid": target_qid,
+                "target_label": _safe_val(b, "targetLabel"),
+                "target_description": _safe_val(b, "targetDescription"),
+                "start_date": _safe_val(b, "start"),
+                "end_date": _safe_val(b, "end"),
+            })
 
         log.info(
             "Wikidata connections for {qid}: {n} links across {p} properties",
-            qid=qid, n=len(connections), p=len(_PERSON_PROPERTIES),
+            qid=qid, n=len(connections), p=len(per_prop),
         )
         return connections
 
@@ -415,8 +510,8 @@ class WikidataPersonPuller(BasePuller):
         death_date: str = "",
         image_url: str = "",
         raw_data: dict[str, Any] | None = None,
-    ) -> None:
-        """Insert or update a row in wikidata_persons.
+    ) -> int:
+        """Insert or update a row in wikidata_persons (returns rows written).
 
         Parameters:
             conn: Active DB connection (inside a transaction).
@@ -430,7 +525,7 @@ class WikidataPersonPuller(BasePuller):
             image_url: Wikimedia Commons image URL.
             raw_data: Full SPARQL result for archival.
         """
-        conn.execute(
+        return _written(conn.execute(
             text(
                 "INSERT INTO wikidata_persons "
                 "(wikidata_id, label, description, grid_actor_id, category, "
@@ -462,7 +557,7 @@ class WikidataPersonPuller(BasePuller):
                 "now": datetime.now(timezone.utc),
                 "raw": json.dumps(raw_data or {}),
             },
-        )
+        ))
 
     def _upsert_connection(
         self,
@@ -474,8 +569,8 @@ class WikidataPersonPuller(BasePuller):
         qualifier: str = "",
         start_date: str = "",
         end_date: str = "",
-    ) -> None:
-        """Insert or update a row in wikidata_connections.
+    ) -> int:
+        """Insert or update a row in wikidata_connections (returns rows written).
 
         Parameters:
             conn: Active DB connection (inside a transaction).
@@ -487,7 +582,7 @@ class WikidataPersonPuller(BasePuller):
             start_date: ISO date or empty.
             end_date: ISO date or empty.
         """
-        conn.execute(
+        return _written(conn.execute(
             text(
                 "INSERT INTO wikidata_connections "
                 "(source_qid, target_qid, relationship, property_id, "
@@ -510,7 +605,7 @@ class WikidataPersonPuller(BasePuller):
                 "ed": end_date or "",
                 "now": datetime.now(timezone.utc),
             },
-        )
+        ))
 
     # ------------------------------------------------------------------
     # Core enrichment pipeline
@@ -534,15 +629,16 @@ class WikidataPersonPuller(BasePuller):
             visited: Set of already-visited Q-ids to avoid cycles.
 
         Returns:
-            Dict with persons_stored and connections_stored counts.
+            Dict with persons_stored, connections_stored and rows_written
+            (committed upserts) counts.
         """
         if visited is None:
             visited = set()
 
-        stats = {"persons_stored": 0, "connections_stored": 0}
+        stats = {"persons_stored": 0, "connections_stored": 0, "rows_written": 0}
 
-        # Step 1 -- find the person on Wikidata
-        candidates = self.search_person(actor_name)
+        # Step 1 -- find the person on Wikidata (humans only, Q5).
+        candidates = self.search_person(_clean_actor_name(actor_name))
         if not candidates:
             log.debug(
                 "No Wikidata match for actor '{name}'",
@@ -560,7 +656,7 @@ class WikidataPersonPuller(BasePuller):
 
         # Step 2 -- store the person
         with self.engine.begin() as conn:
-            self._upsert_person(
+            written = self._upsert_person(
                 conn,
                 wikidata_id=qid,
                 label=best["label"],
@@ -572,63 +668,66 @@ class WikidataPersonPuller(BasePuller):
                 image_url=best.get("image_url", ""),
                 raw_data=best,
             )
-            stats["persons_stored"] += 1
+        stats["persons_stored"] += 1
+        stats["rows_written"] += written
 
-        # Step 3 -- fetch connections
+        self._enrich_qid(qid, depth=depth, visited=visited, stats=stats)
+        return stats
+
+    def _enrich_qid(self, qid: str, *, depth: int, visited: set[str], stats: dict[str, int]) -> None:
+        """Store ``qid``'s connections, then follow them by Q-id.
+
+        Recursion uses the connection's own Q-id; it never re-searches a
+        connection's label (an office, an employer, a party) as a name.
+        """
         connections = self._fetch_connections(qid)
 
+        persons = connections_n = written = 0
         with self.engine.begin() as conn:
             for link in connections:
                 target_qid = link["target_qid"]
                 target_label = link["target_label"]
-                relationship = link["relationship"]
-                property_id = link["property_id"]
 
                 # Ensure target person/entity exists in wikidata_persons
-                self._upsert_person(
+                written += self._upsert_person(
                     conn,
                     wikidata_id=target_qid,
                     label=target_label,
                     description=link.get("target_description", ""),
                 )
-                stats["persons_stored"] += 1
+                persons += 1
 
                 # Store the connection
-                self._upsert_connection(
+                written += self._upsert_connection(
                     conn,
                     source_qid=qid,
                     target_qid=target_qid,
-                    relationship=relationship,
-                    property_id=property_id,
+                    relationship=link["relationship"],
+                    property_id=link["property_id"],
                     qualifier=target_label,
                     start_date=link.get("start_date", ""),
                     end_date=link.get("end_date", ""),
                 )
-                stats["connections_stored"] += 1
+                connections_n += 1
+        # Counted only once the transaction committed.
+        stats["persons_stored"] += persons
+        stats["connections_stored"] += connections_n
+        stats["rows_written"] += written
 
-        # Step 4 -- recurse one level for connected persons/orgs
-        if depth < _MAX_RECURSE_DEPTH:
-            for link in connections:
-                target_qid = link["target_qid"]
-                prop_id = link["property_id"]
-
-                # Only recurse into person-linked or org-linked properties
-                if prop_id not in (_PERSON_LINK_PROPS | _ORG_LINK_PROPS):
-                    continue
-                if target_qid in visited:
-                    continue
-
-                sub_stats = self._enrich_actor(
-                    grid_actor_id="",
-                    actor_name=link["target_label"],
-                    actor_category=None,
-                    depth=depth + 1,
-                    visited=visited,
-                )
-                stats["persons_stored"] += sub_stats["persons_stored"]
-                stats["connections_stored"] += sub_stats["connections_stored"]
-
-        return stats
+        if depth >= _MAX_RECURSE_DEPTH:
+            return
+        for link in connections:
+            target_qid = link["target_qid"]
+            # Family links are persons. Organisation targets were never
+            # enriched in practice (their labels failed the Q5 human filter
+            # of the old label search), so following them would only add
+            # load, not data, to a person-connection puller.
+            if link["property_id"] not in _PERSON_LINK_PROPS:
+                continue
+            if target_qid in visited:
+                continue
+            visited.add(target_qid)
+            self._enrich_qid(target_qid, depth=depth + 1, visited=visited, stats=stats)
 
     # ------------------------------------------------------------------
     # pull_all -- main entry point
@@ -659,7 +758,7 @@ class WikidataPersonPuller(BasePuller):
                 log.error(
                     "Cannot import _KNOWN_ACTORS from intelligence.actors.seed_data"
                 )
-                return {"status": "FAILED", "error": "seed_data import failed"}
+                return {"status": "FAILED", "rows_upserted": 0, "error": "seed_data import failed"}
 
         log.info(
             "WikidataPersonPuller.pull_all -- {n} actors available, "
@@ -669,17 +768,20 @@ class WikidataPersonPuller(BasePuller):
 
         total_persons = 0
         total_connections = 0
+        rows_written = 0
         actors_searched = 0
         actors_matched = 0
+        actors_failed = 0
         visited: set[str] = set()
+        stopped: str | None = None
+        self._request_errors = 0
+        self._consecutive_429 = 0
 
-        for actor_id, actor_data in list(actors.items())[:max_actors]:
+        batch = [(aid, data) for aid, data in list(actors.items())[:max_actors] if data.get("name")]
+        for actor_id, actor_data in batch:
             name = actor_data.get("name", "")
             category = actor_data.get("category")
-            if not name:
-                continue
-
-            actors_searched += 1
+            errors_before = self._request_errors
 
             try:
                 stats = self._enrich_actor(
@@ -689,18 +791,28 @@ class WikidataPersonPuller(BasePuller):
                     depth=0,
                     visited=visited,
                 )
+            except WikidataRateLimited as exc:
+                stopped = str(exc)
+                log.warning("Wikidata rate limit: {e} after {n} actors", e=stopped, n=actors_searched)
+                break
             except Exception as exc:
+                actors_failed += 1
+                actors_searched += 1
                 log.warning(
                     "Failed to enrich actor '{name}' ({aid}): {e}",
                     name=name, aid=actor_id, e=exc,
                 )
                 continue
 
+            actors_searched += 1
+            if self._request_errors > errors_before:
+                actors_failed += 1
             if stats["persons_stored"] > 0:
                 actors_matched += 1
 
             total_persons += stats["persons_stored"]
             total_connections += stats["connections_stored"]
+            rows_written += stats["rows_written"]
 
             log.info(
                 "Actor '{name}': {p} persons, {c} connections",
@@ -709,22 +821,38 @@ class WikidataPersonPuller(BasePuller):
                 c=stats["connections_stored"],
             )
 
-        summary = {
-            "status": "SUCCESS",
+        total = len(batch)
+        if stopped or actors_failed:
+            # Rows committed so far are kept; coverage is incomplete.
+            status = "PARTIAL"
+        else:
+            status = "SUCCESS"
+        summary: dict[str, Any] = {
+            "status": status,
+            "rows_upserted": rows_written,
+            "succeeded": actors_searched - actors_failed,
+            "total": total,
             "actors_searched": actors_searched,
             "actors_matched": actors_matched,
             "total_persons_stored": total_persons,
             "total_connections_stored": total_connections,
         }
+        if stopped:
+            summary["error"] = stopped
+            summary["stopped_by_rate_limit"] = True
+        elif actors_failed:
+            summary["error"] = f"{actors_failed} of {total} actors had Wikidata request failures"
 
         log.info(
             "WikidataPersonPuller.pull_all complete: "
             "{searched} searched, {matched} matched, "
-            "{persons} persons, {conns} connections stored",
+            "{persons} persons, {conns} connections stored ({rows} rows, {st})",
             searched=actors_searched,
             matched=actors_matched,
             persons=total_persons,
             conns=total_connections,
+            rows=rows_written,
+            st=status,
         )
         return summary
 

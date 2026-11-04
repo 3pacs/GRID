@@ -198,13 +198,19 @@ def _smart_money_puller():
     return p
 
 
-def test_smart_money_reddit_not_configured_is_failed(no_creds: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_smart_money_reddit_not_configured_is_skipped(no_creds: None, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Missing optional Reddit creds are an operator state: SKIPPED, not FAILED.
+
+    2026-11-04: FAILED here made Social_Smart_Money a "failed source" with
+    escalating cooldowns every 10-minute run although nothing was broken.
+    """
     import ingestion.altdata.smart_money as sm
 
     monkeypatch.setattr(sm.time, "sleep", lambda s: None)
     result = _smart_money_puller().pull_reddit(subreddits=["options"])
-    assert result["status"] == "FAILED"
+    assert result["status"] == "SKIPPED"
     assert result["rows_inserted"] == 0
+    assert "REDDIT_CLIENT_ID" in result["skipped_reason"]
 
 
 def test_smart_money_all_subreddits_failing_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:

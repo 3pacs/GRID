@@ -144,6 +144,14 @@ def _source_item_to_dict(item: Any) -> dict:
 # ── Dataclass ───────────────────────────────────────────────────────────
 
 
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
+
+
 @dataclass
 class TrendingItem:
     """A trending item from any platform."""
@@ -339,6 +347,9 @@ class TrendingNewsPuller(BasePuller):
                 "last30days research failed for '{t}': {e}",
                 t=topic, e=str(exc),
             )
+            # pull_topic cannot tell a failed research run from "nothing
+            # trending" by the return value alone; record it.
+            self._research_failures = getattr(self, "_research_failures", 0) + 1
             return None
         finally:
             # Clean up sys.path
@@ -436,72 +447,82 @@ class TrendingNewsPuller(BasePuller):
             items: List of TrendingItem objects to store.
 
         Returns:
-            Number of rows inserted.
+            Number of NEW trending_items rows committed (``ON CONFLICT DO
+            NOTHING`` duplicates count 0). raw_series mirror rows are
+            counted separately in ``self._raw_rows_inserted``.
         """
         if not items:
             return 0
 
         inserted = 0
+        raw_rows = 0
         today = date.today()
 
         with self.engine.begin() as conn:
             for item in items:
+                # One savepoint per item: on PostgreSQL a failed statement
+                # aborts the whole transaction, so a swallowed error without
+                # a savepoint would roll back every row counted so far.
                 try:
-                    conn.execute(
-                        text(
-                            "INSERT INTO trending_items "
-                            "(dedup_hash, platform, topic, item_id, title, url, "
-                            "content, author, published_at, engagement_total, "
-                            "relevance, score, raw_engagement, metadata) "
-                            "VALUES (:hash, :platform, :topic, :item_id, :title, "
-                            ":url, :content, :author, :pub, :eng, :rel, :score, "
-                            ":raw_eng, :meta) "
-                            "ON CONFLICT (dedup_hash) DO NOTHING"
-                        ),
-                        {
-                            "hash": item.dedup_hash,
-                            "platform": item.platform,
-                            "topic": item.topic,
-                            "item_id": item.item_id,
-                            "title": item.title,
-                            "url": item.url,
-                            "content": item.content,
-                            "author": item.author,
-                            "pub": item.published,
-                            "eng": item.engagement_total,
-                            "rel": item.relevance,
-                            "score": item.score,
-                            "raw_eng": json.dumps(item.raw_engagement),
-                            "meta": json.dumps(item.metadata, default=str),
-                        },
-                    )
-                    inserted += 1
-                    self._seen_hashes.add(item.dedup_hash)
+                    with conn.begin_nested():
+                        result = conn.execute(
+                            text(
+                                "INSERT INTO trending_items "
+                                "(dedup_hash, platform, topic, item_id, title, url, "
+                                "content, author, published_at, engagement_total, "
+                                "relevance, score, raw_engagement, metadata) "
+                                "VALUES (:hash, :platform, :topic, :item_id, :title, "
+                                ":url, :content, :author, :pub, :eng, :rel, :score, "
+                                ":raw_eng, :meta) "
+                                "ON CONFLICT (dedup_hash) DO NOTHING"
+                            ),
+                            {
+                                "hash": item.dedup_hash,
+                                "platform": item.platform,
+                                "topic": item.topic,
+                                "item_id": item.item_id,
+                                "title": item.title,
+                                "url": item.url,
+                                "content": item.content,
+                                "author": item.author,
+                                "pub": item.published,
+                                "eng": item.engagement_total,
+                                "rel": item.relevance,
+                                "score": item.score,
+                                "raw_eng": json.dumps(item.raw_engagement),
+                                "meta": json.dumps(item.metadata, default=str),
+                            },
+                        )
+                        new_rows = _inserted(result)
                 except Exception as exc:
                     log.debug(
                         "Failed to store trending item: {e}", e=str(exc),
                     )
                     continue
+                inserted += new_rows
+                self._seen_hashes.add(item.dedup_hash)
 
                 # Store in raw_series for PIT queries
                 topic_slug = _slugify(item.topic)
                 series_id = f"TRENDING:{item.platform}:{topic_slug}:{item.item_id}"
                 try:
-                    if not self._row_exists(series_id, today, conn):
-                        self._insert_raw(
-                            conn=conn,
-                            series_id=series_id,
-                            obs_date=today,
-                            value=float(item.engagement_total),
-                            raw_payload={
-                                "title": item.title[:200],
-                                "url": item.url,
-                                "platform": item.platform,
-                                "relevance": item.relevance,
-                                "score": item.score,
-                                "author": item.author,
-                            },
-                        )
+                    with conn.begin_nested():
+                        if not self._row_exists(series_id, today, conn):
+                            raw_rows += _inserted(self._insert_raw(
+                                conn=conn,
+                                series_id=series_id,
+                                obs_date=today,
+                                value=float(item.engagement_total),
+                                raw_payload={
+                                    "title": item.title[:200],
+                                    "url": item.url,
+                                    "platform": item.platform,
+                                    "relevance": item.relevance,
+                                    "score": item.score,
+                                    "author": item.author,
+                                },
+                                return_result=True,
+                            ))
                 except Exception as exc:
                     log.debug(
                         "Failed to store raw_series for {sid}: {e}",
@@ -511,6 +532,8 @@ class TrendingNewsPuller(BasePuller):
                 # Emit signal for trust scoring
                 self._emit_signal(conn, item, today)
 
+        # Counted only once the transaction above committed.
+        self._raw_rows_inserted = getattr(self, "_raw_rows_inserted", 0) + raw_rows
         return inserted
 
     def _emit_signal(
@@ -531,31 +554,32 @@ class TrendingNewsPuller(BasePuller):
             return
 
         try:
-            conn.execute(
-                text(
-                    "INSERT INTO signal_sources "
-                    "(source_type, source_name, ticker, direction, confidence, "
-                    "signal_date, metadata) "
-                    "VALUES ('social', :name, :ticker, :direction, :conf, "
-                    ":sig_date, :meta) "
-                    "ON CONFLICT DO NOTHING"
-                ),
-                {
-                    "name": f"trending_{item.platform}",
-                    "ticker": "MARKET",
-                    "direction": "neutral",
-                    "conf": min(item.relevance, 1.0),
-                    "sig_date": obs_date,
-                    "meta": json.dumps({
-                        "title": item.title[:200],
-                        "url": item.url,
-                        "platform": item.platform,
-                        "topic": item.topic,
-                        "engagement": item.engagement_total,
-                        "score": item.score,
-                    }),
-                },
-            )
+            with conn.begin_nested():
+                conn.execute(
+                    text(
+                        "INSERT INTO signal_sources "
+                        "(source_type, source_name, ticker, direction, confidence, "
+                        "signal_date, metadata) "
+                        "VALUES ('social', :name, :ticker, :direction, :conf, "
+                        ":sig_date, :meta) "
+                        "ON CONFLICT DO NOTHING"
+                    ),
+                    {
+                        "name": f"trending_{item.platform}",
+                        "ticker": "MARKET",
+                        "direction": "neutral",
+                        "conf": min(item.relevance, 1.0),
+                        "sig_date": obs_date,
+                        "meta": json.dumps({
+                            "title": item.title[:200],
+                            "url": item.url,
+                            "platform": item.platform,
+                            "topic": item.topic,
+                            "engagement": item.engagement_total,
+                            "score": item.score,
+                        }),
+                    },
+                )
         except Exception:
             # signal_sources table may not exist yet — not critical
             pass
@@ -567,56 +591,46 @@ class TrendingNewsPuller(BasePuller):
         topic: str,
         platform_counts: dict[str, int],
         target_date: date,
-    ) -> None:
+    ) -> int:
         """Store per-topic aggregate counts in raw_series.
 
         Parameters:
             topic: The research topic.
             platform_counts: Dict of platform -> item count.
             target_date: Observation date.
+
+        Returns:
+            raw_series rows committed.
         """
         topic_slug = _slugify(topic)
+        rows: list[tuple[str, float, dict[str, Any]]] = [
+            (f"TRENDING_AGG:{topic_slug}:{platform}_count", float(count),
+             {"topic": topic, "platform": platform})
+            for platform, count in platform_counts.items()
+        ]
+        rows.append((f"TRENDING_AGG:{topic_slug}:total", float(sum(platform_counts.values())),
+                     {"topic": topic, "platforms": platform_counts}))
 
+        inserted = 0
         with self.engine.begin() as conn:
-            for platform, count in platform_counts.items():
-                series_id = f"TRENDING_AGG:{topic_slug}:{platform}_count"
+            for series_id, value, payload in rows:
                 try:
-                    if not self._row_exists(series_id, target_date, conn):
-                        self._insert_raw(
-                            conn=conn,
-                            series_id=series_id,
-                            obs_date=target_date,
-                            value=float(count),
-                            raw_payload={
-                                "topic": topic,
-                                "platform": platform,
-                            },
-                        )
+                    with conn.begin_nested():
+                        if not self._row_exists(series_id, target_date, conn):
+                            inserted += _inserted(self._insert_raw(
+                                conn=conn,
+                                series_id=series_id,
+                                obs_date=target_date,
+                                value=value,
+                                raw_payload=payload,
+                                return_result=True,
+                            ))
                 except Exception as exc:
                     log.debug(
                         "Failed to store aggregate {sid}: {e}",
                         sid=series_id, e=str(exc),
                     )
-
-            # Total across platforms
-            total = sum(platform_counts.values())
-            total_sid = f"TRENDING_AGG:{topic_slug}:total"
-            try:
-                if not self._row_exists(total_sid, target_date, conn):
-                    self._insert_raw(
-                        conn=conn,
-                        series_id=total_sid,
-                        obs_date=target_date,
-                        value=float(total),
-                        raw_payload={
-                            "topic": topic,
-                            "platforms": platform_counts,
-                        },
-                    )
-            except Exception as exc:
-                log.debug(
-                    "Failed to store total aggregate: {e}", e=str(exc),
-                )
+        return inserted
 
     # ── Feature Registration ────────────────────────────────────────────
 
@@ -679,26 +693,49 @@ class TrendingNewsPuller(BasePuller):
         """Pull trending news for all configured topics.
 
         Returns:
-            Summary dict with per-topic counts and totals.
+            Summary dict with per-topic counts and totals, plus the write
+            contract: ``status``, ``rows_inserted`` (new trending_items rows
+            + raw_series rows committed) and ``succeeded``/``total`` topics.
         """
-        self._ensure_features()
         today = date.today()
+        if not self._last30days_available:
+            # The research engine is a vendored checkout (vendor/ is
+            # gitignored); without it there is nothing to check.
+            return {
+                "status": "SKIPPED",
+                "rows_inserted": 0,
+                "skipped_reason": f"last30days-skill not installed at {_SCRIPTS_DIR}",
+                "date": today.isoformat(),
+                "total_items": 0,
+                "total_stored": 0,
+                "topics_researched": len(self.topics),
+                "topic_results": {},
+            }
+
+        self._ensure_features()
+        self._raw_rows_inserted = 0
 
         topic_results: dict[str, dict[str, int]] = {}
-        total_items = 0
         total_stored = 0
+        agg_rows = 0
+        failed_topics: list[str] = []
 
-        for topic in self.topics:
+        for idx, topic in enumerate(self.topics):
+            if idx:
+                time.sleep(_TOPIC_DELAY)
+            failures_before = getattr(self, "_research_failures", 0)
             try:
                 platform_counts = self.pull_topic(topic)
                 topic_results[topic] = platform_counts
                 topic_stored = sum(platform_counts.values())
                 total_stored += topic_stored
-                total_items += topic_stored
 
                 # Store aggregates
                 if platform_counts:
-                    self._store_aggregates(topic, platform_counts, today)
+                    agg_rows += self._store_aggregates(topic, platform_counts, today)
+
+                if getattr(self, "_research_failures", 0) > failures_before:
+                    failed_topics.append(topic)
 
                 log.info(
                     "Trending '{t}': {n} items across {p} platforms",
@@ -710,14 +747,26 @@ class TrendingNewsPuller(BasePuller):
                     t=topic, e=str(exc),
                 )
                 topic_results[topic] = {}
+                failed_topics.append(topic)
 
-            time.sleep(_TOPIC_DELAY)
+        rows_inserted = total_stored + self._raw_rows_inserted + agg_rows
+        total = len(self.topics)
+        if not failed_topics:
+            status = "SUCCESS"
+        elif len(failed_topics) < total or rows_inserted:
+            status = "PARTIAL"
+        else:
+            status = "FAILED"
 
-        summary = {
+        summary: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "succeeded": total - len(failed_topics),
+            "total": total,
             "date": today.isoformat(),
-            "total_items": total_items,
+            "total_items": total_stored,
             "total_stored": total_stored,
-            "topics_researched": len(self.topics),
+            "topics_researched": total,
             "topic_results": {
                 topic: {
                     "platforms": counts,
@@ -726,10 +775,12 @@ class TrendingNewsPuller(BasePuller):
                 for topic, counts in topic_results.items()
             },
         }
+        if failed_topics:
+            summary["error"] = f"{len(failed_topics)} of {total} topics failed: {', '.join(failed_topics)}"
 
         log.info(
-            "Trending news pull complete — {n} items across {t} topics",
-            n=total_stored, t=len(self.topics),
+            "Trending news pull complete — {n} items, {r} rows across {t} topics",
+            n=total_stored, r=rows_inserted, t=total,
         )
         return summary
 

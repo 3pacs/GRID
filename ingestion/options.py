@@ -85,10 +85,31 @@ class OptionsPullResults(list[dict[str, Any]]):
     are subsets even if every requested ticker succeeded.
     """
 
+    # Per-ticker SKIPPED reasons meaning "checked: Yahoo lists no options
+    # chain for this symbol today". 2026-11-04: every full run reported
+    # PARTIAL "source coverage incomplete" (yfinance_options stale since
+    # 2026-09-29) because ~31 catalyst-universe names -- OTC/foreign listings
+    # (TKPHF, SNYNF), micro caps without listed options (VXRT, ONCY) and
+    # delisted symbols (NUOX) -- can never produce a chain. They are
+    # accounted-for coverage, not failures. The hand-listed EQUITY_TICKERS
+    # always have listed options, so for them the same answer is still a
+    # capture failure.
+    _CLEAN_NO_CHAIN_REASONS: frozenset[str] = frozenset({
+        "no expirations", "no chain listed", "no dated regular-market price",
+    })
+    _CORE_TICKERS: frozenset[str] = frozenset(EQUITY_TICKERS)
+
     def __init__(self, items: list[dict[str, Any]], *, full_universe: bool) -> None:
         super().__init__(items)
         self.full_universe = full_universe
         self.publication_error: str | None = None
+
+    def _is_clean_no_chain(self, result: dict[str, Any]) -> bool:
+        return (
+            result.get("status") == "SKIPPED"
+            and result.get("reason") in self._CLEAN_NO_CHAIN_REASONS
+            and result.get("ticker") not in self._CORE_TICKERS
+        )
 
     @property
     def summary(self) -> dict[str, Any]:
@@ -98,6 +119,7 @@ class OptionsPullResults(list[dict[str, Any]]):
         rows = sum(counts) if known_rows else None
         ok = statuses.count("SUCCESS")
         deferred = statuses.count("DEFERRED")
+        no_data = [r.get("ticker") for r in self if self._is_clean_no_chain(r)]
         if not self or all(s == "SKIPPED" for s in statuses):
             reasons = sorted({str(r["reason"]) for r in self if r.get("reason")})
             status, note = "SKIPPED", "no ticker capture completed"
@@ -105,8 +127,13 @@ class OptionsPullResults(list[dict[str, Any]]):
                 note = f"{note}: {', '.join(reasons)}"
         elif not ok and not deferred:
             status, note = "FAILED", "no ticker succeeded"
-        elif self.publication_error or not self.full_universe or ok != len(self) or not known_rows:
+        elif (self.publication_error or not self.full_universe
+                or ok + len(no_data) != len(self) or not known_rows):
             status, note = "PARTIAL", self.publication_error or "source coverage incomplete or row count unknown"
+            if not self.publication_error and self.full_universe and known_rows:
+                missing = [r.get("ticker") for r in self
+                           if r.get("status") != "SUCCESS" and not self._is_clean_no_chain(r)]
+                note = f"{note}: {len(missing)} tickers not captured ({', '.join(map(str, missing[:10]))})"
         elif not rows:
             status, note = "NO_NEW_DATA", "run completed, 0 rows written"
         else:
@@ -116,10 +143,13 @@ class OptionsPullResults(list[dict[str, Any]]):
             "scope": "full_universe" if self.full_universe else "subset",
             "tickers_total": len(self), "tickers_ok": ok,
             "tickers_deferred": deferred,
+            "tickers_no_chain": len(no_data),
+            "no_chain_tickers": no_data[:50],
             "snapshots": sum(r.get("snapshots", 0) for r in self),
             "error": note if status in ("PARTIAL", "FAILED") else None,
             "reason": note,
         }
+
 
 
 def _utc_now() -> datetime:
@@ -256,6 +286,8 @@ class YahooOptionsClient:
         self.session = requests.Session()
         self.session.headers.update({"User-Agent": self._USER_AGENT})
         self.crumb: str | None = None
+        # True after get_options() saw a clean empty chain (no such symbol).
+        self.last_no_chain = False
         self._init_session()
 
     def _init_session(self) -> None:
@@ -291,6 +323,7 @@ class YahooOptionsClient:
 
         Returns dict with keys: expirations, strikes, calls, puts, quote.
         """
+        self.last_no_chain = False
         if not self.crumb:
             return None
 
@@ -317,6 +350,9 @@ class YahooOptionsClient:
             results = chain.get("result") if isinstance(chain, dict) else None
             if not isinstance(results, list) or not results:
                 log.warning("Yahoo options {t}: no chain result", t=ticker)
+                # HTTP 200, no provider error, empty result: Yahoo has no
+                # chain for this symbol (e.g. delisted), not a transport failure.
+                self.last_no_chain = isinstance(results, list)
                 return None
             result = results[0]
             if not isinstance(result, dict):
@@ -600,6 +636,9 @@ class OptionsPuller(BasePuller):
                 ).fetchone()
             first = self._yahoo.get_options(ticker)
             if not first:
+                if getattr(self._yahoo, "last_no_chain", False) is True:
+                    return {"ticker": ticker, "status": "SKIPPED", "rows_inserted": 0,
+                            "reason": "no chain listed"}
                 return {"ticker": ticker, "status": "FAILED", "rows_inserted": 0, "error": "no data from Yahoo"}
 
             quote = first.get("quote", {})
