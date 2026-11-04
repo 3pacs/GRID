@@ -45,10 +45,13 @@ def redact_secrets(reason: str | None) -> str | None:
     """
     if reason is None:
         return None
-    text_ = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", str(reason))
-    text_ = _URL_QUERY_RE.sub(r"\1?[REDACTED]", text_)
-    text_ = _HEX_PATH_KEY_RE.sub(r"\1[REDACTED]", text_)
-    text_ = _JWT_RE.sub("[REDACTED-JWT]", text_)
-    text_ = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", text_)
-    text_ = _AUTH_SCHEME_RE.sub(r"\1 [REDACTED]", text_)
-    return _SECRET_ASSIGN_RE.sub(r"\1[REDACTED]", text_)
+    # Callable replacements, not "\\1" templates: re parses templates via a
+    # lazy import, which breaks logging wherever builtins.__import__ is
+    # patched (and this runs inside the global log patcher).
+    text_ = _URL_USERINFO_RE.sub(lambda m: m.group(1) + "[REDACTED]@", str(reason))
+    text_ = _URL_QUERY_RE.sub(lambda m: m.group(1) + "?[REDACTED]", text_)
+    text_ = _HEX_PATH_KEY_RE.sub(lambda m: m.group(1) + "[REDACTED]", text_)
+    text_ = _JWT_RE.sub(lambda m: "[REDACTED-JWT]", text_)
+    text_ = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + "[REDACTED]", text_)
+    text_ = _AUTH_SCHEME_RE.sub(lambda m: m.group(1) + " [REDACTED]", text_)
+    return _SECRET_ASSIGN_RE.sub(lambda m: m.group(1) + "[REDACTED]", text_)

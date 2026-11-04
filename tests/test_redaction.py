@@ -162,3 +162,34 @@ def test_git_sink_output_is_redacted(tmp_path, monkeypatch) -> None:
     msg.record = {"message": "x", "name": "n", "function": "f", "line": 1}
     sink.write(msg)
     assert "PolyKey123456" not in (tmp_path / "errors.jsonl").read_text()
+
+
+def test_git_sink_redacts_fields_before_json_escaping(tmp_path, monkeypatch) -> None:
+    from server_log import git_sink as gs
+
+    sink = object.__new__(gs.GitSink)
+    sink.__dict__.update(
+        _buffer_lock=__import__("threading").Lock(), _dedup={}, _pending_count=0,
+        _errors_path=tmp_path / "errors.jsonl",
+        _sanitizer=type("S", (), {"scrub": staticmethod(lambda t: t)})(),
+    )
+    monkeypatch.setattr(sink, "_format_entry", lambda record: {
+        "message": "bad payload",
+        "exception": 'ValueError: {"api_key": "JsonKey998877"} token="TokKey665544"',
+    }, raising=False)
+    monkeypatch.setattr(sink, "_rotate_locked", lambda: None, raising=False)
+    msg = type("M", (str,), {})("x")
+    msg.record = {"message": "x", "name": "n", "function": "f", "line": 2}
+    sink.write(msg)
+    out = (tmp_path / "errors.jsonl").read_text()
+    assert "JsonKey998877" not in out and "TokKey665544" not in out
+
+
+def test_logging_survives_patched_import() -> None:
+    from unittest.mock import patch
+
+    import config  # noqa: F401
+    from loguru import logger
+
+    with patch("builtins.__import__", side_effect=ImportError("blocked")):
+        logger.info("still logs with imports blocked")
