@@ -308,6 +308,14 @@ class TestParseSDMX:
         assert _parse_jodi_sdmx([]) == []  # type: ignore[arg-type]
 
 
+
+@pytest.fixture(autouse=True)
+def _single_csv_file(monkeypatch):
+    """Pin the per-year file list to one URL so request counts are date-independent."""
+    import ingestion.altdata.jodi_oil as jodi_mod
+
+    monkeypatch.setattr(jodi_mod, "jodi_csv_urls", lambda today=None: [JODI_CSV_URL])
+
 # ---------------------------------------------------------------------------
 # run_jodi_oil_puller — top-level entry point
 # ---------------------------------------------------------------------------
