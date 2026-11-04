@@ -1,0 +1,12 @@
+# GRID code imports these outside requirements.txt; production had them hand-installed in /home/grid/.local (2026-11-04
+# inventory of grid-svr's python3.10 user site against an AST scan of non-test imports). torch is installed separately
+# by build_venv.sh from the PyTorch cu128 index (GPU wheel, not part of CI).
+datasets
+eth-account
+feedparser
+google-genai
+hyperliquid-python-sdk
+lightgbm
+playwright
+pypdf
+transformers
