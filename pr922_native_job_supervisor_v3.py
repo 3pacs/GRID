@@ -25,6 +25,45 @@ PINNED_TREE = "a7175ca730e7b2ffd82b4da5fc013ee5b7f9cd48"
 MANIFEST = "pr922-native-v3-manifest.json"
 SOURCE_PATHS = {"pr922_native_job_supervisor_v3.py", "pr922_native_job_contract_v3.py",
                 ".github/workflows/python-floor-qualification.yml"}
+PG_BIN = pathlib.Path("/usr/lib/postgresql/16/bin")
+PG_NAMES = ("initdb", "pg_ctl", "postgres", "psql")
+
+
+def parse_pg_hashes(text):
+    """Accept exactly one preflight digest for each prescribed absolute path."""
+    parsed = {}
+    for line in text.splitlines():
+        match = re.fullmatch(r"([0-9a-f]{64})  (/usr/lib/postgresql/16/bin/(?:initdb|pg_ctl|postgres|psql))", line)
+        if not match:
+            raise RuntimeError("invalid preflight hash record")
+        digest, path = match.groups()
+        name = pathlib.PurePosixPath(path).name
+        if name in parsed:
+            raise RuntimeError("duplicate preflight binary")
+        parsed[name] = digest
+    if set(parsed) != set(PG_NAMES):
+        raise RuntimeError("incomplete preflight binary record")
+    return parsed
+
+
+def verify_pg_tool(name, hashes):
+    if name not in PG_NAMES or name not in hashes:
+        raise RuntimeError("unapproved PostgreSQL executable")
+    path = PG_BIN / name
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("PostgreSQL binary unavailable")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != hashes[name]:
+        raise RuntimeError("PostgreSQL binary changed since preflight")
+    return str(path)
+
+
+def pg_call(name, args, hashes, *, data=None, timeout=15):
+    # The selected tool and server bytes are rechecked before each command.
+    # These checks are not atomic against same-user filesystem replacement.
+    executable = verify_pg_tool(name, hashes)
+    if name in ("initdb", "pg_ctl"):
+        verify_pg_tool("postgres", hashes)
+    call([executable, *args], data=data, timeout=timeout)
 
 
 def verify_checkout():
@@ -215,11 +254,10 @@ def main():
     # approve this exact single-use hosted runner and workflow at action time.
     if os.environ.get("GITHUB_ACTIONS") != "true" or not os.environ.get("RUNNER_TEMP"):
         raise SystemExit("hosted runner admission missing")
-    for name in ("initdb", "pg_ctl", "psql"):
-        if not shutil.which(name):
-            raise SystemExit("required PostgreSQL binary unavailable")
-    bindir = pathlib.Path(shutil.which("pg_ctl")).resolve(strict=True).parent
-    postgres_exe = (bindir / "postgres").resolve(strict=True)
+    preflight_hashes = parse_pg_hashes((pathlib.Path(os.environ["RUNNER_TEMP"]) / "grid922-pg16-sha256.txt").read_text(encoding="utf-8"))
+    for name in PG_NAMES:
+        verify_pg_tool(name, preflight_hashes)
+    postgres_exe = (PG_BIN / "postgres").resolve(strict=True)
     temp_root = pathlib.Path(os.environ["RUNNER_TEMP"]).resolve(strict=True)
     root_identity = identity(temp_root.stat())
     work = None
@@ -253,13 +291,13 @@ def main():
         # Port reservation closes before postgres binds: exclusive fresh VM
         # and post-start attestation are essential; ambiguity is UNKNOWN.
         setup_started = True
-        call(["initdb", "-D", str(data), "--username=" + admin,
-              "--auth-local=trust", "--auth-host=scram-sha-256", "--no-locale"], timeout=45)
+        pg_call("initdb", ["-D", str(data), "--username=" + admin,
+                "--auth-local=trust", "--auth-host=scram-sha-256", "--no-locale"], preflight_hashes, timeout=45)
         data_inode = data.stat().st_ino
         opts = "-h 127.0.0.1 -p " + str(port) + " -k " + shlex.quote(str(sock))
         launch_attempted = True
-        call(["pg_ctl", "-D", str(data), "-l", str(work / "server.log"),
-              "-o", opts, "-w", "-t", "10", "start"], timeout=15)
+        pg_call("pg_ctl", ["-D", str(data), "-l", str(work / "server.log"),
+                "-p", str(PG_BIN / "postgres"), "-o", opts, "-w", "-t", "10", "start"], preflight_hashes, timeout=15)
         pid = int((data / "postmaster.pid").read_text().splitlines()[0])
         ctx = Context(pid=pid, process_start=process_start(pid),
                       inode=listener_inode(pid, port), postgres_exe=str(postgres_exe),
@@ -272,8 +310,8 @@ def main():
         # Values are generated hex identifiers and password, never user input.
         sql = ("CREATE ROLE " + role + " LOGIN PASSWORD '" + password + "';\n" +
                "CREATE DATABASE " + database + " OWNER " + role + ";\n")
-        call(["psql", "-X", "-v", "ON_ERROR_STOP=1", "-h", str(sock), "-p", str(port),
-              "-U", admin, "-d", "postgres"], data=sql, timeout=10)
+        pg_call("psql", ["-X", "-v", "ON_ERROR_STOP=1", "-h", str(sock), "-p", str(port),
+                "-U", admin, "-d", "postgres"], preflight_hashes, data=sql, timeout=10)
         ctx.attest()
         # This check runs only after setup returns; it is not an independent
         # 90-second watchdog and cannot interrupt hung in-process setup.
@@ -313,7 +351,7 @@ def main():
         if decision == "STOP_AND_REMOVE":
             try:
                 ctx.attest()
-                call(["pg_ctl", "-D", str(data), "-w", "-t", "10", "-m", "fast", "stop"], timeout=15)
+                pg_call("pg_ctl", ["-D", str(data), "-w", "-t", "10", "-m", "fast", "stop"], preflight_hashes, timeout=15)
                 # Existence of the same PID, including a reused PID, means
                 # ownership/exit is unresolved and must not be treated as safe.
                 if pathlib.Path("/proc", str(ctx.pid)).exists():

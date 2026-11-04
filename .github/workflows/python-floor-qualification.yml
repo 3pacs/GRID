@@ -32,7 +32,8 @@ jobs:
           PG_VERSION="$("$PG_BIN/postgres" --version)"
           case "$PG_VERSION" in 'postgres (PostgreSQL) 16.15'*) ;; *) exit 1 ;; esac
           echo "$PG_VERSION"
-          echo "$PG_BIN" >> "$GITHUB_PATH"
+          sha256sum "$PG_BIN/initdb" "$PG_BIN/pg_ctl" "$PG_BIN/postgres" "$PG_BIN/psql" > "$RUNNER_TEMP/grid922-pg16-sha256.txt"
+          cat "$RUNNER_TEMP/grid922-pg16-sha256.txt"
       # Proposed network/package setup; execution needs separate admission.
       - name: Install two hash-pinned synthetic-test dependencies in job venv
         timeout-minutes: 2
