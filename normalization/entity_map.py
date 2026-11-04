@@ -529,6 +529,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CUUR0000SA0": "bls_cpi_u_all",
     "PRS85006092": "bls_nonfarm_productivity",
     "JTS00000000JOL": "bls_jolts_openings",
+    # The id above is not a BLS series ("Series does not exist"), so JOLTS was
+    # never stored. ingestion/bls.py now pulls the real one (2026-11-04):
+    # total nonfarm job openings, SA level -- 2026 M09 = 7523. The old key is
+    # kept; it is harmless.
+    "JTS000000000000000JOL": "bls_jolts_openings",
 
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
@@ -828,6 +833,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CBOE:VIX": "vix_spot",
     "CBOE:VIX3M": "vix3m_spot",
     "CBOE:VIX9D": "vix9d_spot",
+    # COR3M replaces Cboe's discontinued ICJ (correlation_index, last obs
+    # 2021-11-19); registered by migrations/versions/ghost_features_20261104.py.
+    "CBOE:COR3M": "implied_correlation_3m",
     "CBOE:SKEW": "skew_index",
 
     # Binance crypto (bulk ZIP)
@@ -1094,6 +1102,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 # that migrations 0062/0063 had to clean up: a mapping that looks resolved
 # while silently dropping every row.
 
+# (series_id, feature_name) pairs already warned about as "Mapping exists but
+# feature not in registry" in this process. Module-level because the resolver
+# constructs a new EntityMap per cycle; see EntityMap.get_feature_id.
+_WARNED_MAPPED_MISSES: set[tuple[str, str]] = set()
+
 # Sentinel for the pattern cache.  A cached *miss* is stored as None, so
 # "absent from the cache" needs a value None cannot collide with.
 _PATTERN_CACHE_MISS: object = object()
@@ -1342,13 +1355,29 @@ class EntityMap:
         if feature_id is None:
             self._mapped_misses[series_id] = feature_name
             if self._record_miss(series_id) == 1:
-                log.warning(
-                    "Mapping exists ({sid} -> {fn}) but feature not in "
-                    "registry — further misses for this series_id are "
-                    "counted, not logged",
-                    sid=series_id,
-                    fn=feature_name,
-                )
+                # The resolver builds a fresh EntityMap every cycle, so a
+                # per-instance "once" was once per cycle: 498 identical lines
+                # a day on grid-hermes (2026-11-04) for 47 names that stay
+                # unregistered until a migration lands. Warn once per process
+                # per (series_id, name); the resolver's per-run summary still
+                # names every missing feature, so nothing goes silent.
+                key = (series_id, feature_name)
+                if key in _WARNED_MAPPED_MISSES:
+                    log.debug(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry (already warned this process)",
+                        sid=series_id, fn=feature_name,
+                    )
+                else:
+                    _WARNED_MAPPED_MISSES.add(key)
+                    log.warning(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry — further misses for this series_id are "
+                        "counted, not logged (once per process; the resolver "
+                        "summary names it every run)",
+                        sid=series_id,
+                        fn=feature_name,
+                    )
             return feature_id
 
         # Warn if the resolved feature has no recent data (cached check)
