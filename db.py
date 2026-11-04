@@ -109,15 +109,69 @@ def get_pool_peak_checked_out() -> int:
 #   now clears this table (and the peak tracker) for that reason.
 # ---------------------------------------------------------------------------
 _checkout_lock = threading.Lock()
-# id(connection_rec) -> (acquiring_thread_name, monotonic_open_time)
-_open_checkouts: dict[int, tuple[str, float]] = {}
+# id(connection_rec) -> (acquiring_thread_name, monotonic_open_time,
+#                        expected_hold_seconds declared by the acquirer)
+_open_checkouts: dict[int, tuple[Any, ...]] = {}
+
+
+def _env_seconds(name: str, default: float) -> float:
+    """A positive float from the environment, else ``default``."""
+    raw = os.environ.get(name, "")
+    try:
+        value = float(raw) if raw.strip() else default
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 
 # A connection held open this long is notable regardless of pool pressure --
 # most queries in this codebase are expected to complete in well under a
 # second (db.py's own statement_timeout defaults to 120s as a hard ceiling,
 # but that bounds a single statement, not how long application code might
 # hold a connection open across several statements or other work).
-_LIFETIME_WARN_SECONDS = 5.0
+# Override with GRID_DB_HOLD_WARN_SECONDS.
+_LIFETIME_WARN_SECONDS = _env_seconds("GRID_DB_HOLD_WARN_SECONDS", 5.0)
+
+# Holds above _LIFETIME_WARN_SECONDS but below this are batch-shaped (the
+# 24h grid-hermes journal to 2026-11-04: 323 "DB connection held" warnings,
+# ~85% of them 8-11s, almost all from the resolver's four partition workers
+# and PITStore.get_feature_matrix -- one long scan per checkout, released
+# promptly, i.e. expected batch work, not leaks). They are summarised: one
+# warning per acquirer group (thread name without its numeric suffix) per
+# _HOLD_SUMMARY_INTERVAL_SECONDS, carrying the count and the longest hold
+# since the last report; the rest go to debug. Holds at or above this
+# threshold always warn individually (the 70-380s holds are the ones worth
+# chasing). GRID_DB_HOLD_ALERT_SECONDS / GRID_DB_HOLD_SUMMARY_SECONDS.
+_LIFETIME_ALERT_SECONDS = _env_seconds("GRID_DB_HOLD_ALERT_SECONDS", 60.0)
+_HOLD_SUMMARY_INTERVAL_SECONDS = _env_seconds("GRID_DB_HOLD_SUMMARY_SECONDS", 1800.0)
+# acquirer group -> [monotonic time last warned, suppressed count, longest suppressed]
+_hold_summary: dict[str, list[float]] = {}
+
+# Thread-local expected hold declared via expected_long_hold().
+_expected_hold = threading.local()
+
+
+@contextlib.contextmanager
+def expected_long_hold(seconds: float) -> Generator[None, None, None]:
+    """Declare that connections checked out on this thread may be held long.
+
+    For batch work that legitimately keeps one connection across a long
+    scan (e.g. a resolver partition worker): a hold up to ``seconds`` logs
+    at debug instead of warning. Holds beyond it still warn as usual. Only
+    connections *checked out* inside the block are affected.
+    """
+    previous = getattr(_expected_hold, "seconds", 0.0)
+    _expected_hold.seconds = max(float(seconds), previous)
+    try:
+        yield
+    finally:
+        _expected_hold.seconds = previous
+
+
+def _acquirer_group(thread_name: str) -> str:
+    """'ThreadPoolExecutor-142_2' -> 'ThreadPoolExecutor'; 'hermes-cycle-1365' -> 'hermes-cycle'."""
+    group = thread_name.rstrip("0123456789_-")
+    return group or thread_name
 
 # Defensive cap on how many individual open-checkout entries
 # get_outstanding_checkouts() returns in one call. Pool capacity in this
@@ -131,8 +185,9 @@ _MAX_REPORTED_OPEN_CHECKOUTS = 200
 def _record_checkout_open(connection_rec: object) -> None:
     """Record that a connection was just checked out, by whichever thread did it."""
     thread_name = threading.current_thread().name
+    expected = float(getattr(_expected_hold, "seconds", 0.0) or 0.0)
     with _checkout_lock:
-        _open_checkouts[id(connection_rec)] = (thread_name, time.monotonic())
+        _open_checkouts[id(connection_rec)] = (thread_name, time.monotonic(), expected)
 
 
 def _record_checkout_closed(connection_rec: object) -> str | None:
@@ -150,15 +205,61 @@ def _record_checkout_closed(connection_rec: object) -> str | None:
         entry = _open_checkouts.pop(key, None)
     if entry is None:
         return None
-    acquired_by, opened_at = entry
+    acquired_by, opened_at = entry[0], entry[1]
+    expected_s = entry[2] if len(entry) > 2 else 0.0
     lifetime_s = time.monotonic() - opened_at
     released_by = threading.current_thread().name
     if lifetime_s > _LIFETIME_WARN_SECONDS:
+        _report_long_hold(lifetime_s, acquired_by, released_by, expected_s)
+    return acquired_by
+
+
+def _report_long_hold(
+    lifetime_s: float, acquired_by: str, released_by: str, expected_s: float,
+) -> None:
+    """Warn on a long hold: always when severe, else summarised per group."""
+    if expected_s and lifetime_s <= expected_s:
+        log.debug(
+            "DB connection held {s:.1f}s (declared batch hold <= {e:.0f}s) — acquired_by={a}",
+            s=lifetime_s, e=expected_s, a=acquired_by,
+        )
+        return
+    if lifetime_s >= _LIFETIME_ALERT_SECONDS:
         log.warning(
             "DB connection held {s:.1f}s — acquired_by={a}, released_by={r}",
             s=lifetime_s, a=acquired_by, r=released_by,
         )
-    return acquired_by
+        return
+    group = _acquirer_group(acquired_by)
+    now = time.monotonic()
+    with _checkout_lock:
+        record = _hold_summary.get(group)
+        if record is None or now - record[0] >= _HOLD_SUMMARY_INTERVAL_SECONDS:
+            suppressed, longest = (int(record[1]), record[2]) if record else (0, 0.0)
+            _hold_summary[group] = [now, 0, 0.0]
+            emit = True
+        else:
+            record[1] += 1
+            record[2] = max(record[2], lifetime_s)
+            emit = False
+    if not emit:
+        log.debug(
+            "DB connection held {s:.1f}s — acquired_by={a}, released_by={r}",
+            s=lifetime_s, a=acquired_by, r=released_by,
+        )
+        return
+    if suppressed:
+        log.warning(
+            "DB connection held {s:.1f}s — acquired_by={a}, released_by={r} "
+            "(+{n} more {g} holds over {w:.0f}s in the last {i:.0f} min, longest {m:.1f}s)",
+            s=lifetime_s, a=acquired_by, r=released_by, n=suppressed, g=group,
+            w=_LIFETIME_WARN_SECONDS, i=_HOLD_SUMMARY_INTERVAL_SECONDS / 60, m=longest,
+        )
+    else:
+        log.warning(
+            "DB connection held {s:.1f}s — acquired_by={a}, released_by={r}",
+            s=lifetime_s, a=acquired_by, r=released_by,
+        )
 
 
 def get_checkout_attribution() -> dict[str, Any]:
@@ -177,7 +278,7 @@ def get_checkout_attribution() -> dict[str, Any]:
         entries = list(_open_checkouts.values())
     by_thread: dict[str, int] = {}
     oldest_age: float | None = None
-    for thread_name, opened_at in entries:
+    for thread_name, opened_at, *_rest in entries:
         by_thread[thread_name] = by_thread.get(thread_name, 0) + 1
         age = now - opened_at
         if oldest_age is None or age > oldest_age:
@@ -203,7 +304,7 @@ def get_outstanding_checkouts(min_age_seconds: float = 0.0) -> list[dict[str, An
         entries = list(_open_checkouts.values())
     result = [
         {"acquired_by": thread_name, "age_seconds": round(now - opened_at, 1)}
-        for thread_name, opened_at in entries
+        for thread_name, opened_at, *_rest in entries
         if (now - opened_at) >= min_age_seconds
     ]
     result.sort(key=lambda r: r["age_seconds"], reverse=True)
