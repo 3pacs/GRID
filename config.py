@@ -978,16 +978,33 @@ def _redact_log_record(record: dict) -> None:
     from utils.redaction import redact_secrets
 
     record["message"] = redact_secrets(record["message"])
+    extra = record.get("extra")
+    if extra:
+        for key, value in list(extra.items()):
+            if isinstance(value, str):
+                extra[key] = redact_secrets(value)
 
 
 log.configure(patcher=_redact_log_record)
+
+
+def _redacting_stderr_sink(message: str) -> None:
+    """stderr sink that redacts the fully formatted record.
+
+    The patcher only sees the message; a logged exception's traceback (with
+    requests' "...for url: ...?apiKey=" text) is formatted later, so the
+    final string is redacted again here before it reaches journald.
+    """
+    from utils.redaction import redact_secrets
+
+    sys.stderr.write(redact_secrets(str(message)))
 
 # diagnose=False: loguru's diagnose mode prints local variable values in
 # tracebacks (it logged FredAPI(api_key='...') 4,642 times). Set
 # GRID_LOG_DIAGNOSE=1 for local debugging only.
 _LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
 log.add(
-    sys.stderr,
+    _redacting_stderr_sink,
     level=settings.LOG_LEVEL,
     diagnose=_LOG_DIAGNOSE,
     format=(
