@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import MagicMock
+
+import pytest
 
 from ingestion.altdata import baltic_dry
 from ingestion.altdata.baltic_dry import BalticDryPuller
@@ -21,9 +23,21 @@ def _mock_engine(source_id: int = 13) -> tuple[MagicMock, MagicMock]:
     return engine, conn
 
 
-def _normalized_snapshot() -> dict:
+_FRESH = date.today() - timedelta(days=1)
+
+
+@pytest.fixture(autouse=True)
+def _reset_process_state():
+    baltic_dry._KNOWN_DEAD_FRED_IDS.clear()
+    baltic_dry._STALE_SNAPSHOT_REPORTED.clear()
+    yield
+    baltic_dry._KNOWN_DEAD_FRED_IDS.clear()
+    baltic_dry._STALE_SNAPSHOT_REPORTED.clear()
+
+
+def _normalized_snapshot(obs_date: date | None = None) -> dict:
     return {
-        "date": date(2026, 5, 19),
+        "date": obs_date or _FRESH,
         "updated": "21:51 UTC",
         "source": "Baltic Exchange",
         "values": {
@@ -82,7 +96,7 @@ def test_known_dead_fred_series_uses_public_snapshot_without_failed_row(monkeypa
     )
     monkeypatch.setattr(puller, "_get_public_snapshot", _normalized_snapshot)
 
-    result = puller.pull_series("baltic.bdi", start_date="2026-05-01")
+    result = puller.pull_series("baltic.bdi", start_date=(_FRESH - timedelta(days=30)).isoformat())
 
     assert result["status"] == "SUCCESS"
     assert result["source"] == "public_snapshot"
@@ -101,9 +115,46 @@ def test_public_snapshot_outside_requested_range_is_partial_without_insert(monke
 
     result = puller._pull_public_snapshot_series(
         "baltic.bdi",
-        start_date="2026-05-20",
+        start_date=(_FRESH + timedelta(days=1)).isoformat(),
     )
 
     assert result["status"] == "PARTIAL"
     assert result["rows_inserted"] == 0
     assert not any("INSERT INTO raw_series" in str(call.args[0]) for call in conn.execute.call_args_list)
+
+
+def test_frozen_public_snapshot_is_reported_dead_once(monkeypatch) -> None:
+    """The balticdryindex snapshot froze at 2026-05-20: FAILED with a truthful
+    reason, one warning per process, never an insert."""
+    _engine, conn = _mock_engine()
+    puller = BalticDryPuller(api_key="test", db_engine=_engine)
+    monkeypatch.setattr(
+        puller, "_get_public_snapshot", lambda: _normalized_snapshot(date(2026, 5, 20))
+    )
+    warnings: list[str] = []
+    monkeypatch.setattr(baltic_dry.log, "warning", lambda msg, **kw: warnings.append(kw.get("r", msg)))
+
+    results = [
+        puller._pull_public_snapshot_series(gsid, start_date="2026-01-01")
+        for gsid in baltic_dry.BALTIC_SERIES
+    ]
+
+    assert all(r["status"] == "FAILED" for r in results)
+    assert all("Baltic source dead" in r["errors"][0] and "2026-05-20" in r["errors"][0] for r in results)
+    assert len(warnings) == 1
+    assert not any("INSERT INTO raw_series" in str(call.args[0]) for call in conn.execute.call_args_list)
+
+
+def test_known_dead_fred_id_is_not_requested_again(monkeypatch) -> None:
+    _engine, _conn = _mock_engine()
+    puller = BalticDryPuller(api_key="test", db_engine=_engine)
+    puller.fred.get_series_observations = MagicMock(
+        side_effect=RuntimeError("Bad Request: The series does not exist.")
+    )
+    monkeypatch.setattr(puller, "_get_public_snapshot", _normalized_snapshot)
+    start = (_FRESH - timedelta(days=30)).isoformat()
+
+    puller.pull_series("baltic.bdi", start_date=start)
+    puller.pull_series("baltic.bdi", start_date=start)
+
+    assert puller.fred.get_series_observations.call_count == 1
