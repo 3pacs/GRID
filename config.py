@@ -965,9 +965,31 @@ settings = Settings()
 
 # Configure loguru
 log.remove()  # Remove default handler
+
+
+def _redact_log_record(record: dict) -> None:
+    """Redact credentials from every log message before any sink sees it.
+
+    2026-11-04: Polygon/FRED/Congress.gov/WorldNews keys were in grid-svr
+    logs thousands of times, via messages interpolating str(exc) (requests
+    embeds the request URL) from many modules. Redacting here covers every
+    caller; utils.redaction leaves ordinary text unchanged.
+    """
+    from utils.redaction import redact_secrets
+
+    record["message"] = redact_secrets(record["message"])
+
+
+log.configure(patcher=_redact_log_record)
+
+# diagnose=False: loguru's diagnose mode prints local variable values in
+# tracebacks (it logged FredAPI(api_key='...') 4,642 times). Set
+# GRID_LOG_DIAGNOSE=1 for local debugging only.
+_LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
 log.add(
     sys.stderr,
     level=settings.LOG_LEVEL,
+    diagnose=_LOG_DIAGNOSE,
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -988,7 +1010,7 @@ if os.getenv("GRID_GIT_SINK_DISABLED", "").lower() not in ("1", "true", "yes"):
         from server_log.git_sink import GitSink
 
         _git_sink = GitSink()
-        log.add(_git_sink.write, level="ERROR")
+        log.add(_git_sink.write, level="ERROR", diagnose=_LOG_DIAGNOSE)
         _git_sink.start()
         log.info(
             "GitSink attached — errors land in .server-logs/errors.jsonl "
