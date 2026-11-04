@@ -193,3 +193,27 @@ def test_logging_survives_patched_import() -> None:
 
     with patch("builtins.__import__", side_effect=ImportError("blocked")):
         logger.info("still logs with imports blocked")
+
+
+def test_config_fallback_redactor_fails_closed(tmp_path) -> None:
+    """config.py loaded without utils/ still redacts, and warns."""
+    import shutil
+    import subprocess
+    import sys
+
+    shutil.copy("config.py", tmp_path / "config.py")
+    key, tok = "Fb" * 8, "Tk" * 6  # built at runtime: not literal secrets
+    code = (
+        "import io, sys; sys.path.insert(0, '.');\n"
+        "import config\n"
+        "from loguru import logger\n"
+        "buf = io.StringIO(); logger.add(buf, format='{message}')\n"
+        f"logger.warning('x https://api.polygon.io/v3/a?apiKey={key} token={tok}')\n"
+        "print(buf.getvalue())\n"
+    )
+    env = {"DB_PASSWORD": "testpass", "GRID_JWT_SECRET": "test-secret-ci", "GRID_GIT_SINK_DISABLED": "1",
+           "PATH": "/usr/bin:/bin"}
+    proc = subprocess.run([sys.executable, "-c", code], cwd=tmp_path, env=env, capture_output=True, text=True)
+    assert proc.returncode == 0, proc.stderr[-2000:]
+    assert key not in proc.stdout and tok not in proc.stdout
+    assert "fallback log redactor" in proc.stderr
