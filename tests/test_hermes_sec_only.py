@@ -512,13 +512,31 @@ def scheduler_tail_before_reviewed_options_delta(source):
     return tail.replace(_PR806_OPTIONS_METHODS, _PRE_PR806_OPTIONS_METHODS, 1).replace(reviewed, historical, 1)
 
 
+# Reverse only the two reviewed resolver count log lines. The original tail
+# digest still guards every other byte, including operators and SEC controls.
+_REVIEWED_OPERATOR_RESOLUTION_LOGS = (
+    ('            "Resolution completed with {e} worker error(s) \u2014 inserted count={r} (None means unknown), "\n',
+     '            "Resolution completed with {e} worker error(s) \u2014 resolved={r}, "\n'),
+    ('        "Resolution: inserted count={r} (None means unknown), {c} conflicts, {s} series in {t}s "\n',
+     '        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s "\n'),
+)
+
+
+def operator_tail_before_reviewed_resolution_logs(source):
+    tail = source.split('\nimport argparse\n', 1)[1]
+    for reviewed, historical in _REVIEWED_OPERATOR_RESOLUTION_LOGS:
+        assert source.count(reviewed) == 1 and tail.count(reviewed) == 1, 'REVIEWED_RESOLUTION_LOG_DELTA_CHANGED'
+        tail = tail.replace(reviewed, historical, 1)
+    return tail
+
+
 class CurrentSecDefaultTests(unittest.TestCase):
     def test_unselected_default_source_tails_are_current_base_exact(self):
         # Operator tail: accepted PR911 head 7ec182b, blob 4b039ec9.
         # Parent 9135c68 tail d1b16920 differs only in the approved stale block.
         for path,marker,pin in [(OPER,'\nimport argparse\n','381edbc4c69e5024c19ec0f616c6420d81b375bb293a8974b7f5b78dde32f624'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
             source = path.read_text(encoding='utf-8')
-            tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else source.split(marker, 1)[1]
+            tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
 
     def test_default_tail_pin_rejects_guard_and_unselected_source_mutations(self):
@@ -583,6 +601,39 @@ class CurrentSecDefaultTests(unittest.TestCase):
                 with patch.object(Path, 'read_text', changed_read):
                     with self.assertRaises(AssertionError):
                         self.test_unselected_default_source_tails_are_current_base_exact()
+
+    def test_reviewed_operator_log_allowance_rejects_mutation_or_duplication(self):
+        original = OPER.read_text(encoding='utf-8')
+        read = Path.read_text
+        for reviewed, historical in _REVIEWED_OPERATOR_RESOLUTION_LOGS:
+            self.assertEqual(original.count(reviewed), 1)
+            mutations = [
+                original.replace(reviewed, reviewed.replace('None means unknown', 'None means zero'), 1),
+                original.replace(reviewed, historical, 1),
+                original + '\n' + reviewed,
+                original.replace('\nimport argparse\n', '\n' + reviewed + '\nimport argparse\n', 1),
+            ]
+            for changed in mutations:
+                with self.subTest(reviewed=reviewed, changed=changed != original):
+                    self.assertNotEqual(changed, original)
+                    def changed_read(path, *args, **kwargs):
+                        return changed if path == OPER else read(path, *args, **kwargs)
+                    with patch.object(Path, 'read_text', changed_read):
+                        with self.assertRaises(AssertionError):
+                            self.test_unselected_default_source_tails_are_current_base_exact()
+
+    def test_reviewed_operator_allowance_preserves_sec_body_guard(self):
+        original = SCHED.read_text(encoding='utf-8')
+        before = 'class SecOnlyRefused(ValueError):'
+        self.assertEqual(original.count(before), 1)
+        changed = original.replace(before, 'class SecOnlyRefused(RuntimeError):', 1)
+        read = Path.read_text
+        def changed_read(path, *args, **kwargs):
+            return changed if path == SCHED else read(path, *args, **kwargs)
+        with patch.object(Path, 'read_text', changed_read):
+            with self.assertRaises(AssertionError):
+                self.test_all_accepted_sec_function_bodies_are_preserved()
+
     def test_sec_wrong_source_and_clock_refuse_before_reads(self):
         m=front();selection={'schema':'hermes-sec-only-v1','base':m._SEC_ONLY_BASE,
           'source':'other','module':'ingestion.altdata.sec_xbrl_shares','class':'SECXBRLSharesPuller',
