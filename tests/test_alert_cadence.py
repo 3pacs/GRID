@@ -232,3 +232,14 @@ def test_annual_latency_class_maps_to_quarterly_not_default_daily():
     from alerts.cadence import QUARTERLY, cadence_for_source
 
     assert cadence_for_source("pushshift_reddit", latency_class="ANNUAL") is QUARTERLY
+
+
+def test_world_bank_is_annual_data_on_the_coarsest_tier():
+    assert cadence.cadence_for_source("world_bank", update_frequency="DAILY", latency_class="EOD") is cadence.QUARTERLY
+
+
+def test_live_catalog_monthly_and_weekly_rows_resolve_from_latency_class():
+    # Comtrade (MONTHLY) and ecb_ilm_ltro (WEEKLY) were stale-flagged on
+    # 2026-11-04 although healthy: update_frequency='DAILY' masked them.
+    assert cadence.cadence_for_source("Comtrade", update_frequency="DAILY", latency_class="MONTHLY") is cadence.MONTHLY
+    assert cadence.cadence_for_source("ecb_ilm_ltro", update_frequency="DAILY", latency_class="WEEKLY") is cadence.WEEKLY

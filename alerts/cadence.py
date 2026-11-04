@@ -135,6 +135,9 @@ SOURCE_CADENCE_OVERRIDES: dict[str, Cadence] = {
     "foia_cables": WEEKLY,
     "buyback_execution": QUARTERLY,
     "atlanta_fed_wage_tracker": MONTHLY,
+    # World Bank indicators are annual; zero-row runs never refresh it
+    # (2026-11-04 investigation). QUARTERLY is the coarsest tier.
+    "world_bank": QUARTERLY,
     # 2D -- genuinely stale or broken writers (real cadence recorded so
     # they still trip the alert, honestly, instead of via the wrong reason)
     "open_meteo": DAILY,
