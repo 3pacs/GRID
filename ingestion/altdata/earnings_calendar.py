@@ -17,6 +17,8 @@ Schedule: daily pull via hermes operator.
 from __future__ import annotations
 
 import json
+import math
+from collections.abc import Callable
 from datetime import date, timedelta
 from typing import Any
 
@@ -72,6 +74,68 @@ def _safe_float(val) -> float | None:
         return None if math.isnan(f) or math.isinf(f) else f
     except (ValueError, TypeError):
         return None
+
+
+# One budget-stop WARNING per process; later stops in the same process log at
+# INFO (the scheduler still records every PARTIAL in pull_log).
+_BUDGET_STOP_WARNED = False
+
+
+def _same_value(a: float, b: float) -> bool:
+    """True when two stored EPS values are the same observation."""
+    return math.isclose(float(a), float(b), rel_tol=1e-9, abs_tol=1e-12)
+
+
+def _dedupe_earnings_rows(earnings_dates: Any) -> list[dict[str, Any]]:
+    """Collapse a yfinance ``earnings_dates`` frame to one record per date.
+
+    yfinance can return several rows for the same calendar day (different
+    announcement timestamps, or the SAME timestamp with two estimates — seen
+    for IVA on 2022-03-10). raw_series' unique index is
+    ``(series_id, source_id, obs_date, pull_timestamp)`` and pull_timestamp
+    is the transaction time, so two rows for one obs_date inside one
+    transaction raise UniqueViolation and abort the whole ticker.
+
+    The kept row is chosen deterministically, independent of yfinance's row
+    order (so the choice cannot flip between pulls and mint a fake vintage):
+    a row with a Reported EPS wins, then the latest announcement timestamp,
+    then a row with an EPS Estimate, then the lower estimate.
+
+    Returns:
+        list of dicts (earn_date, eps_est, eps_act, surprise_pct), sorted by
+        earn_date ascending. Rows whose index cannot be read as a date are
+        skipped with a debug log.
+    """
+    best: dict[date, tuple[tuple, dict[str, Any]]] = {}
+    for idx, row in earnings_dates.iterrows():
+        try:
+            earn_date = idx.date() if hasattr(idx, "date") else idx
+            if not isinstance(earn_date, date):
+                raise TypeError(f"earnings date index is {type(idx).__name__}")
+            eps_est = _safe_float(row.get("EPS Estimate"))
+            eps_act = _safe_float(row.get("Reported EPS"))
+            surprise = _safe_float(row.get("Surprise(%)"))
+            ts = float(idx.timestamp()) if hasattr(idx, "timestamp") else 0.0
+        except Exception as row_err:
+            log.debug("Earnings row skipped at {d}: {e}", d=idx, e=str(row_err))
+            continue
+        rank = (
+            eps_act is not None,
+            ts,
+            eps_est is not None,
+            -eps_est if eps_est is not None else 0.0,
+            -eps_act if eps_act is not None else 0.0,
+        )
+        record = {
+            "earn_date": earn_date,
+            "eps_est": eps_est,
+            "eps_act": eps_act,
+            "surprise_pct": surprise,
+        }
+        current = best.get(earn_date)
+        if current is None or rank > current[0]:
+            best[earn_date] = (rank, record)
+    return [best[d][1] for d in sorted(best)]
 
 
 class EarningsCalendarPuller(BasePuller):
@@ -159,6 +223,115 @@ class EarningsCalendarPuller(BasePuller):
         except Exception:
             return []
 
+    def _order_least_recently_pulled(self, tickers: list[str]) -> list[str]:
+        """Order tickers so the least recently refreshed are pulled first.
+
+        A budget-limited run (``should_continue``) stops part-way through
+        the universe; ordering by the last ``earnings_calendar`` refresh
+        means the next run continues with the tickers this one did not
+        reach instead of re-pulling the same alphabetical prefix. Tickers
+        never seen (no earnings_calendar row) come first. On any lookup
+        failure the original order is kept.
+        """
+        if not tickers:
+            return tickers
+        try:
+            with self.engine.connect() as conn:
+                rows = conn.execute(text("""
+                    SELECT ticker, MAX(pull_timestamp)
+                    FROM earnings_calendar
+                    WHERE ticker = ANY(:tickers)
+                    GROUP BY ticker
+                """), {"tickers": list(tickers)}).fetchall()
+        except Exception as exc:
+            log.debug("Earnings rotation lookup failed: {e}", e=str(exc))
+            return tickers
+        last = {r[0]: r[1] for r in rows if r[1] is not None}
+        position = {t: i for i, t in enumerate(tickers)}
+        return sorted(
+            tickers,
+            key=lambda t: (t in last, last[t].timestamp() if t in last else 0.0, position[t]),
+        )
+
+    def _latest_success_values(
+        self,
+        conn: Any,
+        keys: list[tuple[str, date]],
+    ) -> dict[tuple[str, date], float]:
+        """Latest SUCCESS value per (series_id, obs_date), in ONE statement.
+
+        One index probe per key on ``uq_raw_series_composite``
+        (series_id, source_id, obs_date, pull_timestamp), walked backward so
+        only the newest vintage is read. Measured on grid-svr 2026-11-04:
+        0.5 ms for 5 keys of EARNINGS:AMD, whose two series hold ~21k
+        duplicate vintages; a DISTINCT ON over the same two series took
+        5.4 s because it visits every vintage.
+        """
+        if not keys:
+            return {}
+        rows = conn.execute(text("""
+            SELECT k.sid, k.od, l.value
+            FROM unnest(CAST(:sids AS text[]), CAST(:ods AS date[])) AS k(sid, od)
+            CROSS JOIN LATERAL (
+                SELECT r.value
+                FROM raw_series r
+                WHERE r.series_id = k.sid
+                  AND r.obs_date = k.od
+                  AND r.source_id = :src
+                  AND r.pull_status = 'SUCCESS'
+                ORDER BY r.pull_timestamp DESC
+                LIMIT 1
+            ) l
+        """), {
+            "sids": [k[0] for k in keys],
+            "ods": [k[1] for k in keys],
+            "src": self.source_id,
+        }).fetchall()
+        return {(r[0], r[1]): r[2] for r in rows if r[2] is not None}
+
+    def _store_raw_vintages(
+        self,
+        ticker: str,
+        records: list[dict[str, Any]],
+    ) -> tuple[int, int]:
+        """Write EARNINGS:{ticker}:estimate|actual rows that are new or changed.
+
+        A row is written only when its (series_id, obs_date) has no SUCCESS
+        row yet, or the latest SUCCESS value differs (a revised estimate or
+        actual is a new PIT vintage and is still recorded). Re-pulling an
+        unchanged history writes nothing — before this, every pull appended
+        every row again (EARNINGS:AMD:actual held 10,349 rows for 27 dates).
+
+        The per-ticker transaction-scoped advisory lock serialises an
+        orphaned SmartScheduler thread with a concurrent retry for the same
+        ticker, so both cannot read "absent" and insert the same vintage.
+
+        Returns:
+            (rows_inserted, rows_unchanged) — counted only after commit.
+        """
+        candidates: list[tuple[str, date, float]] = []
+        for rec in records:
+            if rec["eps_est"] is not None:
+                candidates.append((f"EARNINGS:{ticker}:estimate", rec["earn_date"], rec["eps_est"]))
+            if rec["eps_act"] is not None:
+                candidates.append((f"EARNINGS:{ticker}:actual", rec["earn_date"], rec["eps_act"]))
+        if not candidates:
+            return 0, 0
+
+        inserted = 0
+        unchanged = 0
+        with self.engine.begin() as conn:
+            self._file_advisory_lock(conn, "EARNINGS_RAW", ticker)
+            latest = self._latest_success_values(conn, [(c[0], c[1]) for c in candidates])
+            for series_id, obs_date, value in candidates:
+                prev = latest.get((series_id, obs_date))
+                if prev is not None and _same_value(prev, value):
+                    unchanged += 1
+                    continue
+                self._insert_raw(conn, series_id=series_id, obs_date=obs_date, value=value)
+                inserted += 1
+        return inserted, unchanged
+
     def pull_ticker_earnings(self, ticker: str) -> dict[str, Any]:
         """Pull earnings data for a single ticker.
 
@@ -166,12 +339,19 @@ class EarningsCalendarPuller(BasePuller):
         EPS estimates/actuals) and .calendar (for revenue estimates).
 
         Returns:
-            dict with ticker, rows_inserted, rows_updated, status, errors.
+            dict with ticker, status, errors and committed write counts:
+            ``rows_inserted`` (earnings_calendar upserts + raw_series rows,
+            the scheduler's write count), ``calendar_rows_upserted``,
+            ``raw_series_inserted`` and ``raw_series_unchanged`` (vintages
+            skipped because the latest stored value is identical).
         """
         result: dict[str, Any] = {
             "ticker": ticker,
             "rows_inserted": 0,
             "rows_updated": 0,
+            "calendar_rows_upserted": 0,
+            "raw_series_inserted": 0,
+            "raw_series_unchanged": 0,
             "status": "SUCCESS",
             "errors": [],
         }
@@ -186,60 +366,65 @@ class EarningsCalendarPuller(BasePuller):
             except Exception as e:
                 log.debug("No earnings_dates for {t}: {e}", t=ticker, e=str(e))
 
+            records: list[dict[str, Any]] = []
             if earnings_dates is not None and not earnings_dates.empty:
+                records = _dedupe_earnings_rows(earnings_dates)
+                if len(records) < len(earnings_dates):
+                    log.debug(
+                        "Earnings {t}: {n} yfinance rows collapsed to {m} dates",
+                        t=ticker, n=len(earnings_dates), m=len(records),
+                    )
+
+            if records:
+                upserted = 0
                 with self.engine.begin() as conn:
-                    for idx, row in earnings_dates.iterrows():
-                        try:
-                            # idx is the earnings date (Timestamp)
-                            earn_date = idx.date() if hasattr(idx, "date") else idx
+                    for rec in records:
+                        eps_est = rec["eps_est"]
+                        eps_act = rec["eps_act"]
+                        surprise_pct_raw = rec["surprise_pct"]
 
-                            eps_est = _safe_float(row.get("EPS Estimate"))
-                            eps_act = _safe_float(row.get("Reported EPS"))
-                            surprise_pct_raw = _safe_float(row.get("Surprise(%)"))
+                        # Compute surprise % ourselves if yfinance doesn't provide it
+                        if surprise_pct_raw is None and eps_est is not None and eps_act is not None and eps_est != 0:
+                            surprise_pct_raw = (eps_act - eps_est) / abs(eps_est) * 100
 
-                            # Compute surprise % ourselves if yfinance doesn't provide it
-                            if surprise_pct_raw is None and eps_est is not None and eps_act is not None and eps_est != 0:
-                                surprise_pct_raw = (eps_act - eps_est) / abs(eps_est) * 100
+                        reported = eps_act is not None
+                        classification = _classify_surprise(eps_est, eps_act)
 
-                            reported = eps_act is not None
-                            classification = _classify_surprise(eps_est, eps_act)
-
-                            conn.execute(text("""
-                                INSERT INTO earnings_calendar
-                                    (ticker, earnings_date, eps_estimate, eps_actual,
-                                     eps_surprise_pct, classification, reported, raw_payload)
-                                VALUES
-                                    (:ticker, :edate, :eps_est, :eps_act,
-                                     :surprise, :cls, :reported, :payload)
-                                ON CONFLICT (ticker, earnings_date)
-                                DO UPDATE SET
-                                    eps_estimate = COALESCE(EXCLUDED.eps_estimate, earnings_calendar.eps_estimate),
-                                    eps_actual = COALESCE(EXCLUDED.eps_actual, earnings_calendar.eps_actual),
-                                    eps_surprise_pct = COALESCE(EXCLUDED.eps_surprise_pct, earnings_calendar.eps_surprise_pct),
-                                    classification = CASE
-                                        WHEN EXCLUDED.reported = TRUE THEN EXCLUDED.classification
-                                        ELSE earnings_calendar.classification
-                                    END,
-                                    reported = EXCLUDED.reported OR earnings_calendar.reported,
-                                    pull_timestamp = NOW()
-                            """), {
-                                "ticker": ticker,
-                                "edate": earn_date,
-                                "eps_est": eps_est,
-                                "eps_act": eps_act,
-                                "surprise": round(surprise_pct_raw, 2) if surprise_pct_raw is not None else None,
-                                "cls": classification,
-                                "reported": reported,
-                                "payload": json.dumps({
-                                    "eps_estimate": eps_est,
-                                    "eps_actual": eps_act,
-                                    "surprise_pct": round(surprise_pct_raw, 2) if surprise_pct_raw else None,
-                                }),
-                            })
-                            result["rows_inserted"] += 1
-
-                        except Exception as row_err:
-                            log.debug("Row error for {t} at {d}: {e}", t=ticker, d=idx, e=str(row_err))
+                        conn.execute(text("""
+                            INSERT INTO earnings_calendar
+                                (ticker, earnings_date, eps_estimate, eps_actual,
+                                 eps_surprise_pct, classification, reported, raw_payload)
+                            VALUES
+                                (:ticker, :edate, :eps_est, :eps_act,
+                                 :surprise, :cls, :reported, :payload)
+                            ON CONFLICT (ticker, earnings_date)
+                            DO UPDATE SET
+                                eps_estimate = COALESCE(EXCLUDED.eps_estimate, earnings_calendar.eps_estimate),
+                                eps_actual = COALESCE(EXCLUDED.eps_actual, earnings_calendar.eps_actual),
+                                eps_surprise_pct = COALESCE(EXCLUDED.eps_surprise_pct, earnings_calendar.eps_surprise_pct),
+                                classification = CASE
+                                    WHEN EXCLUDED.reported = TRUE THEN EXCLUDED.classification
+                                    ELSE earnings_calendar.classification
+                                END,
+                                reported = EXCLUDED.reported OR earnings_calendar.reported,
+                                pull_timestamp = NOW()
+                        """), {
+                            "ticker": ticker,
+                            "edate": rec["earn_date"],
+                            "eps_est": eps_est,
+                            "eps_act": eps_act,
+                            "surprise": round(surprise_pct_raw, 2) if surprise_pct_raw is not None else None,
+                            "cls": classification,
+                            "reported": reported,
+                            "payload": json.dumps({
+                                "eps_estimate": eps_est,
+                                "eps_actual": eps_act,
+                                "surprise_pct": round(surprise_pct_raw, 2) if surprise_pct_raw else None,
+                            }),
+                        })
+                        upserted += 1
+                # Counted only once the transaction has committed.
+                result["calendar_rows_upserted"] = upserted
 
             # ── Calendar (revenue estimates) ──
             try:
@@ -276,68 +461,107 @@ class EarningsCalendarPuller(BasePuller):
             except Exception as e:
                 log.debug("No calendar for {t}: {e}", t=ticker, e=str(e))
 
-            # ── Also store as raw_series for PIT tracking ──
-            if earnings_dates is not None and not earnings_dates.empty:
-                with self.engine.begin() as conn:
-                    for idx, row in earnings_dates.iterrows():
-                        earn_date = idx.date() if hasattr(idx, "date") else idx
-                        eps_est = _safe_float(row.get("EPS Estimate"))
-                        if eps_est is not None:
-                            self._insert_raw(
-                                conn,
-                                series_id=f"EARNINGS:{ticker}:estimate",
-                                obs_date=earn_date,
-                                value=eps_est,
-                            )
-                        eps_act = _safe_float(row.get("Reported EPS"))
-                        if eps_act is not None:
-                            self._insert_raw(
-                                conn,
-                                series_id=f"EARNINGS:{ticker}:actual",
-                                obs_date=earn_date,
-                                value=eps_act,
-                            )
+            # ── Also store as raw_series for PIT tracking (new/changed only) ──
+            if records:
+                inserted, unchanged = self._store_raw_vintages(ticker, records)
+                result["raw_series_inserted"] = inserted
+                result["raw_series_unchanged"] = unchanged
 
         except Exception as exc:
             log.error("Earnings pull failed for {t}: {err}", t=ticker, err=str(exc))
             result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
+        result["rows_inserted"] = result["calendar_rows_upserted"] + result["raw_series_inserted"]
         return result
 
     def pull_all(
-        self, ticker_list: list[str] | None = None,
-    ) -> list[dict[str, Any]]:
+        self,
+        ticker_list: list[str] | None = None,
+        should_continue: Callable[[], bool] | None = None,
+    ) -> list[dict[str, Any]] | dict[str, Any]:
         """Pull earnings data for all watchlist tickers.
 
         Parameters:
-            ticker_list: Override list; defaults to watchlist tickers.
+            ticker_list: Override list; defaults to watchlist tickers
+                (ordered least-recently-refreshed first, so a budget-limited
+                run resumes where the previous one stopped).
+            should_continue: Optional cooperative-budget check polled
+                BETWEEN tickers (SmartScheduler._run_puller and
+                hermes_fixers._retry_source wire one automatically). When it
+                returns False the pull stops before the next ticker instead
+                of being orphaned by the scheduler's hard join timeout.
 
         Returns:
-            list[dict]: One result dict per ticker.
+            - should_continue is None: list[dict], one result per ticker
+              (unchanged legacy shape).
+            - should_continue given: {"status": "SUCCESS" | "PARTIAL" |
+              "SKIPPED", "stopped_by_budget": bool, "results": [...],
+              "tickers_not_attempted": [...], "rows_inserted": int,
+              "raw_series_inserted": int, "raw_series_unchanged": int}.
+              A budget stop is PARTIAL with honest committed counts; the
+              unattempted tickers are listed, never reported as checked.
         """
+        global _BUDGET_STOP_WARNED
+
         if ticker_list is None:
-            ticker_list = self._get_watchlist_tickers()
+            ticker_list = self._order_least_recently_pulled(self._get_watchlist_tickers())
 
         if not ticker_list:
             log.warning("No tickers for earnings calendar pull")
-            return []
+            if should_continue is None:
+                return []
+            return {
+                "status": "SKIPPED",
+                "skipped_reason": "no tickers for earnings calendar pull",
+                "stopped_by_budget": False,
+                "results": [],
+                "tickers_not_attempted": [],
+                "rows_inserted": 0,
+                "raw_series_inserted": 0,
+                "raw_series_unchanged": 0,
+            }
 
         log.info(
             "Starting earnings calendar pull — {n} tickers",
             n=len(ticker_list),
         )
         results: list[dict[str, Any]] = []
+        stopped_by_budget = False
         for ticker in ticker_list:
+            if should_continue is not None and not should_continue():
+                stopped_by_budget = True
+                log_fn = log.info if _BUDGET_STOP_WARNED else log.warning
+                _BUDGET_STOP_WARNED = True
+                log_fn(
+                    "Earnings calendar pull: time budget reached after {n}/{total} "
+                    "tickers — returning PARTIAL, the rest go first next run",
+                    n=len(results), total=len(ticker_list),
+                )
+                break
             res = self.pull_ticker_earnings(ticker)
             results.append(res)
 
         ok = sum(1 for r in results if r["status"] == "SUCCESS")
+        raw_inserted = sum(r.get("raw_series_inserted", 0) for r in results)
+        raw_unchanged = sum(r.get("raw_series_unchanged", 0) for r in results)
         log.info(
-            "Earnings calendar pull complete — {ok}/{total} succeeded",
-            ok=ok, total=len(results),
+            "Earnings calendar pull complete — {ok}/{total} succeeded, "
+            "{ins} raw_series vintages written, {same} unchanged skipped",
+            ok=ok, total=len(ticker_list), ins=raw_inserted, same=raw_unchanged,
         )
-        return results
+        if should_continue is None:
+            return results
+
+        return {
+            "status": "PARTIAL" if stopped_by_budget else "SUCCESS",
+            "stopped_by_budget": stopped_by_budget,
+            "results": results,
+            "tickers_not_attempted": list(ticker_list[len(results):]),
+            "rows_inserted": sum(r["rows_inserted"] for r in results),
+            "raw_series_inserted": raw_inserted,
+            "raw_series_unchanged": raw_unchanged,
+        }
 
 
 # ── Convenience Functions ────────────────────────────────────────────────
