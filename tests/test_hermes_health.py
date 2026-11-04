@@ -93,8 +93,9 @@ def test_redact_reason_strips_credentials():
         "429 Client Error: Too Many Requests for url: "
         "https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key=abcd1234efgh&file_type=json"
     )
-    assert "abcd1234efgh" not in r and "series_id" not in r
-    assert "https://api.stlouisfed.org/fred/series/observations?[REDACTED]" in r
+    assert "abcd1234efgh" not in r and "SOFR" not in r
+    assert ("https://api.stlouisfed.org/fred/series/observations?series_id=[REDACTED]"
+            "&api_key=[REDACTED]&file_type=[REDACTED]") in r
     assert "hunter2" not in redact_reason("connect https://grid:hunter2@db.example/x failed")
     assert "s3cr3tvalue" not in redact_reason("bad config token=s3cr3tvalue retry")
     assert "abcdefghijkl" not in redact_reason("Authorization: Bearer abcdefghijkl")

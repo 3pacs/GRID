@@ -11,7 +11,7 @@ from __future__ import annotations
 import re
 
 # Query strings of any scheme are dropped whole (to whitespace or "#").
-_URL_QUERY_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?[^\s#'\"<>]*")
+_URL_QUERY_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?([^\s#'\"<>]*)")
 # Userinfo of any scheme, greedy to the LAST "@" that is followed by a host,
 # so passwords containing "@" or "/" are covered (over-redacts a path "@").
 _URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^\s'\"<>]*@(?=[^\s@/'\"<>]+)")
@@ -29,9 +29,25 @@ _HEX_PATH_KEY_RE = re.compile(r"(?i)(/)[0-9a-f]{32,}(?=/|\b)")
 # to the end of the text.
 _SECRET_ASSIGN_RE = re.compile(
     r"(?i)\b([a-z0-9_-]*(?:api[_-]?key|apikey|access[_-]?key|private[_-]?key|client[_-]?secret"
-    r"|credential|token|secret|password|passwd|auth)[a-z0-9_-]*['\"]?\s*[=:]\s*)"
+    r"|credential|token|secret|password|passwd|auth)[a-z0-9_-]*"
+    # Separator: "=", a quoted key's colon ('"api_key": ...'), or a colon
+    # followed by whitespace ("token: ..."). A bare colon is not one: the
+    # rendered log location "api.auth:login:42" must stay readable.
+    r"(?:\s*=\s*|['\"]\s*:\s*|:\s+))"
     r"(?:\"[^\"]*(?:\"|$)|'[^']*(?:'|$)|[^\s,&'\"}]+)"
 )
+
+
+def _redact_query(m: re.Match[str]) -> str:
+    """Keep each query parameter's name, mask every value (unknown names such
+    as ``k=`` or ``sig=`` can carry keys too)."""
+    parts = []
+    for part in m.group(2).split("&"):
+        if "=" in part:
+            parts.append(part.split("=", 1)[0] + "=[REDACTED]")
+        else:
+            parts.append("[REDACTED]" if part else part)
+    return m.group(1) + "?" + "&".join(parts)
 
 
 def redact_secrets(reason: str | None) -> str | None:
@@ -49,7 +65,7 @@ def redact_secrets(reason: str | None) -> str | None:
     # lazy import, which breaks logging wherever builtins.__import__ is
     # patched (and this runs inside the global log patcher).
     text_ = _URL_USERINFO_RE.sub(lambda m: m.group(1) + "[REDACTED]@", str(reason))
-    text_ = _URL_QUERY_RE.sub(lambda m: m.group(1) + "?[REDACTED]", text_)
+    text_ = _URL_QUERY_RE.sub(_redact_query, text_)
     text_ = _HEX_PATH_KEY_RE.sub(lambda m: m.group(1) + "[REDACTED]", text_)
     text_ = _JWT_RE.sub(lambda m: "[REDACTED-JWT]", text_)
     text_ = _AUTH_HEADER_RE.sub(lambda m: m.group(1) + "[REDACTED]", text_)

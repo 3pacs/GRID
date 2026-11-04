@@ -122,16 +122,16 @@ def test_central_loguru_config_redacts_messages_and_disables_diagnose() -> None:
         logger.remove(sink)
     out = buf.getvalue()
     assert "PolyKey123456" not in out
-    assert "failed: for url: https://api.polygon.io/v3/x?[REDACTED]" in out
+    assert "failed: for url: https://api.polygon.io/v3/x?apiKey=[REDACTED]" in out
     src = open(config.__file__, encoding="utf-8").read()
-    assert "diagnose=_LOG_DIAGNOSE" in src and src.count("diagnose=_LOG_DIAGNOSE") >= 2
+    assert src.count("diagnose=LOG_DIAGNOSE") >= 2  # console sink and GitSink
 
 
 def test_stderr_sink_redacts_exception_tracebacks(capsys) -> None:
     import config
     from loguru import logger
 
-    sink = logger.add(config._redacting_stderr_sink, level="DEBUG", format="{message}", diagnose=False)
+    sink = logger.add(config.scrubbed_stderr, level="DEBUG", format="{message}", diagnose=False)
     try:
         try:
             raise requests.exceptions.HTTPError(
@@ -217,3 +217,12 @@ def test_config_fallback_redactor_fails_closed(tmp_path) -> None:
     assert proc.returncode == 0, proc.stderr[-2000:]
     assert key not in proc.stdout and tok not in proc.stdout
     assert "fallback log redactor" in proc.stderr
+
+
+def test_log_location_and_prose_stay_readable() -> None:
+    # The rendered loguru line carries "module:function:line"; a module named
+    # *auth*/*secret*/*token* must not lose its location.
+    for msg in ("api.auth:login:42 — token refreshed", "tests.test_log_secret_scrubbing:test_x:9 — ok",
+                "token refresh scheduled", "no CF Radar token configured"):
+        assert redact_secrets(msg) == msg
+    assert "v4lue" not in redact_secrets("token: v4lue") and "v5lue" not in redact_secrets('{"secret": "v5lue"}')

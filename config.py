@@ -964,16 +964,36 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Configure loguru
-log.remove()  # Remove default handler
+#
+# Credentials are scrubbed from log output. Pullers log exception text, and a requests HTTPError carries the full
+# request URL, query-string API key included. Two layers:
+#   - a patcher scrubs each record's message and string extras before any sink sees it; it lives on the logger
+#     core, so it also covers sinks that scripts add after log.remove();
+#   - scrubbed_stderr, the console sink, scrubs the fully rendered line, which is the only place the formatted
+#     traceback of log.exception()/log.opt(exception=...) exists as text. Scripts that replace the console sink
+#     must add scrubbed_stderr, not sys.stderr (tests/test_log_secret_scrubbing.py enforces it). A plain file sink
+#     still gets scrubbed messages and extras but an unscrubbed traceback; the git sink scrubs its own entries.
+try:
+    from server_log.sanitizer import Sanitizer, secret_values_from_settings
+
+    _log_scrubber: Sanitizer | None = Sanitizer(
+        secret_values_from_settings(settings), generic=False, min_secret_len=8,
+    )
+except Exception:
+    _log_scrubber = None
 
 
+# Second layer: pattern redaction (URL query strings and userinfo, auth
+# headers/schemes, JWTs, hex path keys such as the FIRMS MAP_KEY, quoted and
+# JSON key=value forms). The sanitizer above knows today's configured secret
+# values; this catches keys it doesn't (old/rotated keys, provider tokens
+# fetched at runtime). Imported once at load: a per-record import breaks
+# logging wherever builtins.__import__ is patched. Fails closed: without
+# utils/ (config.py copied standalone) a minimal fallback still masks query
+# strings and key=value pairs, and says so once.
 try:
     from utils.redaction import redact_secrets as _redact_secrets
 except ImportError:
-    # Fail closed: config.py loaded without the repo's utils package (the
-    # dotenv contract tests copy it standalone) still masks the common
-    # leak shapes -- URL query strings and key/token/secret assignments --
-    # and says so once on stderr.
     import re as _re
 
     _FALLBACK_QUERY_RE = _re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?[^\s#'\"<>]*")
@@ -994,44 +1014,43 @@ except ImportError:
     )
 
 
-def _redact_log_record(record: dict) -> None:
-    """Redact credentials from every log message before any sink sees it.
-
-    2026-11-04: Polygon/FRED/Congress.gov/WorldNews keys were in grid-svr
-    logs thousands of times, via messages interpolating str(exc) (requests
-    embeds the request URL) from many modules. Redacting here covers every
-    caller; utils.redaction leaves ordinary text unchanged.
-    """
-    # Imported once at module load: a per-record import breaks logging
-    # wherever builtins.__import__ is patched.
-    record["message"] = _redact_secrets(record["message"])
-    extra = record.get("extra")
-    if extra:
-        for key, value in list(extra.items()):
-            if isinstance(value, str):
-                extra[key] = _redact_secrets(value)
+def _scrub_log_text(text: str) -> str:
+    if _log_scrubber is not None:
+        try:
+            text = _log_scrubber.scrub(text)
+        except Exception:
+            pass  # never let scrubbing drop a log line
+    try:
+        return _redact_secrets(text)
+    except Exception:
+        return text  # never let scrubbing drop a log line
 
 
-log.configure(patcher=_redact_log_record)
+def _scrub_log_record(record: dict) -> None:
+    record["message"] = _scrub_log_text(record["message"])
+    for key, value in record["extra"].items():
+        if isinstance(value, str):
+            record["extra"][key] = _scrub_log_text(value)
 
 
-def _redacting_stderr_sink(message: str) -> None:
-    """stderr sink that redacts the fully formatted record.
+def scrubbed_stderr(message: str) -> None:
+    """Console sink: writes the scrubbed rendered line to stderr."""
+    # sys.stderr looked up per call, so redirected/captured stderr keeps working
+    sys.stderr.write(_scrub_log_text(str(message)))
 
-    The patcher only sees the message; a logged exception's traceback (with
-    requests' "...for url: ...?apiKey=" text) is formatted later, so the
-    final string is redacted again here before it reaches journald.
-    """
-    sys.stderr.write(_redact_secrets(str(message)))
 
-# diagnose=False: loguru's diagnose mode prints local variable values in
-# tracebacks (it logged FredAPI(api_key='...') 4,642 times). Set
-# GRID_LOG_DIAGNOSE=1 for local debugging only.
-_LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+# loguru's diagnose mode prints the value of every local variable under each traceback line. Those bare values
+# (an API key, an OAuth access token fetched at runtime) carry no key= prefix for the patterns to find, so it is
+# off unless GRID_LOG_DIAGNOSE=1 is set for a debugging session.
+LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+
+log.remove()  # Remove default handler
+log.configure(patcher=_scrub_log_record)
 log.add(
-    _redacting_stderr_sink,
+    scrubbed_stderr,
     level=settings.LOG_LEVEL,
-    diagnose=_LOG_DIAGNOSE,
+    diagnose=LOG_DIAGNOSE,
+    colorize=sys.stderr.isatty(),
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -1039,6 +1058,8 @@ log.add(
         "<level>{message}</level>"
     ),
 )
+if _log_scrubber is None:
+    log.warning("log secret scrubbing not installed: sanitizer could not be built")
 
 # Git-backed error sink. Writes ERROR+ records to .server-logs/errors.jsonl
 # locally; the background push-to-remote is env-gated off by default
@@ -1052,7 +1073,7 @@ if os.getenv("GRID_GIT_SINK_DISABLED", "").lower() not in ("1", "true", "yes"):
         from server_log.git_sink import GitSink
 
         _git_sink = GitSink()
-        log.add(_git_sink.write, level="ERROR", diagnose=_LOG_DIAGNOSE)
+        log.add(_git_sink.write, level="ERROR", diagnose=LOG_DIAGNOSE)
         _git_sink.start()
         log.info(
             "GitSink attached — errors land in .server-logs/errors.jsonl "
