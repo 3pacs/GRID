@@ -32,6 +32,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+from utils.redaction import redact_secrets
 
 # ── API configuration ────────────────────────────────────────────────────
 
@@ -437,7 +438,7 @@ class LegislationPuller(BasePuller):
             }
 
         except Exception as exc:
-            log.debug("Failed to parse bill: {e}", e=str(exc))
+            log.debug("Failed to parse bill: {e}", e=redact_secrets(str(exc)))
             return None
 
     # ── Hearings ─────────────────────────────────────────────────────────
@@ -526,7 +527,7 @@ class LegislationPuller(BasePuller):
             }
 
         except Exception as exc:
-            log.debug("Failed to parse hearing: {e}", e=str(exc))
+            log.debug("Failed to parse hearing: {e}", e=redact_secrets(str(exc)))
             return None
 
     # ── Votes ────────────────────────────────────────────────────────────
@@ -643,7 +644,7 @@ class LegislationPuller(BasePuller):
             except Exception as exc:
                 log.warning(
                     "LegislationPuller: {c} member vote fetch failed: {e}",
-                    c=chamber, e=str(exc),
+                    c=chamber, e=redact_secrets(str(exc)),
                 )
                 continue
 
@@ -676,7 +677,7 @@ class LegislationPuller(BasePuller):
                     except Exception as exc:
                         log.debug(
                             "Member vote detail fetch failed for {c} roll {r}: {e}",
-                            c=chamber, r=roll_call, e=str(exc),
+                            c=chamber, r=roll_call, e=redact_secrets(str(exc)),
                         )
                         continue
 
@@ -750,7 +751,7 @@ class LegislationPuller(BasePuller):
                         except Exception as exc:
                             log.debug(
                                 "Member vote signal emit failed for {m}: {e}",
-                                m=member["member_name"], e=str(exc),
+                                m=member["member_name"], e=redact_secrets(str(exc)),
                             )
 
         log.info(
@@ -818,7 +819,7 @@ class LegislationPuller(BasePuller):
                     "Signal emit failed for {t}/{r}: {e}",
                     t=ticker,
                     r=record_id,
-                    e=str(exc),
+                    e=redact_secrets(str(exc)),
                 )
 
     # ── Main pull methods ────────────────────────────────────────────────
@@ -838,8 +839,8 @@ class LegislationPuller(BasePuller):
         try:
             raw_bills = self._fetch_recent_bills(days_back=days_back)
         except Exception as exc:
-            log.error("LegislationPuller: bill fetch failed: {e}", e=str(exc))
-            return {"status": "FAILED", "error": str(exc), "rows_inserted": 0}
+            log.error("LegislationPuller: bill fetch failed: {e}", e=redact_secrets(str(exc)))
+            return {"status": "FAILED", "error": redact_secrets(str(exc)), "rows_inserted": 0}
 
         bills = [self._parse_bill(b) for b in raw_bills]
         bills = [b for b in bills if b is not None]
@@ -888,7 +889,7 @@ class LegislationPuller(BasePuller):
                     log.warning(
                         "LegislationPuller: signal emit failed for {b}: {e}",
                         b=bill["bill_id"],
-                        e=str(exc),
+                        e=redact_secrets(str(exc)),
                     )
 
         log.info(
@@ -918,8 +919,8 @@ class LegislationPuller(BasePuller):
         try:
             raw_hearings = self._fetch_hearings(days_ahead=days_ahead)
         except Exception as exc:
-            log.error("LegislationPuller: hearing fetch failed: {e}", e=str(exc))
-            return {"status": "FAILED", "error": str(exc), "rows_inserted": 0}
+            log.error("LegislationPuller: hearing fetch failed: {e}", e=redact_secrets(str(exc)))
+            return {"status": "FAILED", "error": redact_secrets(str(exc)), "rows_inserted": 0}
 
         hearings = [self._parse_hearing(h) for h in raw_hearings]
         hearings = [h for h in hearings if h is not None]
@@ -961,7 +962,7 @@ class LegislationPuller(BasePuller):
                     log.warning(
                         "LegislationPuller: signal emit failed for {h}: {e}",
                         h=hearing["hearing_id"],
-                        e=str(exc),
+                        e=redact_secrets(str(exc)),
                     )
 
         log.info(
@@ -998,7 +999,7 @@ class LegislationPuller(BasePuller):
                 log.warning(
                     "LegislationPuller: {c} vote fetch failed: {e}",
                     c=chamber,
-                    e=str(exc),
+                    e=redact_secrets(str(exc)),
                 )
                 continue
 

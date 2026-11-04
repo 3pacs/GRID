@@ -1,0 +1,7 @@
+[mcp_servers.dune]
+command = "npx"
+args = [
+    "-y",
+    "dune-analytics-mcp",
+]
+env_vars = ["DUNE_API_KEY"]

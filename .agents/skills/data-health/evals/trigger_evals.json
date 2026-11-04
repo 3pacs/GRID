@@ -1,0 +1,34 @@
+[
+  {
+    "query": "Hermes just restarted after the deploy. Before I run inference, are all the sources actually pulling?",
+    "should_trigger": true
+  },
+  {
+    "query": "The regime model is suddenly outputting weird labels. Could one of the feeds be stale or full of NaNs?",
+    "should_trigger": true
+  },
+  {
+    "query": "which API keys is the system silently missing? I suspect KOSIS and Comtrade are returning 401 and we never noticed",
+    "should_trigger": true
+  },
+  {
+    "query": "I'm adding a new ingestion source for weekly CFTC data. What freshness threshold should I alert on?",
+    "should_trigger": true
+  },
+  {
+    "query": "Raw rows exist but nothing is in resolved_series for XLRE. Debug the entity mapping.",
+    "should_trigger": false
+  },
+  {
+    "query": "Tiingo returns 404 for CL=F, what ticker format do they use?",
+    "should_trigger": false
+  },
+  {
+    "query": "How do I add a scheduled step to Hermes for a daily 18:15 UTC pull?",
+    "should_trigger": false
+  },
+  {
+    "query": "Who are the main actors in the energy sector network?",
+    "should_trigger": false
+  }
+]

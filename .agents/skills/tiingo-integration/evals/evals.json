@@ -1,0 +1,41 @@
+{
+  "skill_name": "tiingo-integration",
+  "evals": [
+    {
+      "id": 1,
+      "prompt": "Write the call to fetch SPY daily prices from 2024-01-01 and store them the way GRID expects.",
+      "expected_output": "Correct endpoint, Token header, params; store `close` not adjClose into raw_series as YF:SPY:<field>.",
+      "files": [],
+      "expectations": [
+        "Uses GET https://api.tiingo.com/tiingo/daily/SPY/prices with startDate/endDate/format=json",
+        "Authenticates with the header 'Authorization: Token <TIINGO_API_KEY>' read from config/env, not hardcoded",
+        "Writes series ids as YF:SPY:close etc. (same format as yfinance) to raw_series",
+        "Uses close, not adjClose, because GRID does not adjust for splits in raw_series",
+        "Respects the ~0.2s inter-call pacing and uses batch inserts; points at ingestion/tiingo_pull.py rather than writing a new puller"
+      ]
+    },
+    {
+      "id": 2,
+      "prompt": "I need Tiingo data for ^VIX, CL=F and EURUSD=X.",
+      "expected_output": "Tiingo symbol format differs from yfinance; these three don't map directly.",
+      "files": [],
+      "expectations": [
+        "States Tiingo uses plain symbols with no ^ prefix, no =F suffix and no =X suffix",
+        "Does not pass ^VIX, CL=F or EURUSD=X verbatim to Tiingo",
+        "Warns that a 404 means the ticker is not on Tiingo (spelling or delisted) rather than an auth problem"
+      ]
+    },
+    {
+      "id": 3,
+      "prompt": "Add 300 new tickers with 5-year backfill plus news. Will we stay inside the Tiingo budget, and what do I need to do after pulling?",
+      "expected_output": "Bandwidth math (tens of MB vs 40GB/month), news key formats, then resolver step.",
+      "files": [],
+      "expectations": [
+        "Concludes the load is far below the 40GB/month Pro limit, with a per-ticker size estimate (prices ~5KB for 5y, news ~25KB for 50 articles)",
+        "Names the news series formats TIINGO_NEWS:{TICKER}:{url_hash} and TIINGO_NEWS:{TICKER}:daily_count",
+        "Says pulled prices must still be resolved into resolved_series (direct SQL) and need feature_registry / entity_map entries",
+        "Notes the Hermes overnight step (7h, 02:00-06:00 UTC) pulls only last 5 days of prices and 3 days of news, so a backfill is a separate manual job"
+      ]
+    }
+  ]
+}

@@ -27,6 +27,7 @@ from loguru import logger as log
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+from utils.redaction import redact_secrets
 
 _FIRMS_BASE = "https://firms.modaps.eosdis.nasa.gov/api/country/csv"
 _SERIES_PREFIX = "nasa_firms"
@@ -78,8 +79,12 @@ class NASAFirePuller(BasePuller):
         try:
             df = self._fetch_csv(days=days)
         except Exception as exc:
-            log.error("NASA FIRMS pull failed: {e}", e=str(exc))
-            return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)}
+            # The MAP_KEY is a URL path segment, so HTTPError text carries
+            # it; redact before it reaches the journal or pull_log. An
+            # upstream failure is a WARNING, not an application bug.
+            err = redact_secrets(str(exc))
+            log.warning("NASA FIRMS pull failed: {e}", e=err)
+            return {"status": "FAILED", "rows_inserted": 0, "error": err}
         if df.empty:
             return {"status": "SUCCESS", "rows_inserted": 0}
 
