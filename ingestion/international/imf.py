@@ -2,16 +2,20 @@
 GRID IMF IFS and WEO ingestion module.
 
 WEO indicators come from the IMF DataMapper JSON API (annual actuals and
-projections; future years are not stored). IFS series still go through the
-imfdatapy library, whose client targets the retired dataservices.imf.org host
-— those pulls are reported as SKIPPED until the module moves to the IMF
-SDMX 3.0 API at api.imf.org.
+projections; future years are not stored). The former IFS series come from
+the IMF SDMX 3.0 data API (api.imf.org), which replaced IFS with topical
+dataflows: quarterly national accounts (QNEA) and balance of payments (BOP).
+
+2026-11-04: the imfdatapy client this module used targeted the retired
+dataservices.imf.org host (NXDOMAIN), so every IFS pull was SKIPPED with a
+warning (10 lines/day), and the library also wrote a log file into the
+working directory on every call. imfdatapy is no longer imported.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import pandas as pd
@@ -20,14 +24,22 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
+from ingestion.international import sdmx_json
 
-# IMF IFS series: (search_terms, period, country) -> feature name
-IMF_IFS_SERIES: dict[tuple[str, str, str], str] = {
-    ("gross domestic product, real", "Q", "US"): "us_gdp_real_imf",
-    ("gross domestic product, real", "Q", "CN"): "china_gdp_real_imf",
-    ("gross domestic product, real", "Q", "DE"): "germany_gdp_real_imf",
-    ("current account, total", "Q", "US"): "us_current_account_imf",
-    ("current account, total", "Q", "CN"): "china_current_account_imf",
+# Former IFS targets -> IMF SDMX 3.0 (flow, key). Keys verified by probe
+# from grid-svr 2026-11-04:
+#   QNEA COUNTRY.INDICATOR.PRICE_TYPE.S_ADJUSTMENT.TYPE_OF_TRANSFORMATION.FREQUENCY
+#        B1GQ = GDP, Q = chain-linked volume (real), SA/NSA, XDC = national currency
+#   BOP  COUNTRY.BOP_ACCOUNTING_ENTRY.INDICATOR.UNIT.FREQUENCY
+#        NETCD_T = net (credit - debit), CAB = current account balance, USD
+# China publishes no seasonally adjusted real GDP level to the IMF, so its
+# series is NSA (compare it year over year, not quarter over quarter).
+IMF_IFS_SERIES: dict[str, tuple[str, str]] = {
+    "us_gdp_real_imf": ("QNEA", "USA.B1GQ.Q.SA.XDC.Q"),
+    "china_gdp_real_imf": ("QNEA", "CHN.B1GQ.Q.NSA.XDC.Q"),
+    "germany_gdp_real_imf": ("QNEA", "DEU.B1GQ.Q.SA.XDC.Q"),
+    "us_current_account_imf": ("BOP", "USA.NETCD_T.CAB.USD.Q"),
+    "china_current_account_imf": ("BOP", "CHN.NETCD_T.CAB.USD.Q"),
 }
 
 # WEO extraction targets: (subject_code, country) -> feature name
@@ -45,12 +57,12 @@ IMF_WEO_TARGETS: dict[tuple[str, str], str] = {
 
 _RATE_LIMIT_DELAY: float = 3.0
 
-# imfdatapy's IFS client still targets dataservices.imf.org, the SDMX host the
-# IMF retired in 2025; the name no longer resolves, so every IFS pull failed
-# with a NameResolutionError and landed in errors.jsonl. Treat that as an
-# upstream outage (warning + SKIPPED), not an application error.
+# Transport-level failures of an IMF host are an upstream outage (warning +
+# SKIPPED), not an application error.
 _UPSTREAM_OUTAGE_MARKERS: tuple[str, ...] = (
     "dataservices.imf.org",
+    "Read timed out",
+    "ConnectTimeout",
     "NameResolutionError",
     "Failed to resolve",
     "Max retries exceeded",
@@ -123,16 +135,13 @@ class IMFPuller(BasePuller):
 
     def pull_ifs(
         self,
-        search_terms: str,
-        period: str,
-        country: str,
+        feature_name: str,
         start: str = "2000",
         end: str | None = None,
     ) -> dict[str, Any]:
-        """Pull a single IFS series using imfdatapy."""
-        key = (search_terms, period, country)
-        feature_name = IMF_IFS_SERIES.get(key, f"imf_ifs_{country.lower()}")
-        log.info("Pulling IMF IFS: {fn} ({ct})", fn=feature_name, ct=country)
+        """Pull one former-IFS series from the IMF SDMX 3.0 API."""
+        flow, key = IMF_IFS_SERIES[feature_name]
+        log.info("Pulling IMF {fl} {k} ({fn})", fl=flow, k=key, fn=feature_name)
 
         result: dict[str, Any] = {
             "series_id": feature_name,
@@ -142,72 +151,43 @@ class IMFPuller(BasePuller):
         }
 
         try:
-            from imfdatapy.imf import IFS
+            observations = sdmx_json.fetch_imf_series(flow, key, start)
+            if end:
+                end_dt = self._parse_period(str(end)[:7]) or date.max
+                observations = [(d, v) for d, v in observations if d <= end_dt]
 
-            ifs = IFS(search_terms=search_terms, period=period, countries=[country])
-            df = ifs.download_data()
-
-            if df is None or df.empty:
+            if not observations:
                 result["status"] = "PARTIAL"
-                result["errors"].append("No data returned from IFS")
+                result["errors"].append(f"IMF {flow}/{key} returned no observations")
                 return result
 
             inserted = 0
             with self.engine.begin() as conn:
-                for idx, row in df.iterrows():
-                    try:
-                        # imfdatapy returns period as index or column
-                        if isinstance(idx, str):
-                            obs_dt = self._parse_period(idx)
-                        elif hasattr(idx, "date"):
-                            obs_dt = idx.date() if callable(idx.date) else idx.date
-                        else:
-                            obs_dt = pd.Timestamp(str(idx)).date()
-
-                        if obs_dt is None:
-                            continue
-
-                        # Get the first numeric column
-                        value = None
-                        for col in df.columns:
-                            try:
-                                value = float(row[col])
-                                break
-                            except (ValueError, TypeError):
-                                continue
-
-                        if value is None or pd.isna(value):
-                            continue
-
-                        if self._row_exists(feature_name, obs_dt, conn):
-                            continue
-
-                        conn.execute(
-                            text(
-                                "INSERT INTO raw_series "
-                                "(series_id, source_id, obs_date, value, pull_status) "
-                                "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                            ),
-                            {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
-                        )
-                        inserted += 1
-                    except Exception as row_exc:
-                        log.debug("Skipping IFS row: {err}", err=str(row_exc))
+                for obs_dt, value in observations:
+                    if self._row_exists(feature_name, obs_dt, conn):
                         continue
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                        ),
+                        {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
+                    )
+                    inserted += 1
 
             result["rows_inserted"] = inserted
-            log.info("IMF IFS {fn}: inserted {n} rows", fn=feature_name, n=inserted)
+            log.info("IMF {fn}: inserted {n} rows", fn=feature_name, n=inserted)
 
         except Exception as exc:
-            if is_upstream_outage(exc):
+            if is_upstream_outage(exc) or isinstance(exc, (requests.RequestException, ValueError)):
                 log.warning(
-                    "IMF IFS {fn} skipped — imfdatapy targets the retired "
-                    "dataservices.imf.org SDMX host: {err}",
-                    fn=feature_name, err=str(exc)[:200],
+                    "IMF {fn} ({fl}/{k}) unavailable: {err}",
+                    fn=feature_name, fl=flow, k=key, err=str(exc)[:200],
                 )
-                result["status"] = "SKIPPED"
+                result["status"] = "SKIPPED" if is_upstream_outage(exc) else "FAILED"
             else:
-                log.error("IMF IFS pull failed: {err}", err=str(exc))
+                log.error("IMF pull failed for {fn}: {err}", fn=feature_name, err=str(exc))
                 result["status"] = "FAILED"
             result["errors"].append(str(exc))
 
@@ -216,17 +196,7 @@ class IMFPuller(BasePuller):
 
     @staticmethod
     def _parse_period(period_str: str) -> date | None:
-        try:
-            if "Q" in period_str:
-                year, q = period_str.split("Q")
-                return date(int(year), (int(q) - 1) * 3 + 1, 1)
-            elif len(period_str) == 7:
-                return datetime.strptime(period_str, "%Y-%m").date()
-            elif len(period_str) == 4:
-                return date(int(period_str), 1, 1)
-        except (ValueError, TypeError):
-            pass
-        return None
+        return sdmx_json.parse_period(period_str)
 
     def pull_weo(self, max_year: int | None = None) -> dict[str, Any]:
         """Pull the WEO targets from the IMF DataMapper API.
@@ -307,10 +277,9 @@ class IMFPuller(BasePuller):
         log.info("Starting IMF bulk pull from {sd}", sd=start_date)
         results: list[dict[str, Any]] = []
 
-        start_year = str(start_date)[:4]
-        for (terms, period, country), _fn in IMF_IFS_SERIES.items():
-            res = self.pull_ifs(terms, period, country, start=start_year)
-            results.append(res)
+        start_year = sdmx_json.lookback_start_year(start_date) or "2000"
+        for feature_name in IMF_IFS_SERIES:
+            results.append(self.pull_ifs(feature_name, start=start_year))
 
         weo_result = self.pull_weo()
         results.append(weo_result)

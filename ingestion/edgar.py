@@ -44,6 +44,38 @@ TOP_HEDGE_FUND_CIKS: list[str] = [f.cik.zfill(10) for f in VERIFIED_FILERS]
 _RATE_LIMIT_DELAY: float = 0.12  # SEC asks for <=10 req/sec
 
 
+# SEC's fair-access filter rejects a User-Agent whose contact address is not
+# a deliverable email. The old default "GRID Trading System grid@localhost"
+# drew HTTP 403 on every www.sec.gov/Archives request -- including the past
+# quarter full-index (.../full-index/2026/QTR1/form.gz), which is what the
+# "8-K count pull failed: ... 403 for past quarter 2026Q1" ERROR was. Probe
+# from grid-svr 2026-11-04: that UA -> 403, "GRID Research ops@stepdad.finance"
+# -> 200 on the same URL. Same contact as ingestion/altdata/sec_xbrl_financials.py.
+DEFAULT_SEC_IDENTITY: str = "GRID Intelligence ops@stepdad.finance"
+
+
+def resolve_sec_identity(identity: str | None = None) -> str:
+    """Return the SEC User-Agent identity: explicit, then config, then default.
+
+    A value without a deliverable-looking email (no ``@``, or ``@localhost``)
+    is rejected by SEC, so it is replaced by the default rather than used.
+    """
+    candidates: list[str] = []
+    if identity:
+        candidates.append(identity)
+    try:
+        from config import settings
+
+        if getattr(settings, "SEC_USER_AGENT", ""):
+            candidates.append(settings.SEC_USER_AGENT)
+    except Exception:  # noqa: BLE001 — config import is optional in tests/tools
+        pass
+    for cand in candidates:
+        if re.search(r"@[A-Za-z0-9-]+\.[A-Za-z]{2,}", cand) and "@localhost" not in cand:
+            return cand.strip()
+    return DEFAULT_SEC_IDENTITY
+
+
 class EDGARPuller(BasePuller):
     """Pulls SEC filing data from EDGAR into ``raw_series``.
 
@@ -63,15 +95,17 @@ class EDGARPuller(BasePuller):
     def __init__(
         self,
         db_engine: Engine,
-        identity: str = "GRID Trading System grid@localhost",
+        identity: str | None = None,
     ) -> None:
         """Initialise the EDGAR puller.
 
         Parameters:
             db_engine: SQLAlchemy engine connected to the GRID database.
             identity: User-agent identity string for SEC EDGAR compliance.
+                Defaults to ``settings.SEC_USER_AGENT``, then to
+                :data:`DEFAULT_SEC_IDENTITY`.
         """
-        set_identity(identity)
+        set_identity(resolve_sec_identity(identity))
         super().__init__(db_engine)
         log.info("EDGARPuller initialised — source_id={sid}", sid=self.source_id)
 
@@ -535,7 +569,8 @@ class EDGARPuller(BasePuller):
                 )
             else:
                 msg = f"8-K count pull failed: {exc}"
-            log.error(msg)
+            # Upstream access/network failure: operational, not a code bug.
+            log.warning(msg)
             errors.append(msg)
 
         log.info("8-K count pull complete — {n} rows inserted", n=total_inserted)

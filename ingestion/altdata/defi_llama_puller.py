@@ -39,7 +39,16 @@ _HISTORICAL_CHAIN_TVL_URL: str = f"{_BASE_URL}/v2/historicalChainTvl"
 # The free OpenAPI operation overrides the TVL server for stablecoins.
 # api.llama.fi/stablecoins returns 404; this is a separate public service.
 _STABLECOINS_URL: str = "https://stablecoins.llama.fi/stablecoins"
-_BRIDGES_URL: str = f"{_BASE_URL}/bridges"
+# Bridges moved off api.llama.fi (404) to bridges.llama.fi, which now answers
+# HTTP 402 "Upgrade to the paid API plan" (probed from grid-svr 2026-11-04).
+# The free tier no longer serves bridge volumes, so pull_all() leaves bridges
+# out by default instead of failing that item (and turning every DeFi Llama
+# run PARTIAL) each cycle. Pass include_bridges=True with a paid plan.
+_BRIDGES_URL: str = "https://bridges.llama.fi/bridges"
+_BRIDGES_PAID_ONLY_REASON: str = (
+    "DeFi Llama bridge volumes are paid-API only (bridges.llama.fi answers 402)"
+)
+_bridges_skip_logged: bool = False
 _YIELDS_URL: str = f"{_BASE_URL}/yields/pools"
 
 # Series ID prefix
@@ -595,12 +604,14 @@ class DefiLlamaPuller(BasePuller):
         self,
         chains: list[str] | None = None,
         days_back: int = 90,
+        include_bridges: bool = False,
     ) -> list[dict[str, Any]]:
         """Pull all DeFi Llama data sources.
 
         Parameters:
             chains: List of chain names for TVL history. Defaults to MAJOR_CHAINS.
             days_back: Days of chain TVL history to fetch.
+            include_bridges: Also pull bridge volumes (paid DeFi Llama plan only).
 
         Returns:
             List of result dicts (one per data source).
@@ -624,9 +635,15 @@ class DefiLlamaPuller(BasePuller):
         results.append({"source": "stablecoins", **stable_result})
         time.sleep(_RATE_LIMIT_DELAY)
 
-        # 4. Bridges
-        bridge_result = self.pull_bridges()
-        results.append({"source": "bridges", **bridge_result})
+        # 4. Bridges -- paid-API only since 2026; opt-in.
+        if include_bridges:
+            bridge_result = self.pull_bridges()
+            results.append({"source": "bridges", **bridge_result})
+        else:
+            global _bridges_skip_logged
+            if not _bridges_skip_logged:
+                _bridges_skip_logged = True
+                log.info("DeFi Llama: bridges not pulled — {r}", r=_BRIDGES_PAID_ONLY_REASON)
 
         succeeded = sum(1 for r in results if r.get("status") == "SUCCESS")
         total_rows = sum(r.get("rows_inserted", 0) for r in results)

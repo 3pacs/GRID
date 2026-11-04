@@ -594,11 +594,34 @@ class TestPullAll:
         ):
             results = p.pull_all()
 
-        assert len(results) == 4
+        # Bridges are paid-API only (bridges.llama.fi answers 402): not
+        # pulled by default, so they cannot turn every run PARTIAL.
+        assert len(results) == 3
         mock_proto.assert_called_once()
         mock_chain.assert_called_once()
         mock_stable.assert_called_once()
+        mock_bridge.assert_not_called()
+
+    @patch("ingestion.altdata.defi_llama_puller.time.sleep")
+    def test_pull_all_include_bridges_opt_in(self, mock_sleep, puller):
+        p, engine, conn = puller
+
+        with (
+            patch.object(p, "pull_protocols", return_value={"status": "SUCCESS", "rows_inserted": 10}),
+            patch.object(p, "pull_chain_tvl", return_value={"status": "SUCCESS", "rows_inserted": 20}),
+            patch.object(p, "pull_stablecoins", return_value={"status": "SUCCESS", "rows_inserted": 5}),
+            patch.object(p, "pull_bridges", return_value={"status": "SUCCESS", "rows_inserted": 3}) as mock_bridge,
+        ):
+            results = p.pull_all(include_bridges=True)
+
+        assert len(results) == 4
+        assert results[-1]["source"] == "bridges"
         mock_bridge.assert_called_once()
+
+    def test_bridges_url_is_not_the_dead_api_host(self):
+        from ingestion.altdata import defi_llama_puller as mod
+
+        assert mod._BRIDGES_URL == "https://bridges.llama.fi/bridges"
 
     @patch("ingestion.altdata.defi_llama_puller.time.sleep")
     def test_pull_all_continues_on_failure(self, mock_sleep, puller):
@@ -612,7 +635,7 @@ class TestPullAll:
         ):
             results = p.pull_all()
 
-        assert len(results) == 4
+        assert len(results) == 3
         statuses = [r["status"] for r in results]
         assert statuses[0] == "FAILED"
         assert statuses[1] == "SUCCESS"

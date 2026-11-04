@@ -1305,7 +1305,9 @@ PULLER_REGISTRY: list[dict[str, Any]] = [
         "mod": "ingestion.altdata.gdelt",
         "cls": "GDELTPuller",
         "method": "pull_recent",
-        "freq_h": 0.083,
+        # GDELT answers grid-svr with 429 even for single requests at a
+        # 5-minute cadence (2026-11-04); hourly is within its tolerance.
+        "freq_h": 1,
         "timeout_s": 60,
         "kwargs": {
             "days_back": 1,

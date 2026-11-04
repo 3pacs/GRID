@@ -3,7 +3,7 @@ Solana top-volume universe snapshotter.
 
 Every 4 hours (or whenever the scheduler calls :meth:`ingest_once`):
 
-  1. Pull a candidate universe from Jupiter's strict token list
+  1. Pull a candidate universe from Jupiter's verified token list (Tokens API v2)
      (~1000 verified Solana tokens).
   2. Fetch 24h volume and pair stats for each candidate via DexScreener,
      aggregating across all of a token's pairs.
@@ -52,10 +52,33 @@ from trading.solana.safety import SolanaSafetyChecker, TokenSafetyReport
 # Constants — DexScreener / Jupiter
 # ----------------------------------------------------------------------
 _DEX_BASE = "https://api.dexscreener.com"
-_JUPITER_STRICT_URL = "https://token.jup.ag/strict"
+# token.jup.ag (the v1 "strict" list) was retired and no longer resolves
+# ("[Errno -5] No address associated with hostname" every 4h run, so the
+# universe was always empty). Jupiter's keyless Tokens API v2 serves the
+# verified list (~4.1k tokens, each with ``id`` = mint and ``stats24h``);
+# probed from grid-svr 2026-11-04.
+_JUPITER_VERIFIED_URL = "https://lite-api.jup.ag/tokens/v2/tag?query=verified"
+_JUPITER_STRICT_URL = _JUPITER_VERIFIED_URL  # backward-compatible name
+# The verified list is ~4x the old strict list; cap the DexScreener fan-out
+# to the most-traded candidates (by Jupiter's own 24h volume) so a run stays
+# around the old ~1000-token / 34-batch budget.
+_MAX_CANDIDATES = 1000
 _DEX_BATCH_SIZE = 30               # DexScreener tokens endpoint limit
 _DEX_REQUEST_DELAY = 0.25          # 4 req/s = 240 req/min (under 300 cap)
 _DEFAULT_HTTP_TIMEOUT = 15.0
+
+
+def _jupiter_volume_24h(token: dict[str, Any]) -> float:
+    """Jupiter v2 24h buy+sell volume (USD); 0.0 when absent or malformed."""
+    stats = token.get("stats24h")
+    if not isinstance(stats, dict):
+        return 0.0
+    total = 0.0
+    for key in ("buyVolume", "sellVolume"):
+        val = stats.get(key)
+        if isinstance(val, (int, float)) and not isinstance(val, bool) and val == val:
+            total += float(val)
+    return total
 
 
 # ----------------------------------------------------------------------
@@ -122,6 +145,14 @@ class JupiterDexScreenerProvider:
         timeout: float = _DEFAULT_HTTP_TIMEOUT,
         client: httpx.Client | None = None,
     ) -> None:
+        if "token.jup.ag" in (jupiter_tokens_url or ""):
+            # config.SOLANA_UNIVERSE_JUPITER_URL still defaults to the retired
+            # host; a dead URL can only ever yield an empty universe.
+            log.info(
+                "Jupiter token list {old} is retired; using {new}",
+                old=jupiter_tokens_url, new=_JUPITER_VERIFIED_URL,
+            )
+            jupiter_tokens_url = _JUPITER_VERIFIED_URL
         self._jupiter_url = jupiter_tokens_url
         self._dex_base = dex_base_url.rstrip("/")
         self._batch_size = max(1, min(batch_size, _DEX_BATCH_SIZE))
@@ -150,7 +181,7 @@ class JupiterDexScreenerProvider:
     def list_top_by_volume(self, limit: int) -> list[TokenVolumeSnapshot]:
         universe = self._fetch_jupiter_universe()
         if not universe:
-            log.warning("Jupiter strict list was empty; universe is empty")
+            log.warning("Jupiter verified token list was empty; universe is empty")
             return []
 
         log.info(
@@ -190,16 +221,28 @@ class JupiterDexScreenerProvider:
                 exc, (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout)
             )
             log_fn = log.warning if is_transient else log.error
-            log_fn("Jupiter strict list fetch failed: {e}", e=str(exc))
+            log_fn("Jupiter verified token list fetch failed: {e}", e=str(exc))
             return []
         if not isinstance(data, list):
-            log.warning("Jupiter strict list unexpected shape: {t}", t=type(data))
+            log.warning("Jupiter verified token list unexpected shape: {t}", t=type(data))
             return []
-        return [
-            {"address": t["address"], "symbol": t.get("symbol"), "name": t.get("name")}
-            for t in data
-            if isinstance(t, dict) and isinstance(t.get("address"), str)
-        ]
+        tokens: list[tuple[float, dict[str, Any]]] = []
+        for t in data:
+            if not isinstance(t, dict):
+                continue
+            # v2 names the mint ``id``; the retired strict list used ``address``.
+            mint = t.get("id") if isinstance(t.get("id"), str) else t.get("address")
+            if not isinstance(mint, str):
+                continue
+            tokens.append((
+                _jupiter_volume_24h(t),
+                {"address": mint, "symbol": t.get("symbol"), "name": t.get("name")},
+            ))
+        if len(tokens) > _MAX_CANDIDATES:
+            # Stable sort keeps upstream order among equal (e.g. unknown) volumes.
+            tokens.sort(key=lambda pair: pair[0], reverse=True)
+            tokens = tokens[:_MAX_CANDIDATES]
+        return [tok for _, tok in tokens]
 
     # ------------------------------------------------------------------
     # Internal — DexScreener

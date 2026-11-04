@@ -797,7 +797,7 @@ class Settings(BaseSettings):
     SOLANA_UNIVERSE_LIMIT: int = 250
     SOLANA_UNIVERSE_CRON: str = "0 */4 * * *"          # every 4 hours
     SOLANA_UNIVERSE_ENRICH_ON_INSERT: bool = True
-    SOLANA_UNIVERSE_JUPITER_URL: str = "https://token.jup.ag/strict"
+    SOLANA_UNIVERSE_JUPITER_URL: str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified"  # token.jup.ag retired
     SOLANA_UNIVERSE_DEX_BATCH: int = 30
 
     # Solana real-time ingest + cross-reference

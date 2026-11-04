@@ -125,15 +125,19 @@ class SECVelocityPuller(BasePuller):
     def __init__(
         self,
         db_engine: Engine,
-        identity: str = "GRID Trading System grid@localhost",
+        identity: str | None = None,
     ) -> None:
         """Initialise the SEC velocity puller.
 
         Parameters:
             db_engine: SQLAlchemy engine connected to the GRID database.
-            identity: User-agent identity for SEC EDGAR compliance.
+            identity: User-agent identity for SEC EDGAR compliance. Resolved by
+                ingestion.edgar.resolve_sec_identity (SEC rejects
+                "grid@localhost" with 403).
         """
-        set_identity(identity)
+        from ingestion.edgar import resolve_sec_identity
+
+        set_identity(resolve_sec_identity(identity))
         super().__init__(db_engine)
         log.info("SECVelocityPuller initialised — source_id={sid}", sid=self.source_id)
 

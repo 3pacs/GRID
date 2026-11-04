@@ -111,16 +111,18 @@ class TestEdgar8KBreaker:
 
 
 class TestMASCooldown:
-    """All four MAS resources share one upstream API — when it's sick,
-    the second/third/fourth calls don't add information.
+    """The legacy MAS datastore API (whose sickness the old 6h cooldown
+    absorbed) is retired; MAS must not call it at all any more, and the
+    series with no keyless source are reported once per process.
     """
 
-    def test_cooldown_globals_exist(self):
+    def test_legacy_datastore_api_not_used(self):
+        import inspect
+
         from ingestion.international import mas
-        assert hasattr(mas, "_API_COOLDOWN_UNTIL")
-        assert hasattr(mas, "_API_COOLDOWN_SECONDS")
-        # Must be at least an hour so we don't immediately retry.
-        assert mas._API_COOLDOWN_SECONDS >= 3600
+
+        assert "api/action/datastore" not in inspect.getsource(mas.MASPuller)
+        assert set(mas.MAS_UNAVAILABLE_SERIES) >= {"singapore_sora", "singapore_sibor_3m"}
 
 
 # ---------------------------------------------------------------------------

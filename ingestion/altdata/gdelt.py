@@ -136,6 +136,12 @@ _GDELT_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "data", "g
 _CONFLICT_CODES = {14, 15, 16, 17, 18, 19, 20}
 _RATE_LIMIT_DELAY: float = 1.0
 
+# DOC API (connect, read) timeouts. GDELT routinely takes 10-13 s just to
+# answer a request with HTTP 429 (probed from grid-svr 2026-11-04), so the
+# old flat 10 s read timeout turned every throttled request into a
+# "Read timed out" warning instead of a clean 429.
+_DOC_API_TIMEOUT: tuple[float, float] = (10.0, 30.0)
+
 # GDELT DOC API rate limit. The public DOC 2.0 endpoint starts returning
 # HTTP 429 above ~12 requests / 60s. We enforce that sustained rate with a
 # shared token bucket (≈ 5s between requests, small burst allowance) across
@@ -374,7 +380,7 @@ class GDELTPuller(BasePuller):
             "maxrecords": 250,
         }
         self._acquire_doc_token()
-        resp = requests.get(_GDELT_API_URL, params=params, timeout=10)
+        resp = requests.get(_GDELT_API_URL, params=params, timeout=_DOC_API_TIMEOUT)
         if resp.status_code in {400, 403, 404, 429, 500, 502, 503, 504}:
             log.info(
                 "GDELT query skipped status={status} query={query}",
@@ -635,6 +641,25 @@ class GDELTPuller(BasePuller):
 
     # ── Main pull methods ───────────────────────────────────────────────
 
+    def pull_all(self, **kwargs: Any) -> dict[str, Any]:
+        """Bounded recent pull -- the entry point generic callers expect.
+
+        ``scripts/hermes_fixers.py`` retries a failed source via
+        ``pull_all()``; GDELTPuller had none, so every GDELT repair attempt
+        failed with ``AttributeError`` (6 warnings/day). Defaults mirror the
+        SmartScheduler "gdelt" entry: one day, four theme queries, no actor
+        or tension fan-out.
+        """
+        params: dict[str, Any] = {
+            "days_back": 1,
+            "max_theme_queries": 4,
+            "include_actor_tones": False,
+            "include_tensions": False,
+            "include_signals": False,
+        }
+        params.update(kwargs)
+        return self.pull_recent(**params)
+
     def pull_recent(
         self,
         days_back: int = 30,
@@ -665,7 +690,7 @@ class GDELTPuller(BasePuller):
         if max_theme_queries is not None:
             theme_queries = GDELT_QUERIES[:max(0, max_theme_queries)]
 
-        for query_def in theme_queries:
+        for q_idx, query_def in enumerate(theme_queries):
             try:
                 data = self._fetch_gdelt_api(
                     query_def["query"],
@@ -673,6 +698,20 @@ class GDELTPuller(BasePuller):
                     f"{days_back}d",
                 )
                 feature = query_def["feature"]
+                if data.get("http_status") == 429:
+                    # GDELT is throttling this host: more queries this run
+                    # only deepen the penalty. Stop and let the scheduler's
+                    # failure cooldown space the next attempt.
+                    remaining = len(theme_queries) - q_idx - 1
+                    log.info(
+                        "GDELT DOC API rate-limited (429); skipping the remaining "
+                        "{n} theme queries this run",
+                        n=remaining,
+                    )
+                    result["errors"].append(
+                        f"GDELT DOC API rate-limited (HTTP 429); {remaining} theme queries not attempted"
+                    )
+                    break
 
                 # Parse timeline data. The DOC API always wraps points one
                 # level deeper than they look: ``timeline`` is a list of
@@ -711,6 +750,19 @@ class GDELTPuller(BasePuller):
                             except (ValueError, TypeError):
                                 continue
 
+            except (requests.Timeout, requests.ConnectionError) as exc:
+                # One unreachable/overloaded DOC API answer stands for the
+                # whole run: log once, stop, and let the cooldown back off.
+                remaining = len(theme_queries) - q_idx - 1
+                log.warning(
+                    "GDELT DOC API unavailable ({feature}): {err}; skipping the "
+                    "remaining {n} theme queries this run",
+                    feature=query_def["feature"],
+                    err=str(exc)[:200],
+                    n=remaining,
+                )
+                result["errors"].append(str(exc))
+                break
             except Exception as exc:
                 log.warning(
                     "GDELT query unavailable for {feature}: {err}",
