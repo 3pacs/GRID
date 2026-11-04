@@ -10,13 +10,13 @@ Contains:
 
 from __future__ import annotations
 
-import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from loguru import logger as log
 
 from alerts.cadence import cadence_for_source, is_excluded, is_stale
+from utils.redaction import redact_secrets
 
 
 # Import constants from the main module
@@ -780,35 +780,9 @@ _NOT_CONFIGURED_MARKERS = (
 )
 
 
-_URL_QUERY_RE = re.compile(r"(https?://[^\s?#'\"<>]+)\?[^\s'\"<>)]*")
-# Any scheme (postgresql://, redis://, ...); greedy up to the last "@"
-# before the host so passwords containing "@" are covered too.
-_URL_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s'\"<>]*@")
-# key=value, key: value, "key": "value", 'key'='value' -- the key may be
-# quoted, and a quoted value is redacted whole (spaces included). An
-# unterminated quote (pull_log truncates messages at 500 chars) is redacted
-# to the end of the text.
-_SECRET_ASSIGN_RE = re.compile(
-    r"(?i)\b([a-z0-9_]*(?:api[_-]?key|apikey|token|secret|password|passwd|auth)[a-z0-9_]*['\"]?\s*[=:]\s*)"
-    r"(?:\"[^\"]*(?:\"|$)|'[^']*(?:'|$)|[^\s,&'\"}]+)"
-)
-_BEARER_RE = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
-
-
 def redact_reason(reason: str | None) -> str | None:
-    """Strip credentials from a pull_log error before it leaves the DB.
-
-    Pull errors embed request URLs (FRED-style ``?api_key=...``) and
-    occasionally ``token=...`` text; these reasons go into alert emails and
-    the Hermes LLM prompt. Drops URL query strings and userinfo entirely and
-    masks key/token/secret/password assignments.
-    """
-    if reason is None:
-        return None
-    text_ = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", str(reason))
-    text_ = _URL_QUERY_RE.sub(r"\1?[REDACTED]", text_)
-    text_ = _BEARER_RE.sub(r"\1 [REDACTED]", text_)
-    return _SECRET_ASSIGN_RE.sub(r"\1[REDACTED]", text_)
+    """Strip credentials from a pull_log reason (see utils.redaction)."""
+    return redact_secrets(reason)
 
 
 def is_not_configured_reason(reason: str | None) -> bool:
