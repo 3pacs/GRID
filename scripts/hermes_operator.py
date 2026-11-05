@@ -42,6 +42,87 @@ NOTE (hermes/scheduler split, verified 2026-04-13):
 
 from __future__ import annotations
 
+# A selected FINRA workflow is a finite invocation, never a daemon cycle.
+# Its actual entry origin precedes selection parsing, imports and source reads.
+def _hermes_finra_bootstrap(argv, *, entry_t0, clock):
+    if not (type(entry_t0) is float and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    last = entry_t0
+    def check():
+        nonlocal last
+        value = clock()
+        if not (type(value) in (int, float) and value == value
+                and last <= value < entry_t0 + 450):
+            raise ValueError("FINRA_ENTRY_BOUND")
+        last = value
+    try:
+        check()
+        if any(type(a) is not str or a.startswith("--sec-") for a in argv):
+            return 2
+        import runpy
+        from pathlib import Path
+        check()
+        scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+        check()
+        runpy.run_path(str(scheduler), run_name="__hermes_finra_only__",
+                       init_globals={"HERMES_FINRA_ONLY_ARGS": list(argv),
+                                     "HERMES_FINRA_ENTRY_ORIGIN": entry_t0,
+                                     "HERMES_FINRA_CLOCK": clock})
+    except SystemExit:
+        raise
+    except BaseException:
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _finra_sys
+    if any(type(a) is str and a.startswith("--finra-") for a in _finra_sys.argv[1:]):
+        from time import monotonic as _finra_clock
+        try:
+            _finra_origin = _finra_clock()
+        except BaseException:
+            _finra_origin = None
+        raise SystemExit(_hermes_finra_bootstrap(_finra_sys.argv[1:], entry_t0=_finra_origin, clock=_finra_clock))
+
+# SEC-only dispatch is deliberately before chdir, environment/config and heavy
+# imports. Ordinary invocations fall through byte-identical legacy startup.
+def _hermes_sec_bootstrap(argv, *, entry_t0, clock):
+    # The selected branch captures its actual origin before these imports/reads.
+    if not (type(entry_t0) in (int, float) and entry_t0 == entry_t0
+            and -float("inf") < entry_t0 < float("inf")):
+        return 2
+    try:
+        before_import = clock()
+        if not (type(before_import) in (int, float) and entry_t0 <= before_import < entry_t0 + 120):
+            return 2
+        import runpy
+        from pathlib import Path
+        now = clock()
+    except BaseException:
+        return 2
+    if not (type(now) in (int, float) and before_import <= now < entry_t0 + 120):
+        return 2
+    scheduler = Path(__file__).resolve().parents[1] / "ingestion" / "smart_scheduler.py"
+    runpy.run_path(str(scheduler), run_name="__hermes_sec_only__",
+                   init_globals={"HERMES_SEC_ONLY_ARGS": list(argv),
+                                 "HERMES_SEC_OUTER_ORIGIN": entry_t0,
+                                 "HERMES_SEC_CLOCK": clock})
+    return 2
+
+
+if __name__ == "__main__":
+    import sys as _sec_sys
+    if any(type(a) is str and a.startswith("--sec-") for a in _sec_sys.argv[1:]):
+        from time import monotonic as _sec_clock
+        try:
+            _sec_origin = _sec_clock()  # before runpy/pathlib/selection/source reads
+        except BaseException:
+            _sec_origin = None
+        raise SystemExit(_hermes_sec_bootstrap(_sec_sys.argv[1:], entry_t0=_sec_origin, clock=_sec_clock))
+
+
 import argparse
 import json
 import os
@@ -488,6 +569,11 @@ _SOURCE_ALIASES: dict[str, str] = {
     "institutional_flows":  "etf_flows",
 }
 
+def _usda_repair_start_year() -> int:
+    """Previous calendar year: a bounded USDA NASS repair window."""
+    return datetime.now(timezone.utc).year - 1
+
+
 # Entries that PULLER_REGISTRY structurally cannot carry (fn-based, audit-only
 # skip_runtime stubs) or that simply haven't been wired into the scheduler yet
 # but are catalogued for ``hermes_fixers._resolve_puller`` consumers.
@@ -521,6 +607,24 @@ _SOURCE_EXTRAS: dict[str, dict[str, Any]] = {
     "pmxt_archive":    {"mod": "ingestion.altdata.pmxt_archive",               "cls": "PmxtArchivePuller"},
     "pm_history":      {"mod": "ingestion.altdata.prediction_market_history",  "cls": "PredictionMarketHistoryPuller"},
     "warn_layoffs":    {"mod": "ingestion.altdata.warn_layoffs",               "cls": "WARNLayoffsPuller",     "interval_h": 24},
+    # Pullers scheduled from ingestion/scheduler.py (not PULLER_REGISTRY)
+    # whose catalog rows used to be routed to an unrelated writer by
+    # hermes_fixers._CATALOG_TO_REGISTRY (and refused there). Each class's
+    # SOURCE_NAME is its catalog name; keys/tokens are read by the class.
+    "polygon":          {"mod": "ingestion.altdata.polygon_puller",    "cls": "PolygonPuller",        "pull_method": "pull", "interval_h": 24},
+    "fmp":              {"mod": "ingestion.altdata.fmp_puller",        "cls": "FMPPuller",            "pull_method": "pull", "interval_h": 24},
+    "nasa_firms":       {"mod": "ingestion.altdata.nasa_firms_puller", "cls": "NASAFirmsPuller",      "pull_method": "pull", "interval_h": 24},
+    "treasury_auction": {"mod": "ingestion.altdata.treasury_auction",  "cls": "TreasuryAuctionPuller", "interval_h": 24},
+    "fed_h8":           {"mod": "ingestion.altdata.h8_bank_balance",   "cls": "H8BankBalancePuller",
+                         "api_key": "FRED_API_KEY", "api_key_mode": "first", "interval_h": 168},
+    # USDA NASS QuickStats (scheduled from ingestion/scheduler.py's weekly
+    # pulls). Its pull_all defaults to start_year=1970 -- a full-history
+    # backfill -- so a repair is bounded to the previous calendar year
+    # onward (callable kwarg, evaluated at retry time). Key passed as the
+    # api_key keyword, as ingestion/scheduler.py does.
+    "usda_nass":       {"mod": "ingestion.physical.usda_nass",                 "cls": "USDAPuller",
+                        "api_key": "USDA_NASS_API_KEY", "api_key_mode": "keyword",
+                        "pull_kwargs": {"start_year": _usda_repair_start_year}, "interval_h": 168},
     # FMP market-cap refresh for trial tickers (pull(), not pull_all()).
     "company_profiles_puller": {"mod": "ingestion.altdata.company_profiles_puller", "cls": "CompanyProfilesPuller", "pull_method": "pull", "interval_h": 24},
 
@@ -599,6 +703,10 @@ def _build_source_registry() -> dict[str, dict[str, Any]]:
             cfg["skip_runtime"] = entry["hold_reason"]
         if "api_key" in entry:
             cfg["api_key"] = entry["api_key"]
+            # The retry path constructs pullers with the scheduler's own
+            # convention (hermes_fixers._construct_retry_puller); the
+            # scheduler's default mode is "first".
+            cfg["api_key_mode"] = entry.get("api_key_mode", "first")
         method = entry.get("method")
         if method and method != "pull_all":
             cfg["pull_method"] = method
@@ -626,6 +734,17 @@ def _build_source_registry() -> dict[str, dict[str, Any]]:
     # shadowed by a stale extras stub).
     for name, cfg in _SOURCE_EXTRAS.items():
         registry.setdefault(name, dict(cfg))
+
+    # Catalog-name aliases derived from the scheduler's own source of truth
+    # (smart_scheduler.REGISTRY_CATALOG_NAMES / catalog_name_for): a failed
+    # or stale row is reported under its source_catalog name, which for
+    # these entries differs from the registry key. setdefault: an explicit
+    # entry always wins, and hermes_fixers still checks the class identity.
+    from ingestion.smart_scheduler import REGISTRY_CATALOG_NAMES
+    for name, catalog in REGISTRY_CATALOG_NAMES.items():
+        if name in registry:
+            alias = catalog.strip().lower().replace(" ", "_").replace("-", "_")
+            registry.setdefault(alias, registry[name])
 
     # Aliases: cfg-side names that point at the same underlying entry as a
     # PULLER_REGISTRY name. We share-reference deliberately so that runtime
@@ -779,7 +898,53 @@ from scripts.hermes_fixers import (  # noqa: E402, F401
     _hours_since,
     _execute_hermes_repair_command,
     _refresh_signal_registry,
+    _is_deterministic_retry_error,
+    _record_deterministic_failure,
+    repair_deterministically_blocked,
+    NoRetryHandler,
+    note_repair_failure,
+    note_repair_recovered,
 )
+
+
+# Stale-source entries already reported as not actionable by a retry
+# (once per process per source, not once per cycle).
+_STALE_NOT_ACTIONABLE_LOGGED: set[str] = set()
+# Stale sources _resolve_puller found no handler for (process lifetime: a
+# handler only appears with a deploy, which restarts the daemon).
+_STALE_NO_HANDLER: set[str] = set()
+
+
+def _stale_refresh_not_actionable(stale: dict[str, Any]) -> bool:
+    """True when a stale source must not take one of the 15 refresh slots.
+
+    Three cases, each logged once per process per source:
+      - ``not_configured`` — check_db_health saw the latest pull_log row
+        say the source has no key/token/SDK (an operator action, not a
+        retry). Read with ``.get`` so an older health payload without the
+        field behaves exactly as before.
+      - a deterministic repair failure recorded by hermes_fixers (code or
+        wiring defect, unset key) whose skip window is still active.
+      - an earlier cycle found no retry handler for it (_resolve_puller
+        raised NoRetryHandler before constructing anything). Handler-less
+        or mis-routed sources (finviz_fundamentals, ecb_tltro, polygon,
+        fmp, USDA_NASS, ...) each used a slot every cycle this way, logging
+        nothing after "Retrying X".
+    """
+    src = str(stale.get("source"))
+    reason: str | None = None
+    if stale.get("not_configured"):
+        reason = "not configured: " + str(stale.get("last_attempt_reason") or "no key/token/SDK")[:160]
+    else:
+        reason = repair_deterministically_blocked(src)
+    if reason is None and src in _STALE_NO_HANDLER:
+        reason = f"no retry handler for {src}"
+    if reason is None:
+        return False
+    if src not in _STALE_NOT_ACTIONABLE_LOGGED:
+        _STALE_NOT_ACTIONABLE_LOGGED.add(src)
+        log.info("Stale refresh skips {s} — {r}", s=src, r=reason)
+    return True
 
 
 # ─── Intelligence task runner (remains in this file) ────────────────────
@@ -3414,7 +3579,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
 
     if result.get("errors"):
         log.warning(
-            "Resolution completed with {e} worker error(s) — resolved={r}, "
+            "Resolution completed with {e} worker error(s) — inserted count={r} (None means unknown), "
             "watermark held at {w}",
             e=result["errors"], r=result.get("resolved", 0),
             w=getattr(state, "last_resolution", None),
@@ -3440,7 +3605,7 @@ def _run_resolution_step(engine: Any, state: OperatorState) -> dict[str, Any]:
             o=since, w=state.last_resolution,
         )
     log.info(
-        "Resolution: {r} rows resolved, {c} conflicts, {s} series in {t}s "
+        "Resolution: inserted count={r} (None means unknown), {c} conflicts, {s} series in {t}s "
         "(scanned through {w}, complete={k})",
         r=result.get("resolved", 0), c=result.get("conflicts_found", 0),
         s=result.get("series_scanned", 0), t=result.get("duration_s", 0),
@@ -3585,12 +3750,27 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
     stale_sources = health["db"].get("stale_sources", [])
     if stale_sources and not dry_run:
         stale_repulled = 0
-        for stale in stale_sources[:15]:  # up to 15 per cycle
+        stale_attempted = 0
+        for stale in stale_sources:
+            # Cooling sources must not consume the bounded repair slots.
+            # Count every admitted retry call, including skipped/no-handler
+            # results, and never start another after this cycle's deadline.
+            if stale_attempted >= 15 or time.monotonic() >= cycle_deadline:
+                break
             src = stale["source"]
+            # Sources whose latest pull said "no key/token/SDK", or that no
+            # retry handler can serve, cannot be refreshed by a retry; give
+            # the slots to fixable sources.
+            if _stale_refresh_not_actionable(stale):
+                continue
             state.current_step = f"stale_refresh:{src}"
             if state.cooldowns.can_retry(src):
+                stale_attempted += 1
                 try:
-                    pull_result = _retry_source(src, engine, attempt=1, state=state)
+                    pull_result = _retry_source(
+                        src, engine, attempt=1, state=state,
+                        should_continue=lambda: time.monotonic() < cycle_deadline,
+                    )
                     if pull_result.get("status") == "skipped" and pull_result.get("reason") == "in_flight":
                         log.info("Skipping stale refresh for {s} — repair already in flight", s=src)
                         continue
@@ -3600,6 +3780,7 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                         continue
                     if pull_result.get("outcome") == "NO_NEW_DATA":
                         state.cooldowns.record_attempt(src, success=True)
+                        note_repair_recovered(src)
                         log.info("Stale source {s} checked with no new writes; remains stale", s=src)
                         continue
                     not_fresh = retry_not_fresh_reason(pull_result)
@@ -3608,15 +3789,33 @@ def run_cycle(state: OperatorState, dry_run: bool = False) -> dict[str, Any]:
                         # _retry_source left last_pull_at alone (2026-09-29).
                         state.cooldowns.record_attempt(src, success=False, error=not_fresh)
                         log.info("Stale refresh for {s} did not refresh: {r}", s=src, r=not_fresh)
+                        if pull_result.get("reason") == "missing_api_key":
+                            _record_deterministic_failure(
+                                src, f"{pull_result.get('missing_api_key')} is not configured",
+                            )
+                        else:
+                            note_repair_failure(src, not_fresh)
                         continue
                     state.cooldowns.record_attempt(src, success=True)
+                    note_repair_recovered(src)
                     stale_repulled += 1
                     log.info("Proactively refreshed stale source: {s}", s=src)
+                except NoRetryHandler as exc:
+                    # Routing found nothing to run: not an attempt. Give the
+                    # slot back and skip this source in later cycles.
+                    stale_attempted -= 1
+                    _STALE_NO_HANDLER.add(src)
+                    log.info("Stale refresh: no retry handler for {s} ({e}) — skipping it", s=src, e=str(exc))
+                    _STALE_NOT_ACTIONABLE_LOGGED.add(src)
                 except ValueError:
                     pass  # no handler
                 except Exception as exc:
                     state.cooldowns.record_attempt(src, success=False, error=str(exc))
                     log.warning("Stale refresh for {s} failed: {e}", s=src, e=str(exc))
+                    if _is_deterministic_retry_error(exc):
+                        _record_deterministic_failure(src, f"{type(exc).__name__}: {exc}")
+                    else:
+                        note_repair_failure(src, f"{type(exc).__name__}: {exc}")
         cycle_result["stale_refreshed"] = stale_repulled
 
     # 3. Smart ingestion — run only due/stale pullers (replaces full pipeline)

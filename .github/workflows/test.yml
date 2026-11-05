@@ -24,14 +24,21 @@ env:
   # vitest 5 both included) in both places -- this pin is about keeping CI
   # and the deploy build on the same version, not the safety check itself.
   NODE_VERSION: "22.23.2"
-  # Non-empty -> target the alien self-hosted runner; empty/unset -> ubuntu-latest.
+  # Non-empty -> target any self-hosted runner labelled `tests` (alien x3,
+  # threadripper); empty/unset -> ubuntu-latest. Every `tests` runner must
+  # provide the persistent PostgreSQL 15 + TimescaleDB the reset step expects
+  # (see docs/SERVER-SERVICES.md, "Alien Runner" / "Threadripper Runner").
   # Set via Settings > Secrets and variables > Actions > Variables > TEST_RUNNER.
-  ON_ALIEN: ${{ vars.TEST_RUNNER != '' }}
+  # PR543's existing research-digest branch uses hosted CI and ephemeral DB only.
+  # PR932's stacked Schwab integration branch (claude/schwab-integration-r6-20261031)
+  # likewise: hosted CI and ephemeral DB only, once it targets main; same-repo
+  # head only. See tests/test_ci_test_workflow_pr932_routing.py.
+  ON_SELF_HOSTED: ${{ !((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && vars.TEST_RUNNER != '' }}
 
 jobs:
   backend-tests:
     name: Backend Tests
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     # alien (Xeon E5-2698 v3) is ~2x slower per core than ubuntu-latest: the
     # suite takes ~14.5 min there and TestGauntlet::test_run_gauntlet alone
     # takes ~90 s, so both timeouts need headroom (measured 2026-09-11).
@@ -47,11 +54,11 @@ jobs:
           cache: pip
 
       # ubuntu-latest is a fresh VM every run, so bring up an ephemeral
-      # Postgres container. alien keeps a persistent PostgreSQL 15 +
-      # TimescaleDB service (see docs/SERVER-SERVICES.md, "Alien Runner")
+      # Postgres container. Self-hosted `tests` runners keep a persistent
+      # PostgreSQL 15 + TimescaleDB service (see docs/SERVER-SERVICES.md)
       # that the next step resets instead of pulling+starting a container.
       - name: Start ephemeral Postgres (hosted runner)
-        if: env.ON_ALIEN != 'true'
+        if: env.ON_SELF_HOSTED != 'true'
         run: |
           docker run -d --name grid-test-pg \
             -e POSTGRES_USER=grid -e POSTGRES_PASSWORD=testpass -e POSTGRES_DB=griddb_test \
@@ -61,8 +68,8 @@ jobs:
             sleep 1
           done
 
-      - name: Reset persistent Postgres (alien)
-        if: env.ON_ALIEN == 'true'
+      - name: Reset persistent Postgres (self-hosted)
+        if: env.ON_SELF_HOSTED == 'true'
         env:
           PGPASSWORD: testpass
         run: |
@@ -106,7 +113,7 @@ jobs:
             exit "$collection_status"
           fi
 
-          # -n auto: one worker per core (24 on alien, 4 on ubuntu-latest).
+          # -n auto: one worker per core (24 on alien, 32 on threadripper, 4 on ubuntu-latest).
           # --dist loadgroup honours the xdist_group markers tests/conftest.py
           # assigns: every test that can reach a live PostgreSQL shares one
           # group and so runs serially on a single worker, and every other test
@@ -819,12 +826,12 @@ jobs:
           fi
 
       - name: Stop ephemeral Postgres (hosted runner)
-        if: always() && env.ON_ALIEN != 'true'
+        if: always() && env.ON_SELF_HOSTED != 'true'
         run: docker rm -f grid-test-pg 2>/dev/null || true
 
   frontend-build:
     name: Frontend Build
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -865,7 +872,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ${{ vars.TEST_RUNNER != '' && fromJSON('["self-hosted","alien","tests"]') || 'ubuntu-latest' }}
+    runs-on: ${{ ((((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'pull_request' && github.event.pull_request.number == 543 && github.head_ref == 'fix/digest-confidence-and-freshness-honesty') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 857 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/hermes-finra-v8-caller-composition-20261017') || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.number == 806 && github.event.pull_request.base.ref == 'main' && github.head_ref == 'draft/options-single-writer-20261002')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 918 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'codex/oct25-publication-thesis-native-validation-20261027')) || (github.event_name == 'pull_request' && github.repository == '3pacs/GRID' && github.event.pull_request.number == 932 && github.event.pull_request.head.repo.full_name == '3pacs/GRID' && github.event.pull_request.base.ref == 'main' && github.head_ref == 'claude/schwab-integration-r6-20261031')) && 'ubuntu-latest' || (vars.TEST_RUNNER != '' && fromJSON('["self-hosted","tests"]') || 'ubuntu-latest') }}
     timeout-minutes: 10
 
     steps:
@@ -923,6 +930,9 @@ jobs:
 
       - name: Deploy pipeline — immutable runtime preservation
         run: bash tests/deploy/test_runtime_preservation.sh
+
+      - name: Deploy pipeline — runtime preservation refresh after scheduler activation
+        run: bash tests/deploy/test_refresh_runtime_preservation.sh
 
       # Failure-injection proof for scripts/deploy_verify_release_tree.sh,
       # the resolved-cwd + independent-SHA check every "verify running the

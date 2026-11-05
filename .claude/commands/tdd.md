@@ -321,8 +321,8 @@ Never skip the RED phase. Never write code before tests.
 
 This command invokes the `tdd-guide` agent provided by ECC.
 
-The related `tdd-workflow` skill is also bundled with ECC.
+The related `python-testing` skill covers pytest TDD patterns.
 
 For manual installs, the source files live at:
 - `agents/tdd-guide.md`
-- `skills/tdd-workflow/SKILL.md`
+- `skills/python-testing/SKILL.md`

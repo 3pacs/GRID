@@ -461,6 +461,111 @@ def _tickers_file(tmp_path):
     return str(path)
 
 
+def _assert_no_prices(report: dict, prices: list[float]) -> None:
+    """Check all serialized values and keys, except typed receipt timestamps.
+
+    Fetch receipts carry canonical UTC datetimes, whose seconds/microseconds
+    can coincidentally contain a fixture price (e.g. 56.636467 vs 6.6364).
+    Only the paths emitted by the three report builders have that meaning.
+    """
+    td_report = (report.get("probe") == gd4.PROBE_NAME
+                 or report.get("report") == f"{gd4.STUDY}-twelvedata-crosscheck")
+    meta_report = report.get("report") == f"{gd4.STUDY}-tiingo-metadata"
+    receipt_modes = (*fetch.TD_ADJUST_MODES, *(f"{a}_supplement" for a in fetch.TD_ADJUST_MODES))
+
+    def scrub(value: object, path: tuple = ()) -> object:
+        td_time = (td_report and len(path) == 6 and path[0] == "tickers"
+                   and isinstance(path[1], str)
+                   and path[2:4] == ("twelvedata", "receipts") and path[4] in receipt_modes
+                   and path[5] == "fetched_at")
+        meta_time = (meta_report and len(path) == 4 and path[0] == "tickers"
+                     and isinstance(path[1], str)
+                     and path[2:] == ("receipt", "fetched_at"))
+        if td_time or meta_time:
+            assert isinstance(value, str), f"invalid receipt timestamp at {path}"
+            try:
+                stamp = datetime.fromisoformat(value)
+            except ValueError:
+                raise AssertionError(f"invalid receipt timestamp at {path}") from None
+            assert stamp.tzinfo == timezone.utc and stamp.isoformat() == value, (
+                f"invalid receipt timestamp at {path}")
+            return None
+        if isinstance(value, dict):
+            return {k: scrub(v, (*path, k)) for k, v in value.items()}
+        if isinstance(value, list):
+            return [scrub(v, (*path, i)) for i, v in enumerate(value)]
+        return value
+
+    text_ = json.dumps(scrub(report))
+    for v in prices:
+        assert repr(v) not in text_ and f"{v:.4f}" not in text_, "price leaked in report"
+
+
+@pytest.mark.parametrize("kind,mode", [("probe", a) for a in ("all", "none", "all_supplement", "none_supplement")]
+                         + [("cross", "none"), ("meta", None)])
+def test_report_privacy_guard_accepts_receipt_timestamp_collision(kind, mode):
+    # Actual CI collision: raw 6.63635 rounds to 6.6364 inside these timestamp digits.
+    receipt = {"fetched_at": "2026-10-20T09:32:56.636467+00:00"}
+    if kind == "meta":
+        report = {"report": f"{gd4.STUDY}-tiingo-metadata", "tickers": {"BBB": {"receipt": receipt}}}
+    else:
+        report = {**({"probe": gd4.PROBE_NAME} if kind == "probe" else
+                     {"report": f"{gd4.STUDY}-twelvedata-crosscheck"}),
+                  "tickers": {"BBB": {"twelvedata": {"receipts": {mode: receipt}}}}}
+    before = json.dumps(report)
+    assert "6.6364" in before
+    _assert_no_prices(report, [6.63635])
+    assert json.dumps(report) == before  # checking must not alter the reports
+
+
+@pytest.mark.parametrize("leak", [
+    6.63635, 6.6364, "6.63635", "6.6364", {"nested": [0, {"close": 6.63635}]},
+    "vendor close USD 6.6364 per share", {"close_6.63635": None}, {"6.6364": None},
+    {"fetched_at": "2026-10-20T09:32:56.636467+00:00"},
+])
+def test_report_privacy_guard_rejects_prices_in_values_and_keys(leak):
+    # A fetched_at key away from a declared receipt path has no exemption.
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices({"probe": gd4.PROBE_NAME, "extra": leak}, [6.63635])
+
+
+@pytest.mark.parametrize("value", [
+    6.63635, "6.6364", [6.63635], {"close": 6.6364},
+    "2026-10-20T09:32:56.636467+00:00 close=6.63635",
+    "2026-10-20T09:32:56.636467", "2026-10-20T09:32:56.636467+01:00",
+])
+def test_report_privacy_guard_rejects_malformed_or_price_bearing_receipt_time(value):
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": {"twelvedata": {
+        "receipts": {"none": {"fetched_at": value}}}}}}
+    with pytest.raises(AssertionError, match="invalid receipt timestamp"):
+        _assert_no_prices(report, [6.63635])
+
+
+@pytest.mark.parametrize("key,value", [("close", 6.63635), ("close_6.6364", None)])
+def test_report_privacy_guard_rejects_prices_beside_valid_receipt_time(key, value):
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": {"twelvedata": {"receipts": {"none": {
+        "fetched_at": "2026-10-20T09:32:56.636467+00:00", key: value}}}}}}
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices(report, [6.63635])
+
+
+@pytest.mark.parametrize("shape", ["ticker_list", "unknown_report", "unknown_mode", "nested_receipt"])
+def test_report_privacy_guard_rejects_misplaced_timestamp(shape):
+    receipts = {"none": {"fetched_at": "2026-10-20T09:32:56.636467+00:00"}}
+    ticker = {"twelvedata": {"receipts": receipts}}
+    report = {"probe": gd4.PROBE_NAME, "tickers": {"BBB": ticker}}
+    if shape == "ticker_list":
+        report["tickers"] = [ticker]
+    elif shape == "unknown_report":
+        report["probe"] = "other"
+    elif shape == "unknown_mode":
+        receipts["other"] = receipts.pop("none")
+    else:
+        report["tickers"] = {"BBB": {"extra": ticker}}
+    with pytest.raises(AssertionError, match="price leaked"):
+        _assert_no_prices(report, [6.63635])
+
+
 def test_the_probe_report_is_identical_whatever_the_timeout(tmp_path, monkeypatch):
     engine, series = _db()
     _Vendors(series, tmp_path).write(TICKERS)
@@ -539,9 +644,8 @@ def test_cli_writes_reports_and_a_manifest_the_v6_harness_accepts(tmp_path, monk
     for line in (out / "sha256s.txt").read_text().splitlines():
         h, name = line.split()
         assert v1.data_sha256(out / name) == h
-    for text_ in (json.dumps(report), json.dumps(cross), json.dumps(meta)):
-        for v in list(series["AAA"][1].values())[:20]:
-            assert repr(v) not in text_ and f"{v:.4f}" not in text_
+    for artifact in (report, cross, meta):
+        _assert_no_prices(artifact, list(series["AAA"][1].values())[:20])
     with pytest.raises(FileExistsError):
         cli.main(base + ["--out", str(out)])
     with pytest.raises(SystemExit):

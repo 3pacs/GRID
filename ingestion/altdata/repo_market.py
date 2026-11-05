@@ -11,6 +11,7 @@ All series are publicly available via the FRED API (requires FRED_API_KEY).
 from __future__ import annotations
 
 import time
+import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -43,13 +44,84 @@ REPO_SERIES: dict[str, dict[str, str]] = {
 # Derived features computed from the raw series above
 DERIVED_FEATURES: list[str] = [
     "sofr_spread_to_ffr",     # SOFR minus effective FFR
-    "rrp_as_pct_of_peak",     # Current RRP / peak RRP
+    # rrp_as_pct_of_peak is no longer derived here (2026-11-04): this window's
+    # peak disagreed with fed_liquidity's all-history peak, which now feeds
+    # the feature (COMPUTED:reverse_repo_pct_of_peak -> rrp_as_pct_of_peak).
     "treasury_bill_spread",   # 3M T-bill minus SOFR
 ]
 
 # Rate limit between FRED API calls
 _RATE_LIMIT_DELAY: float = 0.3
 _REQUEST_TIMEOUT: int = 30
+
+
+# FRED marks a date with no observation (market holiday on a daily series)
+# with value "."; fedfred coerces it to NaN before we see it. A handful per
+# year is expected and logged at DEBUG. A window where more than this share of
+# rows is unusable is not holiday noise and is logged at WARNING
+# (ATTENTION.md #13).
+_MISSING_WARN_SHARE: float = 0.25
+
+
+def _normalise_fred_frame(df: Any, series_id: str) -> Any:
+    """Return a ``date``/``value`` frame from a fedfred observations frame.
+
+    Rows whose value is missing ("." on FRED) or non-finite are skipped -- never
+    stored, never fatal -- so a series whose latest observation is "." still
+    stores every valid one. Only a non-empty response with no usable row at all
+    raises ``ValueError`` (docs/puller_outcome_contracts.md).
+    """
+    result = pd.DataFrame()
+    idx = df.index
+    if isinstance(idx, pd.DatetimeIndex):
+        result["date"] = pd.Series(idx.to_numpy())
+    elif idx.name in ("date", "Date", "observation_date"):
+        result["date"] = pd.Series(pd.to_datetime(idx, errors="coerce").to_numpy())
+    for col in ("date", "Date", "observation_date"):
+        if "date" not in result.columns and col in df.columns:
+            result["date"] = pd.to_datetime(df[col], errors="coerce").to_numpy()
+            break
+    if "date" not in result.columns:
+        result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce").to_numpy()
+
+    for col in ("value", "Value", series_id):
+        if col in df.columns:
+            result["value"] = pd.to_numeric(df[col], errors="coerce").to_numpy()
+            break
+    if "value" not in result.columns:
+        numeric_cols = df.select_dtypes(include=["number"]).columns
+        source = df[numeric_cols[0]] if len(numeric_cols) > 0 else df.iloc[:, -1]
+        result["value"] = pd.to_numeric(source, errors="coerce").to_numpy()
+
+    total = len(result)
+    kept_dates: list[Any] = []
+    kept_values: list[float] = []
+    missing = 0
+    non_finite = 0
+    for obs_date, value in zip(result["date"], result["value"]):
+        if pd.isna(obs_date) or pd.isna(value):
+            missing += 1
+            continue
+        if not math.isfinite(float(value)):
+            non_finite += 1
+            continue
+        kept_dates.append(obs_date)
+        kept_values.append(float(value))
+
+    if missing or non_finite:
+        skipped = missing + non_finite
+        emit = log.warning if non_finite or skipped > total * _MISSING_WARN_SHARE else log.debug
+        emit(
+            "FRED {sid}: skipped {m} missing ('.') and {nf} non-finite "
+            "observations; kept {k}/{t}",
+            sid=series_id, m=missing, nf=non_finite, k=len(kept_dates), t=total,
+        )
+    if total > 0 and not kept_dates:
+        raise ValueError(
+            "Invalid FRED observation date or value: all "
+            f"{total} observations for {series_id} unusable"
+        )
+    return pd.DataFrame({"date": kept_dates, "value": kept_values})
 
 
 class RepoMarketPuller(BasePuller):
@@ -59,7 +131,6 @@ class RepoMarketPuller(BasePuller):
     - sofr_rate: Secured Overnight Financing Rate
     - sofr_spread_to_ffr: SOFR minus effective FFR (positive = funding stress)
     - reverse_repo_usage: Fed ON RRP facility usage (billions)
-    - rrp_as_pct_of_peak: current usage / peak usage
     - treasury_bill_spread: 3M T-bill minus SOFR
 
     Attributes:
@@ -90,7 +161,9 @@ class RepoMarketPuller(BasePuller):
     @retry_on_failure(
         max_attempts=3,
         backoff=2.0,
-        retryable_exceptions=(ConnectionError, TimeoutError, OSError, Exception),
+        # Transport errors only: a deterministic parse failure returns the same
+        # answer on every attempt, so retrying it only triples the log lines.
+        retryable_exceptions=(ConnectionError, TimeoutError, OSError),
     )
     def _fetch_fred_series(
         self, series_id: str, start_date: date, end_date: date
@@ -118,48 +191,25 @@ class RepoMarketPuller(BasePuller):
             observation_end=str(end_date),
         )
 
-        if df is None or (hasattr(df, "empty") and df.empty):
+        if not isinstance(df, pd.DataFrame):
+            raise ValueError("Unsupported FRED response")
+        if df.empty:
+            if not any(c in df.columns for c in ("date", "Date", "observation_date")) or not any(c in df.columns for c in ("value", "Value", series_id)):
+                raise ValueError("Empty FRED response lacks required columns")
             return pd.DataFrame(columns=["date", "value"])
 
-        # fedfred returns a DataFrame — normalise column names
-        if isinstance(df, pd.DataFrame):
-            result = pd.DataFrame()
+        # fedfred 3.x (fedfred/helpers.py ``to_pd_df``) returns the
+        # observation date as a DatetimeIndex named "date" and has already
+        # coerced FRED's "." missing-value marker to NaN. Every column below is
+        # assigned positionally (``.to_numpy()``): the previous code assigned
+        # the index-bearing value Series onto a RangeIndex frame, pandas
+        # aligned on index, and EVERY value became NaN (grid-hermes
+        # 2026-11-03 18:02Z "FRED SOFR: 261 values coerced to NaN" ->
+        # "Invalid FRED observation date or value", retried 3x, ERROR for all
+        # four repo series every run). Same fix as yield_curve_full.py.
+        return _normalise_fred_frame(df, series_id)
 
-            # Find date column
-            for col in ("date", "Date", "observation_date"):
-                if col in df.columns:
-                    result["date"] = pd.to_datetime(df[col], errors="coerce")
-                    break
-            if "date" not in result.columns and df.index.name in ("date", "Date"):
-                result["date"] = pd.to_datetime(df.index, errors="coerce")
-            elif "date" not in result.columns:
-                result["date"] = pd.to_datetime(df.iloc[:, 0], errors="coerce")
-
-            # Find value column
-            for col in ("value", "Value", series_id):
-                if col in df.columns:
-                    result["value"] = pd.to_numeric(df[col], errors="coerce")
-                    break
-            if "value" not in result.columns:
-                numeric_cols = df.select_dtypes(include=["number"]).columns
-                if len(numeric_cols) > 0:
-                    result["value"] = df[numeric_cols[0]]
-                else:
-                    result["value"] = pd.to_numeric(df.iloc[:, -1], errors="coerce")
-
-            # Log coerced values (ATTENTION.md #13)
-            nan_count = result["value"].isna().sum()
-            if nan_count > 0:
-                log.warning(
-                    "FRED {sid}: {n} values coerced to NaN",
-                    sid=series_id,
-                    n=nan_count,
-                )
-
-            result = result.dropna(subset=["date", "value"])
-            return result
-
-        return pd.DataFrame(columns=["date", "value"])
+        raise ValueError("Unsupported FRED response")
 
     def _pull_raw_series(
         self,
@@ -181,15 +231,21 @@ class RepoMarketPuller(BasePuller):
         """
         rows_inserted = 0
 
+        transaction_started = False
         try:
             df = self._fetch_fred_series(fred_id, start_date, end_date)
+            if not isinstance(df, pd.DataFrame):
+                raise ValueError("Unsupported normalized FRED response")
+            if "date" not in df.columns or "value" not in df.columns:
+                raise ValueError("Malformed normalized FRED columns")
             if df.empty:
                 return {
                     "feature": feature_name,
-                    "status": "NO_DATA",
+                    "status": "NO_NEW_DATA",
                     "rows_inserted": 0,
                 }
 
+            transaction_started = True
             with self.engine.begin() as conn:
                 for _, row in df.iterrows():
                     obs_date = row["date"].date()
@@ -198,14 +254,18 @@ class RepoMarketPuller(BasePuller):
                     if self._row_exists(feature_name, obs_date, conn):
                         continue
 
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id=feature_name,
                         obs_date=obs_date,
                         value=value,
                         raw_payload={"fred_series": fred_id},
+                        return_result=True,
                     )
-                    rows_inserted += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    rows_inserted += affected
 
             log.info(
                 "Repo {feat} ({fid}) — {n} rows inserted",
@@ -218,7 +278,7 @@ class RepoMarketPuller(BasePuller):
             return {
                 "feature": feature_name,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": "fedfred not installed",
             }
         except Exception as exc:
@@ -228,7 +288,7 @@ class RepoMarketPuller(BasePuller):
             return {
                 "feature": feature_name,
                 "status": "FAILED",
-                "rows_inserted": 0,
+                "rows_inserted": None if transaction_started else 0,
                 "error": str(exc),
             }
 
@@ -280,50 +340,29 @@ class RepoMarketPuller(BasePuller):
 
             sofr = raw_data.get("sofr_rate", {})
             ffr = raw_data.get("fed_funds_effective", {})
-            rrp = raw_data.get("reverse_repo_usage", {})
             tbill = raw_data.get("treasury_bill_3m", {})
-
-            # Peak RRP for ratio calculation
-            rrp_peak = max(rrp.values()) if rrp else 1.0
-            if rrp_peak == 0:
-                rrp_peak = 1.0
 
             # sofr_spread_to_ffr
             spread_rows = 0
             for obs_date in sorted(set(sofr.keys()) & set(ffr.keys())):
                 spread = sofr[obs_date] - ffr[obs_date]
                 if not self._row_exists("sofr_spread_to_ffr", obs_date, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id="sofr_spread_to_ffr",
                         obs_date=obs_date,
                         value=spread,
                         raw_payload={"sofr": sofr[obs_date], "ffr": ffr[obs_date]},
+                        return_result=True,
                     )
-                    spread_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    spread_rows += affected
             results.append({
                 "feature": "sofr_spread_to_ffr",
                 "status": "SUCCESS",
                 "rows_inserted": spread_rows,
-            })
-
-            # rrp_as_pct_of_peak
-            pct_rows = 0
-            for obs_date, val in sorted(rrp.items()):
-                pct = val / rrp_peak
-                if not self._row_exists("rrp_as_pct_of_peak", obs_date, conn):
-                    self._insert_raw(
-                        conn=conn,
-                        series_id="rrp_as_pct_of_peak",
-                        obs_date=obs_date,
-                        value=pct,
-                        raw_payload={"rrp": val, "peak": rrp_peak},
-                    )
-                    pct_rows += 1
-            results.append({
-                "feature": "rrp_as_pct_of_peak",
-                "status": "SUCCESS",
-                "rows_inserted": pct_rows,
             })
 
             # treasury_bill_spread: 3M T-bill minus SOFR
@@ -331,7 +370,7 @@ class RepoMarketPuller(BasePuller):
             for obs_date in sorted(set(tbill.keys()) & set(sofr.keys())):
                 spread = tbill[obs_date] - sofr[obs_date]
                 if not self._row_exists("treasury_bill_spread", obs_date, conn):
-                    self._insert_raw(
+                    insert_result = self._insert_raw(
                         conn=conn,
                         series_id="treasury_bill_spread",
                         obs_date=obs_date,
@@ -340,8 +379,12 @@ class RepoMarketPuller(BasePuller):
                             "tbill_3m": tbill[obs_date],
                             "sofr": sofr[obs_date],
                         },
+                        return_result=True,
                     )
-                    tb_spread_rows += 1
+                    affected = getattr(insert_result, "rowcount", None)
+                    if type(affected) is not int or affected < 0:
+                        raise ValueError("Unknown affected row count")
+                    tb_spread_rows += affected
             results.append({
                 "feature": "treasury_bill_spread",
                 "status": "SUCCESS",
@@ -395,7 +438,10 @@ class RepoMarketPuller(BasePuller):
         except Exception as exc:
             log.error("Repo derived feature computation failed: {e}", e=str(exc))
 
-        total_rows = sum(r["rows_inserted"] for r in results)
+            results.append({"feature": "derived_features", "status": "FAILED",
+                            "rows_inserted": None, "error": str(exc)})
+
+        total_rows = (None if any(r.get("rows_inserted") is None for r in results) else sum(r["rows_inserted"] for r in results))
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
             "RepoMarket pull_all — {ok}/{total} features, {rows} rows",

@@ -41,6 +41,7 @@ from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
 from ingestion.base import BasePuller, retry_on_failure
+from store.observations import read_window
 
 # ── Taxonomy ─────────────────────────────────────────────────────────────
 
@@ -101,6 +102,54 @@ NEWS_TAXONOMY: dict[str, dict[str, Any]] = {
 _RATE_LIMIT_DELAY: float = 1.1  # WorldNewsAPI free tier: ~1 req/sec
 _REQUEST_TIMEOUT: int = 30
 _API_BASE: str = "https://api.worldnewsapi.com"
+
+# HTTP 402 circuit breaker. WorldNewsAPI answers 402 Payment Required when the
+# key's plan has expired or its daily quota is spent. Before 2026-11-04 a 402
+# was turned into an empty article list, so every remaining request of the run
+# still went out (105 warnings/day on grid-hermes) and pull_day stored the
+# zeros as SUCCESS rows -- wn_total_volume carries 0-valued latest vintages
+# for 2026-11-01..03 on griddb. Now the first 402 aborts the day being pulled
+# (its transaction rolls back, nothing is written), stops the rest of the run,
+# and holds every run in this process for the cooldown without a request.
+# One WARNING per cooldown; the cooldown elapses on its own, so a renewed key
+# or a reset quota recovers with no restart. Module-level because the
+# scheduler builds a new puller instance per run.
+PAYMENT_REQUIRED_COOLDOWN_SECONDS: int = 6 * 3600
+_payment_required_until: float = 0.0
+PAYMENT_REQUIRED_REASON: str = (
+    "WorldNewsAPI 402 Payment Required (plan expired or daily quota spent) -- "
+    "renew the WORLDNEWS_API_KEY plan or raise its quota"
+)
+
+
+class WorldNewsPaymentRequired(Exception):
+    """HTTP 402 from WorldNewsAPI. Deliberately not a RequestException, so
+    ``retry_on_failure`` does not retry it."""
+
+
+def _payment_required_active() -> bool:
+    return time.monotonic() < _payment_required_until
+
+
+def _trip_payment_required() -> None:
+    """Open the breaker; warn only when it was not already open."""
+    global _payment_required_until
+    was_open = _payment_required_active()
+    _payment_required_until = time.monotonic() + PAYMENT_REQUIRED_COOLDOWN_SECONDS
+    if not was_open:
+        log.warning(
+            "{r}; no WorldNewsAPI requests for {h}h (logged once per cooldown)",
+            r=PAYMENT_REQUIRED_REASON, h=PAYMENT_REQUIRED_COOLDOWN_SECONDS // 3600,
+        )
+
+
+def _payment_required_result(target_date: date | None = None) -> dict[str, Any]:
+    out: dict[str, Any] = {
+        "status": "FAILED", "rows_inserted": 0, "error": PAYMENT_REQUIRED_REASON,
+    }
+    if target_date is not None:
+        out["date"] = target_date.isoformat()
+    return out
 
 
 class WorldNewsPuller(BasePuller):
@@ -172,10 +221,8 @@ class WorldNewsPuller(BasePuller):
             timeout=_REQUEST_TIMEOUT,
         )
         if resp.status_code == 402:
-            log.warning(
-                "WorldNewsAPI returned 402 (Payment Required) — API key expired or quota exceeded"
-            )
-            return {"news": []}
+            # Never an empty article list: that was stored as a zero day.
+            raise WorldNewsPaymentRequired(PAYMENT_REQUIRED_REASON)
         resp.raise_for_status()
         return resp.json()
 
@@ -327,12 +374,12 @@ class WorldNewsPuller(BasePuller):
                 latest_date=target_date.isoformat(),
                 number=100,
             )
+        except WorldNewsPaymentRequired:
+            # Propagate: pull_day must abort the whole day, not store zeros.
+            raise
         except requests.exceptions.HTTPError as exc:
             if exc.response is not None and exc.response.status_code == 402:
-                log.warning("WorldNewsAPI key expired (402) — disabling further calls")
-                self._api_expired = True
-                result["status"] = "EXPIRED"
-                return result
+                raise WorldNewsPaymentRequired(PAYMENT_REQUIRED_REASON) from exc
             log.warning(
                 "WorldNews pull failed for {cat} on {d}: {e}",
                 cat=category, d=target_date, e=str(exc),
@@ -378,10 +425,21 @@ class WorldNewsPuller(BasePuller):
         """
         if not self.api_key:
             return {"status": "SKIPPED", "reason": "WORLDNEWS_API_KEY not set"}
-        if self._api_expired:
-            return {"status": "SKIPPED", "reason": "WorldNewsAPI key expired (402)"}
+        if self._api_expired or _payment_required_active():
+            return _payment_required_result(target_date)
 
         log.info("WorldNews pulling all categories for {d}", d=target_date)
+        try:
+            return self._pull_day_unguarded(target_date)
+        except WorldNewsPaymentRequired:
+            # Raised inside the day's transaction, so it rolled back: no
+            # category of this day, and no composite, was written.
+            self._api_expired = True
+            _trip_payment_required()
+            return _payment_required_result(target_date)
+
+    def _pull_day_unguarded(self, target_date: date) -> dict[str, Any]:
+        """pull_day's body; a 402 propagates out of the open transaction."""
 
         all_countries: set[str] = set()
         total_articles = 0
@@ -457,6 +515,25 @@ class WorldNewsPuller(BasePuller):
             "categories": category_results,
         }
 
+    def _captured_days(self, start_date: date, end_date: date) -> set[date]:
+        """Days whose latest wn_total_volume vintage is a real (non-zero) count.
+
+        Read through store.observations (SUCCESS only, latest vintage per
+        obs_date). A day whose latest vintage is 0 -- the zeros a 402 used to
+        write -- is not captured, so it is re-pulled and gets a correct newer
+        vintage. A read failure skips nothing.
+        """
+        try:
+            with self.engine.connect() as conn:
+                rows = read_window(
+                    conn, "wn_total_volume", source=self.SOURCE_NAME,
+                    start=start_date, as_of=end_date,
+                )
+        except Exception as exc:
+            log.warning("WorldNews captured-day check failed, pulling all days: {e}", e=str(exc))
+            return set()
+        return {o.obs_date for o in rows if o.value and o.value > 0}
+
     def pull_all(
         self,
         days_back: int = 7,
@@ -474,9 +551,9 @@ class WorldNewsPuller(BasePuller):
         if not self.api_key:
             log.warning("WorldNews pull_all skipped — WORLDNEWS_API_KEY not set")
             return [{"status": "SKIPPED", "reason": "WORLDNEWS_API_KEY not set"}]
-        if self._api_expired:
-            log.warning("WorldNews pull_all skipped — API key expired (402)")
-            return [{"status": "SKIPPED", "reason": "WorldNewsAPI key expired (402)"}]
+        if self._api_expired or _payment_required_active():
+            log.debug("WorldNews pull_all held by the 402 circuit breaker")
+            return [_payment_required_result()]
 
         # Ensure features are registered
         self._ensure_features()
@@ -484,6 +561,7 @@ class WorldNewsPuller(BasePuller):
         end_date = date.today() - timedelta(days=1)  # Yesterday (complete day)
         if start_date is None:
             start_date = end_date - timedelta(days=days_back - 1)
+        captured = self._captured_days(start_date, end_date)
 
         log.info(
             "WorldNews pull_all — {s} to {e} ({d} days)",
@@ -493,8 +571,19 @@ class WorldNewsPuller(BasePuller):
         results: list[dict[str, Any]] = []
         current = start_date
         while current <= end_date:
+            if current in captured:
+                # A past day's news is final; re-pulling it spent 10 requests
+                # of the daily quota per day per run for nothing.
+                results.append({
+                    "date": current.isoformat(), "status": "UNCHANGED",
+                    "rows_inserted": 0, "reason": "day already captured",
+                })
+                current += timedelta(days=1)
+                continue
             day_result = self.pull_day(current)
             results.append(day_result)
+            if self._api_expired:
+                break  # 402: the rest of the run would only hit it again
             current += timedelta(days=1)
 
         total_rows = sum(r.get("rows_inserted", 0) for r in results)

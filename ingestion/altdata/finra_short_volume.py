@@ -338,7 +338,12 @@ class FINRAShortVolumePuller(BasePuller):
         "priority_rank": 40,
     }
 
-    def __init__(self, db_engine: Engine) -> None:
+    def __init__(self, db_engine: Engine, *, occurrence_io: Any = None) -> None:
+        self._occurrence_io = occurrence_io
+        if occurrence_io is not None:
+            self.engine = db_engine
+            self.source_id = occurrence_io.source_id
+            return
         super().__init__(db_engine)
         log.info(
             "FINRAShortVolumePuller initialised -- source_id={sid}",
@@ -432,6 +437,11 @@ class FINRAShortVolumePuller(BasePuller):
             published it) -- this is NOT a failure of this puller and must
             never advance a cooldown as if it were one.
         """
+        if getattr(self, "_occurrence_io", None) is not None:
+            return self._occurrence_io.pull(
+                self, trade_date=trade_date, url=url,
+                market_prefix=market_prefix, dry_run=dry_run,
+            )
         if isinstance(trade_date, str):
             trade_date = date.fromisoformat(trade_date)
 

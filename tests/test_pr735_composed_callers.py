@@ -271,13 +271,13 @@ def test_composed_options_callers(capture, monkeypatch, caller, case, expected, 
         assert emitted.call_args.args[2:4] == (expected, rows)
     else:
         monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (capture["obj"], "pull_all", kwargs))
-        # Use an alias so SOURCE_NAME, rather than a name-only guard, proves
-        # that the options puller owns the catalog even through repair.
-        observed = hf._retry_source("Options_Alias", engine)
+        # Repair requires an explicit requested catalog contract. The actual
+        # options target retains its writer-owned publication/accounting.
+        observed = hf._retry_source("options", engine)
         status = observed["outcome"]
         assert observed["rows_inserted"] == rows
         assert (hf.retry_not_fresh_reason(observed) is None) == (expected == "SUCCESS")
-        assert "options_alias" not in hf._REPAIRS_IN_FLIGHT
+        assert "options" not in hf._REPAIRS_IN_FLIGHT
         assert _logs(engine) == []  # repair itself has no pull_log contract
     assert status == expected
     assert len(capture["calls"]) == n_calls
@@ -349,7 +349,7 @@ def test_unchanged_owned_options_cadence_without_publication(capture, monkeypatc
         assert (result["status"], result["rows_inserted"]) == ("NO_NEW_DATA", 0)
     else:
         monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (obj, "pull_all", {}))
-        result = hf._retry_source("Options_Alias", engine)
+        result = hf._retry_source("options", engine)
         assert (result["outcome"], result["rows_inserted"]) == ("NO_NEW_DATA", 0)
         assert hf.retry_not_fresh_reason(result)
     assert capture["bridge"].started == len(capture["updates"]) == 0
@@ -357,3 +357,16 @@ def test_unchanged_owned_options_cadence_without_publication(capture, monkeypatc
     if caller != "retry":
         assert tuple(_logs(engine)[0][:2]) == ("SUCCESS", 0)
         assert _logs(engine)[0][2].startswith("NO_NEW_DATA:")
+
+
+def test_retry_refuses_undeclared_options_alias(capture, monkeypatch):
+    """A writer declaration does not authorize an arbitrary requested alias."""
+    engine = MagicMock()
+    provider = MagicMock()
+    monkeypatch.setattr(capture["obj"], "pull_all", provider)
+    monkeypatch.setattr(hf, "_resolve_puller", lambda *_a: (capture["obj"], "pull_all", {}))
+    with pytest.raises(ValueError, match="catalog identity changed before dispatch"):
+        hf._retry_source("Options_Alias", engine)
+    provider.assert_not_called()
+    engine.begin.assert_not_called()
+    assert "options_alias" not in hf._REPAIRS_IN_FLIGHT

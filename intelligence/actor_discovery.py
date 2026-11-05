@@ -1114,6 +1114,7 @@ def enrich_actor(engine: Engine, actor_id: str) -> dict:
                 SELECT AVG(trust_score), COUNT(*)
                 FROM signal_sources
                 WHERE source_id ILIKE :name
+                  AND substr(source_id, 1, 3) <> 'qq_'
                   AND trust_score IS NOT NULL
             """), {"name": f"%{name}%"}).fetchone()
 
@@ -1439,6 +1440,7 @@ def enrich_all_actors(engine: Engine, batch_size: int = _ENRICHMENT_BATCH) -> di
                 SELECT ss.source_id, AVG(ss.trust_score), COUNT(*)
                 FROM signal_sources ss
                 WHERE ss.trust_score IS NOT NULL
+                  AND substr(ss.source_id, 1, 3) <> 'qq_'
                   AND EXISTS (
                       SELECT 1 FROM actors a
                       WHERE a.id = ANY(:aids)
@@ -3077,7 +3079,6 @@ def _cross_reference_icij_with_known_actors(
     """
     try:
         from ingestion.altdata.offshore_leaks import (
-            _normalize_name as _icij_normalize,
             _build_known_names_index,
             _match_officer_to_actor,
         )

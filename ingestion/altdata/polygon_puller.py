@@ -8,8 +8,19 @@ This is the Swiss Army knife data source. Polygon provides:
 - Dividends and stock splits
 - Crypto tickers and forex pairs
 
-API: https://polygon.io/docs
+API: https://polygon.io/docs (Polygon.io is now Massive; api.polygon.io still serves)
 Free tier: 5 API calls/minute. Paid: unlimited.
+
+Entitlement (probed from grid-svr 2026-11-04): the configured key gets
+``403 NOT_AUTHORIZED`` on ``/v3/snapshot/options/{ticker}`` -- the options
+snapshot (OI, volume, Greeks) needs an options plan. The free reference
+endpoint lists contracts without OI or Greeks, so a "summary" built from it
+is all zeros. ``pull()`` therefore stops on the first entitlement refusal and
+reports SKIPPED with the operator action instead of storing zero-valued
+Greeks for 30 tickers.
+
+The key is sent as an ``Authorization: Bearer`` header, never as the
+``apiKey`` query parameter: request URLs end up in exception text and logs.
 """
 
 from __future__ import annotations
@@ -26,12 +37,41 @@ from ingestion.base import BasePuller, retry_on_failure
 
 POLYGON_BASE = "https://api.polygon.io"
 
+# Polygon's documented status for a plan that does not include the endpoint.
+_NOT_ENTITLED_STATUS = "NOT_AUTHORIZED"
+_NOT_ENTITLED_REASON = (
+    "Polygon/Massive plan is not entitled to /v3/snapshot/options "
+    "(HTTP 403 NOT_AUTHORIZED); options Greeks need an options plan "
+    "upgrade, or retire this source"
+)
+_entitlement_warned = False
+
 # Top tickers for options Greeks tracking
 OPTIONS_TICKERS = [
     "SPY", "QQQ", "IWM", "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "META", "TSLA",
     "AMD", "JPM", "GS", "BAC", "XLF", "XLE", "XLK", "XLV", "GLD", "SLV",
     "TLT", "HYG", "VIX", "COIN", "MARA", "PLTR", "CRWD", "SMCI", "ARM", "NFLX",
 ]
+
+
+class PolygonNotEntitled(RuntimeError):
+    """The API key's plan does not include the requested endpoint (permanent)."""
+
+
+class _PolygonHTTPError(RuntimeError):
+    """Non-2xx Polygon response; the message never contains the request URL."""
+
+    def __init__(self, status_code: int, endpoint: str) -> None:
+        self.status_code = status_code
+        super().__init__(f"Polygon HTTP {status_code} on {endpoint}")
+
+
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
 
 
 class PolygonPuller(BasePuller):
@@ -60,13 +100,28 @@ class PolygonPuller(BasePuller):
 
     @retry_on_failure(max_attempts=3, retryable_exceptions=(ConnectionError, TimeoutError, OSError, requests.exceptions.RequestException))
     def _api_get(self, endpoint: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
-        """Make a Polygon API call."""
+        """Make a Polygon API call (key in the Authorization header).
+
+        Raises:
+            PolygonNotEntitled: 403 whose body says the plan lacks the endpoint.
+            _PolygonHTTPError: any other non-2xx status (not retried).
+        """
         url = f"{POLYGON_BASE}{endpoint}"
-        query = {"apiKey": self.api_key}
-        if params:
-            query.update(params)
-        resp = requests.get(url, params=query, timeout=30)
-        resp.raise_for_status()
+        resp = requests.get(
+            url,
+            params=params or None,
+            headers={"Authorization": f"Bearer {self.api_key}"},
+            timeout=30,
+        )
+        if resp.status_code == 403:
+            try:
+                status = (resp.json() or {}).get("status")
+            except ValueError:
+                status = None
+            if status == _NOT_ENTITLED_STATUS:
+                raise PolygonNotEntitled(f"{endpoint}: {_NOT_ENTITLED_STATUS}")
+        if resp.status_code >= 400:
+            raise _PolygonHTTPError(resp.status_code, endpoint)
         return resp.json()
 
     # ------------------------------------------------------------------
@@ -74,44 +129,25 @@ class PolygonPuller(BasePuller):
     # ------------------------------------------------------------------
 
     def pull_options_chain(self, ticker: str) -> list[dict[str, Any]]:
-        """Pull full options chain snapshot with Greeks for a ticker.
+        """Pull the options chain snapshot with Greeks for a ticker.
 
         Returns options contracts with: strike, expiry, type (call/put),
         bid, ask, last, volume, OI, IV, delta, gamma, theta, vega.
 
-        Uses /v3/snapshot/options if available (paid), falls back to
-        /v3/reference/options/contracts (free) + individual snapshots.
+        Uses ``/v3/snapshot/options`` (options plan). There is deliberately
+        no fallback to ``/v3/reference/options/contracts``: that list has no
+        open interest, volume or Greeks, so every aggregate computed from it
+        is zero -- not a measurement.
+
+        Raises:
+            PolygonNotEntitled: the key's plan lacks the snapshot endpoint.
         """
-        # Try snapshot endpoint first (paid tier, has Greeks inline)
-        try:
-            data = self._api_get(f"/v3/snapshot/options/{ticker}", {
-                "limit": 250,
-                "order": "desc",
-                "sort": "volume",
-            })
-            results = data.get("results", [])
-            if results:
-                return results
-        except Exception:
-            pass
-
-        # Fallback: get contract list (free tier) then fetch snapshots
-        try:
-            data = self._api_get("/v3/reference/options/contracts", {
-                "underlying_ticker": ticker,
-                "limit": 100,
-                "order": "desc",
-                "sort": "open_interest",
-            })
-            contracts = data.get("results", [])
-            if not contracts:
-                return []
-
-            # For free tier, we get contract metadata but not live Greeks
-            # Return what we have — the summary method handles missing Greeks
-            return [{"details": c, "greeks": {}, "day": {}} for c in contracts]
-        except Exception:
-            return []
+        data = self._api_get(f"/v3/snapshot/options/{ticker}", {
+            "limit": 250,
+            "order": "desc",
+            "sort": "volume",
+        })
+        return data.get("results", []) or []
 
     def pull_options_greeks_summary(self, ticker: str) -> dict[str, Any]:
         """Pull and summarize options Greeks for a ticker.
@@ -219,84 +255,106 @@ class PolygonPuller(BasePuller):
         """Pull options Greeks summaries for tracked tickers.
 
         Returns:
-            Summary with options data counts.
+            Write-contract summary: ``status`` plus ``rows_inserted`` (rows
+            committed to raw_series) and per-ticker coverage counts.
         """
+        global _entitlement_warned
         if not self.api_key:
-            return {"error": "POLYGON_API_KEY not configured"}
+            return {"status": "SKIPPED", "rows_inserted": 0,
+                    "skipped_reason": "POLYGON_API_KEY not configured"}
 
         today = date.today()
-        total_tickers = 0
+        rows_inserted = 0
+        succeeded = 0
+        no_data = 0
+        failed = 0
         api_calls = 0
         anomalies: list[dict[str, Any]] = []
 
-        for ticker in OPTIONS_TICKERS:
+        for idx, ticker in enumerate(OPTIONS_TICKERS):
+            if idx:
+                time.sleep(12.5)  # free tier is 5 calls/min
             try:
-                summary = self.pull_options_greeks_summary(ticker)
                 api_calls += 1
-
-                # Rate limit: free tier is 5/min
-                time.sleep(12.5)  # ~5 calls/min
-
-                if not summary:
-                    continue
-
-                total_tickers += 1
-
-                with self.engine.begin() as conn:
-                    # Store aggregate Greeks
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:put_call_ratio",
-                        obs_date=today,
-                        value=summary["put_call_ratio"],
-                        raw_payload=summary,
-                    )
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:avg_iv",
-                        obs_date=today,
-                        value=summary["avg_implied_vol"],
-                    )
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:net_gamma",
-                        obs_date=today,
-                        value=summary["net_gamma_exposure"],
-                    )
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:net_delta",
-                        obs_date=today,
-                        value=summary["net_delta_exposure"],
-                    )
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:call_oi",
-                        obs_date=today,
-                        value=float(summary["total_call_oi"]),
-                    )
-                    self._insert_raw(conn,
-                        series_id=f"polygon:{ticker}:put_oi",
-                        obs_date=today,
-                        value=float(summary["total_put_oi"]),
-                    )
-
-                # Anomaly: extreme put/call ratio
-                pcr = summary["put_call_ratio"]
-                if pcr > 1.5:
-                    anomalies.append({
-                        "ticker": ticker, "signal": "extreme_put_call",
-                        "put_call_ratio": pcr, "direction": "bearish",
-                    })
-                elif pcr < 0.5 and pcr > 0:
-                    anomalies.append({
-                        "ticker": ticker, "signal": "extreme_put_call",
-                        "put_call_ratio": pcr, "direction": "bullish",
-                    })
-
+                summary = self.pull_options_greeks_summary(ticker)
+            except PolygonNotEntitled:
+                if succeeded or rows_inserted:
+                    # Entitlement changed mid-run: keep what was committed.
+                    failed += len(OPTIONS_TICKERS) - idx
+                    break
+                if not _entitlement_warned:
+                    log.warning("Polygon: {r}", r=_NOT_ENTITLED_REASON)
+                    _entitlement_warned = True
+                return {"status": "SKIPPED", "rows_inserted": 0,
+                        "skipped_reason": _NOT_ENTITLED_REASON, "api_calls": api_calls}
             except Exception as exc:
-                log.debug("Polygon options failed for {t}: {e}", t=ticker, e=str(exc))
+                failed += 1
+                log.warning("Polygon options failed for {t}: {e}", t=ticker, e=str(exc))
+                continue
 
-        log.info("Polygon: {t} tickers, {a} anomalies, {api} API calls",
-                 t=total_tickers, a=len(anomalies), api=api_calls)
+            if not summary:
+                no_data += 1
+                continue
 
-        return {
-            "tickers_pulled": total_tickers,
+            try:
+                ticker_rows = 0
+                with self.engine.begin() as conn:
+                    for suffix, value, payload in (
+                        ("put_call_ratio", summary["put_call_ratio"], summary),
+                        ("avg_iv", summary["avg_implied_vol"], None),
+                        ("net_gamma", summary["net_gamma_exposure"], None),
+                        ("net_delta", summary["net_delta_exposure"], None),
+                        ("call_oi", float(summary["total_call_oi"]), None),
+                        ("put_oi", float(summary["total_put_oi"]), None),
+                    ):
+                        ticker_rows += _inserted(self._insert_raw(
+                            conn,
+                            series_id=f"polygon:{ticker}:{suffix}",
+                            obs_date=today,
+                            value=value,
+                            raw_payload=payload,
+                            return_result=True,
+                        ))
+                # Counted only after the transaction committed.
+                rows_inserted += ticker_rows
+                succeeded += 1
+            except Exception as exc:
+                failed += 1
+                log.warning("Polygon store failed for {t}: {e}", t=ticker, e=str(exc))
+                continue
+
+            pcr = summary["put_call_ratio"]
+            if pcr > 1.5:
+                anomalies.append({
+                    "ticker": ticker, "signal": "extreme_put_call",
+                    "put_call_ratio": pcr, "direction": "bearish",
+                })
+            elif 0 < pcr < 0.5:
+                anomalies.append({
+                    "ticker": ticker, "signal": "extreme_put_call",
+                    "put_call_ratio": pcr, "direction": "bullish",
+                })
+
+        log.info("Polygon: {ok}/{n} tickers, {r} rows, {a} anomalies, {api} API calls",
+                 ok=succeeded, n=len(OPTIONS_TICKERS), r=rows_inserted,
+                 a=len(anomalies), api=api_calls)
+
+        total = len(OPTIONS_TICKERS)
+        if failed:
+            status = "PARTIAL" if (succeeded or rows_inserted) else "FAILED"
+        else:
+            status = "SUCCESS"
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "succeeded": succeeded + no_data,
+            "total": total,
+            "tickers_pulled": succeeded,
+            "tickers_no_data": no_data,
+            "tickers_failed": failed,
             "anomalies": anomalies,
             "api_calls": api_calls,
         }
+        if failed:
+            result["error"] = f"{failed} of {total} tickers failed"
+        return result

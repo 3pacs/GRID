@@ -253,3 +253,77 @@ class TestMicroPoolSingleton:
 
         assert p1 is p2
         gm._pool_instance = None
+
+
+# ---------------------------------------------------------------------------
+# Circuit breaker (2026-11-04: knowledge_mapper on CPU-only :8085 timed out
+# 86x/day, each a 15s stall plus a warning)
+# ---------------------------------------------------------------------------
+
+
+class TestMicroCircuitBreaker:
+    @pytest.fixture(autouse=True)
+    def _fresh_circuits(self, monkeypatch):
+        import gemma.micro as gm
+
+        monkeypatch.setattr(gm, "_CIRCUITS", {})
+        yield
+
+    def _client(self, name: str = "knowledge_mapper") -> GemmaMicroClient:
+        cfg = MicroModelConfig(name=name, base_url="http://localhost:8085",
+                               model="m", system_prompt="s")
+        ok = MagicMock(status_code=200)
+        with patch("gemma.micro.requests.get", return_value=ok):
+            return GemmaMicroClient(cfg)
+
+    def test_opens_after_consecutive_timeouts_and_skips_silently(self, monkeypatch) -> None:
+        import requests
+        import gemma.micro as gm
+
+        client = self._client()
+        warnings: list[str] = []
+        monkeypatch.setattr(gm.log, "warning",
+                            lambda template, **k: warnings.append(template.format(**k)))
+        with patch("gemma.micro.requests.post",
+                   side_effect=requests.ReadTimeout("Read timed out")) as post:
+            for _ in range(gm.CIRCUIT_TIMEOUT_THRESHOLD + 5):
+                assert client.run("text") is None
+        assert post.call_count == gm.CIRCUIT_TIMEOUT_THRESHOLD
+        # One warning for the first timeout, one for opening the circuit.
+        assert len(warnings) == 2
+        assert "skipping it for 30 min" in warnings[1]
+
+    def test_half_open_success_closes_and_failure_reopens_longer(self, monkeypatch) -> None:
+        import requests
+        import gemma.micro as gm
+
+        client = self._client()
+        circuit = gm._circuit_for(client.config)
+        with patch("gemma.micro.requests.post", side_effect=requests.ReadTimeout("t")):
+            for _ in range(gm.CIRCUIT_TIMEOUT_THRESHOLD):
+                client.run("text")
+        assert not circuit.allow()
+
+        circuit.open_until = 0.0  # cooldown elapsed: one trial call
+        with patch("gemma.micro.requests.post", side_effect=requests.ReadTimeout("t")) as post:
+            client.run("text")
+            client.run("text")
+        assert post.call_count == 1, "a failed trial re-opens immediately"
+        remaining = circuit.open_until - gm.time.monotonic()
+        assert remaining > gm.CIRCUIT_BASE_COOLDOWN_SECONDS, "re-open backs off longer"
+
+        circuit.open_until = 0.0
+        resp = MagicMock(status_code=200)
+        resp.json.return_value = {"choices": [{"message": {"content": "entry"}}]}
+        with patch("gemma.micro.requests.post", return_value=resp):
+            assert client.run("text") == "entry"
+        assert circuit.consecutive_timeouts == 0 and circuit.allow()
+
+    def test_non_timeout_errors_do_not_trip_the_circuit(self) -> None:
+        import gemma.micro as gm
+
+        client = self._client()
+        with patch("gemma.micro.requests.post", side_effect=ValueError("bad json")):
+            for _ in range(gm.CIRCUIT_TIMEOUT_THRESHOLD + 2):
+                client.run("text")
+        assert gm._circuit_for(client.config).allow()

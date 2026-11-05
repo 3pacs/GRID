@@ -1,14 +1,33 @@
 """
 GRID Monetary Authority of Singapore (MAS) ingestion module.
 
-Pulls Singapore SORA rate, SIBOR, FX reserves, and M2 money supply
-from the MAS public data API.
+2026-11-04 rebuild. The legacy MAS datastore API
+(``eservices.mas.gov.sg/api/action/datastore/search.json``) is retired: it
+answers every resource id with an HTML maintenance page, so each cycle failed
+with ``RetryError[JSONDecodeError]`` after three retries. MAS now serves its
+statistics only through the APIMG gateway, which requires a registered API
+key (``eservices.mas.gov.sg/apimg-gw/...`` answers 401 anonymously).
+
+What is still reachable without a key (verified by probe from grid-svr):
+
+* ``singapore_fx_reserves`` -- IMF International Liquidity dataflow,
+  ``IL/SGP.TRGMV_REVS.USD.M`` (total reserves incl. gold at market value,
+  USD, monthly). Singapore reports its reserves to the IMF; this is the
+  same official number MAS publishes, with a ~2 month lag.
+
+Not available (reported once per process, never attempted every cycle):
+
+* ``singapore_sora`` and ``singapore_m2`` -- MAS-only series; need an APIMG
+  key. Singapore does not report to the IMF monetary-aggregate or
+  interest-rate dataflows (MFS_MA / MFS_IR return no SGP series).
+* ``singapore_sibor_3m`` -- SIBOR was discontinued on 2024-12-31 (replaced
+  by SORA); there is nothing left to pull.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 import requests
@@ -16,197 +35,102 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 from ingestion.base import BasePuller
-from tenacity import retry, stop_after_attempt, wait_exponential
+from ingestion.international import sdmx_json
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 
-# MAS resource_id -> feature name
-MAS_SERIES: dict[str, str] = {
-    "9a0bf149-308c-4bd2-832d-76c8e6cb47ed": "singapore_sora",
-    "5f2b18a2-671d-4994-ba42-7a48094adb11": "singapore_sibor_3m",
-    "2fe9c5af-57e5-4dd8-9ce6-c9ecff4f4a13": "singapore_fx_reserves",
-    "65e62e81-7b80-4fa9-a2bb-9ce4ba3ad3e6": "singapore_m2",
+# feature -> (IMF flow, key) for the series still available keylessly.
+MAS_SERIES: dict[str, tuple[str, str]] = {
+    "singapore_fx_reserves": ("IL", "SGP.TRGMV_REVS.USD.M"),
 }
 
-_MAS_BASE_URL = "https://eservices.mas.gov.sg/api/action/datastore/search.json"
-_RATE_LIMIT_DELAY: float = 1.0
+# feature -> why it is no longer pulled (logged once per process).
+MAS_UNAVAILABLE_SERIES: dict[str, str] = {
+    "singapore_sora": "MAS-only series; the legacy datastore API is retired and the MAS APIMG gateway requires an API key",
+    "singapore_m2": "MAS-only series; the legacy datastore API is retired and the MAS APIMG gateway requires an API key",
+    "singapore_sibor_3m": "SIBOR was discontinued on 2024-12-31",
+}
 
-# Process-scoped cooldown: when MAS returns ReadTimeout / non-JSON for one
-# resource, the same upstream issue typically affects all four series
-# (whole API down or geo-blocked). Trip a 6h cooldown after the first
-# RetryError so the cycle skips the remaining resources instead of
-# logging 4 ERROR rows per cycle (24+/day at the 6h cadence).
-_API_COOLDOWN_UNTIL: float = 0.0
-_API_COOLDOWN_SECONDS: int = 6 * 3600
+_RATE_LIMIT_DELAY: float = 1.0
+_UNAVAILABLE_LOGGED: bool = False
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Retry transport failures and 5xx/429 only; a 4xx is final."""
+    if isinstance(exc, requests.HTTPError):
+        status = getattr(exc.response, "status_code", None)
+        return status is None or status >= 500 or status == 429
+    return isinstance(exc, (requests.ConnectionError, requests.Timeout))
 
 
 class MASPuller(BasePuller):
-    """Pulls monetary and financial data from the MAS API."""
+    """Pulls Singapore monetary data (MAS series reported to the IMF)."""
 
     SOURCE_NAME = "MAS_SG"
-    SOURCE_CONFIG = {"base_url": "https://eservices.mas.gov.sg/api", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 29}
+    SOURCE_CONFIG = {"base_url": "https://api.imf.org/external/sdmx/3.0", "cost_tier": "FREE", "latency_class": "MONTHLY", "pit_available": True, "revision_behavior": "RARE", "trust_score": "HIGH", "priority_rank": 29}
 
     def __init__(self, db_engine: Engine) -> None:
         super().__init__(db_engine)
         log.info("MASPuller initialised — source_id={sid}", sid=self.source_id)
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=2, max=10))
-    def _fetch_page(self, resource_id: str, limit: int, offset: int) -> dict:
-        params = {
-            "resource_id": resource_id,
-            "limit": str(limit),
-            "offset": str(offset),
-        }
-        resp = requests.get(_MAS_BASE_URL, params=params, timeout=30)
-        resp.raise_for_status()
-        return resp.json()
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=2, min=2, max=10),
+        retry=retry_if_exception(_is_retryable),
+        reraise=True,
+    )
+    def _fetch(self, flow: str, key: str, start_period: str | None) -> list[tuple[date, float]]:
+        return sdmx_json.fetch_imf_series(flow, key, start_period)
 
-    def pull_resource(
-        self,
-        resource_id: str,
-        limit: int = 1000,
-        offset: int = 0,
-    ) -> dict[str, Any]:
-        """Pull a single MAS resource, paginating through all records."""
-        feature_name = MAS_SERIES.get(resource_id, resource_id)
-
-        # Honour process-scoped cooldown set by a sibling resource
-        # earlier in the same cycle.
-        global _API_COOLDOWN_UNTIL
-        now = time.time()
-        if now < _API_COOLDOWN_UNTIL:
-            return {
-                "series_id": feature_name,
-                "rows_inserted": 0,
-                "status": "SKIPPED",
-                "errors": ["MAS API in cooldown — see prior WARNING"],
-            }
-
-        log.info("Pulling MAS {fn}", fn=feature_name)
-
+    def pull_series(self, feature_name: str, start_date: str | date = "2000-01-01") -> dict[str, Any]:
+        """Pull one Singapore series and insert into raw_series."""
+        flow, key = MAS_SERIES[feature_name]
         result: dict[str, Any] = {
             "series_id": feature_name,
             "rows_inserted": 0,
             "status": "SUCCESS",
             "errors": [],
         }
-
         try:
-            total_inserted = 0
-            current_offset = offset
-
-            while True:
-                data = self._fetch_page(resource_id, limit, current_offset)
-                records = data.get("result", {}).get("records", [])
-
-                if not records:
-                    break
-
-                with self.engine.begin() as conn:
-                    for record in records:
-                        try:
-                            # MAS records have end_of_day, end_of_month, or similar date fields
-                            date_str = (
-                                record.get("end_of_day")
-                                or record.get("end_of_month")
-                                or record.get("end_of_quarter")
-                                or record.get("month")
-                                or ""
-                            )
-                            if not date_str:
-                                continue
-
-                            obs_dt = self._parse_date(date_str)
-                            if obs_dt is None:
-                                continue
-
-                            # Find the first numeric value field
-                            value = None
-                            for key in sorted(record.keys()):
-                                if key.startswith("end_of") or key in ("_id", "month", "timestamp"):
-                                    continue
-                                try:
-                                    value = float(record[key])
-                                    break
-                                except (ValueError, TypeError):
-                                    continue
-
-                            if value is None:
-                                continue
-
-                            if self._row_exists(feature_name, obs_dt, conn):
-                                continue
-
-                            conn.execute(
-                                text(
-                                    "INSERT INTO raw_series "
-                                    "(series_id, source_id, obs_date, value, pull_status) "
-                                    "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
-                                ),
-                                {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
-                            )
-                            total_inserted += 1
-                        except Exception as row_exc:
-                            log.debug("Skipping MAS row: {err}", err=str(row_exc))
-                            continue
-
-                # Check if more pages exist
-                total_records = data.get("result", {}).get("total", 0)
-                current_offset += limit
-                if current_offset >= total_records:
-                    break
-
-                time.sleep(0.5)
-
-            result["rows_inserted"] = total_inserted
-            log.info("MAS {fn}: inserted {n} rows", fn=feature_name, n=total_inserted)
-
+            observations = self._fetch(flow, key, sdmx_json.lookback_start_year(start_date))
+            if not observations:
+                result["status"] = "PARTIAL"
+                result["errors"].append(f"IMF {flow}/{key} returned no observations")
+                return result
+            inserted = 0
+            with self.engine.begin() as conn:
+                for obs_dt, value in observations:
+                    if self._row_exists(feature_name, obs_dt, conn):
+                        continue
+                    conn.execute(
+                        text(
+                            "INSERT INTO raw_series "
+                            "(series_id, source_id, obs_date, value, pull_status) "
+                            "VALUES (:sid, :src, :od, :val, 'SUCCESS')"
+                        ),
+                        {"sid": feature_name, "src": self.source_id, "od": obs_dt, "val": value},
+                    )
+                    inserted += 1
+            result["rows_inserted"] = inserted
+            log.info("MAS {fn}: inserted {n} rows", fn=feature_name, n=inserted)
         except Exception as exc:
-            err_str = str(exc)
-            # Tenacity RetryError + JSONDecodeError / ReadTimeout means the
-            # MAS upstream is sick (HTML error page, slow gateway). All four
-            # resources share that upstream so trip a 6h process-scoped
-            # cooldown and downgrade to WARNING — operator already has the
-            # signal from one log line, no value in three more.
-            transient = (
-                "RetryError" in err_str
-                or "JSONDecodeError" in err_str
-                or "ReadTimeout" in err_str
-                or "Timeout" in err_str
-                or "ConnectionError" in err_str
-            )
-            if transient:
-                _API_COOLDOWN_UNTIL = time.time() + _API_COOLDOWN_SECONDS
-                log.warning(
-                    "MAS pull failed for {rid}: {err} — tripping {h}h "
-                    "cooldown for the rest of this cycle",
-                    rid=resource_id,
-                    err=err_str[:200],
-                    h=_API_COOLDOWN_SECONDS // 3600,
-                )
-            else:
-                log.error(
-                    "MAS pull failed for {rid}: {err}", rid=resource_id, err=err_str,
-                )
+            level = log.error if isinstance(exc, (KeyError, AttributeError, TypeError)) else log.warning
+            level("MAS pull failed for {fn} ({fl}/{k}): {err}", fn=feature_name, fl=flow, k=key, err=str(exc)[:200])
             result["status"] = "FAILED"
-            result["errors"].append(err_str)
-
+            result["errors"].append(str(exc))
         time.sleep(_RATE_LIMIT_DELAY)
         return result
 
-    @staticmethod
-    def _parse_date(date_str: str) -> date | None:
-        """Parse various MAS date formats."""
-        for fmt in ("%Y-%m-%d", "%Y-%m", "%Y/%m/%d", "%d/%m/%Y"):
-            try:
-                return datetime.strptime(date_str[:10], fmt).date()
-            except (ValueError, TypeError):
-                continue
-        return None
-
     def pull_all(self, start_date: str | date = "2000-01-01") -> dict[str, Any]:
-        """Pull all MAS resources."""
-        log.info("Starting MAS bulk pull")
-        results = [self.pull_resource(rid) for rid in MAS_SERIES]
-
+        """Pull every Singapore series that is still reachable."""
+        global _UNAVAILABLE_LOGGED
+        if not _UNAVAILABLE_LOGGED:
+            _UNAVAILABLE_LOGGED = True
+            log.info(
+                "MAS: not pulling {n} series with no keyless source: {s}",
+                n=len(MAS_UNAVAILABLE_SERIES),
+                s="; ".join(f"{k} ({v})" for k, v in MAS_UNAVAILABLE_SERIES.items()),
+            )
+        results = [self.pull_series(fn, start_date) for fn in MAS_SERIES]
         total_rows = sum(r["rows_inserted"] for r in results)
         succeeded = sum(1 for r in results if r["status"] == "SUCCESS")
         log.info(
@@ -218,4 +142,5 @@ class MASPuller(BasePuller):
             "total_rows": total_rows,
             "succeeded": succeeded,
             "total": len(results),
+            "unavailable_series": sorted(MAS_UNAVAILABLE_SERIES),
         }

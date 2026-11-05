@@ -10,17 +10,20 @@ auto-create (or its copy-pasted equivalent) for four pullers:
     `revision_behavior` (their inline INSERT omitted several NOT NULL
     columns entirely).
 
-These tests pin the *actual* allowed enum values from schema.sql and
+These tests pin the composed source enum values from schema.sql and
 verify each puller's registration payload against them, so a future
 edit can't silently reintroduce an invalid value.
 """
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
+
+from ingestion.base import BasePuller, VALID_LATENCY_CLASSES  # shared source of truth
 
 # Allowed values per schema.sql's source_catalog CHECK constraints.
+# latency_class is imported from ingestion.base, aligned with merged #881.
+# These mocks do not establish the installed database constraint state.
 VALID_COST_TIERS = {"FREE", "LOW", "PAID"}
-VALID_LATENCY_CLASSES = {"REALTIME", "EOD", "WEEKLY", "MONTHLY"}
 VALID_REVISION_BEHAVIORS = {"NEVER", "RARE", "FREQUENT"}
 VALID_TRUST_SCORES = {"HIGH", "MED", "LOW"}
 
@@ -129,3 +132,28 @@ class TestWikiHistorySourceCatalogInsert:
         assert ok is True
         assert captured["params"], "INSERT INTO source_catalog was not called with bound params"
         _assert_valid_registration_payload(captured["params"])
+
+
+class TestExistingSourceCatalogRow:
+    def test_existing_row_returns_id_without_normalization_or_writes(self):
+        """Registration normalizes only new rows; it does not repair metadata."""
+        engine = MagicMock()
+        conn = engine.connect.return_value.__enter__.return_value
+        conn.execute.return_value.fetchone.return_value = (177,)
+
+        class Puller(BasePuller):
+            SOURCE_NAME = "Existing_Latency_Test"
+            SOURCE_CONFIG = {"base_url": "synthetic", "latency_class": "STATIC"}
+
+        with patch("ingestion.base._normalize_latency_class") as normalize, \
+                patch("ingestion.base.log") as log:
+            puller = Puller(engine)
+
+        assert puller.source_id == 177
+        normalize.assert_not_called()
+        log.warning.assert_not_called()
+        engine.begin.assert_not_called()
+        conn.execute.assert_called_once()
+        statement, params = conn.execute.call_args.args
+        assert str(statement).strip().upper().startswith("SELECT ID FROM SOURCE_CATALOG")
+        assert params == {"name": Puller.SOURCE_NAME}

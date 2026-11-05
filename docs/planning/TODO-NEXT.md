@@ -22,7 +22,8 @@ from intelligence.cross_reference import run_all_checks
 from analysis.flow_thesis import generate_unified_thesis
 from intelligence.thesis_tracker import snapshot_thesis
 from sqlalchemy import create_engine
-engine = create_engine('postgresql://grid:gridmaster2026@localhost:5432/griddb')
+from config import settings
+engine = create_engine(settings.DB_URL)
 print(run_trust_cycle(engine))
 print(run_all_checks(engine))
 thesis = generate_unified_thesis(engine)

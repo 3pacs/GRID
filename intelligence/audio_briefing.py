@@ -22,6 +22,7 @@ No paid key is needed for the default path: local LLM text + local Kokoro.
 from __future__ import annotations
 
 import os
+import math
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -30,6 +31,9 @@ from pathlib import Path
 from typing import Any
 
 from loguru import logger as log
+from ollama.number_grounding import (
+    PUBLICATION_EVIDENCE_RULES, check_publication_claims, flow_evidence_kind,
+)
 
 # Best-effort Langfuse tracing — no-op if SDK absent / keys missing.
 # Used to tag non-chat LLM calls (TTS audio, Imagen image gen) that the
@@ -175,6 +179,7 @@ def _collect_flow_state(engine) -> dict[str, Any]:
                 "stress": layer.stress_score,
                 "total_usd": layer.total_value_usd,
                 "net_flow_1m": layer.net_flow_1m,
+                "measurement_type": "stock_change",
                 "node_count": len(layer.nodes),
                 "confidence": layer.confidence,
             }
@@ -190,6 +195,10 @@ def _collect_flow_state(engine) -> dict[str, Any]:
                 "value_usd": e.value_usd,
                 "channel": e.channel,
                 "direction": e.direction,
+                # FlowEngine computes these from endpoint pools and weights;
+                # even confirmed endpoint data does not make a measured transfer.
+                "source_type": "correlation_proxy" if e.channel == "risk_correlation" else "structural_estimate",
+                "unit": "USD",
             }
             for e in top_edges
         ]
@@ -282,6 +291,30 @@ def _collect_all_data(engine) -> dict[str, Any]:
 
 # -- Script Generation via Gemini -------------------------------------------
 
+def _finite_briefing_amount(value: Any) -> float | int | None:
+    """Keep absent/invalid numbers out of the writer's monetary context."""
+    if isinstance(value, bool) or not isinstance(value, (float, int)):
+        return None
+    try:
+        return value if math.isfinite(value) else None
+    except OverflowError:
+        return None
+
+
+def _format_edge_for_briefing(edge: dict[str, Any]) -> str:
+    """Keep source semantics attached to every edge presented to a writer."""
+    kind = flow_evidence_kind(edge)
+    path = f"{edge.get('from', 'unknown')} -> {edge.get('to', 'unknown')}"
+    if kind == "reported_flow":
+        return (f"{edge['source_id']} source-reported {edge['direction']} ${edge['value_usd'] / 1e9:.3f}B over the reported interval.\n"
+                f"    Path: {path}; interval: {edge['interval_start']} to {edge['interval_end']}")
+    if kind == "correlation_proxy":
+        return f"{path}: correlation proxy via risk_correlation; transfer amount unmeasured"
+    if kind == "structural_estimate":
+        return f"{path}: structural model estimate via {edge.get('channel', 'unknown')}; transfer amount unmeasured"
+    return f"{path}: unknown source; transfer amount unavailable"
+
+
 def _build_briefing_prompt(data: dict[str, Any]) -> str:
     """Build the Gemini prompt to generate a briefing script."""
     briefing_date = data.get("date", date.today().isoformat())
@@ -295,12 +328,12 @@ def _build_briefing_prompt(data: dict[str, Any]) -> str:
     for layer in flow.get("layers", []):
         name = layer.get("name", "Unknown")
         regime = layer.get("regime", "neutral")
-        stress = layer.get("stress")
-        total = layer.get("total_usd")
-        net = layer.get("net_flow_1m")
+        stress = _finite_briefing_amount(layer.get("stress"))
+        total = _finite_briefing_amount(layer.get("total_usd"))
+        net = _finite_briefing_amount(layer.get("net_flow_1m"))
         stress_str = f", stress={stress:.2f}" if stress is not None else ""
-        total_str = f", ${total / 1e12:.1f}T" if total else ""
-        net_str = f", net flow ${net / 1e9:.0f}B/mo" if net else ""
+        total_str = f", ${total / 1e12:.1f}T" if total is not None else ""
+        net_str = f", stock change ${net / 1e9:+.1f}B over one month" if net is not None else ", stock change unavailable"
         layer_lines.append(
             f"  - {name}: {regime}{stress_str}{total_str}{net_str}"
         )
@@ -309,10 +342,7 @@ def _build_briefing_prompt(data: dict[str, Any]) -> str:
     # Format top edges
     edge_lines = []
     for edge in flow.get("top_edges", []):
-        edge_lines.append(
-            f"  - {edge['from']} -> {edge['to']}: "
-            f"${edge['value_usd'] / 1e9:.1f}B via {edge['channel']}"
-        )
+        edge_lines.append(f"  - {_format_edge_for_briefing(edge)}")
     edges_block = "\n".join(edge_lines) if edge_lines else "  (no edges)"
 
     # Format credit
@@ -340,17 +370,17 @@ def _build_briefing_prompt(data: dict[str, Any]) -> str:
     conviction = thesis.get("conviction", "low")
     key_drivers = thesis.get("key_drivers", [])
     risk_factors = thesis.get("risk_factors", [])
-    flow_narrative = flow.get("narrative", "")
+    # Unstructured engine commentary cannot promote proxies into observations.
     thesis_narrative = thesis.get("narrative", "")
 
-    global_liq = flow.get("global_liquidity")
-    liq_str = f"${global_liq / 1e12:.1f}T" if global_liq else "N/A"
-    liq_change = flow.get("liquidity_change_1m")
+    global_liq = _finite_briefing_amount(flow.get("global_liquidity"))
+    liq_str = f"${global_liq / 1e12:.1f}T" if global_liq is not None else "N/A"
+    liq_change = _finite_briefing_amount(flow.get("liquidity_change_1m"))
     liq_chg_str = (
         f"{'expanding' if liq_change > 0 else 'contracting'} "
         f"${abs(liq_change) / 1e9:.0f}B/month"
         if liq_change
-        else "stable"
+        else "unchanged" if liq_change == 0 else "change unavailable"
     )
 
     # Intelligence context
@@ -392,10 +422,10 @@ DATA:
 Global Liquidity: {liq_str} ({liq_chg_str})
 {layers_block}
 
-Top Capital Flows:
+Model Relationships / Source-Reported Transfers:
 {edges_block}
 
-Flow Narrative: {flow_narrative}
+Evidence boundaries: {PUBLICATION_EVIDENCE_RULES}
 
 === Credit / CDS Dashboard ===
 Credit Regime: {regime_str}
@@ -455,10 +485,21 @@ _SCRIPT_SYSTEM_PROMPT = (
     "earnings surprises, or actor moves that shift liquidity. Tag each claim as "
     "confirmed, expected, or rumored. No markdown. Pure broadcast speech, "
     "150-250 words."
-)
+) + " " + PUBLICATION_EVIDENCE_RULES
 
 
 def _generate_script_text(data: dict[str, Any]) -> tuple[str, str]:
+    """Inspect every provider candidate before any public caller can use it."""
+    script, provider = _generate_script_candidate(data)
+    receipt = check_publication_claims(script, data.get("flow", {}).get("top_edges", []))
+    if not receipt["passed"]:
+        # Keep this outside provider fallback: semantic rejection must not
+        # initiate another model request, persistence, synthesis or publishing.
+        raise ValueError(f"Briefing withheld by publication claim guard: {receipt['reasons']}")
+    return script, provider
+
+
+def _generate_script_candidate(data: dict[str, Any]) -> tuple[str, str]:
     """Generate the briefing script text.
 
     Wave 3 fix (GRID-WAVE3-HELD-WRITERS-TRIAGE-20260927.md #5, "text-only via
