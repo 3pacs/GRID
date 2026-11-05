@@ -169,7 +169,9 @@ class PullLogFailureTests(unittest.TestCase):
  def test_partial_counts_success_and_running_do_not(self):
   a,_,_=exercise([],pull_log=[
    plrow('RBI',source=2,hours=2,error='1 of 3 failed',status='PARTIAL'),
-   plrow('RBI',source=2,hours=1,error='SUCCESS_MUST_NOT_COUNT',status='SUCCESS'),
+   # Earlier than the PARTIAL: a later SUCCESS means the source recovered
+   # (RecoveredSourceTests); here it only must not count as a failure.
+   plrow('RBI',source=2,hours=3,error='SUCCESS_MUST_NOT_COUNT',status='SUCCESS'),
    plrow('RBI',source=2,hours=1,error='RUNNING_MUST_NOT_COUNT',status='RUNNING',completed=False),
   ])
   self.assertEqual(a.rows,[('SYNTH_B',1,NOW-dt.timedelta(hours=2),'1 of 3 failed')])
@@ -193,6 +195,33 @@ class PullLogFailureTests(unittest.TestCase):
   _,result,_=exercise([],catalog=((1,'FRED'),),pull_log=[plrow('fred',source=1,error='HTTP 429 Too Many Requests')])
   self.assertEqual(result['fix_actions'],{'fred':'CHECK_KEY'})
   self.assertEqual(result['retried'],0)
+
+class RecoveredSourceTests(unittest.TestCase):
+ """A newer SUCCESS/NO_NEW_ROWS pull_log run supersedes the latest failure (2026-11-05)."""
+ def test_later_success_clears_the_failure(self):
+  a,_,_=exercise([],pull_log=[plrow('BIS',source=1,hours=3,error='OLD_FAIL'),plrow('BIS',source=1,hours=1,error=None,status='SUCCESS')])
+  self.assertEqual(a.rows,[])
+
+ def test_later_no_new_rows_also_clears_it(self):
+  a,_,_=exercise([],pull_log=[plrow('job',source=None,hours=3,error='OLD_FAIL'),plrow('job',source=None,hours=1,error=None,status='NO_NEW_ROWS')])
+  self.assertEqual(a.rows,[])
+
+ def test_success_before_the_latest_failure_does_not(self):
+  a,_,_=exercise([],pull_log=[plrow('BIS',source=1,hours=3,error=None,status='SUCCESS'),plrow('BIS',source=1,hours=1,error='STILL_FAILING')])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=1),'STILL_FAILING')])
+
+ def test_another_sources_success_does_not(self):
+  a,_,_=exercise([],pull_log=[plrow('BIS',source=1,hours=3,error='A_FAIL'),plrow('OTHER',source=2,hours=1,error=None,status='SUCCESS')])
+  self.assertEqual(a.rows,[('SYNTH_A',1,NOW-dt.timedelta(hours=3),'A_FAIL')])
+
+ def test_partial_after_failure_is_not_recovery(self):
+  a,_,_=exercise([],pull_log=[plrow('BIS',source=1,hours=3,error='A_FAIL'),plrow('BIS',source=1,hours=1,error='HALF',status='PARTIAL')])
+  self.assertEqual(a.rows,[('SYNTH_A',2,NOW-dt.timedelta(hours=1),'HALF')])
+
+ def test_raw_series_failure_is_cleared_by_a_later_pull_log_success_of_that_source(self):
+  a,_,_=exercise([row(source=1,hours=3,error='RAW_FAIL')],pull_log=[plrow('anything',source=1,hours=1,error=None,status='SUCCESS')])
+  self.assertEqual(a.rows,[])
+
 
 class MissingPullLogTests(unittest.TestCase):
  # 2026-10-26 review F1: the repair query named pull_log unconditionally, so a
