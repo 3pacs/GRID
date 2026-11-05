@@ -23,7 +23,13 @@ def _load(source: str | None = None):
     path = Path(__file__).resolve().parents[1] / "scripts/hermes_fixers.py"
     tree = ast.parse(path.read_text(encoding="utf8") if source is None else source)
     names = {"diagnose_and_fix_pulls", "_next_diagnostics_token", "_diagnostics_abandoned",
-             "_normalize_source_key", "_classify_pull_failure"}
+             "_normalize_source_key", "_classify_pull_failure",
+             # Progress-per-pass scheduling helpers (2026-11-04).
+             "_order_repair_candidates", "_note_repair_started",
+             "_deterministic_skip_reason", "_record_deterministic_failure",
+             "_is_deterministic_retry_error", "_cached_diagnosis", "_store_diagnosis",
+             "_chat_kwargs_without_thinking", "_warn_throttled", "_run_bounded",
+             "note_repair_failure", "note_repair_recovered"}
     nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name in names]
     assert len(nodes) == len(names)
     clock = SimpleNamespace(now=0.0)
@@ -36,7 +42,20 @@ def _load(source: str | None = None):
                  "_relation_exists": lambda *a: True,
                  "_format_pull_action_catalog": lambda: "RETRY",
                  "_parse_pull_diagnosis_actions": lambda response: {},
-                 "log_issue": MagicMock(), "resolve_source_issues": MagicMock()}
+                 "log_issue": MagicMock(), "resolve_source_issues": MagicMock(),
+                 "threading": threading, "inspect": __import__("inspect"),
+                 "traceback": __import__("traceback"), "Callable": Any,
+                 "DIAGNOSIS_LLM_BUDGET_SECONDS": 45.0, "PER_SOURCE_REPAIR_SECONDS": 60.0,
+                 "MAX_DIAGNOSIS_SOURCES": 12, "DIAGNOSIS_CACHE_TTL_SECONDS": 3600.0,
+                 "DETERMINISTIC_FAILURE_COOLDOWN_SECONDS": 43200.0,
+                 "REPAIR_WARNING_INTERVAL_SECONDS": 3600.0,
+                 "_REPAIR_SCHEDULE_LOCK": threading.Lock(), "_REPAIR_LAST_STARTED": {},
+                 "_DETERMINISTIC_SKIPS": {}, "_DIAGNOSIS_CACHE": {}, "_THROTTLED_WARNINGS": {},
+                 "_DETERMINISTIC_RETRY_ERRORS": (AttributeError, ImportError, NotImplementedError),
+                 "_SIGNATURE_TYPEERROR_MARKERS": ("unexpected keyword argument",),
+                 "_REPEATED_FAILURES": {}, "REPEATED_FAILURE_THRESHOLD": 3,
+                 "REPEATED_FAILURE_COOLDOWN_SECONDS": 86400.0,
+                 "REPEATED_FAILURE_MAX_COOLDOWN_SECONDS": 604800.0}
     exec(compile(ast.Module(body=nodes, type_ignores=[]), str(path), "exec",
                  flags=__future__.annotations.compiler_flag), namespace)
     return namespace, clock

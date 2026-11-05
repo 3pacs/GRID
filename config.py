@@ -112,6 +112,10 @@ class Settings(BaseSettings):
     WORLDNEWS_API_KEY: str = ""
     NEWSAPI_KEY: str = ""                # newsapi.org headline counts (scripts/load_wave2.py)
     OPENSECRETS_API_KEY: str = ""
+    # Read via getattr(settings, ...) by the Hermes retry path; the puller
+    # itself reads os.environ (api_key_mode "env" / "first" in the registry).
+    QUIVERQUANT_API_KEY: str = ""
+    UK_COMPANIES_HOUSE_KEY: str = ""
 
     # Backup data source API keys
     COINGECKO_API_KEY: str = ""          # Free: 30 req/min, Pro: unlimited
@@ -793,7 +797,7 @@ class Settings(BaseSettings):
     SOLANA_UNIVERSE_LIMIT: int = 250
     SOLANA_UNIVERSE_CRON: str = "0 */4 * * *"          # every 4 hours
     SOLANA_UNIVERSE_ENRICH_ON_INSERT: bool = True
-    SOLANA_UNIVERSE_JUPITER_URL: str = "https://token.jup.ag/strict"
+    SOLANA_UNIVERSE_JUPITER_URL: str = "https://lite-api.jup.ag/tokens/v2/tag?query=verified"  # token.jup.ag retired
     SOLANA_UNIVERSE_DEX_BATCH: int = 30
 
     # Solana real-time ingest + cross-reference
@@ -979,11 +983,45 @@ except Exception:
     _log_scrubber = None
 
 
+# Second layer: pattern redaction (URL query strings and userinfo, auth
+# headers/schemes, JWTs, hex path keys such as the FIRMS MAP_KEY, quoted and
+# JSON key=value forms). The sanitizer above knows today's configured secret
+# values; this catches keys it doesn't (old/rotated keys, provider tokens
+# fetched at runtime). Imported once at load: a per-record import breaks
+# logging wherever builtins.__import__ is patched. Fails closed: without
+# utils/ (config.py copied standalone) a minimal fallback still masks query
+# strings and key=value pairs, and says so once.
+try:
+    from utils.redaction import redact_secrets as _redact_secrets
+except ImportError:
+    import re as _re
+
+    _FALLBACK_QUERY_RE = _re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://[^\s?#'\"<>]+)\?[^\s#'\"<>]*")
+    _FALLBACK_ASSIGN_RE = _re.compile(
+        r"(?i)\b([a-z0-9_-]*(?:key|token|secret|password|passwd|auth)[a-z0-9_-]*['\"]?\s*[=:]\s*['\"]?)"
+        r"[^\s,&'\"}]+"
+    )
+
+    def _redact_secrets(text: str | None) -> str | None:  # type: ignore[misc]
+        if text is None:
+            return None
+        text = _FALLBACK_QUERY_RE.sub(lambda m: m.group(1) + "?[REDACTED]", str(text))
+        return _FALLBACK_ASSIGN_RE.sub(lambda m: m.group(1) + "[REDACTED]", text)
+
+    sys.stderr.write(
+        "WARNING: utils.redaction unavailable; config.py is using its fallback "
+        "log redactor (URL query strings and key=value only)\n"
+    )
+
+
 def _scrub_log_text(text: str) -> str:
-    if _log_scrubber is None:
-        return text
+    if _log_scrubber is not None:
+        try:
+            text = _log_scrubber.scrub(text)
+        except Exception:
+            pass  # never let scrubbing drop a log line
     try:
-        return _log_scrubber.scrub(text)
+        return _redact_secrets(text)
     except Exception:
         return text  # never let scrubbing drop a log line
 
@@ -1035,7 +1073,7 @@ if os.getenv("GRID_GIT_SINK_DISABLED", "").lower() not in ("1", "true", "yes"):
         from server_log.git_sink import GitSink
 
         _git_sink = GitSink()
-        log.add(_git_sink.write, level="ERROR")
+        log.add(_git_sink.write, level="ERROR", diagnose=LOG_DIAGNOSE)
         _git_sink.start()
         log.info(
             "GitSink attached — errors land in .server-logs/errors.jsonl "

@@ -534,7 +534,16 @@ class CurrentSecDefaultTests(unittest.TestCase):
     def test_unselected_default_source_tails_are_current_base_exact(self):
         # Operator tail: accepted PR911 head 7ec182b, blob 4b039ec9.
         # Parent 9135c68 tail d1b16920 differs only in the approved stale block.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','381edbc4c69e5024c19ec0f616c6420d81b375bb293a8974b7f5b78dde32f624'),(SCHED,'\nimport calendar\n','11bca7eb2a3cc0852bae9ab0dd4e5135b5cdaf1ebf28c906a76680ec3ce5ad21')]:
+        # Re-pinned 2026-11-04 (claude/hermes-selfheal-llm-20261104; prior pin
+        # 381edbc4...): api_key_mode carried into the derived retry registry,
+        # the stale block skips not-configured / deterministically failing
+        # sources, and records deterministic retry failures. Needs reviewer
+        # acceptance like the prior pins.
+        # SCHED re-pinned 11bca7eb -> 01f537c3 (2026-11-04 wave): the only
+        # scheduler edits are gdelt freq_h 0.083 -> 1, earnings_calendar
+        # timeout_s 120 -> 300, and retirement hold_reasons on
+        # baltic_exchange and dune. Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','01f537c327b5bf6a401b694c82057ece0dde9e61c7a810ea9e547c80ad98dc51')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

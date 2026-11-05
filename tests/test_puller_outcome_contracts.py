@@ -368,7 +368,7 @@ class OutcomeTests(unittest.TestCase):
           'yield':{'yc_5y':[(DAY,4)],'yc_30y':[(DAY,5)],'yc_2y':[(DAY,3)],'yc_10y':[(DAY,4.5)]},
           'repo':{'sofr_rate':[(DAY,5)],'fed_funds_effective':[(DAY,4)],'reverse_repo_usage':[(DAY,100)],'treasury_bill_3m':[(DAY,5.5)]},
         }
-        for key,expected in (('yield',[1.0,0.5]),('repo',[1.0,1.0,0.5])):
+        for key,expected in (('yield',[1.0,0.5]),('repo',[1.0,0.5])):  # repo: rrp_as_pct_of_peak now comes from fed_liquidity (2026-11-04)
             with self.subTest(key=key):
                 e=Engine();e.select_rows=maps[key];p,_,_=self.make(key,engine=e)
                 out=p._compute_derived(DAY,DAY)

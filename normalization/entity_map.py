@@ -217,7 +217,9 @@ SEED_MAPPINGS: dict[str, str] = {
     "DGS1": "yc_1y",
     "DGS2": "yc_2y",
     "DGS5": "yc_5y",
-    "DGS10": "yc_10y",
+    # Live 10Y feeds the registered treasury_10y (owner decision 2026-11-04);
+    # yc_10y was never registered, so its live rows were dropped.
+    "DGS10": "treasury_10y",
     "DGS30": "yc_30y",
     "DFII10": "yc_real_10y",
     "UMCSENT": "umich_sentiment",
@@ -254,6 +256,9 @@ SEED_MAPPINGS: dict[str, str] = {
     # ── Yield curve series (stored with feature name as series_id) ──────────
     "yc_1y": "yc_1y",
     "yc_5y": "yc_5y",
+    # yield_curve_full writes the 10Y as raw "yc_10y" (live); it resolves into
+    # treasury_10y, which the dashboard/canvas/regime/thesis code reads.
+    "yc_10y": "treasury_10y",
     "yc_30y": "yc_30y",
     "yc_real_10y": "yc_real_10y",
     "yc_breakeven_10y": "yc_breakeven_10y",
@@ -524,11 +529,22 @@ SEED_MAPPINGS: dict[str, str] = {
 # V2 mappings for international, trade, physical, and alternative data
 NEW_MAPPINGS_V2: dict[str, str] = {
     # BLS (raw BLS series IDs from bls.py)
-    "CES0000000001": "bls_nonfarm_payrolls",
-    "LNS14000000": "bls_unemployment_rate",
+    # Same series as FRED PAYEMS / UNRATE (2026-09: 159044 / 4.2 from both),
+    # so they resolve into the existing features as a second source with
+    # conflict checking (owner decision 2026-11-04), not as duplicate
+    # bls_* features.
+    "CES0000000001": "nonfarm_payrolls",
+    "LNS14000000": "unemployment_rate",
     "CUUR0000SA0": "bls_cpi_u_all",
     "PRS85006092": "bls_nonfarm_productivity",
     "JTS00000000JOL": "bls_jolts_openings",
+    # The id above is not a BLS series ("Series does not exist"), so JOLTS was
+    # never stored. ingestion/bls.py now pulls the real one (2026-11-04):
+    # total nonfarm job openings, SA level -- 2026 M09 = 7523. The old key is
+    # kept; it is harmless.
+    "JTS000000000000000JOL": "bls_jolts_openings",
+    # FRED republishes the same JOLTS level (thousands, SA).
+    "JTSJOL": "bls_jolts_openings",
 
     # ECB
     "ECB:BSI.M.U2.Y.V.M30.X.1.U2.2300.Z01.A": "ecb_m3_yoy",
@@ -717,15 +733,20 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # "ANALYST:sol_analyst_hold": "sol_analyst_hold",      # DEAD: no matching feature in registry
 
     # ── Fed liquidity equation (fed_liquidity.py) ────────────────────────
-    "RRPONTSYD": "overnight_reverse_repo",
+    # Owner decision 2026-11-04: the live series feed the registered names
+    # that stopped updating on 2026-04-02, instead of new duplicate names.
+    "RRPONTSYD": "reverse_repo_usage",
     "WSHOSHO": "fed_treasury_holdings",
     "SWPT": "central_bank_liq_swaps",
-    "H8B1023NCBCMG": "bank_reserves_at_fed",
-    "TOTRESNS": "total_reserves",
+    # H8B1023NCBCMG is monthly C&I-loan growth, not bank reserves (FRED
+    # metadata); TOTRESNS is total reserves. Owner decision 2026-11-04.
+    "H8B1023NCBCMG": "ci_loans_growth",
+    "TOTRESNS": "bank_reserves_at_fed",
     "COMPUTED:fed_net_liquidity": "fed_net_liquidity",
     "COMPUTED:fed_net_liquidity_change_1w": "fed_net_liquidity_change_1w",
     "COMPUTED:fed_net_liquidity_change_1m": "fed_net_liquidity_change_1m",
-    "COMPUTED:reverse_repo_pct_of_peak": "reverse_repo_pct_of_peak",
+    # All-history peak; repo_market's window-peak copy was dropped.
+    "COMPUTED:reverse_repo_pct_of_peak": "rrp_as_pct_of_peak",
     "COMPUTED:tga_drawdown": "tga_drawdown",
 
     # ── ETF flow proxies (institutional_flows.py) ──────────────────────
@@ -828,6 +849,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     "CBOE:VIX": "vix_spot",
     "CBOE:VIX3M": "vix3m_spot",
     "CBOE:VIX9D": "vix9d_spot",
+    # COR3M replaces Cboe's discontinued ICJ (correlation_index, last obs
+    # 2021-11-19); registered by migrations/versions/ghost_features_20261104.py.
+    "CBOE:COR3M": "implied_correlation_3m",
     "CBOE:SKEW": "skew_index",
 
     # Binance crypto (bulk ZIP)
@@ -926,6 +950,9 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 
     # BCB Brazil (puller writes feature name as series_id)
     "brazil_selic_rate": "brazil_selic_rate",
+    # BCB code 1 / 3545 under their correct names (owner decision 2026-11-04).
+    "brazil_usd_brl_fx": "brazil_usd_brl",
+    "brazil_fx_reserves": "brazil_fx_reserves",
     "brazil_ipca_yoy": "brazil_ipca_yoy",
     "brazil_credit_growth": "brazil_credit_growth",
 
@@ -971,7 +998,7 @@ NEW_MAPPINGS_V2: dict[str, str] = {
     # Yield curve puller (stores as treasury_Xy, sofr, reverse_repo)
     "sofr": "sofr_rate",
     "reverse_repo": "reverse_repo_usage",
-    "treasury_10y": "yc_10y",
+    "treasury_10y": "treasury_10y",
     "treasury_2y": "yc_2y",
     "treasury_30y": "yc_30y",
 
@@ -1093,6 +1120,11 @@ NEW_MAPPINGS_V2: dict[str, str] = {
 # returned — returning one would recreate the "ghost mapping" failure mode
 # that migrations 0062/0063 had to clean up: a mapping that looks resolved
 # while silently dropping every row.
+
+# (series_id, feature_name) pairs already warned about as "Mapping exists but
+# feature not in registry" in this process. Module-level because the resolver
+# constructs a new EntityMap per cycle; see EntityMap.get_feature_id.
+_WARNED_MAPPED_MISSES: set[tuple[str, str]] = set()
 
 # Sentinel for the pattern cache.  A cached *miss* is stored as None, so
 # "absent from the cache" needs a value None cannot collide with.
@@ -1342,13 +1374,29 @@ class EntityMap:
         if feature_id is None:
             self._mapped_misses[series_id] = feature_name
             if self._record_miss(series_id) == 1:
-                log.warning(
-                    "Mapping exists ({sid} -> {fn}) but feature not in "
-                    "registry — further misses for this series_id are "
-                    "counted, not logged",
-                    sid=series_id,
-                    fn=feature_name,
-                )
+                # The resolver builds a fresh EntityMap every cycle, so a
+                # per-instance "once" was once per cycle: 498 identical lines
+                # a day on grid-hermes (2026-11-04) for 47 names that stay
+                # unregistered until a migration lands. Warn once per process
+                # per (series_id, name); the resolver's per-run summary still
+                # names every missing feature, so nothing goes silent.
+                key = (series_id, feature_name)
+                if key in _WARNED_MAPPED_MISSES:
+                    log.debug(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry (already warned this process)",
+                        sid=series_id, fn=feature_name,
+                    )
+                else:
+                    _WARNED_MAPPED_MISSES.add(key)
+                    log.warning(
+                        "Mapping exists ({sid} -> {fn}) but feature not in "
+                        "registry — further misses for this series_id are "
+                        "counted, not logged (once per process; the resolver "
+                        "summary names it every run)",
+                        sid=series_id,
+                        fn=feature_name,
+                    )
             return feature_id
 
         # Warn if the resolved feature has no recent data (cached check)

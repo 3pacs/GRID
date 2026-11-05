@@ -4,10 +4,17 @@
 
 1. scanner rows are sorted by score (descending);
 2. rows failing ``_sanity_check`` are dropped;
-3. at most 15 of the remaining rows are verified (``all_opps[:15]``);
-4. the cards are emitted 100x rows first, then by score (descending).
+3. ``_selection_gate`` withholds the 100x tier, suppressed directions (CALL)
+   and stale signal rows — none of them consumes a verification slot;
+4. at most 15 of the remaining rows are verified;
+5. a row whose verification names no contract is withheld;
+6. contracts emailed inside the re-send window are withheld, and nothing is
+   sent when nothing new is left;
+7. every remaining call is written to the ledger before the email is sent,
+   and a ledger read or write failure sends nothing;
+8. the cards ship in score order (descending).
 
-These tests pin steps 1-4 with synthetic rows. Every collaborator is an
+These tests pin steps 1-8 with synthetic rows. Every collaborator is an
 in-test adapter: the scanner module, the DB engine, the LLM HTTP client, the
 ``config`` module, per-row verification and the email sender. No provider,
 database, SMTP or yfinance call can happen — the adapters raise if reached.
@@ -29,7 +36,7 @@ from alerts import hundredx_digest as hx
 
 VERIFY_CAP = 15
 
-_CARD_TITLE = re.compile(r"^\[#(\d+) — (\S+) (CALL|PUT)S\]$", re.MULTILINE)
+_CARD_TITLE = re.compile(r"^\[#(\d+) — (\S+) (CALL|PUT)S(?: \(UNPROVEN\))?\]$", re.MULTILINE)
 
 
 # ── Synthetic scanner rows ──────────────────────────────────────────────────
@@ -45,7 +52,7 @@ class _Opp:
     ticker: str
     score: float
     estimated_payoff_multiple: float = 20.0
-    direction: str = "CALL"
+    direction: str = "PUT"
     thesis: str = "synthetic selection fixture"
     signals: dict[str, Any] = field(default_factory=lambda: {"pcr": {"value": 1.0, "raw_value": 1.0}})
     strikes: list[float] = field(default_factory=lambda: [100.0])
@@ -53,6 +60,8 @@ class _Opp:
     spot_price: float = 100.0
     iv_atm: float | None = 0.40
     confidence: str = "MEDIUM"
+    signal_date: Any = None
+    signal_captured_at: Any = None
 
     @property
     def is_100x(self) -> bool:
@@ -60,7 +69,7 @@ class _Opp:
 
 
 def _universe(n: int, hundredx_ranks: frozenset[int] = frozenset()) -> list[_Opp]:
-    """``n`` sanity-clean rows with distinct scores; rank 0 scores highest.
+    """``n`` sanity-clean PUT rows with distinct scores; rank 0 scores highest.
 
     Returned in a scrambled order so the digest's own score sort is exercised
     rather than inherited from the fixture.
@@ -132,6 +141,17 @@ class _Run:
     verified: list[str]
     cards: list[tuple[int, str]]
     sent: dict
+    persisted: list[dict]
+    events: list[str]
+
+
+def _contract(ticker: str, strike: float = 98.0) -> dict:
+    from datetime import datetime, timezone
+
+    return {"strike": strike, "bid": 2.00, "ask": 2.20, "iv": 0.40, "oi": 500, "volume": 20,
+            "last_trade": None, "expiry": "2026-12-18",
+            "quote_at": datetime(2026, 11, 3, 15, 0, tzinfo=timezone.utc),
+            "quote_source": "test chain"}
 
 
 @pytest.fixture(autouse=True)
@@ -150,7 +170,9 @@ def _isolate(monkeypatch):
     monkeypatch.setattr(smtplib, "SMTP_SSL", _no_smtp)
 
 
-def _run(monkeypatch, rows: list[_Opp]) -> _Run:
+def _run(monkeypatch, rows: list[_Opp], *, recent: list[dict] | None = None,
+         no_contract: frozenset[str] = frozenset(), ledger_read_error: bool = False,
+         ledger_write_error: bool = False) -> _Run:
     """Drive ``run_100x_digest`` over ``rows`` and record what it selected."""
     scanner_mod = types.ModuleType("discovery.options_scanner")
 
@@ -165,21 +187,52 @@ def _run(monkeypatch, rows: list[_Opp]) -> _Run:
     monkeypatch.setitem(sys.modules, "discovery.options_scanner", scanner_mod)
 
     verified: list[str] = []
+    events: list[str] = []
 
     def fake_verify(ticker, opp, engine):
         verified.append(ticker)
-        return {"verified": True, "issues": [], "corrections": [], "bonus_data": [],
-                "live_spot": None, "live_chain": None, "recommended_strikes": []}
+        contract = None if ticker in no_contract else _contract(ticker)
+        return {"verified": contract is not None, "issues": [], "corrections": [],
+                "bonus_data": [], "live_spot": 100.0, "spot_source": "test",
+                "spot_at": None, "live_chain": None, "contract": contract,
+                "recommended_strikes": [contract] if contract else []}
 
     monkeypatch.setattr(hx, "_verify_opportunity", fake_verify)
 
+    def fake_recent(engine, since):
+        if ledger_read_error:
+            raise RuntimeError('relation "options_digest_calls" does not exist')
+        return list(recent or [])
+
+    persisted: list[dict] = []
+
+    def fake_persist(engine, run_id, calls):
+        if ledger_write_error:
+            raise RuntimeError("permission denied for table options_digest_calls")
+        events.append("persist")
+        persisted.extend(calls)
+        return len(calls)
+
+    monkeypatch.setattr(hx, "_load_recent_calls", fake_recent)
+    monkeypatch.setattr(hx, "_persist_calls", fake_persist)
+    monkeypatch.setattr(hx, "_load_track_record", lambda engine, as_of: {
+        "calls": [], "settled": 0, "settled_wins": 0, "settled_hit_rate": None,
+        "settled_median_return": None, "open": 0, "open_median_return": None, "unpriced": 0})
+    monkeypatch.setattr(hx, "_catalyst_before_expiry",
+                        lambda engine, t, today, exp: {"status": "none_on_file", "detail": "test"})
+
     sent: dict = {}
-    monkeypatch.setattr(hx, "_send_in_thread",
-                        lambda subject, html, plain: sent.update(subject=subject, html=html, plain=plain))
+
+    def fake_send(subject, html, plain):
+        events.append("send")
+        sent.update(subject=subject, html=html, plain=plain)
+
+    monkeypatch.setattr(hx, "_send_in_thread", fake_send)
 
     result = hx.run_100x_digest()
     cards = [(int(i), t) for i, t, _ in _CARD_TITLE.findall(sent.get("plain", ""))]
-    return _Run(result=result, verified=verified, cards=cards, sent=sent)
+    return _Run(result=result, verified=verified, cards=cards, sent=sent,
+                persisted=persisted, events=events)
 
 
 def _r(*ranks: int) -> list[str]:
@@ -213,9 +266,11 @@ def test_verification_is_capped_at_15_rows(monkeypatch, n):
     run = _run(monkeypatch, _universe(n))
 
     expected = min(n, VERIFY_CAP)
+    assert VERIFY_CAP == hx.VERIFY_CAP
     assert len(run.verified) == expected
     assert run.result["opportunities"] == expected
     assert len(run.cards) == expected
+    assert len(run.persisted) == expected
 
 
 def test_cap_keeps_the_15_highest_scores_in_score_order(monkeypatch):
@@ -239,61 +294,183 @@ def test_sanity_rejects_do_not_consume_cap_slots(monkeypatch):
     assert garbage.isdisjoint(run.verified)
 
 
-def test_cap_is_applied_by_score_before_100x_priority(monkeypatch):
-    """Current behaviour: a 100x row ranked 16th or lower by score is never verified.
+# ── Measured selection gates ────────────────────────────────────────────────
 
-    The cap slices the score-sorted list; 100x priority only reorders what
-    survived it. Changing that is a product decision — this test makes it a
-    deliberate one.
-    """
-    run = _run(monkeypatch, _universe(20, hundredx_ranks=frozenset({3, 17})))
+def test_100x_tier_is_withheld_and_does_not_consume_slots(monkeypatch):
+    run = _run(monkeypatch, _universe(20, hundredx_ranks=frozenset({0, 3, 17})))
 
-    assert "R17" not in run.verified
-    assert "R17" not in [t for _, t in run.cards]
-    assert run.result["100x_count"] == 1
+    assert {"R00", "R03", "R17"}.isdisjoint(run.verified)
+    assert run.verified == _r(1, 2, *range(4, 17))
+    assert run.result["gated"]["lottery_tier"] == 3
+    assert run.result["100x_count"] == 0
 
 
-# ── Final ordering: 100x first, then score ──────────────────────────────────
+def test_calls_are_sent_and_labelled_unproven(monkeypatch):
+    # 2026-11-04 owner decision: send CALLs labelled, don't withhold them.
+    rows = _universe(6)
+    calls = {"R00", "R02"}
+    rows = [dataclasses.replace(o, direction="CALL") if o.ticker in calls else o for o in rows]
 
-def test_cards_are_100x_first_then_by_score(monkeypatch):
-    run = _run(monkeypatch, _universe(20, hundredx_ranks=frozenset({3, 9, 14, 17})))
+    run = _run(monkeypatch, rows)
 
-    expected = _r(3, 9, 14) + _r(0, 1, 2, 4, 5, 6, 7, 8, 10, 11, 12, 13)
-    assert [t for _, t in run.cards] == expected
-    assert [i for i, _ in run.cards] == list(range(1, 16))
-    assert run.result["100x_count"] == 3
-    assert run.sent["subject"] == "GRID Intelligence — 3 100x + 12 High-Score Opportunities"
+    assert calls <= set(run.verified)
+    assert run.result["gated"].get("direction_suppressed", 0) == 0
+    assert "CALLS (UNPROVEN)" in run.sent["plain"]
+    assert "42.0% of the time over 5 days" in run.sent["plain"]
+    assert {c["direction"] for c in run.persisted} == {"CALL", "PUT"}
+
+
+def test_call_direction_gate_still_withholds_when_enabled(monkeypatch):
+    from alerts import hundredx_digest as hd
+
+    monkeypatch.setattr(hd, "SUPPRESSED_DIRECTIONS", frozenset({"CALL"}))
+    rows = _universe(6)
+    calls = {"R00", "R02"}
+    rows = [dataclasses.replace(o, direction="CALL") if o.ticker in calls else o for o in rows]
+
+    run = _run(monkeypatch, rows)
+
+    assert calls.isdisjoint(run.verified)
+    assert run.result["gated"]["direction_suppressed"] == 2
+    assert "CALL withheld" in run.sent["plain"]
+    assert all(c["direction"] == "PUT" for c in run.persisted)
+
+
+def test_stale_signal_row_is_withheld(monkeypatch):
+    from datetime import date, timedelta
+
+    today = date.today()
+    rows = [dataclasses.replace(o, signal_date=today - timedelta(days=30 if o.ticker == "R01" else 0))
+            for o in _universe(4)]
+
+    run = _run(monkeypatch, rows)
+
+    assert "R01" not in run.verified
+    assert run.result["gated"]["stale_signal"] == 1
+
+
+def test_row_without_an_executable_contract_is_withheld(monkeypatch):
+    run = _run(monkeypatch, _universe(5), no_contract=frozenset({"R00", "R03"}))
+
+    assert run.verified == _r(0, 1, 2, 3, 4)  # all priced ...
+    assert [t for _, t in run.cards] == _r(1, 2, 4)  # ... two had no contract
+    assert run.result["gated"]["no_executable_contract"] == 2
+
+
+def test_nothing_is_sent_when_every_row_is_withheld(monkeypatch):
+    # Every row in the still-withheld 100x tier (CALLs are sent since 2026-11-04).
+    rows = _universe(4, hundredx_ranks=frozenset(range(4)))
+
+    run = _run(monkeypatch, rows)
+
+    assert run.result["sent"] is False
+    assert run.result["reason"] == "no_new_calls"
+    assert run.verified == []
+    assert run.events == []
+
+
+# ── Re-send window ──────────────────────────────────────────────────────────
+
+def test_contract_emailed_inside_the_window_is_not_resent(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    recent = [
+        {"ticker": "R00", "direction": "PUT", "expiry": "2026-12-18", "strike": 98.0,
+         "emailed_at": now - timedelta(hours=4)},
+        # Outside the window: sent again.
+        {"ticker": "R01", "direction": "PUT", "expiry": "2026-12-18", "strike": 98.0,
+         "emailed_at": now - timedelta(hours=hx.RESEND_COOLDOWN_HOURS + 1)},
+    ]
+
+    run = _run(monkeypatch, _universe(3), recent=recent)
+
+    assert [t for _, t in run.cards] == _r(1, 2)
+    assert run.result["gated"]["already_emailed"] == 1
+
+
+def test_nothing_new_sends_nothing(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.now(timezone.utc)
+    recent = [{"ticker": t, "direction": "PUT", "expiry": "2026-12-18", "strike": 98.0,
+               "emailed_at": now - timedelta(hours=1)} for t in _r(0, 1)]
+
+    run = _run(monkeypatch, _universe(2), recent=recent)
+
+    assert run.result == {**run.result, "sent": False, "reason": "no_new_calls"}
+    assert run.events == []
+
+
+def test_direction_flip_is_noted_on_the_card(monkeypatch):
+    from datetime import datetime, timedelta, timezone
+
+    recent = [{"ticker": "R00", "direction": "CALL", "expiry": "2026-11-20", "strike": 110.0,
+               "emailed_at": datetime.now(timezone.utc) - timedelta(days=3)}]
+
+    run = _run(monkeypatch, _universe(1), recent=recent)
+
+    assert "direction flipped: CALL emailed" in run.sent["plain"]
+
+
+# ── Ledger before email ─────────────────────────────────────────────────────
+
+def test_every_call_is_persisted_before_the_email_is_sent(monkeypatch):
+    run = _run(monkeypatch, _universe(3))
+
+    assert run.events == ["persist", "send"]
+    assert [c["ticker"] for c in run.persisted] == _r(0, 1, 2)
+    row = run.persisted[0]
+    assert row["contract"]["ask"] == 2.20 and row["contract"]["strike"] == 98.0
+    assert row["economics"]["breakeven"] == pytest.approx(98.0 - 2.20)
+    assert row["provenance"]["gates"]["min_dte"] == hx.MIN_DTE_DAYS
+
+
+def test_unreadable_ledger_sends_nothing(monkeypatch):
+    run = _run(monkeypatch, _universe(3), ledger_read_error=True)
+
+    assert run.result["sent"] is False
+    assert run.result["reason"] == "call_ledger_unavailable"
+    assert run.events == []
+
+
+def test_ledger_write_failure_sends_nothing(monkeypatch):
+    run = _run(monkeypatch, _universe(3), ledger_write_error=True)
+
+    assert run.result["sent"] is False
+    assert run.result["reason"] == "call_ledger_write_failed"
+    assert "send" not in run.events
+
+
+# ── Final ordering: by score ────────────────────────────────────────────────
+
+def test_cards_ship_in_score_order(monkeypatch):
+    run = _run(monkeypatch, _universe(6))
+
+    assert [t for _, t in run.cards] == _r(0, 1, 2, 3, 4, 5)
+    assert [i for i, _ in run.cards] == list(range(1, 7))
+    assert run.sent["subject"].startswith("GRID Options — 6 calls: R00 PUT, R01 PUT")
 
 
 def test_html_body_carries_the_same_order(monkeypatch):
-    run = _run(monkeypatch, _universe(6, hundredx_ranks=frozenset({4})))
+    run = _run(monkeypatch, _universe(4))
 
-    titles = re.findall(r'<div class="card-title">#\d+ — (\S+) CALLS</div>', run.sent["html"])
-    assert titles == _r(4, 0, 1, 2, 3, 5)
-
-
-def test_100x_rows_are_ordered_by_score_among_themselves(monkeypatch):
-    run = _run(monkeypatch, _universe(5, hundredx_ranks=frozenset({0, 2, 4})))
-
-    assert [t for _, t in run.cards] == _r(0, 2, 4, 1, 3)
+    titles = re.findall(r'<div class="card-title">#\d+ — (\S+) PUTS(?: \(UNPROVEN\))?</div>', run.sent["html"])
+    assert titles == _r(0, 1, 2, 3)
 
 
-def test_ordering_is_reapplied_after_llm_review(monkeypatch):
-    """A reachable LLM answers in verification (score) order and drops FAILs;
-    the shipped order is still 100x first, then score."""
+def test_llm_fail_drops_the_row(monkeypatch):
+    """A reachable LLM answers in verification (score) order and drops FAILs."""
     calls: list[str] = []
-    # Verification order is R00..R05; index N refers to R0(N-1).
     verdicts = ('[{"index": 1, "verdict": "PASS", "reason": "ok"}, '
                 '{"index": 2, "verdict": "FAIL", "reason": "bad"}, '
                 '{"index": 3, "verdict": "SUSPECT", "reason": "check"}, '
-                '{"index": 4, "verdict": "FAIL", "reason": "bad"}, '
-                '{"index": 5, "verdict": "PASS", "reason": "ok"}, '
-                '{"index": 6, "verdict": "PASS", "reason": "ok"}]')
+                '{"index": 4, "verdict": "FAIL", "reason": "bad"}]')
     monkeypatch.setitem(sys.modules, "requests", _scripted_llm_requests(verdicts, calls))
 
-    run = _run(monkeypatch, _universe(6, hundredx_ranks=frozenset({1, 3, 5})))
+    run = _run(monkeypatch, _universe(4))
 
     assert calls == ["GET /props", "POST /v1/chat/completions"]
-    assert run.verified == _r(0, 1, 2, 3, 4, 5)
-    assert [t for _, t in run.cards] == _r(5, 0, 2, 4)
-    assert run.result["100x_count"] == 1
+    assert run.verified == _r(0, 1, 2, 3)
+    assert [t for _, t in run.cards] == _r(0, 2)
+    assert "SUSPECT: check" in run.sent["plain"]

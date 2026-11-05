@@ -43,6 +43,7 @@ def _get_feature_registry(engine) -> pd.DataFrame:
 _SEMANTIC_GROUPS = {
     "treasury_curve": {
         "treasury_2y", "treasury_5y", "treasury_10y", "treasury_20y", "treasury_30y",
+        "yc_2y",  # live 2Y feature (FRED DGS2) since 2026-11-04
         "yield_curve_10y2y", "yield_curve_10y3m", "yield_curve_5y2y",
     },
     "overnight_rates": {

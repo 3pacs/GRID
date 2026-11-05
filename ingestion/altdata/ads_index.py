@@ -54,6 +54,15 @@ _ADS_CSV_URL: str = (
     "ads/ads_index_most_current_vintage.csv"
 )
 
+# The Philadelphia Fed file writes dates as "YYYY:MM:DD" (probed from
+# grid-svr 2026-11-04: first row "1960:03:01", last "2026:10:24"). Generic
+# pd.to_datetime() cannot read that, coerced every row to NaT, and the puller
+# had parsed 0 records ("no valid records parsed") since the format appeared.
+_ADS_DATE_FORMATS: tuple[str, ...] = ("%Y:%m:%d", "%Y-%m-%d", "%m/%d/%Y")
+
+# An .xlsx (zip) payload starts with these bytes; the ".csv" URL serves one.
+_ZIP_MAGIC: bytes = b"PK\x03\x04"
+
 # Series ID
 _SERIES_ID: str = "ads.business_conditions_index"
 
@@ -62,6 +71,35 @@ _PFX: str = "ads"
 
 # All series managed by this puller
 ALL_SERIES: list[str] = [_SERIES_ID]
+
+
+def _parse_ads_dates(values: Any) -> Any:
+    """Parse the ADS date column; unparseable cells become NaT.
+
+    Tries each known explicit format and keeps the one that parses the most
+    cells, so a format change surfaces as 0 parsed records (FAILED), never
+    as silently mis-dated rows.
+    """
+    import pandas as pd
+
+    raw = pd.Series(values)
+    if pd.api.types.is_datetime64_any_dtype(raw):
+        return raw
+    text_values = raw.astype(str).str.strip()
+    best = None
+    for fmt in _ADS_DATE_FORMATS:
+        parsed = pd.to_datetime(text_values, format=fmt, errors="coerce")
+        if best is None or parsed.notna().sum() > best.notna().sum():
+            best = parsed
+    return best
+
+
+def _inserted(result: Any) -> int:
+    """Committed-row contribution of one INSERT; unknown counts fail closed."""
+    affected = getattr(result, "rowcount", None)
+    if type(affected) is not int or affected < 0:
+        raise ValueError("Unknown affected row count")
+    return affected
 
 
 class ADSIndexPuller(BasePuller):
@@ -105,6 +143,27 @@ class ADSIndexPuller(BasePuller):
             sid=self.source_id,
         )
 
+    def validate_row(
+        self,
+        series_id: str,
+        obs_date: date,
+        value: float | None,
+        family: str | None = None,
+        previous_value: float | None = None,
+    ) -> list[str]:
+        """BasePuller sanity checks, minus the ">5 years old" warning.
+
+        ADS history starts in 1960 by design; the first load inserts ~24k
+        historical rows and the generic stale-source check would log one
+        WARNING per row. Values are already finite (see the parsers), so
+        rows older than five years skip the check entirely.
+        """
+        from datetime import timedelta
+
+        if obs_date < date.today() - timedelta(days=5 * 365):
+            return []
+        return super().validate_row(series_id, obs_date, value, family, previous_value)
+
     # ------------------------------------------------------------------
     # HTTP helpers
     # ------------------------------------------------------------------
@@ -142,18 +201,18 @@ class ADSIndexPuller(BasePuller):
             requests.exceptions.RequestException,
         ),
     )
-    def _fetch_csv(self) -> str:
-        """Download the ADS Index CSV file as fallback.
+    def _fetch_csv(self) -> bytes:
+        """Download the ADS Index ".csv" URL as fallback.
 
         Returns:
-            CSV text content.
+            Raw bytes (the URL currently serves the .xlsx workbook).
 
         Raises:
             requests.exceptions.HTTPError: On non-2xx response.
         """
         resp = self._session.get(_ADS_CSV_URL, timeout=_REQUEST_TIMEOUT)
         resp.raise_for_status()
-        return resp.text
+        return resp.content
 
     # ------------------------------------------------------------------
     # Parsing
@@ -206,7 +265,7 @@ class ADSIndexPuller(BasePuller):
             # Fall back to first column (usually the date)
             date_col = df.columns[0]
 
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[date_col] = _parse_ads_dates(df[date_col]).values
         df = df.dropna(subset=[date_col])
 
         # Identify value column
@@ -227,7 +286,7 @@ class ADSIndexPuller(BasePuller):
             if numeric_cols:
                 value_col = numeric_cols[0]
             else:
-                log.error("ADS: no numeric value column found")
+                log.warning("ADS: no numeric value column found")
                 return []
 
         log.debug(
@@ -292,7 +351,7 @@ class ADSIndexPuller(BasePuller):
         if date_col is None:
             date_col = df.columns[0]
 
-        df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        df[date_col] = _parse_ads_dates(df[date_col]).values
         df = df.dropna(subset=[date_col])
 
         # Identify value column
@@ -311,7 +370,7 @@ class ADSIndexPuller(BasePuller):
             if numeric_cols:
                 value_col = numeric_cols[0]
             else:
-                log.error("ADS CSV: no numeric value column found")
+                log.warning("ADS CSV: no numeric value column found")
                 return []
 
         records: list[tuple[date, float]] = []
@@ -357,21 +416,13 @@ class ADSIndexPuller(BasePuller):
         if isinstance(start_date, str):
             start_date = date.fromisoformat(start_date)
 
-        # Check latest stored date for incremental efficiency
-        latest_stored = self._get_latest_date(_SERIES_ID)
-        if latest_stored is not None:
-            # Only process records after the latest stored date
-            effective_start = max(start_date, latest_stored)
-            log.info(
-                "ADS: incremental pull from {d} (latest stored: {ls})",
-                d=effective_start,
-                ls=latest_stored,
-            )
-        else:
-            effective_start = start_date
-            log.info("ADS: full history pull from {d}", d=effective_start)
+        # Dedup against every stored date from start_date on (one query).
+        # Filtering by the latest stored date instead would never backfill
+        # history once a short-window repair run stored the newest rows.
+        log.info("ADS: pull from {d}", d=start_date)
 
-        # Fetch and parse data -- try Excel first, fall back to CSV
+        # Fetch and parse data -- try Excel first, fall back to the ".csv"
+        # URL (which currently serves the same workbook).
         records: list[tuple[date, float]] = []
         try:
             log.info("ADS: downloading Excel from Philadelphia Fed...")
@@ -383,10 +434,13 @@ class ADSIndexPuller(BasePuller):
                 e=str(exc),
             )
             try:
-                csv_text = self._fetch_csv()
-                records = self._parse_csv(csv_text)
+                payload = self._fetch_csv()
+                if isinstance(payload, bytes) and payload.startswith(_ZIP_MAGIC):
+                    records = self._parse_xlsx(payload)
+                else:
+                    records = self._parse_csv(payload if isinstance(payload, str) else payload.decode("utf-8", "replace"))
             except Exception as csv_exc:
-                log.error(
+                log.warning(
                     "ADS: both Excel and CSV downloads failed: {e}",
                     e=str(csv_exc),
                 )
@@ -398,33 +452,23 @@ class ADSIndexPuller(BasePuller):
                 }
 
         if not records:
+            # The download worked but nothing parsed: a format change, not
+            # "no new data".
             log.warning("ADS: no valid records parsed")
             return {
                 "feature": _SERIES_ID,
-                "status": "NO_DATA",
+                "status": "FAILED",
                 "rows_inserted": 0,
                 "total_parsed": 0,
+                "error": "ADS file downloaded but 0 valid (date, value) records parsed -- format changed?",
             }
 
-        # Filter to records after effective_start
-        records = [
-            (d, v) for d, v in records if d >= effective_start
-        ]
+        latest_record_date = max(d for d, _ in records)
+        records = [(d, v) for d, v in records if d >= start_date]
 
-        if not records:
-            log.info("ADS: no new records after {d}", d=effective_start)
-            return {
-                "feature": _SERIES_ID,
-                "status": "SUCCESS",
-                "rows_inserted": 0,
-                "total_parsed": 0,
-                "latest_date": str(latest_stored) if latest_stored else None,
-            }
-
-        # Batch dedup and insert
         rows_inserted = 0
         with self.engine.begin() as conn:
-            existing_dates = self._get_existing_dates(_SERIES_ID, conn)
+            existing_dates = self._get_existing_dates(_SERIES_ID, conn, start_date=start_date)
             log.debug(
                 "ADS: {n} existing dates in DB, {m} candidate records",
                 n=len(existing_dates),
@@ -434,7 +478,7 @@ class ADSIndexPuller(BasePuller):
             for obs_date, value in records:
                 if obs_date in existing_dates:
                     continue
-                self._insert_raw(
+                rows_inserted += _inserted(self._insert_raw(
                     conn=conn,
                     series_id=_SERIES_ID,
                     obs_date=obs_date,
@@ -443,19 +487,19 @@ class ADSIndexPuller(BasePuller):
                         "source": "Philadelphia Fed ADS Index",
                         "vintage": "most_current",
                     },
-                )
-                rows_inserted += 1
+                    return_result=True,
+                ))
 
-        latest_record_date = max(d for d, _ in records)
         log.info(
-            "ADS pull complete -- {n} new rows inserted (latest: {d})",
+            "ADS pull complete -- {n} new rows inserted (latest in file: {d})",
             n=rows_inserted,
             d=latest_record_date,
         )
 
         return {
             "feature": _SERIES_ID,
-            "status": "SUCCESS",
+            # Checked the current vintage and it has no date we lack.
+            "status": "SUCCESS" if rows_inserted else "UNCHANGED",
             "rows_inserted": rows_inserted,
             "total_parsed": len(records),
             "latest_date": str(latest_record_date),

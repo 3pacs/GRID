@@ -38,6 +38,10 @@ except ImportError:
     _PMXT_AVAILABLE = False
     log.info("pmxt SDK not installed — run: pip install pmxt")
 
+# A missing SDK is a permanent state: pull() warns about it once per process
+# (it warned 23 times a day on grid-hermes) and returns SKIPPED every run.
+_WARNED_PMXT_MISSING: bool = False
+
 
 # ── Configuration ────────────────────────────────────────────────────────
 
@@ -309,7 +313,17 @@ class PmxtPredictionPuller(BasePuller):
             Dict with status, events_scanned, series_stored, per-platform counts.
         """
         if not _PMXT_AVAILABLE:
-            log.warning("pmxt SDK not installed — skipping prediction pull")
+            # Permanent until someone installs the SDK: warn once per process,
+            # keep returning SKIPPED with the reason every run.
+            global _WARNED_PMXT_MISSING
+            if not _WARNED_PMXT_MISSING:
+                _WARNED_PMXT_MISSING = True
+                log.warning(
+                    "pmxt SDK not installed — skipping prediction pull "
+                    "(logged once per process; install pmxt to enable)"
+                )
+            else:
+                log.debug("pmxt SDK not installed — skipping prediction pull")
             return {
                 "status": "SKIPPED",
                 "reason": "pmxt not installed",
