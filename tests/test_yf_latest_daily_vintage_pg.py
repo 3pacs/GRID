@@ -110,7 +110,15 @@ def _seed(engine) -> None:
 
 
 @pytest.fixture()
-def env(monkeypatch):
+def scan(monkeypatch):
+    """The scan-fix revision, pointed at the same test schema/tickers as `env`."""
+    from migrations.versions import yf_latest_vintage_scan_20261026 as scan_mig
+
+    return scan_mig
+
+
+@pytest.fixture()
+def env(monkeypatch, scan):
     from migrations.versions import yf_latest_daily_vintage_20261019 as mig
     from scripts import refresh_yf_latest_vintage as refresh
 
@@ -125,6 +133,8 @@ def env(monkeypatch):
                             f"REFRESH MATERIALIZED VIEW CONCURRENTLY {qualified}")
         monkeypatch.setattr(refresh, "_COUNT_SQL", f"SELECT count(*) FROM {qualified}")
         monkeypatch.setattr(mig, "load_tickers", lambda: list(TICKERS))
+        monkeypatch.setattr(scan, "VIEW_NAME", qualified)
+        monkeypatch.setattr(scan, "load_tickers", lambda: list(TICKERS))
         yield mig, refresh, engine, qualified
 
 
@@ -227,8 +237,8 @@ def test_refresh_runs_inside_one_transaction_with_planner_hints(env):
     seen: dict[str, str] = {}
     original = refresh.refresh_statements
 
-    def spy(populated):
-        stmts = original(populated)
+    def spy(populated, *args, **kwargs):
+        stmts = original(populated, *args, **kwargs)
         seen["last"] = stmts[-1]
         return stmts
 
@@ -243,3 +253,124 @@ def test_refresh_runs_inside_one_transaction_with_planner_hints(env):
     with engine.connect() as conn:
         assert conn.execute(text("SHOW enable_hashjoin")).scalar() == "on"
         assert conn.execute(text("SHOW statement_timeout")).scalar() in ("0", "0ms")
+
+
+# ── scan fix (yf_latest_vintage_scan_20261026) ───────────────────────────
+
+
+def _many_vintages(engine) -> None:
+    """Dozens of vintages per date, with every awkward case the definition must handle."""
+    with engine.begin() as conn:
+        ins = text(
+            "INSERT INTO raw_series (series_id, source_id, obs_date, pull_timestamp, value, raw_payload, pull_status) "
+            "VALUES (:s, :src, :d, :ts, :v, CAST(:p AS JSONB), :st)"
+        )
+        rows = []
+        base = datetime(2026, 3, 1, tzinfo=timezone.utc)
+        from datetime import timedelta
+
+        for k in range(40):                                  # 40 pulls, each re-writes 5 dates of SPY close
+            for day in range(5):
+                rows.append(("YF:SPY:close", 2, date(2026, 3, 2 + day), base + timedelta(hours=3 * k, minutes=day),
+                             100.0 + k, '{"capture_state": "INCOMPLETE", "capture_policy": "p"}' if k % 2 else None,
+                             "SUCCESS"))
+        # Newest vintage of one date is FAILED / PARTIAL / QUARANTINED: the latest SUCCESS one must win.
+        rows += [
+            ("YF:SPY:close", 2, date(2026, 3, 2), base + timedelta(days=30), 0.0, None, "FAILED"),
+            ("YF:SPY:close", 2, date(2026, 3, 3), base + timedelta(days=30), 1.0, None, "PARTIAL"),
+            ("YF:SPY:close", 2, date(2026, 3, 4), base + timedelta(days=30), 2.0, None, "QUARANTINED"),
+            # A date whose only vintages are not SUCCESS yields no row.
+            ("YF:SPY:close", 2, date(2026, 3, 20), base + timedelta(days=1), 0.0, None, "FAILED"),
+            ("YF:SPY:close", 2, date(2026, 3, 20), base + timedelta(days=2), 0.0, None, "QUARANTINED"),
+            # Another source's SUCCESS vintage that falls BETWEEN source 2's latest SUCCESS and its newer
+            # PARTIAL one (2026-03-03): the probe must not pick it up (volume collision case).
+            ("YF:SPY:close", 3, date(2026, 3, 3), base + timedelta(days=29), 4242.0, None, "SUCCESS"),
+            # Another source, newer than every source-2 vintage: must be ignored (volume collision case).
+            ("YF:SPY:close", 3, date(2026, 3, 5), base + timedelta(days=40), 9999.0, None, "SUCCESS"),
+            ("YF:^GSPC:close", 3, date(2026, 3, 5), base + timedelta(days=40), 9999.0, None, "SUCCESS"),
+            # Before the first date.
+            ("YF:SPY:close", 2, date(2025, 12, 31), base, 1.0, None, "SUCCESS"),
+            # Repair vintage with a run tag, newest SUCCESS of its date.
+            ("YF:HG=F:close", 2, date(2026, 3, 2), base, 4.0, None, "SUCCESS"),
+            ("YF:HG=F:close", 2, date(2026, 3, 2), base + timedelta(days=2), 4.4,
+             '{"repair_run_tag": "phase3", "capture_policy": "p", "capture_state": "POLICY_ELIGIBLE"}', "SUCCESS"),
+        ]
+        conn.execute(ins, [
+            {"s": s, "src": src, "d": d, "ts": ts, "v": v, "p": p, "st": st}
+            for s, src, d, ts, v, p, st in rows
+        ])
+        conn.execute(text("ANALYZE raw_series"))
+
+
+def _select_rows(engine, select_sql):
+    with engine.connect() as conn:
+        res = conn.execute(text(select_sql))
+        return sorted(tuple(r) for r in res)
+
+
+def test_scan_fix_returns_exactly_the_rows_of_the_old_definition(env, scan):
+    mig, _refresh, engine, _q = env
+    _many_vintages(engine)
+    old_rows = _select_rows(engine, mig.build_select_sql(list(TICKERS)))
+    new_rows = _select_rows(engine, scan.build_select_sql(list(TICKERS)))
+    assert len(old_rows) > 10
+    assert new_rows == old_rows                   # every column of every row, both directions
+    keys = [(r[0], r[3]) for r in new_rows]       # (series_id, obs_date)
+    assert len(keys) == len(set(keys))            # one row per series/date
+    by_key = {(r[0], r[3]): r for r in new_rows}
+    assert ("YF:SPY:close", date(2026, 3, 20)) not in by_key            # only non-SUCCESS vintages
+    assert ("YF:SPY:close", date(2025, 12, 31)) not in by_key           # before 2026-01-01
+    assert by_key[("YF:SPY:close", date(2026, 3, 2))][6] == 139.0       # newest FAILED ignored: k=39 SUCCESS
+    assert by_key[("YF:SPY:close", date(2026, 3, 5))][6] == 139.0       # source 3 (9999) ignored
+    assert by_key[("YF:SPY:close", date(2026, 3, 3))][6] == 139.0       # source 3 (4242) between source 2's vintages ignored
+    hg = by_key[("YF:HG=F:close", date(2026, 3, 2))]
+    assert hg[6] == 4.4 and hg[10] == "phase3"
+
+
+def test_scan_fix_plan_reads_the_index_only_and_probes_per_date(env, scan):
+    _mig, _refresh, engine, _q = env
+    _many_vintages(engine)
+    with engine.connect() as conn:
+        for hint in scan.PLANNER_HINTS:
+            conn.execute(text(hint))
+        plan = "\n".join(r[0] for r in conn.execute(text("EXPLAIN " + scan.build_select_sql(list(TICKERS)))))
+        conn.rollback()
+    assert "GroupAggregate" in plan or "HashAggregate" in plan
+    assert "Index Only Scan using uq_raw_series_composite" in plan      # newest-per-date step: no heap
+    assert "Limit" in plan                                              # one winner probe per date
+    assert "Seq Scan" not in plan
+
+
+def test_scan_fix_upgrade_downgrade_and_refresh(env, scan):
+    mig, refresh, engine, qualified = env
+    _many_vintages(engine)
+
+    _migrate(mig, engine, "upgrade")                  # historical definition (V1)
+    assert refresh.main([], engine=engine) == 0
+    old_rows = _rows(engine, qualified)
+
+    _migrate(scan, engine, "upgrade")                 # redefinition: drop + create WITH NO DATA
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT relispopulated FROM pg_class WHERE oid = to_regclass(:v)"),
+                            {"v": qualified}).scalar() is False
+        definition = conn.execute(text("SELECT pg_get_viewdef(to_regclass(:v))"), {"v": qualified}).scalar()
+        idx = conn.execute(text("SELECT indexdef FROM pg_indexes WHERE indexname = :n AND schemaname = current_schema()"),
+                           {"n": scan.UNIQUE_INDEX_NAME}).scalar()
+    assert "max(r.pull_timestamp)" in definition and "DISTINCT ON" not in definition
+    assert idx is not None and "UNIQUE" in idx and "(series_id, obs_date)" in idx
+    _migrate(scan, engine, "upgrade")                 # re-applicable
+
+    assert refresh.main([], engine=engine) == 0       # first run after the redefinition: plain REFRESH
+    new_rows = _rows(engine, qualified)
+    assert new_rows.keys() == old_rows.keys()
+    assert {k: tuple(v) for k, v in new_rows.items()} == {k: tuple(v) for k, v in old_rows.items()}
+    assert refresh.main([], engine=engine) == 0       # populated: REFRESH ... CONCURRENTLY (needs the unique index)
+
+    _migrate(scan, engine, "downgrade")               # back to the historical definition, unpopulated
+    with engine.connect() as conn:
+        assert conn.execute(text("SELECT relispopulated FROM pg_class WHERE oid = to_regclass(:v)"),
+                            {"v": qualified}).scalar() is False
+        definition = conn.execute(text("SELECT pg_get_viewdef(to_regclass(:v))"), {"v": qualified}).scalar()
+    assert "DISTINCT ON" in definition
+    assert refresh.main([], engine=engine) == 0
+    assert {k: tuple(v) for k, v in _rows(engine, qualified).items()} == {k: tuple(v) for k, v in old_rows.items()}
