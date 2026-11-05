@@ -1418,7 +1418,7 @@ def hermes_status(
 # Secret fields that should be redacted in settings responses
 _SECRET_FIELDS = {
     "DB_PASSWORD", "FRED_API_KEY", "BLS_API_KEY", "TRADINGVIEW_WEBHOOK_SECRET",
-    "KOSIS_API_KEY", "COMTRADE_API_KEY", "JQUANTS_PASSWORD", "USDA_NASS_API_KEY",
+    "KOSIS_API_KEY", "COMTRADE_API_KEY", "JQUANTS_API_KEY", "JQUANTS_PASSWORD", "USDA_NASS_API_KEY",
     "NOAA_TOKEN", "EIA_API_KEY", "GDELT_API_KEY", "WORLDNEWS_API_KEY", "NEWSAPI_KEY",
     "COINGECKO_API_KEY", "ALPHAVANTAGE_API_KEY", "TWELVEDATA_API_KEY",
     "OPENAI_API_KEY", "GRID_MASTER_PASSWORD_HASH", "GRID_JWT_SECRET",
@@ -1513,8 +1513,7 @@ async def get_api_keys(
         "BLS_API_KEY": "Bureau of Labor Statistics",
         "KOSIS_API_KEY": "Korean Statistical Information (KOSIS)",
         "COMTRADE_API_KEY": "UN Comtrade international trade",
-        "JQUANTS_EMAIL": "J-Quants (Japan) email",
-        "JQUANTS_PASSWORD": "J-Quants (Japan) password",
+        "JQUANTS_API_KEY": "J-Quants (Japan) V2 API key",
         "USDA_NASS_API_KEY": "USDA agricultural data",
         "NOAA_TOKEN": "NOAA weather/climate data",
         "EIA_API_KEY": "Energy Information Administration",
