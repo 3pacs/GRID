@@ -7,17 +7,22 @@ international (ECB, BCB, MAS, etc.), trade (Comtrade, CEPII, etc.),
 and physical/alt data sources in a single scheduler.
 
 Idempotency: uses ``_last_run`` timestamps to prevent duplicate pulls
-if the server restarts mid-period.  DB failures during pulls are retried
-with exponential backoff.
+if the server restarts mid-period. They are persisted to
+``GRID_SCHEDULER_LAST_RUN_PATH`` (default
+``~/.local/state/grid/scheduler_last_run.json``) and reloaded at startup.
+DB failures during pulls are retried with exponential backoff.
 """
 
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import socket
 import threading
 import time
 from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import schedule
@@ -25,8 +30,62 @@ from loguru import logger as log
 from sqlalchemy import text
 from sqlalchemy.engine import Engine
 
-# Track last successful run per schedule type for idempotency
+# Track last successful run per schedule type for idempotency. Kept on disk:
+# an in-memory-only dict made every restart forget the month, so from the
+# 2nd onward any scheduler alive at the slot re-ran the whole monthly group
+# (Comtrade ~25 min + ICIJ_Full ~70 min) daily. On 2026-11-05 that held the
+# loop from 04:00Z past the 05:15Z yfinance morning slot.
 _last_run: dict[str, str] = {}
+
+_LAST_RUN_PATH_ENV = "GRID_SCHEDULER_LAST_RUN_PATH"
+
+
+def _last_run_path() -> Path:
+    """Where ``_last_run`` is persisted (env override, else XDG-style state dir)."""
+    configured = os.environ.get(_LAST_RUN_PATH_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / ".local" / "state" / "grid" / "scheduler_last_run.json"
+
+
+def _load_last_run() -> dict[str, str]:
+    """Read persisted run dates; a missing or unreadable file means 'never ran'."""
+    path = _last_run_path()
+    try:
+        data = json.loads(path.read_text())
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        log.warning("scheduler: ignoring unreadable run-date file {p}: {e}", p=path, e=str(exc))
+        return {}
+    if not isinstance(data, dict):
+        log.warning("scheduler: ignoring run-date file {p}: not a JSON object", p=path)
+        return {}
+    loaded: dict[str, str] = {}
+    for key, value in data.items():
+        if not isinstance(key, str) or not isinstance(value, str):
+            continue
+        try:
+            date.fromisoformat(value)
+        except ValueError:
+            continue
+        loaded[key] = value
+    return loaded
+
+
+def _save_last_run() -> None:
+    """Atomically persist ``_last_run``; failure is logged, never raised."""
+    path = _last_run_path()
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(json.dumps(_last_run, sort_keys=True))
+        os.replace(tmp, path)
+    except OSError as exc:
+        log.warning(
+            "scheduler: could not persist run dates to {p}: {e} — a restart "
+            "this period may repeat the run", p=path, e=str(exc),
+        )
 
 
 def _should_run(key: str, period: str) -> bool:
@@ -48,6 +107,7 @@ def _should_run(key: str, period: str) -> bool:
 def _mark_run(key: str) -> None:
     """Record that a scheduled task ran successfully today."""
     _last_run[key] = date.today().isoformat()
+    _save_last_run()
 
 
 def _with_db_retry(fn, *args, max_retries: int = 3, **kwargs):
@@ -674,6 +734,10 @@ def _slot_lateness(slot_hhmm: str, now: datetime | None = None) -> timedelta:
 #   * The daily-bar Open returned next morning is a later observation of the
 #     provider's daily field, not an opening-time observation or certification.
 YFINANCE_MORNING_SLOT_UTC = "05:15"
+# The extended monthly/annual groups run for hours on the same scheduler
+# thread, so they start after the morning slot rather than ahead of it.
+EXTENDED_MONTHLY_SLOT_UTC = "06:00"
+EXTENDED_ANNUAL_SLOT_UTC = "06:30"
 # Scheduled yfinance runs request a window computed at call time: from
 # YFINANCE_WINDOW_OVERLAP_DAYS (3 calendar days, not trading days) before the
 # last completed session, never from the
@@ -1494,10 +1558,19 @@ def _get_pullers_for_group(
 
         # ── New pullers (2026-04-05 session) ────────────────────────────
 
-        # ICIJ full dataset — 814K entities (monthly re-download + actor discovery)
+        # ICIJ full dataset — 814K entities (monthly re-download + actor discovery).
+        # Same offshore_leaks hold: its _discover_actors inserts ICIJ officer and
+        # entity names straight into `actors`, and its relationships load has no
+        # conflict key, so each run re-appended ~3.3M rows (2026-11-05: 99,117
+        # actors added while the hold said every automated path honoured it).
         try:
-            from ingestion.altdata.icij_puller import ICIJPuller
-            pullers.append(("ICIJ_Full", ICIJPuller(db_engine), "pull", {}))
+            from ingestion.smart_scheduler import hold_reason_for
+            _icij_hold = hold_reason_for("offshore_leaks")
+            if _icij_hold:
+                log.info("ICIJ Full held: {r}", r=_icij_hold)
+            else:
+                from ingestion.altdata.icij_puller import ICIJPuller
+                pullers.append(("ICIJ_Full", ICIJPuller(db_engine), "pull", {}))
         except Exception as exc:
             log.warning("ICIJ Full puller init failed: {err}", err=str(exc))
         # World Bank — 30 countries x 11 indicators (monthly, annual data)
@@ -2373,12 +2446,15 @@ def start_scheduler() -> None:
     International/trade/physical:
     - Daily at 8:00 PM ET on weekdays (ECB, BCB, MAS, AKShare, JQuants, EDINET, etc.)
     - Weekly on Sundays at 3:00 AM (OECD, BIS, IMF, etc.)
-    - Monthly on the 2nd at 4:00 AM (Comtrade, Eurostat, NOAA, VIIRS, CEPII)
-    - Annual on Jan 15 at 4:30 AM (Atlas ECI, WIOD, EU KLEMS, Patents)
+    - Monthly on the 2nd at 06:00 UTC (Comtrade, Eurostat, NOAA, VIIRS, CEPII)
+    - Annual on Jan 15 at 06:30 UTC (Atlas ECI, WIOD, EU KLEMS, Patents)
 
     Runs ``schedule.run_pending()`` in a single loop with 60-second sleep.
     """
     log.info("Starting GRID unified ingestion scheduler")
+    _last_run.update(_load_last_run())
+    if _last_run:
+        log.info("Restored scheduler run dates: {r}", r=dict(sorted(_last_run.items())))
 
     # For ongoing pulls, use recent date
     ongoing_start = date.today().isoformat()
@@ -2489,7 +2565,10 @@ def start_scheduler() -> None:
                 _with_db_retry(run_pull_group, "monthly", ext_engine)
                 _mark_run("monthly_intl")
 
-        schedule.every().day.at("04:00").do(_monthly_extended)
+        # After the 05:15Z yfinance morning slot: this group runs for hours on
+        # the single scheduler thread, and at 04:00 it pushed that slot past
+        # its lateness limit.
+        schedule.every().day.at(EXTENDED_MONTHLY_SLOT_UTC, "UTC").do(_monthly_extended)
 
         # Annual on January 15 (idempotent)
         def _annual_extended() -> None:
@@ -2497,7 +2576,7 @@ def start_scheduler() -> None:
                 _with_db_retry(run_pull_group, "annual", ext_engine)
                 _mark_run("annual_intl")
 
-        schedule.every().day.at("04:30").do(_annual_extended)
+        schedule.every().day.at(EXTENDED_ANNUAL_SLOT_UTC, "UTC").do(_annual_extended)
 
         log.info("International/trade/physical schedules registered")
     except Exception as exc:
