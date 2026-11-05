@@ -462,6 +462,93 @@ jobs:
           chmod +x scripts/deploy_verify_release_tree.sh
           ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
 
+      # grid-goal-worker@grid-svr (python -m scripts.goal_worker) is another
+      # long-running daemon that keeps whatever release it booted in. It ran
+      # from the frozen grid_repo checkout on the old py3.10 venv until
+      # 2026-11-05, when the operator moved it onto $DEPLOY_PATH + venv-314
+      # (zz-release-tree.conf); without this step it falls behind again on the
+      # first merge after that.
+      #
+      # Same policy as grid-coordinator: never writes a drop-in, only an
+      # active, enabled instance already pointed at exactly $DEPLOY_PATH is
+      # eligible, and try-restart (never start) so an operator stop holds.
+      # SIGTERM is honoured between goals; a goal still running at
+      # TimeoutStopSec loses its lease and is reclaimed, as on any restart.
+      # No HTTP endpoint, so "healthy" means the instance is still eligible
+      # and running after a settle window rather than crash-looping under
+      # Restart=on-failure.
+      - name: Restart grid-goal-worker
+        id: goal_worker_restart
+        if: ${{ github.event_name == 'push' || inputs.do_restart == true }}
+        run: |
+          set -euo pipefail
+          unit=grid-goal-worker@grid-svr
+          goal_worker_state() {
+            local raw key value active='' sub='' file='' wd='' seen=0
+            raw="$(systemctl show "$unit" --property=ActiveState --property=SubState --property=UnitFileState --property=WorkingDirectory)" || {
+              echo "::error::cannot read $unit state" >&2; return 1;
+            }
+            while IFS='=' read -r key value; do
+              case "$key" in
+                ActiveState) [ -z "$active" ] && [ -n "$value" ] || return 1; active="$value" ;;
+                SubState) [ -z "$sub" ] && [ -n "$value" ] || return 1; sub="$value" ;;
+                UnitFileState) [ -z "$file" ] && [ -n "$value" ] || return 1; file="$value" ;;
+                WorkingDirectory) [ -z "$wd" ] || return 1; wd="$value" ;;
+                *) echo "::error::malformed $unit state" >&2; return 1 ;;
+              esac
+              seen=$((seen + 1))
+            done <<< "$raw"
+            [ "$seen" -eq 4 ] || return 1
+            printf '%s|%s|%s|%s\n' "$active" "$sub" "$file" "$wd"
+          }
+          echo "verify=false" >> "$GITHUB_OUTPUT"
+          eligible="active|running|enabled|$DEPLOY_PATH"
+          state="$(goal_worker_state)"
+          if [ "$state" != "$eligible" ]; then
+            echo "$unit state preserved ($state); no restart"
+            exit 0
+          fi
+          sudo systemctl try-restart "$unit"
+          # Settle: must be running again and still running 10s later, so an
+          # import error that crash-loops under Restart=on-failure fails here.
+          for attempt in {1..15}; do
+            state="$(goal_worker_state)"
+            [ "$state" = "$eligible" ] && break
+            if [ "${state%%|*}" = "inactive" ]; then
+              echo "$unit stopped after try-restart ($state); tree unverified"
+              exit 0
+            fi
+            if [ "$attempt" -eq 15 ]; then
+              echo "::error::$unit not running after restart ($state)"
+              sudo systemctl status "$unit" --no-pager -l || true
+              journalctl -u "$unit" -n 60 --no-pager || true
+              exit 1
+            fi
+            sleep 2
+          done
+          pid_before="$(systemctl show -p MainPID --value "$unit")"
+          sleep 10
+          state="$(goal_worker_state)"
+          pid_after="$(systemctl show -p MainPID --value "$unit")"
+          if [ "$state" != "$eligible" ] && [ "${state%%|*}" = "inactive" ]; then
+            echo "$unit stopped after try-restart ($state); tree unverified"
+            exit 0
+          fi
+          if [ "$state" != "$eligible" ] || [ "$pid_before" != "$pid_after" ]; then
+            echo "::error::$unit did not stay up after restart ($state, pid $pid_before -> $pid_after)"
+            journalctl -u "$unit" -n 60 --no-pager || true
+            exit 1
+          fi
+          echo "verify=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify grid-goal-worker runs the deployed tree
+        if: ${{ (github.event_name == 'push' || inputs.do_restart == true) && steps.goal_worker_restart.outputs.verify == 'true' }}
+        run: |
+          set -euo pipefail
+          pid="$(systemctl show -p MainPID --value grid-goal-worker@grid-svr)"
+          chmod +x scripts/deploy_verify_release_tree.sh
+          ./scripts/deploy_verify_release_tree.sh "$DEPLOY_PATH" "$pid" "${{ github.sha }}"
+
       # grid-realtime has the exact same class of bug already fixed for
       # grid-hermes (#487/#490): its unit runs `ExecStart=/usr/bin/python3 -m
       # ingestion.realtime.ws_listener`, and `-m` resolves that module against
