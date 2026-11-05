@@ -960,10 +960,59 @@ class Settings(BaseSettings):
 settings = Settings()
 
 # Configure loguru
+#
+# Credentials are scrubbed from log output. Pullers log exception text, and a requests HTTPError carries the full
+# request URL, query-string API key included. Two layers:
+#   - a patcher scrubs each record's message and string extras before any sink sees it; it lives on the logger
+#     core, so it also covers sinks that scripts add after log.remove();
+#   - scrubbed_stderr, the console sink, scrubs the fully rendered line, which is the only place the formatted
+#     traceback of log.exception()/log.opt(exception=...) exists as text. Scripts that replace the console sink
+#     must add scrubbed_stderr, not sys.stderr (tests/test_log_secret_scrubbing.py enforces it). A plain file sink
+#     still gets scrubbed messages and extras but an unscrubbed traceback; the git sink scrubs its own entries.
+try:
+    from server_log.sanitizer import Sanitizer, secret_values_from_settings
+
+    _log_scrubber: Sanitizer | None = Sanitizer(
+        secret_values_from_settings(settings), generic=False, min_secret_len=8,
+    )
+except Exception:
+    _log_scrubber = None
+
+
+def _scrub_log_text(text: str) -> str:
+    if _log_scrubber is None:
+        return text
+    try:
+        return _log_scrubber.scrub(text)
+    except Exception:
+        return text  # never let scrubbing drop a log line
+
+
+def _scrub_log_record(record: dict) -> None:
+    record["message"] = _scrub_log_text(record["message"])
+    for key, value in record["extra"].items():
+        if isinstance(value, str):
+            record["extra"][key] = _scrub_log_text(value)
+
+
+def scrubbed_stderr(message: str) -> None:
+    """Console sink: writes the scrubbed rendered line to stderr."""
+    # sys.stderr looked up per call, so redirected/captured stderr keeps working
+    sys.stderr.write(_scrub_log_text(str(message)))
+
+
+# loguru's diagnose mode prints the value of every local variable under each traceback line. Those bare values
+# (an API key, an OAuth access token fetched at runtime) carry no key= prefix for the patterns to find, so it is
+# off unless GRID_LOG_DIAGNOSE=1 is set for a debugging session.
+LOG_DIAGNOSE = os.getenv("GRID_LOG_DIAGNOSE", "").lower() in ("1", "true", "yes")
+
 log.remove()  # Remove default handler
+log.configure(patcher=_scrub_log_record)
 log.add(
-    sys.stderr,
+    scrubbed_stderr,
     level=settings.LOG_LEVEL,
+    diagnose=LOG_DIAGNOSE,
+    colorize=sys.stderr.isatty(),
     format=(
         "<green>{time:YYYY-MM-DD HH:mm:ss}</green> | "
         "<level>{level: <8}</level> | "
@@ -971,6 +1020,8 @@ log.add(
         "<level>{message}</level>"
     ),
 )
+if _log_scrubber is None:
+    log.warning("log secret scrubbing not installed: sanitizer could not be built")
 
 # Git-backed error sink. Writes ERROR+ records to .server-logs/errors.jsonl
 # locally; the background push-to-remote is env-gated off by default
