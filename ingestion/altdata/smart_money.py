@@ -769,17 +769,10 @@ class SmartMoneyPuller(BasePuller):
                 "error": str(exc),
             })
 
-        # Finviz insiders
-        try:
-            finviz_result = self.pull_finviz_insiders()
-            results.append(finviz_result)
-        except Exception as exc:
-            log.error("SmartMoney: Finviz pull failed: {e}", e=str(exc))
-            results.append({
-                "source": "finviz_insider",
-                "status": "FAILED",
-                "error": str(exc),
-            })
+        # Finviz is retired (insider filings come from the separate SEC Form-4
+        # source), so it is not a work item here: a permanent SKIPPED entry
+        # made every run PARTIAL, and the scheduler's failure cooldown then held
+        # this 10-minute source to one run per 4 hours.
 
         total_signals = sum(r.get("signals_found", 0) for r in results)
         total_inserted = sum(r.get("rows_inserted", 0) for r in results)
