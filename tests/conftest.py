@@ -184,3 +184,9 @@ def mock_pit_store():
         columns=["feature_id", "obs_date", "value"]
     )
     return pit
+
+
+@pytest.fixture(autouse=True)
+def _isolated_scheduler_run_dates(tmp_path, monkeypatch):
+    """Keep ingestion.scheduler's persisted run dates out of the real home dir."""
+    monkeypatch.setenv("GRID_SCHEDULER_LAST_RUN_PATH", str(tmp_path / "scheduler_last_run.json"))
