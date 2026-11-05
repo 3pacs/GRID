@@ -1,7 +1,7 @@
 """Redefine public.yf_latest_daily_vintage so a refresh no longer reads every vintage.
 
 Revision ID: yf_latest_vintage_scan_20261026
-Revises: merge_yf_finra_20261023
+Revises: merge_ghost_digest_20261104
 
 Why
 ---
@@ -70,7 +70,7 @@ Operator notes
 * If the view had been populated, upgrade drops its contents; it is derived
   data and the next refresh rebuilds it.
 * Downgrade restores the previous definition (also WITH NO DATA). It does not
-  traverse ``merge_yf_finra_20261023``, whose own downgrade refuses.
+  go below ``merge_ghost_digest_20261104``.
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ from sqlalchemy import text
 from migrations.versions import yf_latest_daily_vintage_20261019 as _v1
 
 revision = "yf_latest_vintage_scan_20261026"
-down_revision = "merge_yf_finra_20261023"
+down_revision = "merge_ghost_digest_20261104"
 branch_labels = None
 depends_on = None
 

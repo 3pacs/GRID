@@ -89,11 +89,11 @@ def test_create_sql_is_no_data_and_has_no_bind_parameters():
 
 def test_revision_chain_single_child_of_the_merge():
     assert scan.revision == "yf_latest_vintage_scan_20261026" and len(scan.revision) <= 32
-    assert scan.down_revision == "merge_yf_finra_20261023"
+    assert scan.down_revision == "merge_ghost_digest_20261104"
     assert scan.branch_labels is None and scan.depends_on is None
     children = [
         p.name for p in (REPO / "migrations" / "versions").glob("*.py")
-        if re.search(r'^down_revision\s*=\s*"merge_yf_finra_20261023"', p.read_text(), re.M)
+        if re.search(r'^down_revision\s*=\s*"merge_ghost_digest_20261104"', p.read_text(), re.M)
     ]
     assert children == [Path(scan.__file__).name]
 
