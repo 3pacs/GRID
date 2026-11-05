@@ -16,13 +16,29 @@ governments are paying to influence US financial and trade policy, with
 dollar amounts and specific targets.
 
 Data sources:
-  1. DOJ FARA eFile system (efile.fara.gov) — structured search API
+  1. DOJ FARA eFile API (efile.fara.gov/api/v1) — ``Registrants/json/Active``
+     (every active registrant, one call) and
+     ``ForeignPrincipals/json/Active/{registration_number}`` (per registrant)
   2. FARA quick search (fara.gov/quick-search) — supplementary
 
 Series pattern: FARA:{principal_country}:{registrant}:{activity_type}
 Emits signal_sources entries for trust scoring integration.
 
 Scheduled: weekly pull.
+
+Honest outcomes (2026-09-29 write contract, fixed 2026-11-05): the
+``Registrants/search``, ``Activities/search`` and ``Documents/search``
+endpoints this module was written against return HTTP 404 (grid-hermes
+journal 2026-11-05 10:56Z; anonymous probe 2026-11-05 11:3xZ), and the
+fetchers swallowed that as "0 rows, SUCCESS" while the registrant summary
+never reported a committed write count, so every run was recorded FAILED
+"puller did not report committed write count". ``pull_all`` now reads the
+live ``json/Active`` registrant list, looks up foreign principals for the
+registrants registered inside ``days_back``, and returns ``status`` plus the
+committed ``rows_inserted``. A fetch failure is FAILED with its reason, not
+an empty success. The public API has no activity-report endpoint, so
+``pull_all`` reports activities as unavailable instead of pretending to
+check them.
 """
 
 from __future__ import annotations
@@ -43,13 +59,46 @@ from ingestion.base import BasePuller, retry_on_failure
 # ── API Configuration ────────────────────────────────────────────────────
 
 _FARA_EFILE_BASE: str = "https://efile.fara.gov/api/v1"
+# Live (probed 2026-11-05: 200 application/json, 538 active registrants).
+_FARA_ACTIVE_REGISTRANTS_URL: str = f"{_FARA_EFILE_BASE}/Registrants/json/Active"
+_FARA_PRINCIPALS_URL: str = f"{_FARA_EFILE_BASE}/ForeignPrincipals/json/Active/"
+# Dead: all three return HTTP 404 (probed 2026-11-05). Kept for the
+# activity/document helpers, which now report that failure honestly.
 _FARA_SEARCH_URL: str = "https://efile.fara.gov/api/v1/Registrants/search"
 _FARA_ACTIVITIES_URL: str = "https://efile.fara.gov/api/v1/Activities/search"
 _FARA_DOCUMENTS_URL: str = "https://efile.fara.gov/api/v1/Documents/search"
 
+_ACTIVITIES_UNAVAILABLE: str = (
+    "FARA eFile API has no activity-report endpoint (Activities/search "
+    "returns HTTP 404); activities are not pulled"
+)
+
 _REQUEST_TIMEOUT: int = 30
-_RATE_LIMIT_DELAY: float = 1.0
+# Stay under the eFile API's 5-requests-per-10-seconds limit.
+_RATE_LIMIT_DELAY: float = 2.0
 _MAX_PAGES: int = 20
+# Foreign-principal lookups are one call each; bound a run (30 days held 14
+# new registrants on 2026-11-05). Registrants past the cap are reported as
+# unattempted, so the run is PARTIAL rather than silently truncated.
+_MAX_PRINCIPAL_LOOKUPS: int = 40
+
+
+class FaraFetchError(RuntimeError):
+    """A FARA eFile request failed or returned an unexpected shape."""
+
+
+def _rowset(payload: Any, outer: str) -> list[dict[str, Any]]:
+    """Rows of an eFile ``{outer: {"ROW": row | [rows]}}`` envelope.
+
+    A missing ``outer`` key is a schema change, not an empty list.
+    """
+    if not isinstance(payload, dict) or outer not in payload:
+        raise FaraFetchError(f"unexpected response shape (no {outer})")
+    node = payload[outer]
+    rows = node.get("ROW") if isinstance(node, dict) else None
+    if rows is None:
+        return []
+    return [r for r in (rows if isinstance(rows, list) else [rows]) if isinstance(r, dict)]
 
 # ── Country-to-sector/ticker mapping ────────────────────────────────────
 # Foreign principals from these countries often lobby on sectors
@@ -249,52 +298,77 @@ class FARAPuller(BasePuller):
 
     # ── Registrant fetching ─────────────────────────────────────────────
 
-    def _fetch_active_registrants(self) -> list[dict[str, Any]]:
-        """Fetch all active FARA registrants.
+    def _fetch_active_registrants(self, days_back: int = 30) -> dict[str, Any]:
+        """Fetch active registrants and the principals of recent registrants.
+
+        One call returns every active registrant; foreign principals need one
+        call per registrant, so they are looked up only for registrants
+        registered within ``days_back`` (bounded by _MAX_PRINCIPAL_LOOKUPS).
+
+        Parameters:
+            days_back: Registration-date window for principal lookups.
 
         Returns:
-            List of registrant dicts with principal details.
-        """
-        all_registrants: list[dict[str, Any]] = []
-        page = 1
+            ``registrants`` (recent registrants with principals attached),
+            ``active_total``, ``lookups_failed`` and ``lookups_unattempted``.
 
-        while page <= _MAX_PAGES:
+        Raises:
+            FaraFetchError: the registrant list could not be fetched or parsed.
+        """
+        try:
+            data = self._fara_get(_FARA_ACTIVE_REGISTRANTS_URL)
+        except Exception as exc:
+            raise FaraFetchError(f"active registrants: {exc}") from exc
+        try:
+            rows = _rowset(data, "REGISTRANTS_ACTIVE")
+        except FaraFetchError as exc:
+            raise FaraFetchError(f"active registrants: {exc}") from exc
+
+        parsed = [r for r in (self._parse_registrant(row) for row in rows) if r]
+        cutoff = date.today() - timedelta(days=days_back)
+        recent = [r for r in parsed if r["registration_date"] >= cutoff]
+
+        registrants: list[dict[str, Any]] = []
+        failed = 0
+        for reg in recent[:_MAX_PRINCIPAL_LOOKUPS]:
+            reg_number = reg["registrant_id"]
+            if not reg_number.isdigit():
+                failed += 1
+                continue
             try:
-                data = self._fara_get(
-                    _FARA_SEARCH_URL,
-                    params={
-                        "status": "ACTIVE",
-                        "page": page,
-                        "pageSize": 100,
-                    },
+                principal_rows = _rowset(
+                    self._fara_get(_FARA_PRINCIPALS_URL + reg_number), "ROWSET",
                 )
             except Exception as exc:
+                failed += 1
                 log.warning(
-                    "FARA registrant fetch page {p} failed: {e}",
-                    p=page, e=str(exc),
+                    "FARA principal lookup failed for registration {n}: {e}",
+                    n=reg_number, e=str(exc),
                 )
-                break
+                continue
+            reg["principals"] = [
+                {
+                    "name": str(p.get("FP_NAME") or "").strip(),
+                    "country": str(p.get("COUNTRY_NAME") or "").strip().upper(),
+                    "type": "",
+                }
+                for p in principal_rows
+            ]
+            registrants.append(reg)
 
-            results = data.get("results", data.get("data", []))
-            if not results:
-                break
-
-            for reg in results:
-                parsed = self._parse_registrant(reg)
-                if parsed:
-                    all_registrants.append(parsed)
-
-            # Check pagination
-            total_pages = data.get("totalPages", data.get("pages", page))
-            if page >= total_pages:
-                break
-            page += 1
-
+        unattempted = max(len(recent) - _MAX_PRINCIPAL_LOOKUPS, 0)
         log.info(
-            "FARA: fetched {n} active registrants",
-            n=len(all_registrants),
+            "FARA: {t} active registrants, {r} registered in last {d} days, "
+            "{f} principal lookups failed, {u} unattempted",
+            t=len(parsed), r=len(recent), d=days_back, f=failed, u=unattempted,
         )
-        return all_registrants
+        return {
+            "registrants": registrants,
+            "active_total": len(parsed),
+            "recent_total": len(recent),
+            "lookups_failed": failed,
+            "lookups_unattempted": unattempted,
+        }
 
     def _parse_registrant(self, reg: dict[str, Any]) -> dict[str, Any] | None:
         """Parse a FARA registrant record into a normalised dict.
@@ -306,10 +380,11 @@ class FARAPuller(BasePuller):
             Normalised registrant dict, or None if unusable.
         """
         try:
-            registrant_name = (
+            registrant_name = str(
                 reg.get("registrantName")
                 or reg.get("name")
                 or reg.get("Registrant_Name")
+                or reg.get("Name")  # Registrants/json/Active
                 or ""
             ).strip()
             if not registrant_name:
@@ -356,7 +431,9 @@ class FARAPuller(BasePuller):
                     or ""
                 ),
                 "registrant_name": registrant_name,
-                "address": (reg.get("address") or reg.get("Address") or "").strip(),
+                "address": str(
+                    reg.get("address") or reg.get("Address") or reg.get("Address_1") or ""
+                ).strip(),
                 "registration_date": reg_date or date.today(),
                 "status": (reg.get("status") or "ACTIVE").strip(),
                 "principals": parsed_principals,
@@ -371,17 +448,20 @@ class FARAPuller(BasePuller):
     def _fetch_recent_activities(
         self,
         days_back: int = 30,
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], str | None]:
         """Fetch recent FARA activity reports.
 
         Parameters:
             days_back: Number of days to look back.
 
         Returns:
-            List of normalised activity dicts.
+            ``(activities, error)``: normalised activity dicts, and the fetch
+            failure that stopped paging (None when paging completed). A
+            failed fetch is not "no activities".
         """
         cutoff = (date.today() - timedelta(days=days_back)).isoformat()
         all_activities: list[dict[str, Any]] = []
+        error: str | None = None
         page = 1
 
         while page <= _MAX_PAGES:
@@ -399,6 +479,7 @@ class FARAPuller(BasePuller):
                     "FARA activity fetch page {p} failed: {e}",
                     p=page, e=str(exc),
                 )
+                error = f"activities page {page}: {exc}"
                 break
 
             results = data.get("results", data.get("data", []))
@@ -419,7 +500,7 @@ class FARAPuller(BasePuller):
             "FARA: fetched {n} activities from last {d} days",
             n=len(all_activities), d=days_back,
         )
-        return all_activities
+        return all_activities, error
 
     def _parse_activity(self, activity: dict[str, Any]) -> dict[str, Any] | None:
         """Parse a FARA activity record.
@@ -613,12 +694,14 @@ class FARAPuller(BasePuller):
         self,
         conn: Any,
         registrant: dict[str, Any],
+        dedup_hours: int = 168,
     ) -> int:
         """Store a FARA registrant and all its principals as raw_series rows.
 
         Parameters:
             conn: Active database connection (within a transaction).
             registrant: Normalised registrant dict.
+            dedup_hours: Skip a principal row already pulled in this window.
 
         Returns:
             Number of rows inserted.
@@ -634,7 +717,7 @@ class FARAPuller(BasePuller):
             series_id = f"FARA:{country_slug}:{registrant_slug}:REGISTRATION"
             obs_date = registrant["registration_date"]
 
-            if self._row_exists(series_id, obs_date, conn, dedup_hours=168):
+            if self._row_exists(series_id, obs_date, conn, dedup_hours=dedup_hours):
                 continue
 
             payload = {
@@ -747,109 +830,163 @@ class FARAPuller(BasePuller):
 
     # ── Public API ──────────────────────────────────────────────────────
 
-    def pull_registrants(self) -> dict[str, Any]:
-        """Pull active FARA registrants and their foreign principals.
+    def pull_registrants(self, days_back: int = 30) -> dict[str, Any]:
+        """Pull active FARA registrants and the principals of recent ones.
+
+        Parameters:
+            days_back: Registration-date window for principal lookups.
 
         Returns:
-            Summary dict with counts.
+            Write-contract summary: ``status`` and ``rows_inserted`` (rows
+            the transaction committed), plus coverage detail.
         """
         log.info("Pulling FARA active registrants")
 
-        registrants = self._fetch_active_registrants()
+        try:
+            fetched = self._fetch_active_registrants(days_back=days_back)
+        except FaraFetchError as exc:
+            log.warning("FARA registrant pull failed: {e}", e=str(exc))
+            return {"status": "FAILED", "rows_inserted": 0, "error": str(exc)}
+
+        registrants = fetched["registrants"]
         stored = 0
+        store_failed = 0
+        # A row from an earlier run inside the lookback window is the same
+        # registration, not a new observation.
+        dedup_hours = (days_back + 7) * 24
 
         with self.engine.begin() as conn:
             for reg in registrants:
                 try:
-                    count = self._store_registrant(conn, reg)
+                    # SAVEPOINT: a failed statement must not abort the whole
+                    # transaction and silently roll back rows already counted.
+                    with conn.begin_nested():
+                        count = self._store_registrant(conn, reg, dedup_hours=dedup_hours)
                     stored += count
                 except Exception as exc:
+                    store_failed += 1
                     log.warning(
                         "Failed to store FARA registrant {name}: {e}",
                         name=reg.get("registrant_name", "?"),
                         e=str(exc),
                     )
+        # Reached only after the transaction committed.
+        rows_inserted = stored
 
-        summary = {
-            "status": "SUCCESS",
-            "registrants_fetched": len(registrants),
-            "rows_stored": stored,
+        failed = fetched["lookups_failed"] + store_failed
+        unattempted = fetched["lookups_unattempted"]
+        checked = len(registrants) - store_failed
+        if failed or unattempted:
+            status = "PARTIAL" if (checked or rows_inserted) else "FAILED"
+        else:
+            status = "SUCCESS"
+        summary: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "registrants_fetched": fetched["active_total"],
+            "registrants_recent": fetched["recent_total"],
+            "principal_lookups_failed": fetched["lookups_failed"],
+            "principal_lookups_unattempted": unattempted,
+            "store_failed": store_failed,
         }
+        if failed or unattempted:
+            summary["error"] = (
+                f"{fetched['lookups_failed']} principal lookups failed, "
+                f"{unattempted} unattempted, {store_failed} stores failed "
+                f"of {fetched['recent_total']} recent registrants"
+            )
         log.info("FARA registrant pull complete: {s}", s=summary)
         return summary
 
     def pull_activities(self, days_back: int = 30) -> dict[str, Any]:
         """Pull recent FARA lobbying activity reports.
 
+        The public eFile API has no activity endpoint (see
+        _ACTIVITIES_UNAVAILABLE); a direct call reports that fetch failure.
+
         Parameters:
             days_back: Number of days of history to pull.
 
         Returns:
-            Summary dict with counts.
+            Write-contract summary with ``status`` and ``rows_inserted``.
         """
         log.info("Pulling FARA activities — last {d} days", d=days_back)
 
-        activities = self._fetch_recent_activities(days_back=days_back)
+        activities, fetch_error = self._fetch_recent_activities(days_back=days_back)
         stored = 0
         signals = 0
         skipped_dup = 0
+        store_failed = 0
         alerts: list[str] = []
 
         with self.engine.begin() as conn:
             for activity in activities:
                 try:
-                    was_stored = self._store_activity(conn, activity)
-                    if not was_stored:
-                        skipped_dup += 1
-                        continue
+                    with conn.begin_nested():
+                        was_stored = self._store_activity(conn, activity)
+                        if not was_stored:
+                            skipped_dup += 1
+                            continue
+
+                        # Resolve ticker for signal emission
+                        country = activity["country"]
+                        country_info = COUNTRY_SECTOR_MAP.get(country, {})
+                        ticker = country_info.get("ticker")
+
+                        # Also check activity description for sector keywords
+                        if not ticker:
+                            ticker = _extract_sector_from_description(
+                                activity["description"]
+                            )
+
+                        trend: dict[str, Any] = {}
+                        if ticker:
+                            # Compute spending trend for this country
+                            country_slug = _slugify(country) if country else "UNKNOWN"
+                            trend = self._compute_country_trend(conn, country_slug)
+                            self._emit_signal(conn, activity, ticker, trend)
                     stored += 1
-
-                    # Resolve ticker for signal emission
-                    country = activity["country"]
-                    country_info = COUNTRY_SECTOR_MAP.get(country, {})
-                    ticker = country_info.get("ticker")
-
-                    # Also check activity description for sector keywords
                     if not ticker:
-                        ticker = _extract_sector_from_description(
-                            activity["description"]
+                        continue
+                    signals += 1
+
+                    # Alert on high-value or surging activity
+                    if activity["compensation"] > 500_000:
+                        alert_msg = (
+                            f"HIGH-VALUE FARA: {activity['principal_name']} "
+                            f"({country}) paying {activity['registrant_name']} "
+                            f"${activity['compensation']:,.0f} for "
+                            f"{activity['activity_type']}"
                         )
+                        alerts.append(alert_msg)
+                        log.info(alert_msg)
 
-                    if ticker:
-                        # Compute spending trend for this country
-                        country_slug = _slugify(country) if country else "UNKNOWN"
-                        trend = self._compute_country_trend(conn, country_slug)
-
-                        self._emit_signal(conn, activity, ticker, trend)
-                        signals += 1
-
-                        # Alert on high-value or surging activity
-                        if activity["compensation"] > 500_000:
-                            alert_msg = (
-                                f"HIGH-VALUE FARA: {activity['principal_name']} "
-                                f"({country}) paying {activity['registrant_name']} "
-                                f"${activity['compensation']:,.0f} for "
-                                f"{activity['activity_type']}"
-                            )
-                            alerts.append(alert_msg)
-                            log.info(alert_msg)
-
-                        if trend.get("trend") == "INCREASING" and trend.get("change_pct", 0) > 50:
-                            alert_msg = (
-                                f"FARA SURGE: {country} lobbying spend up "
-                                f"{trend['change_pct']}% — policy pressure signal"
-                            )
-                            alerts.append(alert_msg)
-                            log.info(alert_msg)
+                    if trend.get("trend") == "INCREASING" and trend.get("change_pct", 0) > 50:
+                        alert_msg = (
+                            f"FARA SURGE: {country} lobbying spend up "
+                            f"{trend['change_pct']}% — policy pressure signal"
+                        )
+                        alerts.append(alert_msg)
+                        log.info(alert_msg)
 
                 except Exception as exc:
+                    store_failed += 1
                     log.warning(
                         "Failed to store FARA activity: {e}",
                         e=str(exc),
                     )
 
-        summary = {
-            "status": "SUCCESS",
+        problems = [p for p in (
+            fetch_error,
+            f"{store_failed} activity stores failed" if store_failed else None,
+        ) if p]
+        if problems:
+            status = "PARTIAL" if (stored or skipped_dup) else "FAILED"
+        else:
+            status = "SUCCESS"
+        summary: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": stored,
             "activities_fetched": len(activities),
             "stored": stored,
             "signals_emitted": signals,
@@ -857,35 +994,31 @@ class FARAPuller(BasePuller):
             "alerts": alerts,
             "days_back": days_back,
         }
+        if problems:
+            summary["error"] = "; ".join(problems)
         log.info("FARA activity pull complete: {s}", s=summary)
         return summary
 
     def pull_all(self, days_back: int = 30) -> dict[str, Any]:
-        """Pull both FARA registrants and recent activities.
+        """Pull FARA registrants (activities have no live endpoint).
 
         Parameters:
-            days_back: Number of days of activity history to pull.
+            days_back: Registration-date window for principal lookups.
 
         Returns:
-            Combined summary dict.
+            Write-contract summary: the registrant leg's ``status`` and
+            committed ``rows_inserted``, with ``activities_unavailable``
+            naming the coverage the public API cannot provide.
         """
+        registrants = self.pull_registrants(days_back=days_back)
         results: dict[str, Any] = {
-            "status": "SUCCESS",
-            "registrants": {},
-            "activities": {},
+            "status": registrants["status"],
+            "rows_inserted": registrants["rows_inserted"],
+            "registrants": registrants,
+            "activities_unavailable": _ACTIVITIES_UNAVAILABLE,
         }
-
-        results["registrants"] = self.pull_registrants()
-        results["activities"] = self.pull_activities(days_back=days_back)
-
-        # Overall status
-        statuses = [
-            results["registrants"].get("status", "FAILED"),
-            results["activities"].get("status", "FAILED"),
-        ]
-        if any(s == "FAILED" for s in statuses):
-            results["status"] = "PARTIAL"
-
+        if registrants.get("error"):
+            results["error"] = registrants["error"]
         return results
 
     def pull_recent(self, days_back: int = 30) -> dict[str, Any]:

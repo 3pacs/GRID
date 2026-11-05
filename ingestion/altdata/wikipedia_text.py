@@ -4,6 +4,12 @@ Wikipedia Pageviews puller — attention anomaly detection.
 Uses the Wikimedia REST API to track pageviews for financially
 relevant entities and detect anomalous spikes (Z-score > 3).
 
+Honest outcomes (2026-09-29 write contract, fixed 2026-11-05): ``pull``
+returns ``status`` and the committed ``rows_inserted`` count. It used to
+return only ``entities_pulled``/``anomalies``, so grid-scheduler recorded
+every run of Wikipedia_Pageviews FAILED "puller did not report committed
+write count" regardless of what it stored.
+
 API docs: https://wikimedia.org/api/rest_v1/
 No authentication required.
 """
@@ -113,7 +119,8 @@ class WikipediaPuller(BasePuller):
             lookback_days: Days of history to fetch.
 
         Returns:
-            Summary with entity counts and anomalies found.
+            Write-contract summary: ``status`` plus ``rows_inserted`` (raw_series
+            rows committed), coverage counts, and the anomalies found.
         """
         import numpy as np
 
@@ -122,16 +129,20 @@ class WikipediaPuller(BasePuller):
 
         anomalies: list[dict[str, Any]] = []
         entities_pulled = 0
+        entities_short = 0
+        rows_inserted = 0
+        errors: list[str] = []
 
         for display_name, article_title in WATCHLIST.items():
             try:
                 data = self._fetch_pageviews(article_title, start_date, end_date)
                 if len(data) < 30:
+                    # A checked article with too little history; not a failure.
+                    entities_short += 1
                     continue
 
-                entities_pulled += 1
-
                 # Store raw pageviews
+                entity_rows = 0
                 with self.engine.begin() as conn:
                     existing = self._get_existing_dates(f"wiki:{display_name}", conn)
                     for point in data:
@@ -143,6 +154,10 @@ class WikipediaPuller(BasePuller):
                                 value=float(point["views"]),
                                 raw_payload={"article": article_title, "source": "wikipedia"},
                             )
+                            entity_rows += 1
+                # Counted only after the transaction committed.
+                rows_inserted += entity_rows
+                entities_pulled += 1
 
                 # Z-score anomaly detection on last 7 days
                 views = np.array([d["views"] for d in data], dtype=float)
@@ -162,14 +177,35 @@ class WikipediaPuller(BasePuller):
                             })
 
             except Exception as exc:
+                errors.append(f"{display_name}: {exc}")
                 log.debug("Wikipedia pull failed for {e}: {err}", e=display_name, err=str(exc))
 
         # Store anomalies
         if anomalies:
-            self._store_anomalies(anomalies)
+            try:
+                self._store_anomalies(anomalies)
+            except Exception as exc:
+                errors.append(f"attention_anomaly store: {exc}")
+                log.warning("Wikipedia anomaly store failed: {err}", err=str(exc))
 
-        log.info("Wikipedia pull: {e} entities, {a} anomalies", e=entities_pulled, a=len(anomalies))
-        return {"entities_pulled": entities_pulled, "anomalies": anomalies}
+        log.info("Wikipedia pull: {e} entities, {r} rows, {a} anomalies, {f} errors",
+                 e=entities_pulled, r=rows_inserted, a=len(anomalies), f=len(errors))
+        checked = entities_pulled + entities_short
+        if errors:
+            status = "PARTIAL" if (checked or rows_inserted) else "FAILED"
+        else:
+            status = "SUCCESS"
+        result: dict[str, Any] = {
+            "status": status,
+            "rows_inserted": rows_inserted,
+            "entities_pulled": entities_pulled,
+            "entities_short_history": entities_short,
+            "entities_total": len(WATCHLIST),
+            "anomalies": anomalies,
+        }
+        if errors:
+            result["error"] = f"{len(errors)} of {len(WATCHLIST)} lookups failed: {errors[0]}"
+        return result
 
     def _store_anomalies(self, anomalies: list[dict[str, Any]]) -> None:
         with self.engine.begin() as conn:
