@@ -67,6 +67,10 @@ _MIN_POST_SCORE: int = 10
 # Posts in the combined hot feed, across all target boards
 _MAX_HOT_POSTS: int = 100
 
+# Without a vote score one post must not become a signal on its own: an
+# unscored (ticker, direction) needs this many distinct authors in the pull.
+_MIN_UNSCORED_AUTHORS: int = 2
+
 # Finviz insider trading page
 _FINVIZ_INSIDER_URL: str = "https://finviz.com/insidertrading.ashx"
 
@@ -169,6 +173,24 @@ def _text_hash(text_content: str) -> str:
         8-character hex hash.
     """
     return hashlib.sha256(text_content.encode("utf-8", errors="replace")).hexdigest()[:8]
+
+
+def _corroborate_unscored(signals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep scored signals; keep unscored ones only when several authors agree.
+
+    RSS posts carry no vote score, so the minimum-score gate cannot screen
+    them. An unscored (ticker, direction) survives only when at least
+    ``_MIN_UNSCORED_AUTHORS`` distinct authors posted it in the same pull.
+    """
+    authors: dict[tuple[str, str], set[str]] = {}
+    for sig in signals:
+        if sig.get("post_score") is None:
+            authors.setdefault((sig["ticker"], sig["direction"]), set()).add(sig["username"])
+    return [
+        sig for sig in signals
+        if sig.get("post_score") is not None
+        or len(authors[(sig["ticker"], sig["direction"])]) >= _MIN_UNSCORED_AUTHORS
+    ]
 
 
 class SmartMoneyPuller(BasePuller):
@@ -665,6 +687,7 @@ class SmartMoneyPuller(BasePuller):
         all_signals: list[dict[str, Any]] = []
         for post in posts:
             all_signals.extend(self._parse_reddit_post(post, post["subreddit"]))
+        all_signals = _corroborate_unscored(all_signals)
 
         status = "SUCCESS"
         partial_note: dict[str, str] = {}

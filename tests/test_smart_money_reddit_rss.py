@@ -54,14 +54,36 @@ def test_unknown_score_skips_only_the_score_gate() -> None:
     assert p._parse_reddit_post(post, "wallstreetbets") == []
 
 
-def test_signals_are_stored(monkeypatch: Any) -> None:
+def _post(author: str, title: str) -> dict:
+    return {"title": title, "selftext": "", "author": author, "subreddit": "stocks",
+            "score": None, "created_utc": None}
+
+
+def test_corroborated_unscored_signals_are_stored() -> None:
     p = _puller()
     p._load_trust_scores = lambda: None
-    p._fetch_hot_posts = lambda subs: [{"title": "AMD puts, crash coming", "selftext": "",
-                                        "author": "bear1", "subreddit": "stocks",
-                                        "score": None, "created_utc": None}]
+    p._fetch_hot_posts = lambda subs: [_post("bear1", "AMD puts, crash coming"),
+                                       _post("bear2", "AMD dump incoming, buying puts")]
     stored: list[dict] = []
     p._store_signal = lambda conn, signal, d: stored.append(signal) or True
     out = p.pull_reddit()
-    assert out == {"source": "reddit", "status": "SUCCESS", "signals_found": 1, "rows_inserted": 1}
-    assert stored[0]["ticker"] == "AMD" and stored[0]["direction"] == "BEARISH"
+    assert out == {"source": "reddit", "status": "SUCCESS", "signals_found": 2, "rows_inserted": 2}
+    assert {(s["username"], s["ticker"], s["direction"]) for s in stored} == {
+        ("bear1", "AMD", "BEARISH"), ("bear2", "AMD", "BEARISH")}
+
+
+def test_single_author_unscored_signal_is_dropped() -> None:
+    p = _puller()
+    p._load_trust_scores = lambda: None
+    # One author posting twice is still one author.
+    p._fetch_hot_posts = lambda subs: [_post("pumper", "GME calls, squeeze to the moon"),
+                                       _post("pumper", "GME calls again, breakout")]
+    p._store_signal = lambda conn, signal, d: True
+    out = p.pull_reddit()
+    assert out["signals_found"] == 0 and out["rows_inserted"] == 0
+
+
+def test_corroboration_leaves_scored_signals_alone() -> None:
+    sig = {"username": "a", "ticker": "NVDA", "direction": "BULLISH", "post_score": 50}
+    unscored = {"username": "b", "ticker": "TSLA", "direction": "BEARISH", "post_score": None}
+    assert sm._corroborate_unscored([sig, unscored]) == [sig]

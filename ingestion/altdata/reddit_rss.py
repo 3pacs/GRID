@@ -142,19 +142,26 @@ def _open_lock() -> int | None:
         log.warning("reddit_rss: lock {p} unusable ({e}); requests are not "
                     "spaced across processes", p=path, e=str(exc))
         return None
-    if not stat.S_ISREG(os.fstat(fd).st_mode):
+    st = os.fstat(fd)
+    # /tmp is shared: a file planted by another user (or left writable by one)
+    # could stall every Reddit read, so only our own private file coordinates.
+    if (not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid()
+            or stat.S_IMODE(st.st_mode) & 0o022):
         os.close(fd)
-        log.warning("reddit_rss: lock {p} is not a regular file; ignoring it", p=path)
+        log.warning("reddit_rss: lock {p} is not a private regular file owned by "
+                    "this user; requests are not spaced across processes", p=path)
         return None
     return fd
 
 
 def _read_last(fd: int) -> float:
+    """Last recorded request time; a future value counts as 'just now'."""
     os.lseek(fd, 0, os.SEEK_SET)
     try:
-        return float(os.read(fd, 64).decode().strip() or 0.0)
+        last = float(os.read(fd, 64).decode().strip() or 0.0)
     except ValueError:
         return 0.0
+    return min(last, time.time())
 
 
 def _write_last(fd: int, when: float) -> None:

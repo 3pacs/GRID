@@ -166,3 +166,19 @@ class TestFetchFeed:
         monkeypatch.setenv(rr.LOCK_PATH_ENV, str(link))
         entries = rr.fetch_feed("/r/a/hot.rss", session=_session(_resp()))
         assert len(entries) == 3 and target.read_text() == "0"
+
+
+class TestLockHardening:
+    def test_group_writable_lock_is_ignored(self, clock: FakeClock, _lock: Any) -> None:
+        _lock.write_text(f"{clock.now:.3f}\n")
+        _lock.chmod(0o666)
+        session = _session(_resp())
+        rr.fetch_feed("/r/a/hot.rss", session=session)
+        assert clock.slept == []  # untrusted timestamp not honoured
+        assert float(_lock.read_text()) == pytest.approx(clock.now)  # nor rewritten
+
+    def test_future_timestamp_counts_as_now(self, clock: FakeClock, _lock: Any) -> None:
+        _lock.write_text(f"{clock.now + 86_400:.3f}\n")
+        _lock.chmod(0o600)
+        rr.fetch_feed("/r/a/hot.rss", session=_session(_resp()))
+        assert clock.slept == [pytest.approx(rr.MIN_INTERVAL_S)]
