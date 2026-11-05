@@ -138,7 +138,7 @@ def test_opportunity_card_with_null_fields_renders_placeholders():
     assert card["title"] == "#3 — DNTH PUTS (UNPROVEN)"
     body = card["body"]
     assert "N/A/10" in body          # score
-    assert "no executable contract quoted" in body
+    assert "no qualifying two-sided quote retrieved" in body
     assert "NoneType" not in body
     assert "None" not in body
 
@@ -252,7 +252,7 @@ def test_run_100x_digest_sends_with_null_iv_atm_row(monkeypatch):
     assert result["opportunities"] == 2
     assert sent["subject"] == "GRID Options — 2 calls: BMRN PUT, DNTH PUT"
     assert "DNTH PUTS" in sent["html"] and "BMRN PUTS" in sent["html"]
-    assert "60.0% / N/A open" in sent["html"]   # contract IV shown, OI missing labelled
+    assert "60.0% / N/A reported OI" in sent["html"]   # contract IV shown, OI missing labelled
     assert "None" not in sent["plain"]
 
 

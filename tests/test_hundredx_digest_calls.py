@@ -140,10 +140,10 @@ def test_verify_labels_previous_close_spot(monkeypatch, _quiet):
     assert v["spot_source"] == "yfinance info.previousClose"
 
 
-def test_verify_compares_pcr_under_the_scanner_key(monkeypatch, _quiet):
-    """The scanner stores the PCR under "value"; "raw_value" never existed."""
+def test_verify_does_not_compare_aggregate_oi_with_single_expiry_volume(monkeypatch, _quiet):
+    """A different measure and an unknown expiry set cannot prove divergence."""
     calls = _side([(103, 1.0, 1.1, .4, 50, 100, None)])
-    puts = _side([(98, 2.0, 2.2, .4, 50, 100, None)])
+    puts = _side([(98, 2.0, 2.2, .4, 180, 100, None)])
 
     class Ticker:
         def __init__(self, t):
@@ -157,7 +157,129 @@ def test_verify_compares_pcr_under_the_scanner_key(monkeypatch, _quiet):
     v = hx._verify_opportunity("X", {"direction": "PUT", "spot_price": 100.0,
                                      "signals": {"pcr": {"value": 3.6}}}, None)
 
-    assert any("PCR diverged: stored=3.60, live=1.00" in i for i in v["issues"])
+    assert not any("PCR diverged" in i for i in v["issues"])
+    assert v["verified"]
+    assert v["pcr_comparison"]["status"] == "unavailable"
+    assert "exact captured-expiry coverage" in v["pcr_comparison"]["reason"]
+    assert v["live_chain"]["scope"] == "single_expiry"
+    assert v["live_chain"]["expiry"] == _exp(30)
+    assert v["live_chain"]["volume_put_call_ratio"] == 1.0
+    assert v["live_chain"]["open_interest_put_call_ratio"] == 3.6
+    assert "pcr" not in v["live_chain"]  # no ambiguous measure
+
+
+@pytest.mark.parametrize("calls,puts,expected", [
+    ([10], [0], 0.0),
+    ([0], [10], None),
+    ([0], [0], None),
+    ([10], [None], None),
+    ([10, None], [20], None),
+    ([10], [float("nan")], None),
+    ([float("inf")], [20], None),
+    ([-1], [20], None),
+    ([1.5], [20], None),
+    ([10], [], 0.0),  # an explicitly empty side with a count column is zero
+])
+def test_chain_ratios_preserve_zero_denominators_and_missing_counts(calls, puts, expected):
+    def frame(values):
+        return pd.DataFrame({"volume": values, "openInterest": values})
+
+    data = hx._chain_measures(_Chain(frame(calls), frame(puts)), "2026-12-18",
+                              datetime(2026, 11, 5, tzinfo=timezone.utc))
+    assert data["volume_put_call_ratio"] == expected
+    assert data["open_interest_put_call_ratio"] == expected
+
+
+def test_chain_missing_columns_are_unavailable_not_zero():
+    chain = _Chain(pd.DataFrame({"volume": [10]}), pd.DataFrame({"openInterest": [20]}))
+    data = hx._chain_measures(chain, "2026-12-18", datetime.now(timezone.utc))
+    assert data["total_call_volume"] == 10
+    assert data["total_put_volume"] is None
+    assert data["total_call_open_interest"] is None
+    assert data["total_put_open_interest"] == 20
+    assert data["volume_put_call_ratio"] is None
+    assert data["open_interest_put_call_ratio"] is None
+
+
+def test_thin_contract_still_qualifies_without_claiming_a_fill():
+    side = _side([(98, 1.90, 3.10, .5, 2, 0, "2026-10-30 20:00:00+00:00")])
+    contract = hx._pick_contract(side, 100, "PUT")
+    assert contract["oi"] == 2 and contract["volume"] == 0
+    assert (contract["ask"] - contract["bid"]) / 2.5 == pytest.approx(.48)
+    summary = hx._plain(hx._format_summary_section([{}], [{}])["body"])
+    assert "retrieved two-sided quote" in summary
+    assert "60%-of-mid spread limit" in summary
+    assert "do not establish available size or a fill" in summary
+    assert "executable" not in summary
+
+
+def test_missing_contract_counts_are_displayed_as_missing():
+    contract = hx._pick_contract(_side([(98, 2, 2.2, .5, None, None, None)]), 100, "PUT")
+    assert contract["oi"] is None and contract["volume"] is None
+
+
+@pytest.mark.parametrize("missing", [("volume",), ("openInterest",), ("volume", "openInterest")])
+def test_verification_with_missing_count_columns_keeps_quote_and_marks_ratios_unavailable(
+    monkeypatch, _quiet, missing,
+):
+    side = _side([(98, 2, 2.2, .5, 2, 0, None)]).drop(columns=list(missing))
+    yf, _ = _fake_yf(100, {_exp(30): side})
+    monkeypatch.setitem(sys.modules, "yfinance", yf)
+    v = hx._verify_opportunity("X", {"direction": "PUT", "spot_price": 100, "signals": {}}, None)
+    assert v["contract"]["strike"] == 98
+    assert v["verified"]
+    assert v["pcr_comparison"]["status"] == "unavailable"
+    if "volume" in missing:
+        assert v["contract"]["volume"] is None
+        assert v["live_chain"]["volume_put_call_ratio"] is None
+    if "openInterest" in missing:
+        assert v["contract"]["oi"] is None
+        assert v["live_chain"]["open_interest_put_call_ratio"] is None
+
+
+def test_retrieved_chain_scope_is_separate_from_selected_contract(monkeypatch, _quiet):
+    wide = _side([(98, .25, 2.4, .5, 300, 100, None)])
+    thin = _side([(98, 1.9, 3.1, .5, 2, 0, "2026-10-30 20:00:00+00:00")])
+    yf, requested = _fake_yf(100, {_exp(30): wide, _exp(58): thin})
+    monkeypatch.setitem(sys.modules, "yfinance", yf)
+    v = hx._verify_opportunity("X", {"direction": "PUT", "spot_price": 100,
+                                     "signals": {"pcr": {"value": 0}}}, None)
+    assert requested == [_exp(30), _exp(58)]
+    assert v["live_chain"]["expiry"] == _exp(30)
+    assert v["contract"]["expiry"] == _exp(58)
+    assert v["contract"]["quote_at_kind"] == "local_retrieval_time"
+    assert v["contract"]["quote_at"].date() == datetime.now(timezone.utc).date()
+    assert "2026-10-30" in v["contract"]["last_trade"]
+    card = hx._plain(hx._format_opportunity_card(
+        {"ticker": "X", "direction": "PUT", "signals": {"pcr": {"value": 0}}}, v, 1)["body"])
+    assert f"single expiry {_exp(30)}" in card
+    assert f"BUY X {_exp(58)}" in card
+    assert "Stored put/call  open-interest ratio 0.00 across captured expiries" in card
+    assert "Put/call comparison  unavailable" in card
+    assert "provider bid/ask timestamp unavailable" in card
+    assert "local retrieval time" in card
+    assert "2 reported OI, 0 reported volume" in card
+    assert "traded today" not in card
+    assert "executable" not in card
+
+
+def test_card_labels_ratios_and_missing_comparison_data():
+    opp, v = _card_inputs()
+    opp["signals"] = {"pcr": {"value": 3.6, "score": 10, "direction": "PUT"}}
+    v["live_chain"] = hx._chain_measures(
+        _Chain(_side([(103, 1, 1.1, .4, 50, 100, None)]),
+               _side([(98, 2, 2.2, .4, 180, 0, None)])),
+        "2026-12-18", v["spot_at"])
+    card = hx._plain(hx._format_opportunity_card(opp, v, 1)["body"])
+    assert "put/call open-interest ratio 3.60 across captured expiries" in card
+    assert "volume ratio 0.00; open-interest ratio 3.60; single expiry 2026-12-18" in card
+    assert "Put/call comparison  unavailable" in card
+    opp["signals"] = {}
+    v["live_chain"] = None
+    card = hx._plain(hx._format_opportunity_card(opp, v, 1)["body"])
+    assert "Stored put/call  open-interest ratio N/A" in card
+    assert "Retrieved put/call  N/A (chain data unavailable)" in card
+    assert "Put/call comparison  unavailable" in card
 
 
 # ── _call_economics ─────────────────────────────────────────────────────────
