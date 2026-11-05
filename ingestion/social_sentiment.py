@@ -13,6 +13,16 @@ Provides:
 
 Used to gauge whether a product launch or earnings will beat/miss expectations
 based on social buzz relative to historical patterns.
+
+Honest outcomes (2026-09-29 write contract, fixed 2026-11-05): SmartScheduler
+runs ``pull_all``, which used to return only the scan and never persisted it
+(only the intelligence loop called ``save_to_db``), so every scheduled run was
+recorded FAILED "puller did not report committed write count". ``pull_all``
+now stores the day's scan and returns ``status`` plus the committed
+``rows_inserted`` (1 for a new day row, 0 when today's row already exists).
+A scan in which every Reddit and Bluesky request failed is FAILED with the
+reason -- from grid-svr both return HTTP 403 to unauthenticated requests
+(probed 2026-11-05) -- never an empty success.
 """
 
 from __future__ import annotations
@@ -82,23 +92,33 @@ class SocialSentimentPuller:
             "summary": "",
         }
 
+        # Per-request failures: a failed request is lost coverage, not "no posts".
+        failures: list[str] = []
+        attempts = 0
+
         # Reddit
         for theme, subs in SUBREDDITS.items():
             for sub in subs:
+                attempts += 1
                 try:
                     posts = self._reddit_hot(sub)
                     result["reddit"][sub] = posts
                     time.sleep(2)  # Rate limit
                 except Exception as exc:
+                    failures.append(f"reddit r/{sub}: {exc}")
                     log.debug("Reddit r/{s} failed: {e}", s=sub, e=str(exc))
 
         # Bluesky
+        bluesky_ok = 0
         for term in BLUESKY_TERMS[:5]:
+            attempts += 1
             try:
                 posts = self._bluesky_search(term)
                 result["bluesky"].extend(posts)
+                bluesky_ok += 1
                 time.sleep(1)
             except Exception as exc:
+                failures.append(f"bluesky '{term}': {exc}")
                 log.debug("Bluesky search '{t}' failed: {e}", t=term, e=str(exc))
 
         # Google Trends
@@ -137,6 +157,48 @@ class SocialSentimentPuller:
             "Social sentiment: {m} mentions, {b} bullish, {br} bearish tickers",
             m=total_mentions, b=len(bullish_tickers), br=len(bearish_tickers),
         )
+        return self._with_outcome(result, failures, attempts, len(result["reddit"]) + bluesky_ok)
+
+    def _with_outcome(
+        self, result: dict, failures: list[str], attempts: int, succeeded: int,
+    ) -> dict:
+        """Persist the scan and add the scheduler write-contract fields.
+
+        ``rows_inserted`` is what the committed transaction wrote: 1 for a new
+        day row, 0 when today's row already exists. Collection failures make
+        the run PARTIAL (some sources answered) or FAILED (none did).
+        """
+        failure_note = (
+            f"{len(failures)} of {attempts} social requests failed: {failures[0]}"
+            if failures else None
+        )
+        if not self.engine:
+            result.update(status="SKIPPED", rows_inserted=0,
+                          skipped_reason="no database engine")
+            return result
+        if not succeeded:
+            result.update(status="FAILED", rows_inserted=0,
+                          error=failure_note or "no social source returned data")
+            return result
+        if not (result["ticker_sentiment"] or result["reddit"] or result["bluesky"]):
+            # Requests answered with no posts: a completed check, nothing to store.
+            result.update(status="PARTIAL" if failures else "SUCCESS", rows_inserted=0)
+            if failure_note:
+                result["error"] = failure_note
+            return result
+        try:
+            rows = self._store(result)
+        except Exception as exc:
+            log.warning("Failed to save social sentiment: {e}", e=str(exc))
+            result.update(status="FAILED", rows_inserted=0, error=f"store failed: {exc}")
+            return result
+        if rows is None:
+            result.update(status="FAILED", rows_inserted=0,
+                          error="SocialSentiment source_catalog row missing")
+            return result
+        result.update(status="PARTIAL" if failures else "SUCCESS", rows_inserted=rows)
+        if failure_note:
+            result["error"] = failure_note
         return result
 
     def _reddit_hot(self, subreddit: str, limit: int = 25) -> list[dict]:
@@ -272,51 +334,62 @@ class SocialSentimentPuller:
         """
         if not self.engine:
             return False
-        if not (result.get("ticker_sentiment") or result.get("reddit") or result.get("bluesky")):
-            return False
         try:
-            from sqlalchemy import text
-            with self.engine.begin() as conn:
-                conn.execute(text(
-                    "INSERT INTO source_catalog "
-                    "(name, base_url, cost_tier, latency_class, pit_available, "
-                    "revision_behavior, trust_score, priority_rank) "
-                    "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
-                    "ON CONFLICT (name) DO NOTHING"
-                ), {
-                    "name": "SocialSentiment",
-                    "url": "https://reddit.com",
-                    "cost": "FREE",
-                    "latency": "EOD",
-                    "pit": False,
-                    "rev": "NEVER",
-                    "trust": "MED",
-                    "rank": 60,
-                })
-                src = conn.execute(text(
-                    "SELECT id FROM source_catalog WHERE name = 'SocialSentiment'"
-                )).fetchone()
-                if not src:
-                    return False
-                series_id = f"social_sentiment_{result['date']}"
-                exists = conn.execute(text(
-                    "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
-                    "AND obs_date = :d AND pull_status = 'SUCCESS' LIMIT 1"
-                ), {"sid": series_id, "src": src[0], "d": result["date"]}).fetchone()
-                if exists:
-                    return True
-                # pull_timestamp: schema DEFAULT NOW().
-                conn.execute(text(
-                    "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
-                    "VALUES (:sid, :src, :d, :v, :payload, 'SUCCESS')"
-                ), {
-                    "sid": series_id,
-                    "src": src[0],
-                    "d": result["date"],
-                    "v": len(result.get("ticker_sentiment", {})),
-                    "payload": json.dumps(result, default=str),
-                })
-            return True
+            return self._store(result) is not None
         except Exception as exc:
             log.warning("Failed to save social sentiment: {e}", e=str(exc))
             return False
+
+    def _store(self, result: dict) -> int | None:
+        """Insert the day's scan row; rows committed (1 new, 0 already there).
+
+        None when nothing was collected or the source row cannot be resolved.
+        Exceptions propagate (the transaction rolled back, nothing committed).
+        """
+        if not (result.get("ticker_sentiment") or result.get("reddit") or result.get("bluesky")):
+            return None
+        from sqlalchemy import text
+        scan = {k: v for k, v in result.items()
+                if k not in ("status", "rows_inserted", "error", "skipped_reason")}
+        with self.engine.begin() as conn:
+            conn.execute(text(
+                "INSERT INTO source_catalog "
+                "(name, base_url, cost_tier, latency_class, pit_available, "
+                "revision_behavior, trust_score, priority_rank) "
+                "VALUES (:name, :url, :cost, :latency, :pit, :rev, :trust, :rank) "
+                "ON CONFLICT (name) DO NOTHING"
+            ), {
+                "name": "SocialSentiment",
+                "url": "https://reddit.com",
+                "cost": "FREE",
+                "latency": "EOD",
+                "pit": False,
+                "rev": "NEVER",
+                "trust": "MED",
+                "rank": 60,
+            })
+            src = conn.execute(text(
+                "SELECT id FROM source_catalog WHERE name = 'SocialSentiment'"
+            )).fetchone()
+            if not src:
+                return None
+            series_id = f"social_sentiment_{scan['date']}"
+            exists = conn.execute(text(
+                "SELECT 1 FROM raw_series WHERE series_id = :sid AND source_id = :src "
+                "AND obs_date = :d AND pull_status = 'SUCCESS' LIMIT 1"
+            ), {"sid": series_id, "src": src[0], "d": scan["date"]}).fetchone()
+            if exists:
+                return 0
+            # pull_timestamp: schema DEFAULT NOW().
+            conn.execute(text(
+                "INSERT INTO raw_series (series_id, source_id, obs_date, value, raw_payload, pull_status) "
+                "VALUES (:sid, :src, :d, :v, :payload, 'SUCCESS')"
+            ), {
+                "sid": series_id,
+                "src": src[0],
+                "d": scan["date"],
+                "v": len(scan.get("ticker_sentiment", {})),
+                "payload": json.dumps(scan, default=str),
+            })
+        # Reached only after the transaction committed.
+        return 1
