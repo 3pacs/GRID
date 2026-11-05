@@ -51,7 +51,14 @@ def ast_fingerprint(node):
 
 
 def instant(text):
-    d = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    # Validate type before any string method: null/number/bool timestamps are
+    # input rejections with a JSON-safe receipt, never an AttributeError.
+    if not isinstance(text, str) or not text:
+        raise ValueError("timestamp must be a non-empty ISO-8601 string")
+    try:
+        d = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("malformed timestamp") from exc
     if d.tzinfo is None:
         raise ValueError("naive timestamp")
     return d.astimezone(timezone.utc)
@@ -334,9 +341,13 @@ def reconcile(raw):
                         * 0.01
                         * row["sign"]
                     )
+                    if not math.isfinite(contribution):
+                        raise ValueError("nonfinite exposure contribution")
                     refs.append(ref * exact_factor)
                     terms.append(contribution)
                     errors.append(term_ball.e + abs(term_ball.v - refs[-1]))
+                if not math.isfinite(sum(terms)):
+                    raise ValueError("nonfinite exposure reduction")
                 reference_sum = sum(refs, Decimal(0))
                 # Sequential summation: gamma_(n-1) * sum absolute perturbed terms.
                 n = max(0, len(terms) - 1)
@@ -377,19 +388,39 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     raw = args.packet.read_bytes()
+    # Refuse an existing run before any work; the directory is created only
+    # after the complete result is serialized, so a run can never publish
+    # input.json without result.json.
+    if args.output.exists():
+        raise FileExistsError(str(args.output))
     try:
         result = reconcile(raw)
-    except (ValueError, KeyError, TypeError, ArithmeticError) as exc:
-        result = {
-            "status": "INPUT_REJECTED",
-            "reason": str(exc),
-            "raw_sha256": digest(raw),
-        }
+        encoded = canonical(result) + b"\n"
+    except (
+        ValueError,
+        KeyError,
+        TypeError,
+        AttributeError,
+        IndexError,
+        ArithmeticError,
+    ) as exc:
+        result = rejected(raw, exc)
+        encoded = canonical(result) + b"\n"
     args.output.mkdir(parents=True, exist_ok=False)
     (args.output / "input.json").write_bytes(raw)
-    (args.output / "result.json").write_bytes(canonical(result) + b"\n")
+    (args.output / "result.json").write_bytes(encoded)
     print(result["status"])
     return 0 if result["status"] == "PASS_NUMERICAL" else 1
+
+
+def rejected(raw, exc):
+    """Complete JSON-safe INPUT_REJECTED receipt; never contains NaN/inf."""
+    return {
+        "schema": "gex-p2a-result-v1",
+        "status": "INPUT_REJECTED",
+        "reason": f"{type(exc).__name__}: {exc}",
+        "raw_sha256": digest(raw),
+    }
 
 
 if __name__ == "__main__":
