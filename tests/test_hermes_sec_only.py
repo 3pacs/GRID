@@ -553,12 +553,20 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # SCHED re-pinned 9c456151 -> cb33fac5 (2026-11-05): smart_money and
         # social_sentiment timeout_s 60 -> 240, because their Reddit RSS reads
         # can wait up to 150s for the shared request slot (reddit_rss.py).
+        # OPER re-pinned 6a4aa404 -> 994cf156 (2026-11-05,
+        # claude/helius-unconfigured-20261105): the only operator edits are the
+        # new module-level _HELIUS_UNCONFIGURED_LOGGED flag and
+        # _solana_deploy_sources() helper (inserted before the intelligence
+        # task runner), and the 7c-ii Solana universe block now gets
+        # (helius, deployer_registry) from that helper (both None when
+        # HELIUS_API_KEY is unset) and closes helius only when it exists.
+        # Needs reviewer acceptance like the prior pins.
         # SCHED re-pinned cb33fac5 -> ae8c0501 (2026-11-05): _classify_outcome
         # accepts the NO_DATA leaf status alongside UNCHANGED/NO_NEW_DATA (with
         # a 4-line comment), and _run_puller passes YFinancePuller output
         # through scheduler._normalize_expected_spy_refusal before classifying.
         # Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
+        for path,marker,pin in [(OPER,'\nimport argparse\n','994cf156b31a50e12be98b80a6c5f419de5fcf9284ae90f7e0f2743d74b5d7df'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

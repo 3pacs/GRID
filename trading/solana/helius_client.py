@@ -133,6 +133,8 @@ class HeliusClient:
         self._timeout = timeout
         self._owns_client = client is None
         self._client = client or httpx.Client(timeout=timeout)
+        # HTTP status of the first 401/403; once set, _get stops calling out.
+        self._auth_rejected: int | None = None
 
     # ------------------------------------------------------------------
     # Resource management
@@ -156,15 +158,64 @@ class HeliusClient:
             params["api-key"] = self._api_key
         return params
 
+    @property
+    def is_configured(self) -> bool:
+        """True when an API key is set. Helius rejects every keyless call (401)."""
+        return self._api_key is not None
+
     def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+        """GET ``path`` and return the decoded JSON, or raise :class:`HeliusError`.
+
+        Log levels (errors.jsonl must stay signal-rich, see CLAUDE.md):
+        4xx responses are configuration or quota conditions (401/403 = bad or
+        missing key, 429 = rate limit) and network/transport failures are
+        transient, so both log at warning. Anything else (5xx, unexpected
+        httpx errors) stays at error. Callers see the same ``HeliusError``
+        either way. After a 401/403 the client stops calling Helius for the
+        rest of its life: the key will not start working mid-pass.
+
+        The logged text carries the path and status only; the request URL is
+        never logged because it holds the ``api-key`` query parameter.
+        """
+        if self._auth_rejected is not None:
+            raise HeliusError(
+                f"GET {path} skipped: Helius rejected the API key earlier "
+                f"(HTTP {self._auth_rejected})"
+            )
         url = f"{self._base_url}{path}"
         try:
             resp = self._client.get(url, params=self._params(params))
             resp.raise_for_status()
             return resp.json()
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            if 400 <= status < 500:
+                if status in (401, 403):
+                    kind = "auth/config: HELIUS_API_KEY missing or invalid"
+                    self._auth_rejected = status
+                elif status == 429:
+                    kind = "rate limited"
+                else:
+                    kind = "client error"
+                log.warning(
+                    "Helius GET {p} returned HTTP {s} ({k})",
+                    p=path, s=status, k=kind,
+                )
+            else:
+                log.error("Helius GET {p} failed: HTTP {s}", p=path, s=status)
+            raise HeliusError(f"GET {path} failed: HTTP {status}") from exc
+        except httpx.TransportError as exc:
+            # Transport messages ("Connection refused", "timed out") carry no URL.
+            log.warning(
+                "Helius GET {p} transport error: {t}: {e}",
+                p=path, t=type(exc).__name__, e=str(exc),
+            )
+            raise HeliusError(f"GET {path} failed: {type(exc).__name__}: {exc}") from exc
         except httpx.HTTPError as exc:
-            log.error("Helius GET {p} failed: {e}", p=path, e=str(exc))
-            raise HeliusError(f"GET {path} failed: {exc}") from exc
+            log.error(
+                "Helius GET {p} failed: {t}", p=path, t=type(exc).__name__,
+            )
+            raise HeliusError(f"GET {path} failed: {type(exc).__name__}") from exc
 
     # ------------------------------------------------------------------
     # Transactions — the raw input for deployer scoring
