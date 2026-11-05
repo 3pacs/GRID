@@ -6,6 +6,11 @@ the exact deploy.yml blocks against rejecting fake commands (no real
 systemctl/curl/sudo is ever reached) and pin the policy: restart only an
 active, enabled unit already pointed at $DEPLOY_PATH, never write a drop-in,
 never start a stopped unit, and verify the running tree afterwards.
+
+The shell helper is byte-identical. Its protected binding CLI is an explicit
+unit double: it records exact arguments and models identity/refusal results.
+Native path/Git protection is covered by the separate source-policy suites;
+these toy process/tree fixtures do not claim native filesystem qualification.
 """
 
 from __future__ import annotations
@@ -80,10 +85,17 @@ elif cmd == "readlink":
         out = args[1] + "\n"
     else:
         rc = 1
-elif cmd == "git":
-    if args != ["-C", state["deploy"], "rev-parse", "HEAD"]:
-        raise SystemExit(f"unexpected git {args!r}")
-    out = state["sha"] + "\n"
+elif cmd == "dirname":
+    if args != ["--", "./scripts/deploy_verify_release_tree.sh"]:
+        raise SystemExit(f"unexpected dirname {args!r}")
+    out = "./scripts\n"
+elif cmd == "deploy_source_policy.py":
+    if args != ["binding", state["deploy"], state["deploy"],
+                "0123456789abcdef0123456789abcdef01234567"]:
+        raise SystemExit(f"unexpected binding request {args!r}")
+    if state["policy_refusal"] or state["sha"] != args[-1]:
+        rc = 2
+        out = "SOURCE_POLICY_REFUSED GIT_EXPECTED\n"
 else:
     raise SystemExit(f"unexpected command (never forwarded): {cmd} {args!r}")
 path.write_text(json.dumps(state))
@@ -92,11 +104,12 @@ raise SystemExit(rc)
 """
 
 
-def _run(tmp_path, *, states, healthy=True, cwd=None, sha=_EXPECTED_SHA):
+def _run(tmp_path, *, states, healthy=True, cwd=None, sha=_EXPECTED_SHA,
+         policy_refusal=False, policy_available=True):
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     for name in ("sudo", "systemctl", "curl", "journalctl", "sleep", "chmod",
-                 "readlink", "git", "mkdir", "tee"):
+                 "readlink", "git", "mkdir", "tee", "dirname"):
         leaf = fake_bin / name
         leaf.write_text(f"#!{sys.executable}\n" + _FAKE)
         leaf.chmod(0o700)
@@ -106,12 +119,16 @@ def _run(tmp_path, *, states, healthy=True, cwd=None, sha=_EXPECTED_SHA):
     helper = scripts / "deploy_verify_release_tree.sh"
     helper.write_bytes((Path(REPO_ROOT) / "scripts/deploy_verify_release_tree.sh").read_bytes())
     helper.chmod(0o700)
+    if policy_available:
+        # Test-only CLI double, not a copy installed into production scripts.
+        (scripts / "deploy_source_policy.py").write_text(_FAKE)
     deploy = str(tmp_path / "release")
     states = [s.replace("{DEPLOY}", deploy) if isinstance(s, str) else s for s in states]
     state_path = tmp_path / "state.json"
     state_path.write_text(json.dumps({
         "states": states, "queries": 0, "calls": [], "restarts": 0,
         "healthy": healthy, "cwd": cwd or deploy, "deploy": deploy, "sha": sha,
+        "policy_refusal": policy_refusal,
     }))
     output = tmp_path / "output"
     output.write_text("")
@@ -155,6 +172,19 @@ def test_eligible_coordinator_restarts_and_verifies_running_tree(tmp_path):
     assert state["restarts"] == 1
     assert state["output"] == ["verify=false", "verify=true"]
     assert "exactly matches expected" in state["results"][-1].stdout
+    assert ["deploy_source_policy.py", "binding", state["deploy"],
+            state["deploy"], _EXPECTED_SHA] in state["calls"]
+    assert not any(call[0] == "git" for call in state["calls"])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("policy", [{"policy_refusal": True}, {"policy_available": False}])
+def test_policy_refusal_or_missing_helper_cannot_verify(tmp_path, policy):
+    state = _run(tmp_path, states=[ELIGIBLE], **policy)
+    assert [r.returncode for r in state["results"]] == [0, 1]
+    assert "exactly matches expected" not in state["results"][-1].stdout
+    assert "::error::deploy_verify_release_tree" in state["results"][-1].stderr
+    assert not any(call[0] == "git" for call in state["calls"])
 
 
 @pytest.mark.unit

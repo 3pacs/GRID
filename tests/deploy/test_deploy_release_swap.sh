@@ -56,6 +56,7 @@
 # Usage: bash tests/deploy/test_deploy_release_swap.sh
 
 set -euo pipefail
+umask 077  # private synthetic fixture inputs; not production permission repair
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -66,6 +67,15 @@ CLEAR_MARKER_SCRIPT="${REPO_ROOT}/scripts/deploy_clear_activation_marker.sh"
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 export GRID_DEPLOY_TEST_SANDBOX="$SANDBOX"
+
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file
+unset GIT_DIR GIT_WORK_TREE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG
+export TASK11_POLICY_FIXTURE_ROOT="$SANDBOX"
+fixture_repo="$(/usr/bin/python3 -I -S -B "$REPO_ROOT/tests/deploy/source_policy_fixture.py" install "$REPO_ROOT" "$SANDBOX" filesystem)"
+export PATH="$SANDBOX/source-policy-unit-bin:$PATH"
+SWAP_SCRIPT="$fixture_repo/scripts/deploy_release_swap.sh"
+ROLLBACK_SCRIPT="$fixture_repo/scripts/deploy_release_rollback.sh"
+CLEAR_MARKER_SCRIPT="$fixture_repo/scripts/deploy_clear_activation_marker.sh"
 
 pass_count=0
 fail_count=0
