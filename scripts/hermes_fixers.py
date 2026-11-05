@@ -2319,6 +2319,18 @@ def diagnose_and_fix_pulls(
                     " WHERE failed_at > NOW() - INTERVAL '24 hours'"
                     ") AS latest_failed "
                     "WHERE failure_rank = 1 "
+                    # A source whose newest pull_log run after its latest
+                    # failure succeeded has recovered: don't retry, diagnose
+                    # or escalate it for the rest of the 24 h window
+                    # (2026-11-05: NY_Fed SOMA and repo_market were fixed by
+                    # a deploy at 05:29Z and still re-escalated all day).
+                    "AND NOT EXISTS ("
+                    " SELECT 1 FROM pull_log ok "
+                    " LEFT JOIN source_catalog osc ON ok.source_id = osc.id "
+                    " WHERE COALESCE(osc.name, ok.puller_name) = latest_failed.name "
+                    "   AND ok.status IN ('SUCCESS', 'NO_NEW_ROWS') "
+                    "   AND COALESCE(ok.completed_at, ok.started_at) > latest_failed.last_fail"
+                    ") "
                     "ORDER BY fail_count DESC"
                 )
             ).fetchall()
