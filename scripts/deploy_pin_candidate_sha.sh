@@ -44,9 +44,6 @@
 
 set -euo pipefail
 
-SOURCE_POLICY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_policy() { /usr/bin/python3 -I -S -B "$SOURCE_POLICY_DIR/deploy_source_policy.py" "$@"; }
-
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 <candidate_dir> <src_url> <expected_sha>" >&2
   exit 2
@@ -56,4 +53,16 @@ CANDIDATE_DIR="$1"
 SRC_URL="$2"
 EXPECTED_SHA="$3"
 
-source_policy pin "$CANDIDATE_DIR" "$SRC_URL" "$EXPECTED_SHA"
+cd "$CANDIDATE_DIR"
+echo "before: $(git log --oneline -1 2>/dev/null || echo '<no commit yet>')"
+git fetch "$SRC_URL" "$EXPECTED_SHA"
+git reset --hard "$EXPECTED_SHA"
+echo "after:  $(git log --oneline -1)"
+
+actual_sha="$(git rev-parse HEAD)"
+[ "$actual_sha" = "$EXPECTED_SHA" ] || {
+  echo "::error::candidate release tree is at $actual_sha, not the exact expected commit $EXPECTED_SHA"
+  exit 1
+}
+
+echo "pin: candidate is exactly $EXPECTED_SHA"

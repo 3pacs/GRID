@@ -38,7 +38,6 @@
 # Usage: bash tests/deploy/test_deploy_verify_release_tree.sh
 
 set -euo pipefail
-umask 077  # private synthetic fixture inputs; not production permission repair
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
@@ -49,18 +48,10 @@ BG_PIDS=()
 cleanup() {
   for p in "${BG_PIDS[@]:-}"; do
     kill "$p" >/dev/null 2>&1 || true
-    wait "$p" >/dev/null 2>&1 || true
   done
   rm -rf "$SANDBOX"
 }
 trap cleanup EXIT
-
-export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file
-unset GIT_DIR GIT_WORK_TREE GIT_CONFIG_COUNT GIT_CONFIG_PARAMETERS GIT_CONFIG
-export TASK11_POLICY_FIXTURE_ROOT="$SANDBOX"
-fixture_repo="$(/usr/bin/python3 -I -S -B "$REPO_ROOT/tests/deploy/source_policy_fixture.py" install "$REPO_ROOT" "$SANDBOX" git)"
-export PATH="$SANDBOX/source-policy-unit-bin:$PATH"
-VERIFY_SCRIPT="$fixture_repo/scripts/deploy_verify_release_tree.sh"
 
 pass_count=0
 fail_count=0
@@ -147,9 +138,9 @@ sha_unrelated="$(git -C "$unrelated" rev-parse HEAD)"
 
 rel_old="${releases}/${sha_a}"
 rel_new="${releases}/${sha_b}"
-git clone --no-hardlinks -q "$seed" "$rel_old" >/dev/null 2>&1
+git clone -q "$seed" "$rel_old" >/dev/null 2>&1
 git -C "$rel_old" checkout -q "$sha_a"
-git clone --no-hardlinks -q "$seed" "$rel_new" >/dev/null 2>&1
+git clone -q "$seed" "$rel_new" >/dev/null 2>&1
 git -C "$rel_new" checkout -q "$sha_b"
 
 ln -sfn "$rel_new" "$live"

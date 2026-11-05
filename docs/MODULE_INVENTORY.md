@@ -4347,12 +4347,3 @@ Excludes `.git/`, `.mypy_cache/`, `.next/`, `.pytest_cache/`, `.venv/`, `__pycac
 **Functions:** `ModelRegistry`
 **Reads:** `__future__`, `datetime`, `db`, `loguru`, `sqlalchemy`, `typing`, `validation`
 **Imported by:** `api/dependencies.py`
-
-## Task11 prospective protected release inputs
-
-- `scripts/deploy_source_policy.py`: bounded owner/mode/canonical Git-input and tracked-byte validation; protected marker/lock creation; exact repository and configured/loaded release binding. No permission repair or mutable untracked-data traversal. External tracked model/data symlink targets refuse pending explicit receiving policy; installed interpreter, generated output and untracked runtime bytes are not attested.
-
-- `scripts/deploy_payload_contract.json`: commit-bound conservative payload classification. All committed paths remain protected;28 declared external links retain unresolved owner/integrity status and fail closed. It is not a mutable-data allowlist or generated-runtime attestation.
-- `tests/deploy/source_policy_fixture.py`: explicit private UNIT namespace and owned-file-transport/identity seams for legacy caller fixtures; never installed in production and never a production bypass flag.
-
-- `scripts/deploy_metadata_preflight.py`: bounded standalone metadata diagnostic; aggregates independently safe path/owner/mode/ACL and runner-unit findings, blocks unsafe dependencies, never repairs permissions or certifies deployment. Its fixed production profile remains unrun. See `docs/PR933-SOURCE-PREPARATION.md`.

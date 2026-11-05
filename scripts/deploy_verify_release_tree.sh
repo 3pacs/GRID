@@ -57,9 +57,6 @@
 
 set -euo pipefail
 
-SOURCE_POLICY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_policy() { /usr/bin/python3 -I -S -B "$SOURCE_POLICY_DIR/deploy_source_policy.py" "$@"; }
-
 if [ "$#" -ne 3 ]; then
   echo "usage: $0 <deploy_path> <pid> <expected_sha>" >&2
   exit 2
@@ -81,16 +78,10 @@ want="$(readlink -f "$DEPLOY_PATH")"
 cwd_resolved="$(readlink -f "$cwd")"
 [ "$cwd_resolved" = "$want" ] || fail "cwd '$cwd' (resolved: $cwd_resolved) does not resolve to the live release target $want -- process is running a different tree"
 
-if ! binding_result="$(source_policy binding "$DEPLOY_PATH" "$cwd_resolved" "$EXPECTED_SHA" 2>&1)"; then
-  if [ "$binding_result" = 'SOURCE_POLICY_REFUSED GIT_EXPECTED' ]; then
-    fail 'protected target is not the expected deployed commit'
-  fi
-  fail 'protected source/runtime binding refused'
-fi
+deployed_sha="$(git -C "$want" rev-parse HEAD 2>/dev/null)" || fail "could not read a git HEAD commit inside $want -- is it a real checkout?"
+echo "resolved live target: $want (commit $deployed_sha)"
 
-# The preceding shared binding check independently required the actual HEAD
-# to equal EXPECTED_SHA; do not re-enter Git with ambient configuration.
-deployed_sha="$EXPECTED_SHA"
-echo "resolved protected live target: $want (verified commit $deployed_sha)"
+[ "$deployed_sha" = "$EXPECTED_SHA" ] \
+  || fail "live release target $want is at commit $deployed_sha, not the expected deployed commit $EXPECTED_SHA"
 
 echo "verify: pid=$PID is running the deployed tree at $want (commit $deployed_sha, exactly matches expected $EXPECTED_SHA)"

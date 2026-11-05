@@ -66,14 +66,11 @@
 #   1  nothing to roll back to (see the message on stderr for which case)
 #   2  usage error
 #   3  could not acquire the per-<live_path> lock -- a deploy build/swap is in progress
-#   5  refused: --schema-compatible was not passed, or rollback root is unsafe
+#   5  refused: --schema-compatible was not passed
 #   6  refused: <live_path>.releases/.activation-in-progress is present and
 #      --override-stuck-activation was not passed
 
 set -euo pipefail
-
-SOURCE_POLICY_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-source_policy() { /usr/bin/python3 -I -S -B "$SOURCE_POLICY_DIR/deploy_source_policy.py" "$@"; }
 
 if [ "$#" -lt 1 ]; then
   echo "usage: $0 <live_path> --schema-compatible [--override-stuck-activation]" >&2
@@ -131,14 +128,12 @@ INPROGRESS_MARKER="${RELEASES_DIR}/.activation-in-progress"
 LOCK_FILE="${RELEASES_DIR}/.lock"
 LOCK_WAIT_SECS="${DEPLOY_LOCK_WAIT_SECS:-600}"
 
-source_policy prepare "$RELEASES_DIR"
+mkdir -p "$RELEASES_DIR"
 exec {lock_fd}>"$LOCK_FILE"
 if ! flock -w "$LOCK_WAIT_SECS" "$lock_fd"; then
   echo "could not acquire deploy lock on $LOCK_FILE within ${LOCK_WAIT_SECS}s -- a deploy build/swap is in progress against $LIVE_PATH; wait for it to finish rather than rolling back mid-flight" >&2
   exit 3
 fi
-
-source_policy prepare "$RELEASES_DIR"
 
 # Everything below is checked while HOLDING the lock, not before -- see
 # header for why (closes the gap between an unlocked check and the action
@@ -149,7 +144,7 @@ if [ ! -f "$MARKER" ]; then
   exit 1
 fi
 
-target="$(source_policy marker-read "$RELEASES_DIR" .previous-release)"
+target="$(cat "$MARKER")"
 if [ ! -d "$target" ]; then
   echo "recorded previous release '$target' no longer exists (already pruned?) -- refusing to roll back to it" >&2
   exit 1
@@ -180,31 +175,6 @@ MSG
   fi
   echo "proceeding past $INPROGRESS_MARKER (${age}s old) -- --override-stuck-activation was passed" >&2
 fi
-
-# A recorded previous release is not automatically a trusted source root.
-# Preserve schema/activation acknowledgments and refuse unsafe targets without
-# repairing permissions or guessing another rollback. The swap writer records
-# direct children of RELEASES_DIR; linked/escaping targets are not that contract.
-target_leaf="$(basename -- "$target")"
-if [ -z "$target_leaf" ] || [ "$target_leaf" = . ] || [ "$target_leaf" = .. ] ||
-   [ "$target" != "$RELEASES_DIR/$target_leaf" ] ||
-   [ -L "$target" ] || [ ! -d "$target" ]; then
-  echo 'unsafe rollback root path; refusing without changing the live pointer' >&2
-  exit 5
-fi
-root_metadata="$(stat -c '%u %a' -- "$target")" || exit 5
-if [[ ! "$root_metadata" =~ ^[0-9]+\ [0-7]{3,4}$ ]]; then
-  echo 'unavailable rollback root metadata; refusing' >&2
-  exit 5
-fi
-read -r root_uid root_mode <<< "$root_metadata"
-if { [ "$root_uid" != 0 ] && [ "$root_uid" != "$(id -u)" ]; } ||
-   (( (8#$root_mode & 8#22) != 0 )); then
-  echo 'unsafe rollback root owner/mode; refusing without permission repair' >&2
-  exit 5
-fi
-
-source_policy repository "$LIVE_PATH" "$target" >/dev/null || exit 5
 
 current_target=""
 if [ -L "$LIVE_PATH" ]; then
