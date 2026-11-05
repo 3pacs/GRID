@@ -104,6 +104,25 @@ def test_console_sink_scrubs_tracebacks_and_extras(monkeypatch, capsys):
     assert "└" not in err  # no diagnose variable dump: bare values there carry no key= for the patterns to catch
 
 
+def test_config_imported_before_log_remove():
+    """Importing config adds its console sink, so a script must import it before log.remove(), not after.
+
+    Imported after, the first import re-adds config's sink next to the script's own and every line logs twice
+    (seen on grid-backlinker, 2026-11-05).
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1]
+    wrong = []
+    for top in ("api", "ingestion", "intelligence", "scripts", "orchestration", "store", "evals"):
+        for p in (root / top).rglob("*.py") if (root / top).is_dir() else ():
+            src = p.read_text(encoding="utf-8", errors="replace")
+            for m in re.finditer(r"^([ \t]*)(?:log|logger)\.remove\(\)[^\n]*\n\1from config import[^\n]*scrubbed_stderr", src, re.M):
+                wrong.append(f"{p.relative_to(root)}:{src[:m.start()].count(chr(10)) + 1}")
+    assert wrong == []
+
+
 def test_stderr_sinks_keep_diagnose_off():
     """Every scrubbed_stderr sink passes diagnose=LOG_DIAGNOSE, so tracebacks never dump local variable values."""
     import pathlib
