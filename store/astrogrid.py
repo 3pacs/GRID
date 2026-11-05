@@ -90,6 +90,32 @@ def _safe_json(data: Any) -> str:
     return json.dumps(data, default=str)
 
 
+_PREDICTION_MAPPING_FIELDS = (
+    "market_overlay_snapshot",
+    "mystical_feature_payload",
+    "grid_feature_payload",
+)
+
+
+def _require_prediction_payload_shapes(payload: Mapping[str, Any]) -> None:
+    """Reject pre-serialized JSON before ``save_prediction`` writes anything.
+
+    The store serializes these fields itself. A caller that passes
+    ``json.dumps(...)`` gets ``list('["BTC"]')`` (a list of characters) for
+    ``target_symbols`` and a jsonb *string* instead of an object for the
+    payload fields, so fail loudly instead of persisting a corrupted row.
+    """
+    symbols = payload.get("target_symbols")
+    if symbols is not None and not isinstance(symbols, (list, tuple)):
+        raise TypeError(
+            f"target_symbols must be a list of symbols, got {type(symbols).__name__}"
+        )
+    for field in _PREDICTION_MAPPING_FIELDS:
+        value = payload.get(field)
+        if value is not None and not isinstance(value, Mapping):
+            raise TypeError(f"{field} must be a mapping, got {type(value).__name__}")
+
+
 def _json_loads(value: Any, default: Any) -> Any:
     if value is None:
         return default
@@ -775,6 +801,7 @@ class AstroGridStore:
             return int(row[0]) if row else None
 
     def save_prediction(self, payload: dict[str, Any]) -> dict[str, Any] | None:
+        _require_prediction_payload_shapes(payload)
         snapshot = payload.get("snapshot") or {}
         snapshot_id = self.save_snapshot(snapshot) if snapshot else None
         lens_set_id = self.ensure_lens_set(
