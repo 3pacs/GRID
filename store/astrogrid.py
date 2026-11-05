@@ -181,6 +181,78 @@ def _decode_legacy_json_object(value: Any, *, legacy_row: bool) -> tuple[Any, bo
     return decoded, legacy_row and isinstance(value, str) and isinstance(decoded, dict)
 
 
+# --- Legacy grid-crypto-v1 scores: exclude and rescore (2026-11-05) ---------
+#
+# The scorer before 766d3058 graded the char-list legacy rows against SPY
+# (``symbols = [...] or ["SPY"]``) and recorded that instrument in
+# ``prediction_score.raw_payload->'symbols'``. Those rows are immutable, so
+# every reader goes through ``_effective_scores_sql``: it drops them and adds
+# the coin-priced rescores from ``prediction_score_legacy_rescore``.
+LEGACY_CRYPTO_RESCORE_VERSION = "legacy_crypto_rescore_v1"
+LEGACY_SPY_FALLBACK_SYMBOLS = ["SPY"]
+# Stamped on backtest runs and weight proposals built from the effective
+# score set. Runs and proposals without it (everything written before this
+# change, or by a tree that predates it) are excluded / not approvable.
+EFFECTIVE_SCORE_SOURCE = "effective_scores_v1"
+# A backtest result's target_symbol is target_symbols[0]; for a char-list
+# legacy row that is always '['.
+LEGACY_CHAR_LIST_TARGET_SYMBOL = "["
+# Bounded skip for matured non-SPY predictions the scorer cannot score: one
+# attempt per evaluation day, at most this many days, and none after a
+# permanent reason. The prediction stays pending (never a default verdict).
+SCORE_SKIP_MAX_ATTEMPTS = 3
+_PERMANENT_UNSCORED_REASONS = frozenset({"unsupported_target"})
+
+
+def is_excluded_legacy_score(model_version: Any, created_at: Any, score_raw_payload: Any) -> bool:
+    """True for a ``prediction_score`` row that graded a legacy crypto call against SPY.
+
+    Mirrors ``_legacy_spy_score_predicate`` (the SQL every reader uses).
+    """
+    payload = _json_loads(score_raw_payload, {})
+    return (
+        _is_legacy_crypto_row(model_version, created_at)
+        and isinstance(payload, dict)
+        and payload.get("symbols") == LEGACY_SPY_FALLBACK_SYMBOLS
+    )
+
+
+def _legacy_spy_score_predicate(score_alias: str, run_alias: str) -> str:
+    """SQL boolean (never NULL) for ``is_excluded_legacy_score``.
+
+    Needs the binds from ``_legacy_score_params``. Aliases are code constants.
+    """
+    return (
+        f"COALESCE({run_alias}.model_version = :legacy_model_version"
+        f" AND {run_alias}.created_at < :legacy_cutoff"
+        f" AND {score_alias}.raw_payload->'symbols' = CAST(:legacy_spy_symbols AS jsonb), FALSE)"
+    )
+
+
+def _weight_proposal_eligibility(backtest_window: Any) -> dict[str, Any]:
+    """A proposal is approvable only if it was built from the effective score set.
+
+    Every proposal written before the legacy-score exclusion (16,289 pending
+    on grid-svr on 2026-11-05) was computed from the SPY-graded crypto scores;
+    so is any proposal still written by a tree that predates this change.
+    """
+    source = backtest_window.get("score_source") if isinstance(backtest_window, Mapping) else None
+    if source == EFFECTIVE_SCORE_SOURCE:
+        return {"eligible_for_approval": True, "ineligible_reason": None}
+    return {
+        "eligible_for_approval": False,
+        "ineligible_reason": "built_from_legacy_spy_graded_scores",
+    }
+
+
+def _legacy_score_params() -> dict[str, Any]:
+    return {
+        "legacy_model_version": LEGACY_CRYPTO_MODEL_VERSION,
+        "legacy_cutoff": LEGACY_CRYPTO_PAYLOAD_CUTOFF,
+        "legacy_spy_symbols": json.dumps(LEGACY_SPY_FALLBACK_SYMBOLS),
+    }
+
+
 def _json_loads(value: Any, default: Any) -> Any:
     if value is None:
         return default
@@ -1387,13 +1459,15 @@ class AstroGridStore:
                 ps.attribution_mystical,
                 ps.attribution_noise,
                 ps.regime_context
-            FROM {self.schema}.prediction_score ps
+            FROM {self._effective_scores_sql()} ps
             ORDER BY ps.scored_at DESC
             LIMIT :limit
             """
         )
         with self.engine.begin() as conn:
-            prediction_rows = conn.execute(score_sql, {"limit": prediction_limit}).fetchall()
+            prediction_rows = conn.execute(
+                score_sql, {"limit": prediction_limit, **_legacy_score_params()}
+            ).fetchall()
         backtest_summary = self.get_backtest_summary(limit=backtest_limit)
         review_input = {
             "prediction_count": len(prediction_rows),
@@ -1476,6 +1550,7 @@ class AstroGridStore:
                         {
                             "limit": backtest_limit,
                             "latest_by_variant": list((backtest_summary.get("latest_by_variant") or {}).keys()),
+                            "score_source": EFFECTIVE_SCORE_SOURCE,
                         }
                     ),
                     "input_payload": _safe_json(review_input),
@@ -1492,6 +1567,7 @@ class AstroGridStore:
                         {
                             "limit": backtest_limit,
                             "latest_by_variant": list((backtest_summary.get("latest_by_variant") or {}).keys()),
+                            "score_source": EFFECTIVE_SCORE_SOURCE,
                         }
                     ),
                     "proposed_grid_weights": _safe_json(review_payload.get("proposed_grid_weights") or {}),
@@ -1603,6 +1679,8 @@ class AstroGridStore:
         params["spy_outcome_rule"] = SPY_OUTCOME_RULE
         params["spy_entry_max_age_days"] = SPY_ENTRY_MAX_AGE_DAYS
         params["spy_outcome_grace_days"] = SPY_OUTCOME_GRACE_DAYS
+        params["skip_max_attempts"] = SCORE_SKIP_MAX_ATTEMPTS
+        params.update(_legacy_score_params())
         where_sql = f"AND {' AND '.join(filters)}" if filters else ""
         sql = text(
             f"""
@@ -1620,13 +1698,27 @@ class AstroGridStore:
                 pr.mystical_feature_payload,
                 pr.grid_feature_payload,
                 pr.question,
-                ps.id,
-                pr.created_at
+                ps_base.id,
+                pr.created_at,
+                pr.model_version
             FROM {self.schema}.prediction_run pr
-            LEFT JOIN {self.schema}.prediction_score ps
-                ON ps.prediction_run_id = pr.id
-            WHERE ps.id IS NULL
+            LEFT JOIN {self._effective_scores_sql()} es
+                ON es.prediction_run_id = pr.id
+            LEFT JOIN {self.schema}.prediction_score ps_base
+                ON ps_base.prediction_run_id = pr.id
+            WHERE es.prediction_run_id IS NULL
               AND pr.scoring_class = 'liquid_market'
+              -- Bounded skip: one attempt per evaluation day, at most
+              -- SCORE_SKIP_MAX_ATTEMPTS days, none after a permanent reason.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {self.schema}.prediction_score_skip sk
+                  WHERE sk.prediction_run_id = pr.id
+                    AND (sk.permanent OR sk.attempt_date >= :evaluation_date)
+              )
+              AND (
+                  SELECT COUNT(*) FROM {self.schema}.prediction_score_skip sk
+                  WHERE sk.prediction_run_id = pr.id
+              ) < :skip_max_attempts
               AND (
                   CASE WHEN jsonb_typeof(pr.target_symbols) = 'array'
                                  AND jsonb_array_length(pr.target_symbols) = 1
@@ -1765,51 +1857,11 @@ class AstroGridStore:
             LIMIT :limit
             """
         )
-        insert_sql = text(
-            f"""
-            INSERT INTO {self.schema}.prediction_score (
-                prediction_run_id,
-                scored_at,
-                benchmark_symbol,
-                realized_return,
-                benchmark_return,
-                alpha_vs_benchmark,
-                verdict,
-                invalidation_status,
-                max_favorable_excursion,
-                max_adverse_excursion,
-                regime_context,
-                attribution_grid,
-                attribution_mystical,
-                attribution_noise,
-                raw_payload
-            )
-            VALUES (
-                :prediction_run_id,
-                NOW(),
-                :benchmark_symbol,
-                :realized_return,
-                :benchmark_return,
-                :alpha_vs_benchmark,
-                :verdict,
-                :invalidation_status,
-                :max_favorable_excursion,
-                :max_adverse_excursion,
-                CAST(:regime_context AS jsonb),
-                CAST(:attribution_grid AS jsonb),
-                CAST(:attribution_mystical AS jsonb),
-                CAST(:attribution_noise AS jsonb),
-                CAST(:raw_payload AS jsonb)
-            )
-            ON CONFLICT (prediction_run_id) DO NOTHING
-            RETURNING id
-            """
-        )
-
         summary = {
             "evaluation_date": evaluation_date.isoformat(),
             "candidates": 0,
             "scored": 0,
+            "rescored_legacy": 0,
             "skipped_not_mature": 0,
             "skipped_unscoreable": 0,
             "skipped_no_price": 0,
@@ -1821,67 +1873,371 @@ class AstroGridStore:
             rows = conn.execute(sql, params).fetchall()
             summary["candidates"] = len(rows)
             for row in rows:
-                maturity_days = 30 if row[3] == "macro" else 7
-                target_symbols = [str(symbol).upper() for symbol in _json_loads(row[5], [])]
-                created_at = row[14] if len(row) > 14 else None
-                start_date = (
-                    created_at.astimezone(timezone.utc).date()
-                    if target_symbols == ["SPY"] and isinstance(created_at, datetime)
-                    and created_at.tzinfo is not None
-                    else row[2].date() if row[2] else evaluation_date
+                result = self._score_candidate_row(
+                    conn, row, evaluation_date=evaluation_date, score_cutoff=score_cutoff,
                 )
-                maturity_date = start_date + timedelta(days=maturity_days)
-                if evaluation_date < maturity_date:
+                if result["state"] == "not_mature":
                     summary["skipped_not_mature"] += 1
                     continue
-                score = self._build_prediction_score(
-                    conn=conn,
-                    prediction_id=row[1],
-                    call=row[6],
-                    setup=row[7],
-                    invalidation=row[8],
-                    market_overlay=_json_loads(row[9], {}),
-                    mystical_payload=_json_loads(row[10], {}),
-                    grid_payload=_json_loads(row[11], {}),
-                    target_symbols=target_symbols,
-                    start_date=start_date,
-                    evaluation_date=evaluation_date,
-                    prediction_as_of_ts=row[2],
-                    prediction_created_at=created_at,
-                    declared_horizon=row[3],
-                    score_cutoff=score_cutoff,
-                )
-                if score.get("unscored"):
+                if result["state"] == "unscored":
                     summary["skipped_no_price"] += 1
                     summary["unscored"].append({
                         "prediction_id": row[1],
                         "status": "unscored",
-                        **score["unscored"],
+                        **result["unscored"],
                     })
+                    self._record_score_skip(conn, row, result, attempt_date=evaluation_date)
                     continue
-                inserted = conn.execute(
-                    insert_sql,
-                    {
-                        "prediction_run_id": row[0],
-                        "benchmark_symbol": score["benchmark_symbol"],
-                        "realized_return": score["realized_return"],
-                        "benchmark_return": score["benchmark_return"],
-                        "alpha_vs_benchmark": score["alpha_vs_benchmark"],
-                        "verdict": score["verdict"],
-                        "invalidation_status": score["invalidation_status"],
-                        "max_favorable_excursion": score["max_favorable_excursion"],
-                        "max_adverse_excursion": score["max_adverse_excursion"],
-                        "regime_context": _safe_json(score["regime_context"]),
-                        "attribution_grid": _safe_json(score["attribution_grid"]),
-                        "attribution_mystical": _safe_json(score["attribution_mystical"]),
-                        "attribution_noise": _safe_json(score["attribution_noise"]),
-                        "raw_payload": _safe_json(score["raw_payload"]),
-                    },
-                ).fetchone()
-                if inserted:
+                if self._insert_score(conn, row, result):
+                    score = result["score"]
                     summary["scored"] += 1
+                    if result["legacy"]:
+                        summary["rescored_legacy"] += 1
                     summary["prediction_ids"].append(row[1])
                     summary["verdicts"][score["verdict"]] += 1
+        return summary
+
+    def _effective_scores_sql(self) -> str:
+        """Subquery of the scores every reader may count; needs ``_legacy_score_params``.
+
+        ``prediction_score`` rows minus the SPY-graded legacy crypto scores,
+        plus the coin-priced rescores. At most one row per prediction:
+        rescores exist only for legacy predictions whose base score (if any)
+        is excluded. ``target_symbols`` is the decoded list for rescores.
+        """
+        return f"""(
+                SELECT ps_e.id, ps_e.prediction_run_id, ps_e.scored_at, ps_e.benchmark_symbol,
+                       ps_e.realized_return, ps_e.benchmark_return, ps_e.alpha_vs_benchmark,
+                       ps_e.verdict, ps_e.invalidation_status, ps_e.max_favorable_excursion,
+                       ps_e.max_adverse_excursion, ps_e.regime_context, ps_e.attribution_grid,
+                       ps_e.attribution_mystical, ps_e.attribution_noise, ps_e.raw_payload,
+                       pr_e.target_symbols AS target_symbols, 'base'::text AS score_version
+                FROM {self.schema}.prediction_score ps_e
+                JOIN {self.schema}.prediction_run pr_e ON pr_e.id = ps_e.prediction_run_id
+                WHERE NOT {_legacy_spy_score_predicate("ps_e", "pr_e")}
+                UNION ALL
+                SELECT lr_e.id, lr_e.prediction_run_id, lr_e.scored_at, lr_e.benchmark_symbol,
+                       lr_e.realized_return, lr_e.benchmark_return, lr_e.alpha_vs_benchmark,
+                       lr_e.verdict, lr_e.invalidation_status, lr_e.max_favorable_excursion,
+                       lr_e.max_adverse_excursion, lr_e.regime_context, lr_e.attribution_grid,
+                       lr_e.attribution_mystical, lr_e.attribution_noise, lr_e.raw_payload,
+                       lr_e.target_symbols, lr_e.score_version
+                FROM {self.schema}.prediction_score_legacy_rescore lr_e
+            )"""
+
+    def _score_candidate_row(
+        self,
+        conn: Any,
+        row: Any,
+        *,
+        evaluation_date: date,
+        score_cutoff: datetime,
+    ) -> dict[str, Any]:
+        """Score one candidate row (the ``score_predictions`` column layout).
+
+        Legacy grid-crypto-v1 rows are decoded with the legacy-only decoder
+        and measured at their horizon end (start + 7/30 days), not at the
+        run date, so a backfill months later reads the price as of maturity.
+        """
+        maturity_days = 30 if row[3] == "macro" else 7
+        created_at = row[14] if len(row) > 14 else None
+        model_version = row[15] if len(row) > 15 else None
+        legacy = _is_legacy_crypto_row(model_version, created_at)
+        symbols, decoded = _decode_legacy_target_symbols(row[5], legacy_row=legacy)
+        target_symbols = [str(symbol).upper() for symbol in (symbols if isinstance(symbols, list) else [])]
+        start_date = (
+            created_at.astimezone(timezone.utc).date()
+            if target_symbols == ["SPY"] and isinstance(created_at, datetime)
+            and created_at.tzinfo is not None
+            else row[2].date() if row[2] else evaluation_date
+        )
+        maturity_date = start_date + timedelta(days=maturity_days)
+        result: dict[str, Any] = {
+            "legacy": legacy,
+            "decoded": decoded,
+            "target_symbols": target_symbols,
+            "maturity_date": maturity_date,
+        }
+        if evaluation_date < maturity_date:
+            result["state"] = "not_mature"
+            return result
+        row_evaluation_date = maturity_date if legacy else evaluation_date
+        score = self._build_prediction_score(
+            conn=conn,
+            prediction_id=row[1],
+            call=row[6],
+            setup=row[7],
+            invalidation=row[8],
+            market_overlay=_json_loads(row[9], {}),
+            mystical_payload=_json_loads(row[10], {}),
+            grid_payload=_json_loads(row[11], {}),
+            target_symbols=target_symbols,
+            start_date=start_date,
+            evaluation_date=row_evaluation_date,
+            prediction_as_of_ts=row[2],
+            prediction_created_at=created_at,
+            declared_horizon=row[3],
+            score_cutoff=score_cutoff,
+        )
+        if score.get("unscored"):
+            result["state"] = "unscored"
+            result["unscored"] = score["unscored"]
+            return result
+        if legacy:
+            score["raw_payload"] = {
+                **score["raw_payload"],
+                "rescored_from_legacy": True,
+                "score_version": LEGACY_CRYPTO_RESCORE_VERSION,
+                "legacy_target_symbols_decoded": decoded,
+                "superseded_score_id": row[13],
+                "evaluation_rule": "horizon_end",
+            }
+        result["state"] = "scored"
+        result["score"] = score
+        return result
+
+    def _insert_score(self, conn: Any, row: Any, result: dict[str, Any]) -> bool:
+        """Insert one score; legacy rows go to the rescore table. Never updates."""
+        score = result["score"]
+        params = {
+            "prediction_run_id": row[0],
+            "benchmark_symbol": score["benchmark_symbol"],
+            "realized_return": score["realized_return"],
+            "benchmark_return": score["benchmark_return"],
+            "alpha_vs_benchmark": score["alpha_vs_benchmark"],
+            "verdict": score["verdict"],
+            "invalidation_status": score["invalidation_status"],
+            "max_favorable_excursion": score["max_favorable_excursion"],
+            "max_adverse_excursion": score["max_adverse_excursion"],
+            "regime_context": _safe_json(score["regime_context"]),
+            "attribution_grid": _safe_json(score["attribution_grid"]),
+            "attribution_mystical": _safe_json(score["attribution_mystical"]),
+            "attribution_noise": _safe_json(score["attribution_noise"]),
+            "raw_payload": _safe_json(score["raw_payload"]),
+        }
+        if result["legacy"]:
+            params.update({
+                "score_version": LEGACY_CRYPTO_RESCORE_VERSION,
+                "superseded_score_id": row[13],
+                "target_symbols": _safe_json(result["target_symbols"]),
+            })
+            sql = text(
+                f"""
+                INSERT INTO {self.schema}.prediction_score_legacy_rescore (
+                    prediction_run_id, score_version, superseded_score_id, target_symbols,
+                    scored_at, benchmark_symbol, realized_return, benchmark_return,
+                    alpha_vs_benchmark, verdict, invalidation_status,
+                    max_favorable_excursion, max_adverse_excursion, regime_context,
+                    attribution_grid, attribution_mystical, attribution_noise, raw_payload
+                )
+                VALUES (
+                    :prediction_run_id, :score_version, :superseded_score_id,
+                    CAST(:target_symbols AS jsonb), NOW(), :benchmark_symbol,
+                    :realized_return, :benchmark_return, :alpha_vs_benchmark, :verdict,
+                    :invalidation_status, :max_favorable_excursion, :max_adverse_excursion,
+                    CAST(:regime_context AS jsonb), CAST(:attribution_grid AS jsonb),
+                    CAST(:attribution_mystical AS jsonb), CAST(:attribution_noise AS jsonb),
+                    CAST(:raw_payload AS jsonb)
+                )
+                ON CONFLICT (prediction_run_id) DO NOTHING
+                RETURNING id
+                """
+            )
+        else:
+            sql = text(
+                f"""
+                INSERT INTO {self.schema}.prediction_score (
+                    prediction_run_id,
+                    scored_at,
+                    benchmark_symbol,
+                    realized_return,
+                    benchmark_return,
+                    alpha_vs_benchmark,
+                    verdict,
+                    invalidation_status,
+                    max_favorable_excursion,
+                    max_adverse_excursion,
+                    regime_context,
+                    attribution_grid,
+                    attribution_mystical,
+                    attribution_noise,
+                    raw_payload
+                )
+                VALUES (
+                    :prediction_run_id,
+                    NOW(),
+                    :benchmark_symbol,
+                    :realized_return,
+                    :benchmark_return,
+                    :alpha_vs_benchmark,
+                    :verdict,
+                    :invalidation_status,
+                    :max_favorable_excursion,
+                    :max_adverse_excursion,
+                    CAST(:regime_context AS jsonb),
+                    CAST(:attribution_grid AS jsonb),
+                    CAST(:attribution_mystical AS jsonb),
+                    CAST(:attribution_noise AS jsonb),
+                    CAST(:raw_payload AS jsonb)
+                )
+                ON CONFLICT (prediction_run_id) DO NOTHING
+                RETURNING id
+                """
+            )
+        return conn.execute(sql, params).fetchone() is not None
+
+    def _record_score_skip(
+        self, conn: Any, row: Any, result: dict[str, Any], *, attempt_date: date,
+    ) -> None:
+        """Append one bounded-skip row for a matured non-SPY prediction that cannot be scored.
+
+        SPY predictions keep their own receipt-driven retry and are not recorded.
+        """
+        if "SPY" in result.get("target_symbols", []):
+            return
+        reason = str((result.get("unscored") or {}).get("reason") or "unscored")
+        conn.execute(
+            text(
+                f"""
+                INSERT INTO {self.schema}.prediction_score_skip (
+                    prediction_run_id, attempt_date, reason, permanent, detail
+                )
+                VALUES (:prediction_run_id, :attempt_date, :reason, :permanent, CAST(:detail AS jsonb))
+                ON CONFLICT (prediction_run_id, attempt_date) DO NOTHING
+                """
+            ),
+            {
+                "prediction_run_id": row[0],
+                "attempt_date": attempt_date,
+                "reason": reason,
+                "permanent": reason in _PERMANENT_UNSCORED_REASONS,
+                "detail": _safe_json({
+                    **(result.get("unscored") or {}),
+                    "legacy": result.get("legacy", False),
+                }),
+            },
+        )
+
+    def rescore_legacy_crypto_predictions(
+        self,
+        *,
+        apply: bool = False,
+        as_of_date: date | None = None,
+        batch_size: int = 500,
+        limit: int | None = None,
+        progress: Any = None,
+    ) -> dict[str, Any]:
+        """Score every legacy grid-crypto-v1 prediction against its coin (one-shot backfill).
+
+        Candidates: legacy rows (``_is_legacy_crypto_row``) with no effective
+        score, i.e. unscored or carrying only an excluded SPY score. The
+        bounded-skip table is ignored here, so a re-run retries them.
+        ``apply=False`` (default) runs in a READ ONLY transaction and writes
+        nothing. ``apply=True`` inserts rescores (``ON CONFLICT DO NOTHING``)
+        and skip rows; re-running adds nothing for rows already rescored.
+        """
+        evaluation_date = as_of_date or _utc_today()
+        score_cutoff = min(
+            _utc_now(),
+            datetime.combine(evaluation_date + timedelta(days=1), time.min, timezone.utc),
+        )
+        batch_size = max(1, int(batch_size))
+        summary: dict[str, Any] = {
+            "mode": "apply" if apply else "dry_run",
+            "evaluation_date": evaluation_date.isoformat(),
+            "candidates": 0,
+            "with_excluded_spy_score": 0,
+            "not_mature": 0,
+            "scored": 0,
+            "inserted": 0,
+            "insert_conflicts": 0,
+            "undecodable": 0,
+            "verdicts": {"hit": 0, "miss": 0, "partial": 0, "invalidated": 0, "expired": 0},
+            "verdicts_by_symbol": {},
+            "unscored_by_reason": {},
+            "batches": 0,
+        }
+        sql = text(
+            f"""
+            SELECT
+                pr.id,
+                pr.prediction_id,
+                pr.as_of_ts,
+                pr.horizon_label,
+                pr.scoring_class,
+                pr.target_symbols,
+                pr.call,
+                pr.setup,
+                pr.invalidation,
+                pr.market_overlay_snapshot,
+                pr.mystical_feature_payload,
+                pr.grid_feature_payload,
+                pr.question,
+                ps_base.id,
+                pr.created_at,
+                pr.model_version
+            FROM {self.schema}.prediction_run pr
+            LEFT JOIN {self.schema}.prediction_score ps_base
+                ON ps_base.prediction_run_id = pr.id
+            WHERE pr.model_version = :legacy_model_version
+              AND pr.created_at < :legacy_cutoff
+              AND pr.scoring_class = 'liquid_market'
+              AND pr.id > :after_id
+              AND NOT EXISTS (
+                  SELECT 1 FROM {self._effective_scores_sql()} es
+                  WHERE es.prediction_run_id = pr.id
+              )
+            ORDER BY pr.id
+            LIMIT :batch_limit
+            """
+        )
+        after_id = 0
+        remaining = limit
+        while remaining is None or remaining > 0:
+            batch_limit = batch_size if remaining is None else min(batch_size, remaining)
+            params = {**_legacy_score_params(), "after_id": after_id, "batch_limit": batch_limit}
+            context = self.engine.begin() if apply else self.engine.connect()
+            with context as conn:
+                if not apply:
+                    conn.execute(text("SET TRANSACTION READ ONLY"))
+                rows = conn.execute(sql, params).fetchall()
+                for row in rows:
+                    after_id = max(after_id, int(row[0]))
+                    summary["candidates"] += 1
+                    if row[13] is not None:
+                        summary["with_excluded_spy_score"] += 1
+                    result = self._score_candidate_row(
+                        conn, row, evaluation_date=evaluation_date, score_cutoff=score_cutoff,
+                    )
+                    if not result["decoded"]:
+                        summary["undecodable"] += 1
+                    if result["state"] == "not_mature":
+                        summary["not_mature"] += 1
+                        continue
+                    if result["state"] == "unscored":
+                        reason = str(result["unscored"].get("reason") or "unscored")
+                        summary["unscored_by_reason"][reason] = summary["unscored_by_reason"].get(reason, 0) + 1
+                        if apply:
+                            self._record_score_skip(conn, row, result, attempt_date=evaluation_date)
+                        continue
+                    verdict = result["score"]["verdict"]
+                    summary["scored"] += 1
+                    summary["verdicts"][verdict] += 1
+                    symbol = "/".join(result["target_symbols"])
+                    by_symbol = summary["verdicts_by_symbol"].setdefault(symbol, {})
+                    by_symbol[verdict] = by_symbol.get(verdict, 0) + 1
+                    if apply:
+                        if self._insert_score(conn, row, result):
+                            summary["inserted"] += 1
+                        else:
+                            summary["insert_conflicts"] += 1
+            summary["batches"] += 1
+            if remaining is not None:
+                remaining -= len(rows)
+            if callable(progress):
+                progress(dict(summary))
+            if len(rows) < batch_limit:
+                break
         return summary
 
     def build_prediction_scoreboard(self) -> dict[str, Any]:
@@ -1898,37 +2254,46 @@ class AstroGridStore:
                 AVG(alpha_vs_benchmark) AS avg_alpha,
                 AVG(max_favorable_excursion) AS avg_mfe,
                 AVG(max_adverse_excursion) AS avg_mae
-            FROM {self.schema}.prediction_score
+            FROM {self._effective_scores_sql()} es
             """
         )
         symbol_sql = text(
             f"""
             SELECT
-                COALESCE(pr.target_symbols->>0, 'HYBRID') AS symbol,
+                COALESCE(ps.target_symbols->>0, 'HYBRID') AS symbol,
                 COUNT(*) AS total,
                 SUM(CASE WHEN ps.verdict = 'hit' THEN 1 ELSE 0 END) AS hits,
                 SUM(CASE WHEN ps.verdict = 'miss' THEN 1 ELSE 0 END) AS misses,
                 SUM(CASE WHEN ps.verdict = 'partial' THEN 1 ELSE 0 END) AS partials,
                 AVG(ps.realized_return) AS avg_realized,
                 AVG(ps.alpha_vs_benchmark) AS avg_alpha
-            FROM {self.schema}.prediction_score ps
-            JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
-            GROUP BY COALESCE(pr.target_symbols->>0, 'HYBRID')
-            ORDER BY COUNT(*) DESC, COALESCE(pr.target_symbols->>0, 'HYBRID')
+            FROM {self._effective_scores_sql()} ps
+            GROUP BY COALESCE(ps.target_symbols->>0, 'HYBRID')
+            ORDER BY COUNT(*) DESC, COALESCE(ps.target_symbols->>0, 'HYBRID')
             """
         )
         pending_sql = text(
             f"""
             SELECT COUNT(*)
             FROM {self.schema}.prediction_run pr
-            LEFT JOIN {self.schema}.prediction_score ps ON ps.prediction_run_id = pr.id
-            WHERE ps.id IS NULL
+            LEFT JOIN {self._effective_scores_sql()} ps ON ps.prediction_run_id = pr.id
+            WHERE ps.prediction_run_id IS NULL
             """
         )
+        excluded_sql = text(
+            f"""
+            SELECT COUNT(*)
+            FROM {self.schema}.prediction_score ps
+            JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
+            WHERE {_legacy_spy_score_predicate("ps", "pr")}
+            """
+        )
+        legacy_params = _legacy_score_params()
         with self.engine.connect() as conn:
-            overall_row = conn.execute(overall_sql).fetchone()
-            symbol_rows = conn.execute(symbol_sql).fetchall()
-            pending = int(conn.execute(pending_sql).scalar() or 0)
+            overall_row = conn.execute(overall_sql, legacy_params).fetchone()
+            symbol_rows = conn.execute(symbol_sql, legacy_params).fetchall()
+            pending = int(conn.execute(pending_sql, legacy_params).scalar() or 0)
+            excluded_legacy = int(conn.execute(excluded_sql, legacy_params).scalar() or 0)
         total = int(overall_row[0] or 0) if overall_row else 0
         hits = int(overall_row[1] or 0) if overall_row else 0
         misses = int(overall_row[2] or 0) if overall_row else 0
@@ -1950,6 +2315,8 @@ class AstroGridStore:
             "avg_alpha_vs_benchmark": round(float(overall_row[7] or 0.0), 4) if overall_row else 0.0,
             "avg_mfe": round(float(overall_row[8] or 0.0), 4) if overall_row else 0.0,
             "avg_mae": round(float(overall_row[9] or 0.0), 4) if overall_row else 0.0,
+            # SPY-graded legacy grid-crypto-v1 scores left out of every number above.
+            "excluded_legacy_spy_scores": excluded_legacy,
         }
         by_symbol = []
         for row in symbol_rows:
@@ -1984,7 +2351,7 @@ class AstroGridStore:
         if not valid_variants:
             valid_variants = ["grid_only", "grid_plus_mystical", "mystical_only"]
         filters = ["1=1"]
-        params: dict[str, Any] = {"limit": limit}
+        params: dict[str, Any] = {"limit": limit, **_legacy_score_params()}
         if horizon_label in {"macro", "swing"}:
             filters.append("pr.horizon_label = :horizon_label")
             params["horizon_label"] = horizon_label
@@ -2002,7 +2369,7 @@ class AstroGridStore:
                 pr.as_of_ts::date,
                 pr.horizon_label,
                 pr.target_universe,
-                pr.target_symbols,
+                ps.target_symbols,
                 pr.call,
                 pr.setup,
                 pr.note,
@@ -2015,7 +2382,7 @@ class AstroGridStore:
                 ps.attribution_mystical,
                 ps.attribution_noise,
                 ps.regime_context
-            FROM {self.schema}.prediction_score ps
+            FROM {self._effective_scores_sql()} ps
             JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
             WHERE {" AND ".join(filters)}
             ORDER BY pr.as_of_ts DESC
@@ -2142,7 +2509,7 @@ class AstroGridStore:
                         "target_universe": "hybrid",
                         "window_start": window_start,
                         "window_end": window_end,
-                        "params_payload": _safe_json({"limit": limit}),
+                        "params_payload": _safe_json({"limit": limit, "score_source": EFFECTIVE_SCORE_SOURCE}),
                         "summary_payload": _safe_json(summary),
                     },
                 ).fetchone()
@@ -2180,13 +2547,16 @@ class AstroGridStore:
             f"""
             SELECT strategy_variant, started_at, summary_payload
             FROM {self.schema}.backtest_run
+            -- Runs built before the legacy-score exclusion (no marker) are
+            -- summaries of SPY-graded crypto scores; leave them out.
+            WHERE params_payload->>'score_source' = :score_source
             ORDER BY started_at DESC
             LIMIT :limit
             """
         )
         latest_by_variant: dict[str, Any] = {}
         with self.engine.connect() as conn:
-            rows = conn.execute(sql, {"limit": limit}).fetchall()
+            rows = conn.execute(sql, {"limit": limit, "score_source": EFFECTIVE_SCORE_SOURCE}).fetchall()
         history = []
         for row in rows:
             payload = _json_loads(row[2], {})
@@ -2200,12 +2570,13 @@ class AstroGridStore:
         return {"latest_by_variant": latest_by_variant, "history": history}
 
     def list_backtest_results(self, *, strategy_variant: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
-        filters = []
-        params: dict[str, Any] = {"limit": limit}
+        # Results labelled '[' come from char-list legacy rows graded against SPY.
+        filters = ["br.target_symbol IS DISTINCT FROM :legacy_char_symbol"]
+        params: dict[str, Any] = {"limit": limit, "legacy_char_symbol": LEGACY_CHAR_LIST_TARGET_SYMBOL}
         if strategy_variant:
             filters.append("br.strategy_variant = :strategy_variant")
             params["strategy_variant"] = strategy_variant
-        where_sql = f"WHERE {' AND '.join(filters)}" if filters else ""
+        where_sql = f"WHERE {' AND '.join(filters)}"
         sql = text(
             f"""
             SELECT
@@ -2264,6 +2635,7 @@ class AstroGridStore:
             "approved_weight_version_key": row[13],
             "decided_by": row[14],
             "decided_at": row[15].isoformat() if row[15] else None,
+            **_weight_proposal_eligibility(_json_loads(row[3], {})),
         }
 
     def list_weight_proposals(self, *, status: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -2362,6 +2734,16 @@ class AstroGridStore:
             return None
         if proposal["status"] != "pending_review":
             return proposal
+        if not proposal["eligible_for_approval"]:
+            log.warning(
+                "AstroGrid weight proposal {pid} refused: {reason}",
+                pid=weight_proposal_id, reason=proposal["ineligible_reason"],
+            )
+            return {
+                **proposal,
+                "approval_refused": True,
+                "error": f"Weight proposal not approvable: {proposal['ineligible_reason']}",
+            }
         active = self.ensure_active_weight_version()
         version_key = f"astrogrid-v{uuid4().hex[:12]}"
         insert_weight_sql = text(
@@ -2517,14 +2899,16 @@ class AstroGridStore:
             FROM {self.schema}.prediction_run pr
             LEFT JOIN {self.schema}.prediction_postmortem pp
                 ON pp.prediction_run_id = pr.id
-            LEFT JOIN {self.schema}.prediction_score ps
+            LEFT JOIN {self._effective_scores_sql()} ps
                 ON ps.prediction_run_id = pr.id
             ORDER BY pr.created_at DESC
             LIMIT :limit OFFSET :offset
             """
         )
         with self.engine.connect() as conn:
-            rows = conn.execute(sql, {"limit": limit, "offset": offset}).fetchall()
+            rows = conn.execute(
+                sql, {"limit": limit, "offset": offset, **_legacy_score_params()}
+            ).fetchall()
         return [self._prediction_row_to_dict(row) for row in rows]
 
     def list_postmortems(self, *, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
@@ -2596,14 +2980,14 @@ class AstroGridStore:
             FROM {self.schema}.prediction_run pr
             LEFT JOIN {self.schema}.prediction_postmortem pp
                 ON pp.prediction_run_id = pr.id
-            LEFT JOIN {self.schema}.prediction_score ps
+            LEFT JOIN {self._effective_scores_sql()} ps
                 ON ps.prediction_run_id = pr.id
             WHERE pr.prediction_id = :prediction_id
             LIMIT 1
             """
         )
         with self.engine.connect() as conn:
-            row = conn.execute(sql, {"prediction_id": prediction_id}).fetchone()
+            row = conn.execute(sql, {"prediction_id": prediction_id, **_legacy_score_params()}).fetchone()
         return self._prediction_row_to_dict(row, detailed=True) if row else None
 
     def _prediction_row_to_dict(self, row: Any, detailed: bool = False) -> dict[str, Any]:
@@ -3175,7 +3559,7 @@ class AstroGridStore:
 
     def _scored_prediction_date_range(self, *, horizon_label: str | None = None) -> tuple[date | None, date | None] | None:
         filters = []
-        params: dict[str, Any] = {}
+        params: dict[str, Any] = _legacy_score_params()
         if horizon_label in {"macro", "swing"}:
             filters.append("pr.horizon_label = :horizon_label")
             params["horizon_label"] = horizon_label
@@ -3183,7 +3567,7 @@ class AstroGridStore:
         sql = text(
             f"""
             SELECT min(pr.as_of_ts::date), max(pr.as_of_ts::date)
-            FROM {self.schema}.prediction_score ps
+            FROM {self._effective_scores_sql()} ps
             JOIN {self.schema}.prediction_run pr ON pr.id = ps.prediction_run_id
             {where_sql}
             """
