@@ -667,12 +667,14 @@ class EarningsPuller(BasePuller):
                 result["rows_failed"] += failed
                 result["errors"].extend(errors)
 
-            if result["rows_failed"] and not result["rows_inserted"]:
-                result["status"] = "FAILED"
-            elif result["errors"] or result["rows_inserted"] == 0:
-                result["status"] = "PARTIAL"
             if not points and not result["errors"]:
                 result["errors"].append("No earnings data available")
+            if result["rows_failed"] and not result["rows_inserted"]:
+                result["status"] = "FAILED"
+            elif result["errors"]:
+                result["status"] = "PARTIAL"
+            # Otherwise SUCCESS, including 0 rows: every fetched point was
+            # already stored, a completed check rather than a partial one.
 
         except Exception as exc:
             # yfinance throws plain RuntimeError/HTTPError on rate-limit

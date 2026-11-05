@@ -327,11 +327,14 @@ class AgCommodityFuturesPuller(BasePuller):
                 df = frames.get(ticker)
                 if df is None or df.empty:
                     log.warning("No data returned for {t}", t=ticker)
+                    # _fetch_batch returns no frame when the download failed;
+                    # report a failed fetch, not a clean "no data" check.
                     results.append({
                         "feature": f"YF:{ticker}:close",
-                        "status": "NO_DATA",
+                        "status": "FAILED",
                         "rows_inserted": 0,
                         "rows_skipped": 0,
+                        "error": f"yfinance returned no bars for {ticker} {start_date}..{end_date}",
                     })
                     continue
                 try:

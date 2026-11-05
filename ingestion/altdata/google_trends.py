@@ -167,10 +167,13 @@ class GoogleTrendsPuller(BasePuller):
 
             df = self._fetch_trend(keyword, timeframe=timeframe)
             if df.empty:
+                # These keywords always have US search interest; an empty
+                # timeline is a failed fetch, not a checked "no new data".
                 return {
-                    "status": "NO_DATA",
+                    "status": "FAILED",
                     "rows_inserted": 0,
                     "keyword": keyword,
+                    "error": f"Google Trends returned no interest timeline for {keyword!r} ({timeframe})",
                 }
 
             # Interpolate to daily

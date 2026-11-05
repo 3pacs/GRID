@@ -1831,7 +1831,11 @@ def _classify_outcome(out: Any) -> tuple[str, int | None, str | None]:
                 return OUTCOME_FAILED, rows, "invalid coverage counts"
             if succeeded < total:
                 return (OUTCOME_PARTIAL if succeeded or rows else OUTCOME_FAILED), rows, f"{succeeded} of {total} items completed"
-        if status in {"UNCHANGED", "NO_NEW_DATA"}:
+        # NO_DATA is the pullers' "checked, the source had nothing new" leaf
+        # (FedSpeeches all-deduped scores, WorldNews zero-article days). A
+        # NO_DATA that carries an error already failed above; producers whose
+        # empty answer is a real failure report FAILED with a reason.
+        if status in {"UNCHANGED", "NO_NEW_DATA", "NO_DATA"}:
             if rows not in (None, 0):
                 return OUTCOME_FAILED, rows, "unchanged outcome reported positive writes"
             return OUTCOME_NO_NEW_DATA, 0, "run checked, nothing changed"
@@ -2303,6 +2307,11 @@ class SmartScheduler:
                 raise err_box[0]
 
             out = out_box[0]
+            if puller["mod"] == "ingestion.yfinance_pull" and puller["cls"] == "YFinancePuller":
+                # The grid-scheduler path's expected SPY provisional-close
+                # refusal applies here too; otherwise every run is PARTIAL.
+                from ingestion.scheduler import _normalize_expected_spy_refusal
+                out = _normalize_expected_spy_refusal(out)
             outcome, rows, note = _classify_outcome(out)
             result["rows_inserted"] = rows
             result["detail"] = str(out)[:200] if out else ""

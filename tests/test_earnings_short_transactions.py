@@ -477,3 +477,39 @@ def test_unknown_commit_remains_unknown_when_close_also_fails():
     assert out[0]["commit_outcome_unknown"] is True
     assert out[0]["rows_inserted"] == 0
     assert engine.begin_calls == 1
+
+
+def test_unchanged_ticker_is_a_clean_check_not_partial():
+    # 2026-11-05 audit: every deduped ticker was PARTIAL (88-90 of 99 per run).
+    from ingestion.smart_scheduler import _classify_outcome
+
+    engine = _Engine()
+    puller = _puller(engine, _frames(3))
+    assert puller.pull_ticker("AAPL")["rows_inserted"] > 0
+    rerun = puller.pull_ticker("AAPL")
+    assert (rerun["status"], rerun["rows_inserted"], rerun["errors"]) == ("SUCCESS", 0, [])
+    assert _classify_outcome([rerun])[:2] == ("NO_NEW_DATA", 0)
+    assert ep.EarningsPuller.get_summary(puller, [rerun])["succeeded"] == 1
+
+
+def test_zero_row_ticker_with_a_fetch_error_stays_partial():
+    from ingestion.smart_scheduler import _classify_outcome
+
+    frames = _frames(3)
+    engine = _Engine()
+    puller = _puller(engine, frames)
+    puller.pull_ticker("AAPL")
+
+    class Broken(SimpleNamespace):
+        @property
+        def earnings_history(self):
+            raise RuntimeError("yahoo 429")
+
+    puller._fetch_ticker_data = lambda ticker: Broken(
+        earnings_dates=frames.earnings_dates, quarterly_earnings=frames.quarterly_earnings)
+    rerun = puller.pull_ticker("AAPL")
+    assert rerun["status"] == "PARTIAL" and rerun["rows_inserted"] == 0
+    assert any("yahoo 429" in e for e in rerun["errors"])
+    assert _classify_outcome([rerun])[0] != "NO_NEW_DATA"
+    clean = dict(rerun, status="SUCCESS", errors=[])
+    assert _classify_outcome([clean, rerun])[0] == "PARTIAL"
