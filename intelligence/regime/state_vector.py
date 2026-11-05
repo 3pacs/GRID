@@ -39,6 +39,15 @@ Availability contract (``as_of`` = end of that UTC day)
   convention (``analysis.panel_insider_density.filing_known_at``: filing date
   22:00 America/New_York). ``INSIDER:*`` rows are dated by *transaction*
   date, so ``obs_date <= as_of`` alone admits filings made after ``as_of``.
+* **VIX** (``vix_level`` / ``vix_percentile``) reads FRED ``VIXCLS``
+  whenever its known-at window can produce those dimensions. Only when it
+  cannot (absent, too short, or mixed-source at ``as_of``) does the whole
+  series switch to the Cboe-published close ``CBOE:VIX`` (source ``CBOE``,
+  the originator of VIXCLS), read with the same known-at rule and the same
+  next-business-day lag. A usable VIXCLS that is only *late* keeps every
+  close it has; just its trailing gap, up to the date VIXCLS itself would be
+  modeled as published by ``as_of``, is filled from CBOE:VIX closes known
+  at ``as_of``. The choice is recorded in ``StateVector.vix_basis``.
 
 State vectors are cached in the `regime_state_vectors` table.
 """
@@ -47,7 +56,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, time, timedelta, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -192,7 +201,40 @@ PUBLICATION_LAGS: dict[str, PublicationLag | None] = {
     # Computed by GRID itself: known when GRID computed it, never earlier
     'COMPUTED:fed_net_liquidity': None,
     'COMPUTED:fed_net_liquidity_change_1m': None,
+    # VIX fallback (see VIX_FALLBACK_SERIES below): the Cboe close FRED
+    # republishes as VIXCLS, so the same reviewer-verified lag applies.
+    'CBOE:VIX': _NEXT_BUSINESS_DAY,
 }
+
+# ── VIX basis (R4) ───────────────────────────────────────────────────────
+#
+# ``vix_level`` / ``vix_percentile`` prefer FRED ``VIXCLS``. ``CBOE:VIX`` is
+# the Cboe-published close FRED republishes (``ingestion/altdata/
+# cboe_indices.py``, source ``CBOE``; history from 1990 via
+# ``scripts/bulk_historical_pull.py``). It is used only when VIXCLS cannot
+# produce the VIX dimensions at ``as_of``, and then as a whole series (values,
+# percentile window and z-score stats all from CBOE:VIX). The read pins
+# ``source`` because both writers of CBOE:VIX use the CBOE catalog entry and
+# any other writer would be a different provenance.
+#
+# A usable VIXCLS that is merely behind (FRED posts late: 2-6 days on ~8% of
+# dates since 2026-04, e.g. the 2026-09-23..25 closes landed on 09-29) gets
+# its *trailing* gap filled from CBOE:VIX: only dates after VIXCLS's last
+# known close, only Cboe closes known at ``as_of``, and only dates VIXCLS
+# itself would be modeled as published by ``as_of`` (its own lag), so the
+# fill never gives the VIX dims a fresher close than an on-time VIXCLS
+# would. A date VIXCLS has is never replaced. On griddb the two series agree
+# to the cent on all 9,150 overlapping dates (1990-01-02..2026-03-25).
+VIX_SERIES = 'VIXCLS'
+VIX_FALLBACK_SERIES = 'CBOE:VIX'
+VIX_GAP_FILLED_BASIS = 'VIXCLS+CBOE:VIX'
+SERIES_SOURCES: dict[str, str] = {VIX_FALLBACK_SERIES: 'CBOE'}
+# A backup series is read for numeric use only: a SUCCESS row whose value is
+# not a finite number (NaN, +/-inf) is not an observation, the same way the
+# reader already treats NULL, so it can neither fill a date, nor count toward
+# ``min_history``, nor enter the z-score history. VIXCLS and every other
+# primary series keep the reader's unchanged behaviour.
+FINITE_ONLY_SERIES: frozenset[str] = frozenset({VIX_FALLBACK_SERIES})
 
 # Raw ``YF:SPY:close`` fallback (E1-V1). A daily close is public when its
 # session ends (16:00 America/New_York = 20:00/21:00 UTC), so the close dated
@@ -266,6 +308,13 @@ class StateVector:
     # than freshly computed. GET routes (persist=False) return cached=False
     # for an in-memory computation that was never written.
     cached: bool = False
+    # Which VIX close series fed vix_level/vix_percentile: VIX_SERIES
+    # ("VIXCLS"), VIX_GAP_FILLED_BASIS ("VIXCLS+CBOE:VIX", VIXCLS with its
+    # trailing gap filled), the VIX_FALLBACK_SERIES ("CBOE:VIX"), or None
+    # when neither had enough known history (see _resolve_vix_series and
+    # _fill_vix_trailing_gap). Cached rows written before this field existed
+    # read back as None.
+    vix_basis: str | None = None
 
     @property
     def array(self) -> np.ndarray:
@@ -284,6 +333,7 @@ class StateVector:
             'completeness': self.completeness,
             'stale_dimensions': list(self.stale_dimensions),
             'price_basis': self.price_basis,
+            'vix_basis': self.vix_basis,
             'cached': self.cached,
         }
 
@@ -300,7 +350,9 @@ def _fetch_series(
     pulled by ``as_of`` (latest such vintage) or, for backfilled history, its
     :data:`PUBLICATION_LAGS` entry puts its release on or before ``as_of``
     (earliest pulled vintage). A series not in :data:`PUBLICATION_LAGS` gets
-    no modeled path (pull evidence only). A series_id whose selected rows
+    no modeled path (pull evidence only). A series in :data:`SERIES_SOURCES`
+    is read from that source only; one in :data:`FINITE_ONLY_SERIES` keeps
+    only finite values. A series_id whose selected rows
     span more than one source (``store.observations.MixedSourceError``)
     degrades to an empty series rather than silently mixing sources; the
     caller already treats a short or empty series as "dimension unavailable".
@@ -309,17 +361,21 @@ def _fetch_series(
     try:
         with engine.connect() as conn:
             obs = read_window_known_at(
-                conn, series_id, as_of=as_of, lag=PUBLICATION_LAGS.get(series_id), start=cutoff,
+                conn, series_id, as_of=as_of, lag=PUBLICATION_LAGS.get(series_id),
+                source=SERIES_SOURCES.get(series_id), start=cutoff,
             )
     except MixedSourceError as exc:
         log.warning("state_vector: {sid} is mixed-source, skipping: {e}", sid=series_id, e=str(exc))
         return pd.Series(dtype=float)
     if not obs:
         return pd.Series(dtype=float)
-    return pd.Series(
+    series = pd.Series(
         {o.obs_date: o.value for o in obs},
         dtype=float,
     ).sort_index()
+    if series_id in FINITE_ONLY_SERIES:
+        series = series[np.isfinite(series.to_numpy())]
+    return series
 
 
 class _AsOfReader:
@@ -350,6 +406,79 @@ class _AsOfReader:
                 self.engine, series_id, self.as_of, lookback_days=VALUE_LOOKBACK_DAYS,
             )
         return self._windows[series_id]
+
+    def append(self, series_id: str, extra: pd.Series) -> None:
+        """Append later-dated observations to both memoized reads of ``series_id``.
+
+        Both expanded series are built before either memo is assigned, so a
+        failure while building the second one leaves both reads exactly as
+        they were: the value/percentile window and the normalization history
+        can never disagree about which observations they contain.
+        """
+        full = pd.concat([self.full(series_id), extra]).sort_index()
+        window = pd.concat([self.window(series_id), extra]).sort_index()
+        self._full[series_id] = full
+        self._windows[series_id] = window
+
+
+def _resolve_vix_series(reader: _AsOfReader) -> str | None:
+    """VIX close series for ``vix_level``/``vix_percentile`` at ``reader.as_of``.
+
+    :data:`VIX_SERIES` whenever its known-at compute window has the
+    ``min_history`` those dimensions need, else :data:`VIX_FALLBACK_SERIES`
+    under the same test (its window holds only finite closes, see
+    :data:`FINITE_ONLY_SERIES`, so the count is of numerically usable
+    history), else ``None``. The fallback is therefore read only
+    when the VIXCLS dimensions would otherwise be unavailable; a vector whose
+    VIXCLS is usable is computed exactly as before and never touches
+    CBOE:VIX.
+    """
+    vix_dims = [d for d in STATE_DIMENSIONS if d.series_id == VIX_SERIES]
+    if not vix_dims:
+        return None
+    need = max(d.min_history for d in vix_dims)
+    for series_id in (VIX_SERIES, VIX_FALLBACK_SERIES):
+        if len(reader.window(series_id)) >= need:
+            return series_id
+    return None
+
+
+def _vix_publication_horizon(as_of: date) -> date:
+    """Latest weekday close VIXCLS is modeled as published by the end of ``as_of``."""
+    lag = PUBLICATION_LAGS[VIX_SERIES]
+    horizon = as_of
+    while horizon.weekday() >= 5 or lag.known_dates([horizon])[0] > as_of:
+        horizon -= timedelta(days=1)
+    return horizon
+
+
+def _fill_vix_trailing_gap(reader: _AsOfReader) -> int:
+    """Fill VIXCLS's trailing gap from CBOE:VIX; return the number of dates filled.
+
+    Applies only when VIXCLS's last known close is older than
+    :func:`_vix_publication_horizon`, so an on-time VIXCLS is left exactly as
+    read (CBOE:VIX is not read at all, except the day after a federal holiday
+    the horizon still counts, where nothing can be filled). Fills dates
+    strictly after that close and no later than the horizon, from CBOE:VIX
+    closes known at ``as_of``. Dates VIXCLS has are never touched. Only
+    finite Cboe closes are used: a NaN or infinite backup value fills nothing
+    for its date, and when nothing finite remains the series and its label
+    stay plain VIXCLS.
+    """
+    vixcls = reader.window(VIX_SERIES)
+    if vixcls.empty:
+        return 0
+    last = vixcls.index[-1]
+    horizon = _vix_publication_horizon(reader.as_of)
+    if last >= horizon:
+        return 0
+    cboe = reader.window(VIX_FALLBACK_SERIES)
+    fill = cboe[(cboe.index > last) & (cboe.index <= horizon)]
+    fill = fill[np.isfinite(fill.to_numpy())]
+    if fill.empty:
+        return 0
+    reader.append(VIX_SERIES, fill)
+    return len(fill)
 
 
 def _fetch_resolved_spy_full(engine: Engine, as_of: date, cutoff: date) -> pd.Series | None:
@@ -698,11 +827,18 @@ def _get_normalization_stats(
     for dim in STATE_DIMENSIONS:
         if dim.series_id.startswith('DERIVED:') or dim.series_id in stats:
             continue
-        series = reader.full(dim.series_id)
-        if len(series) < 20:
-            continue
-        stats[dim.series_id] = (float(series.mean()), float(series.std()))
+        series_stats = _series_norm_stats(reader, dim.series_id)
+        if series_stats is not None:
+            stats[dim.series_id] = series_stats
     return stats
+
+
+def _series_norm_stats(reader: _AsOfReader, series_id: str) -> tuple[float, float] | None:
+    """PIT mean/std of one series over the normalization window, or None if too short."""
+    series = reader.full(series_id)
+    if len(series) < 20:
+        return None
+    return (float(series.mean()), float(series.std()))
 
 
 def _zscore_normalize(value: float | None, mean: float, std: float) -> float | None:
@@ -729,12 +865,34 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         as_of = date.today()
 
     reader = _AsOfReader(engine, as_of)
+    try:
+        vix_basis = _resolve_vix_series(reader)
+    except Exception as exc:
+        # A failed VIXCLS read is not evidence VIXCLS is absent: keep it as
+        # the series, so the VIX dims fail below exactly as they did before.
+        log.debug("state_vector: VIX basis unresolved for {dt}: {e}", dt=as_of, e=str(exc))
+        vix_basis = None
+    vix_series = vix_basis or VIX_SERIES
+    if vix_basis == VIX_SERIES:
+        try:
+            if _fill_vix_trailing_gap(reader):
+                vix_basis = VIX_GAP_FILLED_BASIS
+        except Exception as exc:
+            # No fill is the pre-R4 behaviour: VIXCLS as known, however late.
+            log.debug("state_vector: VIX gap fill skipped for {dt}: {e}", dt=as_of, e=str(exc))
     norm_stats = _get_normalization_stats(engine, as_of, reader)
+    if vix_series != VIX_SERIES:
+        # The fallback is z-scored against its own history, never VIXCLS's.
+        fallback_stats = _series_norm_stats(reader, vix_series)
+        if fallback_stats is not None:
+            norm_stats = {**norm_stats, vix_series: fallback_stats}
     spy_prices, price_basis = _fetch_spy_prices(engine, as_of)
     values: list[float | None] = []
     stale: list[str] = []
 
     for dim in STATE_DIMENSIONS:
+        if dim.series_id == VIX_SERIES:
+            dim = replace(dim, series_id=vix_series)
         try:
             # Same accepted 2520-day series drives value and stale age.
             series = None
@@ -760,6 +918,7 @@ def compute_state_vector(engine: Engine, as_of: date | None = None) -> StateVect
         stale_dimensions=tuple(stale),
         price_basis=price_basis,
         cached=False,
+        vix_basis=vix_basis,
     )
 
 
@@ -907,11 +1066,14 @@ def cache_state_vector(engine: Engine, sv: StateVector) -> None:
     under a reserved key rather than a new column, so no migration is
     needed and the 1,927 pre-existing rows (computed before this field
     existed) are read back with ``price_basis=None``, unchanged.
+    ``vix_basis`` rides along the same way under ``__vix_basis__``.
     """
     _ensure_cache_table(engine)
     dim_dict = {DIM_NAMES[i]: sv.values[i] for i in range(len(sv.values))}
     if sv.price_basis is not None:
         dim_dict["__price_basis__"] = sv.price_basis
+    if sv.vix_basis is not None:
+        dim_dict["__vix_basis__"] = sv.vix_basis
     with engine.begin() as conn:
         conn.execute(
             text(
@@ -947,6 +1109,7 @@ def _row_to_state_vector(row: tuple, *, cached: bool) -> StateVector:
         stale_dimensions=tuple(stale or []),
         price_basis=vec_dict.get("__price_basis__"),
         cached=cached,
+        vix_basis=vec_dict.get("__vix_basis__"),
     )
 
 
