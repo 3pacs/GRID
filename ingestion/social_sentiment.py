@@ -1,9 +1,19 @@
 """
 Social sentiment ingestor — Reddit, Bluesky, Google Trends.
 
-Scrapes public social media for sentiment signals around tracked
-tickers, themes, and product launches. No API keys required for
-Reddit (public JSON) and Bluesky (public AT Protocol).
+Reads public social media for sentiment signals around tracked
+tickers, themes, and product launches. No API keys or logins:
+
+- Reddit hot posts: one combined RSS feed (``/r/a+b+c/hot.rss``) for every
+  tracked board. The ``.json`` listing GRID used to read returns 403 from
+  grid-svr; RSS answers, but unauthenticated RSS is limited to about one
+  request per minute per IP (measured 2026-11-05: ``x-ratelimit-remaining:
+  0.0`` after a single call, 429 until reset), so all boards go in one call.
+- Reddit-wide ticker mention counts from ApeWisdom's free public API
+  (https://apewisdom.io/api/): mentions, upvotes and rank now vs 24h ago,
+  aggregated across the stock and crypto subreddits.
+- Bluesky post search via the AppView (``api.bsky.app``); the
+  ``public.api.bsky.app`` cache host returns 403 for search.
 
 Provides:
 - Volume: how much is being discussed
@@ -21,15 +31,16 @@ recorded FAILED "puller did not report committed write count". ``pull_all``
 now stores the day's scan and returns ``status`` plus the committed
 ``rows_inserted`` (1 for a new day row, 0 when today's row already exists).
 A scan in which every Reddit and Bluesky request failed is FAILED with the
-reason -- from grid-svr both return HTTP 403 to unauthenticated requests
-(probed 2026-11-05) -- never an empty success.
+reason, never an empty success.
 """
 
 from __future__ import annotations
 
+import html
 import json
 import re
 import time
+import xml.etree.ElementTree as ET  # stdlib expat caps entity expansion (3.14)
 from datetime import date
 from typing import Any
 
@@ -44,6 +55,13 @@ SUBREDDITS = {
     "tech": ["technology", "artificial", "MachineLearning", "nvidia"],
     "macro": ["economics", "finance", "personalfinance"],
 }
+
+REDDIT_RSS_URL = "https://www.reddit.com/r/{subs}/hot.rss"
+REDDIT_RSS_LIMIT = 100  # posts in the combined feed, across all boards
+BLUESKY_SEARCH_URL = "https://api.bsky.app/xrpc/app.bsky.feed.searchPosts"
+APEWISDOM_URL = "https://apewisdom.io/api/v1.0/filter/{filter}/page/1"
+APEWISDOM_FILTERS = {"stocks": "all-stocks", "crypto": "all-crypto"}
+_ATOM = "{http://www.w3.org/2005/Atom}"
 
 # Bluesky search terms
 BLUESKY_TERMS = [
@@ -62,6 +80,36 @@ BEARISH_WORDS = {
     "recession", "miss", "tank", "plunge", "red", "downgrade",
     "underperform", "weak", "bust", "collapse", "drop", "fade",
 }
+
+
+def _has_data(result: dict) -> bool:
+    """True when the scan collected anything worth storing."""
+    return bool(result.get("ticker_sentiment") or result.get("reddit")
+                or result.get("reddit_mentions") or result.get("bluesky"))
+
+
+def _int_or_none(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+_MD_BODY = re.compile(r'<div class="md">(.*?)</div>', re.DOTALL)
+_TAG = re.compile(r"<[^>]+>")
+
+
+def _reddit_body_text(content_html: str, max_chars: int = 2000) -> str:
+    """Self-post body from an RSS entry; link posts and the footer give ''.
+
+    Reddit wraps the body in ``<div class="md">``; the rest of the entry is the
+    "submitted by /u/... [link] [comments]" footer, which is not post text.
+    """
+    match = _MD_BODY.search(content_html or "")
+    if not match:
+        return ""
+    text = html.unescape(_TAG.sub(" ", match.group(1)))
+    return " ".join(text.split())[:max_chars]
 
 
 class SocialSentimentPuller:
@@ -86,6 +134,7 @@ class SocialSentimentPuller:
         result = {
             "date": date.today().isoformat(),
             "reddit": {},
+            "reddit_mentions": {},
             "bluesky": [],
             "trends": {},
             "ticker_sentiment": {},
@@ -96,26 +145,35 @@ class SocialSentimentPuller:
         failures: list[str] = []
         attempts = 0
 
-        # Reddit
-        for theme, subs in SUBREDDITS.items():
-            for sub in subs:
-                attempts += 1
-                try:
-                    posts = self._reddit_hot(sub)
-                    result["reddit"][sub] = posts
-                    time.sleep(2)  # Rate limit
-                except Exception as exc:
-                    failures.append(f"reddit r/{sub}: {exc}")
-                    log.debug("Reddit r/{s} failed: {e}", s=sub, e=str(exc))
+        succeeded = 0
+
+        # Reddit: every tracked board in one feed (RSS allows ~1 request/minute)
+        attempts += 1
+        all_subs = [sub for subs in SUBREDDITS.values() for sub in subs]
+        try:
+            result["reddit"] = self._reddit_hot_all(all_subs)
+            succeeded += 1
+        except Exception as exc:
+            failures.append(f"reddit rss: {exc}")
+            log.debug("Reddit RSS failed: {e}", e=str(exc))
+
+        # Reddit-wide ticker mention counts (ApeWisdom)
+        for label, flt in APEWISDOM_FILTERS.items():
+            attempts += 1
+            try:
+                result["reddit_mentions"][label] = self._reddit_mentions(flt)
+                succeeded += 1
+            except Exception as exc:
+                failures.append(f"apewisdom {flt}: {exc}")
+                log.debug("ApeWisdom {f} failed: {e}", f=flt, e=str(exc))
 
         # Bluesky
-        bluesky_ok = 0
         for term in BLUESKY_TERMS[:5]:
             attempts += 1
             try:
                 posts = self._bluesky_search(term)
                 result["bluesky"].extend(posts)
-                bluesky_ok += 1
+                succeeded += 1
                 time.sleep(1)
             except Exception as exc:
                 failures.append(f"bluesky '{term}': {exc}")
@@ -137,8 +195,14 @@ class SocialSentimentPuller:
             "BTC", "ETH", "SOL", "AMD", "INTC", "AVGO",
         ]
 
+        reddit_wide = self._mentions_by_ticker(result["reddit_mentions"])
         for ticker in target_tickers:
             score = self._score_ticker(ticker, all_text)
+            wide = reddit_wide.get(ticker)
+            if wide:
+                score["reddit_mentions_24h"] = wide["mentions"]
+                score["reddit_mentions_prior_24h"] = wide["mentions_24h_ago"]
+                score["reddit_rank"] = wide["rank"]
             if score["mentions"] > 0:
                 result["ticker_sentiment"][ticker] = score
 
@@ -152,12 +216,19 @@ class SocialSentimentPuller:
             f"Bullish: {', '.join(bullish_tickers[:5]) or 'none'}. "
             f"Bearish: {', '.join(bearish_tickers[:5]) or 'none'}."
         )
+        top = result["reddit_mentions"].get("stocks", [])[:5]
+        if top:
+            result["summary"] += " Most-discussed on Reddit (24h): " + ", ".join(
+                f"{r['ticker']} {r['mentions']}"
+                + (f" (prev {r['mentions_24h_ago']})" if r["mentions_24h_ago"] is not None else "")
+                for r in top
+            ) + "."
 
         log.info(
             "Social sentiment: {m} mentions, {b} bullish, {br} bearish tickers",
             m=total_mentions, b=len(bullish_tickers), br=len(bearish_tickers),
         )
-        return self._with_outcome(result, failures, attempts, len(result["reddit"]) + bluesky_ok)
+        return self._with_outcome(result, failures, attempts, succeeded)
 
     def _with_outcome(
         self, result: dict, failures: list[str], attempts: int, succeeded: int,
@@ -180,7 +251,7 @@ class SocialSentimentPuller:
             result.update(status="FAILED", rows_inserted=0,
                           error=failure_note or "no social source returned data")
             return result
-        if not (result["ticker_sentiment"] or result["reddit"] or result["bluesky"]):
+        if not _has_data(result):
             # Requests answered with no posts: a completed check, nothing to store.
             result.update(status="PARTIAL" if failures else "SUCCESS", rows_inserted=0)
             if failure_note:
@@ -201,31 +272,65 @@ class SocialSentimentPuller:
             result["error"] = failure_note
         return result
 
-    def _reddit_hot(self, subreddit: str, limit: int = 25) -> list[dict]:
-        """Fetch hot posts from a subreddit via public JSON API."""
-        url = f"https://www.reddit.com/r/{subreddit}/hot.json?limit={limit}"
-        resp = self._session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    def _reddit_hot_all(self, subreddits: list[str]) -> dict[str, list[dict]]:
+        """Hot posts for every board from one combined RSS feed, keyed by board.
 
-        posts = []
-        for child in data.get("data", {}).get("children", []):
-            post = child.get("data", {})
-            posts.append({
-                "title": post.get("title", ""),
-                "score": post.get("score", 0),
-                "comments": post.get("num_comments", 0),
-                "upvote_ratio": post.get("upvote_ratio", 0),
-                "created": post.get("created_utc", 0),
-                "subreddit": subreddit,
+        RSS carries title, body and publish time but no vote or comment counts;
+        ApeWisdom's per-ticker upvotes cover engagement instead.
+        """
+        url = REDDIT_RSS_URL.format(subs="+".join(subreddits))
+        resp = self._session.get(url, params={"limit": REDDIT_RSS_LIMIT}, timeout=15)
+        resp.raise_for_status()
+        root = ET.fromstring(resp.content)
+        canonical = {s.lower(): s for s in subreddits}
+
+        posts: dict[str, list[dict]] = {}
+        for entry in root.iter(f"{_ATOM}entry"):
+            category = entry.find(f"{_ATOM}category")
+            term = category.get("term", "") if category is not None else ""
+            sub = canonical.get(term.lower(), term)
+            posts.setdefault(sub, []).append({
+                "title": entry.findtext(f"{_ATOM}title", ""),
+                "text": _reddit_body_text(entry.findtext(f"{_ATOM}content", "")),
+                "created": entry.findtext(f"{_ATOM}published", ""),
+                "subreddit": sub,
+                "id": entry.findtext(f"{_ATOM}id", ""),
             })
         return posts
 
+    def _reddit_mentions(self, api_filter: str) -> list[dict]:
+        """Top Reddit tickers for one ApeWisdom filter (page 1, ranked by mentions)."""
+        resp = self._session.get(APEWISDOM_URL.format(filter=api_filter), timeout=15)
+        resp.raise_for_status()
+        rows = []
+        for r in resp.json().get("results", []):
+            ticker = str(r.get("ticker") or "").upper()
+            if not ticker:
+                continue
+            rows.append({
+                "ticker": ticker.removesuffix(".X"),  # crypto rows are "BTC.X"
+                "name": html.unescape(str(r.get("name") or "")),
+                "rank": _int_or_none(r.get("rank")),
+                "mentions": _int_or_none(r.get("mentions")) or 0,
+                "upvotes": _int_or_none(r.get("upvotes")) or 0,
+                "rank_24h_ago": _int_or_none(r.get("rank_24h_ago")),
+                "mentions_24h_ago": _int_or_none(r.get("mentions_24h_ago")),
+            })
+        return rows
+
+    @staticmethod
+    def _mentions_by_ticker(reddit_mentions: dict[str, list[dict]]) -> dict[str, dict]:
+        """First (highest-ranked) ApeWisdom row per ticker across filters."""
+        by_ticker: dict[str, dict] = {}
+        for rows in reddit_mentions.values():
+            for row in rows:
+                by_ticker.setdefault(row["ticker"], row)
+        return by_ticker
+
     def _bluesky_search(self, query: str, limit: int = 25) -> list[dict]:
-        """Search Bluesky public API for posts."""
-        url = "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts"
+        """Search Bluesky posts through the public AppView."""
         params = {"q": query, "limit": limit, "sort": "latest"}
-        resp = self._session.get(url, params=params, timeout=10)
+        resp = self._session.get(BLUESKY_SEARCH_URL, params=params, timeout=10)
         resp.raise_for_status()
         data = resp.json()
 
@@ -285,6 +390,7 @@ class SocialSentimentPuller:
         for sub, posts in result.get("reddit", {}).items():
             for p in posts:
                 parts.append(p.get("title", ""))
+                parts.append(p.get("text", ""))
         for p in result.get("bluesky", []):
             parts.append(p.get("text", ""))
         return " ".join(parts).lower()
@@ -346,7 +452,7 @@ class SocialSentimentPuller:
         None when nothing was collected or the source row cannot be resolved.
         Exceptions propagate (the transaction rolled back, nothing committed).
         """
-        if not (result.get("ticker_sentiment") or result.get("reddit") or result.get("bluesky")):
+        if not _has_data(result):
             return None
         from sqlalchemy import text
         scan = {k: v for k, v in result.items()

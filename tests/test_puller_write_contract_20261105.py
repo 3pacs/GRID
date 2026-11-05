@@ -373,11 +373,18 @@ _POSTS = [{"title": "NVDA calls to the moon, bull breakout", "score": 10, "comme
            "upvote_ratio": 0.9, "created": 0, "subreddit": "stocks"}]
 
 
-def _run_social(engine: Any, reddit: Callable[[str], list], bluesky: Callable[[str], list]) -> dict:
+def _run_social(
+    engine: Any,
+    reddit: Callable[[str], list],
+    bluesky: Callable[[str], list],
+    mentions: Callable[[str], list] = lambda flt: [],
+) -> dict:
     import ingestion.social_sentiment as mod
 
     puller = mod.SocialSentimentPuller(db_engine=engine)
-    puller._reddit_hot = reddit
+    # One combined RSS request returns every board; the stub serves r/stocks.
+    puller._reddit_hot_all = lambda subs: {"stocks": reddit("stocks")}
+    puller._reddit_mentions = mentions
     puller._bluesky_search = bluesky
     puller._google_trends = lambda kw: {}
     with patch.object(mod.time, "sleep"):
@@ -408,11 +415,11 @@ class TestSocialSentiment:
         assert _classify_outcome(out) == ("NO_NEW_DATA", 0, "run completed, 0 rows written")
 
     def test_every_source_403_is_failed_with_reason_and_no_write(self) -> None:
-        # grid-svr 2026-11-05: reddit.com and public.api.bsky.app both 403.
+        # 1 Reddit RSS + 2 ApeWisdom + 5 Bluesky requests, all refused.
         engine = _social_engine()
-        out = _run_social(engine, _http403, _http403)
+        out = _run_social(engine, _http403, _http403, _http403)
         assert out["status"] == "FAILED" and out["rows_inserted"] == 0
-        assert "20 of 20 social requests failed" in out["error"] and "403" in out["error"]
+        assert "8 of 8 social requests failed" in out["error"] and "403" in out["error"]
         assert engine.begins == 0
         outcome, rows, note = _classify_outcome(out)
         assert (outcome, rows) == ("FAILED", 0) and "403" in note
