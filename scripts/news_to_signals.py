@@ -664,8 +664,8 @@ def main(dry_run: bool = False) -> int:
 if __name__ == "__main__":
     import argparse
 
-    log.remove()
     from config import LOG_DIAGNOSE, scrubbed_stderr  # scrubs credentials, tracebacks included
+    log.remove()  # after the config import: importing config adds its own console sink
     log.add(scrubbed_stderr, level="INFO", diagnose=LOG_DIAGNOSE)
 
     parser = argparse.ArgumentParser(description="News intelligence -> signal_data")
