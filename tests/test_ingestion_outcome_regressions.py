@@ -311,3 +311,137 @@ def test_registry_holds_are_carried_to_repair_lookup(monkeypatch):
     monkeypatch.setattr(hermes_operator, "_SOURCE_REGISTRY", registry)
     with pytest.raises(ValueError, match="skipped at runtime"):
         hermes_fixers._resolve_puller("held_contract", MagicMock())
+
+
+# ── 2026-11-05 audit: false PARTIAL/FAILED classifications ────────────────
+
+
+@pytest.mark.parametrize("leaf, expected", [
+    ({"status": "NO_DATA", "rows_inserted": 0}, ("NO_NEW_DATA", 0)),
+    ({"status": "NO_DATA"}, ("NO_NEW_DATA", 0)),
+    ({"status": "NO_DATA", "rows_inserted": 0, "error": "provider 503"}, ("FAILED", 0)),
+    ({"status": "NO_DATA", "rows_inserted": 4}, ("FAILED", 4)),
+])
+def test_no_data_leaf_is_a_completed_check_unless_it_carries_an_error(leaf, expected):
+    assert ss._classify_outcome(leaf)[:2] == expected
+
+
+def test_fedspeeches_all_scores_already_stored_is_no_new_data(monkeypatch):
+    # Production 2026-11-05: "1 of 4 items failed or partial ... NO_DATA".
+    from datetime import date as _date
+
+    from ingestion.altdata import fed_speeches as fs
+
+    engine = MagicMock()
+    engine.begin.return_value.__enter__ = MagicMock(return_value=MagicMock())
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+    puller = fs.FedSpeechPuller.__new__(fs.FedSpeechPuller)
+    puller.engine = engine
+    puller._fomc_dates = [_date.fromisoformat(d) for d in fs._FOMC_DATES]
+    today = _date.today().isoformat()  # noqa: DTZ011 -- the puller's own local-date window
+    puller._fetch_speeches = lambda: [{"d": today, "t": "Inflation remains elevated; rates restrictive"}]
+    puller._row_exists = lambda *a: True  # every date already stored
+    puller._insert_raw = MagicMock()
+    out = puller.pull_all(days_back=3)
+    assert [r["status"] for r in out] == ["UNCHANGED", "SUCCESS", "SUCCESS", "SUCCESS"]
+    assert ss._classify_outcome(out)[:2] == ("NO_NEW_DATA", 0)
+    puller._insert_raw.assert_not_called()
+
+
+def test_fedspeeches_feed_failure_is_failed_and_writes_no_speech_zeros():
+    from datetime import date as _date
+
+    from ingestion.altdata import fed_speeches as fs
+
+    engine = MagicMock()
+    engine.begin.return_value.__enter__ = MagicMock(return_value=MagicMock())
+    engine.begin.return_value.__exit__ = MagicMock(return_value=False)
+    puller = fs.FedSpeechPuller.__new__(fs.FedSpeechPuller)
+    puller.engine = engine
+    puller._fomc_dates = [_date.fromisoformat(d) for d in fs._FOMC_DATES]
+
+    def boom():
+        raise ConnectionError("federalreserve.gov unreachable")
+
+    puller._fetch_speeches = boom
+    puller._row_exists = lambda *a: False
+    puller._insert_raw = MagicMock()
+    out = {r["feature"]: r for r in puller.pull_all(days_back=7)}
+    for feature in ("fomc_hawkish_score", "fed_speech_frequency", "fed_tone_7d_avg"):
+        assert out[feature]["status"] == "FAILED" and "unreachable" in out[feature]["error"]
+        assert out[feature]["rows_inserted"] == 0
+    written = {c.kwargs["series_id"] for c in puller._insert_raw.call_args_list}
+    assert written <= {"fomc_days_since_meeting", "fomc_days_to_meeting"}
+    assert ss._classify_outcome(list(out.values()))[0] in {"FAILED", "PARTIAL"}
+
+
+def test_real_failure_producers_report_failed_with_a_reason():
+    import pandas as pd
+
+    from ingestion.altdata import google_trends as gt
+    from ingestion.altdata import offshore_leaks as ol
+
+    leaks = ol.OffshoreLeaksPuller.__new__(ol.OffshoreLeaksPuller)
+    leaks.ensure_data = lambda: False
+    leaf = leaks.pull()
+    assert leaf["status"] == "FAILED" and "Manual download" in leaf["error"]
+    assert ss._classify_outcome(leaf)[0] == "FAILED"
+
+    trends = gt.GoogleTrendsPuller.__new__(gt.GoogleTrendsPuller)
+    trends._fetch_trend = lambda keyword, timeframe: pd.DataFrame()
+    leaf = trends.pull_keyword("recession", "gt_recession_interest", days_back=30)
+    assert leaf["status"] == "FAILED" and "recession" in leaf["error"]
+    assert ss._classify_outcome(leaf)[0] == "FAILED"
+
+
+_SPY_REFUSAL = scheduler._YF_EXPECTED_REFUSAL
+
+
+def _yf_envelope(spy: dict | None = None, extra: list | None = None) -> dict:
+    results = [{"ticker": "QQQ", "status": "SUCCESS", "rows_inserted": 5, "errors": [],
+                "outcome": "inserted", "daily_policy_refusals": 0, "raw_value_refusals": 0}]
+    results += extra or []
+    results.append(spy or {"ticker": "SPY", "status": "PARTIAL", "rows_inserted": 0,
+                           "errors": [_SPY_REFUSAL], "outcome": "no_data",
+                           "daily_policy_refusals": 1, "raw_value_refusals": 0})
+    counts = {"inserted": 0, "duplicate_only": 0, "no_data": 0, "error": 0, "unattempted": 0}
+    for r in results:
+        counts[r["outcome"] if r["outcome"] in counts else "error"] += 1
+    return {"status": "SUCCESS", "stopped_by_budget": False, "results": results,
+            "tickers_not_attempted": [], "counts": counts}
+
+
+def test_spy_refusal_normalization_accepts_the_budgeted_envelope():
+    env = _yf_envelope()
+    assert ss._classify_outcome(env)[0] == "PARTIAL"  # the pre-fix production outcome
+    normalized = scheduler._normalize_expected_spy_refusal(env)
+    assert normalized["results"][-1]["status"] == "SUCCESS"
+    assert normalized["counts"]["no_data"] == 0 and normalized["counts"]["duplicate_only"] == 1
+    assert env["results"][-1]["status"] == "PARTIAL"  # input not mutated
+    assert ss._classify_outcome(normalized)[:2] == ("SUCCESS", 5)
+
+
+@pytest.mark.parametrize("extra, expected", [
+    (None, "SUCCESS"),
+    ([{"ticker": "IWM", "status": "PARTIAL", "rows_inserted": 0, "errors": ["HTTP 429"],
+       "outcome": "error", "daily_policy_refusals": 0, "raw_value_refusals": 0}], "PARTIAL"),
+])
+def test_smart_yfinance_normalizes_the_expected_spy_refusal(sched, monkeypatch, extra, expected):
+    from types import ModuleType
+
+    envelope = _yf_envelope(extra=extra)
+    fake = ModuleType("ingestion.yfinance_pull")
+
+    class YFinancePuller:
+        def __init__(self, db_engine):
+            pass
+
+        def pull_all(self, should_continue=None):
+            return envelope
+
+    fake.YFinancePuller = YFinancePuller
+    monkeypatch.setitem(sys.modules, "ingestion.yfinance_pull", fake)
+    s = sched(honest._entry("yfinance", "YFinancePuller", mod="ingestion.yfinance_pull"))
+    result = s.tick()["results"][0]
+    assert result["status"] == expected
+    assert honest._pull_log(sched.engine)[0][1:3] == (expected, 5)

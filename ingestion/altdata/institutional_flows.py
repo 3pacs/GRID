@@ -199,10 +199,13 @@ class InstitutionalFlowsPuller(BasePuller):
 
                 if data is None or data.empty:
                     log.warning("No yfinance data for {t}", t=ticker)
+                    # A liquid ETF with no bars over the window is a failed
+                    # fetch (yfinance returns empty on errors), not "no data".
                     results.append({
                         "feature": f"ETF_FLOW:{ticker}",
-                        "status": "NO_DATA",
+                        "status": "FAILED",
                         "rows_inserted": 0,
+                        "error": f"yfinance returned no bars for {ticker} {fetch_start}..{end_date}",
                     })
                     continue
 

@@ -13,7 +13,7 @@ both the grid-scheduler (``PullContext``) and Hermes's SmartScheduler
 One distinction matters more than the rest. Since the honest-outcome contract
 (``ingestion/smart_scheduler.py``, 2026-09-29), a pull that does not report a
 committed row count, or that reports a per-item status the classifier does
-not recognise (``NO_DATA``, ``NO_CIK``), is logged FAILED or PARTIAL even when
+not recognise (e.g. ``NO_CIK``), is logged FAILED or PARTIAL even when
 rows were written. Such a source is not "dead": the log cannot say either
 way. It is reported as ``UNKNOWN`` (or ``PARTIAL`` when the message records a
 positive "N rows written"), never as ``STALE``.

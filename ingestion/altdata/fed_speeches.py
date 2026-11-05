@@ -288,10 +288,12 @@ class FedSpeechPuller(BasePuller):
         results: list[dict[str, Any]] = []
 
         # --- Fetch and score speeches ---
+        fetch_error: str | None = None
         try:
             speeches = self._fetch_speeches()
         except Exception as exc:
-            log.error("Failed to fetch Fed speeches: {e}", e=str(exc))
+            log.warning("Failed to fetch Fed speeches: {e}", e=str(exc))
+            fetch_error = f"speech feed fetch failed: {exc}"
             speeches = []
 
         if isinstance(start_date, str):
@@ -323,6 +325,7 @@ class FedSpeechPuller(BasePuller):
 
         # --- Store per-speech hawkish scores (daily average) ---
         score_rows = 0
+        score_error: str | None = fetch_error
         try:
             with self.engine.begin() as conn:
                 for obs_date, scores in sorted(by_date.items()):
@@ -341,12 +344,20 @@ class FedSpeechPuller(BasePuller):
                     score_rows += 1
         except Exception as exc:
             log.error("Fed hawkish score insert failed: {e}", e=str(exc))
+            # engine.begin() rolled the transaction back: nothing committed.
+            score_rows = 0
+            score_error = f"hawkish score insert failed: {exc}"
 
-        results.append({
+        # Zero rows with no error means every scored date was already stored:
+        # a completed check (UNCHANGED), not a failure.
+        score_result: dict[str, Any] = {
             "feature": "fomc_hawkish_score",
-            "status": "SUCCESS" if score_rows > 0 or not scored_speeches else "NO_DATA",
+            "status": "FAILED" if score_error else ("SUCCESS" if score_rows > 0 else "UNCHANGED"),
             "rows_inserted": score_rows,
-        })
+        }
+        if score_error:
+            score_result["error"] = score_error
+        results.append(score_result)
 
         # --- Store FOMC calendar signals (for each day in range) ---
         cal_rows = 0
@@ -390,7 +401,9 @@ class FedSpeechPuller(BasePuller):
                         for d, scores in by_date.items()
                         if window_start <= d <= current
                     )
-                    if not self._row_exists("fed_speech_frequency", current, conn):
+                    # Speech-derived signals need the feed: a failed fetch
+                    # must not store a fabricated 0 that dedup then freezes.
+                    if fetch_error is None and not self._row_exists("fed_speech_frequency", current, conn):
                         self._insert_raw(
                             conn=conn,
                             series_id="fed_speech_frequency",
@@ -411,7 +424,7 @@ class FedSpeechPuller(BasePuller):
                     else:
                         avg_tone = 0.0
 
-                    if not self._row_exists("fed_tone_7d_avg", current, conn):
+                    if fetch_error is None and not self._row_exists("fed_tone_7d_avg", current, conn):
                         self._insert_raw(
                             conn=conn,
                             series_id="fed_tone_7d_avg",
@@ -425,22 +438,24 @@ class FedSpeechPuller(BasePuller):
 
         except Exception as exc:
             log.error("Fed calendar signal insert failed: {e}", e=str(exc))
+            # The single transaction rolled back, so none of the counted rows
+            # were committed.
+            cal_rows = freq_rows = tone_rows = 0
+            calendar_error = f"calendar signal insert failed: {exc}"
+        else:
+            calendar_error = None
 
-        results.append({
-            "feature": "fomc_calendar",
-            "status": "SUCCESS",
-            "rows_inserted": cal_rows,
-        })
-        results.append({
-            "feature": "fed_speech_frequency",
-            "status": "SUCCESS",
-            "rows_inserted": freq_rows,
-        })
-        results.append({
-            "feature": "fed_tone_7d_avg",
-            "status": "SUCCESS",
-            "rows_inserted": tone_rows,
-        })
+        for feature, rows, error in (("fomc_calendar", cal_rows, calendar_error),
+                                     ("fed_speech_frequency", freq_rows, calendar_error or fetch_error),
+                                     ("fed_tone_7d_avg", tone_rows, calendar_error or fetch_error)):
+            leaf: dict[str, Any] = {
+                "feature": feature,
+                "status": "FAILED" if error else "SUCCESS",
+                "rows_inserted": rows,
+            }
+            if error:
+                leaf["error"] = error
+            results.append(leaf)
 
         total_rows = score_rows + cal_rows + freq_rows + tone_rows
         log.info(

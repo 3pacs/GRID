@@ -553,7 +553,12 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # SCHED re-pinned 9c456151 -> cb33fac5 (2026-11-05): smart_money and
         # social_sentiment timeout_s 60 -> 240, because their Reddit RSS reads
         # can wait up to 150s for the shared request slot (reddit_rss.py).
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','cb33fac536a62173de36652a7fe0678af8c16d5f70fed5ae2af3d094232599a4')]:
+        # SCHED re-pinned cb33fac5 -> ae8c0501 (2026-11-05): _classify_outcome
+        # accepts the NO_DATA leaf status alongside UNCHANGED/NO_NEW_DATA (with
+        # a 4-line comment), and _run_puller passes YFinancePuller output
+        # through scheduler._normalize_expected_spy_refusal before classifying.
+        # Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','ae8c0501077ebc6b0832852fbf4cb2e96360e06338395117916714dff06c9e1a')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)
