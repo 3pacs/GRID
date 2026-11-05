@@ -32,16 +32,6 @@ from ingestion.altdata.reddit_options_pulse import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(autouse=True)
-def _fake_reddit_app_credentials(monkeypatch):
-    """Dummy (non-secret) OAuth app names so the client can be constructed.
-
-    No test here reaches the network: every fetch path is patched.
-    """
-    monkeypatch.setenv("REDDIT_CLIENT_ID", "test-client-id")
-    monkeypatch.setenv("REDDIT_CLIENT_SECRET", "test-client-secret")
-
-
 @pytest.fixture
 def mock_engine():
     """Mock SQLAlchemy engine that pretends source_id == 7."""
@@ -114,6 +104,10 @@ class TestExtractTickers:
         # FED, ETC, ETF should all be filtered out.
         out = extract_tickers("FED cut rates, ETC ETF flows higher")
         assert out == []
+
+    def test_wsb_caps_words_filtered_real_tickers_kept(self):
+        out = extract_tickers("SPY DOWN FOR MORE, YOLO on V and $NVDA, AI is not a buy")
+        assert out == ["SPY", "V", "NVDA"]
 
     def test_multiple_tickers(self):
         out = extract_tickers("AAPL, MSFT, NVDA calls")
@@ -516,8 +510,8 @@ class TestConstants:
     def test_user_agent_identifies_grid(self):
         assert "grid" in REDDIT_USER_AGENT.lower()
 
-    def test_daily_queries_nonempty(self):
-        assert len(DAILY_THREAD_QUERIES) >= 3
+    def test_daily_queries_prefer_the_morning_thread(self):
+        assert DAILY_THREAD_QUERIES[0] == "daily discussion"
 
     def test_top_n_is_20(self):
         assert TOP_N_TICKERS == 20
@@ -528,3 +522,99 @@ class TestConstants:
     def test_false_positives_block_common(self):
         for word in ("FED", "SEC", "ETF", "GDP"):
             assert word in TICKER_FALSE_POSITIVES
+
+
+# ---------------------------------------------------------------------------
+# RSS fetch (ingestion/altdata/reddit_rss.py feeds, stubbed)
+# ---------------------------------------------------------------------------
+
+
+def _entry(eid, title="", author="", body="", published=None, link=""):
+    from ingestion.altdata.reddit_rss import RssEntry
+
+    return RssEntry(id=eid, title=title, author=author, subreddit="wallstreetbets",
+                    published=published, body=body, link=link)
+
+
+class TestFetchDailyThreadRss:
+    def _listing(self):
+        from datetime import datetime, timezone
+
+        t = lambda h: datetime(2026, 11, 5, h, tzinfo=timezone.utc)  # noqa: E731
+        return [
+            _entry("t3_moves", "What Are Your Moves Tomorrow, November 06, 2026", published=t(20),
+                   link="https://www.reddit.com/r/wallstreetbets/comments/moves/x/"),
+            _entry("t3_daily", "Daily Discussion Thread for November 05, 2026", published=t(10),
+                   body="Market open", link="https://www.reddit.com/r/wallstreetbets/comments/daily/y/"),
+            _entry("t3_dd", "NVDA DD", published=t(12)),
+        ]
+
+    def test_picks_daily_discussion_and_shapes_payload(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+
+        calls = []
+        thread = [
+            _entry("t3_daily", "Daily Discussion Thread for November 05, 2026"),
+            _entry("t1_c1", author="alice", body="$NVDA calls, bullish"),
+            _entry("t1_c2", author="bob", body="SPY puts 0dte"),
+            _entry("t1_c3", author="carol", body=""),
+        ]
+
+        def fetch(path, params):
+            calls.append((path, params))
+            return self._listing() if path.endswith("hot.rss") else thread
+
+        payload = _fetch_daily_thread(fetch)
+        assert calls == [("/r/wallstreetbets/hot.rss", {"limit": 10}),
+                         ("/r/wallstreetbets/comments/daily.rss", {"limit": 500})]
+        post = payload["post"]
+        assert post["id"] == "daily" and post["selftext"] == "Market open"
+        assert post["permalink"] == "/r/wallstreetbets/comments/daily/y/"
+        assert payload["thread"] == [
+            {"id": "c1", "body": "$NVDA calls, bullish", "author": "alice"},
+            {"id": "c2", "body": "SPY puts 0dte", "author": "bob"},
+        ]
+
+    def test_falls_back_to_moves_tomorrow(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+
+        listing = [e for e in self._listing() if e.id != "t3_daily"]
+        seen = []
+        _fetch_daily_thread(lambda path, params: seen.append(path) or (
+            listing if path.endswith("hot.rss") else []))
+        assert seen[-1] == "/r/wallstreetbets/comments/moves.rss"
+
+    def test_no_pinned_thread_is_none_after_one_request(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+
+        calls = []
+        assert _fetch_daily_thread(lambda path, params: calls.append(path) or
+                                   [_entry("t3_x", "random post")]) is None
+        assert len(calls) == 1
+
+    def test_rate_limited_is_none(self):
+        from ingestion.altdata.reddit_options_pulse import _fetch_daily_thread
+        from ingestion.altdata.reddit_rss import RedditRateLimited
+
+        def fetch(path, params):
+            raise RedditRateLimited("slot past budget")
+
+        assert _fetch_daily_thread(fetch) is None
+
+    def test_aggregates_into_a_pulse(self, mock_engine):
+        from ingestion.altdata.reddit_options_pulse import (
+            _aggregate_pulse,
+            _fetch_daily_thread,
+            _flatten_comments,
+        )
+
+        thread = [_entry("t1_c1", author="alice", body="$NVDA calls, bullish"),
+                  _entry("t1_c2", author="bob", body="NVDA puts 0dte")]
+        payload = _fetch_daily_thread(
+            lambda path, params: self._listing() if path.endswith("hot.rss") else thread)
+        pulse = _aggregate_pulse(payload["post"], _flatten_comments(payload["thread"]))
+        assert pulse.thread_id == "daily" and pulse.comment_count == 2
+        assert pulse.unique_authors == 2 and pulse.zero_dte_count == 1
+        assert pulse.top_tickers[0] == ("NVDA", 2)
+        assert pulse.thread_url == "https://www.reddit.com/r/wallstreetbets/comments/daily/y/"
+        assert str(pulse.thread_date) == "2026-11-05"

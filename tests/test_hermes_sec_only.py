@@ -550,7 +550,18 @@ class CurrentSecDefaultTests(unittest.TestCase):
         # SCHED re-pinned 805ae5d9 -> 9c456151 (2026-11-05): supply_chain gains
         # "api_key_mode": "keyword" (the default 'first' passed the FRED key as
         # db_engine). Needs reviewer acceptance like the prior pins.
-        for path,marker,pin in [(OPER,'\nimport argparse\n','6a4aa40450788e57043ce0cc8b94535fb8a1e311b112563a9deb0d73fc15ff3f'),(SCHED,'\nimport calendar\n','9c4561510578d1c0d8840e998cbd87f169346f958924c9dce74fa0af76c1ccd4')]:
+        # SCHED re-pinned 9c456151 -> cb33fac5 (2026-11-05): smart_money and
+        # social_sentiment timeout_s 60 -> 240, because their Reddit RSS reads
+        # can wait up to 150s for the shared request slot (reddit_rss.py).
+        # OPER re-pinned 6a4aa404 -> 994cf156 (2026-11-05,
+        # claude/helius-unconfigured-20261105): the only operator edits are the
+        # new module-level _HELIUS_UNCONFIGURED_LOGGED flag and
+        # _solana_deploy_sources() helper (inserted before the intelligence
+        # task runner), and the 7c-ii Solana universe block now gets
+        # (helius, deployer_registry) from that helper (both None when
+        # HELIUS_API_KEY is unset) and closes helius only when it exists.
+        # Needs reviewer acceptance like the prior pins.
+        for path,marker,pin in [(OPER,'\nimport argparse\n','994cf156b31a50e12be98b80a6c5f419de5fcf9284ae90f7e0f2743d74b5d7df'),(SCHED,'\nimport calendar\n','cb33fac536a62173de36652a7fe0678af8c16d5f70fed5ae2af3d094232599a4')]:
             source = path.read_text(encoding='utf-8')
             tail = scheduler_tail_before_reviewed_options_delta(source) if path == SCHED else operator_tail_before_reviewed_resolution_logs(source)
             self.assertEqual(digest(tail.encode()), pin)

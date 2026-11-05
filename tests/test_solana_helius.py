@@ -302,3 +302,121 @@ def test_get_mint_deployer_returns_none_on_http_error(mock_http):
     mock_http.get.side_effect = httpx.ConnectError("down")
     client = HeliusClient(client=mock_http)
     assert client.get_mint_deployer("MINT_X") is None
+
+
+# ----------------------------------------------------------------------
+# Log levels + unconfigured key (2026-11-05: keyless 401s were 66% of
+# errors.jsonl, logged at ERROR from _get on every Solana universe pass)
+# ----------------------------------------------------------------------
+@pytest.fixture()
+def log_records():
+    from loguru import logger
+
+    records: list = []
+    handler_id = logger.add(lambda m: records.append(m.record), level="DEBUG")
+    yield records
+    logger.remove(handler_id)
+
+
+def _status_response(status: int, path: str = "/v0/addresses/M/transactions"):
+    request = httpx.Request("GET", f"https://api.helius.xyz{path}?api-key=SECRETKEY")
+    return httpx.Response(status, request=request, json={"error": "x"})
+
+
+def _levels(records, module: str) -> list[str]:
+    return [r["level"].name for r in records if r["name"] == module]
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 404])
+def test_4xx_logs_warning_not_error(mock_http, log_records, status):
+    mock_http.get.return_value = _status_response(status)
+    client = HeliusClient(api_key="SECRETKEY", client=mock_http)
+    with pytest.raises(HeliusError, match=f"HTTP {status}"):
+        client.get_wallet_transactions("M")
+    levels = _levels(log_records, "trading.solana.helius_client")
+    assert levels == ["WARNING"]
+    text = " ".join(r["message"] for r in log_records)
+    assert "SECRETKEY" not in text  # request URL (with api-key) is never logged
+
+
+def test_401_short_circuits_later_calls(mock_http, log_records):
+    mock_http.get.return_value = _status_response(401)
+    client = HeliusClient(api_key="BADKEY", client=mock_http)
+    assert client.get_mint_deployer("MINT_A") is None  # caller contract unchanged
+    assert client.get_mint_deployer("MINT_B") is None
+    with pytest.raises(HeliusError, match="rejected the API key"):
+        client.get_wallet_transactions("W")
+    assert mock_http.get.call_count == 1
+    assert _levels(log_records, "trading.solana.helius_client") == ["WARNING"]
+
+
+def test_429_does_not_short_circuit(mock_http):
+    mock_http.get.return_value = _status_response(429)
+    client = HeliusClient(api_key="KEY", client=mock_http)
+    assert client.get_mint_deployer("MINT_A") is None
+    assert client.get_mint_deployer("MINT_B") is None
+    assert mock_http.get.call_count == 2
+
+
+def test_5xx_still_logs_error(mock_http, log_records):
+    mock_http.get.return_value = _status_response(503)
+    client = HeliusClient(api_key="KEY", client=mock_http)
+    with pytest.raises(HeliusError, match="HTTP 503"):
+        client.get_wallet_transactions("M")
+    assert _levels(log_records, "trading.solana.helius_client") == ["ERROR"]
+
+
+def test_transport_error_logs_warning(mock_http, log_records):
+    mock_http.get.side_effect = httpx.ConnectError("down")
+    client = HeliusClient(api_key="KEY", client=mock_http)
+    with pytest.raises(HeliusError, match="ConnectError: down"):
+        client.get_wallet_transactions("M")
+    assert _levels(log_records, "trading.solana.helius_client") == ["WARNING"]
+
+
+def test_is_configured():
+    assert HeliusClient(api_key="KEY", client=MagicMock()).is_configured is True
+    assert HeliusClient(api_key="", client=MagicMock()).is_configured is False
+    assert HeliusClient(client=MagicMock()).is_configured is False
+
+
+def test_operator_skips_helius_when_key_unset(monkeypatch, log_records):
+    """No key: no HeliusClient (so no HTTP), no registry, one warning per process."""
+    from types import SimpleNamespace
+
+    import trading.solana as solana_pkg
+    from scripts import hermes_operator as ho
+
+    constructed: list = []
+    monkeypatch.setattr(solana_pkg, "HeliusClient", lambda **kw: constructed.append(kw))
+    monkeypatch.setattr(ho, "_HELIUS_UNCONFIGURED_LOGGED", False)
+
+    for key in ("", "   ", None):
+        assert ho._solana_deploy_sources("ENGINE", SimpleNamespace(HELIUS_API_KEY=key)) == (None, None)
+    assert ho._solana_deploy_sources("ENGINE", SimpleNamespace()) == (None, None)
+    assert constructed == []
+    warnings = [
+        r for r in log_records
+        if r["name"] == "scripts.hermes_operator" and r["level"].name == "WARNING"
+    ]
+    assert len(warnings) == 1 and "not configured" in warnings[0]["message"]
+    assert not [r for r in log_records if r["level"].name == "ERROR"]
+
+
+def test_operator_builds_helius_when_key_set(monkeypatch):
+    from types import SimpleNamespace
+
+    import trading.solana as solana_pkg
+    from scripts import hermes_operator as ho
+
+    class FakeRegistry:
+        def __init__(self, engine, provider):
+            self.engine, self.provider = engine, provider
+
+    monkeypatch.setattr(solana_pkg, "DeployerRegistry", FakeRegistry)
+    helius, registry = ho._solana_deploy_sources("ENGINE", SimpleNamespace(HELIUS_API_KEY="K"))
+    try:
+        assert isinstance(helius, HeliusClient) and helius.is_configured
+        assert registry.provider is helius and registry.engine == "ENGINE"
+    finally:
+        helius.close()

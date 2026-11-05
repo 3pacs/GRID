@@ -8,13 +8,25 @@ This is the baseline migration. It stamps the database as being at the
 initial schema version without running any DDL — the assumption is that
 ``schema.sql`` has already been applied.
 
-For new deployments, run ``schema.sql`` first, then::
+New deployment (fresh database), from the repository root::
 
-    cd grid && alembic stamp head
+    psql -v ON_ERROR_STOP=1 -f schema.sql
+    alembic stamp 7e4dfecce247
+    alembic upgrade head
 
-For existing deployments that predate Alembic::
+Stamp the *baseline*, not ``head``: ``alembic stamp head`` would record every
+later revision as applied without running it, so anything those revisions
+create that ``schema.sql`` does not (feature_registry rows, FTS columns and
+triggers, the intelligence_search view, ...) would silently never exist. The
+later revisions are written to be no-ops where ``schema.sql`` already built
+their end state; the ``migration-replay`` CI job
+(``.github/workflows/migration-replay.yml``) replays exactly this sequence on
+a throwaway PostgreSQL 15 to keep it that way (issue #523).
 
-    cd grid && alembic stamp 7e4dfecce247
+Existing deployment that predates Alembic::
+
+    alembic stamp 7e4dfecce247
+    alembic upgrade head
 """
 
 from typing import Sequence, Union

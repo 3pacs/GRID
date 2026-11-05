@@ -30,6 +30,7 @@ Revises: security_master_20260927
 """
 
 from alembic import op
+import sqlalchemy as sa
 
 revision = "options_append_only_20260930"
 down_revision = "security_master_20260927"
@@ -37,8 +38,26 @@ branch_labels = None
 depends_on = None
 
 
+def _already_append_only() -> bool:
+    """True when ``options_snapshots_all`` already exists.
+
+    schema.sql builds this revision's end state directly on a fresh install
+    (its ``$options_store$`` block), so a fresh database (schema.sql -> stamp
+    7e4dfecce247 -> upgrade head) reaches this revision with the work already
+    done and the RENAME below would fail (issue #523). Production ran this
+    revision before schema.sql carried the block.
+    """
+    return bool(
+        op.get_bind().execute(
+            sa.text("SELECT to_regclass('options_snapshots_all') IS NOT NULL")
+        ).scalar()
+    )
+
+
 
 def upgrade() -> None:
+    if _already_append_only():
+        return
     op.execute("SET LOCAL lock_timeout = '5s'")
     op.execute("SET LOCAL statement_timeout = '15min'")
 

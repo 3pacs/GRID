@@ -1,4 +1,8 @@
-"""Reddit Data API (OAuth) path for reddit_options_pulse and smart_money.
+"""Reddit Data API (OAuth) client, ingestion/altdata/reddit_oauth.py.
+
+No GRID puller uses this client since 2026-11-05: reddit_options_pulse,
+smart_money and social_sentiment read Reddit's RSS feeds instead (see
+tests/test_reddit_rss.py). The client stays for an owner-registered app.
 
 No network. The OAuth/listing payloads below are SYNTHETIC, shaped after
 Reddit's documented Data API responses (no credentials exist yet to record
@@ -13,7 +17,6 @@ from unittest.mock import MagicMock
 import pytest
 
 import ingestion.altdata.reddit_oauth as ro
-import ingestion.altdata.reddit_options_pulse as rop
 from ingestion.altdata.reddit_oauth import (
     RedditAPIError,
     RedditAppClient,
@@ -133,92 +136,3 @@ def test_token_failure_raises() -> None:
     client = RedditAppClient("cid", "bad", "u", session=_Session({}, token_status=401))
     with pytest.raises(RedditAPIError):
         client.get_json("/r/options/search")
-
-
-# ---------------------------------------------------------------------------
-# reddit_options_pulse
-# ---------------------------------------------------------------------------
-
-
-def test_pulse_not_configured_is_failed_and_sends_nothing(no_creds: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    def _no_network(*a, **k):  # noqa: ANN002, ANN003
-        raise AssertionError("must not touch the network")
-
-    monkeypatch.setattr(rop.requests, "get", _no_network)
-    engine = _engine()
-    summary = rop.run_reddit_options_pulse_puller(engine)
-    assert summary["status"] == "FAILED"
-    assert "not configured" in summary["error"]
-    assert summary["inserted"] == 0
-    assert _inserts(engine) == []
-
-
-def test_pulse_forbidden_is_failed_and_writes_nothing() -> None:
-    session = _Session({"/r/options/search": _Resp(403, {})})
-    client = RedditAppClient("cid", "csecret", "u", session=session)
-    engine = _engine()
-    puller = rop.RedditOptionsPulsePuller(engine, client=client)
-    assert puller.pull() == []
-    assert puller.last_error == "no daily-discussion thread fetched"
-    assert _inserts(engine) == []
-
-
-def test_pulse_happy_path_via_oauth() -> None:
-    session = _Session({
-        "/r/options/search": _Resp(200, SEARCH),
-        "/r/options/comments/1abcde": _Resp(200, THREAD),
-    })
-    client = RedditAppClient("cid", "csecret", "u", session=session)
-    engine = _engine()
-    puller = rop.RedditOptionsPulsePuller(engine, client=client)
-    pulses = puller.pull()
-    assert len(pulses) == 1
-    assert pulses[0].comment_count == 3
-    assert pulses[0].unique_authors == 2
-    inserted = puller.save_to_db(pulses)
-    rows = _inserts(engine)
-    assert inserted == len(rows) > 0
-    assert all("pull_timestamp" not in r for r in rows)  # column default = fetch time
-    # Only the OAuth host is used -- never www.reddit.com listing JSON.
-    assert all(g["url"].startswith("https://oauth.reddit.com/") for g in session.gets)
-
-
-# ---------------------------------------------------------------------------
-# smart_money Reddit path
-# ---------------------------------------------------------------------------
-
-
-def _smart_money_puller():
-    from ingestion.altdata.smart_money import SmartMoneyPuller
-
-    p = SmartMoneyPuller.__new__(SmartMoneyPuller)
-    p.engine = _engine()
-    p.source_id = 1
-    p._load_trust_scores = lambda: None  # type: ignore[method-assign]
-    return p
-
-
-def test_smart_money_reddit_not_configured_is_skipped(no_creds: None, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Missing optional Reddit creds are an operator state: SKIPPED, not FAILED.
-
-    2026-11-04: FAILED here made Social_Smart_Money a "failed source" with
-    escalating cooldowns every 10-minute run although nothing was broken.
-    """
-    import ingestion.altdata.smart_money as sm
-
-    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
-    result = _smart_money_puller().pull_reddit(subreddits=["options"])
-    assert result["status"] == "SKIPPED"
-    assert result["rows_inserted"] == 0
-    assert "REDDIT_CLIENT_ID" in result["skipped_reason"]
-
-
-def test_smart_money_all_subreddits_failing_is_failed(monkeypatch: pytest.MonkeyPatch) -> None:
-    import ingestion.altdata.smart_money as sm
-
-    monkeypatch.setattr(sm.time, "sleep", lambda s: None)
-    p = _smart_money_puller()
-    p._reddit_client = RedditAppClient("cid", "csecret", "u", session=_Session({}))  # every GET 404
-    result = p.pull_reddit(subreddits=["options", "stocks"])
-    assert result["status"] == "FAILED"
-    assert "all 2" in result["error"]

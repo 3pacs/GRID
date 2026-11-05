@@ -1,0 +1,110 @@
+name: Migration replay
+
+# Replays the documented fresh-database bootstrap end to end on a throwaway
+# PostgreSQL 15 (issue #523):
+#
+#   schema.sql  ->  alembic stamp 7e4dfecce247  ->  alembic upgrade head
+#
+# then asserts the database is at every head and that a second
+# `alembic upgrade head` applies nothing. Nothing else in CI runs a migration
+# against a database: backend-tests runs pytest only and
+# tests/test_alembic_single_head.py checks the revision graph offline.
+#
+# Hosted runner and a job-scoped service container only -- never a persistent
+# or production database. The password below is a throwaway for a container
+# that lives for this job alone.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: migration-replay-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  migration-replay:
+    name: Migration replay (schema.sql + alembic upgrade head)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: grid
+          POSTGRES_PASSWORD: replay-ci-only
+          POSTGRES_DB: griddb_replay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U grid -d griddb_replay"
+          --health-interval 2s
+          --health-timeout 5s
+          --health-retries 30
+
+    env:
+      # migrations/env.py takes its URL from config.Settings().DB_URL, which
+      # is assembled from these (alembic.ini's sqlalchemy.url is empty).
+      DB_HOST: 127.0.0.1
+      DB_PORT: "5432"
+      DB_NAME: griddb_replay
+      DB_USER: grid
+      DB_PASSWORD: replay-ci-only
+      GRID_JWT_SECRET: migration-replay-ci-only
+      # psql
+      PGHOST: 127.0.0.1
+      PGPORT: "5432"
+      PGDATABASE: griddb_replay
+      PGUSER: grid
+      PGPASSWORD: replay-ci-only
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      # The same requirements deploy.yml installs before its own
+      # `alembic upgrade head`, so the replay runs the production alembic.
+      - name: Install dependencies
+        timeout-minutes: 10
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply schema.sql
+        run: psql -v ON_ERROR_STOP=1 -q -f schema.sql
+
+      - name: Stamp the baseline
+        run: python -m alembic stamp 7e4dfecce247
+
+      - name: Upgrade to head
+        run: python -m alembic upgrade head
+
+      - name: Assert the database is at every head
+        run: |
+          set -euo pipefail
+          heads="$(python -m alembic heads | awk '{print $1}' | sort)"
+          current="$(python -m alembic current | awk '{print $1}' | sort)"
+          echo "heads:   $heads"
+          echo "current: $current"
+          test -n "$heads"
+          test "$heads" = "$current"
+
+      - name: Second upgrade applies nothing
+        run: |
+          set -euo pipefail
+          python -m alembic upgrade head 2>&1 | tee /tmp/second-upgrade.log
+          if grep -q "Running upgrade" /tmp/second-upgrade.log; then
+            echo "::error::a second 'alembic upgrade head' applied revisions"
+            exit 1
+          fi
