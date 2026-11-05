@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
+from html import escape
 from typing import Any
 
 from loguru import logger as log
@@ -57,7 +58,7 @@ _ISSUES_SQL = text("""
 _UX_AUDIT_SQL = text("""
     SELECT score, total_endpoints, endpoints_ok, avg_latency_ms,
            journey_pass, journey_total, priority_fix,
-           friction_points, improvements, audit_timestamp
+           friction_points, improvements, audit_timestamp, full_report
     FROM ux_audit_results
     WHERE audit_timestamp >= NOW() - INTERVAL '24 hours'
     ORDER BY audit_timestamp DESC
@@ -121,7 +122,7 @@ def _collect_issues(engine: Any) -> list[dict[str, Any]] | None:
                     "source": r[3], "title": r[4], "detail": r[5],
                     "diagnosis": r[6], "fix_applied": r[7],
                     "fix_result": r[8],
-                    "time": r[9].strftime("%H:%M") if r[9] else "",
+                    "time": r[9].isoformat() if r[9] else None,
                 }
                 for r in rows
             ]
@@ -137,6 +138,23 @@ def _collect_ux_audit(engine: Any) -> dict[str, Any] | None:
             row = conn.execute(_UX_AUDIT_SQL).fetchone()
             if not row:
                 return None
+            report = _json_value(row[10], {})
+            coverage = None
+            if (
+                isinstance(report, dict) and isinstance(report.get("endpoints"), list)
+                and len(report["endpoints"]) == row[1]
+                and all(isinstance(e, dict) for e in report["endpoints"])
+            ):
+                from scripts.ux_auditor import _summarize_checks
+                journeys = report.get("journeys")
+                journeys_known = (
+                    isinstance(journeys, list) and len(journeys) == row[5]
+                    and all(isinstance(j, dict) for j in journeys)
+                )
+                coverage = _summarize_checks(report["endpoints"], journeys if journeys_known else [])
+                if not journeys_known:
+                    for key in ("journeys_pass", "journeys_total", "journeys_failed", "journeys_incomplete"):
+                        coverage[key] = None
             return {
                 "score": row[0],
                 "total_endpoints": row[1],
@@ -145,9 +163,10 @@ def _collect_ux_audit(engine: Any) -> dict[str, Any] | None:
                 "journey_pass": row[4],
                 "journey_total": row[5],
                 "priority_fix": row[6],
-                "friction_points": json.loads(row[7]) if row[7] else [],
-                "improvements": json.loads(row[8]) if row[8] else [],
+                "friction_points": _json_value(row[7], []),
+                "improvements": _json_value(row[8], []),
                 "timestamp": row[9].isoformat() if row[9] else "",
+                "coverage": coverage,
             }
     except Exception as exc:
         log.debug("Could not collect UX audit: {e}", e=str(exc))
@@ -177,7 +196,7 @@ def _collect_system_stats(engine: Any) -> dict[str, Any]:
             rows = conn.execute(_FAILED_PULLS_SQL).fetchall()
             stats["failed_pulls"] = [
                 {"source": r[0], "title": r[1], "fix": r[3],
-                 "time": r[4].strftime("%H:%M") if r[4] else ""}
+                 "time": r[4].isoformat() if r[4] else None}
                 for r in rows
             ]
     except Exception as exc:
@@ -237,6 +256,40 @@ def _record_digest_sent(engine: Any, sent_at: datetime) -> None:
 # ---------------------------------------------------------------------------
 # Email builder
 # ---------------------------------------------------------------------------
+
+def _json_value(value: Any, default: Any) -> Any:
+    """PostgreSQL drivers may return decoded JSONB or JSON text."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (TypeError, ValueError):
+            return default
+    return value
+
+
+def _format_event_time(value: Any, now: datetime) -> str:
+    """Show a dated UTC time and age without inventing missing timezones."""
+    try:
+        at = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    except (TypeError, ValueError):
+        return "Time unknown"
+    if at.tzinfo is None or at.utcoffset() is None:
+        return f"{at:%Y-%m-%d %H:%M:%S} (timezone unknown; age unknown)"
+    at = at.astimezone(timezone.utc)
+    seconds = (now - at).total_seconds()
+    if seconds < 0:
+        age = "future timestamp; age unknown"
+    elif seconds < 60:
+        age = "<1m ago"
+    elif seconds < 3600:
+        age = f"{int(seconds // 60)}m ago"
+    else:
+        hours, minutes = divmod(int(seconds // 60), 60)
+        age = f"{hours}h {minutes}m ago"
+    return f"{at:%Y-%m-%d %H:%M:%S} UTC ({age})"
+
 
 def _fmt_usd_short(value: Any) -> str:
     """``$906 M`` style market cap, ``—`` when unknown."""
@@ -342,7 +395,7 @@ def _build_digest_sections(
 ) -> list[dict[str, Any]]:
     """Build email sections for the daily digest."""
     sections: list[dict[str, Any]] = []
-    datetime.now(timezone.utc)
+    now = datetime.now(timezone.utc)
 
     # A failed collector cannot establish a zero-issue interval.
     issues_available = issues is not None
@@ -390,7 +443,7 @@ def _build_digest_sections(
             rows_html += (
                 f"<tr>"
                 f"<td style='color:{sev_color};font-weight:700;font-size:11px'>{i['severity']}</td>"
-                f"<td style='font-size:13px'>{i['time']}</td>"
+                f"<td style='font-size:13px'>{_format_event_time(i.get('time'), now)}</td>"
                 f"<td style='font-size:13px'>{i['title'][:80]}</td>"
                 f"<td style='font-size:13px'>{i.get('source', '')}</td>"
                 f"<td style='font-size:13px;text-align:center'>{fix_icon}</td>"
@@ -399,7 +452,7 @@ def _build_digest_sections(
 
         table = (
             "<table class='data-table'>"
-            "<tr><th>SEV</th><th>TIME</th><th>ISSUE</th><th>SOURCE</th><th>FIX</th></tr>"
+            "<tr><th>SEV</th><th>RECORDED AT / AGE</th><th>ISSUE</th><th>SOURCE</th><th>FIX</th></tr>"
             f"{rows_html}</table>"
         )
         if len(issues) > 15:
@@ -409,28 +462,66 @@ def _build_digest_sections(
 
     # ── UX Audit ──
     if ux_audit:
-        score = ux_audit.get("score", "?")
-        score_color = "#22C55E" if (score and score >= 7) else (
-            "#F59E0B" if (score and score >= 4) else "#EF4444"
+        score = ux_audit.get("score")
+        score_known = isinstance(score, (int, float)) and not isinstance(score, bool) and 1 <= score <= 10
+        coverage = ux_audit.get("coverage")
+        complete = (
+            coverage is not None and coverage["endpoints_total"] > 0
+            and not (coverage["endpoints_skipped"] or coverage["endpoints_untested"])
+            and coverage["journeys_incomplete"] == 0
         )
+        score_text = "Score unavailable"
+        if score_known:
+            score_text = f"{score}/10 (recorded LLM estimate)"
+            if not complete:
+                score_text += "; coverage incomplete or unknown"
+        score_color = "#22C55E" if score_known and score >= 7 and complete else "#F59E0B"
+        if score_known and score < 4:
+            score_color = "#EF4444"
+        if coverage is None:
+            endpoint_text = "Coverage unknown; skipped and failed counts unavailable"
+            journey_text = "Coverage unknown; journey outcomes unverified"
+        else:
+            endpoint_text = (
+                f"{coverage['endpoints_tested']}/{coverage['endpoints_total']} tested: "
+                f"{coverage['endpoints_ok']} OK, {coverage['endpoints_failed']} failed; "
+                f"{coverage['endpoints_skipped']} skipped, {coverage['endpoints_untested']} untested"
+            )
+            if coverage.get("skip_reasons"):
+                endpoint_text += " (" + ", ".join(
+                    f"{escape(reason)}: {count}" for reason, count in sorted(coverage["skip_reasons"].items())
+                ) + ")"
+            failed = coverage.get("journeys_failed")
+            incomplete = coverage.get("journeys_incomplete")
+            journey_text = (
+                f"{coverage['journeys_pass']}/{coverage['journeys_total']} pass; "
+                + (f"{failed} with failed steps" if failed is not None else "failed count unknown")
+                + "; "
+                + (f"{incomplete} incomplete" if incomplete is not None else "incomplete count unknown")
+            )
+            if coverage["journeys_total"] is None:
+                journey_text = "Coverage unknown; journey outcomes unverified"
+        latency = coverage.get("avg_latency_ms") if coverage is not None else ux_audit.get("avg_latency_ms")
+        latency_text = f"{latency:.0f}ms" if isinstance(latency, (int, float)) else "Latency unavailable"
 
         ux_body = (
             f"<div class='kpi-row'>"
             f"<span class='kpi-label'>UX Score</span>"
-            f"<span class='kpi-value' style='color:{score_color}'>{score}/10</span>"
+            f"<span class='kpi-value' style='color:{score_color}'>{score_text}</span>"
             f"</div>"
             f"<div class='kpi-row'>"
             f"<span class='kpi-label'>Endpoints</span>"
-            f"<span class='kpi-value'>{ux_audit.get('endpoints_ok', '?')}/{ux_audit.get('total_endpoints', '?')} OK</span>"
+            f"<span class='kpi-value'>{endpoint_text}</span>"
             f"</div>"
             f"<div class='kpi-row'>"
             f"<span class='kpi-label'>Avg Latency</span>"
-            f"<span class='kpi-value'>{ux_audit.get('avg_latency_ms', '?'):.0f}ms</span>"
+            f"<span class='kpi-value'>{latency_text}</span>"
             f"</div>"
             f"<div class='kpi-row'>"
             f"<span class='kpi-label'>User Journeys</span>"
-            f"<span class='kpi-value'>{ux_audit.get('journey_pass', '?')}/{ux_audit.get('journey_total', '?')} pass</span>"
+            f"<span class='kpi-value'>{journey_text}</span>"
             f"</div>"
+            f"<div>Audit recorded: {_format_event_time(ux_audit.get('timestamp'), now)}</div>"
         )
 
         if ux_audit.get("priority_fix"):
@@ -451,12 +542,12 @@ def _build_digest_sections(
                 ux_body += f"<li style='font-size:13px;color:#C8D8E8'>{imp}</li>"
             ux_body += "</ul>"
 
-        ux_accent = "green" if (score and score >= 7) else ("amber" if (score and score >= 4) else "red")
+        ux_accent = "green" if score_color == "#22C55E" else ("red" if score_color == "#EF4444" else "amber")
         sections.append({"title": "UX Audit", "body": ux_body, "accent": ux_accent})
     else:
         sections.append({
             "title": "UX Audit",
-            "body": "<span style='color:#5A7A96'>No UX audit ran in the past 24 hours</span>",
+            "body": "<span style='color:#5A7A96'>No recent UX audit result available; audit status unknown.</span>",
         })
 
     # ── System Health ──
@@ -494,7 +585,7 @@ def _build_digest_sections(
         for fp in failed[:8]:
             sys_body += (
                 f"<li style='font-size:13px;color:#C8D8E8'>"
-                f"{fp['source']} @ {fp['time']} — {fp.get('fix', 'pending')}</li>"
+                f"{fp['source']} @ {_format_event_time(fp.get('time'), now)} - {fp.get('fix', 'pending')}</li>"
             )
         sys_body += "</ul>"
 

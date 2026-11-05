@@ -275,6 +275,59 @@ def _truncate_sample(data: Any, max_chars: int = 500) -> str:
 # Journey tester
 # ---------------------------------------------------------------------------
 
+def _endpoint_outcome(result: dict[str, Any] | None) -> str:
+    """Classify evidence, including skipped rows written by older auditors."""
+    if result is None:
+        return "untested"
+    if result.get("data_quality") == "SKIPPED":
+        return "skipped"
+    if result.get("ok") is True:
+        return "ok"
+    if result.get("ok") is False:
+        return "failed"
+    return "untested"
+
+
+def _summarize_checks(
+    endpoints: list[dict[str, Any]], journeys: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Keep measured failures separate from absent coverage; no schema change."""
+    counts = {outcome: 0 for outcome in ("ok", "failed", "skipped", "untested")}
+    for endpoint in endpoints:
+        counts[_endpoint_outcome(endpoint)] += 1
+    skip_reasons: dict[str, int] = {}
+    for endpoint in endpoints:
+        if _endpoint_outcome(endpoint) == "skipped":
+            reason = endpoint.get("error") or "reason unknown"
+            skip_reasons[reason] = skip_reasons.get(reason, 0) + 1
+    latencies = [
+        e["latency_ms"] for e in endpoints
+        if _endpoint_outcome(e) in ("ok", "failed") and e.get("latency_ms") is not None
+    ]
+    return {
+        "endpoints_total": len(endpoints),
+        **{f"endpoints_{key}": count for key, count in counts.items()},
+        "endpoints_tested": counts["ok"] + counts["failed"],
+        "skip_reasons": skip_reasons,
+        "endpoints_slow": sum(
+            1 for e in endpoints if _endpoint_outcome(e) in ("ok", "failed")
+            and e.get("latency_grade") in ("SLOW", "CRITICAL")
+        ),
+        "avg_latency_ms": round(sum(latencies) / len(latencies), 1) if latencies else None,
+        "journeys_total": len(journeys),
+        "journeys_pass": sum(j.get("grade") == "PASS" for j in journeys),
+        # Legacy journey grades conflated missing coverage with failures.
+        "journeys_failed": (
+            sum(j.get("steps_failed", 0) > 0 for j in journeys)
+            if all("steps_failed" in j for j in journeys) else None
+        ),
+        "journeys_incomplete": (
+            sum(bool(j.get("steps_skipped") or j.get("steps_untested") or not j.get("steps")) for j in journeys)
+            if all("steps_untested" in j for j in journeys) else None
+        ),
+    }
+
+
 def _test_journey(
     journey: dict[str, Any],
     token: str | None,
@@ -282,31 +335,53 @@ def _test_journey(
 ) -> dict[str, Any]:
     """Evaluate a user journey using already-collected endpoint results."""
     steps_ok = 0
+    steps_failed = 0
+    steps_skipped = 0
+    steps_untested = 0
     total_latency = 0.0
+    latency_complete = True
     blockers: list[str] = []
 
     for path in journey["steps"]:
         result = endpoint_results.get(path)
-        if result is None:
+        outcome = _endpoint_outcome(result)
+        if outcome == "untested":
+            steps_untested += 1
             blockers.append(f"{path}: not tested")
             continue
-        if result["ok"]:
+        if outcome == "skipped":
+            steps_skipped += 1
+            blockers.append(f"{path}: skipped ({result.get('error', 'reason unknown')})")
+            continue
+        if outcome == "ok":
             steps_ok += 1
         else:
+            steps_failed += 1
             blockers.append(f"{path}: {result.get('error', result.get('status_code', 'failed'))}")
-        total_latency += result.get("latency_ms", 0) or 0
+        if result.get("latency_ms") is None:
+            latency_complete = False
+        else:
+            total_latency += result["latency_ms"]
 
-    completion_rate = steps_ok / len(journey["steps"]) if journey["steps"] else 0
+    incomplete = bool(steps_skipped or steps_untested or not journey["steps"])
+    completion_rate = steps_ok / len(journey["steps"]) if not incomplete else None
+    if incomplete:
+        grade = "FAIL" if steps_failed else "INCOMPLETE"
+    else:
+        grade = "PASS" if completion_rate == 1.0 else ("DEGRADED" if completion_rate > 0.5 else "FAIL")
 
     return {
         "name": journey["name"],
         "desc": journey["desc"],
-        "completion_rate": round(completion_rate, 2),
-        "total_latency_ms": round(total_latency, 1),
+        "completion_rate": round(completion_rate, 2) if completion_rate is not None else None,
+        "total_latency_ms": round(total_latency, 1) if latency_complete and not incomplete else None,
         "steps": len(journey["steps"]),
         "steps_ok": steps_ok,
+        "steps_failed": steps_failed,
+        "steps_skipped": steps_skipped,
+        "steps_untested": steps_untested,
         "blockers": blockers,
-        "grade": "PASS" if completion_rate == 1.0 else ("DEGRADED" if completion_rate > 0.5 else "FAIL"),
+        "grade": grade,
     }
 
 
@@ -318,6 +393,10 @@ _UX_ANALYSIS_PROMPT = """You are GRID's UX auditor. Analyze these API test resul
 
 Think like a first-time user visiting grid.stepdad.finance. They see a dark trading dashboard.
 What works? What's confusing? What's broken? What would make them leave?
+
+SKIPPED and untested checks provide no evidence of endpoint failure or success.
+INCOMPLETE journeys are unverified. Limit conclusions and scores to tested coverage;
+do not infer the cause of missing coverage beyond the recorded reason.
 
 ## Endpoint Results
 {endpoint_summary}
@@ -364,17 +443,17 @@ def _run_llm_analysis(
 
         # Build summaries
         endpoint_summary = "\n".join(
-            f"  {r['desc']:25s} | {r.get('status_code', '---'):>3} | "
-            f"{r.get('latency_ms', '---'):>7}ms | "
+            f"  {r['desc']:25s} | {_endpoint_outcome(r)} | {str(r.get('status_code') or '---'):>3} | "
+            f"{str(r.get('latency_ms') if r.get('latency_ms') is not None else '---'):>7}ms | "
             f"data={r.get('data_quality', '?'):10s} | "
-            f"latency={r.get('latency_grade', '?')}"
+            f"latency={r.get('latency_grade', '?')} | reason={r.get('error', 'none')}"
             for r in endpoint_results
         )
 
         journey_summary = "\n".join(
             f"  {j['name']:25s} | {j['grade']:8s} | "
             f"{j['steps_ok']}/{j['steps']} steps | "
-            f"{j['total_latency_ms']:.0f}ms total"
+            + (f"{j['total_latency_ms']:.0f}ms total" if j.get("total_latency_ms") is not None else "total latency unknown")
             + (f" | blockers: {', '.join(j['blockers'])}" if j['blockers'] else "")
             for j in journey_results
         )
@@ -382,7 +461,7 @@ def _run_llm_analysis(
         # Include samples from problematic endpoints
         problem_samples = []
         for r in endpoint_results:
-            if r.get("data_quality") not in ("OK", None) or not r.get("ok"):
+            if _endpoint_outcome(r) in ("ok", "failed") and (r.get("data_quality") not in ("OK", None) or not r.get("ok")):
                 sample = r.get("sample", "no data")
                 problem_samples.append(f"  {r['path']}: {sample}")
         # Also include a few good samples for context
@@ -500,18 +579,15 @@ def _save_audit(engine: Any, report: dict[str, Any]) -> int | None:
             endpoint_results = report.get("endpoints", [])
             journey_results = report.get("journeys", [])
 
-            ok_count = sum(1 for e in endpoint_results if e.get("ok"))
-            latencies = [e["latency_ms"] for e in endpoint_results if e.get("latency_ms")]
-            avg_lat = sum(latencies) / len(latencies) if latencies else 0
-            j_pass = sum(1 for j in journey_results if j["grade"] == "PASS")
+            summary = _summarize_checks(endpoint_results, journey_results)
 
             row = conn.execute(
                 _INSERT_AUDIT_SQL.bindparams(
                     score=analysis.get("score"),
                     total_endpoints=len(endpoint_results),
-                    endpoints_ok=ok_count,
-                    avg_latency_ms=round(avg_lat, 1),
-                    journey_pass=j_pass,
+                    endpoints_ok=summary["endpoints_ok"],
+                    avg_latency_ms=summary["avg_latency_ms"],
+                    journey_pass=summary["journeys_pass"],
                     journey_total=len(journey_results),
                     priority_fix=analysis.get("priority_fix"),
                     friction_points=json.dumps(analysis.get("FRICTION_POINTS", [])),
@@ -562,10 +638,12 @@ def run_ux_audit(
 
     for ep in _ENDPOINT_REGISTRY:
         if ep.get("auth") and not token:
-            endpoint_results.append({
+            result = {
                 "path": ep["path"], "desc": ep["desc"],
-                "ok": False, "error": "NO_AUTH", "data_quality": "SKIPPED",
-            })
+                "ok": None, "error": "NO_AUTH", "data_quality": "SKIPPED",
+            }
+            endpoint_results.append(result)
+            endpoint_lookup[ep["path"]] = result
             continue
 
         result = _test_endpoint(ep, token, base_url)
@@ -577,8 +655,8 @@ def run_ux_audit(
             log.info(
                 "  {s} {d:25s} | {code:>3} | {lat:>7}ms",
                 s=status, d=ep["desc"],
-                code=result.get("status_code", "---"),
-                lat=result.get("latency_ms", "---"),
+                code=str(result.get("status_code")),
+                lat=str(result.get("latency_ms")),
             )
 
     report["endpoints"] = endpoint_results
@@ -612,18 +690,8 @@ def run_ux_audit(
         log.warning("UX Audit: LLM analysis unavailable")
 
     # 5. Summary stats
-    ok_count = sum(1 for e in endpoint_results if e.get("ok"))
-    fail_count = len(endpoint_results) - ok_count
-    slow_count = sum(1 for e in endpoint_results if e.get("latency_grade") in ("SLOW", "CRITICAL"))
-    j_pass = sum(1 for j in journey_results if j["grade"] == "PASS")
-
     report["summary"] = {
-        "endpoints_total": len(endpoint_results),
-        "endpoints_ok": ok_count,
-        "endpoints_failed": fail_count,
-        "endpoints_slow": slow_count,
-        "journeys_total": len(journey_results),
-        "journeys_pass": j_pass,
+        **_summarize_checks(endpoint_results, journey_results),
         "score": analysis.get("score") if analysis else None,
         "elapsed_seconds": round(time.monotonic() - audit_start, 1),
     }
@@ -636,9 +704,14 @@ def run_ux_audit(
 
     log.info(
         "═══ UX Audit complete — {ok}/{total} endpoints OK, "
-        "{jp}/{jt} journeys pass, {t:.1f}s ═══",
-        ok=ok_count, total=len(endpoint_results),
-        jp=j_pass, jt=len(journey_results),
+        "{failed} failed, {skipped} skipped, {untested} untested; "
+        "{jp}/{jt} journeys pass, {incomplete} incomplete, {t:.1f}s ═══",
+        ok=report["summary"]["endpoints_ok"], total=len(endpoint_results),
+        jp=report["summary"]["journeys_pass"], jt=len(journey_results),
+        failed=report["summary"]["endpoints_failed"],
+        skipped=report["summary"]["endpoints_skipped"],
+        untested=report["summary"]["endpoints_untested"],
+        incomplete=report["summary"]["journeys_incomplete"],
         t=report["summary"]["elapsed_seconds"],
     )
 
@@ -717,7 +790,10 @@ if __name__ == "__main__":
     log.info("  UX AUDIT RESULTS")
     log.info("{}", '='*50)
     log.info("  Endpoints:  {}/{} OK, {} slow", s['endpoints_ok'], s['endpoints_total'], s['endpoints_slow'])
+    log.info("  Coverage:   {} tested, {} failed, {} skipped, {} untested",
+             s['endpoints_tested'], s['endpoints_failed'], s['endpoints_skipped'], s['endpoints_untested'])
     log.info("  Journeys:   {}/{} pass", s['journeys_pass'], s['journeys_total'])
+    log.info("  Incomplete: {} journeys", s['journeys_incomplete'])
     log.info("  UX Score:   {}/10", s.get('score', '?'))
     log.info("  Time:       {}s", s['elapsed_seconds'])
 
